@@ -1,6 +1,6 @@
 use super::stdlib::rss::strings as string;
 
-fn add_one(x);
+use vm::{add_one};
 
 // Complex RustScript example with closure capture, stdlib module use, and host calls.
 let total = 0;

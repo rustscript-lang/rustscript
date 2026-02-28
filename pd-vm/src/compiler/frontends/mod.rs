@@ -55,21 +55,21 @@ impl FrontendCompiler for RustScriptCompiler {
 impl FrontendCompiler for JavaScriptCompiler {
     fn parse(&self, source: &str) -> Result<FrontendOutput, ParseError> {
         let lowered = javascript::lower(source)?;
-        parse_with_parser(&lowered, true)
+        parse_with_parser(&lowered, false)
     }
 }
 
 impl FrontendCompiler for LuaCompiler {
     fn parse(&self, source: &str) -> Result<FrontendOutput, ParseError> {
         let lowered = lua::lower(source)?;
-        parse_with_parser(&lowered, true)
+        parse_with_parser(&lowered, false)
     }
 }
 
 impl FrontendCompiler for SchemeCompiler {
     fn parse(&self, source: &str) -> Result<FrontendOutput, ParseError> {
         let lowered = scheme::lower(source)?;
-        parse_with_parser(&lowered, true)
+        parse_with_parser(&lowered, false)
     }
 }
 

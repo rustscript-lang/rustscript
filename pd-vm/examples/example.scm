@@ -1,3 +1,5 @@
+(require (only-in "vm" add_one))
+
 (define i 0)
 (define total 0)
 

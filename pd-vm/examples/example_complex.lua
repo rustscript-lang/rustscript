@@ -1,4 +1,4 @@
-local _host = require("pd-vm-host")
+local add_one = require("vm").add_one
 local string = require("../stdlib/rss/strings.rss")
 
 -- Complex Lua flavor example: loop + stdlib + host + closure.

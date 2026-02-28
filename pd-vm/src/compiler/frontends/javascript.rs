@@ -1,5 +1,6 @@
 use super::super::{ParseError, STDLIB_PRINT_NAME};
 use super::{is_ident_continue, is_ident_start};
+use std::collections::HashSet;
 
 pub(super) fn lower(source: &str) -> Result<String, ParseError> {
     let console_rewritten = rewrite_console_log_calls(source);
@@ -11,20 +12,58 @@ pub(super) fn lower(source: &str) -> Result<String, ParseError> {
 
     let mut lines = Vec::new();
     let mut in_import_block = false;
+    let mut import_block = String::new();
+    let mut vm_import_emitted = false;
+    let mut vm_namespace_aliases = HashSet::new();
     for (index, raw_line) in keyword_rewritten.lines().enumerate() {
         let line_no = index + 1;
         let trimmed = raw_line.trim();
         if in_import_block {
-            lines.push(String::new());
+            if !import_block.is_empty() {
+                import_block.push(' ');
+            }
+            import_block.push_str(trimmed);
+            if !vm_import_emitted && is_js_vm_import_block(&import_block) {
+                if let Some(alias) = parse_js_vm_namespace_alias_from_import_block(&import_block) {
+                    vm_namespace_aliases.insert(alias);
+                }
+                lines.push("use vm::*;".to_string());
+                vm_import_emitted = true;
+            } else {
+                lines.push(String::new());
+            }
             if trimmed.contains(" from ") || trimmed.ends_with(';') {
                 in_import_block = false;
+                import_block.clear();
             }
             continue;
         }
         if trimmed.starts_with("import ") {
-            lines.push(String::new());
+            import_block.clear();
+            import_block.push_str(trimmed);
+            if !vm_import_emitted && is_js_vm_import_block(&import_block) {
+                if let Some(alias) = parse_js_vm_namespace_alias_from_import_block(&import_block) {
+                    vm_namespace_aliases.insert(alias);
+                }
+                lines.push("use vm::*;".to_string());
+                vm_import_emitted = true;
+            } else {
+                lines.push(String::new());
+            }
             if !trimmed.contains(" from ") && !trimmed.ends_with(';') {
                 in_import_block = true;
+            }
+            continue;
+        }
+        if is_js_vm_require_line(raw_line) {
+            if let Some(alias) = parse_js_vm_require_namespace_alias(raw_line) {
+                vm_namespace_aliases.insert(alias);
+            }
+            if !vm_import_emitted {
+                lines.push("use vm::*;".to_string());
+                vm_import_emitted = true;
+            } else {
+                lines.push(String::new());
             }
             continue;
         }
@@ -32,7 +71,8 @@ pub(super) fn lower(source: &str) -> Result<String, ParseError> {
             lines.push(String::new());
             continue;
         }
-        lines.push(rewrite_js_arrow_line(raw_line, line_no)?);
+        let namespace_rewritten = rewrite_js_vm_namespace_calls(raw_line, &vm_namespace_aliases);
+        lines.push(rewrite_js_arrow_line(&namespace_rewritten, line_no)?);
     }
     Ok(lines.join("\n"))
 }
@@ -55,6 +95,231 @@ fn is_js_external_decl_line(line: &str) -> bool {
     }
 
     trimmed.contains("require(")
+}
+
+fn is_js_vm_require_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.contains("require(\"vm\")") || trimmed.contains("require('vm')")
+}
+
+fn is_js_vm_import_block(block: &str) -> bool {
+    let trimmed = block.trim();
+    if !trimmed.starts_with("import ") {
+        return false;
+    }
+    if let Some(from_idx) = trimmed.find(" from ") {
+        let tail = &trimmed[from_idx + " from ".len()..];
+        return extract_quoted_literal(tail).is_some_and(|(spec, _)| spec == "vm");
+    }
+    let tail = &trimmed["import ".len()..];
+    extract_quoted_literal(tail).is_some_and(|(spec, _)| spec == "vm")
+}
+
+fn parse_js_vm_namespace_alias_from_import_block(block: &str) -> Option<String> {
+    let trimmed = block.trim();
+    if !is_js_vm_import_block(trimmed) {
+        return None;
+    }
+    let from_idx = trimmed.find(" from ")?;
+    let head = trimmed["import ".len()..from_idx].trim();
+    let alias = head.strip_prefix("* as ")?;
+    let alias = alias.trim();
+    if is_valid_ident(alias) {
+        Some(alias.to_string())
+    } else {
+        None
+    }
+}
+
+fn parse_js_vm_require_namespace_alias(line: &str) -> Option<String> {
+    let trimmed = line.trim().trim_end_matches(';').trim();
+    let rest = if let Some(rest) = trimmed.strip_prefix("let ") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("const ") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("var ") {
+        rest
+    } else {
+        return None;
+    };
+    let (name, rhs) = rest.split_once('=')?;
+    let name = name.trim();
+    if !is_valid_ident(name) {
+        return None;
+    }
+    let (spec, remainder) = parse_js_require_call(rhs.trim())?;
+    if spec == "vm" && remainder.is_empty() {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+fn parse_js_require_call(input: &str) -> Option<(String, String)> {
+    let mut rest = input.trim().strip_prefix("require")?.trim_start();
+    rest = rest.strip_prefix('(')?.trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    rest = &rest[quote.len_utf8()..];
+    let mut end = None;
+    for (idx, ch) in rest.char_indices() {
+        if ch == quote {
+            end = Some(idx);
+            break;
+        }
+    }
+    let end = end?;
+    let spec = rest[..end].to_string();
+    let tail = rest[end + quote.len_utf8()..].trim_start();
+    if !tail.starts_with(')') {
+        return None;
+    }
+    let remainder = tail[1..].trim().to_string();
+    Some((spec, remainder))
+}
+
+fn rewrite_js_vm_namespace_calls(line: &str, vm_namespace_aliases: &HashSet<String>) -> String {
+    if vm_namespace_aliases.is_empty() {
+        return line.to_string();
+    }
+
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0usize;
+    let mut in_string: Option<u8> = None;
+    let mut escaped = false;
+    let mut in_line_comment = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if in_line_comment {
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+
+        if let Some(delim) = in_string {
+            out.push(b as char);
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == delim {
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            out.push('/');
+            out.push('/');
+            i += 2;
+            in_line_comment = true;
+            continue;
+        }
+
+        if b == b'"' || b == b'\'' || b == b'`' {
+            out.push(b as char);
+            in_string = Some(b);
+            escaped = false;
+            i += 1;
+            continue;
+        }
+
+        if is_ident_start(b as char) {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && is_ident_continue(bytes[i] as char) {
+                i += 1;
+            }
+            let ident = &line[start..i];
+            if vm_namespace_aliases.contains(ident) {
+                let mut j = i;
+                while j < bytes.len()
+                    && bytes[j].is_ascii_whitespace()
+                    && bytes[j] != b'\n'
+                    && bytes[j] != b'\r'
+                {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'.' {
+                    let mut k = j + 1;
+                    while k < bytes.len()
+                        && bytes[k].is_ascii_whitespace()
+                        && bytes[k] != b'\n'
+                        && bytes[k] != b'\r'
+                    {
+                        k += 1;
+                    }
+                    if k < bytes.len() && is_ident_start(bytes[k] as char) {
+                        let member_start = k;
+                        k += 1;
+                        while k < bytes.len() && is_ident_continue(bytes[k] as char) {
+                            k += 1;
+                        }
+                        let member = &line[member_start..k];
+                        let mut call_check = k;
+                        while call_check < bytes.len()
+                            && bytes[call_check].is_ascii_whitespace()
+                            && bytes[call_check] != b'\n'
+                            && bytes[call_check] != b'\r'
+                        {
+                            call_check += 1;
+                        }
+                        if call_check < bytes.len() && bytes[call_check] == b'(' {
+                            out.push_str(member);
+                            i = k;
+                            continue;
+                        }
+                    }
+                }
+            }
+            out.push_str(ident);
+            continue;
+        }
+
+        out.push(b as char);
+        i += 1;
+    }
+
+    out
+}
+
+fn is_valid_ident(input: &str) -> bool {
+    let mut chars = input.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    is_ident_start(first) && chars.all(is_ident_continue)
+}
+
+fn extract_quoted_literal(input: &str) -> Option<(&str, &str)> {
+    let bytes = input.as_bytes();
+    let mut start_idx = None;
+    let mut quote = b'"';
+    for (idx, byte) in bytes.iter().enumerate() {
+        if *byte == b'"' || *byte == b'\'' {
+            start_idx = Some(idx);
+            quote = *byte;
+            break;
+        }
+    }
+    let start = start_idx?;
+    let mut i = start + 1;
+    while i < bytes.len() {
+        if bytes[i] == quote {
+            return Some((&input[start + 1..i], &input[i + 1..]));
+        }
+        i += 1;
+    }
+    None
 }
 
 fn rewrite_keywords<F>(source: &str, mut rewrite: F) -> String

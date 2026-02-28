@@ -1,4 +1,5 @@
 (import (prefix "../stdlib/rss/strings.rss" string:))
+(require (only-in "vm" add_one))
 
 ; Complex Scheme flavor example: loop + stdlib + host + closure.
 (define total 0)

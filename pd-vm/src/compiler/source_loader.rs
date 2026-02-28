@@ -54,12 +54,18 @@ pub(super) fn load_units_for_source_file(
 
     let rewritten_root_source =
         rewrite_imported_call_sites(&source, flavor, path, &root_imports, &module_exports)?;
-    let root_parse_source = if flavor == SourceFlavor::RustScript {
-        let mut prelude = build_rustscript_import_prelude(path, &root_imports, &module_exports)?;
-        prelude.push_str(&rewritten_root_source);
-        prelude
-    } else {
-        rewritten_root_source
+    let root_parse_source = match flavor {
+        SourceFlavor::Scheme => {
+            let mut prelude = build_scheme_import_prelude(path, &root_imports, &module_exports)?;
+            prelude.push_str(&rewritten_root_source);
+            prelude
+        }
+        SourceFlavor::RustScript | SourceFlavor::JavaScript | SourceFlavor::Lua => {
+            let mut prelude =
+                build_rustscript_import_prelude(path, &root_imports, &module_exports)?;
+            prelude.push_str(&rewritten_root_source);
+            prelude
+        }
     };
 
     let root_parsed = frontends::parse_source(&root_parse_source, flavor)
@@ -496,8 +502,6 @@ struct SchemeTopLevelForm {
     text: String,
     head: String,
     start_line: usize,
-    start: usize,
-    end: usize,
 }
 
 fn collect_scheme_top_level_forms(source: &str) -> Vec<SchemeTopLevelForm> {
@@ -572,8 +576,6 @@ fn collect_scheme_top_level_forms(source: &str) -> Vec<SchemeTopLevelForm> {
                         text,
                         head,
                         start_line,
-                        start,
-                        end,
                     });
                 }
             }
@@ -982,7 +984,7 @@ fn strip_import_directives(source: &str, flavor: SourceFlavor) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n"),
-        SourceFlavor::Scheme => strip_scheme_import_directives(source),
+        SourceFlavor::Scheme => source.to_string(),
         SourceFlavor::JavaScript | SourceFlavor::Lua => source.to_string(),
     }
 }
@@ -1003,37 +1005,6 @@ fn is_vm_use_directive_line(line: &str) -> bool {
         return true;
     }
     directive_body.starts_with("vm::")
-}
-
-fn strip_scheme_import_directives(source: &str) -> String {
-    let mut ranges = collect_scheme_top_level_forms(source)
-        .into_iter()
-        .filter(|form| form.head == "import" || form.head == "require")
-        .map(|form| (form.start, form.end))
-        .collect::<Vec<_>>();
-
-    if ranges.is_empty() {
-        return source.to_string();
-    }
-    ranges.sort_by_key(|(start, _)| *start);
-
-    let mut out = String::with_capacity(source.len());
-    let mut cursor = 0usize;
-    for (start, end) in ranges {
-        if start > cursor {
-            out.push_str(&source[cursor..start]);
-        }
-        for ch in source[start..end].chars() {
-            if ch == '\n' {
-                out.push('\n');
-            }
-        }
-        cursor = end;
-    }
-    if cursor < source.len() {
-        out.push_str(&source[cursor..]);
-    }
-    out
 }
 
 fn collect_module_units(
@@ -1098,6 +1069,40 @@ fn build_rustscript_import_prelude(
     imports: &[ModuleImport],
     module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
 ) -> Result<String, SourcePathError> {
+    let declared = collect_imported_module_functions(path, imports, module_exports)?;
+    let mut prelude = String::new();
+    for (name, arity) in declared {
+        let args = (0..arity)
+            .map(|idx| format!("arg{idx}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        prelude.push_str(&format!("pub fn {name}({args});\n"));
+    }
+    Ok(prelude)
+}
+
+fn build_scheme_import_prelude(
+    path: &Path,
+    imports: &[ModuleImport],
+    module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
+) -> Result<String, SourcePathError> {
+    let declared = collect_imported_module_functions(path, imports, module_exports)?;
+    let mut prelude = String::new();
+    for (name, arity) in declared {
+        let args = (0..arity)
+            .map(|idx| format!("arg{idx}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        prelude.push_str(&format!("(declare ({name} {args}))\n"));
+    }
+    Ok(prelude)
+}
+
+fn collect_imported_module_functions(
+    path: &Path,
+    imports: &[ModuleImport],
+    module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
+) -> Result<Vec<(String, u8)>, SourcePathError> {
     let mut imported_functions = HashMap::<String, u8>::new();
 
     for import in imports {
@@ -1147,16 +1152,7 @@ fn build_rustscript_import_prelude(
 
     let mut declared = imported_functions.into_iter().collect::<Vec<_>>();
     declared.sort_by(|(lhs_name, _), (rhs_name, _)| lhs_name.cmp(rhs_name));
-
-    let mut prelude = String::new();
-    for (name, arity) in declared {
-        let args = (0..arity)
-            .map(|idx| format!("arg{idx}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        prelude.push_str(&format!("pub fn {name}({args});\n"));
-    }
-    Ok(prelude)
+    Ok(declared)
 }
 
 fn rewrite_imported_call_sites(

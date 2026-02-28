@@ -132,9 +132,9 @@ fn lua_function_literal_without_return_is_rejected() {
 }
 
 #[test]
-fn lua_require_declaration_is_ignored() {
+fn lua_require_namespace_enables_direct_host_calls() {
     let source = r#"
-        local _host = require("pd-vm-host")
+        local vm = require("vm")
         print(add_one(41))
     "#;
     let compiled =
@@ -209,4 +209,21 @@ fn compile_source_file_lua_supports_namespace_and_named_require_imports() {
     let _ = std::fs::remove_file(main_path);
     let _ = std::fs::remove_file(module_path);
     let _ = std::fs::remove_dir(root);
+}
+
+#[test]
+fn lua_undeclared_host_call_is_rejected() {
+    let source = r#"
+        add_one(41)
+    "#;
+    let err = match compile_source_with_flavor(source, SourceFlavor::Lua) {
+        Ok(_) => panic!("undeclared host call should fail"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(parse.message.contains("unknown function 'add_one'"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
 }

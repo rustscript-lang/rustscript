@@ -1,4 +1,4 @@
-fn add_one(x);
+use vm::{add_one};
 
 let i = 0;
 let total = 0;

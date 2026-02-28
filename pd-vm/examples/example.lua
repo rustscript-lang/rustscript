@@ -1,4 +1,4 @@
-local _host = require("pd-vm-host")
+local add_one = require("vm").add_one
 
 local i = 0
 local total = 0

@@ -222,3 +222,20 @@ fn compile_source_file_scheme_supports_module_language_require_sets() {
     let _ = std::fs::remove_file(module_path);
     let _ = std::fs::remove_dir(root);
 }
+
+#[test]
+fn scheme_undeclared_host_call_is_rejected() {
+    let source = r#"
+        (add_one 41)
+    "#;
+    let err = match compile_source_with_flavor(source, SourceFlavor::Scheme) {
+        Ok(_) => panic!("undeclared host call should fail"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(parse.message.contains("unknown function 'add_one'"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}

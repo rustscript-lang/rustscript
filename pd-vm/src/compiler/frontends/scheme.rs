@@ -363,6 +363,7 @@ fn lower_stmt(form: &SchemeForm, indent: usize, out: &mut Vec<String>) -> Result
             "for" => return lower_for_stmt(args, form.line, indent, out),
             "break" => return lower_break_stmt(args, form.line, indent, out),
             "continue" => return lower_continue_stmt(args, form.line, indent, out),
+            "import" | "require" => return lower_import_require_stmt(args, form.line, indent, out),
             "vector-set!" | "hash-set!" => {
                 return lower_index_set_stmt(head, args, form.line, indent, out);
             }
@@ -785,6 +786,138 @@ fn lower_declare_stmt(
     Ok(())
 }
 
+fn lower_import_require_stmt(
+    args: &[SchemeForm],
+    line: usize,
+    indent: usize,
+    out: &mut Vec<String>,
+) -> Result<(), ParseError> {
+    let mut emitted_any = false;
+    let mut emitted_vm_wildcard = false;
+
+    for arg in args {
+        let Some(clause) = arg.as_list() else {
+            if let SchemeNode::String(spec) = &arg.node && spec == "vm" {
+                if !emitted_vm_wildcard {
+                    push_line(out, indent, "use vm::*;");
+                    emitted_vm_wildcard = true;
+                }
+                emitted_any = true;
+            }
+            continue;
+        };
+        if clause.is_empty() {
+            continue;
+        }
+        let Some(head) = clause[0].as_symbol() else {
+            continue;
+        };
+        match head {
+            "only" | "only-in" => {
+                if clause.len() < 3 {
+                    return Err(ParseError {
+                        line,
+                        message: format!("{head} import requires module path and bindings"),
+                    });
+                }
+                let Some(module_spec) = clause[1].as_symbol().or_else(|| {
+                    if let SchemeNode::String(spec) = &clause[1].node {
+                        Some(spec.as_str())
+                    } else {
+                        None
+                    }
+                }) else {
+                    return Err(ParseError {
+                        line: clause[1].line,
+                        message: format!("{head} module path must be a symbol or string"),
+                    });
+                };
+                if module_spec != "vm" {
+                    continue;
+                }
+                if !emitted_vm_wildcard {
+                    push_line(out, indent, "use vm::*;");
+                    emitted_vm_wildcard = true;
+                }
+                let mut bindings = Vec::new();
+                for binding in &clause[2..] {
+                    if let Some(symbol) = binding.as_symbol() {
+                        let name = normalize_identifier(symbol, binding.line, "vm import binding")?;
+                        bindings.push(name);
+                        continue;
+                    }
+                    let Some(pair) = binding.as_list() else {
+                        return Err(ParseError {
+                            line: binding.line,
+                            message: "vm import binding must be a symbol or (imported local)"
+                                .to_string(),
+                        });
+                    };
+                    if pair.len() != 2 {
+                        return Err(ParseError {
+                            line: binding.line,
+                            message: "vm import rename must be (imported local)".to_string(),
+                        });
+                    }
+                    let imported = pair[0].as_symbol().ok_or(ParseError {
+                        line: pair[0].line,
+                        message: "vm import rename source must be a symbol".to_string(),
+                    })?;
+                    let local = pair[1].as_symbol().ok_or(ParseError {
+                        line: pair[1].line,
+                        message: "vm import rename target must be a symbol".to_string(),
+                    })?;
+                    let imported = normalize_identifier(imported, pair[0].line, "vm import source")?;
+                    let local = normalize_identifier(local, pair[1].line, "vm import target")?;
+                    if imported == local {
+                        bindings.push(imported);
+                    } else {
+                        bindings.push(format!("{imported} as {local}"));
+                    }
+                }
+                if !bindings.is_empty() {
+                    push_line(out, indent, &format!("use vm::{{{}}};", bindings.join(", ")));
+                }
+                emitted_any = true;
+            }
+            "prefix" | "prefix-in" => {
+                if clause.len() < 3 {
+                    return Err(ParseError {
+                        line,
+                        message: format!("{head} import requires module path and prefix"),
+                    });
+                }
+                let module_candidate = if head == "prefix" {
+                    &clause[1]
+                } else {
+                    &clause[2]
+                };
+                let module_spec = module_candidate.as_symbol().or_else(|| {
+                    if let SchemeNode::String(spec) = &module_candidate.node {
+                        Some(spec.as_str())
+                    } else {
+                        None
+                    }
+                });
+                if module_spec != Some("vm") {
+                    continue;
+                }
+                if !emitted_vm_wildcard {
+                    push_line(out, indent, "use vm::*;");
+                    emitted_vm_wildcard = true;
+                }
+                emitted_any = true;
+            }
+            _ => {}
+        }
+    }
+
+    if !emitted_any {
+        push_line(out, indent, "");
+    }
+    Ok(())
+}
+
 fn lower_branch_body(
     form: &SchemeForm,
     indent: usize,
@@ -992,7 +1125,12 @@ fn lower_list_expr(items: &[SchemeForm], line: usize) -> Result<String, ParseErr
             message: format!("special form '{head}' is only valid in statement position"),
         }),
         _ => {
-            let callee = normalize_identifier(head, items[0].line, "call target")?;
+            let callee_head = if let Some((_, member)) = head.split_once('.') {
+                member
+            } else {
+                head
+            };
+            let callee = normalize_identifier(callee_head, items[0].line, "call target")?;
             let mut rendered = Vec::new();
             for arg in args {
                 rendered.push(lower_expr(arg)?);

@@ -535,6 +535,57 @@ async fn ui_blocks_and_deploy_endpoints_work() {
 }
 
 #[tokio::test]
+async fn ui_deploy_compiles_graph_code_for_all_flavors() {
+    let (addr, handle, _state) = spawn_controller(ControllerConfig::default()).await;
+    let client = reqwest::Client::new();
+
+    let flavors = [
+        ("rustscript", "dp-ui-rss", "use vm;"),
+        ("javascript", "dp-ui-js", "import * as vm from \"vm\";"),
+        ("lua", "dp-ui-lua", "local vm = require(\"vm\")"),
+        ("scheme", "dp-ui-scm", "(require (prefix-in vm. \"vm\"))"),
+    ];
+
+    for (flavor, edge_id, expected_prelude) in flavors {
+        let deploy = client
+            .post(format!("http://{addr}/v1/ui/deploy"))
+            .json(&serde_json::json!({
+                "edge_id": edge_id,
+                "flavor": flavor,
+                "blocks": [
+                    {
+                        "block_id": "set_response_content",
+                        "values": {
+                            "value": "hello from ui deploy"
+                        }
+                    }
+                ]
+            }))
+            .send()
+            .await
+            .expect("deploy request should complete");
+        assert_eq!(
+            deploy.status(),
+            reqwest::StatusCode::ACCEPTED,
+            "deploy should compile for flavor {flavor}"
+        );
+        let deploy_json = deploy
+            .json::<serde_json::Value>()
+            .await
+            .expect("deploy payload should decode");
+        let source = deploy_json["source"][flavor]
+            .as_str()
+            .expect("flavor source should be present");
+        assert!(
+            source.contains(expected_prelude),
+            "generated source should include vm prelude for flavor {flavor}, got: {source}"
+        );
+    }
+
+    handle.abort();
+}
+
+#[tokio::test]
 async fn ui_render_extended_value_blocks_work_with_flow_graph() {
     let (addr, handle, _state) = spawn_controller(ControllerConfig::default()).await;
     let client = reqwest::Client::new();

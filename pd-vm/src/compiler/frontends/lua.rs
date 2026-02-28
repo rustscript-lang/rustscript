@@ -14,6 +14,7 @@ pub(super) fn lower(source: &str) -> Result<String, ParseError> {
     let mut out = Vec::new();
     let mut blocks = Vec::new();
     let mut vm_namespace_aliases = HashSet::new();
+    let mut vm_import_emitted = false;
 
     for (index, raw_line) in cleaned_source.lines().enumerate() {
         let line_no = index + 1;
@@ -27,6 +28,10 @@ pub(super) fn lower(source: &str) -> Result<String, ParseError> {
                 vm_namespace_aliases.insert(namespace_alias);
             }
             out.push(vm_import.use_stmt);
+            if !vm_import_emitted {
+                out.push("use vm::*;".to_string());
+                vm_import_emitted = true;
+            }
             continue;
         }
         if is_lua_require_line(trimmed_raw) {
