@@ -1,8 +1,8 @@
 import { ArrowLeft } from "lucide-react";
 
 import { formatUnixMs } from "@/app/helpers";
-import { LineChart, MultiLineChart } from "@/app/components/charts";
-import type { EdgeDetailResponse, ProgramSummary } from "@/app/types";
+import { MultiLineChart } from "@/app/components/charts";
+import type { EdgeDetailResponse, EdgeTrafficPoint, ProgramSummary } from "@/app/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
@@ -21,6 +21,32 @@ type EdgeDetailViewProps = {
   applyStatus: string;
   onApplyProgram: () => void;
 };
+
+function statusRatePerSecond(
+  point: EdgeTrafficPoint,
+  index: number,
+  points: EdgeTrafficPoint[],
+  selector: (item: EdgeTrafficPoint) => number
+): number {
+  if (index <= 0) {
+    return 0;
+  }
+  const previous = points[index - 1];
+  const deltaMs = point.unix_ms - previous.unix_ms;
+  if (deltaMs <= 0) {
+    return 0;
+  }
+  return (selector(point) * 1_000) / deltaMs;
+}
+
+function statusRatePerMinute(
+  point: EdgeTrafficPoint,
+  index: number,
+  points: EdgeTrafficPoint[],
+  selector: (item: EdgeTrafficPoint) => number
+): number {
+  return statusRatePerSecond(point, index, points, selector) * 60;
+}
 
 export function EdgeDetailView({
   selectedEdge,
@@ -97,26 +123,79 @@ export function EdgeDetailView({
                 <div className="text-sm font-semibold">Traffic Over Time</div>
                 <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
                   <div>
-                    <div className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">Requests / Poll Interval</div>
-                    <LineChart
-                      points={selectedEdge.traffic_series}
-                      valueFor={(point) => point.requests}
-                      stroke="#0284c7"
-                      emptyLabel="No request samples yet."
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <div className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">Status Codes / Poll Interval</div>
+                    <div className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">Latency Percentiles</div>
                     <MultiLineChart
                       points={selectedEdge.traffic_series}
                       series={[
-                        { key: "2xx", stroke: "#16a34a", valueFor: (point) => point.status_2xx },
-                        { key: "3xx", stroke: "#0ea5e9", valueFor: (point) => point.status_3xx },
-                        { key: "4xx", stroke: "#f59e0b", valueFor: (point) => point.status_4xx },
-                        { key: "5xx", stroke: "#dc2626", valueFor: (point) => point.status_5xx }
+                        { key: "p50", stroke: "#0ea5e9", valueFor: (point) => point.latency_p50_ms },
+                        { key: "p90", stroke: "#f59e0b", valueFor: (point) => point.latency_p90_ms },
+                        { key: "p99", stroke: "#dc2626", valueFor: (point) => point.latency_p99_ms }
+                      ]}
+                      emptyLabel="No latency samples yet."
+                      xAxisLabel="Time"
+                      yAxisLabel="Latency (ms)"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <div className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">Status Codes / Second</div>
+                    <MultiLineChart
+                      points={selectedEdge.traffic_series}
+                      series={[
+                        {
+                          key: "2xx",
+                          stroke: "#16a34a",
+                          valueFor: (point, index, points) => statusRatePerSecond(point, index, points, (item) => item.status_2xx)
+                        },
+                        {
+                          key: "3xx",
+                          stroke: "#0ea5e9",
+                          valueFor: (point, index, points) => statusRatePerSecond(point, index, points, (item) => item.status_3xx)
+                        },
+                        {
+                          key: "4xx",
+                          stroke: "#f59e0b",
+                          valueFor: (point, index, points) => statusRatePerSecond(point, index, points, (item) => item.status_4xx)
+                        },
+                        {
+                          key: "5xx",
+                          stroke: "#dc2626",
+                          valueFor: (point, index, points) => statusRatePerSecond(point, index, points, (item) => item.status_5xx)
+                        }
                       ]}
                       hideZeroSeries
-                      emptyLabel="No status samples yet."
+                      emptyLabel="No status samples per second yet."
+                      xAxisLabel="Time"
+                      yAxisLabel="Requests / sec"
+                    />
+                    <div className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">Status Codes / Minute</div>
+                    <MultiLineChart
+                      points={selectedEdge.traffic_series}
+                      series={[
+                        {
+                          key: "2xx",
+                          stroke: "#16a34a",
+                          valueFor: (point, index, points) => statusRatePerMinute(point, index, points, (item) => item.status_2xx)
+                        },
+                        {
+                          key: "3xx",
+                          stroke: "#0ea5e9",
+                          valueFor: (point, index, points) => statusRatePerMinute(point, index, points, (item) => item.status_3xx)
+                        },
+                        {
+                          key: "4xx",
+                          stroke: "#f59e0b",
+                          valueFor: (point, index, points) => statusRatePerMinute(point, index, points, (item) => item.status_4xx)
+                        },
+                        {
+                          key: "5xx",
+                          stroke: "#dc2626",
+                          valueFor: (point, index, points) => statusRatePerMinute(point, index, points, (item) => item.status_5xx)
+                        }
+                      ]}
+                      hideZeroSeries
+                      emptyLabel="No status samples per minute yet."
+                      xAxisLabel="Time"
+                      yAxisLabel="Requests / min"
                     />
                   </div>
                 </div>

@@ -4,8 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build:wasm-linter": "node ./scripts/build-wasm-linter.mjs",
+    "dev": "node ./scripts/build-wasm-linter.mjs && vite",
+    "build": "node ./scripts/build-wasm-linter.mjs && tsc --noEmit && vite build",
     "preview": "vite preview"
   },
   "dependencies": {

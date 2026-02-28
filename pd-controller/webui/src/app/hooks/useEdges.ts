@@ -23,6 +23,7 @@ export function useEdges({ onError }: UseEdgesArgs) {
   const [applyVersion, setApplyVersion] = useState<string>("latest");
   const [applyLoading, setApplyLoading] = useState(false);
   const [applyStatus, setApplyStatus] = useState("");
+  const [edgesRefreshing, setEdgesRefreshing] = useState(false);
 
   const loadEdges = useCallback(async () => {
     const response = await fetch("/v1/edges");
@@ -32,6 +33,18 @@ export function useEdges({ onError }: UseEdgesArgs) {
     const data = (await response.json()) as EdgeListResponse;
     setEdgeSummaries(data.edges);
   }, []);
+
+  const refreshEdges = useCallback(async () => {
+    setEdgesRefreshing(true);
+    onError("");
+    try {
+      await loadEdges();
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "failed to refresh edges");
+    } finally {
+      setEdgesRefreshing(false);
+    }
+  }, [loadEdges, onError]);
 
   const loadEdgeDetail = useCallback(async (edgeId: string) => {
     const response = await fetch(`/v1/edges/${edgeId}`);
@@ -169,6 +182,8 @@ export function useEdges({ onError }: UseEdgesArgs) {
     filteredEdges,
     edgeStats,
     loadEdges,
+    refreshEdges,
+    edgesRefreshing,
     selectEdge,
     onApplyProgramChange,
     applyProgramToEdge,

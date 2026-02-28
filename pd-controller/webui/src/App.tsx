@@ -7,6 +7,7 @@ import { EdgeListView } from "@/app/components/EdgeListView";
 import { NavBar } from "@/app/components/NavBar";
 import { ProgramDetailView } from "@/app/components/ProgramDetailView";
 import { ProgramListView } from "@/app/components/ProgramListView";
+import { ConfirmDialog } from "@/app/components/ConfirmDialog";
 import { useComposer } from "@/app/hooks/useComposer";
 import { useDebugSessions } from "@/app/hooks/useDebugSessions";
 import { useEdges } from "@/app/hooks/useEdges";
@@ -18,6 +19,13 @@ type RouteState =
   | { section: "edges"; edgeId?: string }
   | { section: "programs"; programId?: string; version?: number }
   | { section: "debug_sessions"; sessionId?: string };
+
+type ConfirmState = {
+  title: string;
+  description: string;
+  confirmLabel: string;
+  action: () => Promise<void>;
+};
 
 function parseRouteFromLocation(): RouteState {
   const [rawHashPath, rawHashQuery = ""] = (window.location.hash.replace(/^#/, "") || "/edges").split("?");
@@ -58,6 +66,8 @@ function parseRouteFromLocation(): RouteState {
 export default function App() {
   const [section, setSection] = useState<Section>("edges");
   const [error, setError] = useState("");
+  const [confirmState, setConfirmState] = useState<ConfirmState | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
   const applyingRouteRef = useRef(false);
   const routeSyncReadyRef = useRef(false);
 
@@ -220,6 +230,24 @@ export default function App() {
     window.history.pushState(null, "", currentRoute);
   }, [currentRoute]);
 
+  const requestConfirm = useCallback((state: ConfirmState) => {
+    setConfirmState(state);
+    setConfirmBusy(false);
+  }, []);
+
+  const onConfirmDelete = useCallback(async () => {
+    if (!confirmState) {
+      return;
+    }
+    setConfirmBusy(true);
+    try {
+      await confirmState.action();
+      setConfirmState(null);
+    } finally {
+      setConfirmBusy(false);
+    }
+  }, [confirmState]);
+
   return (
     <div className="flex min-h-screen bg-background text-foreground">
       <NavBar
@@ -253,6 +281,12 @@ export default function App() {
               onEdgeSearchChange={edges.setEdgeSearch}
               filteredEdges={edges.filteredEdges}
               onSelectEdge={edges.selectEdge}
+              onRefreshEdges={() => {
+                edges.refreshEdges().catch(() => {
+                  // handled by callback
+                });
+              }}
+              refreshing={edges.edgesRefreshing}
             />
           ) : (
             <EdgeDetailView
@@ -282,6 +316,17 @@ export default function App() {
               onProgramSearchChange={programs.setProgramSearch}
               filteredPrograms={programs.filteredPrograms}
               onSelectProgram={programs.selectProgram}
+              deletingProgram={programs.deletingProgram}
+              onDeleteProgram={(program) => {
+                requestConfirm({
+                  title: "Delete",
+                  description: `Delete "${program.name}" and all versions? This cannot be undone.`,
+                  confirmLabel: "Delete",
+                  action: async () => {
+                    await programs.deleteProgram(program.program_id);
+                  }
+                });
+              }}
             />
           ) : (
             <ProgramDetailView
@@ -297,8 +342,15 @@ export default function App() {
                 if (!programs.selectedProgram) {
                   return;
                 }
-                programs.deleteProgram(programs.selectedProgram.program_id, programs.selectedProgram.name).catch(() => {
-                  // handled by callback
+                const programId = programs.selectedProgram.program_id;
+                const programName = programs.selectedProgram.name;
+                requestConfirm({
+                  title: "Delete",
+                  description: `Delete "${programName}" and all versions? This cannot be undone.`,
+                  confirmLabel: "Delete",
+                  action: async () => {
+                    await programs.deleteProgram(programId);
+                  }
                 });
               }}
               savingVersion={programs.savingVersion}
@@ -345,8 +397,14 @@ export default function App() {
             debugEdgeId={debugSessions.debugEdgeId}
             onDebugEdgeIdChange={debugSessions.setDebugEdgeId}
             edgeSummaries={edges.edgeSummaries}
+            debugMode={debugSessions.debugMode}
+            onDebugModeChange={debugSessions.setDebugMode}
             debugHeaderName={debugSessions.debugHeaderName}
             onDebugHeaderNameChange={debugSessions.setDebugHeaderName}
+            debugRequestPath={debugSessions.debugRequestPath}
+            onDebugRequestPathChange={debugSessions.setDebugRequestPath}
+            debugRecordCount={debugSessions.debugRecordCount}
+            onDebugRecordCountChange={debugSessions.setDebugRecordCount}
             onCreateDebugSession={debugSessions.createDebugSession}
             debugCreating={debugSessions.debugCreating}
             startDisabledReason={debugSessions.debugStartDisabledReason}
@@ -355,14 +413,57 @@ export default function App() {
             onSelectDebugSession={debugSessions.selectDebugSession}
             selectedDebugSession={debugSessions.selectedDebugSession}
             runDebugCommand={debugSessions.runDebugCommand}
-            onStopDebugSession={debugSessions.stopDebugSession}
+            onStopDebugSession={(sessionId) => {
+              debugSessions.stopDebugSession(sessionId).catch(() => {
+                // handled by callback
+              });
+            }}
+            onDeleteDebugSession={(sessionId) => {
+              const target =
+                debugSessions.debugSessionsSorted.find((item) => item.session_id === sessionId) ??
+                (debugSessions.selectedDebugSession
+                  ? {
+                      session_id: debugSessions.selectedDebugSession.session_id,
+                      edge_name: debugSessions.selectedDebugSession.edge_name,
+                      phase: debugSessions.selectedDebugSession.phase
+                    }
+                  : null);
+              if (!target) {
+                return;
+              }
+              requestConfirm({
+                title: "Delete",
+                description: `Delete "${target.session_id}" on edge "${target.edge_name}"? Active items will be stopped first.`,
+                confirmLabel: "Delete",
+                action: async () => {
+                  await debugSessions.deleteDebugSession(target.session_id);
+                }
+              });
+            }}
             debugCommandLoading={debugSessions.debugCommandLoading}
             onDebugEditorMount={debugSessions.onDebugEditorMount}
             debugHoveredVar={debugSessions.debugHoveredVar}
             debugHoverValue={debugSessions.debugHoverValue}
+            onSelectRecording={debugSessions.selectRecording}
           />
         )}
       </main>
+      <ConfirmDialog
+        open={confirmState !== null}
+        title={confirmState?.title ?? ""}
+        description={confirmState?.description ?? ""}
+        confirmLabel={confirmState?.confirmLabel ?? "Delete"}
+        busy={confirmBusy}
+        onCancel={() => {
+          if (confirmBusy) {
+            return;
+          }
+          setConfirmState(null);
+        }}
+        onConfirm={() => {
+          void onConfirmDelete();
+        }}
+      />
     </div>
   );
 }

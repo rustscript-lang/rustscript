@@ -26,7 +26,10 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
   const [selectedDebugSessionId, setSelectedDebugSessionId] = useState<string | null>(null);
   const [selectedDebugSession, setSelectedDebugSession] = useState<DebugSessionDetail | null>(null);
   const [debugEdgeId, setDebugEdgeId] = useState<string>("");
+  const [debugMode, setDebugMode] = useState<"interactive" | "recording">("interactive");
   const [debugHeaderName, setDebugHeaderName] = useState<string>("x-pd-debug-nonce");
+  const [debugRequestPath, setDebugRequestPath] = useState<string>("");
+  const [debugRecordCount, setDebugRecordCount] = useState<string>("1");
   const [debugCreating, setDebugCreating] = useState(false);
   const [debugCommandLoading, setDebugCommandLoading] = useState(false);
   const [debugHoveredVar, setDebugHoveredVar] = useState<string>("");
@@ -90,6 +93,17 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
       onError("select an edge for debug session");
       return;
     }
+    const recordCount = Number.parseInt(debugRecordCount, 10);
+    if (debugMode === "recording") {
+      if (!debugRequestPath.trim()) {
+        onError("recording mode requires a request path");
+        return;
+      }
+      if (!Number.isFinite(recordCount) || recordCount < 1) {
+        onError("record count must be >= 1");
+        return;
+      }
+    }
     setDebugCreating(true);
     onError("");
     try {
@@ -98,8 +112,11 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           edge_id: debugEdgeId,
-          header_name: debugHeaderName.trim() || undefined,
-          stop_on_entry: true
+          mode: debugMode,
+          header_name: debugMode === "interactive" ? debugHeaderName.trim() || undefined : undefined,
+          stop_on_entry: true,
+          request_path: debugMode === "recording" ? debugRequestPath.trim() : undefined,
+          record_count: debugMode === "recording" ? recordCount : undefined
         })
       });
       if (!response.ok) {
@@ -115,26 +132,62 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
     } finally {
       setDebugCreating(false);
     }
-  }, [debugEdgeId, debugHeaderName, loadDebugSessionDetail, loadDebugSessions, onError, showDebugSessionsSection]);
+  }, [
+    debugEdgeId,
+    debugHeaderName,
+    debugMode,
+    debugRecordCount,
+    debugRequestPath,
+    loadDebugSessionDetail,
+    loadDebugSessions,
+    onError,
+    showDebugSessionsSection
+  ]);
 
-  const stopDebugSession = useCallback(async () => {
-    if (!selectedDebugSessionId) {
+  const stopDebugSession = useCallback(async (sessionId?: string) => {
+    const targetSessionId = sessionId ?? selectedDebugSessionId;
+    if (!targetSessionId) {
       return;
     }
     setDebugCommandLoading(true);
     onError("");
     try {
-      const response = await fetch(`/v1/debug-sessions/${selectedDebugSessionId}`, {
+      const response = await fetch(`/v1/debug-sessions/${targetSessionId}/stop`, {
+        method: "POST"
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      await Promise.all([loadDebugSessions(), loadDebugSessionDetail(targetSessionId)]);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "failed to stop debug session");
+    } finally {
+      setDebugCommandLoading(false);
+    }
+  }, [loadDebugSessionDetail, loadDebugSessions, onError, selectedDebugSessionId]);
+
+  const deleteDebugSession = useCallback(async (sessionId?: string) => {
+    const targetSessionId = sessionId ?? selectedDebugSessionId;
+    if (!targetSessionId) {
+      return;
+    }
+    setDebugCommandLoading(true);
+    onError("");
+    try {
+      const response = await fetch(`/v1/debug-sessions/${targetSessionId}`, {
         method: "DELETE"
       });
       if (!response.ok) {
         throw new Error(await response.text());
       }
-      const detail = (await response.json()) as DebugSessionDetail;
-      setSelectedDebugSession(detail);
+      if (selectedDebugSessionId === targetSessionId) {
+        setSelectedDebugSession(null);
+        setSelectedDebugSessionId(null);
+        setDebugView("list");
+      }
       await loadDebugSessions();
     } catch (err) {
-      onError(err instanceof Error ? err.message : "failed to stop debug session");
+      onError(err instanceof Error ? err.message : "failed to delete debug session");
     } finally {
       setDebugCommandLoading(false);
     }
@@ -175,6 +228,16 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
       }
     },
     [loadDebugSessionDetail, loadDebugSessions, onError, selectedDebugSessionId]
+  );
+
+  const selectRecording = useCallback(
+    async (recordingId: string) => {
+      if (!recordingId) {
+        return;
+      }
+      await runDebugCommand({ kind: "select_recording", recording_id: recordingId });
+    },
+    [runDebugCommand]
   );
 
   useEffect(() => {
@@ -236,7 +299,8 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
 
     editor.onMouseDown((event) => {
       const session = selectedDebugSessionRef.current;
-      if (!session || session.phase !== "attached" || debugCommandLoadingRef.current) {
+      const sessionReady = session?.phase === "attached" || session?.phase === "replay_ready";
+      if (!session || !sessionReady || debugCommandLoadingRef.current) {
         return;
       }
       if (
@@ -259,7 +323,8 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
     debugMouseMoveDisposableRef.current?.dispose();
     debugMouseMoveDisposableRef.current = editor.onMouseMove((event) => {
       const session = selectedDebugSessionRef.current;
-      if (!session || session.phase !== "attached") {
+      const sessionReady = session?.phase === "attached" || session?.phase === "replay_ready";
+      if (!session || !sessionReady) {
         return;
       }
       const position = event.target.position;
@@ -325,7 +390,8 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
     debugHoverProviderDisposableRef.current = monaco.languages.registerHoverProvider(model.getLanguageId(), {
       provideHover: async (hoverModel, position) => {
         const session = selectedDebugSessionRef.current;
-        if (!session || session.phase !== "attached") {
+        const sessionReady = session?.phase === "attached" || session?.phase === "replay_ready";
+        if (!session || !sessionReady) {
           return null;
         }
         if (hoverModel.uri.toString() !== model.uri.toString()) {
@@ -446,16 +512,31 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
     if (!selectedEdgeSummary.last_telemetry.program_loaded) {
       return "This edge has no loaded program yet. Apply a program before starting debug.";
     }
+    if (debugMode === "recording" && !debugRequestPath.trim()) {
+      return "Recording mode requires a request path.";
+    }
+    if (debugMode === "recording") {
+      const parsed = Number.parseInt(debugRecordCount, 10);
+      if (!Number.isFinite(parsed) || parsed < 1) {
+        return "Record count must be >= 1.";
+      }
+    }
     return null;
-  }, [debugEdgeId, edgeSummaries]);
+  }, [debugEdgeId, debugMode, debugRecordCount, debugRequestPath, edgeSummaries]);
 
   return {
     debugView,
     setDebugView,
     debugEdgeId,
     setDebugEdgeId,
+    debugMode,
+    setDebugMode,
     debugHeaderName,
     setDebugHeaderName,
+    debugRequestPath,
+    setDebugRequestPath,
+    debugRecordCount,
+    setDebugRecordCount,
     debugCreating,
     debugSessionsSorted,
     selectedDebugSessionId,
@@ -463,11 +544,13 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
     selectedDebugSession,
     runDebugCommand,
     stopDebugSession,
+    deleteDebugSession,
     debugCommandLoading,
     onDebugEditorMount,
     debugHoveredVar,
     debugHoverValue,
     debugStartDisabledReason,
+    selectRecording,
     createDebugSession,
     loadDebugSessions
   };

@@ -16,6 +16,7 @@ type GeneratedCodePanelProps = {
   onToggleMinimized?: () => void;
   onEdit?: () => void;
   readOnly?: boolean;
+  enableLint?: boolean;
   onCodeChange?: (flavor: SourceFlavor, value: string) => void;
   editorHeight?: string;
   description?: string;
@@ -33,6 +34,7 @@ export function GeneratedCodePanel({
   onToggleMinimized,
   onEdit,
   readOnly = true,
+  enableLint = false,
   onCodeChange,
   editorHeight = "min(56vh, 640px)",
   description,
@@ -128,6 +130,7 @@ export function GeneratedCodePanel({
                   flavor="rustscript"
                   source={source}
                   readOnly={readOnly}
+                  enableLint={enableLint}
                   height={resolvedEditorHeight}
                   onChange={(value) => onCodeChange?.("rustscript", value)}
                 />
@@ -140,6 +143,7 @@ export function GeneratedCodePanel({
                   flavor="javascript"
                   source={source}
                   readOnly={readOnly}
+                  enableLint={enableLint}
                   height={resolvedEditorHeight}
                   onChange={(value) => onCodeChange?.("javascript", value)}
                 />
@@ -152,6 +156,7 @@ export function GeneratedCodePanel({
                   flavor="lua"
                   source={source}
                   readOnly={readOnly}
+                  enableLint={enableLint}
                   height={resolvedEditorHeight}
                   onChange={(value) => onCodeChange?.("lua", value)}
                 />
@@ -164,6 +169,7 @@ export function GeneratedCodePanel({
                   flavor="scheme"
                   source={source}
                   readOnly={readOnly}
+                  enableLint={enableLint}
                   height={resolvedEditorHeight}
                   onChange={(value) => onCodeChange?.("scheme", value)}
                 />

@@ -1,4 +1,5 @@
 import type {
+  DebugSessionMode,
   DebugSessionPhase,
   EdgeSummary,
   EdgeTrafficPoint,
@@ -171,11 +172,19 @@ export function syncStatusClasses(status: EdgeSummary["sync_status"]): string {
   return "text-slate-500";
 }
 
-export function debugPhaseClasses(phase: DebugSessionPhase): string {
-  if (phase === "attached") {
+export function debugPhaseClasses(phase: DebugSessionPhase, mode?: DebugSessionMode): string {
+  if (phase === "stopped" && mode === "recording") {
     return "text-emerald-600";
   }
-  if (phase === "waiting_for_attach" || phase === "waiting_for_start_result" || phase === "queued") {
+  if (phase === "attached" || phase === "replay_ready") {
+    return "text-emerald-600";
+  }
+  if (
+    phase === "waiting_for_attach" ||
+    phase === "waiting_for_start_result" ||
+    phase === "waiting_for_recordings" ||
+    phase === "queued"
+  ) {
     return "text-amber-600";
   }
   if (phase === "failed") {
@@ -184,7 +193,10 @@ export function debugPhaseClasses(phase: DebugSessionPhase): string {
   return "text-slate-600";
 }
 
-export function debugPhaseLabel(phase: DebugSessionPhase): string {
+export function debugPhaseLabel(phase: DebugSessionPhase, mode?: DebugSessionMode): string {
+  if (phase === "stopped" && mode === "recording") {
+    return "completed";
+  }
   return phase.split("_").join(" ");
 }
 
@@ -241,5 +253,5 @@ export function monacoLanguageForFlavor(flavor: SourceFlavor | string | null | u
 export type LineSeries = {
   key: string;
   stroke: string;
-  valueFor: (point: EdgeTrafficPoint) => number;
+  valueFor: (point: EdgeTrafficPoint, index: number, points: EdgeTrafficPoint[]) => number;
 };

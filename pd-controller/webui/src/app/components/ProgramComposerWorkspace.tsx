@@ -111,6 +111,7 @@ export function ProgramComposerWorkspace({
             source={source}
             onFlavorChange={onFlavorChange}
             readOnly={false}
+            enableLint
             editorHeight="calc(100dvh - 360px)"
             onCodeChange={onSourceChange}
             showHeader={false}

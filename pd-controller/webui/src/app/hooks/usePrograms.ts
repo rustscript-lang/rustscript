@@ -292,11 +292,7 @@ export function usePrograms({ onError, showProgramsSection, onProgramDeleted, co
   }, [loadProgramDetail, loadPrograms, onError, programNameDraft, selectedProgramId, selectedVersion, setGraphStatus]);
 
   const deleteProgram = useCallback(
-    async (programId: string, programName: string) => {
-      const confirmed = window.confirm(`Delete program "${programName}" and all versions? This cannot be undone.`);
-      if (!confirmed) {
-        return;
-      }
+    async (programId: string) => {
       setDeletingProgram(true);
       onError("");
       try {

@@ -140,6 +140,9 @@ export type TelemetrySnapshot = {
   uptime_seconds: number;
   program_loaded: boolean;
   debug_session_active: boolean;
+  debug_session_attached: boolean;
+  debug_session_current_line: number | null;
+  debug_session_request_id: string | null;
   data_requests_total: number;
   vm_execution_errors_total: number;
   program_apply_success_total: number;
@@ -157,6 +160,9 @@ export type EdgeTrafficPoint = {
   status_3xx: number;
   status_4xx: number;
   status_5xx: number;
+  latency_p50_ms: number;
+  latency_p90_ms: number;
+  latency_p99_ms: number;
 };
 
 export type EdgeDetailResponse = {
@@ -173,18 +179,37 @@ export type QueueResponse = {
 export type DebugSessionPhase =
   | "queued"
   | "waiting_for_start_result"
+  | "waiting_for_recordings"
   | "waiting_for_attach"
   | "attached"
+  | "replay_ready"
   | "stopped"
   | "failed";
+
+export type DebugSessionMode = "interactive" | "recording";
+
+export type DebugRecordingSummary = {
+  recording_id: string;
+  sequence: number;
+  created_unix_ms: number;
+  frame_count: number;
+  terminal_status: string | null;
+  request_id: string | null;
+  request_path: string | null;
+};
 
 export type DebugSessionSummary = {
   session_id: string;
   edge_id: string;
   edge_name: string;
   phase: DebugSessionPhase;
+  mode: DebugSessionMode;
   header_name: string | null;
   nonce_header_value: string | null;
+  request_id: string | null;
+  request_path: string | null;
+  recording_target_count: number | null;
+  recording_count: number;
   current_line: number | null;
   created_unix_ms: number;
   updated_unix_ms: number;
@@ -196,9 +221,15 @@ export type DebugSessionDetail = {
   edge_id: string;
   edge_name: string;
   phase: DebugSessionPhase;
+  mode: DebugSessionMode;
   header_name: string | null;
   nonce_header_value: string | null;
+  request_id: string | null;
   tcp_addr: string;
+  request_path: string | null;
+  recording_target_count: number | null;
+  recordings: DebugRecordingSummary[];
+  selected_recording_id: string | null;
   start_command_id: string;
   stop_command_id: string | null;
   current_line: number | null;
@@ -229,6 +260,7 @@ export type DebugCommandRequest =
   | { kind: "next" }
   | { kind: "continue" }
   | { kind: "out" }
+  | { kind: "select_recording"; recording_id: string }
   | { kind: "break_line"; line: number }
   | { kind: "clear_line"; line: number }
   | { kind: "print_var"; name: string }

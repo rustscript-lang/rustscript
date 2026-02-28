@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 
 import { debugPhaseClasses, debugPhaseLabel, formatUnixMs, monacoLanguageForFlavor } from "@/app/helpers";
+import { RowActionMenu } from "@/app/components/RowActionMenu";
 import type {
   DebugSessionDetail,
   DebugSessionSummary,
@@ -30,8 +31,14 @@ type DebugSessionsViewProps = {
   debugEdgeId: string;
   onDebugEdgeIdChange: (value: string) => void;
   edgeSummaries: EdgeSummary[];
+  debugMode: "interactive" | "recording";
+  onDebugModeChange: (value: "interactive" | "recording") => void;
   debugHeaderName: string;
   onDebugHeaderNameChange: (value: string) => void;
+  debugRequestPath: string;
+  onDebugRequestPathChange: (value: string) => void;
+  debugRecordCount: string;
+  onDebugRecordCountChange: (value: string) => void;
   onCreateDebugSession: () => void;
   debugCreating: boolean;
   startDisabledReason: string | null;
@@ -40,11 +47,13 @@ type DebugSessionsViewProps = {
   onSelectDebugSession: (sessionId: string) => Promise<void>;
   selectedDebugSession: DebugSessionDetail | null;
   runDebugCommand: RunDebugCommandFn;
-  onStopDebugSession: () => void;
+  onStopDebugSession: (sessionId?: string) => void;
+  onDeleteDebugSession: (sessionId?: string) => void;
   debugCommandLoading: boolean;
   onDebugEditorMount: OnMount;
   debugHoveredVar: string;
   debugHoverValue: string;
+  onSelectRecording: (recordingId: string) => Promise<void>;
 };
 
 export function DebugSessionsView({
@@ -53,8 +62,14 @@ export function DebugSessionsView({
   debugEdgeId,
   onDebugEdgeIdChange,
   edgeSummaries,
+  debugMode,
+  onDebugModeChange,
   debugHeaderName,
   onDebugHeaderNameChange,
+  debugRequestPath,
+  onDebugRequestPathChange,
+  debugRecordCount,
+  onDebugRecordCountChange,
   onCreateDebugSession,
   debugCreating,
   startDisabledReason,
@@ -64,21 +79,24 @@ export function DebugSessionsView({
   selectedDebugSession,
   runDebugCommand,
   onStopDebugSession,
+  onDeleteDebugSession,
   debugCommandLoading,
   onDebugEditorMount,
   debugHoveredVar,
-  debugHoverValue
+  debugHoverValue,
+  onSelectRecording
 }: DebugSessionsViewProps) {
   let activeCount = 0;
   let waitingCount = 0;
   let stoppedCount = 0;
   let failedCount = 0;
   for (const session of debugSessionsSorted) {
-    if (session.phase === "attached") {
+    if (session.phase === "attached" || session.phase === "replay_ready") {
       activeCount += 1;
     } else if (
       session.phase === "queued" ||
       session.phase === "waiting_for_start_result" ||
+      session.phase === "waiting_for_recordings" ||
       session.phase === "waiting_for_attach"
     ) {
       waitingCount += 1;
@@ -157,50 +175,102 @@ export function DebugSessionsView({
                 </select>
               </div>
               <div className="space-y-1">
-                <Label htmlFor="debug-header-name">Header Name</Label>
-                <Input
-                  id="debug-header-name"
-                  value={debugHeaderName}
-                  onChange={(event) => onDebugHeaderNameChange(event.target.value)}
-                  placeholder="x-pd-debug-nonce"
-                />
+                <Label htmlFor="debug-mode">Mode</Label>
+                <select
+                  id="debug-mode"
+                  value={debugMode}
+                  onChange={(event) => onDebugModeChange(event.target.value as "interactive" | "recording")}
+                  className="h-9 w-full rounded-md border bg-background px-2 text-sm"
+                >
+                  <option value="interactive">Interactive</option>
+                  <option value="recording">Recording</option>
+                </select>
               </div>
               <Button onClick={onCreateDebugSession} disabled={debugCreating || !!startDisabledReason}>
                 {debugCreating ? "Creating..." : "Start Session"}
               </Button>
             </div>
+            {debugMode === "interactive" ? (
+              <div className="mb-3 grid grid-cols-1 gap-3">
+                <div className="space-y-1">
+                  <Label htmlFor="debug-header-name">Header Name</Label>
+                  <Input
+                    id="debug-header-name"
+                    value={debugHeaderName}
+                    onChange={(event) => onDebugHeaderNameChange(event.target.value)}
+                    placeholder="x-pd-debug-nonce"
+                  />
+                </div>
+              </div>
+            ) : (
+              <div className="mb-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+                <div className="space-y-1">
+                  <Label htmlFor="debug-request-path">Request Path</Label>
+                  <Input
+                    id="debug-request-path"
+                    value={debugRequestPath}
+                    onChange={(event) => onDebugRequestPathChange(event.target.value)}
+                    placeholder="/api/example"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="debug-record-count">Record Count</Label>
+                  <Input
+                    id="debug-record-count"
+                    type="number"
+                    min={1}
+                    value={debugRecordCount}
+                    onChange={(event) => onDebugRecordCountChange(event.target.value)}
+                  />
+                </div>
+              </div>
+            )}
             {startDisabledReason ? <div className="mb-3 text-xs text-muted-foreground">{startDisabledReason}</div> : null}
             <div className="overflow-hidden rounded-lg border">
-              <div className="grid grid-cols-[minmax(220px,1.4fr)_160px_200px] gap-2 border-b bg-muted/40 px-3 py-2 text-[11px] uppercase tracking-wide text-muted-foreground">
+              <div className="grid grid-cols-[minmax(220px,1.4fr)_120px_160px_200px_48px] gap-2 border-b bg-muted/40 px-3 py-2 text-[11px] uppercase tracking-wide text-muted-foreground">
                 <div>Session</div>
+                <div>Mode</div>
                 <div>Status</div>
                 <div>Last Updated</div>
+                <div className="text-right">Actions</div>
               </div>
               <div className="max-h-[66vh] overflow-auto">
                 {debugSessionsSorted.map((session) => (
-                  <button
+                  <div
                     key={session.session_id}
-                    type="button"
-                    onClick={() => {
-                      onSelectDebugSession(session.session_id).catch(() => {
-                        // handled by callback
-                      });
-                    }}
-                    className={`grid w-full grid-cols-[minmax(220px,1.4fr)_160px_200px] items-center gap-2 border-b px-3 py-2 text-left text-sm transition hover:bg-muted/50 ${
+                    className={`grid w-full grid-cols-[minmax(220px,1.4fr)_120px_160px_200px_48px] items-center gap-2 border-b px-3 py-2 text-left text-sm transition hover:bg-muted/50 ${
                       selectedDebugSessionId === session.session_id ? "bg-primary/5" : ""
                     }`}
                   >
-                    <div className="min-w-0">
-                      <div className="truncate font-medium">{session.edge_name}</div>
-                      <div className="mt-1 truncate text-xs text-muted-foreground">session={session.session_id}</div>
-                    </div>
-                    <div>
-                      <Badge className={`rounded-full px-2 py-0 text-[10px] font-semibold uppercase ${debugPhaseClasses(session.phase)}`}>
-                        {debugPhaseLabel(session.phase)}
-                      </Badge>
-                    </div>
-                    <div className="text-xs text-muted-foreground">{formatUnixMs(session.updated_unix_ms)}</div>
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onSelectDebugSession(session.session_id).catch(() => {
+                          // handled by callback
+                        });
+                      }}
+                      className="col-span-4 grid min-w-0 grid-cols-[minmax(220px,1.4fr)_120px_160px_200px] items-center gap-2 text-left"
+                    >
+                      <div className="min-w-0">
+                        <div className="truncate font-medium">{session.edge_name}</div>
+                        <div className="mt-1 truncate text-xs text-muted-foreground">session={session.session_id}</div>
+                        {session.request_id ? (
+                          <div className="truncate text-[11px] text-muted-foreground">request={session.request_id}</div>
+                        ) : null}
+                      </div>
+                      <div className="text-xs uppercase text-muted-foreground">{session.mode}</div>
+                      <div>
+                        <Badge className={`rounded-full px-2 py-0 text-[10px] font-semibold uppercase ${debugPhaseClasses(session.phase, session.mode)}`}>
+                          {debugPhaseLabel(session.phase, session.mode)}
+                        </Badge>
+                      </div>
+                      <div className="text-xs text-muted-foreground">{formatUnixMs(session.updated_unix_ms)}</div>
+                    </button>
+                    <RowActionMenu
+                      disabled={debugCommandLoading}
+                      onDelete={() => onDeleteDebugSession(session.session_id)}
+                    />
+                  </div>
                 ))}
                 {debugSessionsSorted.length === 0 ? (
                   <div className="px-3 py-6 text-center text-sm text-muted-foreground">No debug sessions yet.</div>
@@ -239,12 +309,16 @@ export function DebugSessionsView({
                   <div className="rounded-md border bg-background/70 p-2 text-xs">
                     <div className="flex items-center gap-2">
                       <span className="uppercase tracking-wide text-muted-foreground">Phase</span>
-                      <Badge className={`rounded-full px-2 py-0 text-[10px] font-semibold uppercase ${debugPhaseClasses(selectedDebugSession.phase)}`}>
-                        {debugPhaseLabel(selectedDebugSession.phase)}
+                      <Badge className={`rounded-full px-2 py-0 text-[10px] font-semibold uppercase ${debugPhaseClasses(selectedDebugSession.phase, selectedDebugSession.mode)}`}>
+                        {debugPhaseLabel(selectedDebugSession.phase, selectedDebugSession.mode)}
                       </Badge>
                     </div>
                     <div className="mt-1 font-mono">session_id={selectedDebugSession.session_id}</div>
                     <div className="font-mono">edge_id={selectedDebugSession.edge_id}</div>
+                    <div className="font-mono">mode={selectedDebugSession.mode}</div>
+                    <div className="font-mono">
+                      request_id={selectedDebugSession.request_id ?? "(none)"}
+                    </div>
                     {selectedDebugSession.header_name && selectedDebugSession.nonce_header_value ? (
                       <div className="mt-2 rounded-md border bg-amber-50 p-2 text-[11px] text-amber-800">
                         trigger header:{" "}
@@ -256,12 +330,64 @@ export function DebugSessionsView({
                     {selectedDebugSession.message ? (
                       <div className="mt-2 text-muted-foreground">{selectedDebugSession.message}</div>
                     ) : null}
+                    {selectedDebugSession.mode === "recording" ? (
+                      <div className="mt-2 rounded-md border bg-slate-50 p-2 text-[11px] text-slate-700">
+                        request_path: <span className="font-mono">{selectedDebugSession.request_path ?? "(any)"}</span>
+                        <div>
+                          recordings: {selectedDebugSession.recordings.length}
+                          {selectedDebugSession.recording_target_count !== null
+                            ? ` / ${selectedDebugSession.recording_target_count}`
+                            : ""}
+                        </div>
+                        <div>
+                          latest_request_id:{" "}
+                          <span className="font-mono">{selectedDebugSession.request_id ?? "(none)"}</span>
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
                 </div>
               </div>
 
+              {selectedDebugSession.mode === "recording" ? (
+                <div className="rounded-md border bg-background/70 p-2">
+                  <div className="mb-1 text-[11px] uppercase tracking-wide text-muted-foreground">Recordings</div>
+                  <div className="max-h-[180px] overflow-auto rounded border">
+                    {selectedDebugSession.recordings.map((recording) => (
+                      <button
+                        key={recording.recording_id}
+                        type="button"
+                        onClick={() => {
+                          onSelectRecording(recording.recording_id).catch(() => {
+                            // handled by callback
+                          });
+                        }}
+                        className={`grid w-full grid-cols-[70px_minmax(80px,1fr)_minmax(160px,1.2fr)_120px] gap-2 border-b px-2 py-1.5 text-left text-xs hover:bg-muted/40 ${
+                          selectedDebugSession.selected_recording_id === recording.recording_id ? "bg-primary/5" : ""
+                        }`}
+                      >
+                        <div>#{recording.sequence}</div>
+                        <div className="truncate">{recording.frame_count} frames</div>
+                        <div className="truncate font-mono">
+                          {recording.request_id ? `request=${recording.request_id}` : "request=(none)"}
+                        </div>
+                        <div className="truncate">{formatUnixMs(recording.created_unix_ms)}</div>
+                      </button>
+                    ))}
+                    {selectedDebugSession.recordings.length === 0 ? (
+                      <div className="px-2 py-3 text-xs text-muted-foreground">No recordings captured yet.</div>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+
               <div className="rounded-md border bg-background/70 p-1.5">
                 <div className="flex flex-wrap items-center gap-1">
+                  {(() => {
+                    const canControl =
+                      selectedDebugSession.phase === "attached" || selectedDebugSession.phase === "replay_ready";
+                    return (
+                      <>
                   <Button
                     size="sm"
                     variant="outline"
@@ -269,7 +395,7 @@ export function DebugSessionsView({
                     title="Where"
                     aria-label="Where"
                     onClick={() => runDebugCommand({ kind: "where" })}
-                    disabled={debugCommandLoading || selectedDebugSession.phase !== "attached"}
+                    disabled={debugCommandLoading || !canControl}
                   >
                     <Crosshair className="h-4 w-4" />
                   </Button>
@@ -280,7 +406,7 @@ export function DebugSessionsView({
                     title="Locals"
                     aria-label="Locals"
                     onClick={() => runDebugCommand({ kind: "locals" })}
-                    disabled={debugCommandLoading || selectedDebugSession.phase !== "attached"}
+                    disabled={debugCommandLoading || !canControl}
                   >
                     <List className="h-4 w-4" />
                   </Button>
@@ -291,7 +417,7 @@ export function DebugSessionsView({
                     title="Stack"
                     aria-label="Stack"
                     onClick={() => runDebugCommand({ kind: "stack" })}
-                    disabled={debugCommandLoading || selectedDebugSession.phase !== "attached"}
+                    disabled={debugCommandLoading || !canControl}
                   >
                     <Layers className="h-4 w-4" />
                   </Button>
@@ -302,7 +428,7 @@ export function DebugSessionsView({
                     title="Step"
                     aria-label="Step"
                     onClick={() => runDebugCommand({ kind: "step" })}
-                    disabled={debugCommandLoading || selectedDebugSession.phase !== "attached"}
+                    disabled={debugCommandLoading || !canControl}
                   >
                     <ArrowRight className="h-4 w-4" />
                   </Button>
@@ -312,7 +438,7 @@ export function DebugSessionsView({
                     title="Next"
                     aria-label="Next"
                     onClick={() => runDebugCommand({ kind: "next" })}
-                    disabled={debugCommandLoading || selectedDebugSession.phase !== "attached"}
+                    disabled={debugCommandLoading || !canControl}
                   >
                     <ChevronsRight className="h-4 w-4" />
                   </Button>
@@ -322,7 +448,7 @@ export function DebugSessionsView({
                     title="Out"
                     aria-label="Out"
                     onClick={() => runDebugCommand({ kind: "out" })}
-                    disabled={debugCommandLoading || selectedDebugSession.phase !== "attached"}
+                    disabled={debugCommandLoading || !canControl}
                   >
                     <CornerUpLeft className="h-4 w-4" />
                   </Button>
@@ -332,19 +458,26 @@ export function DebugSessionsView({
                     title="Continue"
                     aria-label="Continue"
                     onClick={() => runDebugCommand({ kind: "continue" })}
-                    disabled={debugCommandLoading || selectedDebugSession.phase !== "attached"}
+                    disabled={debugCommandLoading || !canControl}
                   >
                     <Play className="h-4 w-4" />
                   </Button>
+                      </>
+                    );
+                  })()}
                   <div className="mx-1 h-5 w-px bg-border" />
                   <Button
                     size="sm"
                     variant="outline"
                     className="h-8 w-8 border-rose-300 p-0 text-rose-700 hover:bg-rose-50"
-                    title="Stop Session"
-                    aria-label="Stop Session"
-                    onClick={onStopDebugSession}
-                    disabled={debugCommandLoading}
+                    title="Stop"
+                    aria-label="Stop"
+                    onClick={() => onStopDebugSession(selectedDebugSession.session_id)}
+                    disabled={
+                      debugCommandLoading ||
+                      selectedDebugSession.phase === "stopped" ||
+                      selectedDebugSession.phase === "failed"
+                    }
                   >
                     <Square className="h-4 w-4" />
                   </Button>
@@ -354,6 +487,12 @@ export function DebugSessionsView({
               {selectedDebugSession.phase === "waiting_for_attach" || selectedDebugSession.phase === "waiting_for_start_result" ? (
                 <div className="rounded-md border bg-background/70 p-3 text-sm text-muted-foreground">
                   Waiting for attach. Send a request to the selected edge with the trigger header shown above.
+                </div>
+              ) : null}
+
+              {selectedDebugSession.phase === "waiting_for_recordings" ? (
+                <div className="rounded-md border bg-background/70 p-3 text-sm text-muted-foreground">
+                  Waiting for recordings. Send matching requests to capture traces.
                 </div>
               ) : null}
 

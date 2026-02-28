@@ -1,8 +1,9 @@
-import { Activity, ChevronRight, Circle } from "lucide-react";
+import { Activity, ChevronRight, Circle, RefreshCw } from "lucide-react";
 
 import { edgeHealth, edgeHealthClasses, formatNumber, formatUnixMs, syncStatusClasses } from "@/app/helpers";
 import type { EdgeSummary } from "@/app/types";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 
@@ -19,6 +20,8 @@ type EdgeListViewProps = {
   onEdgeSearchChange: (value: string) => void;
   filteredEdges: EdgeSummary[];
   onSelectEdge: (edgeId: string) => void;
+  onRefreshEdges: () => void;
+  refreshing: boolean;
 };
 
 export function EdgeListView({
@@ -26,7 +29,9 @@ export function EdgeListView({
   edgeSearch,
   onEdgeSearchChange,
   filteredEdges,
-  onSelectEdge
+  onSelectEdge,
+  onRefreshEdges,
+  refreshing
 }: EdgeListViewProps) {
   return (
     <div className="space-y-4">
@@ -59,6 +64,17 @@ export function EdgeListView({
       <Card className="border-slate-200/80 bg-white/80 backdrop-blur">
         <CardHeader className="pb-3">
           <div className="flex items-center justify-end gap-3">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-9"
+              onClick={onRefreshEdges}
+              disabled={refreshing}
+            >
+              <RefreshCw className={`mr-1.5 h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
+              {refreshing ? "Refreshing..." : "Refresh"}
+            </Button>
             <div className="relative w-full max-w-[320px]">
               <Input
                 value={edgeSearch}
