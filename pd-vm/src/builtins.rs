@@ -23,6 +23,8 @@ pub(crate) enum BuiltinFunction {
 }
 
 pub(crate) const BUILTIN_CALL_BASE: u16 = 0xFFF0;
+/// Number of builtins in the main range (indices 0..15 above BUILTIN_CALL_BASE).
+/// ToString, TypeOf, and Assert live at special indices below BUILTIN_CALL_BASE.
 pub(crate) const BUILTIN_CALL_COUNT: u16 = 16;
 
 impl BuiltinFunction {
