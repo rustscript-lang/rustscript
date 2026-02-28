@@ -892,7 +892,7 @@ fn lower_import_require_stmt(
                 } else {
                     &clause[2]
                 };
-                let module_spec = module_candidate.as_symbol().or_else(|| {
+                let module_spec = module_candidate.as_symbol().or({
                     if let SchemeNode::String(spec) = &module_candidate.node {
                         Some(spec.as_str())
                     } else {

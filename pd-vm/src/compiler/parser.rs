@@ -2273,15 +2273,11 @@ impl Parser {
             match token.kind {
                 TokenKind::LParen => paren_depth += 1,
                 TokenKind::RParen => {
-                    if paren_depth > 0 {
-                        paren_depth -= 1;
-                    }
+                    paren_depth = paren_depth.saturating_sub(1);
                 }
                 TokenKind::LBracket => bracket_depth += 1,
                 TokenKind::RBracket => {
-                    if bracket_depth > 0 {
-                        bracket_depth -= 1;
-                    }
+                    bracket_depth = bracket_depth.saturating_sub(1);
                 }
                 TokenKind::LBrace => {
                     if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
