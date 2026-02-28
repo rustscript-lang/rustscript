@@ -57,7 +57,7 @@ The sample source (`sample_proxy_program.rss`) declares required proxy host
 functions in fixed ABI order and then:
 
 1. Reads `x-client-id`
-2. Allows at most 3 requests per 60-second window per client id using `rate_limit_allow`
+2. Allows at most 3 requests per 60-second window per client id using `http::rate_limit::allow`
 3. Short-circuits with:
 - `x-vm: allowed` + body `request allowed` when under limit
 - `x-vm: rate-limited` + body `rate limit exceeded` when over limit

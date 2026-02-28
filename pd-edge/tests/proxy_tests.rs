@@ -15,8 +15,9 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use edge::{
     ActiveControlPlaneConfig, CommandResultPayload, ControlPlaneCommand, EdgeCommandResult,
-    EdgePollRequest, EdgePollResponse, FN_SET_HEADER, FN_SET_RESPONSE_CONTENT, FN_SET_UPSTREAM,
-    SharedState, build_admin_app, build_data_app, spawn_active_control_plane_client,
+    EdgePollRequest, EdgePollResponse, FN_HTTP_RESPONSE_SET_BODY, FN_HTTP_RESPONSE_SET_HEADER,
+    FN_HTTP_UPSTREAM_REQUEST_SET_TARGET, SharedState, build_admin_app, build_data_app,
+    spawn_active_control_plane_client,
 };
 use tokio::{sync::Notify, task::JoinHandle, time::timeout};
 use vm::{BytecodeBuilder, Program, Value, compile_source, encode_program};
@@ -52,13 +53,13 @@ fn build_short_circuit_program(body: &str, header: Option<(&str, &str)>) -> Prog
         constants.push(Value::String(value.to_string()));
         bc.ldc(name_index);
         bc.ldc(value_index);
-        bc.call(FN_SET_HEADER, 2);
+        bc.call(FN_HTTP_RESPONSE_SET_HEADER, 2);
     }
 
     let body_index = constants.len() as u32;
     constants.push(Value::String(body.to_string()));
     bc.ldc(body_index);
-    bc.call(FN_SET_RESPONSE_CONTENT, 1);
+    bc.call(FN_HTTP_RESPONSE_SET_BODY, 1);
     bc.ret();
 
     Program::new(constants, bc.finish())
@@ -71,7 +72,7 @@ fn build_upstream_program(upstream: &str, header: Option<(&str, &str)>) -> Progr
     let upstream_index = constants.len() as u32;
     constants.push(Value::String(upstream.to_string()));
     bc.ldc(upstream_index);
-    bc.call(FN_SET_UPSTREAM, 1);
+    bc.call(FN_HTTP_UPSTREAM_REQUEST_SET_TARGET, 1);
 
     if let Some((name, value)) = header {
         let name_index = constants.len() as u32;
@@ -80,7 +81,7 @@ fn build_upstream_program(upstream: &str, header: Option<(&str, &str)>) -> Progr
         constants.push(Value::String(value.to_string()));
         bc.ldc(name_index);
         bc.ldc(value_index);
-        bc.call(FN_SET_HEADER, 2);
+        bc.call(FN_HTTP_RESPONSE_SET_HEADER, 2);
     }
 
     bc.ret();
@@ -524,12 +525,12 @@ async fn tiny_language_can_enforce_simple_rate_limit() {
     let source = r#"
         use vm;
 
-        if vm::rate_limit_allow(vm::get_header("x-client-id"), 2, 60) {
-            vm::set_header("x-vm", "allowed");
-            vm::set_response_content("ok");
+        if vm::http::rate_limit::allow(vm::http::request::get_header("x-client-id"), 2, 60) {
+            vm::http::response::set_header("x-vm", "allowed");
+            vm::http::response::set_body("ok");
         } else {
-            vm::set_header("x-vm", "rate-limited");
-            vm::set_response_content("blocked");
+            vm::http::response::set_header("x-vm", "rate-limited");
+            vm::http::response::set_body("blocked");
         }
     "#;
     let compiled = compile_source(source).expect("source should compile");
@@ -586,6 +587,124 @@ async fn tiny_language_can_enforce_simple_rate_limit() {
         Some("allowed")
     );
 
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn http_prefixed_host_abi_can_rewrite_request_and_short_circuit() {
+    let upstream_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let method = request.method().clone();
+        let path = request
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/");
+        let added = request
+            .headers()
+            .get("x-added")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        Response::new(Body::from(format!("{method}|{path}|{added}")))
+    }));
+    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+
+    let source = format!(
+        r#"
+        use vm;
+
+        let client_id = vm::http::request::get_header("x-client-id");
+        if vm::http::rate_limit::allow(client_id, 1, 60) {{
+            vm::http::upstream::request::set_path("/rewritten");
+            vm::http::upstream::request::set_query("from=vm");
+            vm::http::upstream::request::set_header("x-added", "yes");
+            vm::http::upstream::request::set_target("{upstream_addr}");
+        }} else {{
+            vm::http::response::set_status(429);
+            vm::http::response::set_body("blocked");
+        }}
+    "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let first = client
+        .get(format!("http://{data_addr}/anything?x=1"))
+        .header("x-client-id", "abc")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(
+        first.text().await.expect("body should read"),
+        "GET|/rewritten?from=vm|yes"
+    );
+
+    let second = client
+        .get(format!("http://{data_addr}/anything?x=1"))
+        .header("x-client-id", "abc")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(second.text().await.expect("body should read"), "blocked");
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn http_request_body_can_be_rewritten_before_proxying() {
+    let upstream_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let (parts, body) = request.into_parts();
+        let body = to_bytes(body, usize::MAX)
+            .await
+            .expect("body should be readable");
+        let path = parts
+            .uri
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/");
+        Response::new(Body::from(format!(
+            "{}|{}",
+            path,
+            String::from_utf8_lossy(&body)
+        )))
+    }));
+    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+
+    let source = format!(
+        r#"
+        use vm;
+
+        vm::http::upstream::request::set_body("rewritten-body");
+        vm::http::upstream::request::set_target("{upstream_addr}");
+    "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .post(format!("http://{data_addr}/payload"))
+        .body("original-body")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "/payload|rewritten-body"
+    );
+
+    upstream_handle.abort();
     data_handle.abort();
     admin_handle.abort();
 }
@@ -662,7 +781,7 @@ async fn uploaded_program_with_locals_executes_successfully() {
         use vm;
 
         let body = "from-local";
-        vm::set_response_content(body);
+        vm::http::response::set_body(body);
     "#;
     let compiled = compile_source(source).expect("source should compile");
     assert!(

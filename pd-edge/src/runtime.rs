@@ -9,11 +9,11 @@ use std::{
 
 use axum::{
     Json, Router,
-    body::{Body, Bytes, to_bytes},
+    body::{Body, to_bytes},
     extract::{Request, State},
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Uri,
-        header::{CONTENT_TYPE, HOST},
+        header::{CONTENT_LENGTH, CONTENT_TYPE, HOST},
     },
     middleware::{self, Next},
     response::IntoResponse,
@@ -35,8 +35,8 @@ use crate::{
         stop_debug_session,
     },
     host_abi::{
-        ProxyVmContext, RateLimiterStore, SharedRateLimiter, register_host_module,
-        snapshot_execution_outcome,
+        HttpRequestContext, ProxyVmContext, RateLimiterStore, SharedRateLimiter,
+        register_host_module, snapshot_execution_outcome,
     },
     logging::{category_access, category_debug, category_program, method_label, status_label},
 };
@@ -335,9 +335,10 @@ struct RuntimeMetrics {
 
 struct ProxyUpstreamInputs {
     method: Method,
-    uri: Uri,
+    request_path: String,
+    request_query: String,
     request_headers: HeaderMap,
-    request_body: Bytes,
+    request_body: Vec<u8>,
     upstream: String,
     vm_response_headers: HeaderMap,
     vm_response_status: Option<u16>,
@@ -504,13 +505,27 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
         let uri = parts.uri.clone();
         let request_headers = parts.headers.clone();
         let request_path = uri.path().to_string();
+        let request_query = uri.query().unwrap_or("").to_string();
+        let request_http_version = http_version_label(parts.version);
+        let request_scheme = resolve_request_scheme(&uri, &request_headers);
+        let request_port = resolve_request_port(&uri, &request_headers, &request_scheme);
+        let request_host = resolve_request_host(&uri, &request_headers);
+        let request_client_ip = resolve_request_client_ip(&request_headers);
         let request_id = Uuid::new_v4().to_string();
         let vm_outcome = match execute_vm_for_request(
             &state,
             &program,
+            method.clone(),
             request_headers.clone(),
             request_path,
+            request_query,
+            request_http_version,
+            request_port,
+            request_scheme,
+            request_host,
+            request_client_ip,
             request_id,
+            body_bytes.to_vec(),
         )
         .await
         {
@@ -596,10 +611,11 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
         };
 
         ProxyUpstreamInputs {
-            method,
-            uri,
-            request_headers: parts.headers,
-            request_body: body_bytes,
+            method: vm_outcome.request_method,
+            request_path: vm_outcome.request_path,
+            request_query: vm_outcome.request_query,
+            request_headers: vm_outcome.request_headers,
+            request_body: vm_outcome.request_body,
             upstream,
             vm_response_headers: vm_outcome.response_headers,
             vm_response_status: vm_outcome.response_status,
@@ -824,14 +840,18 @@ async fn proxy_to_upstream(
     inputs: ProxyUpstreamInputs,
 ) -> (Response<Body>, u64) {
     let upstream_started = Instant::now();
-    let (upstream_url, host_header) = build_upstream_url(&inputs.upstream, &inputs.uri);
+    let (upstream_url, host_header) = build_upstream_url(
+        &inputs.upstream,
+        &inputs.request_path,
+        &inputs.request_query,
+    );
 
     let mut outbound = state
         .client
         .request(inputs.method, upstream_url)
-        .body(inputs.request_body.to_vec());
+        .body(inputs.request_body);
     for (name, value) in &inputs.request_headers {
-        if name != HOST && !is_hop_by_hop(name) {
+        if name != HOST && name != CONTENT_LENGTH && !is_hop_by_hop(name) {
             outbound = outbound.header(name, value);
         }
     }
@@ -890,11 +910,21 @@ async fn proxy_to_upstream(
     (response, upstream_latency_ms)
 }
 
-fn build_upstream_url(upstream: &str, uri: &Uri) -> (String, Option<String>) {
-    let path_and_query = uri
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or("/");
+fn build_upstream_url(
+    upstream: &str,
+    request_path: &str,
+    request_query: &str,
+) -> (String, Option<String>) {
+    let path = if request_path.is_empty() {
+        "/"
+    } else {
+        request_path
+    };
+    let path_and_query = if request_query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{request_query}")
+    };
 
     if let Ok(url) = Url::parse(upstream) {
         let mut final_url = url;
@@ -918,6 +948,90 @@ fn build_upstream_url(upstream: &str, uri: &Uri) -> (String, Option<String>) {
 
     let upstream_url = format!("http://{}{path_and_query}", upstream);
     (upstream_url, Some(upstream.to_string()))
+}
+
+fn resolve_request_scheme(uri: &Uri, headers: &HeaderMap) -> String {
+    if let Some(scheme) = uri.scheme_str() {
+        return scheme.to_string();
+    }
+    if let Some(forwarded) = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return forwarded.to_string();
+    }
+    "http".to_string()
+}
+
+fn resolve_request_port(uri: &Uri, headers: &HeaderMap, scheme: &str) -> u16 {
+    if let Some(port) = uri.port_u16() {
+        return port;
+    }
+    if let Some(host_header) = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && let Ok(authority) = host_header.parse::<axum::http::uri::Authority>()
+        && let Some(port) = authority.port_u16()
+    {
+        return port;
+    }
+    if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
+    }
+}
+
+fn http_version_label(version: axum::http::Version) -> String {
+    match version {
+        axum::http::Version::HTTP_09 => "0.9".to_string(),
+        axum::http::Version::HTTP_10 => "1.0".to_string(),
+        axum::http::Version::HTTP_11 => "1.1".to_string(),
+        axum::http::Version::HTTP_2 => "2".to_string(),
+        axum::http::Version::HTTP_3 => "3".to_string(),
+        _ => "1.1".to_string(),
+    }
+}
+
+fn resolve_request_host(uri: &Uri, headers: &HeaderMap) -> String {
+    if let Some(host) = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return host.to_string();
+    }
+    uri.authority()
+        .map(|authority| authority.as_str().to_string())
+        .unwrap_or_default()
+}
+
+fn resolve_request_client_ip(headers: &HeaderMap) -> String {
+    if let Some(value) = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+    {
+        let first = value
+            .split(',')
+            .map(str::trim)
+            .find(|candidate| !candidate.is_empty())
+            .unwrap_or_default();
+        if !first.is_empty() {
+            return first.to_string();
+        }
+    }
+    headers
+        .get("x-real-ip")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_default()
 }
 
 fn short_circuit_response(
@@ -1020,9 +1134,17 @@ enum VmExecutionError {
 async fn execute_vm_for_request(
     state: &SharedState,
     program: &LoadedProgram,
+    request_method: Method,
     request_headers: HeaderMap,
     request_path: String,
+    request_query: String,
+    request_http_version: String,
+    request_port: u16,
+    request_scheme: String,
+    request_host: String,
+    request_client_ip: String,
     request_id: String,
+    request_body: Vec<u8>,
 ) -> Result<crate::host_abi::VmExecutionOutcome, VmExecutionError> {
     let local_count = program.local_count;
     let program = program.program.clone();
@@ -1030,8 +1152,20 @@ async fn execute_vm_for_request(
     let debug_session = state.debug_session.clone();
 
     let task = tokio::task::spawn_blocking(move || {
-        let vm_context = Arc::new(std::sync::Mutex::new(ProxyVmContext::from_request_headers(
-            request_headers.clone(),
+        let vm_context = Arc::new(std::sync::Mutex::new(ProxyVmContext::from_http_request(
+            HttpRequestContext {
+                request_id: request_id.clone(),
+                method: request_method.clone(),
+                path: request_path.clone(),
+                query: request_query.clone(),
+                http_version: request_http_version.clone(),
+                port: request_port,
+                scheme: request_scheme.clone(),
+                host: request_host.clone(),
+                client_ip: request_client_ip.clone(),
+                body: request_body.clone(),
+                headers: request_headers.clone(),
+            },
             rate_limiter,
         )));
 

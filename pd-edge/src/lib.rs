@@ -5,11 +5,7 @@ mod host_abi;
 mod logging;
 mod runtime;
 
-pub use edge_abi::{
-    ABI_VERSION, AbiFunction, FN_GET_HEADER, FN_RATE_LIMIT_ALLOW, FN_SET_HEADER,
-    FN_SET_RESPONSE_CONTENT, FN_SET_RESPONSE_STATUS, FN_SET_UPSTREAM, FUNCTIONS,
-    HOST_FUNCTION_COUNT, abi_json, function_by_index, function_by_name,
-};
+pub use edge_abi::*;
 
 pub use active_control_plane::{
     ActiveControlPlaneConfig, run_active_control_plane_client, spawn_active_control_plane_client,
