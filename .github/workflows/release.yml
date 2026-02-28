@@ -19,6 +19,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -26,11 +28,21 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Build wasm linter and bundle for WebUI
+        shell: bash
+        run: |
+          cargo build -p pd-vm-lint-wasm --target wasm32-unknown-unknown --release --locked
+          mkdir -p pd-controller/webui/public/wasm
+          cp target/wasm32-unknown-unknown/release/pd_vm_lint_wasm.wasm pd-controller/webui/public/wasm/pd_vm_lint_wasm.wasm
+
       - name: Build WebUI assets
+        shell: bash
         run: |
           cd pd-controller/webui
           bun install --frozen-lockfile
-          bun run build
+          bun run tsc --noEmit
+          bun run vite build
+          test -f dist/wasm/pd_vm_lint_wasm.wasm
 
       - name: Compute git build metadata
         shell: bash

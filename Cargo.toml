@@ -1,6 +1,7 @@
 [workspace]
 members = [
 	"pd-vm",
+	"pd-vm-lint-wasm",
 	"pd-edge-abi",
 	"pd-edge",
 	"pd-controller",

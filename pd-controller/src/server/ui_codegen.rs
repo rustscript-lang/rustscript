@@ -164,7 +164,7 @@ pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
             id: "string_slice",
             title: "String Slice",
             category: "string",
-            description: "Slice string by start/length and store into a variable.",
+            description: "Slice string by range and store into a variable (supports [:end], [start:], and negative end).",
             inputs: vec![
                 UiBlockInput {
                     key: "var",
@@ -187,15 +187,15 @@ pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
                     label: "Start",
                     input_type: UiInputType::Number,
                     default_value: "0",
-                    placeholder: "0 or $var",
+                    placeholder: "0, -1, or $var (empty for start)",
                     connectable: true,
                 },
                 UiBlockInput {
-                    key: "length",
-                    label: "Length",
+                    key: "end",
+                    label: "End",
                     input_type: UiInputType::Number,
                     default_value: "3",
-                    placeholder: "3 or $var",
+                    placeholder: "3, -1, or $var (empty for end)",
                     connectable: true,
                 },
             ],
@@ -1668,6 +1668,45 @@ fn render_number_expr(raw: &str, fallback: &str) -> String {
     }
 }
 
+fn is_signed_integer_literal(raw: &str) -> bool {
+    if raw.is_empty() {
+        return false;
+    }
+    let digits = if let Some(rest) = raw.strip_prefix('-') {
+        rest
+    } else {
+        raw
+    };
+    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn render_slice_bound_expr(raw: Option<&String>) -> Option<String> {
+    let raw = raw.map(String::as_str)?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some(expr) = raw.strip_prefix('$') {
+        return Some(sanitize_identifier(Some(&expr.to_string()), "value"));
+    }
+    if is_signed_integer_literal(raw) {
+        return Some(raw.to_string());
+    }
+    None
+}
+
+fn render_slice_index_expr(raw: Option<&String>, fallback: &str) -> String {
+    render_slice_bound_expr(raw).unwrap_or_else(|| fallback.to_string())
+}
+
+fn render_slice_expr(value_expr: String, start: Option<String>, end: Option<String>) -> String {
+    match (start, end) {
+        (Some(start), Some(end)) => format!("({value_expr})[{start}:{end}]"),
+        (None, Some(end)) => format!("({value_expr})[:{end}]"),
+        (Some(start), None) => format!("({value_expr})[{start}:]"),
+        (None, None) => format!("({value_expr})[:]"),
+    }
+}
+
 fn is_dot_member_key(raw: &str) -> bool {
     let Some(first) = raw.chars().next() else {
         return false;
@@ -1840,32 +1879,58 @@ fn render_single_block(
         "string_slice" => {
             let var = sanitize_identifier(block.values.get("var"), "text_slice");
             let value = block_value(block, "value", "hello");
-            let start = render_number_expr(block_value(block, "start", "0"), "0");
-            let length = render_number_expr(block_value(block, "length", "3"), "3");
-            rss.push(format!(
-                "let {var} = slice({}, {}, {});",
-                render_expr_rss(value),
-                start,
-                length
-            ));
-            js.push(format!(
-                "let {var} = slice({}, {}, {});",
-                render_expr_js(value),
-                start,
-                length
-            ));
-            lua.push(format!(
-                "local {var} = slice({}, {}, {})",
-                render_expr_lua(value),
-                start,
-                length
-            ));
-            scm.push(format!(
-                "(define {var} (slice {} {} {}))",
-                render_expr_scheme(value),
-                start,
-                length
-            ));
+            let start = render_slice_bound_expr(block.values.get("start"));
+            let end = render_slice_bound_expr(block.values.get("end"));
+            // Compatibility for previously saved graphs that still use `length`.
+            let legacy_length = if end.is_none() {
+                render_slice_bound_expr(block.values.get("length"))
+            } else {
+                None
+            };
+
+            let rss_expr = if let Some(length) = &legacy_length {
+                let legacy_start = start.clone().unwrap_or_else(|| "0".to_string());
+                let legacy_end = format!("({legacy_start}) + ({length})");
+                render_slice_expr(render_expr_rss(value), Some(legacy_start), Some(legacy_end))
+            } else {
+                render_slice_expr(render_expr_rss(value), start.clone(), end.clone())
+            };
+            let js_expr = if let Some(length) = &legacy_length {
+                let legacy_start = start.clone().unwrap_or_else(|| "0".to_string());
+                let legacy_end = format!("({legacy_start}) + ({length})");
+                render_slice_expr(render_expr_js(value), Some(legacy_start), Some(legacy_end))
+            } else {
+                render_slice_expr(render_expr_js(value), start.clone(), end.clone())
+            };
+            let lua_expr = if let Some(length) = &legacy_length {
+                let legacy_start = start.clone().unwrap_or_else(|| "0".to_string());
+                let legacy_end = format!("({legacy_start}) + ({length})");
+                render_slice_expr(render_expr_lua(value), Some(legacy_start), Some(legacy_end))
+            } else {
+                render_slice_expr(render_expr_lua(value), start.clone(), end.clone())
+            };
+
+            rss.push(format!("let {var} = {rss_expr};"));
+            js.push(format!("let {var} = {js_expr};"));
+            lua.push(format!("local {var} = {lua_expr}"));
+
+            let scheme_value = render_expr_scheme(value);
+            let scheme_expr = if let Some(length) = legacy_length {
+                let legacy_start = start
+                    .clone()
+                    .unwrap_or_else(|| render_slice_index_expr(None, "0"));
+                format!("(slice {scheme_value} {legacy_start} {length})")
+            } else {
+                match (start, end) {
+                    (Some(start), Some(end)) => {
+                        format!("(slice-range {scheme_value} {start} {end})")
+                    }
+                    (None, Some(end)) => format!("(slice-to {scheme_value} {end})"),
+                    (Some(start), None) => format!("(slice-from {scheme_value} {start})"),
+                    (None, None) => format!("(slice-from {scheme_value} 0)"),
+                }
+            };
+            scm.push(format!("(define {var} {scheme_expr})"));
         }
         "math_add" => {
             let var = sanitize_identifier(block.values.get("var"), "math_sum");

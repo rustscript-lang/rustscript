@@ -373,6 +373,7 @@ pub(super) async fn rpc_poll_handler(
     let debug_session_active = request.telemetry.debug_session_active;
     let debug_session_attached = request.telemetry.debug_session_attached;
     let debug_session_current_line = request.telemetry.debug_session_current_line;
+    let debug_session_request_id = request.telemetry.debug_session_request_id.clone();
     let (resolved_edge_id, command) = {
         let mut guard = state.inner.write().await;
         let edge_id = guard.resolve_or_create_edge_id(&request.edge_id);
@@ -410,8 +411,17 @@ pub(super) async fn rpc_poll_handler(
             ) {
                 continue;
             }
+            if session.mode == DebugSessionMode::Recording {
+                if session.edge_id != resolved_edge_id {
+                    session.edge_id = resolved_edge_id.clone();
+                }
+                continue;
+            }
             if session.edge_id != resolved_edge_id {
                 session.edge_id = resolved_edge_id.clone();
+            }
+            if let Some(request_id) = debug_session_request_id.clone() {
+                session.request_id = Some(request_id);
             }
             if !debug_session_active {
                 session.phase = DebugSessionPhase::Stopped;
@@ -498,7 +508,6 @@ pub(super) async fn rpc_result_handler(
             record.edge_name = result.edge_id.clone();
         }
         record.last_result_unix_ms = Some(now_unix_ms());
-        record.last_telemetry = Some(result.telemetry.clone());
         record.total_results += 1;
         record.recent_results.push_back(result);
         while record.recent_results.len() > state.config.max_result_history {
@@ -643,13 +652,28 @@ pub(super) async fn create_debug_session_handler(
     State(state): State<ControllerState>,
     Json(request): Json<CreateDebugSessionRequest>,
 ) -> Result<(StatusCode, Json<DebugSessionDetail>), (StatusCode, Json<ErrorResponse>)> {
+    let mode = request.mode.clone();
     let tcp_addr = request
         .tcp_addr
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_REMOTE_DEBUGGER_TCP_ADDR)
-        .to_string();
+        .map(str::to_string);
+    let request_path = request
+        .request_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let record_count = request.record_count.unwrap_or(DEFAULT_RECORDING_COUNT);
+    if mode == DebugSessionMode::Recording && request_path.is_none() {
+        return Err(bad_request(
+            "recording mode requires request_path (for example: /api/foo)",
+        ));
+    }
+    if mode == DebugSessionMode::Recording && record_count == 0 {
+        return Err(bad_request("record_count must be >= 1"));
+    }
 
     let (resolved_edge_id, edge_name, source_flavor, source_code) = {
         let guard = state.inner.read().await;
@@ -682,11 +706,29 @@ pub(super) async fn create_debug_session_handler(
     let command_id = state.next_command_id();
     let session_id = Uuid::new_v4().to_string();
     let stop_on_entry = request.stop_on_entry.unwrap_or(true);
+    let requested_header_name = request
+        .header_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let command = ControlPlaneCommand::StartDebugSession {
         command_id: command_id.clone(),
-        tcp_addr: tcp_addr.clone(),
-        header_name: request.header_name.clone(),
+        session_id: session_id.clone(),
+        tcp_addr: if mode == DebugSessionMode::Interactive {
+            tcp_addr.clone()
+        } else {
+            None
+        },
+        header_name: if mode == DebugSessionMode::Interactive {
+            requested_header_name.clone()
+        } else {
+            None
+        },
         stop_on_entry: Some(stop_on_entry),
+        mode: mode.clone(),
+        request_path: request_path.clone(),
+        record_count: Some(record_count),
     };
     let _queued = state
         .enqueue_command(resolved_edge_id.clone(), command)
@@ -697,10 +739,20 @@ pub(super) async fn create_debug_session_handler(
         edge_id: resolved_edge_id,
         edge_name,
         phase: DebugSessionPhase::WaitingForStartResult,
-        requested_header_name: request.header_name,
+        mode: mode.clone(),
+        requested_header_name,
         header_name: None,
         nonce_header_value: None,
-        tcp_addr,
+        request_id: None,
+        tcp_addr: tcp_addr.unwrap_or_default(),
+        request_path,
+        recording_target_count: if mode == DebugSessionMode::Recording {
+            Some(record_count)
+        } else {
+            None
+        },
+        recordings: Vec::new(),
+        selected_recording_id: None,
         start_command_id: command_id.clone(),
         stop_command_id: None,
         current_line: None,
@@ -711,8 +763,12 @@ pub(super) async fn create_debug_session_handler(
         updated_unix_ms: now,
         attached_unix_ms: None,
         last_resume_command_unix_ms: None,
-        message: Some("start-debug command queued".to_string()),
+        message: Some(match mode {
+            DebugSessionMode::Interactive => "start-debug command queued".to_string(),
+            DebugSessionMode::Recording => "start-recording command queued".to_string(),
+        }),
         last_output: None,
+        replay_states: HashMap::new(),
     };
 
     {
@@ -723,6 +779,7 @@ pub(super) async fn create_debug_session_handler(
         let mut lookup = state.debug_start_lookup.write().await;
         lookup.insert(command_id, session_id);
     }
+    state.persist_snapshot().await.map_err(internal_error)?;
 
     Ok((StatusCode::ACCEPTED, Json(record.to_detail())))
 }
@@ -730,34 +787,80 @@ pub(super) async fn create_debug_session_handler(
 pub(super) async fn stop_debug_session_handler(
     State(state): State<ControllerState>,
     Path(session_id): Path<String>,
-) -> Result<(StatusCode, Json<DebugSessionDetail>), (StatusCode, Json<ErrorResponse>)> {
-    let edge_id = {
-        let guard = state.debug_sessions.read().await;
-        let Some(session) = guard.get(&session_id) else {
-            return Err(not_found("debug session not found"));
-        };
-        session.edge_id.clone()
-    };
-
-    let command_id = state.next_command_id();
-    let command = ControlPlaneCommand::StopDebugSession {
-        command_id: command_id.clone(),
-    };
-    let _queued = state.enqueue_command(edge_id, command).await;
-
-    let detail = {
+) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut stop_command_to_queue: Option<(String, String)> = None;
+    {
         let mut sessions = state.debug_sessions.write().await;
         let Some(session) = sessions.get_mut(&session_id) else {
             return Err(not_found("debug session not found"));
         };
-        session.phase = DebugSessionPhase::Stopped;
+        if !matches!(
+            session.phase,
+            DebugSessionPhase::Stopped | DebugSessionPhase::Failed
+        ) {
+            let command_id = state.next_command_id();
+            stop_command_to_queue = Some((session.edge_id.clone(), command_id.clone()));
+            session.stop_command_id = Some(command_id);
+            session.phase = DebugSessionPhase::Stopped;
+            session.current_line = None;
+            session.last_resume_command_unix_ms = None;
+            session.message = if session.mode == DebugSessionMode::Recording {
+                Some("recording session stop requested".to_string())
+            } else {
+                Some("debug session stop requested".to_string())
+            };
+        }
         session.updated_unix_ms = now_unix_ms();
-        session.stop_command_id = Some(command_id);
-        session.message = Some("stop-debug command queued".to_string());
-        session.to_detail()
+    }
+    if let Some((edge_id, command_id)) = stop_command_to_queue {
+        let command = ControlPlaneCommand::StopDebugSession { command_id };
+        let _queued = state.enqueue_command(edge_id, command).await;
+    }
+    state.persist_snapshot().await.map_err(internal_error)?;
+    Ok(Json(StatusResponse { status: "stopped" }))
+}
+
+pub(super) async fn delete_debug_session_handler(
+    State(state): State<ControllerState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (edge_id, should_stop_first) = {
+        let guard = state.debug_sessions.read().await;
+        let Some(session) = guard.get(&session_id) else {
+            return Err(not_found("debug session not found"));
+        };
+        (
+            session.edge_id.clone(),
+            !matches!(
+                session.phase,
+                DebugSessionPhase::Stopped | DebugSessionPhase::Failed
+            ),
+        )
     };
 
-    Ok((StatusCode::ACCEPTED, Json(detail)))
+    if should_stop_first {
+        let command_id = state.next_command_id();
+        let command = ControlPlaneCommand::StopDebugSession { command_id };
+        let _queued = state.enqueue_command(edge_id, command).await;
+    }
+
+    {
+        let mut sessions = state.debug_sessions.write().await;
+        if sessions.remove(&session_id).is_none() {
+            return Err(not_found("debug session not found"));
+        }
+    }
+    {
+        let mut lookup = state.debug_start_lookup.write().await;
+        lookup.retain(|_, value| value != &session_id);
+    }
+    {
+        let mut recordings = state.debug_recordings.write().await;
+        recordings.remove(&session_id);
+    }
+    state.persist_snapshot().await.map_err(internal_error)?;
+
+    Ok(Json(StatusResponse { status: "deleted" }))
 }
 
 pub(super) async fn run_debug_command_handler(
@@ -766,84 +869,210 @@ pub(super) async fn run_debug_command_handler(
     Json(request): Json<DebugCommandRequest>,
 ) -> Result<Json<DebugCommandResponse>, (StatusCode, Json<ErrorResponse>)> {
     let request_for_state = request.clone();
-    let (edge_id, phase) = {
+    let (edge_id, phase, mode, selected_recording_id) = {
         let guard = state.debug_sessions.read().await;
         let Some(session) = guard.get(&session_id) else {
             return Err(not_found("debug session not found"));
         };
-        (session.edge_id.clone(), session.phase.clone())
+        (
+            session.edge_id.clone(),
+            session.phase.clone(),
+            session.mode.clone(),
+            session.selected_recording_id.clone(),
+        )
     };
-    if phase != DebugSessionPhase::Attached {
+    if mode == DebugSessionMode::Interactive {
+        if phase != DebugSessionPhase::Attached {
+            return Err(bad_request(
+                "debug session is not attached yet; wait for a matching request",
+            ));
+        }
+
+        let rpc_command = match request {
+            DebugCommandRequest::Where => RemoteDebugCommand::Where,
+            DebugCommandRequest::Step => RemoteDebugCommand::Step,
+            DebugCommandRequest::Next => RemoteDebugCommand::Next,
+            DebugCommandRequest::Continue => RemoteDebugCommand::Continue,
+            DebugCommandRequest::Out => RemoteDebugCommand::Out,
+            DebugCommandRequest::SelectRecording { .. } => {
+                return Err(bad_request(
+                    "recording selection is only available for recording sessions",
+                ));
+            }
+            DebugCommandRequest::BreakLine { line } => RemoteDebugCommand::BreakLine { line },
+            DebugCommandRequest::ClearLine { line } => RemoteDebugCommand::ClearLine { line },
+            DebugCommandRequest::PrintVar { name } => {
+                if name.trim().is_empty() {
+                    return Err(bad_request("variable name cannot be empty"));
+                }
+                RemoteDebugCommand::PrintVar {
+                    name: name.trim().to_string(),
+                }
+            }
+            DebugCommandRequest::Locals => RemoteDebugCommand::Locals,
+            DebugCommandRequest::Stack => RemoteDebugCommand::Stack,
+        };
+
+        let command_id = state.next_command_id();
+        let (response_tx, response_rx) = oneshot::channel();
+        {
+            let mut waiters = state.debug_command_waiters.lock().await;
+            waiters.insert(command_id.clone(), response_tx);
+        }
+
+        let command = ControlPlaneCommand::DebugCommand {
+            command_id: command_id.clone(),
+            session_id: session_id.clone(),
+            command: rpc_command,
+        };
+        let _queued = state.enqueue_command(edge_id, command).await;
+
+        let response = match timeout(Duration::from_secs(20), response_rx).await {
+            Ok(Ok(Ok(response))) => response,
+            Ok(Ok(Err(message))) => {
+                return Err(bad_request(&message));
+            }
+            Ok(Err(_)) => {
+                return Err(bad_request("debug command response channel closed"));
+            }
+            Err(_) => {
+                let mut waiters = state.debug_command_waiters.lock().await;
+                waiters.remove(&command_id);
+                return Err(bad_request(
+                    "debug command timed out waiting for edge result",
+                ));
+            }
+        };
+
+        {
+            let mut sessions = state.debug_sessions.write().await;
+            if let Some(session) = sessions.get_mut(&session_id) {
+                match request_for_state {
+                    DebugCommandRequest::BreakLine { line } => {
+                        session.breakpoints.insert(line);
+                    }
+                    DebugCommandRequest::ClearLine { line } => {
+                        session.breakpoints.remove(&line);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        state.persist_snapshot().await.map_err(internal_error)?;
+
+        return Ok(Json(response));
+    }
+
+    if phase == DebugSessionPhase::WaitingForStartResult
+        || phase == DebugSessionPhase::WaitingForRecordings
+    {
         return Err(bad_request(
-            "debug session is not attached yet; wait for a matching request",
+            "recordings are not available yet; send matching requests first",
         ));
     }
 
-    let rpc_command = match request {
-        DebugCommandRequest::Where => RemoteDebugCommand::Where,
-        DebugCommandRequest::Step => RemoteDebugCommand::Step,
-        DebugCommandRequest::Next => RemoteDebugCommand::Next,
-        DebugCommandRequest::Continue => RemoteDebugCommand::Continue,
-        DebugCommandRequest::Out => RemoteDebugCommand::Out,
-        DebugCommandRequest::BreakLine { line } => RemoteDebugCommand::BreakLine { line },
-        DebugCommandRequest::ClearLine { line } => RemoteDebugCommand::ClearLine { line },
+    let target_recording_id = match request.clone() {
+        DebugCommandRequest::SelectRecording { recording_id } => recording_id,
+        _ => selected_recording_id
+            .ok_or_else(|| bad_request("no recording selected; select a recording first"))?
+            .clone(),
+    };
+
+    let stored_recording = {
+        let recordings = state.debug_recordings.read().await;
+        recordings
+            .get(&session_id)
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.recording_id == target_recording_id)
+                    .cloned()
+            })
+            .ok_or_else(|| bad_request("recording not found"))?
+    };
+
+    let recording_bytes = STANDARD
+        .decode(stored_recording.recording_base64.as_bytes())
+        .map_err(|err| bad_request(&format!("invalid recording payload: {err}")))?;
+    let recording = VmRecording::decode(&recording_bytes)
+        .map_err(|err| bad_request(&format!("failed to decode recording: {err}")))?;
+
+    let command_text = match request.clone() {
+        DebugCommandRequest::SelectRecording { .. } => "where".to_string(),
+        DebugCommandRequest::Where => "where".to_string(),
+        DebugCommandRequest::Step => "step".to_string(),
+        DebugCommandRequest::Next => "next".to_string(),
+        DebugCommandRequest::Continue => "continue".to_string(),
+        DebugCommandRequest::Out => "out".to_string(),
+        DebugCommandRequest::BreakLine { line } => format!("break line {line}"),
+        DebugCommandRequest::ClearLine { line } => format!("clear line {line}"),
         DebugCommandRequest::PrintVar { name } => {
             if name.trim().is_empty() {
                 return Err(bad_request("variable name cannot be empty"));
             }
-            RemoteDebugCommand::PrintVar {
-                name: name.trim().to_string(),
-            }
+            format!("print {}", name.trim())
         }
-        DebugCommandRequest::Locals => RemoteDebugCommand::Locals,
-        DebugCommandRequest::Stack => RemoteDebugCommand::Stack,
+        DebugCommandRequest::Locals => "locals".to_string(),
+        DebugCommandRequest::Stack => "stack".to_string(),
     };
 
-    let command_id = state.next_command_id();
-    let (response_tx, response_rx) = oneshot::channel();
-    {
-        let mut waiters = state.debug_command_waiters.lock().await;
-        waiters.insert(command_id.clone(), response_tx);
-    }
-
-    let command = ControlPlaneCommand::DebugCommand {
-        command_id: command_id.clone(),
-        session_id: session_id.clone(),
-        command: rpc_command,
-    };
-    let _queued = state.enqueue_command(edge_id, command).await;
-
-    let response = match timeout(Duration::from_secs(20), response_rx).await {
-        Ok(Ok(Ok(response))) => response,
-        Ok(Ok(Err(message))) => {
-            return Err(bad_request(&message));
-        }
-        Ok(Err(_)) => {
-            return Err(bad_request("debug command response channel closed"));
-        }
-        Err(_) => {
-            let mut waiters = state.debug_command_waiters.lock().await;
-            waiters.remove(&command_id);
-            return Err(bad_request(
-                "debug command timed out waiting for edge result",
-            ));
-        }
-    };
-
-    {
+    let response = {
         let mut sessions = state.debug_sessions.write().await;
-        if let Some(session) = sessions.get_mut(&session_id) {
-            match request_for_state {
-                DebugCommandRequest::BreakLine { line } => {
-                    session.breakpoints.insert(line);
-                }
-                DebugCommandRequest::ClearLine { line } => {
-                    session.breakpoints.remove(&line);
-                }
-                _ => {}
-            }
+        let Some(session) = sessions.get_mut(&session_id) else {
+            return Err(not_found("debug session not found"));
+        };
+        if !session
+            .recordings
+            .iter()
+            .any(|item| item.recording_id == target_recording_id)
+        {
+            return Err(bad_request("recording is not part of this session"));
         }
-    }
+
+        if matches!(
+            request_for_state,
+            DebugCommandRequest::SelectRecording { .. }
+        ) {
+            session.replay_states.insert(
+                target_recording_id.clone(),
+                VmRecordingReplayState::default(),
+            );
+        }
+        let replay_state = session
+            .replay_states
+            .entry(target_recording_id.clone())
+            .or_insert_with(VmRecordingReplayState::default);
+        let replay = run_recording_replay_command(&recording, replay_state, &command_text);
+
+        match request_for_state {
+            DebugCommandRequest::BreakLine { line } => {
+                session.breakpoints.insert(line);
+            }
+            DebugCommandRequest::ClearLine { line } => {
+                session.breakpoints.remove(&line);
+            }
+            _ => {}
+        }
+
+        session.phase = DebugSessionPhase::ReplayReady;
+        session.current_line = replay.current_line;
+        session.selected_recording_id = Some(target_recording_id);
+        session.request_id = stored_recording.request_id.clone();
+        session.updated_unix_ms = now_unix_ms();
+        session.last_output = Some(replay.output.clone());
+        session.message = if replay.at_end {
+            Some("replay cursor reached end of recording".to_string())
+        } else {
+            Some("replay command completed".to_string())
+        };
+        DebugCommandResponse {
+            phase: session.phase.clone(),
+            output: replay.output,
+            current_line: replay.current_line,
+            attached: !replay.exited,
+        }
+    };
+    state.persist_snapshot().await.map_err(internal_error)?;
 
     Ok(Json(response))
 }
@@ -963,20 +1192,48 @@ pub(super) async fn enqueue_start_debug_handler(
     Path(edge_id): Path<String>,
     Json(request): Json<EnqueueStartDebugRequest>,
 ) -> Result<(StatusCode, Json<EnqueueCommandResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let mode = request.mode.clone();
     let tcp_addr = request
         .tcp_addr
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_REMOTE_DEBUGGER_TCP_ADDR)
-        .to_string();
+        .map(str::to_string);
+    let request_path = request
+        .request_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let record_count = request.record_count.unwrap_or(DEFAULT_RECORDING_COUNT);
+    if mode == DebugSessionMode::Recording && request_path.is_none() {
+        return Err(bad_request(
+            "recording mode requires request_path (for example: /api/foo)",
+        ));
+    }
+    if mode == DebugSessionMode::Recording && record_count == 0 {
+        return Err(bad_request("record_count must be >= 1"));
+    }
+    let session_id = Uuid::new_v4().to_string();
     let command = ControlPlaneCommand::StartDebugSession {
         command_id: request
             .command_id
             .unwrap_or_else(|| state.next_command_id()),
-        tcp_addr,
-        header_name: request.header_name,
+        session_id,
+        tcp_addr: if mode == DebugSessionMode::Interactive {
+            tcp_addr
+        } else {
+            None
+        },
+        header_name: if mode == DebugSessionMode::Interactive {
+            request.header_name
+        } else {
+            None
+        },
         stop_on_entry: request.stop_on_entry,
+        mode,
+        request_path,
+        record_count: Some(record_count),
     };
     let queued = state.enqueue_command(edge_id, command).await;
     Ok((StatusCode::ACCEPTED, Json(queued)))
@@ -1092,10 +1349,14 @@ async fn process_debug_session_result(
                 session.updated_unix_ms = now_unix_ms();
                 if is_ok && status.is_some() {
                     let reported_status = status.as_ref();
-                    session.phase = if reported_status.map(|item| item.attached).unwrap_or(false) {
-                        DebugSessionPhase::Attached
+                    session.phase = if session.mode == DebugSessionMode::Interactive {
+                        if reported_status.map(|item| item.attached).unwrap_or(false) {
+                            DebugSessionPhase::Attached
+                        } else {
+                            DebugSessionPhase::WaitingForAttach
+                        }
                     } else {
-                        DebugSessionPhase::WaitingForAttach
+                        DebugSessionPhase::WaitingForRecordings
                     };
                     session.header_name = nonce_header_name
                         .clone()
@@ -1104,6 +1365,9 @@ async fn process_debug_session_result(
                     session.nonce_header_value = nonce_header_value
                         .clone()
                         .or_else(|| reported_status.and_then(|item| item.header_value.clone()));
+                    session.request_id = reported_status
+                        .and_then(|item| item.request_id.clone())
+                        .or_else(|| session.request_id.clone());
                     if let Some(addr) = reported_status
                         .and_then(|item| item.tcp_addr.clone())
                         .filter(|value| !value.trim().is_empty())
@@ -1111,10 +1375,23 @@ async fn process_debug_session_result(
                         session.tcp_addr = addr;
                     }
                     session.current_line = reported_status.and_then(|item| item.current_line);
-                    session.message = Some(
-                        "debug session active on edge; waiting for a matching request to attach"
-                            .to_string(),
-                    );
+                    if session.mode == DebugSessionMode::Interactive {
+                        session.message = Some(
+                            "debug session active on edge; waiting for a matching request to attach"
+                                .to_string(),
+                        );
+                    } else {
+                        session.request_path = reported_status
+                            .and_then(|item| item.request_path.clone())
+                            .or_else(|| session.request_path.clone());
+                        session.recording_target_count = reported_status
+                            .and_then(|item| item.target_recordings)
+                            .or(session.recording_target_count);
+                        session.message = Some(
+                            "recording session active on edge; waiting for matching requests"
+                                .to_string(),
+                        );
+                    }
                 } else {
                     session.phase = DebugSessionPhase::Failed;
                     session.message =
@@ -1204,6 +1481,149 @@ async fn process_debug_session_result(
                 let _ = waiter.send(response_for_waiter);
             }
         }
+        CommandResultPayload::DebugRecording {
+            session_id,
+            recording_id,
+            request_id,
+            request_path,
+            recording_base64,
+            frame_count,
+            terminal_status,
+            sequence,
+            completed,
+            message,
+        } => {
+            {
+                let sessions = state.debug_sessions.read().await;
+                if !sessions.contains_key(session_id) {
+                    return;
+                }
+            }
+            let created_unix_ms = now_unix_ms();
+            let stored = StoredDebugRecording {
+                recording_id: recording_id.clone(),
+                session_id: session_id.clone(),
+                edge_id: edge_id.to_string(),
+                edge_name: edge_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(edge_id)
+                    .to_string(),
+                sequence: *sequence,
+                created_unix_ms,
+                frame_count: *frame_count,
+                terminal_status: terminal_status.clone(),
+                request_id: request_id.clone(),
+                request_path: request_path.clone(),
+                recording_base64: recording_base64.clone(),
+            };
+            {
+                let mut recordings = state.debug_recordings.write().await;
+                let items = recordings.entry(session_id.clone()).or_default();
+                if let Some(existing) = items
+                    .iter_mut()
+                    .find(|item| item.recording_id == *recording_id)
+                {
+                    *existing = stored.clone();
+                } else {
+                    items.push(stored);
+                }
+                items.sort_by_key(|item| item.sequence);
+            }
+
+            let initial_line = STANDARD
+                .decode(recording_base64.as_bytes())
+                .ok()
+                .and_then(|bytes| VmRecording::decode(&bytes).ok())
+                .and_then(|recording| {
+                    let mut state = VmRecordingReplayState::default();
+                    run_recording_replay_command(&recording, &mut state, "where").current_line
+                });
+
+            let mut stop_command_to_queue: Option<(String, String)> = None;
+            let mut sessions = state.debug_sessions.write().await;
+            let Some(session) = sessions.get_mut(session_id) else {
+                return;
+            };
+            session.edge_id = edge_id.to_string();
+            if let Some(name) = edge_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                session.edge_name = name.to_string();
+            }
+            if let Some(path) = request_path.clone() {
+                session.request_path = Some(path);
+            }
+            if let Some(id) = request_id.clone() {
+                session.request_id = Some(id);
+            }
+            if let Some(target) = session.recording_target_count
+                && target > 0
+            {
+                session.recording_target_count = Some(target);
+            }
+
+            let summary = DebugRecordingSummary {
+                recording_id: recording_id.clone(),
+                sequence: *sequence,
+                created_unix_ms,
+                frame_count: *frame_count,
+                terminal_status: terminal_status.clone(),
+                request_id: request_id.clone(),
+                request_path: request_path.clone(),
+            };
+            if let Some(existing) = session
+                .recordings
+                .iter_mut()
+                .find(|item| item.recording_id == *recording_id)
+            {
+                *existing = summary;
+            } else {
+                session.recordings.push(summary);
+                session.recordings.sort_by_key(|item| item.sequence);
+            }
+
+            if session.selected_recording_id.is_none() {
+                session.selected_recording_id = Some(recording_id.clone());
+                session
+                    .replay_states
+                    .insert(recording_id.clone(), VmRecordingReplayState::default());
+            }
+            if session.current_line.is_none() {
+                session.current_line = initial_line;
+            }
+            if *completed {
+                session.phase = DebugSessionPhase::Stopped;
+                if session.stop_command_id.is_none() {
+                    let command_id = state.next_command_id();
+                    session.stop_command_id = Some(command_id.clone());
+                    stop_command_to_queue = Some((session.edge_id.clone(), command_id));
+                }
+            } else {
+                session.phase = DebugSessionPhase::ReplayReady;
+            }
+            session.updated_unix_ms = created_unix_ms;
+            session.message = if let Some(custom) = message.clone() {
+                Some(custom)
+            } else if *completed {
+                Some("recording collection complete".to_string())
+            } else {
+                Some(format!(
+                    "captured recording {} ({} frame{})",
+                    sequence,
+                    frame_count,
+                    if *frame_count == 1 { "" } else { "s" }
+                ))
+            };
+            drop(sessions);
+            if let Some((edge_id, command_id)) = stop_command_to_queue {
+                let command = ControlPlaneCommand::StopDebugSession { command_id };
+                let _queued = state.enqueue_command(edge_id, command).await;
+            }
+        }
         CommandResultPayload::StopDebugSession { .. } => {
             let mut sessions = state.debug_sessions.write().await;
             if let Some(session) = sessions
@@ -1212,7 +1632,11 @@ async fn process_debug_session_result(
             {
                 session.phase = DebugSessionPhase::Stopped;
                 session.updated_unix_ms = now_unix_ms();
-                session.message = Some("debug session stopped".to_string());
+                session.message = if session.mode == DebugSessionMode::Recording {
+                    Some("recording session completed".to_string())
+                } else {
+                    Some("debug session stopped".to_string())
+                };
             }
         }
         _ => {}

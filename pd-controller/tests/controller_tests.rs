@@ -42,6 +42,7 @@ fn empty_telemetry() -> TelemetrySnapshot {
         debug_session_active: false,
         debug_session_attached: false,
         debug_session_current_line: None,
+        debug_session_request_id: None,
         data_requests_total: 0,
         vm_execution_errors_total: 0,
         program_apply_success_total: 0,
@@ -103,6 +104,9 @@ async fn poll_delivers_enqueued_command_and_results_are_queryable() {
                 status_3xx_total: 1,
                 status_4xx_total: 1,
                 status_5xx_total: 0,
+                latency_p50_ms: 0,
+                latency_p90_ms: 0,
+                latency_p99_ms: 0,
             }),
         })
         .send()
@@ -136,6 +140,9 @@ async fn poll_delivers_enqueued_command_and_results_are_queryable() {
                 status_3xx_total: 1,
                 status_4xx_total: 2,
                 status_5xx_total: 0,
+                latency_p50_ms: 0,
+                latency_p90_ms: 0,
+                latency_p99_ms: 0,
             }),
         })
         .send()
@@ -244,6 +251,139 @@ async fn binary_program_upload_enqueues_apply_program_command() {
         }
         other => panic!("unexpected command payload: {other:?}"),
     }
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn poll_traffic_series_dedupes_when_counters_do_not_change() {
+    let (addr, handle, _state) = spawn_controller(ControllerConfig::default()).await;
+    let client = reqwest::Client::new();
+
+    for sample in [
+        EdgeTrafficSample {
+            requests_total: 10,
+            status_2xx_total: 8,
+            status_3xx_total: 1,
+            status_4xx_total: 1,
+            status_5xx_total: 0,
+            latency_p50_ms: 10,
+            latency_p90_ms: 20,
+            latency_p99_ms: 30,
+        },
+        EdgeTrafficSample {
+            requests_total: 10,
+            status_2xx_total: 8,
+            status_3xx_total: 1,
+            status_4xx_total: 1,
+            status_5xx_total: 0,
+            latency_p50_ms: 10,
+            latency_p90_ms: 20,
+            latency_p99_ms: 30,
+        },
+        EdgeTrafficSample {
+            requests_total: 12,
+            status_2xx_total: 10,
+            status_3xx_total: 1,
+            status_4xx_total: 1,
+            status_5xx_total: 0,
+            latency_p50_ms: 11,
+            latency_p90_ms: 22,
+            latency_p99_ms: 33,
+        },
+    ] {
+        let response = client
+            .post(format!("http://{addr}/rpc/v1/edge/poll"))
+            .json(&EdgePollRequest {
+                edge_id: "dp-dedupe-traffic".to_string(),
+                edge_name: None,
+                telemetry: empty_telemetry(),
+                traffic_sample: Some(sample),
+            })
+            .send()
+            .await
+            .expect("poll should complete");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+
+    let detail = client
+        .get(format!("http://{addr}/v1/edges/dp-dedupe-traffic"))
+        .send()
+        .await
+        .expect("detail request should complete");
+    assert_eq!(detail.status(), reqwest::StatusCode::OK);
+    let detail_body = detail
+        .json::<EdgeDetailResponse>()
+        .await
+        .expect("detail body should decode");
+    assert_eq!(detail_body.traffic_series.len(), 2);
+    assert_eq!(detail_body.traffic_series[1].requests, 2);
+    assert_eq!(detail_body.traffic_series[1].status_2xx, 2);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn result_telemetry_does_not_override_poll_telemetry_snapshot() {
+    let (addr, handle, _state) = spawn_controller(ControllerConfig::default()).await;
+    let client = reqwest::Client::new();
+
+    let mut poll_telemetry = empty_telemetry();
+    poll_telemetry.uptime_seconds = 11;
+    poll_telemetry.program_loaded = true;
+    poll_telemetry.control_rpc_polls_success_total = 3;
+
+    let poll = client
+        .post(format!("http://{addr}/rpc/v1/edge/poll"))
+        .json(&EdgePollRequest {
+            edge_id: "dp-telemetry-dedupe".to_string(),
+            edge_name: None,
+            telemetry: poll_telemetry.clone(),
+            traffic_sample: None,
+        })
+        .send()
+        .await
+        .expect("poll should complete");
+    assert_eq!(poll.status(), reqwest::StatusCode::OK);
+
+    let mut result_telemetry = empty_telemetry();
+    result_telemetry.uptime_seconds = 99;
+    result_telemetry.control_rpc_results_success_total = 77;
+
+    let post_result = client
+        .post(format!("http://{addr}/rpc/v1/edge/result"))
+        .json(&EdgeCommandResult {
+            edge_id: "dp-telemetry-dedupe".to_string(),
+            edge_name: None,
+            command_id: "cmd-telemetry-dedupe".to_string(),
+            ok: true,
+            result: CommandResultPayload::Pong { payload: None },
+            telemetry: result_telemetry,
+        })
+        .send()
+        .await
+        .expect("result post should complete");
+    assert_eq!(post_result.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let detail = client
+        .get(format!("http://{addr}/v1/edges/dp-telemetry-dedupe"))
+        .send()
+        .await
+        .expect("detail request should complete");
+    assert_eq!(detail.status(), reqwest::StatusCode::OK);
+    let detail_body = detail
+        .json::<EdgeDetailResponse>()
+        .await
+        .expect("detail body should decode");
+    let snapshot = detail_body
+        .summary
+        .last_telemetry
+        .expect("poll telemetry snapshot should be available");
+    assert_eq!(snapshot.uptime_seconds, poll_telemetry.uptime_seconds);
+    assert_eq!(
+        snapshot.control_rpc_polls_success_total,
+        poll_telemetry.control_rpc_polls_success_total
+    );
 
     handle.abort();
 }
@@ -618,6 +758,80 @@ async fn ui_render_extended_value_blocks_work_with_flow_graph() {
     assert!(
         rustscript.contains("vm::set_response_content(status_plus_len);"),
         "expected data edge into flow action, got: {rustscript}"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn ui_render_string_slice_emits_range_syntax_in_all_flavors() {
+    let (addr, handle, _state) = spawn_controller(ControllerConfig::default()).await;
+    let client = reqwest::Client::new();
+
+    let render = client
+        .post(format!("http://{addr}/v1/ui/render"))
+        .json(&serde_json::json!({
+            "nodes": [
+                {
+                    "id": "n1",
+                    "block_id": "const_string",
+                    "values": { "var": "text", "value": "abcdef" }
+                },
+                {
+                    "id": "n2",
+                    "block_id": "string_slice",
+                    "values": { "var": "text_slice", "value": "value", "start": "", "end": "-1" }
+                }
+            ],
+            "edges": [
+                {
+                    "source": "n1",
+                    "source_output": "value",
+                    "target": "n2",
+                    "target_input": "value"
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("render request should complete");
+
+    assert_eq!(render.status(), reqwest::StatusCode::OK);
+    let render_json = render
+        .json::<serde_json::Value>()
+        .await
+        .expect("render payload should decode");
+
+    let rustscript = render_json["source"]["rustscript"]
+        .as_str()
+        .expect("rustscript source should be a string");
+    assert!(
+        rustscript.contains("let text_slice = (text)[:-1];"),
+        "expected rustscript bracket slice output, got: {rustscript}"
+    );
+
+    let javascript = render_json["source"]["javascript"]
+        .as_str()
+        .expect("javascript source should be a string");
+    assert!(
+        javascript.contains("let text_slice = (text)[:-1];"),
+        "expected javascript bracket slice output, got: {javascript}"
+    );
+
+    let lua = render_json["source"]["lua"]
+        .as_str()
+        .expect("lua source should be a string");
+    assert!(
+        lua.contains("local text_slice = (text)[:-1]"),
+        "expected lua bracket slice output, got: {lua}"
+    );
+
+    let scheme = render_json["source"]["scheme"]
+        .as_str()
+        .expect("scheme source should be a string");
+    assert!(
+        scheme.contains("(define text_slice (slice-to text -1))"),
+        "expected scheme range slice helper output, got: {scheme}"
     );
 
     handle.abort();
@@ -1243,6 +1457,9 @@ async fn controller_persists_programs_applied_versions_and_traffic_series() {
                 status_3xx_total: 0,
                 status_4xx_total: 1,
                 status_5xx_total: 0,
+                latency_p50_ms: 0,
+                latency_p90_ms: 0,
+                latency_p99_ms: 0,
             }),
         })
         .send()
@@ -1270,6 +1487,9 @@ async fn controller_persists_programs_applied_versions_and_traffic_series() {
                 status_3xx_total: 0,
                 status_4xx_total: 2,
                 status_5xx_total: 0,
+                latency_p50_ms: 0,
+                latency_p90_ms: 0,
+                latency_p99_ms: 0,
             }),
         })
         .send()

@@ -47,6 +47,12 @@ cd ../..
 cargo run -p pd-controller
 ```
 
+`bun run build` now also builds the browser wasm linter (`pd-vm-lint-wasm`) and copies:
+
+- `pd-controller/webui/public/wasm/pd_vm_lint_wasm.wasm`
+
+The controller serves this file under `/ui/wasm/pd_vm_lint_wasm.wasm` for Monaco live linting in code edit mode.
+
 Env vars:
 
 - `CONTROLLER_ADDR` (default `0.0.0.0:9100`)
@@ -59,6 +65,8 @@ Persistence files (when `CONTROLLER_STATE_PATH` is set) are split as:
 - core state: `<state_path>` (edge core status + sequences)
 - programs: `<state_stem>.programs.json`
 - time series: `<state_stem>.timeseries.bin` (compact binary payload, smaller than JSON)
+- debug recordings: `<state_stem>.recordings.json`
+- debug sessions: `<state_stem>.debug-sessions.json`
 
 ## Example: enqueue bytecode for edge `edge-1`
 
@@ -108,3 +116,18 @@ UI-focused APIs exposed by controller:
 - legacy linear payload: `{"blocks":[{"block_id":"...","values":{...}}]}`
 - graph payload:
   `{"nodes":[{"id":"n1","block_id":"...","values":{...}}],"edges":[{"source":"n1","source_output":"value","target":"n2","target_input":"value"}]}`
+
+### Debug sessions in WebUI
+
+`/ui` debug sessions now support two modes:
+
+- `interactive`: existing live edge debugger attach mode (header-triggered).
+- `recording`: collects one or more full VM execution recordings for a target request path, then replays locally in controller UI.
+
+For recording mode in UI:
+
+1. Select `Mode = Recording`.
+2. Set `Request Path` (for example `/api/orders`) and `Record Count` (default `1`).
+3. Start session and send matching requests to the edge.
+4. Open captured recordings from the recordings sub-list in session detail.
+5. Use the same Monaco view + toolbar commands (`where/step/next/continue/out/locals/stack/print`) during replay, including hover variable inspection.

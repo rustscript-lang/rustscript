@@ -20,8 +20,8 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use edge::{
-    CommandResultPayload, ControlPlaneCommand, EdgeCommandResult, EdgePollRequest,
-    EdgePollResponse, EdgeTrafficSample, RemoteDebugCommand, TelemetrySnapshot,
+    CommandResultPayload, ControlPlaneCommand, DebugSessionMode, EdgeCommandResult,
+    EdgePollRequest, EdgePollResponse, EdgeTrafficSample, RemoteDebugCommand, TelemetrySnapshot,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -30,15 +30,22 @@ use tokio::{
 };
 use tracing::{info, warn};
 use uuid::Uuid;
-use vm::{SourceFlavor, compile_source_with_flavor, encode_program};
+use vm::{
+    SourceFlavor, VmRecording, VmRecordingReplayState, compile_source_with_flavor, encode_program,
+    run_recording_replay_command,
+};
 
 const MAX_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_UI_BLOCKS: usize = 256;
 const MAX_TRAFFIC_POINTS: usize = 720;
 const PERSISTENCE_SCHEMA_VERSION: u32 = 1;
+const RECORDINGS_SCHEMA_VERSION: u32 = 1;
+const DEBUG_SESSIONS_SCHEMA_VERSION: u32 = 1;
+const TIMESERIES_SCHEMA_VERSION_V1: u32 = 1;
+const TIMESERIES_SCHEMA_VERSION: u32 = 2;
 const TIMESERIES_BINARY_MAGIC: [u8; 4] = *b"PDTS";
-const DEFAULT_REMOTE_DEBUGGER_TCP_ADDR: &str = "127.0.0.1:9002";
 const DEBUG_RESUME_GRACE_MS: u64 = 1_500;
+const DEFAULT_RECORDING_COUNT: u32 = 1;
 
 type DebugCommandWaiters =
     tokio::sync::Mutex<HashMap<String, oneshot::Sender<Result<DebugCommandResponse, String>>>>;
@@ -77,6 +84,7 @@ pub struct ControllerState {
     command_sequence: Arc<AtomicU64>,
     program_sequence: Arc<AtomicU64>,
     debug_sessions: Arc<tokio::sync::RwLock<HashMap<String, DebugSessionRecord>>>,
+    debug_recordings: Arc<tokio::sync::RwLock<HashMap<String, Vec<StoredDebugRecording>>>>,
     debug_start_lookup: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     debug_command_waiters: Arc<DebugCommandWaiters>,
     persist_lock: Arc<tokio::sync::Mutex<()>>,
@@ -112,9 +120,22 @@ pub enum DebugSessionPhase {
     Queued,
     WaitingForStartResult,
     WaitingForAttach,
+    WaitingForRecordings,
     Attached,
+    ReplayReady,
     Stopped,
     Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DebugRecordingSummary {
+    pub recording_id: String,
+    pub sequence: u32,
+    pub created_unix_ms: u64,
+    pub frame_count: u32,
+    pub terminal_status: Option<String>,
+    pub request_id: Option<String>,
+    pub request_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -123,8 +144,13 @@ pub struct DebugSessionSummary {
     pub edge_id: String,
     pub edge_name: String,
     pub phase: DebugSessionPhase,
+    pub mode: DebugSessionMode,
     pub header_name: Option<String>,
     pub nonce_header_value: Option<String>,
+    pub request_id: Option<String>,
+    pub request_path: Option<String>,
+    pub recording_target_count: Option<u32>,
+    pub recording_count: u32,
     pub current_line: Option<u32>,
     pub created_unix_ms: u64,
     pub updated_unix_ms: u64,
@@ -137,9 +163,15 @@ pub struct DebugSessionDetail {
     pub edge_id: String,
     pub edge_name: String,
     pub phase: DebugSessionPhase,
+    pub mode: DebugSessionMode,
     pub header_name: Option<String>,
     pub nonce_header_value: Option<String>,
+    pub request_id: Option<String>,
     pub tcp_addr: String,
+    pub request_path: Option<String>,
+    pub recording_target_count: Option<u32>,
+    pub recordings: Vec<DebugRecordingSummary>,
+    pub selected_recording_id: Option<String>,
     pub start_command_id: String,
     pub stop_command_id: Option<String>,
     pub current_line: Option<u32>,
@@ -159,10 +191,16 @@ struct DebugSessionRecord {
     edge_id: String,
     edge_name: String,
     phase: DebugSessionPhase,
+    mode: DebugSessionMode,
     requested_header_name: Option<String>,
     header_name: Option<String>,
     nonce_header_value: Option<String>,
+    request_id: Option<String>,
     tcp_addr: String,
+    request_path: Option<String>,
+    recording_target_count: Option<u32>,
+    recordings: Vec<DebugRecordingSummary>,
+    selected_recording_id: Option<String>,
     start_command_id: String,
     stop_command_id: Option<String>,
     current_line: Option<u32>,
@@ -175,6 +213,7 @@ struct DebugSessionRecord {
     last_resume_command_unix_ms: Option<u64>,
     message: Option<String>,
     last_output: Option<String>,
+    replay_states: HashMap<String, VmRecordingReplayState>,
 }
 
 impl DebugSessionRecord {
@@ -184,8 +223,13 @@ impl DebugSessionRecord {
             edge_id: self.edge_id.clone(),
             edge_name: self.edge_name.clone(),
             phase: self.phase.clone(),
+            mode: self.mode.clone(),
             header_name: self.header_name.clone(),
             nonce_header_value: self.nonce_header_value.clone(),
+            request_id: self.request_id.clone(),
+            request_path: self.request_path.clone(),
+            recording_target_count: self.recording_target_count,
+            recording_count: self.recordings.len() as u32,
             current_line: self.current_line,
             created_unix_ms: self.created_unix_ms,
             updated_unix_ms: self.updated_unix_ms,
@@ -201,9 +245,15 @@ impl DebugSessionRecord {
             edge_id: self.edge_id.clone(),
             edge_name: self.edge_name.clone(),
             phase: self.phase.clone(),
+            mode: self.mode.clone(),
             header_name: self.header_name.clone(),
             nonce_header_value: self.nonce_header_value.clone(),
+            request_id: self.request_id.clone(),
             tcp_addr: self.tcp_addr.clone(),
+            request_path: self.request_path.clone(),
+            recording_target_count: self.recording_target_count,
+            recordings: self.recordings.clone(),
+            selected_recording_id: self.selected_recording_id.clone(),
             start_command_id: self.start_command_id.clone(),
             stop_command_id: self.stop_command_id.clone(),
             current_line: self.current_line,
@@ -217,6 +267,198 @@ impl DebugSessionRecord {
             last_output: self.last_output.clone(),
         }
     }
+
+    fn to_persisted(&self) -> PersistedDebugSessionRecord {
+        let mut breakpoints = self.breakpoints.iter().copied().collect::<Vec<_>>();
+        breakpoints.sort_unstable();
+        let replay_states = self
+            .replay_states
+            .iter()
+            .map(|(recording_id, state)| {
+                let mut offset_breakpoints =
+                    state.offset_breakpoints.iter().copied().collect::<Vec<_>>();
+                offset_breakpoints.sort_unstable();
+                let mut line_breakpoints =
+                    state.line_breakpoints.iter().copied().collect::<Vec<_>>();
+                line_breakpoints.sort_unstable();
+                (
+                    recording_id.clone(),
+                    PersistedReplayState {
+                        cursor: state.cursor,
+                        offset_breakpoints,
+                        line_breakpoints,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        PersistedDebugSessionRecord {
+            session_id: self.session_id.clone(),
+            edge_id: self.edge_id.clone(),
+            edge_name: self.edge_name.clone(),
+            phase: self.phase.clone(),
+            mode: self.mode.clone(),
+            requested_header_name: self.requested_header_name.clone(),
+            header_name: self.header_name.clone(),
+            nonce_header_value: self.nonce_header_value.clone(),
+            request_id: self.request_id.clone(),
+            tcp_addr: self.tcp_addr.clone(),
+            request_path: self.request_path.clone(),
+            recording_target_count: self.recording_target_count,
+            recordings: self.recordings.clone(),
+            selected_recording_id: self.selected_recording_id.clone(),
+            start_command_id: self.start_command_id.clone(),
+            stop_command_id: self.stop_command_id.clone(),
+            current_line: self.current_line,
+            source_flavor: self.source_flavor.clone(),
+            source_code: self.source_code.clone(),
+            breakpoints,
+            created_unix_ms: self.created_unix_ms,
+            updated_unix_ms: self.updated_unix_ms,
+            attached_unix_ms: self.attached_unix_ms,
+            last_resume_command_unix_ms: self.last_resume_command_unix_ms,
+            message: self.message.clone(),
+            last_output: self.last_output.clone(),
+            replay_states,
+        }
+    }
+
+    fn from_persisted(value: PersistedDebugSessionRecord) -> Self {
+        let replay_states = value
+            .replay_states
+            .into_iter()
+            .map(|(recording_id, state)| {
+                (
+                    recording_id,
+                    VmRecordingReplayState {
+                        cursor: state.cursor,
+                        offset_breakpoints: state.offset_breakpoints.into_iter().collect(),
+                        line_breakpoints: state.line_breakpoints.into_iter().collect(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        Self {
+            session_id: value.session_id,
+            edge_id: value.edge_id,
+            edge_name: value.edge_name,
+            phase: value.phase,
+            mode: value.mode,
+            requested_header_name: value.requested_header_name,
+            header_name: value.header_name,
+            nonce_header_value: value.nonce_header_value,
+            request_id: value.request_id,
+            tcp_addr: value.tcp_addr,
+            request_path: value.request_path,
+            recording_target_count: value.recording_target_count,
+            recordings: value.recordings,
+            selected_recording_id: value.selected_recording_id,
+            start_command_id: value.start_command_id,
+            stop_command_id: value.stop_command_id,
+            current_line: value.current_line,
+            source_flavor: value.source_flavor,
+            source_code: value.source_code,
+            breakpoints: value.breakpoints.into_iter().collect(),
+            created_unix_ms: value.created_unix_ms,
+            updated_unix_ms: value.updated_unix_ms,
+            attached_unix_ms: value.attached_unix_ms,
+            last_resume_command_unix_ms: value.last_resume_command_unix_ms,
+            message: value.message,
+            last_output: value.last_output,
+            replay_states,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredDebugRecording {
+    recording_id: String,
+    session_id: String,
+    edge_id: String,
+    edge_name: String,
+    sequence: u32,
+    created_unix_ms: u64,
+    frame_count: u32,
+    terminal_status: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
+    request_path: Option<String>,
+    recording_base64: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ControllerRecordingsSnapshot {
+    #[serde(default = "recordings_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    recordings: HashMap<String, Vec<StoredDebugRecording>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedReplayState {
+    #[serde(default)]
+    cursor: usize,
+    #[serde(default)]
+    offset_breakpoints: Vec<usize>,
+    #[serde(default)]
+    line_breakpoints: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedDebugSessionRecord {
+    session_id: String,
+    edge_id: String,
+    edge_name: String,
+    phase: DebugSessionPhase,
+    mode: DebugSessionMode,
+    #[serde(default)]
+    requested_header_name: Option<String>,
+    #[serde(default)]
+    header_name: Option<String>,
+    #[serde(default)]
+    nonce_header_value: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    tcp_addr: String,
+    #[serde(default)]
+    request_path: Option<String>,
+    #[serde(default)]
+    recording_target_count: Option<u32>,
+    #[serde(default)]
+    recordings: Vec<DebugRecordingSummary>,
+    #[serde(default)]
+    selected_recording_id: Option<String>,
+    start_command_id: String,
+    #[serde(default)]
+    stop_command_id: Option<String>,
+    #[serde(default)]
+    current_line: Option<u32>,
+    #[serde(default)]
+    source_flavor: Option<String>,
+    #[serde(default)]
+    source_code: Option<String>,
+    #[serde(default)]
+    breakpoints: Vec<u32>,
+    created_unix_ms: u64,
+    updated_unix_ms: u64,
+    #[serde(default)]
+    attached_unix_ms: Option<u64>,
+    #[serde(default)]
+    last_resume_command_unix_ms: Option<u64>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    last_output: Option<String>,
+    #[serde(default)]
+    replay_states: HashMap<String, PersistedReplayState>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ControllerDebugSessionsSnapshot {
+    #[serde(default = "debug_sessions_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    sessions: HashMap<String, PersistedDebugSessionRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -243,7 +485,7 @@ struct ControllerProgramsSnapshot {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct ControllerTimeseriesSnapshot {
-    #[serde(default = "snapshot_schema_version")]
+    #[serde(default = "timeseries_schema_version")]
     schema_version: u32,
     #[serde(default)]
     edges: HashMap<String, PersistedEdgeTimeseriesRecord>,
@@ -356,15 +598,21 @@ impl Default for ControllerMetrics {
 
 impl ControllerState {
     pub fn new(config: ControllerConfig) -> Self {
-        let (store, command_sequence, program_sequence) =
+        let (store, command_sequence, program_sequence, debug_sessions, debug_recordings) =
             load_snapshot_from_disk(config.state_path.as_deref(), config.max_result_history);
+        let debug_start_lookup = debug_sessions
+            .values()
+            .filter(|session| session.phase == DebugSessionPhase::WaitingForStartResult)
+            .map(|session| (session.start_command_id.clone(), session.session_id.clone()))
+            .collect::<HashMap<_, _>>();
         Self {
             inner: Arc::new(tokio::sync::RwLock::new(store)),
             metrics: Arc::new(ControllerMetrics::default()),
             command_sequence: Arc::new(AtomicU64::new(command_sequence)),
             program_sequence: Arc::new(AtomicU64::new(program_sequence)),
-            debug_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            debug_start_lookup: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            debug_sessions: Arc::new(tokio::sync::RwLock::new(debug_sessions)),
+            debug_recordings: Arc::new(tokio::sync::RwLock::new(debug_recordings)),
+            debug_start_lookup: Arc::new(tokio::sync::RwLock::new(debug_start_lookup)),
             debug_command_waiters: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             config,
@@ -424,11 +672,20 @@ impl ControllerState {
         let Some(path) = self.config.state_path.clone() else {
             return Ok(());
         };
-        let (programs_path, timeseries_path) = sidecar_snapshot_paths(path.as_path());
+        let (programs_path, timeseries_path, recordings_path, debug_sessions_path) =
+            sidecar_snapshot_paths(path.as_path());
 
         let _save_guard = self.persist_lock.lock().await;
-        let (core_snapshot, programs_snapshot, timeseries_snapshot) = {
+        let (
+            core_snapshot,
+            programs_snapshot,
+            timeseries_snapshot,
+            recordings_snapshot,
+            debug_sessions_snapshot,
+        ) = {
             let guard = self.inner.read().await;
+            let debug_sessions = self.debug_sessions.read().await;
+            let recordings = self.debug_recordings.read().await;
             let persisted = guard.to_persisted();
             let core_edges = persisted
                 .edges
@@ -475,14 +732,27 @@ impl ControllerState {
                     programs: persisted.programs.clone(),
                 },
                 ControllerTimeseriesSnapshot {
-                    schema_version: PERSISTENCE_SCHEMA_VERSION,
+                    schema_version: TIMESERIES_SCHEMA_VERSION,
                     edges: timeseries_edges,
+                },
+                ControllerRecordingsSnapshot {
+                    schema_version: RECORDINGS_SCHEMA_VERSION,
+                    recordings: recordings.clone(),
+                },
+                ControllerDebugSessionsSnapshot {
+                    schema_version: DEBUG_SESSIONS_SCHEMA_VERSION,
+                    sessions: debug_sessions
+                        .iter()
+                        .map(|(session_id, session)| (session_id.clone(), session.to_persisted()))
+                        .collect(),
                 },
             )
         };
         write_snapshot_to_disk(path.as_path(), &core_snapshot)?;
         write_snapshot_to_disk(programs_path.as_path(), &programs_snapshot)?;
         write_timeseries_snapshot_to_disk(timeseries_path.as_path(), &timeseries_snapshot)?;
+        write_snapshot_to_disk(recordings_path.as_path(), &recordings_snapshot)?;
+        write_snapshot_to_disk(debug_sessions_path.as_path(), &debug_sessions_snapshot)?;
         Ok(())
     }
 }
@@ -610,21 +880,56 @@ fn snapshot_schema_version() -> u32 {
     PERSISTENCE_SCHEMA_VERSION
 }
 
+fn timeseries_schema_version() -> u32 {
+    TIMESERIES_SCHEMA_VERSION
+}
+
+fn recordings_schema_version() -> u32 {
+    RECORDINGS_SCHEMA_VERSION
+}
+
+fn debug_sessions_schema_version() -> u32 {
+    DEBUG_SESSIONS_SCHEMA_VERSION
+}
+
 fn default_true() -> bool {
     true
+}
+
+fn is_supported_timeseries_schema_version(value: u32) -> bool {
+    value == TIMESERIES_SCHEMA_VERSION_V1 || value == TIMESERIES_SCHEMA_VERSION
 }
 
 fn load_snapshot_from_disk(
     state_path: Option<&FsPath>,
     max_result_history: usize,
-) -> (ControllerStore, u64, u64) {
+) -> (
+    ControllerStore,
+    u64,
+    u64,
+    HashMap<String, DebugSessionRecord>,
+    HashMap<String, Vec<StoredDebugRecording>>,
+) {
     let Some(path) = state_path else {
-        return (ControllerStore::default(), 0, 0);
+        return (
+            ControllerStore::default(),
+            0,
+            0,
+            HashMap::new(),
+            HashMap::new(),
+        );
     };
     if !path.exists() {
-        return (ControllerStore::default(), 0, 0);
+        return (
+            ControllerStore::default(),
+            0,
+            0,
+            HashMap::new(),
+            HashMap::new(),
+        );
     }
-    let (programs_path, timeseries_path) = sidecar_snapshot_paths(path);
+    let (programs_path, timeseries_path, recordings_path, debug_sessions_path) =
+        sidecar_snapshot_paths(path);
 
     let data = match fs::read(path) {
         Ok(data) => data,
@@ -633,7 +938,13 @@ fn load_snapshot_from_disk(
                 "failed to read controller snapshot path={} err={err}",
                 path.display()
             );
-            return (ControllerStore::default(), 0, 0);
+            return (
+                ControllerStore::default(),
+                0,
+                0,
+                HashMap::new(),
+                HashMap::new(),
+            );
         }
     };
     let snapshot = match serde_json::from_slice::<ControllerCoreSnapshot>(&data) {
@@ -647,7 +958,13 @@ fn load_snapshot_from_disk(
                         "failed to parse controller snapshot path={} err={err}",
                         path.display()
                     );
-                    return (ControllerStore::default(), 0, 0);
+                    return (
+                        ControllerStore::default(),
+                        0,
+                        0,
+                        HashMap::new(),
+                        HashMap::new(),
+                    );
                 }
             };
             if legacy.schema_version != PERSISTENCE_SCHEMA_VERSION {
@@ -656,12 +973,20 @@ fn load_snapshot_from_disk(
                     path.display(),
                     legacy.schema_version
                 );
-                return (ControllerStore::default(), 0, 0);
+                return (
+                    ControllerStore::default(),
+                    0,
+                    0,
+                    HashMap::new(),
+                    HashMap::new(),
+                );
             }
             return (
                 ControllerStore::from_persisted(legacy.store, max_result_history),
                 legacy.command_sequence,
                 legacy.program_sequence,
+                HashMap::new(),
+                HashMap::new(),
             );
         }
     };
@@ -671,7 +996,13 @@ fn load_snapshot_from_disk(
             path.display(),
             snapshot.schema_version
         );
-        return (ControllerStore::default(), 0, 0);
+        return (
+            ControllerStore::default(),
+            0,
+            0,
+            HashMap::new(),
+            HashMap::new(),
+        );
     }
 
     let programs = if programs_path.exists() {
@@ -724,14 +1055,59 @@ fn load_snapshot_from_disk(
         programs,
     };
 
+    let recordings = if recordings_path.exists() {
+        match fs::read(recordings_path.as_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ControllerRecordingsSnapshot>(&bytes).ok())
+        {
+            Some(parsed) if parsed.schema_version == RECORDINGS_SCHEMA_VERSION => parsed.recordings,
+            Some(_) => {
+                warn!(
+                    "ignoring controller recordings snapshot path={} unsupported schema_version",
+                    recordings_path.display()
+                );
+                HashMap::new()
+            }
+            None => HashMap::new(),
+        }
+    } else {
+        HashMap::new()
+    };
+
+    let debug_sessions = if debug_sessions_path.exists() {
+        match fs::read(debug_sessions_path.as_path())
+            .ok()
+            .and_then(|bytes| {
+                serde_json::from_slice::<ControllerDebugSessionsSnapshot>(&bytes).ok()
+            }) {
+            Some(parsed) if parsed.schema_version == DEBUG_SESSIONS_SCHEMA_VERSION => parsed
+                .sessions
+                .into_iter()
+                .map(|(session_id, value)| (session_id, DebugSessionRecord::from_persisted(value)))
+                .collect::<HashMap<_, _>>(),
+            Some(_) => {
+                warn!(
+                    "ignoring controller debug sessions snapshot path={} unsupported schema_version",
+                    debug_sessions_path.display()
+                );
+                HashMap::new()
+            }
+            None => HashMap::new(),
+        }
+    } else {
+        HashMap::new()
+    };
+
     (
         ControllerStore::from_persisted(store, max_result_history),
         snapshot.command_sequence,
         snapshot.program_sequence,
+        debug_sessions,
+        recordings,
     )
 }
 
-fn sidecar_snapshot_paths(state_path: &FsPath) -> (PathBuf, PathBuf) {
+fn sidecar_snapshot_paths(state_path: &FsPath) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let parent = state_path.parent().unwrap_or_else(|| FsPath::new(""));
     let stem = state_path
         .file_stem()
@@ -740,6 +1116,8 @@ fn sidecar_snapshot_paths(state_path: &FsPath) -> (PathBuf, PathBuf) {
     (
         parent.join(format!("{stem}.programs.json")),
         parent.join(format!("{stem}.timeseries.bin")),
+        parent.join(format!("{stem}.recordings.json")),
+        parent.join(format!("{stem}.debug-sessions.json")),
     )
 }
 
@@ -797,7 +1175,7 @@ fn load_timeseries_snapshot(
     if timeseries_path.exists() {
         return match fs::read(timeseries_path) {
             Ok(bytes) => match decode_timeseries_snapshot(&bytes) {
-                Ok(snapshot) if snapshot.schema_version == PERSISTENCE_SCHEMA_VERSION => {
+                Ok(snapshot) if is_supported_timeseries_schema_version(snapshot.schema_version) => {
                     snapshot.edges
                 }
                 Ok(_) => {
@@ -853,6 +1231,9 @@ fn encode_timeseries_snapshot(snapshot: &ControllerTimeseriesSnapshot) -> Result
             put_u64(&mut bytes, point.status_3xx);
             put_u64(&mut bytes, point.status_4xx);
             put_u64(&mut bytes, point.status_5xx);
+            put_u64(&mut bytes, point.latency_p50_ms);
+            put_u64(&mut bytes, point.latency_p90_ms);
+            put_u64(&mut bytes, point.latency_p99_ms);
         }
 
         match &record.last_traffic_cumulative {
@@ -863,6 +1244,9 @@ fn encode_timeseries_snapshot(snapshot: &ControllerTimeseriesSnapshot) -> Result
                 put_u64(&mut bytes, sample.status_3xx_total);
                 put_u64(&mut bytes, sample.status_4xx_total);
                 put_u64(&mut bytes, sample.status_5xx_total);
+                put_u64(&mut bytes, sample.latency_p50_ms);
+                put_u64(&mut bytes, sample.latency_p90_ms);
+                put_u64(&mut bytes, sample.latency_p99_ms);
             }
             None => put_u8(&mut bytes, 0),
         }
@@ -886,25 +1270,45 @@ fn decode_timeseries_snapshot(bytes: &[u8]) -> Result<ControllerTimeseriesSnapsh
         let point_count = cursor.read_u32()?;
         let mut traffic_points = VecDeque::with_capacity(point_count as usize);
         for _ in 0..point_count {
-            traffic_points.push_back(EdgeTrafficPoint {
+            let mut point = EdgeTrafficPoint {
                 unix_ms: cursor.read_u64()?,
                 requests: cursor.read_u64()?,
                 status_2xx: cursor.read_u64()?,
                 status_3xx: cursor.read_u64()?,
                 status_4xx: cursor.read_u64()?,
                 status_5xx: cursor.read_u64()?,
-            });
+                latency_p50_ms: 0,
+                latency_p90_ms: 0,
+                latency_p99_ms: 0,
+            };
+            if schema_version >= TIMESERIES_SCHEMA_VERSION {
+                point.latency_p50_ms = cursor.read_u64()?;
+                point.latency_p90_ms = cursor.read_u64()?;
+                point.latency_p99_ms = cursor.read_u64()?;
+            }
+            traffic_points.push_back(point);
         }
 
         let last_traffic_cumulative = match cursor.read_u8()? {
             0 => None,
-            1 => Some(EdgeTrafficSample {
-                requests_total: cursor.read_u64()?,
-                status_2xx_total: cursor.read_u64()?,
-                status_3xx_total: cursor.read_u64()?,
-                status_4xx_total: cursor.read_u64()?,
-                status_5xx_total: cursor.read_u64()?,
-            }),
+            1 => {
+                let mut sample = EdgeTrafficSample {
+                    requests_total: cursor.read_u64()?,
+                    status_2xx_total: cursor.read_u64()?,
+                    status_3xx_total: cursor.read_u64()?,
+                    status_4xx_total: cursor.read_u64()?,
+                    status_5xx_total: cursor.read_u64()?,
+                    latency_p50_ms: 0,
+                    latency_p90_ms: 0,
+                    latency_p99_ms: 0,
+                };
+                if schema_version >= TIMESERIES_SCHEMA_VERSION {
+                    sample.latency_p50_ms = cursor.read_u64()?;
+                    sample.latency_p90_ms = cursor.read_u64()?;
+                    sample.latency_p99_ms = cursor.read_u64()?;
+                }
+                Some(sample)
+            }
             value => {
                 return Err(format!(
                     "invalid last_traffic_cumulative marker for edge {edge_id}: {value}"
@@ -1044,6 +1448,12 @@ pub struct EdgeTrafficPoint {
     pub status_3xx: u64,
     pub status_4xx: u64,
     pub status_5xx: u64,
+    #[serde(default)]
+    pub latency_p50_ms: u64,
+    #[serde(default)]
+    pub latency_p90_ms: u64,
+    #[serde(default)]
+    pub latency_p99_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1065,11 +1475,17 @@ struct DebugSessionListResponse {
 struct CreateDebugSessionRequest {
     edge_id: String,
     #[serde(default)]
+    mode: DebugSessionMode,
+    #[serde(default)]
     tcp_addr: Option<String>,
     #[serde(default)]
     header_name: Option<String>,
     #[serde(default)]
     stop_on_entry: Option<bool>,
+    #[serde(default)]
+    request_path: Option<String>,
+    #[serde(default)]
+    record_count: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1088,6 +1504,7 @@ enum DebugCommandRequest {
     Next,
     Continue,
     Out,
+    SelectRecording { recording_id: String },
     BreakLine { line: u32 },
     ClearLine { line: u32 },
     PrintVar { name: String },
@@ -1166,9 +1583,17 @@ struct EnqueueApplyProgramRequest {
 struct EnqueueStartDebugRequest {
     command_id: Option<String>,
     #[serde(default)]
+    mode: DebugSessionMode,
+    #[serde(default)]
     tcp_addr: Option<String>,
+    #[serde(default)]
     header_name: Option<String>,
+    #[serde(default)]
     stop_on_entry: Option<bool>,
+    #[serde(default)]
+    request_path: Option<String>,
+    #[serde(default)]
+    record_count: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1433,7 +1858,11 @@ pub fn build_controller_app(state: ControllerState) -> Router {
         )
         .route(
             "/v1/debug-sessions/{session_id}",
-            get(get_debug_session_handler).delete(stop_debug_session_handler),
+            get(get_debug_session_handler).delete(delete_debug_session_handler),
+        )
+        .route(
+            "/v1/debug-sessions/{session_id}/stop",
+            post(stop_debug_session_handler),
         )
         .route(
             "/v1/debug-sessions/{session_id}/command",
@@ -1506,6 +1935,17 @@ fn map_summary(edge_id: &str, record: &EdgeRecord) -> EdgeSummary {
 }
 
 fn append_traffic_sample(record: &mut EdgeRecord, sample: EdgeTrafficSample, unix_ms: u64) {
+    if let Some(previous) = record.last_traffic_cumulative.as_ref()
+        && previous.requests_total == sample.requests_total
+        && previous.status_2xx_total == sample.status_2xx_total
+        && previous.status_3xx_total == sample.status_3xx_total
+        && previous.status_4xx_total == sample.status_4xx_total
+        && previous.status_5xx_total == sample.status_5xx_total
+    {
+        record.last_traffic_cumulative = Some(sample);
+        return;
+    }
+
     let previous = record.last_traffic_cumulative.as_ref();
     let point = EdgeTrafficPoint {
         unix_ms,
@@ -1540,6 +1980,9 @@ fn append_traffic_sample(record: &mut EdgeRecord, sample: EdgeTrafficSample, uni
                     .saturating_sub(prev.status_5xx_total)
             })
             .unwrap_or(0),
+        latency_p50_ms: sample.latency_p50_ms,
+        latency_p90_ms: sample.latency_p90_ms,
+        latency_p99_ms: sample.latency_p99_ms,
     };
     record.traffic_points.push_back(point);
     while record.traffic_points.len() > MAX_TRAFFIC_POINTS {
@@ -1639,6 +2082,8 @@ fn webui_content_type(path: &str) -> &'static str {
         "font/ttf"
     } else if path.ends_with(".map") {
         "application/json; charset=utf-8"
+    } else if path.ends_with(".wasm") {
+        "application/wasm"
     } else {
         "application/octet-stream"
     }
