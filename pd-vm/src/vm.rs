@@ -716,10 +716,16 @@ impl Vm {
                 self.binary_add_op()?;
             }
             x if x == OpCode::Sub as u8 => {
-                self.binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_sub(rhs)), |lhs, rhs| Ok(lhs - rhs))?;
+                self.binary_numeric_op(
+                    |lhs, rhs| Ok(lhs.wrapping_sub(rhs)),
+                    |lhs, rhs| Ok(lhs - rhs),
+                )?;
             }
             x if x == OpCode::Mul as u8 => {
-                self.binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_mul(rhs)), |lhs, rhs| Ok(lhs * rhs))?;
+                self.binary_numeric_op(
+                    |lhs, rhs| Ok(lhs.wrapping_mul(rhs)),
+                    |lhs, rhs| Ok(lhs * rhs),
+                )?;
             }
             x if x == OpCode::Div as u8 => {
                 self.binary_numeric_op(
@@ -844,10 +850,16 @@ impl Vm {
                     self.binary_add_op()?;
                 }
                 crate::jit::TraceStep::Sub => {
-                    self.binary_numeric_op(|lhs, rhs| Ok(lhs - rhs), |lhs, rhs| Ok(lhs - rhs))?;
+                    self.binary_numeric_op(
+                        |lhs, rhs| Ok(lhs.wrapping_sub(rhs)),
+                        |lhs, rhs| Ok(lhs - rhs),
+                    )?;
                 }
                 crate::jit::TraceStep::Mul => {
-                    self.binary_numeric_op(|lhs, rhs| Ok(lhs * rhs), |lhs, rhs| Ok(lhs * rhs))?;
+                    self.binary_numeric_op(
+                        |lhs, rhs| Ok(lhs.wrapping_mul(rhs)),
+                        |lhs, rhs| Ok(lhs * rhs),
+                    )?;
                 }
                 crate::jit::TraceStep::Div => {
                     self.binary_numeric_op(
@@ -855,7 +867,7 @@ impl Vm {
                             if rhs == 0 {
                                 return Err(VmError::DivisionByZero);
                             }
-                            Ok(lhs / rhs)
+                            Ok(lhs.wrapping_div(rhs))
                         },
                         |lhs, rhs| {
                             if rhs == 0.0 {
@@ -868,17 +880,19 @@ impl Vm {
                 crate::jit::TraceStep::Shl => {
                     let rhs = self.pop_shift_amount()?;
                     let lhs = self.pop_int()?;
-                    self.stack.push(Value::Int(lhs << rhs));
+                    self.stack.push(Value::Int(lhs.wrapping_shl(rhs)));
                 }
                 crate::jit::TraceStep::Shr => {
                     let rhs = self.pop_shift_amount()?;
                     let lhs = self.pop_int()?;
-                    self.stack.push(Value::Int(lhs >> rhs));
+                    self.stack.push(Value::Int(lhs.wrapping_shr(rhs)));
                 }
                 crate::jit::TraceStep::Neg => {
                     let value = self.pop_numeric()?;
                     match value {
-                        NumericValue::Int(value) => self.stack.push(Value::Int(-value)),
+                        NumericValue::Int(value) => {
+                            self.stack.push(Value::Int(value.wrapping_neg()))
+                        }
                         NumericValue::Float(value) => self.stack.push(Value::Float(-value)),
                     }
                 }

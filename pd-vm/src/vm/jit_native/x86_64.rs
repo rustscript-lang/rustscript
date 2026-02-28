@@ -643,6 +643,21 @@ fn emit_native_step_binary_numeric_inline(
             let int_div_zero = emit_jcc_rel32(code, [0x0F, 0x84]); // je
             code.extend_from_slice(&[0x48, 0x8B, 0x87]); // mov rax, [rdi+disp32]
             code.extend_from_slice(&layout.value.int_payload_offset.to_le_bytes());
+            code.extend_from_slice(&[0x48, 0xB9]); // mov rcx, imm64
+            code.extend_from_slice(&(i64::MIN as u64).to_le_bytes());
+            code.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
+            let lhs_not_min = emit_jcc_rel32(code, [0x0F, 0x85]); // jne
+            code.extend_from_slice(&[0x48, 0x83, 0xBE]); // cmp qword [rsi+disp32], imm8
+            code.extend_from_slice(&layout.value.int_payload_offset.to_le_bytes());
+            code.push(0xFF);
+            let rhs_not_minus_one = emit_jcc_rel32(code, [0x0F, 0x85]); // jne
+            code.extend_from_slice(&[0x48, 0x89, 0x87]); // mov [rdi+disp32], rax
+            code.extend_from_slice(&layout.value.int_payload_offset.to_le_bytes());
+            emit_store_tag_rdi(code, layout.value, layout.value.int_tag)?;
+            emit_adjust_stack_len_minus_one(code, stack_len_offset);
+            emit_status_continue(code);
+            let int_overflow_ok = emit_jmp_rel32(code);
+            let int_div = code.len();
             code.extend_from_slice(&[0x48, 0x99]); // cqo
             code.extend_from_slice(&[0x48, 0xF7, 0xBE]); // idiv qword [rsi+disp32]
             code.extend_from_slice(&layout.value.int_payload_offset.to_le_bytes());
@@ -657,6 +672,9 @@ fn emit_native_step_binary_numeric_inline(
             let int_div_zero_done = emit_jmp_rel32(code);
             let int_div_end = code.len();
             patch_rel32(code, int_div_zero, int_div_zero_label)?;
+            patch_rel32(code, lhs_not_min, int_div)?;
+            patch_rel32(code, rhs_not_minus_one, int_div)?;
+            patch_rel32(code, int_overflow_ok, int_div_end)?;
             patch_rel32(code, int_ok, int_div_end)?;
             patch_rel32(code, int_div_zero_done, int_div_end)?;
         }
@@ -2881,7 +2899,7 @@ fn free_executable_region(_ptr: *mut u8, _len: usize) -> VmResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{STATUS_CONTINUE, STATUS_YIELDED};
+    use super::super::{STATUS_CONTINUE, STATUS_ERROR, STATUS_YIELDED};
     use super::*;
     use crate::builtins::BuiltinFunction;
     use crate::jit::{JitTrace, JitTraceTerminal, TraceStep};
@@ -3331,5 +3349,30 @@ mod tests {
         let status = execute_single_step(&mut vm, TraceStep::Clt).expect("native clt should run");
         assert_eq!(status, STATUS_CONTINUE);
         assert_eq!(vm.stack, vec![Value::Bool(true)]);
+    }
+
+    #[test]
+    fn div_step_inline_wraps_min_over_neg_one() {
+        let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        vm.stack.push(Value::Int(i64::MIN));
+        vm.stack.push(Value::Int(-1));
+
+        let status = execute_single_step(&mut vm, TraceStep::Div).expect("native div should run");
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(vm.stack, vec![Value::Int(i64::MIN)]);
+        assert!(
+            take_bridge_error().is_none(),
+            "wrapped division should not set bridge error"
+        );
+    }
+
+    #[test]
+    fn div_step_inline_rejects_zero_divisor() {
+        let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        vm.stack.push(Value::Int(1));
+        vm.stack.push(Value::Int(0));
+
+        let status = execute_single_step(&mut vm, TraceStep::Div).expect("native div should run");
+        assert_eq!(status, STATUS_ERROR);
     }
 }
