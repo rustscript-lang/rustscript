@@ -528,7 +528,7 @@ impl Vm {
             program_cache_key,
             ip: 0,
             stack: Vec::new(),
-            locals: vec![Value::Int(0); local_count],
+            locals: vec![Value::Null; local_count],
             host_functions: Vec::new(),
             host_function_symbols: HashMap::new(),
             resolved_calls: Vec::new(),

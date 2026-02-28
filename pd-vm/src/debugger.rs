@@ -1604,6 +1604,23 @@ mod tests {
         vm
     }
 
+    fn vm_with_named_unassigned_local(name: &str) -> Vm {
+        let program = Program::with_debug(
+            vec![],
+            vec![crate::vm::OpCode::Ret as u8],
+            Some(DebugInfo {
+                source: None,
+                lines: vec![],
+                functions: vec![],
+                locals: vec![LocalInfo {
+                    name: name.to_string(),
+                    index: 0,
+                }],
+            }),
+        );
+        Vm::with_locals(program, 1)
+    }
+
     #[test]
     fn print_local_by_name_uses_debug_name() {
         let vm = vm_with_named_local("counter", Value::Int(42));
@@ -1643,6 +1660,26 @@ mod tests {
         );
         let text = String::from_utf8(out).expect("output should be utf-8");
         assert!(text.contains("unknown local 'missing'"));
+    }
+
+    #[test]
+    fn print_local_by_name_shows_null_for_unassigned_local() {
+        let vm = vm_with_named_unassigned_local("counter");
+        let mut out = Vec::<u8>::new();
+        let mut breakpoints = HashSet::new();
+        let mut line_breakpoints = HashSet::new();
+        let mut step_mode = StepMode::Running;
+
+        handle_command(
+            "p counter",
+            &vm,
+            &mut breakpoints,
+            &mut line_breakpoints,
+            &mut step_mode,
+            &mut out,
+        );
+        let text = String::from_utf8(out).expect("output should be utf-8");
+        assert!(text.contains("counter = Null"));
     }
 
     #[test]
