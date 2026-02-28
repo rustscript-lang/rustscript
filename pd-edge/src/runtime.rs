@@ -517,13 +517,7 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
             body: body_bytes.to_vec(),
             headers: request_headers,
         };
-        let vm_outcome = match execute_vm_for_request(
-            &state,
-            &program,
-            vm_request,
-        )
-        .await
-        {
+        let vm_outcome = match execute_vm_for_request(&state, &program, vm_request).await {
             Ok(outcome) => outcome,
             Err(VmExecutionError::HostRegistration(err)) => {
                 state.record_vm_execution_error();
