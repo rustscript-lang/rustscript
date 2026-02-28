@@ -234,7 +234,7 @@ pub fn start_debug_session(
                 Some(header_name),
                 Some(header_value),
                 DebugSessionState::Interactive {
-                    debugger: Mutex::new(debugger),
+                    debugger: Box::new(Mutex::new(debugger)),
                     transport,
                 },
             )
@@ -526,7 +526,7 @@ enum InteractiveTransport {
 
 enum DebugSessionState {
     Interactive {
-        debugger: Mutex<Debugger>,
+        debugger: Box<Mutex<Debugger>>,
         transport: InteractiveTransport,
     },
     Recording {

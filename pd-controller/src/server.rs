@@ -49,6 +49,13 @@ const DEFAULT_RECORDING_COUNT: u32 = 1;
 
 type DebugCommandWaiters =
     tokio::sync::Mutex<HashMap<String, oneshot::Sender<Result<DebugCommandResponse, String>>>>;
+type SnapshotLoadResult = (
+    ControllerStore,
+    u64,
+    u64,
+    HashMap<String, DebugSessionRecord>,
+    HashMap<String, Vec<StoredDebugRecording>>,
+);
 
 mod handlers;
 mod ui_codegen;
@@ -903,13 +910,7 @@ fn is_supported_timeseries_schema_version(value: u32) -> bool {
 fn load_snapshot_from_disk(
     state_path: Option<&FsPath>,
     max_result_history: usize,
-) -> (
-    ControllerStore,
-    u64,
-    u64,
-    HashMap<String, DebugSessionRecord>,
-    HashMap<String, Vec<StoredDebugRecording>>,
-) {
+) -> SnapshotLoadResult {
     let Some(path) = state_path else {
         return (
             ControllerStore::default(),
