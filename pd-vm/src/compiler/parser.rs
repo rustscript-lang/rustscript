@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use crate::builtins::BuiltinFunction;
 
 use super::{
-    ClosureExpr, Expr, FunctionDecl, FunctionImpl, MatchPattern, ParseError, STDLIB_PRINT_ARITY,
-    STDLIB_PRINT_NAME, Stmt,
+    ParseError, STDLIB_PRINT_ARITY, STDLIB_PRINT_NAME,
+    ir::{ClosureExpr, Expr, FunctionDecl, FunctionImpl, MatchPattern, Stmt},
 };
 
 #[derive(Debug, Clone, PartialEq)]

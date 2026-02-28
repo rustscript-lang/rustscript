@@ -4,21 +4,13 @@ use std::path::Path;
 use crate::builtins::BuiltinFunction;
 
 use super::{
-    Expr, FunctionDecl, FunctionImpl, ParseError, SourceError, SourcePathError, Stmt, frontends,
+    ParseError, SourceError, SourcePathError,
+    ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, LinkedIr, Stmt},
 };
 
 pub(super) struct ParsedUnit {
-    pub(super) parsed: frontends::FrontendOutput,
+    pub(super) parsed: FrontendIr,
     pub(super) scope_prefix: Option<String>,
-}
-
-pub(super) struct MergedFrontendOutput {
-    pub(super) source: String,
-    pub(super) stmts: Vec<Stmt>,
-    pub(super) locals: usize,
-    pub(super) local_bindings: Vec<(String, u8)>,
-    pub(super) functions: Vec<FunctionDecl>,
-    pub(super) function_impls: HashMap<u16, FunctionImpl>,
 }
 
 pub(super) fn sanitize_scope_prefix(path: &Path) -> String {
@@ -39,7 +31,7 @@ pub(super) fn sanitize_scope_prefix(path: &Path) -> String {
 pub(super) fn merge_units(
     root_source: String,
     units: Vec<ParsedUnit>,
-) -> Result<MergedFrontendOutput, SourcePathError> {
+) -> Result<LinkedIr, SourcePathError> {
     let mut merged_stmts = Vec::new();
     let mut merged_local_bindings = Vec::new();
     let mut merged_functions = Vec::new();
@@ -113,7 +105,7 @@ pub(super) fn merge_units(
         }
     }
 
-    Ok(MergedFrontendOutput {
+    Ok(LinkedIr {
         source: root_source,
         stmts: merged_stmts,
         locals: local_base,
