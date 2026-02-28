@@ -63,7 +63,7 @@ fn unique_state_path(test_name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("pd-controller-{test_name}-{now}-{seq}.json"))
 }
 
-fn snapshot_sidecar_paths(state_path: &Path) -> (PathBuf, PathBuf) {
+fn snapshot_sidecar_paths(state_path: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let parent = state_path
         .parent()
         .map(ToOwned::to_owned)
@@ -75,6 +75,8 @@ fn snapshot_sidecar_paths(state_path: &Path) -> (PathBuf, PathBuf) {
     (
         parent.join(format!("{stem}.programs.json")),
         parent.join(format!("{stem}.timeseries.bin")),
+        parent.join(format!("{stem}.recordings.json")),
+        parent.join(format!("{stem}.debug-sessions.json")),
     )
 }
 
@@ -1684,7 +1686,7 @@ async fn controller_persists_programs_applied_versions_and_traffic_series() {
     assert_eq!(post_result.status(), reqwest::StatusCode::NO_CONTENT);
 
     handle.abort();
-    let (programs_path, timeseries_path) = snapshot_sidecar_paths(&state_path);
+    let (programs_path, timeseries_path, recordings_path, debug_sessions_path) = snapshot_sidecar_paths(&state_path);
     assert!(state_path.exists(), "core state file should exist");
     assert!(programs_path.exists(), "program snapshot should exist");
     assert!(timeseries_path.exists(), "timeseries snapshot should exist");
@@ -1761,4 +1763,6 @@ async fn controller_persists_programs_applied_versions_and_traffic_series() {
     let _ = fs::remove_file(&state_path);
     let _ = fs::remove_file(&programs_path);
     let _ = fs::remove_file(&timeseries_path);
+    let _ = fs::remove_file(&recordings_path);
+    let _ = fs::remove_file(&debug_sessions_path);
 }
