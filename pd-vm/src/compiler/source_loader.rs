@@ -813,7 +813,7 @@ fn parse_scheme_import_set(
                     });
                     Ok(())
                 }
-                ("require", "prefix-in") => {
+                ("import", "prefix-in") | ("require", "prefix-in") => {
                     let prefix = expect_scheme_symbol(path, line, tokens, pos)?;
                     let spec = expect_scheme_string(path, line, tokens, pos)?;
                     expect_scheme_token(path, line, tokens, pos, SchemeImportToken::RParen)?;

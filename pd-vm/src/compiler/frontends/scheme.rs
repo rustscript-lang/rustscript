@@ -15,6 +15,18 @@ fn gensym(prefix: &str) -> String {
     format!("__{prefix}_{id}")
 }
 
+fn wrap_let_expr(name: &str, value: &str, body: &str) -> String {
+    format!("if true => {{ let {name} = {value}; {body} }} else => {{ false }}")
+}
+
+fn wrap_statement_sequence(stmts: Vec<String>, expr: String) -> String {
+    let mut out = expr;
+    for stmt in stmts.into_iter().rev() {
+        out = format!("if true => {{ {stmt} {out} }} else => {{ false }}");
+    }
+    out
+}
+
 pub(super) fn lower(source: &str) -> Result<String, ParseError> {
     let mut parser = SchemeParser::new(source)?;
     let forms = parser.parse_program()?;
@@ -863,13 +875,20 @@ fn lower_for_each_stmt(
     let list = lower_expr(&args[1])?;
     let idx = gensym("fe_i");
     let vec = gensym("fe_v");
+    let callable = if func.trim_start().starts_with('|') {
+        let f = gensym("fe_f");
+        push_line(out, indent, &format!("let {f} = {func};"));
+        f
+    } else {
+        func
+    };
     push_line(out, indent, &format!("let {vec} = {list};"));
     push_line(
         out,
         indent,
         &format!("for (let {idx} = 0; {idx} < len({vec}); {idx} = {idx} + 1) {{"),
     );
-    push_line(out, indent + 1, &format!("{func}(({vec})[{idx}]);"));
+    push_line(out, indent + 1, &format!("{callable}(({vec})[{idx}]);"));
     push_line(out, indent, "}");
     Ok(())
 }
@@ -1356,6 +1375,10 @@ fn lower_expr(form: &SchemeForm) -> Result<String, ParseError> {
             if name == "false" {
                 return Ok("false".to_string());
             }
+            if name == "null" || name == "nil" {
+                // RustScript surface syntax has no null literal; optional access on an empty map yields null.
+                return Ok("({})?.__null".to_string());
+            }
             if let Some(chain) = lower_optional_chain_symbol(name, form.line)? {
                 return Ok(chain);
             }
@@ -1448,7 +1471,7 @@ fn lower_list_expr(items: &[SchemeForm], line: usize) -> Result<String, ParseErr
             }
             fold_infix_expr(args, "-", line, 2, "- expects at least one argument")
         }
-        "modulo" | "mod" => lower_modulo_expr(args, line),
+        "modulo" => lower_modulo_expr(args, line),
         "remainder" => lower_remainder_expr(args, line),
         "quotient" => lower_binary_expr(args, "/", line, "quotient expects exactly two arguments"),
         "abs" => {
@@ -1460,8 +1483,10 @@ fn lower_list_expr(items: &[SchemeForm], line: usize) -> Result<String, ParseErr
             }
             let val = lower_expr(&args[0])?;
             let t = gensym("abs");
-            Ok(format!(
-                "if ({t} = {val}) => {{ if {t} < 0 => {{ (0 - {t}) }} else => {{ {t} }} }} else => {{ {t} }}"
+            Ok(wrap_let_expr(
+                &t,
+                &val,
+                &format!("if {t} < 0 => {{ (0 - {t}) }} else => {{ {t} }}"),
             ))
         }
         "min" => {
@@ -1476,9 +1501,12 @@ fn lower_list_expr(items: &[SchemeForm], line: usize) -> Result<String, ParseErr
                 let rhs = lower_expr(arg)?;
                 let a = gensym("min_a");
                 let b = gensym("min_b");
-                expr = format!(
-                    "if ({a} = {expr}) => {{ if ({b} = {rhs}) => {{ if {a} < {b} => {{ {a} }} else => {{ {b} }} }} else => {{ {b} }} }} else => {{ {a} }}"
+                let inner = wrap_let_expr(
+                    &b,
+                    &rhs,
+                    &format!("if {a} < {b} => {{ {a} }} else => {{ {b} }}"),
                 );
+                expr = wrap_let_expr(&a, &expr, &inner);
             }
             Ok(expr)
         }
@@ -1494,9 +1522,12 @@ fn lower_list_expr(items: &[SchemeForm], line: usize) -> Result<String, ParseErr
                 let rhs = lower_expr(arg)?;
                 let a = gensym("max_a");
                 let b = gensym("max_b");
-                expr = format!(
-                    "if ({a} = {expr}) => {{ if ({b} = {rhs}) => {{ if {a} > {b} => {{ {a} }} else => {{ {b} }} }} else => {{ {b} }} }} else => {{ {a} }}"
+                let inner = wrap_let_expr(
+                    &b,
+                    &rhs,
+                    &format!("if {a} > {b} => {{ {a} }} else => {{ {b} }}"),
                 );
+                expr = wrap_let_expr(&a, &expr, &inner);
             }
             Ok(expr)
         }
@@ -1605,11 +1636,15 @@ fn lower_list_expr(items: &[SchemeForm], line: usize) -> Result<String, ParseErr
             let cdr = lower_expr(&args[1])?;
             // cons creates a new array with car prepended to cdr (if cdr is array) or [car, cdr]
             let t = gensym("cons_cdr");
-            Ok(format!(
-                "if ({t} = {cdr}) => {{ if type_of({t}) == \"array\" => {{ concat([{car}], {t}) }} else => {{ [{car}, {t}] }} }} else => {{ {t} }}"
+            Ok(wrap_let_expr(
+                &t,
+                &cdr,
+                &format!(
+                    "if type_of({t}) == \"array\" => {{ concat([{car}], {t}) }} else => {{ [{car}, {t}] }}"
+                ),
             ))
         }
-        "car" | "first" => {
+        "car" => {
             if args.len() != 1 {
                 return Err(ParseError {
                     line,
@@ -1619,7 +1654,7 @@ fn lower_list_expr(items: &[SchemeForm], line: usize) -> Result<String, ParseErr
             let list = lower_expr(&args[0])?;
             Ok(format!("({list})[0]"))
         }
-        "cdr" | "rest" => {
+        "cdr" => {
             if args.len() != 1 {
                 return Err(ParseError {
                     line,
@@ -1684,9 +1719,14 @@ fn lower_list_expr(items: &[SchemeForm], line: usize) -> Result<String, ParseErr
             let v = gensym("rev_v");
             let i = gensym("rev_i");
             let r = gensym("rev_r");
-            Ok(format!(
-                "if ({v} = {list}) => {{ if ({r} = []) => {{ for (let {i} = len({v}) - 1; {i} >= 0; {i} = {i} - 1) {{ {r} = array_push({r}, ({v})[{i}]); }}; {r} }} else => {{ {r} }} }} else => {{ {v} }}"
-            ))
+            let body = wrap_let_expr(
+                &r,
+                "[]",
+                &format!(
+                    "for (let {i} = len({v}) - 1; !({i} < 0); {i} = {i} - 1) {{ {r} = array_push({r}, ({v})[{i}]); }} {r}"
+                ),
+            );
+            Ok(wrap_let_expr(&v, &list, &body))
         }
 
         // Higher-order
@@ -2026,15 +2066,14 @@ fn lower_body_exprs(exprs: &[SchemeForm], line: usize) -> Result<String, ParseEr
     }
     // Multiple expressions: wrap in a block with all but last as statements
     let (last, prefix) = exprs.split_last().unwrap();
-    let mut parts = Vec::new();
+    let mut stmts = Vec::new();
     for (idx, expr) in prefix.iter().enumerate() {
         let lowered = lower_expr(expr)?;
         let temp = gensym(&format!("body_{}", idx));
-        parts.push(format!("let {temp} = {lowered};"));
+        stmts.push(format!("let {temp} = {lowered};"));
     }
     let last_expr = lower_expr(last)?;
-    parts.push(last_expr);
-    Ok(format!("{{ {} }}", parts.join(" ")))
+    Ok(wrap_statement_sequence(stmts, last_expr))
 }
 
 fn lower_modulo_expr(args: &[SchemeForm], line: usize) -> Result<String, ParseError> {
@@ -2087,8 +2126,10 @@ fn lower_or_expr(args: &[SchemeForm]) -> Result<String, ParseError> {
     let first = lower_expr(&args[0])?;
     let rest = lower_or_expr(&args[1..])?;
     let t = gensym("or");
-    Ok(format!(
-        "if ({t} = {first}) => {{ if {t} => {{ {t} }} else => {{ {rest} }} }} else => {{ {t} }}"
+    Ok(wrap_let_expr(
+        &t,
+        &first,
+        &format!("if {t} => {{ {t} }} else => {{ {rest} }}"),
     ))
 }
 
@@ -2148,7 +2189,8 @@ fn lower_let_expr(
     let mut stmts = Vec::new();
 
     if letrec {
-        // letrec: forward-declare all with false, then assign
+        // letrec: lower recursive lambdas to function declarations.
+        let mut deferred = Vec::<(String, String)>::new();
         for binding in bindings {
             let pair = binding.as_list().ok_or(ParseError {
                 line: binding.line,
@@ -2165,13 +2207,15 @@ fn lower_let_expr(
                 message: "let binding name must be a symbol".to_string(),
             })?;
             let name = normalize_identifier(name_raw, pair[0].line, "let binding")?;
-            stmts.push(format!("let {name} = false;"));
+            if let Some(function_stmt) = lower_letrec_lambda_binding(&name, &pair[1], binding.line)? {
+                stmts.push(function_stmt);
+            } else {
+                stmts.push(format!("let {name} = false;"));
+                let value = lower_expr(&pair[1])?;
+                deferred.push((name, value));
+            }
         }
-        for binding in bindings {
-            let pair = binding.as_list().unwrap();
-            let name_raw = pair[0].as_symbol().unwrap();
-            let name = normalize_identifier(name_raw, pair[0].line, "let binding").unwrap();
-            let value = lower_expr(&pair[1])?;
+        for (name, value) in deferred {
             stmts.push(format!("{name} = {value};"));
         }
     } else if sequential {
@@ -2222,8 +2266,7 @@ fn lower_let_expr(
     }
 
     let body = lower_body_exprs(&args[1..], line)?;
-    stmts.push(body);
-    Ok(format!("{{ {} }}", stmts.join(" ")))
+    Ok(wrap_statement_sequence(stmts, body))
 }
 
 fn lower_named_let_expr(
@@ -2264,11 +2307,50 @@ fn lower_named_let_expr(
 
     let func_name = normalize_identifier(name, line, "named let name")?;
     let body_expr = lower_body_exprs(body, line)?;
-    let lambda = format!("|{}| {}", params.join(", "), body_expr);
+    let function_stmt = format!("fn {func_name}({}) = {body_expr};", params.join(", "));
 
-    // let func_name = lambda; func_name(init_vals...)
+    // fn func_name(params...) = body; func_name(init_vals...)
     let call = format!("{}({})", func_name, init_vals.join(", "));
-    Ok(format!("{{ let {func_name} = {lambda}; {call} }}"))
+    Ok(wrap_statement_sequence(
+        vec![function_stmt],
+        call,
+    ))
+}
+
+fn lower_letrec_lambda_binding(
+    name: &str,
+    value: &SchemeForm,
+    line: usize,
+) -> Result<Option<String>, ParseError> {
+    let Some(items) = value.as_list() else {
+        return Ok(None);
+    };
+    let Some("lambda") = items.first().and_then(|item| item.as_symbol()) else {
+        return Ok(None);
+    };
+    if items.len() < 3 {
+        return Err(ParseError {
+            line,
+            message: "lambda expects (lambda (params...) body...)".to_string(),
+        });
+    }
+    let params_list = items[1].as_list().ok_or(ParseError {
+        line: items[1].line,
+        message: "lambda parameters must be a list".to_string(),
+    })?;
+    let mut params = Vec::new();
+    for param in params_list {
+        let raw = param.as_symbol().ok_or(ParseError {
+            line: param.line,
+            message: "lambda parameter must be a symbol".to_string(),
+        })?;
+        params.push(normalize_identifier(raw, param.line, "lambda parameter")?);
+    }
+    let body_expr = lower_body_exprs(&items[2..], line)?;
+    Ok(Some(format!(
+        "fn {name}({}) = {body_expr};",
+        params.join(", ")
+    )))
 }
 
 fn lower_quote_expr(form: &SchemeForm) -> Result<String, ParseError> {
@@ -2331,12 +2413,28 @@ fn lower_map_expr(args: &[SchemeForm], line: usize) -> Result<String, ParseError
     }
     let func = lower_expr(&args[0])?;
     let list = lower_expr(&args[1])?;
+    let map_func = gensym("map_f");
     let v = gensym("map_v");
     let i = gensym("map_i");
     let r = gensym("map_r");
-    Ok(format!(
-        "if ({v} = {list}) => {{ if ({r} = []) => {{ for (let {i} = 0; {i} < len({v}); {i} = {i} + 1) {{ {r} = array_push({r}, {func}(({v})[{i}])); }}; {r} }} else => {{ {r} }} }} else => {{ {v} }}"
-    ))
+    let callable = if func.trim_start().starts_with('|') {
+        map_func.as_str()
+    } else {
+        func.as_str()
+    };
+    let map_body = wrap_let_expr(
+        &r,
+        "[]",
+        &format!(
+            "for (let {i} = 0; {i} < len({v}); {i} = {i} + 1) {{ {r} = array_push({r}, {callable}(({v})[{i}])); }} {r}"
+        ),
+    );
+    let list_body = wrap_let_expr(&v, &list, &map_body);
+    if func.trim_start().starts_with('|') {
+        Ok(wrap_let_expr(&map_func, &func, &list_body))
+    } else {
+        Ok(list_body)
+    }
 }
 
 fn lower_filter_expr(args: &[SchemeForm], line: usize) -> Result<String, ParseError> {
@@ -2348,13 +2446,29 @@ fn lower_filter_expr(args: &[SchemeForm], line: usize) -> Result<String, ParseEr
     }
     let pred = lower_expr(&args[0])?;
     let list = lower_expr(&args[1])?;
+    let filter_pred = gensym("filt_p");
     let v = gensym("filt_v");
     let i = gensym("filt_i");
     let r = gensym("filt_r");
     let x = gensym("filt_x");
-    Ok(format!(
-        "if ({v} = {list}) => {{ if ({r} = []) => {{ for (let {i} = 0; {i} < len({v}); {i} = {i} + 1) {{ if ({x} = ({v})[{i}]) => {{ if {pred}({x}) => {{ {r} = array_push({r}, {x}); }} else => {{ false }} }} else => {{ false }}; }}; {r} }} else => {{ {r} }} }} else => {{ {v} }}"
-    ))
+    let callable = if pred.trim_start().starts_with('|') {
+        filter_pred.as_str()
+    } else {
+        pred.as_str()
+    };
+    let filter_body = wrap_let_expr(
+        &r,
+        "[]",
+        &format!(
+            "for (let {i} = 0; {i} < len({v}); {i} = {i} + 1) {{ let {x} = ({v})[{i}]; if {callable}({x}) {{ {r} = array_push({r}, {x}); }} }} {r}"
+        ),
+    );
+    let list_body = wrap_let_expr(&v, &list, &filter_body);
+    if pred.trim_start().starts_with('|') {
+        Ok(wrap_let_expr(&filter_pred, &pred, &list_body))
+    } else {
+        Ok(list_body)
+    }
 }
 
 fn lower_apply_expr(args: &[SchemeForm], line: usize) -> Result<String, ParseError> {
@@ -2423,4 +2537,31 @@ fn is_reserved_identifier(name: &str) -> bool {
         name,
         "fn" | "let" | "for" | "if" | "else" | "while" | "break" | "continue" | "true" | "false"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::parse_with_parser;
+    use super::*;
+
+    fn with_line_numbers(source: &str) -> String {
+        source
+            .lines()
+            .enumerate()
+            .map(|(idx, line)| format!("{:>4}: {}", idx + 1, line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn lower_example_complex_parses() {
+        let source = include_str!("../../../examples/example_complex.scm");
+        let lowered = lower(source).expect("scheme lowering should succeed");
+        if let Err(err) = parse_with_parser(&lowered, false, false) {
+            panic!(
+                "lowered source should parse: {err}\n---- lowered ----\n{}",
+                with_line_numbers(&lowered)
+            );
+        }
+    }
 }

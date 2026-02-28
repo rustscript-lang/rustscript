@@ -257,6 +257,28 @@ fn scheme_undeclared_host_call_is_rejected() {
 }
 
 #[test]
+fn scheme_non_standard_aliases_are_rejected() {
+    let cases = [
+        ("(mod 17 5)", "unknown function 'mod'"),
+        ("(first (list 1 2))", "unknown function 'first'"),
+        ("(rest (list 1 2))", "unknown function 'rest'"),
+    ];
+
+    for (source, expected) in cases {
+        let err = match compile_source_with_flavor(source, SourceFlavor::Scheme) {
+            Ok(_) => panic!("alias form should fail: {source}"),
+            Err(err) => err,
+        };
+        match err {
+            vm::SourceError::Parse(parse) => {
+                assert!(parse.message.contains(expected), "{}", parse.message);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+}
+
+#[test]
 fn scheme_modulo_uses_native_operator() {
     let source = r#"(define m (modulo 17 5))
 (+ m 2)"#;

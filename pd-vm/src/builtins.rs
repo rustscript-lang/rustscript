@@ -138,6 +138,7 @@ impl BuiltinFunction {
             "io_flush" => Some(BuiltinFunction::IoFlush),
             "io_close" => Some(BuiltinFunction::IoClose),
             "io_exists" => Some(BuiltinFunction::IoExists),
+            "__to_string" => Some(BuiltinFunction::ToString),
             "type_of" => Some(BuiltinFunction::TypeOf),
             "assert" => Some(BuiltinFunction::Assert),
             _ => None,
