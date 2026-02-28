@@ -187,7 +187,7 @@
         },
         {
           "name": "keyword.control.rss",
-          "match": "\\b(?:for|if|else|while|break|continue|use|as)\\b"
+          "match": "\\b(?:for|if|else|match|while|break|continue|use|as)\\b"
         }
       ]
     },
@@ -234,7 +234,7 @@
       "patterns": [
         {
           "name": "entity.name.function.rss",
-          "match": "\\b(?!pub\\b|fn\\b|let\\b|for\\b|if\\b|else\\b|while\\b|break\\b|continue\\b|use\\b|as\\b|true\\b|false\\b)([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()"
+          "match": "\\b(?!pub\\b|fn\\b|let\\b|for\\b|if\\b|else\\b|match\\b|while\\b|break\\b|continue\\b|use\\b|as\\b|true\\b|false\\b)([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()"
         }
       ]
     },
@@ -293,7 +293,7 @@
       "patterns": [
         {
           "name": "meta.member.access.rss",
-          "match": "(\\.)(\\s*)([A-Za-z_][A-Za-z0-9_]*)",
+          "match": "(\\?\\.|\\.)(\\s*)([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
             "1": {
               "name": "punctuation.accessor.rss"
@@ -311,7 +311,7 @@
     },
     "operators": {
       "name": "keyword.operator.rss",
-      "match": "==|=|\\+|-|\\*|/|<|>"
+      "match": "=>|==|!=|=|\\+|-|\\*|/|<|>|!"
     },
     "punctuation": {
       "name": "punctuation.separator.rss",

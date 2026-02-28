@@ -49,6 +49,7 @@ pub(super) fn execute_builtin_call(
         BuiltinFunction::IoFlush => builtin_io_flush(vm, args),
         BuiltinFunction::IoClose => builtin_io_close(vm, args),
         BuiltinFunction::IoExists => builtin_io_exists(args),
+        BuiltinFunction::ToString => builtin_to_string(args),
         BuiltinFunction::TypeOf => builtin_type_of(args),
         BuiltinFunction::Assert => builtin_assert(args),
     }
@@ -225,6 +226,18 @@ fn builtin_type_of(args: &[Value]) -> VmResult<Vec<Value>> {
         Value::Map(_) => "map",
     };
     Ok(vec![Value::String(ty.to_string())])
+}
+
+fn builtin_to_string(args: &[Value]) -> VmResult<Vec<Value>> {
+    let value = args
+        .first()
+        .ok_or_else(|| VmError::HostError("missing argument to __to_string".to_string()))?;
+    let text = match value {
+        Value::Int(v) => v.to_string(),
+        Value::Float(v) => v.to_string(),
+        _ => return Err(VmError::TypeMismatch("number")),
+    };
+    Ok(vec![Value::String(text)])
 }
 
 fn builtin_set(args: &[Value]) -> VmResult<Vec<Value>> {

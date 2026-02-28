@@ -48,36 +48,37 @@ pub(super) fn is_ident_continue(ch: char) -> bool {
 impl FrontendCompiler for RustScriptCompiler {
     fn parse(&self, source: &str) -> Result<FrontendOutput, ParseError> {
         let lowered = rustscript::lower(source);
-        parse_with_parser(&lowered, false)
+        parse_with_parser(&lowered, false, false)
     }
 }
 
 impl FrontendCompiler for JavaScriptCompiler {
     fn parse(&self, source: &str) -> Result<FrontendOutput, ParseError> {
         let lowered = javascript::lower(source)?;
-        parse_with_parser(&lowered, false)
+        parse_with_parser(&lowered, false, true)
     }
 }
 
 impl FrontendCompiler for LuaCompiler {
     fn parse(&self, source: &str) -> Result<FrontendOutput, ParseError> {
         let lowered = lua::lower(source)?;
-        parse_with_parser(&lowered, false)
+        parse_with_parser(&lowered, false, false)
     }
 }
 
 impl FrontendCompiler for SchemeCompiler {
     fn parse(&self, source: &str) -> Result<FrontendOutput, ParseError> {
         let lowered = scheme::lower(source)?;
-        parse_with_parser(&lowered, false)
+        parse_with_parser(&lowered, false, false)
     }
 }
 
 fn parse_with_parser(
     source: &str,
     allow_implicit_externs: bool,
+    allow_implicit_semicolons: bool,
 ) -> Result<FrontendOutput, ParseError> {
-    let mut parser = Parser::new(source, allow_implicit_externs)?;
+    let mut parser = Parser::new(source, allow_implicit_externs, allow_implicit_semicolons)?;
     let stmts = parser.parse_program()?;
     Ok(FrontendOutput {
         stmts,

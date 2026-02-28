@@ -17,8 +17,9 @@ pub(crate) enum BuiltinFunction {
     IoFlush = 13,
     IoClose = 14,
     IoExists = 15,
-    TypeOf = 16,
-    Assert = 17,
+    ToString = 16,
+    TypeOf = 17,
+    Assert = 18,
 }
 
 pub(crate) const BUILTIN_CALL_BASE: u16 = 0xFFF0;
@@ -43,6 +44,7 @@ impl BuiltinFunction {
             BuiltinFunction::IoFlush => "io_flush",
             BuiltinFunction::IoClose => "io_close",
             BuiltinFunction::IoExists => "io_exists",
+            BuiltinFunction::ToString => "__to_string",
             BuiltinFunction::TypeOf => "type_of",
             BuiltinFunction::Assert => "assert",
         }
@@ -66,6 +68,7 @@ impl BuiltinFunction {
             BuiltinFunction::IoFlush => 1,
             BuiltinFunction::IoClose => 1,
             BuiltinFunction::IoExists => 1,
+            BuiltinFunction::ToString => 1,
             BuiltinFunction::TypeOf => 1,
             BuiltinFunction::Assert => 1,
         }
@@ -73,6 +76,7 @@ impl BuiltinFunction {
 
     pub(crate) fn call_index(self) -> u16 {
         match self {
+            BuiltinFunction::ToString => BUILTIN_CALL_BASE - 3,
             BuiltinFunction::TypeOf => BUILTIN_CALL_BASE - 2,
             BuiltinFunction::Assert => BUILTIN_CALL_BASE - 1,
             _ => BUILTIN_CALL_BASE + self as u16,
@@ -80,6 +84,9 @@ impl BuiltinFunction {
     }
 
     pub(crate) fn from_call_index(index: u16) -> Option<Self> {
+        if index == BUILTIN_CALL_BASE - 3 {
+            return Some(BuiltinFunction::ToString);
+        }
         if index == BUILTIN_CALL_BASE - 2 {
             return Some(BuiltinFunction::TypeOf);
         }

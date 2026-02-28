@@ -165,6 +165,50 @@ fn rustscript_if_expression_assignment_syntax_is_supported() {
 }
 
 #[test]
+fn rustscript_if_expression_branch_blocks_support_multiline_statements() {
+    let source = r#"
+        let base = 40;
+        let out = if true => {
+            let bump = base + 2;
+            bump
+        } else => {
+            let fallback = base - 1;
+            fallback
+        };
+        out;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+}
+
+#[test]
+fn rustscript_if_expression_assignment_executes_else_branch() {
+    let source = r#"
+        let marker = 0;
+        let out = if false => {
+            marker = 1;
+            10
+        } else => {
+            marker = 2;
+            20
+        };
+        marker + out;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(22)]);
+}
+
+#[test]
 fn rustscript_if_expression_supports_else_if_chains() {
     let source = r#"
         let key = 2;

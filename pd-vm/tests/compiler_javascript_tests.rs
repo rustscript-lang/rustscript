@@ -74,6 +74,45 @@ fn javascript_assignment_updates_existing_local_without_new_slot() {
 }
 
 #[test]
+fn javascript_allows_omitted_semicolons_at_line_end() {
+    let source = r#"
+        let out = 40
+        out = out + 1
+        if (out < 50) {
+            out = out + 1
+        }
+        out
+    "#;
+    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
+        .expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+}
+
+#[test]
+fn javascript_allows_omitted_semicolons_with_multiline_calls() {
+    let source = r#"
+        import * as vm from "vm"
+        let value = vm.add_one(
+            41
+        )
+        value
+    "#;
+
+    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
+        .expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    vm.bind_function("add_one", Box::new(AddOne));
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+}
+
+#[test]
 fn javascript_console_log_works_without_decl() {
     let source = r#"
         console.log(40 + 2);

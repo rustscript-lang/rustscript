@@ -333,6 +333,12 @@ fn remap_expr_indices(
             }
             remap_expr_indices(default, local_base, function_map)?;
         }
+        Expr::Block { stmts, expr } => {
+            for stmt in stmts {
+                remap_stmt_indices(stmt, local_base, function_map)?;
+            }
+            remap_expr_indices(expr, local_base, function_map)?;
+        }
     }
     Ok(())
 }

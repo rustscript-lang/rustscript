@@ -381,6 +381,7 @@ pub(super) struct Parser {
     closure_scopes: Vec<HashMap<String, u8>>,
     closure_capture_contexts: Vec<ClosureCaptureContext>,
     allow_implicit_externs: bool,
+    allow_implicit_semicolons: bool,
     loop_depth: usize,
     vm_namespace_aliases: HashSet<String>,
     vm_named_imports: HashMap<String, String>,
@@ -393,7 +394,11 @@ struct ClosureCaptureContext {
 }
 
 impl Parser {
-    pub(super) fn new(source: &str, allow_implicit_externs: bool) -> Result<Self, ParseError> {
+    pub(super) fn new(
+        source: &str,
+        allow_implicit_externs: bool,
+        allow_implicit_semicolons: bool,
+    ) -> Result<Self, ParseError> {
         let mut lexer = Lexer::new(source);
         let mut tokens = Vec::new();
         loop {
@@ -417,6 +422,7 @@ impl Parser {
             closure_scopes: Vec::new(),
             closure_capture_contexts: Vec::new(),
             allow_implicit_externs,
+            allow_implicit_semicolons,
             loop_depth: 0,
             vm_namespace_aliases: HashSet::new(),
             vm_named_imports: HashMap::new(),
@@ -475,7 +481,7 @@ impl Parser {
 
         let line = self.current_line_u32();
         let expr = self.parse_expr()?;
-        self.expect(&TokenKind::Semicolon, "expected ';' after expression")?;
+        self.consume_stmt_terminator("expected ';' after expression")?;
         Ok(Stmt::Expr { expr, line })
     }
 
@@ -491,14 +497,11 @@ impl Parser {
                 },
             });
         }
-        self.expect(
-            &TokenKind::Semicolon,
-            if is_break {
-                "expected ';' after break"
-            } else {
-                "expected ';' after continue"
-            },
-        )?;
+        self.consume_stmt_terminator(if is_break {
+            "expected ';' after break"
+        } else {
+            "expected ';' after continue"
+        })?;
         Ok(if is_break {
             Stmt::Break { line }
         } else {
@@ -760,7 +763,7 @@ impl Parser {
         self.expect(&TokenKind::Equal, "expected '=' after identifier")?;
         let expr = self.parse_expr()?;
         if expect_terminator {
-            self.expect(&TokenKind::Semicolon, "expected ';' after let")?;
+            self.consume_stmt_terminator("expected ';' after let")?;
         }
 
         if let Expr::Closure(closure) = expr {
@@ -815,7 +818,7 @@ impl Parser {
         self.expect(&TokenKind::Equal, "expected '=' after identifier")?;
         let expr = self.parse_expr()?;
         if expect_terminator {
-            self.expect(&TokenKind::Semicolon, "expected ';' after assignment")?;
+            self.consume_stmt_terminator("expected ';' after assignment")?;
         }
 
         if self.closure_bindings.contains_key(&name) {
@@ -1158,13 +1161,67 @@ impl Parser {
             &TokenKind::LBrace,
             "expected '{' after '=>' in if expression branch",
         )?;
-        let expr = self.parse_expr()?;
-        self.match_kind(&TokenKind::Semicolon);
+
+        let mut stmts = Vec::<Stmt>::new();
+        let mut trailing_expr: Option<Expr> = None;
+        while !self.check(&TokenKind::RBrace) {
+            if self.check(&TokenKind::Eof) {
+                return Err(ParseError {
+                    line: self.current_line(),
+                    message: "unexpected end of input in if expression branch".to_string(),
+                });
+            }
+
+            if self.starts_if_expr_branch_statement() {
+                stmts.push(self.parse_stmt()?);
+                continue;
+            }
+
+            let line = self.current_line_u32();
+            let expr = self.parse_expr()?;
+            if self.check(&TokenKind::RBrace) {
+                trailing_expr = Some(expr);
+                break;
+            }
+            self.expect(
+                &TokenKind::Semicolon,
+                "expected ';' after expression in if expression branch",
+            )?;
+            stmts.push(Stmt::Expr { expr, line });
+        }
+
         self.expect(
             &TokenKind::RBrace,
             "expected '}' to close if expression branch",
         )?;
-        Ok(expr)
+
+        let expr = if let Some(expr) = trailing_expr {
+            expr
+        } else {
+            let Some(last_stmt) = stmts.pop() else {
+                return Err(ParseError {
+                    line: self.current_line(),
+                    message: "if expression branch must end with an expression".to_string(),
+                });
+            };
+            if let Stmt::Expr { expr, .. } = last_stmt {
+                expr
+            } else {
+                return Err(ParseError {
+                    line: self.current_line(),
+                    message: "if expression branch must end with an expression".to_string(),
+                });
+            }
+        };
+
+        if stmts.is_empty() {
+            Ok(expr)
+        } else {
+            Ok(Expr::Block {
+                stmts,
+                expr: Box::new(expr),
+            })
+        }
     }
 
     fn parse_match_expr(&mut self) -> Result<Expr, ParseError> {
@@ -1708,10 +1765,7 @@ impl Parser {
         )?;
         let value = self.parse_expr()?;
         if expect_terminator {
-            self.expect(
-                &TokenKind::Semicolon,
-                "expected ';' after indexed assignment",
-            )?;
+            self.consume_stmt_terminator("expected ';' after indexed assignment")?;
         }
 
         let index = self.get_local(&name)?;
@@ -2157,6 +2211,105 @@ impl Parser {
                 })
             )
         )
+    }
+
+    fn consume_stmt_terminator(&mut self, message: &str) -> Result<(), ParseError> {
+        if self.match_kind(&TokenKind::Semicolon) {
+            return Ok(());
+        }
+        if !self.allow_implicit_semicolons {
+            return Err(ParseError {
+                line: self.current_line(),
+                message: message.to_string(),
+            });
+        }
+
+        if self.check(&TokenKind::RBrace) || self.check(&TokenKind::Eof) {
+            return Ok(());
+        }
+
+        let previous_line = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.line)
+            .unwrap_or(1);
+        if self.current_line() > previous_line {
+            return Ok(());
+        }
+
+        Err(ParseError {
+            line: self.current_line(),
+            message: message.to_string(),
+        })
+    }
+
+    fn starts_if_expr_branch_statement(&self) -> bool {
+        if self.check(&TokenKind::Pub)
+            || self.check(&TokenKind::Use)
+            || self.check(&TokenKind::Fn)
+            || self.check(&TokenKind::Let)
+            || self.check(&TokenKind::For)
+            || self.check(&TokenKind::While)
+            || self.check(&TokenKind::Break)
+            || self.check(&TokenKind::Continue)
+            || self.check_assignment_start()
+            || self.check_index_assignment_start()
+        {
+            return true;
+        }
+        self.check(&TokenKind::If) && !self.check_if_expression_start()
+    }
+
+    fn check_if_expression_start(&self) -> bool {
+        if !self.check(&TokenKind::If) {
+            return false;
+        }
+        let mut cursor = self.pos + 1;
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut brace_depth = 0usize;
+
+        while let Some(token) = self.tokens.get(cursor) {
+            match token.kind {
+                TokenKind::LParen => paren_depth += 1,
+                TokenKind::RParen => {
+                    if paren_depth > 0 {
+                        paren_depth -= 1;
+                    }
+                }
+                TokenKind::LBracket => bracket_depth += 1,
+                TokenKind::RBracket => {
+                    if bracket_depth > 0 {
+                        bracket_depth -= 1;
+                    }
+                }
+                TokenKind::LBrace => {
+                    if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+                        return false;
+                    }
+                    brace_depth += 1;
+                }
+                TokenKind::RBrace => {
+                    if brace_depth == 0 {
+                        return false;
+                    }
+                    brace_depth -= 1;
+                }
+                TokenKind::FatArrow
+                    if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 =>
+                {
+                    return true;
+                }
+                TokenKind::Semicolon | TokenKind::Eof
+                    if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+            cursor += 1;
+        }
+        false
     }
 
     fn check(&self, kind: &TokenKind) -> bool {

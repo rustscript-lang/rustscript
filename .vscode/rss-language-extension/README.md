@@ -4,12 +4,12 @@ Local VS Code extension for syntax highlighting of RustScript `.rss` files.
 
 ## Covered syntax
 
-- Keywords: `pub`, `fn`, `let`, `for`, `if`, `else`, `while`, `break`, `continue`, `use`, `as`
+- Keywords: `pub`, `fn`, `let`, `for`, `if`, `else`, `match`, `while`, `break`, `continue`, `use`, `as`
 - Module use: `use foo::bar;`; `use foo::bar as ns;`; `use foo::bar::{a, b as c}`
 - Namespaced calls: `ns::function(...)`
 - Literals: booleans, integers, strings
 - Declarations and calls: functions, variables, macros (for example `print!(...)`)
-- Expressions: operators, closure pipes (`|...|`), member access (`obj.field`)
+- Expressions: operators (including `=>` and `!=`), closure pipes (`|...|`), member access (`obj.field`, `obj?.field`)
 - Delimiters: `()`, `{}`, `[]`, `,`, `:`, `;`
 
 ## Install locally

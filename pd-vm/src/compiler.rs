@@ -197,6 +197,10 @@ pub enum Expr {
         arms: Vec<(MatchPattern, Expr)>,
         default: Box<Expr>,
     },
+    Block {
+        stmts: Vec<Stmt>,
+        expr: Box<Expr>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -626,6 +630,18 @@ impl Compiler {
                 self.compile_expr(&closure.body)?;
             }
             Expr::Add(lhs, rhs) => {
+                if is_definitely_string_expr(lhs) {
+                    self.compile_expr(lhs)?;
+                    self.compile_string_concat_operand(rhs)?;
+                    self.assembler.add();
+                    return Ok(());
+                }
+                if is_definitely_string_expr(rhs) {
+                    self.compile_string_concat_operand(lhs)?;
+                    self.compile_expr(rhs)?;
+                    self.assembler.add();
+                    return Ok(());
+                }
                 self.compile_expr(lhs)?;
                 self.compile_expr(rhs)?;
                 self.assembler.add();
@@ -742,6 +758,10 @@ impl Compiler {
                     .map_err(CompileError::Assembler)?;
                 self.assembler.ldloc(*result_slot);
             }
+            Expr::Block { stmts, expr } => {
+                self.compile_stmts(stmts)?;
+                self.compile_expr(expr)?;
+            }
         }
         Ok(())
     }
@@ -750,6 +770,49 @@ impl Compiler {
         let label = format!("{prefix}_{}", self.next_label_id);
         self.next_label_id += 1;
         label
+    }
+
+    fn compile_string_concat_operand(&mut self, expr: &Expr) -> Result<(), CompileError> {
+        if let Some(value) = eval_const_int_expr(expr) {
+            self.assembler.push_const(Value::String(value.to_string()));
+            return Ok(());
+        }
+
+        self.compile_expr(expr)?;
+        self.lower_number_to_string_for_concat_top();
+        Ok(())
+    }
+
+    fn lower_number_to_string_for_concat_top(&mut self) {
+        let not_int_label = self.fresh_label("concat_not_int");
+        let not_float_label = self.fresh_label("concat_not_float");
+        let done_label = self.fresh_label("concat_value_done");
+
+        self.assembler.dup();
+        self.assembler.call(BuiltinFunction::TypeOf.call_index(), 1);
+        self.assembler.push_const(Value::String("int".to_string()));
+        self.assembler.ceq();
+        self.assembler.brfalse_label(&not_int_label);
+        self.assembler.call(BuiltinFunction::ToString.call_index(), 1);
+        self.assembler.br_label(&done_label);
+
+        self.assembler
+            .label(&not_int_label)
+            .expect("compiler-generated label should be valid");
+        self.assembler.dup();
+        self.assembler.call(BuiltinFunction::TypeOf.call_index(), 1);
+        self.assembler.push_const(Value::String("float".to_string()));
+        self.assembler.ceq();
+        self.assembler.brfalse_label(&not_float_label);
+        self.assembler.call(BuiltinFunction::ToString.call_index(), 1);
+        self.assembler.br_label(&done_label);
+
+        self.assembler
+            .label(&not_float_label)
+            .expect("compiler-generated label should be valid");
+        self.assembler
+            .label(&done_label)
+            .expect("compiler-generated label should be valid");
     }
 }
 
@@ -762,4 +825,34 @@ fn shift_amount_for_power_of_two(value: i64) -> Option<u32> {
         return None;
     }
     Some(as_u64.trailing_zeros())
+}
+
+fn is_definitely_string_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::String(_) => true,
+        Expr::Add(lhs, rhs) => {
+            (is_definitely_string_expr(lhs) && is_definitely_string_expr(rhs))
+                || (is_definitely_string_expr(lhs) && eval_const_int_expr(rhs).is_some())
+                || (eval_const_int_expr(lhs).is_some() && is_definitely_string_expr(rhs))
+        }
+        _ => false,
+    }
+}
+
+fn eval_const_int_expr(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Int(value) => Some(*value),
+        Expr::Neg(inner) => eval_const_int_expr(inner)?.checked_neg(),
+        Expr::Add(lhs, rhs) => eval_const_int_expr(lhs)?.checked_add(eval_const_int_expr(rhs)?),
+        Expr::Sub(lhs, rhs) => eval_const_int_expr(lhs)?.checked_sub(eval_const_int_expr(rhs)?),
+        Expr::Mul(lhs, rhs) => eval_const_int_expr(lhs)?.checked_mul(eval_const_int_expr(rhs)?),
+        Expr::Div(lhs, rhs) => {
+            let rhs = eval_const_int_expr(rhs)?;
+            if rhs == 0 {
+                return None;
+            }
+            eval_const_int_expr(lhs)?.checked_div(rhs)
+        }
+        _ => None,
+    }
 }

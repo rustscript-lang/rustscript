@@ -348,6 +348,96 @@ fn string_and_array_concat_work_via_plus_in_all_frontends() {
 }
 
 #[test]
+fn string_and_int_concat_work_via_plus_in_all_frontends() {
+    let rustscript = r#"
+        let a = "x" + 1;
+        let b = 2 + "y";
+        let c = "x" + 1 + 2;
+        let d = 3 + "y" + 4;
+        len(a) + len(b) + len(c) + len(d);
+    "#;
+    let javascript = r#"
+        let a = "x" + 1;
+        let b = 2 + "y";
+        let c = "x" + 1 + 2;
+        let d = 3 + "y" + 4;
+        len(a) + len(b) + len(c) + len(d);
+    "#;
+    let lua = r#"
+        local a = "x" + 1
+        local b = 2 + "y"
+        local c = "x" + 1 + 2
+        local d = 3 + "y" + 4
+        len(a) + len(b) + len(c) + len(d)
+    "#;
+    let scheme = r#"
+        (define a (+ "x" 1))
+        (define b (+ 2 "y"))
+        (define c (+ "x" 1 2))
+        (define d (+ 3 "y" 4))
+        (+ (len a) (len b) (len c) (len d))
+    "#;
+
+    let cases = [
+        (SourceFlavor::RustScript, rustscript),
+        (SourceFlavor::JavaScript, javascript),
+        (SourceFlavor::Lua, lua),
+        (SourceFlavor::Scheme, scheme),
+    ];
+
+    for (flavor, source) in cases {
+        let compiled = compile_source_with_flavor(source, flavor).expect("compile should succeed");
+        let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::Int(10)]);
+    }
+}
+
+#[test]
+fn string_and_nonconstant_int_concat_autoconverts_in_all_frontends() {
+    let rustscript = r#"
+        let n = 41;
+        let a = "v=" + n;
+        let b = n + "!";
+        len(a) + len(b);
+    "#;
+    let javascript = r#"
+        let n = 41;
+        let a = "v=" + n;
+        let b = n + "!";
+        len(a) + len(b);
+    "#;
+    let lua = r#"
+        local n = 41
+        local a = "v=" + n
+        local b = n + "!"
+        len(a) + len(b)
+    "#;
+    let scheme = r#"
+        (define n 41)
+        (define a (+ "v=" n))
+        (define b (+ n "!"))
+        (+ (len a) (len b))
+    "#;
+
+    let cases = [
+        (SourceFlavor::RustScript, rustscript),
+        (SourceFlavor::JavaScript, javascript),
+        (SourceFlavor::Lua, lua),
+        (SourceFlavor::Scheme, scheme),
+    ];
+
+    for (flavor, source) in cases {
+        let compiled = compile_source_with_flavor(source, flavor).expect("compile should succeed");
+        let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::Int(7)]);
+    }
+}
+
+#[test]
 fn slice_ranges_work_in_all_frontends() {
     let rustscript = r#"
         let text = "abcdef";

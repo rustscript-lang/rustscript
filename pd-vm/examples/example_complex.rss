@@ -8,7 +8,13 @@ for (let i = 0; i < 4; i = i + 1) {
     total = total + i;
 }
 
-let total = if !string::non_empty("rustscript") => { 0 } else => { add_one(total) };
+let total = if !string::non_empty("rustscript") => {
+    let zeroed = 0;
+    zeroed
+} else => {
+    let bumped = add_one(total);
+    bumped
+};
 
 let base = 7;
 let add = |value| value + base;
