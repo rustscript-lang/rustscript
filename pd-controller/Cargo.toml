@@ -5,7 +5,7 @@ version.workspace = true
 build = "build.rs"
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 edge = { package = "pd-edge", path = "../pd-edge" }
 serde = { version = "1", features = ["derive"] }

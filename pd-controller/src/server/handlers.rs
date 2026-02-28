@@ -399,12 +399,22 @@ pub(super) async fn rpc_poll_handler(
         (edge_id, command)
     };
 
+    let mut debug_sessions_changed = false;
     {
         let mut sessions = state.debug_sessions.write().await;
         for session in sessions
             .values_mut()
             .filter(|item| item.edge_id == resolved_edge_id || item.edge_id == request.edge_id)
         {
+            let before = (
+                session.edge_id.clone(),
+                session.phase.clone(),
+                session.request_id.clone(),
+                session.current_line,
+                session.attached_unix_ms,
+                session.last_resume_command_unix_ms,
+                session.message.clone(),
+            );
             if matches!(
                 session.phase,
                 DebugSessionPhase::Stopped | DebugSessionPhase::Failed
@@ -414,6 +424,7 @@ pub(super) async fn rpc_poll_handler(
             if session.mode == DebugSessionMode::Recording {
                 if session.edge_id != resolved_edge_id {
                     session.edge_id = resolved_edge_id.clone();
+                    debug_sessions_changed = true;
                 }
                 continue;
             }
@@ -454,7 +465,22 @@ pub(super) async fn rpc_poll_handler(
                 session.current_line = None;
                 session.updated_unix_ms = now;
             }
+            let after = (
+                session.edge_id.clone(),
+                session.phase.clone(),
+                session.request_id.clone(),
+                session.current_line,
+                session.attached_unix_ms,
+                session.last_resume_command_unix_ms,
+                session.message.clone(),
+            );
+            if after != before {
+                debug_sessions_changed = true;
+            }
         }
+    }
+    if debug_sessions_changed {
+        state.notify_debug_sessions_changed();
     }
 
     if command.is_some() {
@@ -620,6 +646,88 @@ pub(super) async fn get_edge_results_handler(
     Ok(Json(response))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum DebugSessionsStreamClientMessage {
+    Subscribe { session_id: Option<String> },
+}
+
+pub(super) async fn debug_sessions_stream_handler(
+    State(state): State<ControllerState>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_debug_sessions_stream(state, socket))
+}
+
+async fn handle_debug_sessions_stream(state: ControllerState, mut socket: WebSocket) {
+    let mut selected_session_id: Option<String> = None;
+    if send_debug_sessions_snapshot(&state, &mut socket, selected_session_id.as_deref())
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let mut updates = state.subscribe_debug_sessions();
+    loop {
+        tokio::select! {
+            changed = updates.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                if send_debug_sessions_snapshot(&state, &mut socket, selected_session_id.as_deref()).await.is_err() {
+                    break;
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Text(payload))) => {
+                        let Ok(message) = serde_json::from_str::<DebugSessionsStreamClientMessage>(&payload) else {
+                            continue;
+                        };
+                        let DebugSessionsStreamClientMessage::Subscribe { session_id } = message;
+                        selected_session_id = session_id.and_then(|value| {
+                            let trimmed = value.trim();
+                            if trimmed.is_empty() {
+                                None
+                            } else {
+                                Some(trimmed.to_string())
+                            }
+                        });
+                        if send_debug_sessions_snapshot(&state, &mut socket, selected_session_id.as_deref()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                        break;
+                    }
+                    Some(Ok(_)) => {}
+                }
+            }
+        }
+    }
+}
+
+async fn send_debug_sessions_snapshot(
+    state: &ControllerState,
+    socket: &mut WebSocket,
+    selected_session_id: Option<&str>,
+) -> Result<(), ()> {
+    let snapshot = state.debug_sessions_snapshot(selected_session_id).await;
+    let payload = serde_json::to_string(&snapshot).map_err(|err| {
+        warn!("failed to serialize debug session stream payload: {err}");
+    })?;
+    socket
+        .send(Message::Text(payload.into()))
+        .await
+        .map_err(|_| ())
+}
+
 pub(super) async fn list_debug_sessions_handler(
     State(state): State<ControllerState>,
 ) -> Json<DebugSessionListResponse> {
@@ -779,6 +887,7 @@ pub(super) async fn create_debug_session_handler(
         let mut lookup = state.debug_start_lookup.write().await;
         lookup.insert(command_id, session_id);
     }
+    state.notify_debug_sessions_changed();
     state.persist_snapshot().await.map_err(internal_error)?;
 
     Ok((StatusCode::ACCEPTED, Json(record.to_detail())))
@@ -816,6 +925,7 @@ pub(super) async fn stop_debug_session_handler(
         let command = ControlPlaneCommand::StopDebugSession { command_id };
         let _queued = state.enqueue_command(edge_id, command).await;
     }
+    state.notify_debug_sessions_changed();
     state.persist_snapshot().await.map_err(internal_error)?;
     Ok(Json(StatusResponse { status: "stopped" }))
 }
@@ -858,6 +968,7 @@ pub(super) async fn delete_debug_session_handler(
         let mut recordings = state.debug_recordings.write().await;
         recordings.remove(&session_id);
     }
+    state.notify_debug_sessions_changed();
     state.persist_snapshot().await.map_err(internal_error)?;
 
     Ok(Json(StatusResponse { status: "deleted" }))
@@ -944,19 +1055,27 @@ pub(super) async fn run_debug_command_handler(
             }
         };
 
+        let mut debug_sessions_changed = false;
         {
             let mut sessions = state.debug_sessions.write().await;
             if let Some(session) = sessions.get_mut(&session_id) {
                 match request_for_state {
                     DebugCommandRequest::BreakLine { line } => {
-                        session.breakpoints.insert(line);
+                        if session.breakpoints.insert(line) {
+                            debug_sessions_changed = true;
+                        }
                     }
                     DebugCommandRequest::ClearLine { line } => {
-                        session.breakpoints.remove(&line);
+                        if session.breakpoints.remove(&line) {
+                            debug_sessions_changed = true;
+                        }
                     }
                     _ => {}
                 }
             }
+        }
+        if debug_sessions_changed {
+            state.notify_debug_sessions_changed();
         }
         state.persist_snapshot().await.map_err(internal_error)?;
 
@@ -1072,6 +1191,7 @@ pub(super) async fn run_debug_command_handler(
             attached: !replay.exited,
         }
     };
+    state.notify_debug_sessions_changed();
     state.persist_snapshot().await.map_err(internal_error)?;
 
     Ok(Json(response))
@@ -1400,6 +1520,7 @@ async fn process_debug_session_result(
                         }));
                 }
             }
+            state.notify_debug_sessions_changed();
         }
         CommandResultPayload::DebugCommand {
             session_id,
@@ -1418,10 +1539,12 @@ async fn process_debug_session_result(
             let mut response_for_waiter: Result<DebugCommandResponse, String> = Err(message
                 .clone()
                 .unwrap_or_else(|| "debug command failed".to_string()));
+            let mut debug_sessions_changed = false;
 
             if let Some(target_session_id) = target_session_id {
                 let mut sessions = state.debug_sessions.write().await;
                 if let Some(session) = sessions.get_mut(&target_session_id) {
+                    debug_sessions_changed = true;
                     session.updated_unix_ms = now_unix_ms();
                     if let Some(name) = edge_name
                         .as_deref()
@@ -1479,6 +1602,9 @@ async fn process_debug_session_result(
             };
             if let Some(waiter) = waiter {
                 let _ = waiter.send(response_for_waiter);
+            }
+            if debug_sessions_changed {
+                state.notify_debug_sessions_changed();
             }
         }
         CommandResultPayload::DebugRecording {
@@ -1618,6 +1744,7 @@ async fn process_debug_session_result(
                 let command = ControlPlaneCommand::StopDebugSession { command_id };
                 let _queued = state.enqueue_command(edge_id, command).await;
             }
+            state.notify_debug_sessions_changed();
         }
         CommandResultPayload::StopDebugSession { .. } => {
             let mut sessions = state.debug_sessions.write().await;
@@ -1632,6 +1759,7 @@ async fn process_debug_session_result(
                 } else {
                     Some("debug session stopped".to_string())
                 };
+                state.notify_debug_sessions_changed();
             }
         }
         _ => {}

@@ -10,6 +10,7 @@ import type {
   DebugSessionDetail,
   DebugSessionListResponse,
   DebugSessionSummary,
+  DebugSessionsStreamSnapshot,
   EdgeSummary,
   RunDebugCommandFn,
   RunDebugCommandOptions
@@ -49,6 +50,9 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
   const debugHoverCacheRef = useRef<Map<string, string>>(new Map());
   const debugHoverInflightRef = useRef<Map<string, Promise<string | null>>>(new Map());
   const debugHoverActiveKeyRef = useRef<string>("");
+  const selectedDebugSessionIdRef = useRef<string | null>(null);
+  const debugSessionsSocketRef = useRef<WebSocket | null>(null);
+  const debugSessionsReconnectTimerRef = useRef<number | null>(null);
 
   const loadDebugSessions = useCallback(async () => {
     const response = await fetch("/v1/debug-sessions");
@@ -67,6 +71,41 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
     const detail = (await response.json()) as DebugSessionDetail;
     setSelectedDebugSession(detail);
     setSelectedDebugSessionId(detail.session_id);
+  }, []);
+
+  const applyDebugStreamSnapshot = useCallback((snapshot: DebugSessionsStreamSnapshot) => {
+    if (snapshot.kind !== "snapshot") {
+      return;
+    }
+    setDebugSessions(snapshot.sessions);
+
+    const selectedId = selectedDebugSessionIdRef.current;
+    if (!selectedId) {
+      return;
+    }
+    if (snapshot.selected_session && snapshot.selected_session.session_id === selectedId) {
+      setSelectedDebugSession(snapshot.selected_session);
+      return;
+    }
+    const stillExists = snapshot.sessions.some((session) => session.session_id === selectedId);
+    if (!stillExists) {
+      setSelectedDebugSession(null);
+      setSelectedDebugSessionId(null);
+      setDebugView("list");
+    }
+  }, []);
+
+  const sendDebugStreamSubscription = useCallback((sessionId: string | null) => {
+    const socket = debugSessionsSocketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    socket.send(
+      JSON.stringify({
+        kind: "subscribe",
+        session_id: sessionId
+      })
+    );
   }, []);
 
   useEffect(() => {
@@ -246,12 +285,72 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
   }, [selectedDebugSession]);
 
   useEffect(() => {
+    selectedDebugSessionIdRef.current = selectedDebugSessionId;
+    sendDebugStreamSubscription(selectedDebugSessionId);
+  }, [selectedDebugSessionId, sendDebugStreamSubscription]);
+
+  useEffect(() => {
     debugCommandLoadingRef.current = debugCommandLoading;
   }, [debugCommandLoading]);
 
   useEffect(() => {
     runDebugCommandRef.current = runDebugCommand;
   }, [runDebugCommand]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const connect = () => {
+      if (cancelled) {
+        return;
+      }
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const socket = new WebSocket(`${protocol}//${window.location.host}/v1/debug-sessions/stream`);
+      debugSessionsSocketRef.current = socket;
+
+      socket.onopen = () => {
+        sendDebugStreamSubscription(selectedDebugSessionIdRef.current);
+      };
+      socket.onmessage = (event) => {
+        if (typeof event.data !== "string") {
+          return;
+        }
+        try {
+          const payload = JSON.parse(event.data) as DebugSessionsStreamSnapshot;
+          applyDebugStreamSnapshot(payload);
+        } catch {
+          // ignore malformed stream payloads
+        }
+      };
+      socket.onerror = () => {
+        socket.close();
+      };
+      socket.onclose = () => {
+        if (debugSessionsSocketRef.current === socket) {
+          debugSessionsSocketRef.current = null;
+        }
+        if (cancelled) {
+          return;
+        }
+        if (debugSessionsReconnectTimerRef.current !== null) {
+          window.clearTimeout(debugSessionsReconnectTimerRef.current);
+        }
+        debugSessionsReconnectTimerRef.current = window.setTimeout(connect, 1000);
+      };
+    };
+
+    connect();
+    return () => {
+      cancelled = true;
+      if (debugSessionsReconnectTimerRef.current !== null) {
+        window.clearTimeout(debugSessionsReconnectTimerRef.current);
+        debugSessionsReconnectTimerRef.current = null;
+      }
+      const socket = debugSessionsSocketRef.current;
+      debugSessionsSocketRef.current = null;
+      socket?.close();
+    };
+  }, [applyDebugStreamSnapshot, sendDebugStreamSubscription]);
 
   const resolveDebugHoverValue = useCallback(async (session: DebugSessionDetail, variable: string) => {
     const cacheKey = `${session.session_id}:${variable}:${session.current_line ?? 0}`;
@@ -464,21 +563,6 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
     debugHoverInflightRef.current.clear();
     debugHoverActiveKeyRef.current = "";
   }, [selectedDebugSessionId, selectedDebugSession?.current_line]);
-
-  useEffect(() => {
-    if (!selectedDebugSessionId) {
-      return;
-    }
-    const timer = window.setInterval(() => {
-      loadDebugSessionDetail(selectedDebugSessionId).catch(() => {
-        // ignore background refresh errors
-      });
-      loadDebugSessions().catch(() => {
-        // ignore background refresh errors
-      });
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [loadDebugSessionDetail, loadDebugSessions, selectedDebugSessionId]);
 
   useEffect(() => {
     setDebugHoveredVar("");

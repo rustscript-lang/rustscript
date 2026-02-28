@@ -253,6 +253,12 @@ export type DebugSessionListResponse = {
   sessions: DebugSessionSummary[];
 };
 
+export type DebugSessionsStreamSnapshot = {
+  kind: "snapshot";
+  sessions: DebugSessionSummary[];
+  selected_session: DebugSessionDetail | null;
+};
+
 export type DebugCommandResponse = {
   phase: DebugSessionPhase;
   output: string;

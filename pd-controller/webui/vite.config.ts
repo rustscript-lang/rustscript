@@ -16,7 +16,10 @@ export default defineConfig(({ command }) => ({
   server: {
     port: 5173,
     proxy: {
-      "/v1": controllerTarget,
+      "/v1": {
+        target: controllerTarget,
+        ws: true
+      },
       "/healthz": controllerTarget,
       "/metrics": controllerTarget
     }

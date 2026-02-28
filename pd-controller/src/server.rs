@@ -12,7 +12,10 @@ use std::{
 use axum::{
     Json, Router,
     body::to_bytes,
-    extract::{Path, Query, Request, State},
+    extract::{
+        Path, Query, Request, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::{StatusCode, header::CONTENT_TYPE},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -25,7 +28,7 @@ use edge::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::oneshot,
+    sync::{oneshot, watch},
     time::{Duration, timeout},
 };
 use tracing::{info, warn};
@@ -95,6 +98,8 @@ pub struct ControllerState {
     debug_recordings: Arc<tokio::sync::RwLock<HashMap<String, Vec<StoredDebugRecording>>>>,
     debug_start_lookup: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     debug_command_waiters: Arc<DebugCommandWaiters>,
+    debug_sessions_revision: Arc<AtomicU64>,
+    debug_sessions_notify: watch::Sender<u64>,
     persist_lock: Arc<tokio::sync::Mutex<()>>,
     config: ControllerConfig,
 }
@@ -608,6 +613,7 @@ impl ControllerState {
     pub fn new(config: ControllerConfig) -> Self {
         let (store, command_sequence, program_sequence, debug_sessions, debug_recordings) =
             load_snapshot_from_disk(config.state_path.as_deref(), config.max_result_history);
+        let (debug_sessions_notify, _debug_sessions_rx) = watch::channel(0_u64);
         let debug_start_lookup = debug_sessions
             .values()
             .filter(|session| session.phase == DebugSessionPhase::WaitingForStartResult)
@@ -622,6 +628,8 @@ impl ControllerState {
             debug_recordings: Arc::new(tokio::sync::RwLock::new(debug_recordings)),
             debug_start_lookup: Arc::new(tokio::sync::RwLock::new(debug_start_lookup)),
             debug_command_waiters: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            debug_sessions_revision: Arc::new(AtomicU64::new(0)),
+            debug_sessions_notify,
             persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             config,
         }
@@ -634,6 +642,40 @@ impl ControllerState {
 
     fn next_program_id(&self) -> String {
         Uuid::new_v4().to_string()
+    }
+
+    fn notify_debug_sessions_changed(&self) {
+        let revision = self
+            .debug_sessions_revision
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let _ = self.debug_sessions_notify.send(revision);
+    }
+
+    fn subscribe_debug_sessions(&self) -> watch::Receiver<u64> {
+        self.debug_sessions_notify.subscribe()
+    }
+
+    async fn debug_sessions_snapshot(
+        &self,
+        selected_session_id: Option<&str>,
+    ) -> DebugSessionsStreamSnapshot {
+        let (mut sessions, selected_session) = {
+            let guard = self.debug_sessions.read().await;
+            let sessions = guard
+                .values()
+                .map(DebugSessionRecord::to_summary)
+                .collect::<Vec<_>>();
+            let selected_session = selected_session_id
+                .and_then(|session_id| guard.get(session_id).map(DebugSessionRecord::to_detail));
+            (sessions, selected_session)
+        };
+        sessions.sort_by(|lhs, rhs| rhs.updated_unix_ms.cmp(&lhs.updated_unix_ms));
+        DebugSessionsStreamSnapshot {
+            kind: "snapshot",
+            sessions,
+            selected_session,
+        }
     }
 
     async fn enqueue_command(
@@ -1527,6 +1569,13 @@ struct DebugSessionListResponse {
     sessions: Vec<DebugSessionSummary>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct DebugSessionsStreamSnapshot {
+    kind: &'static str,
+    sessions: Vec<DebugSessionSummary>,
+    selected_session: Option<DebugSessionDetail>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct CreateDebugSessionRequest {
     edge_id: String,
@@ -1911,6 +1960,10 @@ pub fn build_controller_app(state: ControllerState) -> Router {
         .route(
             "/v1/debug-sessions",
             get(list_debug_sessions_handler).post(create_debug_session_handler),
+        )
+        .route(
+            "/v1/debug-sessions/stream",
+            get(debug_sessions_stream_handler),
         )
         .route(
             "/v1/debug-sessions/{session_id}",
