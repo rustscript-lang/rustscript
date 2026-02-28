@@ -793,7 +793,8 @@ impl Compiler {
         self.assembler.push_const(Value::String("int".to_string()));
         self.assembler.ceq();
         self.assembler.brfalse_label(&not_int_label);
-        self.assembler.call(BuiltinFunction::ToString.call_index(), 1);
+        self.assembler
+            .call(BuiltinFunction::ToString.call_index(), 1);
         self.assembler.br_label(&done_label);
 
         self.assembler
@@ -801,10 +802,12 @@ impl Compiler {
             .expect("compiler-generated label should be valid");
         self.assembler.dup();
         self.assembler.call(BuiltinFunction::TypeOf.call_index(), 1);
-        self.assembler.push_const(Value::String("float".to_string()));
+        self.assembler
+            .push_const(Value::String("float".to_string()));
         self.assembler.ceq();
         self.assembler.brfalse_label(&not_float_label);
-        self.assembler.call(BuiltinFunction::ToString.call_index(), 1);
+        self.assembler
+            .call(BuiltinFunction::ToString.call_index(), 1);
         self.assembler.br_label(&done_label);
 
         self.assembler

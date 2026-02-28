@@ -797,7 +797,9 @@ fn lower_import_require_stmt(
 
     for arg in args {
         let Some(clause) = arg.as_list() else {
-            if let SchemeNode::String(spec) = &arg.node && spec == "vm" {
+            if let SchemeNode::String(spec) = &arg.node
+                && spec == "vm"
+            {
                 if !emitted_vm_wildcard {
                     push_line(out, indent, "use vm::*;");
                     emitted_vm_wildcard = true;
@@ -867,7 +869,8 @@ fn lower_import_require_stmt(
                         line: pair[1].line,
                         message: "vm import rename target must be a symbol".to_string(),
                     })?;
-                    let imported = normalize_identifier(imported, pair[0].line, "vm import source")?;
+                    let imported =
+                        normalize_identifier(imported, pair[0].line, "vm import source")?;
                     let local = normalize_identifier(local, pair[1].line, "vm import target")?;
                     if imported == local {
                         bindings.push(imported);
@@ -876,7 +879,11 @@ fn lower_import_require_stmt(
                     }
                 }
                 if !bindings.is_empty() {
-                    push_line(out, indent, &format!("use vm::{{{}}};", bindings.join(", ")));
+                    push_line(
+                        out,
+                        indent,
+                        &format!("use vm::{{{}}};", bindings.join(", ")),
+                    );
                 }
                 emitted_any = true;
             }
