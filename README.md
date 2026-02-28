@@ -35,62 +35,104 @@ docker pull fffonion/pd-edge:latest
 docker pull fffonion/pd-controller:latest
 ```
 
-## Local end-to-end quick start
+## Run with Docker
 
-1. Build Web UI assets (embedded into `pd-controller` binary):
+1. Create a shared Docker network:
 
-```powershell
-cd pd-controller/webui
-bun install
-bun run build
-cd ../..
+```bash
+docker network create project-d-net
 ```
 
 2. Start controller:
 
-```powershell
-cargo run -p pd-controller
+```bash
+docker run -d --name pd-controller \
+  --network project-d-net \
+  -p 9100:9100 \
+  -e CONTROLLER_ADDR=0.0.0.0:9100 \
+  -e CONTROLLER_STATE_PATH=/data/state.json \
+  -v pd-controller-data:/data \
+  fffonion/pd-controller:latest
 ```
 
-3. Start one edge that actively connects to controller:
+3. Start edge and connect it to controller:
 
-```powershell
-cargo run -p pd-edge -- --control-plane-url "http://127.0.0.1:9100" --edge-name "edge-local-1"
+```bash
+docker run -d --name pd-edge \
+  --network project-d-net \
+  -p 8080:8080 \
+  -p 8081:8081 \
+  -v pd-edge-data:/var/lib/pd-edge \
+  fffonion/pd-edge:latest \
+  --control-plane-url http://pd-controller:9100 \
+  --edge-name edge-docker-1 \
+  --edge-id-path /var/lib/pd-edge/edge-id \
+  --data-addr 0.0.0.0:8080 \
+  --admin-addr 0.0.0.0:8081 \
+  --control-plane-poll-interval-ms 1000 \
+  --control-plane-rpc-timeout-ms 5000
 ```
 
-4. Open controller Web UI:
+4. Open WebUI:
 
 ```text
 http://127.0.0.1:9100/ui
 ```
 
-## Standalone edge quick start (no controller)
+## Run from Release Binaries
 
-1. Start `pd-edge` without `--control-plane-url`:
+1. Download artifacts from GitHub Releases:
 
-```powershell
-cargo run -p pd-edge
+```bash
+TAG=v0.1.0
+curl -LO https://github.com/fffonion/project-d/releases/download/${TAG}/pd-controller-${TAG}-linux-x86_64.tar.gz
+curl -LO https://github.com/fffonion/project-d/releases/download/${TAG}/pd-edge-${TAG}-linux-x86_64.tar.gz
+curl -LO https://github.com/fffonion/project-d/releases/download/${TAG}/pd-vm-run-${TAG}-linux-x86_64.tar.gz
 ```
 
-2. Compile a program to VMBC bytecode with `pd-vm-run`:
+2. Extract binaries:
 
-```powershell
-New-Item -ItemType Directory -Force out | Out-Null
-cargo run -p pd-vm --bin pd-vm-run -- --emit-vmbc out/sample_proxy_program.vmbc pd-edge/examples/sample_proxy_program.rss
+```bash
+tar -xzf pd-controller-${TAG}-linux-x86_64.tar.gz
+tar -xzf pd-edge-${TAG}-linux-x86_64.tar.gz
+tar -xzf pd-vm-run-${TAG}-linux-x86_64.tar.gz
 ```
 
-3. Upload bytecode to `pd-edge` local admin API:
+3. Run controller:
 
-```powershell
-curl -X PUT "http://127.0.0.1:8081/program" `
-  -H "content-type: application/octet-stream" `
-  --data-binary "@out/sample_proxy_program.vmbc"
+```bash
+CONTROLLER_ADDR=0.0.0.0:9100 \
+CONTROLLER_DEFAULT_POLL_MS=1000 \
+CONTROLLER_STATE_PATH=.pd-controller/state.json \
+./pd-controller
 ```
 
-4. Send a data-plane request:
+4. Run edge:
 
-```powershell
-curl -i "http://127.0.0.1:8080/anything" -H "x-client-id: demo-client"
+```bash
+./pd-edge \
+  --control-plane-url http://127.0.0.1:9100 \
+  --edge-name edge-local-1 \
+  --edge-id-path .pd-edge/edge-id \
+  --data-addr 0.0.0.0:8080 \
+  --admin-addr 127.0.0.1:8081 \
+  --max-program-bytes 1048576 \
+  --control-plane-poll-interval-ms 1000 \
+  --control-plane-rpc-timeout-ms 5000
+```
+
+5. Open WebUI:
+
+```text
+http://127.0.0.1:9100/ui
+```
+
+6. `pd-vm-run` CLI examples:
+
+```bash
+./pd-vm-run --version
+./pd-vm-run --emit-vmbc out/program.vmbc ./program.rss
+./pd-vm-run --jit-hot-loop 2 --jit-dump ./program.rss
 ```
 
 ## Key runtime behavior

@@ -1,9 +1,9 @@
 /target
 .vsix
-.vmbc
-.pdr
 .pd-controller
 .pd-edge
 *.wasm
+*.vmbc
+*.pdr
 node_modules
 dist
