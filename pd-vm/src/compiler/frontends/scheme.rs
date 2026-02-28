@@ -307,7 +307,7 @@ fn parse_number_atom(atom: &str) -> Option<TokenKind> {
     }
 
     let body = atom.strip_prefix('-').unwrap_or(atom);
-    if body.is_empty() || !body.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+    if body.is_empty() || !body.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return None;
     }
 
@@ -1540,8 +1540,8 @@ fn lower_list_expr(items: &[SchemeForm], line: usize) -> Result<String, ParseErr
             let value = lower_expr(&args[0])?;
             Ok(format!("!({value})"))
         }
-        "and" => lower_and_expr(args, line),
-        "or" => lower_or_expr(args, line),
+        "and" => lower_and_expr(args),
+        "or" => lower_or_expr(args),
 
         // Type predicates
         "null?" => lower_type_check(args, line, "null"),
@@ -2063,7 +2063,7 @@ fn lower_remainder_expr(args: &[SchemeForm], line: usize) -> Result<String, Pars
     Ok(format!("(({a}) % ({b}))"))
 }
 
-fn lower_and_expr(args: &[SchemeForm], line: usize) -> Result<String, ParseError> {
+fn lower_and_expr(args: &[SchemeForm]) -> Result<String, ParseError> {
     if args.is_empty() {
         return Ok("true".to_string());
     }
@@ -2072,11 +2072,11 @@ fn lower_and_expr(args: &[SchemeForm], line: usize) -> Result<String, ParseError
     }
     // Short-circuit: if a => { b } else => { false }
     let first = lower_expr(&args[0])?;
-    let rest = lower_and_expr(&args[1..], line)?;
+    let rest = lower_and_expr(&args[1..])?;
     Ok(format!("if {first} => {{ {rest} }} else => {{ false }}"))
 }
 
-fn lower_or_expr(args: &[SchemeForm], line: usize) -> Result<String, ParseError> {
+fn lower_or_expr(args: &[SchemeForm]) -> Result<String, ParseError> {
     if args.is_empty() {
         return Ok("false".to_string());
     }
@@ -2085,7 +2085,7 @@ fn lower_or_expr(args: &[SchemeForm], line: usize) -> Result<String, ParseError>
     }
     // Short-circuit: use temp to avoid re-evaluation
     let first = lower_expr(&args[0])?;
-    let rest = lower_or_expr(&args[1..], line)?;
+    let rest = lower_or_expr(&args[1..])?;
     let t = gensym("or");
     Ok(format!(
         "if ({t} = {first}) => {{ if {t} => {{ {t} }} else => {{ {rest} }} }} else => {{ {t} }}"
@@ -2297,7 +2297,7 @@ fn lower_type_check(
     if args.len() != 1 {
         return Err(ParseError {
             line,
-            message: format!("type predicate expects exactly one argument"),
+            message: "type predicate expects exactly one argument".to_string(),
         });
     }
     let val = lower_expr(&args[0])?;

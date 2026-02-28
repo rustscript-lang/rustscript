@@ -501,31 +501,26 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
     };
 
     let proxy_inputs = {
-        let method = parts.method.clone();
         let uri = parts.uri.clone();
         let request_headers = parts.headers.clone();
-        let request_path = uri.path().to_string();
-        let request_query = uri.query().unwrap_or("").to_string();
-        let request_http_version = http_version_label(parts.version);
         let request_scheme = resolve_request_scheme(&uri, &request_headers);
-        let request_port = resolve_request_port(&uri, &request_headers, &request_scheme);
-        let request_host = resolve_request_host(&uri, &request_headers);
-        let request_client_ip = resolve_request_client_ip(&request_headers);
-        let request_id = Uuid::new_v4().to_string();
+        let vm_request = HttpRequestContext {
+            request_id: Uuid::new_v4().to_string(),
+            method: parts.method.clone(),
+            path: uri.path().to_string(),
+            query: uri.query().unwrap_or("").to_string(),
+            http_version: http_version_label(parts.version),
+            port: resolve_request_port(&uri, &request_headers, &request_scheme),
+            scheme: request_scheme,
+            host: resolve_request_host(&uri, &request_headers),
+            client_ip: resolve_request_client_ip(&request_headers),
+            body: body_bytes.to_vec(),
+            headers: request_headers,
+        };
         let vm_outcome = match execute_vm_for_request(
             &state,
             &program,
-            method.clone(),
-            request_headers.clone(),
-            request_path,
-            request_query,
-            request_http_version,
-            request_port,
-            request_scheme,
-            request_host,
-            request_client_ip,
-            request_id,
-            body_bytes.to_vec(),
+            vm_request,
         )
         .await
         {
@@ -1134,38 +1129,20 @@ enum VmExecutionError {
 async fn execute_vm_for_request(
     state: &SharedState,
     program: &LoadedProgram,
-    request_method: Method,
-    request_headers: HeaderMap,
-    request_path: String,
-    request_query: String,
-    request_http_version: String,
-    request_port: u16,
-    request_scheme: String,
-    request_host: String,
-    request_client_ip: String,
-    request_id: String,
-    request_body: Vec<u8>,
+    request: HttpRequestContext,
 ) -> Result<crate::host_abi::VmExecutionOutcome, VmExecutionError> {
     let local_count = program.local_count;
     let program = program.program.clone();
     let rate_limiter = state.rate_limiter.clone();
     let debug_session = state.debug_session.clone();
 
+    let request_headers = request.headers.clone();
+    let request_path = request.path.clone();
+    let request_id = request.request_id.clone();
+
     let task = tokio::task::spawn_blocking(move || {
         let vm_context = Arc::new(std::sync::Mutex::new(ProxyVmContext::from_http_request(
-            HttpRequestContext {
-                request_id: request_id.clone(),
-                method: request_method.clone(),
-                path: request_path.clone(),
-                query: request_query.clone(),
-                http_version: request_http_version.clone(),
-                port: request_port,
-                scheme: request_scheme.clone(),
-                host: request_host.clone(),
-                client_ip: request_client_ip.clone(),
-                body: request_body.clone(),
-                headers: request_headers.clone(),
-            },
+            request,
             rate_limiter,
         )));
 

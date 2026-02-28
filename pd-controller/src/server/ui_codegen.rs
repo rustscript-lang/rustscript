@@ -3261,9 +3261,15 @@ fn render_single_block(
         }
         "get_upstream_response_status" => {
             let var = sanitize_identifier(block.values.get("var"), "upstream_status");
-            rss.push(format!("let {var} = vm::http::upstream::response::get_status();"));
-            js.push(format!("let {var} = vm.http.upstream.response.get_status();"));
-            lua.push(format!("local {var} = vm.http.upstream.response.get_status()"));
+            rss.push(format!(
+                "let {var} = vm::http::upstream::response::get_status();"
+            ));
+            js.push(format!(
+                "let {var} = vm.http.upstream.response.get_status();"
+            ));
+            lua.push(format!(
+                "local {var} = vm.http.upstream.response.get_status()"
+            ));
             scm.push(format!(
                 "(define {var} (vm.http.upstream.response.get_status))"
             ));
@@ -3305,10 +3311,16 @@ fn render_single_block(
         }
         "get_upstream_response_body" => {
             let var = sanitize_identifier(block.values.get("var"), "upstream_body");
-            rss.push(format!("let {var} = vm::http::upstream::response::get_body();"));
+            rss.push(format!(
+                "let {var} = vm::http::upstream::response::get_body();"
+            ));
             js.push(format!("let {var} = vm.http.upstream.response.get_body();"));
-            lua.push(format!("local {var} = vm.http.upstream.response.get_body()"));
-            scm.push(format!("(define {var} (vm.http.upstream.response.get_body))"));
+            lua.push(format!(
+                "local {var} = vm.http.upstream.response.get_body()"
+            ));
+            scm.push(format!(
+                "(define {var} (vm.http.upstream.response.get_body))"
+            ));
         }
         "string_concat" => {
             let var = sanitize_identifier(block.values.get("var"), "joined_text");

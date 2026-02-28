@@ -678,24 +678,15 @@ fn emit_native_step_shift_inline(
     Ok(())
 }
 
-fn emit_native_step_mod_inline(
-    code: &mut Vec<u8>,
-    layout: NativeStackLayout,
-) -> VmResult<()> {
+fn emit_native_step_mod_inline(code: &mut Vec<u8>, layout: NativeStackLayout) -> VmResult<()> {
     emit_native_step_binary_numeric_inline(code, layout, NativeBinaryNumericOp::Mod)
 }
 
-fn emit_native_step_and_inline(
-    code: &mut Vec<u8>,
-    layout: NativeStackLayout,
-) -> VmResult<()> {
+fn emit_native_step_and_inline(code: &mut Vec<u8>, layout: NativeStackLayout) -> VmResult<()> {
     emit_native_step_bool_inline(code, layout, true)
 }
 
-fn emit_native_step_or_inline(
-    code: &mut Vec<u8>,
-    layout: NativeStackLayout,
-) -> VmResult<()> {
+fn emit_native_step_or_inline(code: &mut Vec<u8>, layout: NativeStackLayout) -> VmResult<()> {
     emit_native_step_bool_inline(code, layout, false)
 }
 
