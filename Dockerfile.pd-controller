@@ -1,5 +1,12 @@
 # syntax=docker/dockerfile:1.7
 
+FROM rust:1-bookworm AS wasm-builder
+WORKDIR /src
+
+COPY . .
+RUN rustup target add wasm32-unknown-unknown \
+    && cargo build -p pd-vm-lint-wasm --target wasm32-unknown-unknown --release --locked
+
 FROM oven/bun:1 AS webui-builder
 WORKDIR /src/pd-controller/webui
 
@@ -7,7 +14,9 @@ COPY pd-controller/webui/package.json pd-controller/webui/bun.lock ./
 RUN bun install --frozen-lockfile
 
 COPY pd-controller/webui/ ./
-RUN bun run build
+RUN mkdir -p ./public/wasm
+COPY --from=wasm-builder /src/target/wasm32-unknown-unknown/release/pd_vm_lint_wasm.wasm ./public/wasm/pd_vm_lint_wasm.wasm
+RUN bun run tsc --noEmit && bun run vite build
 
 FROM rust:1-bookworm AS builder
 WORKDIR /src
