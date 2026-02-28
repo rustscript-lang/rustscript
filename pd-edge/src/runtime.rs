@@ -1,6 +1,7 @@
 use std::{
+    collections::VecDeque,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Instant,
@@ -21,6 +22,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
+use uuid::Uuid;
 use vm::{Program, Vm, VmStatus, decode_program, infer_local_count, validate_program};
 
 use crate::{
@@ -37,6 +39,8 @@ use crate::{
     },
     logging::{category_access, category_debug, category_program, method_label, status_label},
 };
+
+const MAX_LATENCY_SAMPLES: usize = 4096;
 
 #[derive(Clone)]
 pub struct SharedState {
@@ -71,6 +75,8 @@ pub struct TelemetrySnapshot {
     pub debug_session_attached: bool,
     #[serde(default)]
     pub debug_session_current_line: Option<u32>,
+    #[serde(default)]
+    pub debug_session_request_id: Option<String>,
     pub data_requests_total: u64,
     pub vm_execution_errors_total: u64,
     pub program_apply_success_total: u64,
@@ -125,6 +131,10 @@ impl SharedState {
             }
             _ => {}
         }
+    }
+
+    pub fn record_data_plane_latency_ms(&self, latency_ms: u64) {
+        self.runtime_metrics.record_latency_ms(latency_ms);
     }
 
     pub fn record_vm_execution_error(&self) {
@@ -190,6 +200,7 @@ impl SharedState {
             debug_session_active: debug_status.active,
             debug_session_attached: debug_status.attached,
             debug_session_current_line: debug_status.current_line,
+            debug_session_request_id: debug_status.request_id,
             data_requests_total: self
                 .runtime_metrics
                 .data_requests_total
@@ -226,6 +237,8 @@ impl SharedState {
     }
 
     pub fn traffic_sample(&self) -> EdgeTrafficSample {
+        let (latency_p50_ms, latency_p90_ms, latency_p99_ms) =
+            self.runtime_metrics.take_latency_percentiles_ms();
         EdgeTrafficSample {
             requests_total: self
                 .runtime_metrics
@@ -247,6 +260,9 @@ impl SharedState {
                 .runtime_metrics
                 .status_5xx_total
                 .load(Ordering::Relaxed),
+            latency_p50_ms,
+            latency_p90_ms,
+            latency_p99_ms,
         }
     }
 
@@ -305,6 +321,7 @@ struct RuntimeMetrics {
     control_rpc_polls_error_total: AtomicU64,
     control_rpc_results_success_total: AtomicU64,
     control_rpc_results_error_total: AtomicU64,
+    latency_samples_ms: Mutex<VecDeque<u64>>,
 }
 
 struct ProxyUpstreamInputs {
@@ -333,8 +350,47 @@ impl Default for RuntimeMetrics {
             control_rpc_polls_error_total: AtomicU64::new(0),
             control_rpc_results_success_total: AtomicU64::new(0),
             control_rpc_results_error_total: AtomicU64::new(0),
+            latency_samples_ms: Mutex::new(VecDeque::new()),
         }
     }
+}
+
+impl RuntimeMetrics {
+    fn record_latency_ms(&self, latency_ms: u64) {
+        let mut samples = self
+            .latency_samples_ms
+            .lock()
+            .expect("latency samples lock poisoned");
+        samples.push_back(latency_ms);
+        while samples.len() > MAX_LATENCY_SAMPLES {
+            let _ = samples.pop_front();
+        }
+    }
+
+    fn take_latency_percentiles_ms(&self) -> (u64, u64, u64) {
+        let mut values = {
+            let mut samples = self
+                .latency_samples_ms
+                .lock()
+                .expect("latency samples lock poisoned");
+            samples.drain(..).collect::<Vec<_>>()
+        };
+        if values.is_empty() {
+            return (0, 0, 0);
+        }
+        values.sort_unstable();
+        (
+            percentile_ms(&values, 50),
+            percentile_ms(&values, 90),
+            percentile_ms(&values, 99),
+        )
+    }
+}
+
+fn percentile_ms(sorted_values: &[u64], percentile: usize) -> u64 {
+    let len = sorted_values.len();
+    let idx = ((len - 1) * percentile) / 100;
+    sorted_values[idx]
 }
 
 pub fn build_data_app(state: SharedState) -> Router {
@@ -361,10 +417,14 @@ pub fn build_admin_app(state: SharedState) -> Router {
 }
 
 async fn data_plane_handler(State(state): State<SharedState>, request: Request) -> Response<Body> {
-    fn finalize(state: &SharedState, response: Response<Body>) -> Response<Body> {
+    let started = Instant::now();
+    let finalize = |state: &SharedState, response: Response<Body>| -> Response<Body> {
         state.record_data_plane_status(response.status().as_u16());
+        let elapsed_ms = started.elapsed().as_millis();
+        let latency_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
+        state.record_data_plane_latency_ms(latency_ms);
         response
-    }
+    };
 
     state.record_data_plane_request();
 
@@ -394,40 +454,49 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
         let method = parts.method.clone();
         let uri = parts.uri.clone();
         let request_headers = parts.headers.clone();
-        let vm_outcome =
-            match execute_vm_for_request(&state, &program, request_headers.clone()).await {
-                Ok(outcome) => outcome,
-                Err(VmExecutionError::HostRegistration(err)) => {
-                    state.record_vm_execution_error();
-                    warn!(
-                        "{} failed to register host module: {err}",
-                        category_program()
-                    );
-                    return finalize(&state, text_response(StatusCode::NOT_FOUND, "not found"));
-                }
-                Err(VmExecutionError::Vm(err)) => {
-                    state.record_vm_execution_error();
-                    warn!("{} vm execution error: {err}", category_program());
-                    return finalize(&state, text_response(StatusCode::NOT_FOUND, "not found"));
-                }
-                Err(VmExecutionError::NotHalted(status)) => {
-                    state.record_vm_execution_error();
-                    warn!(
-                        "{} vm returned non-halted status {:?}",
-                        category_program(),
-                        status
-                    );
-                    return finalize(&state, text_response(StatusCode::NOT_FOUND, "not found"));
-                }
-                Err(VmExecutionError::TaskJoin(err)) => {
-                    state.record_vm_execution_error();
-                    warn!("{} vm execution task failed: {err}", category_program());
-                    return finalize(
-                        &state,
-                        text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
-                    );
-                }
-            };
+        let request_path = uri.path().to_string();
+        let request_id = Uuid::new_v4().to_string();
+        let vm_outcome = match execute_vm_for_request(
+            &state,
+            &program,
+            request_headers.clone(),
+            request_path,
+            request_id,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(VmExecutionError::HostRegistration(err)) => {
+                state.record_vm_execution_error();
+                warn!(
+                    "{} failed to register host module: {err}",
+                    category_program()
+                );
+                return finalize(&state, text_response(StatusCode::NOT_FOUND, "not found"));
+            }
+            Err(VmExecutionError::Vm(err)) => {
+                state.record_vm_execution_error();
+                warn!("{} vm execution error: {err}", category_program());
+                return finalize(&state, text_response(StatusCode::NOT_FOUND, "not found"));
+            }
+            Err(VmExecutionError::NotHalted(status)) => {
+                state.record_vm_execution_error();
+                warn!(
+                    "{} vm returned non-halted status {:?}",
+                    category_program(),
+                    status
+                );
+                return finalize(&state, text_response(StatusCode::NOT_FOUND, "not found"));
+            }
+            Err(VmExecutionError::TaskJoin(err)) => {
+                state.record_vm_execution_error();
+                warn!("{} vm execution task failed: {err}", category_program());
+                return finalize(
+                    &state,
+                    text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
+                );
+            }
+        };
 
         if let Some(body) = vm_outcome.response_content {
             info!(
@@ -823,6 +892,8 @@ async fn execute_vm_for_request(
     state: &SharedState,
     program: &LoadedProgram,
     request_headers: HeaderMap,
+    request_path: String,
+    request_id: String,
 ) -> Result<crate::host_abi::VmExecutionOutcome, VmExecutionError> {
     let local_count = program.local_count;
     let program = program.program.clone();
@@ -839,8 +910,14 @@ async fn execute_vm_for_request(
         register_host_module(&mut vm, vm_context.clone())
             .map_err(VmExecutionError::HostRegistration)?;
 
-        let status = run_vm_with_optional_debugger(&debug_session, &request_headers, &mut vm)
-            .map_err(VmExecutionError::Vm)?;
+        let status = run_vm_with_optional_debugger(
+            &debug_session,
+            &request_headers,
+            &request_path,
+            &request_id,
+            &mut vm,
+        )
+        .map_err(VmExecutionError::Vm)?;
         if status != VmStatus::Halted {
             return Err(VmExecutionError::NotHalted(status));
         }

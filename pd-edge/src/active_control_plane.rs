@@ -5,9 +5,10 @@ use rand::RngCore;
 use tracing::{info, warn};
 
 use crate::{
-    CommandResultPayload, ControlPlaneCommand, EdgeCommandResult, EdgePollRequest,
-    EdgePollResponse, RemoteDebugCommandResponse, SharedState, StartDebugSessionRequest,
-    apply_program_from_bytes, run_debug_command, start_debug_session, stop_debug_session,
+    CommandResultPayload, ControlPlaneCommand, DebugSessionMode, EdgeCommandResult,
+    EdgePollRequest, EdgePollResponse, RemoteDebugCommandResponse, SharedState,
+    StartDebugSessionRequest, apply_program_from_bytes, drain_recording_artifacts,
+    run_debug_command, start_debug_session, stop_debug_session,
 };
 
 const MIN_POLL_INTERVAL_MS: u64 = 100;
@@ -100,41 +101,47 @@ pub async fn run_active_control_plane_client(state: SharedState, config: ActiveC
                         command.clone(),
                     )
                     .await;
-                    let result_ok = result.ok;
+                    report_result_to_control_plane(
+                        &state,
+                        &result_url,
+                        request_timeout,
+                        command.command_id(),
+                        result,
+                    )
+                    .await;
+                }
 
-                    let send_result = state
-                        .client
-                        .post(&result_url)
-                        .timeout(request_timeout)
-                        .json(&result)
-                        .send()
-                        .await;
-
-                    match send_result {
-                        Ok(response) if response.status().is_success() => {
-                            state.record_control_rpc_result_success();
-                            info!(
-                                "reported command result to control-plane command_id={} ok={}",
-                                command.command_id(),
-                                result_ok
-                            );
-                        }
-                        Ok(response) => {
-                            state.record_control_rpc_result_error();
-                            warn!(
-                                "control-plane result endpoint rejected command_id={} status={}",
-                                command.command_id(),
-                                response.status()
-                            );
-                        }
-                        Err(err) => {
-                            state.record_control_rpc_result_error();
-                            warn!(
-                                "failed to report command result command_id={} err={err}",
-                                command.command_id()
-                            );
-                        }
-                    }
+                let recording_artifacts = drain_recording_artifacts(&state.debug_session);
+                for artifact in recording_artifacts {
+                    let command_id =
+                        format!("recording-{}-{}", artifact.session_id, artifact.sequence);
+                    let result = EdgeCommandResult {
+                        edge_id: config.edge_id.clone(),
+                        edge_name: Some(config.edge_name.clone()),
+                        command_id: command_id.clone(),
+                        ok: true,
+                        result: CommandResultPayload::DebugRecording {
+                            session_id: artifact.session_id,
+                            recording_id: artifact.recording_id,
+                            request_id: artifact.request_id,
+                            request_path: artifact.request_path,
+                            recording_base64: artifact.recording_base64,
+                            frame_count: artifact.frame_count,
+                            terminal_status: artifact.terminal_status,
+                            sequence: artifact.sequence,
+                            completed: artifact.completed,
+                            message: None,
+                        },
+                        telemetry: state.telemetry_snapshot().await,
+                    };
+                    report_result_to_control_plane(
+                        &state,
+                        &result_url,
+                        request_timeout,
+                        command_id.as_str(),
+                        result,
+                    )
+                    .await;
                 }
             }
             Err(err) => {
@@ -173,23 +180,45 @@ async fn execute_command(
             }
         }
         ControlPlaneCommand::StartDebugSession {
+            session_id,
+            tcp_addr,
             header_name,
             stop_on_entry,
+            mode,
+            request_path,
+            record_count,
             ..
         } => {
             let header_name = header_name.unwrap_or_else(|| DEFAULT_DEBUG_NONCE_HEADER.to_string());
-            let nonce = generate_debug_nonce();
+            let nonce = if mode == DebugSessionMode::Interactive {
+                Some(generate_debug_nonce())
+            } else {
+                None
+            };
+            let request_header_name = if mode == DebugSessionMode::Interactive {
+                Some(header_name.clone())
+            } else {
+                None
+            };
             let request = StartDebugSessionRequest {
-                header_name: header_name.clone(),
+                session_id: session_id.clone(),
+                header_name: request_header_name,
                 header_value: nonce.clone(),
-                tcp_addr: None,
+                tcp_addr,
                 stop_on_entry: stop_on_entry.unwrap_or(true),
+                mode: mode.clone(),
+                request_path,
+                record_count: record_count.unwrap_or(1),
             };
             match start_debug_session(&state.debug_session, request) {
                 Ok(status) => CommandResultPayload::StartDebugSession {
                     status: Some(status),
-                    nonce_header_name: Some(header_name),
-                    nonce_header_value: Some(nonce),
+                    nonce_header_name: if mode == DebugSessionMode::Interactive {
+                        Some(header_name)
+                    } else {
+                        None
+                    },
+                    nonce_header_value: nonce,
                     message: None,
                 },
                 Err(err) => {
@@ -253,6 +282,48 @@ async fn execute_command(
         ok,
         result,
         telemetry,
+    }
+}
+
+async fn report_result_to_control_plane(
+    state: &SharedState,
+    result_url: &str,
+    request_timeout: Duration,
+    command_id: &str,
+    result: EdgeCommandResult,
+) {
+    let result_ok = result.ok;
+    let send_result = state
+        .client
+        .post(result_url)
+        .timeout(request_timeout)
+        .json(&result)
+        .send()
+        .await;
+
+    match send_result {
+        Ok(response) if response.status().is_success() => {
+            state.record_control_rpc_result_success();
+            info!(
+                "reported command result to control-plane command_id={} ok={}",
+                command_id, result_ok
+            );
+        }
+        Ok(response) => {
+            state.record_control_rpc_result_error();
+            warn!(
+                "control-plane result endpoint rejected command_id={} status={}",
+                command_id,
+                response.status()
+            );
+        }
+        Err(err) => {
+            state.record_control_rpc_result_error();
+            warn!(
+                "failed to report command result command_id={} err={err}",
+                command_id
+            );
+        }
     }
 }
 
