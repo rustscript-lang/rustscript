@@ -753,6 +753,32 @@ impl Vm {
                 let lhs = self.pop_int()?;
                 self.stack.push(Value::Int(lhs.wrapping_shr(rhs)));
             }
+            x if x == OpCode::Mod as u8 => {
+                self.binary_numeric_op(
+                    |lhs, rhs| {
+                        if rhs == 0 {
+                            return Err(VmError::DivisionByZero);
+                        }
+                        Ok(lhs.wrapping_rem(rhs))
+                    },
+                    |lhs, rhs| {
+                        if rhs == 0.0 {
+                            return Err(VmError::DivisionByZero);
+                        }
+                        Ok(lhs % rhs)
+                    },
+                )?;
+            }
+            x if x == OpCode::And as u8 => {
+                let rhs = self.pop_bool()?;
+                let lhs = self.pop_bool()?;
+                self.stack.push(Value::Bool(lhs && rhs));
+            }
+            x if x == OpCode::Or as u8 => {
+                let rhs = self.pop_bool()?;
+                let lhs = self.pop_bool()?;
+                self.stack.push(Value::Bool(lhs || rhs));
+            }
             x if x == OpCode::Neg as u8 => {
                 let value = self.pop_numeric()?;
                 match value {
@@ -877,6 +903,22 @@ impl Vm {
                         },
                     )?;
                 }
+                crate::jit::TraceStep::Mod => {
+                    self.binary_numeric_op(
+                        |lhs, rhs| {
+                            if rhs == 0 {
+                                return Err(VmError::DivisionByZero);
+                            }
+                            Ok(lhs.wrapping_rem(rhs))
+                        },
+                        |lhs, rhs| {
+                            if rhs == 0.0 {
+                                return Err(VmError::DivisionByZero);
+                            }
+                            Ok(lhs % rhs)
+                        },
+                    )?;
+                }
                 crate::jit::TraceStep::Shl => {
                     let rhs = self.pop_shift_amount()?;
                     let lhs = self.pop_int()?;
@@ -886,6 +928,16 @@ impl Vm {
                     let rhs = self.pop_shift_amount()?;
                     let lhs = self.pop_int()?;
                     self.stack.push(Value::Int(lhs.wrapping_shr(rhs)));
+                }
+                crate::jit::TraceStep::And => {
+                    let rhs = self.pop_bool()?;
+                    let lhs = self.pop_bool()?;
+                    self.stack.push(Value::Bool(lhs && rhs));
+                }
+                crate::jit::TraceStep::Or => {
+                    let rhs = self.pop_bool()?;
+                    let lhs = self.pop_bool()?;
+                    self.stack.push(Value::Bool(lhs || rhs));
                 }
                 crate::jit::TraceStep::Neg => {
                     let value = self.pop_numeric()?;

@@ -36,6 +36,22 @@ fn scheme_vm_prefixed_namespace_host_calls_are_supported() {
 }
 
 #[test]
+fn scheme_vm_http_subnamespace_host_calls_are_supported() {
+    let source = r#"
+        (require (prefix-in vm. "vm"))
+        (vm.http.request.get_header "x-client-id")
+    "#;
+    let compiled =
+        compile_source_with_flavor(source, SourceFlavor::Scheme).expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    vm.bind_function("http::request::get_header", Box::new(EchoString));
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("x-client-id".to_string())]);
+}
+
+#[test]
 fn compile_source_with_scheme_flavor() {
     let source = include_str!("../examples/example.scm");
 
@@ -238,4 +254,17 @@ fn scheme_undeclared_host_call_is_rejected() {
         }
         other => panic!("unexpected error: {other}"),
     }
+}
+
+#[test]
+fn scheme_modulo_uses_native_operator() {
+    let source = r#"(define m (modulo 17 5))
+(+ m 2)"#;
+
+    let compiled =
+        compile_source_with_flavor(source, SourceFlavor::Scheme).expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(4)]);
 }

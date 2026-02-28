@@ -142,12 +142,24 @@ fn emit_native_trace_bytes(trace: &crate::jit::JitTrace) -> VmResult<Vec<u8>> {
                 )?;
                 emit_native_status_check(&mut code, &mut jump_patches);
             }
+            crate::jit::TraceStep::Mod => {
+                emit_native_step_mod_inline(&mut code, layout)?;
+                emit_native_status_check(&mut code, &mut jump_patches);
+            }
             crate::jit::TraceStep::Shl => {
                 emit_native_step_shift_inline(&mut code, layout, true)?;
                 emit_native_status_check(&mut code, &mut jump_patches);
             }
             crate::jit::TraceStep::Shr => {
                 emit_native_step_shift_inline(&mut code, layout, false)?;
+                emit_native_status_check(&mut code, &mut jump_patches);
+            }
+            crate::jit::TraceStep::And => {
+                emit_native_step_and_inline(&mut code, layout)?;
+                emit_native_status_check(&mut code, &mut jump_patches);
+            }
+            crate::jit::TraceStep::Or => {
+                emit_native_step_or_inline(&mut code, layout)?;
                 emit_native_status_check(&mut code, &mut jump_patches);
             }
             crate::jit::TraceStep::Neg => {
@@ -282,6 +294,7 @@ enum NativeBinaryNumericOp {
     Sub,
     Mul,
     Div,
+    Mod,
     Clt,
     Cgt,
 }
@@ -678,6 +691,49 @@ fn emit_native_step_binary_numeric_inline(
             patch_rel32(code, int_ok, int_div_end)?;
             patch_rel32(code, int_div_zero_done, int_div_end)?;
         }
+        NativeBinaryNumericOp::Mod => {
+            code.extend_from_slice(&[0x48, 0x83, 0xBE]); // cmp qword [rsi+disp32], imm8
+            code.extend_from_slice(&layout.value.int_payload_offset.to_le_bytes());
+            code.push(0x00);
+            let int_div_zero = emit_jcc_rel32(code, [0x0F, 0x84]); // je
+            code.extend_from_slice(&[0x48, 0x8B, 0x87]); // mov rax, [rdi+disp32]
+            code.extend_from_slice(&layout.value.int_payload_offset.to_le_bytes());
+            code.extend_from_slice(&[0x48, 0xB9]); // mov rcx, imm64
+            code.extend_from_slice(&(i64::MIN as u64).to_le_bytes());
+            code.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
+            let lhs_not_min = emit_jcc_rel32(code, [0x0F, 0x85]); // jne
+            code.extend_from_slice(&[0x48, 0x83, 0xBE]); // cmp qword [rsi+disp32], imm8
+            code.extend_from_slice(&layout.value.int_payload_offset.to_le_bytes());
+            code.push(0xFF);
+            let rhs_not_minus_one = emit_jcc_rel32(code, [0x0F, 0x85]); // jne
+            code.extend_from_slice(&[0x48, 0xC7, 0x87]); // mov qword [rdi+disp32], imm32
+            code.extend_from_slice(&layout.value.int_payload_offset.to_le_bytes());
+            code.extend_from_slice(&0i32.to_le_bytes());
+            emit_store_tag_rdi(code, layout.value, layout.value.int_tag)?;
+            emit_adjust_stack_len_minus_one(code, stack_len_offset);
+            emit_status_continue(code);
+            let int_overflow_ok = emit_jmp_rel32(code);
+            let int_div = code.len();
+            code.extend_from_slice(&[0x48, 0x99]); // cqo
+            code.extend_from_slice(&[0x48, 0xF7, 0xBE]); // idiv qword [rsi+disp32]
+            code.extend_from_slice(&layout.value.int_payload_offset.to_le_bytes());
+            code.extend_from_slice(&[0x48, 0x89, 0x97]); // mov [rdi+disp32], rdx
+            code.extend_from_slice(&layout.value.int_payload_offset.to_le_bytes());
+            emit_store_tag_rdi(code, layout.value, layout.value.int_tag)?;
+            emit_adjust_stack_len_minus_one(code, stack_len_offset);
+            emit_status_continue(code);
+            let int_ok = emit_jmp_rel32(code);
+            let int_div_zero_label = code.len();
+            emit_status_error(code);
+            let int_div_zero_done = emit_jmp_rel32(code);
+            let int_div_end = code.len();
+            patch_rel32(code, int_div_zero, int_div_zero_label)?;
+            patch_rel32(code, lhs_not_min, int_div)?;
+            patch_rel32(code, rhs_not_minus_one, int_div)?;
+            patch_rel32(code, int_overflow_ok, int_div_end)?;
+            patch_rel32(code, int_ok, int_div_end)?;
+            patch_rel32(code, int_div_zero_done, int_div_end)?;
+        }
         NativeBinaryNumericOp::Clt | NativeBinaryNumericOp::Cgt => {
             code.extend_from_slice(&[0x48, 0x8B, 0x87]); // mov rax, [rdi+disp32]
             code.extend_from_slice(&layout.value.int_payload_offset.to_le_bytes());
@@ -789,6 +845,30 @@ fn emit_native_step_binary_numeric_inline(
             patch_rel32(code, float_div_zero, div_zero_label)?;
             patch_rel32(code, div_ok, div_end)?;
             patch_rel32(code, div_zero_done, div_end)?;
+        }
+        NativeBinaryNumericOp::Mod => {
+            code.extend_from_slice(&[0x66, 0x0F, 0x57, 0xD2]); // xorpd xmm2, xmm2
+            code.extend_from_slice(&[0x66, 0x0F, 0x2E, 0xCA]); // ucomisd xmm1, xmm2
+            let float_div_zero = emit_jcc_rel32(code, [0x0F, 0x84]); // je
+            code.extend_from_slice(&[0x66, 0x0F, 0x28, 0xD0]); // movapd xmm2, xmm0
+            code.extend_from_slice(&[0xF2, 0x0F, 0x5E, 0xD1]); // divsd xmm2, xmm1
+            code.extend_from_slice(&[0xF2, 0x48, 0x0F, 0x2C, 0xC2]); // cvttsd2si rax, xmm2
+            code.extend_from_slice(&[0xF2, 0x48, 0x0F, 0x2A, 0xD0]); // cvtsi2sd xmm2, rax
+            code.extend_from_slice(&[0xF2, 0x0F, 0x59, 0xD1]); // mulsd xmm2, xmm1
+            code.extend_from_slice(&[0xF2, 0x0F, 0x5C, 0xC2]); // subsd xmm0, xmm2
+            emit_store_tag_rdi(code, layout.value, layout.value.float_tag)?;
+            code.extend_from_slice(&[0xF2, 0x0F, 0x11, 0x87]); // movsd [rdi+disp32], xmm0
+            code.extend_from_slice(&layout.value.float_payload_offset.to_le_bytes());
+            emit_adjust_stack_len_minus_one(code, stack_len_offset);
+            emit_status_continue(code);
+            let mod_ok = emit_jmp_rel32(code);
+            let mod_zero_label = code.len();
+            emit_status_error(code);
+            let mod_zero_done = emit_jmp_rel32(code);
+            let mod_end = code.len();
+            patch_rel32(code, float_div_zero, mod_zero_label)?;
+            patch_rel32(code, mod_ok, mod_end)?;
+            patch_rel32(code, mod_zero_done, mod_end)?;
         }
         NativeBinaryNumericOp::Clt | NativeBinaryNumericOp::Cgt => {
             code.extend_from_slice(&[0x66, 0x0F, 0x2E, 0xC1]); // ucomisd xmm0, xmm1
@@ -905,6 +985,72 @@ fn emit_native_step_shift_inline(
     patch_rel32(code, rhs_not_int, error_label)?;
     patch_rel32(code, neg_shift, error_label)?;
     patch_rel32(code, big_shift, error_label)?;
+    patch_rel32(code, ok_done, done_label)?;
+    Ok(())
+}
+
+fn emit_native_step_mod_inline(
+    code: &mut Vec<u8>,
+    layout: NativeStackLayout,
+) -> VmResult<()> {
+    emit_native_step_binary_numeric_inline(code, layout, NativeBinaryNumericOp::Mod)
+}
+
+fn emit_native_step_and_inline(
+    code: &mut Vec<u8>,
+    layout: NativeStackLayout,
+) -> VmResult<()> {
+    emit_native_step_bool_inline(code, layout, true)
+}
+
+fn emit_native_step_or_inline(
+    code: &mut Vec<u8>,
+    layout: NativeStackLayout,
+) -> VmResult<()> {
+    emit_native_step_bool_inline(code, layout, false)
+}
+
+fn emit_native_step_bool_inline(
+    code: &mut Vec<u8>,
+    layout: NativeStackLayout,
+    is_and: bool,
+) -> VmResult<()> {
+    let stack_len_offset = checked_add_i32(
+        layout.vm_stack_offset,
+        layout.stack_vec.len_offset,
+        "stack len offset overflow",
+    )?;
+    emit_stack_binary_setup(code, layout, 2)?;
+    emit_load_tag_eax_from_rdi(code, layout.value)?;
+    code.extend_from_slice(&[0x3D]); // cmp eax, bool_tag
+    code.extend_from_slice(&layout.value.bool_tag.to_le_bytes());
+    let lhs_not_bool = emit_jcc_rel32(code, [0x0F, 0x85]); // jne
+    emit_load_tag_edx_from_rsi(code, layout.value)?;
+    code.extend_from_slice(&[0x81, 0xFA]); // cmp edx, bool_tag
+    code.extend_from_slice(&layout.value.bool_tag.to_le_bytes());
+    let rhs_not_bool = emit_jcc_rel32(code, [0x0F, 0x85]); // jne
+
+    code.extend_from_slice(&[0x0F, 0xB6, 0x87]); // movzx eax, byte [rdi+disp32]
+    code.extend_from_slice(&layout.value.bool_payload_offset.to_le_bytes());
+    code.extend_from_slice(&[0x0F, 0xB6, 0x96]); // movzx edx, byte [rsi+disp32]
+    code.extend_from_slice(&layout.value.bool_payload_offset.to_le_bytes());
+    if is_and {
+        code.extend_from_slice(&[0x21, 0xD0]); // and eax, edx
+    } else {
+        code.extend_from_slice(&[0x09, 0xD0]); // or eax, edx
+    }
+    emit_store_tag_rdi(code, layout.value, layout.value.bool_tag)?;
+    code.extend_from_slice(&[0x88, 0x87]); // mov [rdi+disp32], al
+    code.extend_from_slice(&layout.value.bool_payload_offset.to_le_bytes());
+    emit_adjust_stack_len_minus_one(code, stack_len_offset);
+    emit_status_continue(code);
+    let ok_done = emit_jmp_rel32(code);
+
+    let error_label = code.len();
+    emit_status_error(code);
+    let done_label = code.len();
+    patch_rel32(code, lhs_not_bool, error_label)?;
+    patch_rel32(code, rhs_not_bool, error_label)?;
     patch_rel32(code, ok_done, done_label)?;
     Ok(())
 }
@@ -3052,6 +3198,25 @@ mod tests {
     }
 
     #[test]
+    fn mod_and_logic_steps_emit_no_helper_calls() {
+        let steps = [TraceStep::Mod, TraceStep::And, TraceStep::Or];
+        for step in steps {
+            let trace = build_single_step_trace(step.clone());
+            let code = emit_native_trace_bytes(&trace).expect("native trace should compile");
+            let call_count = code
+                .windows(2)
+                .filter(|window| *window == [0xFF, 0xD0])
+                .count();
+            assert_eq!(
+                call_count, 0,
+                "step {:?} should emit no helper calls, code bytes: {:02X?}",
+                step,
+                code
+            );
+        }
+    }
+
+    #[test]
     fn call_step_emits_helper_call() {
         let trace = build_single_step_trace(TraceStep::Call {
             index: 0,
@@ -3374,5 +3539,52 @@ mod tests {
 
         let status = execute_single_step(&mut vm, TraceStep::Div).expect("native div should run");
         assert_eq!(status, STATUS_ERROR);
+    }
+
+    #[test]
+    fn mod_step_inline_supports_int_and_float_and_rejects_zero() {
+        let mut int_vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        int_vm.stack.push(Value::Int(17));
+        int_vm.stack.push(Value::Int(5));
+        let status =
+            execute_single_step(&mut int_vm, TraceStep::Mod).expect("native mod should run");
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(int_vm.stack(), &[Value::Int(2)]);
+
+        let mut float_vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        float_vm.stack.push(Value::Float(7.5));
+        float_vm.stack.push(Value::Float(2.0));
+        let status =
+            execute_single_step(&mut float_vm, TraceStep::Mod).expect("native mod should run");
+        assert_eq!(status, STATUS_CONTINUE);
+        match float_vm.stack.last() {
+            Some(Value::Float(value)) => assert!((*value - 1.5).abs() < f64::EPSILON),
+            other => panic!("expected float result, got {other:?}"),
+        }
+
+        let mut err_vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        err_vm.stack.push(Value::Int(1));
+        err_vm.stack.push(Value::Int(0));
+        let status =
+            execute_single_step(&mut err_vm, TraceStep::Mod).expect("native mod should run");
+        assert_eq!(status, STATUS_ERROR);
+    }
+
+    #[test]
+    fn and_or_steps_inline_execute_boolean_logic() {
+        let mut and_vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        and_vm.stack.push(Value::Bool(true));
+        and_vm.stack.push(Value::Bool(false));
+        let status =
+            execute_single_step(&mut and_vm, TraceStep::And).expect("native and should run");
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(and_vm.stack(), &[Value::Bool(false)]);
+
+        let mut or_vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        or_vm.stack.push(Value::Bool(true));
+        or_vm.stack.push(Value::Bool(false));
+        let status = execute_single_step(&mut or_vm, TraceStep::Or).expect("native or should run");
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(or_vm.stack(), &[Value::Bool(true)]);
     }
 }

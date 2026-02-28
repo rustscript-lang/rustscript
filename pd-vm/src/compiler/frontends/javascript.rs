@@ -250,34 +250,54 @@ fn rewrite_js_vm_namespace_calls(line: &str, vm_namespace_aliases: &HashSet<Stri
                     j += 1;
                 }
                 if j < bytes.len() && bytes[j] == b'.' {
-                    let mut k = j + 1;
-                    while k < bytes.len()
-                        && bytes[k].is_ascii_whitespace()
-                        && bytes[k] != b'\n'
-                        && bytes[k] != b'\r'
-                    {
+                    let mut k = j;
+                    let mut segments = Vec::<String>::new();
+                    loop {
+                        if k >= bytes.len() || bytes[k] != b'.' {
+                            break;
+                        }
                         k += 1;
-                    }
-                    if k < bytes.len() && is_ident_start(bytes[k] as char) {
+                        while k < bytes.len()
+                            && bytes[k].is_ascii_whitespace()
+                            && bytes[k] != b'\n'
+                            && bytes[k] != b'\r'
+                        {
+                            k += 1;
+                        }
+                        if k >= bytes.len() || !is_ident_start(bytes[k] as char) {
+                            segments.clear();
+                            break;
+                        }
                         let member_start = k;
                         k += 1;
                         while k < bytes.len() && is_ident_continue(bytes[k] as char) {
                             k += 1;
                         }
-                        let member = &line[member_start..k];
-                        let mut call_check = k;
-                        while call_check < bytes.len()
-                            && bytes[call_check].is_ascii_whitespace()
-                            && bytes[call_check] != b'\n'
-                            && bytes[call_check] != b'\r'
+                        segments.push(line[member_start..k].to_string());
+                        let mut next = k;
+                        while next < bytes.len()
+                            && bytes[next].is_ascii_whitespace()
+                            && bytes[next] != b'\n'
+                            && bytes[next] != b'\r'
                         {
-                            call_check += 1;
+                            next += 1;
                         }
-                        if call_check < bytes.len() && bytes[call_check] == b'(' {
-                            out.push_str(member);
-                            i = k;
+                        if next < bytes.len() && bytes[next] == b'.' {
+                            k = next;
                             continue;
                         }
+                        k = next;
+                        break;
+                    }
+                    if !segments.is_empty() && k < bytes.len() && bytes[k] == b'(' {
+                        if segments.len() == 1 {
+                            out.push_str(&segments[0]);
+                        } else {
+                            out.push_str("vm::");
+                            out.push_str(&segments.join("::"));
+                        }
+                        i = k;
+                        continue;
                     }
                 }
             }

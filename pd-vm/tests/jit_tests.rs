@@ -94,6 +94,57 @@ fn compiler_uses_shl_for_power_of_two_multiply_and_jit_accepts_it() {
 }
 
 #[test]
+fn compiler_emits_mod_and_or_and_jit_accepts_them() {
+    let source = r#"
+        let i = 1;
+        let sum = 0;
+        while i < 12 {
+            let is_evenish = ((i % 2) == 0) && true;
+            let is_small = (i < 3) || is_evenish;
+            if is_small {
+                sum = sum + 1;
+            } else {
+                sum = sum + 2;
+            }
+            i = i + 1;
+        }
+        sum;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    assert!(
+        compiled.program.code.contains(&(OpCode::Mod as u8)),
+        "expected compiler to emit mod"
+    );
+    assert!(
+        compiled.program.code.contains(&(OpCode::And as u8)),
+        "expected compiler to emit and"
+    );
+    assert!(
+        compiled.program.code.contains(&(OpCode::Or as u8)),
+        "expected compiler to emit or"
+    );
+
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    vm.set_jit_config(JitConfig {
+        enabled: native_jit_supported(),
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(16)]);
+
+    if native_jit_supported() {
+        let dump = vm.dump_jit_info();
+        assert!(dump.contains(" mod"), "expected trace dump to include mod");
+        assert!(dump.contains(" and"), "expected trace dump to include and");
+        assert!(dump.contains(" or"), "expected trace dump to include or");
+    }
+}
+
+#[test]
 fn trace_jit_supports_host_calls_with_native_mixed_mode() {
     let source = r#"
         fn print(x);

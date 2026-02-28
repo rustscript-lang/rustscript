@@ -36,6 +36,22 @@ fn javascript_vm_namespace_host_calls_are_supported() {
 }
 
 #[test]
+fn javascript_vm_http_subnamespace_host_calls_are_supported() {
+    let source = r#"
+        import * as vm from "vm";
+        vm.http.request.get_header("x-client-id");
+    "#;
+    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
+        .expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    vm.bind_function("http::request::get_header", Box::new(EchoString));
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("x-client-id".to_string())]);
+}
+
+#[test]
 fn compile_source_with_javascript_flavor() {
     let source = include_str!("../examples/example.js");
 
@@ -251,4 +267,24 @@ fn javascript_undeclared_host_call_is_rejected() {
         }
         other => panic!("unexpected error: {other}"),
     }
+}
+
+#[test]
+fn javascript_modulo_and_logical_operators_work() {
+    let source = r#"
+        const a = 17 % 5;
+        const b = true && false;
+        const c = true || false;
+        const d = (10 > 5) && (3 < 7);
+        const e = (10 < 5) || (3 > 7);
+        const f = 100 % 7;
+        a + f;
+    "#;
+
+    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
+        .expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(4)]);
 }

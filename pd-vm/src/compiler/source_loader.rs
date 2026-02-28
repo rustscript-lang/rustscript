@@ -1164,7 +1164,7 @@ fn rewrite_imported_call_sites(
 ) -> Result<String, SourcePathError> {
     let mut alias_calls = HashMap::<String, String>::new();
     let mut namespace_calls = HashMap::<String, HashSet<String>>::new();
-    let mut namespace_wildcards = HashSet::<String>::new();
+    let namespace_wildcards = HashSet::<String>::new();
     let mut prefix_aliases = Vec::<String>::new();
 
     for import in imports {
@@ -1178,12 +1178,8 @@ fn rewrite_imported_call_sites(
                         }
                     }
                 }
-                ImportClause::Namespace(namespace) => {
-                    namespace_wildcards.insert(namespace.clone());
-                }
-                ImportClause::Prefix(prefix) => {
-                    prefix_aliases.push(prefix.clone());
-                }
+                ImportClause::Namespace(_) => {}
+                ImportClause::Prefix(_) => {}
             }
             continue;
         }

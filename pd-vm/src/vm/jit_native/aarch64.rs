@@ -153,12 +153,24 @@ fn emit_native_trace_bytes(trace: &crate::jit::JitTrace) -> VmResult<Vec<u8>> {
                 )?;
                 emit_native_status_check(&mut code, &mut status_checks);
             }
+            crate::jit::TraceStep::Mod => {
+                emit_native_step_mod_inline(&mut code, layout)?;
+                emit_native_status_check(&mut code, &mut status_checks);
+            }
             crate::jit::TraceStep::Shl => {
                 emit_native_step_shift_inline(&mut code, layout, true)?;
                 emit_native_status_check(&mut code, &mut status_checks);
             }
             crate::jit::TraceStep::Shr => {
                 emit_native_step_shift_inline(&mut code, layout, false)?;
+                emit_native_status_check(&mut code, &mut status_checks);
+            }
+            crate::jit::TraceStep::And => {
+                emit_native_step_and_inline(&mut code, layout)?;
+                emit_native_status_check(&mut code, &mut status_checks);
+            }
+            crate::jit::TraceStep::Or => {
+                emit_native_step_or_inline(&mut code, layout)?;
                 emit_native_status_check(&mut code, &mut status_checks);
             }
             crate::jit::TraceStep::Neg => {
@@ -216,11 +228,18 @@ fn emit_native_trace_bytes(trace: &crate::jit::JitTrace) -> VmResult<Vec<u8>> {
                 emit_native_step_guard_false_inline(&mut code, layout, exit_ip)?;
                 emit_native_status_check(&mut code, &mut status_checks);
             }
+            crate::jit::TraceStep::JumpToIp { target_ip } => {
+                let target_ip = u64::try_from(*target_ip).map_err(|_| {
+                    VmError::JitNative("trace jump target ip exceeds 64-bit range".to_string())
+                })?;
+                emit_native_step_jump_to_ip_inline(&mut code, layout, target_ip)?;
+                emit_native_status_check(&mut code, &mut status_checks);
+            }
             crate::jit::TraceStep::JumpToRoot => {
                 let root_ip = u64::try_from(trace.root_ip).map_err(|_| {
                     VmError::JitNative("trace root ip exceeds 64-bit range".to_string())
                 })?;
-                emit_native_step_jump_to_root_inline(&mut code, layout, root_ip)?;
+                emit_native_step_jump_to_ip_inline(&mut code, layout, root_ip)?;
                 emit_native_status_check(&mut code, &mut status_checks);
             }
             crate::jit::TraceStep::Ret => {
@@ -286,6 +305,7 @@ enum NativeBinaryNumericOp {
     Sub,
     Mul,
     Div,
+    Mod,
     Clt,
     Cgt,
 }
@@ -359,6 +379,18 @@ fn emit_native_step_binary_numeric_inline(
             emit_cmp_imm(code, 15, 0)?;
             int_div_zero = Some(emit_b_cond_placeholder(code, Cond::Eq));
             emit_sdiv_x(code, 14, 14, 15);
+            emit_str_x_disp(code, 14, 12, layout.value.int_payload_offset)?;
+            emit_store_tag_ptr(code, 12, layout.value, layout.value.int_tag)?;
+            emit_sub_imm(code, 9, 9, 1);
+            emit_str_x_disp(code, 9, VM_REG, stack_len_offset)?;
+            emit_status_continue(code);
+        }
+        NativeBinaryNumericOp::Mod => {
+            emit_cmp_imm(code, 15, 0)?;
+            int_div_zero = Some(emit_b_cond_placeholder(code, Cond::Eq));
+            emit_sdiv_x(code, 16, 14, 15); // q in x16
+            emit_mul_x(code, 16, 16, 15); // q * rhs
+            emit_sub_reg(code, 14, 14, 16); // lhs - q*rhs
             emit_str_x_disp(code, 14, 12, layout.value.int_payload_offset)?;
             emit_store_tag_ptr(code, 12, layout.value, layout.value.int_tag)?;
             emit_sub_imm(code, 9, 9, 1);
@@ -462,6 +494,20 @@ fn emit_native_step_binary_numeric_inline(
             emit_fcmp_d_zero(code, 1);
             float_div_zero = Some(emit_b_cond_placeholder(code, Cond::Eq));
             emit_fdiv_d(code, 0, 0, 1);
+            emit_store_tag_ptr(code, 12, layout.value, layout.value.float_tag)?;
+            emit_str_d_disp(code, 0, 12, layout.value.float_payload_offset)?;
+            emit_sub_imm(code, 9, 9, 1);
+            emit_str_x_disp(code, 9, VM_REG, stack_len_offset)?;
+            emit_status_continue(code);
+        }
+        NativeBinaryNumericOp::Mod => {
+            emit_fcmp_d_zero(code, 1);
+            float_div_zero = Some(emit_b_cond_placeholder(code, Cond::Eq));
+            emit_fdiv_d(code, 2, 0, 1); // q = lhs / rhs
+            emit_fcvtzs_x_from_d(code, 14, 2);
+            emit_scvtf_d_from_x(code, 2, 14);
+            emit_fmul_d(code, 2, 2, 1);
+            emit_fsub_d(code, 0, 0, 2);
             emit_store_tag_ptr(code, 12, layout.value, layout.value.float_tag)?;
             emit_str_d_disp(code, 0, 12, layout.value.float_payload_offset)?;
             emit_sub_imm(code, 9, 9, 1);
@@ -628,6 +674,86 @@ fn emit_native_step_shift_inline(
     patch_b_cond_rel19(code, rhs_not_int, err_label)?;
     patch_b_cond_rel19(code, neg_shift, err_label)?;
     patch_b_cond_rel19(code, big_shift, err_label)?;
+    patch_b_rel26(code, ok_done, done_label)?;
+    Ok(())
+}
+
+fn emit_native_step_mod_inline(
+    code: &mut Vec<u8>,
+    layout: NativeStackLayout,
+) -> VmResult<()> {
+    emit_native_step_binary_numeric_inline(code, layout, NativeBinaryNumericOp::Mod)
+}
+
+fn emit_native_step_and_inline(
+    code: &mut Vec<u8>,
+    layout: NativeStackLayout,
+) -> VmResult<()> {
+    emit_native_step_bool_inline(code, layout, true)
+}
+
+fn emit_native_step_or_inline(
+    code: &mut Vec<u8>,
+    layout: NativeStackLayout,
+) -> VmResult<()> {
+    emit_native_step_bool_inline(code, layout, false)
+}
+
+fn emit_native_step_bool_inline(
+    code: &mut Vec<u8>,
+    layout: NativeStackLayout,
+    is_and: bool,
+) -> VmResult<()> {
+    let stack_len_offset = vec_len_disp(layout.vm_stack_offset, layout.stack_vec)?;
+    let stack_ptr_offset = vec_ptr_disp(layout.vm_stack_offset, layout.stack_vec)?;
+
+    emit_ldr_x_disp(code, 9, VM_REG, stack_len_offset)?;
+    emit_cmp_imm(code, 9, 2)?;
+    let underflow = emit_b_cond_placeholder(code, Cond::Lo);
+
+    emit_ldr_x_disp(code, 10, VM_REG, stack_ptr_offset)?;
+    emit_sub_imm(code, 11, 9, 1);
+    emit_mov_imm64(code, 14, layout.value.size as u64);
+    emit_mul_x(code, 11, 11, 14);
+    emit_add_reg(code, 13, 10, 11); // rhs
+    emit_sub_reg(code, 11, 11, 14);
+    emit_add_reg(code, 12, 10, 11); // lhs
+
+    emit_load_tag_w_from_ptr(code, 16, 12, layout.value)?;
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.bool_tag).unwrap_or(0xFFFF),
+    )?;
+    let lhs_not_bool = emit_b_cond_placeholder(code, Cond::Ne);
+    emit_load_tag_w_from_ptr(code, 17, 13, layout.value)?;
+    emit_cmp_imm(
+        code,
+        17,
+        u16::try_from(layout.value.bool_tag).unwrap_or(0xFFFF),
+    )?;
+    let rhs_not_bool = emit_b_cond_placeholder(code, Cond::Ne);
+
+    emit_ldr_b_disp(code, 14, 12, layout.value.bool_payload_offset)?;
+    emit_ldr_b_disp(code, 15, 13, layout.value.bool_payload_offset)?;
+    if is_and {
+        emit_and_w(code, 14, 14, 15);
+    } else {
+        emit_orr_w(code, 14, 14, 15);
+    }
+    emit_store_bool_from_w(code, 14, 12, layout.value)?;
+    emit_sub_imm(code, 9, 9, 1);
+    emit_str_x_disp(code, 9, VM_REG, stack_len_offset)?;
+    emit_status_continue(code);
+
+    let ok_done = emit_b_placeholder(code);
+    let err_label = code.len();
+    emit_status_error(code);
+    let done_label = code.len();
+
+    patch_b_cond_rel19(code, underflow, err_label)?;
+    patch_b_cond_rel19(code, lhs_not_bool, err_label)?;
+    patch_b_cond_rel19(code, rhs_not_bool, err_label)?;
     patch_b_rel26(code, ok_done, done_label)?;
     Ok(())
 }
@@ -1051,12 +1177,12 @@ fn emit_native_step_guard_false_inline(
     Ok(())
 }
 
-fn emit_native_step_jump_to_root_inline(
+fn emit_native_step_jump_to_ip_inline(
     code: &mut Vec<u8>,
     layout: NativeStackLayout,
-    root_ip: u64,
+    target_ip: u64,
 ) -> VmResult<()> {
-    emit_mov_imm64(code, 14, root_ip);
+    emit_mov_imm64(code, 14, target_ip);
     emit_str_x_disp(code, 14, VM_REG, layout.vm_ip_offset)?;
     emit_status_trace_exit(code);
     Ok(())
@@ -1064,6 +1190,18 @@ fn emit_native_step_jump_to_root_inline(
 
 fn emit_native_step_ret_inline(code: &mut Vec<u8>) {
     emit_status_halted(code);
+}
+
+fn helper_ptr_to_u64(ptr: *const (), name: &str) -> VmResult<u64> {
+    let addr = ptr as usize;
+    u64::try_from(addr)
+        .map_err(|_| VmError::JitNative(format!("native {name} pointer exceeds 64-bit range")))
+}
+
+fn emit_vm_helper_call0(code: &mut Vec<u8>, helper_addr: u64) {
+    emit_mov_reg(code, 0, VM_REG);
+    emit_mov_imm64(code, 16, helper_addr);
+    emit_u32(code, 0xD63F0200); // blr x16
 }
 
 fn emit_native_step_call_inline(
@@ -1074,10 +1212,7 @@ fn emit_native_step_call_inline(
 ) -> VmResult<()> {
     let call_ip = u64::try_from(call_ip)
         .map_err(|_| VmError::JitNative("trace call_ip exceeds 64-bit range".to_string()))?;
-    let helper_addr = jit_native_call_bridge as *const () as usize;
-    let helper_addr = u64::try_from(helper_addr).map_err(|_| {
-        VmError::JitNative("native helper pointer exceeds 64-bit range".to_string())
-    })?;
+    let helper_addr = helper_ptr_to_u64(jit_native_call_bridge as *const (), "call helper")?;
 
     emit_mov_reg(code, 0, VM_REG);
     emit_mov_imm64(code, 1, u64::from(index));
@@ -1485,6 +1620,11 @@ fn emit_scvtf_d_from_x(code: &mut Vec<u8>, vd: u8, xn: u8) {
     emit_u32(code, insn);
 }
 
+fn emit_fcvtzs_x_from_d(code: &mut Vec<u8>, xd: u8, vn: u8) {
+    let insn = 0x9E780000_u32 | ((vn as u32) << 5) | (xd as u32);
+    emit_u32(code, insn);
+}
+
 fn emit_fadd_d(code: &mut Vec<u8>, vd: u8, vn: u8, vm: u8) {
     let insn = 0x1E602800_u32 | ((vm as u32) << 16) | ((vn as u32) << 5) | (vd as u32);
     emit_u32(code, insn);
@@ -1517,6 +1657,16 @@ fn emit_fcmp_d_zero(code: &mut Vec<u8>, vn: u8) {
 
 fn emit_fneg_d(code: &mut Vec<u8>, vd: u8, vn: u8) {
     let insn = 0x1E614000_u32 | ((vn as u32) << 5) | (vd as u32);
+    emit_u32(code, insn);
+}
+
+fn emit_and_w(code: &mut Vec<u8>, wd: u8, wn: u8, wm: u8) {
+    let insn = 0x0A000000_u32 | ((wm as u32) << 16) | ((wn as u32) << 5) | (wd as u32);
+    emit_u32(code, insn);
+}
+
+fn emit_orr_w(code: &mut Vec<u8>, wd: u8, wn: u8, wm: u8) {
+    let insn = 0x2A000000_u32 | ((wm as u32) << 16) | ((wn as u32) << 5) | (wd as u32);
     emit_u32(code, insn);
 }
 
@@ -2168,6 +2318,53 @@ mod tests {
     }
 
     #[test]
+    fn mod_step_supports_int_and_float_and_rejects_zero() {
+        let mut int_vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        int_vm.stack.push(Value::Int(17));
+        int_vm.stack.push(Value::Int(5));
+        let status =
+            execute_single_step(&mut int_vm, TraceStep::Mod).expect("native mod should run");
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(int_vm.stack, vec![Value::Int(2)]);
+
+        let mut float_vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        float_vm.stack.push(Value::Float(7.5));
+        float_vm.stack.push(Value::Float(2.0));
+        let status =
+            execute_single_step(&mut float_vm, TraceStep::Mod).expect("native mod should run");
+        assert_eq!(status, STATUS_CONTINUE);
+        match float_vm.stack.last() {
+            Some(Value::Float(value)) => assert!((*value - 1.5).abs() < f64::EPSILON),
+            other => panic!("expected float result, got {other:?}"),
+        }
+
+        let mut err_vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        err_vm.stack.push(Value::Int(1));
+        err_vm.stack.push(Value::Int(0));
+        let status =
+            execute_single_step(&mut err_vm, TraceStep::Mod).expect("native mod should run");
+        assert_eq!(status, STATUS_ERROR);
+    }
+
+    #[test]
+    fn and_or_steps_execute_boolean_logic() {
+        let mut and_vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        and_vm.stack.push(Value::Bool(true));
+        and_vm.stack.push(Value::Bool(false));
+        let status =
+            execute_single_step(&mut and_vm, TraceStep::And).expect("native and should run");
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(and_vm.stack, vec![Value::Bool(false)]);
+
+        let mut or_vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        or_vm.stack.push(Value::Bool(true));
+        or_vm.stack.push(Value::Bool(false));
+        let status = execute_single_step(&mut or_vm, TraceStep::Or).expect("native or should run");
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(or_vm.stack, vec![Value::Bool(true)]);
+    }
+
+    #[test]
     fn clt_supports_float_and_nan_is_false() {
         let mut clt_vm = Vm::new(Program::new(Vec::new(), Vec::new()));
         clt_vm.stack.push(Value::Float(1.5));
@@ -2270,8 +2467,11 @@ mod tests {
                 TraceStep::Sub,
                 TraceStep::Mul,
                 TraceStep::Div,
+                TraceStep::Mod,
                 TraceStep::Shl,
                 TraceStep::Shr,
+                TraceStep::And,
+                TraceStep::Or,
                 TraceStep::Neg,
                 TraceStep::Ceq,
                 TraceStep::Clt,
@@ -2286,6 +2486,7 @@ mod tests {
                     call_ip: 0,
                 },
                 TraceStep::GuardFalse { exit_ip: 0 },
+                TraceStep::JumpToIp { target_ip: 0 },
                 TraceStep::JumpToRoot,
                 TraceStep::Ret,
             ],

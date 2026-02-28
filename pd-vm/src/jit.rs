@@ -82,8 +82,11 @@ pub enum TraceStep {
     Sub,
     Mul,
     Div,
+    Mod,
     Shl,
     Shr,
+    And,
+    Or,
     Neg,
     Ceq,
     Clt,
@@ -373,12 +376,24 @@ impl TraceJitEngine {
                 steps.push(TraceStep::Div);
                 continue;
             }
+            if opcode == OpCode::Mod as u8 {
+                steps.push(TraceStep::Mod);
+                continue;
+            }
             if opcode == OpCode::Shl as u8 {
                 steps.push(TraceStep::Shl);
                 continue;
             }
             if opcode == OpCode::Shr as u8 {
                 steps.push(TraceStep::Shr);
+                continue;
+            }
+            if opcode == OpCode::And as u8 {
+                steps.push(TraceStep::And);
+                continue;
+            }
+            if opcode == OpCode::Or as u8 {
+                steps.push(TraceStep::Or);
                 continue;
             }
             if opcode == OpCode::Neg as u8 {
@@ -549,8 +564,11 @@ fn trace_step_name(step: &TraceStep) -> &'static str {
         TraceStep::Sub => "sub",
         TraceStep::Mul => "mul",
         TraceStep::Div => "div",
+        TraceStep::Mod => "mod",
         TraceStep::Shl => "shl",
         TraceStep::Shr => "shr",
+        TraceStep::And => "and",
+        TraceStep::Or => "or",
         TraceStep::Neg => "neg",
         TraceStep::Ceq => "ceq",
         TraceStep::Clt => "clt",

@@ -18,6 +18,21 @@ fn rustscript_vm_namespace_host_calls_are_supported() {
 }
 
 #[test]
+fn rustscript_vm_http_subnamespace_host_calls_are_supported() {
+    let source = r#"
+        use vm;
+        vm::http::request::get_header("x-client-id");
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    vm.bind_function("http::request::get_header", Box::new(EchoString));
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("x-client-id".to_string())]);
+}
+
+#[test]
 fn rustscript_vm_named_host_imports_are_supported() {
     let source = r#"
         use vm::{add_one as inc};
@@ -615,4 +630,23 @@ fn rss_function_definition_is_inlined_without_host_imports() {
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Bool(true)]);
+}
+
+#[test]
+fn rustscript_modulo_and_logical_operators_work() {
+    let source = r#"
+        let a = 17 % 5;
+        let b = true && false;
+        let c = true || false;
+        let d = (10 > 5) && (3 < 7);
+        let e = (10 < 5) || (3 > 7);
+        let f = 100 % 7;
+        a + f;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(4)]);
 }

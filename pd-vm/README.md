@@ -38,6 +38,9 @@ Constants are stored in `Program.constants` and accessed by index via `ldc`.
 | 0x11   | `call`   | u16 id, u8 argc| pop args, call host, push returns  |
 | 0x12   | `shl`    | -              | (a, b) -> (a << b)                 |
 | 0x13   | `shr`    | -              | (a, b) -> (a >> b)                 |
+| 0x14   | `mod`    | -              | (a, b) -> (a % b)                  |
+| 0x15   | `and`    | -              | (a, b) -> (a && b)                 |
+| 0x16   | `or`     | -              | (a, b) -> (a \|\| b)               |
 
 ### Host calls and resuming
 
@@ -154,10 +157,9 @@ The VM includes a trace-based JIT path inspired by LuaJIT's hot-loop tracing mod
 - native machine code is emitted per hot trace and invoked by the VM
 - the native bridge executes trace semantics without bytecode re-decoding
 - unsupported patterns fall back to interpreter and are tracked as NYI
+- native trace emission supports arithmetic/logical opcodes including `mod`, `and`, and `or`
 
 Current NYI in trace compiler:
-- `call` (host calls inside trace)
-- `br` to non-root targets (only loop-back jump to trace root is supported)
 - backward `brfalse` targets (only forward guard exits are supported)
 - traces longer than configured max trace length
 - targets outside native-JIT support (`x86_64` Windows/Unix-non-macOS, `aarch64` Linux/macOS)

@@ -180,6 +180,18 @@ impl Assembler {
         self.emit_opcode(OpCode::Div);
     }
 
+    pub fn modulo(&mut self) {
+        self.emit_opcode(OpCode::Mod);
+    }
+
+    pub fn and(&mut self) {
+        self.emit_opcode(OpCode::And);
+    }
+
+    pub fn or(&mut self) {
+        self.emit_opcode(OpCode::Or);
+    }
+
     pub fn neg(&mut self) {
         self.emit_opcode(OpCode::Neg);
     }
@@ -321,6 +333,18 @@ impl BytecodeBuilder {
 
     pub fn div(&mut self) {
         self.emit_opcode(OpCode::Div);
+    }
+
+    pub fn modulo(&mut self) {
+        self.emit_opcode(OpCode::Mod);
+    }
+
+    pub fn and(&mut self) {
+        self.emit_opcode(OpCode::And);
+    }
+
+    pub fn or(&mut self) {
+        self.emit_opcode(OpCode::Or);
     }
 
     pub fn neg(&mut self) {
@@ -662,6 +686,9 @@ pub fn assemble(source: &str) -> Result<Program, AsmParseError> {
             }
             OpCode::Shl => assembler.shl(),
             OpCode::Shr => assembler.shr(),
+            OpCode::Mod => assembler.modulo(),
+            OpCode::And => assembler.and(),
+            OpCode::Or => assembler.or(),
         }
 
         if check_extra && parts.next().is_some() {

@@ -297,6 +297,9 @@ fn remap_expr_indices(
         | Expr::Sub(lhs, rhs)
         | Expr::Mul(lhs, rhs)
         | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
         | Expr::Eq(lhs, rhs)
         | Expr::Lt(lhs, rhs)
         | Expr::Gt(lhs, rhs) => {

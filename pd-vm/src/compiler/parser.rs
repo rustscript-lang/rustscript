@@ -32,6 +32,9 @@ enum TokenKind {
     Minus,
     Star,
     Slash,
+    Percent,
+    AmpersandAmpersand,
+    PipePipe,
     Pipe,
     LParen,
     RParen,
@@ -111,9 +114,30 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 TokenKind::Slash
             }
+            '%' => {
+                self.advance();
+                TokenKind::Percent
+            }
+            '&' => {
+                self.advance();
+                if self.current == Some('&') {
+                    self.advance();
+                    TokenKind::AmpersandAmpersand
+                } else {
+                    return Err(ParseError {
+                        message: "unexpected character '&', did you mean '&&'?".to_string(),
+                        line,
+                    });
+                }
+            }
             '|' => {
                 self.advance();
-                TokenKind::Pipe
+                if self.current == Some('|') {
+                    self.advance();
+                    TokenKind::PipePipe
+                } else {
+                    TokenKind::Pipe
+                }
             }
             '(' => {
                 self.advance();
@@ -927,7 +951,25 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        self.parse_comparison()
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_and()?;
+        while self.match_kind(&TokenKind::PipePipe) {
+            let rhs = self.parse_and()?;
+            expr = Expr::Or(Box::new(expr), Box::new(rhs));
+        }
+        Ok(expr)
+    }
+
+    fn parse_and(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_comparison()?;
+        while self.match_kind(&TokenKind::AmpersandAmpersand) {
+            let rhs = self.parse_comparison()?;
+            expr = Expr::And(Box::new(expr), Box::new(rhs));
+        }
+        Ok(expr)
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
@@ -977,6 +1019,9 @@ impl Parser {
             } else if self.match_kind(&TokenKind::Slash) {
                 let rhs = self.parse_unary()?;
                 expr = Expr::Div(Box::new(expr), Box::new(rhs));
+            } else if self.match_kind(&TokenKind::Percent) {
+                let rhs = self.parse_unary()?;
+                expr = Expr::Mod(Box::new(expr), Box::new(rhs));
             } else {
                 break;
             }
@@ -1020,26 +1065,43 @@ impl Parser {
         }
         if let Some(name) = self.match_ident() {
             if self.match_path_separator() {
-                let member = self.expect_ident("expected function name after '::'")?;
+                let mut path_segments = Vec::new();
+                path_segments.push(self.expect_ident("expected function name after '::'")?);
+                while self.match_path_separator() {
+                    path_segments.push(self.expect_ident("expected function name after '::'")?);
+                }
                 self.expect(
                     &TokenKind::LParen,
                     "expected '(' after namespaced function name",
                 )?;
                 let args = self.parse_call_args()?;
-                if let Some(builtin) = self.resolve_builtin_namespace_call(&name, &member) {
+                let member = path_segments
+                    .first()
+                    .ok_or_else(|| ParseError {
+                        line: self.current_line(),
+                        message: "expected function name after '::'".to_string(),
+                    })?
+                    .clone();
+                let subpath = path_segments
+                    .get(1..)
+                    .map(|tail| tail.to_vec())
+                    .unwrap_or_default();
+                if subpath.is_empty()
+                    && let Some(builtin) = self.resolve_builtin_namespace_call(&name, &member)
+                {
                     let expr = self.build_builtin_call_expr(builtin, args)?;
                     return Ok(expr);
                 }
-                let host_name =
-                    self.resolve_vm_namespace_call_target(&name, &member)
-                        .ok_or_else(|| ParseError {
-                            line: self.current_line(),
-                            message: format!(
-                                "unknown namespace call '{}::{}'; supported namespaces are io:: (builtins) and vm:: (host imports via 'use vm;' or 'use vm as <alias>;')",
-                                name, member
-                            ),
-                        })?
-                        .to_string();
+                let host_name = self
+                    .resolve_vm_namespace_call_target(&name, &member, &subpath)
+                    .ok_or_else(|| ParseError {
+                        line: self.current_line(),
+                        message: format!(
+                            "unknown namespace call '{}::{}'; supported namespaces are io:: (builtins) and vm:: (host imports via 'use vm;', 'use vm::*;', or 'use vm as <alias>;')",
+                            name,
+                            path_segments.join("::")
+                        ),
+                    })?;
                 let expr = self.build_vm_host_call_expr(&host_name, args)?;
                 return Ok(expr);
             }
@@ -1708,16 +1770,27 @@ impl Parser {
         None
     }
 
-    fn resolve_vm_namespace_call_target<'a>(
-        &'a self,
+    fn resolve_vm_namespace_call_target(
+        &self,
         namespace: &str,
-        member: &'a str,
-    ) -> Option<&'a str> {
-        if self.vm_namespace_aliases.contains(namespace) {
-            Some(member)
-        } else {
-            None
+        member: &str,
+        subpath: &[String],
+    ) -> Option<String> {
+        let namespace_matches = self.vm_namespace_aliases.contains(namespace)
+            || (namespace == "vm" && self.vm_wildcard_import);
+        if !namespace_matches {
+            return None;
         }
+
+        if subpath.is_empty() {
+            return Some(member.to_string());
+        }
+        let mut host_name = member.to_string();
+        for segment in subpath {
+            host_name.push_str("::");
+            host_name.push_str(segment);
+        }
+        Some(host_name)
     }
 
     fn resolve_builtin_namespace_call(

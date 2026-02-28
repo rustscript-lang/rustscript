@@ -179,8 +179,11 @@ pub enum Expr {
     Sub(Box<Expr>, Box<Expr>),
     Mul(Box<Expr>, Box<Expr>),
     Div(Box<Expr>, Box<Expr>),
+    Mod(Box<Expr>, Box<Expr>),
     Neg(Box<Expr>),
     Not(Box<Expr>),
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
     Eq(Box<Expr>, Box<Expr>),
     Lt(Box<Expr>, Box<Expr>),
     Gt(Box<Expr>, Box<Expr>),
@@ -675,6 +678,11 @@ impl Compiler {
                 self.compile_expr(rhs)?;
                 self.assembler.div();
             }
+            Expr::Mod(lhs, rhs) => {
+                self.compile_expr(lhs)?;
+                self.compile_expr(rhs)?;
+                self.assembler.modulo();
+            }
             Expr::Neg(inner) => {
                 self.compile_expr(inner)?;
                 self.assembler.neg();
@@ -683,6 +691,16 @@ impl Compiler {
                 self.compile_expr(inner)?;
                 self.assembler.push_const(Value::Bool(false));
                 self.assembler.ceq();
+            }
+            Expr::And(lhs, rhs) => {
+                self.compile_expr(lhs)?;
+                self.compile_expr(rhs)?;
+                self.assembler.and();
+            }
+            Expr::Or(lhs, rhs) => {
+                self.compile_expr(lhs)?;
+                self.compile_expr(rhs)?;
+                self.assembler.or();
             }
             Expr::Eq(lhs, rhs) => {
                 self.compile_expr(lhs)?;

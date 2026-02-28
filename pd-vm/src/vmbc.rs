@@ -405,6 +405,9 @@ pub fn disassemble_program_with_options(program: &Program, options: DisassembleO
             }
             x if x == OpCode::Shl as u8 => instruction.push_str("shl"),
             x if x == OpCode::Shr as u8 => instruction.push_str("shr"),
+            x if x == OpCode::Mod as u8 => instruction.push_str("mod"),
+            x if x == OpCode::And as u8 => instruction.push_str("and"),
+            x if x == OpCode::Or as u8 => instruction.push_str("or"),
             other => instruction.push_str(&format!(".byte 0x{other:02X} ; invalid opcode")),
         }
 
@@ -494,6 +497,9 @@ fn analyze_program(
                 || x == OpCode::Div as u8
                 || x == OpCode::Shl as u8
                 || x == OpCode::Shr as u8
+                || x == OpCode::Mod as u8
+                || x == OpCode::And as u8
+                || x == OpCode::Or as u8
                 || x == OpCode::Neg as u8
                 || x == OpCode::Ceq as u8
                 || x == OpCode::Clt as u8

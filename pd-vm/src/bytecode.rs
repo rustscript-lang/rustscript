@@ -84,6 +84,9 @@ pub enum OpCode {
     Call = 0x11,
     Shl = 0x12,
     Shr = 0x13,
+    Mod = 0x14,
+    And = 0x15,
+    Or = 0x16,
 }
 
 impl OpCode {
@@ -109,6 +112,9 @@ impl OpCode {
             OpCode::Call => "call",
             OpCode::Shl => "shl",
             OpCode::Shr => "shr",
+            OpCode::Mod => "mod",
+            OpCode::And => "and",
+            OpCode::Or => "or",
         }
     }
 
@@ -134,6 +140,9 @@ impl OpCode {
             "call" => Some(OpCode::Call),
             "shl" => Some(OpCode::Shl),
             "shr" => Some(OpCode::Shr),
+            "mod" => Some(OpCode::Mod),
+            "and" => Some(OpCode::And),
+            "or" => Some(OpCode::Or),
             _ => None,
         }
     }

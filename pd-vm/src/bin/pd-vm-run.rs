@@ -367,12 +367,10 @@ fn register_functions(vm: &mut Vm, functions: &[FunctionDecl]) -> Result<(), io:
             "print" => vm.bind_function("print", Box::new(PrintFunction)),
             "add_one" => vm.bind_function("add_one", Box::new(AddOneFunction)),
             "echo" => vm.bind_function("echo", Box::new(EchoFunction)),
-            "get_header" => vm.bind_function("get_header", Box::new(GetHeaderFunction)),
-            "rate_limit_allow" => {
-                vm.bind_function("rate_limit_allow", Box::new(RateLimitAllowFunction))
-            }
-            "set_header" | "set_response_content" | "set_response_status" | "set_upstream" => {
-                vm.bind_function(decl.name.as_str(), Box::new(NoopFunction))
+            name if name.starts_with("http::") => {
+                return Err(io::Error::other(format!(
+                    "host function '{name}' requires pd-edge runtime context",
+                )));
             }
             other => {
                 return Err(io::Error::other(format!(
@@ -658,30 +656,6 @@ impl HostFunction for EchoFunction {
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         let value = args.first().cloned().ok_or(VmError::StackUnderflow)?;
         Ok(CallOutcome::Return(vec![value]))
-    }
-}
-
-struct GetHeaderFunction;
-
-impl HostFunction for GetHeaderFunction {
-    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, VmError> {
-        Ok(CallOutcome::Return(vec![Value::String(String::new())]))
-    }
-}
-
-struct RateLimitAllowFunction;
-
-impl HostFunction for RateLimitAllowFunction {
-    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, VmError> {
-        Ok(CallOutcome::Return(vec![Value::Bool(true)]))
-    }
-}
-
-struct NoopFunction;
-
-impl HostFunction for NoopFunction {
-    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, VmError> {
-        Ok(CallOutcome::Return(vec![]))
     }
 }
 
