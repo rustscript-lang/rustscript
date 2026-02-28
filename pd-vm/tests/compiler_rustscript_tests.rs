@@ -131,7 +131,7 @@ fn closure_captures_outer_value_at_definition_time() {
     let source = r#"
         let base = 7;
         let add = |value| value + base;
-        let base = 8;
+        base = 8;
         print!(add(5));
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
