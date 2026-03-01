@@ -989,16 +989,12 @@ pub(super) fn lower(source: &str) -> Result<LoweredSource, ParseError> {
                 &mut lowering_context,
                 line_no,
             )?;
-            if step_expr.starts_with('-') {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: line_no,
-                    message: "negative lua for steps are not supported in this subset".to_string(),
-                });
-            }
+            let end_temp = lowering_context.fresh_temp("for_end");
+            let step_temp = lowering_context.fresh_temp("for_step");
+            out.push(format!("let {end_temp} = {end_expr};"));
+            out.push(format!("let {step_temp} = {step_expr};"));
             out.push(format!(
-                "for (let {name} = {start_expr}; {name} < (({end_expr}) + 1); {name} = {name} + ({step_expr})) {{"
+                "for (let {name} = {start_expr}; ((({step_temp}) > 0) && ({name} < (({end_temp}) + 1))) || ((({step_temp}) < 0) && ({name} > (({end_temp}) - 1))); {name} = {name} + ({step_temp})) {{"
             ));
             blocks.push(LuaBlock::For);
             continue;

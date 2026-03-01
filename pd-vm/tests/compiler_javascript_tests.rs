@@ -120,6 +120,36 @@ fn javascript_empty_param_arrow_closure_is_supported() {
 }
 
 #[test]
+fn javascript_function_return_statement_is_lowered() {
+    let source = r#"
+        function inc(v) { return v + 1; }
+        inc(41);
+    "#;
+    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
+        .expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+}
+
+#[test]
+fn javascript_object_property_named_return_is_not_rewritten() {
+    let source = r#"
+        const obj = { return: 42 };
+        obj.return;
+    "#;
+    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
+        .expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+}
+
+#[test]
 fn javascript_block_body_arrow_closure_is_rejected() {
     let source = r#"
         let inc = (value) => { value + 1; };

@@ -22,4 +22,5 @@ const profile = { stats: { score: closureValue } };
 const chainedScore = profile?.stats?.score;
 const missingScore = profile?.missing?.value;
 
-console.log(chainedScore);
+function keep(value) { return value; }
+console.log(keep(chainedScore));

@@ -333,10 +333,10 @@ Module/source loading:
 JavaScript frontend:
 
 - arrow closures with block bodies are not supported (expression-body arrows only)
+- `return <expr>;` is lowered to `<expr>;` (function results still follow final-expression semantics)
 
 Lua frontend:
 
-- numeric `for` loops with negative step are not supported
 - Lua pattern API string methods (`:match`, `:gsub`, etc.) are not supported
 - function literals require a non-empty return expression (`function(...) return <expr> end`)
 

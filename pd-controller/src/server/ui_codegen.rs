@@ -2503,7 +2503,7 @@ fn render_flow_node(
 
             statements
                 .lua
-                .push(indent_line(indent, format!("for i = 1, {count} do")));
+                .push(indent_line(indent, format!("for i = 1, {count}, 1 do")));
             statements.lua.extend(body_branch.lua.clone());
             statements.lua.push(indent_line(indent, "end".to_string()));
             statements.lua.extend(done_branch.lua.clone());
@@ -3871,7 +3871,7 @@ fn render_single_block(
             js.push(format!("for (let i = 0; i < {count}; i = i + 1) {{"));
             js.push("}".to_string());
 
-            lua.push(format!("for i = 1, {count} do"));
+            lua.push(format!("for i = 1, {count}, 1 do"));
             lua.push("end".to_string());
 
             scm.push(format!(
@@ -3979,7 +3979,7 @@ fn render_single_block(
             ));
             js.push("}".to_string());
 
-            lua.push(format!("for i = 1, {count} do"));
+            lua.push(format!("for i = 1, {count}, 1 do"));
             lua.push(format!(
                 "    vm.http.response.set_header({}, {})",
                 lua_string(header_name),

@@ -79,6 +79,7 @@ Supported syntax and features:
   - `typeof value` -> `type(value)`
   - `const` -> `let`
   - `function` -> `fn`
+  - `return <expr>;` -> `<expr>;` (final-expression function body model)
 - Imports/host calls:
   - `import * as vm from "vm";` for namespace calls (`vm.add_one(...)`,
     `vm.http.request.get_header(...)`)
@@ -90,8 +91,6 @@ Supported syntax and features:
 Current subset limits:
 
 - Arrow closures with block bodies are rejected (`(x) => { ... }`).
-- `return` statements are not part of this JavaScript subset; function bodies follow the shared
-  frontend rule that the final expression statement is the function result.
 - Direct calls to VM helper builtins like `len/get/set/count/...` are rejected; use language syntax
   (`.length`, indexing, assignment, `typeof`, namespace forms).
 - Undeclared host calls are rejected (import from `"vm"` first).
@@ -127,7 +126,6 @@ Supported syntax and features:
 
 Current subset limits:
 
-- Numeric `for` with a negative step is rejected.
 - Function literals must use `return <expr>` (single-expression body).
 - Lua pattern API string methods (`:find`, `:match`, `:gsub`) are currently rejected.
 - Direct VM helper builtin calls are not exposed as frontend functions.

@@ -4,8 +4,9 @@ use crate::compiler::source_map::{LineSpanMapping, LoweredSource};
 use std::collections::HashSet;
 
 pub(super) fn lower(source: &str) -> Result<LoweredSource, ParseError> {
-    reject_js_direct_builtin_calls(source)?;
-    let console_rewritten = rewrite_console_log_calls(source);
+    let return_rewritten = rewrite_js_return_statements(source);
+    reject_js_direct_builtin_calls(&return_rewritten)?;
+    let console_rewritten = rewrite_console_log_calls(&return_rewritten);
     let typeof_rewritten = rewrite_js_typeof_operator(&console_rewritten);
     let keyword_rewritten = rewrite_keywords(&typeof_rewritten, |ident| match ident {
         "function" => Some("fn"),
@@ -253,6 +254,112 @@ fn js_builtin_syntax_hint(name: &str) -> &'static str {
     }
 }
 
+fn rewrite_js_return_statements(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0usize;
+    let mut in_string: Option<u8> = None;
+    let mut escaped = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if in_line_comment {
+            out.push(b as char);
+            if b == b'\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_block_comment {
+            out.push(b as char);
+            if b == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                out.push('/');
+                i += 2;
+                in_block_comment = false;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        if let Some(delim) = in_string {
+            out.push(b as char);
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == delim {
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            out.push('/');
+            out.push('/');
+            i += 2;
+            in_line_comment = true;
+            continue;
+        }
+
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            out.push('/');
+            out.push('*');
+            i += 2;
+            in_block_comment = true;
+            continue;
+        }
+
+        if b == b'"' || b == b'\'' || b == b'`' {
+            out.push(b as char);
+            i += 1;
+            in_string = Some(b);
+            escaped = false;
+            continue;
+        }
+
+        if is_ident_start(b as char) {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && is_ident_continue(bytes[i] as char) {
+                i += 1;
+            }
+            let ident = &source[start..i];
+            if ident != "return" {
+                out.push_str(ident);
+                continue;
+            }
+
+            let prev_non_ws = previous_non_whitespace(bytes, start);
+            let next_non_ws = skip_js_ignorable(bytes, i);
+            let is_member = prev_non_ws.is_some_and(|idx| bytes[idx] == b'.');
+            let is_property_key = next_non_ws < bytes.len() && bytes[next_non_ws] == b':';
+            if is_member || is_property_key {
+                out.push_str(ident);
+                continue;
+            }
+
+            if next_non_ws < bytes.len() && bytes[next_non_ws] == b';' {
+                out.push_str("null");
+            }
+            out.push_str(&source[i..next_non_ws]);
+            i = next_non_ws;
+            continue;
+        }
+
+        out.push(b as char);
+        i += 1;
+    }
+
+    out
+}
+
 fn rewrite_js_typeof_operator(source: &str) -> String {
     const TYPEOF: &[u8] = b"typeof";
 
@@ -495,6 +602,37 @@ fn skip_js_whitespace(bytes: &[u8], mut index: usize) -> usize {
         index += 1;
     }
     index
+}
+
+fn skip_js_ignorable(bytes: &[u8], mut index: usize) -> usize {
+    loop {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+
+        if index + 1 < bytes.len() && bytes[index] == b'/' && bytes[index + 1] == b'/' {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+
+        if index + 1 < bytes.len() && bytes[index] == b'/' && bytes[index + 1] == b'*' {
+            index += 2;
+            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                index += 1;
+            }
+            if index + 1 < bytes.len() {
+                index += 2;
+            } else {
+                return bytes.len();
+            }
+            continue;
+        }
+
+        return index;
+    }
 }
 
 fn previous_non_whitespace(bytes: &[u8], mut index: usize) -> Option<usize> {

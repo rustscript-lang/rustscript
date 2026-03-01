@@ -1520,6 +1520,22 @@ async fn ui_render_plain_if_and_loop_flow() {
         "expected if false branch action in rustscript, got: {rustscript}"
     );
 
+    let javascript = render_json["source"]["javascript"]
+        .as_str()
+        .expect("javascript source should be a string");
+    assert!(
+        javascript.contains("for (let i = 0; i < 2; i = i + 1) {"),
+        "expected plain loop in javascript, got: {javascript}"
+    );
+
+    let lua = render_json["source"]["lua"]
+        .as_str()
+        .expect("lua source should be a string");
+    assert!(
+        lua.contains("for i = 1, 2, 1 do"),
+        "expected explicit-step loop in lua, got: {lua}"
+    );
+
     handle.abort();
 }
 

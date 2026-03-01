@@ -3,7 +3,7 @@ local string = require("../stdlib/rss/strings.rss")
 
 -- Complex Lua flavor example: loop + stdlib + host + closure + string method lowering.
 local total = 0
-for i = 0, 3, 1 do
+for i = 3, 0, -1 do
     total = total + i
 end
 

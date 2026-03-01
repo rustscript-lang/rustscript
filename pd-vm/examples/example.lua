@@ -1,10 +1,8 @@
 local add_one = require("vm").add_one
 
-local i = 0
 local total = 0
-while i < 3 do
+for i = 3, 1, -1 do
     total = total + 1
-    i = i + 1
 end
 
 if total ~= 3 then
