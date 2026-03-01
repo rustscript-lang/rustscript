@@ -1202,6 +1202,8 @@ async fn ui_render_new_http_blocks_generate_expected_calls() {
     let rustscript = render_json["source"]["rustscript"]
         .as_str()
         .expect("rustscript source should be a string");
+    assert!(rustscript.contains("use runtime;"));
+    assert!(rustscript.contains("use rate_limit;"));
     assert!(rustscript.contains("let req_id = vm::http::request::get_id();"));
     assert!(rustscript.contains("let req_method = vm::http::request::get_method();"));
     assert!(rustscript.contains("let req_path = vm::http::request::get_path();"));
@@ -1232,7 +1234,7 @@ async fn ui_render_new_http_blocks_generate_expected_calls() {
     assert!(rustscript.contains("vm::http::upstream::request::set_raw_query(query_next);"));
     assert!(rustscript.contains("vm::http::upstream::request::set_query_arg(\"token\", req_id);"));
     assert!(rustscript.contains("vm::http::upstream::request::set_body(req_body);"));
-    assert!(rustscript.contains("vm::runtime::sleep(5);"));
+    assert!(rustscript.contains("runtime::sleep(5);"));
     assert!(rustscript.contains("vm::http::response::remove_header(\"x-hidden\");"));
     assert!(rustscript.contains("vm::http::response::clear_header(\"x-clear\");"));
     assert!(rustscript.contains("vm::http::response::add_header(\"set-cookie\", \"a=1\");"));
@@ -1241,7 +1243,7 @@ async fn ui_render_new_http_blocks_generate_expected_calls() {
     assert!(rustscript.contains("let resp_header = vm::http::response::get_header(\"x-vm\");"));
     assert!(rustscript.contains("let resp_headers = vm::http::response::get_headers();"));
     assert!(rustscript.contains("let resp_body = vm::http::response::get_body();"));
-    assert!(rustscript.contains("let allowed = vm::rate_limit::allow(req_id, 5, 60);"));
+    assert!(rustscript.contains("let allowed = rate_limit::allow(req_id, 5, 60);"));
 
     let javascript = render_json["source"]["javascript"]
         .as_str()
@@ -1390,7 +1392,7 @@ async fn ui_render_rate_limit_flow_branches_to_actions() {
         .as_str()
         .expect("rustscript source should be a string");
     assert!(
-        rustscript.contains("if vm::rate_limit::allow(client_id, 3, 60) {"),
+        rustscript.contains("if rate_limit::allow(client_id, 3, 60) {"),
         "expected rate limit branch in rustscript, got: {rustscript}"
     );
     assert!(

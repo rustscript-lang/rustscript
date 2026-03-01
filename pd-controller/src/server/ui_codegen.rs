@@ -2103,6 +2103,8 @@ fn render_sources_with_flow(
         scm_lines.extend(statements.scheme);
     }
 
+    ensure_rustscript_host_namespace_imports(&mut rss_lines);
+
     Ok(UiSourceBundle {
         rustscript: join_lines(&rss_lines),
         javascript: join_lines(&js_lines),
@@ -2303,7 +2305,7 @@ fn render_flow_node(
             statements.rustscript.push(indent_line(
                 indent,
                 format!(
-                    "if vm::rate_limit::allow({}, {}, {}) {{",
+                    "if rate_limit::allow({}, {}, {}) {{",
                     render_expr_rss(key_expr),
                     limit,
                     window
@@ -2966,7 +2968,7 @@ fn flow_action_statement(
         "runtime_sleep" => {
             let millis = render_number_expr(block_value(block, "millis", "10"), "10");
             Ok(FlowActionStatement {
-                rustscript: format!("vm::runtime::sleep({millis});"),
+                rustscript: format!("runtime::sleep({millis});"),
                 javascript: format!("vm.runtime.sleep({millis});"),
                 lua: format!("vm.runtime.sleep({millis})"),
                 scheme: format!("(vm.runtime.sleep {millis})"),
@@ -3121,12 +3123,37 @@ fn render_sources(
         )?
     }
 
+    ensure_rustscript_host_namespace_imports(&mut rss_lines);
+
     Ok(UiSourceBundle {
         rustscript: join_lines(&rss_lines),
         javascript: join_lines(&js_lines),
         lua: join_lines(&lua_lines),
         scheme: join_lines(&scm_lines),
     })
+}
+
+fn ensure_rustscript_host_namespace_imports(lines: &mut Vec<String>) {
+    let requires_runtime = lines.iter().any(|line| line.contains("runtime::"));
+    let requires_rate_limit = lines.iter().any(|line| line.contains("rate_limit::"));
+
+    if !requires_runtime && !requires_rate_limit {
+        return;
+    }
+
+    let mut insert_at = 1usize;
+    if requires_runtime && !lines.iter().any(|line| line.trim() == "use runtime;") {
+        lines.insert(insert_at, "use runtime;".to_string());
+        insert_at += 1;
+    }
+    if requires_rate_limit && !lines.iter().any(|line| line.trim() == "use rate_limit;") {
+        lines.insert(insert_at, "use rate_limit;".to_string());
+        insert_at += 1;
+    }
+
+    if insert_at < lines.len() && !lines[insert_at].trim().is_empty() {
+        lines.insert(insert_at, String::new());
+    }
 }
 
 fn render_single_block(
@@ -3706,7 +3733,7 @@ fn render_single_block(
             let window = render_number_expr(block_value(block, "window_seconds", "60"), "60");
 
             rss.push(format!(
-                "let {var} = vm::rate_limit::allow({}, {}, {});",
+                "let {var} = rate_limit::allow({}, {}, {});",
                 render_expr_rss(key_expr),
                 limit,
                 window
@@ -3736,7 +3763,7 @@ fn render_single_block(
             let window = sanitize_number(block.values.get("window_seconds"), "60");
 
             rss.push(format!(
-                "if vm::rate_limit::allow({}, {}, {}) {{",
+                "if rate_limit::allow({}, {}, {}) {{",
                 render_expr_rss(key_expr),
                 limit,
                 window
