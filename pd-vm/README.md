@@ -5,8 +5,16 @@ source syntaxes (`.rss`, `.js`, `.lua`, `.scm`).
 
 ## Sections
 
+- [Overview](#overview)
 - [How To Use](#how-to-use)
 - [Internals](#internals)
+
+
+## Overview
+
+Executes compiled compact bytecode rather than interpreting source.
+Offers consistent runtime semantics for both synchronous and asynchronous execution.
+Includes rich debugging and profiling tools: interactive debugger, recording and replay, and JIT trace insights.
 
 ## How To Use
 

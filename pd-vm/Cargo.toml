@@ -17,6 +17,7 @@ path = "src/bin/pd-vm-run.rs"
 required-features = ["cli"]
 
 [dependencies]
+futures-channel = "0.3"
 regex = "1"
 rustyline = { version = "14", optional = true }
 
@@ -25,3 +26,6 @@ windows-sys = { version = "0.59", features = ["Win32_System_Diagnostics_Debug", 
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }

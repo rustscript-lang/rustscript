@@ -35,6 +35,25 @@ pub(crate) const BUILTIN_CALL_BASE: u16 = 0xFFE0;
 pub(crate) const BUILTIN_CALL_COUNT: u16 = 23;
 
 impl BuiltinFunction {
+    pub(crate) fn from_namespaced_name(name: &str) -> Option<Self> {
+        match name.trim() {
+            "io::open" => Some(BuiltinFunction::IoOpen),
+            "io::popen" => Some(BuiltinFunction::IoPopen),
+            "io::read_all" => Some(BuiltinFunction::IoReadAll),
+            "io::read_line" => Some(BuiltinFunction::IoReadLine),
+            "io::write" => Some(BuiltinFunction::IoWrite),
+            "io::flush" => Some(BuiltinFunction::IoFlush),
+            "io::close" => Some(BuiltinFunction::IoClose),
+            "io::exists" => Some(BuiltinFunction::IoExists),
+            "re::match" | "re::is_match" => Some(BuiltinFunction::ReIsMatch),
+            "re::find" => Some(BuiltinFunction::ReFind),
+            "re::replace" => Some(BuiltinFunction::ReReplace),
+            "re::split" => Some(BuiltinFunction::ReSplit),
+            "re::captures" => Some(BuiltinFunction::ReCaptures),
+            _ => None,
+        }
+    }
+
     pub(crate) fn name(self) -> &'static str {
         match self {
             BuiltinFunction::Len => "len",

@@ -95,6 +95,84 @@ fn call_can_yield_and_resume() {
 }
 
 #[test]
+fn call_can_wait_for_host_op_and_resume_without_replay() {
+    struct PendingOnce {
+        called: bool,
+    }
+
+    impl HostFunction for PendingOnce {
+        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            if self.called {
+                return Err(vm::VmError::HostError(
+                    "pending host should not be replayed".to_string(),
+                ));
+            }
+            self.called = true;
+            Ok(CallOutcome::Pending(99))
+        }
+    }
+
+    let mut bc = BytecodeBuilder::new();
+    bc.call(0, 0);
+    bc.ret();
+    let program = Program::new(Vec::new(), bc.finish());
+
+    let mut vm = Vm::new(program);
+    vm.register_function(Box::new(PendingOnce { called: false }));
+
+    let status = vm.run().expect("first run should wait on host op");
+    assert_eq!(status, VmStatus::Waiting(99));
+
+    vm.complete_host_op(99, vec![Value::Int(7)])
+        .expect("host op completion should succeed");
+    let resumed = vm.resume().expect("resume should halt after completion");
+    assert_eq!(resumed, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(7)]);
+}
+
+#[test]
+fn namespaced_builtin_io_call_can_be_overridden_by_host_binding() {
+    struct ExistsOverride;
+
+    impl HostFunction for ExistsOverride {
+        fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            assert_eq!(args, &[Value::String("request_body".to_string())]);
+            Ok(CallOutcome::Return(vec![Value::Bool(false)]))
+        }
+    }
+
+    let compiled = compile_source(
+        r#"
+        io::exists("request_body");
+    "#,
+    )
+    .expect("source should compile");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    vm.bind_function("io::exists", Box::new(ExistsOverride));
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Bool(false)]);
+}
+
+#[test]
+fn bind_builtin_override_rejects_unknown_namespaced_builtin() {
+    struct Dummy;
+
+    impl HostFunction for Dummy {
+        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            Ok(CallOutcome::Return(vec![]))
+        }
+    }
+
+    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let err = vm
+        .bind_builtin_override("io::not_real", Box::new(Dummy))
+        .expect_err("unknown builtin override name should fail");
+    assert!(matches!(err, vm::VmError::HostError(_)));
+}
+
+#[test]
 fn assembler_resolves_labels() {
     let mut asm = Assembler::new();
     asm.push_const(Value::Bool(false));

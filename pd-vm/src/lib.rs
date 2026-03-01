@@ -18,9 +18,9 @@ pub use bytecode::{HostImport, OpCode, Program, Value};
 pub use compiler::diagnostics::render_source_error;
 pub use compiler::source_map::{LineSpanMapping, LoweredSource, SourceId, SourceMap, Span};
 pub use compiler::{
-    CompileError, CompiledProgram, Compiler, Expr, FunctionDecl, ParseError, SourceError,
-    SourceFlavor, SourcePathError, Stmt, compile_source, compile_source_file,
-    compile_source_with_flavor,
+    CompileError, CompileSourceFileOptions, CompiledProgram, Compiler, Expr, FunctionDecl,
+    ParseError, SourceError, SourceFlavor, SourcePathError, Stmt, compile_source,
+    compile_source_file, compile_source_file_with_options, compile_source_with_flavor,
 };
 pub use debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 #[cfg(feature = "runtime")]
@@ -39,8 +39,8 @@ pub use jit::{
 pub use vm::diagnostics::render_vm_error;
 #[cfg(feature = "runtime")]
 pub use vm::{
-    CallOutcome, HostBindingPlan, HostFunction, HostFunctionRegistry, StaticHostFunction, Vm,
-    VmError, VmResult, VmStatus,
+    CallOutcome, HostAsyncBridge, HostBindingPlan, HostFunction, HostFunctionRegistry, HostOpId,
+    StaticHostFunction, Vm, VmError, VmResult, VmStatus,
 };
 #[cfg(feature = "runtime")]
 pub use vmbc::{

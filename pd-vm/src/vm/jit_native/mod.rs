@@ -12,6 +12,7 @@ pub(super) const STATUS_CONTINUE: i32 = 0;
 pub(super) const STATUS_HALTED: i32 = 1;
 pub(super) const STATUS_TRACE_EXIT: i32 = 2;
 pub(super) const STATUS_YIELDED: i32 = 3;
+pub(super) const STATUS_WAITING: i32 = 4;
 pub(super) const STATUS_ERROR: i32 = -1;
 
 pub(super) trait NativeBackend {

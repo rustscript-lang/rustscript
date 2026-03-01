@@ -120,6 +120,11 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("vm yielded, resuming...");
                     continue;
                 }
+                VmStatus::Waiting(_op_id) => {
+                    vm.wait_for_host_op_blocking()
+                        .map_err(|err| io::Error::other(render_vm_error(&vm, &err)))?;
+                    continue;
+                }
             }
         }
         let recording = debugger
@@ -165,6 +170,11 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             }
             VmStatus::Yielded => {
                 println!("vm yielded, resuming...");
+                continue;
+            }
+            VmStatus::Waiting(_op_id) => {
+                vm.wait_for_host_op_blocking()
+                    .map_err(|err| io::Error::other(render_vm_error(&vm, &err)))?;
                 continue;
             }
         }
@@ -512,6 +522,14 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
                             break;
                         }
                         Ok(VmStatus::Yielded) => continue,
+                        Ok(VmStatus::Waiting(_op_id)) => {
+                            if let Err(err) = vm.wait_for_host_op_blocking() {
+                                sync_repl_session(&vm, &mut session);
+                                println!("{}", render_vm_error(&vm, &err));
+                                break;
+                            }
+                            continue;
+                        }
                         Err(err) => {
                             sync_repl_session(&vm, &mut session);
                             println!("{}", render_vm_error(&vm, &err));

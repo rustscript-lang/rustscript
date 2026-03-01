@@ -172,7 +172,7 @@ impl VmRecording {
 
     pub fn encode(&self) -> Result<Vec<u8>, VmRecordingError> {
         const MAGIC: [u8; 4] = *b"PDRC";
-        const VERSION: u16 = 1;
+        const VERSION: u16 = 2;
 
         let mut out = Vec::new();
         out.extend_from_slice(&MAGIC);
@@ -186,9 +186,13 @@ impl VmRecording {
         let status_tag = match self.terminal_status {
             Some(VmStatus::Halted) => 1u8,
             Some(VmStatus::Yielded) => 2u8,
+            Some(VmStatus::Waiting(_)) => 3u8,
             None => 0u8,
         };
         out.push(status_tag);
+        if let Some(VmStatus::Waiting(op_id)) = self.terminal_status {
+            out.extend_from_slice(&op_id.to_le_bytes());
+        }
 
         write_u32_len(self.frames.len(), &mut out)?;
         for frame in &self.frames {
@@ -211,7 +215,8 @@ impl VmRecording {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, VmRecordingError> {
         const MAGIC: [u8; 4] = *b"PDRC";
-        const VERSION: u16 = 1;
+        const VERSION_LEGACY: u16 = 1;
+        const VERSION: u16 = 2;
 
         let mut cursor = RecordingCursor::new(bytes);
 
@@ -221,7 +226,7 @@ impl VmRecording {
         }
 
         let version = cursor.read_u16()?;
-        if version != VERSION {
+        if version != VERSION && version != VERSION_LEGACY {
             return Err(VmRecordingError::Message(format!(
                 "unsupported recording version {version}"
             )));
@@ -235,6 +240,10 @@ impl VmRecording {
             0 => None,
             1 => Some(VmStatus::Halted),
             2 => Some(VmStatus::Yielded),
+            3 if version >= VERSION => {
+                let op_id = cursor.read_u64()?;
+                Some(VmStatus::Waiting(op_id))
+            }
             _ => {
                 return Err(VmRecordingError::InvalidFormat(
                     "invalid terminal status tag",
@@ -1546,6 +1555,13 @@ impl<'a> RecordingCursor<'a> {
     fn read_u32(&mut self) -> Result<u32, VmRecordingError> {
         let bytes = self.read_exact(4)?;
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, VmRecordingError> {
+        let bytes = self.read_exact(8)?;
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
     }
 
     fn read_i64(&mut self) -> Result<i64, VmRecordingError> {

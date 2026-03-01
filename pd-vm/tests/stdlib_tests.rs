@@ -15,8 +15,16 @@ fn run_rustscript_spec(path: &Path) -> Vec<Value> {
     );
 
     let mut vm = Vm::with_locals(compiled.program, compiled.locals);
-    let status = vm.run().expect("spec vm should run");
-    assert_eq!(status, VmStatus::Halted);
+    loop {
+        let status = vm.run().expect("spec vm should run");
+        match status {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => continue,
+            VmStatus::Waiting(_op_id) => vm
+                .wait_for_host_op_blocking()
+                .expect("spec vm should complete builtin async op"),
+        }
+    }
     vm.stack().to_vec()
 }
 

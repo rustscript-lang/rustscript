@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
 
 use crate::builtins::BuiltinFunction;
 #[cfg(any(
@@ -109,20 +110,28 @@ impl std::error::Error for VmError {}
 
 pub type VmResult<T> = Result<T, VmError>;
 
+pub type HostOpId = u64;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmStatus {
     Halted,
     Yielded,
+    Waiting(HostOpId),
 }
 
 #[derive(Debug, PartialEq)]
 pub enum CallOutcome {
     Return(Vec<Value>),
     Yield,
+    Pending(HostOpId),
 }
 
-pub trait HostFunction {
+pub trait HostFunction: Send {
     fn call(&mut self, vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome>;
+}
+
+pub trait HostAsyncBridge: Send {
+    fn poll_op(&mut self, op_id: HostOpId, cx: &mut Context<'_>) -> Poll<VmResult<Vec<Value>>>;
 }
 
 pub type StaticHostFunction = fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>;
@@ -319,12 +328,16 @@ pub struct Vm {
     locals: Vec<Value>,
     host_functions: Vec<VmHostFunction>,
     host_function_symbols: HashMap<String, u16>,
+    builtin_overrides: HashMap<u16, u16>,
     resolved_calls: Vec<u16>,
     resolved_calls_dirty: bool,
     call_depth: usize,
     jit: crate::jit::TraceJitEngine,
     native_traces: HashMap<usize, NativeTrace>,
     native_trace_exec_count: u64,
+    async_bridge: Option<Box<dyn HostAsyncBridge>>,
+    waiting_host_op: Option<WaitingHostOp>,
+    next_host_op_id: HostOpId,
     io_state: builtin_runtime::IoState,
 }
 
@@ -332,12 +345,42 @@ enum StepExecOutcome {
     Continue,
     Halted,
     Yielded,
+    Waiting(HostOpId),
 }
 
 enum TraceExecOutcome {
     Continue,
     Halted,
     Yielded,
+    Waiting(HostOpId),
+}
+
+enum HostCallExecOutcome {
+    Returned,
+    Yielded,
+    Pending(HostOpId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WaitingHostOp {
+    op_id: HostOpId,
+    source: WaitingHostOpSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitingHostOpSource {
+    HostBridge,
+    BuiltinIo,
+}
+
+struct NoopWake;
+
+impl Wake for NoopWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+fn noop_waker() -> Waker {
+    Waker::from(Arc::new(NoopWake))
 }
 
 #[cfg(any(
@@ -512,12 +555,16 @@ impl Vm {
             locals: Vec::new(),
             host_functions: Vec::new(),
             host_function_symbols: HashMap::new(),
+            builtin_overrides: HashMap::new(),
             resolved_calls: Vec::new(),
             resolved_calls_dirty: true,
             call_depth: 0,
             jit: crate::jit::TraceJitEngine::default(),
             native_traces: HashMap::new(),
             native_trace_exec_count: 0,
+            async_bridge: None,
+            waiting_host_op: None,
+            next_host_op_id: 1,
             io_state: builtin_runtime::IoState::default(),
         }
     }
@@ -532,12 +579,16 @@ impl Vm {
             locals: vec![Value::Null; local_count],
             host_functions: Vec::new(),
             host_function_symbols: HashMap::new(),
+            builtin_overrides: HashMap::new(),
             resolved_calls: Vec::new(),
             resolved_calls_dirty: true,
             call_depth: 0,
             jit: crate::jit::TraceJitEngine::default(),
             native_traces: HashMap::new(),
             native_trace_exec_count: 0,
+            async_bridge: None,
+            waiting_host_op: None,
+            next_host_op_id: 1,
             io_state: builtin_runtime::IoState::default(),
         }
     }
@@ -558,6 +609,10 @@ impl Vm {
 
     pub fn bind_function(&mut self, name: impl Into<String>, function: Box<dyn HostFunction>) {
         let name = name.into();
+        if let Some(builtin) = BuiltinFunction::from_namespaced_name(&name) {
+            self.bind_builtin_overrideslot(builtin.call_index(), VmHostFunction::Dynamic(function));
+            return;
+        }
         if let Some(&index) = self.host_function_symbols.get(&name)
             && let Some(slot) = self.host_functions.get_mut(index as usize)
         {
@@ -573,6 +628,10 @@ impl Vm {
 
     pub fn bind_static_function(&mut self, name: impl Into<String>, function: StaticHostFunction) {
         let name = name.into();
+        if let Some(builtin) = BuiltinFunction::from_namespaced_name(&name) {
+            self.bind_builtin_overrideslot(builtin.call_index(), VmHostFunction::Static(function));
+            return;
+        }
         if let Some(&index) = self.host_function_symbols.get(&name)
             && let Some(slot) = self.host_functions.get_mut(index as usize)
         {
@@ -584,6 +643,121 @@ impl Vm {
         let index = self.register_static_function(function);
         self.host_function_symbols.insert(name, index);
         self.resolved_calls_dirty = true;
+    }
+
+    pub fn bind_builtin_override(
+        &mut self,
+        name: impl Into<String>,
+        function: Box<dyn HostFunction>,
+    ) -> VmResult<()> {
+        let name = name.into();
+        let builtin = BuiltinFunction::from_namespaced_name(&name).ok_or_else(|| {
+            VmError::HostError(format!("unknown namespaced builtin override '{name}'"))
+        })?;
+        self.bind_builtin_overrideslot(builtin.call_index(), VmHostFunction::Dynamic(function));
+        Ok(())
+    }
+
+    pub fn bind_builtin_static_override(
+        &mut self,
+        name: impl Into<String>,
+        function: StaticHostFunction,
+    ) -> VmResult<()> {
+        let name = name.into();
+        let builtin = BuiltinFunction::from_namespaced_name(&name).ok_or_else(|| {
+            VmError::HostError(format!("unknown namespaced builtin override '{name}'"))
+        })?;
+        self.bind_builtin_overrideslot(builtin.call_index(), VmHostFunction::Static(function));
+        Ok(())
+    }
+
+    fn bind_builtin_overrideslot(&mut self, builtin_call_index: u16, function: VmHostFunction) {
+        if let Some(&host_slot) = self.builtin_overrides.get(&builtin_call_index)
+            && let Some(slot) = self.host_functions.get_mut(host_slot as usize)
+        {
+            *slot = function;
+            return;
+        }
+
+        let host_slot = self.host_functions.len() as u16;
+        self.host_functions.push(function);
+        self.builtin_overrides.insert(builtin_call_index, host_slot);
+    }
+
+    pub fn set_async_bridge(&mut self, bridge: Box<dyn HostAsyncBridge>) {
+        self.async_bridge = Some(bridge);
+    }
+
+    pub fn clear_async_bridge(&mut self) {
+        self.async_bridge = None;
+    }
+
+    pub fn allocate_host_op_id(&mut self) -> HostOpId {
+        let op_id = self.next_host_op_id;
+        self.next_host_op_id = self.next_host_op_id.wrapping_add(1).max(1);
+        op_id
+    }
+
+    pub fn waiting_host_op_id(&self) -> Option<HostOpId> {
+        self.waiting_host_op.map(|op| op.op_id)
+    }
+
+    pub fn complete_host_op(&mut self, op_id: HostOpId, values: Vec<Value>) -> VmResult<()> {
+        self.complete_waiting_host_op(op_id, values)
+    }
+
+    pub fn poll_waiting_host_op(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<()>> {
+        let Some(waiting) = self.waiting_host_op else {
+            return Poll::Ready(Ok(()));
+        };
+
+        let poll_result = match waiting.source {
+            WaitingHostOpSource::HostBridge => {
+                let bridge_ptr = match self.async_bridge.as_mut() {
+                    Some(bridge) => bridge.as_mut() as *mut dyn HostAsyncBridge,
+                    None => {
+                        return Poll::Ready(Err(VmError::HostError(format!(
+                            "vm waiting on host op {} without an async bridge",
+                            waiting.op_id
+                        ))));
+                    }
+                };
+
+                // SAFETY: `bridge_ptr` points to `self.async_bridge`, and this scope does not
+                // mutably access `self.async_bridge` again before `poll_op` returns.
+                unsafe { (&mut *bridge_ptr).poll_op(waiting.op_id, cx) }
+            }
+            WaitingHostOpSource::BuiltinIo => {
+                builtin_runtime::poll_builtin_io_op(self, waiting.op_id, cx)
+            }
+        };
+
+        match poll_result {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(values)) => {
+                self.complete_waiting_host_op(waiting.op_id, values)?;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(err)) => {
+                self.waiting_host_op = None;
+                Poll::Ready(Err(err))
+            }
+        }
+    }
+
+    pub async fn await_waiting_host_op(&mut self) -> VmResult<()> {
+        std::future::poll_fn(|cx| self.poll_waiting_host_op(cx)).await
+    }
+
+    pub fn wait_for_host_op_blocking(&mut self) -> VmResult<()> {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            match self.poll_waiting_host_op(&mut cx) {
+                Poll::Ready(result) => return result,
+                Poll::Pending => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
     }
 
     pub fn run(&mut self) -> VmResult<VmStatus> {
@@ -647,6 +821,14 @@ impl Vm {
         allow_jit: bool,
     ) -> VmResult<VmStatus> {
         self.ensure_call_bindings()?;
+        if let Some(waiting) = self.waiting_host_op {
+            let status = VmStatus::Waiting(waiting.op_id);
+            if let Some(active_debugger) = debugger.as_deref_mut() {
+                active_debugger.on_vm_status(self, status);
+            }
+            return Ok(status);
+        }
+
         loop {
             if let Some(active_debugger) = debugger.as_deref_mut() {
                 active_debugger.on_instruction(self);
@@ -672,6 +854,12 @@ impl Vm {
                             }
                             return Ok(VmStatus::Yielded);
                         }
+                        TraceExecOutcome::Waiting(op_id) => {
+                            if let Some(active_debugger) = debugger.as_deref_mut() {
+                                active_debugger.on_vm_status(self, VmStatus::Waiting(op_id));
+                            }
+                            return Ok(VmStatus::Waiting(op_id));
+                        }
                     }
                 }
             }
@@ -694,6 +882,12 @@ impl Vm {
                         active_debugger.on_vm_status(self, VmStatus::Yielded);
                     }
                     return Ok(VmStatus::Yielded);
+                }
+                StepExecOutcome::Waiting(op_id) => {
+                    if let Some(active_debugger) = debugger.as_deref_mut() {
+                        active_debugger.on_vm_status(self, VmStatus::Waiting(op_id));
+                    }
+                    return Ok(VmStatus::Waiting(op_id));
                 }
             }
         }
@@ -838,8 +1032,12 @@ impl Vm {
                 let call_ip = self.ip - 1;
                 let index = self.read_u16()?;
                 let argc_u8 = self.read_u8()?;
-                if self.execute_host_call(index, argc_u8, call_ip)? {
-                    return Ok(StepExecOutcome::Yielded);
+                match self.execute_host_call(index, argc_u8, call_ip)? {
+                    HostCallExecOutcome::Returned => {}
+                    HostCallExecOutcome::Yielded => return Ok(StepExecOutcome::Yielded),
+                    HostCallExecOutcome::Pending(op_id) => {
+                        return Ok(StepExecOutcome::Waiting(op_id));
+                    }
                 }
             }
             other => return Err(VmError::InvalidOpcode(other)),
@@ -988,8 +1186,12 @@ impl Vm {
                     argc,
                     call_ip,
                 } => {
-                    if self.execute_host_call(*index, *argc, *call_ip)? {
-                        return Ok(TraceExecOutcome::Yielded);
+                    match self.execute_host_call(*index, *argc, *call_ip)? {
+                        HostCallExecOutcome::Returned => {}
+                        HostCallExecOutcome::Yielded => return Ok(TraceExecOutcome::Yielded),
+                        HostCallExecOutcome::Pending(op_id) => {
+                            return Ok(TraceExecOutcome::Waiting(op_id));
+                        }
                     }
                 }
                 crate::jit::TraceStep::GuardFalse { exit_ip } => {
@@ -1029,6 +1231,9 @@ impl Vm {
             all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
         ))]
         {
+            if !self.builtin_overrides.is_empty() {
+                return self.execute_jit_trace(trace_id);
+            }
             self.execute_jit_native(trace_id)
         }
         #[cfg(not(any(
@@ -1085,6 +1290,14 @@ impl Vm {
                 }
                 jit_native::STATUS_HALTED => return Ok(TraceExecOutcome::Halted),
                 jit_native::STATUS_YIELDED => return Ok(TraceExecOutcome::Yielded),
+                jit_native::STATUS_WAITING => {
+                    let op_id = self.waiting_host_op.map(|op| op.op_id).ok_or_else(|| {
+                        VmError::JitNative(
+                            "native call bridge reported waiting without a pending op".to_string(),
+                        )
+                    })?;
+                    return Ok(TraceExecOutcome::Waiting(op_id));
+                }
                 jit_native::STATUS_ERROR => {
                     let err = jit_native::take_bridge_error().unwrap_or_else(|| {
                         VmError::JitNative(
@@ -1307,7 +1520,12 @@ impl Vm {
         Ok(value as u32)
     }
 
-    fn execute_host_call(&mut self, index: u16, argc_u8: u8, call_ip: usize) -> VmResult<bool> {
+    fn execute_host_call(
+        &mut self,
+        index: u16,
+        argc_u8: u8,
+        call_ip: usize,
+    ) -> VmResult<HostCallExecOutcome> {
         let argc = argc_u8 as usize;
         let mut args = Vec::with_capacity(argc);
         for _ in 0..argc {
@@ -1323,20 +1541,58 @@ impl Vm {
                     got: argc_u8,
                 });
             }
-            let values = builtin_runtime::execute_builtin_call(self, builtin, args)?;
-            for value in values {
-                self.stack.push(value);
+            if self.builtin_overrides.contains_key(&index) {
+                return self.execute_builtin_override_call(index, args, call_ip);
             }
-            return Ok(false);
+            match builtin_runtime::execute_builtin_call(self, builtin, args)? {
+                builtin_runtime::BuiltinCallOutcome::Return(values) => {
+                    for value in values {
+                        self.stack.push(value);
+                    }
+                    return Ok(HostCallExecOutcome::Returned);
+                }
+                builtin_runtime::BuiltinCallOutcome::Pending(op_id) => {
+                    let resume_ip = self.call_resume_ip(call_ip)?;
+                    self.set_waiting_host_op(op_id, WaitingHostOpSource::BuiltinIo)?;
+                    self.ip = resume_ip;
+                    return Ok(HostCallExecOutcome::Pending(op_id));
+                }
+            }
         }
 
         let resolved_index = self.resolve_call_target(index, argc_u8)?;
+        self.execute_bound_host_function(resolved_index, args, call_ip)
+    }
 
+    fn execute_builtin_override_call(
+        &mut self,
+        builtin_call_index: u16,
+        args: Vec<Value>,
+        call_ip: usize,
+    ) -> VmResult<HostCallExecOutcome> {
+        let resolved_index = self
+            .builtin_overrides
+            .get(&builtin_call_index)
+            .copied()
+            .ok_or_else(|| {
+                VmError::HostError(format!(
+                    "missing builtin override slot for call index {builtin_call_index}"
+                ))
+            })?;
+        self.execute_bound_host_function(resolved_index, args, call_ip)
+    }
+
+    fn execute_bound_host_function(
+        &mut self,
+        resolved_index: u16,
+        args: Vec<Value>,
+        call_ip: usize,
+    ) -> VmResult<HostCallExecOutcome> {
         self.call_depth += 1;
         let function_ptr = self
             .host_functions
             .get_mut(resolved_index as usize)
-            .ok_or(VmError::InvalidCall(index))? as *mut VmHostFunction;
+            .ok_or(VmError::InvalidCall(resolved_index))? as *mut VmHostFunction;
         let outcome = unsafe {
             match &mut *function_ptr {
                 VmHostFunction::Dynamic(function) => function.call(self, &args),
@@ -1351,16 +1607,63 @@ impl Vm {
                 for value in values {
                     self.stack.push(value);
                 }
-                Ok(false)
+                Ok(HostCallExecOutcome::Returned)
             }
             CallOutcome::Yield => {
                 for value in args {
                     self.stack.push(value);
                 }
                 self.ip = call_ip;
-                Ok(true)
+                Ok(HostCallExecOutcome::Yielded)
+            }
+            CallOutcome::Pending(op_id) => {
+                let resume_ip = self.call_resume_ip(call_ip)?;
+                self.set_waiting_host_op(op_id, WaitingHostOpSource::HostBridge)?;
+                self.ip = resume_ip;
+                Ok(HostCallExecOutcome::Pending(op_id))
             }
         }
+    }
+
+    fn call_resume_ip(&self, call_ip: usize) -> VmResult<usize> {
+        let resume_ip = call_ip.checked_add(4).ok_or(VmError::BytecodeBounds)?;
+        if resume_ip > self.program.code.len() {
+            return Err(VmError::BytecodeBounds);
+        }
+        Ok(resume_ip)
+    }
+
+    fn set_waiting_host_op(&mut self, op_id: HostOpId, source: WaitingHostOpSource) -> VmResult<()> {
+        if let Some(active) = self.waiting_host_op
+            && active.op_id != op_id
+        {
+            return Err(VmError::HostError(format!(
+                "vm already waiting on host op {}, cannot wait on {}",
+                active.op_id, op_id
+            )));
+        }
+        self.waiting_host_op = Some(WaitingHostOp { op_id, source });
+        Ok(())
+    }
+
+    fn complete_waiting_host_op(&mut self, op_id: HostOpId, values: Vec<Value>) -> VmResult<()> {
+        let waiting = self.waiting_host_op.ok_or_else(|| {
+            VmError::HostError(format!(
+                "host op {} completed but vm is not waiting on any op",
+                op_id
+            ))
+        })?;
+        if waiting.op_id != op_id {
+            return Err(VmError::HostError(format!(
+                "host op {} completed while vm waits on {}",
+                op_id, waiting.op_id
+            )));
+        }
+        self.waiting_host_op = None;
+        for value in values {
+            self.stack.push(value);
+        }
+        Ok(())
     }
 
     fn read_u8(&mut self) -> VmResult<u8> {

@@ -55,8 +55,16 @@ fn rustscript_io_namespace_builtin_calls_are_supported() {
     let compiled = compile_source(source).expect("compile should succeed");
     let mut vm = Vm::with_locals(compiled.program, compiled.locals);
 
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
+    loop {
+        let status = vm.run().expect("vm should run");
+        match status {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => continue,
+            VmStatus::Waiting(_op_id) => vm
+                .wait_for_host_op_blocking()
+                .expect("vm should complete builtin async op"),
+        }
+    }
     assert_eq!(vm.stack(), &[Value::Bool(true)]);
 }
 
@@ -635,6 +643,59 @@ fn compile_source_file_rustscript_supports_namespace_and_named_imports() {
 
     let _ = std::fs::remove_file(main_path);
     let _ = std::fs::remove_file(module_path);
+    let _ = std::fs::remove_dir(root);
+}
+
+#[test]
+fn compile_source_file_module_override_path_redirects_import_spec() {
+    let unique = format!(
+        "vm_rustscript_module_override_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).expect("temp module root should be created");
+
+    let override_module_path = root.join("edge_io_async_override.rss");
+    std::fs::write(
+        &override_module_path,
+        r#"
+        pub fn request_body_read() {
+            "override-body";
+        }
+    "#,
+    )
+    .expect("override module source should write");
+
+    let main_path = root.join("main.rss");
+    std::fs::write(
+        &main_path,
+        r#"
+        use edge::io_async as edge_io;
+        edge_io::request_body_read();
+    "#,
+    )
+    .expect("main source should write");
+
+    let options = CompileSourceFileOptions::new()
+        .with_module_override_path("edge/io_async.rss", &override_module_path);
+    let compiled =
+        compile_source_file_with_options(&main_path, options).expect("compile should succeed");
+    assert!(
+        compiled.functions.is_empty(),
+        "override module functions should be inlined into root program"
+    );
+
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("override-body".to_string())]);
+
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_file(override_module_path);
     let _ = std::fs::remove_dir(root);
 }
 

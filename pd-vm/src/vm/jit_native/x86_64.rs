@@ -1,6 +1,7 @@
 use super::super::{Program, Value, Vm, VmError, VmResult};
 use super::{
-    NativeBackend, STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_TRACE_EXIT, STATUS_YIELDED,
+    NativeBackend, STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_TRACE_EXIT,
+    STATUS_WAITING, STATUS_YIELDED,
 };
 use crate::builtins::BuiltinFunction;
 use std::sync::OnceLock;
@@ -2872,8 +2873,9 @@ extern "C" fn jit_native_call_bridge(vm_ptr: *mut Vm, index: u16, argc: u8, call
 
     let vm = unsafe { &mut *vm_ptr };
     match vm.execute_host_call(index, argc, call_ip) {
-        Ok(false) => STATUS_CONTINUE,
-        Ok(true) => STATUS_YIELDED,
+        Ok(super::super::HostCallExecOutcome::Returned) => STATUS_CONTINUE,
+        Ok(super::super::HostCallExecOutcome::Yielded) => STATUS_YIELDED,
+        Ok(super::super::HostCallExecOutcome::Pending(_)) => STATUS_WAITING,
         Err(err) => {
             set_bridge_error(err);
             STATUS_ERROR

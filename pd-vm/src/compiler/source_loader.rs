@@ -5,7 +5,7 @@ use crate::compiler::source_map::SourceMap;
 
 use super::frontends::{is_ident_continue, is_ident_start};
 use super::{
-    SourceError, SourceFlavor, SourcePathError, frontends,
+    CompileSourceFileOptions, SourceError, SourceFlavor, SourcePathError, frontends,
     linker::{ParsedUnit, sanitize_scope_prefix},
 };
 
@@ -36,6 +36,7 @@ pub(super) fn load_units_for_source_file(
     path: &Path,
     flavor: SourceFlavor,
     source_raw: &str,
+    options: &CompileSourceFileOptions,
 ) -> Result<(String, Vec<ParsedUnit>), SourcePathError> {
     let root_imports = parse_module_imports(source_raw, flavor, path)?;
     let source = strip_import_directives(source_raw, flavor);
@@ -48,23 +49,31 @@ pub(super) fn load_units_for_source_file(
         path,
         source_raw,
         flavor,
+        options,
         &mut visiting,
         &mut seen,
         &mut units,
         &mut module_exports,
     )?;
 
-    let rewritten_root_source =
-        rewrite_imported_call_sites(&source, flavor, path, &root_imports, &module_exports)?;
+    let rewritten_root_source = rewrite_imported_call_sites(
+        &source,
+        flavor,
+        path,
+        &root_imports,
+        &module_exports,
+        options,
+    )?;
     let root_parse_source = match flavor {
         SourceFlavor::Scheme => {
-            let mut prelude = build_scheme_import_prelude(path, &root_imports, &module_exports)?;
+            let mut prelude =
+                build_scheme_import_prelude(path, &root_imports, &module_exports, options)?;
             prelude.push_str(&rewritten_root_source);
             prelude
         }
         SourceFlavor::RustScript | SourceFlavor::JavaScript | SourceFlavor::Lua => {
             let mut prelude =
-                build_rustscript_import_prelude(path, &root_imports, &module_exports)?;
+                build_rustscript_import_prelude(path, &root_imports, &module_exports, options)?;
             prelude.push_str(&rewritten_root_source);
             prelude
         }
@@ -958,7 +967,26 @@ fn is_module_specifier(spec: &str) -> bool {
         || spec.starts_with('/')
 }
 
-fn resolve_module_path(base_path: &Path, spec: &str) -> Result<PathBuf, SourcePathError> {
+fn resolve_module_path(
+    base_path: &Path,
+    spec: &str,
+    options: &CompileSourceFileOptions,
+) -> Result<PathBuf, SourcePathError> {
+    if let Some(override_path) = options.module_override_path(spec) {
+        let path = if override_path.is_absolute() {
+            override_path.to_path_buf()
+        } else {
+            let parent = base_path
+                .parent()
+                .ok_or_else(|| SourcePathError::ImportWithoutParent(base_path.to_path_buf()))?;
+            parent.join(override_path)
+        };
+        if path.extension().and_then(|value| value.to_str()) != Some("rss") {
+            return Err(SourcePathError::NonRustScriptModule(path));
+        }
+        return Ok(path);
+    }
+
     let parent = base_path
         .parent()
         .ok_or_else(|| SourcePathError::ImportWithoutParent(base_path.to_path_buf()))?;
@@ -1018,6 +1046,7 @@ fn collect_module_units(
     path: &Path,
     source: &str,
     flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
     visiting: &mut Vec<PathBuf>,
     seen: &mut HashSet<PathBuf>,
     units: &mut Vec<ParsedUnit>,
@@ -1029,7 +1058,7 @@ fn collect_module_units(
         if !is_module_specifier(&spec) {
             continue;
         }
-        let resolved = resolve_module_path(path, &spec)?;
+        let resolved = resolve_module_path(path, &spec, options)?;
         let key = resolved.clone();
         if visiting.contains(&key) {
             return Err(SourcePathError::ImportCycle(key));
@@ -1044,6 +1073,7 @@ fn collect_module_units(
             &resolved,
             &module_source_raw,
             SourceFlavor::RustScript,
+            options,
             visiting,
             seen,
             units,
@@ -1082,8 +1112,9 @@ fn build_rustscript_import_prelude(
     path: &Path,
     imports: &[ModuleImport],
     module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
+    options: &CompileSourceFileOptions,
 ) -> Result<String, SourcePathError> {
-    let declared = collect_imported_module_functions(path, imports, module_exports)?;
+    let declared = collect_imported_module_functions(path, imports, module_exports, options)?;
     let mut prelude = String::new();
     for (name, arity) in declared {
         let args = (0..arity)
@@ -1099,8 +1130,9 @@ fn build_scheme_import_prelude(
     path: &Path,
     imports: &[ModuleImport],
     module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
+    options: &CompileSourceFileOptions,
 ) -> Result<String, SourcePathError> {
-    let declared = collect_imported_module_functions(path, imports, module_exports)?;
+    let declared = collect_imported_module_functions(path, imports, module_exports, options)?;
     let mut prelude = String::new();
     for (name, arity) in declared {
         let args = (0..arity)
@@ -1116,6 +1148,7 @@ fn collect_imported_module_functions(
     path: &Path,
     imports: &[ModuleImport],
     module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
+    options: &CompileSourceFileOptions,
 ) -> Result<Vec<(String, u8)>, SourcePathError> {
     let mut imported_functions = HashMap::<String, u8>::new();
 
@@ -1124,7 +1157,7 @@ fn collect_imported_module_functions(
             continue;
         }
 
-        let resolved = resolve_module_path(path, &import.spec)?;
+        let resolved = resolve_module_path(path, &import.spec, options)?;
         let exports =
             module_exports
                 .get(&resolved)
@@ -1175,6 +1208,7 @@ fn rewrite_imported_call_sites(
     path: &Path,
     imports: &[ModuleImport],
     module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
+    options: &CompileSourceFileOptions,
 ) -> Result<String, SourcePathError> {
     let mut alias_calls = HashMap::<String, String>::new();
     let mut namespace_calls = HashMap::<String, HashSet<String>>::new();
@@ -1201,7 +1235,7 @@ fn rewrite_imported_call_sites(
             continue;
         }
 
-        let resolved = resolve_module_path(path, &import.spec)?;
+        let resolved = resolve_module_path(path, &import.spec, options)?;
         let Some(exports) = module_exports.get(&resolved) else {
             continue;
         };

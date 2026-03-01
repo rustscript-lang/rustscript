@@ -1,9 +1,10 @@
 #![allow(dead_code, unused_imports)]
 
 pub use vm::{
-    Assembler, BytecodeBuilder, CallOutcome, Compiler, Expr, HostFunction, HostFunctionRegistry,
-    Program, SourceFlavor, Stmt, Value, Vm, VmStatus, assemble, compile_source,
-    compile_source_file, compile_source_with_flavor,
+    Assembler, BytecodeBuilder, CallOutcome, CompileSourceFileOptions, Compiler, Expr,
+    HostFunction, HostFunctionRegistry, Program, SourceFlavor, Stmt, Value, Vm, VmStatus,
+    assemble, compile_source, compile_source_file, compile_source_file_with_options,
+    compile_source_with_flavor,
 };
 
 pub struct YieldOnce {

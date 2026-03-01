@@ -232,6 +232,44 @@ impl CompiledProgram {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct CompileSourceFileOptions {
+    module_path_overrides: HashMap<String, PathBuf>,
+}
+
+impl CompileSourceFileOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_module_override_path(
+        mut self,
+        import_spec: impl Into<String>,
+        module_path: impl Into<PathBuf>,
+    ) -> Self {
+        self.set_module_override_path(import_spec, module_path);
+        self
+    }
+
+    pub fn set_module_override_path(
+        &mut self,
+        import_spec: impl Into<String>,
+        module_path: impl Into<PathBuf>,
+    ) {
+        let key = normalize_import_spec(import_spec.into());
+        self.module_path_overrides.insert(key, module_path.into());
+    }
+
+    pub fn module_override_path(&self, import_spec: &str) -> Option<&Path> {
+        let key = normalize_import_spec(import_spec.to_string());
+        self.module_path_overrides.get(&key).map(PathBuf::as_path)
+    }
+}
+
+fn normalize_import_spec(spec: String) -> String {
+    spec.trim().replace('\\', "/")
+}
+
 fn compile_parsed_output(parsed: LinkedIr) -> Result<CompiledProgram, SourceError> {
     let LinkedIr {
         source,
@@ -329,15 +367,25 @@ fn compile_source_with_flavor_impl(
 }
 
 pub fn compile_source_file(path: impl AsRef<Path>) -> Result<CompiledProgram, SourcePathError> {
-    let path = path.as_ref().to_path_buf();
-    run_with_compiler_stack(move || compile_source_file_impl(&path))
+    compile_source_file_with_options(path, CompileSourceFileOptions::default())
 }
 
-fn compile_source_file_impl(path: &Path) -> Result<CompiledProgram, SourcePathError> {
+pub fn compile_source_file_with_options(
+    path: impl AsRef<Path>,
+    options: CompileSourceFileOptions,
+) -> Result<CompiledProgram, SourcePathError> {
+    let path = path.as_ref().to_path_buf();
+    run_with_compiler_stack(move || compile_source_file_impl(&path, &options))
+}
+
+fn compile_source_file_impl(
+    path: &Path,
+    options: &CompileSourceFileOptions,
+) -> Result<CompiledProgram, SourcePathError> {
     let flavor = SourceFlavor::from_path(path)?;
     let source_raw = std::fs::read_to_string(path)?;
     let (root_source, units) =
-        source_loader::load_units_for_source_file(path, flavor, &source_raw)?;
+        source_loader::load_units_for_source_file(path, flavor, &source_raw, options)?;
     let merged = merge_units(root_source, units)?;
     compile_parsed_output(merged).map_err(SourcePathError::Source)
 }
