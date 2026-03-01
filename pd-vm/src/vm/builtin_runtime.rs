@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::future::Future;
 use std::fs::OpenOptions;
+use std::future::Future;
 use std::io::{Read, Write};
 use std::pin::Pin;
 use std::process::{Child, Command, Stdio};
@@ -533,7 +533,9 @@ fn builtin_io_read_line(vm: &mut Vm, args: Vec<Value>) -> VmResult<BuiltinCallOu
     let op_id = schedule_io_task(vm, move || {
         let mut handle = handle;
         let result = match &mut handle {
-            IoHandle::File(file) => read_line_from_reader(file).map(|line| vec![Value::String(line)]),
+            IoHandle::File(file) => {
+                read_line_from_reader(file).map(|line| vec![Value::String(line)])
+            }
             IoHandle::PopenRead { child } => {
                 let stdout = match child.stdout.as_mut() {
                     Some(stdout) => stdout,
@@ -652,7 +654,9 @@ fn builtin_io_exists(vm: &mut Vm, args: Vec<Value>) -> VmResult<BuiltinCallOutco
     let path = arg_string(&args, 0, "io_exists path")?.to_string();
     let op_id = schedule_io_task(vm, move || IoAsyncCompletion {
         restored_handle: None,
-        result: Ok(vec![Value::Bool(std::path::Path::new(path.as_str()).exists())]),
+        result: Ok(vec![Value::Bool(
+            std::path::Path::new(path.as_str()).exists(),
+        )]),
     })?;
     Ok(BuiltinCallOutcome::Pending(op_id))
 }

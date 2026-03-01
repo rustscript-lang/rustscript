@@ -119,9 +119,15 @@ fn edge_io_target_from_string(value: &str) -> Option<EdgeIoHandleKind> {
     match normalized.as_str() {
         "request_body" | "request.body" | "request" | "body" | "http.request.body"
         | "inbound.body" => Some(EdgeIoHandleKind::RequestBody),
-        "response_body" | "response.body" | "response" | "http.response.body"
+        "response_body"
+        | "response.body"
+        | "response"
+        | "http.response.body"
         | "outbound.response.body" => Some(EdgeIoHandleKind::ResponseBody),
-        "upstream_body" | "upstream.body" | "upstream_request_body" | "outbound.body"
+        "upstream_body"
+        | "upstream.body"
+        | "upstream_request_body"
+        | "outbound.body"
         | "http.upstream.request.body" => Some(EdgeIoHandleKind::UpstreamBody),
         _ => None,
     }
@@ -131,16 +137,14 @@ fn edge_io_readable_path(path: &str) -> bool {
     let normalized = path.trim().to_ascii_lowercase();
     matches!(
         normalized.as_str(),
-        "request_body"
-            | "request.body"
-            | "request"
-            | "body"
-            | "http.request.body"
-            | "inbound.body"
+        "request_body" | "request.body" | "request" | "body" | "http.request.body" | "inbound.body"
     )
 }
 
-fn allocate_edge_virtual_io_handle(context: &mut ProxyVmContext, handle: EdgeVirtualIoHandle) -> i64 {
+fn allocate_edge_virtual_io_handle(
+    context: &mut ProxyVmContext,
+    handle: EdgeVirtualIoHandle,
+) -> i64 {
     let handle_id = context.edge_io_next_handle.max(EDGE_IO_HANDLE_DYNAMIC_BASE);
     context.edge_io_next_handle = handle_id.saturating_add(1);
     context.edge_io_handles.insert(handle_id, handle);
@@ -434,7 +438,10 @@ impl BuiltinIoReadAllFunction {
 impl HostFunction for BuiltinIoReadAllFunction {
     fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 1)?;
-        let source = args.first().cloned().ok_or(VmError::TypeMismatch("string/int"))?;
+        let source = args
+            .first()
+            .cloned()
+            .ok_or(VmError::TypeMismatch("string/int"))?;
         let context = self.context.clone();
         schedule_future_call(vm, &self.async_ops, async move {
             tokio::task::yield_now().await;
@@ -474,7 +481,10 @@ impl BuiltinIoReadLineFunction {
 impl HostFunction for BuiltinIoReadLineFunction {
     fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 1)?;
-        let source = args.first().cloned().ok_or(VmError::TypeMismatch("string/int"))?;
+        let source = args
+            .first()
+            .cloned()
+            .ok_or(VmError::TypeMismatch("string/int"))?;
         let context = self.context.clone();
         schedule_future_call(vm, &self.async_ops, async move {
             tokio::task::yield_now().await;
@@ -517,7 +527,10 @@ impl BuiltinIoWriteFunction {
 impl HostFunction for BuiltinIoWriteFunction {
     fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 2)?;
-        let target_arg = args.first().cloned().ok_or(VmError::TypeMismatch("string/int"))?;
+        let target_arg = args
+            .first()
+            .cloned()
+            .ok_or(VmError::TypeMismatch("string/int"))?;
         let text = expect_string(args, 1)?;
         let context = self.context.clone();
         schedule_future_call(vm, &self.async_ops, async move {
@@ -555,7 +568,10 @@ impl BuiltinIoFlushFunction {
 impl HostFunction for BuiltinIoFlushFunction {
     fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 1)?;
-        let target = args.first().cloned().ok_or(VmError::TypeMismatch("string/int"))?;
+        let target = args
+            .first()
+            .cloned()
+            .ok_or(VmError::TypeMismatch("string/int"))?;
         let context = self.context.clone();
         schedule_future_call(vm, &self.async_ops, async move {
             tokio::task::yield_now().await;
@@ -592,7 +608,10 @@ impl BuiltinIoCloseFunction {
 impl HostFunction for BuiltinIoCloseFunction {
     fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 1)?;
-        let target = args.first().cloned().ok_or(VmError::TypeMismatch("string/int"))?;
+        let target = args
+            .first()
+            .cloned()
+            .ok_or(VmError::TypeMismatch("string/int"))?;
         let context = self.context.clone();
         schedule_future_call(vm, &self.async_ops, async move {
             tokio::task::yield_now().await;

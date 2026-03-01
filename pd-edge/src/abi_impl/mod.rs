@@ -97,11 +97,7 @@ impl VmAsyncOps {
         Ok(op_id)
     }
 
-    fn insert_pending(
-        &mut self,
-        op_id: HostOpId,
-        pending_op: PendingOp,
-    ) -> Result<(), VmError> {
+    fn insert_pending(&mut self, op_id: HostOpId, pending_op: PendingOp) -> Result<(), VmError> {
         if self.pending.contains_key(&op_id) {
             return Err(VmError::HostError(format!(
                 "duplicate async host op id {op_id}"
@@ -456,7 +452,10 @@ pub fn register_host_module(
     io::register_builtin_io_overrides(vm, context, async_ops)
 }
 
-pub fn register_runtime_host_module(vm: &mut Vm, async_ops: SharedVmAsyncOps) -> Result<(), VmError> {
+pub fn register_runtime_host_module(
+    vm: &mut Vm,
+    async_ops: SharedVmAsyncOps,
+) -> Result<(), VmError> {
     runtime::register_runtime_host_module(vm, async_ops)
 }
 

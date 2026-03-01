@@ -113,13 +113,10 @@ fn reserve_tcp_addr() -> SocketAddr {
 async fn send_pdb_continue(addr: SocketAddr) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut stream = timeout(
-        Duration::from_secs(2),
-        tokio::net::TcpStream::connect(addr),
-    )
-    .await
-    .expect("pdb helper connect timed out")
-    .expect("debugger tcp should accept connections");
+    let mut stream = timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(addr))
+        .await
+        .expect("pdb helper connect timed out")
+        .expect("debugger tcp should accept connections");
 
     let mut banner = [0u8; 512];
     let _ = timeout(Duration::from_millis(300), stream.read(&mut banner)).await;
@@ -742,7 +739,10 @@ async fn http_request_body_chunk_api_reads_in_chunks() {
         .await
         .expect("request should complete");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.text().await.expect("body should read"), "abcdefghij");
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "abcdefghij"
+    );
 
     data_handle.abort();
     admin_handle.abort();
@@ -774,10 +774,7 @@ async fn debug_attached_request_does_not_block_non_debug_requests() {
         }
 
         async fn join(mut self) -> Result<T, tokio::task::JoinError> {
-            self.handle
-                .take()
-                .expect("join handle should exist")
-                .await
+            self.handle.take().expect("join handle should exist").await
         }
     }
 

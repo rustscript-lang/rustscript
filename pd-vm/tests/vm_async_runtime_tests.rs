@@ -80,7 +80,11 @@ impl TestAsyncBridge {
 }
 
 impl HostAsyncBridge for TestAsyncBridge {
-    fn poll_op(&mut self, op_id: HostOpId, cx: &mut Context<'_>) -> Poll<Result<Vec<Value>, VmError>> {
+    fn poll_op(
+        &mut self,
+        op_id: HostOpId,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Vec<Value>, VmError>> {
         self.ops
             .lock()
             .expect("test async ops lock poisoned")
@@ -186,7 +190,9 @@ async fn async_host_call_waits_and_resumes_via_tokio_runtime() {
         "vm should clear waiting state once op completes"
     );
 
-    let status = vm.resume().expect("vm should resume after host op completion");
+    let status = vm
+        .resume()
+        .expect("vm should resume after host op completion");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(vm.stack(), &[Value::Int(42)]);

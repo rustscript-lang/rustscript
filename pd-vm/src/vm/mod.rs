@@ -1185,15 +1185,13 @@ impl Vm {
                     index,
                     argc,
                     call_ip,
-                } => {
-                    match self.execute_host_call(*index, *argc, *call_ip)? {
-                        HostCallExecOutcome::Returned => {}
-                        HostCallExecOutcome::Yielded => return Ok(TraceExecOutcome::Yielded),
-                        HostCallExecOutcome::Pending(op_id) => {
-                            return Ok(TraceExecOutcome::Waiting(op_id));
-                        }
+                } => match self.execute_host_call(*index, *argc, *call_ip)? {
+                    HostCallExecOutcome::Returned => {}
+                    HostCallExecOutcome::Yielded => return Ok(TraceExecOutcome::Yielded),
+                    HostCallExecOutcome::Pending(op_id) => {
+                        return Ok(TraceExecOutcome::Waiting(op_id));
                     }
-                }
+                },
                 crate::jit::TraceStep::GuardFalse { exit_ip } => {
                     let condition = self.pop_bool()?;
                     if !condition {
@@ -1589,10 +1587,10 @@ impl Vm {
         call_ip: usize,
     ) -> VmResult<HostCallExecOutcome> {
         self.call_depth += 1;
-        let function_ptr = self
-            .host_functions
-            .get_mut(resolved_index as usize)
-            .ok_or(VmError::InvalidCall(resolved_index))? as *mut VmHostFunction;
+        let function_ptr =
+            self.host_functions
+                .get_mut(resolved_index as usize)
+                .ok_or(VmError::InvalidCall(resolved_index))? as *mut VmHostFunction;
         let outcome = unsafe {
             match &mut *function_ptr {
                 VmHostFunction::Dynamic(function) => function.call(self, &args),
@@ -1633,7 +1631,11 @@ impl Vm {
         Ok(resume_ip)
     }
 
-    fn set_waiting_host_op(&mut self, op_id: HostOpId, source: WaitingHostOpSource) -> VmResult<()> {
+    fn set_waiting_host_op(
+        &mut self,
+        op_id: HostOpId,
+        source: WaitingHostOpSource,
+    ) -> VmResult<()> {
         if let Some(active) = self.waiting_host_op
             && active.op_id != op_id
         {
