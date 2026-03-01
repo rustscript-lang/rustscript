@@ -7,11 +7,7 @@ use super::super::{
     parse_headers_map_arg,
 };
 
-pub(super) fn register_13_to_16(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-) {
+pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) {
     bind_async_host(
         vm,
         &async_ops,
@@ -36,13 +32,6 @@ pub(super) fn register_13_to_16(
         "http::response::set_status",
         Box::new(SetResponseStatusFunction::new(context.clone())),
     );
-}
-
-pub(super) fn register_33_to_39(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-) {
     bind_async_host(
         vm,
         &async_ops,
@@ -103,6 +92,7 @@ impl HostFunction for SetResponseHeaderFunction {
         let (header_name, header_value) = parse_header_args(args)?;
 
         let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_response_output();
         context.response_headers.insert(header_name, header_value);
         Ok(CallOutcome::Return(vec![]))
     }
@@ -124,6 +114,7 @@ impl HostFunction for AddResponseHeaderFunction {
         let (header_name, header_value) = parse_header_args(args)?;
 
         let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_response_output();
         context.response_headers.append(header_name, header_value);
         Ok(CallOutcome::Return(vec![]))
     }
@@ -145,6 +136,7 @@ impl HostFunction for SetResponseHeadersFunction {
         let headers = parse_headers_map_arg(args, 0)?;
 
         let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_response_output();
         for (name, values) in headers {
             context.response_headers.remove(name.clone());
             for value in values {
@@ -171,6 +163,7 @@ impl HostFunction for RemoveResponseHeaderFunction {
         let header_name = parse_header_name_arg(args, 0)?;
 
         let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_response_output();
         context.response_headers.remove(header_name);
         Ok(CallOutcome::Return(vec![]))
     }
@@ -209,7 +202,8 @@ impl HostFunction for GetResponseHeaderFunction {
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
 
-        let context = self.context.lock().expect("vm context lock poisoned");
+        let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_response_output();
         let value = context
             .response_headers
             .get(&header_name)
@@ -232,7 +226,8 @@ impl GetResponseHeadersFunction {
 impl HostFunction for GetResponseHeadersFunction {
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 0)?;
-        let context = self.context.lock().expect("vm context lock poisoned");
+        let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_response_output();
         Ok(CallOutcome::Return(vec![headers_to_value_map(
             &context.response_headers,
         )]))
@@ -254,6 +249,7 @@ impl HostFunction for SetResponseContentFunction {
         expect_arg_count(args, 1)?;
         let body = expect_string(args, 0)?;
         let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_response_output();
         context.response_content = Some(body);
         Ok(CallOutcome::Return(vec![]))
     }
@@ -272,7 +268,8 @@ impl GetResponseBodyFunction {
 impl HostFunction for GetResponseBodyFunction {
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 0)?;
-        let context = self.context.lock().expect("vm context lock poisoned");
+        let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_response_output();
         let value = context.response_content.clone().unwrap_or_default();
         Ok(CallOutcome::Return(vec![Value::String(value)]))
     }
@@ -299,6 +296,7 @@ impl HostFunction for SetResponseStatusFunction {
         }
 
         let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_response_output();
         context.response_status = Some(status as u16);
         Ok(CallOutcome::Return(vec![]))
     }
@@ -317,7 +315,8 @@ impl GetResponseStatusFunction {
 impl HostFunction for GetResponseStatusFunction {
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 0)?;
-        let context = self.context.lock().expect("vm context lock poisoned");
+        let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_response_output();
         let status = context.response_status.unwrap_or(0);
         Ok(CallOutcome::Return(vec![Value::Int(status as i64)]))
     }

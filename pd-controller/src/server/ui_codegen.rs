@@ -363,6 +363,56 @@ pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
             accepts_flow: false,
         },
         UiBlockDefinition {
+            id: "get_request_body_next_chunk",
+            title: "Get Request Body Chunk",
+            category: "http_request",
+            description: "Read the next request body chunk into a variable.",
+            inputs: vec![
+                UiBlockInput {
+                    key: "var",
+                    label: "Variable",
+                    input_type: UiInputType::Text,
+                    default_value: "request_chunk",
+                    placeholder: "request_chunk",
+                    connectable: false,
+                },
+                UiBlockInput {
+                    key: "max_bytes",
+                    label: "Max Bytes",
+                    input_type: UiInputType::Number,
+                    default_value: "1024",
+                    placeholder: "1024 or $var",
+                    connectable: true,
+                },
+            ],
+            outputs: vec![UiBlockOutput {
+                key: "value",
+                label: "value",
+                expr_from_input: Some("var"),
+            }],
+            accepts_flow: false,
+        },
+        UiBlockDefinition {
+            id: "get_request_body_eof",
+            title: "Get Request Body EOF",
+            category: "http_request",
+            description: "Read whether request body stream reached EOF into a variable.",
+            inputs: vec![UiBlockInput {
+                key: "var",
+                label: "Variable",
+                input_type: UiInputType::Text,
+                default_value: "request_body_eof",
+                placeholder: "request_body_eof",
+                connectable: false,
+            }],
+            outputs: vec![UiBlockOutput {
+                key: "value",
+                label: "value",
+                expr_from_input: Some("var"),
+            }],
+            accepts_flow: false,
+        },
+        UiBlockDefinition {
             id: "get_request_host",
             title: "Get Request Host",
             category: "http_request",
@@ -1525,10 +1575,30 @@ pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
             accepts_flow: true,
         },
         UiBlockDefinition {
+            id: "runtime_sleep",
+            title: "Runtime Sleep",
+            category: "runtime",
+            description: "Sleep runtime VM execution for a number of milliseconds via vm.runtime.sleep.",
+            inputs: vec![UiBlockInput {
+                key: "millis",
+                label: "Milliseconds",
+                input_type: UiInputType::Number,
+                default_value: "10",
+                placeholder: "10 or $var",
+                connectable: true,
+            }],
+            outputs: vec![UiBlockOutput {
+                key: "next",
+                label: "next",
+                expr_from_input: None,
+            }],
+            accepts_flow: true,
+        },
+        UiBlockDefinition {
             id: "rate_limit_allow",
             title: "Rate Limit Allow",
             category: "control",
-            description: "Evaluate vm.http.rate_limit.allow and store a boolean result.",
+            description: "Evaluate vm.rate_limit.allow and store a boolean result.",
             inputs: vec![
                 UiBlockInput {
                     key: "var",
@@ -1574,7 +1644,7 @@ pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
             id: "rate_limit_if_else",
             title: "Rate Limit If/Else",
             category: "control",
-            description: "Use vm.http.rate_limit.allow and branch to allowed/blocked flow outputs.",
+            description: "Use vm.rate_limit.allow and branch to allowed/blocked flow outputs.",
             inputs: vec![
                 UiBlockInput {
                     key: "key_expr",
@@ -2062,6 +2132,8 @@ fn is_value_block(block_id: &str) -> bool {
             | "get_request_port"
             | "get_request_client_ip"
             | "get_request_body"
+            | "get_request_body_next_chunk"
+            | "get_request_body_eof"
             | "get_response_status"
             | "get_response_header"
             | "get_response_headers"
@@ -2110,6 +2182,7 @@ fn is_flow_block(block_id: &str) -> bool {
             | "set_response_content"
             | "set_response_status"
             | "set_upstream"
+            | "runtime_sleep"
             | "rate_limit_if_else"
             | "if"
             | "loop"
@@ -2174,7 +2247,8 @@ fn render_flow_node(
         | "set_response_headers"
         | "set_response_content"
         | "set_response_status"
-        | "set_upstream" => {
+        | "set_upstream"
+        | "runtime_sleep" => {
             let mut statements = FlowStatements::default();
             let action = flow_action_statement(block)?;
             statements
@@ -2229,7 +2303,7 @@ fn render_flow_node(
             statements.rustscript.push(indent_line(
                 indent,
                 format!(
-                    "if vm::http::rate_limit::allow({}, {}, {}) {{",
+                    "if vm::rate_limit::allow({}, {}, {}) {{",
                     render_expr_rss(key_expr),
                     limit,
                     window
@@ -2251,7 +2325,7 @@ fn render_flow_node(
             statements.javascript.push(indent_line(
                 indent,
                 format!(
-                    "if (vm.http.rate_limit.allow({}, {}, {})) {{",
+                    "if (vm.rate_limit.allow({}, {}, {})) {{",
                     render_expr_js(key_expr),
                     limit,
                     window
@@ -2273,7 +2347,7 @@ fn render_flow_node(
             statements.lua.push(indent_line(
                 indent,
                 format!(
-                    "if vm.http.rate_limit.allow({}, {}, {}) then",
+                    "if vm.rate_limit.allow({}, {}, {}) then",
                     render_expr_lua(key_expr),
                     limit,
                     window
@@ -2285,7 +2359,7 @@ fn render_flow_node(
             statements.lua.push(indent_line(indent, "end".to_string()));
 
             statements.scheme.push(format!(
-                "(if (vm.http.rate_limit.allow {} {} {}) {} {})",
+                "(if (vm.rate_limit.allow {} {} {}) {} {})",
                 render_expr_scheme(key_expr),
                 limit,
                 window,
@@ -2889,6 +2963,15 @@ fn flow_action_statement(
                 ),
             })
         }
+        "runtime_sleep" => {
+            let millis = render_number_expr(block_value(block, "millis", "10"), "10");
+            Ok(FlowActionStatement {
+                rustscript: format!("vm::runtime::sleep({millis});"),
+                javascript: format!("vm.runtime.sleep({millis});"),
+                lua: format!("vm.runtime.sleep({millis})"),
+                scheme: format!("(vm.runtime.sleep {millis})"),
+            })
+        }
         other => Err(bad_request(&format!(
             "unsupported flow action block '{}'",
             other
@@ -3217,6 +3300,29 @@ fn render_single_block(
             js.push(format!("let {var} = vm.http.request.get_body();"));
             lua.push(format!("local {var} = vm.http.request.get_body()"));
             scm.push(format!("(define {var} (vm.http.request.get_body))"));
+        }
+        "get_request_body_next_chunk" => {
+            let var = sanitize_identifier(block.values.get("var"), "request_chunk");
+            let max_bytes = render_number_expr(block_value(block, "max_bytes", "1024"), "1024");
+            rss.push(format!(
+                "let {var} = vm::http::request::body::next_chunk({max_bytes});"
+            ));
+            js.push(format!(
+                "let {var} = vm.http.request.body.next_chunk({max_bytes});"
+            ));
+            lua.push(format!(
+                "local {var} = vm.http.request.body.next_chunk({max_bytes})"
+            ));
+            scm.push(format!(
+                "(define {var} (vm.http.request.body.next_chunk {max_bytes}))"
+            ));
+        }
+        "get_request_body_eof" => {
+            let var = sanitize_identifier(block.values.get("var"), "request_body_eof");
+            rss.push(format!("let {var} = vm::http::request::body::eof();"));
+            js.push(format!("let {var} = vm.http.request.body.eof();"));
+            lua.push(format!("local {var} = vm.http.request.body.eof()"));
+            scm.push(format!("(define {var} (vm.http.request.body.eof))"));
         }
         "get_response_status" => {
             let var = sanitize_identifier(block.values.get("var"), "response_status");
@@ -3585,7 +3691,8 @@ fn render_single_block(
         | "set_response_headers"
         | "set_response_content"
         | "set_response_status"
-        | "set_upstream" => {
+        | "set_upstream"
+        | "runtime_sleep" => {
             let action = flow_action_statement(block)?;
             rss.push(action.rustscript);
             js.push(action.javascript);
@@ -3599,25 +3706,25 @@ fn render_single_block(
             let window = render_number_expr(block_value(block, "window_seconds", "60"), "60");
 
             rss.push(format!(
-                "let {var} = vm::http::rate_limit::allow({}, {}, {});",
+                "let {var} = vm::rate_limit::allow({}, {}, {});",
                 render_expr_rss(key_expr),
                 limit,
                 window
             ));
             js.push(format!(
-                "let {var} = vm.http.rate_limit.allow({}, {}, {});",
+                "let {var} = vm.rate_limit.allow({}, {}, {});",
                 render_expr_js(key_expr),
                 limit,
                 window
             ));
             lua.push(format!(
-                "local {var} = vm.http.rate_limit.allow({}, {}, {})",
+                "local {var} = vm.rate_limit.allow({}, {}, {})",
                 render_expr_lua(key_expr),
                 limit,
                 window
             ));
             scm.push(format!(
-                "(define {var} (vm.http.rate_limit.allow {} {} {}))",
+                "(define {var} (vm.rate_limit.allow {} {} {}))",
                 render_expr_scheme(key_expr),
                 limit,
                 window
@@ -3629,7 +3736,7 @@ fn render_single_block(
             let window = sanitize_number(block.values.get("window_seconds"), "60");
 
             rss.push(format!(
-                "if vm::http::rate_limit::allow({}, {}, {}) {{",
+                "if vm::rate_limit::allow({}, {}, {}) {{",
                 render_expr_rss(key_expr),
                 limit,
                 window
@@ -3646,7 +3753,7 @@ fn render_single_block(
             rss.push("}".to_string());
 
             js.push(format!(
-                "if (vm.http.rate_limit.allow({}, {}, {})) {{",
+                "if (vm.rate_limit.allow({}, {}, {})) {{",
                 render_expr_js(key_expr),
                 limit,
                 window
@@ -3663,7 +3770,7 @@ fn render_single_block(
             js.push("}".to_string());
 
             lua.push(format!(
-                "if vm.http.rate_limit.allow({}, {}, {}) then",
+                "if vm.rate_limit.allow({}, {}, {}) then",
                 render_expr_lua(key_expr),
                 limit,
                 window
@@ -3680,7 +3787,7 @@ fn render_single_block(
             lua.push("end".to_string());
 
             scm.push(format!(
-                "(if (vm.http.rate_limit.allow {} {} {})",
+                "(if (vm.rate_limit.allow {} {} {})",
                 render_expr_scheme(key_expr),
                 limit,
                 window

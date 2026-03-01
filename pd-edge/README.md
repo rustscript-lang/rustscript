@@ -1,246 +1,207 @@
-# Proxy Quickstart
+# pd-edge
 
-This proxy has two listeners:
+`pd-edge` is the edge runtime crate for running VM programs at the edge.
 
-- Data plane: `0.0.0.0:8080` (default)
-- Admin endpoint: `127.0.0.1:8081` (default)
+This crate now ships two binaries with different scopes:
 
-The admin endpoint accepts compiled VM bytecode via `PUT /program`.
-`pd-edge` works standalone without `pd-controller`; in that mode you load programs directly through this admin endpoint.
+- `pd-edge-http-proxy`: full HTTP data plane runtime (proxy path + admin API + optional active control-plane client)
+- `pd-edge-console`: interactive local console runtime (stdin/stdout/stderr host APIs + optional active control-plane client)
 
-## Codebase Layout
+## Binary Scope
 
-- `pd-edge/src/runtime.rs`: proxy skeleton (data/admin HTTP routes, upload, forwarding)
-- `pd-edge/src/host_abi.rs`: all VM host ABI functions and registration
-- `pd-edge/src/debug_session.rs`: on-demand debugger session lifecycle and VM attach logic
+### `pd-edge-http-proxy`
 
-## Logging
+- Handles HTTP traffic on a data plane listener
+- Exposes local admin APIs for program upload, health, metrics, telemetry, and debug session lifecycle
+- Can run standalone (admin upload only) or with active control-plane RPC
+- Registers HTTP host ABI + runtime host ABI + built-in IO overrides
 
-Proxy emits colored logs (via `tracing`) for:
+Default listeners:
 
-- access logs (method, path, status, latency) on both data/admin endpoints
-- program load success/fail and validation/decode errors
-- debug session start/stop and debugger attach events
+- Data plane: `0.0.0.0:8080`
+- Admin API: `127.0.0.1:8081`
 
-Set log level with `RUST_LOG`, for example:
+### `pd-edge-console`
 
-```powershell
-$env:RUST_LOG="info"
-cargo run -p pd-edge
-```
+- No HTTP proxy listeners
+- Runs an interactive shell to load and execute VM programs locally
+- Supports console host APIs: `console::stdin::read_line()`, `console::stdin::read_all()`, `console::stdout::write(text)`, `console::stdout::flush()`, `console::stderr::write(text)`, `console::stderr::flush()`
+- Registers runtime host ABI (`runtime::sleep`, `rate_limit::allow`) plus the console host APIs above
 
-## ABI Source of Truth
+## Quick Start
 
-Proxy host-call ABI is centralized in the `edge_abi` crate:
+### HTTP Proxy Mode
 
-- Rust constants + metadata: `edge_abi::FUNCTIONS`
-- ABI version: `edge_abi::ABI_VERSION`
-- Machine-readable manifest: [`pd-edge-abi/abi.json`](../pd-edge-abi/abi.json)
-
-For Rust runtime embedding, use:
-
-```rust
-edge::register_host_module(&mut vm, context)?;
-```
-
-instead of registering host functions one-by-one.
-
-## Sample Program
-
-`pd-edge/examples/build_sample_program.rs` does:
-
-1. Reads source from default path `examples/sample_proxy_program.rss` (resolved from the `pd-edge` crate root)
-2. Compiles it with `vm::compile_source_file` (extension-driven flavor detection)
-3. Encodes bytecode and uploads to `http://127.0.0.1:8081/program`
-
-The sample source (`sample_proxy_program.rss`) declares required proxy host
-functions in fixed ABI order and then:
-
-1. Reads `x-client-id`
-2. Allows at most 3 requests per 60-second window per client id using `http::rate_limit::allow`
-3. Short-circuits with:
-- `x-vm: allowed` + body `request allowed` when under limit
-- `x-vm: rate-limited` + body `rate limit exceeded` when over limit
-
-## Docker image
-
-Release workflow publishes `fffonion/pd-edge:<tag>` and `fffonion/pd-edge:latest`.
-
-Run standalone edge with published image:
+1. Start proxy + admin endpoints:
 
 ```powershell
-docker run --rm -p 8080:8080 -p 8081:8081 fffonion/pd-edge:latest
+cargo run -p pd-edge --bin pd-edge-http-proxy
 ```
 
-## Run + Upload (PowerShell)
-
-1. Start the proxy:
-
-```powershell
-cargo run -p pd-edge
-```
-
-Version metadata:
-
-```powershell
-cargo run -p pd-edge -- --version
-```
-
-2. In another terminal, compile and upload sample source:
+2. Compile and upload sample program:
 
 ```powershell
 cargo run -p pd-edge --example build_sample_program
 ```
 
-Alternative sample source flavors are also available:
-- `pd-edge/examples/sample_proxy_program.js`
-- `pd-edge/examples/sample_proxy_program.lua`
-- `pd-edge/examples/sample_proxy_program.scm`
-
-You can pass a relative sample path explicitly, for example:
-
-```powershell
-cargo run -p pd-edge --example build_sample_program -- examples/sample_proxy_program.js
-```
-
-Expected output includes `control response: 204 No Content`.
-
-### Compile with `pd-vm-run` and upload via Admin API
-
-This path is useful when you want to run `pd-edge` without controller and explicitly manage bytecode artifacts.
-
-1. Emit VMBC bytecode from source:
-
-```powershell
-New-Item -ItemType Directory -Force out | Out-Null
-cargo run -p pd-vm --bin pd-vm-run -- --emit-vmbc out/sample_proxy_program.vmbc examples/sample_proxy_program.rss
-```
-
-2. Upload the compiled VMBC bytes to local admin API:
-
-```powershell
-curl -X PUT "http://127.0.0.1:8081/program" `
-  -H "content-type: application/octet-stream" `
-  --data-binary "@out/sample_proxy_program.vmbc"
-```
-
-Expected response status: `204 No Content`.
-
-3. Hit data plane to verify:
+3. Send traffic to data plane:
 
 ```powershell
 curl -i "http://127.0.0.1:8080/anything" -H "x-client-id: demo-client"
 ```
 
-First 3 responses for the same `x-client-id`:
+The sample program in `examples/sample_proxy_program.*` uses `rate_limit::allow` and writes response headers/body via `http::response::*`.
 
-- Status: `200 OK`
-- Header: `x-vm: allowed`
-- Body: `request allowed`
+### Console Mode
 
-4th response within 60 seconds:
-
-- Status: `200 OK`
-- Header: `x-vm: rate-limited`
-- Body: `rate limit exceeded`
-
-## Optional CLI Overrides
+Start the interactive console:
 
 ```powershell
-cargo run -p pd-edge -- --data-addr "0.0.0.0:9000" --admin-addr "127.0.0.1:9001" --max-program-bytes "1048576"
+cargo run -p pd-edge --bin pd-edge-console
 ```
 
-If you do not provide `--control-plane-url`, `pd-edge` stays in standalone mode and only uses local admin APIs.
-
-### Active Data-Plane Control RPC
-
-The data plane can actively dial a remote control-plane endpoint and poll for commands.
-
-Edge identity includes:
-
-- edge UUID:
-  - if `--edge-id` is provided, that UUID is used
-  - otherwise `pd-edge` loads UUID from `--edge-id-path` (default `.pd-edge/edge-id`)
-  - if the file does not exist, a new UUID is generated and persisted
-- edge friendly name:
-  - if `--edge-name` is provided, that value is used
-  - otherwise `pd-edge` defaults to hostname (`HOSTNAME`/`COMPUTERNAME`)
-
-Example with explicit UUID:
+Optional: preload a local source or `.vmbc` program:
 
 ```powershell
-cargo run -p pd-edge -- --control-plane-url "http://127.0.0.1:9100" --edge-id "3f626ca0-c2ec-41a6-a5da-6fbc53aa857f" --control-plane-poll-interval-ms "1000" --control-plane-rpc-timeout-ms "5000"
+cargo run -p pd-edge --bin pd-edge-console -- --program path\to\program.rss
 ```
 
-Example with persisted UUID file:
+Interactive commands:
 
-```powershell
-cargo run -p pd-edge -- --control-plane-url "http://127.0.0.1:9100" --edge-id-path ".pd-edge/edge-id" --control-plane-poll-interval-ms "1000" --control-plane-rpc-timeout-ms "5000"
+- `.help`
+- `.status`
+- `.load <PATH>`
+- `.run`
+- `.quit`
+
+## HTTP Proxy Admin API
+
+Admin endpoints are served by `pd-edge-http-proxy` only:
+
+- `PUT /program` (requires `content-type: application/octet-stream`)
+- `GET /healthz`
+- `GET /metrics`
+- `GET /telemetry`
+- `PUT /debug/session`
+- `GET /debug/session`
+- `DELETE /debug/session`
+
+Program upload limit defaults to `1048576` bytes and can be changed with `--max-program-bytes`.
+
+## CLI
+
+### `pd-edge-http-proxy`
+
+```text
+Usage: pd-edge-http-proxy [options]
+
+--proxy-addr <ADDR>                   Proxy/data-plane listen address (default: 0.0.0.0:8080)
+--data-addr <ADDR>                    Alias for --proxy-addr
+--admin-addr <ADDR>                   Admin listen address (default: 127.0.0.1:8081)
+--max-program-bytes <BYTES>           Max program/upload size in bytes (default: 1048576)
+--control-plane-url <URL>             Enable active control-plane RPC client
+--edge-id <UUID>                      Explicit edge UUID for active control-plane mode
+--edge-name <NAME>                    Edge display name (default: hostname)
+--edge-id-path <PATH>                 UUID persistence path (default: .pd-edge/edge-id)
+--control-plane-poll-interval-ms <MS> Poll interval for active control-plane mode
+--control-plane-rpc-timeout-ms <MS>   RPC timeout for active control-plane mode
+-V, --version
+-h, --help
 ```
 
-When `--control-plane-url` is set, `pd-edge` sends:
+### `pd-edge-console`
 
-- `POST /rpc/v1/edge/poll`
-- `POST /rpc/v1/edge/result`
+```text
+Usage: pd-edge-console [options]
 
-### RPC Command Types
+--program <PATH>                      Optional source/.vmbc to load at startup
+--max-program-bytes <BYTES>           Max program size in bytes (default: 1048576)
+--control-plane-url <URL>             Enable active control-plane RPC client
+--edge-id <UUID>                      Explicit edge UUID for active control-plane mode
+--edge-name <NAME>                    Edge display name (default: hostname)
+--edge-id-path <PATH>                 UUID persistence path (default: .pd-edge/edge-id)
+--control-plane-poll-interval-ms <MS> Poll interval for active control-plane mode
+--control-plane-rpc-timeout-ms <MS>   RPC timeout for active control-plane mode
+-V, --version
+-h, --help
+```
 
-Poll responses can include one command:
+## Active Control-Plane RPC
 
-- `apply_program`: push base64 VM bytecode and apply it
-- `start_debug_session`: starts debug attach mode and returns generated nonce header/value
+Both binaries can run with active control-plane polling when `--control-plane-url` is set.
+
+- Poll endpoint: `POST /rpc/v1/edge/poll`
+- Result endpoint: `POST /rpc/v1/edge/result`
+
+If `--control-plane-url` is not provided, control-plane-related flags are rejected.
+
+Supported command types:
+
+- `apply_program`
+- `start_debug_session`
+- `debug_command`
 - `stop_debug_session`
 - `get_health`
 - `get_metrics`
 - `get_telemetry`
 - `ping`
 
-`start_debug_session` auto-generates a random nonce (default header `x-pd-debug-nonce`) on the data plane. The debug session is automatically removed once the debugger client disconnects.
-
-### Built-In Admin APIs
-
-Local admin endpoint also exposes:
-
-- `GET /healthz`
-- `GET /metrics`
-- `GET /telemetry`
-- existing `PUT /program` and `/debug/session` lifecycle endpoints
-
-## On-Demand VM Debugging
-
-Start a debugger session on admin endpoint and target only requests that include a specific header.
-
-1. Start debugger session:
+### Example
 
 ```powershell
-curl -X PUT "http://127.0.0.1:8081/debug/session" \
-  -H "content-type: application/json" \
-  -d "{\"header_name\":\"x-debug-vm\",\"header_value\":\"on\",\"tcp_addr\":\"127.0.0.1:9002\",\"stop_on_entry\":true}"
+cargo run -p pd-edge --bin pd-edge-http-proxy -- `
+  --control-plane-url "http://127.0.0.1:9100" `
+  --edge-id "3f626ca0-c2ec-41a6-a5da-6fbc53aa857f" `
+  --control-plane-poll-interval-ms "1000" `
+  --control-plane-rpc-timeout-ms "5000"
 ```
 
-2. Connect a terminal client to debugger TCP port (example with netcat):
+## ABI Source of Truth
 
-```bash
-nc 127.0.0.1 9002
+Host-call ABI metadata is centralized in `pd-edge-abi`:
+
+- Rust constants + metadata: `edge_abi::FUNCTIONS`
+- ABI version: `edge_abi::ABI_VERSION`
+- Manifest: [`pd-edge-abi/abi.json`](../pd-edge-abi/abi.json)
+
+For embedding with a VM:
+
+```rust
+let async_ops = edge::new_shared_vm_async_ops();
+edge::register_http_plane_host_module(&mut vm, context, async_ops)?;
 ```
 
-3. Send a matching request to data plane:
+Use `register_host_module` when only runtime ABI is needed.
+
+## Release Artifacts
+
+Release workflow publishes Linux tarballs for:
+
+- `pd-edge-http-proxy-<tag>-linux-x86_64.tar.gz`
+- `pd-edge-console-<tag>-linux-x86_64.tar.gz`
+- `pd-controller-<tag>-linux-x86_64.tar.gz`
+- `pd-vm-run-<tag>-linux-x86_64.tar.gz`
+
+## Docker
+
+Docker release image currently packages `pd-edge-http-proxy`:
+
+- `fffonion/pd-edge:<tag>`
+- `fffonion/pd-edge:latest`
+
+Run:
 
 ```powershell
-curl -i "http://127.0.0.1:8080/anything" -H "x-debug-vm: on" -H "x-client-id: demo-client"
+docker run --rm -p 8080:8080 -p 8081:8081 fffonion/pd-edge:latest
 ```
 
-The VM for that request will attach to debugger and accept iterative `pdb` commands such as:
-`break`, `break line`, `step`, `next`, `out`, `stack`, `locals`, `where`, `funcs`, `continue`.
+## Codebase Layout
 
-4. Check session status:
-
-```powershell
-curl "http://127.0.0.1:8081/debug/session"
-```
-
-5. Stop debugger session:
-
-```powershell
-curl -X DELETE "http://127.0.0.1:8081/debug/session"
-```
+- `pd-edge/src/bin/pd-edge-http-proxy.rs`: HTTP proxy binary entrypoint and CLI
+- `pd-edge/src/bin/pd-edge-console.rs`: console binary entrypoint and CLI
+- `pd-edge/src/runtime.rs`: shared runtime state, telemetry, program apply/load, exports
+- `pd-edge/src/runtime/http_plane/`: HTTP data/admin plane handlers
+- `pd-edge/src/abi_impl/runtime.rs`: protocol-independent runtime host ABI
+- `pd-edge/src/abi_impl/http/`: HTTP-specific host ABI
+- `pd-edge/src/active_control_plane.rs`: active control-plane poll/report loop
+- `pd-edge/src/debug_session.rs`: on-demand debug session lifecycle

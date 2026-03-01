@@ -6,11 +6,7 @@ use super::super::super::{
     headers_to_value_map,
 };
 
-pub(super) fn register_40_to_43(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-) {
+pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) {
     bind_async_host(
         vm,
         &async_ops,
@@ -50,7 +46,8 @@ impl GetUpstreamResponseStatusFunction {
 impl HostFunction for GetUpstreamResponseStatusFunction {
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 0)?;
-        let context = self.context.lock().expect("vm context lock poisoned");
+        let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_upstream_response();
         let status = context.upstream_response_status.unwrap_or(0);
         Ok(CallOutcome::Return(vec![Value::Int(status as i64)]))
     }
@@ -73,7 +70,8 @@ impl HostFunction for GetUpstreamResponseHeaderFunction {
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
 
-        let context = self.context.lock().expect("vm context lock poisoned");
+        let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_upstream_response();
         let value = context
             .upstream_response_headers
             .get(&header_name)
@@ -96,7 +94,8 @@ impl GetUpstreamResponseHeadersFunction {
 impl HostFunction for GetUpstreamResponseHeadersFunction {
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 0)?;
-        let context = self.context.lock().expect("vm context lock poisoned");
+        let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_upstream_response();
         Ok(CallOutcome::Return(vec![headers_to_value_map(
             &context.upstream_response_headers,
         )]))
@@ -116,7 +115,8 @@ impl GetUpstreamResponseBodyFunction {
 impl HostFunction for GetUpstreamResponseBodyFunction {
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 0)?;
-        let context = self.context.lock().expect("vm context lock poisoned");
+        let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_upstream_response();
         let value = context
             .upstream_response_content
             .clone()

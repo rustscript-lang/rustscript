@@ -5,7 +5,7 @@ pub struct AbiFunction {
     pub arity: u8,
 }
 
-pub const ABI_VERSION: u16 = 8;
+pub const ABI_VERSION: u16 = 10;
 
 pub const FN_HTTP_REQUEST_GET_ID: u16 = 0;
 pub const FN_HTTP_REQUEST_GET_METHOD: u16 = 1;
@@ -25,7 +25,7 @@ pub const FN_HTTP_RESPONSE_REMOVE_HEADER: u16 = 14;
 pub const FN_HTTP_RESPONSE_SET_BODY: u16 = 15;
 pub const FN_HTTP_RESPONSE_SET_STATUS: u16 = 16;
 pub const FN_HTTP_UPSTREAM_REQUEST_SET_TARGET: u16 = 17;
-pub const FN_HTTP_RATE_LIMIT_ALLOW: u16 = 18;
+pub const FN_RATE_LIMIT_ALLOW: u16 = 18;
 pub const FN_HTTP_REQUEST_GET_HEADERS: u16 = 19;
 pub const FN_HTTP_REQUEST_GET_QUERY_ARG: u16 = 20;
 pub const FN_HTTP_REQUEST_GET_QUERY_ARGS: u16 = 21;
@@ -145,8 +145,8 @@ pub const FUNCTIONS: [AbiFunction; 45] = [
         arity: 1,
     },
     AbiFunction {
-        index: FN_HTTP_RATE_LIMIT_ALLOW,
-        name: "http::rate_limit::allow",
+        index: FN_RATE_LIMIT_ALLOW,
+        name: "rate_limit::allow",
         arity: 3,
     },
     AbiFunction {
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn abi_json_contains_declared_functions() {
         let manifest = abi_json();
-        assert!(manifest.contains("\"abi_version\": 8"));
+        assert!(manifest.contains("\"abi_version\": 10"));
         for function in FUNCTIONS {
             assert!(manifest.contains(function.name));
         }

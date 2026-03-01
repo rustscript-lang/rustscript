@@ -16,7 +16,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use edge::{
     ActiveControlPlaneConfig, CommandResultPayload, ControlPlaneCommand, EdgeCommandResult,
     EdgePollRequest, EdgePollResponse, FN_HTTP_RESPONSE_SET_BODY, FN_HTTP_RESPONSE_SET_HEADER,
-    FN_HTTP_UPSTREAM_REQUEST_SET_TARGET, SharedState, build_admin_app, build_data_app,
+    FN_HTTP_UPSTREAM_REQUEST_SET_TARGET, SharedState, build_admin_app, build_http_proxy_app,
     spawn_active_control_plane_client,
 };
 use tokio::{sync::Notify, task::JoinHandle, time::timeout};
@@ -37,7 +37,7 @@ async fn spawn_proxy(
     max_program_bytes: usize,
 ) -> (SocketAddr, SocketAddr, JoinHandle<()>, JoinHandle<()>) {
     let state = SharedState::new(max_program_bytes);
-    let (data_addr, data_handle) = spawn_server(build_data_app(state.clone())).await;
+    let (data_addr, data_handle) = spawn_server(build_http_proxy_app(state.clone())).await;
     let (admin_addr, admin_handle) = spawn_server(build_admin_app(state)).await;
     (data_addr, admin_addr, data_handle, admin_handle)
 }
@@ -526,7 +526,7 @@ async fn tiny_language_can_enforce_simple_rate_limit() {
     let source = r#"
         use vm;
 
-        if vm::http::rate_limit::allow(vm::http::request::get_header("x-client-id"), 2, 60) {
+        if vm::rate_limit::allow(vm::http::request::get_header("x-client-id"), 2, 60) {
             vm::http::response::set_header("x-vm", "allowed");
             vm::http::response::set_body("ok");
         } else {
@@ -617,7 +617,7 @@ async fn http_prefixed_host_abi_can_rewrite_request_and_short_circuit() {
         use vm;
 
         let client_id = vm::http::request::get_header("x-client-id");
-        if vm::http::rate_limit::allow(client_id, 1, 60) {{
+        if vm::rate_limit::allow(client_id, 1, 60) {{
             vm::http::upstream::request::set_path("/rewritten");
             vm::http::upstream::request::set_query("from=vm");
             vm::http::upstream::request::set_header("x-added", "yes");
@@ -938,7 +938,7 @@ async fn active_control_plane_can_push_program_and_receive_result() {
     let (rpc_addr, rpc_handle) = spawn_server(control_app).await;
 
     let state = SharedState::new(1024 * 1024);
-    let (data_addr, data_handle) = spawn_server(build_data_app(state.clone())).await;
+    let (data_addr, data_handle) = spawn_server(build_http_proxy_app(state.clone())).await;
     let active_handle = spawn_active_control_plane_client(
         state.clone(),
         ActiveControlPlaneConfig {

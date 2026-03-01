@@ -7,11 +7,7 @@ use super::super::super::{
     parse_headers_map_arg, serialize_query_pairs,
 };
 
-pub(super) fn register_7_to_11(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-) {
+pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) {
     bind_async_host(
         vm,
         &async_ops,
@@ -42,22 +38,12 @@ pub(super) fn register_7_to_11(
         "http::upstream::request::set_query",
         Box::new(SetRequestQueryFunction::new(context.clone())),
     );
-}
-
-pub(super) fn register_17(vm: &mut Vm, context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) {
     bind_async_host(
         vm,
         &async_ops,
         "http::upstream::request::set_target",
-        Box::new(SetUpstreamFunction::new(context)),
+        Box::new(SetUpstreamFunction::new(context.clone())),
     );
-}
-
-pub(super) fn register_25_to_30(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-) {
     bind_async_host(
         vm,
         &async_ops,
@@ -112,6 +98,7 @@ impl HostFunction for SetRequestHeaderFunction {
         let (header_name, header_value) = parse_header_args(args)?;
 
         let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_upstream_request();
         context
             .outbound_request_headers
             .insert(header_name, header_value);
@@ -135,6 +122,7 @@ impl HostFunction for AddRequestHeaderFunction {
         let (header_name, header_value) = parse_header_args(args)?;
 
         let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_upstream_request();
         context
             .outbound_request_headers
             .append(header_name, header_value);
@@ -158,6 +146,7 @@ impl HostFunction for SetRequestHeadersFunction {
         let headers = parse_headers_map_arg(args, 0)?;
 
         let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_upstream_request();
         for (name, values) in headers {
             context.outbound_request_headers.remove(name.clone());
             for value in values {
@@ -184,6 +173,7 @@ impl HostFunction for RemoveRequestHeaderFunction {
         let header_name = parse_header_name_arg(args, 0)?;
 
         let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_upstream_request();
         context.outbound_request_headers.remove(header_name);
         Ok(CallOutcome::Return(vec![]))
     }
@@ -223,6 +213,7 @@ impl HostFunction for SetRequestMethodFunction {
             .map_err(|_| VmError::HostError(format!("invalid http method '{method}'")))?;
 
         let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_upstream_request();
         context.outbound_request_method = parsed;
         Ok(CallOutcome::Return(vec![]))
     }
@@ -249,6 +240,7 @@ impl HostFunction for SetRequestPathFunction {
         }
 
         let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_upstream_request();
         context.outbound_request_path = path;
         Ok(CallOutcome::Return(vec![]))
     }
@@ -276,6 +268,7 @@ impl HostFunction for SetRequestQueryFunction {
         }
 
         let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_upstream_request();
         context.outbound_request_query = query.to_string();
         Ok(CallOutcome::Return(vec![]))
     }
@@ -298,6 +291,7 @@ impl HostFunction for SetRequestQueryArgFunction {
         let value = expect_string(args, 1)?;
 
         let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_upstream_request();
         let mut pairs = url::form_urlencoded::parse(context.outbound_request_query.as_bytes())
             .map(|(name, value)| (name.into_owned(), value.into_owned()))
             .collect::<Vec<_>>();
@@ -323,7 +317,9 @@ impl HostFunction for SetRequestBodyFunction {
         expect_arg_count(args, 1)?;
         let body = expect_string(args, 0)?;
         let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_upstream_request();
         context.outbound_request_body = body.into_bytes();
+        context.outbound_request_body_overridden = true;
         Ok(CallOutcome::Return(vec![]))
     }
 }
@@ -349,6 +345,7 @@ impl HostFunction for SetUpstreamFunction {
         }
 
         let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_upstream_request();
         context.upstream = Some(upstream);
         Ok(CallOutcome::Return(vec![]))
     }

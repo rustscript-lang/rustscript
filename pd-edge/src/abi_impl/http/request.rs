@@ -3,8 +3,8 @@ use vm::{CallOutcome, HostFunction, Value, Vm, VmError};
 
 use super::super::{
     SharedProxyVmContext, SharedVmAsyncOps, bind_async_host, expect_arg_count, expect_int,
-    expect_string, headers_to_value_map, query_to_value_map, request_path_with_query,
-    schedule_ready_call,
+    expect_string, headers_to_value_map, query_to_value_map, read_request_body_all,
+    read_request_body_next_chunk, request_body_eof, request_path_with_query, schedule_future_call,
 };
 
 fn bind_request_host(
@@ -31,11 +31,7 @@ fn bind_request_field(
     );
 }
 
-pub(super) fn register_0_to_6(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-) {
+pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) {
     let field_symbols = [
         ("http::request::get_id", RequestField::Id),
         ("http::request::get_method", RequestField::Method),
@@ -43,33 +39,24 @@ pub(super) fn register_0_to_6(
         ("http::request::get_query", RequestField::Query),
         ("http::request::get_scheme", RequestField::Scheme),
         ("http::request::get_host", RequestField::Host),
+        ("http::request::get_client_ip", RequestField::ClientIp),
+        (
+            "http::request::get_path_with_query",
+            RequestField::PathWithQuery,
+        ),
+        ("http::request::get_raw_query", RequestField::RawQuery),
+        ("http::request::get_http_version", RequestField::HttpVersion),
     ];
     for (symbol, field) in field_symbols {
         bind_request_field(vm, &async_ops, &context, symbol, field);
     }
+
     bind_request_host(
         vm,
         &async_ops,
         "http::request::get_header",
-        Box::new(GetHeaderFunction::new(context)),
+        Box::new(GetHeaderFunction::new(context.clone())),
     );
-}
-
-pub(super) fn register_12(vm: &mut Vm, context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) {
-    bind_request_field(
-        vm,
-        &async_ops,
-        &context,
-        "http::request::get_client_ip",
-        RequestField::ClientIp,
-    );
-}
-
-pub(super) fn register_19_to_24(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-) {
     bind_request_host(
         vm,
         &async_ops,
@@ -88,39 +75,14 @@ pub(super) fn register_19_to_24(
         "http::request::get_query_args",
         Box::new(GetRequestQueryArgsFunction::new(context.clone())),
     );
-    bind_request_field(
-        vm,
-        &async_ops,
-        &context,
-        "http::request::get_path_with_query",
-        RequestField::PathWithQuery,
-    );
-    bind_request_field(
-        vm,
-        &async_ops,
-        &context,
-        "http::request::get_raw_query",
-        RequestField::RawQuery,
-    );
     bind_request_host(
         vm,
         &async_ops,
         "http::request::get_body",
-        Box::new(GetRequestBodyFunction::new(context, async_ops.clone())),
-    );
-}
-
-pub(super) fn register_31_to_32(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-) {
-    bind_request_field(
-        vm,
-        &async_ops,
-        &context,
-        "http::request::get_http_version",
-        RequestField::HttpVersion,
+        Box::new(GetRequestBodyFunction::new(
+            context.clone(),
+            async_ops.clone(),
+        )),
     );
     bind_request_host(
         vm,
@@ -148,7 +110,7 @@ pub(super) fn register_streaming_extensions(
         vm,
         &async_ops,
         "http::request::body::eof",
-        Box::new(GetRequestBodyEofFunction::new(context)),
+        Box::new(GetRequestBodyEofFunction::new(context, async_ops.clone())),
     );
 }
 
@@ -180,7 +142,8 @@ impl GetRequestFieldFunction {
 impl HostFunction for GetRequestFieldFunction {
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 0)?;
-        let context = self.context.lock().expect("vm context lock poisoned");
+        let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_request_line();
         let value = match self.field {
             RequestField::Id => context.inbound_request_id.clone(),
             RequestField::Method => context.inbound_request_method.as_str().to_string(),
@@ -217,7 +180,8 @@ impl HostFunction for GetHeaderFunction {
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
 
-        let context = self.context.lock().expect("vm context lock poisoned");
+        let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_request_headers();
         let value = context
             .inbound_request_headers
             .get(&header_name)
@@ -240,7 +204,8 @@ impl GetRequestPortFunction {
 impl HostFunction for GetRequestPortFunction {
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 0)?;
-        let context = self.context.lock().expect("vm context lock poisoned");
+        let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_request_line();
         Ok(CallOutcome::Return(vec![Value::Int(
             context.inbound_request_port as i64,
         )]))
@@ -260,7 +225,8 @@ impl GetRequestHeadersFunction {
 impl HostFunction for GetRequestHeadersFunction {
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 0)?;
-        let context = self.context.lock().expect("vm context lock poisoned");
+        let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_request_headers();
         Ok(CallOutcome::Return(vec![headers_to_value_map(
             &context.inbound_request_headers,
         )]))
@@ -281,7 +247,8 @@ impl HostFunction for GetRequestQueryArgFunction {
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 1)?;
         let name = expect_string(args, 0)?;
-        let context = self.context.lock().expect("vm context lock poisoned");
+        let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_request_line();
         let value = url::form_urlencoded::parse(context.inbound_request_query.as_bytes())
             .find_map(|(key, value)| {
                 if key == name {
@@ -308,7 +275,8 @@ impl GetRequestQueryArgsFunction {
 impl HostFunction for GetRequestQueryArgsFunction {
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 0)?;
-        let context = self.context.lock().expect("vm context lock poisoned");
+        let mut context = self.context.lock().expect("vm context lock poisoned");
+        context.touch_request_line();
         Ok(CallOutcome::Return(vec![query_to_value_map(
             &context.inbound_request_query,
         )]))
@@ -329,10 +297,13 @@ impl GetRequestBodyFunction {
 impl HostFunction for GetRequestBodyFunction {
     fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 0)?;
-        let context = self.context.lock().expect("vm context lock poisoned");
-        let body = String::from_utf8_lossy(&context.inbound_request_body).into_owned();
-        drop(context);
-        schedule_ready_call(vm, &self.async_ops, vec![Value::String(body)])
+        let context = self.context.clone();
+        schedule_future_call(vm, &self.async_ops, async move {
+            let body = read_request_body_all(&context).await?;
+            Ok(vec![Value::String(
+                String::from_utf8_lossy(&body).into_owned(),
+            )])
+        })
     }
 }
 
@@ -357,35 +328,34 @@ impl HostFunction for GetRequestBodyChunkFunction {
             )));
         }
 
-        let mut context = self.context.lock().expect("vm context lock poisoned");
-        let start = context
-            .inbound_request_body_offset
-            .min(context.inbound_request_body.len());
-        let end = start
-            .saturating_add(max_bytes as usize)
-            .min(context.inbound_request_body.len());
-        let chunk = String::from_utf8_lossy(&context.inbound_request_body[start..end]).into_owned();
-        context.inbound_request_body_offset = end;
-        drop(context);
-        schedule_ready_call(vm, &self.async_ops, vec![Value::String(chunk)])
+        let context = self.context.clone();
+        schedule_future_call(vm, &self.async_ops, async move {
+            let chunk = read_request_body_next_chunk(&context, max_bytes as usize).await?;
+            Ok(vec![Value::String(
+                String::from_utf8_lossy(&chunk).into_owned(),
+            )])
+        })
     }
 }
 
 struct GetRequestBodyEofFunction {
     context: SharedProxyVmContext,
+    async_ops: SharedVmAsyncOps,
 }
 
 impl GetRequestBodyEofFunction {
-    fn new(context: SharedProxyVmContext) -> Self {
-        Self { context }
+    fn new(context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) -> Self {
+        Self { context, async_ops }
     }
 }
 
 impl HostFunction for GetRequestBodyEofFunction {
-    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
+    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 0)?;
-        let context = self.context.lock().expect("vm context lock poisoned");
-        let eof = context.inbound_request_body_offset >= context.inbound_request_body.len();
-        Ok(CallOutcome::Return(vec![Value::Bool(eof)]))
+        let context = self.context.clone();
+        schedule_future_call(vm, &self.async_ops, async move {
+            let eof = request_body_eof(&context).await?;
+            Ok(vec![Value::Bool(eof)])
+        })
     }
 }
