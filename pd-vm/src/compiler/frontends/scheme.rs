@@ -282,8 +282,8 @@ fn lower_scheme_direct_list_expr(
     let args = &items[1..];
 
     match head {
-        "+" => lower_scheme_direct_fold(args, builder, line, Expr::Add),
-        "*" => lower_scheme_direct_fold(args, builder, line, Expr::Mul),
+        "+" => lower_scheme_direct_fold(args, builder, line, Expr::Add, fold_int_add),
+        "*" => lower_scheme_direct_fold(args, builder, line, Expr::Mul, fold_int_mul),
         "-" => {
             if args.is_empty() {
                 return Ok(None);
@@ -294,9 +294,9 @@ fn lower_scheme_direct_list_expr(
                 };
                 return Ok(Some(Expr::Neg(Box::new(inner))));
             }
-            lower_scheme_direct_fold(args, builder, line, Expr::Sub)
+            lower_scheme_direct_fold(args, builder, line, Expr::Sub, fold_int_sub)
         }
-        "/" => lower_scheme_direct_fold(args, builder, line, Expr::Div),
+        "/" => lower_scheme_direct_fold(args, builder, line, Expr::Div, fold_int_div),
         "modulo" | "remainder" => lower_scheme_direct_binary(args, builder, Expr::Mod),
         "=" => lower_scheme_direct_compare_fold(args, builder, Expr::Eq),
         "/=" => {
@@ -422,6 +422,7 @@ fn lower_scheme_direct_fold<F>(
     builder: &SchemeDirectIrBuilder,
     _line: usize,
     build: F,
+    eval_int: fn(i64, i64) -> Option<i64>,
 ) -> Result<Option<Expr>, ParseError>
 where
     F: Fn(Box<Expr>, Box<Expr>) -> Expr + Copy,
@@ -429,17 +430,46 @@ where
     if args.len() < 2 {
         return Ok(None);
     }
-    let mut iter = args.iter();
-    let Some(first) = iter.next() else {
-        return Ok(None);
-    };
-    let Some(mut expr) = lower_scheme_direct_expr(first, builder)? else {
-        return Ok(None);
-    };
-    for arg in iter {
-        let Some(rhs) = lower_scheme_direct_expr(arg, builder)? else {
+
+    let mut lowered_exprs = Vec::with_capacity(args.len());
+    let mut int_values = Vec::with_capacity(args.len());
+    let mut all_int_values = true;
+
+    for arg in args {
+        let Some(expr) = lower_scheme_direct_expr(arg, builder)? else {
             return Ok(None);
         };
+        if let Expr::Int(value) = &expr {
+            int_values.push(*value);
+        } else {
+            all_int_values = false;
+        }
+        lowered_exprs.push(expr);
+    }
+
+    if all_int_values {
+        let mut iter = int_values.into_iter();
+        let Some(mut acc) = iter.next() else {
+            return Ok(None);
+        };
+        let mut foldable = true;
+        for rhs in iter {
+            let Some(next) = eval_int(acc, rhs) else {
+                foldable = false;
+                break;
+            };
+            acc = next;
+        }
+        if foldable {
+            return Ok(Some(Expr::Int(acc)));
+        }
+    }
+
+    let mut iter = lowered_exprs.into_iter();
+    let Some(mut expr) = iter.next() else {
+        return Ok(None);
+    };
+    for rhs in iter {
         expr = build(Box::new(expr), Box::new(rhs));
     }
     Ok(Some(expr))
@@ -500,6 +530,13 @@ impl SchemeForm {
     fn as_list(&self) -> Option<&[SchemeForm]> {
         match &self.node {
             SchemeNode::List(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    fn as_int(&self) -> Option<i64> {
+        match self.node {
+            SchemeNode::Int(value) => Some(value),
             _ => None,
         }
     }
@@ -2036,7 +2073,14 @@ fn lower_list_expr(items: &[SchemeForm], line: usize) -> Result<String, ParseErr
             if args.len() == 1 {
                 return lower_expr(&args[0]);
             }
-            fold_infix_expr(args, "+", line, 2, "+ expects at least two arguments")
+            fold_infix_expr(
+                args,
+                "+",
+                line,
+                2,
+                "+ expects at least two arguments",
+                fold_int_add,
+            )
         }
         "*" => {
             if args.is_empty() {
@@ -2045,9 +2089,23 @@ fn lower_list_expr(items: &[SchemeForm], line: usize) -> Result<String, ParseErr
             if args.len() == 1 {
                 return lower_expr(&args[0]);
             }
-            fold_infix_expr(args, "*", line, 2, "* expects at least two arguments")
+            fold_infix_expr(
+                args,
+                "*",
+                line,
+                2,
+                "* expects at least two arguments",
+                fold_int_mul,
+            )
         }
-        "/" => fold_infix_expr(args, "/", line, 2, "/ expects at least two arguments"),
+        "/" => fold_infix_expr(
+            args,
+            "/",
+            line,
+            2,
+            "/ expects at least two arguments",
+            fold_int_div,
+        ),
         "-" => {
             if args.is_empty() {
                 return Err(ParseError {
@@ -2060,7 +2118,14 @@ fn lower_list_expr(items: &[SchemeForm], line: usize) -> Result<String, ParseErr
             if args.len() == 1 {
                 return Ok(format!("-({})", lower_expr(&args[0])?));
             }
-            fold_infix_expr(args, "-", line, 2, "- expects at least one argument")
+            fold_infix_expr(
+                args,
+                "-",
+                line,
+                2,
+                "- expects at least one argument",
+                fold_int_sub,
+            )
         }
         "modulo" => lower_modulo_expr(args, line),
         "remainder" => lower_remainder_expr(args, line),
@@ -2728,6 +2793,7 @@ fn fold_infix_expr(
     line: usize,
     min_arity: usize,
     arity_message: &str,
+    eval_int: fn(i64, i64) -> Option<i64>,
 ) -> Result<String, ParseError> {
     if args.len() < min_arity {
         return Err(ParseError {
@@ -2738,12 +2804,68 @@ fn fold_infix_expr(
         });
     }
 
+    let mut int_values = Vec::with_capacity(args.len());
+    let mut all_int_values = true;
+    for arg in args {
+        if let Some(value) = arg.as_int() {
+            int_values.push(value);
+        } else {
+            all_int_values = false;
+            break;
+        }
+    }
+    if all_int_values {
+        let mut iter = int_values.into_iter();
+        let Some(mut acc) = iter.next() else {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line,
+                message: arity_message.to_string(),
+            });
+        };
+        let mut foldable = true;
+        for rhs in iter {
+            let Some(next) = eval_int(acc, rhs) else {
+                foldable = false;
+                break;
+            };
+            acc = next;
+        }
+        if foldable {
+            return Ok(acc.to_string());
+        }
+    }
+
     let mut expr = lower_expr(&args[0])?;
     for arg in &args[1..] {
         let rhs = lower_expr(arg)?;
         expr = format!("({expr} {op} {rhs})");
     }
     Ok(expr)
+}
+
+#[inline]
+fn fold_int_add(lhs: i64, rhs: i64) -> Option<i64> {
+    Some(lhs.wrapping_add(rhs))
+}
+
+#[inline]
+fn fold_int_sub(lhs: i64, rhs: i64) -> Option<i64> {
+    Some(lhs.wrapping_sub(rhs))
+}
+
+#[inline]
+fn fold_int_mul(lhs: i64, rhs: i64) -> Option<i64> {
+    Some(lhs.wrapping_mul(rhs))
+}
+
+#[inline]
+fn fold_int_div(lhs: i64, rhs: i64) -> Option<i64> {
+    if rhs == 0 {
+        return None;
+    }
+    Some(lhs.wrapping_div(rhs))
 }
 
 fn lower_binary_expr(
