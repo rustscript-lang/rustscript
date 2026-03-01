@@ -341,14 +341,7 @@ pub struct Vm {
     io_state: builtin_runtime::IoState,
 }
 
-enum StepExecOutcome {
-    Continue,
-    Halted,
-    Yielded,
-    Waiting(HostOpId),
-}
-
-enum TraceExecOutcome {
+enum ExecOutcome {
     Continue,
     Halted,
     Yielded,
@@ -815,6 +808,35 @@ impl Vm {
         out
     }
 
+    fn notify_debugger_status(
+        &mut self,
+        debugger: &mut Option<&mut crate::debugger::Debugger>,
+        status: VmStatus,
+    ) {
+        if let Some(active_debugger) = debugger.as_deref_mut() {
+            active_debugger.on_vm_status(self, status);
+        }
+    }
+
+    fn outcome_to_status(outcome: ExecOutcome) -> Option<VmStatus> {
+        match outcome {
+            ExecOutcome::Continue => None,
+            ExecOutcome::Halted => Some(VmStatus::Halted),
+            ExecOutcome::Yielded => Some(VmStatus::Yielded),
+            ExecOutcome::Waiting(op_id) => Some(VmStatus::Waiting(op_id)),
+        }
+    }
+
+    fn finish_outcome(
+        &mut self,
+        debugger: &mut Option<&mut crate::debugger::Debugger>,
+        outcome: ExecOutcome,
+    ) -> Option<VmStatus> {
+        let status = Self::outcome_to_status(outcome)?;
+        self.notify_debugger_status(debugger, status);
+        Some(status)
+    }
+
     fn run_internal(
         &mut self,
         mut debugger: Option<&mut crate::debugger::Debugger>,
@@ -823,9 +845,7 @@ impl Vm {
         self.ensure_call_bindings()?;
         if let Some(waiting) = self.waiting_host_op {
             let status = VmStatus::Waiting(waiting.op_id);
-            if let Some(active_debugger) = debugger.as_deref_mut() {
-                active_debugger.on_vm_status(self, status);
-            }
+            self.notify_debugger_status(&mut debugger, status);
             return Ok(status);
         }
 
@@ -840,27 +860,11 @@ impl Vm {
                     self.jit.observe_hot_ip(self.ip, program)
                 };
                 if let Some(trace_id) = trace_id {
-                    match self.execute_jit_entry(trace_id)? {
-                        TraceExecOutcome::Continue => continue,
-                        TraceExecOutcome::Halted => {
-                            if let Some(active_debugger) = debugger.as_deref_mut() {
-                                active_debugger.on_vm_status(self, VmStatus::Halted);
-                            }
-                            return Ok(VmStatus::Halted);
-                        }
-                        TraceExecOutcome::Yielded => {
-                            if let Some(active_debugger) = debugger.as_deref_mut() {
-                                active_debugger.on_vm_status(self, VmStatus::Yielded);
-                            }
-                            return Ok(VmStatus::Yielded);
-                        }
-                        TraceExecOutcome::Waiting(op_id) => {
-                            if let Some(active_debugger) = debugger.as_deref_mut() {
-                                active_debugger.on_vm_status(self, VmStatus::Waiting(op_id));
-                            }
-                            return Ok(VmStatus::Waiting(op_id));
-                        }
+                    let outcome = self.execute_jit_entry(trace_id)?;
+                    if let Some(status) = self.finish_outcome(&mut debugger, outcome) {
+                        return Ok(status);
                     }
+                    continue;
                 }
             }
 
@@ -869,34 +873,17 @@ impl Vm {
             }
 
             let opcode = self.read_u8()?;
-            match self.execute_interpreter_instruction(opcode)? {
-                StepExecOutcome::Continue => {}
-                StepExecOutcome::Halted => {
-                    if let Some(active_debugger) = debugger.as_deref_mut() {
-                        active_debugger.on_vm_status(self, VmStatus::Halted);
-                    }
-                    return Ok(VmStatus::Halted);
-                }
-                StepExecOutcome::Yielded => {
-                    if let Some(active_debugger) = debugger.as_deref_mut() {
-                        active_debugger.on_vm_status(self, VmStatus::Yielded);
-                    }
-                    return Ok(VmStatus::Yielded);
-                }
-                StepExecOutcome::Waiting(op_id) => {
-                    if let Some(active_debugger) = debugger.as_deref_mut() {
-                        active_debugger.on_vm_status(self, VmStatus::Waiting(op_id));
-                    }
-                    return Ok(VmStatus::Waiting(op_id));
-                }
+            let outcome = self.execute_interpreter_instruction(opcode)?;
+            if let Some(status) = self.finish_outcome(&mut debugger, outcome) {
+                return Ok(status);
             }
         }
     }
 
-    fn execute_interpreter_instruction(&mut self, opcode: u8) -> VmResult<StepExecOutcome> {
+    fn execute_interpreter_instruction(&mut self, opcode: u8) -> VmResult<ExecOutcome> {
         match opcode {
             x if x == OpCode::Nop as u8 => {}
-            x if x == OpCode::Ret as u8 => return Ok(StepExecOutcome::Halted),
+            x if x == OpCode::Ret as u8 => return Ok(ExecOutcome::Halted),
             x if x == OpCode::Ldc as u8 => {
                 let index = self.read_u32()?;
                 let value = self
@@ -1034,15 +1021,15 @@ impl Vm {
                 let argc_u8 = self.read_u8()?;
                 match self.execute_host_call(index, argc_u8, call_ip)? {
                     HostCallExecOutcome::Returned => {}
-                    HostCallExecOutcome::Yielded => return Ok(StepExecOutcome::Yielded),
+                    HostCallExecOutcome::Yielded => return Ok(ExecOutcome::Yielded),
                     HostCallExecOutcome::Pending(op_id) => {
-                        return Ok(StepExecOutcome::Waiting(op_id));
+                        return Ok(ExecOutcome::Waiting(op_id));
                     }
                 }
             }
             other => return Err(VmError::InvalidOpcode(other)),
         }
-        Ok(StepExecOutcome::Continue)
+        Ok(ExecOutcome::Continue)
     }
 
     #[cfg_attr(
@@ -1055,9 +1042,9 @@ impl Vm {
         ),
         allow(dead_code)
     )]
-    fn execute_jit_trace(&mut self, trace_id: usize) -> VmResult<TraceExecOutcome> {
+    fn execute_jit_trace(&mut self, trace_id: usize) -> VmResult<ExecOutcome> {
         let Some(trace) = self.jit.trace_clone(trace_id) else {
-            return Ok(TraceExecOutcome::Continue);
+            return Ok(ExecOutcome::Continue);
         };
         for step in &trace.steps {
             match step {
@@ -1187,9 +1174,9 @@ impl Vm {
                     call_ip,
                 } => match self.execute_host_call(*index, *argc, *call_ip)? {
                     HostCallExecOutcome::Returned => {}
-                    HostCallExecOutcome::Yielded => return Ok(TraceExecOutcome::Yielded),
+                    HostCallExecOutcome::Yielded => return Ok(ExecOutcome::Yielded),
                     HostCallExecOutcome::Pending(op_id) => {
-                        return Ok(TraceExecOutcome::Waiting(op_id));
+                        return Ok(ExecOutcome::Waiting(op_id));
                     }
                 },
                 crate::jit::TraceStep::GuardFalse { exit_ip } => {
@@ -1197,30 +1184,30 @@ impl Vm {
                     if !condition {
                         self.jump_to(*exit_ip)?;
                         self.jit.mark_trace_executed(trace_id);
-                        return Ok(TraceExecOutcome::Continue);
+                        return Ok(ExecOutcome::Continue);
                     }
                 }
                 crate::jit::TraceStep::JumpToIp { target_ip } => {
                     self.jump_to(*target_ip)?;
                     self.jit.mark_trace_executed(trace_id);
-                    return Ok(TraceExecOutcome::Continue);
+                    return Ok(ExecOutcome::Continue);
                 }
                 crate::jit::TraceStep::JumpToRoot => {
                     self.jump_to(trace.root_ip)?;
                     self.jit.mark_trace_executed(trace_id);
-                    return Ok(TraceExecOutcome::Continue);
+                    return Ok(ExecOutcome::Continue);
                 }
                 crate::jit::TraceStep::Ret => {
                     self.jit.mark_trace_executed(trace_id);
-                    return Ok(TraceExecOutcome::Halted);
+                    return Ok(ExecOutcome::Halted);
                 }
             }
         }
         self.jit.mark_trace_executed(trace_id);
-        Ok(TraceExecOutcome::Continue)
+        Ok(ExecOutcome::Continue)
     }
 
-    fn execute_jit_entry(&mut self, trace_id: usize) -> VmResult<TraceExecOutcome> {
+    fn execute_jit_entry(&mut self, trace_id: usize) -> VmResult<ExecOutcome> {
         #[cfg(any(
             all(
                 target_arch = "x86_64",
@@ -1253,7 +1240,7 @@ impl Vm {
         ),
         all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
     ))]
-    fn execute_jit_native(&mut self, trace_id: usize) -> VmResult<TraceExecOutcome> {
+    fn execute_jit_native(&mut self, trace_id: usize) -> VmResult<ExecOutcome> {
         self.ensure_native_trace(trace_id)?;
         let (entry, root_ip, terminal, has_yielding_call) = {
             let native = self.native_traces.get(&trace_id).ok_or_else(|| {
@@ -1274,7 +1261,7 @@ impl Vm {
             self.jit.mark_trace_executed(trace_id);
 
             match status {
-                jit_native::STATUS_CONTINUE => return Ok(TraceExecOutcome::Continue),
+                jit_native::STATUS_CONTINUE => return Ok(ExecOutcome::Continue),
                 jit_native::STATUS_TRACE_EXIT => {
                     // Fast path: if this trace looped back to its own root and cannot yield via host
                     // calls, keep executing in native mode without bouncing through the interpreter.
@@ -1284,17 +1271,17 @@ impl Vm {
                     {
                         continue;
                     }
-                    return Ok(TraceExecOutcome::Continue);
+                    return Ok(ExecOutcome::Continue);
                 }
-                jit_native::STATUS_HALTED => return Ok(TraceExecOutcome::Halted),
-                jit_native::STATUS_YIELDED => return Ok(TraceExecOutcome::Yielded),
+                jit_native::STATUS_HALTED => return Ok(ExecOutcome::Halted),
+                jit_native::STATUS_YIELDED => return Ok(ExecOutcome::Yielded),
                 jit_native::STATUS_WAITING => {
                     let op_id = self.waiting_host_op.map(|op| op.op_id).ok_or_else(|| {
                         VmError::JitNative(
                             "native call bridge reported waiting without a pending op".to_string(),
                         )
                     })?;
-                    return Ok(TraceExecOutcome::Waiting(op_id));
+                    return Ok(ExecOutcome::Waiting(op_id));
                 }
                 jit_native::STATUS_ERROR => {
                     let err = jit_native::take_bridge_error().unwrap_or_else(|| {

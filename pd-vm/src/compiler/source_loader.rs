@@ -30,6 +30,14 @@ struct ModuleImport {
     line: usize,
 }
 
+#[derive(Default)]
+struct ModuleCollectState {
+    visiting: Vec<PathBuf>,
+    seen: HashSet<PathBuf>,
+    units: Vec<ParsedUnit>,
+    module_exports: HashMap<PathBuf, HashMap<String, u8>>,
+}
+
 const VM_HOST_NAMESPACE_SPEC: &str = "vm";
 
 pub(super) fn load_units_for_source_file(
@@ -41,39 +49,36 @@ pub(super) fn load_units_for_source_file(
     let root_imports = parse_module_imports(source_raw, flavor, path)?;
     let source = strip_import_directives(source_raw, flavor);
 
-    let mut units = Vec::new();
-    let mut visiting = vec![path.to_path_buf()];
-    let mut seen = HashSet::new();
-    let mut module_exports = HashMap::<PathBuf, HashMap<String, u8>>::new();
-    collect_module_units(
-        path,
-        source_raw,
-        flavor,
-        options,
-        &mut visiting,
-        &mut seen,
-        &mut units,
-        &mut module_exports,
-    )?;
+    let mut collect_state = ModuleCollectState::default();
+    collect_state.visiting.push(path.to_path_buf());
+    collect_module_units(path, source_raw, flavor, options, &mut collect_state)?;
 
     let rewritten_root_source = rewrite_imported_call_sites(
         &source,
         flavor,
         path,
         &root_imports,
-        &module_exports,
+        &collect_state.module_exports,
         options,
     )?;
     let root_parse_source = match flavor {
         SourceFlavor::Scheme => {
-            let mut prelude =
-                build_scheme_import_prelude(path, &root_imports, &module_exports, options)?;
+            let mut prelude = build_scheme_import_prelude(
+                path,
+                &root_imports,
+                &collect_state.module_exports,
+                options,
+            )?;
             prelude.push_str(&rewritten_root_source);
             prelude
         }
         SourceFlavor::RustScript | SourceFlavor::JavaScript | SourceFlavor::Lua => {
-            let mut prelude =
-                build_rustscript_import_prelude(path, &root_imports, &module_exports, options)?;
+            let mut prelude = build_rustscript_import_prelude(
+                path,
+                &root_imports,
+                &collect_state.module_exports,
+                options,
+            )?;
             prelude.push_str(&rewritten_root_source);
             prelude
         }
@@ -87,12 +92,12 @@ pub(super) fn load_units_for_source_file(
             SourceError::Parse(err.with_line_span_from_source(&root_source_map, root_source_id))
         })
         .map_err(SourcePathError::Source)?;
-    units.push(ParsedUnit {
+    collect_state.units.push(ParsedUnit {
         parsed: root_parsed,
         scope_prefix: None,
     });
 
-    Ok((root_parse_source, units))
+    Ok((root_parse_source, collect_state.units))
 }
 
 fn parse_module_imports(
@@ -1047,10 +1052,7 @@ fn collect_module_units(
     source: &str,
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
-    visiting: &mut Vec<PathBuf>,
-    seen: &mut HashSet<PathBuf>,
-    units: &mut Vec<ParsedUnit>,
-    module_exports: &mut HashMap<PathBuf, HashMap<String, u8>>,
+    state: &mut ModuleCollectState,
 ) -> Result<(), SourcePathError> {
     let imports = parse_module_imports(source, flavor, path)?;
     for import in imports {
@@ -1060,26 +1062,23 @@ fn collect_module_units(
         }
         let resolved = resolve_module_path(path, &spec, options)?;
         let key = resolved.clone();
-        if visiting.contains(&key) {
+        if state.visiting.contains(&key) {
             return Err(SourcePathError::ImportCycle(key));
         }
-        if seen.contains(&key) {
+        if state.seen.contains(&key) {
             continue;
         }
 
         let module_source_raw = std::fs::read_to_string(&resolved)?;
-        visiting.push(key.clone());
+        state.visiting.push(key.clone());
         collect_module_units(
             &resolved,
             &module_source_raw,
             SourceFlavor::RustScript,
             options,
-            visiting,
-            seen,
-            units,
-            module_exports,
+            state,
         )?;
-        visiting.pop();
+        state.visiting.pop();
 
         let module_source = strip_import_directives(&module_source_raw, SourceFlavor::RustScript);
         let mut module_source_map = SourceMap::new();
@@ -1098,12 +1097,12 @@ fn collect_module_units(
             .filter(|func| func.exported)
             .map(|func| (func.name.clone(), func.arity))
             .collect::<HashMap<_, _>>();
-        units.push(ParsedUnit {
+        state.units.push(ParsedUnit {
             parsed,
             scope_prefix: Some(sanitize_scope_prefix(&resolved)),
         });
-        module_exports.insert(key.clone(), exports);
-        seen.insert(key);
+        state.module_exports.insert(key.clone(), exports);
+        state.seen.insert(key);
     }
     Ok(())
 }

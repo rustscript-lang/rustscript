@@ -8,13 +8,15 @@ use super::{
 
 const EDGE_IO_HANDLE_REQUEST_BODY: i64 = 1;
 const EDGE_IO_HANDLE_RESPONSE_BODY: i64 = 2;
-const EDGE_IO_HANDLE_UPSTREAM_BODY: i64 = 3;
+const EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY: i64 = 3;
+const EDGE_IO_HANDLE_UPSTREAM_RESPONSE_BODY: i64 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EdgeIoHandleKind {
-    RequestBody,
-    ResponseBody,
-    UpstreamBody,
+    Request,
+    Response,
+    UpstreamRequest,
+    UpstreamResponse,
 }
 
 #[derive(Clone, Debug)]
@@ -100,16 +102,17 @@ pub(super) fn register_builtin_io_overrides(
 
 fn decode_edge_io_handle(handle: i64) -> Result<EdgeIoHandleKind, VmError> {
     match handle {
-        EDGE_IO_HANDLE_REQUEST_BODY => Ok(EdgeIoHandleKind::RequestBody),
-        EDGE_IO_HANDLE_RESPONSE_BODY => Ok(EdgeIoHandleKind::ResponseBody),
-        EDGE_IO_HANDLE_UPSTREAM_BODY => Ok(EdgeIoHandleKind::UpstreamBody),
+        EDGE_IO_HANDLE_REQUEST_BODY => Ok(EdgeIoHandleKind::Request),
+        EDGE_IO_HANDLE_RESPONSE_BODY => Ok(EdgeIoHandleKind::Response),
+        EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY => Ok(EdgeIoHandleKind::UpstreamRequest),
+        EDGE_IO_HANDLE_UPSTREAM_RESPONSE_BODY => Ok(EdgeIoHandleKind::UpstreamResponse),
         _ => Err(VmError::HostError(format!(
-            "edge io handle {handle} is invalid; expected request/response/upstream handle",
+            "edge io handle {handle} is invalid; expected request/response/upstream request/upstream response handle",
         ))),
     }
 }
 
-fn path_targets_upstream(path: &str) -> bool {
+fn path_targets_upstream_request(path: &str) -> bool {
     let normalized = path.trim().to_ascii_lowercase();
     normalized.contains("upstream")
 }
@@ -118,17 +121,22 @@ fn edge_io_target_from_string(value: &str) -> Option<EdgeIoHandleKind> {
     let normalized = value.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "request_body" | "request.body" | "request" | "body" | "http.request.body"
-        | "inbound.body" => Some(EdgeIoHandleKind::RequestBody),
+        | "inbound.body" => Some(EdgeIoHandleKind::Request),
         "response_body"
         | "response.body"
         | "response"
         | "http.response.body"
-        | "outbound.response.body" => Some(EdgeIoHandleKind::ResponseBody),
+        | "outbound.response.body" => Some(EdgeIoHandleKind::Response),
         "upstream_body"
         | "upstream.body"
         | "upstream_request_body"
+        | "upstream.request.body"
         | "outbound.body"
-        | "http.upstream.request.body" => Some(EdgeIoHandleKind::UpstreamBody),
+        | "http.upstream.request.body" => Some(EdgeIoHandleKind::UpstreamRequest),
+        "upstream_response_body"
+        | "upstream.response.body"
+        | "http.upstream.response.body"
+        | "outbound.upstream.response.body" => Some(EdgeIoHandleKind::UpstreamResponse),
         _ => None,
     }
 }
@@ -259,20 +267,24 @@ async fn write_edge_file_path(path: &str, append: bool, text: &str) -> Result<()
 
 fn read_io_target_all(context: &mut ProxyVmContext, target: EdgeIoHandleKind) -> String {
     match target {
-        EdgeIoHandleKind::RequestBody => {
+        EdgeIoHandleKind::Request => {
             context.inbound_request_body_offset = context.inbound_request_body.len();
             String::from_utf8_lossy(&context.inbound_request_body).into_owned()
         }
-        EdgeIoHandleKind::ResponseBody => context.response_content.clone().unwrap_or_default(),
-        EdgeIoHandleKind::UpstreamBody => {
+        EdgeIoHandleKind::Response => context.response_content.clone().unwrap_or_default(),
+        EdgeIoHandleKind::UpstreamRequest => {
             String::from_utf8_lossy(&context.outbound_request_body).into_owned()
         }
+        EdgeIoHandleKind::UpstreamResponse => context
+            .upstream_response_content
+            .clone()
+            .unwrap_or_default(),
     }
 }
 
 fn read_io_target_line(context: &mut ProxyVmContext, target: EdgeIoHandleKind) -> String {
     match target {
-        EdgeIoHandleKind::RequestBody => {
+        EdgeIoHandleKind::Request => {
             let start = context
                 .inbound_request_body_offset
                 .min(context.inbound_request_body.len());
@@ -291,10 +303,14 @@ fn read_io_target_line(context: &mut ProxyVmContext, target: EdgeIoHandleKind) -
             context.inbound_request_body_offset = end;
             line
         }
-        EdgeIoHandleKind::ResponseBody => context.response_content.clone().unwrap_or_default(),
-        EdgeIoHandleKind::UpstreamBody => {
+        EdgeIoHandleKind::Response => context.response_content.clone().unwrap_or_default(),
+        EdgeIoHandleKind::UpstreamRequest => {
             String::from_utf8_lossy(&context.outbound_request_body).into_owned()
         }
+        EdgeIoHandleKind::UpstreamResponse => context
+            .upstream_response_content
+            .clone()
+            .unwrap_or_default(),
     }
 }
 
@@ -304,17 +320,20 @@ fn write_io_target(
     text: &str,
 ) -> Result<(), VmError> {
     match target {
-        EdgeIoHandleKind::RequestBody => Err(VmError::HostError(
+        EdgeIoHandleKind::Request => Err(VmError::HostError(
             "edge io::write does not support request body read handle".to_string(),
         )),
-        EdgeIoHandleKind::ResponseBody => {
+        EdgeIoHandleKind::Response => {
             context.response_content = Some(text.to_string());
             Ok(())
         }
-        EdgeIoHandleKind::UpstreamBody => {
+        EdgeIoHandleKind::UpstreamRequest => {
             context.outbound_request_body = text.as_bytes().to_vec();
             Ok(())
         }
+        EdgeIoHandleKind::UpstreamResponse => Err(VmError::HostError(
+            "edge io::write does not support upstream response body handles".to_string(),
+        )),
     }
 }
 
@@ -343,9 +362,14 @@ impl HostFunction for BuiltinIoOpenFunction {
                 "r" => {
                     if let Some(target) = explicit_target {
                         let handle = match target {
-                            EdgeIoHandleKind::RequestBody => EDGE_IO_HANDLE_REQUEST_BODY,
-                            EdgeIoHandleKind::ResponseBody => EDGE_IO_HANDLE_RESPONSE_BODY,
-                            EdgeIoHandleKind::UpstreamBody => EDGE_IO_HANDLE_UPSTREAM_BODY,
+                            EdgeIoHandleKind::Request => EDGE_IO_HANDLE_REQUEST_BODY,
+                            EdgeIoHandleKind::Response => EDGE_IO_HANDLE_RESPONSE_BODY,
+                            EdgeIoHandleKind::UpstreamRequest => {
+                                EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY
+                            }
+                            EdgeIoHandleKind::UpstreamResponse => {
+                                EDGE_IO_HANDLE_UPSTREAM_RESPONSE_BODY
+                            }
                         };
                         return Ok(vec![Value::Int(handle)]);
                     }
@@ -367,20 +391,28 @@ impl HostFunction for BuiltinIoOpenFunction {
                 "w" | "a" => {
                     if let Some(target) = explicit_target {
                         let handle = match target {
-                            EdgeIoHandleKind::RequestBody => {
+                            EdgeIoHandleKind::Request => {
                                 return Err(VmError::HostError(
                                     "edge io::open does not allow write mode on request body"
                                         .to_string(),
                                 ));
                             }
-                            EdgeIoHandleKind::ResponseBody => EDGE_IO_HANDLE_RESPONSE_BODY,
-                            EdgeIoHandleKind::UpstreamBody => EDGE_IO_HANDLE_UPSTREAM_BODY,
+                            EdgeIoHandleKind::Response => EDGE_IO_HANDLE_RESPONSE_BODY,
+                            EdgeIoHandleKind::UpstreamRequest => {
+                                EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY
+                            }
+                            EdgeIoHandleKind::UpstreamResponse => {
+                                return Err(VmError::HostError(
+                                    "edge io::open does not allow write mode on upstream response body"
+                                        .to_string(),
+                                ));
+                            }
                         };
                         return Ok(vec![Value::Int(handle)]);
                     }
 
-                    let target = if path_targets_upstream(&path) {
-                        EDGE_IO_HANDLE_UPSTREAM_BODY
+                    let target = if path_targets_upstream_request(&path) {
+                        EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY
                     } else {
                         let mut guard = context.lock().expect("vm context lock poisoned");
                         allocate_edge_virtual_io_handle(
@@ -650,7 +682,10 @@ impl HostFunction for BuiltinIoExistsFunction {
         let path = expect_string(args, 0)?;
         schedule_future_call(vm, &self.async_ops, async move {
             tokio::task::yield_now().await;
-            let exists = if edge_io_readable_path(&path) || path_targets_upstream(&path) {
+            let exists = if edge_io_readable_path(&path)
+                || edge_io_target_from_string(&path).is_some()
+                || path_targets_upstream_request(&path)
+            {
                 true
             } else {
                 tokio::fs::metadata(path.as_str()).await.is_ok()

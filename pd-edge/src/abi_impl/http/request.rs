@@ -7,82 +7,61 @@ use super::super::{
     schedule_ready_call,
 };
 
+fn bind_request_host(
+    vm: &mut Vm,
+    async_ops: &SharedVmAsyncOps,
+    symbol: &'static str,
+    function: Box<dyn HostFunction>,
+) {
+    bind_async_host(vm, async_ops, symbol, function);
+}
+
+fn bind_request_field(
+    vm: &mut Vm,
+    async_ops: &SharedVmAsyncOps,
+    context: &SharedProxyVmContext,
+    symbol: &'static str,
+    field: RequestField,
+) {
+    bind_request_host(
+        vm,
+        async_ops,
+        symbol,
+        Box::new(GetRequestFieldFunction::new(context.clone(), field)),
+    );
+}
+
 pub(super) fn register_0_to_6(
     vm: &mut Vm,
     context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
 ) {
-    bind_async_host(
-        vm,
-        &async_ops,
-        "http::request::get_id",
-        Box::new(GetRequestFieldFunction::new(
-            context.clone(),
-            RequestField::Id,
-        )),
-    );
-    bind_async_host(
-        vm,
-        &async_ops,
-        "http::request::get_method",
-        Box::new(GetRequestFieldFunction::new(
-            context.clone(),
-            RequestField::Method,
-        )),
-    );
-    bind_async_host(
-        vm,
-        &async_ops,
-        "http::request::get_path",
-        Box::new(GetRequestFieldFunction::new(
-            context.clone(),
-            RequestField::Path,
-        )),
-    );
-    bind_async_host(
-        vm,
-        &async_ops,
-        "http::request::get_query",
-        Box::new(GetRequestFieldFunction::new(
-            context.clone(),
-            RequestField::Query,
-        )),
-    );
-    bind_async_host(
-        vm,
-        &async_ops,
-        "http::request::get_scheme",
-        Box::new(GetRequestFieldFunction::new(
-            context.clone(),
-            RequestField::Scheme,
-        )),
-    );
-    bind_async_host(
-        vm,
-        &async_ops,
-        "http::request::get_host",
-        Box::new(GetRequestFieldFunction::new(
-            context.clone(),
-            RequestField::Host,
-        )),
-    );
-    bind_async_host(
+    let field_symbols = [
+        ("http::request::get_id", RequestField::Id),
+        ("http::request::get_method", RequestField::Method),
+        ("http::request::get_path", RequestField::Path),
+        ("http::request::get_query", RequestField::Query),
+        ("http::request::get_scheme", RequestField::Scheme),
+        ("http::request::get_host", RequestField::Host),
+    ];
+    for (symbol, field) in field_symbols {
+        bind_request_field(vm, &async_ops, &context, symbol, field);
+    }
+    bind_request_host(
         vm,
         &async_ops,
         "http::request::get_header",
-        Box::new(GetHeaderFunction::new(context.clone())),
+        Box::new(GetHeaderFunction::new(context)),
     );
 }
 
 pub(super) fn register_12(vm: &mut Vm, context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) {
-    bind_async_host(
+    bind_request_field(
         vm,
         &async_ops,
+        &context,
         "http::request::get_client_ip",
-        Box::new(GetRequestFieldFunction::new(
-            context,
-            RequestField::ClientIp,
-        )),
+        RequestField::ClientIp,
     );
 }
 
@@ -91,50 +70,43 @@ pub(super) fn register_19_to_24(
     context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
 ) {
-    bind_async_host(
+    bind_request_host(
         vm,
         &async_ops,
         "http::request::get_headers",
         Box::new(GetRequestHeadersFunction::new(context.clone())),
     );
-    bind_async_host(
+    bind_request_host(
         vm,
         &async_ops,
         "http::request::get_query_arg",
         Box::new(GetRequestQueryArgFunction::new(context.clone())),
     );
-    bind_async_host(
+    bind_request_host(
         vm,
         &async_ops,
         "http::request::get_query_args",
         Box::new(GetRequestQueryArgsFunction::new(context.clone())),
     );
-    bind_async_host(
+    bind_request_field(
         vm,
         &async_ops,
+        &context,
         "http::request::get_path_with_query",
-        Box::new(GetRequestFieldFunction::new(
-            context.clone(),
-            RequestField::PathWithQuery,
-        )),
+        RequestField::PathWithQuery,
     );
-    bind_async_host(
+    bind_request_field(
         vm,
         &async_ops,
+        &context,
         "http::request::get_raw_query",
-        Box::new(GetRequestFieldFunction::new(
-            context.clone(),
-            RequestField::RawQuery,
-        )),
+        RequestField::RawQuery,
     );
-    bind_async_host(
+    bind_request_host(
         vm,
         &async_ops,
         "http::request::get_body",
-        Box::new(GetRequestBodyFunction::new(
-            context.clone(),
-            async_ops.clone(),
-        )),
+        Box::new(GetRequestBodyFunction::new(context, async_ops.clone())),
     );
 }
 
@@ -143,16 +115,14 @@ pub(super) fn register_31_to_32(
     context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
 ) {
-    bind_async_host(
+    bind_request_field(
         vm,
         &async_ops,
+        &context,
         "http::request::get_http_version",
-        Box::new(GetRequestFieldFunction::new(
-            context.clone(),
-            RequestField::HttpVersion,
-        )),
+        RequestField::HttpVersion,
     );
-    bind_async_host(
+    bind_request_host(
         vm,
         &async_ops,
         "http::request::get_port",
@@ -165,7 +135,7 @@ pub(super) fn register_streaming_extensions(
     context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
 ) {
-    bind_async_host(
+    bind_request_host(
         vm,
         &async_ops,
         "http::request::body::next_chunk",
@@ -174,7 +144,7 @@ pub(super) fn register_streaming_extensions(
             async_ops.clone(),
         )),
     );
-    bind_async_host(
+    bind_request_host(
         vm,
         &async_ops,
         "http::request::body::eof",
@@ -182,6 +152,7 @@ pub(super) fn register_streaming_extensions(
     );
 }
 
+#[derive(Clone, Copy)]
 enum RequestField {
     Id,
     Method,
