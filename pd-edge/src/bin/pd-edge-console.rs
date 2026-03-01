@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_console_loop(&state).await
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CliArgs {
     program_path: Option<PathBuf>,
     max_program_bytes: Option<usize>,
@@ -91,6 +91,7 @@ struct CliArgs {
     control_plane_rpc_timeout_ms: Option<u64>,
 }
 
+#[derive(Debug)]
 enum CliAction {
     Run(Box<CliArgs>),
     Help,
@@ -98,7 +99,14 @@ enum CliAction {
 }
 
 fn parse_cli_args() -> Result<CliAction, String> {
-    let mut args = env::args().skip(1).peekable();
+    parse_cli_args_from(env::args().skip(1))
+}
+
+fn parse_cli_args_from<I>(args: I) -> Result<CliAction, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter().peekable();
     let mut cli = CliArgs::default();
 
     while let Some(arg) = args.next() {
@@ -639,4 +647,130 @@ fn default_edge_name() -> String {
         }
     }
     "unknown-host".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_test_dir(prefix: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("{}-{}", prefix, Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        dir
+    }
+
+    #[test]
+    fn parse_cli_args_from_handles_help_and_version() {
+        assert!(matches!(
+            parse_cli_args_from(["--help".to_string()]).expect("parse should succeed"),
+            CliAction::Help
+        ));
+        assert!(matches!(
+            parse_cli_args_from(["-V".to_string()]).expect("parse should succeed"),
+            CliAction::Version
+        ));
+    }
+
+    #[test]
+    fn parse_cli_args_from_parses_run_options() {
+        let action = parse_cli_args_from([
+            "--program".to_string(),
+            "examples/demo.rss".to_string(),
+            "--max-program-bytes".to_string(),
+            "4096".to_string(),
+            "--control-plane-url".to_string(),
+            "http://127.0.0.1:9100".to_string(),
+            "--edge-id".to_string(),
+            "123e4567-e89b-12d3-a456-426614174000".to_string(),
+            "--edge-name".to_string(),
+            "console-edge".to_string(),
+            "--edge-id-path".to_string(),
+            ".pd-edge/console-id".to_string(),
+            "--control-plane-poll-interval-ms".to_string(),
+            "120".to_string(),
+            "--control-plane-rpc-timeout-ms".to_string(),
+            "3400".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        let CliAction::Run(cli) = action else {
+            panic!("expected run action");
+        };
+        assert_eq!(
+            *cli,
+            CliArgs {
+                program_path: Some(PathBuf::from("examples/demo.rss")),
+                max_program_bytes: Some(4096),
+                control_plane_url: Some("http://127.0.0.1:9100".to_string()),
+                edge_id: Some("123e4567-e89b-12d3-a456-426614174000".to_string()),
+                edge_name: Some("console-edge".to_string()),
+                edge_id_path: Some(PathBuf::from(".pd-edge/console-id")),
+                control_plane_poll_interval_ms: Some(120),
+                control_plane_rpc_timeout_ms: Some(3400),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_from_rejects_unknown_argument() {
+        let err = parse_cli_args_from(["--bad".to_string()]).expect_err("unknown should fail");
+        assert!(err.contains("unknown argument: --bad"));
+    }
+
+    #[test]
+    fn parse_cli_args_from_rejects_missing_value() {
+        let err =
+            parse_cli_args_from(["--program".to_string()]).expect_err("missing value should fail");
+        assert!(err.contains("missing value for --program"));
+    }
+
+    #[test]
+    fn resolve_edge_id_explicit_value_is_persisted() {
+        let dir = temp_test_dir("pd-edge-console-explicit-id");
+        let path = dir.join("edge-id");
+        let edge_id = resolve_edge_id(Some("123e4567-e89b-12d3-a456-426614174000"), path.as_path())
+            .expect("explicit id should resolve");
+        assert_eq!(edge_id, "123e4567-e89b-12d3-a456-426614174000");
+        let on_disk = fs::read_to_string(&path).expect("id file should exist");
+        assert_eq!(on_disk, "123e4567-e89b-12d3-a456-426614174000\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_edge_id_existing_invalid_file_is_replaced() {
+        let dir = temp_test_dir("pd-edge-console-invalid-id");
+        let path = dir.join("edge-id");
+        fs::write(&path, "invalid-uuid\n").expect("seed invalid id");
+
+        let edge_id = resolve_edge_id(None, path.as_path()).expect("id should be generated");
+        assert!(
+            Uuid::parse_str(&edge_id).is_ok(),
+            "generated id should be uuid"
+        );
+        let on_disk = fs::read_to_string(&path).expect("id file should exist");
+        assert_eq!(on_disk, format!("{edge_id}\n"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_program_path_returns_error_for_missing_path() {
+        let missing = PathBuf::from("path/that/does/not/exist.rss");
+        let err = resolve_program_path(missing.as_path()).expect_err("missing path should fail");
+        assert!(err.to_string().contains("program path not found"));
+    }
+
+    #[test]
+    fn resolve_program_path_falls_back_to_manifest_dir() {
+        let relative = PathBuf::from(format!("target/console-test-{}.rss", Uuid::new_v4()));
+        let absolute = Path::new(env!("CARGO_MANIFEST_DIR")).join(&relative);
+        if let Some(parent) = absolute.parent() {
+            fs::create_dir_all(parent).expect("parent should be created");
+        }
+        fs::write(&absolute, "vm::http::response::set_body(\"ok\");")
+            .expect("fixture file should be written");
+
+        let resolved = resolve_program_path(relative.as_path()).expect("path should resolve");
+        assert_eq!(resolved, absolute);
+        let _ = fs::remove_file(absolute);
+    }
 }

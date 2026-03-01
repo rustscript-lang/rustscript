@@ -877,6 +877,14 @@ impl Vm {
         &self.program
     }
 
+    pub fn bound_function_count(&self) -> usize {
+        self.host_functions.len()
+    }
+
+    pub fn has_bound_function(&self, name: &str) -> bool {
+        self.host_function_symbols.contains_key(name)
+    }
+
     pub fn ip(&self) -> usize {
         self.ip
     }
@@ -1268,6 +1276,12 @@ impl Drop for Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn native_cache_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     #[cfg(any(
@@ -1278,6 +1292,9 @@ mod tests {
         all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
     ))]
     fn native_trace_cache_resets_when_program_changes() {
+        let _guard = native_cache_test_lock()
+            .lock()
+            .expect("native cache test lock should succeed");
         jit::runtime::clear_native_trace_cache_for_tests();
 
         let source_one = r#"
@@ -1356,6 +1373,89 @@ mod tests {
         assert_eq!(
             cache_entries_after_two, vm_two_trace_count,
             "cache should only contain traces from the active program"
+        );
+    }
+
+    #[test]
+    #[cfg(any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "windows", all(unix, not(target_os = "macos")))
+        ),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+    ))]
+    fn native_trace_cache_reuses_entries_for_same_program() {
+        let _guard = native_cache_test_lock()
+            .lock()
+            .expect("native cache test lock should succeed");
+        jit::runtime::clear_native_trace_cache_for_tests();
+
+        let source = r#"
+            let i = 0;
+            let sum = 0;
+            while i < 10 {
+                sum = sum + i;
+                i = i + 1;
+            }
+            sum;
+        "#;
+        let compiled = crate::compile_source(source).expect("source should compile");
+
+        let mut vm_one = Vm::with_locals(compiled.program.clone(), compiled.locals);
+        vm_one.set_jit_config(jit::JitConfig {
+            enabled: true,
+            hot_loop_threshold: 1,
+            max_trace_len: 512,
+        });
+        let status_one = vm_one.run().expect("first vm should run");
+        assert_eq!(status_one, VmStatus::Halted);
+        let vm_one_trace_count = vm_one.jit_native_trace_count();
+        assert!(
+            vm_one_trace_count > 0,
+            "first vm should produce native traces"
+        );
+
+        let (cache_program_after_one, cache_entries_after_one) =
+            jit::runtime::native_trace_cache_snapshot_for_tests();
+        assert_eq!(
+            cache_program_after_one,
+            Some(vm_one.program_cache_key),
+            "cache should be keyed to the first program"
+        );
+        assert_eq!(
+            cache_entries_after_one, vm_one_trace_count,
+            "cache entry count should match first vm traces"
+        );
+
+        let mut vm_two = Vm::with_locals(compiled.program, compiled.locals);
+        vm_two.set_jit_config(jit::JitConfig {
+            enabled: true,
+            hot_loop_threshold: 1,
+            max_trace_len: 512,
+        });
+        assert_eq!(
+            vm_two.program_cache_key, vm_one.program_cache_key,
+            "same program should use identical cache key"
+        );
+
+        let status_two = vm_two.run().expect("second vm should run");
+        assert_eq!(status_two, VmStatus::Halted);
+        let vm_two_trace_count = vm_two.jit_native_trace_count();
+        assert_eq!(
+            vm_two_trace_count, vm_one_trace_count,
+            "same program should compile same native trace count"
+        );
+
+        let (cache_program_after_two, cache_entries_after_two) =
+            jit::runtime::native_trace_cache_snapshot_for_tests();
+        assert_eq!(
+            cache_program_after_two,
+            Some(vm_two.program_cache_key),
+            "cache key should remain the same for identical program"
+        );
+        assert_eq!(
+            cache_entries_after_two, cache_entries_after_one,
+            "cache entries should be reused instead of duplicated"
         );
     }
 }

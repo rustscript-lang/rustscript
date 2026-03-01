@@ -11,6 +11,7 @@ use axum::{
     body::Body,
     http::{HeaderMap, HeaderName, HeaderValue, Method},
 };
+use edge_abi::FUNCTIONS as EDGE_ABI_FUNCTIONS;
 use http_body_util::BodyExt;
 use tokio::sync::oneshot;
 use url::Url;
@@ -279,12 +280,40 @@ impl EdgeProtocolHostModule for HttpProtocolHostModule {
     }
 }
 
+fn unbound_edge_abi_function(_vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, VmError> {
+    Err(VmError::HostError(
+        "edge ABI host function is not bound".to_string(),
+    ))
+}
+
+fn ensure_edge_abi_host_slots(vm: &mut Vm) -> Result<(), VmError> {
+    if EDGE_ABI_FUNCTIONS
+        .iter()
+        .all(|function| vm.has_bound_function(function.name))
+    {
+        return Ok(());
+    }
+
+    if vm.bound_function_count() != 0 {
+        return Err(VmError::HostError(
+            "edge ABI host slots must be initialized before registering custom host functions"
+                .to_string(),
+        ));
+    }
+
+    for function in EDGE_ABI_FUNCTIONS {
+        vm.bind_static_function(function.name, unbound_edge_abi_function);
+    }
+    Ok(())
+}
+
 pub fn register_protocol_modules(
     vm: &mut Vm,
     context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
     modules: &[&dyn EdgeProtocolHostModule],
 ) -> Result<(), VmError> {
+    ensure_edge_abi_host_slots(vm)?;
     for module in modules {
         module.register(vm, context.clone(), async_ops.clone())?;
     }
@@ -780,6 +809,7 @@ pub fn register_runtime_host_module(
     context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
 ) -> Result<(), VmError> {
+    ensure_edge_abi_host_slots(vm)?;
     runtime::register_runtime_host_module(vm, context, async_ops)
 }
 
@@ -788,6 +818,7 @@ pub fn register_http_host_module(
     context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
 ) -> Result<(), VmError> {
+    ensure_edge_abi_host_slots(vm)?;
     http::register_http_host_module(vm, context, async_ops)
 }
 

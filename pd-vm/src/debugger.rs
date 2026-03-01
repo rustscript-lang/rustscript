@@ -1582,13 +1582,14 @@ impl<'a> RecordingCursor<'a> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::time::Duration;
 
     use crate::debug_info::{DebugInfo, LocalInfo};
     use crate::vm::{Program, Value, Vm, VmStatus};
 
     use super::{
-        Debugger, ReplAction, ReplayBreakpoints, StepMode, VmRecording, VmRecordingFrame,
-        handle_command, handle_replay_command,
+        DebugCommandBridgeError, Debugger, ReplAction, ReplayBreakpoints, StepMode, VmRecording,
+        VmRecordingFrame, handle_command, handle_replay_command,
     };
 
     fn vm_with_named_local(name: &str, value: Value) -> Vm {
@@ -1956,5 +1957,154 @@ mod tests {
         assert_eq!(state.cursor, 1);
         assert!(response.at_end);
         assert_eq!(response.current_line, Some(11));
+    }
+
+    #[test]
+    fn handle_command_next_and_out_set_expected_step_modes() {
+        let vm = Vm::new(Program::new(vec![], vec![crate::vm::OpCode::Ret as u8]));
+        let mut out = Vec::<u8>::new();
+        let mut breakpoints = HashSet::new();
+        let mut line_breakpoints = HashSet::new();
+        let mut step_mode = StepMode::Running;
+
+        let action = handle_command(
+            "next",
+            &vm,
+            &mut breakpoints,
+            &mut line_breakpoints,
+            &mut step_mode,
+            &mut out,
+        );
+        assert_eq!(action, ReplAction::Break);
+        assert!(
+            matches!(step_mode, StepMode::StepOver { depth: 0, ip: 0 }),
+            "unexpected step mode after next: {step_mode:?}"
+        );
+
+        let action = handle_command(
+            "out",
+            &vm,
+            &mut breakpoints,
+            &mut line_breakpoints,
+            &mut step_mode,
+            &mut out,
+        );
+        assert_eq!(action, ReplAction::Break);
+        assert!(
+            matches!(step_mode, StepMode::StepOut { depth: 0 }),
+            "unexpected step mode after out: {step_mode:?}"
+        );
+    }
+
+    #[test]
+    fn replay_next_and_out_follow_call_depth_transitions() {
+        let recording = VmRecording {
+            program: Program::new(vec![], vec![]),
+            frames: vec![
+                VmRecordingFrame {
+                    ip: 10,
+                    call_depth: 0,
+                    stack: vec![],
+                    locals: vec![],
+                },
+                VmRecordingFrame {
+                    ip: 10,
+                    call_depth: 1,
+                    stack: vec![],
+                    locals: vec![],
+                },
+                VmRecordingFrame {
+                    ip: 11,
+                    call_depth: 1,
+                    stack: vec![],
+                    locals: vec![],
+                },
+                VmRecordingFrame {
+                    ip: 10,
+                    call_depth: 0,
+                    stack: vec![],
+                    locals: vec![],
+                },
+                VmRecordingFrame {
+                    ip: 12,
+                    call_depth: 0,
+                    stack: vec![],
+                    locals: vec![],
+                },
+            ],
+            terminal_status: Some(VmStatus::Halted),
+        };
+        let mut replay_breakpoints = ReplayBreakpoints::default();
+        let mut out = Vec::<u8>::new();
+
+        let mut cursor = 0usize;
+        handle_replay_command(
+            "next",
+            &recording,
+            &mut cursor,
+            &mut replay_breakpoints,
+            &mut out,
+        );
+        assert_eq!(cursor, 4, "next should step over nested call frames");
+
+        out.clear();
+        cursor = 1;
+        handle_replay_command(
+            "out",
+            &recording,
+            &mut cursor,
+            &mut replay_breakpoints,
+            &mut out,
+        );
+        assert_eq!(cursor, 3, "out should stop when call depth decreases");
+    }
+
+    #[test]
+    fn replay_api_reports_empty_recording_without_crashing() {
+        let recording = VmRecording {
+            program: Program::new(vec![], vec![]),
+            frames: vec![],
+            terminal_status: None,
+        };
+        let mut state = super::VmRecordingReplayState::default();
+
+        let response = super::run_recording_replay_command(&recording, &mut state, "continue");
+        assert_eq!(response.output, "recording has no captured frames");
+        assert!(response.at_end);
+        assert!(!response.exited);
+        assert_eq!(response.current_line, None);
+    }
+
+    #[test]
+    fn debug_command_bridge_reports_not_attached_timeout_and_closed_states() {
+        let bridge = super::DebugCommandBridge::new();
+        assert!(!bridge.status().attached);
+
+        let not_attached = bridge
+            .execute("where", Duration::from_millis(5))
+            .expect_err("bridge should reject commands before attach");
+        assert_eq!(not_attached, DebugCommandBridgeError::NotAttached);
+
+        {
+            let mut state = bridge
+                .inner
+                .state
+                .lock()
+                .expect("debug command bridge lock poisoned");
+            state.attached = true;
+        }
+        let timeout = bridge
+            .execute("where", Duration::from_millis(5))
+            .expect_err("bridge should time out with no debugger repl consumer");
+        assert_eq!(timeout, DebugCommandBridgeError::Timeout);
+
+        bridge.close();
+        let closed = bridge
+            .execute("where", Duration::from_millis(5))
+            .expect_err("closed bridge should reject commands");
+        assert_eq!(closed, DebugCommandBridgeError::Closed);
+        let status = bridge.status();
+        assert!(!status.attached);
+        assert_eq!(status.current_line, None);
     }
 }

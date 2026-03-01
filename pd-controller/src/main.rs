@@ -82,3 +82,127 @@ fn binary_version_text() -> String {
         format!("{binary} {git_tag}")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn parse_addr_uses_default_when_env_missing() {
+        let _guard = env_lock().lock().expect("env lock");
+        let key = "PD_TEST_CONTROLLER_ADDR_MISSING";
+        // SAFETY: tests serialize process env access via env_lock.
+        unsafe {
+            env::remove_var(key);
+        }
+
+        let parsed = parse_addr(key, "127.0.0.1:9910").expect("addr should parse");
+        assert_eq!(
+            parsed,
+            "127.0.0.1:9910"
+                .parse::<SocketAddr>()
+                .expect("valid literal")
+        );
+    }
+
+    #[test]
+    fn parse_addr_reads_env_when_present() {
+        let _guard = env_lock().lock().expect("env lock");
+        let key = "PD_TEST_CONTROLLER_ADDR_PRESENT";
+        // SAFETY: tests serialize process env access via env_lock.
+        unsafe {
+            env::set_var(key, "127.0.0.1:9911");
+        }
+
+        let parsed = parse_addr(key, "127.0.0.1:9910").expect("addr should parse");
+        assert_eq!(
+            parsed,
+            "127.0.0.1:9911"
+                .parse::<SocketAddr>()
+                .expect("valid literal")
+        );
+        // SAFETY: tests serialize process env access via env_lock.
+        unsafe {
+            env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn parse_u64_and_usize_use_defaults_when_env_missing() {
+        let _guard = env_lock().lock().expect("env lock");
+        let u64_key = "PD_TEST_CONTROLLER_U64_MISSING";
+        let usize_key = "PD_TEST_CONTROLLER_USIZE_MISSING";
+        // SAFETY: tests serialize process env access via env_lock.
+        unsafe {
+            env::remove_var(u64_key);
+            env::remove_var(usize_key);
+        }
+
+        assert_eq!(parse_u64(u64_key, 123).expect("u64 parse"), 123);
+        assert_eq!(parse_usize(usize_key, 456).expect("usize parse"), 456);
+    }
+
+    #[test]
+    fn parse_u64_and_usize_read_env_when_present() {
+        let _guard = env_lock().lock().expect("env lock");
+        let u64_key = "PD_TEST_CONTROLLER_U64_PRESENT";
+        let usize_key = "PD_TEST_CONTROLLER_USIZE_PRESENT";
+        // SAFETY: tests serialize process env access via env_lock.
+        unsafe {
+            env::set_var(u64_key, "789");
+            env::set_var(usize_key, "321");
+        }
+
+        assert_eq!(parse_u64(u64_key, 123).expect("u64 parse"), 789);
+        assert_eq!(parse_usize(usize_key, 456).expect("usize parse"), 321);
+        // SAFETY: tests serialize process env access via env_lock.
+        unsafe {
+            env::remove_var(u64_key);
+            env::remove_var(usize_key);
+        }
+    }
+
+    #[test]
+    fn parse_state_path_returns_none_for_blank_value() {
+        let _guard = env_lock().lock().expect("env lock");
+        let key = "PD_TEST_CONTROLLER_STATE_PATH_BLANK";
+        // SAFETY: tests serialize process env access via env_lock.
+        unsafe {
+            env::set_var(key, "   ");
+        }
+
+        assert!(parse_state_path(key, ".pd-controller/state.json").is_none());
+        // SAFETY: tests serialize process env access via env_lock.
+        unsafe {
+            env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn parse_state_path_uses_default_when_env_missing() {
+        let _guard = env_lock().lock().expect("env lock");
+        let key = "PD_TEST_CONTROLLER_STATE_PATH_MISSING";
+        // SAFETY: tests serialize process env access via env_lock.
+        unsafe {
+            env::remove_var(key);
+        }
+
+        let parsed = parse_state_path(key, ".pd-controller/state.json");
+        assert_eq!(
+            parsed,
+            Some(std::path::PathBuf::from(".pd-controller/state.json"))
+        );
+    }
+
+    #[test]
+    fn binary_version_text_contains_binary_name() {
+        let text = binary_version_text();
+        assert!(text.starts_with(env!("CARGO_PKG_NAME")));
+    }
+}

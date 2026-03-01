@@ -1999,3 +1999,495 @@ async fn controller_persists_programs_applied_versions_and_traffic_series() {
     let _ = fs::remove_file(&recordings_path);
     let _ = fs::remove_file(&debug_sessions_path);
 }
+
+#[tokio::test]
+async fn program_and_version_endpoints_validate_error_paths() {
+    let (addr, handle, _state) = spawn_controller(ControllerConfig::default()).await;
+    let client = reqwest::Client::new();
+
+    let created_empty = client
+        .post(format!("http://{addr}/v1/programs"))
+        .json(&serde_json::json!({ "name": "   " }))
+        .send()
+        .await
+        .expect("create program should complete");
+    assert_eq!(created_empty.status(), reqwest::StatusCode::BAD_REQUEST);
+    let created_empty_json = created_empty
+        .json::<serde_json::Value>()
+        .await
+        .expect("error payload should decode");
+    assert!(
+        created_empty_json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cannot be empty"),
+        "unexpected error payload: {created_empty_json}"
+    );
+
+    let get_missing = client
+        .get(format!("http://{addr}/v1/programs/missing-program"))
+        .send()
+        .await
+        .expect("get program should complete");
+    assert_eq!(get_missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let rename_missing = client
+        .patch(format!("http://{addr}/v1/programs/missing-program"))
+        .json(&serde_json::json!({ "name": "renamed" }))
+        .send()
+        .await
+        .expect("rename request should complete");
+    assert_eq!(rename_missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let delete_missing = client
+        .delete(format!("http://{addr}/v1/programs/missing-program"))
+        .send()
+        .await
+        .expect("delete request should complete");
+    assert_eq!(delete_missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let created = client
+        .post(format!("http://{addr}/v1/programs"))
+        .json(&serde_json::json!({ "name": "validation target" }))
+        .send()
+        .await
+        .expect("create program should complete");
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let created_json = created
+        .json::<serde_json::Value>()
+        .await
+        .expect("create payload should decode");
+    let program_id = created_json["program_id"]
+        .as_str()
+        .expect("program_id should be set")
+        .to_string();
+
+    let rename_empty = client
+        .patch(format!("http://{addr}/v1/programs/{program_id}"))
+        .json(&serde_json::json!({ "name": "" }))
+        .send()
+        .await
+        .expect("rename request should complete");
+    assert_eq!(rename_empty.status(), reqwest::StatusCode::BAD_REQUEST);
+    let rename_empty_json = rename_empty
+        .json::<serde_json::Value>()
+        .await
+        .expect("error payload should decode");
+    assert!(
+        rename_empty_json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cannot be empty"),
+        "unexpected error payload: {rename_empty_json}"
+    );
+
+    let missing_version = client
+        .get(format!(
+            "http://{addr}/v1/programs/{program_id}/versions/99"
+        ))
+        .send()
+        .await
+        .expect("get version should complete");
+    assert_eq!(missing_version.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let create_version_unknown_program = client
+        .post(format!(
+            "http://{addr}/v1/programs/missing-program/versions"
+        ))
+        .json(&serde_json::json!({
+            "flavor": "rustscript",
+            "nodes": [
+                {
+                    "id": "n1",
+                    "block_id": "set_response_content",
+                    "values": { "value": "hello" }
+                }
+            ],
+            "edges": []
+        }))
+        .send()
+        .await
+        .expect("create version should complete");
+    assert_eq!(
+        create_version_unknown_program.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    let create_version_missing_source = client
+        .post(format!("http://{addr}/v1/programs/{program_id}/versions"))
+        .json(&serde_json::json!({
+            "flow_synced": false,
+            "flavor": "rustscript"
+        }))
+        .send()
+        .await
+        .expect("create version should complete");
+    assert_eq!(
+        create_version_missing_source.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let create_version_missing_source_json = create_version_missing_source
+        .json::<serde_json::Value>()
+        .await
+        .expect("error payload should decode");
+    assert!(
+        create_version_missing_source_json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("source is required"),
+        "unexpected error payload: {create_version_missing_source_json}"
+    );
+
+    let create_version_missing_nodes = client
+        .post(format!("http://{addr}/v1/programs/{program_id}/versions"))
+        .json(&serde_json::json!({
+            "flow_synced": true,
+            "flavor": "rustscript",
+            "nodes": [],
+            "edges": []
+        }))
+        .send()
+        .await
+        .expect("create version should complete");
+    assert_eq!(
+        create_version_missing_nodes.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let create_version_missing_nodes_json = create_version_missing_nodes
+        .json::<serde_json::Value>()
+        .await
+        .expect("error payload should decode");
+    assert!(
+        create_version_missing_nodes_json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("at least one node"),
+        "unexpected error payload: {create_version_missing_nodes_json}"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn apply_program_version_enqueue_validates_program_and_flavor() {
+    let (addr, handle, _state) = spawn_controller(ControllerConfig::default()).await;
+    let client = reqwest::Client::new();
+
+    let apply_unknown = client
+        .post(format!(
+            "http://{addr}/v1/edges/dp-apply-errors/commands/apply-program-version"
+        ))
+        .json(&serde_json::json!({
+            "program_id": "missing-program"
+        }))
+        .send()
+        .await
+        .expect("apply version should complete");
+    assert_eq!(apply_unknown.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let created = client
+        .post(format!("http://{addr}/v1/programs"))
+        .json(&serde_json::json!({ "name": "apply validation target" }))
+        .send()
+        .await
+        .expect("create program should complete");
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let created_json = created
+        .json::<serde_json::Value>()
+        .await
+        .expect("create payload should decode");
+    let program_id = created_json["program_id"]
+        .as_str()
+        .expect("program_id should be set")
+        .to_string();
+
+    let apply_without_versions = client
+        .post(format!(
+            "http://{addr}/v1/edges/dp-apply-errors/commands/apply-program-version"
+        ))
+        .json(&serde_json::json!({
+            "program_id": program_id
+        }))
+        .send()
+        .await
+        .expect("apply version should complete");
+    assert_eq!(
+        apply_without_versions.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let apply_without_versions_json = apply_without_versions
+        .json::<serde_json::Value>()
+        .await
+        .expect("error payload should decode");
+    assert!(
+        apply_without_versions_json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no versions"),
+        "unexpected error payload: {apply_without_versions_json}"
+    );
+
+    let created_version = client
+        .post(format!("http://{addr}/v1/programs/{program_id}/versions"))
+        .json(&serde_json::json!({
+            "flavor": "rustscript",
+            "nodes": [
+                {
+                    "id": "n1",
+                    "block_id": "set_response_content",
+                    "values": { "value": "from version" }
+                }
+            ],
+            "edges": []
+        }))
+        .send()
+        .await
+        .expect("create version should complete");
+    assert_eq!(created_version.status(), reqwest::StatusCode::CREATED);
+
+    let apply_invalid_flavor = client
+        .post(format!(
+            "http://{addr}/v1/edges/dp-apply-errors/commands/apply-program-version"
+        ))
+        .json(&serde_json::json!({
+            "program_id": program_id,
+            "flavor": "not-a-real-flavor"
+        }))
+        .send()
+        .await
+        .expect("apply version should complete");
+    assert_eq!(
+        apply_invalid_flavor.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let apply_invalid_flavor_json = apply_invalid_flavor
+        .json::<serde_json::Value>()
+        .await
+        .expect("error payload should decode");
+    assert!(
+        apply_invalid_flavor_json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("flavor"),
+        "unexpected error payload: {apply_invalid_flavor_json}"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn binary_program_upload_rejects_invalid_content_type_and_large_payloads() {
+    let (addr, handle, _state) = spawn_controller(ControllerConfig::default()).await;
+    let client = reqwest::Client::new();
+
+    let bad_content_type = client
+        .put(format!("http://{addr}/v1/edges/dp-upload-errors/program"))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("upload request should complete");
+    assert_eq!(
+        bad_content_type.status(),
+        reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    let bad_content_type_json = bad_content_type
+        .json::<serde_json::Value>()
+        .await
+        .expect("error payload should decode");
+    assert!(
+        bad_content_type_json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("application/octet-stream"),
+        "unexpected error payload: {bad_content_type_json}"
+    );
+
+    const MAX_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
+    let oversized_payload = vec![0_u8; MAX_UPLOAD_BYTES + 1];
+    let oversized = client
+        .put(format!("http://{addr}/v1/edges/dp-upload-errors/program"))
+        .header("content-type", "application/octet-stream")
+        .body(oversized_payload)
+        .send()
+        .await
+        .expect("upload request should complete");
+    assert_eq!(oversized.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+
+    let oversize_limit_error_payload = vec![0_u8; MAX_UPLOAD_BYTES + 2];
+    let oversize_limit_error = client
+        .put(format!("http://{addr}/v1/edges/dp-upload-errors/program"))
+        .header("content-type", "application/octet-stream")
+        .body(oversize_limit_error_payload)
+        .send()
+        .await
+        .expect("upload request should complete");
+    assert_eq!(
+        oversize_limit_error.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn start_debug_enqueue_validates_recording_mode_and_command_shape() {
+    let (addr, handle, _state) = spawn_controller(ControllerConfig::default()).await;
+    let client = reqwest::Client::new();
+
+    let missing_request_path = client
+        .post(format!(
+            "http://{addr}/v1/edges/dp-debug-validation/commands/start-debug"
+        ))
+        .json(&serde_json::json!({
+            "mode": "recording"
+        }))
+        .send()
+        .await
+        .expect("start-debug request should complete");
+    assert_eq!(
+        missing_request_path.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let missing_request_path_json = missing_request_path
+        .json::<serde_json::Value>()
+        .await
+        .expect("error payload should decode");
+    assert!(
+        missing_request_path_json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("requires request_path"),
+        "unexpected error payload: {missing_request_path_json}"
+    );
+
+    let zero_record_count = client
+        .post(format!(
+            "http://{addr}/v1/edges/dp-debug-validation/commands/start-debug"
+        ))
+        .json(&serde_json::json!({
+            "mode": "recording",
+            "request_path": "/api/orders",
+            "record_count": 0
+        }))
+        .send()
+        .await
+        .expect("start-debug request should complete");
+    assert_eq!(zero_record_count.status(), reqwest::StatusCode::BAD_REQUEST);
+    let zero_record_count_json = zero_record_count
+        .json::<serde_json::Value>()
+        .await
+        .expect("error payload should decode");
+    assert!(
+        zero_record_count_json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(">= 1"),
+        "unexpected error payload: {zero_record_count_json}"
+    );
+
+    let recording_start = client
+        .post(format!(
+            "http://{addr}/v1/edges/dp-debug-validation/commands/start-debug"
+        ))
+        .json(&serde_json::json!({
+            "mode": "recording",
+            "tcp_addr": "127.0.0.1:9001",
+            "header_name": "x-debug-token",
+            "request_path": "/api/orders",
+            "record_count": 2,
+            "stop_on_entry": true
+        }))
+        .send()
+        .await
+        .expect("start-debug request should complete");
+    assert_eq!(recording_start.status(), reqwest::StatusCode::ACCEPTED);
+
+    let poll_recording = client
+        .post(format!("http://{addr}/rpc/v1/edge/poll"))
+        .json(&EdgePollRequest {
+            edge_id: "dp-debug-validation".to_string(),
+            edge_name: None,
+            telemetry: empty_telemetry(),
+            traffic_sample: None,
+        })
+        .send()
+        .await
+        .expect("poll should complete");
+    assert_eq!(poll_recording.status(), reqwest::StatusCode::OK);
+    let poll_recording_body = poll_recording
+        .json::<EdgePollResponse>()
+        .await
+        .expect("poll body should decode");
+    match poll_recording_body.command {
+        Some(ControlPlaneCommand::StartDebugSession {
+            mode,
+            tcp_addr,
+            header_name,
+            request_path,
+            record_count,
+            stop_on_entry,
+            ..
+        }) => {
+            assert_eq!(mode, edge::DebugSessionMode::Recording);
+            assert_eq!(request_path.as_deref(), Some("/api/orders"));
+            assert_eq!(record_count, Some(2));
+            assert_eq!(stop_on_entry, Some(true));
+            assert_eq!(tcp_addr, None);
+            assert_eq!(header_name, None);
+        }
+        other => panic!("unexpected command payload: {other:?}"),
+    }
+
+    let interactive_start = client
+        .post(format!(
+            "http://{addr}/v1/edges/dp-debug-validation/commands/start-debug"
+        ))
+        .json(&serde_json::json!({
+            "tcp_addr": "127.0.0.1:9002",
+            "header_name": "x-debug-token",
+            "stop_on_entry": false
+        }))
+        .send()
+        .await
+        .expect("start-debug request should complete");
+    assert_eq!(interactive_start.status(), reqwest::StatusCode::ACCEPTED);
+
+    let poll_interactive = client
+        .post(format!("http://{addr}/rpc/v1/edge/poll"))
+        .json(&EdgePollRequest {
+            edge_id: "dp-debug-validation".to_string(),
+            edge_name: None,
+            telemetry: empty_telemetry(),
+            traffic_sample: None,
+        })
+        .send()
+        .await
+        .expect("poll should complete");
+    assert_eq!(poll_interactive.status(), reqwest::StatusCode::OK);
+    let poll_interactive_body = poll_interactive
+        .json::<EdgePollResponse>()
+        .await
+        .expect("poll body should decode");
+    match poll_interactive_body.command {
+        Some(ControlPlaneCommand::StartDebugSession {
+            mode,
+            tcp_addr,
+            header_name,
+            request_path,
+            record_count,
+            stop_on_entry,
+            ..
+        }) => {
+            assert_eq!(mode, edge::DebugSessionMode::Interactive);
+            assert_eq!(tcp_addr.as_deref(), Some("127.0.0.1:9002"));
+            assert_eq!(header_name.as_deref(), Some("x-debug-token"));
+            assert_eq!(request_path, None);
+            assert_eq!(record_count, Some(1));
+            assert_eq!(stop_on_entry, Some(false));
+        }
+        other => panic!("unexpected command payload: {other:?}"),
+    }
+
+    handle.abort();
+}
