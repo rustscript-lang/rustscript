@@ -1,5 +1,5 @@
 {
-  "abi_version": 7,
+  "abi_version": 8,
   "functions": [
     { "index": 0, "name": "http::request::get_id", "arity": 0 },
     { "index": 1, "name": "http::request::get_method", "arity": 0 },
@@ -44,6 +44,7 @@
     { "index": 40, "name": "http::upstream::response::get_status", "arity": 0 },
     { "index": 41, "name": "http::upstream::response::get_header", "arity": 1 },
     { "index": 42, "name": "http::upstream::response::get_headers", "arity": 0 },
-    { "index": 43, "name": "http::upstream::response::get_body", "arity": 0 }
+    { "index": 43, "name": "http::upstream::response::get_body", "arity": 0 },
+    { "index": 44, "name": "runtime::sleep", "arity": 1 }
   ]
 }
