@@ -402,25 +402,52 @@ fn print_usage() {
 
 fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
     println!("pd-vm REPL (RustScript)");
-    println!("history: up/down arrows, commands: .help, .quit");
+    println!("history: up/down arrows, commands: .help, .quit, .cancel");
     println!("state: locals persist across entries");
     let mut editor = DefaultEditor::new()?;
     let mut session = ReplSession::default();
+    let mut pending_input = String::new();
     loop {
-        match editor.readline("pd-vm> ") {
+        let prompt = if pending_input.is_empty() {
+            "pd-vm> "
+        } else {
+            "...> "
+        };
+        match editor.readline(prompt) {
             Ok(line) => {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if let Some(action) = handle_repl_command(line) {
-                    if action == ReplAction::Break {
-                        break;
+                let trimmed = line.trim();
+                if pending_input.is_empty() {
+                    if trimmed.is_empty() {
+                        continue;
                     }
+                    if let Some(action) = handle_repl_command(trimmed) {
+                        if action == ReplAction::Break {
+                            break;
+                        }
+                        continue;
+                    }
+                } else if trimmed == ".cancel" {
+                    pending_input.clear();
+                    println!("pending input cleared");
                     continue;
                 }
-                let _ = editor.add_history_entry(line);
-                let compiled = match compile_repl_snippet(line, &session.locals) {
+
+                if !pending_input.is_empty() {
+                    pending_input.push('\n');
+                }
+                pending_input.push_str(line.trim_end());
+                if !is_repl_input_complete(&pending_input) {
+                    continue;
+                }
+
+                let snippet = pending_input.trim().to_string();
+                pending_input.clear();
+                if snippet.is_empty() {
+                    continue;
+                }
+
+                let _ = editor.add_history_entry(&snippet);
+                let compiled = match compile_repl_snippet(&snippet, &session.locals) {
                     Ok(compiled) => compiled,
                     Err(err) => {
                         println!("{err}");
@@ -452,7 +479,15 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+            Err(ReadlineError::Interrupted) => {
+                if pending_input.is_empty() {
+                    println!("bye");
+                    break;
+                }
+                pending_input.clear();
+                println!("pending input cleared");
+            }
+            Err(ReadlineError::Eof) => {
                 println!("bye");
                 break;
             }
@@ -494,11 +529,16 @@ enum ReplAction {
 fn handle_repl_command(line: &str) -> Option<ReplAction> {
     match line {
         ".quit" | ".exit" => Some(ReplAction::Break),
+        ".cancel" => {
+            println!("no pending input");
+            Some(ReplAction::Continue)
+        }
         ".help" => {
             println!("commands:");
             println!("  .help      show commands");
             println!("  .quit      quit repl");
             println!("  .exit      quit repl");
+            println!("  .cancel    clear pending multiline input");
             Some(ReplAction::Continue)
         }
         _ if line.starts_with('.') => {
@@ -527,6 +567,128 @@ fn compile_repl_snippet(
                 .map_err(|_| remap_repl_source_error(first_err, locals.len()))
         }
     }
+}
+
+fn is_repl_input_complete(input: &str) -> bool {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Delimiter {
+        Paren,
+        Bracket,
+        Brace,
+    }
+
+    let mut stack: Vec<Delimiter> = Vec::new();
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut code = String::with_capacity(input.len());
+
+    while let Some(ch) = chars.next() {
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+                code.push('\n');
+            }
+            continue;
+        }
+        if in_block_comment {
+            if ch == '*'
+                && let Some('/') = chars.peek()
+            {
+                chars.next();
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => {
+                    in_string = false;
+                    code.push('"');
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if ch == '/' {
+            match chars.peek().copied() {
+                Some('/') => {
+                    chars.next();
+                    in_line_comment = true;
+                    continue;
+                }
+                Some('*') => {
+                    chars.next();
+                    in_block_comment = true;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                code.push('"');
+            }
+            '(' => {
+                stack.push(Delimiter::Paren);
+                code.push(ch);
+            }
+            '[' => {
+                stack.push(Delimiter::Bracket);
+                code.push(ch);
+            }
+            '{' => {
+                stack.push(Delimiter::Brace);
+                code.push(ch);
+            }
+            ')' => {
+                if stack.pop() != Some(Delimiter::Paren) {
+                    return true;
+                }
+                code.push(ch);
+            }
+            ']' => {
+                if stack.pop() != Some(Delimiter::Bracket) {
+                    return true;
+                }
+                code.push(ch);
+            }
+            '}' => {
+                if stack.pop() != Some(Delimiter::Brace) {
+                    return true;
+                }
+                code.push(ch);
+            }
+            _ => code.push(ch),
+        }
+    }
+
+    if in_string || in_block_comment || !stack.is_empty() {
+        return false;
+    }
+
+    let trimmed = code.trim_end();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    const TRAILING_INCOMPLETE_TOKENS: [&str; 18] = [
+        "=>", "::", "&&", "||", "<=", ">=", "==", "!=", "=", ",", ".", "+", "-", "*", "/", "%",
+        "!", ":",
+    ];
+    !TRAILING_INCOMPLETE_TOKENS
+        .iter()
+        .any(|token| trimmed.ends_with(token))
 }
 
 fn build_repl_source(input: &str, locals: &BTreeMap<String, Value>) -> String {
@@ -880,5 +1042,36 @@ mod tests {
             Err(other) => panic!("expected parse error, got {other}"),
             Ok(_) => panic!("expected parse error, got successful compile"),
         }
+    }
+
+    #[test]
+    fn repl_input_complete_for_balanced_match_block() {
+        let input = "let b = match a {\n    Option::Some(String) => 2,\n    _ => 3,\n};";
+        assert!(super::is_repl_input_complete(input));
+    }
+
+    #[test]
+    fn repl_input_incomplete_for_open_brace() {
+        assert!(!super::is_repl_input_complete("let b = match a {"));
+    }
+
+    #[test]
+    fn repl_input_incomplete_for_unclosed_string() {
+        assert!(!super::is_repl_input_complete("let s = \"hello"));
+    }
+
+    #[test]
+    fn repl_input_incomplete_for_unclosed_block_comment() {
+        assert!(!super::is_repl_input_complete("let a = 1; /* comment"));
+    }
+
+    #[test]
+    fn repl_input_ignores_comment_delimiters() {
+        assert!(super::is_repl_input_complete("// {\nlet a = 1;"));
+    }
+
+    #[test]
+    fn repl_input_incomplete_for_trailing_operator() {
+        assert!(!super::is_repl_input_complete("let a = 1 +"));
     }
 }
