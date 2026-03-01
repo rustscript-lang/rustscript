@@ -1,0 +1,106 @@
+// Iteration helpers implemented in pure RustScript.
+
+pub fn range_step(start, stop, step) {
+    let out = [];
+    if step != 0 {
+        let value = start;
+        if step > 0 {
+            while value < stop {
+                out[(out).length] = value;
+                value = value + step;
+            }
+        } else {
+            while value > stop {
+                out[(out).length] = value;
+                value = value + step;
+            }
+        }
+    }
+    out;
+}
+
+pub fn range(stop) {
+    range_step(0, stop, 1);
+}
+
+pub fn enumerate(values) {
+    let out = [];
+    let index = 0;
+    while index < (values).length {
+        out[(out).length] = [index, values[index]];
+        index = index + 1;
+    }
+    out;
+}
+
+pub fn take(values, count) {
+    let out = [];
+    if count > 0 {
+        out = values[0:count];
+    }
+    out;
+}
+
+pub fn skip(values, count) {
+    let start = 0;
+    if count > 0 {
+        start = count;
+    }
+    if start > (values).length {
+        start = (values).length;
+    }
+    values[start:(values).length];
+}
+
+pub fn chunk(values, size) {
+    let out = [];
+    if size > 0 {
+        let index = 0;
+        let value_len = (values).length;
+        while index < value_len {
+            let next = index + size;
+            if next > value_len {
+                next = value_len;
+            }
+            out[(out).length] = values[index:next];
+            index = next;
+        }
+    }
+    out;
+}
+
+pub fn sum(values) {
+    let out = 0;
+    let index = 0;
+    while index < (values).length {
+        out = out + values[index];
+        index = index + 1;
+    }
+    out;
+}
+
+pub fn any_true(values) {
+    let out = false;
+    let index = 0;
+    while index < (values).length {
+        if values[index] {
+            out = true;
+            break;
+        }
+        index = index + 1;
+    }
+    out;
+}
+
+pub fn all_true(values) {
+    let out = true;
+    let index = 0;
+    while index < (values).length {
+        if values[index] == false {
+            out = false;
+            break;
+        }
+        index = index + 1;
+    }
+    out;
+}

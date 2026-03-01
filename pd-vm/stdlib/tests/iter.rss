@@ -1,0 +1,41 @@
+use super::rss::iter::{all_true, any_true, chunk, enumerate, range, range_step, skip, sum, take};
+
+let ascending = range(5);
+assert(ascending.length == 5);
+assert(ascending[0] == 0);
+assert(ascending[4] == 4);
+
+let descending = range_step(10, 0, -3);
+assert(descending.length == 4);
+assert(descending[0] == 10);
+assert(descending[1] == 7);
+assert(descending[2] == 4);
+assert(descending[3] == 1);
+
+let pairs = enumerate(["a", "b"]);
+assert(pairs.length == 2);
+assert(pairs[1][0] == 1);
+assert(pairs[1][1] == "b");
+
+let head = take([1, 2, 3, 4], 2);
+assert(head.length == 2);
+assert(head[0] == 1);
+assert(head[1] == 2);
+
+let tail = skip([1, 2, 3, 4], 2);
+assert(tail.length == 2);
+assert(tail[0] == 3);
+assert(tail[1] == 4);
+
+let groups = chunk([1, 2, 3, 4, 5], 2);
+assert(groups.length == 3);
+assert(groups[0].length == 2);
+assert(groups[1].length == 2);
+assert(groups[2].length == 1);
+assert(groups[2][0] == 5);
+
+assert(sum([2, 3, 4]) == 9);
+assert(any_true([false, false, true]));
+assert(any_true([false, false]) == false);
+assert(all_true([true, true]));
+assert(all_true([true, false]) == false);

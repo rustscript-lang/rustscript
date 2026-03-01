@@ -1,0 +1,101 @@
+// Numeric helpers implemented in pure RustScript.
+
+pub fn abs(value) {
+    let out = value;
+    if value < 0 {
+        out = -value;
+    }
+    out;
+}
+
+pub fn min(lhs, rhs) {
+    let out = rhs;
+    if lhs < rhs || lhs == rhs {
+        out = lhs;
+    }
+    out;
+}
+
+pub fn max(lhs, rhs) {
+    let out = rhs;
+    if lhs > rhs || lhs == rhs {
+        out = lhs;
+    }
+    out;
+}
+
+pub fn clamp(value, lower, upper) {
+    let out = value;
+    if value < lower {
+        out = lower;
+    } else if value > upper {
+        out = upper;
+    }
+    out;
+}
+
+pub fn sign(value) {
+    let out = 0;
+    if value < 0 {
+        out = -1;
+    } else if value > 0 {
+        out = 1;
+    }
+    out;
+}
+
+pub fn in_range(value, lower, upper) {
+    let lower_ok = value > lower || value == lower;
+    let upper_ok = value < upper || value == upper;
+    lower_ok && upper_ok;
+}
+
+pub fn is_even(value) {
+    value % 2 == 0;
+}
+
+pub fn is_odd(value) {
+    is_even(value) == false;
+}
+
+pub fn sum(values) {
+    let out = 0;
+    let index = 0;
+    while index < (values).length {
+        out = out + values[index];
+        index = index + 1;
+    }
+    out;
+}
+
+pub fn floor(value) {
+    let out = value;
+    let value_type = type(value);
+    if value_type == "float" {
+        let remainder = value % 1;
+        if remainder == 0 {
+            out = value;
+        } else if value > 0 {
+            out = value - remainder;
+        } else {
+            out = value - remainder - 1;
+        }
+    }
+    out;
+}
+
+pub fn ceil(value) {
+    let out = value;
+    let value_type = type(value);
+    if value_type == "float" {
+        let remainder = value % 1;
+        if remainder == 0 {
+            out = value;
+        } else if value > 0 {
+            out = value - remainder + 1;
+        } else {
+            out = value - remainder;
+        }
+    }
+    out;
+}

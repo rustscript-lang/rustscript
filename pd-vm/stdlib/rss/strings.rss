@@ -4,19 +4,15 @@ fn is_whitespace(ch) {
     let is_whitespace_value = false;
     if ch == " " {
         is_whitespace_value = true;
-    } else {
     }
     if ch == "\n" {
         is_whitespace_value = true;
-    } else {
     }
     if ch == "\r" {
         is_whitespace_value = true;
-    } else {
     }
     if ch == "\t" {
         is_whitespace_value = true;
-    } else {
     }
     is_whitespace_value;
 }
@@ -39,19 +35,16 @@ pub fn contains(haystack, needle) {
     let contains_found = false;
     if contains_needle_len == 0 {
         contains_found = true;
-    } else {
-        if contains_needle_len > contains_haystack_len {
-        } else {
-            let contains_limit = contains_haystack_len - contains_needle_len + 1;
-            let contains_index = 0;
-            while contains_index < contains_limit {
-                if equals((haystack)[contains_index:(contains_index + contains_needle_len)], needle) {
-                    contains_found = true;
-                    break;
-                } else {
-                }
-                contains_index = contains_index + 1;
+    }
+    if contains_needle_len > 0 {
+        let contains_limit = contains_haystack_len - contains_needle_len + 1;
+        let contains_index = 0;
+        while contains_index < contains_limit {
+            if equals((haystack)[contains_index:(contains_index + contains_needle_len)], needle) {
+                contains_found = true;
+                break;
             }
+            contains_index = contains_index + 1;
         }
     }
     contains_found;
@@ -113,8 +106,7 @@ pub fn replace(value, needle, replacement) {
     let replace_value_len = (value).length;
     let replace_needle_len = (needle).length;
     let replace_result = value;
-    if replace_needle_len == 0 {
-    } else {
+    if replace_needle_len > 0 {
         let replace_index = 0;
         let replace_output = "";
         while replace_index < replace_value_len {

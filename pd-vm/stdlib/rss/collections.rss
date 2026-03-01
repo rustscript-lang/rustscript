@@ -1,0 +1,112 @@
+// Collection helpers implemented in pure RustScript.
+
+pub fn append(lhs, rhs) {
+    lhs + rhs;
+}
+
+pub fn index_of(values, needle) {
+    let find_index = 0;
+    let found = -1;
+    while find_index < (values).length {
+        if values[find_index] == needle {
+            found = find_index;
+            break;
+        }
+        find_index = find_index + 1;
+    }
+    found;
+}
+
+pub fn contains(values, needle) {
+    index_of(values, needle) > -1;
+}
+
+pub fn reverse(values) {
+    let out = [];
+    let reverse_index = (values).length - 1;
+    while reverse_index > -1 {
+        out[(out).length] = values[reverse_index];
+        reverse_index = reverse_index - 1;
+    }
+    out;
+}
+
+pub fn dedup(values) {
+    let out = [];
+    let dedup_index = 0;
+    while dedup_index < (values).length {
+        let value = values[dedup_index];
+        if contains(out, value) == false {
+            out[(out).length] = value;
+        }
+        dedup_index = dedup_index + 1;
+    }
+    out;
+}
+
+pub fn has(map, key) {
+    let keys = (map).keys;
+    let key_index = 0;
+    let found = false;
+    while key_index < (keys).length {
+        if keys[key_index] == key {
+            found = true;
+            break;
+        }
+        key_index = key_index + 1;
+    }
+    found;
+}
+
+pub fn get_or(map, key, fallback) {
+    let out = fallback;
+    if has(map, key) {
+        out = map[key];
+    }
+    out;
+}
+
+pub fn values(map) {
+    let keys = (map).keys;
+    let out = [];
+    let value_index = 0;
+    while value_index < (keys).length {
+        let key = keys[value_index];
+        out[(out).length] = map[key];
+        value_index = value_index + 1;
+    }
+    out;
+}
+
+pub fn entries(map) {
+    let keys = (map).keys;
+    let out = [];
+    let entry_index = 0;
+    while entry_index < (keys).length {
+        let key = keys[entry_index];
+        out[(out).length] = [key, map[key]];
+        entry_index = entry_index + 1;
+    }
+    out;
+}
+
+pub fn merge(lhs, rhs) {
+    let out = {};
+
+    let lhs_keys = (lhs).keys;
+    let left_index = 0;
+    while left_index < (lhs_keys).length {
+        let key = lhs_keys[left_index];
+        out[key] = lhs[key];
+        left_index = left_index + 1;
+    }
+
+    let rhs_keys = (rhs).keys;
+    let right_index = 0;
+    while right_index < (rhs_keys).length {
+        let key = rhs_keys[right_index];
+        out[key] = rhs[key];
+        right_index = right_index + 1;
+    }
+    out;
+}

@@ -1,0 +1,16 @@
+use super::rss::path::{basename, dirname, extname, join, normalize_sep};
+
+assert(normalize_sep("folder\\child\\file.txt") == "folder/child/file.txt");
+assert(join("folder/child", "file.txt") == "folder/child/file.txt");
+assert(join("folder/child/", "/file.txt") == "folder/child/file.txt");
+
+assert(basename("folder/child/file.txt") == "file.txt");
+assert(basename("folder/child/") == "child");
+
+assert(dirname("folder/child/file.txt") == "folder/child");
+assert(dirname("/file.txt") == "/");
+assert(dirname("file.txt") == "");
+
+assert(extname("folder/child/file.txt") == ".txt");
+assert(extname("archive.tar.gz") == ".gz");
+assert(extname(".env") == "");

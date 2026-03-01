@@ -1,0 +1,30 @@
+use super::rss::math::{abs, ceil, clamp, floor, in_range, is_even, is_odd, max, min, sign, sum};
+
+assert(abs(-7) == 7);
+assert(abs(3) == 3);
+
+assert(min(3, 5) == 3);
+assert(max(3, 5) == 5);
+
+assert(clamp(10, 0, 5) == 5);
+assert(clamp(-2, 0, 5) == 0);
+assert(clamp(3, 0, 5) == 3);
+
+assert(sign(-3) == -1);
+assert(sign(0) == 0);
+assert(sign(9) == 1);
+
+assert(in_range(5, 1, 5));
+assert(in_range(0, 1, 5) == false);
+
+assert(is_even(10));
+assert(is_even(11) == false);
+assert(is_odd(11));
+assert(is_odd(10) == false);
+
+assert(sum([2, 4, 6]) == 12);
+
+assert(floor(7) == 7);
+assert(ceil(7) == 7);
+assert(floor(-3) == -3);
+assert(ceil(-3) == -3);

@@ -43,3 +43,43 @@ fn stdlib_collections_primitives_spec_passes() {
     let stack = run_rustscript_spec(&path);
     assert_eq!(stack, Vec::<Value>::new());
 }
+
+#[test]
+fn stdlib_collections_spec_passes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("stdlib/tests/collections.rss");
+    let stack = run_rustscript_spec(&path);
+    assert_eq!(stack, Vec::<Value>::new());
+}
+
+#[test]
+fn stdlib_iter_spec_passes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("stdlib/tests/iter.rss");
+    let stack = run_rustscript_spec(&path);
+    assert_eq!(stack, Vec::<Value>::new());
+}
+
+#[test]
+fn stdlib_io_spec_passes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("stdlib/tests/io.rss");
+    let stack = run_rustscript_spec(&path);
+    assert_eq!(stack, Vec::<Value>::new());
+}
+
+#[test]
+fn stdlib_path_spec_passes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("stdlib/tests/path.rss");
+    let stack = run_rustscript_spec(&path);
+    assert_eq!(stack, Vec::<Value>::new());
+}
+
+#[test]
+fn stdlib_math_spec_passes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("stdlib/tests/math.rss");
+    let stack = run_rustscript_spec(&path);
+    assert_eq!(stack, Vec::<Value>::new());
+}

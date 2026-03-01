@@ -1,0 +1,43 @@
+// I/O wrappers implemented in pure RustScript.
+
+pub fn read_text(path) {
+    let handle = io::open(path, "r");
+    let out = io::read_all(handle);
+    let read_text_closed = io::close(handle);
+    out;
+}
+
+pub fn write_text(path, text) {
+    let handle = io::open(path, "w");
+    let written = io::write(handle, text);
+    let write_text_flushed = io::flush(handle);
+    let write_text_closed = io::close(handle);
+    written;
+}
+
+pub fn append_text(path, text) {
+    let handle = io::open(path, "a");
+    let written = io::write(handle, text);
+    let append_text_flushed = io::flush(handle);
+    let append_text_closed = io::close(handle);
+    written;
+}
+
+pub fn read_lines(path) {
+    let text = read_text(path);
+    let lines = [];
+    let text_len = (text).length;
+    let start = 0;
+    let index = 0;
+    while index < text_len {
+        if (text)[index:(index + 1)] == "\n" {
+            lines[(lines).length] = (text)[start:index];
+            start = index + 1;
+        }
+        index = index + 1;
+    }
+    if start < text_len {
+        lines[(lines).length] = (text)[start:text_len];
+    }
+    lines;
+}

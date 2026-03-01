@@ -2,6 +2,32 @@
 
 This document tracks current compiler behavior and known subset limitations.
 
+## Pipeline Layers
+
+The end-to-end stack is split into distinct layers. Not every entrypoint uses every layer (for
+example, `compile_source()` skips module loading/linking), but this is the full model:
+
+1. Source + flavor selection
+   - `SourceFlavor` selects frontend behavior by extension (`.rss`, `.js`, `.lua`, `.scm`) or explicit API.
+2. Module/source loading (file-based path)
+   - `compile_source_file()` uses `source_loader` to read files, parse import directives, resolve modules, and rewrite import call sites/preambles.
+3. Unit linking
+   - `linker::merge_units` merges parsed units and remaps local/function indices into one `LinkedIr`.
+4. Frontend lowering
+   - Frontends (`rustscript`, `javascript`, `lua`, `scheme`) normalize syntax and lower into the shared compiler representation.
+5. Frontend-independent IR
+   - `ir::{Stmt, Expr, FunctionDecl, FunctionImpl}` is the common IR (`FrontendIr` / `LinkedIr`) used by the backend.
+6. Bytecode backend
+   - `Compiler` lowers IR to stack-machine ops via `Assembler`, producing `bytecode::Program` (`constants`, `code`, `imports`, `debug`).
+7. VM execution layer
+   - The interpreter executes `Program.code` opcodes directly.
+8. Trace-JIT IR layer
+   - `jit::TraceJitEngine` records hot loop traces as `JitTrace` with `TraceStep` ops.
+9. Native machine code layer
+   - On supported targets, trace steps are compiled to native bytes and executed via executable memory bridges.
+10. Optional wire format layer
+   - `vmbc` encodes/decodes `Program` for persistence/transport (`.vmbc`).
+
 ## Not Supported
 
 ### Core compiler/IR limitations

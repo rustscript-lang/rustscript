@@ -1,0 +1,116 @@
+// Path helpers implemented in pure RustScript.
+
+fn is_separator(ch) {
+    ch == "/" || ch == "\\";
+}
+
+fn trim_trailing_separators(path) {
+    let out = path;
+    let path_len = (path).length;
+    let end = path_len;
+    while end > 1 && is_separator((path)[(end - 1):end]) {
+        end = end - 1;
+    }
+    out = (path)[0:end];
+    out;
+}
+
+pub fn normalize_sep(path) {
+    let out = "";
+    let index = 0;
+    while index < (path).length {
+        let ch = (path)[index:(index + 1)];
+        if ch == "\\" {
+            out = out + "/";
+        } else {
+            out = out + ch;
+        }
+        index = index + 1;
+    }
+    out;
+}
+
+pub fn join(lhs, rhs) {
+    let left = normalize_sep(lhs);
+    let right = normalize_sep(rhs);
+    let out = "";
+    if (left).length == 0 {
+        out = right;
+    } else {
+        if (right).length == 0 {
+            out = left;
+        } else {
+            let left_last = (left)[((left).length - 1):(left).length];
+            let right_first = (right)[0:1];
+            if is_separator(left_last) && is_separator(right_first) {
+                out = left + (right)[1:(right).length];
+            } else {
+                if is_separator(left_last) || is_separator(right_first) {
+                    out = left + right;
+                } else {
+                    out = left + "/" + right;
+                }
+            }
+        }
+    }
+    out;
+}
+
+pub fn basename(path) {
+    let normalized = trim_trailing_separators(normalize_sep(path));
+    let start = 0;
+    let index = (normalized).length - 1;
+    while index > -1 {
+        if (normalized)[index:(index + 1)] == "/" {
+            start = index + 1;
+            break;
+        }
+        index = index - 1;
+    }
+    (normalized)[start:(normalized).length];
+}
+
+pub fn dirname(path) {
+    let normalized = trim_trailing_separators(normalize_sep(path));
+    let cut = -1;
+    let out = "";
+    let index = (normalized).length - 1;
+    while index > -1 {
+        if (normalized)[index:(index + 1)] == "/" {
+            cut = index;
+            break;
+        }
+        index = index - 1;
+    }
+
+    if cut < 0 {
+        out = "";
+    } else {
+        if cut == 0 {
+            out = "/";
+        } else {
+            out = (normalized)[0:cut];
+        }
+    }
+    out;
+}
+
+pub fn extname(path) {
+    let name = basename(path);
+    let dot = -1;
+    let out = "";
+    let index = (name).length - 1;
+    while index > -1 {
+        if (name)[index:(index + 1)] == "." {
+            dot = index;
+            break;
+        }
+        index = index - 1;
+    }
+    if dot < 1 {
+        out = "";
+    } else {
+        out = (name)[dot:(name).length];
+    }
+    out;
+}

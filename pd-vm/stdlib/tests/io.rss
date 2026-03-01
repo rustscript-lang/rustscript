@@ -1,0 +1,13 @@
+use super::rss::io as file_io;
+use super::rss::strings as string;
+
+let fixture_path = "stdlib/rss/strings.rss";
+assert(io::exists(fixture_path));
+
+let text = file_io::read_text(fixture_path);
+assert(string::contains(text, "pub fn contains"));
+assert(string::contains(text, "pub fn trim"));
+
+let lines = file_io::read_lines(fixture_path);
+assert(lines.length > 10);
+assert(string::contains(lines[0], "String helpers"));
