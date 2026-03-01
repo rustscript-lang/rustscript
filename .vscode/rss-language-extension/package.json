@@ -2,7 +2,7 @@
   "name": "rustscript-syntax",
   "displayName": "RustScript Syntax",
   "description": "Syntax highlighting for RustScript .rss files.",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "publisher": "local",
   "license": "UNLICENSED",
   "engines": {

@@ -28,9 +28,12 @@ const FALLBACK_LINE_COMMENT = "//.*$";
 const FALLBACK_STRING_BEGIN = "\"";
 const FALLBACK_STRING_END = "\"";
 const FALLBACK_STRING_ESCAPE = "\\\\(?:[nrt\\\\\"0])";
+const FALLBACK_NUMBERS = "\\b(?:\\d+\\.\\d+|\\d+)\\b";
+const FALLBACK_OPERATORS = "=>|==|!=|&&|\\|\\||=|\\+|-|\\*|/|%|<|>|!|\\?";
 const IDENT = "[A-Za-z_][A-Za-z0-9_]*";
 const PATH_IDENT = `(?:self|super|crate|${IDENT})`;
 const PATH = `(?:${PATH_IDENT})(?:::(?:${PATH_IDENT}))*`;
+const PATH_CALL = `${IDENT}(?:(?:\\s*::\\s*)${IDENT})*`;
 
 let rustScriptLanguageRegistered = false;
 
@@ -127,7 +130,7 @@ export function ensureRustScriptLanguage(monaco: typeof import("monaco-editor"))
     [new RegExp(`\\b(fn)(\\s+)(${IDENT})\\s*(?=\\()`), ["keyword", "", "function"]],
     [new RegExp(`\\b(let)(\\s+)(${IDENT})\\b`), ["keyword", "", "identifier"]],
     [
-      new RegExp(`\\b(${IDENT})(\\s*)(::)(\\s*)(${IDENT})(?=\\s*\\()`),
+      new RegExp(`\\b(${IDENT})(\\s*)(::)(\\s*)(${PATH_CALL})(?=\\s*\\()`),
       ["type.identifier", "", "delimiter", "", "function"],
     ],
     [new RegExp(`\\b(${IDENT})(\\s*)(!)(?=\\s*\\()`), ["function", "", "operator"]],
@@ -136,16 +139,20 @@ export function ensureRustScriptLanguage(monaco: typeof import("monaco-editor"))
       ["delimiter", "", "variable"],
     ],
     [
-      /\b(?!pub\b|fn\b|let\b|for\b|if\b|else\b|match\b|while\b|break\b|continue\b|use\b|as\b|true\b|false\b)([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()/,
+      /\b(?!pub\b|fn\b|let\b|for\b|if\b|else\b|match\b|while\b|break\b|continue\b|use\b|as\b|true\b|false\b|null\b)([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()/,
       "function",
     ],
   ];
 
   rootRules.push([sectionMatch("booleans", "\\b(?:true|false)\\b"), "keyword"]);
-  rootRules.push([sectionMatch("numbers", "\\b\\d+\\b"), "number"]);
-  rootRules.push([sectionMatch("keywords", "\\b(?:if|else|for|while|let|fn|pub|use|as)\\b"), "keyword"]);
+  rootRules.push([sectionMatch("null-literal", "\\bnull\\b"), "keyword"]);
+  rootRules.push([sectionMatch("numbers", FALLBACK_NUMBERS), "number"]);
+  for (const keywordPattern of sectionPatternMatches("keywords")) {
+    rootRules.push([keywordPattern, "keyword"]);
+  }
+  rootRules.push([sectionMatch("wildcard-pattern", "\\b_\\b"), "keyword"]);
   rootRules.push([sectionMatch("closure-pipes", "\\|"), "delimiter"]);
-  rootRules.push([sectionMatch("operators", "==|=|\\+|-|\\*|/|<|>"), "operator"]);
+  rootRules.push([sectionMatch("operators", FALLBACK_OPERATORS), "operator"]);
   rootRules.push([sectionMatch("punctuation", "[(){}\\[\\],;:]"), "delimiter"]);
 
   monaco.languages.setMonarchTokensProvider(languageId, {

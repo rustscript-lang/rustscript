@@ -28,10 +28,16 @@
       "include": "#booleans"
     },
     {
+      "include": "#null-literal"
+    },
+    {
       "include": "#numbers"
     },
     {
       "include": "#keywords"
+    },
+    {
+      "include": "#wildcard-pattern"
     },
     {
       "include": "#namespace-call"
@@ -195,9 +201,13 @@
       "name": "constant.language.boolean.rss",
       "match": "\\b(?:true|false)\\b"
     },
+    "null-literal": {
+      "name": "constant.language.null.rss",
+      "match": "\\bnull\\b"
+    },
     "numbers": {
-      "name": "constant.numeric.integer.decimal.rss",
-      "match": "\\b\\d+\\b"
+      "name": "constant.numeric.rss",
+      "match": "\\b(?:\\d+\\.\\d+|\\d+)\\b"
     },
     "function-declaration": {
       "patterns": [
@@ -234,7 +244,7 @@
       "patterns": [
         {
           "name": "entity.name.function.rss",
-          "match": "\\b(?!pub\\b|fn\\b|let\\b|for\\b|if\\b|else\\b|match\\b|while\\b|break\\b|continue\\b|use\\b|as\\b|true\\b|false\\b)([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()"
+          "match": "\\b(?!pub\\b|fn\\b|let\\b|for\\b|if\\b|else\\b|match\\b|while\\b|break\\b|continue\\b|use\\b|as\\b|true\\b|false\\b|null\\b)([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()"
         }
       ]
     },
@@ -242,7 +252,7 @@
       "patterns": [
         {
           "name": "meta.namespace.call.rss",
-          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(\\s*)(::)(\\s*)([A-Za-z_][A-Za-z0-9_]*)(?=\\s*\\()",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(\\s*)(::)(\\s*)([A-Za-z_][A-Za-z0-9_]*(?:(?:\\s*::\\s*)[A-Za-z_][A-Za-z0-9_]*)*)(?=\\s*\\()",
           "captures": {
             "1": {
               "name": "entity.name.namespace.rss"
@@ -305,13 +315,17 @@
         }
       ]
     },
+    "wildcard-pattern": {
+      "name": "constant.language.wildcard.rss",
+      "match": "\\b_\\b"
+    },
     "closure-pipes": {
       "name": "punctuation.separator.closure.rss",
       "match": "\\|"
     },
     "operators": {
       "name": "keyword.operator.rss",
-      "match": "=>|==|!=|=|\\+|-|\\*|/|<|>|!"
+      "match": "=>|==|!=|&&|\\|\\||=|\\+|-|\\*|/|%|<|>|!|\\?"
     },
     "punctuation": {
       "name": "punctuation.separator.rss",
