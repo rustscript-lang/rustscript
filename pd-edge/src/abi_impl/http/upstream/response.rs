@@ -1,126 +1,79 @@
 use axum::http::HeaderName;
-use vm::{CallOutcome, HostFunction, Value, Vm, VmError};
+use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::super::super::{
-    SharedProxyVmContext, SharedVmAsyncOps, bind_async_host, expect_arg_count, expect_string,
-    headers_to_value_map,
+    SharedProxyVmContext, SharedVmAsyncOps, bind_async_host_handler, expect_arg_count,
+    expect_string, headers_to_value_map,
 };
 
+macro_rules! bind_upstream_response_handler {
+    ($vm:expr, $async_ops:expr, $symbol:literal, $context:expr, |$vm_arg:ident, $args_arg:ident, $context_arg:ident| $body:block) => {{
+        let context = $context.clone();
+        bind_async_host_handler($vm, $async_ops, $symbol, move |$vm_arg, $args_arg| {
+            let mut $context_arg = context.lock().expect("vm context lock poisoned");
+            $body
+        });
+    }};
+}
+
 pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) {
-    bind_async_host(
+    bind_upstream_response_handler!(
         vm,
         &async_ops,
         "http::upstream::response::get_status",
-        Box::new(GetUpstreamResponseStatusFunction::new(context.clone())),
+        context,
+        |_vm, args, context| {
+            expect_arg_count(args, 0)?;
+            context.touch_upstream_response();
+            let status = context.upstream_response_status.unwrap_or(0);
+            Ok(CallOutcome::Return(vec![Value::Int(status as i64)]))
+        }
     );
-    bind_async_host(
+    bind_upstream_response_handler!(
         vm,
         &async_ops,
         "http::upstream::response::get_header",
-        Box::new(GetUpstreamResponseHeaderFunction::new(context.clone())),
+        context,
+        |_vm, args, context| {
+            expect_arg_count(args, 1)?;
+            let name = expect_string(args, 0)?;
+            let header_name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
+            context.touch_upstream_response();
+            let value = context
+                .upstream_response_headers
+                .get(&header_name)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            Ok(CallOutcome::Return(vec![Value::String(value.to_string())]))
+        }
     );
-    bind_async_host(
+    bind_upstream_response_handler!(
         vm,
         &async_ops,
         "http::upstream::response::get_headers",
-        Box::new(GetUpstreamResponseHeadersFunction::new(context.clone())),
+        context,
+        |_vm, args, context| {
+            expect_arg_count(args, 0)?;
+            context.touch_upstream_response();
+            Ok(CallOutcome::Return(vec![headers_to_value_map(
+                &context.upstream_response_headers,
+            )]))
+        }
     );
-    bind_async_host(
+    bind_upstream_response_handler!(
         vm,
         &async_ops,
         "http::upstream::response::get_body",
-        Box::new(GetUpstreamResponseBodyFunction::new(context)),
+        context,
+        |_vm, args, context| {
+            expect_arg_count(args, 0)?;
+            context.touch_upstream_response();
+            let value = context
+                .upstream_response_content
+                .clone()
+                .unwrap_or_default();
+            Ok(CallOutcome::Return(vec![Value::String(value)]))
+        }
     );
-}
-
-struct GetUpstreamResponseStatusFunction {
-    context: SharedProxyVmContext,
-}
-
-impl GetUpstreamResponseStatusFunction {
-    fn new(context: SharedProxyVmContext) -> Self {
-        Self { context }
-    }
-}
-
-impl HostFunction for GetUpstreamResponseStatusFunction {
-    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
-        expect_arg_count(args, 0)?;
-        let mut context = self.context.lock().expect("vm context lock poisoned");
-        context.touch_upstream_response();
-        let status = context.upstream_response_status.unwrap_or(0);
-        Ok(CallOutcome::Return(vec![Value::Int(status as i64)]))
-    }
-}
-
-struct GetUpstreamResponseHeaderFunction {
-    context: SharedProxyVmContext,
-}
-
-impl GetUpstreamResponseHeaderFunction {
-    fn new(context: SharedProxyVmContext) -> Self {
-        Self { context }
-    }
-}
-
-impl HostFunction for GetUpstreamResponseHeaderFunction {
-    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
-        expect_arg_count(args, 1)?;
-        let name = expect_string(args, 0)?;
-        let header_name = HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
-
-        let mut context = self.context.lock().expect("vm context lock poisoned");
-        context.touch_upstream_response();
-        let value = context
-            .upstream_response_headers
-            .get(&header_name)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("");
-        Ok(CallOutcome::Return(vec![Value::String(value.to_string())]))
-    }
-}
-
-struct GetUpstreamResponseHeadersFunction {
-    context: SharedProxyVmContext,
-}
-
-impl GetUpstreamResponseHeadersFunction {
-    fn new(context: SharedProxyVmContext) -> Self {
-        Self { context }
-    }
-}
-
-impl HostFunction for GetUpstreamResponseHeadersFunction {
-    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
-        expect_arg_count(args, 0)?;
-        let mut context = self.context.lock().expect("vm context lock poisoned");
-        context.touch_upstream_response();
-        Ok(CallOutcome::Return(vec![headers_to_value_map(
-            &context.upstream_response_headers,
-        )]))
-    }
-}
-
-struct GetUpstreamResponseBodyFunction {
-    context: SharedProxyVmContext,
-}
-
-impl GetUpstreamResponseBodyFunction {
-    fn new(context: SharedProxyVmContext) -> Self {
-        Self { context }
-    }
-}
-
-impl HostFunction for GetUpstreamResponseBodyFunction {
-    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
-        expect_arg_count(args, 0)?;
-        let mut context = self.context.lock().expect("vm context lock poisoned");
-        context.touch_upstream_response();
-        let value = context
-            .upstream_response_content
-            .clone()
-            .unwrap_or_default();
-        Ok(CallOutcome::Return(vec![Value::String(value)]))
-    }
 }

@@ -18,10 +18,7 @@ pub use abi_impl::{
 pub use active_control_plane::{
     ActiveControlPlaneConfig, run_active_control_plane_client, spawn_active_control_plane_client,
 };
-pub use compile::{
-    EDGE_ASYNC_IO_MODULE_SPEC, compile_edge_source_file, compile_edge_source_file_with_options,
-    edge_async_io_module_path, edge_compile_options,
-};
+pub use compile::{compile_edge_source_file, compile_edge_source_file_with_options};
 pub use control_plane_rpc::{
     CommandResultPayload, ControlPlaneCommand, DebugSessionMode, EdgeCommandResult,
     EdgePollRequest, EdgePollResponse, EdgeTrafficSample, RemoteDebugCommand,

@@ -1,10 +1,11 @@
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
-use vm::{CallOutcome, HostFunction, Value, Vm, VmError};
+use vm::{Value, Vm, VmError};
 
 use super::{
     EDGE_IO_HANDLE_DYNAMIC_BASE, EdgeVirtualIoHandle, ProxyVmContext, SharedProxyVmContext,
-    SharedVmAsyncOps, bind_async_host, consume_request_body_all, expect_arg_count, expect_string,
-    read_request_body_next_line, resolve_outbound_request_body, schedule_future_call,
+    SharedVmAsyncOps, bind_async_host_handler, consume_request_body_all, expect_arg_count,
+    expect_string, read_request_body_next_line, resolve_outbound_request_body,
+    schedule_future_call,
 };
 
 const EDGE_IO_HANDLE_REQUEST_BODY: i64 = 1;
@@ -27,77 +28,35 @@ enum EdgeIoWriteTarget {
     Ignore,
 }
 
+macro_rules! bind_io_async {
+    ($vm:expr, $async_ops:expr, $symbol:literal, move |$vm_arg:ident, $args_arg:ident, $ops_arg:ident| $body:block) => {{
+        let async_ops_for_bind = $async_ops.clone();
+        let async_ops_for_call = async_ops_for_bind.clone();
+        bind_async_host_handler(
+            $vm,
+            &async_ops_for_bind,
+            $symbol,
+            move |$vm_arg, $args_arg| {
+                let $ops_arg = &async_ops_for_call;
+                $body
+            },
+        );
+    }};
+}
+
 pub(super) fn register_builtin_io_overrides(
     vm: &mut Vm,
     context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
 ) -> Result<(), VmError> {
-    bind_async_host(
-        vm,
-        &async_ops,
-        "io::open",
-        Box::new(BuiltinIoOpenFunction::new(
-            context.clone(),
-            async_ops.clone(),
-        )),
-    );
-    bind_async_host(
-        vm,
-        &async_ops,
-        "io::popen",
-        Box::new(BuiltinIoPopenFunction::new(async_ops.clone())),
-    );
-    bind_async_host(
-        vm,
-        &async_ops,
-        "io::read_all",
-        Box::new(BuiltinIoReadAllFunction::new(
-            context.clone(),
-            async_ops.clone(),
-        )),
-    );
-    bind_async_host(
-        vm,
-        &async_ops,
-        "io::read_line",
-        Box::new(BuiltinIoReadLineFunction::new(
-            context.clone(),
-            async_ops.clone(),
-        )),
-    );
-    bind_async_host(
-        vm,
-        &async_ops,
-        "io::write",
-        Box::new(BuiltinIoWriteFunction::new(
-            context.clone(),
-            async_ops.clone(),
-        )),
-    );
-    bind_async_host(
-        vm,
-        &async_ops,
-        "io::flush",
-        Box::new(BuiltinIoFlushFunction::new(
-            context.clone(),
-            async_ops.clone(),
-        )),
-    );
-    bind_async_host(
-        vm,
-        &async_ops,
-        "io::close",
-        Box::new(BuiltinIoCloseFunction::new(
-            context.clone(),
-            async_ops.clone(),
-        )),
-    );
-    bind_async_host(
-        vm,
-        &async_ops,
-        "io::exists",
-        Box::new(BuiltinIoExistsFunction::new(async_ops.clone())),
-    );
+    bind_builtin_io_open(vm, &context, &async_ops);
+    bind_builtin_io_popen(vm, &async_ops);
+    bind_builtin_io_read_all(vm, &context, &async_ops);
+    bind_builtin_io_read_line(vm, &context, &async_ops);
+    bind_builtin_io_write(vm, &context, &async_ops);
+    bind_builtin_io_flush(vm, &context, &async_ops);
+    bind_builtin_io_close(vm, &context, &async_ops);
+    bind_builtin_io_exists(vm, &async_ops);
     Ok(())
 }
 
@@ -350,25 +309,15 @@ fn write_io_target(
     }
 }
 
-struct BuiltinIoOpenFunction {
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-}
-
-impl BuiltinIoOpenFunction {
-    fn new(context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) -> Self {
-        Self { context, async_ops }
-    }
-}
-
-impl HostFunction for BuiltinIoOpenFunction {
-    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
+fn bind_builtin_io_open(vm: &mut Vm, context: &SharedProxyVmContext, async_ops: &SharedVmAsyncOps) {
+    let context = context.clone();
+    bind_io_async!(vm, async_ops, "io::open", move |vm, args, ops| {
         expect_arg_count(args, 2)?;
         let path = expect_string(args, 0)?;
         let mode = expect_string(args, 1)?;
         let explicit_target = edge_io_target_from_string(&path);
-        let context = self.context.clone();
-        schedule_future_call(vm, &self.async_ops, async move {
+        let context = context.clone();
+        schedule_future_call(vm, ops, async move {
             tokio::task::yield_now().await;
             let mode = mode.trim().to_ascii_lowercase();
             match mode.as_str() {
@@ -443,52 +392,36 @@ impl HostFunction for BuiltinIoOpenFunction {
                 ))),
             }
         })
-    }
+    });
 }
 
-struct BuiltinIoPopenFunction {
-    async_ops: SharedVmAsyncOps,
-}
-
-impl BuiltinIoPopenFunction {
-    fn new(async_ops: SharedVmAsyncOps) -> Self {
-        Self { async_ops }
-    }
-}
-
-impl HostFunction for BuiltinIoPopenFunction {
-    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
+fn bind_builtin_io_popen(vm: &mut Vm, async_ops: &SharedVmAsyncOps) {
+    bind_io_async!(vm, async_ops, "io::popen", move |vm, args, ops| {
         expect_arg_count(args, 2)?;
-        schedule_future_call(vm, &self.async_ops, async move {
+        schedule_future_call(vm, ops, async move {
             tokio::task::yield_now().await;
             Err(VmError::HostError(
                 "io::popen is disabled in edge runtime; use protocol-specific async host APIs"
                     .to_string(),
             ))
         })
-    }
+    });
 }
 
-struct BuiltinIoReadAllFunction {
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-}
-
-impl BuiltinIoReadAllFunction {
-    fn new(context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) -> Self {
-        Self { context, async_ops }
-    }
-}
-
-impl HostFunction for BuiltinIoReadAllFunction {
-    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
+fn bind_builtin_io_read_all(
+    vm: &mut Vm,
+    context: &SharedProxyVmContext,
+    async_ops: &SharedVmAsyncOps,
+) {
+    let context = context.clone();
+    bind_io_async!(vm, async_ops, "io::read_all", move |vm, args, ops| {
         expect_arg_count(args, 1)?;
         let source = args
             .first()
             .cloned()
             .ok_or(VmError::TypeMismatch("string/int"))?;
-        let context = self.context.clone();
-        schedule_future_call(vm, &self.async_ops, async move {
+        let context = context.clone();
+        schedule_future_call(vm, ops, async move {
             tokio::task::yield_now().await;
             let text = match &source {
                 Value::String(literal) => match edge_io_target_from_string(literal) {
@@ -509,29 +442,23 @@ impl HostFunction for BuiltinIoReadAllFunction {
             };
             Ok(vec![Value::String(text)])
         })
-    }
+    });
 }
 
-struct BuiltinIoReadLineFunction {
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-}
-
-impl BuiltinIoReadLineFunction {
-    fn new(context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) -> Self {
-        Self { context, async_ops }
-    }
-}
-
-impl HostFunction for BuiltinIoReadLineFunction {
-    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
+fn bind_builtin_io_read_line(
+    vm: &mut Vm,
+    context: &SharedProxyVmContext,
+    async_ops: &SharedVmAsyncOps,
+) {
+    let context = context.clone();
+    bind_io_async!(vm, async_ops, "io::read_line", move |vm, args, ops| {
         expect_arg_count(args, 1)?;
         let source = args
             .first()
             .cloned()
             .ok_or(VmError::TypeMismatch("string/int"))?;
-        let context = self.context.clone();
-        schedule_future_call(vm, &self.async_ops, async move {
+        let context = context.clone();
+        schedule_future_call(vm, ops, async move {
             tokio::task::yield_now().await;
             let text = match &source {
                 Value::String(literal) => match edge_io_target_from_string(literal) {
@@ -555,30 +482,24 @@ impl HostFunction for BuiltinIoReadLineFunction {
             };
             Ok(vec![Value::String(text)])
         })
-    }
+    });
 }
 
-struct BuiltinIoWriteFunction {
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-}
-
-impl BuiltinIoWriteFunction {
-    fn new(context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) -> Self {
-        Self { context, async_ops }
-    }
-}
-
-impl HostFunction for BuiltinIoWriteFunction {
-    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
+fn bind_builtin_io_write(
+    vm: &mut Vm,
+    context: &SharedProxyVmContext,
+    async_ops: &SharedVmAsyncOps,
+) {
+    let context = context.clone();
+    bind_io_async!(vm, async_ops, "io::write", move |vm, args, ops| {
         expect_arg_count(args, 2)?;
         let target_arg = args
             .first()
             .cloned()
             .ok_or(VmError::TypeMismatch("string/int"))?;
         let text = expect_string(args, 1)?;
-        let context = self.context.clone();
-        schedule_future_call(vm, &self.async_ops, async move {
+        let context = context.clone();
+        schedule_future_call(vm, ops, async move {
             tokio::task::yield_now().await;
             let target = {
                 let guard = context.lock().expect("vm context lock poisoned");
@@ -596,29 +517,23 @@ impl HostFunction for BuiltinIoWriteFunction {
             }
             Ok(vec![Value::Int(text.len() as i64)])
         })
-    }
+    });
 }
 
-struct BuiltinIoFlushFunction {
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-}
-
-impl BuiltinIoFlushFunction {
-    fn new(context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) -> Self {
-        Self { context, async_ops }
-    }
-}
-
-impl HostFunction for BuiltinIoFlushFunction {
-    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
+fn bind_builtin_io_flush(
+    vm: &mut Vm,
+    context: &SharedProxyVmContext,
+    async_ops: &SharedVmAsyncOps,
+) {
+    let context = context.clone();
+    bind_io_async!(vm, async_ops, "io::flush", move |vm, args, ops| {
         expect_arg_count(args, 1)?;
         let target = args
             .first()
             .cloned()
             .ok_or(VmError::TypeMismatch("string/int"))?;
-        let context = self.context.clone();
-        schedule_future_call(vm, &self.async_ops, async move {
+        let context = context.clone();
+        schedule_future_call(vm, ops, async move {
             tokio::task::yield_now().await;
             match target {
                 Value::Int(handle) => {
@@ -636,29 +551,23 @@ impl HostFunction for BuiltinIoFlushFunction {
             }
             Ok(vec![Value::Bool(true)])
         })
-    }
+    });
 }
 
-struct BuiltinIoCloseFunction {
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-}
-
-impl BuiltinIoCloseFunction {
-    fn new(context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) -> Self {
-        Self { context, async_ops }
-    }
-}
-
-impl HostFunction for BuiltinIoCloseFunction {
-    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
+fn bind_builtin_io_close(
+    vm: &mut Vm,
+    context: &SharedProxyVmContext,
+    async_ops: &SharedVmAsyncOps,
+) {
+    let context = context.clone();
+    bind_io_async!(vm, async_ops, "io::close", move |vm, args, ops| {
         expect_arg_count(args, 1)?;
         let target = args
             .first()
             .cloned()
             .ok_or(VmError::TypeMismatch("string/int"))?;
-        let context = self.context.clone();
-        schedule_future_call(vm, &self.async_ops, async move {
+        let context = context.clone();
+        schedule_future_call(vm, ops, async move {
             tokio::task::yield_now().await;
             match target {
                 Value::Int(handle) => {
@@ -676,24 +585,14 @@ impl HostFunction for BuiltinIoCloseFunction {
             }
             Ok(vec![Value::Bool(true)])
         })
-    }
+    });
 }
 
-struct BuiltinIoExistsFunction {
-    async_ops: SharedVmAsyncOps,
-}
-
-impl BuiltinIoExistsFunction {
-    fn new(async_ops: SharedVmAsyncOps) -> Self {
-        Self { async_ops }
-    }
-}
-
-impl HostFunction for BuiltinIoExistsFunction {
-    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
+fn bind_builtin_io_exists(vm: &mut Vm, async_ops: &SharedVmAsyncOps) {
+    bind_io_async!(vm, async_ops, "io::exists", move |vm, args, ops| {
         expect_arg_count(args, 1)?;
         let path = expect_string(args, 0)?;
-        schedule_future_call(vm, &self.async_ops, async move {
+        schedule_future_call(vm, ops, async move {
             tokio::task::yield_now().await;
             let exists = if edge_io_readable_path(&path)
                 || edge_io_target_from_string(&path).is_some()
@@ -705,5 +604,5 @@ impl HostFunction for BuiltinIoExistsFunction {
             };
             Ok(vec![Value::Bool(exists)])
         })
-    }
+    });
 }
