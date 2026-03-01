@@ -1,20 +1,153 @@
-# Stack VM
+# pd-vm
 
-This crate provides a compact stack-based VM intended as a compilation target for a higher-level language.
+`pd-vm` is a stack-based virtual machine plus compiler toolchain used as a backend for multiple
+source syntaxes (`.rss`, `.js`, `.lua`, `.scm`).
 
-## Bytecode format
+## Sections
 
-Bytecode is a stream of opcodes followed by little-endian operands. The VM uses absolute jump targets
-and a separate constant table.
+- [How To Use](#how-to-use)
+- [Internals](#internals)
 
-- 1 byte: opcode
-- Operands: little-endian integers (u8, u16, u32)
+## How To Use
 
-### Constant table
+### Run Programs
 
-Constants are stored in `Program.constants` and accessed by index via `ldc`.
+Run with the VM runner binary:
 
-### Instruction set
+```powershell
+cargo run -p pd-vm --bin pd-vm-run -- examples/example.lua
+```
+
+Other supported flavors:
+
+```powershell
+cargo run -p pd-vm --bin pd-vm-run -- examples/example.js
+cargo run -p pd-vm --bin pd-vm-run -- examples/example.rss
+cargo run -p pd-vm --bin pd-vm-run -- examples/example.scm
+```
+
+### REPL
+
+RustScript REPL (history + multiline support):
+
+```powershell
+cargo run -p pd-vm --bin pd-vm-run -- --repl
+```
+
+
+### Debugging
+
+Run with interactive `pdb` debugger on stdio:
+
+```powershell
+cargo run -p pd-vm --bin pd-vm-run -- --debug examples/example.lua
+```
+
+Run debugger over TCP:
+
+```powershell
+cargo run -p pd-vm --bin pd-vm-run -- --debug --tcp 127.0.0.1:9002 examples/example.lua
+```
+
+Useful commands: `break`, `break line`, `step`, `next`, `out`, `stack`, `locals`, `where`, `continue`.
+
+### Recording and Replay
+
+Record execution:
+
+```powershell
+cargo run -p pd-vm --bin pd-vm-run -- --record out/example.pdr examples/example.lua
+```
+
+Replay execution:
+
+```powershell
+cargo run -p pd-vm --bin pd-vm-run -- --view-record out/example.pdr
+```
+
+Replay supports `break`, `break line`, `continue`, `step`, `next`, `out`, `stack`, `locals`,
+`print`, `ip`, `where`, and `funcs`. In replay mode, breakpoints set pause points in the replay
+stream instead of runtime VM breakpoints.
+
+### Bytecode and VMBC
+
+Emit VMBC wire-format output without running:
+
+```powershell
+cargo run -p pd-vm --bin pd-vm-run -- --emit-vmbc out/example.vmbc examples/example.rss
+```
+
+Disassemble VMBC:
+
+```powershell
+cargo run -p pd-vm --bin pd-vm-run -- --disasm-vmbc path/to/program.vmbc
+```
+
+Disassemble with embedded source (if present):
+
+```powershell
+cargo run -p pd-vm --bin pd-vm-run -- --disasm-vmbc path/to/program.vmbc --show-source
+```
+
+### JIT
+
+Dump trace-JIT activity:
+
+```powershell
+cargo run -p pd-vm --bin pd-vm-run -- --jit-hot-loop 2 --jit-dump examples/example.rss
+```
+
+Library hooks:
+
+- `vm.set_jit_config(...)`
+- `vm.jit_snapshot()`
+- `vm.dump_jit_info()`
+- `vm.jit_native_trace_count()`
+- `vm.jit_native_exec_count()`
+
+### Wasm Lint
+
+Compiler-only wasm build (without runtime/JIT/debugger/CLI):
+
+```powershell
+cargo check -p pd-vm --target wasm32-unknown-unknown --no-default-features
+```
+
+Browser/editor lint integration is provided by sibling crate `pd-vm-lint-wasm` via
+`lint_source_json`.
+
+### Test and Perf Commands
+
+Integration example tests:
+
+```powershell
+cargo test -p pd-vm --test example_tests
+```
+
+Manual perf characterization (ignored by default):
+
+```powershell
+cargo test -p pd-vm --test perf_tests -- --ignored --nocapture
+```
+
+## Internals
+
+### VM Internals
+
+`Program` consists of:
+
+- `constants: Vec<Value>`
+- `code: Vec<u8>`
+- `imports: Vec<HostImport>`
+- `debug: Option<DebugInfo>`
+
+Bytecode format:
+
+- 1 byte opcode
+- little-endian operands (`u8`, `u16`, `u32`)
+- absolute jump targets
+
+Instruction set:
 
 | Opcode | Mnemonic | Operands       | Stack effect                       |
 |--------|----------|----------------|------------------------------------|
@@ -42,26 +175,85 @@ Constants are stored in `Program.constants` and accessed by index via `ldc`.
 | 0x15   | `and`    | -              | (a, b) -> (a && b)                 |
 | 0x16   | `or`     | -              | (a, b) -> (a \|\| b)               |
 
-### Host calls and resuming
+Host calls and resuming:
 
-`call` invokes a host function registered in the VM. The host can return `Yield` to suspend execution.
-Calling `vm.resume()` continues execution from the next instruction.
+- `call` dispatches to builtin or bound host function
+- host functions can yield
+- `vm.resume()` continues from the next instruction
 
-## Assembler and compiler skeleton
+### Compiler Internals
 
-`Assembler` emits bytecode with labels and patches jumps when `finish_program()` is called.
-`Compiler` is a small AST-to-bytecode skeleton that uses `Assembler` to generate control flow.
+#### Pipeline Layers
 
-### Text assembler
+The end-to-end stack is split into layers. Not every entrypoint uses every layer (for example,
+`compile_source()` skips module loading/linking), but this is the full model:
 
-Use `assemble()` to parse a tiny assembly language into a `Program`.
+1. Source and flavor selection
+2. Module/source loading (`compile_source_file()` path)
+3. Unit linking (`linker::merge_units`)
+4. Frontend lowering (`rustscript`, `javascript`, `lua`, `scheme`)
+5. Frontend-independent IR (`FrontendIr` / `LinkedIr`)
+6. Bytecode backend (`Compiler` + `Assembler` -> `Program`)
+7. VM interpreter execution
+8. Trace-JIT IR recording (`JitTrace` + `TraceStep`)
+9. Native machine code emission and execution
+10. Optional VMBC wire serialization (`vmbc`)
 
-Data section declarations:
+
+#### Compiler APIs
+
+Use `compile_source()` for RustScript, or `compile_source_file()` for extension-based flavor
+selection (`.rss`, `.js`, `.lua`, `.scm`).
+
+```text
+fn print(x);
+let x = 2 + 3;
+let y = x * 4;
+if y > 10 {
+    print(y);
+} else {
+    0;
+}
+```
+
+Closure subset example:
+
+```text
+let base = 7;
+let add = |value| value + base;
+add(5);
+```
+
+Lua closure equivalent lowered by frontend:
+
+```lua
+local add = function(value) return value + base end
+```
+
+Built-in print aliases (no declaration needed):
+
+- RustScript: `print!(value);`
+- JavaScript subset: `console.log(value);` and `print(value);`
+- Lua subset: `print(value)`
+- Scheme subset: `(print value)`
+
+Host calls must be explicitly imported:
+
+- RustScript: `use vm::{...};` / `use vm;`
+- JavaScript: `import ... from "vm"` or `require("vm")`
+- Lua: `require("vm")`
+- Scheme: `(import ...)` / `(require ...)` forms for `"vm"`
+
+#### Assembler API
+
+Use `assemble()` to parse text assembly into a `Program`.
+
+Data declarations:
 
 - `const NAME VALUE`
 - `string NAME "..."`
 
-```
+```text
 .data
 const two 2
 string greeting "hello"
@@ -85,191 +277,82 @@ ret
 Directives:
 
 - `.data` and `.code` switch sections
-- `.label NAME` defines a label for jump targets
+- `.label NAME` defines a jump label
 - `.local NAME [INDEX]` defines a named local
 
-### Tiny compiler
 
-Use `compile_source()` for RustScript syntax (`.rss`) or `compile_source_file()` to auto-detect
-syntax by extension (`.rss`, `.js`, `.lua`, `.scm`). It returns `CompiledProgram`, which includes the
-program and required local count.
+#### Builtins and Bridged `call` Opcode
 
-```
-fn print(x);
-let x = 2 + 3;
-let y = x * 4;
-if y > 10 {
-	print(y);
-} else {
-	0;
-}
-```
+The compiler uses one call shape (`Expr::Call` -> `OpCode::Call`) and distinguishes targets by call
+index.
 
-Closure subset:
+1. Builtin calls (fixed reserved indices)
+   - Builtins use `BuiltinFunction::call_index()`
+   - parser lowering emits these for helpers such as `len`, `get`, `set`, `slice`, `count`,
+     `type_of`, `assert`, and `io::*`
+2. Runtime host imports (per-program remapped indices)
+   - non-inlined runtime imports are remapped to dense import slots (`call_index_remap`)
+   - emitted as `call <slot>, <argc>`
+   - exposed as `Program.imports` and bound via `HostFunctionRegistry`
+3. Inlined RustScript function bodies
+   - calls to targets with `FunctionImpl` are inlined (no emitted `call`)
 
-```
-let base = 7;
-let add = |value| value + base;
-add(5);
-```
+At runtime, `call` is bridged through `Vm::execute_host_call`:
 
-Lua flavor closure syntax is lowered from:
+- builtin call indices dispatch to `vm/builtin_runtime.rs`
+- non-builtin indices dispatch to bound host imports
+- trace-JIT records `TraceStep::Call`, and native traces bridge call steps through runtime helpers
+  (with builtin fast paths where available), preserving interpreter semantics
 
-```lua
-local add = function(value) return value + base end
-```
+#### Current Compiler Subset Limitations
 
-Built-in print aliases (no declaration needed):
-- RustScript: `print!(value);`
-- JavaScript subset: `console.log(value);` and `print(value);`
-- Lua subset: `print(value)`
-- Scheme subset: `(print value)`
+Core compiler/IR:
 
-Loop control supports `break` and `continue`.
-Scheme loop forms include `(while condition body...)` and Guile-style
-`(do ((name init [step]) ...) (test expr...) body...)`.
+- no first-class function values in IR/runtime call path
+- calls are lowered as static call indices, not callable values
+- closures are not general values in this subset
+- higher-order patterns like storing/returning arbitrary callable values are not generally supported
+- recursive RustScript function declarations are not supported by current inlining-based lowering
+- nested function declarations are not supported
+- RustScript function declarations cannot capture outer locals
+- `match` patterns are limited to int/string literals and `_`
+- `break` and `continue` are only valid inside loops
+- host import namespace support in parser is limited to `vm` (plus `io::` builtin namespace calls)
 
-Host calls must be explicitly imported:
-- RustScript: `use vm::{...};` / `use vm;`
-- JavaScript: `import ... from "vm"` or `require("vm")`
-- Lua: `require("vm")`
-- Scheme: `(import ...)` / `(require ...)` forms for `"vm"`
+Module/source loading:
 
-Compiler subset limitations and TODOs are tracked in `compiler/README.md`.
+- `crate::...` module paths are not supported in RustScript source loading; use relative module paths
 
-## Wasm parser/compiler mode
+JavaScript frontend:
 
-For browser/editor linting scenarios, `pd-vm` supports a compiler-only build that excludes
-VM runtime/JIT/debugger/CLI.
+- arrow closures with block bodies are not supported (expression-body arrows only)
+- empty arrow parameter lists are not supported
 
-Build the wasm target with compiler/parser APIs only:
+Lua frontend:
 
-```powershell
-cargo check -p pd-vm --target wasm32-unknown-unknown --no-default-features
-```
+- numeric `for` loops with negative step are not supported
+- Lua pattern API string methods (`:match`, `:gsub`, etc.) are not supported
+- function literals require non-empty parameter list and non-empty return expression
 
-Linting integration lives in the sibling `pd-vm-lint-wasm` crate, which wraps compiler errors
-into JSON diagnostics via the `lint_source_json` export.
+Scheme frontend:
 
-## Trace JIT (x86_64 + aarch64)
+- no runtime symbol/procedure type support in VM typing model (`procedure?` and `symbol?` lower to `false`)
+- `string->number` currently lowers to placeholder behavior (`0`) due to missing parse builtin
+- `apply` is limited to `(apply func arglist)` and does not implement full spread/varargs semantics
 
-The VM includes a trace-based JIT path inspired by LuaJIT's hot-loop tracing model:
+### JIT Internals
+
+The VM includes a trace-based JIT path inspired by LuaJIT hot-loop tracing:
+
 - hot bytecode loop heads are detected
-- a straight-line trace is recorded from that root
-- native machine code is emitted per hot trace and invoked by the VM
+- a straight-line trace is recorded from each hot root
+- native machine code is emitted per compiled trace and invoked by the VM
 - the native bridge executes trace semantics without bytecode re-decoding
-- unsupported patterns fall back to interpreter and are tracked as NYI
+- unsupported shapes fall back to interpreter and are recorded as NYI
 - native trace emission supports arithmetic/logical opcodes including `mod`, `and`, and `or`
 
 Current NYI in trace compiler:
+
 - backward `brfalse` targets (only forward guard exits are supported)
 - traces longer than configured max trace length
-- targets outside native-JIT support (`x86_64` Windows/Unix-non-macOS, `aarch64` Linux/macOS)
-
-## Run examples
-
-Use the VM runner binary:
-
-```powershell
-cargo run -p pd-vm --bin pd-vm-run -- examples/example.lua
-```
-
-Other flavors:
-
-```powershell
-cargo run -p pd-vm --bin pd-vm-run -- examples/example.js
-cargo run -p pd-vm --bin pd-vm-run -- examples/example.rss
-cargo run -p pd-vm --bin pd-vm-run -- examples/example.scm
-```
-
-Interactive REPL (RustScript snippets, with up/down history):
-
-```powershell
-cargo run -p pd-vm --bin pd-vm-run -- --repl
-```
-
-JIT visibility (dump compiled traces + NYI reasons):
-
-```powershell
-cargo run -p pd-vm --bin pd-vm-run -- --jit-hot-loop 2 --jit-dump examples/example.rss
-```
-
-Emit VMBC wire-format bytecode without running:
-
-```powershell
-cargo run -p pd-vm --bin pd-vm-run -- --emit-vmbc out/example.vmbc examples/example.rss
-```
-
-Disassemble VMBC wire-format binaries:
-
-```powershell
-cargo run -p pd-vm --bin pd-vm-run -- --disasm-vmbc path/to/program.vmbc
-```
-
-Include embedded source from debug info (if present):
-
-```powershell
-cargo run -p pd-vm --bin pd-vm-run -- --disasm-vmbc path/to/program.vmbc --show-source
-```
-
-The listing uses tab-separated columns for `offset`, `opcode`, and `assembly`.
-When `--show-source` is enabled, source is shown on separate `; src ...` lines before the first opcode for that line.
-
-Library API visibility hooks:
-- `vm.set_jit_config(...)`
-- `vm.jit_snapshot()`
-- `vm.dump_jit_info()`
-- `vm.jit_native_trace_count()`
-- `vm.jit_native_exec_count()`
-
-## Performance tests
-
-Manual perf characterization tests (ignored by default):
-
-```powershell
-cargo test -p pd-vm --test perf_tests -- --ignored --nocapture
-```
-
-Includes:
-- VM creation/cleanup speed and RSS delta
-- compiler speed and RSS delta
-- JIT native machine code execution verification on supported native targets
-
-### Debugger mode
-
-Run with interactive `pdb` debugger on stdio:
-
-```powershell
-cargo run -p pd-vm --bin pd-vm-run -- --debug examples/example.lua
-```
-
-Run with TCP debugger socket:
-
-```powershell
-cargo run -p pd-vm --bin pd-vm-run -- --debug --tcp 127.0.0.1:9002 examples/example.lua
-```
-
-Useful `pdb` commands: `break`, `break line`, `step`, `next`, `out`, `stack`, `locals`, `where`, `continue`.
-
-### Execution recording and replay
-
-Record a full VM run (captures per-step VM state such as `ip`, `stack`, `locals`, and stores bytecode + debug info):
-
-```powershell
-cargo run -p pd-vm --bin pd-vm-run -- --record out/example.pdr examples/example.lua
-```
-
-Open a saved recording in replay mode:
-
-```powershell
-cargo run -p pd-vm --bin pd-vm-run -- --view-record out/example.pdr
-```
-
-Replay mode supports `pdb`-style commands including `break`, `break line`, `continue`, `step`, `next`, `out`, `stack`, `locals`, `print`, `ip`, `where`, and `funcs`.
-In replay mode, `break`/`break line` do not create runtime VM breakpoints; they set the next replay pause point used by `continue`.
-
-Try it with integration tests:
-
-```powershell
-cargo test -p pd-vm --test example_tests
-```
+- unsupported native targets (currently `x86_64` Windows/Unix-non-macOS and `aarch64` Linux/macOS)
