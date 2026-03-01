@@ -8,6 +8,7 @@ source syntaxes (`.rss`, `.js`, `.lua`, `.scm`).
 - [Overview](#overview)
 - [How To Use](#how-to-use)
 - [Internals](#internals)
+- [Compiler frontend syntax and feature support](src/compiler/frontends/README.md)
 
 
 ## Overview
