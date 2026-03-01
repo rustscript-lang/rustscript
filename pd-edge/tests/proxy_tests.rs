@@ -1,5 +1,5 @@
 use std::{
-    io::{Read, Write},
+    io::Read,
     net::{SocketAddr, TcpStream},
     sync::{Arc, Mutex},
     time::Duration,
@@ -111,18 +111,22 @@ fn reserve_tcp_addr() -> SocketAddr {
 }
 
 async fn send_pdb_continue(addr: SocketAddr) {
-    tokio::task::spawn_blocking(move || {
-        let mut stream = TcpStream::connect(addr).expect("debugger tcp should accept connections");
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let mut banner = [0u8; 512];
-        let _ = stream.read(&mut banner);
-        stream
-            .write_all(b"continue\n")
-            .expect("pdb continue command should be written");
-    })
+    let mut stream = timeout(
+        Duration::from_secs(2),
+        tokio::net::TcpStream::connect(addr),
+    )
     .await
-    .expect("pdb helper should not panic");
+    .expect("pdb helper connect timed out")
+    .expect("debugger tcp should accept connections");
+
+    let mut banner = [0u8; 512];
+    let _ = timeout(Duration::from_millis(300), stream.read(&mut banner)).await;
+    timeout(Duration::from_secs(1), stream.write_all(b"continue\n"))
+        .await
+        .expect("pdb helper write timed out")
+        .expect("pdb continue command should be written");
 }
 
 #[tokio::test]
@@ -710,9 +714,87 @@ async fn http_request_body_can_be_rewritten_before_proxying() {
 }
 
 #[tokio::test]
+async fn http_request_body_chunk_api_reads_in_chunks() {
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+
+    let source = r#"
+        use vm;
+
+        let first = vm::http::request::body::next_chunk(4);
+        let second = vm::http::request::body::next_chunk(4);
+        let rest = vm::http::request::body::next_chunk(64);
+        let done = vm::http::request::body::eof();
+        if done {
+            vm::http::response::set_body(first + second + rest);
+        } else {
+            vm::http::response::set_body("body-not-finished");
+        }
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .post(format!("http://{data_addr}/chunked"))
+        .body("abcdefghij")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.expect("body should read"), "abcdefghij");
+
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
 async fn debug_attached_request_does_not_block_non_debug_requests() {
+    struct AbortProxyOnDrop {
+        data: JoinHandle<()>,
+        admin: JoinHandle<()>,
+    }
+
+    impl Drop for AbortProxyOnDrop {
+        fn drop(&mut self) {
+            self.data.abort();
+            self.admin.abort();
+        }
+    }
+
+    struct AbortTaskOnDrop<T> {
+        handle: Option<JoinHandle<T>>,
+    }
+
+    impl<T> AbortTaskOnDrop<T> {
+        fn new(handle: JoinHandle<T>) -> Self {
+            Self {
+                handle: Some(handle),
+            }
+        }
+
+        async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+            self.handle
+                .take()
+                .expect("join handle should exist")
+                .await
+        }
+    }
+
+    impl<T> Drop for AbortTaskOnDrop<T> {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                handle.abort();
+            }
+        }
+    }
+
     timeout(Duration::from_secs(10), async {
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let _abort_proxy = AbortProxyOnDrop {
+        data: data_handle,
+        admin: admin_handle,
+    };
     let client = reqwest::Client::new();
 
     let program = build_short_circuit_program("ok", None);
@@ -732,7 +814,7 @@ async fn debug_attached_request_does_not_block_non_debug_requests() {
     assert_eq!(start_response.status(), StatusCode::CREATED);
 
     let debug_client = client.clone();
-    let debug_request = tokio::spawn(async move {
+    let debug_request = AbortTaskOnDrop::new(tokio::spawn(async move {
         let response = debug_client
             .get(format!("http://{data_addr}/debug-target"))
             .header("x-debug", "on")
@@ -742,7 +824,7 @@ async fn debug_attached_request_does_not_block_non_debug_requests() {
         let status = response.status();
         let body = response.text().await.expect("body should read");
         (status, body)
-    });
+    }));
 
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -758,15 +840,13 @@ async fn debug_attached_request_does_not_block_non_debug_requests() {
 
     send_pdb_continue(debug_addr).await;
 
-    let (status, body) = timeout(Duration::from_secs(2), debug_request)
+    let (status, body) = timeout(Duration::from_secs(2), debug_request.join())
         .await
         .expect("debug request timed out")
         .expect("debug task should join");
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "ok");
 
-    data_handle.abort();
-    admin_handle.abort();
     })
     .await
     .expect("test timed out");

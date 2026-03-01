@@ -31,12 +31,13 @@ use crate::{
     control_plane_rpc::EdgeTrafficSample,
     debug_session::{
         DebugSessionStatus, SharedDebugSession, StartDebugSessionRequest, debug_session_status,
-        new_debug_session_store, run_vm_with_optional_debugger, start_debug_session,
-        stop_debug_session,
+        new_debug_session_store, request_will_attach_debugger, run_vm_with_optional_debugger,
+        start_debug_session, stop_debug_session,
     },
     host_abi::{
         HttpRequestContext, ProxyVmContext, RateLimiterStore, SharedRateLimiter,
-        register_host_module, snapshot_execution_outcome,
+        VmAsyncOpBridge, new_shared_vm_async_ops, register_host_module,
+        snapshot_execution_outcome,
     },
     logging::{category_access, category_debug, category_program, method_label, status_label},
 };
@@ -535,30 +536,6 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
             Err(VmExecutionError::Vm(err)) => {
                 state.record_vm_execution_error();
                 warn!("{} vm execution error: {err}", category_program());
-                return finalize_data_plane_response(
-                    &state,
-                    started,
-                    text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
-                    0,
-                );
-            }
-            Err(VmExecutionError::NotHalted(status)) => {
-                state.record_vm_execution_error();
-                warn!(
-                    "{} vm returned non-halted status {:?}",
-                    category_program(),
-                    status
-                );
-                return finalize_data_plane_response(
-                    &state,
-                    started,
-                    text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
-                    0,
-                );
-            }
-            Err(VmExecutionError::TaskJoin(err)) => {
-                state.record_vm_execution_error();
-                warn!("{} vm execution task failed: {err}", category_program());
                 return finalize_data_plane_response(
                     &state,
                     started,
@@ -1116,8 +1093,6 @@ async fn access_log_middleware(request: Request, next: Next) -> Response<Body> {
 enum VmExecutionError {
     HostRegistration(vm::VmError),
     Vm(vm::VmError),
-    NotHalted(VmStatus),
-    TaskJoin(tokio::task::JoinError),
 }
 
 async fn execute_vm_for_request(
@@ -1133,17 +1108,61 @@ async fn execute_vm_for_request(
     let request_headers = request.headers.clone();
     let request_path = request.path.clone();
     let request_id = request.request_id.clone();
+    let debug_attached = request_will_attach_debugger(&debug_session, &request_headers, &request_path);
+    let async_ops = new_shared_vm_async_ops();
 
-    let task = tokio::task::spawn_blocking(move || {
-        let vm_context = Arc::new(std::sync::Mutex::new(ProxyVmContext::from_http_request(
-            request,
-            rate_limiter,
-        )));
+    if debug_attached {
+        let async_ops_for_debug = async_ops.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let vm_context = Arc::new(std::sync::Mutex::new(ProxyVmContext::from_http_request(
+                request,
+                rate_limiter,
+            )));
+            let mut vm = Vm::with_locals((*program).clone(), local_count);
+            vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops_for_debug.clone())));
+            register_host_module(&mut vm, vm_context.clone(), async_ops_for_debug)
+                .map_err(VmExecutionError::HostRegistration)?;
 
-        let mut vm = Vm::with_locals((*program).clone(), local_count);
-        register_host_module(&mut vm, vm_context.clone())
-            .map_err(VmExecutionError::HostRegistration)?;
+            loop {
+                let status = run_vm_with_optional_debugger(
+                    &debug_session,
+                    &request_headers,
+                    &request_path,
+                    &request_id,
+                    &mut vm,
+                )
+                .map_err(VmExecutionError::Vm)?;
 
+                match status {
+                    VmStatus::Halted => break,
+                    VmStatus::Yielded => continue,
+                    VmStatus::Waiting(_op_id) => tokio::runtime::Handle::current()
+                        .block_on(vm.await_waiting_host_op())
+                        .map_err(VmExecutionError::Vm)?,
+                }
+            }
+
+            Ok(snapshot_execution_outcome(&vm_context))
+        });
+
+        return task.await.map_err(|err| {
+            VmExecutionError::Vm(vm::VmError::HostError(format!(
+                "vm blocking execution task failed: {err}"
+            )))
+        })?;
+    }
+
+    let vm_context = Arc::new(std::sync::Mutex::new(ProxyVmContext::from_http_request(
+        request,
+        rate_limiter,
+    )));
+
+    let mut vm = Vm::with_locals((*program).clone(), local_count);
+    vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));
+    register_host_module(&mut vm, vm_context.clone(), async_ops)
+        .map_err(VmExecutionError::HostRegistration)?;
+
+    loop {
         let status = run_vm_with_optional_debugger(
             &debug_session,
             &request_headers,
@@ -1152,12 +1171,16 @@ async fn execute_vm_for_request(
             &mut vm,
         )
         .map_err(VmExecutionError::Vm)?;
-        if status != VmStatus::Halted {
-            return Err(VmExecutionError::NotHalted(status));
+        match status {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => {
+                tokio::task::yield_now().await;
+            }
+            VmStatus::Waiting(_op_id) => {
+                vm.await_waiting_host_op().await.map_err(VmExecutionError::Vm)?;
+            }
         }
+    }
 
-        Ok(snapshot_execution_outcome(&vm_context))
-    });
-
-    task.await.map_err(VmExecutionError::TaskJoin)?
+    Ok(snapshot_execution_outcome(&vm_context))
 }
