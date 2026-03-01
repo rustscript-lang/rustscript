@@ -1,4 +1,4 @@
-use super::{VmError, VmResult};
+use super::super::super::{VmError, VmResult};
 
 #[cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))]
 mod aarch64;
@@ -18,7 +18,7 @@ pub(super) const STATUS_ERROR: i32 = -1;
 pub(super) trait NativeBackend {
     type ExecutableMemory;
 
-    fn emit_trace_bytes(trace: &crate::jit::JitTrace) -> VmResult<Vec<u8>>;
+    fn emit_trace_bytes(trace: &super::JitTrace) -> VmResult<Vec<u8>>;
     fn executable_memory_from_code(code: &[u8]) -> VmResult<Self::ExecutableMemory>;
     fn executable_memory_ptr(memory: &Self::ExecutableMemory) -> *mut u8;
     fn clear_bridge_error();
@@ -51,7 +51,7 @@ impl ExecutableMemory {
     }
 }
 
-pub(super) fn emit_native_trace_bytes(trace: &crate::jit::JitTrace) -> VmResult<Vec<u8>> {
+pub(super) fn emit_native_trace_bytes(trace: &super::JitTrace) -> VmResult<Vec<u8>> {
     ActiveBackend::emit_trace_bytes(trace)
 }
 

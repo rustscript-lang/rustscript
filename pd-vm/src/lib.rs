@@ -7,7 +7,12 @@ pub mod debug_info;
 #[cfg(feature = "runtime")]
 pub mod debugger;
 #[cfg(feature = "runtime")]
-pub mod jit;
+pub mod jit {
+    pub use crate::vm::jit::{
+        JitAttempt, JitConfig, JitNyiDoc, JitNyiReason, JitSnapshot, JitTrace, JitTraceTerminal,
+        TraceJitEngine, TraceStep,
+    };
+}
 #[cfg(feature = "runtime")]
 pub mod vm;
 #[cfg(feature = "runtime")]

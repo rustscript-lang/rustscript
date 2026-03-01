@@ -1,0 +1,273 @@
+use super::super::{Value, VmError, VmResult};
+
+pub(super) fn builtin_len(args: &[Value]) -> VmResult<Vec<Value>> {
+    let value = args
+        .first()
+        .ok_or_else(|| VmError::HostError("missing argument to len".to_string()))?;
+    let len = match value {
+        Value::String(text) => text.chars().count() as i64,
+        Value::Array(values) => values.len() as i64,
+        Value::Map(entries) => entries.len() as i64,
+        _ => return Err(VmError::TypeMismatch("string/array/map")),
+    };
+    Ok(vec![Value::Int(len)])
+}
+
+pub(super) fn builtin_slice(args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let mut iter = args.into_iter();
+    let source = iter
+        .next()
+        .ok_or_else(|| VmError::HostError("missing source for slice".to_string()))?;
+    let start = iter
+        .next()
+        .ok_or_else(|| VmError::HostError("missing slice start".to_string()))?
+        .as_int()?;
+    let len = iter
+        .next()
+        .ok_or_else(|| VmError::HostError("missing slice length".to_string()))?
+        .as_int()?;
+
+    if start < 0 || len <= 0 {
+        return match source {
+            Value::String(_) => Ok(vec![Value::String(String::new())]),
+            Value::Array(_) => Ok(vec![Value::Array(Vec::new())]),
+            _ => Err(VmError::TypeMismatch("string/array")),
+        };
+    }
+
+    let start = usize::try_from(start).map_err(|_| {
+        VmError::HostError("slice start overflow while converting to usize".to_string())
+    })?;
+    let len = usize::try_from(len).map_err(|_| {
+        VmError::HostError("slice length overflow while converting to usize".to_string())
+    })?;
+    match source {
+        Value::String(text) => {
+            let out = text.chars().skip(start).take(len).collect::<String>();
+            Ok(vec![Value::String(out)])
+        }
+        Value::Array(values) => {
+            let out = values.into_iter().skip(start).take(len).collect::<Vec<_>>();
+            Ok(vec![Value::Array(out)])
+        }
+        _ => Err(VmError::TypeMismatch("string/array")),
+    }
+}
+
+pub(super) fn builtin_concat(args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let mut iter = args.into_iter();
+    let lhs = iter
+        .next()
+        .ok_or_else(|| VmError::HostError("missing left argument to concat".to_string()))?;
+    let rhs = iter
+        .next()
+        .ok_or_else(|| VmError::HostError("missing right argument to concat".to_string()))?;
+    match (lhs, rhs) {
+        (Value::String(lhs), Value::String(rhs)) => {
+            let mut out = String::with_capacity(lhs.len() + rhs.len());
+            out.push_str(&lhs);
+            out.push_str(&rhs);
+            Ok(vec![Value::String(out)])
+        }
+        (Value::Array(lhs), Value::Array(rhs)) => {
+            let mut out = lhs;
+            out.extend(rhs);
+            Ok(vec![Value::Array(out)])
+        }
+        _ => Err(VmError::TypeMismatch("string/string or array/array")),
+    }
+}
+
+pub(super) fn builtin_array_push(args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let mut iter = args.into_iter();
+    let mut out = match iter
+        .next()
+        .ok_or_else(|| VmError::HostError("missing array argument".to_string()))?
+    {
+        Value::Array(values) => values,
+        _ => return Err(VmError::TypeMismatch("array")),
+    };
+    let value = iter
+        .next()
+        .ok_or_else(|| VmError::HostError("missing value argument".to_string()))?;
+    out.push(value);
+    Ok(vec![Value::Array(out)])
+}
+
+pub(super) fn builtin_get(args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let mut iter = args.into_iter();
+    let container = iter
+        .next()
+        .ok_or_else(|| VmError::HostError("missing container argument".to_string()))?;
+    let key = iter
+        .next()
+        .ok_or_else(|| VmError::HostError("missing key argument".to_string()))?;
+
+    match container {
+        Value::Array(values) => {
+            let index = key.as_int()?;
+            if index < 0 {
+                return Err(VmError::HostError(
+                    "array index must be non-negative".to_string(),
+                ));
+            }
+            let index = usize::try_from(index)
+                .map_err(|_| VmError::HostError("array index overflow".to_string()))?;
+            let mut values = values;
+            if index >= values.len() {
+                return Err(VmError::HostError(format!(
+                    "array index {index} out of bounds"
+                )));
+            }
+            let value = values.swap_remove(index);
+            Ok(vec![value])
+        }
+        Value::Map(entries) => {
+            for (existing_key, value) in entries {
+                if existing_key == key {
+                    return Ok(vec![value]);
+                }
+            }
+            Err(VmError::HostError("map key not found".to_string()))
+        }
+        Value::String(text) => {
+            let index = key.as_int()?;
+            if index < 0 {
+                return Err(VmError::HostError(
+                    "string index must be non-negative".to_string(),
+                ));
+            }
+            let index = usize::try_from(index)
+                .map_err(|_| VmError::HostError("string index overflow".to_string()))?;
+            let value = text
+                .chars()
+                .nth(index)
+                .map(|ch| Value::String(ch.to_string()))
+                .ok_or_else(|| VmError::HostError(format!("string index {index} out of bounds")))?;
+            Ok(vec![value])
+        }
+        _ => Err(VmError::TypeMismatch("array/map/string")),
+    }
+}
+
+pub(super) fn builtin_type_of(args: &[Value]) -> VmResult<Vec<Value>> {
+    let value = args
+        .first()
+        .ok_or_else(|| VmError::HostError("missing argument to type_of".to_string()))?;
+    let ty = match value {
+        Value::Null => "null",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::Bool(_) => "bool",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Map(_) => "map",
+    };
+    Ok(vec![Value::String(ty.to_string())])
+}
+
+pub(super) fn builtin_to_string(args: &[Value]) -> VmResult<Vec<Value>> {
+    let value = args
+        .first()
+        .ok_or_else(|| VmError::HostError("missing argument to __to_string".to_string()))?;
+    let text = match value {
+        Value::Int(v) => v.to_string(),
+        Value::Float(v) => v.to_string(),
+        _ => return Err(VmError::TypeMismatch("number")),
+    };
+    Ok(vec![Value::String(text)])
+}
+
+pub(super) fn builtin_set(args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let mut iter = args.into_iter();
+    let container = iter
+        .next()
+        .ok_or_else(|| VmError::HostError("missing container argument".to_string()))?;
+    let key = iter
+        .next()
+        .ok_or_else(|| VmError::HostError("missing key argument".to_string()))?;
+    let value = iter
+        .next()
+        .ok_or_else(|| VmError::HostError("missing value argument".to_string()))?;
+
+    match container {
+        Value::Array(values) => {
+            let index = key.as_int()?;
+            if index < 0 {
+                return Err(VmError::HostError(
+                    "array index must be non-negative".to_string(),
+                ));
+            }
+            let index = usize::try_from(index)
+                .map_err(|_| VmError::HostError("array index overflow".to_string()))?;
+            let mut out = values;
+            if index < out.len() {
+                out[index] = value;
+            } else if index == out.len() {
+                out.push(value);
+            } else {
+                let mut entries = out
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, existing)| (Value::Int(idx as i64), existing))
+                    .collect::<Vec<_>>();
+                entries.push((Value::Int(index as i64), value));
+                return Ok(vec![Value::Map(entries)]);
+            }
+            Ok(vec![Value::Array(out)])
+        }
+        Value::Map(entries) => {
+            let mut out = entries;
+            if let Some((_, existing_value)) = out
+                .iter_mut()
+                .find(|(existing_key, _)| *existing_key == key)
+            {
+                *existing_value = value;
+            } else {
+                out.push((key, value));
+            }
+            Ok(vec![Value::Map(out)])
+        }
+        _ => Err(VmError::TypeMismatch("array/map")),
+    }
+}
+
+pub(super) fn builtin_keys(args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let container = args
+        .into_iter()
+        .next()
+        .ok_or_else(|| VmError::HostError("missing container argument".to_string()))?;
+
+    let keys = match container {
+        Value::Array(values) => (0..values.len())
+            .map(|index| Value::Int(index as i64))
+            .collect::<Vec<_>>(),
+        Value::Map(entries) => entries.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
+        _ => return Err(VmError::TypeMismatch("array/map")),
+    };
+    Ok(vec![Value::Array(keys)])
+}
+
+pub(super) fn builtin_count(args: &[Value]) -> VmResult<Vec<Value>> {
+    let container = args
+        .first()
+        .ok_or_else(|| VmError::HostError("missing container argument".to_string()))?;
+    let count = match container {
+        Value::Array(values) => values.len() as i64,
+        Value::Map(entries) => entries.len() as i64,
+        _ => return Err(VmError::TypeMismatch("array/map")),
+    };
+    Ok(vec![Value::Int(count)])
+}
+
+pub(super) fn builtin_assert(args: &[Value]) -> VmResult<Vec<Value>> {
+    let condition = args
+        .first()
+        .ok_or_else(|| VmError::HostError("missing argument: assert condition".to_string()))?
+        .as_bool()?;
+    if condition {
+        Ok(Vec::new())
+    } else {
+        Err(VmError::HostError("assertion failed".to_string()))
+    }
+}
