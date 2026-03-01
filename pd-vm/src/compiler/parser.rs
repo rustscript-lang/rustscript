@@ -478,6 +478,7 @@ pub(super) struct Parser {
     allow_implicit_semicolons: bool,
     loop_depth: usize,
     vm_namespace_aliases: HashSet<String>,
+    host_namespace_aliases: HashMap<String, String>,
     vm_named_imports: HashMap<String, String>,
     vm_wildcard_import: bool,
 }
@@ -519,6 +520,7 @@ impl Parser {
             allow_implicit_semicolons,
             loop_depth: 0,
             vm_namespace_aliases: HashSet::new(),
+            host_namespace_aliases: HashMap::new(),
             vm_named_imports: HashMap::new(),
             vm_wildcard_import: false,
         })
@@ -611,12 +613,25 @@ impl Parser {
         let line = self.last_line();
         let namespace = self.expect_ident("expected namespace after 'use'")?;
         if namespace != "vm" {
+            if self.match_kind(&TokenKind::Semicolon) {
+                self.host_namespace_aliases
+                    .insert(namespace.clone(), namespace);
+                return Ok(Stmt::Noop { line });
+            }
+
+            if self.match_kind(&TokenKind::As) {
+                let alias = self.expect_ident("expected namespace alias after 'as'")?;
+                self.expect(&TokenKind::Semicolon, "expected ';' after use alias")?;
+                self.host_namespace_aliases.insert(alias, namespace);
+                return Ok(Stmt::Noop { line });
+            }
+
             return Err(ParseError {
                 span: None,
                 code: None,
                 line: self.current_line(),
                 message: format!(
-                    "unsupported use namespace '{namespace}'; only 'vm' host namespace is supported here"
+                    "unsupported use syntax for host namespace '{namespace}'; expected ';' or 'as <alias>'"
                 ),
             });
         }
@@ -1189,7 +1204,7 @@ impl Parser {
                     .ok_or_else(|| ParseError { span: None, code: None,
                         line: self.current_line(),
                         message: format!(
-                            "unknown namespace call '{}::{}'; supported namespaces are io:: and re:: (builtins), and vm:: (host imports via 'use vm;', 'use vm::*;', or 'use vm as <alias>;')",
+                            "unknown namespace call '{}::{}'; supported namespaces are io:: and re:: (builtins), vm:: host imports, and any host namespace imported via 'use <namespace>;' or 'use <namespace> as <alias>;'",
                             name,
                             path_segments.join("::")
                         ),
@@ -2002,14 +2017,18 @@ impl Parser {
     ) -> Option<String> {
         let namespace_matches = self.vm_namespace_aliases.contains(namespace)
             || (namespace == "vm" && self.vm_wildcard_import);
-        if !namespace_matches {
+        let mut host_name = if namespace_matches {
+            member.to_string()
+        } else if let Some(host_root) = self.host_namespace_aliases.get(namespace) {
+            if member.is_empty() {
+                host_root.clone()
+            } else {
+                format!("{host_root}::{member}")
+            }
+        } else {
             return None;
-        }
+        };
 
-        if subpath.is_empty() {
-            return Some(member.to_string());
-        }
-        let mut host_name = member.to_string();
         for segment in subpath {
             host_name.push_str("::");
             host_name.push_str(segment);

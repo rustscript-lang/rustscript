@@ -33,6 +33,44 @@ fn rustscript_vm_http_subnamespace_host_calls_are_supported() {
 }
 
 #[test]
+fn rustscript_host_namespace_import_without_vm_prefix_is_supported() {
+    let source = r#"
+        use runtime;
+        runtime::sleep(41);
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    vm.bind_function("runtime::sleep", Box::new(AddOne));
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+}
+
+#[test]
+fn rustscript_host_namespace_alias_import_is_supported() {
+    struct AlwaysAllow;
+
+    impl HostFunction for AlwaysAllow {
+        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            Ok(CallOutcome::Return(vec![Value::Bool(true)]))
+        }
+    }
+
+    let source = r#"
+        use rate_limit as rl;
+        rl::allow("client-1", 3, 60);
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    vm.bind_function("rate_limit::allow", Box::new(AlwaysAllow));
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Bool(true)]);
+}
+
+#[test]
 fn rustscript_vm_named_host_imports_are_supported() {
     let source = r#"
         use vm::{add_one as inc};
