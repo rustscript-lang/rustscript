@@ -3,6 +3,7 @@ use super::{
     NativeBackend, STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_TRACE_EXIT, STATUS_WAITING,
     STATUS_YIELDED,
 };
+use crate::jit::TraceStep;
 use std::sync::OnceLock;
 
 pub(super) struct AArch64Backend;
@@ -107,6 +108,24 @@ enum Cond {
 
 const VM_REG: u8 = 19;
 
+macro_rules! emit_step_with_status {
+    ($code:ident, $patches:ident => $emit:expr) => {{
+        $emit?;
+        emit_native_status_check(&mut $code, &mut $patches);
+    }};
+}
+
+macro_rules! emit_infallible_step_with_status {
+    ($code:ident, $patches:ident => $emit:expr) => {{
+        $emit;
+        emit_native_status_check(&mut $code, &mut $patches);
+    }};
+}
+
+fn trace_ip_to_u64(ip: usize, context: &str) -> VmResult<u64> {
+    u64::try_from(ip).map_err(|_| VmError::JitNative(format!("{context} exceeds 64-bit range")))
+}
+
 fn emit_native_trace_bytes(trace: &crate::jit::JitTrace) -> VmResult<Vec<u8>> {
     let layout = detect_native_stack_layout()?;
     let mut code = Vec::with_capacity(1024);
@@ -117,135 +136,175 @@ fn emit_native_trace_bytes(trace: &crate::jit::JitTrace) -> VmResult<Vec<u8>> {
 
     for step in &trace.steps {
         match step {
-            crate::jit::TraceStep::Nop => {}
-            crate::jit::TraceStep::Ldc(index) => {
-                emit_native_step_ldc_inline(&mut code, layout, *index)?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Nop => {}
+            TraceStep::Ldc(index) => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_ldc_inline(&mut code, layout, *index)
+                );
             }
-            crate::jit::TraceStep::Add => {
-                emit_native_step_binary_numeric_inline(
-                    &mut code,
-                    layout,
-                    NativeBinaryNumericOp::Add,
-                )?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Add => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_binary_numeric_inline(
+                        &mut code,
+                        layout,
+                        NativeBinaryNumericOp::Add,
+                    )
+                );
             }
-            crate::jit::TraceStep::Sub => {
-                emit_native_step_binary_numeric_inline(
-                    &mut code,
-                    layout,
-                    NativeBinaryNumericOp::Sub,
-                )?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Sub => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_binary_numeric_inline(
+                        &mut code,
+                        layout,
+                        NativeBinaryNumericOp::Sub,
+                    )
+                );
             }
-            crate::jit::TraceStep::Mul => {
-                emit_native_step_binary_numeric_inline(
-                    &mut code,
-                    layout,
-                    NativeBinaryNumericOp::Mul,
-                )?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Mul => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_binary_numeric_inline(
+                        &mut code,
+                        layout,
+                        NativeBinaryNumericOp::Mul,
+                    )
+                );
             }
-            crate::jit::TraceStep::Div => {
-                emit_native_step_binary_numeric_inline(
-                    &mut code,
-                    layout,
-                    NativeBinaryNumericOp::Div,
-                )?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Div => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_binary_numeric_inline(
+                        &mut code,
+                        layout,
+                        NativeBinaryNumericOp::Div,
+                    )
+                );
             }
-            crate::jit::TraceStep::Mod => {
-                emit_native_step_mod_inline(&mut code, layout)?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Mod => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_mod_inline(&mut code, layout)
+                );
             }
-            crate::jit::TraceStep::Shl => {
-                emit_native_step_shift_inline(&mut code, layout, true)?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Shl => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_shift_inline(&mut code, layout, true)
+                );
             }
-            crate::jit::TraceStep::Shr => {
-                emit_native_step_shift_inline(&mut code, layout, false)?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Shr => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_shift_inline(&mut code, layout, false)
+                );
             }
-            crate::jit::TraceStep::And => {
-                emit_native_step_and_inline(&mut code, layout)?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::And => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_and_inline(&mut code, layout)
+                );
             }
-            crate::jit::TraceStep::Or => {
-                emit_native_step_or_inline(&mut code, layout)?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Or => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_or_inline(&mut code, layout)
+                );
             }
-            crate::jit::TraceStep::Neg => {
-                emit_native_step_neg_inline(&mut code, layout)?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Neg => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_neg_inline(&mut code, layout)
+                );
             }
-            crate::jit::TraceStep::Ceq => {
-                emit_native_step_ceq_inline(&mut code, layout)?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Ceq => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_ceq_inline(&mut code, layout)
+                );
             }
-            crate::jit::TraceStep::Clt => {
-                emit_native_step_binary_numeric_inline(
-                    &mut code,
-                    layout,
-                    NativeBinaryNumericOp::Clt,
-                )?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Clt => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_binary_numeric_inline(
+                        &mut code,
+                        layout,
+                        NativeBinaryNumericOp::Clt,
+                    )
+                );
             }
-            crate::jit::TraceStep::Cgt => {
-                emit_native_step_binary_numeric_inline(
-                    &mut code,
-                    layout,
-                    NativeBinaryNumericOp::Cgt,
-                )?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Cgt => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_binary_numeric_inline(
+                        &mut code,
+                        layout,
+                        NativeBinaryNumericOp::Cgt,
+                    )
+                );
             }
-            crate::jit::TraceStep::Pop => {
-                emit_native_step_pop_inline(&mut code, layout)?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Pop => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_pop_inline(&mut code, layout)
+                );
             }
-            crate::jit::TraceStep::Dup => {
-                emit_native_step_dup_inline(&mut code, layout)?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Dup => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_dup_inline(&mut code, layout)
+                );
             }
-            crate::jit::TraceStep::Ldloc(index) => {
-                emit_native_step_ldloc_inline(&mut code, layout, *index)?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Ldloc(index) => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_ldloc_inline(&mut code, layout, *index)
+                );
             }
-            crate::jit::TraceStep::Stloc(index) => {
-                emit_native_step_stloc_inline(&mut code, layout, *index)?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Stloc(index) => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_stloc_inline(&mut code, layout, *index)
+                );
             }
-            crate::jit::TraceStep::Call {
+            TraceStep::Call {
                 index,
                 argc,
                 call_ip,
             } => {
-                emit_native_step_call_inline(&mut code, *index, *argc, *call_ip)?;
-                emit_native_status_check(&mut code, &mut status_checks);
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_call_inline(&mut code, *index, *argc, *call_ip)
+                );
             }
-            crate::jit::TraceStep::GuardFalse { exit_ip } => {
-                let exit_ip = u64::try_from(*exit_ip).map_err(|_| {
-                    VmError::JitNative("guard exit ip exceeds 64-bit range".to_string())
-                })?;
-                emit_native_step_guard_false_inline(&mut code, layout, exit_ip)?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::GuardFalse { exit_ip } => {
+                let exit_ip = trace_ip_to_u64(*exit_ip, "guard exit ip")?;
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_guard_false_inline(&mut code, layout, exit_ip)
+                );
             }
-            crate::jit::TraceStep::JumpToIp { target_ip } => {
-                let target_ip = u64::try_from(*target_ip).map_err(|_| {
-                    VmError::JitNative("trace jump target ip exceeds 64-bit range".to_string())
-                })?;
-                emit_native_step_jump_to_ip_inline(&mut code, layout, target_ip)?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::JumpToIp { target_ip } => {
+                let target_ip = trace_ip_to_u64(*target_ip, "trace jump target ip")?;
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_jump_to_ip_inline(&mut code, layout, target_ip)
+                );
             }
-            crate::jit::TraceStep::JumpToRoot => {
-                let root_ip = u64::try_from(trace.root_ip).map_err(|_| {
-                    VmError::JitNative("trace root ip exceeds 64-bit range".to_string())
-                })?;
-                emit_native_step_jump_to_ip_inline(&mut code, layout, root_ip)?;
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::JumpToRoot => {
+                let root_ip = trace_ip_to_u64(trace.root_ip, "trace root ip")?;
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_jump_to_ip_inline(&mut code, layout, root_ip)
+                );
             }
-            crate::jit::TraceStep::Ret => {
-                emit_native_step_ret_inline(&mut code);
-                emit_native_status_check(&mut code, &mut status_checks);
+            TraceStep::Ret => {
+                emit_infallible_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_ret_inline(&mut code)
+                );
             }
         }
     }
