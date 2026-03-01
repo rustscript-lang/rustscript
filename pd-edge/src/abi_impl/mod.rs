@@ -25,6 +25,8 @@ pub type SharedVmAsyncOps = Arc<Mutex<VmAsyncOps>>;
 
 type AsyncOpResult = Result<Vec<Value>, VmError>;
 type PendingFuture = Pin<Box<dyn Future<Output = AsyncOpResult> + Send + 'static>>;
+type HostCallResult = Result<CallOutcome, VmError>;
+type HostCallHandler = dyn FnMut(&mut Vm, &[Value]) -> HostCallResult + Send + 'static;
 
 enum PendingOp {
     Receiver(oneshot::Receiver<AsyncOpResult>),
@@ -184,12 +186,33 @@ impl AsyncHostAdapter {
 }
 
 impl HostFunction for AsyncHostAdapter {
-    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
+    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> HostCallResult {
         match self.inner.call(vm, args)? {
             CallOutcome::Return(values) => schedule_ready_call(vm, &self.async_ops, values),
             CallOutcome::Yield => Ok(CallOutcome::Yield),
             CallOutcome::Pending(op_id) => Ok(CallOutcome::Pending(op_id)),
         }
+    }
+}
+
+struct ClosureHostFunction {
+    handler: Box<HostCallHandler>,
+}
+
+impl ClosureHostFunction {
+    fn new<F>(handler: F) -> Self
+    where
+        F: FnMut(&mut Vm, &[Value]) -> HostCallResult + Send + 'static,
+    {
+        Self {
+            handler: Box::new(handler),
+        }
+    }
+}
+
+impl HostFunction for ClosureHostFunction {
+    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> HostCallResult {
+        (self.handler)(vm, args)
     }
 }
 
@@ -202,6 +225,22 @@ fn bind_async_host(
     vm.bind_function(
         name,
         Box::new(AsyncHostAdapter::new(function, async_ops.clone())),
+    );
+}
+
+pub(super) fn bind_async_host_handler<F>(
+    vm: &mut Vm,
+    async_ops: &SharedVmAsyncOps,
+    name: impl Into<String>,
+    handler: F,
+) where
+    F: FnMut(&mut Vm, &[Value]) -> HostCallResult + Send + 'static,
+{
+    bind_async_host(
+        vm,
+        async_ops,
+        name,
+        Box::new(ClosureHostFunction::new(handler)),
     );
 }
 
