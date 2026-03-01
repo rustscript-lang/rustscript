@@ -30,10 +30,10 @@ pub(super) enum IoHandle {
 pub(super) fn execute_builtin_call(
     vm: &mut Vm,
     builtin: BuiltinFunction,
-    args: &[Value],
+    args: Vec<Value>,
 ) -> VmResult<Vec<Value>> {
     match builtin {
-        BuiltinFunction::Len => builtin_len(args),
+        BuiltinFunction::Len => builtin_len(&args),
         BuiltinFunction::Slice => builtin_slice(args),
         BuiltinFunction::Concat => builtin_concat(args),
         BuiltinFunction::ArrayNew => Ok(vec![Value::Array(Vec::new())]),
@@ -49,11 +49,11 @@ pub(super) fn execute_builtin_call(
         BuiltinFunction::IoWrite => builtin_io_write(vm, args),
         BuiltinFunction::IoFlush => builtin_io_flush(vm, args),
         BuiltinFunction::IoClose => builtin_io_close(vm, args),
-        BuiltinFunction::IoExists => builtin_io_exists(args),
-        BuiltinFunction::Count => builtin_count(args),
-        BuiltinFunction::ToString => builtin_to_string(args),
-        BuiltinFunction::TypeOf => builtin_type_of(args),
-        BuiltinFunction::Assert => builtin_assert(args),
+        BuiltinFunction::IoExists => builtin_io_exists(&args),
+        BuiltinFunction::Count => builtin_count(&args),
+        BuiltinFunction::ToString => builtin_to_string(&args),
+        BuiltinFunction::TypeOf => builtin_type_of(&args),
+        BuiltinFunction::Assert => builtin_assert(&args),
     }
 }
 
@@ -77,25 +77,26 @@ fn builtin_len(args: &[Value]) -> VmResult<Vec<Value>> {
     Ok(vec![Value::Int(len)])
 }
 
-fn builtin_slice(args: &[Value]) -> VmResult<Vec<Value>> {
-    let source = args
-        .first()
+fn builtin_slice(args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let mut iter = args.into_iter();
+    let source = iter
+        .next()
         .ok_or_else(|| VmError::HostError("missing source for slice".to_string()))?;
-    let start = args
-        .get(1)
+    let start = iter
+        .next()
         .ok_or_else(|| VmError::HostError("missing slice start".to_string()))?
         .as_int()?;
-    let len = args
-        .get(2)
+    let len = iter
+        .next()
         .ok_or_else(|| VmError::HostError("missing slice length".to_string()))?
         .as_int()?;
 
     if start < 0 || len <= 0 {
-        return Ok(vec![match source {
-            Value::String(_) => Value::String(String::new()),
-            Value::Array(_) => Value::Array(Vec::new()),
-            _ => return Err(VmError::TypeMismatch("string/array")),
-        }]);
+        return match source {
+            Value::String(_) => Ok(vec![Value::String(String::new())]),
+            Value::Array(_) => Ok(vec![Value::Array(Vec::new())]),
+            _ => Err(VmError::TypeMismatch("string/array")),
+        };
     }
 
     let start = usize::try_from(start).map_err(|_| {
@@ -110,64 +111,60 @@ fn builtin_slice(args: &[Value]) -> VmResult<Vec<Value>> {
             Ok(vec![Value::String(out)])
         }
         Value::Array(values) => {
-            let out = values
-                .iter()
-                .skip(start)
-                .take(len)
-                .cloned()
-                .collect::<Vec<_>>();
+            let out = values.into_iter().skip(start).take(len).collect::<Vec<_>>();
             Ok(vec![Value::Array(out)])
         }
         _ => Err(VmError::TypeMismatch("string/array")),
     }
 }
 
-fn builtin_concat(args: &[Value]) -> VmResult<Vec<Value>> {
-    let lhs = args
-        .first()
+fn builtin_concat(args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let mut iter = args.into_iter();
+    let lhs = iter
+        .next()
         .ok_or_else(|| VmError::HostError("missing left argument to concat".to_string()))?;
-    let rhs = args
-        .get(1)
+    let rhs = iter
+        .next()
         .ok_or_else(|| VmError::HostError("missing right argument to concat".to_string()))?;
     match (lhs, rhs) {
         (Value::String(lhs), Value::String(rhs)) => {
             let mut out = String::with_capacity(lhs.len() + rhs.len());
-            out.push_str(lhs);
-            out.push_str(rhs);
+            out.push_str(&lhs);
+            out.push_str(&rhs);
             Ok(vec![Value::String(out)])
         }
         (Value::Array(lhs), Value::Array(rhs)) => {
-            let mut out = lhs.clone();
-            out.extend(rhs.iter().cloned());
+            let mut out = lhs;
+            out.extend(rhs);
             Ok(vec![Value::Array(out)])
         }
         _ => Err(VmError::TypeMismatch("string/string or array/array")),
     }
 }
 
-fn builtin_array_push(args: &[Value]) -> VmResult<Vec<Value>> {
-    let values = match args
-        .first()
+fn builtin_array_push(args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let mut iter = args.into_iter();
+    let mut out = match iter
+        .next()
         .ok_or_else(|| VmError::HostError("missing array argument".to_string()))?
     {
         Value::Array(values) => values,
         _ => return Err(VmError::TypeMismatch("array")),
     };
-    let mut out = values.clone();
-    let value = args
-        .get(1)
-        .ok_or_else(|| VmError::HostError("missing value argument".to_string()))?
-        .clone();
+    let value = iter
+        .next()
+        .ok_or_else(|| VmError::HostError("missing value argument".to_string()))?;
     out.push(value);
     Ok(vec![Value::Array(out)])
 }
 
-fn builtin_get(args: &[Value]) -> VmResult<Vec<Value>> {
-    let container = args
-        .first()
+fn builtin_get(args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let mut iter = args.into_iter();
+    let container = iter
+        .next()
         .ok_or_else(|| VmError::HostError("missing container argument".to_string()))?;
-    let key = args
-        .get(1)
+    let key = iter
+        .next()
         .ok_or_else(|| VmError::HostError("missing key argument".to_string()))?;
 
     match container {
@@ -180,16 +177,19 @@ fn builtin_get(args: &[Value]) -> VmResult<Vec<Value>> {
             }
             let index = usize::try_from(index)
                 .map_err(|_| VmError::HostError("array index overflow".to_string()))?;
-            let value = values
-                .get(index)
-                .cloned()
-                .ok_or_else(|| VmError::HostError(format!("array index {index} out of bounds")))?;
+            let mut values = values;
+            if index >= values.len() {
+                return Err(VmError::HostError(format!(
+                    "array index {index} out of bounds"
+                )));
+            }
+            let value = values.swap_remove(index);
             Ok(vec![value])
         }
         Value::Map(entries) => {
             for (existing_key, value) in entries {
                 if existing_key == key {
-                    return Ok(vec![value.clone()]);
+                    return Ok(vec![value]);
                 }
             }
             Err(VmError::HostError("map key not found".to_string()))
@@ -242,17 +242,17 @@ fn builtin_to_string(args: &[Value]) -> VmResult<Vec<Value>> {
     Ok(vec![Value::String(text)])
 }
 
-fn builtin_set(args: &[Value]) -> VmResult<Vec<Value>> {
-    let container = args
-        .first()
+fn builtin_set(args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let mut iter = args.into_iter();
+    let container = iter
+        .next()
         .ok_or_else(|| VmError::HostError("missing container argument".to_string()))?;
-    let key = args
-        .get(1)
+    let key = iter
+        .next()
         .ok_or_else(|| VmError::HostError("missing key argument".to_string()))?;
-    let value = args
-        .get(2)
-        .ok_or_else(|| VmError::HostError("missing value argument".to_string()))?
-        .clone();
+    let value = iter
+        .next()
+        .ok_or_else(|| VmError::HostError("missing value argument".to_string()))?;
 
     match container {
         Value::Array(values) => {
@@ -264,7 +264,7 @@ fn builtin_set(args: &[Value]) -> VmResult<Vec<Value>> {
             }
             let index = usize::try_from(index)
                 .map_err(|_| VmError::HostError("array index overflow".to_string()))?;
-            let mut out = values.clone();
+            let mut out = values;
             if index < out.len() {
                 out[index] = value;
             } else if index == out.len() {
@@ -281,13 +281,13 @@ fn builtin_set(args: &[Value]) -> VmResult<Vec<Value>> {
             Ok(vec![Value::Array(out)])
         }
         Value::Map(entries) => {
-            let mut out = entries.clone();
+            let mut out = entries;
             if let Some((_, existing_value)) =
-                out.iter_mut().find(|(existing_key, _)| existing_key == key)
+                out.iter_mut().find(|(existing_key, _)| *existing_key == key)
             {
                 *existing_value = value;
             } else {
-                out.push((key.clone(), value));
+                out.push((key, value));
             }
             Ok(vec![Value::Map(out)])
         }
@@ -295,19 +295,17 @@ fn builtin_set(args: &[Value]) -> VmResult<Vec<Value>> {
     }
 }
 
-fn builtin_keys(args: &[Value]) -> VmResult<Vec<Value>> {
+fn builtin_keys(args: Vec<Value>) -> VmResult<Vec<Value>> {
     let container = args
-        .first()
+        .into_iter()
+        .next()
         .ok_or_else(|| VmError::HostError("missing container argument".to_string()))?;
 
     let keys = match container {
         Value::Array(values) => (0..values.len())
             .map(|index| Value::Int(index as i64))
             .collect::<Vec<_>>(),
-        Value::Map(entries) => entries
-            .iter()
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>(),
+        Value::Map(entries) => entries.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
         _ => return Err(VmError::TypeMismatch("array/map")),
     };
     Ok(vec![Value::Array(keys)])
@@ -325,9 +323,9 @@ fn builtin_count(args: &[Value]) -> VmResult<Vec<Value>> {
     Ok(vec![Value::Int(count)])
 }
 
-fn builtin_io_open(vm: &mut Vm, args: &[Value]) -> VmResult<Vec<Value>> {
-    let path = arg_string(args, 0, "io_open path")?;
-    let mode = arg_string(args, 1, "io_open mode")?;
+fn builtin_io_open(vm: &mut Vm, args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let path = arg_string(&args, 0, "io_open path")?;
+    let mode = arg_string(&args, 1, "io_open mode")?;
 
     let mut options = OpenOptions::new();
     match mode {
@@ -363,9 +361,9 @@ fn builtin_io_open(vm: &mut Vm, args: &[Value]) -> VmResult<Vec<Value>> {
     Ok(vec![Value::Int(id)])
 }
 
-fn builtin_io_popen(vm: &mut Vm, args: &[Value]) -> VmResult<Vec<Value>> {
-    let command = arg_string(args, 0, "io_popen command")?;
-    let mode = arg_string(args, 1, "io_popen mode")?;
+fn builtin_io_popen(vm: &mut Vm, args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let command = arg_string(&args, 0, "io_popen command")?;
+    let mode = arg_string(&args, 1, "io_popen mode")?;
     if mode != "r" && mode != "w" {
         return Err(VmError::HostError(format!(
             "unsupported io_popen mode '{mode}', expected r or w"
@@ -396,8 +394,8 @@ fn builtin_io_popen(vm: &mut Vm, args: &[Value]) -> VmResult<Vec<Value>> {
     Ok(vec![Value::Int(id)])
 }
 
-fn builtin_io_read_all(vm: &mut Vm, args: &[Value]) -> VmResult<Vec<Value>> {
-    let handle_id = arg_handle_id(args, 0, "io_read_all handle")?;
+fn builtin_io_read_all(vm: &mut Vm, args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let handle_id = arg_handle_id(&args, 0, "io_read_all handle")?;
     let mut out = String::new();
     let handle = io_get_handle_mut(vm, handle_id)?;
     match handle {
@@ -422,8 +420,8 @@ fn builtin_io_read_all(vm: &mut Vm, args: &[Value]) -> VmResult<Vec<Value>> {
     Ok(vec![Value::String(out)])
 }
 
-fn builtin_io_read_line(vm: &mut Vm, args: &[Value]) -> VmResult<Vec<Value>> {
-    let handle_id = arg_handle_id(args, 0, "io_read_line handle")?;
+fn builtin_io_read_line(vm: &mut Vm, args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let handle_id = arg_handle_id(&args, 0, "io_read_line handle")?;
     let handle = io_get_handle_mut(vm, handle_id)?;
     let line = match handle {
         IoHandle::File(file) => read_line_from_reader(file)?,
@@ -442,9 +440,9 @@ fn builtin_io_read_line(vm: &mut Vm, args: &[Value]) -> VmResult<Vec<Value>> {
     Ok(vec![Value::String(line)])
 }
 
-fn builtin_io_write(vm: &mut Vm, args: &[Value]) -> VmResult<Vec<Value>> {
-    let handle_id = arg_handle_id(args, 0, "io_write handle")?;
-    let data = arg_string(args, 1, "io_write data")?;
+fn builtin_io_write(vm: &mut Vm, args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let handle_id = arg_handle_id(&args, 0, "io_write handle")?;
+    let data = arg_string(&args, 1, "io_write data")?;
     let bytes = data.as_bytes();
 
     let handle = io_get_handle_mut(vm, handle_id)?;
@@ -470,8 +468,8 @@ fn builtin_io_write(vm: &mut Vm, args: &[Value]) -> VmResult<Vec<Value>> {
     Ok(vec![Value::Int(written as i64)])
 }
 
-fn builtin_io_flush(vm: &mut Vm, args: &[Value]) -> VmResult<Vec<Value>> {
-    let handle_id = arg_handle_id(args, 0, "io_flush handle")?;
+fn builtin_io_flush(vm: &mut Vm, args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let handle_id = arg_handle_id(&args, 0, "io_flush handle")?;
     let handle = io_get_handle_mut(vm, handle_id)?;
     match handle {
         IoHandle::File(file) => file
@@ -490,8 +488,8 @@ fn builtin_io_flush(vm: &mut Vm, args: &[Value]) -> VmResult<Vec<Value>> {
     Ok(vec![Value::Bool(true)])
 }
 
-fn builtin_io_close(vm: &mut Vm, args: &[Value]) -> VmResult<Vec<Value>> {
-    let handle_id = arg_handle_id(args, 0, "io_close handle")?;
+fn builtin_io_close(vm: &mut Vm, args: Vec<Value>) -> VmResult<Vec<Value>> {
+    let handle_id = arg_handle_id(&args, 0, "io_close handle")?;
     let handle = vm
         .io_state
         .handles

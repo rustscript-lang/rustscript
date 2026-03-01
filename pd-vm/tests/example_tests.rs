@@ -211,3 +211,17 @@ text?.[5]
         ]
     );
 }
+
+#[test]
+fn nullable_map_lookup_does_not_mutate_source_map() {
+    let source = r#"
+let m = { present: 1 };
+m?.missing;
+m.length;
+m.present;
+"#;
+    assert_eq!(
+        run_compiled_source(SourceFlavor::RustScript, source),
+        vec![Value::Null, Value::Int(1), Value::Int(1)]
+    );
+}

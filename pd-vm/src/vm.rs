@@ -1322,7 +1322,7 @@ impl Vm {
                     got: argc_u8,
                 });
             }
-            let values = builtin_runtime::execute_builtin_call(self, builtin, &args)?;
+            let values = builtin_runtime::execute_builtin_call(self, builtin, args)?;
             for value in values {
                 self.stack.push(value);
             }
