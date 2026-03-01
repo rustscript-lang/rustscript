@@ -5,11 +5,7 @@ use super::super::{
     expect_string,
 };
 
-pub(super) fn register_18(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-) {
+pub(super) fn register_18(vm: &mut Vm, context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) {
     bind_async_host(
         vm,
         &async_ops,

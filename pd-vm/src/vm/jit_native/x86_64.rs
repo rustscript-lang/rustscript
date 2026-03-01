@@ -1,7 +1,7 @@
 use super::super::{Program, Value, Vm, VmError, VmResult};
 use super::{
-    NativeBackend, STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_TRACE_EXIT,
-    STATUS_WAITING, STATUS_YIELDED,
+    NativeBackend, STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_TRACE_EXIT, STATUS_WAITING,
+    STATUS_YIELDED,
 };
 use crate::builtins::BuiltinFunction;
 use std::sync::OnceLock;

@@ -840,9 +840,11 @@ version = "0.1.0"
 name = "pd-vm"
 version = "0.1.0"
 dependencies = [
+ "futures-channel",
  "libc",
  "regex",
  "rustyline",
+ "tokio",
  "windows-sys 0.59.0",
 ]
 

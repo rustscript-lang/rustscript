@@ -13,11 +13,7 @@ pub(super) fn register_7_to_11(
     request::register_7_to_11(vm, context, async_ops);
 }
 
-pub(super) fn register_17(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-) {
+pub(super) fn register_17(vm: &mut Vm, context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) {
     request::register_17(vm, context, async_ops);
 }
 

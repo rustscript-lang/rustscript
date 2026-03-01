@@ -35,9 +35,8 @@ use crate::{
         start_debug_session, stop_debug_session,
     },
     host_abi::{
-        HttpRequestContext, ProxyVmContext, RateLimiterStore, SharedRateLimiter,
-        VmAsyncOpBridge, new_shared_vm_async_ops, register_host_module,
-        snapshot_execution_outcome,
+        HttpRequestContext, ProxyVmContext, RateLimiterStore, SharedRateLimiter, VmAsyncOpBridge,
+        new_shared_vm_async_ops, register_host_module, snapshot_execution_outcome,
     },
     logging::{category_access, category_debug, category_program, method_label, status_label},
 };
@@ -1108,7 +1107,8 @@ async fn execute_vm_for_request(
     let request_headers = request.headers.clone();
     let request_path = request.path.clone();
     let request_id = request.request_id.clone();
-    let debug_attached = request_will_attach_debugger(&debug_session, &request_headers, &request_path);
+    let debug_attached =
+        request_will_attach_debugger(&debug_session, &request_headers, &request_path);
     let async_ops = new_shared_vm_async_ops();
 
     if debug_attached {
@@ -1177,7 +1177,9 @@ async fn execute_vm_for_request(
                 tokio::task::yield_now().await;
             }
             VmStatus::Waiting(_op_id) => {
-                vm.await_waiting_host_op().await.map_err(VmExecutionError::Vm)?;
+                vm.await_waiting_host_op()
+                    .await
+                    .map_err(VmExecutionError::Vm)?;
             }
         }
     }

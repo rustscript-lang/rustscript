@@ -16,7 +16,9 @@ pub fn edge_compile_options() -> CompileSourceFileOptions {
     options
 }
 
-pub fn compile_edge_source_file(path: impl AsRef<Path>) -> Result<CompiledProgram, SourcePathError> {
+pub fn compile_edge_source_file(
+    path: impl AsRef<Path>,
+) -> Result<CompiledProgram, SourcePathError> {
     compile_edge_source_file_with_options(path, CompileSourceFileOptions::new())
 }
 

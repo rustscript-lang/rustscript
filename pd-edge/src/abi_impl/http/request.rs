@@ -16,7 +16,10 @@ pub(super) fn register_0_to_6(
         vm,
         &async_ops,
         "http::request::get_id",
-        Box::new(GetRequestFieldFunction::new(context.clone(), RequestField::Id)),
+        Box::new(GetRequestFieldFunction::new(
+            context.clone(),
+            RequestField::Id,
+        )),
     );
     bind_async_host(
         vm,
@@ -31,7 +34,10 @@ pub(super) fn register_0_to_6(
         vm,
         &async_ops,
         "http::request::get_path",
-        Box::new(GetRequestFieldFunction::new(context.clone(), RequestField::Path)),
+        Box::new(GetRequestFieldFunction::new(
+            context.clone(),
+            RequestField::Path,
+        )),
     );
     bind_async_host(
         vm,
@@ -55,7 +61,10 @@ pub(super) fn register_0_to_6(
         vm,
         &async_ops,
         "http::request::get_host",
-        Box::new(GetRequestFieldFunction::new(context.clone(), RequestField::Host)),
+        Box::new(GetRequestFieldFunction::new(
+            context.clone(),
+            RequestField::Host,
+        )),
     );
     bind_async_host(
         vm,
@@ -65,16 +74,15 @@ pub(super) fn register_0_to_6(
     );
 }
 
-pub(super) fn register_12(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-) {
+pub(super) fn register_12(vm: &mut Vm, context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) {
     bind_async_host(
         vm,
         &async_ops,
         "http::request::get_client_ip",
-        Box::new(GetRequestFieldFunction::new(context, RequestField::ClientIp)),
+        Box::new(GetRequestFieldFunction::new(
+            context,
+            RequestField::ClientIp,
+        )),
     );
 }
 
@@ -144,7 +152,12 @@ pub(super) fn register_31_to_32(
             RequestField::HttpVersion,
         )),
     );
-    bind_async_host(vm, &async_ops, "http::request::get_port", Box::new(GetRequestPortFunction::new(context)));
+    bind_async_host(
+        vm,
+        &async_ops,
+        "http::request::get_port",
+        Box::new(GetRequestPortFunction::new(context)),
+    );
 }
 
 pub(super) fn register_streaming_extensions(

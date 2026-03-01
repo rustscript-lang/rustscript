@@ -117,7 +117,10 @@ impl HostFunction for GetUpstreamResponseBodyFunction {
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         expect_arg_count(args, 0)?;
         let context = self.context.lock().expect("vm context lock poisoned");
-        let value = context.upstream_response_content.clone().unwrap_or_default();
+        let value = context
+            .upstream_response_content
+            .clone()
+            .unwrap_or_default();
         Ok(CallOutcome::Return(vec![Value::String(value)]))
     }
 }
