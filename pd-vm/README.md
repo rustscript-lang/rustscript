@@ -197,16 +197,13 @@ Host calls and resuming:
 The end-to-end stack is split into layers. Not every entrypoint uses every layer (for example,
 `compile_source()` skips module loading/linking), but this is the full model:
 
-1. Source and flavor selection
-2. Module/source loading (`compile_source_file()` path)
-3. Unit linking (`linker::merge_units`)
-4. Frontend lowering (`rustscript`, `javascript`, `lua`, `scheme`)
-5. Frontend-independent IR (`FrontendIr` / `LinkedIr`)
-6. Bytecode backend (`Compiler` + `Assembler` -> `Program`)
-7. VM interpreter execution
-8. Trace-JIT IR recording (`JitTrace` + `TraceStep`)
-9. Native machine code emission and execution
-10. Optional VMBC wire serialization (`vmbc`)
+1. Module/source loading (`compile_source_file()` path)
+1. Unit linking (`linker::merge_units`)
+1. Frontend lowering (`rustscript`, `javascript`, `lua`, `scheme`)
+1. Frontend-independent IR
+1. Bytecode backend (`Compiler` + `Assembler` -> `Program`) executed by VM
+1. Trace-JIT IR recording (`JitTrace` + `TraceStep`) using TraceStep IR
+1. Native machine code emission and execution
 
 
 #### Compiler APIs

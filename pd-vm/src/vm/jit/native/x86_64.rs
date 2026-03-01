@@ -1,10 +1,10 @@
-use super::super::{Program, Value, Vm, VmError, VmResult};
 use super::{
     NativeBackend, STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_TRACE_EXIT, STATUS_WAITING,
     STATUS_YIELDED,
 };
 use crate::builtins::BuiltinFunction;
-use crate::jit::TraceStep;
+use crate::vm::jit::TraceStep;
+use crate::vm::{HostCallExecOutcome, Program, Value, Vm, VmError, VmResult};
 use std::sync::OnceLock;
 
 pub(super) struct X86_64Backend;
@@ -12,7 +12,7 @@ pub(super) struct X86_64Backend;
 impl NativeBackend for X86_64Backend {
     type ExecutableMemory = BackendExecutableMemory;
 
-    fn emit_trace_bytes(trace: &crate::jit::JitTrace) -> VmResult<Vec<u8>> {
+    fn emit_trace_bytes(trace: &crate::vm::jit::JitTrace) -> VmResult<Vec<u8>> {
         emit_native_trace_bytes(trace)
     }
 
@@ -115,7 +115,7 @@ fn trace_ip_to_u32(ip: usize, context: &str) -> VmResult<u32> {
         .map_err(|_| VmError::JitNative(format!("{context} {ip} exceeds u32 immediate range")))
 }
 
-fn emit_native_trace_bytes(trace: &crate::jit::JitTrace) -> VmResult<Vec<u8>> {
+fn emit_native_trace_bytes(trace: &crate::vm::jit::JitTrace) -> VmResult<Vec<u8>> {
     let mut code = Vec::with_capacity(512);
     let mut jump_patches: Vec<usize> = Vec::new();
     let layout = detect_native_stack_layout()?;
@@ -2923,9 +2923,9 @@ extern "C" fn jit_native_call_bridge(vm_ptr: *mut Vm, index: u16, argc: u8, call
 
     let vm = unsafe { &mut *vm_ptr };
     match vm.execute_host_call(index, argc, call_ip) {
-        Ok(super::super::HostCallExecOutcome::Returned) => STATUS_CONTINUE,
-        Ok(super::super::HostCallExecOutcome::Yielded) => STATUS_YIELDED,
-        Ok(super::super::HostCallExecOutcome::Pending(_)) => STATUS_WAITING,
+        Ok(HostCallExecOutcome::Returned) => STATUS_CONTINUE,
+        Ok(HostCallExecOutcome::Yielded) => STATUS_YIELDED,
+        Ok(HostCallExecOutcome::Pending(_)) => STATUS_WAITING,
         Err(err) => {
             set_bridge_error(err);
             STATUS_ERROR
@@ -3127,8 +3127,8 @@ mod tests {
     use super::super::{STATUS_CONTINUE, STATUS_ERROR, STATUS_YIELDED};
     use super::*;
     use crate::builtins::BuiltinFunction;
-    use crate::jit::{JitTrace, JitTraceTerminal, TraceStep};
     use crate::vm::Program;
+    use crate::vm::jit::{JitTrace, JitTraceTerminal, TraceStep};
     use crate::vm::{CallOutcome, HostFunction};
 
     type NativeEntry = unsafe extern "C" fn(*mut Vm) -> i32;

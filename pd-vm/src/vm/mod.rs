@@ -4,25 +4,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use crate::builtins::BuiltinFunction;
-#[cfg(any(
-    all(
-        target_arch = "x86_64",
-        any(target_os = "windows", all(unix, not(target_os = "macos")))
-    ),
-    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-))]
-use std::sync::{Mutex, OnceLock};
 
-mod builtin_runtime;
+mod builtins_impl;
 pub mod diagnostics;
-#[cfg(any(
-    all(
-        target_arch = "x86_64",
-        any(target_os = "windows", all(unix, not(target_os = "macos")))
-    ),
-    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-))]
-mod jit_native;
+pub(crate) mod jit;
 
 pub use crate::bytecode::{HostImport, OpCode, Program, Value};
 
@@ -332,13 +317,13 @@ pub struct Vm {
     resolved_calls: Vec<u16>,
     resolved_calls_dirty: bool,
     call_depth: usize,
-    jit: crate::jit::TraceJitEngine,
-    native_traces: HashMap<usize, NativeTrace>,
+    jit: jit::TraceJitEngine,
+    native_traces: HashMap<usize, jit::NativeTrace>,
     native_trace_exec_count: u64,
     async_bridge: Option<Box<dyn HostAsyncBridge>>,
     waiting_host_op: Option<WaitingHostOp>,
     next_host_op_id: HostOpId,
-    io_state: builtin_runtime::IoState,
+    io_state: builtins_impl::IoState,
 }
 
 enum ExecOutcome {
@@ -374,118 +359,6 @@ impl Wake for NoopWake {
 
 fn noop_waker() -> Waker {
     Waker::from(Arc::new(NoopWake))
-}
-
-#[cfg(any(
-    all(
-        target_arch = "x86_64",
-        any(target_os = "windows", all(unix, not(target_os = "macos")))
-    ),
-    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-))]
-type NativeTraceEntry = unsafe extern "C" fn(*mut Vm) -> i32;
-
-#[cfg(not(any(
-    all(
-        target_arch = "x86_64",
-        any(target_os = "windows", all(unix, not(target_os = "macos")))
-    ),
-    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-)))]
-type NativeTraceEntry = fn(*mut Vm) -> i32;
-
-struct NativeTrace {
-    #[cfg(any(
-        all(
-            target_arch = "x86_64",
-            any(target_os = "windows", all(unix, not(target_os = "macos")))
-        ),
-        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-    ))]
-    _memory: Arc<jit_native::ExecutableMemory>,
-    entry: NativeTraceEntry,
-    code: Arc<[u8]>,
-    root_ip: usize,
-    terminal: crate::jit::JitTraceTerminal,
-    has_yielding_call: bool,
-}
-
-#[cfg(any(
-    all(
-        target_arch = "x86_64",
-        any(target_os = "windows", all(unix, not(target_os = "macos")))
-    ),
-    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-))]
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct NativeTraceCacheKey {
-    root_ip: usize,
-    terminal: crate::jit::JitTraceTerminal,
-    steps: Vec<crate::jit::TraceStep>,
-}
-
-#[cfg(any(
-    all(
-        target_arch = "x86_64",
-        any(target_os = "windows", all(unix, not(target_os = "macos")))
-    ),
-    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-))]
-struct NativeTraceCacheEntry {
-    memory: Arc<jit_native::ExecutableMemory>,
-    code: Arc<[u8]>,
-}
-
-#[cfg(any(
-    all(
-        target_arch = "x86_64",
-        any(target_os = "windows", all(unix, not(target_os = "macos")))
-    ),
-    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-))]
-struct NativeTraceCache {
-    active_program_key: Option<u64>,
-    entries: HashMap<NativeTraceCacheKey, NativeTraceCacheEntry>,
-}
-
-#[cfg(any(
-    all(
-        target_arch = "x86_64",
-        any(target_os = "windows", all(unix, not(target_os = "macos")))
-    ),
-    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-))]
-static NATIVE_TRACE_CACHE: OnceLock<Mutex<NativeTraceCache>> = OnceLock::new();
-
-#[cfg(any(
-    all(
-        target_arch = "x86_64",
-        any(target_os = "windows", all(unix, not(target_os = "macos")))
-    ),
-    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-))]
-fn native_trace_cache() -> &'static Mutex<NativeTraceCache> {
-    NATIVE_TRACE_CACHE.get_or_init(|| {
-        Mutex::new(NativeTraceCache {
-            active_program_key: None,
-            entries: HashMap::new(),
-        })
-    })
-}
-
-#[cfg(any(
-    all(
-        target_arch = "x86_64",
-        any(target_os = "windows", all(unix, not(target_os = "macos")))
-    ),
-    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-))]
-fn native_trace_cache_key(trace: &crate::jit::JitTrace) -> NativeTraceCacheKey {
-    NativeTraceCacheKey {
-        root_ip: trace.root_ip,
-        terminal: trace.terminal.clone(),
-        steps: trace.steps.clone(),
-    }
 }
 
 fn compute_program_cache_key(program: &Program) -> u64 {
@@ -552,13 +425,13 @@ impl Vm {
             resolved_calls: Vec::new(),
             resolved_calls_dirty: true,
             call_depth: 0,
-            jit: crate::jit::TraceJitEngine::default(),
+            jit: jit::TraceJitEngine::default(),
             native_traces: HashMap::new(),
             native_trace_exec_count: 0,
             async_bridge: None,
             waiting_host_op: None,
             next_host_op_id: 1,
-            io_state: builtin_runtime::IoState::default(),
+            io_state: builtins_impl::IoState::default(),
         }
     }
 
@@ -576,13 +449,13 @@ impl Vm {
             resolved_calls: Vec::new(),
             resolved_calls_dirty: true,
             call_depth: 0,
-            jit: crate::jit::TraceJitEngine::default(),
+            jit: jit::TraceJitEngine::default(),
             native_traces: HashMap::new(),
             native_trace_exec_count: 0,
             async_bridge: None,
             waiting_host_op: None,
             next_host_op_id: 1,
-            io_state: builtin_runtime::IoState::default(),
+            io_state: builtins_impl::IoState::default(),
         }
     }
 
@@ -721,7 +594,7 @@ impl Vm {
                 unsafe { (&mut *bridge_ptr).poll_op(waiting.op_id, cx) }
             }
             WaitingHostOpSource::BuiltinIo => {
-                builtin_runtime::poll_builtin_io_op(self, waiting.op_id, cx)
+                builtins_impl::poll_builtin_io_op(self, waiting.op_id, cx)
             }
         };
 
@@ -762,50 +635,6 @@ impl Vm {
         debugger: &mut crate::debugger::Debugger,
     ) -> VmResult<VmStatus> {
         self.run_internal(Some(debugger), false)
-    }
-
-    pub fn set_jit_config(&mut self, config: crate::jit::JitConfig) {
-        self.jit.set_config(config);
-    }
-
-    pub fn jit_config(&self) -> &crate::jit::JitConfig {
-        self.jit.config()
-    }
-
-    pub fn jit_snapshot(&self) -> crate::jit::JitSnapshot {
-        self.jit.snapshot()
-    }
-
-    pub fn dump_jit_info(&self) -> String {
-        let mut out = self.jit.dump_text(self.program.debug.as_ref());
-        out.push_str(&format!(
-            "  native trace executions: {}\n",
-            self.native_trace_exec_count
-        ));
-        if self.native_traces.is_empty() {
-            out.push_str("  native traces: 0\n");
-            return out;
-        }
-
-        out.push_str(&format!("  native traces: {}\n", self.native_traces.len()));
-        let mut ids: Vec<usize> = self.native_traces.keys().copied().collect();
-        ids.sort_unstable();
-        for id in ids {
-            if let Some(native) = self.native_traces.get(&id) {
-                out.push_str(&format!(
-                    "  native trace#{} entry=0x{:X} code_bytes={}\n",
-                    id,
-                    native.entry as usize,
-                    native.code.len()
-                ));
-                out.push_str("    code:");
-                for byte in native.code.iter() {
-                    out.push_str(&format!(" {:02X}", byte));
-                }
-                out.push('\n');
-            }
-        }
-        out
     }
 
     fn notify_debugger_status(
@@ -1032,333 +861,6 @@ impl Vm {
         Ok(ExecOutcome::Continue)
     }
 
-    #[cfg_attr(
-        any(
-            all(
-                target_arch = "x86_64",
-                any(target_os = "windows", all(unix, not(target_os = "macos")))
-            ),
-            all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-        ),
-        allow(dead_code)
-    )]
-    fn execute_jit_trace(&mut self, trace_id: usize) -> VmResult<ExecOutcome> {
-        let Some(trace) = self.jit.trace_clone(trace_id) else {
-            return Ok(ExecOutcome::Continue);
-        };
-        for step in &trace.steps {
-            match step {
-                crate::jit::TraceStep::Nop => {}
-                crate::jit::TraceStep::Ldc(index) => {
-                    let value = self
-                        .program
-                        .constants
-                        .get(*index as usize)
-                        .cloned()
-                        .ok_or(VmError::InvalidConstant(*index))?;
-                    self.stack.push(value);
-                }
-                crate::jit::TraceStep::Add => {
-                    self.binary_add_op()?;
-                }
-                crate::jit::TraceStep::Sub => {
-                    self.binary_numeric_op(
-                        |lhs, rhs| Ok(lhs.wrapping_sub(rhs)),
-                        |lhs, rhs| Ok(lhs - rhs),
-                    )?;
-                }
-                crate::jit::TraceStep::Mul => {
-                    self.binary_numeric_op(
-                        |lhs, rhs| Ok(lhs.wrapping_mul(rhs)),
-                        |lhs, rhs| Ok(lhs * rhs),
-                    )?;
-                }
-                crate::jit::TraceStep::Div => {
-                    self.binary_numeric_op(
-                        |lhs, rhs| {
-                            if rhs == 0 {
-                                return Err(VmError::DivisionByZero);
-                            }
-                            Ok(lhs.wrapping_div(rhs))
-                        },
-                        |lhs, rhs| {
-                            if rhs == 0.0 {
-                                return Err(VmError::DivisionByZero);
-                            }
-                            Ok(lhs / rhs)
-                        },
-                    )?;
-                }
-                crate::jit::TraceStep::Mod => {
-                    self.binary_numeric_op(
-                        |lhs, rhs| {
-                            if rhs == 0 {
-                                return Err(VmError::DivisionByZero);
-                            }
-                            Ok(lhs.wrapping_rem(rhs))
-                        },
-                        |lhs, rhs| {
-                            if rhs == 0.0 {
-                                return Err(VmError::DivisionByZero);
-                            }
-                            Ok(lhs % rhs)
-                        },
-                    )?;
-                }
-                crate::jit::TraceStep::Shl => {
-                    let rhs = self.pop_shift_amount()?;
-                    let lhs = self.pop_int()?;
-                    self.stack.push(Value::Int(lhs.wrapping_shl(rhs)));
-                }
-                crate::jit::TraceStep::Shr => {
-                    let rhs = self.pop_shift_amount()?;
-                    let lhs = self.pop_int()?;
-                    self.stack.push(Value::Int(lhs.wrapping_shr(rhs)));
-                }
-                crate::jit::TraceStep::And => {
-                    let rhs = self.pop_bool()?;
-                    let lhs = self.pop_bool()?;
-                    self.stack.push(Value::Bool(lhs && rhs));
-                }
-                crate::jit::TraceStep::Or => {
-                    let rhs = self.pop_bool()?;
-                    let lhs = self.pop_bool()?;
-                    self.stack.push(Value::Bool(lhs || rhs));
-                }
-                crate::jit::TraceStep::Neg => {
-                    let value = self.pop_numeric()?;
-                    match value {
-                        NumericValue::Int(value) => {
-                            self.stack.push(Value::Int(value.wrapping_neg()))
-                        }
-                        NumericValue::Float(value) => self.stack.push(Value::Float(-value)),
-                    }
-                }
-                crate::jit::TraceStep::Ceq => {
-                    let rhs = self.pop_value()?;
-                    let lhs = self.pop_value()?;
-                    self.stack.push(Value::Bool(lhs == rhs));
-                }
-                crate::jit::TraceStep::Clt => {
-                    self.compare_numeric_op(|lhs, rhs| lhs < rhs, |lhs, rhs| lhs < rhs)?;
-                }
-                crate::jit::TraceStep::Cgt => {
-                    self.compare_numeric_op(|lhs, rhs| lhs > rhs, |lhs, rhs| lhs > rhs)?;
-                }
-                crate::jit::TraceStep::Pop => {
-                    self.pop_value()?;
-                }
-                crate::jit::TraceStep::Dup => {
-                    let value = self.peek_value()?.clone();
-                    self.stack.push(value);
-                }
-                crate::jit::TraceStep::Ldloc(index) => {
-                    let value = self
-                        .locals
-                        .get(*index as usize)
-                        .cloned()
-                        .ok_or(VmError::InvalidLocal(*index))?;
-                    self.stack.push(value);
-                }
-                crate::jit::TraceStep::Stloc(index) => {
-                    let value = self.pop_value()?;
-                    let slot = self
-                        .locals
-                        .get_mut(*index as usize)
-                        .ok_or(VmError::InvalidLocal(*index))?;
-                    *slot = value;
-                }
-                crate::jit::TraceStep::Call {
-                    index,
-                    argc,
-                    call_ip,
-                } => match self.execute_host_call(*index, *argc, *call_ip)? {
-                    HostCallExecOutcome::Returned => {}
-                    HostCallExecOutcome::Yielded => return Ok(ExecOutcome::Yielded),
-                    HostCallExecOutcome::Pending(op_id) => {
-                        return Ok(ExecOutcome::Waiting(op_id));
-                    }
-                },
-                crate::jit::TraceStep::GuardFalse { exit_ip } => {
-                    let condition = self.pop_bool()?;
-                    if !condition {
-                        self.jump_to(*exit_ip)?;
-                        self.jit.mark_trace_executed(trace_id);
-                        return Ok(ExecOutcome::Continue);
-                    }
-                }
-                crate::jit::TraceStep::JumpToIp { target_ip } => {
-                    self.jump_to(*target_ip)?;
-                    self.jit.mark_trace_executed(trace_id);
-                    return Ok(ExecOutcome::Continue);
-                }
-                crate::jit::TraceStep::JumpToRoot => {
-                    self.jump_to(trace.root_ip)?;
-                    self.jit.mark_trace_executed(trace_id);
-                    return Ok(ExecOutcome::Continue);
-                }
-                crate::jit::TraceStep::Ret => {
-                    self.jit.mark_trace_executed(trace_id);
-                    return Ok(ExecOutcome::Halted);
-                }
-            }
-        }
-        self.jit.mark_trace_executed(trace_id);
-        Ok(ExecOutcome::Continue)
-    }
-
-    fn execute_jit_entry(&mut self, trace_id: usize) -> VmResult<ExecOutcome> {
-        #[cfg(any(
-            all(
-                target_arch = "x86_64",
-                any(target_os = "windows", all(unix, not(target_os = "macos")))
-            ),
-            all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-        ))]
-        {
-            if !self.builtin_overrides.is_empty() {
-                return self.execute_jit_trace(trace_id);
-            }
-            self.execute_jit_native(trace_id)
-        }
-        #[cfg(not(any(
-            all(
-                target_arch = "x86_64",
-                any(target_os = "windows", all(unix, not(target_os = "macos")))
-            ),
-            all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-        )))]
-        {
-            self.execute_jit_trace(trace_id)
-        }
-    }
-
-    #[cfg(any(
-        all(
-            target_arch = "x86_64",
-            any(target_os = "windows", all(unix, not(target_os = "macos")))
-        ),
-        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-    ))]
-    fn execute_jit_native(&mut self, trace_id: usize) -> VmResult<ExecOutcome> {
-        self.ensure_native_trace(trace_id)?;
-        let (entry, root_ip, terminal, has_yielding_call) = {
-            let native = self.native_traces.get(&trace_id).ok_or_else(|| {
-                VmError::JitNative(format!("native trace entry for id {} missing", trace_id))
-            })?;
-            (
-                native.entry,
-                native.root_ip,
-                native.terminal.clone(),
-                native.has_yielding_call,
-            )
-        };
-
-        loop {
-            jit_native::clear_bridge_error();
-            let status = unsafe { entry(self as *mut Vm) };
-            self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
-            self.jit.mark_trace_executed(trace_id);
-
-            match status {
-                jit_native::STATUS_CONTINUE => return Ok(ExecOutcome::Continue),
-                jit_native::STATUS_TRACE_EXIT => {
-                    // Fast path: if this trace looped back to its own root and cannot yield via host
-                    // calls, keep executing in native mode without bouncing through the interpreter.
-                    if !has_yielding_call
-                        && terminal == crate::jit::JitTraceTerminal::LoopBack
-                        && self.ip == root_ip
-                    {
-                        continue;
-                    }
-                    return Ok(ExecOutcome::Continue);
-                }
-                jit_native::STATUS_HALTED => return Ok(ExecOutcome::Halted),
-                jit_native::STATUS_YIELDED => return Ok(ExecOutcome::Yielded),
-                jit_native::STATUS_WAITING => {
-                    let op_id = self.waiting_host_op.map(|op| op.op_id).ok_or_else(|| {
-                        VmError::JitNative(
-                            "native call bridge reported waiting without a pending op".to_string(),
-                        )
-                    })?;
-                    return Ok(ExecOutcome::Waiting(op_id));
-                }
-                jit_native::STATUS_ERROR => {
-                    let err = jit_native::take_bridge_error().unwrap_or_else(|| {
-                        VmError::JitNative(
-                            "jit bridge reported failure without VmError".to_string(),
-                        )
-                    });
-                    return Err(err);
-                }
-                other => {
-                    return Err(VmError::JitNative(format!(
-                        "unexpected native trace return status {}",
-                        other
-                    )));
-                }
-            }
-        }
-    }
-
-    #[cfg(any(
-        all(
-            target_arch = "x86_64",
-            any(target_os = "windows", all(unix, not(target_os = "macos")))
-        ),
-        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-    ))]
-    fn ensure_native_trace(&mut self, trace_id: usize) -> VmResult<()> {
-        if self.native_traces.contains_key(&trace_id) {
-            return Ok(());
-        }
-
-        let trace = self.jit.trace_clone(trace_id).ok_or_else(|| {
-            VmError::JitNative(format!("trace {} missing for native compile", trace_id))
-        })?;
-        let key = native_trace_cache_key(&trace);
-        let cache = native_trace_cache();
-        let (memory, code) = {
-            let mut guard = cache
-                .lock()
-                .map_err(|_| VmError::JitNative("native trace cache lock poisoned".to_string()))?;
-            if guard.active_program_key != Some(self.program_cache_key) {
-                guard.entries.clear();
-                guard.active_program_key = Some(self.program_cache_key);
-            }
-
-            if let Some(hit) = guard.entries.get(&key) {
-                (Arc::clone(&hit.memory), Arc::clone(&hit.code))
-            } else {
-                let code = Arc::<[u8]>::from(
-                    jit_native::emit_native_trace_bytes(&trace)?.into_boxed_slice(),
-                );
-                let memory = Arc::new(jit_native::ExecutableMemory::from_code(code.as_ref())?);
-                guard.entries.insert(
-                    key,
-                    NativeTraceCacheEntry {
-                        memory: Arc::clone(&memory),
-                        code: Arc::clone(&code),
-                    },
-                );
-                (memory, code)
-            }
-        };
-        let entry = unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(memory.ptr) };
-        self.native_traces.insert(
-            trace_id,
-            NativeTrace {
-                _memory: memory,
-                entry,
-                code,
-                root_ip: trace.root_ip,
-                terminal: trace.terminal,
-                has_yielding_call: trace.has_yielding_call,
-            },
-        );
-        Ok(())
-    }
-
     pub fn resume(&mut self) -> VmResult<VmStatus> {
         self.run()
     }
@@ -1385,14 +887,6 @@ impl Vm {
 
     pub fn call_depth(&self) -> usize {
         self.call_depth
-    }
-
-    pub fn jit_native_trace_count(&self) -> usize {
-        self.native_traces.len()
-    }
-
-    pub fn jit_native_exec_count(&self) -> u64 {
-        self.native_trace_exec_count
     }
 
     fn pop_value(&mut self) -> VmResult<Value> {
@@ -1529,14 +1023,14 @@ impl Vm {
             if self.builtin_overrides.contains_key(&index) {
                 return self.execute_builtin_override_call(index, args, call_ip);
             }
-            match builtin_runtime::execute_builtin_call(self, builtin, args)? {
-                builtin_runtime::BuiltinCallOutcome::Return(values) => {
+            match builtins_impl::execute_builtin_call(self, builtin, args)? {
+                builtins_impl::BuiltinCallOutcome::Return(values) => {
                     for value in values {
                         self.stack.push(value);
                     }
                     return Ok(HostCallExecOutcome::Returned);
                 }
-                builtin_runtime::BuiltinCallOutcome::Pending(op_id) => {
+                builtins_impl::BuiltinCallOutcome::Pending(op_id) => {
                     let resume_ip = self.call_resume_ip(call_ip)?;
                     self.set_waiting_host_op(op_id, WaitingHostOpSource::BuiltinIo)?;
                     self.ip = resume_ip;
@@ -1767,7 +1261,7 @@ impl Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
-        builtin_runtime::close_all_handles(self);
+        builtins_impl::close_all_handles(self);
     }
 }
 
@@ -1784,13 +1278,7 @@ mod tests {
         all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
     ))]
     fn native_trace_cache_resets_when_program_changes() {
-        {
-            let mut guard = native_trace_cache()
-                .lock()
-                .expect("native trace cache lock should succeed");
-            guard.entries.clear();
-            guard.active_program_key = None;
-        }
+        jit::runtime::clear_native_trace_cache_for_tests();
 
         let source_one = r#"
             let i = 0;
@@ -1815,7 +1303,7 @@ mod tests {
         let compiled_two = crate::compile_source(source_two).expect("source two should compile");
 
         let mut vm_one = Vm::with_locals(compiled_one.program, compiled_one.locals);
-        vm_one.set_jit_config(crate::jit::JitConfig {
+        vm_one.set_jit_config(jit::JitConfig {
             enabled: true,
             hot_loop_threshold: 1,
             max_trace_len: 512,
@@ -1828,12 +1316,8 @@ mod tests {
             "first vm should produce native traces"
         );
 
-        let (cache_program_after_one, cache_entries_after_one) = {
-            let guard = native_trace_cache()
-                .lock()
-                .expect("native trace cache lock should succeed");
-            (guard.active_program_key, guard.entries.len())
-        };
+        let (cache_program_after_one, cache_entries_after_one) =
+            jit::runtime::native_trace_cache_snapshot_for_tests();
         assert_eq!(
             cache_program_after_one,
             Some(vm_one.program_cache_key),
@@ -1845,7 +1329,7 @@ mod tests {
         );
 
         let mut vm_two = Vm::with_locals(compiled_two.program, compiled_two.locals);
-        vm_two.set_jit_config(crate::jit::JitConfig {
+        vm_two.set_jit_config(jit::JitConfig {
             enabled: true,
             hot_loop_threshold: 1,
             max_trace_len: 512,
@@ -1862,12 +1346,8 @@ mod tests {
             "second vm should produce native traces"
         );
 
-        let (cache_program_after_two, cache_entries_after_two) = {
-            let guard = native_trace_cache()
-                .lock()
-                .expect("native trace cache lock should succeed");
-            (guard.active_program_key, guard.entries.len())
-        };
+        let (cache_program_after_two, cache_entries_after_two) =
+            jit::runtime::native_trace_cache_snapshot_for_tests();
         assert_eq!(
             cache_program_after_two,
             Some(vm_two.program_cache_key),

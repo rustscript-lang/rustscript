@@ -1,3 +1,5 @@
+// Shared builtin catalog (ids, names, arity, call-index mapping).
+// VM execution logic lives under vm/builtins_impl/.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub(crate) enum BuiltinFunction {
