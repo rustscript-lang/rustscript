@@ -647,6 +647,125 @@ fn compile_source_file_rustscript_supports_namespace_and_named_imports() {
 }
 
 #[test]
+fn compile_source_file_rustscript_all_public_import_supports_namespace_calls() {
+    let unique = format!(
+        "vm_rustscript_all_public_namespace_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).expect("temp module root should be created");
+
+    let module_path = root.join("runtime.rss");
+    std::fs::write(
+        &module_path,
+        r#"
+        pub fn sleep(ms) {
+            ms;
+        }
+    "#,
+    )
+    .expect("module source should write");
+
+    let main_path = root.join("main.rss");
+    std::fs::write(
+        &main_path,
+        r#"
+        use runtime;
+        runtime::sleep(3);
+    "#,
+    )
+    .expect("main source should write");
+
+    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(3)]);
+
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_file(module_path);
+    let _ = std::fs::remove_dir(root);
+}
+
+#[test]
+fn compile_source_file_rustscript_missing_runtime_module_falls_back_to_host_namespace() {
+    let unique = format!(
+        "vm_rustscript_runtime_host_fallback_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).expect("temp module root should be created");
+
+    let main_path = root.join("main.rss");
+    std::fs::write(
+        &main_path,
+        r#"
+        use runtime;
+        runtime::sleep(3);
+    "#,
+    )
+    .expect("main source should write");
+
+    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    assert!(
+        compiled
+            .program
+            .imports
+            .iter()
+            .any(|import| import.name == "runtime::sleep"),
+        "missing runtime.rss should fall back to runtime host namespace import"
+    );
+
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_dir(root);
+}
+
+#[test]
+fn compile_source_file_rustscript_host_namespace_alias_maps_to_vm_host_import() {
+    let unique = format!(
+        "vm_rustscript_runtime_alias_host_fallback_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).expect("temp module root should be created");
+
+    let main_path = root.join("main.rss");
+    std::fs::write(
+        &main_path,
+        r#"
+        use rate_limit as rl;
+        rl::allow("client-a", 2, 30);
+    "#,
+    )
+    .expect("main source should write");
+
+    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    assert!(
+        compiled
+            .program
+            .imports
+            .iter()
+            .any(|import| import.name == "rate_limit::allow"),
+        "namespace alias should map to rate_limit host import"
+    );
+
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_dir(root);
+}
+
+#[test]
 fn compile_source_file_module_override_path_redirects_import_spec() {
     let unique = format!(
         "vm_rustscript_module_override_test_{}_{}",

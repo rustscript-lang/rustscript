@@ -40,6 +40,11 @@ struct ModuleCollectState {
 
 const VM_HOST_NAMESPACE_SPEC: &str = "vm";
 
+struct ImportRewriteResult {
+    source: String,
+    requires_vm_namespace: bool,
+}
+
 pub(super) fn load_units_for_source_file(
     path: &Path,
     flavor: SourceFlavor,
@@ -53,7 +58,7 @@ pub(super) fn load_units_for_source_file(
     collect_state.visiting.push(path.to_path_buf());
     collect_module_units(path, source_raw, flavor, options, &mut collect_state)?;
 
-    let rewritten_root_source = rewrite_imported_call_sites(
+    let rewritten_root = rewrite_imported_call_sites(
         &source,
         flavor,
         path,
@@ -69,7 +74,7 @@ pub(super) fn load_units_for_source_file(
                 &collect_state.module_exports,
                 options,
             )?;
-            prelude.push_str(&rewritten_root_source);
+            prelude.push_str(&rewritten_root.source);
             prelude
         }
         SourceFlavor::RustScript | SourceFlavor::JavaScript | SourceFlavor::Lua => {
@@ -79,7 +84,13 @@ pub(super) fn load_units_for_source_file(
                 &collect_state.module_exports,
                 options,
             )?;
-            prelude.push_str(&rewritten_root_source);
+            if flavor == SourceFlavor::RustScript
+                && rewritten_root.requires_vm_namespace
+                && !vm_namespace_direct_calls_supported(&root_imports)
+            {
+                prelude.push_str("use vm;\n");
+            }
+            prelude.push_str(&rewritten_root.source);
             prelude
         }
     };
@@ -1047,6 +1058,45 @@ fn is_vm_use_directive_line(line: &str) -> bool {
     directive_body.starts_with("vm::")
 }
 
+fn vm_namespace_direct_calls_supported(imports: &[ModuleImport]) -> bool {
+    imports.iter().any(|import| {
+        if import.spec != VM_HOST_NAMESPACE_SPEC {
+            return false;
+        }
+        match &import.clause {
+            ImportClause::AllPublic => true,
+            ImportClause::Namespace(alias) => alias == VM_HOST_NAMESPACE_SPEC,
+            ImportClause::Named(_) | ImportClause::Prefix(_) => false,
+        }
+    })
+}
+
+fn host_namespace_root_from_spec(spec: &str) -> Option<String> {
+    if spec == VM_HOST_NAMESPACE_SPEC {
+        return None;
+    }
+    if spec.contains('/') {
+        return None;
+    }
+    let stem = Path::new(spec).file_stem()?.to_str()?;
+    if !is_valid_ident(stem) {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
+fn is_virtual_host_namespace_spec(spec: &str, options: &CompileSourceFileOptions) -> bool {
+    options.module_override_path(spec).is_none() && host_namespace_root_from_spec(spec).is_some()
+}
+
+fn should_treat_missing_module_as_host_namespace(
+    spec: &str,
+    options: &CompileSourceFileOptions,
+    err: &std::io::Error,
+) -> bool {
+    err.kind() == std::io::ErrorKind::NotFound && is_virtual_host_namespace_spec(spec, options)
+}
+
 fn collect_module_units(
     path: &Path,
     source: &str,
@@ -1069,7 +1119,15 @@ fn collect_module_units(
             continue;
         }
 
-        let module_source_raw = std::fs::read_to_string(&resolved)?;
+        let module_source_raw = match std::fs::read_to_string(&resolved) {
+            Ok(source) => source,
+            Err(err) => {
+                if should_treat_missing_module_as_host_namespace(&spec, options, &err) {
+                    continue;
+                }
+                return Err(SourcePathError::Io(err));
+            }
+        };
         state.visiting.push(key.clone());
         collect_module_units(
             &resolved,
@@ -1157,14 +1215,16 @@ fn collect_imported_module_functions(
         }
 
         let resolved = resolve_module_path(path, &import.spec, options)?;
-        let exports =
-            module_exports
-                .get(&resolved)
-                .ok_or_else(|| SourcePathError::InvalidImportSyntax {
-                    path: path.to_path_buf(),
-                    line: import.line,
-                    message: format!("module '{}' did not load", import.spec),
-                })?;
+        let Some(exports) = module_exports.get(&resolved) else {
+            if is_virtual_host_namespace_spec(&import.spec, options) {
+                continue;
+            }
+            return Err(SourcePathError::InvalidImportSyntax {
+                path: path.to_path_buf(),
+                line: import.line,
+                message: format!("module '{}' did not load", import.spec),
+            });
+        };
 
         match &import.clause {
             ImportClause::AllPublic | ImportClause::Namespace(_) | ImportClause::Prefix(_) => {
@@ -1208,11 +1268,13 @@ fn rewrite_imported_call_sites(
     imports: &[ModuleImport],
     module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
     options: &CompileSourceFileOptions,
-) -> Result<String, SourcePathError> {
+) -> Result<ImportRewriteResult, SourcePathError> {
     let mut alias_calls = HashMap::<String, String>::new();
     let mut namespace_calls = HashMap::<String, HashSet<String>>::new();
+    let mut namespace_prefix_calls = HashMap::<String, String>::new();
     let namespace_wildcards = HashSet::<String>::new();
     let mut prefix_aliases = Vec::<String>::new();
+    let mut requires_vm_namespace = false;
 
     for import in imports {
         if import.spec == VM_HOST_NAMESPACE_SPEC {
@@ -1236,11 +1298,49 @@ fn rewrite_imported_call_sites(
 
         let resolved = resolve_module_path(path, &import.spec, options)?;
         let Some(exports) = module_exports.get(&resolved) else {
+            if let Some(host_root) = host_namespace_root_from_spec(&import.spec)
+                && is_virtual_host_namespace_spec(&import.spec, options)
+            {
+                let vm_prefix = format!("vm::{host_root}");
+                match &import.clause {
+                    ImportClause::AllPublic => {
+                        if let Some(namespace) = module_default_namespace(&import.spec) {
+                            namespace_prefix_calls.insert(namespace, vm_prefix.clone());
+                            requires_vm_namespace = true;
+                        }
+                    }
+                    ImportClause::Named(named) => {
+                        for binding in named {
+                            alias_calls.insert(
+                                binding.local.clone(),
+                                format!("{vm_prefix}::{}", binding.imported),
+                            );
+                        }
+                        if !named.is_empty() {
+                            requires_vm_namespace = true;
+                        }
+                    }
+                    ImportClause::Namespace(namespace) => {
+                        namespace_prefix_calls.insert(namespace.clone(), vm_prefix.clone());
+                        requires_vm_namespace = true;
+                    }
+                    ImportClause::Prefix(_) => {}
+                }
+            }
             continue;
         };
 
         match &import.clause {
-            ImportClause::AllPublic => {}
+            ImportClause::AllPublic => {
+                // Bare `use module;` keeps direct calls (`fn_name(...)`) and now also
+                // supports namespace-style calls (`module::fn_name(...)`) for ergonomics.
+                if let Some(namespace) = module_default_namespace(&import.spec) {
+                    let entries = namespace_calls.entry(namespace).or_default();
+                    for name in exports.keys() {
+                        entries.insert(name.clone());
+                    }
+                }
+            }
             ImportClause::Named(named) => {
                 for binding in named {
                     if !exports.contains_key(&binding.imported) {
@@ -1275,31 +1375,224 @@ fn rewrite_imported_call_sites(
     prefix_aliases.sort();
     prefix_aliases.dedup();
 
+    let rewritten = rewrite_host_namespace_call_paths(source, flavor, &namespace_prefix_calls);
+
     if alias_calls.is_empty()
         && namespace_calls.is_empty()
         && namespace_wildcards.is_empty()
         && prefix_aliases.is_empty()
     {
-        return Ok(source.to_string());
+        return Ok(ImportRewriteResult {
+            source: rewritten,
+            requires_vm_namespace,
+        });
     }
 
     if flavor == SourceFlavor::Scheme {
-        Ok(rewrite_scheme_call_heads(
-            source,
-            &alias_calls,
-            &namespace_calls,
-            &namespace_wildcards,
-            &prefix_aliases,
-        ))
+        Ok(ImportRewriteResult {
+            source: rewrite_scheme_call_heads(
+                &rewritten,
+                &alias_calls,
+                &namespace_calls,
+                &namespace_wildcards,
+                &prefix_aliases,
+            ),
+            requires_vm_namespace,
+        })
     } else {
-        Ok(rewrite_function_call_paths(
-            source,
-            flavor,
-            &alias_calls,
-            &namespace_calls,
-            &namespace_wildcards,
-            &prefix_aliases,
-        ))
+        Ok(ImportRewriteResult {
+            source: rewrite_function_call_paths(
+                &rewritten,
+                flavor,
+                &alias_calls,
+                &namespace_calls,
+                &namespace_wildcards,
+                &prefix_aliases,
+            ),
+            requires_vm_namespace,
+        })
+    }
+}
+
+fn rewrite_host_namespace_call_paths(
+    source: &str,
+    flavor: SourceFlavor,
+    namespace_prefix_calls: &HashMap<String, String>,
+) -> String {
+    if namespace_prefix_calls.is_empty() {
+        return source.to_string();
+    }
+
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0usize;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut string_delim: Option<u8> = None;
+    let mut escaped = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if let Some(delim) = string_delim {
+            out.push(b as char);
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == delim {
+                string_delim = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_line_comment {
+            out.push(b as char);
+            if b == b'\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_block_comment {
+            out.push(b as char);
+            if b == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                out.push('/');
+                i += 2;
+                in_block_comment = false;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            out.push('/');
+            out.push('/');
+            i += 2;
+            in_line_comment = true;
+            continue;
+        }
+
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            out.push('/');
+            out.push('*');
+            i += 2;
+            in_block_comment = true;
+            continue;
+        }
+
+        if b == b'"' || b == b'\'' || b == b'`' {
+            out.push(b as char);
+            i += 1;
+            string_delim = Some(b);
+            escaped = false;
+            continue;
+        }
+
+        if !is_ident_start(b as char) {
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        i += 1;
+        while i < bytes.len() && is_ident_continue(bytes[i] as char) {
+            i += 1;
+        }
+        let ident = &source[start..i];
+
+        if let Some(prefix) = namespace_prefix_calls.get(ident)
+            && namespace_call_target_is_function(source, i, flavor)
+        {
+            out.push_str(prefix);
+            continue;
+        }
+
+        out.push_str(ident);
+    }
+
+    out
+}
+
+fn namespace_call_target_is_function(source: &str, index: usize, flavor: SourceFlavor) -> bool {
+    let bytes = source.as_bytes();
+    let mut cursor = index;
+    if !consume_namespace_separator(bytes, &mut cursor, flavor) {
+        return false;
+    }
+
+    loop {
+        while cursor < bytes.len()
+            && bytes[cursor].is_ascii_whitespace()
+            && bytes[cursor] != b'\n'
+            && bytes[cursor] != b'\r'
+        {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || !is_ident_start(bytes[cursor] as char) {
+            return false;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && is_ident_continue(bytes[cursor] as char) {
+            cursor += 1;
+        }
+
+        while cursor < bytes.len()
+            && bytes[cursor].is_ascii_whitespace()
+            && bytes[cursor] != b'\n'
+            && bytes[cursor] != b'\r'
+        {
+            cursor += 1;
+        }
+        if cursor < bytes.len() && bytes[cursor] == b'(' {
+            return true;
+        }
+        if !consume_namespace_separator(bytes, &mut cursor, flavor) {
+            return false;
+        }
+    }
+}
+
+fn consume_namespace_separator(bytes: &[u8], cursor: &mut usize, flavor: SourceFlavor) -> bool {
+    if *cursor >= bytes.len() {
+        return false;
+    }
+    if flavor == SourceFlavor::RustScript {
+        if bytes[*cursor] != b':' {
+            return false;
+        }
+        *cursor += 1;
+        while *cursor < bytes.len()
+            && bytes[*cursor].is_ascii_whitespace()
+            && bytes[*cursor] != b'\n'
+            && bytes[*cursor] != b'\r'
+        {
+            *cursor += 1;
+        }
+        if *cursor >= bytes.len() || bytes[*cursor] != b':' {
+            return false;
+        }
+        *cursor += 1;
+        return true;
+    }
+
+    if bytes[*cursor] == b'.' {
+        *cursor += 1;
+        return true;
+    }
+    false
+}
+
+fn module_default_namespace(spec: &str) -> Option<String> {
+    let stem = Path::new(spec).file_stem()?.to_str()?;
+    if is_valid_ident(stem) {
+        Some(stem.to_string())
+    } else {
+        None
     }
 }
 
