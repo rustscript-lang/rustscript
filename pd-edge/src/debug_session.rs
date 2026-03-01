@@ -403,6 +403,7 @@ pub fn run_vm_with_optional_debugger(
                     let terminal_status = recording.terminal_status.map(|status| match status {
                         VmStatus::Halted => "halted".to_string(),
                         VmStatus::Yielded => "yielded".to_string(),
+                        VmStatus::Waiting(op_id) => format!("waiting({op_id})"),
                     });
                     match recording.encode() {
                         Ok(bytes) => {
@@ -435,6 +436,21 @@ pub fn run_vm_with_optional_debugger(
     }
 
     vm.run()
+}
+
+pub fn request_will_attach_debugger(
+    store: &SharedDebugSession,
+    request_headers: &HeaderMap,
+    request_path: &str,
+) -> bool {
+    let session = {
+        let guard = store.session.read().expect("debug session lock poisoned");
+        guard.clone()
+    };
+    let Some(session) = session else {
+        return false;
+    };
+    request_matches_session(request_headers, request_path, &session)
 }
 
 pub fn drain_recording_artifacts(store: &SharedDebugSession) -> Vec<DebugRecordingArtifact> {

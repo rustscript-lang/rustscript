@@ -1,8 +1,8 @@
 use std::{io, path::PathBuf};
 
-use edge::{ABI_VERSION, HOST_FUNCTION_COUNT, function_by_name};
+use edge::{ABI_VERSION, HOST_FUNCTION_COUNT, compile_edge_source_file, function_by_name};
 use reqwest::StatusCode;
-use vm::{HostImport, compile_source_file, encode_program, validate_program};
+use vm::{HostImport, encode_program, validate_program};
 
 const SOURCE_PATH: &str = "examples/sample_proxy_program.rss";
 const CONTROL_URL: &str = "http://127.0.0.1:8081/program";
@@ -13,7 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| SOURCE_PATH.to_string());
     let source_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(source_rel);
-    let compiled = compile_source_file(&source_path)?;
+    let compiled = compile_edge_source_file(&source_path)?;
 
     ensure_edge_abi(&compiled.program.imports)?;
     validate_program(&compiled.program, HOST_FUNCTION_COUNT)?;

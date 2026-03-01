@@ -1,0 +1,41 @@
+// Edge-only async IO helpers backed by vm::http host ABI functions.
+// Import this module from edge programs via:
+//   use edge::io_async as io_async;
+// and compile with edge::compile_edge_source_file(...).
+
+use vm;
+
+pub fn request_body_read() {
+    vm::http::request::get_body();
+}
+
+pub fn request_body_next_chunk(max_bytes) {
+    vm::http::request::body::next_chunk(max_bytes);
+}
+
+pub fn request_body_eof() {
+    vm::http::request::body::eof();
+}
+
+pub fn request_body_read_all(max_bytes) {
+    let chunk_size = max_bytes;
+    if chunk_size < 1 {
+        chunk_size = 4096;
+    }
+
+    let out = "";
+    while !request_body_eof() {
+        let chunk = request_body_next_chunk(chunk_size);
+        if (chunk).length == 0 && request_body_eof() {
+            break;
+        }
+        out = out + chunk;
+    }
+    out;
+}
+
+pub fn request_body_forward_to_upstream(max_bytes) {
+    let body = request_body_read_all(max_bytes);
+    vm::http::upstream::request::set_body(body);
+    body;
+}
