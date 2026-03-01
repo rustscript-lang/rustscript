@@ -5,7 +5,7 @@ use std::{
 };
 
 use edge::{
-    ActiveControlPlaneConfig, SharedState, build_admin_app, build_data_app, init_logging,
+    ActiveControlPlaneConfig, SharedState, build_admin_app, build_http_proxy_app, init_logging,
     spawn_active_control_plane_client,
 };
 use tracing::{info, warn};
@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging()?;
     info!("{}", binary_version_text());
 
-    let data_addr = if let Some(value) = cli.data_addr {
+    let data_addr = if let Some(value) = cli.proxy_addr {
         value
     } else {
         "0.0.0.0:8080".parse()?
@@ -79,14 +79,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("active control-plane rpc enabled edge_id={edge_id} edge_name={edge_name}");
     }
 
-    let data_app = build_data_app(state.clone());
+    let data_app = build_http_proxy_app(state.clone());
     let admin_app = build_admin_app(state);
 
     let data_listener = tokio::net::TcpListener::bind(data_addr).await?;
     let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
 
     info!(
-        "data-plane listening on http://{}",
+        "proxy/data-plane listening on http://{}",
         data_listener.local_addr()?
     );
     info!(
@@ -107,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[derive(Clone, Debug, Default)]
 struct CliArgs {
-    data_addr: Option<SocketAddr>,
+    proxy_addr: Option<SocketAddr>,
     admin_addr: Option<SocketAddr>,
     max_program_bytes: Option<usize>,
     control_plane_url: Option<String>,
@@ -135,12 +135,17 @@ fn parse_cli_args() -> Result<CliAction, String> {
             "--control-plane-url" => {
                 cli.control_plane_url = Some(next_arg_value("--control-plane-url", &mut args)?);
             }
-            "--data-addr" => {
-                let value = next_arg_value("--data-addr", &mut args)?;
-                cli.data_addr = Some(
+            "--proxy-addr" | "--data-addr" => {
+                let flag = if arg == "--proxy-addr" {
+                    "--proxy-addr"
+                } else {
+                    "--data-addr"
+                };
+                let value = next_arg_value(flag, &mut args)?;
+                cli.proxy_addr = Some(
                     value
                         .parse::<SocketAddr>()
-                        .map_err(|_| format!("invalid --data-addr: {value}"))?,
+                        .map_err(|_| format!("invalid {flag}: {value}"))?,
                 );
             }
             "--admin-addr" => {
@@ -207,9 +212,10 @@ fn next_arg_value(
 
 fn print_cli_help() {
     eprintln!(concat!(
-        "Usage: pd-edge [options]\n\n",
+        "Usage: pd-edge-http-proxy [options]\n\n",
         "Options:\n",
-        "  --data-addr <ADDR>                        Data plane listen address (default: 0.0.0.0:8080)\n",
+        "  --proxy-addr <ADDR>                       Proxy/data-plane listen address (default: 0.0.0.0:8080)\n",
+        "  --data-addr <ADDR>                        Alias for --proxy-addr\n",
         "  --admin-addr <ADDR>                       Admin endpoint listen address (default: 127.0.0.1:8081)\n",
         "  --max-program-bytes <BYTES>               Max upload/program size in bytes (default: 1048576)\n",
         "  --control-plane-url <URL>                 Enable active control-plane RPC client\n",
@@ -224,7 +230,7 @@ fn print_cli_help() {
 }
 
 fn binary_version_text() -> String {
-    let binary = env!("CARGO_PKG_NAME");
+    let binary = env!("CARGO_BIN_NAME");
     let git_tag = option_env!("PD_BUILD_GIT_TAG").unwrap_or("untagged");
     let git_commit = option_env!("PD_BUILD_GIT_COMMIT").unwrap_or("unknown");
     let git_dirty = option_env!("PD_BUILD_GIT_DIRTY").unwrap_or("false");

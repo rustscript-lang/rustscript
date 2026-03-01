@@ -55,9 +55,9 @@ jobs:
             echo "PD_BUILD_GIT_DIRTY=false" >> "$GITHUB_ENV"
           fi
 
-      - name: Build pd-edge, pd-controller and pd-vm-run
+      - name: Build pd-edge-http-proxy, pd-edge-console, pd-controller and pd-vm-run
         run: |
-          cargo build -p pd-edge --release --locked
+          cargo build -p pd-edge --bin pd-edge-http-proxy --bin pd-edge-console --release --locked
           cargo build -p pd-controller --release --locked
           cargo build -p pd-vm --bin pd-vm-run --release --locked
 
@@ -65,10 +65,12 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp target/release/pd-edge dist/pd-edge
+          cp target/release/pd-edge-http-proxy dist/pd-edge-http-proxy
+          cp target/release/pd-edge-console dist/pd-edge-console
           cp target/release/pd-controller dist/pd-controller
           cp target/release/pd-vm-run dist/pd-vm-run
-          tar -czf dist/pd-edge-${{ github.ref_name }}-linux-x86_64.tar.gz -C dist pd-edge
+          tar -czf dist/pd-edge-http-proxy-${{ github.ref_name }}-linux-x86_64.tar.gz -C dist pd-edge-http-proxy
+          tar -czf dist/pd-edge-console-${{ github.ref_name }}-linux-x86_64.tar.gz -C dist pd-edge-console
           tar -czf dist/pd-controller-${{ github.ref_name }}-linux-x86_64.tar.gz -C dist pd-controller
           tar -czf dist/pd-vm-run-${{ github.ref_name }}-linux-x86_64.tar.gz -C dist pd-vm-run
 
@@ -77,7 +79,8 @@ jobs:
         with:
           name: release-binaries-${{ github.ref_name }}-linux-x86_64
           path: |
-            dist/pd-edge-${{ github.ref_name }}-linux-x86_64.tar.gz
+            dist/pd-edge-http-proxy-${{ github.ref_name }}-linux-x86_64.tar.gz
+            dist/pd-edge-console-${{ github.ref_name }}-linux-x86_64.tar.gz
             dist/pd-controller-${{ github.ref_name }}-linux-x86_64.tar.gz
             dist/pd-vm-run-${{ github.ref_name }}-linux-x86_64.tar.gz
 
@@ -90,7 +93,7 @@ jobs:
           username: fffonion
           password: ${{ secrets.DOCKERHUB_PUSH_TOKEN }}
 
-      - name: Build and push pd-edge image
+      - name: Build and push pd-edge-http-proxy image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -115,6 +118,7 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            dist/pd-edge-${{ github.ref_name }}-linux-x86_64.tar.gz
+            dist/pd-edge-http-proxy-${{ github.ref_name }}-linux-x86_64.tar.gz
+            dist/pd-edge-console-${{ github.ref_name }}-linux-x86_64.tar.gz
             dist/pd-controller-${{ github.ref_name }}-linux-x86_64.tar.gz
             dist/pd-vm-run-${{ github.ref_name }}-linux-x86_64.tar.gz

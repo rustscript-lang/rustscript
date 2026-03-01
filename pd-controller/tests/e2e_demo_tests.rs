@@ -2,7 +2,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use edge::{
     ActiveControlPlaneConfig, CommandResultPayload, EdgeCommandResult, FN_HTTP_RESPONSE_SET_BODY,
-    SharedState, build_data_app, spawn_active_control_plane_client,
+    SharedState, build_http_proxy_app, spawn_active_control_plane_client,
 };
 use pd_controller::{
     ControllerConfig, ControllerState, EnqueueCommandResponse, build_controller_app,
@@ -47,7 +47,7 @@ async fn e2e_controller_can_push_program_to_active_proxy_edge() {
         spawn_server(build_controller_app(controller_state)).await;
 
     let proxy_state = SharedState::new(1024 * 1024);
-    let (data_addr, data_handle) = spawn_server(build_data_app(proxy_state.clone())).await;
+    let (data_addr, data_handle) = spawn_server(build_http_proxy_app(proxy_state.clone())).await;
     let active_handle = spawn_active_control_plane_client(
         proxy_state,
         ActiveControlPlaneConfig {

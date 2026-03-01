@@ -523,6 +523,27 @@ async fn ui_blocks_and_deploy_endpoints_work() {
             .as_array()
             .expect("blocks should be an array")
             .iter()
+            .any(|item| item["id"].as_str() == Some("get_request_body_next_chunk"))
+    );
+    assert!(
+        blocks_json["blocks"]
+            .as_array()
+            .expect("blocks should be an array")
+            .iter()
+            .any(|item| item["id"].as_str() == Some("get_request_body_eof"))
+    );
+    assert!(
+        blocks_json["blocks"]
+            .as_array()
+            .expect("blocks should be an array")
+            .iter()
+            .any(|item| item["id"].as_str() == Some("runtime_sleep"))
+    );
+    assert!(
+        blocks_json["blocks"]
+            .as_array()
+            .expect("blocks should be an array")
+            .iter()
             .any(|item| item["id"].as_str() == Some("get_response_headers"))
     );
     let blocks = blocks_json["blocks"]
@@ -572,6 +593,15 @@ async fn ui_blocks_and_deploy_endpoints_work() {
         remove_response_header["category"].as_str(),
         Some("http_response"),
         "remove_response_header should be response-http scoped"
+    );
+    let runtime_sleep = blocks
+        .iter()
+        .find(|item| item["id"].as_str() == Some("runtime_sleep"))
+        .expect("runtime_sleep block should exist");
+    assert_eq!(
+        runtime_sleep["category"].as_str(),
+        Some("runtime"),
+        "runtime_sleep should be runtime scoped"
     );
 
     let deploy = client
@@ -1131,6 +1161,8 @@ async fn ui_render_new_http_blocks_generate_expected_calls() {
                 { "block_id": "get_request_port", "values": { "var": "req_port" } },
                 { "block_id": "get_request_client_ip", "values": { "var": "req_ip" } },
                 { "block_id": "get_request_body", "values": { "var": "req_body" } },
+                { "block_id": "get_request_body_next_chunk", "values": { "var": "req_chunk", "max_bytes": "8" } },
+                { "block_id": "get_request_body_eof", "values": { "var": "req_body_done" } },
                 { "block_id": "get_request_headers", "values": { "var": "req_headers" } },
                 { "block_id": "set_request_header", "values": { "name": "x-added", "value": "yes" } },
                 { "block_id": "add_request_header", "values": { "name": "x-added", "value": "yes-2" } },
@@ -1143,6 +1175,7 @@ async fn ui_render_new_http_blocks_generate_expected_calls() {
                 { "block_id": "set_request_raw_query", "values": { "query": "$query_next" } },
                 { "block_id": "set_request_query_arg", "values": { "name": "token", "value": "$req_id" } },
                 { "block_id": "set_request_body", "values": { "value": "$req_body" } },
+                { "block_id": "runtime_sleep", "values": { "millis": "5" } },
                 { "block_id": "remove_response_header", "values": { "name": "x-hidden" } },
                 { "block_id": "clear_response_header", "values": { "name": "x-clear" } },
                 { "block_id": "add_response_header", "values": { "name": "set-cookie", "value": "a=1" } },
@@ -1183,6 +1216,8 @@ async fn ui_render_new_http_blocks_generate_expected_calls() {
     assert!(rustscript.contains("let req_port = vm::http::request::get_port();"));
     assert!(rustscript.contains("let req_ip = vm::http::request::get_client_ip();"));
     assert!(rustscript.contains("let req_body = vm::http::request::get_body();"));
+    assert!(rustscript.contains("let req_chunk = vm::http::request::body::next_chunk(8);"));
+    assert!(rustscript.contains("let req_body_done = vm::http::request::body::eof();"));
     assert!(rustscript.contains("let req_headers = vm::http::request::get_headers();"));
     assert!(rustscript.contains("vm::http::upstream::request::set_header(\"x-added\", \"yes\");"));
     assert!(
@@ -1197,6 +1232,7 @@ async fn ui_render_new_http_blocks_generate_expected_calls() {
     assert!(rustscript.contains("vm::http::upstream::request::set_raw_query(query_next);"));
     assert!(rustscript.contains("vm::http::upstream::request::set_query_arg(\"token\", req_id);"));
     assert!(rustscript.contains("vm::http::upstream::request::set_body(req_body);"));
+    assert!(rustscript.contains("vm::runtime::sleep(5);"));
     assert!(rustscript.contains("vm::http::response::remove_header(\"x-hidden\");"));
     assert!(rustscript.contains("vm::http::response::clear_header(\"x-clear\");"));
     assert!(rustscript.contains("vm::http::response::add_header(\"set-cookie\", \"a=1\");"));
@@ -1205,7 +1241,7 @@ async fn ui_render_new_http_blocks_generate_expected_calls() {
     assert!(rustscript.contains("let resp_header = vm::http::response::get_header(\"x-vm\");"));
     assert!(rustscript.contains("let resp_headers = vm::http::response::get_headers();"));
     assert!(rustscript.contains("let resp_body = vm::http::response::get_body();"));
-    assert!(rustscript.contains("let allowed = vm::http::rate_limit::allow(req_id, 5, 60);"));
+    assert!(rustscript.contains("let allowed = vm::rate_limit::allow(req_id, 5, 60);"));
 
     let javascript = render_json["source"]["javascript"]
         .as_str()
@@ -1354,7 +1390,7 @@ async fn ui_render_rate_limit_flow_branches_to_actions() {
         .as_str()
         .expect("rustscript source should be a string");
     assert!(
-        rustscript.contains("if vm::http::rate_limit::allow(client_id, 3, 60) {"),
+        rustscript.contains("if vm::rate_limit::allow(client_id, 3, 60) {"),
         "expected rate limit branch in rustscript, got: {rustscript}"
     );
     assert!(

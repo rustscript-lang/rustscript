@@ -7,7 +7,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
+use axum::{
+    body::Body,
+    http::{HeaderMap, HeaderName, HeaderValue, Method},
+};
+use http_body_util::BodyExt;
 use tokio::sync::oneshot;
 use url::Url;
 use vm::{CallOutcome, HostAsyncBridge, HostFunction, HostOpId, Value, Vm, VmError};
@@ -216,10 +220,10 @@ impl EdgeProtocolHostModule for RuntimeProtocolHostModule {
     fn register(
         &self,
         vm: &mut Vm,
-        _context: SharedProxyVmContext,
+        context: SharedProxyVmContext,
         async_ops: SharedVmAsyncOps,
     ) -> Result<(), VmError> {
-        register_runtime_host_module(vm, async_ops)
+        register_runtime_host_module(vm, context, async_ops)
     }
 }
 
@@ -295,7 +299,7 @@ impl RateLimiterStore {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct HttpRequestContext {
     pub request_id: String,
     pub method: Method,
@@ -306,9 +310,149 @@ pub struct HttpRequestContext {
     pub scheme: String,
     pub host: String,
     pub client_ip: String,
-    pub body: Vec<u8>,
+    pub body: Body,
     pub headers: HeaderMap,
 }
+
+#[derive(Clone, Debug)]
+struct InboundRequestLineSource {
+    request_id: String,
+    method: Method,
+    path: String,
+    query: String,
+    http_version: String,
+    port: u16,
+    scheme: String,
+    host: String,
+    client_ip: String,
+}
+
+struct InboundRequestBodyState {
+    body: Option<Body>,
+    buffered: Vec<u8>,
+    read_offset: usize,
+    eof: bool,
+}
+
+impl std::fmt::Debug for InboundRequestBodyState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboundRequestBodyState")
+            .field("buffered_len", &self.buffered.len())
+            .field("read_offset", &self.read_offset)
+            .field("eof", &self.eof)
+            .finish()
+    }
+}
+
+impl InboundRequestBodyState {
+    fn new(body: Body) -> Self {
+        Self {
+            body: Some(body),
+            buffered: Vec::new(),
+            read_offset: 0,
+            eof: false,
+        }
+    }
+
+    async fn pull_next_frame(&mut self) -> Result<(), VmError> {
+        if self.eof {
+            return Ok(());
+        }
+        let Some(body) = self.body.as_mut() else {
+            self.eof = true;
+            return Ok(());
+        };
+
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                if let Ok(chunk) = frame.into_data()
+                    && !chunk.is_empty()
+                {
+                    self.buffered.extend_from_slice(&chunk);
+                }
+            }
+            Some(Err(err)) => {
+                return Err(VmError::HostError(format!(
+                    "failed to read inbound request body frame: {err}",
+                )));
+            }
+            None => {
+                self.eof = true;
+                self.body = None;
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_readable_byte(&mut self) -> Result<(), VmError> {
+        while self.read_offset >= self.buffered.len() && !self.eof {
+            self.pull_next_frame().await?;
+        }
+        Ok(())
+    }
+
+    async fn read_next_chunk(&mut self, max_bytes: usize) -> Result<Vec<u8>, VmError> {
+        self.ensure_readable_byte().await?;
+        if self.read_offset >= self.buffered.len() {
+            return Ok(Vec::new());
+        }
+        let end = self
+            .read_offset
+            .saturating_add(max_bytes)
+            .min(self.buffered.len());
+        let chunk = self.buffered[self.read_offset..end].to_vec();
+        self.read_offset = end;
+        Ok(chunk)
+    }
+
+    async fn read_next_line(&mut self) -> Result<Vec<u8>, VmError> {
+        loop {
+            let start = self.read_offset.min(self.buffered.len());
+            if start < self.buffered.len() {
+                if let Some(rel_end) = self.buffered[start..]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                {
+                    let end = start + rel_end;
+                    let line = self.buffered[start..end].to_vec();
+                    self.read_offset = end.saturating_add(1);
+                    return Ok(line);
+                }
+                if self.eof {
+                    let line = self.buffered[start..].to_vec();
+                    self.read_offset = self.buffered.len();
+                    return Ok(line);
+                }
+            } else if self.eof {
+                return Ok(Vec::new());
+            }
+
+            self.pull_next_frame().await?;
+        }
+    }
+
+    async fn read_all_and_consume(&mut self) -> Result<Vec<u8>, VmError> {
+        let body = self.read_all().await?;
+        self.read_offset = self.buffered.len();
+        Ok(body)
+    }
+
+    async fn read_all(&mut self) -> Result<Vec<u8>, VmError> {
+        while !self.eof {
+            self.pull_next_frame().await?;
+        }
+        Ok(self.buffered.clone())
+    }
+
+    async fn eof(&mut self) -> Result<bool, VmError> {
+        while self.read_offset >= self.buffered.len() && !self.eof {
+            self.pull_next_frame().await?;
+        }
+        Ok(self.eof && self.read_offset >= self.buffered.len())
+    }
+}
+
+type SharedInboundRequestBody = Arc<tokio::sync::Mutex<InboundRequestBodyState>>;
 
 #[derive(Clone, Debug)]
 enum EdgeVirtualIoHandle {
@@ -317,6 +461,13 @@ enum EdgeVirtualIoHandle {
 }
 
 const EDGE_IO_HANDLE_DYNAMIC_BASE: i64 = 1024;
+
+const ACCESS_REQUEST_LINE: u8 = 1 << 0;
+const ACCESS_REQUEST_HEADERS: u8 = 1 << 1;
+const ACCESS_REQUEST_BODY: u8 = 1 << 2;
+const ACCESS_UPSTREAM_REQUEST: u8 = 1 << 3;
+const ACCESS_RESPONSE_OUTPUT: u8 = 1 << 4;
+const ACCESS_UPSTREAM_RESPONSE: u8 = 1 << 5;
 
 #[derive(Clone, Debug)]
 pub struct ProxyVmContext {
@@ -329,13 +480,16 @@ pub struct ProxyVmContext {
     inbound_request_scheme: String,
     inbound_request_host: String,
     inbound_request_client_ip: String,
-    inbound_request_body: Vec<u8>,
-    inbound_request_body_offset: usize,
+    inbound_request_line_source: Option<InboundRequestLineSource>,
+    inbound_request_headers_source: Option<HeaderMap>,
+    inbound_request_body: SharedInboundRequestBody,
     inbound_request_headers: HeaderMap,
+    outbound_request_initialized: bool,
     outbound_request_method: Method,
     outbound_request_path: String,
     outbound_request_query: String,
     outbound_request_body: Vec<u8>,
+    outbound_request_body_overridden: bool,
     outbound_request_headers: HeaderMap,
     response_headers: HeaderMap,
     response_content: Option<String>,
@@ -344,6 +498,7 @@ pub struct ProxyVmContext {
     upstream_response_headers: HeaderMap,
     upstream_response_content: Option<String>,
     upstream_response_status: Option<u16>,
+    http_access_bits: u8,
     rate_limiter: SharedRateLimiter,
     edge_io_next_handle: i64,
     edge_io_handles: HashMap<i64, EdgeVirtualIoHandle>,
@@ -351,24 +506,40 @@ pub struct ProxyVmContext {
 
 impl ProxyVmContext {
     pub fn from_http_request(request: HttpRequestContext, rate_limiter: SharedRateLimiter) -> Self {
+        let line_source = InboundRequestLineSource {
+            request_id: request.request_id,
+            method: request.method,
+            path: request.path,
+            query: request.query,
+            http_version: request.http_version,
+            port: request.port,
+            scheme: request.scheme,
+            host: request.host,
+            client_ip: request.client_ip,
+        };
         Self {
-            inbound_request_id: request.request_id,
-            inbound_request_method: request.method.clone(),
-            inbound_request_path: request.path.clone(),
-            inbound_request_query: request.query.clone(),
-            inbound_request_http_version: request.http_version,
-            inbound_request_port: request.port,
-            inbound_request_scheme: request.scheme,
-            inbound_request_host: request.host,
-            inbound_request_client_ip: request.client_ip,
-            inbound_request_body: request.body.clone(),
-            inbound_request_body_offset: 0,
-            inbound_request_headers: request.headers.clone(),
-            outbound_request_method: request.method,
-            outbound_request_path: request.path,
-            outbound_request_query: request.query,
-            outbound_request_body: request.body,
-            outbound_request_headers: request.headers,
+            inbound_request_id: String::new(),
+            inbound_request_method: Method::GET,
+            inbound_request_path: String::new(),
+            inbound_request_query: String::new(),
+            inbound_request_http_version: String::new(),
+            inbound_request_port: 0,
+            inbound_request_scheme: String::new(),
+            inbound_request_host: String::new(),
+            inbound_request_client_ip: String::new(),
+            inbound_request_line_source: Some(line_source),
+            inbound_request_headers_source: Some(request.headers),
+            inbound_request_body: Arc::new(tokio::sync::Mutex::new(InboundRequestBodyState::new(
+                request.body,
+            ))),
+            inbound_request_headers: HeaderMap::new(),
+            outbound_request_initialized: false,
+            outbound_request_method: Method::GET,
+            outbound_request_path: String::new(),
+            outbound_request_query: String::new(),
+            outbound_request_body: Vec::new(),
+            outbound_request_body_overridden: false,
+            outbound_request_headers: HeaderMap::new(),
             response_headers: HeaderMap::new(),
             response_content: None,
             response_status: None,
@@ -376,6 +547,7 @@ impl ProxyVmContext {
             upstream_response_headers: HeaderMap::new(),
             upstream_response_content: None,
             upstream_response_status: None,
+            http_access_bits: 0,
             rate_limiter,
             edge_io_next_handle: EDGE_IO_HANDLE_DYNAMIC_BASE,
             edge_io_handles: HashMap::new(),
@@ -397,11 +569,92 @@ impl ProxyVmContext {
                 scheme: "http".to_string(),
                 host: String::new(),
                 client_ip: String::new(),
-                body: Vec::new(),
+                body: Body::empty(),
                 headers: request_headers,
             },
             rate_limiter,
         )
+    }
+
+    fn ensure_request_line_loaded(&mut self) {
+        if let Some(source) = self.inbound_request_line_source.take() {
+            self.inbound_request_id = source.request_id;
+            self.inbound_request_method = source.method;
+            self.inbound_request_path = source.path;
+            self.inbound_request_query = source.query;
+            self.inbound_request_http_version = source.http_version;
+            self.inbound_request_port = source.port;
+            self.inbound_request_scheme = source.scheme;
+            self.inbound_request_host = source.host;
+            self.inbound_request_client_ip = source.client_ip;
+        }
+    }
+
+    fn ensure_request_headers_loaded(&mut self) {
+        self.ensure_request_line_loaded();
+        if let Some(headers) = self.inbound_request_headers_source.take() {
+            self.inbound_request_headers = headers;
+        }
+    }
+
+    fn ensure_outbound_request_initialized(&mut self) {
+        if self.outbound_request_initialized {
+            return;
+        }
+        self.ensure_request_headers_loaded();
+        self.outbound_request_method = self.inbound_request_method.clone();
+        self.outbound_request_path = self.inbound_request_path.clone();
+        self.outbound_request_query = self.inbound_request_query.clone();
+        self.outbound_request_headers = self.inbound_request_headers.clone();
+        self.outbound_request_initialized = true;
+    }
+
+    fn touch_request_line(&mut self) {
+        self.ensure_request_line_loaded();
+        self.mark_http_access(ACCESS_REQUEST_LINE);
+    }
+
+    fn touch_request_headers(&mut self) {
+        self.ensure_request_headers_loaded();
+        self.mark_http_access(ACCESS_REQUEST_LINE | ACCESS_REQUEST_HEADERS);
+    }
+
+    fn touch_request_body(&mut self) {
+        self.ensure_request_headers_loaded();
+        self.mark_http_access(ACCESS_REQUEST_LINE | ACCESS_REQUEST_HEADERS | ACCESS_REQUEST_BODY);
+    }
+
+    fn touch_upstream_request(&mut self) {
+        self.ensure_outbound_request_initialized();
+        self.mark_http_access(
+            ACCESS_REQUEST_LINE
+                | ACCESS_REQUEST_HEADERS
+                | ACCESS_REQUEST_BODY
+                | ACCESS_UPSTREAM_REQUEST,
+        );
+    }
+
+    fn touch_response_output(&mut self) {
+        self.mark_http_access(
+            ACCESS_REQUEST_LINE
+                | ACCESS_REQUEST_HEADERS
+                | ACCESS_REQUEST_BODY
+                | ACCESS_RESPONSE_OUTPUT,
+        );
+    }
+
+    fn touch_upstream_response(&mut self) {
+        self.mark_http_access(
+            ACCESS_REQUEST_LINE
+                | ACCESS_REQUEST_HEADERS
+                | ACCESS_REQUEST_BODY
+                | ACCESS_UPSTREAM_REQUEST
+                | ACCESS_UPSTREAM_RESPONSE,
+        );
+    }
+
+    fn mark_http_access(&mut self, bits: u8) {
+        self.http_access_bits |= bits;
     }
 }
 
@@ -421,7 +674,8 @@ pub struct VmExecutionOutcome {
 }
 
 pub fn snapshot_execution_outcome(context: &SharedProxyVmContext) -> VmExecutionOutcome {
-    let context = context.lock().expect("vm context lock poisoned");
+    let mut context = context.lock().expect("vm context lock poisoned");
+    context.ensure_outbound_request_initialized();
     VmExecutionOutcome {
         response_headers: context.response_headers.clone(),
         response_content: context.response_content.clone(),
@@ -435,7 +689,37 @@ pub fn snapshot_execution_outcome(context: &SharedProxyVmContext) -> VmExecution
     }
 }
 
+pub async fn resolve_outbound_request_body(
+    context: &SharedProxyVmContext,
+) -> Result<Vec<u8>, VmError> {
+    let (overridden, explicit_body, inbound_body) = {
+        let mut guard = context.lock().expect("vm context lock poisoned");
+        guard.touch_upstream_request();
+        (
+            guard.outbound_request_body_overridden,
+            guard.outbound_request_body.clone(),
+            guard.inbound_request_body.clone(),
+        )
+    };
+
+    if overridden {
+        return Ok(explicit_body);
+    }
+
+    let mut inbound = inbound_body.lock().await;
+    inbound.read_all().await
+}
+
 pub fn register_host_module(
+    vm: &mut Vm,
+    context: SharedProxyVmContext,
+    async_ops: SharedVmAsyncOps,
+) -> Result<(), VmError> {
+    static RUNTIME_PROTOCOL_MODULE: RuntimeProtocolHostModule = RuntimeProtocolHostModule;
+    register_protocol_modules(vm, context, async_ops, &[&RUNTIME_PROTOCOL_MODULE])
+}
+
+pub fn register_http_plane_host_module(
     vm: &mut Vm,
     context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
@@ -454,9 +738,10 @@ pub fn register_host_module(
 
 pub fn register_runtime_host_module(
     vm: &mut Vm,
+    context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
 ) -> Result<(), VmError> {
-    runtime::register_runtime_host_module(vm, async_ops)
+    runtime::register_runtime_host_module(vm, context, async_ops)
 }
 
 pub fn register_http_host_module(
@@ -488,6 +773,59 @@ fn schedule_ready_call(
     let mut ops = async_ops.lock().expect("vm async ops lock poisoned");
     let op_id = ops.schedule_ready(vm, Ok(values))?;
     Ok(CallOutcome::Pending(op_id))
+}
+
+async fn read_request_body_all(context: &SharedProxyVmContext) -> Result<Vec<u8>, VmError> {
+    let body = {
+        let mut guard = context.lock().expect("vm context lock poisoned");
+        guard.touch_request_body();
+        guard.inbound_request_body.clone()
+    };
+    let mut inbound = body.lock().await;
+    inbound.read_all().await
+}
+
+async fn consume_request_body_all(context: &SharedProxyVmContext) -> Result<Vec<u8>, VmError> {
+    let body = {
+        let mut guard = context.lock().expect("vm context lock poisoned");
+        guard.touch_request_body();
+        guard.inbound_request_body.clone()
+    };
+    let mut inbound = body.lock().await;
+    inbound.read_all_and_consume().await
+}
+
+async fn read_request_body_next_chunk(
+    context: &SharedProxyVmContext,
+    max_bytes: usize,
+) -> Result<Vec<u8>, VmError> {
+    let body = {
+        let mut guard = context.lock().expect("vm context lock poisoned");
+        guard.touch_request_body();
+        guard.inbound_request_body.clone()
+    };
+    let mut inbound = body.lock().await;
+    inbound.read_next_chunk(max_bytes).await
+}
+
+async fn read_request_body_next_line(context: &SharedProxyVmContext) -> Result<Vec<u8>, VmError> {
+    let body = {
+        let mut guard = context.lock().expect("vm context lock poisoned");
+        guard.touch_request_body();
+        guard.inbound_request_body.clone()
+    };
+    let mut inbound = body.lock().await;
+    inbound.read_next_line().await
+}
+
+async fn request_body_eof(context: &SharedProxyVmContext) -> Result<bool, VmError> {
+    let body = {
+        let mut guard = context.lock().expect("vm context lock poisoned");
+        guard.touch_request_body();
+        guard.inbound_request_body.clone()
+    };
+    let mut inbound = body.lock().await;
+    inbound.eof().await
 }
 
 fn expect_arg_count(args: &[Value], expected: usize) -> Result<(), VmError> {

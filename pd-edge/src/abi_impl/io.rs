@@ -3,7 +3,8 @@ use vm::{CallOutcome, HostFunction, Value, Vm, VmError};
 
 use super::{
     EDGE_IO_HANDLE_DYNAMIC_BASE, EdgeVirtualIoHandle, ProxyVmContext, SharedProxyVmContext,
-    SharedVmAsyncOps, bind_async_host, expect_arg_count, expect_string, schedule_future_call,
+    SharedVmAsyncOps, bind_async_host, consume_request_body_all, expect_arg_count, expect_string,
+    read_request_body_next_line, resolve_outbound_request_body, schedule_future_call,
 };
 
 const EDGE_IO_HANDLE_REQUEST_BODY: i64 = 1;
@@ -265,52 +266,55 @@ async fn write_edge_file_path(path: &str, append: bool, text: &str) -> Result<()
         .map_err(|err| VmError::HostError(format!("edge io::write failed: {err}")))
 }
 
-fn read_io_target_all(context: &mut ProxyVmContext, target: EdgeIoHandleKind) -> String {
+async fn read_io_target_all(
+    context: &SharedProxyVmContext,
+    target: EdgeIoHandleKind,
+) -> Result<String, VmError> {
     match target {
         EdgeIoHandleKind::Request => {
-            context.inbound_request_body_offset = context.inbound_request_body.len();
-            String::from_utf8_lossy(&context.inbound_request_body).into_owned()
+            let body = consume_request_body_all(context).await?;
+            Ok(String::from_utf8_lossy(&body).into_owned())
         }
-        EdgeIoHandleKind::Response => context.response_content.clone().unwrap_or_default(),
+        EdgeIoHandleKind::Response => {
+            let mut guard = context.lock().expect("vm context lock poisoned");
+            guard.touch_response_output();
+            Ok(guard.response_content.clone().unwrap_or_default())
+        }
         EdgeIoHandleKind::UpstreamRequest => {
-            String::from_utf8_lossy(&context.outbound_request_body).into_owned()
+            let body = resolve_outbound_request_body(context).await?;
+            Ok(String::from_utf8_lossy(&body).into_owned())
         }
-        EdgeIoHandleKind::UpstreamResponse => context
-            .upstream_response_content
-            .clone()
-            .unwrap_or_default(),
+        EdgeIoHandleKind::UpstreamResponse => {
+            let mut guard = context.lock().expect("vm context lock poisoned");
+            guard.touch_upstream_response();
+            Ok(guard.upstream_response_content.clone().unwrap_or_default())
+        }
     }
 }
 
-fn read_io_target_line(context: &mut ProxyVmContext, target: EdgeIoHandleKind) -> String {
+async fn read_io_target_line(
+    context: &SharedProxyVmContext,
+    target: EdgeIoHandleKind,
+) -> Result<String, VmError> {
     match target {
         EdgeIoHandleKind::Request => {
-            let start = context
-                .inbound_request_body_offset
-                .min(context.inbound_request_body.len());
-            if start >= context.inbound_request_body.len() {
-                return String::new();
-            }
-            let bytes = &context.inbound_request_body;
-            let mut end = start;
-            while end < bytes.len() && bytes[end] != b'\n' {
-                end += 1;
-            }
-            let line = String::from_utf8_lossy(&bytes[start..end]).into_owned();
-            if end < bytes.len() && bytes[end] == b'\n' {
-                end += 1;
-            }
-            context.inbound_request_body_offset = end;
-            line
+            let line = read_request_body_next_line(context).await?;
+            Ok(String::from_utf8_lossy(&line).into_owned())
         }
-        EdgeIoHandleKind::Response => context.response_content.clone().unwrap_or_default(),
+        EdgeIoHandleKind::Response => {
+            let mut guard = context.lock().expect("vm context lock poisoned");
+            guard.touch_response_output();
+            Ok(guard.response_content.clone().unwrap_or_default())
+        }
         EdgeIoHandleKind::UpstreamRequest => {
-            String::from_utf8_lossy(&context.outbound_request_body).into_owned()
+            let body = resolve_outbound_request_body(context).await?;
+            Ok(String::from_utf8_lossy(&body).into_owned())
         }
-        EdgeIoHandleKind::UpstreamResponse => context
-            .upstream_response_content
-            .clone()
-            .unwrap_or_default(),
+        EdgeIoHandleKind::UpstreamResponse => {
+            let mut guard = context.lock().expect("vm context lock poisoned");
+            guard.touch_upstream_response();
+            Ok(guard.upstream_response_content.clone().unwrap_or_default())
+        }
     }
 }
 
@@ -320,20 +324,29 @@ fn write_io_target(
     text: &str,
 ) -> Result<(), VmError> {
     match target {
-        EdgeIoHandleKind::Request => Err(VmError::HostError(
-            "edge io::write does not support request body read handle".to_string(),
-        )),
+        EdgeIoHandleKind::Request => {
+            context.touch_request_body();
+            Err(VmError::HostError(
+                "edge io::write does not support request body read handle".to_string(),
+            ))
+        }
         EdgeIoHandleKind::Response => {
+            context.touch_response_output();
             context.response_content = Some(text.to_string());
             Ok(())
         }
         EdgeIoHandleKind::UpstreamRequest => {
+            context.touch_upstream_request();
             context.outbound_request_body = text.as_bytes().to_vec();
+            context.outbound_request_body_overridden = true;
             Ok(())
         }
-        EdgeIoHandleKind::UpstreamResponse => Err(VmError::HostError(
-            "edge io::write does not support upstream response body handles".to_string(),
-        )),
+        EdgeIoHandleKind::UpstreamResponse => {
+            context.touch_upstream_response();
+            Err(VmError::HostError(
+                "edge io::write does not support upstream response body handles".to_string(),
+            ))
+        }
     }
 }
 
@@ -479,16 +492,16 @@ impl HostFunction for BuiltinIoReadAllFunction {
             tokio::task::yield_now().await;
             let text = match &source {
                 Value::String(literal) => match edge_io_target_from_string(literal) {
-                    Some(target) => {
-                        let mut guard = context.lock().expect("vm context lock poisoned");
-                        read_io_target_all(&mut guard, target)
-                    }
+                    Some(target) => read_io_target_all(&context, target).await?,
                     None => literal.clone(),
                 },
                 Value::Int(handle) => {
                     let mut guard = context.lock().expect("vm context lock poisoned");
                     match decode_edge_io_handle(*handle) {
-                        Ok(target) => read_io_target_all(&mut guard, target),
+                        Ok(target) => {
+                            drop(guard);
+                            read_io_target_all(&context, target).await?
+                        }
                         Err(_) => read_edge_virtual_handle_all(&mut guard, *handle)?,
                     }
                 }
@@ -522,10 +535,7 @@ impl HostFunction for BuiltinIoReadLineFunction {
             tokio::task::yield_now().await;
             let text = match &source {
                 Value::String(literal) => match edge_io_target_from_string(literal) {
-                    Some(target) => {
-                        let mut guard = context.lock().expect("vm context lock poisoned");
-                        read_io_target_line(&mut guard, target)
-                    }
+                    Some(target) => read_io_target_line(&context, target).await?,
                     None => {
                         let mut lines = literal.lines();
                         lines.next().unwrap_or_default().to_string()
@@ -534,7 +544,10 @@ impl HostFunction for BuiltinIoReadLineFunction {
                 Value::Int(handle) => {
                     let mut guard = context.lock().expect("vm context lock poisoned");
                     match decode_edge_io_handle(*handle) {
-                        Ok(target) => read_io_target_line(&mut guard, target),
+                        Ok(target) => {
+                            drop(guard);
+                            read_io_target_line(&context, target).await?
+                        }
                         Err(_) => read_edge_virtual_handle_line(&mut guard, *handle)?,
                     }
                 }
