@@ -306,7 +306,7 @@ enum VmHostFunction {
 }
 
 pub struct Vm {
-    program: Program,
+    program: Arc<Program>,
     program_cache_key: u64,
     program_cache_key_ready: bool,
     ip: usize,
@@ -413,6 +413,10 @@ fn hash_value(value: &Value, state: &mut impl Hasher) {
 
 impl Vm {
     pub fn new(program: Program) -> Self {
+        Self::new_shared(Arc::new(program))
+    }
+
+    pub fn new_shared(program: Arc<Program>) -> Self {
         Self {
             program,
             program_cache_key: 0,
@@ -437,6 +441,10 @@ impl Vm {
     }
 
     pub fn with_locals(program: Program, local_count: usize) -> Self {
+        Self::with_locals_shared(Arc::new(program), local_count)
+    }
+
+    pub fn with_locals_shared(program: Arc<Program>, local_count: usize) -> Self {
         Self {
             program,
             program_cache_key: 0,
@@ -900,7 +908,7 @@ impl Vm {
     }
 
     pub fn program(&self) -> &Program {
-        &self.program
+        self.program.as_ref()
     }
 
     pub fn bound_function_count(&self) -> usize {

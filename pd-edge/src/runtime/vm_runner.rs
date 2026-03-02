@@ -41,8 +41,9 @@ pub async fn execute_vm_with_context(
     if debug.attach_debugger {
         let async_ops_for_debug = async_ops.clone();
         let vm_context_for_debug = vm_context.clone();
+        let program_for_debug = program.clone();
         let task = tokio::task::spawn_blocking(move || {
-            let mut vm = Vm::with_locals((*program).clone(), local_count);
+            let mut vm = Vm::with_locals_shared(program_for_debug, local_count);
             vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops_for_debug.clone())));
             register_host_modules(&mut vm, vm_context_for_debug.clone(), async_ops_for_debug)
                 .map_err(VmExecutionError::HostRegistration)?;
@@ -76,7 +77,7 @@ pub async fn execute_vm_with_context(
         })?;
     }
 
-    let mut vm = Vm::with_locals((*program).clone(), local_count);
+    let mut vm = Vm::with_locals_shared(program, local_count);
     vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));
     register_host_modules(&mut vm, vm_context.clone(), async_ops)
         .map_err(VmExecutionError::HostRegistration)?;
