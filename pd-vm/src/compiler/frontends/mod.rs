@@ -5,7 +5,11 @@ mod scheme;
 
 use crate::compiler::source_map::{LoweredSource, SourceMap};
 
-use super::{ParseError, SourceFlavor, ir::FrontendIr, parser::Parser};
+use super::{
+    ParseError, SourceFlavor,
+    ir::FrontendIr,
+    parser::{Parser, ParserDialect},
+};
 
 trait FrontendCompiler {
     fn lower_to_ir(&self, source: &str) -> Result<FrontendIr, ParseError>;
@@ -64,14 +68,14 @@ fn parse_with_parser(
     source_id: u32,
     allow_implicit_externs: bool,
     allow_implicit_semicolons: bool,
-    js_mode: bool,
+    dialect: &'static dyn ParserDialect,
 ) -> Result<FrontendIr, ParseError> {
     let mut parser = Parser::new(
         source,
         source_id,
         allow_implicit_externs,
         allow_implicit_semicolons,
-        js_mode,
+        dialect,
     )?;
     let stmts = parser.parse_program()?;
     Ok(FrontendIr {
@@ -98,7 +102,7 @@ fn parse_lowered_with_mapping(
         lowered_source_id,
         allow_implicit_externs,
         allow_implicit_semicolons,
-        false,
+        rustscript::parser_dialect(),
     ) {
         Ok(ir) => Ok(ir),
         Err(mut err) => {

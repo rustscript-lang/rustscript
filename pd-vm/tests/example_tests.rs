@@ -71,7 +71,8 @@ fn expect_direct_only_source_file_error(path: &Path) {
     match err {
         vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
             assert!(
-                parse.message.contains("direct IR lowering only"),
+                parse.message.contains("unsupported Lua syntax")
+                    || parse.message.contains("unsupported Scheme syntax"),
                 "{}",
                 parse.message
             );

@@ -9,11 +9,7 @@ fn expect_lua_direct_only_error(source: &str) {
     };
     match err {
         vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("direct IR lowering only"),
-                "{}",
-                parse.message
-            );
+            assert!(parse.message.contains("unsupported Lua syntax"), "{}", parse.message);
         }
         other => panic!("unexpected error: {other}"),
     }
@@ -96,6 +92,33 @@ fn lua_direct_subset_do_end_block_work() {
 }
 
 #[test]
+fn lua_direct_subset_float_char_and_hex_escape_literals_work() {
+    let source = r#"
+        local f = 1.25
+        local c = '\x41'
+        local s = "\x42"
+        f
+        c
+        s
+    "#;
+
+    let compiled =
+        compile_source_with_flavor(source, SourceFlavor::Lua).expect("compile should succeed");
+
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[
+            Value::Float(1.25),
+            Value::String("A".to_string()),
+            Value::String("B".to_string())
+        ]
+    );
+}
+
+#[test]
 fn lua_assignment_to_undeclared_local_is_rejected() {
     let source = r#"
         value = 1
@@ -160,11 +183,7 @@ fn lua_complex_fixture_is_rejected_without_rewrite_path() {
 
     match err {
         vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
-            assert!(
-                parse.message.contains("direct IR lowering only"),
-                "{}",
-                parse.message
-            );
+            assert!(parse.message.contains("unsupported Lua syntax"), "{}", parse.message);
         }
         vm::SourcePathError::Source(vm::SourceError::Compile(other)) => {
             panic!("unexpected nested compile error: {other:?}");

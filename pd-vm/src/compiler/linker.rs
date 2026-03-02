@@ -5,7 +5,7 @@ use crate::builtins::BuiltinFunction;
 
 use super::{
     ParseError, SourceError, SourcePathError,
-    ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, LinkedIr, Stmt},
+    ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, Stmt},
 };
 
 pub(super) struct ParsedUnit {
@@ -28,10 +28,7 @@ pub(super) fn sanitize_scope_prefix(path: &Path) -> String {
         .collect()
 }
 
-pub(super) fn merge_units(
-    root_source: String,
-    units: Vec<ParsedUnit>,
-) -> Result<LinkedIr, SourcePathError> {
+pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePathError> {
     let mut merged_stmts = Vec::new();
     let mut merged_local_bindings = Vec::new();
     let mut merged_functions = Vec::new();
@@ -113,8 +110,7 @@ pub(super) fn merge_units(
         }
     }
 
-    Ok(LinkedIr {
-        source: root_source,
+    Ok(FrontendIr {
         stmts: merged_stmts,
         locals: local_base,
         local_bindings: merged_local_bindings,

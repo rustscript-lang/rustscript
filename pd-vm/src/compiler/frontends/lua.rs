@@ -1,7 +1,7 @@
 use super::super::ParseError;
-use super::super::ir::{Expr, FrontendIr, Stmt};
+use super::super::ir::{Expr, FrontendIr, LocalIrBuilder, Stmt};
 use super::{is_ident_continue, is_ident_start};
-use std::collections::HashMap;
+
 pub(super) fn lower_to_ir(source: &str) -> Result<FrontendIr, ParseError> {
     if let Some(ir) = try_lower_direct_subset_to_ir(source)? {
         return Ok(ir);
@@ -10,14 +10,12 @@ pub(super) fn lower_to_ir(source: &str) -> Result<FrontendIr, ParseError> {
         span: None,
         code: None,
         line: 1,
-        message:
-            "Lua frontend now uses direct IR lowering only; source is outside the supported direct subset"
-                .to_string(),
+        message: "unsupported Lua syntax".to_string(),
     })
 }
 fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, ParseError> {
     let cleaned_source = remove_lua_comments(source)?;
-    let mut builder = LuaDirectIrBuilder::new();
+    let mut builder = LocalIrBuilder::new();
     let mut root_stmts = Vec::<Stmt>::new();
     let mut block_stack = Vec::<LuaDirectBlock>::new();
     for (index, raw_line) in cleaned_source.lines().enumerate() {
@@ -228,68 +226,12 @@ fn emit_lua_direct_stmt(stmt: Stmt, root: &mut Vec<Stmt>, blocks: &mut [LuaDirec
         LuaDirectBlock::While { body, .. } | LuaDirectBlock::Do { body, .. } => body.push(stmt),
     }
 }
-struct LuaDirectIrBuilder {
-    locals: HashMap<String, u8>,
-    next_local: u8,
-}
-impl LuaDirectIrBuilder {
-    fn new() -> Self {
-        Self {
-            locals: HashMap::new(),
-            next_local: 0,
-        }
-    }
-    fn lower_local(&mut self, name: &str, expr: Expr, line: u32) -> Result<Stmt, ParseError> {
-        let index = if let Some(index) = self.locals.get(name).copied() {
-            index
-        } else {
-            let index = self.alloc_local()?;
-            self.locals.insert(name.to_string(), index);
-            index
-        };
-        Ok(Stmt::Let { index, expr, line })
-    }
-    fn lower_assign(&self, name: &str, expr: Expr, line: u32) -> Result<Stmt, ParseError> {
-        let Some(index) = self.locals.get(name).copied() else {
-            return Err(ParseError {
-                span: None,
-                code: None,
-                line: line as usize,
-                message: format!("unknown local '{name}'"),
-            });
-        };
-        Ok(Stmt::Assign { index, expr, line })
-    }
-    fn resolve_local_expr(&self, name: &str) -> Option<Expr> {
-        self.locals.get(name).copied().map(Expr::Var)
-    }
-    fn finish(self, stmts: Vec<Stmt>) -> FrontendIr {
-        let mut local_bindings = self.locals.into_iter().collect::<Vec<(String, u8)>>();
-        local_bindings.sort_by_key(|(_, index)| *index);
-        FrontendIr {
-            stmts,
-            locals: self.next_local as usize,
-            local_bindings,
-            functions: Vec::new(),
-            function_impls: HashMap::new(),
-        }
-    }
-    fn alloc_local(&mut self) -> Result<u8, ParseError> {
-        let index = self.next_local;
-        self.next_local = self.next_local.checked_add(1).ok_or(ParseError {
-            span: None,
-            code: None,
-            line: 1,
-            message: "local index overflow".to_string(),
-        })?;
-        Ok(index)
-    }
-}
 #[derive(Clone)]
 enum LuaDirectExpr {
     Null,
     Bool(bool),
     Int(i64),
+    Float(f64),
     String(String),
     Var(String),
     Add(Box<LuaDirectExpr>, Box<LuaDirectExpr>),
@@ -311,6 +253,7 @@ enum LuaDirectExpr {
 #[derive(Clone)]
 enum LuaDirectToken {
     Int(i64),
+    Float(f64),
     String(String),
     Bool(bool),
     Null,
@@ -334,7 +277,7 @@ enum LuaDirectToken {
 }
 fn parse_lua_direct_expr(
     input: &str,
-    builder: &LuaDirectIrBuilder,
+    builder: &LocalIrBuilder,
 ) -> Result<Option<Expr>, ParseError> {
     let Some(tokens) = tokenize_lua_direct_expr(input) else {
         return Ok(None);
@@ -348,11 +291,12 @@ fn parse_lua_direct_expr(
     }
     Ok(lower_lua_direct_expr(expr, builder))
 }
-fn lower_lua_direct_expr(expr: LuaDirectExpr, builder: &LuaDirectIrBuilder) -> Option<Expr> {
+fn lower_lua_direct_expr(expr: LuaDirectExpr, builder: &LocalIrBuilder) -> Option<Expr> {
     match expr {
         LuaDirectExpr::Null => Some(Expr::Null),
         LuaDirectExpr::Bool(value) => Some(Expr::Bool(value)),
         LuaDirectExpr::Int(value) => Some(Expr::Int(value)),
+        LuaDirectExpr::Float(value) => Some(Expr::Float(value)),
         LuaDirectExpr::String(value) => Some(Expr::String(value)),
         LuaDirectExpr::Var(name) => builder.resolve_local_expr(&name),
         LuaDirectExpr::Add(lhs, rhs) => Some(Expr::Add(
@@ -508,6 +452,10 @@ impl LuaDirectExprParser {
                     self.pos += 1;
                     Some(LuaDirectExpr::Int(value))
                 }
+                LuaDirectToken::Float(value) => {
+                    self.pos += 1;
+                    Some(LuaDirectExpr::Float(value))
+                }
                 LuaDirectToken::String(value) => {
                     self.pos += 1;
                     Some(LuaDirectExpr::String(value))
@@ -572,11 +520,20 @@ fn tokenize_lua_direct_expr(input: &str) -> Option<Vec<LuaDirectToken>> {
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
             }
-            let value = std::str::from_utf8(&bytes[start..i])
-                .ok()?
-                .parse::<i64>()
-                .ok()?;
-            out.push(LuaDirectToken::Int(value));
+            let mut is_float = false;
+            if i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1].is_ascii_digit() {
+                is_float = true;
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            let text = std::str::from_utf8(&bytes[start..i]).ok()?;
+            if is_float {
+                out.push(LuaDirectToken::Float(text.parse::<f64>().ok()?));
+            } else {
+                out.push(LuaDirectToken::Int(text.parse::<i64>().ok()?));
+            }
             continue;
         }
         if b == b'"' || b == b'\'' {
@@ -588,16 +545,25 @@ fn tokenize_lua_direct_expr(input: &str) -> Option<Vec<LuaDirectToken>> {
                 let ch = bytes[i];
                 i += 1;
                 if escaped {
-                    let mapped = match ch {
-                        b'n' => '\n',
-                        b'r' => '\r',
-                        b't' => '\t',
-                        b'\\' => '\\',
-                        b'"' => '"',
-                        b'\'' => '\'',
-                        other => other as char,
-                    };
-                    text.push(mapped);
+                    match ch {
+                        b'n' => text.push('\n'),
+                        b'r' => text.push('\r'),
+                        b't' => text.push('\t'),
+                        b'\\' => text.push('\\'),
+                        b'"' => text.push('"'),
+                        b'\'' => text.push('\''),
+                        b'0' => text.push('\0'),
+                        b'x' => {
+                            if i + 1 >= bytes.len() {
+                                return None;
+                            }
+                            let hi = hex_nibble_byte(bytes[i])?;
+                            let lo = hex_nibble_byte(bytes[i + 1])?;
+                            text.push(((hi << 4) | lo) as char);
+                            i += 2;
+                        }
+                        other => text.push(other as char),
+                    }
                     escaped = false;
                     continue;
                 }
@@ -702,6 +668,16 @@ fn is_valid_lua_ident(input: &str) -> bool {
     }
     chars.all(is_ident_continue)
 }
+
+fn hex_nibble_byte(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn remove_lua_comments(source: &str) -> Result<String, ParseError> {
     let bytes = source.as_bytes();
     let mut out = String::with_capacity(source.len());

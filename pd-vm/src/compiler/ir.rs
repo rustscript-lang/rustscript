@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use super::ParseError;
+
 /// Shared frontend-independent program representation that all source
 /// frontends lower into before bytecode emission.
 #[derive(Clone, Debug)]
@@ -152,12 +154,76 @@ pub struct FrontendIr {
     pub function_impls: HashMap<u16, FunctionImpl>,
 }
 
-#[derive(Clone, Debug)]
-pub struct LinkedIr {
-    pub source: String,
-    pub stmts: Vec<Stmt>,
-    pub locals: usize,
-    pub local_bindings: Vec<(String, u8)>,
-    pub functions: Vec<FunctionDecl>,
-    pub function_impls: HashMap<u16, FunctionImpl>,
+pub(super) struct LocalIrBuilder {
+    locals: HashMap<String, u8>,
+    next_local: u8,
+}
+
+impl LocalIrBuilder {
+    pub(super) fn new() -> Self {
+        Self {
+            locals: HashMap::new(),
+            next_local: 0,
+        }
+    }
+
+    pub(super) fn lower_local(
+        &mut self,
+        name: &str,
+        expr: Expr,
+        line: u32,
+    ) -> Result<Stmt, ParseError> {
+        let index = if let Some(index) = self.locals.get(name).copied() {
+            index
+        } else {
+            let index = self.alloc_local()?;
+            self.locals.insert(name.to_string(), index);
+            index
+        };
+        Ok(Stmt::Let { index, expr, line })
+    }
+
+    pub(super) fn lower_assign(
+        &self,
+        name: &str,
+        expr: Expr,
+        line: u32,
+    ) -> Result<Stmt, ParseError> {
+        let Some(index) = self.locals.get(name).copied() else {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: line as usize,
+                message: format!("unknown local '{name}'"),
+            });
+        };
+        Ok(Stmt::Assign { index, expr, line })
+    }
+
+    pub(super) fn resolve_local_expr(&self, name: &str) -> Option<Expr> {
+        self.locals.get(name).copied().map(Expr::Var)
+    }
+
+    pub(super) fn finish(self, stmts: Vec<Stmt>) -> FrontendIr {
+        let mut local_bindings = self.locals.into_iter().collect::<Vec<(String, u8)>>();
+        local_bindings.sort_by_key(|(_, index)| *index);
+        FrontendIr {
+            stmts,
+            locals: self.next_local as usize,
+            local_bindings,
+            functions: Vec::new(),
+            function_impls: HashMap::new(),
+        }
+    }
+
+    fn alloc_local(&mut self) -> Result<u8, ParseError> {
+        let index = self.next_local;
+        self.next_local = self.next_local.checked_add(1).ok_or(ParseError {
+            span: None,
+            code: None,
+            line: 1,
+            message: "local index overflow".to_string(),
+        })?;
+        Ok(index)
+    }
 }

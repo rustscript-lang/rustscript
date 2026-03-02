@@ -156,6 +156,25 @@ fn rustscript_float_literal_binding_is_supported() {
 }
 
 #[test]
+fn rustscript_char_and_hex_escape_literals_are_supported() {
+    let source = r#"
+        let c = '\x41';
+        let s = "\x42";
+        c;
+        s;
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::String("A".to_string()), Value::String("B".to_string())]
+    );
+}
+
+#[test]
 fn rustscript_array_primitives_are_supported_without_namespace() {
     let source = r#"
         let values = [];

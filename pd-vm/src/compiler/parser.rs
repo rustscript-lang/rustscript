@@ -72,17 +72,59 @@ enum NumberLiteral {
     Float(f64),
 }
 
+pub(super) trait ParserDialect {
+    fn is_import_keyword(&self, _ident: &str) -> bool {
+        false
+    }
+
+    fn is_from_keyword(&self, _ident: &str) -> bool {
+        false
+    }
+
+    fn is_fn_alias_keyword(&self, _ident: &str) -> bool {
+        false
+    }
+
+    fn is_let_alias_keyword(&self, _ident: &str) -> bool {
+        false
+    }
+
+    fn allow_import_stmt(&self) -> bool {
+        false
+    }
+
+    fn allow_return_stmt(&self) -> bool {
+        false
+    }
+
+    fn allow_require_declaration(&self) -> bool {
+        false
+    }
+
+    fn allow_typeof_operator(&self) -> bool {
+        false
+    }
+
+    fn allow_arrow_closure(&self) -> bool {
+        false
+    }
+
+    fn allow_dotted_call(&self) -> bool {
+        false
+    }
+}
+
 struct Lexer<'a> {
     chars: std::str::Chars<'a>,
     current: Option<char>,
     line: usize,
     offset: usize,
     source_id: SourceId,
-    js_mode: bool,
+    dialect: &'static dyn ParserDialect,
 }
 
 impl<'a> Lexer<'a> {
-    fn new(source: &'a str, source_id: SourceId, js_mode: bool) -> Self {
+    fn new(source: &'a str, source_id: SourceId, dialect: &'static dyn ParserDialect) -> Self {
         let mut chars = source.chars();
         let current = chars.next();
         Self {
@@ -91,7 +133,7 @@ impl<'a> Lexer<'a> {
             line: 1,
             offset: 0,
             source_id,
-            js_mode,
+            dialect,
         }
     }
 
@@ -224,8 +266,8 @@ impl<'a> Lexer<'a> {
                     TokenKind::Equal
                 }
             }
-            '"' => {
-                let value = self.consume_string()?;
+            '"' | '\'' => {
+                let value = self.consume_string(ch)?;
                 TokenKind::String(value)
             }
             c if c.is_ascii_digit() => match self.consume_number()? {
@@ -237,14 +279,13 @@ impl<'a> Lexer<'a> {
                 match ident.as_str() {
                     "pub" => TokenKind::Pub,
                     "use" => TokenKind::Use,
-                    "import" if self.js_mode => TokenKind::Import,
-                    "from" if self.js_mode => TokenKind::From,
+                    _ if self.dialect.is_import_keyword(&ident) => TokenKind::Import,
+                    _ if self.dialect.is_from_keyword(&ident) => TokenKind::From,
                     "as" => TokenKind::As,
                     "fn" => TokenKind::Fn,
-                    "function" if self.js_mode => TokenKind::Fn,
+                    _ if self.dialect.is_fn_alias_keyword(&ident) => TokenKind::Fn,
                     "let" => TokenKind::Let,
-                    "const" if self.js_mode => TokenKind::Let,
-                    "var" if self.js_mode => TokenKind::Let,
+                    _ if self.dialect.is_let_alias_keyword(&ident) => TokenKind::Let,
                     "for" => TokenKind::For,
                     "if" => TokenKind::If,
                     "else" => TokenKind::Else,
@@ -383,14 +424,14 @@ impl<'a> Lexer<'a> {
             })
     }
 
-    fn consume_string(&mut self) -> Result<String, ParseError> {
+    fn consume_string(&mut self, delimiter: char) -> Result<String, ParseError> {
         let line = self.line;
-        if self.current != Some('"') {
+        if self.current != Some(delimiter) {
             return Err(ParseError {
                 span: None,
                 code: None,
                 line,
-                message: "string literal must start with '\"'".to_string(),
+                message: "string literal has invalid delimiter".to_string(),
             });
         }
         self.advance();
@@ -407,7 +448,7 @@ impl<'a> Lexer<'a> {
             };
 
             match ch {
-                '"' => {
+                quote if quote == delimiter => {
                     self.advance();
                     break;
                 }
@@ -427,7 +468,47 @@ impl<'a> Lexer<'a> {
                         't' => '\t',
                         '\\' => '\\',
                         '"' => '"',
+                        '\'' => '\'',
                         '0' => '\0',
+                        'x' => {
+                            self.advance();
+                            let Some(hi) = self.current else {
+                                return Err(ParseError {
+                                    span: None,
+                                    code: None,
+                                    line,
+                                    message: "unterminated string escape".to_string(),
+                                });
+                            };
+                            let Some(hi) = hex_nibble(hi) else {
+                                return Err(ParseError {
+                                    span: None,
+                                    code: None,
+                                    line,
+                                    message: "invalid escape '\\x'".to_string(),
+                                });
+                            };
+                            self.advance();
+                            let Some(lo) = self.current else {
+                                return Err(ParseError {
+                                    span: None,
+                                    code: None,
+                                    line,
+                                    message: "unterminated string escape".to_string(),
+                                });
+                            };
+                            let Some(lo) = hex_nibble(lo) else {
+                                return Err(ParseError {
+                                    span: None,
+                                    code: None,
+                                    line,
+                                    message: "invalid escape '\\x'".to_string(),
+                                });
+                            };
+                            out.push(((hi << 4) | lo) as char);
+                            self.advance();
+                            continue;
+                        }
                         other => {
                             return Err(ParseError {
                                 span: None,
@@ -472,6 +553,15 @@ fn is_ident_continue(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
 }
 
+fn hex_nibble(ch: char) -> Option<u8> {
+    match ch {
+        '0'..='9' => Some((ch as u8) - b'0'),
+        'a'..='f' => Some((ch as u8) - b'a' + 10),
+        'A'..='F' => Some((ch as u8) - b'A' + 10),
+        _ => None,
+    }
+}
+
 pub(super) struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -485,7 +575,7 @@ pub(super) struct Parser {
     closure_capture_contexts: Vec<ClosureCaptureContext>,
     allow_implicit_externs: bool,
     allow_implicit_semicolons: bool,
-    js_mode: bool,
+    dialect: &'static dyn ParserDialect,
     loop_depth: usize,
     function_body_depth: usize,
     vm_namespace_aliases: HashSet<String>,
@@ -505,9 +595,9 @@ impl Parser {
         source_id: SourceId,
         allow_implicit_externs: bool,
         allow_implicit_semicolons: bool,
-        js_mode: bool,
+        dialect: &'static dyn ParserDialect,
     ) -> Result<Self, ParseError> {
-        let mut lexer = Lexer::new(source, source_id, js_mode);
+        let mut lexer = Lexer::new(source, source_id, dialect);
         let mut tokens = Vec::new();
         loop {
             let token = lexer.next_token()?;
@@ -530,7 +620,7 @@ impl Parser {
             closure_capture_contexts: Vec::new(),
             allow_implicit_externs,
             allow_implicit_semicolons,
-            js_mode,
+            dialect,
             loop_depth: 0,
             function_body_depth: 0,
             vm_namespace_aliases: HashSet::new(),
@@ -563,17 +653,18 @@ impl Parser {
         if self.match_kind(&TokenKind::Use) {
             return self.parse_use_stmt();
         }
-        if self.js_mode && self.match_kind(&TokenKind::Import) {
+        if self.dialect.allow_import_stmt() && self.match_kind(&TokenKind::Import) {
             return self.parse_js_import_stmt();
         }
-        if self.js_mode && self.check_ident_literal("return") {
+        if self.dialect.allow_return_stmt() && self.check_ident_literal("return") {
             return self.parse_return_stmt();
         }
         if self.match_kind(&TokenKind::Fn) {
             return self.parse_fn_decl(false);
         }
         if self.match_kind(&TokenKind::Let) {
-            if self.js_mode && self.check_js_require_declaration_start() {
+            if self.dialect.allow_require_declaration() && self.check_js_require_declaration_start()
+            {
                 return self.parse_js_require_declaration_after_let();
             }
             return self.parse_let_with_terminator(true);
@@ -1340,7 +1431,7 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
-        if self.js_mode && self.match_ident_literal("typeof") {
+        if self.dialect.allow_typeof_operator() && self.match_ident_literal("typeof") {
             let inner = self.parse_unary()?;
             return Ok(self.build_builtin_call_expr(BuiltinFunction::TypeOf, vec![inner])?);
         }
@@ -1383,14 +1474,14 @@ impl Parser {
         if self.match_kind(&TokenKind::Pipe) {
             return self.parse_closure_literal();
         }
-        if self.js_mode && self.check_parenthesized_arrow_closure_start() {
+        if self.dialect.allow_arrow_closure() && self.check_parenthesized_arrow_closure_start() {
             return self.parse_parenthesized_arrow_closure();
         }
-        if self.js_mode && self.check_single_param_arrow_closure_start() {
+        if self.dialect.allow_arrow_closure() && self.check_single_param_arrow_closure_start() {
             return self.parse_single_param_arrow_closure();
         }
         if let Some(name) = self.match_ident() {
-            if self.js_mode
+            if self.dialect.allow_dotted_call()
                 && let Some(expr) = self.try_parse_js_dotted_call(&name)?
             {
                 return Ok(expr);
@@ -2469,7 +2560,7 @@ impl Parser {
     }
 
     fn check_parenthesized_arrow_closure_start(&self) -> bool {
-        if !self.js_mode || !self.check(&TokenKind::LParen) {
+        if !self.check(&TokenKind::LParen) {
             return false;
         }
         let mut cursor = self.pos + 1;
@@ -2501,9 +2592,7 @@ impl Parser {
     }
 
     fn check_single_param_arrow_closure_start(&self) -> bool {
-        self.js_mode
-            && self.check_ident_at(self.pos)
-            && self.check_kind_at(self.pos + 1, &TokenKind::FatArrow)
+        self.check_ident_at(self.pos) && self.check_kind_at(self.pos + 1, &TokenKind::FatArrow)
     }
 
     fn parse_parenthesized_arrow_closure(&mut self) -> Result<Expr, ParseError> {

@@ -1,7 +1,5 @@
-use std::collections::HashMap;
-
 use super::super::ParseError;
-use super::super::ir::{Expr, FrontendIr, Stmt};
+use super::super::ir::{Expr, FrontendIr, LocalIrBuilder, Stmt};
 use super::{is_ident_continue, is_ident_start};
 
 pub(super) fn lower_to_ir(source: &str) -> Result<FrontendIr, ParseError> {
@@ -12,9 +10,7 @@ pub(super) fn lower_to_ir(source: &str) -> Result<FrontendIr, ParseError> {
         span: None,
         code: None,
         line: 1,
-        message:
-            "Scheme frontend now uses direct IR lowering only; source is outside the supported direct subset"
-                .to_string(),
+        message: "unsupported Scheme syntax".to_string(),
     })
 }
 
@@ -22,7 +18,7 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
     let mut parser = SchemeParser::new(source)?;
     let forms = parser.parse_program()?;
 
-    let mut builder = SchemeDirectIrBuilder::new();
+    let mut builder = LocalIrBuilder::new();
     let mut stmts = Vec::<Stmt>::new();
     for form in &forms {
         let Some(mut lowered) = lower_scheme_direct_stmt(form, &mut builder)? else {
@@ -33,73 +29,9 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
     Ok(Some(builder.finish(stmts)))
 }
 
-struct SchemeDirectIrBuilder {
-    locals: HashMap<String, u8>,
-    next_local: u8,
-}
-
-impl SchemeDirectIrBuilder {
-    fn new() -> Self {
-        Self {
-            locals: HashMap::new(),
-            next_local: 0,
-        }
-    }
-
-    fn lower_local(&mut self, name: &str, expr: Expr, line: u32) -> Result<Stmt, ParseError> {
-        let index = if let Some(index) = self.locals.get(name).copied() {
-            index
-        } else {
-            let index = self.alloc_local()?;
-            self.locals.insert(name.to_string(), index);
-            index
-        };
-        Ok(Stmt::Let { index, expr, line })
-    }
-
-    fn lower_assign(&self, name: &str, expr: Expr, line: u32) -> Result<Stmt, ParseError> {
-        let Some(index) = self.locals.get(name).copied() else {
-            return Err(ParseError {
-                span: None,
-                code: None,
-                line: line as usize,
-                message: format!("unknown local '{name}'"),
-            });
-        };
-        Ok(Stmt::Assign { index, expr, line })
-    }
-
-    fn resolve_local_expr(&self, name: &str) -> Option<Expr> {
-        self.locals.get(name).copied().map(Expr::Var)
-    }
-
-    fn finish(self, stmts: Vec<Stmt>) -> FrontendIr {
-        let mut local_bindings = self.locals.into_iter().collect::<Vec<_>>();
-        local_bindings.sort_by_key(|(_, index)| *index);
-        FrontendIr {
-            stmts,
-            locals: self.next_local as usize,
-            local_bindings,
-            functions: Vec::new(),
-            function_impls: HashMap::new(),
-        }
-    }
-
-    fn alloc_local(&mut self) -> Result<u8, ParseError> {
-        let index = self.next_local;
-        self.next_local = self.next_local.checked_add(1).ok_or(ParseError {
-            span: None,
-            code: None,
-            line: 1,
-            message: "local index overflow".to_string(),
-        })?;
-        Ok(index)
-    }
-}
-
 fn lower_scheme_direct_stmt(
     form: &SchemeForm,
-    builder: &mut SchemeDirectIrBuilder,
+    builder: &mut LocalIrBuilder,
 ) -> Result<Option<Vec<Stmt>>, ParseError> {
     if let Some(items) = form.as_list()
         && let Some(head) = items.first().and_then(|item| item.as_symbol())
@@ -201,7 +133,7 @@ fn lower_scheme_direct_stmt(
 
 fn lower_scheme_direct_branch(
     form: &SchemeForm,
-    builder: &mut SchemeDirectIrBuilder,
+    builder: &mut LocalIrBuilder,
 ) -> Result<Option<Vec<Stmt>>, ParseError> {
     if let Some(items) = form.as_list()
         && items
@@ -227,13 +159,13 @@ fn lower_scheme_direct_branch(
 
 fn lower_scheme_direct_expr(
     form: &SchemeForm,
-    builder: &SchemeDirectIrBuilder,
+    builder: &LocalIrBuilder,
 ) -> Result<Option<Expr>, ParseError> {
     match &form.node {
         SchemeNode::Int(value) => Ok(Some(Expr::Int(*value))),
-        SchemeNode::Float => Ok(None),
+        SchemeNode::Float(value) => Ok(Some(Expr::Float(*value))),
         SchemeNode::Bool(value) => Ok(Some(Expr::Bool(*value))),
-        SchemeNode::Char => Ok(None),
+        SchemeNode::Char(value) => Ok(Some(Expr::String(value.to_string()))),
         SchemeNode::String(value) => Ok(Some(Expr::String(value.clone()))),
         SchemeNode::Symbol(symbol) => {
             if symbol == "null" || symbol == "nil" {
@@ -254,7 +186,7 @@ fn lower_scheme_direct_expr(
 
 fn lower_scheme_direct_list_expr(
     items: &[SchemeForm],
-    builder: &SchemeDirectIrBuilder,
+    builder: &LocalIrBuilder,
 ) -> Result<Option<Expr>, ParseError> {
     let Some(head) = items.first().and_then(|item| item.as_symbol()) else {
         return Ok(None);
@@ -376,7 +308,7 @@ fn lower_scheme_direct_list_expr(
 
 fn lower_scheme_direct_binary<F>(
     args: &[SchemeForm],
-    builder: &SchemeDirectIrBuilder,
+    builder: &LocalIrBuilder,
     build: F,
 ) -> Result<Option<Expr>, ParseError>
 where
@@ -396,7 +328,7 @@ where
 
 fn lower_scheme_direct_fold<F>(
     args: &[SchemeForm],
-    builder: &SchemeDirectIrBuilder,
+    builder: &LocalIrBuilder,
     build: F,
     eval_int: fn(i64, i64) -> Option<i64>,
 ) -> Result<Option<Expr>, ParseError>
@@ -453,7 +385,7 @@ where
 
 fn lower_scheme_direct_compare_fold<F>(
     args: &[SchemeForm],
-    builder: &SchemeDirectIrBuilder,
+    builder: &LocalIrBuilder,
     build: F,
 ) -> Result<Option<Expr>, ParseError>
 where
@@ -490,9 +422,9 @@ impl SchemeForm {
 #[derive(Clone, Debug)]
 enum SchemeNode {
     Int(i64),
-    Float,
+    Float(f64),
     Bool(bool),
-    Char,
+    Char(char),
     String(String),
     Symbol(String),
     List(Vec<SchemeForm>),
@@ -665,6 +597,45 @@ impl<'a> SchemeLexer<'a> {
                         '\\' => '\\',
                         '"' => '"',
                         '0' => '\0',
+                        'x' => {
+                            self.advance();
+                            let Some(hi) = self.current else {
+                                return Err(ParseError {
+                                    span: None,
+                                    code: None,
+                                    line,
+                                    message: "unterminated string escape".to_string(),
+                                });
+                            };
+                            let Some(hi) = hex_nibble(hi) else {
+                                return Err(ParseError {
+                                    span: None,
+                                    code: None,
+                                    line,
+                                    message: "invalid escape '\\x'".to_string(),
+                                });
+                            };
+                            self.advance();
+                            let Some(lo) = self.current else {
+                                return Err(ParseError {
+                                    span: None,
+                                    code: None,
+                                    line,
+                                    message: "unterminated string escape".to_string(),
+                                });
+                            };
+                            let Some(lo) = hex_nibble(lo) else {
+                                return Err(ParseError {
+                                    span: None,
+                                    code: None,
+                                    line,
+                                    message: "invalid escape '\\x'".to_string(),
+                                });
+                            };
+                            out.push(((hi << 4) | lo) as char);
+                            self.advance();
+                            continue;
+                        }
                         other => {
                             return Err(ParseError {
                                 span: None,
@@ -724,6 +695,22 @@ impl<'a> SchemeLexer<'a> {
                 "tab" => '\t',
                 "return" => '\r',
                 "nul" | "null" => '\0',
+                _ if is_hex_char_literal(rest) => {
+                    let bytes = rest.as_bytes();
+                    let hi = hex_nibble(bytes[1] as char).ok_or(ParseError {
+                        span: None,
+                        code: None,
+                        line,
+                        message: format!("unknown character literal '#\\{rest}'"),
+                    })?;
+                    let lo = hex_nibble(bytes[2] as char).ok_or(ParseError {
+                        span: None,
+                        code: None,
+                        line,
+                        message: format!("unknown character literal '#\\{rest}'"),
+                    })?;
+                    ((hi << 4) | lo) as char
+                }
                 s if s.chars().count() == 1 => s.chars().next().unwrap(),
                 _ => {
                     return Err(ParseError {
@@ -747,6 +734,23 @@ impl<'a> SchemeLexer<'a> {
 
 fn is_scheme_delimiter(ch: char) -> bool {
     ch.is_whitespace() || matches!(ch, '(' | ')' | ';' | '\'' | '"')
+}
+
+fn is_hex_char_literal(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    bytes.len() == 3
+        && (bytes[0] == b'x' || bytes[0] == b'X')
+        && hex_nibble(bytes[1] as char).is_some()
+        && hex_nibble(bytes[2] as char).is_some()
+}
+
+fn hex_nibble(ch: char) -> Option<u8> {
+    match ch {
+        '0'..='9' => Some((ch as u8) - b'0'),
+        'a'..='f' => Some((ch as u8) - b'a' + 10),
+        'A'..='F' => Some((ch as u8) - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn parse_number_atom(atom: &str) -> Option<TokenKind> {
@@ -841,17 +845,17 @@ impl SchemeParser {
                 line: token.line,
                 node: SchemeNode::Int(value),
             }),
-            TokenKind::Float(_) => Ok(SchemeForm {
+            TokenKind::Float(value) => Ok(SchemeForm {
                 line: token.line,
-                node: SchemeNode::Float,
+                node: SchemeNode::Float(value),
             }),
             TokenKind::Bool(value) => Ok(SchemeForm {
                 line: token.line,
                 node: SchemeNode::Bool(value),
             }),
-            TokenKind::Char(_) => Ok(SchemeForm {
+            TokenKind::Char(value) => Ok(SchemeForm {
                 line: token.line,
-                node: SchemeNode::Char,
+                node: SchemeNode::Char(value),
             }),
             TokenKind::String(value) => Ok(SchemeForm {
                 line: token.line,

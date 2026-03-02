@@ -10,7 +10,7 @@ fn expect_scheme_direct_only_error(source: &str) {
     match err {
         vm::SourceError::Parse(parse) => {
             assert!(
-                parse.message.contains("direct IR lowering only"),
+                parse.message.contains("unsupported Scheme syntax"),
                 "{}",
                 parse.message
             );
@@ -111,13 +111,30 @@ fn scheme_general_function_calls_are_not_supported_in_direct_subset() {
 }
 
 #[test]
-fn scheme_float_literals_are_not_supported_in_direct_subset() {
+fn scheme_float_char_and_hex_escape_literals_are_supported() {
     let source = r#"
-        (define a 1.1)
-        a
+        (define f 1.25)
+        (define c #\x41)
+        (define s "\x42")
+        f
+        c
+        s
     "#;
 
-    expect_scheme_direct_only_error(source);
+    let compiled =
+        compile_source_with_flavor(source, SourceFlavor::Scheme).expect("compile should succeed");
+
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[
+            Value::Float(1.25),
+            Value::String("A".to_string()),
+            Value::String("B".to_string())
+        ]
+    );
 }
 
 #[test]
@@ -142,7 +159,7 @@ fn scheme_complex_fixture_is_rejected_without_rewrite_path() {
     match err {
         vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
             assert!(
-                parse.message.contains("direct IR lowering only"),
+                parse.message.contains("unsupported Scheme syntax"),
                 "{}",
                 parse.message
             );

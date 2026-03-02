@@ -212,7 +212,6 @@ mod parser;
 mod source_loader;
 pub mod source_map;
 
-use ir::LinkedIr;
 use linker::merge_units;
 
 pub use ir::{
@@ -270,9 +269,8 @@ fn normalize_import_spec(spec: String) -> String {
     spec.trim().replace('\\', "/")
 }
 
-fn compile_parsed_output(parsed: LinkedIr) -> Result<CompiledProgram, SourceError> {
-    let LinkedIr {
-        source,
+fn compile_parsed_output(source: String, parsed: FrontendIr) -> Result<CompiledProgram, SourceError> {
+    let FrontendIr {
         stmts,
         locals,
         local_bindings,
@@ -356,14 +354,7 @@ fn compile_source_with_flavor_impl(
     let parsed = frontends::parse_source(source, flavor).map_err(|err| {
         SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
     })?;
-    compile_parsed_output(LinkedIr {
-        source: source.to_string(),
-        stmts: parsed.stmts,
-        locals: parsed.locals,
-        local_bindings: parsed.local_bindings,
-        functions: parsed.functions,
-        function_impls: parsed.function_impls,
-    })
+    compile_parsed_output(source.to_string(), parsed)
 }
 
 pub fn compile_source_file(path: impl AsRef<Path>) -> Result<CompiledProgram, SourcePathError> {
@@ -386,8 +377,8 @@ fn compile_source_file_impl(
     let source_raw = std::fs::read_to_string(path)?;
     let (root_source, units) =
         source_loader::load_units_for_source_file(path, flavor, &source_raw, options)?;
-    let merged = merge_units(root_source, units)?;
-    compile_parsed_output(merged).map_err(SourcePathError::Source)
+    let merged = merge_units(units)?;
+    compile_parsed_output(root_source, merged).map_err(SourcePathError::Source)
 }
 
 fn run_with_compiler_stack<T, F>(f: F) -> T

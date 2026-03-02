@@ -320,7 +320,7 @@ fn count_builtin_is_not_exposed_to_frontends() {
                 assert!(
                     parse.message.contains("unknown function 'count'")
                         || parse.message.contains("not exposed in")
-                        || parse.message.contains("direct IR lowering only"),
+                        || parse.message.contains("unsupported"),
                     "unexpected parse error for {flavor:?}: {parse:?}"
                 );
             }
@@ -532,11 +532,7 @@ fn compile_source_file_detects_lua_extension() {
     };
     match err {
         vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
-            assert!(
-                parse.message.contains("direct IR lowering only"),
-                "{}",
-                parse.message
-            );
+            assert!(parse.message.contains("unsupported Lua syntax"), "{}", parse.message);
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -566,7 +562,7 @@ fn compile_source_file_detects_scheme_extension() {
     match err {
         vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
             assert!(
-                parse.message.contains("direct IR lowering only"),
+                parse.message.contains("unsupported Scheme syntax"),
                 "{}",
                 parse.message
             );
@@ -629,11 +625,7 @@ fn compile_source_file_supports_rss_modules_from_js_lua_and_scheme() {
     };
     match lua_err {
         vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
-            assert!(
-                parse.message.contains("direct IR lowering only"),
-                "{}",
-                parse.message
-            );
+            assert!(parse.message.contains("unsupported Lua syntax"), "{}", parse.message);
         }
         other => panic!("unexpected lua error: {other:?}"),
     }
@@ -654,7 +646,7 @@ fn compile_source_file_supports_rss_modules_from_js_lua_and_scheme() {
     match scm_err {
         vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
             assert!(
-                parse.message.contains("direct IR lowering only"),
+                parse.message.contains("unsupported Scheme syntax"),
                 "{}",
                 parse.message
             );
