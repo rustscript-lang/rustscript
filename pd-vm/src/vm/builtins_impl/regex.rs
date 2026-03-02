@@ -1,10 +1,10 @@
 use regex::Regex;
 
+use super::super::{Value, VmError, VmResult};
+use super::arg_string;
 use crate::builtins::{
     BuiltinFunction, BuiltinNamespace, BuiltinNamespaceMember, BuiltinNamespaceRegistry,
 };
-use super::super::{Value, VmError, VmResult};
-use super::arg_string;
 
 pub(super) fn builtin_re_is_match(args: &[Value]) -> VmResult<Vec<Value>> {
     let pattern = arg_string(args, 0, "re_is_match pattern")?;

@@ -1,8 +1,8 @@
+use super::super::{Value, Vm, VmError, VmResult};
+use super::BuiltinCallOutcome;
 use crate::builtins::{
     BuiltinFunction, BuiltinNamespace, BuiltinNamespaceMember, BuiltinNamespaceRegistry,
 };
-use super::super::{Value, Vm, VmError, VmResult};
-use super::BuiltinCallOutcome;
 
 fn config_as_value(vm: &Vm) -> Value {
     let config = vm.jit_config();
@@ -38,9 +38,7 @@ fn arg_non_negative_u32(args: &[Value], index: usize, label: &str) -> VmResult<u
         None => return Err(VmError::HostError(format!("missing argument: {label}"))),
     };
     if raw < 0 {
-        return Err(VmError::HostError(format!(
-            "{label} must be non-negative",
-        )));
+        return Err(VmError::HostError(format!("{label} must be non-negative",)));
     }
     u32::try_from(raw).map_err(|_| VmError::HostError(format!("{label} overflow")))
 }
@@ -52,17 +50,17 @@ fn arg_non_negative_usize(args: &[Value], index: usize, label: &str) -> VmResult
         None => return Err(VmError::HostError(format!("missing argument: {label}"))),
     };
     if raw < 0 {
-        return Err(VmError::HostError(format!(
-            "{label} must be non-negative",
-        )));
+        return Err(VmError::HostError(format!("{label} must be non-negative",)));
     }
     usize::try_from(raw).map_err(|_| VmError::HostError(format!("{label} overflow")))
 }
 
-pub(super) fn builtin_jit_set_config(vm: &mut Vm, args: Vec<Value>) -> VmResult<BuiltinCallOutcome> {
+pub(super) fn builtin_jit_set_config(
+    vm: &mut Vm,
+    args: Vec<Value>,
+) -> VmResult<BuiltinCallOutcome> {
     let enabled = arg_bool(&args, 0, "jit.set_config enabled")?;
-    let hot_loop_threshold =
-        arg_non_negative_u32(&args, 1, "jit.set_config hot_loop_threshold")?;
+    let hot_loop_threshold = arg_non_negative_u32(&args, 1, "jit.set_config hot_loop_threshold")?;
     let max_trace_len = arg_non_negative_usize(&args, 2, "jit.set_config max_trace_len")?;
 
     let mut config = vm.jit_config().clone();
@@ -77,7 +75,10 @@ pub(super) fn builtin_jit_get_config(vm: &mut Vm) -> VmResult<BuiltinCallOutcome
     Ok(BuiltinCallOutcome::Return(vec![config_as_value(vm)]))
 }
 
-pub(super) fn builtin_jit_set_enabled(vm: &mut Vm, args: Vec<Value>) -> VmResult<BuiltinCallOutcome> {
+pub(super) fn builtin_jit_set_enabled(
+    vm: &mut Vm,
+    args: Vec<Value>,
+) -> VmResult<BuiltinCallOutcome> {
     let enabled = arg_bool(&args, 0, "jit.set_enabled value")?;
     let mut config = vm.jit_config().clone();
     config.enabled = enabled;

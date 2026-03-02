@@ -42,7 +42,11 @@ pub(crate) struct BuiltinNamespaceRegistry {
 
 impl BuiltinNamespaceRegistry {
     pub(crate) fn register(&mut self, namespace: BuiltinNamespace) {
-        if self.namespaces.iter().any(|entry| entry.name == namespace.name) {
+        if self
+            .namespaces
+            .iter()
+            .any(|entry| entry.name == namespace.name)
+        {
             return;
         }
         self.namespaces.push(namespace);

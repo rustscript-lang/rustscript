@@ -19,7 +19,9 @@ pub(super) enum BuiltinCallOutcome {
     Pending(HostOpId),
 }
 
-pub(crate) fn register_builtin_namespaces(registry: &mut crate::builtins::BuiltinNamespaceRegistry) {
+pub(crate) fn register_builtin_namespaces(
+    registry: &mut crate::builtins::BuiltinNamespaceRegistry,
+) {
     io::register_builtin_namespace(registry);
     regex::register_builtin_namespace(registry);
     json::register_builtin_namespace(registry);
@@ -76,9 +78,7 @@ pub(super) fn execute_builtin_call(
         BuiltinFunction::JitSetHotLoopThreshold => {
             jit::builtin_jit_set_hot_loop_threshold(vm, args)
         }
-        BuiltinFunction::JitGetHotLoopThreshold => {
-            jit::builtin_jit_get_hot_loop_threshold(vm)
-        }
+        BuiltinFunction::JitGetHotLoopThreshold => jit::builtin_jit_get_hot_loop_threshold(vm),
         BuiltinFunction::JitSetMaxTraceLen => jit::builtin_jit_set_max_trace_len(vm, args),
         BuiltinFunction::JitGetMaxTraceLen => jit::builtin_jit_get_max_trace_len(vm),
         BuiltinFunction::ToString => core::builtin_to_string(&args).map(BuiltinCallOutcome::Return),

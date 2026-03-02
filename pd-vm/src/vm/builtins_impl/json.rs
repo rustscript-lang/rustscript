@@ -1,10 +1,10 @@
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
+use super::super::{Value, VmError, VmResult};
+use super::arg_string;
 use crate::builtins::{
     BuiltinFunction, BuiltinNamespace, BuiltinNamespaceMember, BuiltinNamespaceRegistry,
 };
-use super::super::{Value, VmError, VmResult};
-use super::arg_string;
 
 pub(super) fn builtin_json_encode(args: &[Value]) -> VmResult<Vec<Value>> {
     let value = args
