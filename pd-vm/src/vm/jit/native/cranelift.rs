@@ -175,14 +175,24 @@ pub(crate) fn compile_trace(trace: &JitTrace) -> VmResult<CraneliftCompiledTrace
     module
         .define_function(func_id, &mut ctx)
         .map_err(|err| VmError::JitNative(format!("define cranelift trace failed: {err}")))?;
+    let code_len = ctx
+        .compiled_code()
+        .ok_or_else(|| VmError::JitNative("cranelift trace produced no machine code".to_string()))?
+        .code_buffer()
+        .len();
     module.clear_context(&mut ctx);
     module
         .finalize_definitions()
         .map_err(|err| VmError::JitNative(format!("finalize cranelift trace failed: {err}")))?;
 
     let entry = module.get_finalized_function(func_id);
-    let mut code = Vec::with_capacity(8);
-    code.extend_from_slice(&(entry as usize as u64).to_le_bytes());
+    let code = if code_len == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: `entry` points to a finalized function body and remains valid for the lifetime
+        // of `module` (held by `keepalive`); `code_len` is the exact emitted function size.
+        unsafe { std::slice::from_raw_parts(entry, code_len).to_vec() }
+    };
 
     Ok(CraneliftCompiledTrace {
         entry,

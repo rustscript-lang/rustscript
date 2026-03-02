@@ -269,7 +269,10 @@ fn normalize_import_spec(spec: String) -> String {
     spec.trim().replace('\\', "/")
 }
 
-fn compile_parsed_output(source: String, parsed: FrontendIr) -> Result<CompiledProgram, SourceError> {
+fn compile_parsed_output(
+    source: String,
+    parsed: FrontendIr,
+) -> Result<CompiledProgram, SourceError> {
     let FrontendIr {
         stmts,
         locals,

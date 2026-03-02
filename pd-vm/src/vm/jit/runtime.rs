@@ -214,6 +214,9 @@ fn native_trace_cache_key(
 
 impl Vm {
     pub fn set_jit_config(&mut self, config: super::JitConfig) {
+        if config.enabled {
+            self.ensure_program_cache_key();
+        }
         self.jit.set_config(config);
     }
 
@@ -544,6 +547,7 @@ impl Vm {
             return Ok(());
         }
 
+        let program_cache_key = self.ensure_program_cache_key();
         let trace = self.jit.trace_clone(trace_id).ok_or_else(|| {
             VmError::JitNative(format!("trace {} missing for native compile", trace_id))
         })?;
@@ -555,9 +559,9 @@ impl Vm {
                     let mut guard = cache.lock().map_err(|_| {
                         VmError::JitNative("native trace cache lock poisoned".to_string())
                     })?;
-                    if guard.active_program_key != Some(self.program_cache_key) {
+                    if guard.active_program_key != Some(program_cache_key) {
                         guard.entries.clear();
-                        guard.active_program_key = Some(self.program_cache_key);
+                        guard.active_program_key = Some(program_cache_key);
                     }
 
                     if let Some(hit) = guard.entries.get(&key) {
@@ -599,9 +603,9 @@ impl Vm {
                     let key =
                         native_trace_cache_key(&trace, native::NativeCodegenBackend::Cranelift);
                     let cached = with_cranelift_native_trace_cache(|cache| {
-                        if cache.active_program_key != Some(self.program_cache_key) {
+                        if cache.active_program_key != Some(program_cache_key) {
                             cache.entries.clear();
-                            cache.active_program_key = Some(self.program_cache_key);
+                            cache.active_program_key = Some(program_cache_key);
                         }
                         cache.entries.get(&key).cloned()
                     });
@@ -644,9 +648,9 @@ impl Vm {
                                 native::NativeCodegenBackend::Cranelift,
                             );
                             with_cranelift_native_trace_cache(|cache| {
-                                if cache.active_program_key != Some(self.program_cache_key) {
+                                if cache.active_program_key != Some(program_cache_key) {
                                     cache.entries.clear();
-                                    cache.active_program_key = Some(self.program_cache_key);
+                                    cache.active_program_key = Some(program_cache_key);
                                 }
                                 cache.entries.insert(key, cached);
                             });
