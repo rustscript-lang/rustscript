@@ -410,7 +410,7 @@ fn javascript_direct_builtin_len_call_is_rejected() {
     };
     match err {
         vm::SourceError::Parse(parse) => {
-            assert!(parse.message.contains("not exposed in JavaScript frontend"));
+            assert!(parse.message.contains("unknown function 'len'"));
         }
         other => panic!("unexpected error: {other}"),
     }

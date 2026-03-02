@@ -43,8 +43,7 @@ impl FrontendCompiler for RustScriptCompiler {
 
 impl FrontendCompiler for JavaScriptCompiler {
     fn lower_to_ir(&self, source: &str) -> Result<FrontendIr, ParseError> {
-        let lowered = javascript::lower(source)?;
-        parse_lowered_with_mapping(source, lowered, false, true)
+        javascript::lower_to_ir(source)
     }
 }
 
@@ -65,12 +64,14 @@ fn parse_with_parser(
     source_id: u32,
     allow_implicit_externs: bool,
     allow_implicit_semicolons: bool,
+    js_mode: bool,
 ) -> Result<FrontendIr, ParseError> {
     let mut parser = Parser::new(
         source,
         source_id,
         allow_implicit_externs,
         allow_implicit_semicolons,
+        js_mode,
     )?;
     let stmts = parser.parse_program()?;
     Ok(FrontendIr {
@@ -97,6 +98,7 @@ fn parse_lowered_with_mapping(
         lowered_source_id,
         allow_implicit_externs,
         allow_implicit_semicolons,
+        false,
     ) {
         Ok(ir) => Ok(ir),
         Err(mut err) => {

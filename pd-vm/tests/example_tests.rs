@@ -63,6 +63,23 @@ fn run_compiled_source(flavor: SourceFlavor, source: &str) -> Vec<Value> {
     vm.stack().to_vec()
 }
 
+fn expect_direct_only_source_file_error(path: &Path) {
+    let err = match compile_source_file(path) {
+        Ok(_) => panic!("source file should be rejected in direct subset"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
+            assert!(
+                parse.message.contains("direct IR lowering only"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
 #[test]
 fn examples_run() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
@@ -73,11 +90,8 @@ fn examples_run() {
     let stack = run_compiled_file(&root.join("example.js"));
     assert_eq!(stack, vec![Value::Int(6)]);
 
-    let stack = run_compiled_file(&root.join("example.lua"));
-    assert_eq!(stack, vec![Value::Int(6)]);
-
-    let stack = run_compiled_file(&root.join("example.scm"));
-    assert_eq!(stack, vec![Value::Int(6)]);
+    expect_direct_only_source_file_error(&root.join("example.lua"));
+    expect_direct_only_source_file_error(&root.join("example.scm"));
 
     // Feature examples for each frontend flavor.
     let stack = run_compiled_file(&root.join("example_complex.rss"));
@@ -86,11 +100,8 @@ fn examples_run() {
     let stack = run_compiled_file(&root.join("example_complex.js"));
     assert_eq!(stack, vec![Value::Int(12)]);
 
-    let stack = run_compiled_file(&root.join("example_complex.lua"));
-    assert_eq!(stack, vec![Value::Int(12)]);
-
-    let stack = run_compiled_file(&root.join("example_complex.scm"));
-    assert_eq!(stack, vec![Value::Int(12)]);
+    expect_direct_only_source_file_error(&root.join("example_complex.lua"));
+    expect_direct_only_source_file_error(&root.join("example_complex.scm"));
 
     // AES fixture should also be consumable as a module from another RSS program.
     let stack = run_compiled_file(&root.join("aes_128_cbc_usage.rss"));
@@ -123,28 +134,6 @@ m?.b?.c;
 "#;
     assert_eq!(
         run_compiled_source(SourceFlavor::JavaScript, js_source),
-        vec![Value::Int(7), Value::Null]
-    );
-
-    let lua_source = r#"
-local a = { b = { c = 7 } }
-a?.b?.c
-local m = { b = {} }
-m?.b?.c
-"#;
-    assert_eq!(
-        run_compiled_source(SourceFlavor::Lua, lua_source),
-        vec![Value::Int(7), Value::Null]
-    );
-
-    let scheme_source = r#"
-(define a (hash (b (hash (c 7)))))
-a?.b?.c
-(define m (hash (b (hash))))
-m?.b?.c
-"#;
-    assert_eq!(
-        run_compiled_source(SourceFlavor::Scheme, scheme_source),
         vec![Value::Int(7), Value::Null]
     );
 }
@@ -182,26 +171,6 @@ text?.[5];
 "#;
     assert_eq!(
         run_compiled_source(SourceFlavor::JavaScript, js_source),
-        vec![
-            Value::Int(20),
-            Value::Null,
-            Value::Null,
-            Value::String("b".to_string()),
-            Value::Null,
-        ]
-    );
-
-    let lua_source = r#"
-local arr = {10, 20}
-arr?.[1]
-arr?.[2]
-arr?.["x"]
-local text = "abc"
-text?.[1]
-text?.[5]
-"#;
-    assert_eq!(
-        run_compiled_source(SourceFlavor::Lua, lua_source),
         vec![
             Value::Int(20),
             Value::Null,
