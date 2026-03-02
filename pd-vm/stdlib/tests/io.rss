@@ -1,5 +1,6 @@
 use super::rss::io as file_io;
 use super::rss::strings as string;
+use io;
 
 let fixture_path = "stdlib/rss/strings.rss";
 assert(io::exists(fixture_path));

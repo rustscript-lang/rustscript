@@ -88,6 +88,7 @@ fn rustscript_vm_named_host_imports_are_supported() {
 #[test]
 fn rustscript_io_namespace_builtin_calls_are_supported() {
     let source = r#"
+        use io;
         io::exists(".");
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
@@ -107,8 +108,30 @@ fn rustscript_io_namespace_builtin_calls_are_supported() {
 }
 
 #[test]
+fn rustscript_builtin_namespace_calls_require_use_import() {
+    let source = r#"
+        json::encode("ok");
+    "#;
+    let err = match compile_source(source) {
+        Ok(_) => panic!("builtin namespace calls should require explicit use import"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("import builtin namespaces first"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
 fn rustscript_re_namespace_supports_optional_inline_flags_across_functions() {
     let source = r#"
+        use re;
         let a = re::match("^foo$", "FoO", "i");
         let b = re::find("^foo", "FoO bar", "i");
         let c = re::replace("foo", "FoO bar", "x", "i");
@@ -142,6 +165,94 @@ fn rustscript_re_namespace_supports_optional_inline_flags_across_functions() {
 }
 
 #[test]
+fn rustscript_json_encode_decode_builtins_are_supported() {
+    let source = r#"
+        use json;
+        let payload = {
+            answer: 42,
+            ok: true,
+            arr: [1, 2],
+            inner: { name: "pd" },
+        };
+        let text = json::encode(payload);
+        let decoded = json::decode(text);
+        decoded.answer + decoded.arr[1];
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(44)]);
+}
+
+#[test]
+fn rustscript_jit_namespace_builtins_can_configure_and_read_jit() {
+    let source = r#"
+        use jit;
+        let _set = jit::set_hot_loop_threshold(3);
+        let after = jit::get_hot_loop_threshold();
+        let cfg = jit::get_config();
+        if after == 3 && cfg.hot_loop_threshold == 3 {
+            1;
+        } else {
+            0;
+        }
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1)]);
+}
+
+#[test]
+fn compile_source_file_preserves_jit_builtin_namespace_use_directive() {
+    let unique = format!(
+        "vm_rustscript_jit_builtin_namespace_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).expect("temp module root should be created");
+
+    let main_path = root.join("main.rss");
+    std::fs::write(
+        &main_path,
+        r#"
+        use jit;
+        let _set = jit::set_hot_loop_threshold(2);
+        let out = jit::get_hot_loop_threshold();
+        out;
+    "#,
+    )
+    .expect("main source should write");
+
+    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    assert!(
+        compiled
+            .program
+            .imports
+            .iter()
+            .all(|import| !import.name.starts_with("jit::")),
+        "jit namespace calls should lower as builtins, not host imports"
+    );
+
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(2)]);
+
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_dir(root);
+}
+
+#[test]
 fn rustscript_float_literal_binding_is_supported() {
     let source = r#"
         let a=1.1;
@@ -170,7 +281,10 @@ fn rustscript_char_and_hex_escape_literals_are_supported() {
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
         vm.stack(),
-        &[Value::String("A".to_string()), Value::String("B".to_string())]
+        &[
+            Value::String("A".to_string()),
+            Value::String("B".to_string())
+        ]
     );
 }
 

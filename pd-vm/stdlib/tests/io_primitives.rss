@@ -1,4 +1,5 @@
 use super::rss::strings as string;
+use io;
 
 assert(io::exists("stdlib/rss/strings.rss"));
 

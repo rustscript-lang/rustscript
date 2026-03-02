@@ -44,6 +44,10 @@ impl ParserDialect for JavaScriptDialect {
     fn allow_dotted_call(&self) -> bool {
         true
     }
+
+    fn allow_namespace_path_separator(&self) -> bool {
+        false
+    }
 }
 
 static JAVASCRIPT_DIALECT: JavaScriptDialect = JavaScriptDialect;

@@ -321,7 +321,7 @@ index.
 1. Builtin calls (fixed reserved indices)
    - Builtins use `BuiltinFunction::call_index()`
    - parser lowering emits these for helpers such as `len`, `get`, `set`, `slice`, `count`,
-     `type_of`, `assert`, and `io::*`
+     `type_of`, `assert`, and `io::*`/`re::*`/`json::*`/`jit::*`
 2. Runtime host imports (per-program remapped indices)
    - non-inlined runtime imports are remapped to dense import slots (`call_index_remap`)
    - emitted as `call <slot>, <argc>`
@@ -347,7 +347,7 @@ Core compiler/IR:
 - RustScript function declarations cannot capture outer locals
 - `match` patterns are limited to int/string/null literals, `_`, and type constructors (`Some(TypeName)` / `Option::Some(TypeName)`)
 - `break` and `continue` are only valid inside loops
-- host import namespace support in parser is limited to `vm` (builtin namespaces are `io::` and `re::`)
+- host import namespace support in parser is limited to `vm` (builtin namespaces are `io::`, `re::`, `json::`, and `jit::`)
 
 Module/source loading:
 

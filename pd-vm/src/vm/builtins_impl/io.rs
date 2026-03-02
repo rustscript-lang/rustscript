@@ -6,6 +6,9 @@ use std::pin::Pin;
 use std::process::{Child, Command, Stdio};
 use std::task::{Context, Poll};
 
+use crate::builtins::{
+    BuiltinFunction, BuiltinNamespace, BuiltinNamespaceMember, BuiltinNamespaceRegistry,
+};
 use futures_channel::oneshot;
 
 use super::super::{HostOpId, Value, Vm, VmError, VmResult};
@@ -464,4 +467,19 @@ fn read_line_from_reader(reader: &mut impl Read) -> VmResult<String> {
         }
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+const NAMESPACE_MEMBERS: &[BuiltinNamespaceMember] = &[
+    BuiltinNamespaceMember::new("open", BuiltinFunction::IoOpen),
+    BuiltinNamespaceMember::new("popen", BuiltinFunction::IoPopen),
+    BuiltinNamespaceMember::new("read_all", BuiltinFunction::IoReadAll),
+    BuiltinNamespaceMember::new("read_line", BuiltinFunction::IoReadLine),
+    BuiltinNamespaceMember::new("write", BuiltinFunction::IoWrite),
+    BuiltinNamespaceMember::new("flush", BuiltinFunction::IoFlush),
+    BuiltinNamespaceMember::new("close", BuiltinFunction::IoClose),
+    BuiltinNamespaceMember::new("exists", BuiltinFunction::IoExists),
+];
+
+pub(crate) fn register_builtin_namespace(registry: &mut BuiltinNamespaceRegistry) {
+    registry.register(BuiltinNamespace::new("io", NAMESPACE_MEMBERS, false));
 }

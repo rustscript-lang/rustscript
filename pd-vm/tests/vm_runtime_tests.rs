@@ -143,6 +143,7 @@ fn namespaced_builtin_io_call_can_be_overridden_by_host_binding() {
 
     let compiled = compile_source(
         r#"
+        use io;
         io::exists("request_body");
     "#,
     )
@@ -153,6 +154,57 @@ fn namespaced_builtin_io_call_can_be_overridden_by_host_binding() {
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Bool(false)]);
+}
+
+#[test]
+fn namespaced_builtin_json_encode_call_can_be_overridden_by_host_binding() {
+    struct JsonEncodeOverride;
+
+    impl HostFunction for JsonEncodeOverride {
+        fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            assert_eq!(args, &[Value::String("request_body".to_string())]);
+            Ok(CallOutcome::Return(vec![Value::String(
+                "\"override\"".to_string(),
+            )]))
+        }
+    }
+
+    let compiled = compile_source(
+        r#"
+        use json;
+        json::encode("request_body");
+    "#,
+    )
+    .expect("source should compile");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    vm.bind_function("json::encode", Box::new(JsonEncodeOverride));
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("\"override\"".to_string())]);
+}
+
+#[test]
+fn json_encode_rejects_non_string_map_keys() {
+    let compiled = compile_source(
+        r#"
+        use json;
+        let payload = { 1: "one" };
+        json::encode(payload);
+    "#,
+    )
+    .expect("source should compile");
+
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let err = vm
+        .run()
+        .expect_err("json::encode should reject non-string map keys");
+    match err {
+        vm::VmError::HostError(message) => {
+            assert!(message.contains("map keys must be strings"), "{message}");
+        }
+        other => panic!("unexpected vm error: {other}"),
+    }
 }
 
 #[test]

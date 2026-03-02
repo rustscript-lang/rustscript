@@ -532,7 +532,11 @@ fn compile_source_file_detects_lua_extension() {
     };
     match err {
         vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
-            assert!(parse.message.contains("unsupported Lua syntax"), "{}", parse.message);
+            assert!(
+                parse.message.contains("unsupported Lua syntax"),
+                "{}",
+                parse.message
+            );
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -625,7 +629,11 @@ fn compile_source_file_supports_rss_modules_from_js_lua_and_scheme() {
     };
     match lua_err {
         vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
-            assert!(parse.message.contains("unsupported Lua syntax"), "{}", parse.message);
+            assert!(
+                parse.message.contains("unsupported Lua syntax"),
+                "{}",
+                parse.message
+            );
         }
         other => panic!("unexpected lua error: {other:?}"),
     }

@@ -8,6 +8,8 @@ use super::{HostOpId, Value, Vm, VmError, VmResult};
 
 mod core;
 mod io;
+mod jit;
+mod json;
 mod regex;
 
 pub(in crate::vm) use io::IoState;
@@ -15,6 +17,13 @@ pub(in crate::vm) use io::IoState;
 pub(super) enum BuiltinCallOutcome {
     Return(Vec<Value>),
     Pending(HostOpId),
+}
+
+pub(crate) fn register_builtin_namespaces(registry: &mut crate::builtins::BuiltinNamespaceRegistry) {
+    io::register_builtin_namespace(registry);
+    regex::register_builtin_namespace(registry);
+    json::register_builtin_namespace(registry);
+    jit::register_builtin_namespace(registry);
 }
 
 pub(super) fn execute_builtin_call(
@@ -54,6 +63,24 @@ pub(super) fn execute_builtin_call(
         BuiltinFunction::ReCaptures => {
             regex::builtin_re_captures(&args).map(BuiltinCallOutcome::Return)
         }
+        BuiltinFunction::JsonEncode => {
+            json::builtin_json_encode(&args).map(BuiltinCallOutcome::Return)
+        }
+        BuiltinFunction::JsonDecode => {
+            json::builtin_json_decode(&args).map(BuiltinCallOutcome::Return)
+        }
+        BuiltinFunction::JitSetConfig => jit::builtin_jit_set_config(vm, args),
+        BuiltinFunction::JitGetConfig => jit::builtin_jit_get_config(vm),
+        BuiltinFunction::JitSetEnabled => jit::builtin_jit_set_enabled(vm, args),
+        BuiltinFunction::JitGetEnabled => jit::builtin_jit_get_enabled(vm),
+        BuiltinFunction::JitSetHotLoopThreshold => {
+            jit::builtin_jit_set_hot_loop_threshold(vm, args)
+        }
+        BuiltinFunction::JitGetHotLoopThreshold => {
+            jit::builtin_jit_get_hot_loop_threshold(vm)
+        }
+        BuiltinFunction::JitSetMaxTraceLen => jit::builtin_jit_set_max_trace_len(vm, args),
+        BuiltinFunction::JitGetMaxTraceLen => jit::builtin_jit_get_max_trace_len(vm),
         BuiltinFunction::ToString => core::builtin_to_string(&args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::TypeOf => core::builtin_type_of(&args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Assert => core::builtin_assert(&args).map(BuiltinCallOutcome::Return),

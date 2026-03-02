@@ -5,7 +5,7 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use crate::builtins::BuiltinFunction;
 
-mod builtins_impl;
+pub(crate) mod builtins_impl;
 pub mod diagnostics;
 pub(crate) mod jit;
 

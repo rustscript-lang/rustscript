@@ -1555,6 +1555,66 @@ pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
             accepts_flow: false,
         },
         UiBlockDefinition {
+            id: "json_encode",
+            title: "JSON Encode",
+            category: "json",
+            description: "Encode a value to JSON text.",
+            inputs: vec![
+                UiBlockInput {
+                    key: "var",
+                    label: "Variable",
+                    input_type: UiInputType::Text,
+                    default_value: "json_text",
+                    placeholder: "json_text",
+                    connectable: false,
+                },
+                UiBlockInput {
+                    key: "value",
+                    label: "Value",
+                    input_type: UiInputType::Text,
+                    default_value: "$payload",
+                    placeholder: "$payload or literal",
+                    connectable: true,
+                },
+            ],
+            outputs: vec![UiBlockOutput {
+                key: "value",
+                label: "value",
+                expr_from_input: Some("var"),
+            }],
+            accepts_flow: false,
+        },
+        UiBlockDefinition {
+            id: "json_decode",
+            title: "JSON Decode",
+            category: "json",
+            description: "Decode JSON text into a value.",
+            inputs: vec![
+                UiBlockInput {
+                    key: "var",
+                    label: "Variable",
+                    input_type: UiInputType::Text,
+                    default_value: "json_value",
+                    placeholder: "json_value",
+                    connectable: false,
+                },
+                UiBlockInput {
+                    key: "value",
+                    label: "JSON Text",
+                    input_type: UiInputType::Text,
+                    default_value: "$json_text",
+                    placeholder: "$json_text or literal",
+                    connectable: true,
+                },
+            ],
+            outputs: vec![UiBlockOutput {
+                key: "value",
+                label: "value",
+                expr_from_input: Some("var"),
+            }],
+            accepts_flow: false,
+        },
+        UiBlockDefinition {
             id: "set_upstream",
             title: "Set Upstream",
             category: "routing",
@@ -2103,7 +2163,12 @@ fn render_sources_with_flow(
         scm_lines.extend(statements.scheme);
     }
 
-    ensure_rustscript_host_namespace_imports(&mut rss_lines);
+    ensure_host_namespace_imports(
+        &mut rss_lines,
+        &mut js_lines,
+        &mut lua_lines,
+        &mut scm_lines,
+    );
 
     Ok(UiSourceBundle {
         rustscript: join_lines(&rss_lines),
@@ -2158,6 +2223,8 @@ fn is_value_block(block_id: &str) -> bool {
             | "map_new"
             | "map_get"
             | "map_set"
+            | "json_encode"
+            | "json_decode"
             | "rate_limit_allow"
     )
 }
@@ -3123,7 +3190,12 @@ fn render_sources(
         )?
     }
 
-    ensure_rustscript_host_namespace_imports(&mut rss_lines);
+    ensure_host_namespace_imports(
+        &mut rss_lines,
+        &mut js_lines,
+        &mut lua_lines,
+        &mut scm_lines,
+    );
 
     Ok(UiSourceBundle {
         rustscript: join_lines(&rss_lines),
@@ -3133,21 +3205,168 @@ fn render_sources(
     })
 }
 
+fn ensure_host_namespace_imports(
+    rss: &mut Vec<String>,
+    js: &mut Vec<String>,
+    lua: &mut Vec<String>,
+    scm: &mut Vec<String>,
+) {
+    ensure_rustscript_host_namespace_imports(rss);
+    ensure_javascript_host_namespace_imports(js);
+    ensure_lua_host_namespace_imports(lua);
+    ensure_scheme_host_namespace_imports(scm);
+}
+
 fn ensure_rustscript_host_namespace_imports(lines: &mut Vec<String>) {
+    let requires_io = lines.iter().any(|line| line.contains("io::"));
+    let requires_re = lines.iter().any(|line| line.contains("re::"));
+    let requires_json = lines.iter().any(|line| line.contains("json::"));
     let requires_runtime = lines.iter().any(|line| line.contains("runtime::"));
     let requires_rate_limit = lines.iter().any(|line| line.contains("rate_limit::"));
 
-    if !requires_runtime && !requires_rate_limit {
+    if !requires_io && !requires_re && !requires_json && !requires_runtime && !requires_rate_limit {
         return;
     }
 
     let mut insert_at = 1usize;
+    if requires_io && !lines.iter().any(|line| line.trim() == "use io;") {
+        lines.insert(insert_at, "use io;".to_string());
+        insert_at += 1;
+    }
+    if requires_re && !lines.iter().any(|line| line.trim() == "use re;") {
+        lines.insert(insert_at, "use re;".to_string());
+        insert_at += 1;
+    }
+    if requires_json && !lines.iter().any(|line| line.trim() == "use json;") {
+        lines.insert(insert_at, "use json;".to_string());
+        insert_at += 1;
+    }
     if requires_runtime && !lines.iter().any(|line| line.trim() == "use runtime;") {
         lines.insert(insert_at, "use runtime;".to_string());
         insert_at += 1;
     }
     if requires_rate_limit && !lines.iter().any(|line| line.trim() == "use rate_limit;") {
         lines.insert(insert_at, "use rate_limit;".to_string());
+        insert_at += 1;
+    }
+
+    if insert_at < lines.len() && !lines[insert_at].trim().is_empty() {
+        lines.insert(insert_at, String::new());
+    }
+}
+
+fn ensure_javascript_host_namespace_imports(lines: &mut Vec<String>) {
+    let requires_io = lines.iter().any(|line| line.contains("io."));
+    let requires_re = lines.iter().any(|line| line.contains("re."));
+    let requires_json = lines.iter().any(|line| line.contains("json."));
+    if !requires_io && !requires_re && !requires_json {
+        return;
+    }
+
+    let mut insert_at = 1usize;
+    if requires_io
+        && !lines
+            .iter()
+            .any(|line| line.trim() == "import * as io from \"io\";")
+    {
+        lines.insert(insert_at, "import * as io from \"io\";".to_string());
+        insert_at += 1;
+    }
+    if requires_re
+        && !lines
+            .iter()
+            .any(|line| line.trim() == "import * as re from \"re\";")
+    {
+        lines.insert(insert_at, "import * as re from \"re\";".to_string());
+        insert_at += 1;
+    }
+    if requires_json
+        && !lines
+            .iter()
+            .any(|line| line.trim() == "import * as json from \"json\";")
+    {
+        lines.insert(insert_at, "import * as json from \"json\";".to_string());
+        insert_at += 1;
+    }
+
+    if insert_at < lines.len() && !lines[insert_at].trim().is_empty() {
+        lines.insert(insert_at, String::new());
+    }
+}
+
+fn ensure_lua_host_namespace_imports(lines: &mut Vec<String>) {
+    let requires_io = lines.iter().any(|line| line.contains("io."));
+    let requires_re = lines.iter().any(|line| line.contains("re."));
+    let requires_json = lines.iter().any(|line| line.contains("json."));
+    if !requires_io && !requires_re && !requires_json {
+        return;
+    }
+
+    let mut insert_at = 1usize;
+    if requires_io
+        && !lines
+            .iter()
+            .any(|line| line.trim() == "local io = require(\"io\")")
+    {
+        lines.insert(insert_at, "local io = require(\"io\")".to_string());
+        insert_at += 1;
+    }
+    if requires_re
+        && !lines
+            .iter()
+            .any(|line| line.trim() == "local re = require(\"re\")")
+    {
+        lines.insert(insert_at, "local re = require(\"re\")".to_string());
+        insert_at += 1;
+    }
+    if requires_json
+        && !lines
+            .iter()
+            .any(|line| line.trim() == "local json = require(\"json\")")
+    {
+        lines.insert(insert_at, "local json = require(\"json\")".to_string());
+        insert_at += 1;
+    }
+
+    if insert_at < lines.len() && !lines[insert_at].trim().is_empty() {
+        lines.insert(insert_at, String::new());
+    }
+}
+
+fn ensure_scheme_host_namespace_imports(lines: &mut Vec<String>) {
+    let requires_io = lines.iter().any(|line| line.contains("(io."));
+    let requires_re = lines.iter().any(|line| line.contains("(re."));
+    let requires_json = lines.iter().any(|line| line.contains("(json."));
+    if !requires_io && !requires_re && !requires_json {
+        return;
+    }
+
+    let mut insert_at = 1usize;
+    if requires_io
+        && !lines
+            .iter()
+            .any(|line| line.trim() == "(require (prefix-in io. \"io\"))")
+    {
+        lines.insert(insert_at, "(require (prefix-in io. \"io\"))".to_string());
+        insert_at += 1;
+    }
+    if requires_re
+        && !lines
+            .iter()
+            .any(|line| line.trim() == "(require (prefix-in re. \"re\"))")
+    {
+        lines.insert(insert_at, "(require (prefix-in re. \"re\"))".to_string());
+        insert_at += 1;
+    }
+    if requires_json
+        && !lines
+            .iter()
+            .any(|line| line.trim() == "(require (prefix-in json. \"json\"))")
+    {
+        lines.insert(
+            insert_at,
+            "(require (prefix-in json. \"json\"))".to_string(),
+        );
         insert_at += 1;
     }
 
@@ -3697,6 +3916,46 @@ fn render_single_block(
             scm.push(format!(
                 "(hash-set! {var} {} {})",
                 render_scheme_hash_key_expr(key),
+                render_expr_scheme(value)
+            ));
+        }
+        "json_encode" => {
+            let var = sanitize_identifier(block.values.get("var"), "json_text");
+            let value = block_value(block, "value", "$payload");
+            rss.push(format!(
+                "let {var} = json::encode({});",
+                render_expr_rss(value)
+            ));
+            js.push(format!(
+                "let {var} = json.encode({});",
+                render_expr_js(value)
+            ));
+            lua.push(format!(
+                "local {var} = json.encode({})",
+                render_expr_lua(value)
+            ));
+            scm.push(format!(
+                "(define {var} (json.encode {}))",
+                render_expr_scheme(value)
+            ));
+        }
+        "json_decode" => {
+            let var = sanitize_identifier(block.values.get("var"), "json_value");
+            let value = block_value(block, "value", "$json_text");
+            rss.push(format!(
+                "let {var} = json::decode({});",
+                render_expr_rss(value)
+            ));
+            js.push(format!(
+                "let {var} = json.decode({});",
+                render_expr_js(value)
+            ));
+            lua.push(format!(
+                "local {var} = json.decode({})",
+                render_expr_lua(value)
+            ));
+            scm.push(format!(
+                "(define {var} (json.decode {}))",
                 render_expr_scheme(value)
             ));
         }

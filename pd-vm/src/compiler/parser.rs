@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::builtins::BuiltinFunction;
+use crate::builtins::{
+    BuiltinFunction, builtin_namespace_hint, is_builtin_namespace, namespace_supports_regex_flags,
+    resolve_builtin_namespace_call,
+};
 use crate::compiler::source_map::{SourceId, Span};
 
 use super::{
@@ -111,6 +114,10 @@ pub(super) trait ParserDialect {
 
     fn allow_dotted_call(&self) -> bool {
         false
+    }
+
+    fn allow_namespace_path_separator(&self) -> bool {
+        true
     }
 }
 
@@ -835,6 +842,8 @@ impl Parser {
             self.consume_stmt_terminator("expected ';' after import statement")?;
             if spec == "vm" {
                 self.vm_namespace_aliases.insert(alias);
+            } else if is_builtin_namespace(&spec) {
+                self.host_namespace_aliases.insert(alias, spec);
             }
             return Ok(Stmt::Noop { line });
         }
@@ -875,6 +884,8 @@ impl Parser {
         self.consume_stmt_terminator("expected ';' after import statement")?;
         if spec == "vm" {
             self.vm_namespace_aliases.insert(default_ident);
+        } else if is_builtin_namespace(&spec) {
+            self.host_namespace_aliases.insert(default_ident, spec);
         }
         Ok(Stmt::Noop { line })
     }
@@ -993,6 +1004,8 @@ impl Parser {
         self.consume_stmt_terminator("expected ';' after require declaration")?;
         if spec == "vm" {
             self.vm_namespace_aliases.insert(alias);
+        } else if is_builtin_namespace(&spec) {
+            self.host_namespace_aliases.insert(alias, spec);
         }
         Ok(Stmt::Noop { line })
     }
@@ -1433,7 +1446,7 @@ impl Parser {
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
         if self.dialect.allow_typeof_operator() && self.match_ident_literal("typeof") {
             let inner = self.parse_unary()?;
-            return Ok(self.build_builtin_call_expr(BuiltinFunction::TypeOf, vec![inner])?);
+            return self.build_builtin_call_expr(BuiltinFunction::TypeOf, vec![inner]);
         }
         if self.match_kind(&TokenKind::Minus) {
             let inner = self.parse_unary()?;
@@ -1486,7 +1499,16 @@ impl Parser {
             {
                 return Ok(expr);
             }
-            if self.match_path_separator() {
+            if !self.dialect.allow_namespace_path_separator() && self.check_path_separator() {
+                return Err(ParseError {
+                    span: None,
+                    code: None,
+                    line: self.current_line(),
+                    message: "namespace calls use '.' in this language (for example 'json.encode(...)'), not '::'"
+                        .to_string(),
+                });
+            }
+            if self.dialect.allow_namespace_path_separator() && self.match_path_separator() {
                 let mut path_segments = Vec::new();
                 path_segments
                     .push(self.expect_namespace_segment("expected function name after '::'")?);
@@ -1513,27 +1535,45 @@ impl Parser {
                     .map(|tail| tail.to_vec())
                     .unwrap_or_default();
                 let mut args = args;
-                if subpath.is_empty()
-                    && name == "re"
-                    && let Some(builtin) = self.try_re_namespace_builtin_call(&member, &mut args)?
+                if let Some((builtin_namespace, builtin_member)) =
+                    self.resolve_builtins_call_path(&name, &member, &subpath)
                 {
-                    let expr = self.build_builtin_call_expr(builtin, args)?;
-                    return Ok(expr);
-                }
-                if subpath.is_empty()
-                    && let Some(builtin) = self.resolve_builtin_namespace_call(&name, &member)
-                {
-                    let expr = self.build_builtin_call_expr(builtin, args)?;
-                    return Ok(expr);
+                    let builtin_namespace = builtin_namespace.to_string();
+                    let builtin_member = builtin_member.to_string();
+                    if namespace_supports_regex_flags(&builtin_namespace) {
+                        if let Some(builtin) =
+                            self.try_re_namespace_builtin_call(&builtin_member, &mut args)?
+                        {
+                            let expr = self.build_builtin_call_expr(builtin, args)?;
+                            return Ok(expr);
+                        }
+                    } else if let Some(builtin) =
+                        resolve_builtin_namespace_call(&builtin_namespace, &builtin_member)
+                    {
+                        let expr = self.build_builtin_call_expr(builtin, args)?;
+                        return Ok(expr);
+                    }
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: self.current_line(),
+                        message: format!(
+                            "unknown builtin function '{}::{}'",
+                            builtin_namespace, builtin_member
+                        ),
+                    });
                 }
                 let host_name = self
                     .resolve_vm_namespace_call_target(&name, &member, &subpath)
-                    .ok_or_else(|| ParseError { span: None, code: None,
+                    .ok_or_else(|| ParseError {
+                        span: None,
+                        code: None,
                         line: self.current_line(),
                         message: format!(
-                            "unknown namespace call '{}::{}'; supported namespaces are io:: and re:: (builtins), vm:: host imports, and any host namespace imported via 'use <namespace>;' or 'use <namespace> as <alias>;'",
+                            "unknown namespace call '{}::{}'; import builtin namespaces first ({}), and for host calls import 'vm' or a host namespace alias",
                             name,
-                            path_segments.join("::")
+                            path_segments.join("::"),
+                            builtin_namespace_hint()
                         ),
                     })?;
                 let expr = self.build_vm_host_call_expr(&host_name, args)?;
@@ -1820,7 +1860,7 @@ impl Parser {
         if head == "Some" {
             return self.parse_some_type_pattern();
         }
-        if head == "Option" {
+        if head == "Option" && self.dialect.allow_namespace_path_separator() {
             if !self.match_path_separator() {
                 return Ok(None);
             }
@@ -1891,7 +1931,7 @@ impl Parser {
                 continue;
             }
             if self.match_kind(&TokenKind::Dot) {
-                let member = self.expect_ident("expected member name after '.'")?;
+                let member = self.expect_namespace_segment("expected member name after '.'")?;
                 if member == "length" {
                     expr = self.build_builtin_call_expr(BuiltinFunction::Len, vec![expr])?;
                 } else if member == "keys" {
@@ -1915,7 +1955,7 @@ impl Parser {
                     expr = self.build_optional_get_expr(expr, key)?;
                     continue;
                 }
-                let member = self.expect_ident("expected member name after '?.'")?;
+                let member = self.expect_namespace_segment("expected member name after '?.'")?;
                 expr = self.build_optional_get_expr(expr, Expr::String(member))?;
                 continue;
             }
@@ -2363,33 +2403,34 @@ impl Parser {
         Some(host_name)
     }
 
-    fn resolve_builtin_namespace_call(
-        &self,
-        namespace: &str,
-        member: &str,
-    ) -> Option<BuiltinFunction> {
-        match namespace {
-            "io" => match member {
-                "open" => Some(BuiltinFunction::IoOpen),
-                "popen" => Some(BuiltinFunction::IoPopen),
-                "read_all" => Some(BuiltinFunction::IoReadAll),
-                "read_line" => Some(BuiltinFunction::IoReadLine),
-                "write" => Some(BuiltinFunction::IoWrite),
-                "flush" => Some(BuiltinFunction::IoFlush),
-                "close" => Some(BuiltinFunction::IoClose),
-                "exists" => Some(BuiltinFunction::IoExists),
-                _ => None,
-            },
-            "re" => match member {
-                "match" | "is_match" => Some(BuiltinFunction::ReIsMatch),
-                "find" => Some(BuiltinFunction::ReFind),
-                "replace" => Some(BuiltinFunction::ReReplace),
-                "split" => Some(BuiltinFunction::ReSplit),
-                "captures" => Some(BuiltinFunction::ReCaptures),
-                _ => None,
-            },
-            _ => None,
+    fn resolve_imported_builtin_namespace<'a>(&'a self, namespace: &'a str) -> Option<&'a str> {
+        let root = self.host_namespace_aliases.get(namespace)?.as_str();
+        if is_builtin_namespace(root) {
+            Some(root)
+        } else {
+            None
         }
+    }
+
+    fn resolve_builtins_call_path<'a>(
+        &'a self,
+        namespace: &'a str,
+        member: &'a str,
+        subpath: &'a [String],
+    ) -> Option<(&'a str, &'a str)> {
+        if subpath.is_empty()
+            && let Some(imported_root) = self.resolve_imported_builtin_namespace(namespace)
+        {
+            return Some((imported_root, member));
+        }
+
+        let namespace_is_vm = self.vm_namespace_aliases.contains(namespace)
+            || (namespace == "vm" && self.vm_wildcard_import);
+        if namespace_is_vm && subpath.len() == 1 && is_builtin_namespace(member) {
+            return Some((member, subpath[0].as_str()));
+        }
+
+        None
     }
 
     fn try_re_namespace_builtin_call(
@@ -2644,7 +2685,7 @@ impl Parser {
 
         let mut segments = Vec::<String>::new();
         loop {
-            let member = self.expect_ident("expected member name after '.'")?;
+            let member = self.expect_namespace_segment("expected member name after '.'")?;
             segments.push(member);
             if self.match_kind(&TokenKind::Dot) {
                 continue;
@@ -2656,7 +2697,7 @@ impl Parser {
             self.pos = save_pos;
             return Ok(None);
         }
-        let args = self.parse_call_args()?;
+        let mut args = self.parse_call_args()?;
 
         if base == "console" && segments.len() == 1 && segments[0] == "log" {
             let decl = self.resolve_function_for_call(STDLIB_PRINT_NAME, args.len())?;
@@ -2667,6 +2708,57 @@ impl Parser {
             self.pos = save_pos;
             return Ok(None);
         }
+
+        if let Some(imported_root) = self.resolve_imported_builtin_namespace(base) {
+            let imported_root = imported_root.to_string();
+            if segments.len() != 1 {
+                return Err(ParseError {
+                    span: None,
+                    code: None,
+                    line: self.current_line(),
+                    message: format!(
+                        "unknown builtin function '{}::{}'",
+                        imported_root,
+                        segments.join("::")
+                    ),
+                });
+            }
+            let member = segments[0].as_str();
+            if namespace_supports_regex_flags(&imported_root) {
+                if let Some(builtin) = self.try_re_namespace_builtin_call(member, &mut args)? {
+                    return Ok(Some(self.build_builtin_call_expr(builtin, args)?));
+                }
+            } else if let Some(builtin) = resolve_builtin_namespace_call(&imported_root, member) {
+                return Ok(Some(self.build_builtin_call_expr(builtin, args)?));
+            }
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: format!("unknown builtin function '{}::{}'", imported_root, member),
+            });
+        }
+
+        let base_is_vm_namespace =
+            self.vm_namespace_aliases.contains(base) || (base == "vm" && self.vm_wildcard_import);
+        if base_is_vm_namespace && segments.len() == 2 && is_builtin_namespace(&segments[0]) {
+            let builtin_root = segments[0].as_str();
+            let member = segments[1].as_str();
+            if namespace_supports_regex_flags(builtin_root) {
+                if let Some(builtin) = self.try_re_namespace_builtin_call(member, &mut args)? {
+                    return Ok(Some(self.build_builtin_call_expr(builtin, args)?));
+                }
+            } else if let Some(builtin) = resolve_builtin_namespace_call(builtin_root, member) {
+                return Ok(Some(self.build_builtin_call_expr(builtin, args)?));
+            }
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: format!("unknown builtin function '{}::{}'", builtin_root, member),
+            });
+        }
+
         let member = segments[0].clone();
         let subpath = segments.into_iter().skip(1).collect::<Vec<_>>();
         if let Some(host_name) = self.resolve_vm_namespace_call_target(base, &member, &subpath) {

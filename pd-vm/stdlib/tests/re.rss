@@ -1,3 +1,5 @@
+use re;
+
 assert(re::match("^foo", "foobar"));
 assert(re::match("^foo", "barfoo") == false);
 assert(re::match("^foo", "foobar"));

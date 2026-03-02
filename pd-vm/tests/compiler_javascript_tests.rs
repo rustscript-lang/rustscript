@@ -52,6 +52,88 @@ fn javascript_vm_http_subnamespace_host_calls_are_supported() {
 }
 
 #[test]
+fn javascript_builtin_namespace_calls_require_import() {
+    let source = r#"
+        json.encode("ok");
+    "#;
+    let err = match compile_source_with_flavor(source, SourceFlavor::JavaScript) {
+        Ok(_) => panic!("builtin namespace calls should require explicit import"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("unknown local 'json'"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn javascript_builtin_namespace_calls_reject_path_separator() {
+    let source = r#"
+        import * as json from "json";
+        json::encode("ok");
+    "#;
+    let err = match compile_source_with_flavor(source, SourceFlavor::JavaScript) {
+        Ok(_) => panic!("JavaScript namespace separator should be '.'"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse
+                    .message
+                    .contains("namespace calls use '.' in this language"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn javascript_builtin_namespace_calls_work_with_import() {
+    let source = r#"
+        import * as json from "json";
+        let text = json.encode("ok");
+        text;
+    "#;
+    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
+        .expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("\"ok\"".to_string())]);
+}
+
+#[test]
+fn javascript_jit_namespace_builtins_work_with_import() {
+    let source = r#"
+        import * as jit from "jit";
+        const _set = jit.set_hot_loop_threshold(4);
+        const cfg = jit.get_config();
+        if (cfg.hot_loop_threshold == 4) {
+            1;
+        } else {
+            0;
+        }
+    "#;
+    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
+        .expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1)]);
+}
+
+#[test]
 fn compile_source_with_javascript_flavor() {
     let source = include_str!("../examples/example.js");
 
@@ -120,7 +202,10 @@ fn javascript_char_and_hex_escape_literals_are_supported() {
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
         vm.stack(),
-        &[Value::String("A".to_string()), Value::String("B".to_string())]
+        &[
+            Value::String("A".to_string()),
+            Value::String("B".to_string())
+        ]
     );
 }
 

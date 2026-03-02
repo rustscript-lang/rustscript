@@ -44,7 +44,7 @@ Supported syntax and features:
   literals including `null`.
 - Host/runtime calls:
   - `use vm;`, `use vm as alias;`, `use vm::{name, name as local};`, `use vm::*;`
-  - builtins via namespaces: `io::...`, `re::...` (regex supports optional flags arg)
+  - builtins via namespaces: `io::...`, `re::...`, `json::...`, `jit::...` (regex supports optional flags arg)
   - additional host namespaces via `use <namespace>;` / `use <namespace> as <alias>;`
 - RustScript frontend rewrites:
   - `print!(x)` -> `print(x)`

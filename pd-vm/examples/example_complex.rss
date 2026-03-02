@@ -1,6 +1,9 @@
 use super::stdlib::rss::strings as string;
 
 use vm::{add_one};
+use io;
+use re;
+use json;
 
 // Complex RustScript example with closure capture, stdlib module use, and host calls.
 let total = 0;
@@ -30,4 +33,23 @@ let matched = match chained_score {
     _ => 0,
 };
 
-print!(closure_value);
+let regex_ok = re::match("^rustscript$", "RUSTSCRIPT", "i");
+let payload = {
+    lang: "rustscript",
+    score: closure_value,
+    matched: matched,
+};
+let payload_json = json::encode(payload);
+let payload_decoded = json::decode(payload_json);
+let json_score = payload_decoded.score;
+let io_ok = if false => {
+    io::exists(".");
+} else => {
+    true
+};
+
+if regex_ok && io_ok && json_score == matched {
+    print!(closure_value);
+} else {
+    print!(0);
+}

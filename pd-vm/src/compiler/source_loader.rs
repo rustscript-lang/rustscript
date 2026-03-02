@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::builtins::is_builtin_namespace;
 use crate::compiler::source_map::SourceMap;
 
 use super::frontends::{is_ident_continue, is_ident_start};
@@ -140,6 +141,9 @@ fn parse_rustscript_imports(
             });
         }
         if !line.starts_with("use ") {
+            continue;
+        }
+        if is_builtin_namespace_use_directive_line(line) {
             continue;
         }
         let tail = line["use ".len()..].trim();
@@ -1026,7 +1030,7 @@ fn strip_import_directives(source: &str, flavor: SourceFlavor) -> String {
             .lines()
             .map(|line| {
                 if line.trim_start().starts_with("use ")
-                    && !is_vm_use_directive_line(line.trim_start())
+                    && !is_preserved_rustscript_use_directive_line(line.trim_start())
                 {
                     String::new()
                 } else {
@@ -1038,6 +1042,10 @@ fn strip_import_directives(source: &str, flavor: SourceFlavor) -> String {
         SourceFlavor::Scheme => source.to_string(),
         SourceFlavor::JavaScript | SourceFlavor::Lua => source.to_string(),
     }
+}
+
+fn is_preserved_rustscript_use_directive_line(line: &str) -> bool {
+    is_vm_use_directive_line(line) || is_builtin_namespace_use_directive_line(line)
 }
 
 fn is_vm_use_directive_line(line: &str) -> bool {
@@ -1056,6 +1064,28 @@ fn is_vm_use_directive_line(line: &str) -> bool {
         return true;
     }
     directive_body.starts_with("vm::")
+}
+
+fn is_builtin_namespace_use_directive_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("use ") {
+        return false;
+    }
+    let Some((directive_body, _)) = trimmed["use ".len()..].split_once(';') else {
+        return false;
+    };
+    let directive_body = directive_body.trim();
+    if is_builtin_host_namespace_spec(directive_body) {
+        return true;
+    }
+    if let Some((root, alias)) = directive_body.rsplit_once(" as ") {
+        return is_builtin_host_namespace_spec(root.trim()) && is_valid_ident(alias.trim());
+    }
+    false
+}
+
+fn is_builtin_host_namespace_spec(spec: &str) -> bool {
+    is_builtin_namespace(spec)
 }
 
 fn vm_namespace_direct_calls_supported(imports: &[ModuleImport]) -> bool {

@@ -9,7 +9,11 @@ fn expect_lua_direct_only_error(source: &str) {
     };
     match err {
         vm::SourceError::Parse(parse) => {
-            assert!(parse.message.contains("unsupported Lua syntax"), "{}", parse.message);
+            assert!(
+                parse.message.contains("unsupported Lua syntax"),
+                "{}",
+                parse.message
+            );
         }
         other => panic!("unexpected error: {other}"),
     }
@@ -183,7 +187,11 @@ fn lua_complex_fixture_is_rejected_without_rewrite_path() {
 
     match err {
         vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
-            assert!(parse.message.contains("unsupported Lua syntax"), "{}", parse.message);
+            assert!(
+                parse.message.contains("unsupported Lua syntax"),
+                "{}",
+                parse.message
+            );
         }
         vm::SourcePathError::Source(vm::SourceError::Compile(other)) => {
             panic!("unexpected nested compile error: {other:?}");

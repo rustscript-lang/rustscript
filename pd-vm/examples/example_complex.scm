@@ -2,6 +2,9 @@
 (import (prefix-in string2: "../stdlib/rss/strings.rss"))
 (import (only "../stdlib/rss/strings.rss" non_empty))
 (require (only-in "vm" add_one))
+(require (prefix-in io. "io"))
+(require (prefix-in re. "re"))
+(require (prefix-in json. "json"))
 
 ; Complex Scheme flavor example: loops + stdlib + host + closure + syntax coverage.
 (declare (print value))
@@ -111,6 +114,15 @@
 
 (define vm-call (vm.add_one 5))
 (define add-one-alias (add_one 6))
+(define regex-ok (re.match "^scheme$" "SCHEME" "i"))
+(define payload-json
+  (json.encode (hash (lang "scheme") (score closure-value) (vm_call vm-call))))
+(define payload-decoded (json.decode payload-json))
+(define io-ok true)
+(if false
+    (set! io-ok (io.exists "."))
+    (set! io-ok io-ok))
+(define payload-score (hash-ref payload-decoded "score"))
 
 (define remainder-val (remainder 17 5))
 (define quotient-val (quotient 9 2))
@@ -122,4 +134,6 @@
 
 (if false (begin (display "hidden") (write "hidden") (newline)))
 
-(print closure-value)
+(if (and regex-ok io-ok (= payload-score closure-value))
+    (print closure-value)
+    (print 0))

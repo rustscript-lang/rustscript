@@ -544,6 +544,20 @@ async fn ui_blocks_and_deploy_endpoints_work() {
             .as_array()
             .expect("blocks should be an array")
             .iter()
+            .any(|item| item["id"].as_str() == Some("json_encode"))
+    );
+    assert!(
+        blocks_json["blocks"]
+            .as_array()
+            .expect("blocks should be an array")
+            .iter()
+            .any(|item| item["id"].as_str() == Some("json_decode"))
+    );
+    assert!(
+        blocks_json["blocks"]
+            .as_array()
+            .expect("blocks should be an array")
+            .iter()
             .any(|item| item["id"].as_str() == Some("get_response_headers"))
     );
     let blocks = blocks_json["blocks"]
@@ -602,6 +616,15 @@ async fn ui_blocks_and_deploy_endpoints_work() {
         runtime_sleep["category"].as_str(),
         Some("runtime"),
         "runtime_sleep should be runtime scoped"
+    );
+    let json_encode = blocks
+        .iter()
+        .find(|item| item["id"].as_str() == Some("json_encode"))
+        .expect("json_encode block should exist");
+    assert_eq!(
+        json_encode["category"].as_str(),
+        Some("json"),
+        "json_encode should be json scoped"
     );
 
     let deploy = client
@@ -1250,6 +1273,70 @@ async fn ui_render_new_http_blocks_generate_expected_calls() {
         .expect("javascript source should be a string");
     assert!(javascript.contains("vm.http.upstream.request.set_path(path_next);"));
     assert!(javascript.contains("vm.http.response.remove_header(\"x-hidden\");"));
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn ui_render_json_blocks_generate_expected_calls() {
+    let (addr, handle, _state) = spawn_controller(ControllerConfig::default()).await;
+    let client = reqwest::Client::new();
+
+    let render = client
+        .post(format!("http://{addr}/v1/ui/render"))
+        .json(&serde_json::json!({
+            "blocks": [
+                {
+                    "block_id": "const_string",
+                    "values": { "var": "payload_json", "value": "{\"ok\":true,\"n\":2}" }
+                },
+                {
+                    "block_id": "json_decode",
+                    "values": { "var": "payload", "value": "$payload_json" }
+                },
+                {
+                    "block_id": "json_encode",
+                    "values": { "var": "payload_json_out", "value": "$payload" }
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("render request should complete");
+
+    assert_eq!(render.status(), reqwest::StatusCode::OK);
+    let render_json = render
+        .json::<serde_json::Value>()
+        .await
+        .expect("render payload should decode");
+
+    let rustscript = render_json["source"]["rustscript"]
+        .as_str()
+        .expect("rustscript source should be a string");
+    assert!(rustscript.contains("use json;"));
+    assert!(rustscript.contains("let payload = json::decode(payload_json);"));
+    assert!(rustscript.contains("let payload_json_out = json::encode(payload);"));
+
+    let javascript = render_json["source"]["javascript"]
+        .as_str()
+        .expect("javascript source should be a string");
+    assert!(javascript.contains("import * as json from \"json\";"));
+    assert!(javascript.contains("let payload = json.decode(payload_json);"));
+    assert!(javascript.contains("let payload_json_out = json.encode(payload);"));
+
+    let lua = render_json["source"]["lua"]
+        .as_str()
+        .expect("lua source should be a string");
+    assert!(lua.contains("local json = require(\"json\")"));
+    assert!(lua.contains("local payload = json.decode(payload_json)"));
+    assert!(lua.contains("local payload_json_out = json.encode(payload)"));
+
+    let scheme = render_json["source"]["scheme"]
+        .as_str()
+        .expect("scheme source should be a string");
+    assert!(scheme.contains("(require (prefix-in json. \"json\"))"));
+    assert!(scheme.contains("(define payload (json.decode payload_json))"));
+    assert!(scheme.contains("(define payload_json_out (json.encode payload))"));
 
     handle.abort();
 }
