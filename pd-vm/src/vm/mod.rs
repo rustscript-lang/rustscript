@@ -308,6 +308,7 @@ enum VmHostFunction {
 pub struct Vm {
     program: Program,
     program_cache_key: u64,
+    program_cache_key_ready: bool,
     ip: usize,
     stack: Vec<Value>,
     locals: Vec<Value>,
@@ -412,10 +413,10 @@ fn hash_value(value: &Value, state: &mut impl Hasher) {
 
 impl Vm {
     pub fn new(program: Program) -> Self {
-        let program_cache_key = compute_program_cache_key(&program);
         Self {
             program,
-            program_cache_key,
+            program_cache_key: 0,
+            program_cache_key_ready: false,
             ip: 0,
             stack: Vec::new(),
             locals: Vec::new(),
@@ -436,10 +437,10 @@ impl Vm {
     }
 
     pub fn with_locals(program: Program, local_count: usize) -> Self {
-        let program_cache_key = compute_program_cache_key(&program);
         Self {
             program,
-            program_cache_key,
+            program_cache_key: 0,
+            program_cache_key_ready: false,
             ip: 0,
             stack: Vec::new(),
             locals: vec![Value::Null; local_count],
@@ -457,6 +458,14 @@ impl Vm {
             next_host_op_id: 1,
             io_state: builtins_impl::IoState::default(),
         }
+    }
+
+    fn ensure_program_cache_key(&mut self) -> u64 {
+        if !self.program_cache_key_ready {
+            self.program_cache_key = compute_program_cache_key(&self.program);
+            self.program_cache_key_ready = true;
+        }
+        self.program_cache_key
     }
 
     /// Reset VM execution state to allow rerunning the same program instance while
