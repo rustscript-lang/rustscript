@@ -106,6 +106,24 @@ Dump trace-JIT activity:
 cargo run -p pd-vm --bin pd-vm-run -- --jit-hot-loop 2 --jit-dump examples/example.rss
 ```
 
+Select native JIT codegen backend:
+
+```powershell
+$env:PD_VM_JIT_CODEGEN="handwritten"  # or "cranelift"
+cargo run -p pd-vm --features cranelift-jit --bin pd-vm-run -- --jit-hot-loop 2 --jit-dump examples/example.rss
+```
+
+- Accepted values: `handwritten` (default), `native` (alias of handwritten), `cranelift`
+- `cranelift` requires `--features cranelift-jit`
+- Cranelift is part of the Bytecode Alliance/Wasmtime ecosystem
+
+Backend parity notes:
+
+- NYI behavior is shared by the trace recorder (`TraceJitEngine`) and is backend-independent.
+- In practice, `nyi` counts should match between `handwritten` and `cranelift` for the same program/config.
+- Cranelift supports the same current `TraceStep` set as handwritten emission. Some operations may use helper fallback paths internally, but that is not counted as trace-recorder NYI.
+- Cranelift trace-code cache is currently per-thread; handwritten cache is process-global.
+
 Library hooks:
 
 - `vm.set_jit_config(...)`
@@ -137,6 +155,14 @@ Manual perf characterization (ignored by default):
 
 ```powershell
 cargo test -p pd-vm --test perf_tests -- --ignored --nocapture
+```
+
+Compare handwritten vs cranelift on the same ignored perf test:
+
+```powershell
+pd-vm/scripts/compare-jit-backends.sh
+# or choose a specific ignored perf test:
+pd-vm/scripts/compare-jit-backends.sh perf_manual_aes_128_cbc_rustscript_matches_in_interpreter_and_jit
 ```
 
 ## Internals

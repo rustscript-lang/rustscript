@@ -10,6 +10,17 @@ use std::sync::Arc;
     all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
 ))]
 use std::sync::{Mutex, OnceLock};
+#[cfg(all(
+    feature = "cranelift-jit",
+    any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "windows", all(unix, not(target_os = "macos")))
+        ),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+    )
+))]
+use std::{cell::RefCell, thread_local};
 
 #[cfg(any(
     all(
@@ -29,6 +40,9 @@ type NativeTraceEntry = unsafe extern "C" fn(*mut Vm) -> i32;
 )))]
 type NativeTraceEntry = fn(*mut Vm) -> i32;
 
+#[cfg(feature = "cranelift-jit")]
+type MaybeCraneliftKeepalive = Option<Arc<native::CraneliftTraceKeepAlive>>;
+
 pub(crate) struct NativeTrace {
     #[cfg(any(
         all(
@@ -37,7 +51,9 @@ pub(crate) struct NativeTrace {
         ),
         all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
     ))]
-    _memory: Arc<native::ExecutableMemory>,
+    _memory: Option<Arc<native::ExecutableMemory>>,
+    #[cfg(feature = "cranelift-jit")]
+    _cranelift_keepalive: MaybeCraneliftKeepalive,
     entry: NativeTraceEntry,
     code: Arc<[u8]>,
     root_ip: usize,
@@ -54,6 +70,7 @@ pub(crate) struct NativeTrace {
 ))]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct NativeTraceCacheKey {
+    backend: native::NativeCodegenBackend,
     root_ip: usize,
     terminal: JitTraceTerminal,
     steps: Vec<TraceStep>,
@@ -83,6 +100,57 @@ struct NativeTraceCache {
     entries: HashMap<NativeTraceCacheKey, NativeTraceCacheEntry>,
 }
 
+#[cfg(all(
+    feature = "cranelift-jit",
+    any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "windows", all(unix, not(target_os = "macos")))
+        ),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+    )
+))]
+#[derive(Clone)]
+struct CraneliftNativeTraceCacheEntry {
+    entry: NativeTraceEntry,
+    keepalive: Arc<native::CraneliftTraceKeepAlive>,
+    code: Arc<[u8]>,
+}
+
+#[cfg(all(
+    feature = "cranelift-jit",
+    any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "windows", all(unix, not(target_os = "macos")))
+        ),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+    )
+))]
+struct CraneliftNativeTraceCache {
+    active_program_key: Option<u64>,
+    entries: HashMap<NativeTraceCacheKey, CraneliftNativeTraceCacheEntry>,
+}
+
+#[cfg(all(
+    feature = "cranelift-jit",
+    any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "windows", all(unix, not(target_os = "macos")))
+        ),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+    )
+))]
+thread_local! {
+    static CRANELIFT_NATIVE_TRACE_CACHE: RefCell<CraneliftNativeTraceCache> = RefCell::new(
+        CraneliftNativeTraceCache {
+            active_program_key: None,
+            entries: HashMap::new(),
+        }
+    );
+}
+
 #[cfg(any(
     all(
         target_arch = "x86_64",
@@ -108,6 +176,23 @@ fn native_trace_cache() -> &'static Mutex<NativeTraceCache> {
     })
 }
 
+#[cfg(all(
+    feature = "cranelift-jit",
+    any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "windows", all(unix, not(target_os = "macos")))
+        ),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+    )
+))]
+fn with_cranelift_native_trace_cache<R>(f: impl FnOnce(&mut CraneliftNativeTraceCache) -> R) -> R {
+    CRANELIFT_NATIVE_TRACE_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        f(&mut cache)
+    })
+}
+
 #[cfg(any(
     all(
         target_arch = "x86_64",
@@ -115,8 +200,12 @@ fn native_trace_cache() -> &'static Mutex<NativeTraceCache> {
     ),
     all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
 ))]
-fn native_trace_cache_key(trace: &JitTrace) -> NativeTraceCacheKey {
+fn native_trace_cache_key(
+    trace: &JitTrace,
+    backend: native::NativeCodegenBackend,
+) -> NativeTraceCacheKey {
     NativeTraceCacheKey {
+        backend,
         root_ip: trace.root_ip,
         terminal: trace.terminal.clone(),
         steps: trace.steps.clone(),
@@ -138,6 +227,10 @@ impl Vm {
 
     pub fn dump_jit_info(&self) -> String {
         let mut out = self.jit.dump_text(self.program.debug.as_ref());
+        out.push_str(&format!(
+            "  native codegen backend: {:?}\n",
+            native::selected_codegen_backend()
+        ));
         out.push_str(&format!(
             "  native trace executions: {}\n",
             self.native_trace_exec_count
@@ -454,45 +547,147 @@ impl Vm {
         let trace = self.jit.trace_clone(trace_id).ok_or_else(|| {
             VmError::JitNative(format!("trace {} missing for native compile", trace_id))
         })?;
-        let key = native_trace_cache_key(&trace);
-        let cache = native_trace_cache();
-        let (memory, code) = {
-            let mut guard = cache
-                .lock()
-                .map_err(|_| VmError::JitNative("native trace cache lock poisoned".to_string()))?;
-            if guard.active_program_key != Some(self.program_cache_key) {
-                guard.entries.clear();
-                guard.active_program_key = Some(self.program_cache_key);
-            }
+        match native::selected_codegen_backend() {
+            native::NativeCodegenBackend::Handwritten => {
+                let key = native_trace_cache_key(&trace, native::NativeCodegenBackend::Handwritten);
+                let cache = native_trace_cache();
+                let (memory, code) = {
+                    let mut guard = cache.lock().map_err(|_| {
+                        VmError::JitNative("native trace cache lock poisoned".to_string())
+                    })?;
+                    if guard.active_program_key != Some(self.program_cache_key) {
+                        guard.entries.clear();
+                        guard.active_program_key = Some(self.program_cache_key);
+                    }
 
-            if let Some(hit) = guard.entries.get(&key) {
-                (Arc::clone(&hit.memory), Arc::clone(&hit.code))
-            } else {
-                let code =
-                    Arc::<[u8]>::from(native::emit_native_trace_bytes(&trace)?.into_boxed_slice());
-                let memory = Arc::new(native::ExecutableMemory::from_code(code.as_ref())?);
-                guard.entries.insert(
-                    key,
-                    NativeTraceCacheEntry {
-                        memory: Arc::clone(&memory),
-                        code: Arc::clone(&code),
+                    if let Some(hit) = guard.entries.get(&key) {
+                        (Arc::clone(&hit.memory), Arc::clone(&hit.code))
+                    } else {
+                        let code = Arc::<[u8]>::from(
+                            native::emit_native_trace_bytes(&trace)?.into_boxed_slice(),
+                        );
+                        let memory = Arc::new(native::ExecutableMemory::from_code(code.as_ref())?);
+                        guard.entries.insert(
+                            key,
+                            NativeTraceCacheEntry {
+                                memory: Arc::clone(&memory),
+                                code: Arc::clone(&code),
+                            },
+                        );
+                        (memory, code)
+                    }
+                };
+                let entry =
+                    unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(memory.ptr) };
+                self.native_traces.insert(
+                    trace_id,
+                    NativeTrace {
+                        _memory: Some(memory),
+                        #[cfg(feature = "cranelift-jit")]
+                        _cranelift_keepalive: None,
+                        entry,
+                        code,
+                        root_ip: trace.root_ip,
+                        terminal: trace.terminal,
+                        has_yielding_call: trace.has_yielding_call,
                     },
                 );
-                (memory, code)
             }
-        };
-        let entry = unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(memory.ptr) };
-        self.native_traces.insert(
-            trace_id,
-            NativeTrace {
-                _memory: memory,
-                entry,
-                code,
-                root_ip: trace.root_ip,
-                terminal: trace.terminal,
-                has_yielding_call: trace.has_yielding_call,
-            },
-        );
+            native::NativeCodegenBackend::Cranelift => {
+                #[cfg(feature = "cranelift-jit")]
+                {
+                    let key =
+                        native_trace_cache_key(&trace, native::NativeCodegenBackend::Cranelift);
+                    let cached = with_cranelift_native_trace_cache(|cache| {
+                        if cache.active_program_key != Some(self.program_cache_key) {
+                            cache.entries.clear();
+                            cache.active_program_key = Some(self.program_cache_key);
+                        }
+                        cache.entries.get(&key).cloned()
+                    });
+                    if let Some(cached) = cached {
+                        self.native_traces.insert(
+                            trace_id,
+                            NativeTrace {
+                                _memory: None,
+                                _cranelift_keepalive: Some(cached.keepalive),
+                                entry: cached.entry,
+                                code: cached.code,
+                                root_ip: trace.root_ip,
+                                terminal: trace.terminal,
+                                has_yielding_call: trace.has_yielding_call,
+                            },
+                        );
+                        return Ok(());
+                    }
+                }
+
+                let compiled =
+                    native::compile_native_trace(&trace, native::NativeCodegenBackend::Cranelift)?;
+                match compiled {
+                    #[cfg(feature = "cranelift-jit")]
+                    native::CompiledNativeTrace::Cranelift(compiled) => {
+                        let entry = unsafe {
+                            std::mem::transmute::<*const u8, NativeTraceEntry>(compiled.entry)
+                        };
+                        let code = Arc::<[u8]>::from(compiled.code.into_boxed_slice());
+                        let keepalive = Arc::new(compiled.keepalive);
+                        #[cfg(feature = "cranelift-jit")]
+                        {
+                            let cached = CraneliftNativeTraceCacheEntry {
+                                entry,
+                                keepalive: Arc::clone(&keepalive),
+                                code: Arc::clone(&code),
+                            };
+                            let key = native_trace_cache_key(
+                                &trace,
+                                native::NativeCodegenBackend::Cranelift,
+                            );
+                            with_cranelift_native_trace_cache(|cache| {
+                                if cache.active_program_key != Some(self.program_cache_key) {
+                                    cache.entries.clear();
+                                    cache.active_program_key = Some(self.program_cache_key);
+                                }
+                                cache.entries.insert(key, cached);
+                            });
+                        }
+                        self.native_traces.insert(
+                            trace_id,
+                            NativeTrace {
+                                _memory: None,
+                                #[cfg(feature = "cranelift-jit")]
+                                _cranelift_keepalive: Some(keepalive),
+                                entry,
+                                code,
+                                root_ip: trace.root_ip,
+                                terminal: trace.terminal,
+                                has_yielding_call: trace.has_yielding_call,
+                            },
+                        );
+                    }
+                    native::CompiledNativeTrace::Handwritten { code } => {
+                        let code = Arc::<[u8]>::from(code.into_boxed_slice());
+                        let memory = Arc::new(native::ExecutableMemory::from_code(code.as_ref())?);
+                        let entry = unsafe {
+                            std::mem::transmute::<*const u8, NativeTraceEntry>(memory.ptr)
+                        };
+                        self.native_traces.insert(
+                            trace_id,
+                            NativeTrace {
+                                _memory: Some(memory),
+                                #[cfg(feature = "cranelift-jit")]
+                                _cranelift_keepalive: None,
+                                entry,
+                                code,
+                                root_ip: trace.root_ip,
+                                terminal: trace.terminal,
+                                has_yielding_call: trace.has_yielding_call,
+                            },
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -520,6 +715,11 @@ pub(crate) fn clear_native_trace_cache_for_tests() {
         guard.entries.clear();
         guard.active_program_key = None;
     }
+    #[cfg(feature = "cranelift-jit")]
+    with_cranelift_native_trace_cache(|cache| {
+        cache.entries.clear();
+        cache.active_program_key = None;
+    });
 }
 
 #[cfg(all(

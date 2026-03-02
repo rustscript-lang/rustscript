@@ -275,6 +275,10 @@ fn jit_emitted_machine_code_is_executed_on_native_targets() {
             native_exec_count > 0,
             "expected native execution count > 0, dump:\n{dump}"
         );
+        assert!(
+            dump.contains("native codegen backend:"),
+            "missing native backend line"
+        );
         assert!(dump.contains("native trace#"), "missing native trace entry");
         assert!(dump.contains("code:"), "missing native machine code bytes");
     }
