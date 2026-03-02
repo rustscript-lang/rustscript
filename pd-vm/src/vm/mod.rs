@@ -459,6 +459,23 @@ impl Vm {
         }
     }
 
+    /// Reset VM execution state to allow rerunning the same program instance while
+    /// preserving JIT artifacts and registered host bindings.
+    ///
+    /// Locals are reset to `Null`, stack is cleared, and instruction pointer is
+    /// rewound to the program entry.
+    pub fn reset_for_reuse(&mut self) {
+        self.ip = 0;
+        self.stack.clear();
+        for local in &mut self.locals {
+            *local = Value::Null;
+        }
+        self.call_depth = 0;
+        self.waiting_host_op = None;
+        self.next_host_op_id = 1;
+        self.io_state = builtins_impl::IoState::default();
+    }
+
     pub fn register_function(&mut self, function: Box<dyn HostFunction>) -> u16 {
         let index = self.host_functions.len() as u16;
         self.host_functions.push(VmHostFunction::Dynamic(function));
