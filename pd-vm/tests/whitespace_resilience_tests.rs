@@ -70,8 +70,7 @@ fn lua_spacing_variants_produce_same_result() {
         else
             b=0
         end
-        local add=function(v) return v+b end
-        add(3)
+        b
     "#;
     let spaced = r#"
         local      a = 1
@@ -81,8 +80,7 @@ fn lua_spacing_variants_produce_same_result() {
         else
             b = 0
         end
-        local add = function   ( v )   return   v + b   end
-        add ( 3 )
+        b
     "#;
 
     assert_eq!(
@@ -97,19 +95,19 @@ fn scheme_spacing_variants_produce_same_result() {
         (define a 1)
         (define b 2)
         (if (< a b)
-            (set! b (+ b a))
-            (set! b 0))
-        (define add (lambda (v) (+ v b)))
-        (add 3)
+            (begin
+                (set! b (+ b a))
+                b)
+            0)
     "#;
     let spaced = r#"
         ( define   a   1 )
         ( define b 2 )
         ( if ( < a b )
-            ( set!   b ( + b a ) )
-            ( set! b 0 ) )
-        ( define add ( lambda ( v ) ( + v b ) ) )
-        ( add   3 )
+            ( begin
+                ( set!   b ( + b a ) )
+                b )
+            0 )
     "#;
 
     assert_eq!(

@@ -122,20 +122,10 @@ fn nested_loop_break_semantics_match_across_frontends() {
         end
         total
     "#;
-    let scheme = r#"
-        (define total 0)
-        (do ((outer 0 (+ outer 1)))
-            ((>= outer 4) total)
-          (do ((inner 0 (+ inner 1)))
-              ((or (>= inner 6) (= inner 4)) #f)
-            (set! total (+ total (+ (* outer 10) inner)))))
-    "#;
-
     let cases = [
         (SourceFlavor::RustScript, rustscript),
         (SourceFlavor::JavaScript, javascript),
         (SourceFlavor::Lua, lua),
-        (SourceFlavor::Scheme, scheme),
     ];
 
     for (flavor, source) in cases {

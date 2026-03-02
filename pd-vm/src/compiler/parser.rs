@@ -19,6 +19,8 @@ enum TokenKind {
     Null,
     Pub,
     Use,
+    Import,
+    From,
     As,
     Fn,
     Let,
@@ -76,10 +78,11 @@ struct Lexer<'a> {
     line: usize,
     offset: usize,
     source_id: SourceId,
+    js_mode: bool,
 }
 
 impl<'a> Lexer<'a> {
-    fn new(source: &'a str, source_id: SourceId) -> Self {
+    fn new(source: &'a str, source_id: SourceId, js_mode: bool) -> Self {
         let mut chars = source.chars();
         let current = chars.next();
         Self {
@@ -88,6 +91,7 @@ impl<'a> Lexer<'a> {
             line: 1,
             offset: 0,
             source_id,
+            js_mode,
         }
     }
 
@@ -233,9 +237,14 @@ impl<'a> Lexer<'a> {
                 match ident.as_str() {
                     "pub" => TokenKind::Pub,
                     "use" => TokenKind::Use,
+                    "import" if self.js_mode => TokenKind::Import,
+                    "from" if self.js_mode => TokenKind::From,
                     "as" => TokenKind::As,
                     "fn" => TokenKind::Fn,
+                    "function" if self.js_mode => TokenKind::Fn,
                     "let" => TokenKind::Let,
+                    "const" if self.js_mode => TokenKind::Let,
+                    "var" if self.js_mode => TokenKind::Let,
                     "for" => TokenKind::For,
                     "if" => TokenKind::If,
                     "else" => TokenKind::Else,
@@ -476,7 +485,9 @@ pub(super) struct Parser {
     closure_capture_contexts: Vec<ClosureCaptureContext>,
     allow_implicit_externs: bool,
     allow_implicit_semicolons: bool,
+    js_mode: bool,
     loop_depth: usize,
+    function_body_depth: usize,
     vm_namespace_aliases: HashSet<String>,
     host_namespace_aliases: HashMap<String, String>,
     vm_named_imports: HashMap<String, String>,
@@ -494,8 +505,9 @@ impl Parser {
         source_id: SourceId,
         allow_implicit_externs: bool,
         allow_implicit_semicolons: bool,
+        js_mode: bool,
     ) -> Result<Self, ParseError> {
-        let mut lexer = Lexer::new(source, source_id);
+        let mut lexer = Lexer::new(source, source_id, js_mode);
         let mut tokens = Vec::new();
         loop {
             let token = lexer.next_token()?;
@@ -518,7 +530,9 @@ impl Parser {
             closure_capture_contexts: Vec::new(),
             allow_implicit_externs,
             allow_implicit_semicolons,
+            js_mode,
             loop_depth: 0,
+            function_body_depth: 0,
             vm_namespace_aliases: HashSet::new(),
             host_namespace_aliases: HashMap::new(),
             vm_named_imports: HashMap::new(),
@@ -549,10 +563,19 @@ impl Parser {
         if self.match_kind(&TokenKind::Use) {
             return self.parse_use_stmt();
         }
+        if self.js_mode && self.match_kind(&TokenKind::Import) {
+            return self.parse_js_import_stmt();
+        }
+        if self.js_mode && self.check_ident_literal("return") {
+            return self.parse_return_stmt();
+        }
         if self.match_kind(&TokenKind::Fn) {
             return self.parse_fn_decl(false);
         }
         if self.match_kind(&TokenKind::Let) {
+            if self.js_mode && self.check_js_require_declaration_start() {
+                return self.parse_js_require_declaration_after_let();
+            }
             return self.parse_let_with_terminator(true);
         }
         if self.match_kind(&TokenKind::For) {
@@ -703,6 +726,202 @@ impl Parser {
         self.expect(&TokenKind::RBrace, "expected '}' after use list")?;
         self.expect(&TokenKind::Semicolon, "expected ';' after use list")?;
         Ok(Stmt::Noop { line })
+    }
+
+    fn parse_js_import_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let line = self.last_line();
+
+        if self.match_string().is_some() {
+            self.consume_stmt_terminator("expected ';' after import statement")?;
+            return Ok(Stmt::Noop { line });
+        }
+
+        if self.match_kind(&TokenKind::Star) {
+            self.expect(&TokenKind::As, "expected 'as' in namespace import")?;
+            let alias = self.expect_ident("expected namespace alias in import")?;
+            self.expect(&TokenKind::From, "expected 'from' in import statement")?;
+            let spec = self.expect_string_literal("expected module string after 'from'")?;
+            self.consume_stmt_terminator("expected ';' after import statement")?;
+            if spec == "vm" {
+                self.vm_namespace_aliases.insert(alias);
+            }
+            return Ok(Stmt::Noop { line });
+        }
+
+        if self.match_kind(&TokenKind::LBrace) {
+            let named = self.parse_js_named_import_list()?;
+            self.expect(&TokenKind::RBrace, "expected '}' after import list")?;
+            self.expect(&TokenKind::From, "expected 'from' in import statement")?;
+            let spec = self.expect_string_literal("expected module string after 'from'")?;
+            self.consume_stmt_terminator("expected ';' after import statement")?;
+            if spec == "vm" {
+                for (imported, local) in named {
+                    self.vm_named_imports.insert(local, imported);
+                }
+            }
+            return Ok(Stmt::Noop { line });
+        }
+
+        let default_ident = self.expect_ident("expected import clause after 'import'")?;
+        if self.match_kind(&TokenKind::Comma) {
+            if self.match_kind(&TokenKind::Star) {
+                self.expect(&TokenKind::As, "expected 'as' in namespace import")?;
+                let _alias = self.expect_ident("expected namespace alias in import")?;
+            } else if self.match_kind(&TokenKind::LBrace) {
+                let _ = self.parse_js_named_import_list()?;
+                self.expect(&TokenKind::RBrace, "expected '}' after import list")?;
+            } else {
+                return Err(ParseError {
+                    span: None,
+                    code: None,
+                    line: self.current_line(),
+                    message: "unsupported import clause after ','".to_string(),
+                });
+            }
+        }
+        self.expect(&TokenKind::From, "expected 'from' in import statement")?;
+        let spec = self.expect_string_literal("expected module string after 'from'")?;
+        self.consume_stmt_terminator("expected ';' after import statement")?;
+        if spec == "vm" {
+            self.vm_namespace_aliases.insert(default_ident);
+        }
+        Ok(Stmt::Noop { line })
+    }
+
+    fn parse_js_named_import_list(&mut self) -> Result<Vec<(String, String)>, ParseError> {
+        let mut named = Vec::<(String, String)>::new();
+        if self.check(&TokenKind::RBrace) {
+            return Ok(named);
+        }
+        loop {
+            let imported = self.expect_ident("expected imported symbol in import list")?;
+            let local = if self.match_kind(&TokenKind::As) {
+                self.expect_ident("expected local alias after 'as'")?
+            } else {
+                imported.clone()
+            };
+            named.push((imported, local));
+            if self.match_kind(&TokenKind::Comma) {
+                if self.check(&TokenKind::RBrace) {
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+        Ok(named)
+    }
+
+    fn parse_return_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let line = self.current_line_u32();
+        let _ = self.match_ident_literal("return");
+
+        if self.function_body_depth == 0 {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: "'return' is only valid inside function bodies".to_string(),
+            });
+        }
+
+        let expr = if self.match_kind(&TokenKind::Semicolon)
+            || self.check(&TokenKind::RBrace)
+            || self.check(&TokenKind::Eof)
+        {
+            Expr::Null
+        } else {
+            let expr = self.parse_expr()?;
+            self.consume_stmt_terminator("expected ';' after return value")?;
+            expr
+        };
+        Ok(Stmt::Expr { expr, line })
+    }
+
+    fn check_js_require_declaration_start(&self) -> bool {
+        if self.check(&TokenKind::LBrace) {
+            let mut cursor = self.pos + 1;
+            while cursor < self.tokens.len() {
+                match self.tokens[cursor].kind {
+                    TokenKind::RBrace => {
+                        return self.check_kind_at(cursor + 1, &TokenKind::Equal)
+                            && self.check_ident_literal_at(cursor + 2, "require")
+                            && self.check_kind_at(cursor + 3, &TokenKind::LParen)
+                            && self.check_string_at(cursor + 4)
+                            && self.check_kind_at(cursor + 5, &TokenKind::RParen);
+                    }
+                    TokenKind::Eof => return false,
+                    _ => cursor += 1,
+                }
+            }
+            return false;
+        }
+
+        self.check_ident_at(self.pos)
+            && self.check_kind_at(self.pos + 1, &TokenKind::Equal)
+            && self.check_ident_literal_at(self.pos + 2, "require")
+            && self.check_kind_at(self.pos + 3, &TokenKind::LParen)
+            && self.check_string_at(self.pos + 4)
+            && self.check_kind_at(self.pos + 5, &TokenKind::RParen)
+    }
+
+    fn parse_js_require_declaration_after_let(&mut self) -> Result<Stmt, ParseError> {
+        let line = self.last_line();
+
+        if self.match_kind(&TokenKind::LBrace) {
+            while !self.check(&TokenKind::RBrace) {
+                if self.check(&TokenKind::Eof) {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: self.current_line(),
+                        message: "unexpected end of input in require destructuring".to_string(),
+                    });
+                }
+                self.pos += 1;
+            }
+            self.expect(&TokenKind::RBrace, "expected '}' in require destructuring")?;
+            self.expect(
+                &TokenKind::Equal,
+                "expected '=' after destructuring in require declaration",
+            )?;
+            let spec = self.parse_js_require_call()?;
+            self.consume_stmt_terminator("expected ';' after require declaration")?;
+            if spec == "vm" {
+                self.vm_wildcard_import = true;
+            }
+            return Ok(Stmt::Noop { line });
+        }
+
+        let alias = self.expect_ident("expected identifier after 'let'")?;
+        self.expect(
+            &TokenKind::Equal,
+            "expected '=' in require declaration after identifier",
+        )?;
+        let spec = self.parse_js_require_call()?;
+        self.consume_stmt_terminator("expected ';' after require declaration")?;
+        if spec == "vm" {
+            self.vm_namespace_aliases.insert(alias);
+        }
+        Ok(Stmt::Noop { line })
+    }
+
+    fn parse_js_require_call(&mut self) -> Result<String, ParseError> {
+        if !self.match_ident_literal("require") {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: "expected 'require(...)' in declaration".to_string(),
+            });
+        }
+        self.expect(&TokenKind::LParen, "expected '(' after require")?;
+        let spec = self.expect_string_literal("expected module string in require")?;
+        self.expect(
+            &TokenKind::RParen,
+            "expected ')' after require module string",
+        )?;
+        Ok(spec)
     }
 
     fn parse_fn_decl(&mut self, exported: bool) -> Result<Stmt, ParseError> {
@@ -872,7 +1091,9 @@ impl Parser {
             by_name: HashMap::new(),
             capture_copies: Vec::new(),
         });
+        self.function_body_depth += 1;
         let (body_stmts, body_expr) = parse_body(self)?;
+        self.function_body_depth = self.function_body_depth.saturating_sub(1);
         let capture_context = self
             .closure_capture_contexts
             .pop()
@@ -1119,6 +1340,10 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        if self.js_mode && self.match_ident_literal("typeof") {
+            let inner = self.parse_unary()?;
+            return Ok(self.build_builtin_call_expr(BuiltinFunction::TypeOf, vec![inner])?);
+        }
         if self.match_kind(&TokenKind::Minus) {
             let inner = self.parse_unary()?;
             Ok(Expr::Neg(Box::new(inner)))
@@ -1158,7 +1383,18 @@ impl Parser {
         if self.match_kind(&TokenKind::Pipe) {
             return self.parse_closure_literal();
         }
+        if self.js_mode && self.check_parenthesized_arrow_closure_start() {
+            return self.parse_parenthesized_arrow_closure();
+        }
+        if self.js_mode && self.check_single_param_arrow_closure_start() {
+            return self.parse_single_param_arrow_closure();
+        }
         if let Some(name) = self.match_ident() {
+            if self.js_mode
+                && let Some(expr) = self.try_parse_js_dotted_call(&name)?
+            {
+                return Ok(expr);
+            }
             if self.match_path_separator() {
                 let mut path_segments = Vec::new();
                 path_segments
@@ -2232,23 +2468,131 @@ impl Parser {
         false
     }
 
+    fn check_parenthesized_arrow_closure_start(&self) -> bool {
+        if !self.js_mode || !self.check(&TokenKind::LParen) {
+            return false;
+        }
+        let mut cursor = self.pos + 1;
+        if self.check_kind_at(cursor, &TokenKind::RParen) {
+            return self.check_kind_at(cursor + 1, &TokenKind::FatArrow);
+        }
+
+        let mut expect_ident = true;
+        while cursor < self.tokens.len() {
+            if expect_ident {
+                if !self.check_ident_at(cursor) {
+                    return false;
+                }
+                expect_ident = false;
+                cursor += 1;
+                continue;
+            }
+            if self.check_kind_at(cursor, &TokenKind::Comma) {
+                expect_ident = true;
+                cursor += 1;
+                continue;
+            }
+            if self.check_kind_at(cursor, &TokenKind::RParen) {
+                return self.check_kind_at(cursor + 1, &TokenKind::FatArrow);
+            }
+            return false;
+        }
+        false
+    }
+
+    fn check_single_param_arrow_closure_start(&self) -> bool {
+        self.js_mode
+            && self.check_ident_at(self.pos)
+            && self.check_kind_at(self.pos + 1, &TokenKind::FatArrow)
+    }
+
+    fn parse_parenthesized_arrow_closure(&mut self) -> Result<Expr, ParseError> {
+        self.expect(&TokenKind::LParen, "expected '(' to start arrow parameters")?;
+        let mut params = Vec::<String>::new();
+        if !self.check(&TokenKind::RParen) {
+            loop {
+                params.push(self.expect_ident("expected arrow parameter name")?);
+                if self.match_kind(&TokenKind::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&TokenKind::RParen, "expected ')' after arrow parameters")?;
+        self.expect(&TokenKind::FatArrow, "expected '=>' after arrow parameters")?;
+        if self.check(&TokenKind::LBrace) {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: "arrow closures with block bodies are not supported in this subset"
+                    .to_string(),
+            });
+        }
+        self.parse_closure_expr_with_params(params)
+    }
+
+    fn parse_single_param_arrow_closure(&mut self) -> Result<Expr, ParseError> {
+        let param = self.expect_ident("expected arrow parameter name")?;
+        self.expect(&TokenKind::FatArrow, "expected '=>' after arrow parameter")?;
+        if self.check(&TokenKind::LBrace) {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: "arrow closures with block bodies are not supported in this subset"
+                    .to_string(),
+            });
+        }
+        self.parse_closure_expr_with_params(vec![param])
+    }
+
+    fn try_parse_js_dotted_call(&mut self, base: &str) -> Result<Option<Expr>, ParseError> {
+        let save_pos = self.pos;
+        if !self.match_kind(&TokenKind::Dot) {
+            return Ok(None);
+        }
+
+        let mut segments = Vec::<String>::new();
+        loop {
+            let member = self.expect_ident("expected member name after '.'")?;
+            segments.push(member);
+            if self.match_kind(&TokenKind::Dot) {
+                continue;
+            }
+            break;
+        }
+
+        if !self.match_kind(&TokenKind::LParen) {
+            self.pos = save_pos;
+            return Ok(None);
+        }
+        let args = self.parse_call_args()?;
+
+        if base == "console" && segments.len() == 1 && segments[0] == "log" {
+            let decl = self.resolve_function_for_call(STDLIB_PRINT_NAME, args.len())?;
+            return Ok(Some(Expr::Call(decl.index, args)));
+        }
+
+        if segments.is_empty() {
+            self.pos = save_pos;
+            return Ok(None);
+        }
+        let member = segments[0].clone();
+        let subpath = segments.into_iter().skip(1).collect::<Vec<_>>();
+        if let Some(host_name) = self.resolve_vm_namespace_call_target(base, &member, &subpath) {
+            return Ok(Some(self.build_vm_host_call_expr(&host_name, args)?));
+        }
+
+        self.pos = save_pos;
+        Ok(None)
+    }
+
     fn parse_closure_literal(&mut self) -> Result<Expr, ParseError> {
-        let mut param_slots = Vec::new();
-        let mut param_scope = HashMap::new();
+        let mut params = Vec::<String>::new();
         if !self.check(&TokenKind::Pipe) {
             loop {
-                let param_name = self.expect_ident("expected closure parameter name")?;
-                if param_scope.contains_key(&param_name) {
-                    return Err(ParseError {
-                        span: None,
-                        code: None,
-                        line: self.current_line(),
-                        message: format!("duplicate closure parameter '{param_name}'"),
-                    });
-                }
-                let slot = self.allocate_hidden_local()?;
-                param_scope.insert(param_name, slot);
-                param_slots.push(slot);
+                params.push(self.expect_ident("expected closure parameter name")?);
                 if self.match_kind(&TokenKind::Comma) {
                     continue;
                 }
@@ -2256,6 +2600,26 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::Pipe, "expected '|' after closure parameters")?;
+        self.parse_closure_expr_with_params(params)
+    }
+
+    fn parse_closure_expr_with_params(&mut self, params: Vec<String>) -> Result<Expr, ParseError> {
+        let mut param_slots = Vec::new();
+        let mut param_scope = HashMap::new();
+        for param_name in &params {
+            if param_scope.contains_key(param_name) {
+                return Err(ParseError {
+                    span: None,
+                    code: None,
+                    line: self.current_line(),
+                    message: format!("duplicate closure parameter '{param_name}'"),
+                });
+            }
+            let slot = self.allocate_hidden_local()?;
+            param_scope.insert(param_name.clone(), slot);
+            param_slots.push(slot);
+        }
+
         self.closure_scopes.push(param_scope);
         self.closure_capture_contexts.push(ClosureCaptureContext {
             by_name: HashMap::new(),
@@ -2310,6 +2674,19 @@ impl Parser {
     fn expect_ident(&mut self, message: &str) -> Result<String, ParseError> {
         if let Some(name) = self.match_ident() {
             Ok(name)
+        } else {
+            Err(ParseError {
+                line: self.current_line(),
+                message: message.to_string(),
+                span: Some(self.current_span()),
+                code: None,
+            })
+        }
+    }
+
+    fn expect_string_literal(&mut self, message: &str) -> Result<String, ParseError> {
+        if let Some(value) = self.match_string() {
+            Ok(value)
         } else {
             Err(ParseError {
                 line: self.current_line(),
@@ -2668,6 +3045,56 @@ impl Parser {
                 Some(value)
             }
             _ => None,
+        }
+    }
+
+    fn check_kind_at(&self, index: usize, kind: &TokenKind) -> bool {
+        matches!(
+            self.tokens.get(index),
+            Some(token) if std::mem::discriminant(&token.kind) == std::mem::discriminant(kind)
+        )
+    }
+
+    fn check_ident_at(&self, index: usize) -> bool {
+        matches!(
+            self.tokens.get(index),
+            Some(Token {
+                kind: TokenKind::Ident(_),
+                ..
+            })
+        )
+    }
+
+    fn check_string_at(&self, index: usize) -> bool {
+        matches!(
+            self.tokens.get(index),
+            Some(Token {
+                kind: TokenKind::String(_),
+                ..
+            })
+        )
+    }
+
+    fn check_ident_literal_at(&self, index: usize, literal: &str) -> bool {
+        matches!(
+            self.tokens.get(index),
+            Some(Token {
+                kind: TokenKind::Ident(name),
+                ..
+            }) if name == literal
+        )
+    }
+
+    fn check_ident_literal(&self, literal: &str) -> bool {
+        self.check_ident_literal_at(self.pos, literal)
+    }
+
+    fn match_ident_literal(&mut self, literal: &str) -> bool {
+        if self.check_ident_literal(literal) {
+            self.pos += 1;
+            true
+        } else {
+            false
         }
     }
 

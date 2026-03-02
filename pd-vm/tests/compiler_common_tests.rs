@@ -202,34 +202,9 @@ fn not_not_equal_and_else_if_are_supported_across_frontends() {
         }
         out;
     "#;
-    let lua = r#"
-        local a = 2
-        local out = 0
-        if not (a ~= 2) then
-            out = 10
-        elseif a == 3 then
-            out = 20
-        else
-            out = 30
-        end
-        out
-    "#;
-    let scheme = r#"
-        (define a 2)
-        (define out 0)
-        (if (not (/= a 2))
-            (set! out 10)
-            (if (= a 3)
-                (set! out 20)
-                (set! out 30)))
-        out
-    "#;
-
     let cases = [
         (SourceFlavor::RustScript, rustscript),
         (SourceFlavor::JavaScript, javascript),
-        (SourceFlavor::Lua, lua),
-        (SourceFlavor::Scheme, scheme),
     ];
 
     for (flavor, source) in cases {
@@ -265,34 +240,9 @@ fn collections_are_created_and_accessed_in_all_frontends() {
         let v2 = m["z"];
         second + arr[1] + v1 + v2;
     "#;
-    let lua = r#"
-        local arr = {1, 2, 3}
-        local second = arr[1]
-        arr[1] = 9
-        local m = { x = 1, y = 2 }
-        m.z = 7
-        m["x"] = 4
-        local v1 = m.x
-        local v2 = m["z"]
-        second + arr[1] + v1 + v2
-    "#;
-    let scheme = r#"
-        (define arr (vector 1 2 3))
-        (define second (vector-ref arr 1))
-        (vector-set! arr 1 9)
-        (define m (hash (x 1) ("y" 2)))
-        (hash-set! m z 7)
-        (hash-set! m "x" 4)
-        (define v1 (hash-ref m x))
-        (define v2 (hash-ref m "z"))
-        (+ second (vector-ref arr 1) v1 v2)
-    "#;
-
     let cases = [
         (SourceFlavor::RustScript, rustscript),
         (SourceFlavor::JavaScript, javascript),
-        (SourceFlavor::Lua, lua),
-        (SourceFlavor::Scheme, scheme),
     ];
 
     for (flavor, source) in cases {
@@ -320,26 +270,9 @@ fn collection_cardinality_uses_language_syntax_in_all_frontends() {
         let m = { x: 1, y: 2 };
         arr.length + m.length;
     "#;
-    let lua = r#"
-        local arr = {1, 2, 3}
-        local m = { x = 1, y = 2 }
-        local map_count = 0
-        for _k in pairs(m) do
-            map_count = map_count + 1
-        end
-        #arr + map_count
-    "#;
-    let scheme = r#"
-        (define arr (vector 1 2 3))
-        (define m (hash (x 1) (y 2)))
-        (+ (length arr) (length (keys m)))
-    "#;
-
     let cases = [
         (SourceFlavor::RustScript, rustscript),
         (SourceFlavor::JavaScript, javascript),
-        (SourceFlavor::Lua, lua),
-        (SourceFlavor::Scheme, scheme),
     ];
 
     for (flavor, source) in cases {
@@ -386,7 +319,8 @@ fn count_builtin_is_not_exposed_to_frontends() {
             vm::SourceError::Parse(parse) => {
                 assert!(
                     parse.message.contains("unknown function 'count'")
-                        || parse.message.contains("not exposed in"),
+                        || parse.message.contains("not exposed in")
+                        || parse.message.contains("direct IR lowering only"),
                     "unexpected parse error for {flavor:?}: {parse:?}"
                 );
             }
@@ -407,22 +341,9 @@ fn string_and_array_concat_work_via_plus_in_all_frontends() {
         let arr = [1] + [2];
         joined.length + arr[0] + arr[1];
     "#;
-    let lua = r#"
-        local joined = "he" + "llo"
-        local arr = [1] + [2]
-        #joined + arr[0] + arr[1]
-    "#;
-    let scheme = r#"
-        (define joined (+ "he" "llo"))
-        (define arr (+ (vector 1) (vector 2)))
-        (+ (length joined) (vector-ref arr 0) (vector-ref arr 1))
-    "#;
-
     let cases = [
         (SourceFlavor::RustScript, rustscript),
         (SourceFlavor::JavaScript, javascript),
-        (SourceFlavor::Lua, lua),
-        (SourceFlavor::Scheme, scheme),
     ];
 
     for (flavor, source) in cases {
@@ -450,26 +371,9 @@ fn string_and_int_concat_work_via_plus_in_all_frontends() {
         let d = 3 + "y" + 4;
         a.length + b.length + c.length + d.length;
     "#;
-    let lua = r#"
-        local a = "x" + 1
-        local b = 2 + "y"
-        local c = "x" + 1 + 2
-        local d = 3 + "y" + 4
-        #a + #b + #c + #d
-    "#;
-    let scheme = r#"
-        (define a (+ "x" 1))
-        (define b (+ 2 "y"))
-        (define c (+ "x" 1 2))
-        (define d (+ 3 "y" 4))
-        (+ (length a) (length b) (length c) (length d))
-    "#;
-
     let cases = [
         (SourceFlavor::RustScript, rustscript),
         (SourceFlavor::JavaScript, javascript),
-        (SourceFlavor::Lua, lua),
-        (SourceFlavor::Scheme, scheme),
     ];
 
     for (flavor, source) in cases {
@@ -495,24 +399,9 @@ fn string_and_nonconstant_int_concat_autoconverts_in_all_frontends() {
         let b = n + "!";
         a.length + b.length;
     "#;
-    let lua = r#"
-        local n = 41
-        local a = "v=" + n
-        local b = n + "!"
-        #a + #b
-    "#;
-    let scheme = r#"
-        (define n 41)
-        (define a (+ "v=" n))
-        (define b (+ n "!"))
-        (+ (length a) (length b))
-    "#;
-
     let cases = [
         (SourceFlavor::RustScript, rustscript),
         (SourceFlavor::JavaScript, javascript),
-        (SourceFlavor::Lua, lua),
-        (SourceFlavor::Scheme, scheme),
     ];
 
     for (flavor, source) in cases {
@@ -556,42 +445,9 @@ fn slice_ranges_work_in_all_frontends() {
         let i = arr[:-2];
         a.length + b.length + c.length + d.length + e.length + f.length + g.length + h.length + i.length;
     "#;
-    let lua = r#"
-        local text = "abcdef"
-        local end_pos = -2
-        local a = text[1:4]
-        local b = text[:3]
-        local c = text[2:]
-        local d = text[:-1]
-        local e = text[1:end_pos]
-        local arr = {1, 2, 3, 4, 5}
-        local f = arr[1:4]
-        local g = arr[:2]
-        local h = arr[3:]
-        local i = arr[:-2]
-        #a + #b + #c + #d + #e + #f + #g + #h + #i
-    "#;
-    let scheme = r#"
-        (define text "abcdef")
-        (define end_pos -2)
-        (define a (slice-range text 1 4))
-        (define b (slice-to text 3))
-        (define c (slice-from text 2))
-        (define d (slice-to text -1))
-        (define e (slice-range text 1 end_pos))
-        (define arr (vector 1 2 3 4 5))
-        (define f (slice-range arr 1 4))
-        (define g (slice-to arr 2))
-        (define h (slice-from arr 3))
-        (define i (slice-to arr -2))
-        (+ (length a) (length b) (length c) (length d) (length e) (length f) (length g) (length h) (length i))
-    "#;
-
     let cases = [
         (SourceFlavor::RustScript, rustscript),
         (SourceFlavor::JavaScript, javascript),
-        (SourceFlavor::Lua, lua),
-        (SourceFlavor::Scheme, scheme),
     ];
 
     for (flavor, source) in cases {
@@ -670,18 +526,20 @@ fn compile_source_file_detects_lua_extension() {
     std::fs::write(&path, include_str!("../examples/example.lua"))
         .expect("temp source should write");
 
-    let compiled = compile_source_file(&path).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
-    for func in &compiled.functions {
-        match func.name.as_str() {
-            "add_one" => vm.register_function(Box::new(AddOne)),
-            "print" => vm.register_function(Box::new(PrintBuiltin)),
-            _ => panic!("unexpected function {}", func.name),
-        };
+    let err = match compile_source_file(&path) {
+        Ok(_) => panic!("Lua example fixture should be rejected in direct subset"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
+            assert!(
+                parse.message.contains("direct IR lowering only"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
     }
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(6)]);
 
     let _ = std::fs::remove_file(path);
 }
@@ -701,18 +559,20 @@ fn compile_source_file_detects_scheme_extension() {
     std::fs::write(&path, include_str!("../examples/example.scm"))
         .expect("temp source should write");
 
-    let compiled = compile_source_file(&path).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
-    for func in &compiled.functions {
-        match func.name.as_str() {
-            "add_one" => vm.register_function(Box::new(AddOne)),
-            "print" => vm.register_function(Box::new(PrintBuiltin)),
-            _ => panic!("unexpected function {}", func.name),
-        };
+    let err = match compile_source_file(&path) {
+        Ok(_) => panic!("Scheme example fixture should be rejected in direct subset"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
+            assert!(
+                parse.message.contains("direct IR lowering only"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
     }
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(6)]);
 
     let _ = std::fs::remove_file(path);
 }
@@ -763,18 +623,20 @@ fn compile_source_file_supports_rss_modules_from_js_lua_and_scheme() {
     "#,
     )
     .expect("lua source should write");
-    let lua_compiled = compile_source_file(&lua_path).expect("lua compile should succeed");
-    let mut lua_vm = Vm::with_locals(lua_compiled.program, lua_compiled.locals);
-    for func in &lua_compiled.functions {
-        match func.name.as_str() {
-            "add_one" => lua_vm.register_function(Box::new(AddOne)),
-            "print" => lua_vm.register_function(Box::new(PrintBuiltin)),
-            _ => panic!("unexpected function {}", func.name),
-        };
+    let lua_err = match compile_source_file(&lua_path) {
+        Ok(_) => panic!("lua compile should be rejected in direct subset"),
+        Err(err) => err,
+    };
+    match lua_err {
+        vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
+            assert!(
+                parse.message.contains("direct IR lowering only"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("unexpected lua error: {other:?}"),
     }
-    let lua_status = lua_vm.run().expect("lua vm should run");
-    assert_eq!(lua_status, VmStatus::Halted);
-    assert_eq!(lua_vm.stack(), &[Value::Int(42)]);
 
     let scm_path = root.join("main.scm");
     std::fs::write(
@@ -785,18 +647,20 @@ fn compile_source_file_supports_rss_modules_from_js_lua_and_scheme() {
     "#,
     )
     .expect("scheme source should write");
-    let scm_compiled = compile_source_file(&scm_path).expect("scheme compile should succeed");
-    let mut scm_vm = Vm::with_locals(scm_compiled.program, scm_compiled.locals);
-    for func in &scm_compiled.functions {
-        match func.name.as_str() {
-            "add_one" => scm_vm.register_function(Box::new(AddOne)),
-            "print" => scm_vm.register_function(Box::new(PrintBuiltin)),
-            _ => panic!("unexpected function {}", func.name),
-        };
+    let scm_err = match compile_source_file(&scm_path) {
+        Ok(_) => panic!("scheme compile should be rejected in direct subset"),
+        Err(err) => err,
+    };
+    match scm_err {
+        vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
+            assert!(
+                parse.message.contains("direct IR lowering only"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("unexpected scheme error: {other:?}"),
     }
-    let scm_status = scm_vm.run().expect("scheme vm should run");
-    assert_eq!(scm_status, VmStatus::Halted);
-    assert_eq!(scm_vm.stack(), &[Value::Int(42)]);
 
     let _ = std::fs::remove_file(scm_path);
     let _ = std::fs::remove_file(lua_path);
