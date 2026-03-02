@@ -821,28 +821,46 @@ fn emit_native_step_pop_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
     emit_ldr_x_disp(code, 10, VM_REG, stack_ptr_offset)?;
     emit_mov_imm64(code, 14, layout.value.size as u64);
     emit_mul_x(code, 11, 11, 14);
-    emit_add_reg(code, 12, 10, 11);
+    emit_add_reg(code, 12, 10, 11); // top
 
     emit_load_tag_w_from_ptr(code, 16, 12, layout.value)?;
     emit_cmp_imm(
         code,
         16,
-        u16::try_from(layout.value.string_tag).unwrap_or(0xFFFF),
+        u16::try_from(layout.value.int_tag).unwrap_or(0xFFFF),
     )?;
-    let is_string = emit_b_cond_placeholder(code, Cond::Eq);
+    let primitive_int = emit_b_cond_placeholder(code, Cond::Eq);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.float_tag).unwrap_or(0xFFFF),
+    )?;
+    let primitive_float = emit_b_cond_placeholder(code, Cond::Eq);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.bool_tag).unwrap_or(0xFFFF),
+    )?;
+    let primitive_bool = emit_b_cond_placeholder(code, Cond::Eq);
+    let fallback = emit_b_placeholder(code);
 
+    let primitive_label = code.len();
     emit_sub_imm(code, 9, 9, 1);
     emit_str_x_disp(code, 9, VM_REG, stack_len_offset)?;
     emit_status_continue(code);
+    let done = emit_b_placeholder(code);
 
-    let ok_done = emit_b_placeholder(code);
-    let err_label = code.len();
-    emit_status_error(code);
+    let fallback_label = code.len();
+    let helper_addr = helper_ptr_to_u64(jit_native_pop_bridge as *const (), "pop helper")?;
+    emit_vm_helper_call0(code, helper_addr);
     let done_label = code.len();
 
-    patch_b_cond_rel19(code, underflow, err_label)?;
-    patch_b_cond_rel19(code, is_string, err_label)?;
-    patch_b_rel26(code, ok_done, done_label)?;
+    patch_b_cond_rel19(code, underflow, fallback_label)?;
+    patch_b_cond_rel19(code, primitive_int, primitive_label)?;
+    patch_b_cond_rel19(code, primitive_float, primitive_label)?;
+    patch_b_cond_rel19(code, primitive_bool, primitive_label)?;
+    patch_b_rel26(code, fallback, fallback_label)?;
+    patch_b_rel26(code, done, done_label)?;
     Ok(())
 }
 
@@ -852,9 +870,9 @@ fn emit_native_step_dup_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
     let stack_cap_offset = vec_cap_disp(layout.vm_stack_offset, layout.stack_vec)?;
 
     emit_ldr_x_disp(code, 9, VM_REG, stack_len_offset)?;
-    emit_ldr_x_disp(code, 15, VM_REG, stack_cap_offset)?;
     emit_cmp_imm(code, 9, 1)?;
     let underflow = emit_b_cond_placeholder(code, Cond::Lo);
+    emit_ldr_x_disp(code, 15, VM_REG, stack_cap_offset)?;
     emit_cmp_reg(code, 9, 15);
     let no_cap = emit_b_cond_placeholder(code, Cond::Hs);
 
@@ -868,28 +886,45 @@ fn emit_native_step_dup_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
     emit_cmp_imm(
         code,
         16,
-        u16::try_from(layout.value.string_tag).unwrap_or(0xFFFF),
+        u16::try_from(layout.value.int_tag).unwrap_or(0xFFFF),
     )?;
-    let src_string = emit_b_cond_placeholder(code, Cond::Eq);
+    let primitive_int = emit_b_cond_placeholder(code, Cond::Eq);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.float_tag).unwrap_or(0xFFFF),
+    )?;
+    let primitive_float = emit_b_cond_placeholder(code, Cond::Eq);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.bool_tag).unwrap_or(0xFFFF),
+    )?;
+    let primitive_bool = emit_b_cond_placeholder(code, Cond::Eq);
+    let fallback = emit_b_placeholder(code);
 
+    let primitive_label = code.len();
     emit_mov_imm64(code, 11, layout.value.size as u64);
     emit_mul_x(code, 11, 9, 11);
     emit_add_reg(code, 12, 10, 11); // dst at len
     emit_copy_value_ptr_to_ptr(code, layout.value, 13, 12)?;
-
     emit_add_imm(code, 9, 9, 1);
     emit_str_x_disp(code, 9, VM_REG, stack_len_offset)?;
     emit_status_continue(code);
+    let done = emit_b_placeholder(code);
 
-    let ok_done = emit_b_placeholder(code);
-    let err_label = code.len();
-    emit_status_error(code);
+    let fallback_label = code.len();
+    let helper_addr = helper_ptr_to_u64(jit_native_dup_bridge as *const (), "dup helper")?;
+    emit_vm_helper_call0(code, helper_addr);
     let done_label = code.len();
 
-    patch_b_cond_rel19(code, underflow, err_label)?;
-    patch_b_cond_rel19(code, no_cap, err_label)?;
-    patch_b_cond_rel19(code, src_string, err_label)?;
-    patch_b_rel26(code, ok_done, done_label)?;
+    patch_b_cond_rel19(code, underflow, fallback_label)?;
+    patch_b_cond_rel19(code, no_cap, fallback_label)?;
+    patch_b_cond_rel19(code, primitive_int, primitive_label)?;
+    patch_b_cond_rel19(code, primitive_float, primitive_label)?;
+    patch_b_cond_rel19(code, primitive_bool, primitive_label)?;
+    patch_b_rel26(code, fallback, fallback_label)?;
+    patch_b_rel26(code, done, done_label)?;
     Ok(())
 }
 
@@ -901,7 +936,6 @@ fn emit_native_step_ldc_inline(
     let stack_len_offset = vec_len_disp(layout.vm_stack_offset, layout.stack_vec)?;
     let stack_ptr_offset = vec_ptr_disp(layout.vm_stack_offset, layout.stack_vec)?;
     let stack_cap_offset = vec_cap_disp(layout.vm_stack_offset, layout.stack_vec)?;
-
     let constants_base = checked_add_i32(
         layout.vm_program_offset,
         layout.program_constants_offset,
@@ -930,29 +964,46 @@ fn emit_native_step_ldc_inline(
     emit_cmp_imm(
         code,
         16,
-        u16::try_from(layout.value.string_tag).unwrap_or(0xFFFF),
+        u16::try_from(layout.value.int_tag).unwrap_or(0xFFFF),
     )?;
-    let src_string = emit_b_cond_placeholder(code, Cond::Eq);
+    let primitive_int = emit_b_cond_placeholder(code, Cond::Eq);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.float_tag).unwrap_or(0xFFFF),
+    )?;
+    let primitive_float = emit_b_cond_placeholder(code, Cond::Eq);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.bool_tag).unwrap_or(0xFFFF),
+    )?;
+    let primitive_bool = emit_b_cond_placeholder(code, Cond::Eq);
+    let fallback = emit_b_placeholder(code);
 
+    let primitive_label = code.len();
     emit_ldr_x_disp(code, 10, VM_REG, stack_ptr_offset)?;
     emit_mov_imm64(code, 11, layout.value.size as u64);
     emit_mul_x(code, 11, 9, 11);
     emit_add_reg(code, 12, 10, 11); // dst stack slot
     emit_copy_value_ptr_to_ptr(code, layout.value, 13, 12)?;
-
     emit_add_imm(code, 9, 9, 1);
     emit_str_x_disp(code, 9, VM_REG, stack_len_offset)?;
     emit_status_continue(code);
+    let done = emit_b_placeholder(code);
 
-    let ok_done = emit_b_placeholder(code);
-    let err_label = code.len();
-    emit_status_error(code);
+    let fallback_label = code.len();
+    let helper_addr = helper_ptr_to_u64(jit_native_ldc_bridge as *const (), "ldc helper")?;
+    emit_vm_helper_call1_u32(code, helper_addr, const_index);
     let done_label = code.len();
 
-    patch_b_cond_rel19(code, bad_index, err_label)?;
-    patch_b_cond_rel19(code, no_cap, err_label)?;
-    patch_b_cond_rel19(code, src_string, err_label)?;
-    patch_b_rel26(code, ok_done, done_label)?;
+    patch_b_cond_rel19(code, bad_index, fallback_label)?;
+    patch_b_cond_rel19(code, no_cap, fallback_label)?;
+    patch_b_cond_rel19(code, primitive_int, primitive_label)?;
+    patch_b_cond_rel19(code, primitive_float, primitive_label)?;
+    patch_b_cond_rel19(code, primitive_bool, primitive_label)?;
+    patch_b_rel26(code, fallback, fallback_label)?;
+    patch_b_rel26(code, done, done_label)?;
     Ok(())
 }
 
@@ -961,11 +1012,11 @@ fn emit_native_step_ldloc_inline(
     layout: NativeStackLayout,
     local_index: u8,
 ) -> VmResult<()> {
-    let locals_len_offset = vec_len_disp(layout.vm_locals_offset, layout.stack_vec)?;
-    let locals_ptr_offset = vec_ptr_disp(layout.vm_locals_offset, layout.stack_vec)?;
     let stack_len_offset = vec_len_disp(layout.vm_stack_offset, layout.stack_vec)?;
     let stack_ptr_offset = vec_ptr_disp(layout.vm_stack_offset, layout.stack_vec)?;
     let stack_cap_offset = vec_cap_disp(layout.vm_stack_offset, layout.stack_vec)?;
+    let locals_len_offset = vec_len_disp(layout.vm_locals_offset, layout.stack_vec)?;
+    let locals_ptr_offset = vec_ptr_disp(layout.vm_locals_offset, layout.stack_vec)?;
 
     emit_ldr_x_disp(code, 15, VM_REG, locals_len_offset)?;
     emit_mov_imm64(code, 14, u64::from(local_index));
@@ -987,29 +1038,46 @@ fn emit_native_step_ldloc_inline(
     emit_cmp_imm(
         code,
         16,
-        u16::try_from(layout.value.string_tag).unwrap_or(0xFFFF),
+        u16::try_from(layout.value.int_tag).unwrap_or(0xFFFF),
     )?;
-    let src_string = emit_b_cond_placeholder(code, Cond::Eq);
+    let primitive_int = emit_b_cond_placeholder(code, Cond::Eq);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.float_tag).unwrap_or(0xFFFF),
+    )?;
+    let primitive_float = emit_b_cond_placeholder(code, Cond::Eq);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.bool_tag).unwrap_or(0xFFFF),
+    )?;
+    let primitive_bool = emit_b_cond_placeholder(code, Cond::Eq);
+    let fallback = emit_b_placeholder(code);
 
+    let primitive_label = code.len();
     emit_ldr_x_disp(code, 10, VM_REG, stack_ptr_offset)?;
     emit_mov_imm64(code, 11, layout.value.size as u64);
     emit_mul_x(code, 11, 9, 11);
     emit_add_reg(code, 12, 10, 11); // dst stack
     emit_copy_value_ptr_to_ptr(code, layout.value, 13, 12)?;
-
     emit_add_imm(code, 9, 9, 1);
     emit_str_x_disp(code, 9, VM_REG, stack_len_offset)?;
     emit_status_continue(code);
+    let done = emit_b_placeholder(code);
 
-    let ok_done = emit_b_placeholder(code);
-    let err_label = code.len();
-    emit_status_error(code);
+    let fallback_label = code.len();
+    let helper_addr = helper_ptr_to_u64(jit_native_ldloc_bridge as *const (), "ldloc helper")?;
+    emit_vm_helper_call1_u32(code, helper_addr, u32::from(local_index));
     let done_label = code.len();
 
-    patch_b_cond_rel19(code, bad_index, err_label)?;
-    patch_b_cond_rel19(code, no_cap, err_label)?;
-    patch_b_cond_rel19(code, src_string, err_label)?;
-    patch_b_rel26(code, ok_done, done_label)?;
+    patch_b_cond_rel19(code, bad_index, fallback_label)?;
+    patch_b_cond_rel19(code, no_cap, fallback_label)?;
+    patch_b_cond_rel19(code, primitive_int, primitive_label)?;
+    patch_b_cond_rel19(code, primitive_float, primitive_label)?;
+    patch_b_cond_rel19(code, primitive_bool, primitive_label)?;
+    patch_b_rel26(code, fallback, fallback_label)?;
+    patch_b_rel26(code, done, done_label)?;
     Ok(())
 }
 
@@ -1018,10 +1086,10 @@ fn emit_native_step_stloc_inline(
     layout: NativeStackLayout,
     local_index: u8,
 ) -> VmResult<()> {
-    let locals_len_offset = vec_len_disp(layout.vm_locals_offset, layout.stack_vec)?;
-    let locals_ptr_offset = vec_ptr_disp(layout.vm_locals_offset, layout.stack_vec)?;
     let stack_len_offset = vec_len_disp(layout.vm_stack_offset, layout.stack_vec)?;
     let stack_ptr_offset = vec_ptr_disp(layout.vm_stack_offset, layout.stack_vec)?;
+    let locals_len_offset = vec_len_disp(layout.vm_locals_offset, layout.stack_vec)?;
+    let locals_ptr_offset = vec_ptr_disp(layout.vm_locals_offset, layout.stack_vec)?;
 
     emit_ldr_x_disp(code, 9, VM_REG, stack_len_offset)?;
     emit_cmp_imm(code, 9, 1)?;
@@ -1038,43 +1106,78 @@ fn emit_native_step_stloc_inline(
     emit_mul_x(code, 11, 11, 14);
     emit_add_reg(code, 13, 10, 11); // src top
 
-    emit_load_tag_w_from_ptr(code, 16, 13, layout.value)?;
-    emit_cmp_imm(
-        code,
-        16,
-        u16::try_from(layout.value.string_tag).unwrap_or(0xFFFF),
-    )?;
-    let src_string = emit_b_cond_placeholder(code, Cond::Eq);
-
     emit_ldr_x_disp(code, 10, VM_REG, locals_ptr_offset)?;
     emit_mov_imm64(code, 11, u64::from(local_index));
     emit_mov_imm64(code, 14, layout.value.size as u64);
     emit_mul_x(code, 11, 11, 14);
     emit_add_reg(code, 12, 10, 11); // dst local
 
+    emit_load_tag_w_from_ptr(code, 16, 13, layout.value)?;
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.int_tag).unwrap_or(0xFFFF),
+    )?;
+    let src_primitive_int = emit_b_cond_placeholder(code, Cond::Eq);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.float_tag).unwrap_or(0xFFFF),
+    )?;
+    let src_primitive_float = emit_b_cond_placeholder(code, Cond::Eq);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.bool_tag).unwrap_or(0xFFFF),
+    )?;
+    let src_primitive_bool = emit_b_cond_placeholder(code, Cond::Eq);
+    let fallback = emit_b_placeholder(code);
+
+    let src_primitive_label = code.len();
     emit_load_tag_w_from_ptr(code, 16, 12, layout.value)?;
     emit_cmp_imm(
         code,
         16,
-        u16::try_from(layout.value.string_tag).unwrap_or(0xFFFF),
+        u16::try_from(layout.value.int_tag).unwrap_or(0xFFFF),
     )?;
-    let dst_string = emit_b_cond_placeholder(code, Cond::Eq);
+    let dst_primitive_int = emit_b_cond_placeholder(code, Cond::Eq);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.float_tag).unwrap_or(0xFFFF),
+    )?;
+    let dst_primitive_float = emit_b_cond_placeholder(code, Cond::Eq);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.bool_tag).unwrap_or(0xFFFF),
+    )?;
+    let dst_primitive_bool = emit_b_cond_placeholder(code, Cond::Eq);
+    let fallback_from_dst = emit_b_placeholder(code);
 
+    let dst_primitive_label = code.len();
     emit_copy_value_ptr_to_ptr(code, layout.value, 13, 12)?;
     emit_sub_imm(code, 9, 9, 1);
     emit_str_x_disp(code, 9, VM_REG, stack_len_offset)?;
     emit_status_continue(code);
+    let done = emit_b_placeholder(code);
 
-    let ok_done = emit_b_placeholder(code);
-    let err_label = code.len();
-    emit_status_error(code);
+    let fallback_label = code.len();
+    let helper_addr = helper_ptr_to_u64(jit_native_stloc_bridge as *const (), "stloc helper")?;
+    emit_vm_helper_call1_u32(code, helper_addr, u32::from(local_index));
     let done_label = code.len();
 
-    patch_b_cond_rel19(code, underflow, err_label)?;
-    patch_b_cond_rel19(code, bad_index, err_label)?;
-    patch_b_cond_rel19(code, src_string, err_label)?;
-    patch_b_cond_rel19(code, dst_string, err_label)?;
-    patch_b_rel26(code, ok_done, done_label)?;
+    patch_b_cond_rel19(code, underflow, fallback_label)?;
+    patch_b_cond_rel19(code, bad_index, fallback_label)?;
+    patch_b_cond_rel19(code, src_primitive_int, src_primitive_label)?;
+    patch_b_cond_rel19(code, src_primitive_float, src_primitive_label)?;
+    patch_b_cond_rel19(code, src_primitive_bool, src_primitive_label)?;
+    patch_b_rel26(code, fallback, fallback_label)?;
+    patch_b_cond_rel19(code, dst_primitive_int, dst_primitive_label)?;
+    patch_b_cond_rel19(code, dst_primitive_float, dst_primitive_label)?;
+    patch_b_cond_rel19(code, dst_primitive_bool, dst_primitive_label)?;
+    patch_b_rel26(code, fallback_from_dst, fallback_label)?;
+    patch_b_rel26(code, done, done_label)?;
     Ok(())
 }
 
@@ -1251,6 +1354,13 @@ fn helper_ptr_to_u64(ptr: *const (), name: &str) -> VmResult<u64> {
 
 fn emit_vm_helper_call0(code: &mut Vec<u8>, helper_addr: u64) {
     emit_mov_reg(code, 0, VM_REG);
+    emit_mov_imm64(code, 16, helper_addr);
+    emit_u32(code, 0xD63F0200); // blr x16
+}
+
+fn emit_vm_helper_call1_u32(code: &mut Vec<u8>, helper_addr: u64, arg: u32) {
+    emit_mov_reg(code, 0, VM_REG);
+    emit_mov_imm64(code, 1, u64::from(arg));
     emit_mov_imm64(code, 16, helper_addr);
     emit_u32(code, 0xD63F0200); // blr x16
 }
@@ -2094,6 +2204,128 @@ fn set_bridge_error(error: VmError) {
     });
 }
 
+extern "C" fn jit_native_pop_bridge(vm_ptr: *mut Vm) -> i32 {
+    if vm_ptr.is_null() {
+        set_bridge_error(VmError::JitNative(
+            "native trace pop helper received null vm pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+
+    let vm = unsafe { &mut *vm_ptr };
+    match vm.pop_value() {
+        Ok(_) => STATUS_CONTINUE,
+        Err(err) => {
+            set_bridge_error(err);
+            STATUS_ERROR
+        }
+    }
+}
+
+extern "C" fn jit_native_dup_bridge(vm_ptr: *mut Vm) -> i32 {
+    if vm_ptr.is_null() {
+        set_bridge_error(VmError::JitNative(
+            "native trace dup helper received null vm pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+
+    let vm = unsafe { &mut *vm_ptr };
+    let value = match vm.peek_value() {
+        Ok(value) => value.clone(),
+        Err(err) => {
+            set_bridge_error(err);
+            return STATUS_ERROR;
+        }
+    };
+    vm.stack.push(value);
+    STATUS_CONTINUE
+}
+
+extern "C" fn jit_native_ldc_bridge(vm_ptr: *mut Vm, const_index: u32) -> i32 {
+    if vm_ptr.is_null() {
+        set_bridge_error(VmError::JitNative(
+            "native trace ldc helper received null vm pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+
+    let vm = unsafe { &mut *vm_ptr };
+    let value = match vm.program.constants.get(const_index as usize) {
+        Some(value) => value.clone(),
+        None => {
+            set_bridge_error(VmError::InvalidConstant(const_index));
+            return STATUS_ERROR;
+        }
+    };
+    vm.stack.push(value);
+    STATUS_CONTINUE
+}
+
+extern "C" fn jit_native_ldloc_bridge(vm_ptr: *mut Vm, local_index: u32) -> i32 {
+    if vm_ptr.is_null() {
+        set_bridge_error(VmError::JitNative(
+            "native trace ldloc helper received null vm pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+
+    let index = match u8::try_from(local_index) {
+        Ok(index) => index,
+        Err(_) => {
+            set_bridge_error(VmError::JitNative(
+                "native trace ldloc helper received out-of-range local index".to_string(),
+            ));
+            return STATUS_ERROR;
+        }
+    };
+
+    let vm = unsafe { &mut *vm_ptr };
+    let value = match vm.locals.get(index as usize) {
+        Some(value) => value.clone(),
+        None => {
+            set_bridge_error(VmError::InvalidLocal(index));
+            return STATUS_ERROR;
+        }
+    };
+    vm.stack.push(value);
+    STATUS_CONTINUE
+}
+
+extern "C" fn jit_native_stloc_bridge(vm_ptr: *mut Vm, local_index: u32) -> i32 {
+    if vm_ptr.is_null() {
+        set_bridge_error(VmError::JitNative(
+            "native trace stloc helper received null vm pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+
+    let index = match u8::try_from(local_index) {
+        Ok(index) => index,
+        Err(_) => {
+            set_bridge_error(VmError::JitNative(
+                "native trace stloc helper received out-of-range local index".to_string(),
+            ));
+            return STATUS_ERROR;
+        }
+    };
+
+    let vm = unsafe { &mut *vm_ptr };
+    let value = match vm.pop_value() {
+        Ok(value) => value,
+        Err(err) => {
+            set_bridge_error(err);
+            return STATUS_ERROR;
+        }
+    };
+    let Some(slot) = vm.locals.get_mut(index as usize) else {
+        set_bridge_error(VmError::InvalidLocal(index));
+        return STATUS_ERROR;
+    };
+    *slot = value;
+    STATUS_CONTINUE
+}
+
 extern "C" fn jit_native_call_bridge(vm_ptr: *mut Vm, index: u16, argc: u8, call_ip: u64) -> i32 {
     if vm_ptr.is_null() {
         set_bridge_error(VmError::JitNative(
@@ -2310,6 +2542,21 @@ mod tests {
         }
     }
 
+    struct YieldOnceHost {
+        yielded: bool,
+    }
+
+    impl HostFunction for YieldOnceHost {
+        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+            if !self.yielded {
+                self.yielded = true;
+                Ok(CallOutcome::Yield)
+            } else {
+                Ok(CallOutcome::Return(Vec::new()))
+            }
+        }
+    }
+
     #[test]
     fn add_step_executes() {
         let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
@@ -2485,6 +2732,120 @@ mod tests {
     }
 
     #[test]
+    fn call_step_bridge_propagates_yield_status() {
+        let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        vm.register_function(Box::new(YieldOnceHost { yielded: false }));
+        vm.stack.push(Value::Int(9));
+
+        let status = execute_single_step(
+            &mut vm,
+            TraceStep::Call {
+                index: 0,
+                argc: 1,
+                call_ip: 0,
+            },
+        )
+        .expect("native call should run");
+        assert_eq!(status, STATUS_YIELDED);
+        assert_eq!(vm.stack(), &[Value::Int(9)]);
+        assert_eq!(vm.ip(), 0);
+        assert!(
+            take_bridge_error().is_none(),
+            "yielding call bridge should not set bridge error"
+        );
+    }
+
+    #[test]
+    fn dup_step_bridge_clones_owned_values() {
+        let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        vm.stack.push(Value::String("hello".to_string()));
+
+        let status = execute_single_step(&mut vm, TraceStep::Dup).expect("native dup should run");
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(
+            vm.stack(),
+            &[
+                Value::String("hello".to_string()),
+                Value::String("hello".to_string())
+            ]
+        );
+        assert!(
+            take_bridge_error().is_none(),
+            "successful dup bridge should not set bridge error"
+        );
+    }
+
+    #[test]
+    fn stloc_step_bridge_moves_owned_values_safely() {
+        let mut vm = Vm::with_locals(Program::new(Vec::new(), Vec::new()), 1);
+        vm.locals[0] = Value::String("old".to_string());
+        vm.stack.push(Value::String("new".to_string()));
+
+        let status =
+            execute_single_step(&mut vm, TraceStep::Stloc(0)).expect("native stloc should run");
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(vm.locals(), &[Value::String("new".to_string())]);
+        assert!(vm.stack().is_empty());
+        assert!(
+            take_bridge_error().is_none(),
+            "successful stloc bridge should not set bridge error"
+        );
+    }
+
+    #[test]
+    fn ldc_step_bridge_clones_owned_values() {
+        let mut vm = Vm::new(Program::new(
+            vec![Value::Array(vec![Value::Int(1), Value::Int(2)])],
+            Vec::new(),
+        ));
+
+        let status =
+            execute_single_step(&mut vm, TraceStep::Ldc(0)).expect("native ldc should run");
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(
+            vm.stack(),
+            &[Value::Array(vec![Value::Int(1), Value::Int(2)])]
+        );
+        assert!(
+            take_bridge_error().is_none(),
+            "successful ldc bridge should not set bridge error"
+        );
+    }
+
+    #[test]
+    fn ldloc_step_bridge_clones_owned_values() {
+        let mut vm = Vm::with_locals(Program::new(Vec::new(), Vec::new()), 1);
+        vm.locals[0] = Value::Map(vec![(Value::Int(1), Value::Int(2))]);
+
+        let status =
+            execute_single_step(&mut vm, TraceStep::Ldloc(0)).expect("native ldloc should run");
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(
+            vm.stack(),
+            &[Value::Map(vec![(Value::Int(1), Value::Int(2))])]
+        );
+        assert!(
+            take_bridge_error().is_none(),
+            "successful ldloc bridge should not set bridge error"
+        );
+    }
+
+    #[test]
+    fn pop_step_bridge_handles_owned_values() {
+        let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        vm.stack
+            .push(Value::Array(vec![Value::Int(1), Value::Int(2)]));
+
+        let status = execute_single_step(&mut vm, TraceStep::Pop).expect("native pop should run");
+        assert_eq!(status, STATUS_CONTINUE);
+        assert!(vm.stack().is_empty());
+        assert!(
+            take_bridge_error().is_none(),
+            "successful pop bridge should not set bridge error"
+        );
+    }
+
+    #[test]
     fn jump_to_root_step_returns_trace_exit() {
         let trace = build_single_step_trace(TraceStep::JumpToRoot);
         let code = emit_native_trace_bytes(&trace).expect("jump trace should compile");
@@ -2604,6 +2965,8 @@ mod tests {
             Program::new(vec![Value::Int(200), Value::Int(1)], vec![0; 128]),
             2,
         );
+        vm.locals[0] = Value::Int(0);
+        vm.locals[1] = Value::Int(0);
         vm.stack = Vec::with_capacity(16);
 
         let (status, memory) = execute_trace_with_entry(&mut vm, trace.clone()).expect("compile");
