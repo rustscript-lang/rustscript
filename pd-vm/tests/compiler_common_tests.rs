@@ -625,6 +625,183 @@ fn liveness_pass_clears_dead_locals_after_last_use() {
     assert_eq!(vm.locals()[e_index as usize], Value::Null);
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DecodedInstr {
+    ip: usize,
+    op: u8,
+    width: usize,
+    u32_operand: Option<u32>,
+    u8_operand: Option<u8>,
+}
+
+fn decode_instructions(code: &[u8]) -> Vec<DecodedInstr> {
+    let mut ip = 0usize;
+    let mut instructions = Vec::new();
+    while ip < code.len() {
+        let op = code[ip];
+        let (width, u32_operand, u8_operand) = if op == vm::OpCode::Ldc as u8
+            || op == vm::OpCode::Br as u8
+            || op == vm::OpCode::Brfalse as u8
+        {
+            assert!(
+                ip + 5 <= code.len(),
+                "truncated 4-byte operand at instruction {ip}"
+            );
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&code[ip + 1..ip + 5]);
+            (5usize, Some(u32::from_le_bytes(bytes)), None)
+        } else if op == vm::OpCode::Ldloc as u8 || op == vm::OpCode::Stloc as u8 {
+            assert!(
+                ip + 2 <= code.len(),
+                "truncated 1-byte operand at instruction {ip}"
+            );
+            (2usize, None, Some(code[ip + 1]))
+        } else if op == vm::OpCode::Call as u8 {
+            assert!(
+                ip + 4 <= code.len(),
+                "truncated call operand at instruction {ip}"
+            );
+            (4usize, None, None)
+        } else {
+            (1usize, None, None)
+        };
+        instructions.push(DecodedInstr {
+            ip,
+            op,
+            width,
+            u32_operand,
+            u8_operand,
+        });
+        ip += width;
+    }
+    instructions
+}
+
+fn find_first_while_loop_span(instructions: &[DecodedInstr]) -> (usize, usize, usize) {
+    for instruction in instructions {
+        if instruction.op != vm::OpCode::Brfalse as u8 {
+            continue;
+        }
+        let Some(loop_end_u32) = instruction.u32_operand else {
+            continue;
+        };
+        let loop_end = loop_end_u32 as usize;
+        if loop_end <= instruction.ip + instruction.width {
+            continue;
+        }
+
+        let loop_body_start = instruction.ip + instruction.width;
+        let mut backedge_ip: Option<usize> = None;
+        for candidate in instructions {
+            if candidate.ip < loop_body_start || candidate.ip >= loop_end {
+                continue;
+            }
+            if candidate.op != vm::OpCode::Br as u8 {
+                continue;
+            }
+            let Some(target_u32) = candidate.u32_operand else {
+                continue;
+            };
+            let target = target_u32 as usize;
+            if target < instruction.ip {
+                backedge_ip = Some(backedge_ip.map_or(candidate.ip, |current| current.max(candidate.ip)));
+            }
+        }
+
+        if let Some(loop_backedge_ip) = backedge_ip {
+            return (loop_body_start, loop_backedge_ip, loop_end);
+        }
+    }
+    panic!("expected to find at least one while-loop span in emitted bytecode");
+}
+
+fn collect_null_store_pairs(
+    instructions: &[DecodedInstr],
+    constants: &[Value],
+) -> Vec<(usize, u8)> {
+    let mut null_stores = Vec::new();
+    for pair in instructions.windows(2) {
+        let lhs = pair[0];
+        let rhs = pair[1];
+        if lhs.op != vm::OpCode::Ldc as u8 || rhs.op != vm::OpCode::Stloc as u8 {
+            continue;
+        }
+        if lhs.ip + lhs.width != rhs.ip {
+            continue;
+        }
+
+        let Some(const_index_u32) = lhs.u32_operand else {
+            continue;
+        };
+        let const_index = const_index_u32 as usize;
+        let is_null_const = matches!(constants.get(const_index), Some(Value::Null));
+        if !is_null_const {
+            continue;
+        }
+        let slot = rhs.u8_operand.expect("stloc should include local slot");
+        null_stores.push((lhs.ip, slot));
+    }
+    null_stores
+}
+
+#[test]
+fn liveness_avoids_in_loop_null_clears_but_clears_after_loop_exit() {
+    let source = r#"
+        let iter = 0;
+        let carry = 0;
+        while iter < 2 {
+            let a = iter + 1;
+            let b = a + carry;
+            carry = b;
+            iter = iter + 1;
+        }
+        carry;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug info should be present");
+    let a_index = debug.local_index("a").expect("a should exist");
+    let b_index = debug.local_index("b").expect("b should exist");
+
+    let instructions = decode_instructions(&compiled.program.code);
+    let (loop_body_start, loop_backedge_ip, loop_end) = find_first_while_loop_span(&instructions);
+    let null_stores = collect_null_store_pairs(&instructions, &compiled.program.constants);
+
+    let in_loop_null_stores = null_stores
+        .iter()
+        .copied()
+        .filter(|(ip, _)| *ip >= loop_body_start && *ip < loop_backedge_ip)
+        .collect::<Vec<_>>();
+    assert!(
+        in_loop_null_stores.is_empty(),
+        "expected no `ldc null; stloc` in loop body [{}..{}), found {:?}",
+        loop_body_start,
+        loop_backedge_ip,
+        in_loop_null_stores
+    );
+
+    for slot in [a_index, b_index] {
+        assert!(
+            null_stores
+                .iter()
+                .any(|(ip, cleared_slot)| *ip >= loop_end && *cleared_slot == slot),
+            "expected post-loop null clear for local slot {slot}, clears={:?}, loop_end={loop_end}",
+            null_stores
+        );
+    }
+
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(3)]);
+    assert_eq!(vm.locals()[a_index as usize], Value::Null);
+    assert_eq!(vm.locals()[b_index as usize], Value::Null);
+}
+
 #[test]
 fn compile_source_file_detects_extension() {
     let unique = format!(

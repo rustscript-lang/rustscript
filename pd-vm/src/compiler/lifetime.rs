@@ -530,7 +530,7 @@ impl LivenessRewriter {
 
     fn rewrite_program_block(&self, stmts: &[Stmt]) -> Vec<Stmt> {
         let live_out = self.empty_set();
-        self.rewrite_block(stmts, &live_out).0
+        self.rewrite_block(stmts, &live_out, false).0
     }
 
     fn rewrite_function_impl(&self, function_impl: FunctionImpl) -> FunctionImpl {
@@ -540,7 +540,7 @@ impl LivenessRewriter {
             body_expr,
         } = function_impl;
         let live_out = self.uses_expr(&body_expr);
-        let (rewritten_body, _) = self.rewrite_block(&body_stmts, &live_out);
+        let (rewritten_body, _) = self.rewrite_block(&body_stmts, &live_out, false);
         FunctionImpl {
             param_slots,
             body_stmts: rewritten_body,
@@ -548,12 +548,22 @@ impl LivenessRewriter {
         }
     }
 
-    fn rewrite_block(&self, stmts: &[Stmt], live_out: &LiveSet) -> (Vec<Stmt>, LiveSet) {
+    fn rewrite_block(
+        &self,
+        stmts: &[Stmt],
+        live_out: &LiveSet,
+        suppress_clears: bool,
+    ) -> (Vec<Stmt>, LiveSet) {
         let mut live_after = live_out.clone();
         let mut rewritten_rev = Vec::<Stmt>::new();
         for stmt in stmts.iter().rev() {
-            let (rewritten_stmt, live_before, defs) = self.rewrite_stmt(stmt, &live_after);
-            let clear_slots = self.compute_clear_slots(&live_before, &live_after, &defs);
+            let (rewritten_stmt, live_before, defs) =
+                self.rewrite_stmt(stmt, &live_after, suppress_clears);
+            let clear_slots = if suppress_clears {
+                Vec::new()
+            } else {
+                self.compute_clear_slots(&live_before, &live_after, &defs)
+            };
             let clear_line = stmt_line(stmt);
             for slot in clear_slots.iter().rev() {
                 rewritten_rev.push(Stmt::Assign {
@@ -569,7 +579,12 @@ impl LivenessRewriter {
         (rewritten_rev, live_after)
     }
 
-    fn rewrite_stmt(&self, stmt: &Stmt, live_after: &LiveSet) -> (Stmt, LiveSet, Vec<DefInfo>) {
+    fn rewrite_stmt(
+        &self,
+        stmt: &Stmt,
+        live_after: &LiveSet,
+        suppress_clears: bool,
+    ) -> (Stmt, LiveSet, Vec<DefInfo>) {
         match stmt {
             Stmt::Noop { .. }
             | Stmt::FuncDecl { .. }
@@ -648,9 +663,9 @@ impl LivenessRewriter {
                 line,
             } => {
                 let (rewritten_then, then_live_before) =
-                    self.rewrite_block(then_branch, live_after);
+                    self.rewrite_block(then_branch, live_after, suppress_clears);
                 let (rewritten_else, else_live_before) =
-                    self.rewrite_block(else_branch, live_after);
+                    self.rewrite_block(else_branch, live_after, suppress_clears);
                 let mut live_before = then_live_before;
                 self.union_inplace(&mut live_before, &else_live_before);
                 self.union_inplace(&mut live_before, &self.uses_expr(condition));
@@ -683,7 +698,7 @@ impl LivenessRewriter {
                     }
                     live_cond = next;
                 }
-                let (rewritten_body, _) = self.rewrite_block(body, &live_cond);
+                let (rewritten_body, _) = self.rewrite_block(body, &live_cond, true);
                 (
                     Stmt::While {
                         condition: condition.clone(),
@@ -717,9 +732,10 @@ impl LivenessRewriter {
                 }
 
                 let post_live_before = self.compute_live_before_stmt(post, &live_cond);
-                let (rewritten_post, _, _) = self.rewrite_stmt(post, &live_cond);
-                let (rewritten_body, _) = self.rewrite_block(body, &post_live_before);
-                let (rewritten_init, live_before, _) = self.rewrite_stmt(init, &live_cond);
+                let (rewritten_post, _, _) = self.rewrite_stmt(post, &live_cond, true);
+                let (rewritten_body, _) = self.rewrite_block(body, &post_live_before, true);
+                let (rewritten_init, live_before, _) =
+                    self.rewrite_stmt(init, &live_cond, suppress_clears);
                 (
                     Stmt::For {
                         init: Box::new(rewritten_init),
