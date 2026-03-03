@@ -20,7 +20,7 @@ Includes rich debugging and profiling tools: interactive debugger, recording and
 
 ## TODO
 
-- [x] Built-in fuel budgeting API in the VM loop (`Vm` + `Store`).
+- [ ] JIT native path and host call fuel budgeting.
 - [ ] Epoch-based interruption API.
 - [ ] Callable-as-value support.
 

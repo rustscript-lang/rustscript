@@ -872,11 +872,13 @@ impl Vm {
                 return Err(VmError::BytecodeBounds);
             }
 
-            if let Err(err) = self.charge_fuel_tick() {
-                if self.handle_debugger_error(&mut debugger, &err) {
-                    continue;
+            if self.fuel_remaining.is_some() {
+                if let Err(err) = self.charge_fuel_tick() {
+                    if self.handle_debugger_error(&mut debugger, &err) {
+                        continue;
+                    }
+                    return Err(err);
                 }
-                return Err(err);
             }
             let opcode = self.read_u8()?;
             let outcome = match self.execute_interpreter_instruction(opcode) {

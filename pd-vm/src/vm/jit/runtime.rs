@@ -447,7 +447,7 @@ impl Vm {
     pub(in crate::vm) fn execute_jit_entry(&mut self, trace_id: usize) -> VmResult<ExecOutcome> {
         // Keep fuel accounting exact at IR-step granularity: when fuel metering is enabled,
         // execute traced IR steps through the trace interpreter path.
-        if self.fuel_metering_enabled() {
+        if self.fuel_remaining.is_some() {
             return self.execute_jit_trace(trace_id);
         }
 

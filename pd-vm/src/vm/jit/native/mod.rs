@@ -1,5 +1,6 @@
 use super::super::super::{VmError, VmResult};
 use std::env;
+#[cfg(feature = "cranelift-jit")]
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))]
@@ -107,8 +108,10 @@ pub(super) fn emit_native_trace_bytes(trace: &super::JitTrace) -> VmResult<Vec<u
     ActiveBackend::emit_trace_bytes(trace)
 }
 
+#[cfg(feature = "cranelift-jit")]
 static GENERIC_BRIDGE_ERROR: OnceLock<Mutex<Option<VmError>>> = OnceLock::new();
 
+#[cfg(feature = "cranelift-jit")]
 fn generic_bridge_error_cell() -> &'static Mutex<Option<VmError>> {
     GENERIC_BRIDGE_ERROR.get_or_init(|| Mutex::new(None))
 }
@@ -121,6 +124,7 @@ pub(super) fn store_bridge_error(error: VmError) {
 }
 
 pub(super) fn clear_bridge_error() {
+    #[cfg(feature = "cranelift-jit")]
     if let Ok(mut guard) = generic_bridge_error_cell().lock() {
         *guard = None;
     }
@@ -128,6 +132,7 @@ pub(super) fn clear_bridge_error() {
 }
 
 pub(super) fn take_bridge_error() -> Option<VmError> {
+    #[cfg(feature = "cranelift-jit")]
     if let Ok(mut guard) = generic_bridge_error_cell().lock()
         && let Some(error) = guard.take()
     {
