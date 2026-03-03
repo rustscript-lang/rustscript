@@ -385,10 +385,10 @@ fn compile_source_file_impl(
 ) -> Result<CompiledProgram, SourcePathError> {
     let flavor = SourceFlavor::from_path(path)?;
     let source_raw = std::fs::read_to_string(path)?;
-    let (root_source, units) =
+    let (_root_parse_source, units) =
         source_loader::load_units_for_source_file(path, flavor, &source_raw, options)?;
     let merged = merge_units(units)?;
-    compile_parsed_output(root_source, merged).map_err(SourcePathError::Source)
+    compile_parsed_output(source_raw, merged).map_err(SourcePathError::Source)
 }
 
 fn run_with_compiler_stack<T, F>(f: F) -> T

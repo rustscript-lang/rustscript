@@ -118,6 +118,13 @@ impl DebugInfoBuilder {
 
     pub fn mark_line(&mut self, offset: u32, line: u32) {
         if self.last_offset == Some(offset) {
+            if let Some(last) = self.lines.last_mut()
+                && last.offset == offset
+            {
+                // Keep the most recent line mapping for this offset so non-emitting
+                // statements (e.g., import declarations) do not pin stale lines.
+                last.line = line;
+            }
             return;
         }
         self.lines.push(LineInfo { offset, line });
