@@ -3,7 +3,7 @@ use super::{
     STATUS_YIELDED,
 };
 use crate::vm::jit::TraceStep;
-use crate::vm::{HostCallExecOutcome, Program, Value, Vm, VmError, VmResult};
+use crate::vm::{HostCallExecOutcome, Value, Vm, VmError, VmResult};
 use std::sync::OnceLock;
 
 pub(super) struct AArch64Backend;
@@ -83,9 +83,9 @@ struct ValueLayout {
 struct NativeStackLayout {
     vm_stack_offset: i32,
     vm_locals_offset: i32,
-    vm_program_offset: i32,
+    vm_program_constants_ptr_offset: i32,
+    vm_program_constants_len_offset: i32,
     vm_ip_offset: i32,
-    program_constants_offset: i32,
     stack_vec: VecLayout,
     value: ValueLayout,
 }
@@ -936,13 +936,8 @@ fn emit_native_step_ldc_inline(
     let stack_len_offset = vec_len_disp(layout.vm_stack_offset, layout.stack_vec)?;
     let stack_ptr_offset = vec_ptr_disp(layout.vm_stack_offset, layout.stack_vec)?;
     let stack_cap_offset = vec_cap_disp(layout.vm_stack_offset, layout.stack_vec)?;
-    let constants_base = checked_add_i32(
-        layout.vm_program_offset,
-        layout.program_constants_offset,
-        "vm constants base overflow",
-    )?;
-    let constants_len_offset = vec_len_disp(constants_base, layout.stack_vec)?;
-    let constants_ptr_offset = vec_ptr_disp(constants_base, layout.stack_vec)?;
+    let constants_len_offset = layout.vm_program_constants_len_offset;
+    let constants_ptr_offset = layout.vm_program_constants_ptr_offset;
 
     emit_ldr_x_disp(code, 15, VM_REG, constants_len_offset)?;
     emit_mov_imm64(code, 14, u64::from(const_index));
@@ -1485,20 +1480,23 @@ fn detect_native_stack_layout() -> VmResult<NativeStackLayout> {
 fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
     let vm_stack_offset = usize_to_i32(std::mem::offset_of!(Vm, stack), "Vm::stack offset")?;
     let vm_locals_offset = usize_to_i32(std::mem::offset_of!(Vm, locals), "Vm::locals offset")?;
-    let vm_program_offset = usize_to_i32(std::mem::offset_of!(Vm, program), "Vm::program offset")?;
-    let vm_ip_offset = usize_to_i32(std::mem::offset_of!(Vm, ip), "Vm::ip offset")?;
-    let program_constants_offset = usize_to_i32(
-        std::mem::offset_of!(Program, constants),
-        "Program::constants offset",
+    let vm_program_constants_ptr_offset = usize_to_i32(
+        std::mem::offset_of!(Vm, program_constants_ptr),
+        "Vm::program_constants_ptr offset",
     )?;
+    let vm_program_constants_len_offset = usize_to_i32(
+        std::mem::offset_of!(Vm, program_constants_len),
+        "Vm::program_constants_len offset",
+    )?;
+    let vm_ip_offset = usize_to_i32(std::mem::offset_of!(Vm, ip), "Vm::ip offset")?;
     let stack_vec = detect_vec_layout()?;
     let value = detect_value_layout()?;
     Ok(NativeStackLayout {
         vm_stack_offset,
         vm_locals_offset,
-        vm_program_offset,
+        vm_program_constants_ptr_offset,
+        vm_program_constants_len_offset,
         vm_ip_offset,
-        program_constants_offset,
         stack_vec,
         value,
     })
