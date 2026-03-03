@@ -8,8 +8,10 @@ use crate::builtins::BuiltinFunction;
 pub(crate) mod builtins_impl;
 pub mod diagnostics;
 pub(crate) mod jit;
+mod store;
 
 pub use crate::bytecode::{HostImport, OpCode, Program, Value};
+pub use store::Store;
 
 #[derive(Clone, Copy, Debug)]
 enum NumericValue {
@@ -60,6 +62,12 @@ pub enum VmError {
     BytecodeBounds,
     HostError(String),
     JitNative(String),
+    InvalidFuelCheckInterval(u32),
+    FuelOverflow,
+    OutOfFuel {
+        needed: u64,
+        remaining: u64,
+    },
 }
 
 impl std::fmt::Display for VmError {
@@ -87,6 +95,14 @@ impl std::fmt::Display for VmError {
             VmError::BytecodeBounds => write!(f, "bytecode bounds"),
             VmError::HostError(message) => write!(f, "host error: {message}"),
             VmError::JitNative(message) => write!(f, "jit native error: {message}"),
+            VmError::InvalidFuelCheckInterval(value) => {
+                write!(f, "invalid fuel check interval {value}, expected >= 1")
+            }
+            VmError::FuelOverflow => write!(f, "fuel arithmetic overflow"),
+            VmError::OutOfFuel { needed, remaining } => write!(
+                f,
+                "out of fuel: needed {needed} units, remaining {remaining}"
+            ),
         }
     }
 }
@@ -96,6 +112,23 @@ impl std::error::Error for VmError {}
 pub type VmResult<T> = Result<T, VmError>;
 
 pub type HostOpId = u64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FuelCheckpoint {
+    remaining: Option<u64>,
+    check_interval: u32,
+    ops_until_check: u32,
+}
+
+impl FuelCheckpoint {
+    pub fn fuel(&self) -> Option<u64> {
+        self.remaining
+    }
+
+    pub fn check_interval(&self) -> u32 {
+        self.check_interval
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmStatus {
@@ -325,6 +358,9 @@ pub struct Vm {
     waiting_host_op: Option<WaitingHostOp>,
     next_host_op_id: HostOpId,
     io_state: builtins_impl::IoState,
+    fuel_remaining: Option<u64>,
+    fuel_check_interval: u32,
+    fuel_ops_until_check: u32,
 }
 
 enum ExecOutcome {
@@ -437,6 +473,9 @@ impl Vm {
             waiting_host_op: None,
             next_host_op_id: 1,
             io_state: builtins_impl::IoState::default(),
+            fuel_remaining: None,
+            fuel_check_interval: 1,
+            fuel_ops_until_check: 1,
         }
     }
 
@@ -465,6 +504,9 @@ impl Vm {
             waiting_host_op: None,
             next_host_op_id: 1,
             io_state: builtins_impl::IoState::default(),
+            fuel_remaining: None,
+            fuel_check_interval: 1,
+            fuel_ops_until_check: 1,
         }
     }
 
@@ -602,6 +644,77 @@ impl Vm {
         self.waiting_host_op.map(|op| op.op_id)
     }
 
+    pub fn set_fuel(&mut self, fuel: u64) {
+        self.fuel_remaining = Some(fuel);
+        self.fuel_ops_until_check = self.fuel_check_interval;
+    }
+
+    pub fn clear_fuel(&mut self) {
+        self.fuel_remaining = None;
+        self.fuel_ops_until_check = self.fuel_check_interval;
+    }
+
+    pub fn set_fuel_check_interval(&mut self, interval: u32) -> VmResult<()> {
+        if interval == 0 {
+            return Err(VmError::InvalidFuelCheckInterval(interval));
+        }
+        self.fuel_check_interval = interval;
+        self.fuel_ops_until_check = interval;
+        Ok(())
+    }
+
+    pub fn fuel_check_interval(&self) -> u32 {
+        self.fuel_check_interval
+    }
+
+    pub fn get_fuel(&self) -> Option<u64> {
+        self.fuel_remaining
+            .map(|remaining| remaining.saturating_sub(self.pending_fuel_debt()))
+    }
+
+    pub fn add_fuel(&mut self, fuel: u64) -> VmResult<()> {
+        if fuel == 0 {
+            return Ok(());
+        }
+        self.fuel_remaining = Some(match self.fuel_remaining {
+            Some(remaining) => remaining.checked_add(fuel).ok_or(VmError::FuelOverflow)?,
+            None => fuel,
+        });
+        Ok(())
+    }
+
+    pub fn recharge_fuel(&mut self, fuel: u64) -> VmResult<()> {
+        self.add_fuel(fuel)
+    }
+
+    pub fn consume_fuel(&mut self, fuel: u64) -> VmResult<()> {
+        self.charge_fuel(fuel)
+    }
+
+    pub fn fuel_checkpoint(&self) -> FuelCheckpoint {
+        FuelCheckpoint {
+            remaining: self.fuel_remaining,
+            check_interval: self.fuel_check_interval,
+            ops_until_check: self.fuel_ops_until_check,
+        }
+    }
+
+    pub fn checkpoint(&self) -> FuelCheckpoint {
+        self.fuel_checkpoint()
+    }
+
+    pub fn restore_fuel(&mut self, checkpoint: FuelCheckpoint) {
+        self.fuel_remaining = checkpoint.remaining;
+        self.fuel_check_interval = checkpoint.check_interval.max(1);
+        self.fuel_ops_until_check = checkpoint
+            .ops_until_check
+            .clamp(1, self.fuel_check_interval);
+    }
+
+    pub fn restore_checkpoint(&mut self, checkpoint: FuelCheckpoint) {
+        self.restore_fuel(checkpoint);
+    }
+
     pub fn complete_host_op(&mut self, op_id: HostOpId, values: Vec<Value>) -> VmResult<()> {
         self.complete_waiting_host_op(op_id, values)
     }
@@ -681,6 +794,22 @@ impl Vm {
         }
     }
 
+    fn handle_debugger_error(
+        &mut self,
+        debugger: &mut Option<&mut crate::debugger::Debugger>,
+        err: &VmError,
+    ) -> bool {
+        match err {
+            VmError::OutOfFuel { .. } => {
+                if let Some(active_debugger) = debugger.as_deref_mut() {
+                    return active_debugger.on_vm_error(self, err);
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     fn outcome_to_status(outcome: ExecOutcome) -> Option<VmStatus> {
         match outcome {
             ExecOutcome::Continue => None,
@@ -723,7 +852,15 @@ impl Vm {
                     self.jit.observe_hot_ip(self.ip, program)
                 };
                 if let Some(trace_id) = trace_id {
-                    let outcome = self.execute_jit_entry(trace_id)?;
+                    let outcome = match self.execute_jit_entry(trace_id) {
+                        Ok(outcome) => outcome,
+                        Err(err) => {
+                            if self.handle_debugger_error(&mut debugger, &err) {
+                                continue;
+                            }
+                            return Err(err);
+                        }
+                    };
                     if let Some(status) = self.finish_outcome(&mut debugger, outcome) {
                         return Ok(status);
                     }
@@ -735,8 +872,22 @@ impl Vm {
                 return Err(VmError::BytecodeBounds);
             }
 
+            if let Err(err) = self.charge_fuel_tick() {
+                if self.handle_debugger_error(&mut debugger, &err) {
+                    continue;
+                }
+                return Err(err);
+            }
             let opcode = self.read_u8()?;
-            let outcome = self.execute_interpreter_instruction(opcode)?;
+            let outcome = match self.execute_interpreter_instruction(opcode) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    if self.handle_debugger_error(&mut debugger, &err) {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
             if let Some(status) = self.finish_outcome(&mut debugger, outcome) {
                 return Ok(status);
             }
@@ -931,8 +1082,57 @@ impl Vm {
         self.call_depth
     }
 
+    pub(in crate::vm) fn fuel_metering_enabled(&self) -> bool {
+        self.fuel_remaining.is_some()
+    }
+
+    fn pending_fuel_debt(&self) -> u64 {
+        if self.fuel_remaining.is_none() {
+            return 0;
+        }
+        let executed_since_last_check = self
+            .fuel_check_interval
+            .saturating_sub(self.fuel_ops_until_check);
+        u64::from(executed_since_last_check)
+    }
+
     fn pop_value(&mut self) -> VmResult<Value> {
         self.stack.pop().ok_or(VmError::StackUnderflow)
+    }
+
+    pub(in crate::vm) fn charge_fuel(&mut self, amount: u64) -> VmResult<()> {
+        if amount == 0 {
+            return Ok(());
+        }
+
+        let Some(remaining) = self.fuel_remaining else {
+            return Ok(());
+        };
+
+        if remaining < amount {
+            self.fuel_remaining = Some(remaining);
+            return Err(VmError::OutOfFuel {
+                needed: amount,
+                remaining,
+            });
+        }
+        self.fuel_remaining = Some(remaining - amount);
+        Ok(())
+    }
+
+    pub(in crate::vm) fn charge_fuel_tick(&mut self) -> VmResult<()> {
+        if self.fuel_remaining.is_none() {
+            return Ok(());
+        }
+        if self.fuel_ops_until_check > 1 {
+            self.fuel_ops_until_check -= 1;
+            return Ok(());
+        }
+
+        let amount = u64::from(self.fuel_check_interval);
+        self.charge_fuel(amount)?;
+        self.fuel_ops_until_check = self.fuel_check_interval;
+        Ok(())
     }
 
     fn peek_value(&self) -> VmResult<&Value> {

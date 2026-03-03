@@ -281,6 +281,7 @@ impl Vm {
             return Ok(ExecOutcome::Continue);
         };
         for step in &trace.steps {
+            self.charge_fuel_tick()?;
             match step {
                 TraceStep::Nop => {}
                 TraceStep::Ldc(index) => {
@@ -444,6 +445,12 @@ impl Vm {
     }
 
     pub(in crate::vm) fn execute_jit_entry(&mut self, trace_id: usize) -> VmResult<ExecOutcome> {
+        // Keep fuel accounting exact at IR-step granularity: when fuel metering is enabled,
+        // execute traced IR steps through the trace interpreter path.
+        if self.fuel_metering_enabled() {
+            return self.execute_jit_trace(trace_id);
+        }
+
         #[cfg(any(
             all(
                 target_arch = "x86_64",

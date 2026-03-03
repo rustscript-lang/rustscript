@@ -27,6 +27,7 @@ struct CliConfig {
     stop_on_entry: bool,
     jit_dump: bool,
     jit_hot_loop_threshold: Option<u32>,
+    fuel: Option<u64>,
     help: bool,
 }
 
@@ -45,6 +46,7 @@ impl Default for CliConfig {
             stop_on_entry: true,
             jit_dump: false,
             jit_hot_loop_threshold: None,
+            fuel: None,
             help: false,
         }
     }
@@ -96,6 +98,9 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let recording_program = cli.record_path.as_ref().map(|_| compiled.program.clone());
     let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    if let Some(fuel) = cli.fuel {
+        vm.set_fuel(fuel);
+    }
     if let Some(hot_loop) = cli.jit_hot_loop_threshold {
         let mut jit_config = vm.jit_config().clone();
         jit_config.hot_loop_threshold = hot_loop;
@@ -275,6 +280,16 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
                 cfg.jit_hot_loop_threshold = Some(value);
                 index += 2;
             }
+            "--fuel" => {
+                let raw = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --fuel".to_string())?;
+                let value = raw
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --fuel value '{raw}'"))?;
+                cfg.fuel = Some(value);
+                index += 2;
+            }
             "--emit-vmbc" => {
                 let path = args
                     .get(index + 1)
@@ -332,12 +347,14 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
             || cfg.tcp_addr.is_some()
             || cfg.jit_dump
             || cfg.jit_hot_loop_threshold.is_some()
+            || cfg.fuel.is_some()
             || cfg.emit_vmbc_path.is_some()
             || cfg.record_path.is_some()
             || cfg.view_recording_path.is_some()
         {
             return Err(
-                "repl mode cannot be combined with debug/jit/emit-vmbc runtime flags".to_string(),
+                "repl mode cannot be combined with debug/jit/fuel/emit-vmbc runtime flags"
+                    .to_string(),
             );
         }
     }
@@ -350,12 +367,13 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
             || cfg.tcp_addr.is_some()
             || cfg.jit_dump
             || cfg.jit_hot_loop_threshold.is_some()
+            || cfg.fuel.is_some()
             || cfg.emit_vmbc_path.is_some()
             || cfg.record_path.is_some()
             || cfg.view_recording_path.is_some()
         {
             return Err(
-                "disasm mode cannot be combined with repl/debug/jit/emit-vmbc runtime flags"
+                "disasm mode cannot be combined with repl/debug/jit/fuel/emit-vmbc runtime flags"
                     .to_string(),
             );
         }
@@ -383,6 +401,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
             || cfg.tcp_addr.is_some()
             || cfg.jit_dump
             || cfg.jit_hot_loop_threshold.is_some()
+            || cfg.fuel.is_some()
             || cfg.emit_vmbc_path.is_some()
             || cfg.disasm_vmbc_path.is_some()
             || cfg.record_path.is_some()
@@ -448,6 +467,7 @@ fn print_usage() {
     println!(
         "  pd-vm-run [--jit-hot-loop <n>] [--jit-dump] [--emit-vmbc <output.vmbc>] [source_path]"
     );
+    println!("  pd-vm-run [--fuel <n>] [source_path]");
     println!("  pd-vm-run debug [--tcp <addr>] [source_path]");
 }
 
@@ -941,6 +961,7 @@ mod tests {
         assert!(cfg.stop_on_entry);
         assert!(!cfg.jit_dump);
         assert!(cfg.jit_hot_loop_threshold.is_none());
+        assert!(cfg.fuel.is_none());
         assert!(cfg.source.is_none());
         assert!(cfg.emit_vmbc_path.is_none());
         assert!(cfg.disasm_vmbc_path.is_none());
@@ -987,6 +1008,20 @@ mod tests {
         assert_eq!(cfg.jit_hot_loop_threshold, Some(2));
         assert!(cfg.jit_dump);
         assert_eq!(cfg.source.as_deref(), Some("examples/example.rss"));
+    }
+
+    #[test]
+    fn parse_cli_fuel_flag() {
+        let cfg = parse_cli_args(&[s("--fuel"), s("123"), s("examples/example.rss")])
+            .expect("parse should succeed");
+        assert_eq!(cfg.fuel, Some(123));
+        assert_eq!(cfg.source.as_deref(), Some("examples/example.rss"));
+    }
+
+    #[test]
+    fn parse_cli_fuel_requires_value() {
+        let err = parse_cli_args(&[s("--fuel")]).expect_err("parse should fail");
+        assert!(err.contains("missing value for --fuel"));
     }
 
     #[test]
@@ -1059,6 +1094,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_cli_view_record_rejects_fuel() {
+        let err = parse_cli_args(&[s("--view-record"), s("out/run.pdr"), s("--fuel"), s("10")])
+            .expect_err("parse should fail");
+        assert!(err.contains("view-record mode"));
+    }
+
+    #[test]
     fn parse_cli_record_rejects_debug() {
         let err = parse_cli_args(&[s("--record"), s("run.pdr"), s("--debug")])
             .expect_err("parse should fail");
@@ -1088,6 +1130,13 @@ mod tests {
     fn parse_cli_repl_rejects_emit_vmbc() {
         let err = parse_cli_args(&[s("--repl"), s("--emit-vmbc"), s("out.vmbc")])
             .expect_err("parse should fail");
+        assert!(err.contains("cannot be combined"));
+    }
+
+    #[test]
+    fn parse_cli_repl_rejects_fuel() {
+        let err =
+            parse_cli_args(&[s("--repl"), s("--fuel"), s("10")]).expect_err("parse should fail");
         assert!(err.contains("cannot be combined"));
     }
 

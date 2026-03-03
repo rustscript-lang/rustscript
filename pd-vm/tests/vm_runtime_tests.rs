@@ -307,3 +307,156 @@ fn assemble_rejects_legacy_opcode_literals() {
     let err = assemble(source).expect_err("legacy opcodes should be rejected");
     assert!(err.message.contains("unknown opcode"));
 }
+
+#[test]
+fn fuel_budget_exhausts_and_recharge_allows_resume() {
+    let constants = vec![Value::Int(9)];
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.pop();
+    bc.ret();
+
+    let program = Program::new(constants, bc.finish());
+    let mut vm = Vm::new(program);
+    vm.set_fuel(2);
+
+    let err = vm
+        .run()
+        .expect_err("run should stop once fuel reaches zero");
+    assert!(matches!(
+        err,
+        vm::VmError::OutOfFuel {
+            needed: 1,
+            remaining: 0
+        }
+    ));
+    assert_eq!(vm.get_fuel(), Some(0));
+
+    vm.recharge_fuel(1).expect("recharge should succeed");
+    let status = vm.run().expect("run should halt after recharge");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.get_fuel(), Some(0));
+}
+
+#[test]
+fn fuel_checkpoint_and_restore_work() {
+    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    vm.set_fuel(10);
+    let checkpoint = vm.fuel_checkpoint();
+
+    vm.consume_fuel(4)
+        .expect("manual fuel consumption should succeed");
+    assert_eq!(vm.get_fuel(), Some(6));
+
+    vm.restore_fuel(checkpoint);
+    assert_eq!(vm.get_fuel(), Some(10));
+}
+
+#[test]
+fn store_api_exposes_fuel_checkpoint_and_recharge() {
+    let constants = vec![Value::Int(1)];
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.ret();
+
+    let program = Program::new(constants, bc.finish());
+    let mut store = Store::new(Vm::new(program), String::from("ctx"));
+    store.set_fuel(1);
+    let checkpoint = store.checkpoint();
+
+    let err = store
+        .run()
+        .expect_err("first run should stop when fuel is depleted");
+    assert!(matches!(
+        err,
+        vm::VmError::OutOfFuel {
+            needed: 1,
+            remaining: 0
+        }
+    ));
+    assert_eq!(store.get_fuel(), Some(0));
+
+    store.recharge(1).expect("store recharge should succeed");
+    let status = store.run().expect("store run should finish after recharge");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(store.data(), "ctx");
+
+    store.restore_checkpoint(checkpoint);
+    assert_eq!(store.get_fuel(), Some(1));
+}
+
+#[test]
+fn fuel_check_interval_can_be_configured() {
+    let constants = vec![Value::Int(1)];
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.pop();
+    bc.ret();
+
+    let program = Program::new(constants, bc.finish());
+    let mut vm = Vm::new(program);
+    vm.set_fuel_check_interval(3)
+        .expect("interval update should succeed");
+    vm.set_fuel(3);
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.get_fuel(), Some(0));
+}
+
+#[test]
+fn coarse_fuel_checking_trades_precision_for_overhead() {
+    let constants = vec![Value::Int(1)];
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.pop();
+    bc.ret();
+
+    let program = Program::new(constants, bc.finish());
+    let mut vm = Vm::new(program);
+    vm.set_fuel_check_interval(3)
+        .expect("interval update should succeed");
+    vm.set_fuel(2);
+
+    let err = vm.run().expect_err("vm should stop on batched fuel charge");
+    assert!(matches!(
+        err,
+        vm::VmError::OutOfFuel {
+            needed: 3,
+            remaining: 2
+        }
+    ));
+    assert_eq!(vm.get_fuel(), Some(0));
+
+    vm.recharge_fuel(1).expect("recharge should succeed");
+    let resumed = vm.run().expect("run should halt after recharge");
+    assert_eq!(resumed, VmStatus::Halted);
+}
+
+#[test]
+fn fuel_check_interval_zero_is_rejected() {
+    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let err = vm
+        .set_fuel_check_interval(0)
+        .expect_err("zero interval should fail");
+    assert!(matches!(err, vm::VmError::InvalidFuelCheckInterval(0)));
+}
+
+#[test]
+fn fuel_checkpoint_restores_interval() {
+    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    vm.set_fuel_check_interval(7)
+        .expect("interval update should succeed");
+    vm.set_fuel(22);
+    let checkpoint = vm.checkpoint();
+
+    vm.set_fuel_check_interval(2)
+        .expect("interval update should succeed");
+    vm.consume_fuel(5)
+        .expect("manual fuel consumption should succeed");
+    assert_eq!(vm.fuel_check_interval(), 2);
+
+    vm.restore_checkpoint(checkpoint);
+    assert_eq!(vm.fuel_check_interval(), 7);
+    assert_eq!(vm.get_fuel(), Some(22));
+}

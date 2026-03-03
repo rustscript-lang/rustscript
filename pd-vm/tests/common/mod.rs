@@ -2,8 +2,8 @@
 
 pub use vm::{
     Assembler, BytecodeBuilder, CallOutcome, CompileSourceFileOptions, Compiler, Expr,
-    HostFunction, HostFunctionRegistry, Program, SourceFlavor, Stmt, Value, Vm, VmStatus, assemble,
-    compile_source, compile_source_file, compile_source_file_with_options,
+    HostFunction, HostFunctionRegistry, Program, SourceFlavor, Stmt, Store, Value, Vm, VmStatus,
+    assemble, compile_source, compile_source_file, compile_source_file_with_options,
     compile_source_with_flavor,
 };
 
