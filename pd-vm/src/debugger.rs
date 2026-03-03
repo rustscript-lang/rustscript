@@ -809,9 +809,20 @@ fn handle_command(
         "b" | "break" => {
             if let Some(arg) = parts.next() {
                 if arg == "line" {
-                    if let Some(line) = parse_u32(parts.next()) {
+                    if let Some(requested_line) = parse_u32(parts.next()) {
+                        let line = vm
+                            .debug_info()
+                            .map(|info| resolve_executable_line(info, requested_line))
+                            .unwrap_or(requested_line);
                         line_breakpoints.insert(line);
-                        let _ = writeln!(out, "line breakpoint set at {line}");
+                        if line == requested_line {
+                            let _ = writeln!(out, "line breakpoint set at {line}");
+                        } else {
+                            let _ = writeln!(
+                                out,
+                                "line breakpoint set at {line} (requested line {requested_line})"
+                            );
+                        }
                     } else {
                         let _ = writeln!(out, "usage: break line <number>");
                     }
@@ -828,9 +839,20 @@ fn handle_command(
             }
         }
         "bl" => {
-            if let Some(line) = parse_u32(parts.next()) {
+            if let Some(requested_line) = parse_u32(parts.next()) {
+                let line = vm
+                    .debug_info()
+                    .map(|info| resolve_executable_line(info, requested_line))
+                    .unwrap_or(requested_line);
                 line_breakpoints.insert(line);
-                let _ = writeln!(out, "line breakpoint set at {line}");
+                if line == requested_line {
+                    let _ = writeln!(out, "line breakpoint set at {line}");
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "line breakpoint set at {line} (requested line {requested_line})"
+                    );
+                }
             } else {
                 let _ = writeln!(out, "usage: bl <line>");
             }
@@ -838,9 +860,20 @@ fn handle_command(
         "clear" => {
             if let Some(arg) = parts.next() {
                 if arg == "line" {
-                    if let Some(line) = parse_u32(parts.next()) {
+                    if let Some(requested_line) = parse_u32(parts.next()) {
+                        let line = vm
+                            .debug_info()
+                            .map(|info| resolve_executable_line(info, requested_line))
+                            .unwrap_or(requested_line);
                         line_breakpoints.remove(&line);
-                        let _ = writeln!(out, "line breakpoint cleared at {line}");
+                        if line == requested_line {
+                            let _ = writeln!(out, "line breakpoint cleared at {line}");
+                        } else {
+                            let _ = writeln!(
+                                out,
+                                "line breakpoint cleared at {line} (requested line {requested_line})"
+                            );
+                        }
                     } else {
                         let _ = writeln!(out, "usage: clear line <number>");
                     }
@@ -857,9 +890,20 @@ fn handle_command(
             }
         }
         "cl" => {
-            if let Some(line) = parse_u32(parts.next()) {
+            if let Some(requested_line) = parse_u32(parts.next()) {
+                let line = vm
+                    .debug_info()
+                    .map(|info| resolve_executable_line(info, requested_line))
+                    .unwrap_or(requested_line);
                 line_breakpoints.remove(&line);
-                let _ = writeln!(out, "line breakpoint cleared at {line}");
+                if line == requested_line {
+                    let _ = writeln!(out, "line breakpoint cleared at {line}");
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "line breakpoint cleared at {line} (requested line {requested_line})"
+                    );
+                }
             } else {
                 let _ = writeln!(out, "usage: cl <line>");
             }
@@ -991,6 +1035,22 @@ fn parse_u32(token: Option<&str>) -> Option<u32> {
     token.and_then(|value| value.parse::<u32>().ok())
 }
 
+fn resolve_executable_line(info: &DebugInfo, requested_line: u32) -> u32 {
+    let mut next = None::<u32>;
+    let mut prev = None::<u32>;
+
+    for line in info.lines.iter().map(|entry| entry.line) {
+        if line >= requested_line && next.is_none_or(|candidate| line < candidate) {
+            next = Some(line);
+        }
+        if line <= requested_line && prev.is_none_or(|candidate| line > candidate) {
+            prev = Some(line);
+        }
+    }
+
+    next.or(prev).unwrap_or(requested_line)
+}
+
 pub fn replay_recording_stdio(recording: &VmRecording) {
     if recording.frames.is_empty() {
         println!("recording has no captured frames");
@@ -1063,7 +1123,6 @@ fn handle_replay_command(
                 replay_breakpoints.next_pause_frame(recording, cursor.saturating_add(1))
             {
                 *cursor = next;
-                replay_breakpoints.consume_pause_at_frame(recording, *cursor);
             } else {
                 *cursor = recording.frames.len().saturating_sub(1);
             }
@@ -1090,9 +1149,22 @@ fn handle_replay_command(
         "b" | "break" => {
             if let Some(arg) = parts.next() {
                 if arg == "line" {
-                    if let Some(line) = parse_u32(parts.next()) {
+                    if let Some(requested_line) = parse_u32(parts.next()) {
+                        let line = recording
+                            .program
+                            .debug
+                            .as_ref()
+                            .map(|info| resolve_executable_line(info, requested_line))
+                            .unwrap_or(requested_line);
                         replay_breakpoints.line_breakpoints.insert(line);
-                        let _ = writeln!(out, "replay pause point set at line {line}");
+                        if line == requested_line {
+                            let _ = writeln!(out, "replay pause point set at line {line}");
+                        } else {
+                            let _ = writeln!(
+                                out,
+                                "replay pause point set at line {line} (requested line {requested_line})"
+                            );
+                        }
                     } else {
                         let _ = writeln!(out, "usage: break line <number>");
                     }
@@ -1110,9 +1182,22 @@ fn handle_replay_command(
             return ReplayAction::Continue;
         }
         "bl" => {
-            if let Some(line) = parse_u32(parts.next()) {
+            if let Some(requested_line) = parse_u32(parts.next()) {
+                let line = recording
+                    .program
+                    .debug
+                    .as_ref()
+                    .map(|info| resolve_executable_line(info, requested_line))
+                    .unwrap_or(requested_line);
                 replay_breakpoints.line_breakpoints.insert(line);
-                let _ = writeln!(out, "replay pause point set at line {line}");
+                if line == requested_line {
+                    let _ = writeln!(out, "replay pause point set at line {line}");
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "replay pause point set at line {line} (requested line {requested_line})"
+                    );
+                }
             } else {
                 let _ = writeln!(out, "usage: bl <line>");
             }
@@ -1121,9 +1206,22 @@ fn handle_replay_command(
         "clear" => {
             if let Some(arg) = parts.next() {
                 if arg == "line" {
-                    if let Some(line) = parse_u32(parts.next()) {
+                    if let Some(requested_line) = parse_u32(parts.next()) {
+                        let line = recording
+                            .program
+                            .debug
+                            .as_ref()
+                            .map(|info| resolve_executable_line(info, requested_line))
+                            .unwrap_or(requested_line);
                         replay_breakpoints.line_breakpoints.remove(&line);
-                        let _ = writeln!(out, "replay pause point cleared at line {line}");
+                        if line == requested_line {
+                            let _ = writeln!(out, "replay pause point cleared at line {line}");
+                        } else {
+                            let _ = writeln!(
+                                out,
+                                "replay pause point cleared at line {line} (requested line {requested_line})"
+                            );
+                        }
                     } else {
                         let _ = writeln!(out, "usage: clear line <number>");
                     }
@@ -1141,9 +1239,22 @@ fn handle_replay_command(
             return ReplayAction::Continue;
         }
         "cl" => {
-            if let Some(line) = parse_u32(parts.next()) {
+            if let Some(requested_line) = parse_u32(parts.next()) {
+                let line = recording
+                    .program
+                    .debug
+                    .as_ref()
+                    .map(|info| resolve_executable_line(info, requested_line))
+                    .unwrap_or(requested_line);
                 replay_breakpoints.line_breakpoints.remove(&line);
-                let _ = writeln!(out, "replay pause point cleared at line {line}");
+                if line == requested_line {
+                    let _ = writeln!(out, "replay pause point cleared at line {line}");
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "replay pause point cleared at line {line} (requested line {requested_line})"
+                    );
+                }
             } else {
                 let _ = writeln!(out, "usage: cl <line>");
             }
@@ -1293,18 +1404,6 @@ impl ReplayBreakpoints {
             }
         }
         None
-    }
-
-    fn consume_pause_at_frame(&mut self, recording: &VmRecording, frame_index: usize) {
-        let Some(frame) = recording.frames.get(frame_index) else {
-            return;
-        };
-        self.offset_breakpoints.remove(&frame.ip);
-        if let Some(info) = recording.program.debug.as_ref()
-            && let Some(line) = info.line_for_offset(frame.ip)
-        {
-            self.line_breakpoints.remove(&line);
-        }
     }
 }
 
@@ -1582,7 +1681,7 @@ impl<'a> RecordingCursor<'a> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::debug_info::{DebugInfo, LocalInfo};
     use crate::vm::{Program, Value, Vm, VmStatus};
@@ -1591,6 +1690,20 @@ mod tests {
         DebugCommandBridgeError, Debugger, ReplAction, ReplayBreakpoints, StepMode, VmRecording,
         VmRecordingFrame, handle_command, handle_replay_command,
     };
+
+    fn wait_for_bridge_attachment(bridge: &super::DebugCommandBridge, attached: bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if bridge.status().attached == attached {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for debugger attached={attached}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
 
     fn vm_with_named_local(name: &str, value: Value) -> Vm {
         let program = Program::with_debug(
@@ -1918,6 +2031,340 @@ mod tests {
     }
 
     #[test]
+    fn replay_break_line_on_non_executable_source_line_resolves_forward() {
+        let program = Program::with_debug(
+            vec![],
+            vec![],
+            Some(DebugInfo {
+                source: None,
+                lines: vec![
+                    crate::debug_info::LineInfo { offset: 0, line: 8 },
+                    crate::debug_info::LineInfo {
+                        offset: 10,
+                        line: 13,
+                    },
+                ],
+                functions: vec![],
+                locals: vec![],
+            }),
+        );
+        let recording = VmRecording {
+            program,
+            frames: vec![
+                VmRecordingFrame {
+                    ip: 0,
+                    call_depth: 0,
+                    stack: vec![],
+                    locals: vec![],
+                },
+                VmRecordingFrame {
+                    ip: 10,
+                    call_depth: 0,
+                    stack: vec![],
+                    locals: vec![],
+                },
+            ],
+            terminal_status: Some(VmStatus::Halted),
+        };
+        let mut cursor = 0usize;
+        let mut replay_breakpoints = ReplayBreakpoints::default();
+        let mut out = Vec::<u8>::new();
+
+        handle_replay_command(
+            "break line 11",
+            &recording,
+            &mut cursor,
+            &mut replay_breakpoints,
+            &mut out,
+        );
+        let set_text = String::from_utf8(out.clone()).expect("output should be utf-8");
+        assert!(
+            set_text.contains("line 13 (requested line 11)"),
+            "expected resolved-line message, got: {set_text}"
+        );
+
+        out.clear();
+        handle_replay_command(
+            "continue",
+            &recording,
+            &mut cursor,
+            &mut replay_breakpoints,
+            &mut out,
+        );
+        assert_eq!(cursor, 1, "continue should pause at resolved executable line");
+    }
+
+    #[test]
+    fn replay_offset_breakpoint_persists_until_cleared() {
+        let recording = VmRecording {
+            program: Program::new(vec![], vec![]),
+            frames: vec![
+                VmRecordingFrame {
+                    ip: 0,
+                    call_depth: 0,
+                    stack: vec![],
+                    locals: vec![],
+                },
+                VmRecordingFrame {
+                    ip: 1,
+                    call_depth: 0,
+                    stack: vec![],
+                    locals: vec![],
+                },
+                VmRecordingFrame {
+                    ip: 2,
+                    call_depth: 0,
+                    stack: vec![],
+                    locals: vec![],
+                },
+                VmRecordingFrame {
+                    ip: 1,
+                    call_depth: 0,
+                    stack: vec![],
+                    locals: vec![],
+                },
+                VmRecordingFrame {
+                    ip: 3,
+                    call_depth: 0,
+                    stack: vec![],
+                    locals: vec![],
+                },
+            ],
+            terminal_status: Some(VmStatus::Halted),
+        };
+        let mut cursor = 0usize;
+        let mut replay_breakpoints = ReplayBreakpoints::default();
+        let mut out = Vec::<u8>::new();
+
+        handle_replay_command(
+            "break 1",
+            &recording,
+            &mut cursor,
+            &mut replay_breakpoints,
+            &mut out,
+        );
+        out.clear();
+        handle_replay_command(
+            "continue",
+            &recording,
+            &mut cursor,
+            &mut replay_breakpoints,
+            &mut out,
+        );
+        assert_eq!(
+            cursor, 1,
+            "first continue should stop at the first matching ip"
+        );
+
+        out.clear();
+        handle_replay_command(
+            "continue",
+            &recording,
+            &mut cursor,
+            &mut replay_breakpoints,
+            &mut out,
+        );
+        assert_eq!(
+            cursor, 3,
+            "second continue should stop at the next matching ip while breakpoint is still set"
+        );
+    }
+
+    #[test]
+    fn replay_line_breakpoint_persists_until_cleared() {
+        let program = Program::with_debug(
+            vec![],
+            vec![],
+            Some(DebugInfo {
+                source: None,
+                lines: vec![
+                    crate::debug_info::LineInfo { offset: 0, line: 1 },
+                    crate::debug_info::LineInfo { offset: 1, line: 7 },
+                    crate::debug_info::LineInfo { offset: 2, line: 2 },
+                    crate::debug_info::LineInfo { offset: 3, line: 7 },
+                ],
+                functions: vec![],
+                locals: vec![],
+            }),
+        );
+        let recording = VmRecording {
+            program,
+            frames: vec![
+                VmRecordingFrame {
+                    ip: 0,
+                    call_depth: 0,
+                    stack: vec![],
+                    locals: vec![],
+                },
+                VmRecordingFrame {
+                    ip: 1,
+                    call_depth: 0,
+                    stack: vec![],
+                    locals: vec![],
+                },
+                VmRecordingFrame {
+                    ip: 2,
+                    call_depth: 0,
+                    stack: vec![],
+                    locals: vec![],
+                },
+                VmRecordingFrame {
+                    ip: 3,
+                    call_depth: 0,
+                    stack: vec![],
+                    locals: vec![],
+                },
+                VmRecordingFrame {
+                    ip: 4,
+                    call_depth: 0,
+                    stack: vec![],
+                    locals: vec![],
+                },
+            ],
+            terminal_status: Some(VmStatus::Halted),
+        };
+        let mut cursor = 0usize;
+        let mut replay_breakpoints = ReplayBreakpoints::default();
+        let mut out = Vec::<u8>::new();
+
+        handle_replay_command(
+            "break line 7",
+            &recording,
+            &mut cursor,
+            &mut replay_breakpoints,
+            &mut out,
+        );
+        out.clear();
+        handle_replay_command(
+            "continue",
+            &recording,
+            &mut cursor,
+            &mut replay_breakpoints,
+            &mut out,
+        );
+        assert_eq!(
+            cursor, 1,
+            "first continue should stop at the first matching line"
+        );
+
+        out.clear();
+        handle_replay_command(
+            "continue",
+            &recording,
+            &mut cursor,
+            &mut replay_breakpoints,
+            &mut out,
+        );
+        assert_eq!(
+            cursor, 3,
+            "second continue should stop at the next matching line while breakpoint is still set"
+        );
+    }
+
+    #[test]
+    fn bridge_continue_stops_again_at_line_breakpoint() {
+        let source = "let a = 1;\nlet b = 2;\nlet c = 3;\n".to_string();
+        let program = Program::with_debug(
+            vec![Value::Int(1), Value::Int(2), Value::Int(3)],
+            vec![
+                crate::vm::OpCode::Ldc as u8,
+                0,
+                0,
+                0,
+                0,
+                crate::vm::OpCode::Stloc as u8,
+                0,
+                crate::vm::OpCode::Ldc as u8,
+                1,
+                0,
+                0,
+                0,
+                crate::vm::OpCode::Stloc as u8,
+                1,
+                crate::vm::OpCode::Ldc as u8,
+                2,
+                0,
+                0,
+                0,
+                crate::vm::OpCode::Stloc as u8,
+                2,
+                crate::vm::OpCode::Ret as u8,
+            ],
+            Some(DebugInfo {
+                source: Some(source),
+                lines: vec![
+                    crate::debug_info::LineInfo { offset: 0, line: 1 },
+                    crate::debug_info::LineInfo { offset: 7, line: 2 },
+                    crate::debug_info::LineInfo {
+                        offset: 14,
+                        line: 3,
+                    },
+                    crate::debug_info::LineInfo {
+                        offset: 19,
+                        line: 4,
+                    },
+                ],
+                functions: vec![],
+                locals: vec![
+                    LocalInfo {
+                        name: "a".to_string(),
+                        index: 0,
+                    },
+                    LocalInfo {
+                        name: "b".to_string(),
+                        index: 1,
+                    },
+                    LocalInfo {
+                        name: "c".to_string(),
+                        index: 2,
+                    },
+                ],
+            }),
+        );
+        let bridge = super::DebugCommandBridge::new();
+        let mut debugger = Debugger::with_command_bridge(bridge.clone());
+        debugger.stop_on_entry();
+
+        let join = std::thread::spawn(move || {
+            let mut vm = Vm::with_locals(program, 3);
+            vm.run_with_debugger(&mut debugger)
+                .expect("debugged vm run should succeed")
+        });
+
+        wait_for_bridge_attachment(&bridge, true);
+        let set_response = bridge
+            .execute("break line 3", Duration::from_millis(200))
+            .expect("set breakpoint command should succeed");
+        assert!(set_response.attached);
+
+        let continue_response = bridge
+            .execute("continue", Duration::from_millis(200))
+            .expect("continue command should succeed");
+        assert!(continue_response.resumed);
+        assert!(!continue_response.attached);
+
+        wait_for_bridge_attachment(&bridge, true);
+        let where_response = bridge
+            .execute("where", Duration::from_millis(200))
+            .expect("where command should succeed");
+        assert!(where_response.attached);
+        assert!(
+            where_response.output.contains("line 3"),
+            "expected to pause at line 3, got: {}",
+            where_response.output
+        );
+
+        let final_continue = bridge
+            .execute("continue", Duration::from_millis(200))
+            .expect("final continue should succeed");
+        assert!(final_continue.resumed);
+        assert!(!final_continue.attached);
+
+        let status = join.join().expect("debugger thread should join");
+        assert_eq!(status, VmStatus::Halted);
+    }
+
+    #[test]
     fn public_replay_api_updates_cursor_and_reports_line() {
         let program = Program::with_debug(
             vec![],
@@ -1993,6 +2440,50 @@ mod tests {
         assert!(
             matches!(step_mode, StepMode::StepOut { depth: 0 }),
             "unexpected step mode after out: {step_mode:?}"
+        );
+    }
+
+    #[test]
+    fn break_line_on_non_executable_source_line_resolves_forward() {
+        let vm = Vm::new(Program::with_debug(
+            vec![],
+            vec![crate::vm::OpCode::Nop as u8, crate::vm::OpCode::Ret as u8],
+            Some(DebugInfo {
+                source: None,
+                lines: vec![
+                    crate::debug_info::LineInfo { offset: 0, line: 8 },
+                    crate::debug_info::LineInfo { offset: 1, line: 13 },
+                ],
+                functions: vec![],
+                locals: vec![],
+            }),
+        ));
+        let mut out = Vec::<u8>::new();
+        let mut breakpoints = HashSet::new();
+        let mut line_breakpoints = HashSet::new();
+        let mut step_mode = StepMode::Running;
+
+        let action = handle_command(
+            "break line 11",
+            &vm,
+            &mut breakpoints,
+            &mut line_breakpoints,
+            &mut step_mode,
+            &mut out,
+        );
+        assert_eq!(action, ReplAction::Continue);
+        assert!(
+            line_breakpoints.contains(&13),
+            "breakpoint should resolve to next executable line"
+        );
+        assert!(
+            !line_breakpoints.contains(&11),
+            "raw non-executable line should not remain as unresolved breakpoint"
+        );
+        let text = String::from_utf8(out).expect("output should be utf-8");
+        assert!(
+            text.contains("line breakpoint set at 13 (requested line 11)"),
+            "expected resolved-line message, got: {text}"
         );
     }
 

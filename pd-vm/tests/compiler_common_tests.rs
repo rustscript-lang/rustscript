@@ -815,6 +815,54 @@ fn compile_source_file_supports_rss_modules_from_js_lua_and_scheme() {
 }
 
 #[test]
+fn compile_source_file_keeps_debug_lines_in_original_source_coordinates() {
+    let unique = format!(
+        "vm_debug_line_map_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).expect("temp module root should be created");
+    let module_path = root.join("module.rss");
+    std::fs::write(&module_path, "pub fn add_one(x);\n").expect("module source should write");
+
+    let js_source = r#"import { add_one } from "./module.rss";
+let value = add_one(41);
+console.log(value);
+"#;
+    let js_path = root.join("main.js");
+    std::fs::write(&js_path, js_source).expect("js source should write");
+
+    let compiled = compile_source_file(&js_path).expect("js compile should succeed");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("compiled program should have debug info");
+    let source = debug
+        .source
+        .as_ref()
+        .expect("debug source should be embedded");
+
+    assert!(
+        source.contains("import { add_one } from \"./module.rss\";"),
+        "debug source should stay in original source coordinates"
+    );
+    let max_source_line = js_source.lines().count() as u32;
+    assert!(
+        debug.lines.iter().all(|line| line.line <= max_source_line),
+        "all debug lines should fit within original source line count"
+    );
+
+    let _ = std::fs::remove_file(js_path);
+    let _ = std::fs::remove_file(module_path);
+    let _ = std::fs::remove_dir(root);
+}
+
+#[test]
 fn compile_source_file_rejects_import_cycles() {
     let unique = format!(
         "vm_import_cycle_test_{}_{}",

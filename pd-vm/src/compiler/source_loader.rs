@@ -7,6 +7,7 @@ use crate::compiler::source_map::SourceMap;
 use super::frontends::{is_ident_continue, is_ident_start};
 use super::{
     CompileSourceFileOptions, SourceError, SourceFlavor, SourcePathError, frontends,
+    ir::{Expr, FrontendIr, Stmt},
     linker::{ParsedUnit, sanitize_scope_prefix},
 };
 
@@ -67,19 +68,15 @@ pub(super) fn load_units_for_source_file(
         &collect_state.module_exports,
         options,
     )?;
-    let root_parse_source = match flavor {
-        SourceFlavor::Scheme => {
-            let mut prelude = build_scheme_import_prelude(
-                path,
-                &root_imports,
-                &collect_state.module_exports,
-                options,
-            )?;
-            prelude.push_str(&rewritten_root.source);
-            prelude
-        }
+    let mut prelude = match flavor {
+        SourceFlavor::Scheme => build_scheme_import_prelude(
+            path,
+            &root_imports,
+            &collect_state.module_exports,
+            options,
+        )?,
         SourceFlavor::RustScript | SourceFlavor::JavaScript | SourceFlavor::Lua => {
-            let mut prelude = build_rustscript_import_prelude(
+            let mut generated = build_rustscript_import_prelude(
                 path,
                 &root_imports,
                 &collect_state.module_exports,
@@ -89,27 +86,185 @@ pub(super) fn load_units_for_source_file(
                 && rewritten_root.requires_vm_namespace
                 && !vm_namespace_direct_calls_supported(&root_imports)
             {
-                prelude.push_str("use vm;\n");
+                generated.push_str("use vm;\n");
             }
-            prelude.push_str(&rewritten_root.source);
-            prelude
+            generated
         }
     };
+    let prelude_line_count = count_lines(&prelude);
+    prelude.push_str(&rewritten_root.source);
+    let root_parse_source = prelude;
 
     let mut root_source_map = SourceMap::new();
     let root_source_id =
         root_source_map.add_source(path.display().to_string(), root_parse_source.clone());
-    let root_parsed = frontends::parse_source(&root_parse_source, flavor)
+    let mut root_parsed = frontends::parse_source(&root_parse_source, flavor)
         .map_err(|err| {
             SourceError::Parse(err.with_line_span_from_source(&root_source_map, root_source_id))
         })
         .map_err(SourcePathError::Source)?;
+    shift_frontend_ir_lines(&mut root_parsed, prelude_line_count);
     collect_state.units.push(ParsedUnit {
         parsed: root_parsed,
         scope_prefix: None,
     });
 
     Ok((root_parse_source, collect_state.units))
+}
+
+fn count_lines(text: &str) -> u32 {
+    if text.is_empty() {
+        0
+    } else {
+        text.lines().count() as u32
+    }
+}
+
+fn shift_frontend_ir_lines(ir: &mut FrontendIr, shift_down: u32) {
+    if shift_down == 0 {
+        return;
+    }
+    for stmt in &mut ir.stmts {
+        shift_stmt_lines(stmt, shift_down);
+    }
+    for function_impl in ir.function_impls.values_mut() {
+        for stmt in &mut function_impl.body_stmts {
+            shift_stmt_lines(stmt, shift_down);
+        }
+        shift_expr_lines(&mut function_impl.body_expr, shift_down);
+    }
+}
+
+fn shift_stmt_lines(stmt: &mut Stmt, shift_down: u32) {
+    match stmt {
+        Stmt::Noop { line }
+        | Stmt::ClosureLet { line, .. }
+        | Stmt::FuncDecl { line, .. }
+        | Stmt::Break { line }
+        | Stmt::Continue { line } => {
+            *line = shifted_line(*line, shift_down);
+        }
+        Stmt::Let { expr, line, .. }
+        | Stmt::Assign { expr, line, .. }
+        | Stmt::Expr { expr, line } => {
+            *line = shifted_line(*line, shift_down);
+            shift_expr_lines(expr, shift_down);
+        }
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            line,
+        } => {
+            *line = shifted_line(*line, shift_down);
+            shift_expr_lines(condition, shift_down);
+            for nested in then_branch {
+                shift_stmt_lines(nested, shift_down);
+            }
+            for nested in else_branch {
+                shift_stmt_lines(nested, shift_down);
+            }
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            line,
+        } => {
+            *line = shifted_line(*line, shift_down);
+            shift_stmt_lines(init, shift_down);
+            shift_expr_lines(condition, shift_down);
+            shift_stmt_lines(post, shift_down);
+            for nested in body {
+                shift_stmt_lines(nested, shift_down);
+            }
+        }
+        Stmt::While {
+            condition,
+            body,
+            line,
+        } => {
+            *line = shifted_line(*line, shift_down);
+            shift_expr_lines(condition, shift_down);
+            for nested in body {
+                shift_stmt_lines(nested, shift_down);
+            }
+        }
+    }
+}
+
+fn shift_expr_lines(expr: &mut Expr, shift_down: u32) {
+    match expr {
+        Expr::Call(_, args) | Expr::LocalCall(_, args) => {
+            for arg in args {
+                shift_expr_lines(arg, shift_down);
+            }
+        }
+        Expr::Closure(closure) => {
+            shift_expr_lines(&mut closure.body, shift_down);
+        }
+        Expr::ClosureCall(closure, args) => {
+            shift_expr_lines(&mut closure.body, shift_down);
+            for arg in args {
+                shift_expr_lines(arg, shift_down);
+            }
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            shift_expr_lines(lhs, shift_down);
+            shift_expr_lines(rhs, shift_down);
+        }
+        Expr::Neg(inner) | Expr::Not(inner) => {
+            shift_expr_lines(inner, shift_down);
+        }
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            shift_expr_lines(condition, shift_down);
+            shift_expr_lines(then_expr, shift_down);
+            shift_expr_lines(else_expr, shift_down);
+        }
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            shift_expr_lines(value, shift_down);
+            for (_, arm_expr) in arms {
+                shift_expr_lines(arm_expr, shift_down);
+            }
+            shift_expr_lines(default, shift_down);
+        }
+        Expr::Block { stmts, expr } => {
+            for stmt in stmts {
+                shift_stmt_lines(stmt, shift_down);
+            }
+            shift_expr_lines(expr, shift_down);
+        }
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::FunctionRef(_)
+        | Expr::Var(_) => {}
+    }
+}
+
+fn shifted_line(line: u32, shift_down: u32) -> u32 {
+    line.saturating_sub(shift_down).max(1)
 }
 
 fn parse_module_imports(

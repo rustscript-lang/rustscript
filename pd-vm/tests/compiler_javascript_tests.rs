@@ -352,6 +352,118 @@ fn compile_source_file_with_javascript_complex_fixture() {
 }
 
 #[test]
+fn compile_source_file_js_replay_break_line_uses_original_source_lines() {
+    let unique = format!(
+        "vm_js_replay_line_map_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).expect("temp module root should be created");
+
+    let module_path = root.join("module.rss");
+    std::fs::write(&module_path, "pub fn add_one(x);\n").expect("module source should write");
+
+    let main_path = root.join("main.js");
+    let main_source = r#"import { add_one } from "./module.rss";
+let value = add_one(41);
+console.log(value);
+"#;
+    std::fs::write(&main_path, main_source).expect("js source should write");
+
+    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let recording_program = compiled.program.clone();
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    for func in &compiled.functions {
+        match func.name.as_str() {
+            "add_one" => vm.register_function(Box::new(AddOne)),
+            "print" => vm.register_function(Box::new(PrintBuiltin)),
+            _ => panic!("unexpected function {}", func.name),
+        };
+    }
+
+    let mut debugger = vm::Debugger::with_recording(recording_program);
+    let status = vm
+        .run_with_debugger(&mut debugger)
+        .expect("vm should run under debugger recording");
+    assert_eq!(status, VmStatus::Halted);
+
+    let recording = debugger
+        .take_recording()
+        .expect("recording should be available");
+    let mut replay = vm::VmRecordingReplayState::default();
+    let _ = vm::run_recording_replay_command(&recording, &mut replay, "break line 2");
+    let continue_response = vm::run_recording_replay_command(&recording, &mut replay, "continue");
+    assert_eq!(
+        continue_response.current_line,
+        Some(2),
+        "expected replay to stop at source line 2, got output: {}",
+        continue_response.output
+    );
+    let where_response = vm::run_recording_replay_command(&recording, &mut replay, "where");
+    assert!(
+        where_response.output.contains("line 2"),
+        "where output should report line 2, got: {}",
+        where_response.output
+    );
+
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_file(module_path);
+    let _ = std::fs::remove_dir(root);
+}
+
+#[test]
+fn compile_source_file_js_complex_replay_break_line_resolves_non_executable_lines() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.js");
+    let compiled = compile_source_file(&path).expect("compile should succeed");
+    let recording_program = compiled.program.clone();
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    for func in &compiled.functions {
+        match func.name.as_str() {
+            "add_one" => vm.register_function(Box::new(AddOne)),
+            "print" => vm.register_function(Box::new(PrintBuiltin)),
+            _ => panic!("unexpected function {}", func.name),
+        };
+    }
+
+    let mut debugger = vm::Debugger::with_recording(recording_program);
+    let status = vm
+        .run_with_debugger(&mut debugger)
+        .expect("vm should run under debugger recording");
+    assert_eq!(status, VmStatus::Halted);
+
+    let recording = debugger
+        .take_recording()
+        .expect("recording should be available");
+    let mut replay = vm::VmRecordingReplayState::default();
+
+    let set_response = vm::run_recording_replay_command(&recording, &mut replay, "break line 11");
+    assert!(
+        set_response.output.contains("line 13 (requested line 11)"),
+        "non-executable line should resolve to next executable source line, got: {}",
+        set_response.output
+    );
+
+    let continue_response = vm::run_recording_replay_command(&recording, &mut replay, "continue");
+    assert_eq!(
+        continue_response.current_line,
+        Some(13),
+        "expected replay to stop at resolved source line 13, got output: {}",
+        continue_response.output
+    );
+
+    let where_response = vm::run_recording_replay_command(&recording, &mut replay, "where");
+    assert!(
+        where_response.output.contains("line 13"),
+        "where output should report line 13, got: {}",
+        where_response.output
+    );
+}
+
+#[test]
 fn javascript_module_declarations_are_ignored() {
     let source = r#"
         import {
