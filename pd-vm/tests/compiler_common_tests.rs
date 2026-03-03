@@ -704,7 +704,8 @@ fn find_first_while_loop_span(instructions: &[DecodedInstr]) -> (usize, usize, u
             };
             let target = target_u32 as usize;
             if target < instruction.ip {
-                backedge_ip = Some(backedge_ip.map_or(candidate.ip, |current| current.max(candidate.ip)));
+                backedge_ip =
+                    Some(backedge_ip.map_or(candidate.ip, |current| current.max(candidate.ip)));
             }
         }
 

@@ -340,6 +340,8 @@ enum VmHostFunction {
 
 pub struct Vm {
     program: Arc<Program>,
+    program_constants_ptr: *const Value,
+    program_constants_len: usize,
     program_cache_key: u64,
     program_cache_key_ready: bool,
     ip: usize,
@@ -453,8 +455,12 @@ impl Vm {
     }
 
     pub fn new_shared(program: Arc<Program>) -> Self {
+        let program_constants_ptr = program.constants.as_ptr();
+        let program_constants_len = program.constants.len();
         Self {
             program,
+            program_constants_ptr,
+            program_constants_len,
             program_cache_key: 0,
             program_cache_key_ready: false,
             ip: 0,
@@ -484,8 +490,12 @@ impl Vm {
     }
 
     pub fn with_locals_shared(program: Arc<Program>, local_count: usize) -> Self {
+        let program_constants_ptr = program.constants.as_ptr();
+        let program_constants_len = program.constants.len();
         Self {
             program,
+            program_constants_ptr,
+            program_constants_len,
             program_cache_key: 0,
             program_cache_key_ready: false,
             ip: 0,
@@ -872,13 +882,13 @@ impl Vm {
                 return Err(VmError::BytecodeBounds);
             }
 
-            if self.fuel_remaining.is_some() {
-                if let Err(err) = self.charge_fuel_tick() {
-                    if self.handle_debugger_error(&mut debugger, &err) {
-                        continue;
-                    }
-                    return Err(err);
+            if self.fuel_remaining.is_some()
+                && let Err(err) = self.charge_fuel_tick()
+            {
+                if self.handle_debugger_error(&mut debugger, &err) {
+                    continue;
                 }
+                return Err(err);
             }
             let opcode = self.read_u8()?;
             let outcome = match self.execute_interpreter_instruction(opcode) {
@@ -1082,10 +1092,6 @@ impl Vm {
 
     pub fn call_depth(&self) -> usize {
         self.call_depth
-    }
-
-    pub(in crate::vm) fn fuel_metering_enabled(&self) -> bool {
-        self.fuel_remaining.is_some()
     }
 
     fn pending_fuel_debt(&self) -> u64 {
