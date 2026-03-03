@@ -88,7 +88,7 @@ pub(super) enum CompiledNativeTrace {
         code: Vec<u8>,
     },
     #[cfg(feature = "cranelift-jit")]
-    Cranelift(CraneliftCompiledTrace),
+    Cranelift(Box<CraneliftCompiledTrace>),
 }
 
 pub(super) fn compile_native_trace(
@@ -139,9 +139,9 @@ pub(super) fn take_bridge_error() -> Option<VmError> {
 fn compile_native_trace_cranelift(trace: &super::JitTrace) -> VmResult<CompiledNativeTrace> {
     #[cfg(feature = "cranelift-jit")]
     {
-        return Ok(CompiledNativeTrace::Cranelift(cranelift::compile_trace(
-            trace,
-        )?));
+        Ok(CompiledNativeTrace::Cranelift(Box::new(
+            cranelift::compile_trace(trace)?,
+        )))
     }
 
     #[cfg(not(feature = "cranelift-jit"))]

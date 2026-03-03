@@ -1,6 +1,8 @@
 use super::super::{ExecOutcome, HostCallExecOutcome, Vm, VmError, VmResult};
 use super::{JitTrace, JitTraceTerminal, TraceStep, native};
 use std::collections::HashMap;
+#[cfg(feature = "cranelift-jit")]
+use std::rc::Rc;
 use std::sync::Arc;
 #[cfg(any(
     all(
@@ -41,7 +43,7 @@ type NativeTraceEntry = unsafe extern "C" fn(*mut Vm) -> i32;
 type NativeTraceEntry = fn(*mut Vm) -> i32;
 
 #[cfg(feature = "cranelift-jit")]
-type MaybeCraneliftKeepalive = Option<Arc<native::CraneliftTraceKeepAlive>>;
+type MaybeCraneliftKeepalive = Option<Rc<native::CraneliftTraceKeepAlive>>;
 
 pub(crate) struct NativeTrace {
     #[cfg(any(
@@ -113,7 +115,7 @@ struct NativeTraceCache {
 #[derive(Clone)]
 struct CraneliftNativeTraceCacheEntry {
     entry: NativeTraceEntry,
-    keepalive: Arc<native::CraneliftTraceKeepAlive>,
+    keepalive: Rc<native::CraneliftTraceKeepAlive>,
     code: Arc<[u8]>,
 }
 
@@ -635,12 +637,12 @@ impl Vm {
                             std::mem::transmute::<*const u8, NativeTraceEntry>(compiled.entry)
                         };
                         let code = Arc::<[u8]>::from(compiled.code.into_boxed_slice());
-                        let keepalive = Arc::new(compiled.keepalive);
+                        let keepalive = Rc::new(compiled.keepalive);
                         #[cfg(feature = "cranelift-jit")]
                         {
                             let cached = CraneliftNativeTraceCacheEntry {
                                 entry,
-                                keepalive: Arc::clone(&keepalive),
+                                keepalive: Rc::clone(&keepalive),
                                 code: Arc::clone(&code),
                             };
                             let key = native_trace_cache_key(

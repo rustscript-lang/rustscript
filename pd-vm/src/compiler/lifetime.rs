@@ -109,7 +109,7 @@ impl AvailabilityAnalyzer {
                 let after_possible = state.possible[slot];
                 let after_definite = state.definite[slot];
                 let entered_uncertain =
-                    after_possible && !after_definite && !(before_possible && !before_definite);
+                    after_possible && !after_definite && (!before_possible || before_definite);
                 if entered_uncertain {
                     rewritten.push(Stmt::Assign {
                         index: slot as u8,
@@ -198,8 +198,10 @@ impl AvailabilityAnalyzer {
                 // `for` loop condition executes before each iteration and at least once.
                 // Body/post execution is optional, so only condition-side availability is guaranteed after loop.
                 let mut possible = cond_state.possible.clone();
-                for slot in 0..self.local_count {
-                    possible[slot] = possible[slot] || post_state.possible[slot];
+                for (possible_slot, post_possible) in
+                    possible.iter_mut().zip(post_state.possible.iter())
+                {
+                    *possible_slot = *possible_slot || *post_possible;
                 }
                 let out = FlowState {
                     reachable: state.reachable && cond_state.reachable,
@@ -227,8 +229,10 @@ impl AvailabilityAnalyzer {
 
                 // `while` condition executes at least once; body execution is optional.
                 let mut possible = cond_state.possible.clone();
-                for slot in 0..self.local_count {
-                    possible[slot] = possible[slot] || body_state.possible[slot];
+                for (possible_slot, body_possible) in
+                    possible.iter_mut().zip(body_state.possible.iter())
+                {
+                    *possible_slot = *possible_slot || *body_possible;
                 }
                 let out = FlowState {
                     reachable: state.reachable && cond_state.reachable,
