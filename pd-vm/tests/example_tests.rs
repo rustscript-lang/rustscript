@@ -1,4 +1,5 @@
 #![cfg(feature = "runtime")]
+use std::collections::HashSet;
 use std::path::Path;
 
 use vm::{
@@ -72,7 +73,9 @@ fn expect_direct_only_source_file_error(path: &Path) {
         vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
             assert!(
                 parse.message.contains("unsupported Lua syntax")
-                    || parse.message.contains("unsupported Scheme syntax"),
+                    || parse.message.contains("unsupported Scheme syntax")
+                    || parse.message.contains("unsupported identifier")
+                    || parse.message.contains("reserved"),
                 "{}",
                 parse.message
             );
@@ -85,24 +88,41 @@ fn expect_direct_only_source_file_error(path: &Path) {
 fn examples_run() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
 
-    let stack = run_compiled_file(&root.join("example.rss"));
-    assert_eq!(stack, vec![Value::Int(6)]);
+    let runnable_examples = [
+        ("example.rss", vec![Value::Int(6)]),
+        ("example.js", vec![Value::Int(6)]),
+        ("example.lua", vec![Value::Int(6)]),
+        ("example.scm", vec![Value::Int(6)]),
+        ("example_complex.rss", vec![Value::Int(12)]),
+        ("example_complex.js", vec![Value::Int(12)]),
+    ];
+    let direct_only_rejected_examples = ["example_complex.lua", "example_complex.scm"];
 
-    let stack = run_compiled_file(&root.join("example.js"));
-    assert_eq!(stack, vec![Value::Int(6)]);
+    let mut covered = HashSet::new();
+    for (name, expected_stack) in runnable_examples {
+        let stack = run_compiled_file(&root.join(name));
+        assert_eq!(stack, expected_stack, "unexpected stack for {name}");
+        covered.insert(name);
+    }
+    for name in direct_only_rejected_examples {
+        expect_direct_only_source_file_error(&root.join(name));
+        covered.insert(name);
+    }
 
-    expect_direct_only_source_file_error(&root.join("example.lua"));
-    expect_direct_only_source_file_error(&root.join("example.scm"));
-
-    // Feature examples for each frontend flavor.
-    let stack = run_compiled_file(&root.join("example_complex.rss"));
-    assert_eq!(stack, vec![Value::Int(12)]);
-
-    let stack = run_compiled_file(&root.join("example_complex.js"));
-    assert_eq!(stack, vec![Value::Int(12)]);
-
-    expect_direct_only_source_file_error(&root.join("example_complex.lua"));
-    expect_direct_only_source_file_error(&root.join("example_complex.scm"));
+    let discovered = std::fs::read_dir(&root)
+        .expect("examples directory should be readable")
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with("example.") || name.starts_with("example_complex."))
+        .collect::<HashSet<_>>();
+    let expected = covered
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        discovered, expected,
+        "example fixture coverage drifted; update examples_run matrix"
+    );
 
     // AES fixture should also be consumable as a module from another RSS program.
     let stack = run_compiled_file(&root.join("aes_128_cbc_usage.rss"));

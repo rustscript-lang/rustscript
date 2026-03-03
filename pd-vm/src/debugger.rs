@@ -2091,7 +2091,10 @@ mod tests {
             &mut replay_breakpoints,
             &mut out,
         );
-        assert_eq!(cursor, 1, "continue should pause at resolved executable line");
+        assert_eq!(
+            cursor, 1,
+            "continue should pause at resolved executable line"
+        );
     }
 
     #[test]
@@ -2452,7 +2455,10 @@ mod tests {
                 source: None,
                 lines: vec![
                     crate::debug_info::LineInfo { offset: 0, line: 8 },
-                    crate::debug_info::LineInfo { offset: 1, line: 13 },
+                    crate::debug_info::LineInfo {
+                        offset: 1,
+                        line: 13,
+                    },
                 ],
                 functions: vec![],
                 locals: vec![],

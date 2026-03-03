@@ -1,12 +1,15 @@
 local add_one = require("vm").add_one
+local strings = require("../stdlib/rss/strings.rss")
 
-local total = 0
-for i = 3, 1, -1 do
-    total = total + 1
+local d = "12321312"
+local e = "23232"
+
+local ret = 1
+
+if strings.non_empty(d) and strings.non_empty(e) then
+    ret = add_one(5)
+else
+    ret =   0
 end
 
-if total ~= 3 then
-    print(0)
-elseif total == 3 then
-    print(add_one(5))
-end
+print(ret)

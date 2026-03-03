@@ -120,6 +120,27 @@ fn lower_scheme_direct_stmt(
                 }
                 return Ok(Some(out));
             }
+            "declare" => {
+                for decl in args {
+                    if let Some(name_raw) = decl.as_symbol() {
+                        let name =
+                            normalize_identifier(name_raw, decl.line, "declare target function")?;
+                        builder.declare_function(&name, None)?;
+                        continue;
+                    }
+                    let Some(items) = decl.as_list() else {
+                        return Ok(None);
+                    };
+                    let Some(name_raw) = items.first().and_then(|item| item.as_symbol()) else {
+                        return Ok(None);
+                    };
+                    let name =
+                        normalize_identifier(name_raw, decl.line, "declare target function")?;
+                    let arity = u8::try_from(items.len().saturating_sub(1)).ok();
+                    builder.declare_function(&name, arity)?;
+                }
+                return Ok(Some(Vec::new()));
+            }
             _ => {}
         }
     }
@@ -159,7 +180,7 @@ fn lower_scheme_direct_branch(
 
 fn lower_scheme_direct_expr(
     form: &SchemeForm,
-    builder: &LocalIrBuilder,
+    builder: &mut LocalIrBuilder,
 ) -> Result<Option<Expr>, ParseError> {
     match &form.node {
         SchemeNode::Int(value) => Ok(Some(Expr::Int(*value))),
@@ -186,7 +207,7 @@ fn lower_scheme_direct_expr(
 
 fn lower_scheme_direct_list_expr(
     items: &[SchemeForm],
-    builder: &LocalIrBuilder,
+    builder: &mut LocalIrBuilder,
 ) -> Result<Option<Expr>, ParseError> {
     let Some(head) = items.first().and_then(|item| item.as_symbol()) else {
         return Ok(None);
@@ -302,13 +323,23 @@ fn lower_scheme_direct_list_expr(
                 else_expr: Box::new(else_expr),
             }))
         }
-        _ => Ok(None),
+        _ => {
+            let name = normalize_identifier(head, items[0].line, "function call target")?;
+            let mut lowered_args = Vec::with_capacity(args.len());
+            for arg in args {
+                let Some(expr) = lower_scheme_direct_expr(arg, builder)? else {
+                    return Ok(None);
+                };
+                lowered_args.push(expr);
+            }
+            Ok(builder.resolve_call_expr(&name, lowered_args))
+        }
     }
 }
 
 fn lower_scheme_direct_binary<F>(
     args: &[SchemeForm],
-    builder: &LocalIrBuilder,
+    builder: &mut LocalIrBuilder,
     build: F,
 ) -> Result<Option<Expr>, ParseError>
 where
@@ -328,7 +359,7 @@ where
 
 fn lower_scheme_direct_fold<F>(
     args: &[SchemeForm],
-    builder: &LocalIrBuilder,
+    builder: &mut LocalIrBuilder,
     build: F,
     eval_int: fn(i64, i64) -> Option<i64>,
 ) -> Result<Option<Expr>, ParseError>
@@ -385,7 +416,7 @@ where
 
 fn lower_scheme_direct_compare_fold<F>(
     args: &[SchemeForm],
-    builder: &LocalIrBuilder,
+    builder: &mut LocalIrBuilder,
     build: F,
 ) -> Result<Option<Expr>, ParseError>
 where
