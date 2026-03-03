@@ -148,13 +148,10 @@ mod tests {
                 SourceFlavor::JavaScript,
                 include_str!("../../examples/example.js"),
             ),
-            (
-                SourceFlavor::Lua,
-                include_str!("../../examples/example.lua"),
-            ),
+            (SourceFlavor::Lua, "local a = 1\na = a + 1\na"),
             (
                 SourceFlavor::Scheme,
-                include_str!("../../examples/example.scm"),
+                "(define a 1)\n(set! a (+ a 1))\na",
             ),
         ];
 

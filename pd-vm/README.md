@@ -6,6 +6,7 @@ source syntaxes (`.rss`, `.js`, `.lua`, `.scm`).
 ## Sections
 
 - [Overview](#overview)
+- [TODO](#todo)
 - [How To Use](#how-to-use)
 - [Internals](#internals)
 - [Compiler frontend syntax and feature support](src/compiler/frontends/README.md)
@@ -16,6 +17,11 @@ source syntaxes (`.rss`, `.js`, `.lua`, `.scm`).
 Executes compiled compact bytecode rather than interpreting source.
 Offers consistent runtime semantics for both synchronous and asynchronous execution.
 Includes rich debugging and profiling tools: interactive debugger, recording and replay, and JIT trace insights.
+
+## TODO
+
+- [ ] Built-in first-class fuel/epoch budgeting API in the VM loop.
+- [ ] Callable-as-value support.
 
 ## How To Use
 

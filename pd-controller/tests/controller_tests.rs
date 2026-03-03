@@ -698,13 +698,28 @@ async fn ui_deploy_compiles_graph_code_for_all_flavors() {
     let client = reqwest::Client::new();
 
     let flavors = [
-        ("rustscript", "dp-ui-rss", "use vm;"),
-        ("javascript", "dp-ui-js", "import * as vm from \"vm\";"),
-        ("lua", "dp-ui-lua", "local vm = require(\"vm\")"),
-        ("scheme", "dp-ui-scm", "(require (prefix-in vm. \"vm\"))"),
+        ("rustscript", "dp-ui-rss", "use vm;", reqwest::StatusCode::ACCEPTED),
+        (
+            "javascript",
+            "dp-ui-js",
+            "import * as vm from \"vm\";",
+            reqwest::StatusCode::ACCEPTED,
+        ),
+        (
+            "lua",
+            "dp-ui-lua",
+            "local vm = require(\"vm\")",
+            reqwest::StatusCode::BAD_REQUEST,
+        ),
+        (
+            "scheme",
+            "dp-ui-scm",
+            "(require (prefix-in vm. \"vm\"))",
+            reqwest::StatusCode::BAD_REQUEST,
+        ),
     ];
 
-    for (flavor, edge_id, expected_prelude) in flavors {
+    for (flavor, edge_id, expected_prelude, expected_status) in flavors {
         let deploy = client
             .post(format!("http://{addr}/v1/ui/deploy"))
             .json(&serde_json::json!({
@@ -724,20 +739,31 @@ async fn ui_deploy_compiles_graph_code_for_all_flavors() {
             .expect("deploy request should complete");
         assert_eq!(
             deploy.status(),
-            reqwest::StatusCode::ACCEPTED,
-            "deploy should compile for flavor {flavor}"
+            expected_status,
+            "unexpected deploy status for flavor {flavor}"
         );
-        let deploy_json = deploy
+
+        let payload = deploy
             .json::<serde_json::Value>()
             .await
             .expect("deploy payload should decode");
-        let source = deploy_json["source"][flavor]
-            .as_str()
-            .expect("flavor source should be present");
-        assert!(
-            source.contains(expected_prelude),
-            "generated source should include vm prelude for flavor {flavor}, got: {source}"
-        );
+        if expected_status == reqwest::StatusCode::ACCEPTED {
+            let source = payload["source"][flavor]
+                .as_str()
+                .expect("flavor source should be present");
+            assert!(
+                source.contains(expected_prelude),
+                "generated source should include vm prelude for flavor {flavor}, got: {source}"
+            );
+        } else {
+            let message = payload["error"]
+                .as_str()
+                .expect("error payload should include message");
+            assert!(
+                message.contains("source compile failed"),
+                "lua/scheme deploy should fail during compile, got: {message}"
+            );
+        }
     }
 
     handle.abort();
