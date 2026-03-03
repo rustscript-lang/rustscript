@@ -20,7 +20,8 @@ Includes rich debugging and profiling tools: interactive debugger, recording and
 
 ## TODO
 
-- [ ] Built-in first-class fuel/epoch budgeting API in the VM loop.
+- [x] Built-in fuel budgeting API in the VM loop (`Vm` + `Store`).
+- [ ] Epoch-based interruption API.
 - [ ] Callable-as-value support.
 
 ## How To Use
@@ -30,7 +31,7 @@ Includes rich debugging and profiling tools: interactive debugger, recording and
 Run with the VM runner binary:
 
 ```powershell
-cargo run -p pd-vm --bin pd-vm-run -- examples/example.lua
+cargo run -p pd-vm --bin pd-vm-run -- --fuel 100000 examples/example.lua
 ```
 
 Other supported flavors:
@@ -64,7 +65,7 @@ Run debugger over TCP:
 cargo run -p pd-vm --bin pd-vm-run -- --debug --tcp 127.0.0.1:9002 examples/example.lua
 ```
 
-Useful commands: `break`, `break line`, `step`, `next`, `out`, `stack`, `locals`, `where`, `continue`.
+Useful commands: `break`, `break line`, `step`, `next`, `out`, `stack`, `locals`, `where`, `continue`, `fuel`.
 
 ### Recording and Replay
 
@@ -137,6 +138,78 @@ Library hooks:
 - `vm.dump_jit_info()`
 - `vm.jit_native_trace_count()`
 - `vm.jit_native_exec_count()`
+
+### Fuel Metering
+
+`pd-vm` provides Wasmtime-style fuel controls on both `Vm` and `Store<T>`:
+
+- `set_fuel`
+- `set_fuel_check_interval`
+- `fuel_check_interval`
+- `get_fuel`
+- `consume_fuel`
+- `add_fuel` / `recharge_fuel` (`Store::recharge`)
+- `fuel_checkpoint` / `checkpoint`
+- `restore_fuel` / `restore_checkpoint`
+
+`Store<T>` is a lightweight wrapper around `Vm` plus host context data (`data()` / `data_mut()`),
+and forwards `run()` / `resume()`.
+
+`pd-vm-run` supports `--fuel <n>` to set the initial VM fuel budget.
+
+Debugger fuel commands:
+
+- `fuel` (show remaining fuel and check interval)
+- `fuel set <n>`
+- `fuel add <n>`
+- `fuel clear`
+- `fuel interval [n]`
+
+Example:
+
+```rust
+use vm::{Store, VmStatus};
+
+// ... create vm ...
+let mut store = Store::from_vm(vm);
+store.set_fuel(10_000);
+store.set_fuel_check_interval(1)?; // exact mode: check every instruction/trace step
+let checkpoint = store.checkpoint();
+
+loop {
+    match store.run()? {
+        VmStatus::Halted => break,
+        VmStatus::Yielded => continue,
+        VmStatus::Waiting(_) => {
+            store.vm_mut().wait_for_host_op_blocking()?;
+        }
+    }
+}
+
+store.recharge(1_000)?;
+store.restore_checkpoint(checkpoint);
+```
+
+Fuel charging semantics:
+
+- Fuel metering is disabled by default (`get_fuel() == None`).
+- `set_fuel` sets an explicit budget; `add_fuel` also enables metering if it was disabled.
+- Fuel is consumed in chunks at the configured check cadence.
+  Chunk size = `fuel_check_interval`.
+  Default interval is `1` (exact mode).
+- The interpreter applies fuel checks in the VM loop before opcode fetch/execute.
+- Trace-JIT execution applies the same cadence before each `TraceStep`.
+- When fuel metering is enabled, native JIT entry falls back to trace-step execution so accounting
+  stays per-step accurate.
+- With interval `> 1`, out-of-fuel detection is coarse-grained: execution may run up to
+  `interval - 1` extra instructions before the next fuel check.
+- If there is not enough fuel, execution returns `VmError::OutOfFuel { needed, remaining }`
+  before the next instruction runs (instruction pointer is not advanced).
+- `FuelCheckpoint` snapshots only fuel-accounting state (remaining budget, check interval, and
+  current check-phase cursor). Restoring a checkpoint does not rewind VM stack, locals, or
+  instruction pointer.
+- Host-side work is not automatically metered beyond VM instruction execution; host code can call
+  `consume_fuel` explicitly for additional charging policy.
 
 ### Wasm Lint
 

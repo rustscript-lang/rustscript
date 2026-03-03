@@ -6,7 +6,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::debug_info::DebugInfo;
-use crate::vm::{Program, Value, Vm, VmStatus};
+use crate::vm::{Program, Value, Vm, VmError, VmStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepMode {
@@ -367,7 +367,7 @@ impl Debugger {
         self.breakpoints.remove(&offset);
     }
 
-    pub fn on_instruction(&mut self, vm: &Vm) {
+    pub fn on_instruction(&mut self, vm: &mut Vm) {
         if let Some(recording) = self.recording.as_mut() {
             recording.record_state(vm);
         }
@@ -405,7 +405,7 @@ impl Debugger {
         }
         if should_break {
             self.step_mode = StepMode::Running;
-            self.client_detached = self.repl(vm);
+            self.client_detached = self.repl(vm, None);
         }
     }
 
@@ -413,6 +413,17 @@ impl Debugger {
         if let Some(recording) = self.recording.as_mut() {
             recording.on_terminal_status(vm, status);
         }
+    }
+
+    pub fn on_vm_error(&mut self, vm: &mut Vm, err: &VmError) -> bool {
+        let banner = match err {
+            VmError::OutOfFuel { needed, remaining } => Some(format!(
+                "execution interrupted: out of fuel (needed {needed}, remaining {remaining}). use `fuel set <n>` or `fuel add <n>`, then `continue`"
+            )),
+            _ => None,
+        };
+        self.client_detached = self.repl(vm, banner.as_deref());
+        !self.client_detached
     }
 
     pub fn take_recording(&mut self) -> Option<VmRecording> {
@@ -423,13 +434,14 @@ impl Debugger {
         std::mem::take(&mut self.client_detached)
     }
 
-    fn repl(&mut self, vm: &Vm) -> bool {
+    fn repl(&mut self, vm: &mut Vm, banner: Option<&str>) -> bool {
         if let Some(server) = self.server.as_mut() {
             return server.repl(
                 vm,
                 &mut self.breakpoints,
                 &mut self.line_breakpoints,
                 &mut self.step_mode,
+                banner,
             );
         }
         if let Some(bridge) = self.bridge.as_ref() {
@@ -438,6 +450,7 @@ impl Debugger {
                 &mut self.breakpoints,
                 &mut self.line_breakpoints,
                 &mut self.step_mode,
+                banner,
             );
         }
         repl_stdio(
@@ -445,6 +458,7 @@ impl Debugger {
             &mut self.breakpoints,
             &mut self.line_breakpoints,
             &mut self.step_mode,
+            banner,
         );
         false
     }
@@ -553,10 +567,11 @@ impl DebugCommandBridge {
 
     fn repl(
         &self,
-        vm: &Vm,
+        vm: &mut Vm,
         breakpoints: &mut HashSet<usize>,
         line_breakpoints: &mut HashSet<u32>,
         step: &mut StepMode,
+        _banner: Option<&str>,
     ) -> bool {
         {
             let mut state = self
@@ -687,10 +702,11 @@ impl DebugServer {
 
     fn repl(
         &mut self,
-        vm: &Vm,
+        vm: &mut Vm,
         breakpoints: &mut HashSet<usize>,
         line_breakpoints: &mut HashSet<u32>,
         step: &mut StepMode,
+        banner: Option<&str>,
     ) -> bool {
         if self.ensure_client().is_err() {
             return false;
@@ -699,6 +715,9 @@ impl DebugServer {
             return false;
         };
         let _ = writeln!(stream, "debugger attached. type 'help' for commands");
+        if let Some(text) = banner {
+            let _ = writeln!(stream, "{text}");
+        }
         let Ok(clone) = stream.try_clone() else {
             self.stream = None;
             return true;
@@ -729,13 +748,17 @@ impl DebugServer {
 }
 
 fn repl_stdio(
-    vm: &Vm,
+    vm: &mut Vm,
     breakpoints: &mut HashSet<usize>,
     line_breakpoints: &mut HashSet<u32>,
     step: &mut StepMode,
+    banner: Option<&str>,
 ) {
     let stdin = io::stdin();
     let mut input = String::new();
+    if let Some(text) = banner {
+        println!("{text}");
+    }
     loop {
         input.clear();
         print!("(pdb) ");
@@ -777,7 +800,7 @@ impl ReplAction {
 
 fn handle_command(
     line: &str,
-    vm: &Vm,
+    vm: &mut Vm,
     breakpoints: &mut HashSet<usize>,
     line_breakpoints: &mut HashSet<u32>,
     step: &mut StepMode,
@@ -928,6 +951,69 @@ fn handle_command(
         "ip" => {
             let _ = writeln!(out, "ip: {}", vm.ip());
         }
+        "fuel" => {
+            let Some(sub) = parts.next() else {
+                print_fuel_state(vm, out);
+                return ReplAction::Continue;
+            };
+            match sub {
+                "set" => {
+                    if let Some(value) = parse_u64(parts.next()) {
+                        vm.set_fuel(value);
+                        let _ = writeln!(out, "fuel set to {value}");
+                        print_fuel_state(vm, out);
+                    } else {
+                        let _ = writeln!(out, "usage: fuel set <amount>");
+                    }
+                }
+                "add" => {
+                    if let Some(value) = parse_u64(parts.next()) {
+                        match vm.add_fuel(value) {
+                            Ok(()) => {
+                                let _ = writeln!(out, "fuel added: {value}");
+                                print_fuel_state(vm, out);
+                            }
+                            Err(err) => {
+                                let _ = writeln!(out, "fuel add failed: {err}");
+                            }
+                        }
+                    } else {
+                        let _ = writeln!(out, "usage: fuel add <amount>");
+                    }
+                }
+                "clear" => {
+                    vm.clear_fuel();
+                    let _ = writeln!(out, "fuel metering disabled");
+                    print_fuel_state(vm, out);
+                }
+                "interval" => {
+                    if let Some(raw) = parts.next() {
+                        match raw.parse::<u32>() {
+                            Ok(interval) => match vm.set_fuel_check_interval(interval) {
+                                Ok(()) => {
+                                    let _ = writeln!(out, "fuel check interval set to {interval}");
+                                    print_fuel_state(vm, out);
+                                }
+                                Err(err) => {
+                                    let _ = writeln!(out, "fuel interval update failed: {err}");
+                                }
+                            },
+                            Err(_) => {
+                                let _ = writeln!(out, "usage: fuel interval <n>");
+                            }
+                        }
+                    } else {
+                        let _ = writeln!(out, "fuel check interval: {}", vm.fuel_check_interval());
+                    }
+                }
+                _ => {
+                    let _ = writeln!(
+                        out,
+                        "usage: fuel | fuel set <amount> | fuel add <amount> | fuel clear | fuel interval [n]"
+                    );
+                }
+            }
+        }
         "where" => {
             if let Some(info) = vm.debug_info() {
                 let line = info.line_for_offset(vm.ip());
@@ -956,7 +1042,7 @@ fn handle_command(
         "help" => {
             let _ = writeln!(
                 out,
-                "commands: break, break line, bl, clear, clear line, cl, breaks, continue, step, next, out, stack, locals, print, ip, where, funcs, help"
+                "commands: break, break line, bl, clear, clear line, cl, breaks, continue, step, next, out, stack, locals, print, ip, where, funcs, fuel, help"
             );
         }
         _ => {
@@ -1018,6 +1104,18 @@ fn print_local_by_name(vm: &Vm, name: &str, out: &mut dyn Write) {
     }
 }
 
+fn print_fuel_state(vm: &Vm, out: &mut dyn Write) {
+    let remaining = vm
+        .get_fuel()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "disabled".to_string());
+    let _ = writeln!(
+        out,
+        "fuel: {remaining}, check_interval={}",
+        vm.fuel_check_interval()
+    );
+}
+
 pub fn attach_with_debugger(vm: &mut Vm, debugger: &mut Debugger) {
     debugger.on_instruction(vm);
 }
@@ -1033,6 +1131,10 @@ fn current_line(vm: &Vm) -> Option<u32> {
 
 fn parse_u32(token: Option<&str>) -> Option<u32> {
     token.and_then(|value| value.parse::<u32>().ok())
+}
+
+fn parse_u64(token: Option<&str>) -> Option<u64> {
+    token.and_then(|value| value.parse::<u64>().ok())
 }
 
 fn resolve_executable_line(info: &DebugInfo, requested_line: u32) -> u32 {
@@ -1753,7 +1855,7 @@ mod tests {
 
     #[test]
     fn print_local_by_name_uses_debug_name() {
-        let vm = vm_with_named_local("counter", Value::Int(42));
+        let mut vm = vm_with_named_local("counter", Value::Int(42));
         let mut out = Vec::<u8>::new();
         let mut breakpoints = HashSet::new();
         let mut line_breakpoints = HashSet::new();
@@ -1761,7 +1863,7 @@ mod tests {
 
         let action = handle_command(
             "print counter",
-            &vm,
+            &mut vm,
             &mut breakpoints,
             &mut line_breakpoints,
             &mut step_mode,
@@ -1774,7 +1876,7 @@ mod tests {
 
     #[test]
     fn print_local_by_name_reports_unknown_local() {
-        let vm = vm_with_named_local("counter", Value::Int(42));
+        let mut vm = vm_with_named_local("counter", Value::Int(42));
         let mut out = Vec::<u8>::new();
         let mut breakpoints = HashSet::new();
         let mut line_breakpoints = HashSet::new();
@@ -1782,7 +1884,7 @@ mod tests {
 
         handle_command(
             "p missing",
-            &vm,
+            &mut vm,
             &mut breakpoints,
             &mut line_breakpoints,
             &mut step_mode,
@@ -1794,7 +1896,7 @@ mod tests {
 
     #[test]
     fn print_local_by_name_shows_null_for_unassigned_local() {
-        let vm = vm_with_named_unassigned_local("counter");
+        let mut vm = vm_with_named_unassigned_local("counter");
         let mut out = Vec::<u8>::new();
         let mut breakpoints = HashSet::new();
         let mut line_breakpoints = HashSet::new();
@@ -1802,7 +1904,7 @@ mod tests {
 
         handle_command(
             "p counter",
-            &vm,
+            &mut vm,
             &mut breakpoints,
             &mut line_breakpoints,
             &mut step_mode,
@@ -2411,7 +2513,7 @@ mod tests {
 
     #[test]
     fn handle_command_next_and_out_set_expected_step_modes() {
-        let vm = Vm::new(Program::new(vec![], vec![crate::vm::OpCode::Ret as u8]));
+        let mut vm = Vm::new(Program::new(vec![], vec![crate::vm::OpCode::Ret as u8]));
         let mut out = Vec::<u8>::new();
         let mut breakpoints = HashSet::new();
         let mut line_breakpoints = HashSet::new();
@@ -2419,7 +2521,7 @@ mod tests {
 
         let action = handle_command(
             "next",
-            &vm,
+            &mut vm,
             &mut breakpoints,
             &mut line_breakpoints,
             &mut step_mode,
@@ -2433,7 +2535,7 @@ mod tests {
 
         let action = handle_command(
             "out",
-            &vm,
+            &mut vm,
             &mut breakpoints,
             &mut line_breakpoints,
             &mut step_mode,
@@ -2448,7 +2550,7 @@ mod tests {
 
     #[test]
     fn break_line_on_non_executable_source_line_resolves_forward() {
-        let vm = Vm::new(Program::with_debug(
+        let mut vm = Vm::new(Program::with_debug(
             vec![],
             vec![crate::vm::OpCode::Nop as u8, crate::vm::OpCode::Ret as u8],
             Some(DebugInfo {
@@ -2471,7 +2573,7 @@ mod tests {
 
         let action = handle_command(
             "break line 11",
-            &vm,
+            &mut vm,
             &mut breakpoints,
             &mut line_breakpoints,
             &mut step_mode,
@@ -2491,6 +2593,102 @@ mod tests {
             text.contains("line breakpoint set at 13 (requested line 11)"),
             "expected resolved-line message, got: {text}"
         );
+    }
+
+    #[test]
+    fn handle_command_fuel_queries_and_updates_budget() {
+        let mut vm = Vm::new(Program::new(vec![], vec![crate::vm::OpCode::Ret as u8]));
+        vm.set_fuel(9);
+        let mut out = Vec::<u8>::new();
+        let mut breakpoints = HashSet::new();
+        let mut line_breakpoints = HashSet::new();
+        let mut step_mode = StepMode::Running;
+
+        let action = handle_command(
+            "fuel",
+            &mut vm,
+            &mut breakpoints,
+            &mut line_breakpoints,
+            &mut step_mode,
+            &mut out,
+        );
+        assert_eq!(action, ReplAction::Continue);
+        let text = String::from_utf8(out.clone()).expect("output should be utf-8");
+        assert!(text.contains("fuel: 9"), "{text}");
+
+        out.clear();
+        handle_command(
+            "fuel set 4",
+            &mut vm,
+            &mut breakpoints,
+            &mut line_breakpoints,
+            &mut step_mode,
+            &mut out,
+        );
+        assert_eq!(vm.get_fuel(), Some(4));
+        let text = String::from_utf8(out.clone()).expect("output should be utf-8");
+        assert!(text.contains("fuel set to 4"), "{text}");
+
+        out.clear();
+        handle_command(
+            "fuel interval 5",
+            &mut vm,
+            &mut breakpoints,
+            &mut line_breakpoints,
+            &mut step_mode,
+            &mut out,
+        );
+        assert_eq!(vm.fuel_check_interval(), 5);
+    }
+
+    #[test]
+    fn debugger_bridge_can_recover_from_out_of_fuel_by_adding_fuel() {
+        let program = Program::new(
+            vec![],
+            vec![
+                crate::vm::OpCode::Nop as u8,
+                crate::vm::OpCode::Nop as u8,
+                crate::vm::OpCode::Ret as u8,
+            ],
+        );
+        let bridge = super::DebugCommandBridge::new();
+        let mut debugger = Debugger::with_command_bridge(bridge.clone());
+
+        let join = std::thread::spawn(move || {
+            let mut vm = Vm::new(program);
+            vm.set_fuel(1);
+            vm.run_with_debugger(&mut debugger)
+                .expect("debugged vm run should recover and succeed")
+        });
+
+        wait_for_bridge_attachment(&bridge, true);
+
+        let fuel_response = bridge
+            .execute("fuel", Duration::from_millis(200))
+            .expect("fuel command should succeed");
+        assert!(
+            fuel_response.output.contains("fuel: 0"),
+            "{}",
+            fuel_response.output
+        );
+
+        let add_response = bridge
+            .execute("fuel add 2", Duration::from_millis(200))
+            .expect("fuel add command should succeed");
+        assert!(
+            add_response.output.contains("fuel added: 2"),
+            "{}",
+            add_response.output
+        );
+
+        let continue_response = bridge
+            .execute("continue", Duration::from_millis(200))
+            .expect("continue command should succeed");
+        assert!(continue_response.resumed);
+        assert!(!continue_response.attached);
+
+        let status = join.join().expect("debugger thread should join");
+        assert_eq!(status, VmStatus::Halted);
     }
 
     #[test]

@@ -698,7 +698,12 @@ async fn ui_deploy_compiles_graph_code_for_all_flavors() {
     let client = reqwest::Client::new();
 
     let flavors = [
-        ("rustscript", "dp-ui-rss", "use vm;", reqwest::StatusCode::ACCEPTED),
+        (
+            "rustscript",
+            "dp-ui-rss",
+            "use vm;",
+            reqwest::StatusCode::ACCEPTED,
+        ),
         (
             "javascript",
             "dp-ui-js",

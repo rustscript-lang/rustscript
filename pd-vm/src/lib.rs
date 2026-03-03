@@ -44,8 +44,8 @@ pub use jit::{
 pub use vm::diagnostics::render_vm_error;
 #[cfg(feature = "runtime")]
 pub use vm::{
-    CallOutcome, HostAsyncBridge, HostBindingPlan, HostFunction, HostFunctionRegistry, HostOpId,
-    StaticHostFunction, Vm, VmError, VmResult, VmStatus,
+    CallOutcome, FuelCheckpoint, HostAsyncBridge, HostBindingPlan, HostFunction,
+    HostFunctionRegistry, HostOpId, StaticHostFunction, Store, Vm, VmError, VmResult, VmStatus,
 };
 #[cfg(feature = "runtime")]
 pub use vmbc::{
