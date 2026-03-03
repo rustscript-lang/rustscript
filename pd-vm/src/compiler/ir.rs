@@ -157,6 +157,8 @@ pub struct FrontendIr {
 pub(super) struct LocalIrBuilder {
     locals: HashMap<String, u8>,
     next_local: u8,
+    functions: Vec<FunctionDecl>,
+    function_meta: HashMap<String, (u16, Option<u8>)>,
 }
 
 impl LocalIrBuilder {
@@ -164,6 +166,8 @@ impl LocalIrBuilder {
         Self {
             locals: HashMap::new(),
             next_local: 0,
+            functions: Vec::new(),
+            function_meta: HashMap::new(),
         }
     }
 
@@ -204,6 +208,77 @@ impl LocalIrBuilder {
         self.locals.get(name).copied().map(Expr::Var)
     }
 
+    pub(super) fn declare_function(
+        &mut self,
+        name: &str,
+        arity: Option<u8>,
+    ) -> Result<(), ParseError> {
+        if let Some((index, existing_arity)) = self.function_meta.get(name).copied() {
+            match (existing_arity, arity) {
+                (Some(expected), Some(actual)) if expected != actual => {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: 1,
+                        message: format!(
+                            "function '{name}' declared with conflicting arity {expected} vs {actual}"
+                        ),
+                    });
+                }
+                (None, Some(actual)) => {
+                    if let Some(function) = self.functions.get_mut(index as usize) {
+                        function.arity = actual;
+                        function.args = (0..actual).map(|slot| format!("arg{slot}")).collect();
+                    }
+                    self.function_meta
+                        .insert(name.to_string(), (index, Some(actual)));
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        let index = u16::try_from(self.functions.len()).map_err(|_| ParseError {
+            span: None,
+            code: None,
+            line: 1,
+            message: "too many declared functions".to_string(),
+        })?;
+        let effective_arity = arity.unwrap_or(0);
+        self.functions.push(FunctionDecl {
+            name: name.to_string(),
+            arity: effective_arity,
+            index,
+            args: (0..effective_arity)
+                .map(|slot| format!("arg{slot}"))
+                .collect(),
+            exported: false,
+        });
+        self.function_meta.insert(name.to_string(), (index, arity));
+        Ok(())
+    }
+
+    pub(super) fn resolve_call_expr(&mut self, name: &str, args: Vec<Expr>) -> Option<Expr> {
+        if let Some(local_index) = self.locals.get(name).copied() {
+            return Some(Expr::LocalCall(local_index, args));
+        }
+        let (func_index, declared_arity) = self.function_meta.get(name).copied()?;
+        let call_arity = u8::try_from(args.len()).ok()?;
+        match declared_arity {
+            Some(expected) if expected != call_arity => return None,
+            Some(_) => {}
+            None => {
+                if let Some(function) = self.functions.get_mut(func_index as usize) {
+                    function.arity = call_arity;
+                    function.args = (0..call_arity).map(|slot| format!("arg{slot}")).collect();
+                }
+                self.function_meta
+                    .insert(name.to_string(), (func_index, Some(call_arity)));
+            }
+        }
+        Some(Expr::Call(func_index, args))
+    }
+
     pub(super) fn finish(self, stmts: Vec<Stmt>) -> FrontendIr {
         let mut local_bindings = self.locals.into_iter().collect::<Vec<(String, u8)>>();
         local_bindings.sort_by_key(|(_, index)| *index);
@@ -211,7 +286,7 @@ impl LocalIrBuilder {
             stmts,
             locals: self.next_local as usize,
             local_bindings,
-            functions: Vec::new(),
+            functions: self.functions,
             function_impls: HashMap::new(),
         }
     }

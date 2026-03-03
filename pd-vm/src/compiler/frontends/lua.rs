@@ -25,6 +25,10 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
         if trimmed.is_empty() {
             continue;
         }
+        if let Some((name, arity)) = parse_lua_declare_directive(trimmed) {
+            builder.declare_function(name, arity)?;
+            continue;
+        }
         if trimmed.starts_with("local function ")
             || trimmed.starts_with("function ")
             || trimmed.starts_with("for ")
@@ -46,7 +50,7 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
         if let Some(rest) = trimmed.strip_prefix("if ")
             && let Some(condition_raw) = rest.strip_suffix(" then")
         {
-            let condition = parse_lua_direct_expr(condition_raw, &builder)?;
+            let condition = parse_lua_direct_expr(condition_raw, &mut builder)?;
             let Some(condition) = condition else {
                 return Ok(None);
             };
@@ -69,7 +73,7 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
         if let Some(rest) = trimmed.strip_prefix("while ")
             && let Some(condition_raw) = rest.strip_suffix(" do")
         {
-            let condition = parse_lua_direct_expr(condition_raw, &builder)?;
+            let condition = parse_lua_direct_expr(condition_raw, &mut builder)?;
             let Some(condition) = condition else {
                 return Ok(None);
             };
@@ -147,7 +151,7 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
             if !is_valid_lua_ident(name) {
                 return Ok(None);
             }
-            let expr = parse_lua_direct_expr(expr_raw.trim(), &builder)?;
+            let expr = parse_lua_direct_expr(expr_raw.trim(), &mut builder)?;
             let Some(expr) = expr else {
                 return Ok(None);
             };
@@ -161,7 +165,7 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
             && !lhs.contains('<')
             && !lhs.contains('>')
         {
-            let expr = parse_lua_direct_expr(rhs.trim(), &builder)?;
+            let expr = parse_lua_direct_expr(rhs.trim(), &mut builder)?;
             let Some(expr) = expr else {
                 return Ok(None);
             };
@@ -169,7 +173,7 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
             emit_lua_direct_stmt(stmt, &mut root_stmts, &mut block_stack);
             continue;
         }
-        let expr = parse_lua_direct_expr(trimmed, &builder)?;
+        let expr = parse_lua_direct_expr(trimmed, &mut builder)?;
         let Some(expr) = expr else {
             return Ok(None);
         };
@@ -226,6 +230,21 @@ fn emit_lua_direct_stmt(stmt: Stmt, root: &mut Vec<Stmt>, blocks: &mut [LuaDirec
         LuaDirectBlock::While { body, .. } | LuaDirectBlock::Do { body, .. } => body.push(stmt),
     }
 }
+
+fn parse_lua_declare_directive(line: &str) -> Option<(&str, Option<u8>)> {
+    let tail = line.strip_prefix("declare ")?;
+    let mut parts = tail.split_whitespace();
+    let name = parts.next()?;
+    if !is_valid_lua_ident(name) {
+        return None;
+    }
+    let arity = parts.next().and_then(|raw| raw.parse::<u8>().ok());
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((name, arity))
+}
+
 #[derive(Clone)]
 enum LuaDirectExpr {
     Null,
@@ -234,6 +253,7 @@ enum LuaDirectExpr {
     Float(f64),
     String(String),
     Var(String),
+    Call(String, Vec<LuaDirectExpr>),
     Add(Box<LuaDirectExpr>, Box<LuaDirectExpr>),
     Sub(Box<LuaDirectExpr>, Box<LuaDirectExpr>),
     Mul(Box<LuaDirectExpr>, Box<LuaDirectExpr>),
@@ -260,6 +280,7 @@ enum LuaDirectToken {
     Ident(String),
     LParen,
     RParen,
+    Comma,
     Plus,
     Minus,
     Star,
@@ -277,7 +298,7 @@ enum LuaDirectToken {
 }
 fn parse_lua_direct_expr(
     input: &str,
-    builder: &LocalIrBuilder,
+    builder: &mut LocalIrBuilder,
 ) -> Result<Option<Expr>, ParseError> {
     let Some(tokens) = tokenize_lua_direct_expr(input) else {
         return Ok(None);
@@ -291,7 +312,7 @@ fn parse_lua_direct_expr(
     }
     Ok(lower_lua_direct_expr(expr, builder))
 }
-fn lower_lua_direct_expr(expr: LuaDirectExpr, builder: &LocalIrBuilder) -> Option<Expr> {
+fn lower_lua_direct_expr(expr: LuaDirectExpr, builder: &mut LocalIrBuilder) -> Option<Expr> {
     match expr {
         LuaDirectExpr::Null => Some(Expr::Null),
         LuaDirectExpr::Bool(value) => Some(Expr::Bool(value)),
@@ -299,6 +320,13 @@ fn lower_lua_direct_expr(expr: LuaDirectExpr, builder: &LocalIrBuilder) -> Optio
         LuaDirectExpr::Float(value) => Some(Expr::Float(value)),
         LuaDirectExpr::String(value) => Some(Expr::String(value)),
         LuaDirectExpr::Var(name) => builder.resolve_local_expr(&name),
+        LuaDirectExpr::Call(name, args) => {
+            let lowered_args = args
+                .into_iter()
+                .map(|arg| lower_lua_direct_expr(arg, builder))
+                .collect::<Option<Vec<_>>>()?;
+            builder.resolve_call_expr(&name, lowered_args)
+        }
         LuaDirectExpr::Add(lhs, rhs) => Some(Expr::Add(
             Box::new(lower_lua_direct_expr(*lhs, builder)?),
             Box::new(lower_lua_direct_expr(*rhs, builder)?),
@@ -471,7 +499,23 @@ impl LuaDirectExprParser {
                 LuaDirectToken::Ident(value) => {
                     self.pos += 1;
                     if matches!(self.peek(), Some(LuaDirectToken::LParen)) {
-                        return None;
+                        self.pos += 1;
+                        let mut args = Vec::new();
+                        if !matches!(self.peek(), Some(LuaDirectToken::RParen)) {
+                            loop {
+                                let arg = self.parse_or()?;
+                                args.push(arg);
+                                if self.match_token(|token| matches!(token, LuaDirectToken::Comma))
+                                {
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                        if !self.match_token(|token| matches!(token, LuaDirectToken::RParen)) {
+                            return None;
+                        }
+                        return Some(LuaDirectExpr::Call(value, args));
                     }
                     Some(LuaDirectExpr::Var(value))
                 }
@@ -607,6 +651,10 @@ fn tokenize_lua_direct_expr(input: &str) -> Option<Vec<LuaDirectToken>> {
             }
             b')' => {
                 out.push(LuaDirectToken::RParen);
+                i += 1;
+            }
+            b',' => {
+                out.push(LuaDirectToken::Comma);
                 i += 1;
             }
             b'+' => {

@@ -1,12 +1,9 @@
+(import (only "../stdlib/rss/strings.rss" non_empty))
 (require (only-in "vm" add_one))
 
-(define i 0)
-(define total 0)
+(define d "12321312")
+(define e "23232")
 
-(while (< i 3)
-  (set! total (+ total 1))
-  (set! i (+ i 1)))
-
-(if (/= total 3)
-    (print 0)
-    (print (add_one 5)))
+(if (and (non_empty d) (non_empty e))
+    (add_one 5)
+    0)

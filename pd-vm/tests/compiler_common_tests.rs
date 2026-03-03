@@ -658,35 +658,19 @@ fn compile_source_file_detects_extension() {
 
 #[test]
 fn compile_source_file_detects_lua_extension() {
-    let unique = format!(
-        "vm_extension_test_lua_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos()
-    );
-    let base = std::env::temp_dir().join(unique);
-    let path = base.with_extension("lua");
-    std::fs::write(&path, include_str!("../examples/example.lua"))
-        .expect("temp source should write");
-
-    let err = match compile_source_file(&path) {
-        Ok(_) => panic!("Lua example fixture should be rejected in direct subset"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
-            assert!(
-                parse.message.contains("unsupported Lua syntax"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("unexpected error: {other:?}"),
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example.lua");
+    let compiled = compile_source_file(&path).expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    for func in &compiled.functions {
+        match func.name.as_str() {
+            "add_one" => vm.register_function(Box::new(AddOne)),
+            "print" => vm.register_function(Box::new(PrintBuiltin)),
+            _ => panic!("unexpected function {}", func.name),
+        };
     }
-
-    let _ = std::fs::remove_file(path);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(6)]);
 }
 
 #[test]
@@ -701,23 +685,24 @@ fn compile_source_file_detects_scheme_extension() {
     );
     let base = std::env::temp_dir().join(unique);
     let path = base.with_extension("scm");
-    std::fs::write(&path, include_str!("../examples/example.scm"))
-        .expect("temp source should write");
+    std::fs::write(
+        &path,
+        r#"
+        (define i 0)
+        (define total 0)
+        (while (< i 3)
+          (set! total (+ total 1))
+          (set! i (+ i 1)))
+        (+ total 3)
+    "#,
+    )
+    .expect("temp source should write");
 
-    let err = match compile_source_file(&path) {
-        Ok(_) => panic!("Scheme example fixture should be rejected in direct subset"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
-            assert!(
-                parse.message.contains("unsupported Scheme syntax"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
+    let compiled = compile_source_file(&path).expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(6)]);
 
     let _ = std::fs::remove_file(path);
 }
@@ -768,20 +753,18 @@ fn compile_source_file_supports_rss_modules_from_js_lua_and_scheme() {
     "#,
     )
     .expect("lua source should write");
-    let lua_err = match compile_source_file(&lua_path) {
-        Ok(_) => panic!("lua compile should be rejected in direct subset"),
-        Err(err) => err,
-    };
-    match lua_err {
-        vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
-            assert!(
-                parse.message.contains("unsupported Lua syntax"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("unexpected lua error: {other:?}"),
+    let lua_compiled = compile_source_file(&lua_path).expect("lua compile should succeed");
+    let mut lua_vm = Vm::with_locals(lua_compiled.program, lua_compiled.locals);
+    for func in &lua_compiled.functions {
+        match func.name.as_str() {
+            "add_one" => lua_vm.register_function(Box::new(AddOne)),
+            "print" => lua_vm.register_function(Box::new(PrintBuiltin)),
+            _ => panic!("unexpected function {}", func.name),
+        };
     }
+    let lua_status = lua_vm.run().expect("lua vm should run");
+    assert_eq!(lua_status, VmStatus::Halted);
+    assert_eq!(lua_vm.stack(), &[Value::Int(42)]);
 
     let scm_path = root.join("main.scm");
     std::fs::write(
@@ -792,20 +775,18 @@ fn compile_source_file_supports_rss_modules_from_js_lua_and_scheme() {
     "#,
     )
     .expect("scheme source should write");
-    let scm_err = match compile_source_file(&scm_path) {
-        Ok(_) => panic!("scheme compile should be rejected in direct subset"),
-        Err(err) => err,
-    };
-    match scm_err {
-        vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
-            assert!(
-                parse.message.contains("unsupported Scheme syntax"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("unexpected scheme error: {other:?}"),
+    let scm_compiled = compile_source_file(&scm_path).expect("scheme compile should succeed");
+    let mut scm_vm = Vm::with_locals(scm_compiled.program, scm_compiled.locals);
+    for func in &scm_compiled.functions {
+        match func.name.as_str() {
+            "add_one" => scm_vm.register_function(Box::new(AddOne)),
+            "print" => scm_vm.register_function(Box::new(PrintBuiltin)),
+            _ => panic!("unexpected function {}", func.name),
+        };
     }
+    let scm_status = scm_vm.run().expect("scheme vm should run");
+    assert_eq!(scm_status, VmStatus::Halted);
+    assert_eq!(scm_vm.stack(), &[Value::Int(42)]);
 
     let _ = std::fs::remove_file(scm_path);
     let _ = std::fs::remove_file(lua_path);

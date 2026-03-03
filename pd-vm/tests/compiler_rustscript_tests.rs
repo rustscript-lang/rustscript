@@ -549,7 +549,9 @@ fn liveness_clears_local_after_function_value_last_use() {
         .debug
         .as_ref()
         .expect("debug info should exist");
-    let func_index = debug.local_index("func").expect("func binding should exist");
+    let func_index = debug
+        .local_index("func")
+        .expect("func binding should exist");
 
     let mut vm = Vm::with_locals(compiled.program, compiled.locals);
     let status = vm.run().expect("vm should run");

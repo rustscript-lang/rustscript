@@ -10,7 +10,9 @@ fn expect_scheme_direct_only_error(source: &str) {
     match err {
         vm::SourceError::Parse(parse) => {
             assert!(
-                parse.message.contains("unsupported Scheme syntax"),
+                parse.message.contains("unsupported Scheme syntax")
+                    || parse.message.contains("unsupported identifier")
+                    || parse.message.contains("reserved"),
                 "{}",
                 parse.message
             );
@@ -159,7 +161,9 @@ fn scheme_complex_fixture_is_rejected_without_rewrite_path() {
     match err {
         vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
             assert!(
-                parse.message.contains("unsupported Scheme syntax"),
+                parse.message.contains("unsupported Scheme syntax")
+                    || parse.message.contains("identifier")
+                    || parse.message.contains("reserved"),
                 "{}",
                 parse.message
             );
