@@ -433,6 +433,143 @@ fn named_functions_are_first_class_and_can_be_passed_to_functions() {
 }
 
 #[test]
+fn closure_value_from_partial_control_flow_is_rejected_on_call() {
+    let source = r#"
+        if true {
+            let inc = |x| x + 1;
+        }
+        inc(1);
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("branch-local closure call should fail"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("inc") && parse.message.contains("unavailable"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn function_value_from_partial_control_flow_is_rejected_on_call() {
+    let source = r#"
+        fn add_one(value) {
+            value + 1;
+        }
+        if true {
+            let f = add_one;
+        }
+        f(1);
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("branch-local function value call should fail"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("f") && parse.message.contains("unavailable"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn liveness_clears_local_after_closure_value_last_use() {
+    let source = r#"
+        fn apply_once(func, value) {
+            func(value);
+        }
+
+        let closure = "stale";
+        let base = 1;
+        closure = |x| x + base;
+        let out = apply_once(closure, 41);
+        out;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug info should exist");
+    let closure_index = debug
+        .local_index("closure")
+        .expect("closure binding should exist");
+
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack().len(),
+        1,
+        "apply_once result should be the only remaining stack value"
+    );
+    assert_eq!(vm.stack()[0], Value::Int(42));
+    assert!(
+        !vm.stack()
+            .iter()
+            .any(|value| matches!(value, Value::String(text) if text == "stale")),
+        "stack should not retain pre-call placeholder values"
+    );
+    assert_eq!(vm.locals()[closure_index as usize], Value::Null);
+}
+
+#[test]
+fn liveness_clears_local_after_function_value_last_use() {
+    let source = r#"
+        fn add_one(value) {
+            value + 1;
+        }
+        fn apply_once(func, value) {
+            func(value);
+        }
+
+        let func = "stale";
+        func = add_one;
+        let out = apply_once(func, 41);
+        out;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug info should exist");
+    let func_index = debug.local_index("func").expect("func binding should exist");
+
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack().len(),
+        1,
+        "apply_once result should be the only remaining stack value"
+    );
+    assert_eq!(vm.stack()[0], Value::Int(42));
+    assert!(
+        !vm.stack()
+            .iter()
+            .any(|value| matches!(value, Value::String(text) if text == "stale")),
+        "stack should not retain pre-call placeholder values"
+    );
+    assert_eq!(vm.locals()[func_index as usize], Value::Null);
+}
+
+#[test]
 fn rustscript_callable_values_cannot_be_stored_in_arrays() {
     let source = r#"
         fn add_one(value) {

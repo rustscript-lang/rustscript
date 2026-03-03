@@ -481,6 +481,151 @@ fn break_and_continue_outside_loop_are_rejected() {
 }
 
 #[test]
+fn local_declared_only_on_one_if_path_is_rejected_on_later_use() {
+    let source = r#"
+        if true {
+            let branch_only = 7;
+        }
+        branch_only;
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("using a path-dependent local should fail"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("branch_only") && parse.message.contains("unavailable"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn local_declared_only_in_loop_body_is_rejected_after_loop() {
+    let source = r#"
+        while false {
+            let loop_only = 1;
+        }
+        loop_only;
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("using a loop-path local should fail"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("loop_only") && parse.message.contains("unavailable"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn path_dependent_local_assignment_requires_redeclaration() {
+    let source = r#"
+        if true {
+            let path_local = 1;
+        }
+        path_local = 9;
+        path_local;
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("path-dependent assignment should fail without redeclaration"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("path_local") && parse.message.contains("before assignment"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn path_dependent_local_redeclaration_before_assignment_is_allowed() {
+    let source = r#"
+        if true {
+            let path_local = 1;
+        }
+        let path_local = 9;
+        path_local;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(9)]);
+}
+
+#[test]
+fn compiler_clears_uncertain_locals_after_control_flow_join() {
+    let source = r#"
+        let gate = true;
+        if gate {
+            let ephemeral = "payload";
+        }
+        0;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug info should be present");
+    let ephemeral_index = debug
+        .local_index("ephemeral")
+        .expect("ephemeral local should be emitted");
+
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(0)]);
+    assert_eq!(vm.locals()[ephemeral_index as usize], Value::Null);
+}
+
+#[test]
+fn liveness_pass_clears_dead_locals_after_last_use() {
+    let source = r#"
+        let d = "12321312";
+        let e = "23232";
+        e;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug info should be present");
+    let d_index = debug.local_index("d").expect("d should exist");
+    let e_index = debug.local_index("e").expect("e should exist");
+
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("23232".to_string())]);
+    assert_eq!(vm.locals()[d_index as usize], Value::Null);
+    assert_eq!(vm.locals()[e_index as usize], Value::Null);
+}
+
+#[test]
 fn compile_source_file_detects_extension() {
     let unique = format!(
         "vm_extension_test_{}_{}",

@@ -207,6 +207,7 @@ const STDLIB_PRINT_ARITY: u8 = 1;
 pub mod diagnostics;
 mod frontends;
 pub mod ir;
+mod lifetime;
 mod linker;
 mod parser;
 mod source_loader;
@@ -273,6 +274,7 @@ fn compile_parsed_output(
     source: String,
     parsed: FrontendIr,
 ) -> Result<CompiledProgram, SourceError> {
+    let parsed = lifetime::enforce_local_availability(parsed).map_err(SourceError::Parse)?;
     let FrontendIr {
         stmts,
         locals,
@@ -357,7 +359,12 @@ fn compile_source_with_flavor_impl(
     let parsed = frontends::parse_source(source, flavor).map_err(|err| {
         SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
     })?;
-    compile_parsed_output(source.to_string(), parsed)
+    match compile_parsed_output(source.to_string(), parsed) {
+        Err(SourceError::Parse(err)) => Err(SourceError::Parse(
+            err.with_line_span_from_source(&source_map, source_id),
+        )),
+        other => other,
+    }
 }
 
 pub fn compile_source_file(path: impl AsRef<Path>) -> Result<CompiledProgram, SourcePathError> {
