@@ -73,6 +73,7 @@ struct ValueLayout {
     size: i32,
     tag_offset: i32,
     tag_size: u8,
+    null_tag: u32,
     int_tag: u32,
     float_tag: u32,
     bool_tag: u32,
@@ -934,6 +935,12 @@ fn emit_native_step_pop_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
         u16::try_from(layout.value.bool_tag).unwrap_or(0xFFFF),
     )?;
     let primitive_bool = emit_b_cond_placeholder(code, Cond::Eq);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.null_tag).unwrap_or(0xFFFF),
+    )?;
+    let primitive_null = emit_b_cond_placeholder(code, Cond::Eq);
     let fallback = emit_b_placeholder(code);
 
     let primitive_label = code.len();
@@ -951,6 +958,7 @@ fn emit_native_step_pop_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
     patch_b_cond_rel19(code, primitive_int, primitive_label)?;
     patch_b_cond_rel19(code, primitive_float, primitive_label)?;
     patch_b_cond_rel19(code, primitive_bool, primitive_label)?;
+    patch_b_cond_rel19(code, primitive_null, primitive_label)?;
     patch_b_rel26(code, fallback, fallback_label)?;
     patch_b_rel26(code, done, done_label)?;
     Ok(())
@@ -993,6 +1001,12 @@ fn emit_native_step_dup_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
         u16::try_from(layout.value.bool_tag).unwrap_or(0xFFFF),
     )?;
     let primitive_bool = emit_b_cond_placeholder(code, Cond::Eq);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.null_tag).unwrap_or(0xFFFF),
+    )?;
+    let primitive_null = emit_b_cond_placeholder(code, Cond::Eq);
     let fallback = emit_b_placeholder(code);
 
     let primitive_label = code.len();
@@ -1015,6 +1029,7 @@ fn emit_native_step_dup_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
     patch_b_cond_rel19(code, primitive_int, primitive_label)?;
     patch_b_cond_rel19(code, primitive_float, primitive_label)?;
     patch_b_cond_rel19(code, primitive_bool, primitive_label)?;
+    patch_b_cond_rel19(code, primitive_null, primitive_label)?;
     patch_b_rel26(code, fallback, fallback_label)?;
     patch_b_rel26(code, done, done_label)?;
     Ok(())
@@ -1066,6 +1081,12 @@ fn emit_native_step_ldc_inline(
         u16::try_from(layout.value.bool_tag).unwrap_or(0xFFFF),
     )?;
     let primitive_bool = emit_b_cond_placeholder(code, Cond::Eq);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.null_tag).unwrap_or(0xFFFF),
+    )?;
+    let primitive_null = emit_b_cond_placeholder(code, Cond::Eq);
     let fallback = emit_b_placeholder(code);
 
     let primitive_label = code.len();
@@ -1089,6 +1110,7 @@ fn emit_native_step_ldc_inline(
     patch_b_cond_rel19(code, primitive_int, primitive_label)?;
     patch_b_cond_rel19(code, primitive_float, primitive_label)?;
     patch_b_cond_rel19(code, primitive_bool, primitive_label)?;
+    patch_b_cond_rel19(code, primitive_null, primitive_label)?;
     patch_b_rel26(code, fallback, fallback_label)?;
     patch_b_rel26(code, done, done_label)?;
     Ok(())
@@ -1140,6 +1162,12 @@ fn emit_native_step_ldloc_inline(
         u16::try_from(layout.value.bool_tag).unwrap_or(0xFFFF),
     )?;
     let primitive_bool = emit_b_cond_placeholder(code, Cond::Eq);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.null_tag).unwrap_or(0xFFFF),
+    )?;
+    let primitive_null = emit_b_cond_placeholder(code, Cond::Eq);
     let fallback = emit_b_placeholder(code);
 
     let primitive_label = code.len();
@@ -1163,6 +1191,7 @@ fn emit_native_step_ldloc_inline(
     patch_b_cond_rel19(code, primitive_int, primitive_label)?;
     patch_b_cond_rel19(code, primitive_float, primitive_label)?;
     patch_b_cond_rel19(code, primitive_bool, primitive_label)?;
+    patch_b_cond_rel19(code, primitive_null, primitive_label)?;
     patch_b_rel26(code, fallback, fallback_label)?;
     patch_b_rel26(code, done, done_label)?;
     Ok(())
@@ -1199,28 +1228,6 @@ fn emit_native_step_stloc_inline(
     emit_mul_x(code, 11, 11, 14);
     emit_add_reg(code, 12, 10, 11); // dst local
 
-    emit_load_tag_w_from_ptr(code, 16, 13, layout.value)?;
-    emit_cmp_imm(
-        code,
-        16,
-        u16::try_from(layout.value.int_tag).unwrap_or(0xFFFF),
-    )?;
-    let src_primitive_int = emit_b_cond_placeholder(code, Cond::Eq);
-    emit_cmp_imm(
-        code,
-        16,
-        u16::try_from(layout.value.float_tag).unwrap_or(0xFFFF),
-    )?;
-    let src_primitive_float = emit_b_cond_placeholder(code, Cond::Eq);
-    emit_cmp_imm(
-        code,
-        16,
-        u16::try_from(layout.value.bool_tag).unwrap_or(0xFFFF),
-    )?;
-    let src_primitive_bool = emit_b_cond_placeholder(code, Cond::Eq);
-    let fallback = emit_b_placeholder(code);
-
-    let src_primitive_label = code.len();
     emit_load_tag_w_from_ptr(code, 16, 12, layout.value)?;
     emit_cmp_imm(
         code,
@@ -1240,7 +1247,13 @@ fn emit_native_step_stloc_inline(
         u16::try_from(layout.value.bool_tag).unwrap_or(0xFFFF),
     )?;
     let dst_primitive_bool = emit_b_cond_placeholder(code, Cond::Eq);
-    let fallback_from_dst = emit_b_placeholder(code);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.null_tag).unwrap_or(0xFFFF),
+    )?;
+    let dst_primitive_null = emit_b_cond_placeholder(code, Cond::Eq);
+    let fallback = emit_b_placeholder(code);
 
     let dst_primitive_label = code.len();
     emit_copy_value_ptr_to_ptr(code, layout.value, 13, 12)?;
@@ -1256,14 +1269,11 @@ fn emit_native_step_stloc_inline(
 
     patch_b_cond_rel19(code, underflow, fallback_label)?;
     patch_b_cond_rel19(code, bad_index, fallback_label)?;
-    patch_b_cond_rel19(code, src_primitive_int, src_primitive_label)?;
-    patch_b_cond_rel19(code, src_primitive_float, src_primitive_label)?;
-    patch_b_cond_rel19(code, src_primitive_bool, src_primitive_label)?;
-    patch_b_rel26(code, fallback, fallback_label)?;
     patch_b_cond_rel19(code, dst_primitive_int, dst_primitive_label)?;
     patch_b_cond_rel19(code, dst_primitive_float, dst_primitive_label)?;
     patch_b_cond_rel19(code, dst_primitive_bool, dst_primitive_label)?;
-    patch_b_rel26(code, fallback_from_dst, fallback_label)?;
+    patch_b_cond_rel19(code, dst_primitive_null, dst_primitive_label)?;
+    patch_b_rel26(code, fallback, fallback_label)?;
     patch_b_rel26(code, done, done_label)?;
     Ok(())
 }
@@ -1315,6 +1325,12 @@ fn emit_native_step_ceq_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
         u16::try_from(layout.value.bool_tag).unwrap_or(0xFFFF),
     )?;
     let tag_is_bool = emit_b_cond_placeholder(code, Cond::Eq);
+    emit_cmp_imm(
+        code,
+        16,
+        u16::try_from(layout.value.null_tag).unwrap_or(0xFFFF),
+    )?;
+    let tag_is_null = emit_b_cond_placeholder(code, Cond::Eq);
     let unknown_tag = emit_b_placeholder(code);
 
     let int_label = code.len();
@@ -1335,6 +1351,10 @@ fn emit_native_step_ceq_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
     emit_mov_imm64(code, 14, 1);
     let bool_done = emit_b_placeholder(code);
 
+    let null_label = code.len();
+    emit_mov_imm64(code, 14, 1);
+    let null_done = emit_b_placeholder(code);
+
     let not_equal_label = code.len();
     emit_mov_imm64(code, 14, 0);
     let ne_done = emit_b_placeholder(code);
@@ -1353,11 +1373,13 @@ fn emit_native_step_ceq_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
 
     patch_b_cond_rel19(code, tag_is_int, int_label)?;
     patch_b_cond_rel19(code, tag_is_bool, bool_label)?;
+    patch_b_cond_rel19(code, tag_is_null, null_label)?;
     patch_b_rel26(code, unknown_tag, fallback_label)?;
     patch_b_cond_rel19(code, int_ne, result_label)?;
     patch_b_rel26(code, int_done, result_label)?;
     patch_b_cond_rel19(code, bool_ne, result_label)?;
     patch_b_rel26(code, bool_done, result_label)?;
+    patch_b_rel26(code, null_done, result_label)?;
     patch_b_cond_rel19(code, tags_not_equal, not_equal_label)?;
     patch_b_rel26(code, ne_done, result_label)?;
     patch_b_cond_rel19(code, underflow, fallback_label)?;
@@ -2083,6 +2105,8 @@ fn find_unique_word_index(words: &[usize; 3], needle: usize, label: &str) -> VmR
 
 fn detect_value_layout() -> VmResult<ValueLayout> {
     let value_size = std::mem::size_of::<Value>();
+    let null_a_bytes = encode_value_bytes(Value::Null);
+    let null_b_bytes = encode_value_bytes(Value::Null);
     let int_a = 0x0102_0304_0506_0708_i64;
     let int_b = 0x1112_1314_1516_1718_i64;
     let float_a = 3.25_f64;
@@ -2096,12 +2120,14 @@ fn detect_value_layout() -> VmResult<ValueLayout> {
     let string_a_bytes = encode_value_bytes(Value::String("a".to_string()));
     let string_b_bytes = encode_value_bytes(Value::String("b".to_string()));
     let stable_tag_pairs = [
+        (&null_a_bytes[..], &null_b_bytes[..]),
         (&int_a_bytes[..], &int_b_bytes[..]),
         (&float_a_bytes[..], &float_b_bytes[..]),
         (&bool_false_bytes[..], &bool_true_bytes[..]),
         (&string_a_bytes[..], &string_b_bytes[..]),
     ];
     let (tag_offset, tag_size) = detect_tag_layout(&stable_tag_pairs)?;
+    let null_tag = decode_tag(&null_a_bytes, tag_offset, tag_size);
     let int_tag = decode_tag(&int_a_bytes, tag_offset, tag_size);
     let float_tag = decode_tag(&float_a_bytes, tag_offset, tag_size);
     let bool_tag = decode_tag(&bool_false_bytes, tag_offset, tag_size);
@@ -2177,6 +2203,7 @@ fn detect_value_layout() -> VmResult<ValueLayout> {
         size: usize_to_i32(value_size, "Value size")?,
         tag_offset: usize_to_i32(tag_offset, "Value tag offset")?,
         tag_size: tag_size as u8,
+        null_tag,
         int_tag,
         float_tag,
         bool_tag,

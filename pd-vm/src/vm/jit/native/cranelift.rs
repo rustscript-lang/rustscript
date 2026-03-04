@@ -806,7 +806,6 @@ fn emit_inline_stloc(
         .ins()
         .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_ptr);
     let src_addr = value_addr(b, pointer_type, stack_ptr, src_index, layout.value.size);
-    let src_tag = load_tag_i32(b, layout.value, src_addr);
 
     let locals_ptr = b
         .ins()
@@ -814,11 +813,9 @@ fn emit_inline_stloc(
     let dst_addr = value_addr(b, pointer_type, locals_ptr, idx, layout.value.size);
     let dst_tag = load_tag_i32(b, layout.value, dst_addr);
 
-    let src_scalar = is_scalar_tag(b, layout.value, src_tag);
     let dst_scalar = is_scalar_tag(b, layout.value, dst_tag);
-    let both_scalar = b.ins().band(src_scalar, dst_scalar);
     let scalar_ok = b.create_block();
-    b.ins().brif(both_scalar, scalar_ok, &[], slow, &[]);
+    b.ins().brif(dst_scalar, scalar_ok, &[], slow, &[]);
 
     b.switch_to_block(scalar_ok);
     copy_value_bytes(b, src_addr, dst_addr, layout.value.size);
@@ -1491,7 +1488,11 @@ fn emit_inline_int_eq(
 ) -> VmResult<()> {
     let slow = b.create_block();
     let len_ok = b.create_block();
-    let fast = b.create_block();
+    let int_fast = b.create_block();
+    let bool_check = b.create_block();
+    let bool_fast = b.create_block();
+    let null_check = b.create_block();
+    let null_fast = b.create_block();
     let next = b.create_block();
 
     let len = b
@@ -1512,16 +1513,29 @@ fn emit_inline_int_eq(
     let rhs_addr = value_addr(b, pointer_type, stack_ptr, rhs_index, layout.value.size);
     let lhs_tag = load_tag_i32(b, layout.value, lhs_addr);
     let rhs_tag = load_tag_i32(b, layout.value, rhs_addr);
+    let tags_equal = b.ins().icmp(IntCC::Equal, lhs_tag, rhs_tag);
+    let tag_eq = b.create_block();
+    b.ins().brif(tags_equal, tag_eq, &[], slow, &[]);
+
+    b.switch_to_block(tag_eq);
     let lhs_int = b
         .ins()
         .icmp_imm(IntCC::Equal, lhs_tag, i64::from(layout.value.int_tag));
-    let rhs_int = b
-        .ins()
-        .icmp_imm(IntCC::Equal, rhs_tag, i64::from(layout.value.int_tag));
-    let both_int = b.ins().band(lhs_int, rhs_int);
-    b.ins().brif(both_int, fast, &[], slow, &[]);
+    b.ins().brif(lhs_int, int_fast, &[], bool_check, &[]);
 
-    b.switch_to_block(fast);
+    b.switch_to_block(bool_check);
+    let lhs_bool = b
+        .ins()
+        .icmp_imm(IntCC::Equal, lhs_tag, i64::from(layout.value.bool_tag));
+    b.ins().brif(lhs_bool, bool_fast, &[], null_check, &[]);
+
+    b.switch_to_block(null_check);
+    let lhs_null = b
+        .ins()
+        .icmp_imm(IntCC::Equal, lhs_tag, i64::from(layout.value.null_tag));
+    b.ins().brif(lhs_null, null_fast, &[], slow, &[]);
+
+    b.switch_to_block(int_fast);
     let lhs = b.ins().load(
         types::I64,
         MemFlags::new(),
@@ -1539,6 +1553,34 @@ fn emit_inline_int_eq(
     let new_len = b.ins().isub(len, one);
     b.ins()
         .store(MemFlags::new(), new_len, vm_ptr, offsets.stack_len);
+    b.ins().jump(next, &[]);
+
+    b.switch_to_block(bool_fast);
+    let lhs_bool_value = b.ins().load(
+        types::I8,
+        MemFlags::new(),
+        lhs_addr,
+        layout.value.bool_payload_offset,
+    );
+    let rhs_bool_value = b.ins().load(
+        types::I8,
+        MemFlags::new(),
+        rhs_addr,
+        layout.value.bool_payload_offset,
+    );
+    let bool_eq = b.ins().icmp(IntCC::Equal, lhs_bool_value, rhs_bool_value);
+    store_bool_in_value(b, layout.value, lhs_addr, bool_eq);
+    let new_len_bool = b.ins().isub(len, one);
+    b.ins()
+        .store(MemFlags::new(), new_len_bool, vm_ptr, offsets.stack_len);
+    b.ins().jump(next, &[]);
+
+    b.switch_to_block(null_fast);
+    let null_eq = b.ins().icmp_imm(IntCC::Equal, lhs_tag, i64::from(layout.value.null_tag));
+    store_bool_in_value(b, layout.value, lhs_addr, null_eq);
+    let new_len_null = b.ins().isub(len, one);
+    b.ins()
+        .store(MemFlags::new(), new_len_null, vm_ptr, offsets.stack_len);
     b.ins().jump(next, &[]);
 
     b.switch_to_block(slow);
@@ -2205,9 +2247,41 @@ where
     }
 }
 
+fn bridge_name_for_op(op: i64) -> Option<&'static str> {
+    match op {
+        OP_LDC => Some("ldc"),
+        OP_ADD => Some("add"),
+        OP_SUB => Some("sub"),
+        OP_MUL => Some("mul"),
+        OP_DIV => Some("div"),
+        OP_MOD => Some("mod"),
+        OP_SHL => Some("shl"),
+        OP_SHR => Some("shr"),
+        OP_AND => Some("and"),
+        OP_OR => Some("or"),
+        OP_NEG => Some("neg"),
+        OP_CEQ => Some("ceq"),
+        OP_CLT => Some("clt"),
+        OP_CGT => Some("cgt"),
+        OP_POP => Some("pop"),
+        OP_DUP => Some("dup"),
+        OP_LDLOC => Some("ldloc"),
+        OP_STLOC => Some("stloc"),
+        OP_CALL => Some("call"),
+        OP_GUARD_FALSE => Some("guard_false"),
+        OP_JUMP => Some("jump_ip"),
+        _ => None,
+    }
+}
+
 extern "C" fn pd_vm_cranelift_step(vm: *mut Vm, op: i64, a: i64, b: i64, c: i64) -> i32 {
-    run_step(vm, "step", |vm| match op {
-        OP_LDC => {
+    run_step(vm, "step", |vm| {
+        if let Some(name) = bridge_name_for_op(op) {
+            vm.record_jit_native_bridge_hit(name);
+        }
+
+        match op {
+            OP_LDC => {
             let index = u32::try_from(a)
                 .map_err(|_| VmError::JitNative("ldc index out of range".to_string()))?;
             let value = vm
@@ -2381,8 +2455,9 @@ extern "C" fn pd_vm_cranelift_step(vm: *mut Vm, op: i64, a: i64, b: i64, c: i64)
             vm.jump_to(target_ip)?;
             Ok(STATUS_TRACE_EXIT)
         }
-        _ => Err(VmError::JitNative(format!(
-            "cranelift step helper received unsupported op id {op}"
-        ))),
+            _ => Err(VmError::JitNative(format!(
+                "cranelift step helper received unsupported op id {op}"
+            ))),
+        }
     })
 }

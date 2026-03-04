@@ -74,6 +74,7 @@ struct ValueLayout {
     size: i32,
     tag_offset: i32,
     tag_size: u8,
+    null_tag: u32,
     int_tag: u32,
     float_tag: u32,
     bool_tag: u32,
@@ -1229,6 +1230,9 @@ fn emit_native_step_pop_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
     code.extend_from_slice(&[0x3D]); // cmp eax, bool_tag
     code.extend_from_slice(&layout.value.bool_tag.to_le_bytes());
     let primitive_bool = emit_jcc_rel32(code, [0x0F, 0x84]); // je
+    code.extend_from_slice(&[0x3D]); // cmp eax, null_tag
+    code.extend_from_slice(&layout.value.null_tag.to_le_bytes());
+    let primitive_null = emit_jcc_rel32(code, [0x0F, 0x84]); // je
     let fallback = emit_jmp_rel32(code);
 
     let primitive_label = code.len();
@@ -1246,6 +1250,7 @@ fn emit_native_step_pop_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
     patch_rel32(code, primitive, primitive_label)?;
     patch_rel32(code, primitive_float, primitive_label)?;
     patch_rel32(code, primitive_bool, primitive_label)?;
+    patch_rel32(code, primitive_null, primitive_label)?;
     patch_rel32(code, fallback, fallback_label)?;
     patch_rel32(code, done, done_label)?;
     Ok(())
@@ -1280,6 +1285,9 @@ fn emit_native_step_dup_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
     code.extend_from_slice(&[0x81, 0xFA]); // cmp edx, bool_tag
     code.extend_from_slice(&layout.value.bool_tag.to_le_bytes());
     let primitive_bool = emit_jcc_rel32(code, [0x0F, 0x84]); // je
+    code.extend_from_slice(&[0x81, 0xFA]); // cmp edx, null_tag
+    code.extend_from_slice(&layout.value.null_tag.to_le_bytes());
+    let primitive_null = emit_jcc_rel32(code, [0x0F, 0x84]); // je
     let fallback = emit_jmp_rel32(code);
 
     let primitive_label = code.len();
@@ -1304,6 +1312,7 @@ fn emit_native_step_dup_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
     patch_rel32(code, primitive, primitive_label)?;
     patch_rel32(code, primitive_float, primitive_label)?;
     patch_rel32(code, primitive_bool, primitive_label)?;
+    patch_rel32(code, primitive_null, primitive_label)?;
     patch_rel32(code, fallback, fallback_label)?;
     patch_rel32(code, done, done_label)?;
     Ok(())
@@ -1353,6 +1362,9 @@ fn emit_native_step_ldc_inline(
     code.extend_from_slice(&[0x81, 0xFA]); // cmp edx, bool_tag
     code.extend_from_slice(&layout.value.bool_tag.to_le_bytes());
     let primitive_bool = emit_jcc_rel32(code, [0x0F, 0x84]); // je
+    code.extend_from_slice(&[0x81, 0xFA]); // cmp edx, null_tag
+    code.extend_from_slice(&layout.value.null_tag.to_le_bytes());
+    let primitive_null = emit_jcc_rel32(code, [0x0F, 0x84]); // je
     let fallback = emit_jmp_rel32(code);
 
     let primitive_label = code.len();
@@ -1377,6 +1389,7 @@ fn emit_native_step_ldc_inline(
     patch_rel32(code, primitive, primitive_label)?;
     patch_rel32(code, primitive_float, primitive_label)?;
     patch_rel32(code, primitive_bool, primitive_label)?;
+    patch_rel32(code, primitive_null, primitive_label)?;
     patch_rel32(code, fallback, fallback_label)?;
     patch_rel32(code, done, done_label)?;
     Ok(())
@@ -1426,6 +1439,9 @@ fn emit_native_step_ldloc_inline(
     code.extend_from_slice(&[0x81, 0xFA]); // cmp edx, bool_tag
     code.extend_from_slice(&layout.value.bool_tag.to_le_bytes());
     let primitive_bool = emit_jcc_rel32(code, [0x0F, 0x84]); // je
+    code.extend_from_slice(&[0x81, 0xFA]); // cmp edx, null_tag
+    code.extend_from_slice(&layout.value.null_tag.to_le_bytes());
+    let primitive_null = emit_jcc_rel32(code, [0x0F, 0x84]); // je
     let fallback = emit_jmp_rel32(code);
 
     let primitive_label = code.len();
@@ -1450,6 +1466,7 @@ fn emit_native_step_ldloc_inline(
     patch_rel32(code, primitive, primitive_label)?;
     patch_rel32(code, primitive_float, primitive_label)?;
     patch_rel32(code, primitive_bool, primitive_label)?;
+    patch_rel32(code, primitive_null, primitive_label)?;
     patch_rel32(code, fallback, fallback_label)?;
     patch_rel32(code, done, done_label)?;
     Ok(())
@@ -1492,19 +1509,6 @@ fn emit_native_step_stloc_inline(
     code.extend_from_slice(&layout.value.size.to_le_bytes());
     code.extend_from_slice(&[0x49, 0x8D, 0x3C, 0x01]); // lea rdi, [r9+rax] ; dst(local)
 
-    emit_load_tag_edx_from_rsi(code, layout.value)?;
-    code.extend_from_slice(&[0x81, 0xFA]); // cmp edx, int_tag
-    code.extend_from_slice(&layout.value.int_tag.to_le_bytes());
-    let src_primitive = emit_jcc_rel32(code, [0x0F, 0x84]); // je
-    code.extend_from_slice(&[0x81, 0xFA]); // cmp edx, float_tag
-    code.extend_from_slice(&layout.value.float_tag.to_le_bytes());
-    let src_primitive_float = emit_jcc_rel32(code, [0x0F, 0x84]); // je
-    code.extend_from_slice(&[0x81, 0xFA]); // cmp edx, bool_tag
-    code.extend_from_slice(&layout.value.bool_tag.to_le_bytes());
-    let src_primitive_bool = emit_jcc_rel32(code, [0x0F, 0x84]); // je
-    let fallback = emit_jmp_rel32(code);
-
-    let src_primitive_label = code.len();
     emit_load_tag_eax_from_rdi(code, layout.value)?;
     code.extend_from_slice(&[0x3D]); // cmp eax, int_tag
     code.extend_from_slice(&layout.value.int_tag.to_le_bytes());
@@ -1515,7 +1519,10 @@ fn emit_native_step_stloc_inline(
     code.extend_from_slice(&[0x3D]); // cmp eax, bool_tag
     code.extend_from_slice(&layout.value.bool_tag.to_le_bytes());
     let dst_primitive_bool = emit_jcc_rel32(code, [0x0F, 0x84]); // je
-    let fallback_from_dst = emit_jmp_rel32(code);
+    code.extend_from_slice(&[0x3D]); // cmp eax, null_tag
+    code.extend_from_slice(&layout.value.null_tag.to_le_bytes());
+    let dst_primitive_null = emit_jcc_rel32(code, [0x0F, 0x84]); // je
+    let fallback = emit_jmp_rel32(code);
 
     let dst_primitive_label = code.len();
     emit_copy_value_rsi_to_rdi(code, layout.value)?;
@@ -1532,14 +1539,11 @@ fn emit_native_step_stloc_inline(
 
     patch_rel32(code, underflow, fallback_label)?;
     patch_rel32(code, bad_index, fallback_label)?;
-    patch_rel32(code, src_primitive, src_primitive_label)?;
-    patch_rel32(code, src_primitive_float, src_primitive_label)?;
-    patch_rel32(code, src_primitive_bool, src_primitive_label)?;
-    patch_rel32(code, fallback, fallback_label)?;
     patch_rel32(code, dst_primitive, dst_primitive_label)?;
     patch_rel32(code, dst_primitive_float, dst_primitive_label)?;
     patch_rel32(code, dst_primitive_bool, dst_primitive_label)?;
-    patch_rel32(code, fallback_from_dst, fallback_label)?;
+    patch_rel32(code, dst_primitive_null, dst_primitive_label)?;
+    patch_rel32(code, fallback, fallback_label)?;
     patch_rel32(code, done, done_label)?;
     Ok(())
 }
@@ -1582,6 +1586,9 @@ fn emit_native_step_ceq_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
     code.extend_from_slice(&[0x3D]); // cmp eax, bool_tag
     code.extend_from_slice(&layout.value.bool_tag.to_le_bytes());
     let cmp_bool = emit_jcc_rel32(code, [0x0F, 0x84]); // je
+    code.extend_from_slice(&[0x3D]); // cmp eax, null_tag
+    code.extend_from_slice(&layout.value.null_tag.to_le_bytes());
+    let cmp_null = emit_jcc_rel32(code, [0x0F, 0x84]); // je
     let unknown_tag = emit_jmp_rel32(code);
 
     let cmp_int_label = code.len();
@@ -1611,6 +1618,10 @@ fn emit_native_step_ceq_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
     code.extend_from_slice(&[0x0F, 0x94, 0xC0]); // sete al
     let bool_ready = emit_jmp_rel32(code);
 
+    let cmp_null_label = code.len();
+    code.extend_from_slice(&[0xB0, 0x01]); // mov al, 1
+    let null_ready = emit_jmp_rel32(code);
+
     let not_equal_label = code.len();
     code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
     let ne_ready = emit_jmp_rel32(code);
@@ -1631,10 +1642,12 @@ fn emit_native_step_ceq_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
     patch_rel32(code, cmp_int, cmp_int_label)?;
     patch_rel32(code, cmp_float, cmp_float_label)?;
     patch_rel32(code, cmp_bool, cmp_bool_label)?;
+    patch_rel32(code, cmp_null, cmp_null_label)?;
     patch_rel32(code, tags_not_equal, not_equal_label)?;
     patch_rel32(code, result_ready, result_label)?;
     patch_rel32(code, float_ready, result_label)?;
     patch_rel32(code, bool_ready, result_label)?;
+    patch_rel32(code, null_ready, result_label)?;
     patch_rel32(code, ne_ready, result_label)?;
     patch_rel32(code, underflow, fallback_label)?;
     patch_rel32(code, lhs_string, fallback_label)?;
@@ -2137,6 +2150,8 @@ fn find_unique_word_index(words: &[usize; 3], needle: usize, label: &str) -> VmR
 
 fn detect_value_layout() -> VmResult<ValueLayout> {
     let value_size = std::mem::size_of::<Value>();
+    let null_a_bytes = encode_value_bytes(Value::Null);
+    let null_b_bytes = encode_value_bytes(Value::Null);
     let int_a = 0x0102_0304_0506_0708_i64;
     let int_b = 0x1112_1314_1516_1718_i64;
     let float_a = 3.25_f64;
@@ -2163,6 +2178,7 @@ fn detect_value_layout() -> VmResult<ValueLayout> {
     let array_a_bytes = encode_value_bytes(Value::Array(array_vec_a));
     let array_b_bytes = encode_value_bytes(Value::Array(array_vec_b));
     let stable_tag_pairs = [
+        (&null_a_bytes[..], &null_b_bytes[..]),
         (&int_a_bytes[..], &int_b_bytes[..]),
         (&float_a_bytes[..], &float_b_bytes[..]),
         (&bool_false_bytes[..], &bool_true_bytes[..]),
@@ -2170,6 +2186,7 @@ fn detect_value_layout() -> VmResult<ValueLayout> {
         (&array_a_bytes[..], &array_b_bytes[..]),
     ];
     let (tag_offset, tag_size) = detect_tag_layout(&stable_tag_pairs)?;
+    let null_tag = decode_tag(&null_a_bytes, tag_offset, tag_size);
     let int_tag = decode_tag(&int_a_bytes, tag_offset, tag_size);
     let float_tag = decode_tag(&float_a_bytes, tag_offset, tag_size);
     let bool_tag = decode_tag(&bool_false_bytes, tag_offset, tag_size);
@@ -2261,6 +2278,7 @@ fn detect_value_layout() -> VmResult<ValueLayout> {
         size: usize_to_i32(value_size, "Value size")?,
         tag_offset: usize_to_i32(tag_offset, "Value tag offset")?,
         tag_size: tag_size as u8,
+        null_tag,
         int_tag,
         float_tag,
         bool_tag,
