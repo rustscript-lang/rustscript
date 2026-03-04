@@ -8,7 +8,10 @@ use crate::compiler::source_map::{SourceId, Span};
 
 use super::{
     ParseError, STDLIB_PRINT_ARITY, STDLIB_PRINT_NAME,
-    ir::{ClosureExpr, Expr, FunctionDecl, FunctionImpl, MatchPattern, MatchTypePattern, Stmt},
+    ir::{
+        ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, MatchTypePattern,
+        Stmt,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -572,13 +575,13 @@ fn hex_nibble(ch: char) -> Option<u8> {
 pub(super) struct Parser {
     tokens: Vec<Token>,
     pos: usize,
-    locals: HashMap<String, u8>,
-    next_local: u8,
+    locals: HashMap<String, LocalSlot>,
+    next_local: LocalSlot,
     functions: HashMap<String, FunctionDecl>,
     function_list: Vec<FunctionDecl>,
     function_impls: HashMap<u16, FunctionImpl>,
     next_function: u16,
-    closure_scopes: Vec<HashMap<String, u8>>,
+    closure_scopes: Vec<HashMap<String, LocalSlot>>,
     closure_capture_contexts: Vec<ClosureCaptureContext>,
     allow_implicit_externs: bool,
     allow_implicit_semicolons: bool,
@@ -592,8 +595,8 @@ pub(super) struct Parser {
 }
 
 struct ClosureCaptureContext {
-    by_name: HashMap<String, u8>,
-    capture_copies: Vec<(u8, u8)>,
+    by_name: HashMap<String, LocalSlot>,
+    capture_copies: Vec<(LocalSlot, LocalSlot)>,
 }
 
 impl Parser {
@@ -2049,8 +2052,8 @@ impl Parser {
 
     fn build_optional_map_lookup_expr(
         &mut self,
-        container_slot: u8,
-        key_slot: u8,
+        container_slot: LocalSlot,
+        key_slot: LocalSlot,
     ) -> Result<Expr, ParseError> {
         let set_probe = self.build_builtin_call_expr(
             BuiltinFunction::Set,
@@ -2073,8 +2076,8 @@ impl Parser {
 
     fn build_optional_index_lookup_expr(
         &mut self,
-        container_slot: u8,
-        key_slot: u8,
+        container_slot: LocalSlot,
+        key_slot: LocalSlot,
     ) -> Result<Expr, ParseError> {
         let key_is_int = self.build_type_check_expr(Expr::Var(key_slot), "int")?;
         let key_is_negative = Expr::Lt(Box::new(Expr::Var(key_slot)), Box::new(Expr::Int(0)));
@@ -2104,7 +2107,7 @@ impl Parser {
 
     fn bind_hidden_local_expr(
         &mut self,
-        value_slot: u8,
+        value_slot: LocalSlot,
         value: Expr,
         body: Expr,
     ) -> Result<Expr, ParseError> {
@@ -2891,7 +2894,7 @@ impl Parser {
         }
     }
 
-    fn get_local(&mut self, name: &str) -> Result<u8, ParseError> {
+    fn get_local(&mut self, name: &str) -> Result<LocalSlot, ParseError> {
         for scope in self.closure_scopes.iter().rev() {
             if let Some(&index) = scope.get(name) {
                 return Ok(index);
@@ -3109,7 +3112,7 @@ impl Parser {
         Ok(decl)
     }
 
-    fn get_or_assign_local(&mut self, name: &str) -> Result<u8, ParseError> {
+    fn get_or_assign_local(&mut self, name: &str) -> Result<LocalSlot, ParseError> {
         if let Some(&index) = self.locals.get(name) {
             return Ok(index);
         }
@@ -3118,7 +3121,7 @@ impl Parser {
         Ok(index)
     }
 
-    fn allocate_hidden_local(&mut self) -> Result<u8, ParseError> {
+    fn allocate_hidden_local(&mut self) -> Result<LocalSlot, ParseError> {
         let index = self.next_local;
         self.next_local = self.next_local.checked_add(1).ok_or(ParseError {
             span: None,
@@ -3444,8 +3447,8 @@ impl Parser {
         self.function_impls.clone()
     }
 
-    pub(super) fn local_bindings(&self) -> Vec<(String, u8)> {
-        let mut locals: Vec<(String, u8)> = self
+    pub(super) fn local_bindings(&self) -> Vec<(String, LocalSlot)> {
+        let mut locals: Vec<(String, LocalSlot)> = self
             .locals
             .iter()
             .map(|(name, index)| (name.clone(), *index))

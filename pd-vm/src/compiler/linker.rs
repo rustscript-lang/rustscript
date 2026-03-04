@@ -5,7 +5,7 @@ use crate::builtins::BuiltinFunction;
 
 use super::{
     ParseError, SourceError, SourcePathError,
-    ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, Stmt},
+    ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt},
 };
 
 pub(super) struct ParsedUnit {
@@ -100,7 +100,7 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
                 message: "local count overflow while merging imported modules".to_string(),
             }))
         })?;
-        if local_base > (u8::MAX as usize) {
+        if local_base > (LocalSlot::MAX as usize + 1) {
             return Err(SourcePathError::Source(SourceError::Parse(ParseError {
                 span: None,
                 code: None,
@@ -167,7 +167,7 @@ fn remap_functions(
     Ok(map)
 }
 
-fn remap_local_index(index: u8, local_base: usize) -> Result<u8, SourcePathError> {
+fn remap_local_index(index: LocalSlot, local_base: usize) -> Result<LocalSlot, SourcePathError> {
     let remapped = (index as usize).checked_add(local_base).ok_or_else(|| {
         SourcePathError::Source(SourceError::Parse(ParseError {
             span: None,
@@ -176,7 +176,7 @@ fn remap_local_index(index: u8, local_base: usize) -> Result<u8, SourcePathError
             message: "local index overflow while merging imported modules".to_string(),
         }))
     })?;
-    u8::try_from(remapped).map_err(|_| {
+    LocalSlot::try_from(remapped).map_err(|_| {
         SourcePathError::Source(SourceError::Parse(ParseError {
             span: None,
             code: None,

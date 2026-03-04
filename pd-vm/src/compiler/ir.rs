@@ -2,12 +2,14 @@ use std::collections::HashMap;
 
 use super::ParseError;
 
+pub type LocalSlot = u16;
+
 /// Shared frontend-independent program representation that all source
 /// frontends lower into before bytecode emission.
 #[derive(Clone, Debug)]
 pub struct ClosureExpr {
-    pub param_slots: Vec<u8>,
-    pub capture_copies: Vec<(u8, u8)>,
+    pub param_slots: Vec<LocalSlot>,
+    pub capture_copies: Vec<(LocalSlot, LocalSlot)>,
     pub body: Box<Expr>,
 }
 
@@ -39,7 +41,7 @@ pub enum Expr {
     String(String),
     FunctionRef(u16),
     Call(u16, Vec<Expr>),
-    LocalCall(u8, Vec<Expr>),
+    LocalCall(LocalSlot, Vec<Expr>),
     Closure(ClosureExpr),
     ClosureCall(ClosureExpr, Vec<Expr>),
     Add(Box<Expr>, Box<Expr>),
@@ -54,15 +56,15 @@ pub enum Expr {
     Eq(Box<Expr>, Box<Expr>),
     Lt(Box<Expr>, Box<Expr>),
     Gt(Box<Expr>, Box<Expr>),
-    Var(u8),
+    Var(LocalSlot),
     IfElse {
         condition: Box<Expr>,
         then_expr: Box<Expr>,
         else_expr: Box<Expr>,
     },
     Match {
-        value_slot: u8,
-        result_slot: u8,
+        value_slot: LocalSlot,
+        result_slot: LocalSlot,
         value: Box<Expr>,
         arms: Vec<(MatchPattern, Expr)>,
         default: Box<Expr>,
@@ -79,12 +81,12 @@ pub enum Stmt {
         line: u32,
     },
     Let {
-        index: u8,
+        index: LocalSlot,
         expr: Expr,
         line: u32,
     },
     Assign {
-        index: u8,
+        index: LocalSlot,
         expr: Expr,
         line: u32,
     },
@@ -140,7 +142,7 @@ pub struct FunctionDecl {
 
 #[derive(Clone, Debug)]
 pub struct FunctionImpl {
-    pub param_slots: Vec<u8>,
+    pub param_slots: Vec<LocalSlot>,
     pub body_stmts: Vec<Stmt>,
     pub body_expr: Expr,
 }
@@ -149,14 +151,14 @@ pub struct FunctionImpl {
 pub struct FrontendIr {
     pub stmts: Vec<Stmt>,
     pub locals: usize,
-    pub local_bindings: Vec<(String, u8)>,
+    pub local_bindings: Vec<(String, LocalSlot)>,
     pub functions: Vec<FunctionDecl>,
     pub function_impls: HashMap<u16, FunctionImpl>,
 }
 
 pub(super) struct LocalIrBuilder {
-    locals: HashMap<String, u8>,
-    next_local: u8,
+    locals: HashMap<String, LocalSlot>,
+    next_local: LocalSlot,
     functions: Vec<FunctionDecl>,
     function_meta: HashMap<String, (u16, Option<u8>)>,
 }
@@ -280,7 +282,10 @@ impl LocalIrBuilder {
     }
 
     pub(super) fn finish(self, stmts: Vec<Stmt>) -> FrontendIr {
-        let mut local_bindings = self.locals.into_iter().collect::<Vec<(String, u8)>>();
+        let mut local_bindings = self
+            .locals
+            .into_iter()
+            .collect::<Vec<(String, LocalSlot)>>();
         local_bindings.sort_by_key(|(_, index)| *index);
         FrontendIr {
             stmts,
@@ -291,7 +296,7 @@ impl LocalIrBuilder {
         }
     }
 
-    fn alloc_local(&mut self) -> Result<u8, ParseError> {
+    fn alloc_local(&mut self) -> Result<LocalSlot, ParseError> {
         let index = self.next_local;
         self.next_local = self.next_local.checked_add(1).ok_or(ParseError {
             span: None,
