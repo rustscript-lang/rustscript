@@ -78,6 +78,47 @@ fn compiler_reuses_slots_when_declared_locals_exceed_bytecode_limit() {
 }
 
 #[test]
+fn slot_reuse_preserves_distinct_debug_locals() {
+    use std::collections::HashSet;
+
+    let mut source = String::new();
+    for idx in 0..300usize {
+        source.push_str(&format!("let v{idx} = {idx};\n"));
+    }
+    source.push_str("0;\n");
+
+    let compiled = compile_source(&source).expect("compile should succeed");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("compiled program should include debug info");
+
+    let locals = debug
+        .locals
+        .iter()
+        .filter(|local| local.name.starts_with('v'))
+        .collect::<Vec<_>>();
+    assert_eq!(locals.len(), 300);
+    assert!(
+        locals
+            .iter()
+            .all(|local| local.declared_line.is_some() && local.last_line.is_some()),
+        "all named locals should include declaration and last-use lines"
+    );
+
+    let distinct_slots = locals
+        .iter()
+        .map(|local| local.index)
+        .collect::<HashSet<_>>()
+        .len();
+    assert!(
+        distinct_slots < locals.len(),
+        "debug locals should remain distinct even when physical slots are reused"
+    );
+}
+
+#[test]
 fn compiler_rejects_programs_with_more_than_256_simultaneously_live_locals() {
     let live_count = (u8::MAX as usize) + 2;
     let mut source = String::new();

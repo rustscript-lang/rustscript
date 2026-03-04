@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::debug_info::DebugInfo;
+use crate::debug_info::{DebugInfo, LocalInfo};
 use crate::vm::{Program, Value, Vm, VmError, VmStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1071,7 +1071,11 @@ fn print_locals(vm: &Vm, out: &mut dyn Write) {
         return;
     }
 
+    let current_line = info.line_for_offset(vm.ip());
     for local in &info.locals {
+        if !local_visible_at_line(local, current_line) {
+            continue;
+        }
         match vm.locals().get(local.index as usize) {
             Some(value) => {
                 let _ = writeln!(out, "{} = {:?}", local.name, value);
@@ -1089,12 +1093,17 @@ fn print_local_by_name(vm: &Vm, name: &str, out: &mut dyn Write) {
         return;
     };
 
-    let Some(index) = info.local_index(name) else {
+    let Some(local) = info.locals.iter().find(|local| local.name == name) else {
         let _ = writeln!(out, "unknown local '{name}'");
         return;
     };
+    let current_line = info.line_for_offset(vm.ip());
+    if !local_visible_at_line(local, current_line) {
+        let _ = writeln!(out, "local '{name}' is not visible at this location");
+        return;
+    }
 
-    match vm.locals().get(index as usize) {
+    match vm.locals().get(local.index as usize) {
         Some(value) => {
             let _ = writeln!(out, "{name} = {:?}", value);
         }
@@ -1572,7 +1581,11 @@ fn print_replay_locals(recording: &VmRecording, frame: &VmRecordingFrame, out: &
         return;
     }
 
+    let current_line = info.line_for_offset(frame.ip);
     for local in &info.locals {
+        if !local_visible_at_line(local, current_line) {
+            continue;
+        }
         match frame.locals.get(local.index as usize) {
             Some(value) => {
                 let _ = writeln!(out, "{} = {:?}", local.name, value);
@@ -1582,6 +1595,23 @@ fn print_replay_locals(recording: &VmRecording, frame: &VmRecordingFrame, out: &
             }
         }
     }
+}
+
+fn local_visible_at_line(local: &LocalInfo, line: Option<u32>) -> bool {
+    let Some(line) = line else {
+        return true;
+    };
+    if let Some(declared_line) = local.declared_line
+        && line < declared_line
+    {
+        return false;
+    }
+    if let Some(last_line) = local.last_line
+        && line > last_line
+    {
+        return false;
+    }
+    true
 }
 
 fn print_replay_local_by_name(
@@ -1595,12 +1625,17 @@ fn print_replay_local_by_name(
         return;
     };
 
-    let Some(index) = info.local_index(name) else {
+    let Some(local) = info.locals.iter().find(|local| local.name == name) else {
         let _ = writeln!(out, "unknown local '{name}'");
         return;
     };
+    let current_line = info.line_for_offset(frame.ip);
+    if !local_visible_at_line(local, current_line) {
+        let _ = writeln!(out, "local '{name}' is not visible in this frame");
+        return;
+    }
 
-    match frame.locals.get(index as usize) {
+    match frame.locals.get(local.index as usize) {
         Some(value) => {
             let _ = writeln!(out, "{name} = {:?}", value);
         }
@@ -1827,6 +1862,8 @@ mod tests {
                 locals: vec![LocalInfo {
                     name: name.to_string(),
                     index: 0,
+                    declared_line: None,
+                    last_line: None,
                 }],
             }),
         );
@@ -1847,10 +1884,51 @@ mod tests {
                 locals: vec![LocalInfo {
                     name: name.to_string(),
                     index: 0,
+                    declared_line: None,
+                    last_line: None,
                 }],
             }),
         );
         Vm::with_locals(program, 1)
+    }
+
+    fn vm_with_scoped_named_locals() -> Vm {
+        let program = Program::with_debug(
+            vec![Value::Int(1)],
+            vec![
+                crate::vm::OpCode::Ldc as u8,
+                0,
+                0,
+                0,
+                0,
+                crate::vm::OpCode::Stloc as u8,
+                0,
+                crate::vm::OpCode::Ret as u8,
+            ],
+            Some(DebugInfo {
+                source: None,
+                lines: vec![crate::debug_info::LineInfo { offset: 0, line: 1 }],
+                functions: vec![],
+                locals: vec![
+                    LocalInfo {
+                        name: "a".to_string(),
+                        index: 0,
+                        declared_line: Some(1),
+                        last_line: Some(1),
+                    },
+                    LocalInfo {
+                        name: "b".to_string(),
+                        index: 0,
+                        declared_line: Some(2),
+                        last_line: Some(3),
+                    },
+                ],
+            }),
+        );
+        let mut vm = Vm::with_locals(program, 1);
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, crate::vm::VmStatus::Halted);
+        vm
     }
 
     #[test]
@@ -1915,6 +1993,49 @@ mod tests {
     }
 
     #[test]
+    fn locals_command_filters_by_debug_line_visibility() {
+        let mut vm = vm_with_scoped_named_locals();
+        let mut out = Vec::<u8>::new();
+        let mut breakpoints = HashSet::new();
+        let mut line_breakpoints = HashSet::new();
+        let mut step_mode = StepMode::Running;
+
+        handle_command(
+            "locals",
+            &mut vm,
+            &mut breakpoints,
+            &mut line_breakpoints,
+            &mut step_mode,
+            &mut out,
+        );
+
+        let text = String::from_utf8(out).expect("output should be utf-8");
+        assert!(text.contains("a = Int(1)"));
+        assert!(!text.contains("b = "));
+    }
+
+    #[test]
+    fn print_local_by_name_reports_not_visible_when_outside_debug_window() {
+        let mut vm = vm_with_scoped_named_locals();
+        let mut out = Vec::<u8>::new();
+        let mut breakpoints = HashSet::new();
+        let mut line_breakpoints = HashSet::new();
+        let mut step_mode = StepMode::Running;
+
+        handle_command(
+            "p b",
+            &mut vm,
+            &mut breakpoints,
+            &mut line_breakpoints,
+            &mut step_mode,
+            &mut out,
+        );
+
+        let text = String::from_utf8(out).expect("output should be utf-8");
+        assert!(text.contains("local 'b' is not visible"));
+    }
+
+    #[test]
     fn recording_encode_decode_roundtrip() {
         let program = Program::with_debug(
             vec![Value::Int(1)],
@@ -1926,6 +2047,8 @@ mod tests {
                 locals: vec![LocalInfo {
                     name: "x".to_string(),
                     index: 0,
+                    declared_line: None,
+                    last_line: None,
                 }],
             }),
         );
@@ -2414,14 +2537,20 @@ mod tests {
                     LocalInfo {
                         name: "a".to_string(),
                         index: 0,
+                        declared_line: None,
+                        last_line: None,
                     },
                     LocalInfo {
                         name: "b".to_string(),
                         index: 1,
+                        declared_line: None,
+                        last_line: None,
                     },
                     LocalInfo {
                         name: "c".to_string(),
                         index: 2,
+                        declared_line: None,
+                        last_line: None,
                     },
                 ],
             }),

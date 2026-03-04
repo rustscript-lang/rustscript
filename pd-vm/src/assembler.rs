@@ -81,6 +81,17 @@ impl Assembler {
         self.debug.add_local(name, index);
     }
 
+    pub fn add_local_with_range(
+        &mut self,
+        name: String,
+        index: u8,
+        declared_line: Option<u32>,
+        last_line: Option<u32>,
+    ) {
+        self.debug
+            .add_local_with_range(name, index, declared_line, last_line);
+    }
+
     pub fn add_constant(&mut self, value: Value) -> u32 {
         match value {
             Value::Int(number) => {

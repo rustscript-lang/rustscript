@@ -14,6 +14,8 @@ pub struct DebugFunction {
 pub struct LocalInfo {
     pub name: String,
     pub index: u8,
+    pub declared_line: Option<u32>,
+    pub last_line: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,14 +108,28 @@ impl DebugInfoBuilder {
     }
 
     pub fn add_local(&mut self, name: String, index: u8) {
-        if self
-            .locals
-            .iter()
-            .any(|local| local.name == name || local.index == index)
-        {
+        self.add_local_with_range(name, index, None, None);
+    }
+
+    pub fn add_local_with_range(
+        &mut self,
+        name: String,
+        index: u8,
+        declared_line: Option<u32>,
+        last_line: Option<u32>,
+    ) {
+        if let Some(existing) = self.locals.iter_mut().find(|local| local.name == name) {
+            existing.index = index;
+            existing.declared_line = merge_min_line(existing.declared_line, declared_line);
+            existing.last_line = merge_max_line(existing.last_line, last_line);
             return;
         }
-        self.locals.push(LocalInfo { name, index });
+        self.locals.push(LocalInfo {
+            name,
+            index,
+            declared_line,
+            last_line,
+        });
     }
 
     pub fn mark_line(&mut self, offset: u32, line: u32) {
@@ -145,5 +161,40 @@ impl DebugInfoBuilder {
             functions: self.functions,
             locals: self.locals,
         })
+    }
+}
+
+fn merge_min_line(current: Option<u32>, incoming: Option<u32>) -> Option<u32> {
+    match (current, incoming) {
+        (Some(lhs), Some(rhs)) => Some(lhs.min(rhs)),
+        (Some(lhs), None) => Some(lhs),
+        (None, Some(rhs)) => Some(rhs),
+        (None, None) => None,
+    }
+}
+
+fn merge_max_line(current: Option<u32>, incoming: Option<u32>) -> Option<u32> {
+    match (current, incoming) {
+        (Some(lhs), Some(rhs)) => Some(lhs.max(rhs)),
+        (Some(lhs), None) => Some(lhs),
+        (None, Some(rhs)) => Some(rhs),
+        (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DebugInfoBuilder;
+
+    #[test]
+    fn add_local_with_range_keeps_distinct_names_on_shared_slot() {
+        let mut builder = DebugInfoBuilder::new();
+        builder.add_local_with_range("a".to_string(), 0, Some(1), Some(1));
+        builder.add_local_with_range("b".to_string(), 0, Some(2), Some(2));
+
+        let debug = builder.finish().expect("debug info should be present");
+        assert_eq!(debug.locals.len(), 2);
+        assert_eq!(debug.locals[0].name, "a");
+        assert_eq!(debug.locals[1].name, "b");
     }
 }

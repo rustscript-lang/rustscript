@@ -36,6 +36,8 @@ fn wire_roundtrip_preserves_constants_and_code() {
             locals: vec![LocalInfo {
                 name: "v".to_string(),
                 index: 0,
+                declared_line: None,
+                last_line: None,
             }],
         }),
     );

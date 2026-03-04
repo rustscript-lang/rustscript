@@ -10,7 +10,8 @@ const VERSION_V1: u16 = 1;
 const VERSION_V2: u16 = 2;
 const VERSION_V3: u16 = 3;
 const VERSION_V4: u16 = 4;
-const ENCODE_VERSION: u16 = VERSION_V4;
+const VERSION_V5: u16 = 5;
+const ENCODE_VERSION: u16 = VERSION_V5;
 const FLAGS: u16 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +199,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         && version != VERSION_V2
         && version != VERSION_V3
         && version != VERSION_V4
+        && version != VERSION_V5
     {
         return Err(WireError::UnsupportedVersion(version));
     }
@@ -629,6 +631,10 @@ fn write_debug_info(out: &mut Vec<u8>, debug: Option<&DebugInfo>) -> Result<(), 
             for local in &debug.locals {
                 write_string("debug local name", &local.name, out)?;
                 out.push(local.index);
+                if ENCODE_VERSION >= VERSION_V5 {
+                    write_optional_u32(local.declared_line, out);
+                    write_optional_u32(local.last_line, out);
+                }
             }
 
             Ok(())
@@ -675,9 +681,18 @@ fn read_debug_info(cursor: &mut Cursor<'_>, version: u16) -> Result<Option<Debug
                 let local_count = cursor.read_u32()? as usize;
                 let mut locals = Vec::with_capacity(local_count);
                 for _ in 0..local_count {
+                    let name = cursor.read_string()?;
+                    let index = cursor.read_u8()?;
+                    let (declared_line, last_line) = if version >= VERSION_V5 {
+                        (read_optional_u32(cursor)?, read_optional_u32(cursor)?)
+                    } else {
+                        (None, None)
+                    };
                     locals.push(LocalInfo {
-                        name: cursor.read_string()?,
-                        index: cursor.read_u8()?,
+                        name,
+                        index,
+                        declared_line,
+                        last_line,
                     });
                 }
                 locals
@@ -692,6 +707,24 @@ fn read_debug_info(cursor: &mut Cursor<'_>, version: u16) -> Result<Option<Debug
                 locals,
             }))
         }
+        other => Err(WireError::InvalidDebugFlag(other)),
+    }
+}
+
+fn write_optional_u32(value: Option<u32>, out: &mut Vec<u8>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn read_optional_u32(cursor: &mut Cursor<'_>) -> Result<Option<u32>, WireError> {
+    match cursor.read_u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(cursor.read_u32()?)),
         other => Err(WireError::InvalidDebugFlag(other)),
     }
 }
