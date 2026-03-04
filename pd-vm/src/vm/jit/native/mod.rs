@@ -18,12 +18,16 @@ pub(super) const STATUS_HALTED: i32 = 1;
 pub(super) const STATUS_TRACE_EXIT: i32 = 2;
 pub(super) const STATUS_YIELDED: i32 = 3;
 pub(super) const STATUS_WAITING: i32 = 4;
+pub(super) const STATUS_OUT_OF_FUEL: i32 = 5;
 pub(super) const STATUS_ERROR: i32 = -1;
 
 pub(super) trait NativeBackend {
     type ExecutableMemory;
 
-    fn emit_trace_bytes(trace: &super::JitTrace) -> VmResult<Vec<u8>>;
+    fn emit_trace_bytes(
+        trace: &super::JitTrace,
+        fuel_check_interval: Option<u32>,
+    ) -> VmResult<Vec<u8>>;
     fn executable_memory_from_code(code: &[u8]) -> VmResult<Self::ExecutableMemory>;
     fn executable_memory_ptr(memory: &Self::ExecutableMemory) -> *mut u8;
     fn clear_bridge_error();
@@ -95,17 +99,23 @@ pub(super) enum CompiledNativeTrace {
 pub(super) fn compile_native_trace(
     trace: &super::JitTrace,
     backend: NativeCodegenBackend,
+    fuel_check_interval: Option<u32>,
 ) -> VmResult<CompiledNativeTrace> {
     match backend {
         NativeCodegenBackend::Handwritten => Ok(CompiledNativeTrace::Handwritten {
-            code: ActiveBackend::emit_trace_bytes(trace)?,
+            code: ActiveBackend::emit_trace_bytes(trace, fuel_check_interval)?,
         }),
-        NativeCodegenBackend::Cranelift => compile_native_trace_cranelift(trace),
+        NativeCodegenBackend::Cranelift => {
+            compile_native_trace_cranelift(trace, fuel_check_interval)
+        }
     }
 }
 
-pub(super) fn emit_native_trace_bytes(trace: &super::JitTrace) -> VmResult<Vec<u8>> {
-    ActiveBackend::emit_trace_bytes(trace)
+pub(super) fn emit_native_trace_bytes(
+    trace: &super::JitTrace,
+    fuel_check_interval: Option<u32>,
+) -> VmResult<Vec<u8>> {
+    ActiveBackend::emit_trace_bytes(trace, fuel_check_interval)
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -141,17 +151,20 @@ pub(super) fn take_bridge_error() -> Option<VmError> {
     ActiveBackend::take_bridge_error()
 }
 
-fn compile_native_trace_cranelift(trace: &super::JitTrace) -> VmResult<CompiledNativeTrace> {
+fn compile_native_trace_cranelift(
+    trace: &super::JitTrace,
+    fuel_check_interval: Option<u32>,
+) -> VmResult<CompiledNativeTrace> {
     #[cfg(feature = "cranelift-jit")]
     {
         Ok(CompiledNativeTrace::Cranelift(Box::new(
-            cranelift::compile_trace(trace)?,
+            cranelift::compile_trace(trace, fuel_check_interval)?,
         )))
     }
 
     #[cfg(not(feature = "cranelift-jit"))]
     {
-        let _ = trace;
+        let _ = (trace, fuel_check_interval);
         Err(VmError::JitNative(
             "Cranelift backend requested, but pd-vm was built without `cranelift-jit` feature"
                 .to_string(),

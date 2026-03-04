@@ -61,6 +61,7 @@ pub(crate) struct NativeTrace {
     root_ip: usize,
     terminal: JitTraceTerminal,
     has_yielding_call: bool,
+    fuel_check_interval: Option<u32>,
 }
 
 #[cfg(any(
@@ -73,6 +74,7 @@ pub(crate) struct NativeTrace {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct NativeTraceCacheKey {
     backend: native::NativeCodegenBackend,
+    fuel_check_interval: Option<u32>,
     root_ip: usize,
     terminal: JitTraceTerminal,
     steps: Vec<TraceStep>,
@@ -205,9 +207,11 @@ fn with_cranelift_native_trace_cache<R>(f: impl FnOnce(&mut CraneliftNativeTrace
 fn native_trace_cache_key(
     trace: &JitTrace,
     backend: native::NativeCodegenBackend,
+    fuel_check_interval: Option<u32>,
 ) -> NativeTraceCacheKey {
     NativeTraceCacheKey {
         backend,
+        fuel_check_interval,
         root_ip: trace.root_ip,
         terminal: trace.terminal.clone(),
         steps: trace.steps.clone(),
@@ -445,12 +449,6 @@ impl Vm {
     }
 
     pub(in crate::vm) fn execute_jit_entry(&mut self, trace_id: usize) -> VmResult<ExecOutcome> {
-        // Keep fuel accounting exact at IR-step granularity: when fuel metering is enabled,
-        // execute traced IR steps through the trace interpreter path.
-        if self.fuel_remaining.is_some() {
-            return self.execute_jit_trace(trace_id);
-        }
-
         #[cfg(any(
             all(
                 target_arch = "x86_64",
@@ -526,6 +524,12 @@ impl Vm {
                     })?;
                     return Ok(ExecOutcome::Waiting(op_id));
                 }
+                native::STATUS_OUT_OF_FUEL => {
+                    return Err(VmError::OutOfFuel {
+                        needed: u64::from(self.fuel_check_interval),
+                        remaining: self.fuel_remaining,
+                    });
+                }
                 native::STATUS_ERROR => {
                     let err = native::take_bridge_error().unwrap_or_else(|| {
                         VmError::JitNative(
@@ -552,17 +556,25 @@ impl Vm {
         all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
     ))]
     fn ensure_native_trace(&mut self, trace_id: usize) -> VmResult<()> {
-        if self.native_traces.contains_key(&trace_id) {
-            return Ok(());
+        if let Some(native) = self.native_traces.get(&trace_id) {
+            if native.fuel_check_interval == self.fuel_enabled.then_some(self.fuel_check_interval) {
+                return Ok(());
+            }
         }
+        self.native_traces.remove(&trace_id);
 
         let program_cache_key = self.ensure_program_cache_key();
+        let fuel_check_interval = self.fuel_enabled.then_some(self.fuel_check_interval);
         let trace = self.jit.trace_clone(trace_id).ok_or_else(|| {
             VmError::JitNative(format!("trace {} missing for native compile", trace_id))
         })?;
         match native::selected_codegen_backend() {
             native::NativeCodegenBackend::Handwritten => {
-                let key = native_trace_cache_key(&trace, native::NativeCodegenBackend::Handwritten);
+                let key = native_trace_cache_key(
+                    &trace,
+                    native::NativeCodegenBackend::Handwritten,
+                    fuel_check_interval,
+                );
                 let cache = native_trace_cache();
                 let (memory, code) = {
                     let mut guard = cache.lock().map_err(|_| {
@@ -577,7 +589,8 @@ impl Vm {
                         (Arc::clone(&hit.memory), Arc::clone(&hit.code))
                     } else {
                         let code = Arc::<[u8]>::from(
-                            native::emit_native_trace_bytes(&trace)?.into_boxed_slice(),
+                            native::emit_native_trace_bytes(&trace, fuel_check_interval)?
+                                .into_boxed_slice(),
                         );
                         let memory = Arc::new(native::ExecutableMemory::from_code(code.as_ref())?);
                         guard.entries.insert(
@@ -603,14 +616,18 @@ impl Vm {
                         root_ip: trace.root_ip,
                         terminal: trace.terminal,
                         has_yielding_call: trace.has_yielding_call,
+                        fuel_check_interval,
                     },
                 );
             }
             native::NativeCodegenBackend::Cranelift => {
                 #[cfg(feature = "cranelift-jit")]
                 {
-                    let key =
-                        native_trace_cache_key(&trace, native::NativeCodegenBackend::Cranelift);
+                    let key = native_trace_cache_key(
+                        &trace,
+                        native::NativeCodegenBackend::Cranelift,
+                        fuel_check_interval,
+                    );
                     let cached = with_cranelift_native_trace_cache(|cache| {
                         if cache.active_program_key != Some(program_cache_key) {
                             cache.entries.clear();
@@ -629,14 +646,18 @@ impl Vm {
                                 root_ip: trace.root_ip,
                                 terminal: trace.terminal,
                                 has_yielding_call: trace.has_yielding_call,
+                                fuel_check_interval,
                             },
                         );
                         return Ok(());
                     }
                 }
 
-                let compiled =
-                    native::compile_native_trace(&trace, native::NativeCodegenBackend::Cranelift)?;
+                let compiled = native::compile_native_trace(
+                    &trace,
+                    native::NativeCodegenBackend::Cranelift,
+                    fuel_check_interval,
+                )?;
                 match compiled {
                     #[cfg(feature = "cranelift-jit")]
                     native::CompiledNativeTrace::Cranelift(compiled) => {
@@ -655,6 +676,7 @@ impl Vm {
                             let key = native_trace_cache_key(
                                 &trace,
                                 native::NativeCodegenBackend::Cranelift,
+                                fuel_check_interval,
                             );
                             with_cranelift_native_trace_cache(|cache| {
                                 if cache.active_program_key != Some(program_cache_key) {
@@ -675,6 +697,7 @@ impl Vm {
                                 root_ip: trace.root_ip,
                                 terminal: trace.terminal,
                                 has_yielding_call: trace.has_yielding_call,
+                                fuel_check_interval,
                             },
                         );
                     }
@@ -695,6 +718,7 @@ impl Vm {
                                 root_ip: trace.root_ip,
                                 terminal: trace.terminal,
                                 has_yielding_call: trace.has_yielding_call,
+                                fuel_check_interval,
                             },
                         );
                     }

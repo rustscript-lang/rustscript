@@ -1,8 +1,8 @@
 use super::super::super::{HostCallExecOutcome, NumericValue, Value, Vm, VmError, VmResult};
 use super::super::{JitTrace, TraceStep};
 use super::{
-    STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_TRACE_EXIT, STATUS_WAITING,
-    STATUS_YIELDED, store_bridge_error,
+    STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_OUT_OF_FUEL, STATUS_TRACE_EXIT,
+    STATUS_WAITING, STATUS_YIELDED, store_bridge_error,
 };
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -77,6 +77,9 @@ struct NativeStackLayout {
     vm_program_constants_ptr_offset: i32,
     vm_program_constants_len_offset: i32,
     vm_ip_offset: i32,
+    vm_fuel_enabled_offset: i32,
+    vm_fuel_remaining_offset: i32,
+    vm_fuel_ops_until_check_offset: i32,
     stack_vec: VecLayout,
     value: ValueLayout,
 }
@@ -91,9 +94,19 @@ struct ResolvedOffsets {
     constants_ptr: i32,
     constants_len: i32,
     vm_ip: i32,
+    fuel_enabled: i32,
+    fuel_remaining: i32,
+    fuel_ops_until_check: i32,
 }
 
-pub(crate) fn compile_trace(trace: &JitTrace) -> VmResult<CraneliftCompiledTrace> {
+pub(crate) fn compile_trace(
+    trace: &JitTrace,
+    fuel_check_interval: Option<u32>,
+) -> VmResult<CraneliftCompiledTrace> {
+    if matches!(fuel_check_interval, Some(0)) {
+        return Err(VmError::InvalidFuelCheckInterval(0));
+    }
+
     let layout = detect_native_stack_layout()?;
     let offsets = resolve_offsets(layout)?;
 
@@ -142,7 +155,15 @@ pub(crate) fn compile_trace(trace: &JitTrace) -> VmResult<CraneliftCompiledTrace
 
         let helper_ref = module.declare_func_in_func(helper_id, b.func);
 
-        for step in &trace.steps {
+        for (step_index, step) in trace.steps.iter().enumerate() {
+            if let Some(interval) = fuel_check_interval {
+                let stride = interval as usize;
+                if step_index % stride == 0 {
+                    let remaining = trace.steps.len().saturating_sub(step_index);
+                    let chunk_len = remaining.min(stride) as u32;
+                    emit_fuel_tick_inline(&mut b, vm_ptr, exit_block, offsets, chunk_len, interval);
+                }
+            }
             if emit_inline_or_helper_step(
                 &mut b,
                 vm_ptr,
@@ -197,6 +218,98 @@ pub(crate) fn compile_trace(trace: &JitTrace) -> VmResult<CraneliftCompiledTrace
         keepalive: CraneliftTraceKeepAlive { _module: module },
         code,
     })
+}
+
+fn emit_fuel_tick_inline(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    exit_block: Block,
+    offsets: ResolvedOffsets,
+    steps_to_advance: u32,
+    fuel_check_interval: u32,
+) {
+    if steps_to_advance == 0 {
+        return;
+    }
+
+    let metering_enabled_block = b.create_block();
+    let continue_block = b.create_block();
+
+    let fuel_enabled = b
+        .ins()
+        .load(types::I8, MemFlags::new(), vm_ptr, offsets.fuel_enabled);
+    let metering_enabled = b.ins().icmp_imm(IntCC::NotEqual, fuel_enabled, 0);
+    b.ins().brif(
+        metering_enabled,
+        metering_enabled_block,
+        &[],
+        continue_block,
+        &[],
+    );
+
+    b.switch_to_block(metering_enabled_block);
+    let countdown_block = b.create_block();
+    let charge_block = b.create_block();
+
+    let ops_until_check = b
+        .ins()
+        .load(types::I32, MemFlags::new(), vm_ptr, offsets.fuel_ops_until_check);
+    let chunk_steps = b.ins().iconst(types::I32, i64::from(steps_to_advance));
+    let no_charge = b
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThan, ops_until_check, chunk_steps);
+    b.ins().brif(no_charge, countdown_block, &[], charge_block, &[]);
+
+    b.switch_to_block(countdown_block);
+    let new_ops = b.ins().isub(ops_until_check, chunk_steps);
+    b.ins().store(
+        MemFlags::new(),
+        new_ops,
+        vm_ptr,
+        offsets.fuel_ops_until_check,
+    );
+    b.ins().jump(continue_block, &[]);
+
+    b.switch_to_block(charge_block);
+    let remaining = b.ins().load(
+        types::I64,
+        MemFlags::new(),
+        vm_ptr,
+        offsets.fuel_remaining,
+    );
+    let interval_i32 = b.ins().iconst(types::I32, i64::from(fuel_check_interval));
+    let charge_amount = b.ins().uextend(types::I64, interval_i32);
+    let enough_fuel = b
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, remaining, charge_amount);
+
+    let charge_ok = b.create_block();
+    let out_of_fuel = b.create_block();
+    b.ins().brif(enough_fuel, charge_ok, &[], out_of_fuel, &[]);
+
+    b.switch_to_block(charge_ok);
+    let new_remaining = b.ins().isub(remaining, charge_amount);
+    b.ins().store(
+        MemFlags::new(),
+        new_remaining,
+        vm_ptr,
+        offsets.fuel_remaining,
+    );
+    let overrun = b.ins().isub(chunk_steps, ops_until_check);
+    let next_ops = b.ins().isub(interval_i32, overrun);
+    b.ins().store(
+        MemFlags::new(),
+        next_ops,
+        vm_ptr,
+        offsets.fuel_ops_until_check,
+    );
+    b.ins().jump(continue_block, &[]);
+
+    b.switch_to_block(out_of_fuel);
+    let status = b.ins().iconst(types::I32, STATUS_OUT_OF_FUEL as i64);
+    jump_with_status(b, exit_block, status);
+
+    b.switch_to_block(continue_block);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1710,6 +1823,9 @@ fn resolve_offsets(layout: NativeStackLayout) -> VmResult<ResolvedOffsets> {
         constants_ptr,
         constants_len,
         vm_ip: layout.vm_ip_offset,
+        fuel_enabled: layout.vm_fuel_enabled_offset,
+        fuel_remaining: layout.vm_fuel_remaining_offset,
+        fuel_ops_until_check: layout.vm_fuel_ops_until_check_offset,
     })
 }
 
@@ -1808,6 +1924,18 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         "Vm::program_constants_len offset",
     )?;
     let vm_ip_offset = usize_to_i32(std::mem::offset_of!(Vm, ip), "Vm::ip offset")?;
+    let vm_fuel_enabled_offset = usize_to_i32(
+        std::mem::offset_of!(Vm, fuel_enabled),
+        "Vm::fuel_enabled offset",
+    )?;
+    let vm_fuel_remaining_offset = usize_to_i32(
+        std::mem::offset_of!(Vm, fuel_remaining),
+        "Vm::fuel_remaining offset",
+    )?;
+    let vm_fuel_ops_until_check_offset = usize_to_i32(
+        std::mem::offset_of!(Vm, fuel_ops_until_check),
+        "Vm::fuel_ops_until_check offset",
+    )?;
     let stack_vec = detect_vec_layout()?;
     let value = detect_value_layout()?;
     Ok(NativeStackLayout {
@@ -1816,6 +1944,9 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         vm_program_constants_ptr_offset,
         vm_program_constants_len_offset,
         vm_ip_offset,
+        vm_fuel_enabled_offset,
+        vm_fuel_remaining_offset,
+        vm_fuel_ops_until_check_offset,
         stack_vec,
         value,
     })

@@ -1,6 +1,6 @@
 use super::{
-    NativeBackend, STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_TRACE_EXIT, STATUS_WAITING,
-    STATUS_YIELDED,
+    NativeBackend, STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_OUT_OF_FUEL,
+    STATUS_TRACE_EXIT, STATUS_WAITING, STATUS_YIELDED,
 };
 use crate::vm::jit::TraceStep;
 use crate::vm::{HostCallExecOutcome, Value, Vm, VmError, VmResult};
@@ -11,8 +11,11 @@ pub(super) struct AArch64Backend;
 impl NativeBackend for AArch64Backend {
     type ExecutableMemory = BackendExecutableMemory;
 
-    fn emit_trace_bytes(trace: &crate::vm::jit::JitTrace) -> VmResult<Vec<u8>> {
-        emit_native_trace_bytes(trace)
+    fn emit_trace_bytes(
+        trace: &crate::vm::jit::JitTrace,
+        fuel_check_interval: Option<u32>,
+    ) -> VmResult<Vec<u8>> {
+        emit_native_trace_bytes(trace, fuel_check_interval)
     }
 
     fn executable_memory_from_code(code: &[u8]) -> VmResult<Self::ExecutableMemory> {
@@ -86,6 +89,9 @@ struct NativeStackLayout {
     vm_program_constants_ptr_offset: i32,
     vm_program_constants_len_offset: i32,
     vm_ip_offset: i32,
+    vm_fuel_enabled_offset: i32,
+    vm_fuel_remaining_offset: i32,
+    vm_fuel_ops_until_check_offset: i32,
     stack_vec: VecLayout,
     value: ValueLayout,
 }
@@ -126,7 +132,14 @@ fn trace_ip_to_u64(ip: usize, context: &str) -> VmResult<u64> {
     u64::try_from(ip).map_err(|_| VmError::JitNative(format!("{context} exceeds 64-bit range")))
 }
 
-fn emit_native_trace_bytes(trace: &crate::vm::jit::JitTrace) -> VmResult<Vec<u8>> {
+fn emit_native_trace_bytes(
+    trace: &crate::vm::jit::JitTrace,
+    fuel_check_interval: Option<u32>,
+) -> VmResult<Vec<u8>> {
+    if matches!(fuel_check_interval, Some(0)) {
+        return Err(VmError::InvalidFuelCheckInterval(0));
+    }
+
     let layout = detect_native_stack_layout()?;
     let mut code = Vec::with_capacity(1024);
     let mut status_checks = Vec::new();
@@ -134,7 +147,23 @@ fn emit_native_trace_bytes(trace: &crate::vm::jit::JitTrace) -> VmResult<Vec<u8>
     emit_native_prologue(&mut code);
     emit_status_continue(&mut code);
 
-    for step in &trace.steps {
+    for (step_index, step) in trace.steps.iter().enumerate() {
+        if let Some(interval) = fuel_check_interval {
+            let stride = interval as usize;
+            if step_index % stride == 0 {
+                let remaining = trace.steps.len().saturating_sub(step_index);
+                let chunk_len = remaining.min(stride) as u32;
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_fuel_tick_inline(
+                        &mut code,
+                        layout,
+                        chunk_len,
+                        interval,
+                    )
+                );
+            }
+        }
         match step {
             TraceStep::Nop => {}
             TraceStep::Ldc(index) => {
@@ -357,6 +386,64 @@ fn emit_status_trace_exit(code: &mut Vec<u8>) {
 
 fn emit_status_halted(code: &mut Vec<u8>) {
     emit_mov_imm64(code, 0, STATUS_HALTED as i64 as u64);
+}
+
+fn emit_native_fuel_tick_inline(
+    code: &mut Vec<u8>,
+    layout: NativeStackLayout,
+    steps_to_advance: u32,
+    fuel_check_interval: u32,
+) -> VmResult<()> {
+    if steps_to_advance == 0 {
+        return Ok(());
+    }
+
+    emit_ldr_b_disp(code, 14, VM_REG, layout.vm_fuel_enabled_offset)?;
+    emit_cmp_imm(code, 14, 0)?;
+    let metering_disabled = emit_b_cond_placeholder(code, Cond::Eq);
+
+    emit_ldr_w_disp(code, 15, VM_REG, layout.vm_fuel_ops_until_check_offset)?;
+    emit_mov_imm64(code, 16, u64::from(steps_to_advance));
+    emit_cmp_reg(code, 15, 16);
+    let countdown = emit_b_cond_placeholder(code, Cond::Hi);
+
+    emit_ldr_x_disp(code, 17, VM_REG, layout.vm_fuel_remaining_offset)?;
+    emit_mov_imm64(code, 16, u64::from(fuel_check_interval));
+    emit_mov_reg(code, 18, 16);
+    emit_cmp_reg(code, 17, 18);
+    let out_of_fuel = emit_b_cond_placeholder(code, Cond::Lo);
+    emit_sub_reg(code, 17, 17, 18);
+    emit_str_x_disp(code, 17, VM_REG, layout.vm_fuel_remaining_offset)?;
+    emit_mov_imm64(code, 18, u64::from(steps_to_advance));
+    emit_sub_reg(code, 18, 18, 15);
+    emit_mov_imm64(code, 16, u64::from(fuel_check_interval));
+    emit_sub_reg(code, 16, 16, 18);
+    emit_str_w_disp(code, 16, VM_REG, layout.vm_fuel_ops_until_check_offset)?;
+    emit_status_continue(code);
+    let charge_done = emit_b_placeholder(code);
+
+    let countdown_label = code.len();
+    emit_mov_imm64(code, 16, u64::from(steps_to_advance));
+    emit_sub_reg(code, 15, 15, 16);
+    emit_str_w_disp(code, 15, VM_REG, layout.vm_fuel_ops_until_check_offset)?;
+    emit_status_continue(code);
+    let countdown_done = emit_b_placeholder(code);
+
+    let disabled_label = code.len();
+    emit_status_continue(code);
+    let disabled_done = emit_b_placeholder(code);
+
+    let out_of_fuel_label = code.len();
+    emit_mov_imm64(code, 0, STATUS_OUT_OF_FUEL as i64 as u64);
+
+    let done_label = code.len();
+    patch_b_cond_rel19(code, metering_disabled, disabled_label)?;
+    patch_b_cond_rel19(code, countdown, countdown_label)?;
+    patch_b_cond_rel19(code, out_of_fuel, out_of_fuel_label)?;
+    patch_b_rel26(code, charge_done, done_label)?;
+    patch_b_rel26(code, countdown_done, done_label)?;
+    patch_b_rel26(code, disabled_done, done_label)?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1489,6 +1576,18 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         "Vm::program_constants_len offset",
     )?;
     let vm_ip_offset = usize_to_i32(std::mem::offset_of!(Vm, ip), "Vm::ip offset")?;
+    let vm_fuel_enabled_offset = usize_to_i32(
+        std::mem::offset_of!(Vm, fuel_enabled),
+        "Vm::fuel_enabled offset",
+    )?;
+    let vm_fuel_remaining_offset = usize_to_i32(
+        std::mem::offset_of!(Vm, fuel_remaining),
+        "Vm::fuel_remaining offset",
+    )?;
+    let vm_fuel_ops_until_check_offset = usize_to_i32(
+        std::mem::offset_of!(Vm, fuel_ops_until_check),
+        "Vm::fuel_ops_until_check offset",
+    )?;
     let stack_vec = detect_vec_layout()?;
     let value = detect_value_layout()?;
     Ok(NativeStackLayout {
@@ -1497,6 +1596,9 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         vm_program_constants_ptr_offset,
         vm_program_constants_len_offset,
         vm_ip_offset,
+        vm_fuel_enabled_offset,
+        vm_fuel_remaining_offset,
+        vm_fuel_ops_until_check_offset,
         stack_vec,
         value,
     })
@@ -2495,9 +2597,22 @@ mod tests {
         }
     }
 
+    fn build_trace(steps: Vec<TraceStep>) -> JitTrace {
+        JitTrace {
+            id: 0,
+            root_ip: 0,
+            start_line: None,
+            has_call: false,
+            has_yielding_call: false,
+            steps,
+            terminal: JitTraceTerminal::LoopBack,
+            executions: 0,
+        }
+    }
+
     fn execute_single_step(vm: &mut Vm, step: TraceStep) -> VmResult<i32> {
         let trace = build_single_step_trace(step);
-        let code = emit_native_trace_bytes(&trace)?;
+        let code = emit_native_trace_bytes(&trace, None)?;
         let memory = BackendExecutableMemory::from_code(&code)?;
         let entry = unsafe { std::mem::transmute::<*mut u8, NativeEntry>(memory.ptr) };
         clear_bridge_error();
@@ -2507,7 +2622,7 @@ mod tests {
     }
 
     fn execute_trace(vm: &mut Vm, trace: JitTrace) -> VmResult<i32> {
-        let code = emit_native_trace_bytes(&trace)?;
+        let code = emit_native_trace_bytes(&trace, None)?;
         let memory = BackendExecutableMemory::from_code(&code)?;
         let entry = unsafe { std::mem::transmute::<*mut u8, NativeEntry>(memory.ptr) };
         clear_bridge_error();
@@ -2520,7 +2635,7 @@ mod tests {
         vm: &mut Vm,
         trace: JitTrace,
     ) -> VmResult<(i32, BackendExecutableMemory)> {
-        let code = emit_native_trace_bytes(&trace)?;
+        let code = emit_native_trace_bytes(&trace, None)?;
         let memory = BackendExecutableMemory::from_code(&code)?;
         let entry = unsafe { std::mem::transmute::<*mut u8, NativeEntry>(memory.ptr) };
         clear_bridge_error();
@@ -2683,7 +2798,7 @@ mod tests {
     #[test]
     fn add_step_emits_no_helper_call() {
         let trace = build_single_step_trace(TraceStep::Add);
-        let code = emit_native_trace_bytes(&trace).expect("trace should compile");
+        let code = emit_native_trace_bytes(&trace, None).expect("trace should compile");
         let call_count = code
             .chunks_exact(4)
             .filter(|chunk| {
@@ -2694,13 +2809,40 @@ mod tests {
     }
 
     #[test]
+    fn fuel_tick_emission_is_optional() {
+        let trace = build_single_step_trace(TraceStep::Add);
+        let without_fuel_checks = emit_native_trace_bytes(&trace, None).expect("trace should compile");
+        let with_fuel_checks =
+            emit_native_trace_bytes(&trace, Some(1)).expect("trace should compile");
+        assert!(
+            with_fuel_checks.len() > without_fuel_checks.len(),
+            "fuel checks should add machine code; without={} with={}",
+            without_fuel_checks.len(),
+            with_fuel_checks.len()
+        );
+    }
+
+    #[test]
+    fn larger_fuel_intervals_emit_fewer_tick_blocks() {
+        let trace = build_trace(vec![TraceStep::Nop; 32]);
+        let every_step = emit_native_trace_bytes(&trace, Some(1)).expect("trace should compile");
+        let every_eight = emit_native_trace_bytes(&trace, Some(8)).expect("trace should compile");
+        assert!(
+            every_eight.len() < every_step.len(),
+            "expected fewer fuel tick blocks for interval=8; interval=1={} interval=8={}",
+            every_step.len(),
+            every_eight.len()
+        );
+    }
+
+    #[test]
     fn call_step_emits_helper_call() {
         let trace = build_single_step_trace(TraceStep::Call {
             index: 0,
             argc: 1,
             call_ip: 0,
         });
-        let code = emit_native_trace_bytes(&trace).expect("trace should compile");
+        let code = emit_native_trace_bytes(&trace, None).expect("trace should compile");
         let call_count = code
             .chunks_exact(4)
             .filter(|chunk| {
@@ -2846,7 +2988,7 @@ mod tests {
     #[test]
     fn jump_to_root_step_returns_trace_exit() {
         let trace = build_single_step_trace(TraceStep::JumpToRoot);
-        let code = emit_native_trace_bytes(&trace).expect("jump trace should compile");
+        let code = emit_native_trace_bytes(&trace, None).expect("jump trace should compile");
         let mut found_cbnz = false;
         for chunk in code.chunks_exact(4) {
             let insn = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
@@ -2905,7 +3047,7 @@ mod tests {
             executions: 0,
         };
 
-        let code = emit_native_trace_bytes(&trace).expect("all steps should emit");
+        let code = emit_native_trace_bytes(&trace, None).expect("all steps should emit");
         assert!(!code.is_empty());
     }
 

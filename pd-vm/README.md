@@ -17,10 +17,9 @@ source syntaxes (`.rss`, `.js`, `.lua`, `.scm`).
 Executes compiled compact bytecode rather than interpreting source.
 Offers consistent runtime semantics for both synchronous and asynchronous execution.
 Includes rich debugging and profiling tools: interactive debugger, recording and replay, and JIT trace insights.
-
 ## TODO
 
-- [ ] JIT native path and host call fuel budgeting.
+- [ ] host call fuel budgeting.
 - [ ] Epoch-based interruption API.
 - [ ] Callable-as-value support.
 
@@ -199,8 +198,8 @@ Fuel charging semantics:
   Default interval is `1` (exact mode).
 - The interpreter applies fuel checks in the VM loop before opcode fetch/execute.
 - Trace-JIT execution applies the same cadence before each `TraceStep`.
-- When fuel metering is enabled, native JIT entry falls back to trace-step execution so accounting
-  stays per-step accurate.
+- When fuel metering is enabled, native JIT execution injects fuel checks in generated machine
+  code at the configured check cadence.
 - With interval `> 1`, out-of-fuel detection is coarse-grained: execution may run up to
   `interval - 1` extra instructions before the next fuel check.
 - If there is not enough fuel, execution returns `VmError::OutOfFuel { needed, remaining }`

@@ -11,6 +11,21 @@ fn native_jit_supported() -> bool {
             && (cfg!(target_os = "linux") || cfg!(target_os = "macos")))
 }
 
+fn first_native_code_bytes(dump: &str) -> Option<usize> {
+    for line in dump.lines() {
+        let marker = "code_bytes=";
+        let Some(start) = line.find(marker) else {
+            continue;
+        };
+        let raw = &line[start + marker.len()..];
+        let value = raw.split_whitespace().next()?;
+        if let Ok(bytes) = value.parse::<usize>() {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
 struct PrintNoReturn;
 
 impl HostFunction for PrintNoReturn {
@@ -56,6 +71,93 @@ fn trace_jit_compiles_hot_loop_and_is_dumpable() {
     } else {
         assert!(snapshot.traces.is_empty());
     }
+}
+
+#[test]
+fn trace_jit_native_path_honors_fuel_metering() {
+    let source = r#"
+        let i = 0;
+        while i < 100 {
+            i = i + 1;
+        }
+        i;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    vm.set_jit_config(JitConfig {
+        enabled: native_jit_supported(),
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.set_fuel_check_interval(1)
+        .expect("fuel interval update should succeed");
+    vm.set_fuel(12);
+
+    let err = vm
+        .run()
+        .expect_err("run should stop when fuel is exhausted");
+    assert!(
+        matches!(err, vm::VmError::OutOfFuel { .. }),
+        "expected out-of-fuel, got {err:?}"
+    );
+    if native_jit_supported() {
+        assert!(
+            vm.jit_native_exec_count() > 0,
+            "expected native JIT execution under fuel metering, dump:\n{}",
+            vm.dump_jit_info()
+        );
+    }
+}
+
+#[test]
+fn changing_fuel_interval_recompiles_native_trace_variant() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let i = 0;
+        let acc = 0;
+        while i < 40 {
+            acc = acc + i;
+            acc = acc + 1;
+            i = i + 1;
+        }
+        acc;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    vm.set_fuel_check_interval(1)
+        .expect("fuel interval update should succeed");
+    vm.set_fuel(1_000_000);
+    let status = vm.run().expect("first run should halt");
+    assert_eq!(status, VmStatus::Halted);
+    let dump_first = vm.dump_jit_info();
+    let bytes_first =
+        first_native_code_bytes(&dump_first).expect("first run should produce native code bytes");
+
+    vm.reset_for_reuse();
+    vm.set_fuel_check_interval(8)
+        .expect("fuel interval update should succeed");
+    vm.set_fuel(1_000_000);
+    let status = vm.run().expect("second run should halt");
+    assert_eq!(status, VmStatus::Halted);
+    let dump_second = vm.dump_jit_info();
+    let bytes_second =
+        first_native_code_bytes(&dump_second).expect("second run should produce native code bytes");
+
+    assert!(
+        bytes_second < bytes_first,
+        "expected fewer injected fuel checks with interval 8; interval=1 bytes={bytes_first}, interval=8 bytes={bytes_second}\nfirst dump:\n{dump_first}\nsecond dump:\n{dump_second}"
+    );
 }
 
 #[test]
