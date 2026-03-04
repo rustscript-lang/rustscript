@@ -210,6 +210,7 @@ mod frontends;
 pub mod ir;
 mod lifetime;
 mod linker;
+mod opt;
 mod parser;
 mod source_loader;
 pub mod source_map;
@@ -283,6 +284,7 @@ fn compile_parsed_output(
     parsed: FrontendIr,
 ) -> Result<CompiledProgram, SourceError> {
     let local_debug_ranges = collect_named_local_debug_ranges(&parsed);
+    let parsed = opt::legalize_builtins_and_bind_types(parsed);
     let parsed = lifetime::enforce_local_availability(parsed).map_err(SourceError::Parse)?;
     let FrontendIr {
         stmts,
