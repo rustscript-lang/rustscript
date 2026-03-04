@@ -14,7 +14,7 @@ fn run_rustscript_spec(path: &Path) -> Vec<Value> {
         "stdlib RustScript specs should not emit host imports for builtins"
     );
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     loop {
         let status = vm.run().expect("spec vm should run");
         match status {

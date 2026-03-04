@@ -10,7 +10,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
-use vm::{Program, decode_program, infer_local_count, validate_program};
+use vm::{Program, decode_program, validate_program};
 
 use crate::{
     HOST_FUNCTION_COUNT,
@@ -40,7 +40,6 @@ pub struct SharedState {
 #[derive(Clone)]
 pub struct LoadedProgram {
     pub program: Arc<Program>,
-    pub local_count: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -466,28 +465,12 @@ pub async fn apply_program_from_bytes(state: &SharedState, bytes: &[u8]) -> Prog
         };
     }
 
-    let local_count = match infer_local_count(&program) {
-        Ok(local_count) => local_count,
-        Err(err) => {
-            state.record_program_apply_failure();
-            let message = format!("invalid bytecode: {err}");
-            warn!("{} local inference error: {err}", category_program());
-            return ProgramApplyReport {
-                applied: false,
-                constants: None,
-                code_bytes: None,
-                local_count: None,
-                message: Some(message),
-            };
-        }
-    };
-
+    let local_count = program.local_count;
     let const_count = program.constants.len();
     let code_len = program.code.len();
     let mut guard = state.active_program.write().await;
     *guard = Some(Arc::new(LoadedProgram {
         program: Arc::new(program),
-        local_count,
     }));
     state.record_program_apply_success();
     info!(

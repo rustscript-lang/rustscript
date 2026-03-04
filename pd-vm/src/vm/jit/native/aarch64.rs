@@ -2775,7 +2775,7 @@ mod tests {
 
     #[test]
     fn stloc_step_bridge_moves_owned_values_safely() {
-        let mut vm = Vm::with_locals(Program::new(Vec::new(), Vec::new()), 1);
+        let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()).with_local_count(1));
         vm.locals[0] = Value::String("old".to_string());
         vm.stack.push(Value::String("new".to_string()));
 
@@ -2812,7 +2812,7 @@ mod tests {
 
     #[test]
     fn ldloc_step_bridge_clones_owned_values() {
-        let mut vm = Vm::with_locals(Program::new(Vec::new(), Vec::new()), 1);
+        let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()).with_local_count(1));
         vm.locals[0] = Value::Map(vec![(Value::Int(1), Value::Int(2))]);
 
         let status =
@@ -2959,9 +2959,8 @@ mod tests {
             executions: 0,
         };
 
-        let mut vm = Vm::with_locals(
-            Program::new(vec![Value::Int(200), Value::Int(1)], vec![0; 128]),
-            2,
+        let mut vm = Vm::new(
+            Program::new(vec![Value::Int(200), Value::Int(1)], vec![0; 128]).with_local_count(2),
         );
         vm.locals[0] = Value::Int(0);
         vm.locals[1] = Value::Int(0);

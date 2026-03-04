@@ -5,7 +5,7 @@ use vm::{Value, Vm, VmError, VmStatus, compile_source};
 fn run_source(source: &str) -> Result<Vec<Value>, VmError> {
     let wrapped = format!("use io;\n{source}");
     let compiled = compile_source(&wrapped).expect("source should compile");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let mut status = vm.run()?;
     loop {

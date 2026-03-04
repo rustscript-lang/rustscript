@@ -32,7 +32,7 @@ fn trace_jit_compiles_hot_loop_and_is_dumpable() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -76,7 +76,7 @@ fn compiler_uses_shl_for_power_of_two_multiply_and_jit_accepts_it() {
         "expected compiler to emit shl for power-of-two multiply"
     );
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -125,7 +125,7 @@ fn compiler_emits_mod_and_or_and_jit_accepts_them() {
         "expected compiler to emit or"
     );
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -157,7 +157,7 @@ fn trace_jit_supports_host_calls_with_native_mixed_mode() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -222,7 +222,7 @@ fn trace_jit_nested_loops_use_branch_exit_segments() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,

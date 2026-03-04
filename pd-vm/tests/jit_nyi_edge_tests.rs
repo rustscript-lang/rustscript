@@ -64,7 +64,7 @@ fn jit_records_trace_too_long_nyi_and_preserves_results() {
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -103,7 +103,7 @@ fn jit_rejects_zero_hot_loop_threshold_with_explicit_nyi_reason() {
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 0,

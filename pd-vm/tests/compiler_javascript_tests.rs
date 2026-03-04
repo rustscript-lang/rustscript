@@ -25,7 +25,7 @@ fn javascript_vm_namespace_host_calls_are_supported() {
     .expect("js source should write");
 
     let compiled = compile_source_file(&path).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.bind_function("add_one", Box::new(AddOne));
 
     let status = vm.run().expect("vm should run");
@@ -43,7 +43,7 @@ fn javascript_vm_http_subnamespace_host_calls_are_supported() {
     "#;
     let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
         .expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.bind_function("http::request::get_header", Box::new(EchoString));
 
     let status = vm.run().expect("vm should run");
@@ -105,7 +105,7 @@ fn javascript_builtin_namespace_calls_work_with_import() {
     "#;
     let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
         .expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -126,7 +126,7 @@ fn javascript_jit_namespace_builtins_work_with_import() {
     "#;
     let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
         .expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -139,7 +139,7 @@ fn compile_source_with_javascript_flavor() {
 
     let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
         .expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     for func in &compiled.functions {
         match func.name.as_str() {
@@ -165,7 +165,7 @@ fn javascript_assignment_updates_existing_local_without_new_slot() {
         .expect("compile should succeed");
     assert_eq!(compiled.locals, 1);
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(2)]);
@@ -179,7 +179,7 @@ fn javascript_float_literal_binding_is_supported() {
     "#;
     let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
         .expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -196,7 +196,7 @@ fn javascript_char_and_hex_escape_literals_are_supported() {
     "#;
     let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
         .expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -217,7 +217,7 @@ fn javascript_empty_param_arrow_closure_is_supported() {
     "#;
     let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
         .expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -232,7 +232,7 @@ fn javascript_function_return_statement_is_lowered() {
     "#;
     let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
         .expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -247,7 +247,7 @@ fn javascript_object_property_named_return_is_not_rewritten() {
     "#;
     let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
         .expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -284,7 +284,7 @@ fn javascript_allows_omitted_semicolons_at_line_end() {
     "#;
     let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
         .expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -303,7 +303,7 @@ fn javascript_allows_omitted_semicolons_with_multiline_calls() {
 
     let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
         .expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.bind_function("add_one", Box::new(AddOne));
 
     let status = vm.run().expect("vm should run");
@@ -318,7 +318,7 @@ fn javascript_console_log_works_without_decl() {
     "#;
     let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
         .expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     for func in &compiled.functions {
         match func.name.as_str() {
@@ -336,7 +336,7 @@ fn javascript_console_log_works_without_decl() {
 fn compile_source_file_with_javascript_complex_fixture() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.js");
     let compiled = compile_source_file(&path).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     for func in &compiled.functions {
         match func.name.as_str() {
@@ -376,7 +376,7 @@ console.log(value);
 
     let compiled = compile_source_file(&main_path).expect("compile should succeed");
     let recording_program = compiled.program.clone();
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     for func in &compiled.functions {
         match func.name.as_str() {
             "add_one" => vm.register_function(Box::new(AddOne)),
@@ -420,7 +420,7 @@ fn compile_source_file_js_complex_replay_break_line_resolves_non_executable_line
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.js");
     let compiled = compile_source_file(&path).expect("compile should succeed");
     let recording_program = compiled.program.clone();
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     for func in &compiled.functions {
         match func.name.as_str() {
             "add_one" => vm.register_function(Box::new(AddOne)),
@@ -474,7 +474,7 @@ fn javascript_module_declarations_are_ignored() {
     "#;
     let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
         .expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     for func in &compiled.functions {
         match func.name.as_str() {
@@ -536,7 +536,7 @@ fn compile_source_file_js_supports_namespace_and_named_alias_imports() {
     assert_eq!(compiled.functions.len(), 1);
     assert_eq!(compiled.functions[0].name, "print");
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.bind_function("print", Box::new(PrintBuiltin));
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -578,7 +578,7 @@ fn javascript_modulo_and_logical_operators_work() {
 
     let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
         .expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(4)]);
@@ -593,7 +593,7 @@ fn javascript_typeof_operator_is_supported() {
 
     let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
         .expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Bool(true)]);
@@ -608,7 +608,7 @@ fn javascript_typeof_property_name_is_not_rewritten_as_operator() {
 
     let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
         .expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);

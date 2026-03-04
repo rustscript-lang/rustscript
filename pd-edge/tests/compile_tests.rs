@@ -100,7 +100,7 @@ fn compile_edge_source_file_prefers_local_module_over_host_namespace_fallback() 
         "local runtime module should win over host namespace fallback"
     );
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);
@@ -144,7 +144,7 @@ fn compile_edge_source_file_with_options_can_override_runtime_module() {
         "runtime module override should replace host import fallback"
     );
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);

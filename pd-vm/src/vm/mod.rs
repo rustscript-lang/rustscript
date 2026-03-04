@@ -403,6 +403,7 @@ fn noop_waker() -> Waker {
 fn compute_program_cache_key(program: &Program) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     program.code.hash(&mut hasher);
+    program.local_count.hash(&mut hasher);
     for constant in &program.constants {
         hash_value(constant, &mut hasher);
     }
@@ -457,41 +458,7 @@ impl Vm {
     pub fn new_shared(program: Arc<Program>) -> Self {
         let program_constants_ptr = program.constants.as_ptr();
         let program_constants_len = program.constants.len();
-        Self {
-            program,
-            program_constants_ptr,
-            program_constants_len,
-            program_cache_key: 0,
-            program_cache_key_ready: false,
-            ip: 0,
-            stack: Vec::new(),
-            locals: Vec::new(),
-            host_functions: Vec::new(),
-            host_function_symbols: HashMap::new(),
-            builtin_overrides: HashMap::new(),
-            resolved_calls: Vec::new(),
-            resolved_calls_dirty: true,
-            call_depth: 0,
-            jit: jit::TraceJitEngine::default(),
-            native_traces: HashMap::new(),
-            native_trace_exec_count: 0,
-            async_bridge: None,
-            waiting_host_op: None,
-            next_host_op_id: 1,
-            io_state: builtins_impl::IoState::default(),
-            fuel_remaining: None,
-            fuel_check_interval: 1,
-            fuel_ops_until_check: 1,
-        }
-    }
-
-    pub fn with_locals(program: Program, local_count: usize) -> Self {
-        Self::with_locals_shared(Arc::new(program), local_count)
-    }
-
-    pub fn with_locals_shared(program: Arc<Program>, local_count: usize) -> Self {
-        let program_constants_ptr = program.constants.as_ptr();
-        let program_constants_len = program.constants.len();
+        let local_count = program.local_count;
         Self {
             program,
             program_constants_ptr,
@@ -1561,7 +1528,7 @@ mod tests {
         let compiled_one = crate::compile_source(source_one).expect("source one should compile");
         let compiled_two = crate::compile_source(source_two).expect("source two should compile");
 
-        let mut vm_one = Vm::with_locals(compiled_one.program, compiled_one.locals);
+        let mut vm_one = Vm::new(compiled_one.program);
         vm_one.set_jit_config(jit::JitConfig {
             enabled: true,
             hot_loop_threshold: 1,
@@ -1587,7 +1554,7 @@ mod tests {
             "cache entry count should match first program traces"
         );
 
-        let mut vm_two = Vm::with_locals(compiled_two.program, compiled_two.locals);
+        let mut vm_two = Vm::new(compiled_two.program);
         vm_two.set_jit_config(jit::JitConfig {
             enabled: true,
             hot_loop_threshold: 1,
@@ -1643,7 +1610,7 @@ mod tests {
         "#;
         let compiled = crate::compile_source(source).expect("source should compile");
 
-        let mut vm_one = Vm::with_locals(compiled.program.clone(), compiled.locals);
+        let mut vm_one = Vm::new(compiled.program.clone());
         vm_one.set_jit_config(jit::JitConfig {
             enabled: true,
             hot_loop_threshold: 1,
@@ -1669,7 +1636,7 @@ mod tests {
             "cache entry count should match first vm traces"
         );
 
-        let mut vm_two = Vm::with_locals(compiled.program, compiled.locals);
+        let mut vm_two = Vm::new(compiled.program);
         vm_two.set_jit_config(jit::JitConfig {
             enabled: true,
             hot_loop_threshold: 1,

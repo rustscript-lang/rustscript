@@ -236,7 +236,7 @@ struct LocalDebugRange {
 impl CompiledProgram {
     #[cfg(feature = "runtime")]
     pub fn into_vm(self) -> Vm {
-        Vm::with_locals(self.program, self.locals)
+        Vm::new(self.program)
     }
 }
 
@@ -332,6 +332,7 @@ fn compile_parsed_output(
     let mut program = compiler
         .compile_program(&stmts)
         .map_err(SourceError::Compile)?;
+    program.local_count = locals;
     program.imports = runtime_import_functions
         .iter()
         .map(|func| HostImport {

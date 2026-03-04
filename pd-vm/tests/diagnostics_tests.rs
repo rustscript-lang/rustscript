@@ -63,7 +63,7 @@ fn compile_source_file_parse_error_uses_original_line() {
 fn render_vm_error_includes_ip_and_source_line() {
     let source = "let value = 1 / 0;\n";
     let compiled = compile_source(source).expect("source should compile");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let err = vm
         .run()
         .expect_err("runtime should fail with division by zero");

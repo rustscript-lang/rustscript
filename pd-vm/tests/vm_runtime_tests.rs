@@ -148,7 +148,7 @@ fn namespaced_builtin_io_call_can_be_overridden_by_host_binding() {
     "#,
     )
     .expect("source should compile");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.bind_function("io::exists", Box::new(ExistsOverride));
 
     let status = vm.run().expect("vm should run");
@@ -176,7 +176,7 @@ fn namespaced_builtin_json_encode_call_can_be_overridden_by_host_binding() {
     "#,
     )
     .expect("source should compile");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.bind_function("json::encode", Box::new(JsonEncodeOverride));
 
     let status = vm.run().expect("vm should run");
@@ -195,7 +195,7 @@ fn json_encode_rejects_non_string_map_keys() {
     )
     .expect("source should compile");
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let err = vm
         .run()
         .expect_err("json::encode should reject non-string map keys");

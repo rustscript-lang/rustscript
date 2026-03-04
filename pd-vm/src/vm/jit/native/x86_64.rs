@@ -3616,7 +3616,7 @@ mod tests {
 
     #[test]
     fn stloc_step_bridge_moves_owned_values_safely() {
-        let mut vm = Vm::with_locals(Program::new(Vec::new(), Vec::new()), 1);
+        let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()).with_local_count(1));
         vm.locals[0] = Value::String("old".to_string());
         vm.stack.push(Value::String("new".to_string()));
 

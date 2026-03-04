@@ -42,7 +42,7 @@ fn register_functions(vm: &mut Vm, functions: &[FunctionDecl]) {
 
 fn run_compiled_file(path: &Path) -> Vec<Value> {
     let compiled = compile_source_file(path).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let mut jit_config = vm.jit_config().clone();
     jit_config.enabled = false;
     vm.set_jit_config(jit_config);
@@ -54,7 +54,7 @@ fn run_compiled_file(path: &Path) -> Vec<Value> {
 
 fn run_compiled_source(flavor: SourceFlavor, source: &str) -> Vec<Value> {
     let compiled = compile_source_with_flavor(source, flavor).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let mut jit_config = vm.jit_config().clone();
     jit_config.enabled = false;
     vm.set_jit_config(jit_config);

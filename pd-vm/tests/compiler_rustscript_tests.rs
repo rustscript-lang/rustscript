@@ -9,7 +9,7 @@ fn rustscript_vm_namespace_host_calls_are_supported() {
         vm::add_one(41);
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.bind_function("add_one", Box::new(AddOne));
 
     let status = vm.run().expect("vm should run");
@@ -24,7 +24,7 @@ fn rustscript_vm_http_subnamespace_host_calls_are_supported() {
         vm::http::request::get_header("x-client-id");
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.bind_function("http::request::get_header", Box::new(EchoString));
 
     let status = vm.run().expect("vm should run");
@@ -39,7 +39,7 @@ fn rustscript_host_namespace_import_without_vm_prefix_is_supported() {
         runtime::sleep(41);
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.bind_function("runtime::sleep", Box::new(AddOne));
 
     let status = vm.run().expect("vm should run");
@@ -62,7 +62,7 @@ fn rustscript_host_namespace_alias_import_is_supported() {
         rl::allow("client-1", 3, 60);
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.bind_function("rate_limit::allow", Box::new(AlwaysAllow));
 
     let status = vm.run().expect("vm should run");
@@ -77,7 +77,7 @@ fn rustscript_vm_named_host_imports_are_supported() {
         inc(41);
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.bind_function("add_one", Box::new(AddOne));
 
     let status = vm.run().expect("vm should run");
@@ -92,7 +92,7 @@ fn rustscript_io_namespace_builtin_calls_are_supported() {
         io::exists(".");
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     loop {
         let status = vm.run().expect("vm should run");
@@ -157,7 +157,7 @@ fn rustscript_re_namespace_supports_optional_inline_flags_across_functions() {
         score;
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -180,7 +180,7 @@ fn rustscript_json_encode_decode_builtins_are_supported() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -202,7 +202,7 @@ fn rustscript_jit_namespace_builtins_can_configure_and_read_jit() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(1)]);
@@ -243,7 +243,7 @@ fn compile_source_file_preserves_jit_builtin_namespace_use_directive() {
         "jit namespace calls should lower as builtins, not host imports"
     );
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(2)]);
@@ -259,7 +259,7 @@ fn rustscript_float_literal_binding_is_supported() {
         a;
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -275,7 +275,7 @@ fn rustscript_char_and_hex_escape_literals_are_supported() {
         s;
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -296,7 +296,7 @@ fn rustscript_array_primitives_are_supported_without_namespace() {
         values[0] + values.length;
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -322,7 +322,7 @@ fn rustscript_bracket_slice_syntax_is_supported() {
         a.length + b.length + c.length + d.length + e.length + f.length + g.length + h.length + i.length;
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -335,7 +335,7 @@ fn rss_print_macro_works_without_decl() {
         print!(40 + 2);
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     for func in &compiled.functions {
         match func.name.as_str() {
@@ -354,7 +354,7 @@ fn compile_source_file_with_rustscript_complex_fixture() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.rss");
     let compiled = compile_source_file(&path).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     for func in &compiled.functions {
         match func.name.as_str() {
@@ -378,7 +378,7 @@ fn closure_captures_outer_value_at_definition_time() {
         print!(add(5));
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     for func in &compiled.functions {
         match func.name.as_str() {
@@ -404,7 +404,7 @@ fn closure_values_are_first_class_and_can_be_passed_to_functions() {
         apply_twice(inc, 40);
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -425,7 +425,7 @@ fn named_functions_are_first_class_and_can_be_passed_to_functions() {
         apply_twice(add_one, 40);
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -509,7 +509,7 @@ fn liveness_clears_local_after_closure_value_last_use() {
         .local_index("closure")
         .expect("closure binding should exist");
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
@@ -553,7 +553,7 @@ fn liveness_clears_local_after_function_value_last_use() {
         .local_index("func")
         .expect("func binding should exist");
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
@@ -624,7 +624,7 @@ fn rustscript_if_expression_assignment_syntax_is_supported() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -646,7 +646,7 @@ fn rustscript_if_expression_branch_blocks_support_multiline_statements() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -668,7 +668,7 @@ fn rustscript_if_expression_assignment_executes_else_branch() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -684,7 +684,7 @@ fn rustscript_if_expression_supports_else_if_chains() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -726,7 +726,7 @@ fn rustscript_match_expression_supports_int_and_wildcard_patterns() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -746,7 +746,7 @@ fn rustscript_match_expression_supports_string_patterns() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -799,7 +799,7 @@ fn rustscript_match_expression_supports_type_patterns() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -854,7 +854,7 @@ fn compile_source_file_rustscript_imports_merge_with_scoped_locals() {
         "imported function should only be declared once",
     );
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.bind_function("add_one", Box::new(AddOne));
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -946,7 +946,7 @@ fn compile_source_file_rustscript_supports_namespace_and_named_imports() {
         "module functions should be fully inlined for RustScript root"
     );
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Bool(true), Value::Bool(true)]);
@@ -991,7 +991,7 @@ fn compile_source_file_rustscript_all_public_import_supports_namespace_calls() {
     .expect("main source should write");
 
     let compiled = compile_source_file(&main_path).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(3)]);
@@ -1118,7 +1118,7 @@ fn compile_source_file_module_override_path_redirects_import_spec() {
         "override module functions should be inlined into root program"
     );
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::String("override-body".to_string())]);
@@ -1224,7 +1224,7 @@ fn compile_source_file_rustscript_module_exports_only_pub_functions() {
         compiled.functions.is_empty(),
         "pure RustScript function module should not require host imports"
     );
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);
@@ -1278,7 +1278,7 @@ fn rss_function_definition_is_inlined_without_host_imports() {
         "rss-defined functions should not be emitted as host imports"
     );
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Bool(true)]);
@@ -1297,7 +1297,7 @@ fn rustscript_modulo_and_logical_operators_work() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(4)]);
@@ -1311,7 +1311,7 @@ fn rustscript_null_literal_is_supported() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Bool(true)]);
@@ -1346,7 +1346,7 @@ fn rustscript_option_namespace_style_is_supported() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(43)]);
@@ -1364,7 +1364,7 @@ fn rustscript_match_type_pattern_is_not_shadowed_by_local_name() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(2)]);
@@ -1423,7 +1423,7 @@ fn rustscript_null_literal_can_be_used_as_map_key() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);

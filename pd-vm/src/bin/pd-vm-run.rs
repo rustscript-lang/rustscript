@@ -97,7 +97,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let recording_program = cli.record_path.as_ref().map(|_| compiled.program.clone());
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     if let Some(fuel) = cli.fuel {
         vm.set_fuel(fuel);
     }
@@ -525,7 +525,7 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                 };
-                let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+                let mut vm = Vm::new(compiled.program);
                 if let Err(err) = register_functions(&mut vm, &compiled.functions) {
                     println!("{err}");
                     continue;

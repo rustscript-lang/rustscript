@@ -4,7 +4,7 @@ use common::*;
 
 fn run_program(source: &str, flavor: SourceFlavor) -> Vec<Value> {
     let compiled = compile_source_with_flavor(source, flavor).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     vm.stack().to_vec()

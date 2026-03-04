@@ -337,7 +337,7 @@ async fn run_loaded_program_once(state: &SharedState) -> Result<(), Box<dyn std:
         state.rate_limiter.clone(),
     )));
     let async_ops = new_shared_vm_async_ops(); 
-    let mut vm = Vm::with_locals_shared(loaded.program.clone(), loaded.local_count);
+    let mut vm = Vm::new_shared(loaded.program.clone());
     vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));
 
     register_host_module(&mut vm, context, async_ops.clone())?;

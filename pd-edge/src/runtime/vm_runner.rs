@@ -34,14 +34,12 @@ pub async fn execute_vm_with_context(
     debug: VmDebugInvocation,
     register_host_modules: HostModuleRegistrar,
 ) -> Result<VmExecutionOutcome, VmExecutionError> {
-    let local_count = program.local_count;
     let program = program.program.clone();
     let async_ops = new_shared_vm_async_ops();
 
     let task = tokio::task::spawn_blocking(move || {
         run_vm_blocking(
             program,
-            local_count,
             vm_context,
             debug_session,
             debug,
@@ -59,14 +57,13 @@ pub async fn execute_vm_with_context(
 
 fn run_vm_blocking(
     program: std::sync::Arc<vm::Program>,
-    local_count: usize,
     vm_context: SharedProxyVmContext,
     debug_session: SharedDebugSession,
     debug: VmDebugInvocation,
     async_ops: SharedVmAsyncOps,
     register_host_modules: HostModuleRegistrar,
 ) -> Result<VmExecutionOutcome, VmExecutionError> {
-    let mut vm = Vm::with_locals_shared(program, local_count);
+    let mut vm = Vm::new_shared(program);
     vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));
     register_host_modules(&mut vm, vm_context.clone(), async_ops)
         .map_err(VmExecutionError::HostRegistration)?;

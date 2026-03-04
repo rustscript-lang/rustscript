@@ -583,7 +583,8 @@ impl DebugCommandBridge {
             state.attached = true;
             state.current_line = current_line(vm);
             state.pending_request = None;
-            state.pending_response = None;
+            // Keep any in-flight response visible to execute() to avoid
+            // races when the debugger resumes and immediately re-attaches.
             self.inner.changed.notify_all();
         }
 
@@ -1867,7 +1868,7 @@ mod tests {
                 }],
             }),
         );
-        let mut vm = Vm::with_locals(program, 1);
+        let mut vm = Vm::new(program.with_local_count(1));
         let status = vm.run().expect("vm should run");
         assert_eq!(status, crate::vm::VmStatus::Halted);
         vm
@@ -1889,7 +1890,7 @@ mod tests {
                 }],
             }),
         );
-        Vm::with_locals(program, 1)
+        Vm::new(program.with_local_count(1))
     }
 
     fn vm_with_scoped_named_locals() -> Vm {
@@ -1925,7 +1926,7 @@ mod tests {
                 ],
             }),
         );
-        let mut vm = Vm::with_locals(program, 1);
+        let mut vm = Vm::new(program.with_local_count(1));
         let status = vm.run().expect("vm should run");
         assert_eq!(status, crate::vm::VmStatus::Halted);
         vm
@@ -2560,7 +2561,7 @@ mod tests {
         debugger.stop_on_entry();
 
         let join = std::thread::spawn(move || {
-            let mut vm = Vm::with_locals(program, 3);
+            let mut vm = Vm::new(program.with_local_count(3));
             vm.run_with_debugger(&mut debugger)
                 .expect("debugged vm run should succeed")
         });

@@ -19,15 +19,18 @@ pub struct HostImport {
 pub struct Program {
     pub constants: Vec<Value>,
     pub code: Vec<u8>,
+    pub local_count: usize,
     pub imports: Vec<HostImport>,
     pub debug: Option<crate::debug_info::DebugInfo>,
 }
 
 impl Program {
     pub fn new(constants: Vec<Value>, code: Vec<u8>) -> Self {
+        let local_count = infer_local_count_from_code(&code);
         Self {
             constants,
             code,
+            local_count,
             imports: Vec::new(),
             debug: None,
         }
@@ -38,9 +41,11 @@ impl Program {
         code: Vec<u8>,
         debug: Option<crate::debug_info::DebugInfo>,
     ) -> Self {
+        let local_count = infer_local_count_from_code(&code);
         Self {
             constants,
             code,
+            local_count,
             imports: Vec::new(),
             debug,
         }
@@ -52,13 +57,72 @@ impl Program {
         imports: Vec<HostImport>,
         debug: Option<crate::debug_info::DebugInfo>,
     ) -> Self {
+        let local_count = infer_local_count_from_code(&code);
         Self {
             constants,
             code,
+            local_count,
             imports,
             debug,
         }
     }
+
+    pub fn with_local_count(mut self, local_count: usize) -> Self {
+        self.local_count = local_count;
+        self
+    }
+}
+
+fn infer_local_count_from_code(code: &[u8]) -> usize {
+    let mut ip = 0usize;
+    let mut max_local_index: Option<u8> = None;
+
+    while let Some(&opcode) = code.get(ip) {
+        ip += 1;
+        match opcode {
+            x if x == OpCode::Nop as u8
+                || x == OpCode::Ret as u8
+                || x == OpCode::Add as u8
+                || x == OpCode::Sub as u8
+                || x == OpCode::Mul as u8
+                || x == OpCode::Div as u8
+                || x == OpCode::Neg as u8
+                || x == OpCode::Ceq as u8
+                || x == OpCode::Clt as u8
+                || x == OpCode::Cgt as u8
+                || x == OpCode::Pop as u8
+                || x == OpCode::Dup as u8
+                || x == OpCode::Shl as u8
+                || x == OpCode::Shr as u8
+                || x == OpCode::Mod as u8
+                || x == OpCode::And as u8
+                || x == OpCode::Or as u8 => {}
+            x if x == OpCode::Ldc as u8
+                || x == OpCode::Br as u8
+                || x == OpCode::Brfalse as u8 => {
+                    if ip + 4 > code.len() {
+                        break;
+                    }
+                    ip += 4;
+                }
+            x if x == OpCode::Ldloc as u8 || x == OpCode::Stloc as u8 => {
+                let Some(&index) = code.get(ip) else {
+                    break;
+                };
+                ip += 1;
+                max_local_index = Some(max_local_index.map_or(index, |prev| prev.max(index)));
+            }
+            x if x == OpCode::Call as u8 => {
+                if ip + 3 > code.len() {
+                    break;
+                }
+                ip += 3;
+            }
+            _ => break,
+        }
+    }
+
+    max_local_index.map_or(0, |index| index as usize + 1)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

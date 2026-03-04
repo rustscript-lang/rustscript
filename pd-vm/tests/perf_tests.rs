@@ -34,7 +34,7 @@ fn perf_vm_creation_cleanup_speed_and_ram_usage() {
     let rss_before = current_rss_bytes();
     let started = Instant::now();
     for _ in 0..iterations {
-        let vm = Vm::with_locals(program.clone(), 64);
+        let vm = Vm::new(program.clone().with_local_count(64));
         black_box(vm);
     }
     let elapsed = started.elapsed();
@@ -62,7 +62,7 @@ fn perf_vm_creation_cleanup_speed_and_ram_usage() {
     let retained_rss_before = current_rss_bytes();
     let mut retained_vms = Vec::with_capacity(retained_count);
     for _ in 0..retained_count {
-        retained_vms.push(Vm::with_locals(program.clone(), 64));
+        retained_vms.push(Vm::new(program.clone().with_local_count(64)));
     }
     black_box(&retained_vms);
     let retained_rss_after = current_rss_bytes();
@@ -105,7 +105,7 @@ fn perf_vm_creation_cleanup_speed_and_ram_usage() {
     let plain_rss_before = current_rss_bytes();
     let plain_started = Instant::now();
     for _ in 0..host_iterations {
-        let mut vm = Vm::with_locals(plain_compiled.program.clone(), plain_compiled.locals);
+        let mut vm = Vm::new(plain_compiled.program.clone());
         let status = vm.run().expect("plain vm run should succeed");
         assert_eq!(status, VmStatus::Halted);
         black_box(vm.stack());
@@ -121,7 +121,7 @@ fn perf_vm_creation_cleanup_speed_and_ram_usage() {
     let host_rss_before = current_rss_bytes();
     let host_started = Instant::now();
     for _ in 0..host_iterations {
-        let mut vm = Vm::with_locals(host_compiled.program.clone(), host_compiled.locals);
+        let mut vm = Vm::new(host_compiled.program.clone());
         for name in &host_names {
             vm.bind_function(name, Box::new(PerfNoopHost { _marker: 0 }));
         }
@@ -156,7 +156,7 @@ fn perf_vm_creation_cleanup_speed_and_ram_usage() {
     let cached_rss_before = current_rss_bytes();
     let cached_started = Instant::now();
     for _ in 0..host_iterations {
-        let mut vm = Vm::with_locals(host_compiled.program.clone(), host_compiled.locals);
+        let mut vm = Vm::new(host_compiled.program.clone());
         registry
             .bind_vm_with_plan(&mut vm, &cached_plan)
             .expect("cached host binding should succeed");
@@ -190,7 +190,7 @@ fn perf_vm_creation_cleanup_speed_and_ram_usage() {
     let static_cached_rss_before = current_rss_bytes();
     let static_cached_started = Instant::now();
     for _ in 0..host_iterations {
-        let mut vm = Vm::with_locals(host_compiled.program.clone(), host_compiled.locals);
+        let mut vm = Vm::new(host_compiled.program.clone());
         static_registry
             .bind_vm_with_plan(&mut vm, &static_cached_plan)
             .expect("cached static host binding should succeed");
@@ -251,7 +251,7 @@ fn jit_emitted_machine_code_is_executed_on_native_targets() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -389,7 +389,7 @@ fn perf_manual_aes_128_cbc_rustscript_matches_in_interpreter_and_jit() {
     let mut jit_native_exec_total = 0u64;
 
     for trial in 0..TRIALS {
-        let mut vm_interpreter = Vm::with_locals(compiled.program.clone(), compiled.locals);
+        let mut vm_interpreter = Vm::new(compiled.program.clone());
         vm_interpreter.set_jit_config(JitConfig {
             enabled: false,
             hot_loop_threshold: 1,
@@ -412,7 +412,7 @@ fn perf_manual_aes_128_cbc_rustscript_matches_in_interpreter_and_jit() {
         );
         interpreter_times.push(interpreter_elapsed);
 
-        let mut vm_jit = Vm::with_locals(compiled.program.clone(), compiled.locals);
+        let mut vm_jit = Vm::new(compiled.program.clone());
         vm_jit.set_jit_config(JitConfig {
             enabled: true,
             hot_loop_threshold: 1,
@@ -533,7 +533,7 @@ fn run_sum_loop_with_jit(
     enable_jit: bool,
     expected: i64,
 ) -> PerfRun {
-    let mut vm = Vm::with_locals(program.clone(), local_count);
+    let mut vm = Vm::new(program.clone().with_local_count(local_count));
     vm.set_jit_config(JitConfig {
         enabled: enable_jit,
         hot_loop_threshold: 1,

@@ -32,7 +32,7 @@ fn compile_source_program() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
 
     assert_eq!(status, VmStatus::Halted);
@@ -49,7 +49,7 @@ fn assignment_updates_existing_local_without_new_slot() {
 
     let compiled = compile_source(source).expect("compile should succeed");
     assert_eq!(compiled.locals, 1);
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
 
     assert_eq!(status, VmStatus::Halted);
@@ -71,7 +71,7 @@ fn compiler_reuses_slots_when_declared_locals_exceed_bytecode_limit() {
         "slot allocator should remap to bytecode locals"
     );
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(599)]);
@@ -166,7 +166,7 @@ fn compiler_reuses_slots_with_large_programs_that_inline_functions() {
         "slot allocator should keep inline-call programs within bytecode local limits"
     );
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(399)]);
@@ -176,7 +176,7 @@ fn compile_source_with_functions() {
     let source = include_str!("../examples/example.rss");
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     for func in &compiled.functions {
         match func.name.as_str() {
@@ -196,7 +196,7 @@ fn compile_source_with_functions() {
 fn compile_source_resolves_imports_by_name_not_registration_order() {
     let source = include_str!("../examples/example.rss");
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     vm.bind_function("print", Box::new(PrintBuiltin));
     vm.bind_function("add_one", Box::new(AddOne));
@@ -213,7 +213,7 @@ fn run_fails_when_import_is_unbound() {
         add_one(41);
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.bind_function("print", Box::new(PrintBuiltin));
 
     let err = vm.run().expect_err("missing import should fail");
@@ -229,7 +229,7 @@ fn host_function_registry_caches_import_plan_across_vms() {
     registry.register("print", 1, || Box::new(PrintBuiltin));
     registry.register("add_one", 1, || Box::new(AddOne));
 
-    let mut vm1 = Vm::with_locals(compiled.program.clone(), compiled.locals);
+    let mut vm1 = Vm::new(compiled.program.clone());
     registry
         .bind_vm_cached(&mut vm1)
         .expect("cached host binding should succeed");
@@ -237,7 +237,7 @@ fn host_function_registry_caches_import_plan_across_vms() {
     assert_eq!(status1, VmStatus::Halted);
     assert_eq!(vm1.stack(), &[Value::Int(6)]);
 
-    let mut vm2 = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm2 = Vm::new(compiled.program);
     registry
         .bind_vm_cached(&mut vm2)
         .expect("cached host binding should succeed");
@@ -253,7 +253,7 @@ fn compile_source_supports_static_function_pointer_binding() {
         add_one(41);
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     vm.bind_static_function("add_one", static_add_one);
 
     let status = vm.run().expect("vm should run");
@@ -275,7 +275,7 @@ fn host_function_registry_caches_static_function_pointer_plan_across_vms() {
         .prepare_plan(&compiled.program.imports)
         .expect("plan should build");
 
-    let mut vm1 = Vm::with_locals(compiled.program.clone(), compiled.locals);
+    let mut vm1 = Vm::new(compiled.program.clone());
     registry
         .bind_vm_with_plan(&mut vm1, &plan)
         .expect("cached static host binding should succeed");
@@ -283,7 +283,7 @@ fn host_function_registry_caches_static_function_pointer_plan_across_vms() {
     assert_eq!(status1, VmStatus::Halted);
     assert_eq!(vm1.stack(), &[Value::Int(6)]);
 
-    let mut vm2 = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm2 = Vm::new(compiled.program);
     registry
         .bind_vm_with_plan(&mut vm2, &plan)
         .expect("cached static host binding should succeed");
@@ -325,7 +325,7 @@ fn not_not_equal_and_else_if_are_supported_across_frontends() {
 
     for (flavor, source) in cases {
         let compiled = compile_source_with_flavor(source, flavor).expect("compile should succeed");
-        let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+        let mut vm = Vm::new(compiled.program);
         let status = vm.run().expect("vm should run");
         assert_eq!(status, VmStatus::Halted);
         assert_eq!(vm.stack(), &[Value::Int(10)]);
@@ -367,7 +367,7 @@ fn collections_are_created_and_accessed_in_all_frontends() {
             compiled.functions.is_empty(),
             "collection intrinsics should be compiler-managed, not host imports"
         );
-        let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+        let mut vm = Vm::new(compiled.program);
         let status = vm.run().expect("vm should run");
         assert_eq!(status, VmStatus::Halted);
         assert_eq!(vm.stack(), &[Value::Int(22)]);
@@ -393,7 +393,7 @@ fn collection_cardinality_uses_language_syntax_in_all_frontends() {
 
     for (flavor, source) in cases {
         let compiled = compile_source_with_flavor(source, flavor).expect("compile should succeed");
-        let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+        let mut vm = Vm::new(compiled.program);
         let status = vm.run().expect("vm should run");
         assert_eq!(status, VmStatus::Halted);
         assert_eq!(vm.stack(), &[Value::Int(5)]);
@@ -464,7 +464,7 @@ fn string_and_array_concat_work_via_plus_in_all_frontends() {
 
     for (flavor, source) in cases {
         let compiled = compile_source_with_flavor(source, flavor).expect("compile should succeed");
-        let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+        let mut vm = Vm::new(compiled.program);
         let status = vm.run().expect("vm should run");
         assert_eq!(status, VmStatus::Halted);
         assert_eq!(vm.stack(), &[Value::Int(8)]);
@@ -494,7 +494,7 @@ fn string_and_int_concat_work_via_plus_in_all_frontends() {
 
     for (flavor, source) in cases {
         let compiled = compile_source_with_flavor(source, flavor).expect("compile should succeed");
-        let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+        let mut vm = Vm::new(compiled.program);
         let status = vm.run().expect("vm should run");
         assert_eq!(status, VmStatus::Halted);
         assert_eq!(vm.stack(), &[Value::Int(10)]);
@@ -522,7 +522,7 @@ fn string_and_nonconstant_int_concat_autoconverts_in_all_frontends() {
 
     for (flavor, source) in cases {
         let compiled = compile_source_with_flavor(source, flavor).expect("compile should succeed");
-        let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+        let mut vm = Vm::new(compiled.program);
         let status = vm.run().expect("vm should run");
         assert_eq!(status, VmStatus::Halted);
         assert_eq!(vm.stack(), &[Value::Int(7)]);
@@ -568,7 +568,7 @@ fn slice_ranges_work_in_all_frontends() {
 
     for (flavor, source) in cases {
         let compiled = compile_source_with_flavor(source, flavor).expect("compile should succeed");
-        let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+        let mut vm = Vm::new(compiled.program);
         let status = vm.run().expect("vm should run");
         assert_eq!(status, VmStatus::Halted);
         assert_eq!(vm.stack(), &[Value::Int(28)]);
@@ -683,7 +683,7 @@ fn path_dependent_local_redeclaration_before_assignment_is_allowed() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(9)]);
@@ -709,7 +709,7 @@ fn compiler_clears_uncertain_locals_after_control_flow_join() {
         .local_index("ephemeral")
         .expect("ephemeral local should be emitted");
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(0)]);
@@ -733,7 +733,7 @@ fn liveness_pass_clears_dead_locals_after_last_use() {
     let d_index = debug.local_index("d").expect("d should exist");
     let e_index = debug.local_index("e").expect("e should exist");
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::String("23232".to_string())]);
@@ -911,7 +911,7 @@ fn liveness_avoids_in_loop_null_clears_but_clears_after_loop_exit() {
         );
     }
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(3)]);
@@ -935,7 +935,7 @@ fn compile_source_file_detects_extension() {
         .expect("temp source should write");
 
     let compiled = compile_source_file(&path).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     for func in &compiled.functions {
         match func.name.as_str() {
             "add_one" => vm.register_function(Box::new(AddOne)),
@@ -954,7 +954,7 @@ fn compile_source_file_detects_extension() {
 fn compile_source_file_detects_lua_extension() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example.lua");
     let compiled = compile_source_file(&path).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     for func in &compiled.functions {
         match func.name.as_str() {
             "add_one" => vm.register_function(Box::new(AddOne)),
@@ -993,7 +993,7 @@ fn compile_source_file_detects_scheme_extension() {
     .expect("temp source should write");
 
     let compiled = compile_source_file(&path).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(6)]);
@@ -1026,7 +1026,7 @@ fn compile_source_file_supports_rss_modules_from_js_lua_and_scheme() {
     )
     .expect("js source should write");
     let js_compiled = compile_source_file(&js_path).expect("js compile should succeed");
-    let mut js_vm = Vm::with_locals(js_compiled.program, js_compiled.locals);
+    let mut js_vm = Vm::new(js_compiled.program);
     for func in &js_compiled.functions {
         match func.name.as_str() {
             "add_one" => js_vm.register_function(Box::new(AddOne)),
@@ -1048,7 +1048,7 @@ fn compile_source_file_supports_rss_modules_from_js_lua_and_scheme() {
     )
     .expect("lua source should write");
     let lua_compiled = compile_source_file(&lua_path).expect("lua compile should succeed");
-    let mut lua_vm = Vm::with_locals(lua_compiled.program, lua_compiled.locals);
+    let mut lua_vm = Vm::new(lua_compiled.program);
     for func in &lua_compiled.functions {
         match func.name.as_str() {
             "add_one" => lua_vm.register_function(Box::new(AddOne)),
@@ -1070,7 +1070,7 @@ fn compile_source_file_supports_rss_modules_from_js_lua_and_scheme() {
     )
     .expect("scheme source should write");
     let scm_compiled = compile_source_file(&scm_path).expect("scheme compile should succeed");
-    let mut scm_vm = Vm::with_locals(scm_compiled.program, scm_compiled.locals);
+    let mut scm_vm = Vm::new(scm_compiled.program);
     for func in &scm_compiled.functions {
         match func.name.as_str() {
             "add_one" => scm_vm.register_function(Box::new(AddOne)),
@@ -1177,7 +1177,7 @@ fn compile_source_with_string_literals() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
 
     for func in &compiled.functions {
         match func.name.as_str() {

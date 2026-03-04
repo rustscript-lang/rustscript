@@ -33,7 +33,7 @@ fn scheme_direct_subset_define_set_and_arithmetic_work() {
         compile_source_with_flavor(source, SourceFlavor::Scheme).expect("compile should succeed");
     assert_eq!(compiled.locals, 1);
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);
@@ -53,7 +53,7 @@ fn scheme_direct_subset_if_and_begin_work() {
     let compiled =
         compile_source_with_flavor(source, SourceFlavor::Scheme).expect("compile should succeed");
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);
@@ -71,7 +71,7 @@ fn scheme_direct_subset_while_loop_work() {
     let compiled =
         compile_source_with_flavor(source, SourceFlavor::Scheme).expect("compile should succeed");
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(3)]);
@@ -87,7 +87,7 @@ fn scheme_direct_subset_modulo_works() {
     let compiled =
         compile_source_with_flavor(source, SourceFlavor::Scheme).expect("compile should succeed");
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(4)]);
@@ -126,7 +126,7 @@ fn scheme_float_char_and_hex_escape_literals_are_supported() {
     let compiled =
         compile_source_with_flavor(source, SourceFlavor::Scheme).expect("compile should succeed");
 
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
