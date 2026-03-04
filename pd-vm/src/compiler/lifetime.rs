@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 
 use super::ParseError;
-use super::ir::{ClosureExpr, Expr, FrontendIr, FunctionImpl, Stmt};
+use super::ir::{ClosureExpr, Expr, FrontendIr, FunctionImpl, LocalSlot, Stmt};
 
 #[derive(Clone)]
 struct FlowState {
@@ -39,16 +40,21 @@ pub(super) fn enforce_local_availability(mut ir: FrontendIr) -> Result<FrontendI
     for function_impl in ir.function_impls.values_mut() {
         *function_impl = liveness.rewrite_function_impl(function_impl.clone());
     }
+
+    if ir.locals > (u8::MAX as usize + 1) {
+        let allocator = LocalSlotAllocator::new(ir.locals, &ir.local_bindings, &ir.function_impls);
+        ir = allocator.allocate(ir)?;
+    }
     Ok(ir)
 }
 
 struct AvailabilityAnalyzer {
     local_count: usize,
-    local_names: HashMap<u8, String>,
+    local_names: HashMap<LocalSlot, String>,
 }
 
 impl AvailabilityAnalyzer {
-    fn new(local_count: usize, local_bindings: &[(String, u8)]) -> Self {
+    fn new(local_count: usize, local_bindings: &[(String, LocalSlot)]) -> Self {
         let mut local_names = HashMap::with_capacity(local_bindings.len());
         for (name, index) in local_bindings {
             local_names.insert(*index, name.clone());
@@ -112,7 +118,7 @@ impl AvailabilityAnalyzer {
                     after_possible && !after_definite && (!before_possible || before_definite);
                 if entered_uncertain {
                     rewritten.push(Stmt::Assign {
-                        index: slot as u8,
+                        index: slot as LocalSlot,
                         expr: Expr::Null,
                         line: clear_line,
                     });
@@ -393,7 +399,12 @@ impl AvailabilityAnalyzer {
         Ok(())
     }
 
-    fn require_available(&self, index: u8, state: &FlowState, line: u32) -> Result<(), ParseError> {
+    fn require_available(
+        &self,
+        index: LocalSlot,
+        state: &FlowState,
+        line: u32,
+    ) -> Result<(), ParseError> {
         let slot = index as usize;
         if slot >= self.local_count {
             return Err(ParseError {
@@ -423,7 +434,7 @@ impl AvailabilityAnalyzer {
 
     fn require_assignable(
         &self,
-        index: u8,
+        index: LocalSlot,
         state: &FlowState,
         line: u32,
     ) -> Result<(), ParseError> {
@@ -457,7 +468,7 @@ impl AvailabilityAnalyzer {
     fn mark_available(
         &self,
         state: &mut FlowState,
-        index: u8,
+        index: LocalSlot,
         line: u32,
     ) -> Result<(), ParseError> {
         let slot = index as usize;
@@ -504,7 +515,7 @@ type LiveSet = Vec<bool>;
 
 #[derive(Clone, Copy)]
 struct DefInfo {
-    slot: u8,
+    slot: LocalSlot,
     explicit_null: bool,
 }
 
@@ -514,7 +525,7 @@ struct LivenessRewriter {
 }
 
 impl LivenessRewriter {
-    fn new(local_count: usize, local_bindings: &[(String, u8)]) -> Self {
+    fn new(local_count: usize, local_bindings: &[(String, LocalSlot)]) -> Self {
         let mut clearable_slots = vec![false; local_count];
         for (_, index) in local_bindings {
             let slot = *index as usize;
@@ -985,7 +996,7 @@ impl LivenessRewriter {
         live_before: &LiveSet,
         live_after: &LiveSet,
         defs: &[DefInfo],
-    ) -> Vec<u8> {
+    ) -> Vec<LocalSlot> {
         let mut clear = vec![false; self.local_count];
         for slot in 0..self.local_count {
             if self.clearable_slots[slot] && live_before[slot] && !live_after[slot] {
@@ -1005,7 +1016,7 @@ impl LivenessRewriter {
         clear
             .iter()
             .enumerate()
-            .filter_map(|(slot, should_clear)| should_clear.then_some(slot as u8))
+            .filter_map(|(slot, should_clear)| should_clear.then_some(slot as LocalSlot))
             .collect()
     }
 
@@ -1021,14 +1032,14 @@ impl LivenessRewriter {
         }
     }
 
-    fn kill_slot(&self, live: &mut LiveSet, slot: u8) {
+    fn kill_slot(&self, live: &mut LiveSet, slot: LocalSlot) {
         let slot = slot as usize;
         if slot < self.local_count {
             live[slot] = false;
         }
     }
 
-    fn mark_live(&self, live: &mut LiveSet, slot: u8) {
+    fn mark_live(&self, live: &mut LiveSet, slot: LocalSlot) {
         let slot = slot as usize;
         if slot < self.local_count {
             live[slot] = true;
@@ -1050,4 +1061,706 @@ fn stmt_line(stmt: &Stmt) -> u32 {
         | Stmt::Break { line }
         | Stmt::Continue { line } => *line,
     }
+}
+
+struct LocalSlotAllocator {
+    local_count: usize,
+    liveness: LivenessRewriter,
+    function_impls: HashMap<u16, FunctionImpl>,
+    adjacency: Vec<HashSet<usize>>,
+    function_footprint_cache: HashMap<u16, LiveSet>,
+    full_footprint: LiveSet,
+}
+
+impl LocalSlotAllocator {
+    fn new(
+        local_count: usize,
+        local_bindings: &[(String, LocalSlot)],
+        function_impls: &HashMap<u16, FunctionImpl>,
+    ) -> Self {
+        let liveness = LivenessRewriter::new(local_count, local_bindings);
+        Self {
+            local_count,
+            liveness,
+            function_impls: function_impls.clone(),
+            adjacency: (0..local_count).map(|_| HashSet::new()).collect(),
+            function_footprint_cache: HashMap::new(),
+            full_footprint: vec![true; local_count],
+        }
+    }
+
+    fn allocate(mut self, mut ir: FrontendIr) -> Result<FrontendIr, ParseError> {
+        let live_out = self.liveness.empty_set();
+        let _ = self.collect_block(&ir.stmts, &live_out)?;
+        for function_impl in ir.function_impls.values() {
+            let live_after = self.liveness.uses_expr(&function_impl.body_expr);
+            self.add_live_clique(&live_after);
+            self.collect_expr_constraints(&function_impl.body_expr, &live_after)?;
+            let _ = self.collect_block(&function_impl.body_stmts, &live_after)?;
+        }
+
+        let (mapping, compacted_local_count) = self.color_slots()?;
+        remap_frontend_ir(&mut ir, &mapping, compacted_local_count)?;
+        Ok(ir)
+    }
+
+    fn collect_block(&mut self, stmts: &[Stmt], live_out: &LiveSet) -> Result<LiveSet, ParseError> {
+        let mut live_after = live_out.clone();
+        self.add_live_clique(&live_after);
+        for stmt in stmts.iter().rev() {
+            let live_before = self.liveness.compute_live_before_stmt(stmt, &live_after);
+            self.add_live_clique(&live_before);
+            self.add_stmt_def_edges(stmt, &live_after);
+            self.collect_stmt_constraints(stmt, &live_before, &live_after)?;
+            live_after = live_before;
+        }
+        Ok(live_after)
+    }
+
+    fn collect_stmt_constraints(
+        &mut self,
+        stmt: &Stmt,
+        live_before: &LiveSet,
+        live_after: &LiveSet,
+    ) -> Result<(), ParseError> {
+        match stmt {
+            Stmt::Noop { .. }
+            | Stmt::FuncDecl { .. }
+            | Stmt::Break { .. }
+            | Stmt::Continue { .. } => {}
+            Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+                self.collect_expr_constraints(expr, live_before)?;
+            }
+            Stmt::ClosureLet { closure, .. } => {
+                for (source_slot, captured_slot) in &closure.capture_copies {
+                    self.add_slot_live_edges(*source_slot, live_before);
+                    self.add_slot_live_edges(*captured_slot, live_before);
+                }
+            }
+            Stmt::IfElse {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.collect_expr_constraints(condition, live_before)?;
+                let _ = self.collect_block(then_branch, live_after)?;
+                let _ = self.collect_block(else_branch, live_after)?;
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                let cond_uses = self.liveness.uses_expr(condition);
+                let mut live_cond = live_after.clone();
+                self.liveness.union_inplace(&mut live_cond, &cond_uses);
+                loop {
+                    let body_live = self.liveness.compute_live_before_block(body, &live_cond);
+                    let mut next = live_after.clone();
+                    self.liveness.union_inplace(&mut next, &cond_uses);
+                    self.liveness.union_inplace(&mut next, &body_live);
+                    if next == live_cond {
+                        break;
+                    }
+                    live_cond = next;
+                }
+                self.collect_expr_constraints(condition, &live_cond)?;
+                let _ = self.collect_block(body, &live_cond)?;
+            }
+            Stmt::For {
+                init,
+                condition,
+                post,
+                body,
+                ..
+            } => {
+                let cond_uses = self.liveness.uses_expr(condition);
+                let mut live_cond = live_after.clone();
+                self.liveness.union_inplace(&mut live_cond, &cond_uses);
+                loop {
+                    let post_live = self.liveness.compute_live_before_stmt(post, &live_cond);
+                    let body_live = self.liveness.compute_live_before_block(body, &post_live);
+                    let mut next = live_after.clone();
+                    self.liveness.union_inplace(&mut next, &cond_uses);
+                    self.liveness.union_inplace(&mut next, &body_live);
+                    if next == live_cond {
+                        break;
+                    }
+                    live_cond = next;
+                }
+                let post_live_before = self.liveness.compute_live_before_stmt(post, &live_cond);
+                self.collect_expr_constraints(condition, &live_cond)?;
+                self.collect_stmt_constraints(post, &post_live_before, &live_cond)?;
+                let _ = self.collect_block(body, &post_live_before)?;
+                self.collect_stmt_constraints(init, live_before, &live_cond)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_expr_constraints(&mut self, expr: &Expr, live: &LiveSet) -> Result<(), ParseError> {
+        match expr {
+            Expr::Null
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::Bool(_)
+            | Expr::String(_)
+            | Expr::FunctionRef(_) => {}
+            Expr::Var(index) => {
+                self.add_slot_live_edges(*index, live);
+            }
+            Expr::Call(index, args) => {
+                for arg in args {
+                    self.collect_expr_constraints(arg, live)?;
+                }
+                if self.function_impls.contains_key(index) {
+                    let mut stack = Vec::new();
+                    let footprint = self.function_footprint(*index, &mut stack);
+                    self.add_cross_live_with_set(live, &footprint);
+                }
+            }
+            Expr::LocalCall(index, args) => {
+                self.add_slot_live_edges(*index, live);
+                for arg in args {
+                    self.collect_expr_constraints(arg, live)?;
+                }
+                let full_footprint = self.full_footprint.clone();
+                self.add_cross_live_with_set(live, &full_footprint);
+            }
+            Expr::Closure(_closure) => {}
+            Expr::ClosureCall(closure, args) => {
+                for arg in args {
+                    self.collect_expr_constraints(arg, live)?;
+                }
+                let mut stack = Vec::new();
+                let footprint = self.closure_footprint(closure, &mut stack);
+                self.add_cross_live_with_set(live, &footprint);
+            }
+            Expr::Add(lhs, rhs)
+            | Expr::Sub(lhs, rhs)
+            | Expr::Mul(lhs, rhs)
+            | Expr::Div(lhs, rhs)
+            | Expr::Mod(lhs, rhs)
+            | Expr::And(lhs, rhs)
+            | Expr::Or(lhs, rhs)
+            | Expr::Eq(lhs, rhs)
+            | Expr::Lt(lhs, rhs)
+            | Expr::Gt(lhs, rhs) => {
+                self.collect_expr_constraints(lhs, live)?;
+                self.collect_expr_constraints(rhs, live)?;
+            }
+            Expr::Neg(inner) | Expr::Not(inner) => {
+                self.collect_expr_constraints(inner, live)?;
+            }
+            Expr::IfElse {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.collect_expr_constraints(condition, live)?;
+                self.collect_expr_constraints(then_expr, live)?;
+                self.collect_expr_constraints(else_expr, live)?;
+            }
+            Expr::Match {
+                value_slot,
+                result_slot,
+                value,
+                arms,
+                default,
+            } => {
+                self.add_slot_live_edges(*value_slot, live);
+                self.add_slot_live_edges(*result_slot, live);
+                self.collect_expr_constraints(value, live)?;
+                for (_, arm_expr) in arms {
+                    self.collect_expr_constraints(arm_expr, live)?;
+                }
+                self.collect_expr_constraints(default, live)?;
+            }
+            Expr::Block { stmts, expr } => {
+                self.collect_expr_constraints(expr, live)?;
+                let mut block_live_out = live.clone();
+                self.liveness
+                    .union_inplace(&mut block_live_out, &self.liveness.uses_expr(expr));
+                let _ = self.collect_block(stmts, &block_live_out)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn function_footprint(&mut self, index: u16, stack: &mut Vec<u16>) -> LiveSet {
+        if let Some(cached) = self.function_footprint_cache.get(&index) {
+            return cached.clone();
+        }
+        if stack.contains(&index) {
+            return self.full_footprint.clone();
+        }
+        let Some(function_impl) = self.function_impls.get(&index).cloned() else {
+            return self.liveness.empty_set();
+        };
+        stack.push(index);
+        let mut footprint = self.liveness.empty_set();
+        for slot in &function_impl.param_slots {
+            self.mark_set_slot(&mut footprint, *slot);
+        }
+        for stmt in &function_impl.body_stmts {
+            self.collect_stmt_footprint(stmt, &mut footprint, stack);
+        }
+        self.collect_expr_footprint(&function_impl.body_expr, &mut footprint, stack);
+        stack.pop();
+        self.function_footprint_cache
+            .insert(index, footprint.clone());
+        footprint
+    }
+
+    fn closure_footprint(&mut self, closure: &ClosureExpr, stack: &mut Vec<u16>) -> LiveSet {
+        let mut footprint = self.liveness.empty_set();
+        for slot in &closure.param_slots {
+            self.mark_set_slot(&mut footprint, *slot);
+        }
+        for (source_slot, captured_slot) in &closure.capture_copies {
+            self.mark_set_slot(&mut footprint, *source_slot);
+            self.mark_set_slot(&mut footprint, *captured_slot);
+        }
+        self.collect_expr_footprint(&closure.body, &mut footprint, stack);
+        footprint
+    }
+
+    fn collect_stmt_footprint(&mut self, stmt: &Stmt, set: &mut LiveSet, stack: &mut Vec<u16>) {
+        match stmt {
+            Stmt::Noop { .. }
+            | Stmt::FuncDecl { .. }
+            | Stmt::Break { .. }
+            | Stmt::Continue { .. } => {}
+            Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
+                self.mark_set_slot(set, *index);
+                self.collect_expr_footprint(expr, set, stack);
+            }
+            Stmt::ClosureLet { closure, .. } => {
+                for (source_slot, captured_slot) in &closure.capture_copies {
+                    self.mark_set_slot(set, *source_slot);
+                    self.mark_set_slot(set, *captured_slot);
+                }
+            }
+            Stmt::Expr { expr, .. } => self.collect_expr_footprint(expr, set, stack),
+            Stmt::IfElse {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.collect_expr_footprint(condition, set, stack);
+                for nested in then_branch {
+                    self.collect_stmt_footprint(nested, set, stack);
+                }
+                for nested in else_branch {
+                    self.collect_stmt_footprint(nested, set, stack);
+                }
+            }
+            Stmt::For {
+                init,
+                condition,
+                post,
+                body,
+                ..
+            } => {
+                self.collect_stmt_footprint(init, set, stack);
+                self.collect_expr_footprint(condition, set, stack);
+                self.collect_stmt_footprint(post, set, stack);
+                for nested in body {
+                    self.collect_stmt_footprint(nested, set, stack);
+                }
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                self.collect_expr_footprint(condition, set, stack);
+                for nested in body {
+                    self.collect_stmt_footprint(nested, set, stack);
+                }
+            }
+        }
+    }
+
+    fn collect_expr_footprint(&mut self, expr: &Expr, set: &mut LiveSet, stack: &mut Vec<u16>) {
+        match expr {
+            Expr::Null
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::Bool(_)
+            | Expr::String(_)
+            | Expr::FunctionRef(_) => {}
+            Expr::Var(index) | Expr::LocalCall(index, _) => self.mark_set_slot(set, *index),
+            Expr::Call(index, args) => {
+                if self.function_impls.contains_key(index) {
+                    let footprint = self.function_footprint(*index, stack);
+                    for (slot, used) in footprint.iter().enumerate() {
+                        if *used {
+                            set[slot] = true;
+                        }
+                    }
+                }
+                for arg in args {
+                    self.collect_expr_footprint(arg, set, stack);
+                }
+            }
+            Expr::Closure(closure) => {
+                for (source_slot, captured_slot) in &closure.capture_copies {
+                    self.mark_set_slot(set, *source_slot);
+                    self.mark_set_slot(set, *captured_slot);
+                }
+                for slot in &closure.param_slots {
+                    self.mark_set_slot(set, *slot);
+                }
+            }
+            Expr::ClosureCall(closure, args) => {
+                let footprint = self.closure_footprint(closure, stack);
+                for (slot, used) in footprint.iter().enumerate() {
+                    if *used {
+                        set[slot] = true;
+                    }
+                }
+                for arg in args {
+                    self.collect_expr_footprint(arg, set, stack);
+                }
+            }
+            Expr::Add(lhs, rhs)
+            | Expr::Sub(lhs, rhs)
+            | Expr::Mul(lhs, rhs)
+            | Expr::Div(lhs, rhs)
+            | Expr::Mod(lhs, rhs)
+            | Expr::And(lhs, rhs)
+            | Expr::Or(lhs, rhs)
+            | Expr::Eq(lhs, rhs)
+            | Expr::Lt(lhs, rhs)
+            | Expr::Gt(lhs, rhs) => {
+                self.collect_expr_footprint(lhs, set, stack);
+                self.collect_expr_footprint(rhs, set, stack);
+            }
+            Expr::Neg(inner) | Expr::Not(inner) => self.collect_expr_footprint(inner, set, stack),
+            Expr::IfElse {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.collect_expr_footprint(condition, set, stack);
+                self.collect_expr_footprint(then_expr, set, stack);
+                self.collect_expr_footprint(else_expr, set, stack);
+            }
+            Expr::Match {
+                value_slot,
+                result_slot,
+                value,
+                arms,
+                default,
+            } => {
+                self.mark_set_slot(set, *value_slot);
+                self.mark_set_slot(set, *result_slot);
+                self.collect_expr_footprint(value, set, stack);
+                for (_, arm_expr) in arms {
+                    self.collect_expr_footprint(arm_expr, set, stack);
+                }
+                self.collect_expr_footprint(default, set, stack);
+            }
+            Expr::Block { stmts, expr } => {
+                for nested in stmts {
+                    self.collect_stmt_footprint(nested, set, stack);
+                }
+                self.collect_expr_footprint(expr, set, stack);
+            }
+        }
+    }
+
+    fn add_stmt_def_edges(&mut self, stmt: &Stmt, live_after: &LiveSet) {
+        match stmt {
+            Stmt::Let { index, .. } | Stmt::Assign { index, .. } => {
+                self.add_slot_live_edges(*index, live_after);
+            }
+            Stmt::ClosureLet { closure, .. } => {
+                for (_, captured_slot) in &closure.capture_copies {
+                    self.add_slot_live_edges(*captured_slot, live_after);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn add_live_clique(&mut self, live: &LiveSet) {
+        let mut members = Vec::new();
+        for (idx, active) in live.iter().enumerate() {
+            if *active {
+                members.push(idx);
+            }
+        }
+        for left in 0..members.len() {
+            for right in (left + 1)..members.len() {
+                self.add_edge(members[left], members[right]);
+            }
+        }
+    }
+
+    fn add_slot_live_edges(&mut self, slot: LocalSlot, live: &LiveSet) {
+        let slot_idx = slot as usize;
+        if slot_idx >= self.local_count {
+            return;
+        }
+        for (idx, active) in live.iter().enumerate() {
+            if *active {
+                self.add_edge(slot_idx, idx);
+            }
+        }
+    }
+
+    fn add_cross_live_with_set(&mut self, live: &LiveSet, other: &LiveSet) {
+        let mut live_members = Vec::new();
+        let mut other_members = Vec::new();
+        for (idx, active) in live.iter().enumerate() {
+            if *active {
+                live_members.push(idx);
+            }
+        }
+        for (idx, active) in other.iter().enumerate() {
+            if *active {
+                other_members.push(idx);
+            }
+        }
+        for lhs in &live_members {
+            for rhs in &other_members {
+                self.add_edge(*lhs, *rhs);
+            }
+        }
+    }
+
+    fn add_edge(&mut self, lhs: usize, rhs: usize) {
+        if lhs == rhs || lhs >= self.local_count || rhs >= self.local_count {
+            return;
+        }
+        self.adjacency[lhs].insert(rhs);
+        self.adjacency[rhs].insert(lhs);
+    }
+
+    fn mark_set_slot(&self, set: &mut LiveSet, slot: LocalSlot) {
+        let idx = slot as usize;
+        if idx < self.local_count {
+            set[idx] = true;
+        }
+    }
+
+    fn color_slots(&self) -> Result<(Vec<LocalSlot>, usize), ParseError> {
+        let mut nodes = (0..self.local_count).collect::<Vec<_>>();
+        nodes.sort_by_key(|idx| (Reverse(self.adjacency[*idx].len()), *idx));
+
+        let mut colors = vec![LocalSlot::MAX; self.local_count];
+        let mut used = [false; (u8::MAX as usize) + 1];
+        let mut max_color = 0usize;
+
+        for node in nodes {
+            used.fill(false);
+            for neighbor in &self.adjacency[node] {
+                let color = colors[*neighbor];
+                if color != LocalSlot::MAX {
+                    used[color as usize] = true;
+                }
+            }
+            let Some(color) = used.iter().position(|occupied| !occupied) else {
+                return Err(ParseError {
+                    span: None,
+                    code: None,
+                    line: 1,
+                    message: format!(
+                        "too many simultaneously live locals (requires more than {} slots)",
+                        (u8::MAX as usize) + 1
+                    ),
+                });
+            };
+            colors[node] = color as LocalSlot;
+            if color > max_color {
+                max_color = color;
+            }
+        }
+
+        let compacted_local_count = if self.local_count == 0 {
+            0
+        } else {
+            max_color + 1
+        };
+        Ok((colors, compacted_local_count))
+    }
+}
+
+fn remap_frontend_ir(
+    ir: &mut FrontendIr,
+    mapping: &[LocalSlot],
+    compacted_local_count: usize,
+) -> Result<(), ParseError> {
+    for stmt in &mut ir.stmts {
+        remap_stmt_slots(stmt, mapping)?;
+    }
+    for function_impl in ir.function_impls.values_mut() {
+        for slot in &mut function_impl.param_slots {
+            *slot = remap_slot(*slot, mapping)?;
+        }
+        for stmt in &mut function_impl.body_stmts {
+            remap_stmt_slots(stmt, mapping)?;
+        }
+        remap_expr_slots(&mut function_impl.body_expr, mapping)?;
+    }
+
+    for (_, index) in &mut ir.local_bindings {
+        *index = remap_slot(*index, mapping)?;
+    }
+    ir.local_bindings
+        .sort_by(|(lhs_name, lhs_slot), (rhs_name, rhs_slot)| {
+            lhs_slot.cmp(rhs_slot).then_with(|| lhs_name.cmp(rhs_name))
+        });
+    ir.locals = compacted_local_count;
+    Ok(())
+}
+
+fn remap_slot(index: LocalSlot, mapping: &[LocalSlot]) -> Result<LocalSlot, ParseError> {
+    let slot = index as usize;
+    mapping.get(slot).copied().ok_or(ParseError {
+        span: None,
+        code: None,
+        line: 1,
+        message: "internal local slot remap out of range".to_string(),
+    })
+}
+
+fn remap_stmt_slots(stmt: &mut Stmt, mapping: &[LocalSlot]) -> Result<(), ParseError> {
+    match stmt {
+        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
+            *index = remap_slot(*index, mapping)?;
+            remap_expr_slots(expr, mapping)?;
+        }
+        Stmt::ClosureLet { closure, .. } => {
+            for (source_slot, captured_slot) in &mut closure.capture_copies {
+                *source_slot = remap_slot(*source_slot, mapping)?;
+                *captured_slot = remap_slot(*captured_slot, mapping)?;
+            }
+            remap_expr_slots(&mut closure.body, mapping)?;
+        }
+        Stmt::Expr { expr, .. } => {
+            remap_expr_slots(expr, mapping)?;
+        }
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            remap_expr_slots(condition, mapping)?;
+            for nested in then_branch {
+                remap_stmt_slots(nested, mapping)?;
+            }
+            for nested in else_branch {
+                remap_stmt_slots(nested, mapping)?;
+            }
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            ..
+        } => {
+            remap_stmt_slots(init, mapping)?;
+            remap_expr_slots(condition, mapping)?;
+            remap_stmt_slots(post, mapping)?;
+            for nested in body {
+                remap_stmt_slots(nested, mapping)?;
+            }
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            remap_expr_slots(condition, mapping)?;
+            for nested in body {
+                remap_stmt_slots(nested, mapping)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseError> {
+    match expr {
+        Expr::Null | Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::String(_) => {}
+        Expr::FunctionRef(_) => {}
+        Expr::Call(_, args) => {
+            for arg in args {
+                remap_expr_slots(arg, mapping)?;
+            }
+        }
+        Expr::LocalCall(index, args) => {
+            *index = remap_slot(*index, mapping)?;
+            for arg in args {
+                remap_expr_slots(arg, mapping)?;
+            }
+        }
+        Expr::Closure(closure) | Expr::ClosureCall(closure, _) => {
+            for slot in &mut closure.param_slots {
+                *slot = remap_slot(*slot, mapping)?;
+            }
+            for (source_slot, captured_slot) in &mut closure.capture_copies {
+                *source_slot = remap_slot(*source_slot, mapping)?;
+                *captured_slot = remap_slot(*captured_slot, mapping)?;
+            }
+            remap_expr_slots(&mut closure.body, mapping)?;
+            if let Expr::ClosureCall(_, args) = expr {
+                for arg in args {
+                    remap_expr_slots(arg, mapping)?;
+                }
+            }
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            remap_expr_slots(lhs, mapping)?;
+            remap_expr_slots(rhs, mapping)?;
+        }
+        Expr::Neg(inner) | Expr::Not(inner) => {
+            remap_expr_slots(inner, mapping)?;
+        }
+        Expr::Var(index) => {
+            *index = remap_slot(*index, mapping)?;
+        }
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            remap_expr_slots(condition, mapping)?;
+            remap_expr_slots(then_expr, mapping)?;
+            remap_expr_slots(else_expr, mapping)?;
+        }
+        Expr::Match {
+            value_slot,
+            result_slot,
+            value,
+            arms,
+            default,
+        } => {
+            *value_slot = remap_slot(*value_slot, mapping)?;
+            *result_slot = remap_slot(*result_slot, mapping)?;
+            remap_expr_slots(value, mapping)?;
+            for (_, arm_expr) in arms {
+                remap_expr_slots(arm_expr, mapping)?;
+            }
+            remap_expr_slots(default, mapping)?;
+        }
+        Expr::Block { stmts, expr } => {
+            for nested in stmts {
+                remap_stmt_slots(nested, mapping)?;
+            }
+            remap_expr_slots(expr, mapping)?;
+        }
+    }
+    Ok(())
 }

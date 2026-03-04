@@ -14,7 +14,8 @@ pub enum CompileError {
     CallArityOverflow,
     ClosureUsedAsValue,
     CallableUsedAsValue,
-    NonCallableLocal(u8),
+    NonCallableLocal(LocalSlot),
+    LocalSlotOverflow(LocalSlot),
     CallableArityMismatch { expected: usize, got: usize },
     BreakOutsideLoop,
     ContinueOutsideLoop,
@@ -216,7 +217,8 @@ pub mod source_map;
 use linker::merge_units;
 
 pub use ir::{
-    ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, MatchPattern, MatchTypePattern, Stmt,
+    ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern,
+    MatchTypePattern, Stmt,
 };
 
 pub struct CompiledProgram {
@@ -315,7 +317,9 @@ fn compile_parsed_output(
         compiler.add_function_debug(func);
     }
     for (name, index) in local_bindings {
-        compiler.add_local_debug(name, index);
+        compiler
+            .add_local_debug(name, index)
+            .map_err(SourceError::Compile)?;
     }
     let mut program = compiler
         .compile_program(&stmts)
@@ -423,7 +427,7 @@ pub struct Compiler {
     function_impls: HashMap<u16, FunctionImpl>,
     call_index_remap: HashMap<u16, u16>,
     inline_call_stack: Vec<u16>,
-    callable_bindings: HashMap<u8, CallableBinding>,
+    callable_bindings: HashMap<LocalSlot, CallableBinding>,
 }
 
 struct LoopContext {
@@ -465,8 +469,9 @@ impl Compiler {
             .add_function(func.name.clone(), func.args.clone());
     }
 
-    pub fn add_local_debug(&mut self, name: String, index: u8) {
-        self.assembler.add_local(name, index);
+    pub fn add_local_debug(&mut self, name: String, index: LocalSlot) -> Result<(), CompileError> {
+        self.assembler.add_local(name, local_slot_operand(index)?);
+        Ok(())
     }
 
     pub fn set_function_impls(&mut self, function_impls: HashMap<u16, FunctionImpl>) {
@@ -507,7 +512,7 @@ impl Compiler {
             }
             Stmt::ClosureLet { line, closure } => {
                 self.assembler.mark_line(*line);
-                self.bind_closure_captures(closure);
+                self.bind_closure_captures(closure)?;
             }
             Stmt::FuncDecl { .. } => {}
             Stmt::Expr { expr, line } => {
@@ -744,7 +749,7 @@ impl Compiler {
                 if self.callable_bindings.contains_key(index) {
                     return Err(CompileError::CallableUsedAsValue);
                 }
-                self.assembler.ldloc(*index);
+                self.emit_ldloc(*index)?;
             }
             Expr::IfElse {
                 condition,
@@ -773,25 +778,25 @@ impl Compiler {
                 default,
             } => {
                 self.compile_expr(value)?;
-                self.assembler.stloc(*value_slot);
+                self.emit_stloc(*value_slot)?;
                 let end_label = self.fresh_label("match_end");
                 for (pattern, arm_expr) in arms {
                     let next_label = self.fresh_label("match_next");
                     self.compile_match_pattern_condition(*value_slot, pattern)?;
                     self.assembler.brfalse_label(&next_label);
                     self.compile_expr(arm_expr)?;
-                    self.assembler.stloc(*result_slot);
+                    self.emit_stloc(*result_slot)?;
                     self.assembler.br_label(&end_label);
                     self.assembler
                         .label(&next_label)
                         .map_err(CompileError::Assembler)?;
                 }
                 self.compile_expr(default)?;
-                self.assembler.stloc(*result_slot);
+                self.emit_stloc(*result_slot)?;
                 self.assembler
                     .label(&end_label)
                     .map_err(CompileError::Assembler)?;
-                self.assembler.ldloc(*result_slot);
+                self.emit_ldloc(*result_slot)?;
             }
             Expr::Block { stmts, expr } => {
                 self.compile_stmts(stmts)?;
@@ -801,11 +806,12 @@ impl Compiler {
         Ok(())
     }
 
-    fn bind_closure_captures(&mut self, closure: &ClosureExpr) {
+    fn bind_closure_captures(&mut self, closure: &ClosureExpr) -> Result<(), CompileError> {
         for (source_index, captured_slot) in &closure.capture_copies {
-            self.assembler.ldloc(*source_index);
-            self.assembler.stloc(*captured_slot);
+            self.emit_ldloc(*source_index)?;
+            self.emit_stloc(*captured_slot)?;
         }
+        Ok(())
     }
 
     fn callable_binding_from_expr(
@@ -814,7 +820,7 @@ impl Compiler {
     ) -> Result<Option<CallableBinding>, CompileError> {
         match expr {
             Expr::Closure(closure) => {
-                self.bind_closure_captures(closure);
+                self.bind_closure_captures(closure)?;
                 Ok(Some(CallableBinding::Closure(closure.clone())))
             }
             Expr::FunctionRef(index) => Ok(Some(CallableBinding::Function(*index))),
@@ -823,14 +829,14 @@ impl Compiler {
         }
     }
 
-    fn assign_expr_to_slot(&mut self, slot: u8, expr: &Expr) -> Result<(), CompileError> {
+    fn assign_expr_to_slot(&mut self, slot: LocalSlot, expr: &Expr) -> Result<(), CompileError> {
         if let Some(callable) = self.callable_binding_from_expr(expr)? {
             self.callable_bindings.insert(slot, callable);
             return Ok(());
         }
         self.callable_bindings.remove(&slot);
         self.compile_expr(expr)?;
-        self.assembler.stloc(slot);
+        self.emit_stloc(slot)?;
         Ok(())
     }
 
@@ -922,22 +928,22 @@ impl Compiler {
 
     fn compile_match_pattern_condition(
         &mut self,
-        value_slot: u8,
+        value_slot: LocalSlot,
         pattern: &MatchPattern,
     ) -> Result<(), CompileError> {
         match pattern {
             MatchPattern::Int(v) => {
-                self.assembler.ldloc(value_slot);
+                self.emit_ldloc(value_slot)?;
                 self.assembler.push_const(Value::Int(*v));
                 self.assembler.ceq();
             }
             MatchPattern::String(v) => {
-                self.assembler.ldloc(value_slot);
+                self.emit_ldloc(value_slot)?;
                 self.assembler.push_const(Value::String(v.clone()));
                 self.assembler.ceq();
             }
             MatchPattern::Null => {
-                self.assembler.ldloc(value_slot);
+                self.emit_ldloc(value_slot)?;
                 self.assembler.push_const(Value::Null);
                 self.assembler.ceq();
             }
@@ -950,28 +956,28 @@ impl Compiler {
 
     fn compile_match_type_pattern_condition(
         &mut self,
-        value_slot: u8,
+        value_slot: LocalSlot,
         type_pattern: &MatchTypePattern,
     ) -> Result<(), CompileError> {
         match type_pattern {
-            MatchTypePattern::Int => self.compile_type_name_equals(value_slot, "int"),
-            MatchTypePattern::Float => self.compile_type_name_equals(value_slot, "float"),
-            MatchTypePattern::Bool => self.compile_type_name_equals(value_slot, "bool"),
-            MatchTypePattern::String => self.compile_type_name_equals(value_slot, "string"),
-            MatchTypePattern::Array => self.compile_type_name_equals(value_slot, "array"),
-            MatchTypePattern::Map => self.compile_type_name_equals(value_slot, "map"),
+            MatchTypePattern::Int => self.compile_type_name_equals(value_slot, "int")?,
+            MatchTypePattern::Float => self.compile_type_name_equals(value_slot, "float")?,
+            MatchTypePattern::Bool => self.compile_type_name_equals(value_slot, "bool")?,
+            MatchTypePattern::String => self.compile_type_name_equals(value_slot, "string")?,
+            MatchTypePattern::Array => self.compile_type_name_equals(value_slot, "array")?,
+            MatchTypePattern::Map => self.compile_type_name_equals(value_slot, "map")?,
             MatchTypePattern::Number => {
                 let number_fallback_label = self.fresh_label("match_type_number_fallback");
                 let number_end_label = self.fresh_label("match_type_number_end");
 
-                self.compile_type_name_equals(value_slot, "int");
+                self.compile_type_name_equals(value_slot, "int")?;
                 self.assembler.brfalse_label(&number_fallback_label);
                 self.assembler.push_const(Value::Bool(true));
                 self.assembler.br_label(&number_end_label);
                 self.assembler
                     .label(&number_fallback_label)
                     .map_err(CompileError::Assembler)?;
-                self.compile_type_name_equals(value_slot, "float");
+                self.compile_type_name_equals(value_slot, "float")?;
                 self.assembler
                     .label(&number_end_label)
                     .map_err(CompileError::Assembler)?;
@@ -980,18 +986,33 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_type_name_equals(&mut self, value_slot: u8, expected: &str) {
-        self.assembler.ldloc(value_slot);
+    fn compile_type_name_equals(
+        &mut self,
+        value_slot: LocalSlot,
+        expected: &str,
+    ) -> Result<(), CompileError> {
+        self.emit_ldloc(value_slot)?;
         self.assembler.call(BuiltinFunction::TypeOf.call_index(), 1);
         self.assembler
             .push_const(Value::String(expected.to_string()));
         self.assembler.ceq();
+        Ok(())
     }
 
     fn fresh_label(&mut self, prefix: &str) -> String {
         let label = format!("{prefix}_{}", self.next_label_id);
         self.next_label_id += 1;
         label
+    }
+
+    fn emit_ldloc(&mut self, slot: LocalSlot) -> Result<(), CompileError> {
+        self.assembler.ldloc(local_slot_operand(slot)?);
+        Ok(())
+    }
+
+    fn emit_stloc(&mut self, slot: LocalSlot) -> Result<(), CompileError> {
+        self.assembler.stloc(local_slot_operand(slot)?);
+        Ok(())
     }
 
     fn compile_string_concat_operand(&mut self, expr: &Expr) -> Result<(), CompileError> {
@@ -1039,6 +1060,10 @@ impl Compiler {
             .label(&done_label)
             .expect("compiler-generated label should be valid");
     }
+}
+
+fn local_slot_operand(index: LocalSlot) -> Result<u8, CompileError> {
+    u8::try_from(index).map_err(|_| CompileError::LocalSlotOverflow(index))
 }
 
 fn shift_amount_for_power_of_two(value: i64) -> Option<u32> {

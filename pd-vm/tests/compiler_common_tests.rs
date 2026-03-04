@@ -55,6 +55,81 @@ fn assignment_updates_existing_local_without_new_slot() {
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(2)]);
 }
+
+#[test]
+fn compiler_reuses_slots_when_declared_locals_exceed_bytecode_limit() {
+    let mut source = String::from("let out = 0;\n");
+    for idx in 0..600usize {
+        source.push_str(&format!("let v{idx} = {idx};\n"));
+        source.push_str(&format!("out = v{idx};\n"));
+    }
+    source.push_str("out;\n");
+
+    let compiled = compile_source(&source).expect("compile should succeed");
+    assert!(
+        compiled.locals <= (u8::MAX as usize + 1),
+        "slot allocator should remap to bytecode locals"
+    );
+
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(599)]);
+}
+
+#[test]
+fn compiler_rejects_programs_with_more_than_256_simultaneously_live_locals() {
+    let live_count = (u8::MAX as usize) + 2;
+    let mut source = String::new();
+    for idx in 0..live_count {
+        source.push_str(&format!("let v{idx} = {idx};\n"));
+    }
+    source.push_str("let out = ");
+    for idx in 0..live_count {
+        if idx > 0 {
+            source.push_str(" + ");
+        }
+        source.push_str(&format!("v{idx}"));
+    }
+    source.push_str(";\nout;\n");
+
+    let err = match compile_source(&source) {
+        Ok(_) => panic!("compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse_err) => {
+            assert!(
+                parse_err
+                    .message
+                    .contains("too many simultaneously live locals"),
+                "unexpected parse error: {parse_err:?}"
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn compiler_reuses_slots_with_large_programs_that_inline_functions() {
+    let mut source = String::from("fn id(x) { x; }\nlet out = 0;\n");
+    for idx in 0..400usize {
+        source.push_str(&format!("let v{idx} = {idx};\n"));
+        source.push_str(&format!("out = id(v{idx});\n"));
+    }
+    source.push_str("out;\n");
+
+    let compiled = compile_source(&source).expect("compile should succeed");
+    assert!(
+        compiled.locals <= (u8::MAX as usize + 1),
+        "slot allocator should keep inline-call programs within bytecode local limits"
+    );
+
+    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(399)]);
+}
 #[test]
 fn compile_source_with_functions() {
     let source = include_str!("../examples/example.rss");
