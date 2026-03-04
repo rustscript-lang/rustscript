@@ -577,16 +577,24 @@ impl Vm {
                     {
                         continue;
                     }
-                    // Chain directly into another already-compiled trace at the current ip.
-                    if !has_yielding_call
-                        && let Some(next_trace_id) = self.jit.compiled_trace_for_ip(self.ip)
-                        && next_trace_id != current_trace_id
-                    {
-                        current_trace_id = next_trace_id;
-                        self.ensure_native_trace(current_trace_id)?;
-                        (entry, root_ip, terminal, has_yielding_call) =
-                            self.native_trace_state(current_trace_id)?;
-                        continue;
+                    if !has_yielding_call {
+                        let ip = self.ip;
+                        let mut next_trace_id = self.jit.compiled_trace_for_ip(ip);
+                        if next_trace_id.is_none() {
+                            next_trace_id = {
+                                let program = &self.program;
+                                self.jit.observe_exit_ip(ip, program)
+                            };
+                        }
+                        if let Some(next_trace_id) = next_trace_id
+                            && next_trace_id != current_trace_id
+                        {
+                            current_trace_id = next_trace_id;
+                            self.ensure_native_trace(current_trace_id)?;
+                            (entry, root_ip, terminal, has_yielding_call) =
+                                self.native_trace_state(current_trace_id)?;
+                            continue;
+                        }
                     }
                     return Ok(ExecOutcome::Continue);
                 }

@@ -300,6 +300,54 @@ impl TraceJitEngine {
         self.traces.get(trace_id).cloned()
     }
 
+    pub fn observe_exit_ip(&mut self, ip: usize, program: &Program) -> Option<usize> {
+        if !self.config.enabled || !native_jit_supported() {
+            return None;
+        }
+        // Keep default behavior unchanged: only aggressively chain-compile exit roots when the
+        // user requested the most aggressive hotness policy.
+        if self.config.hot_loop_threshold > 1 {
+            return None;
+        }
+        if let Some(&trace_id) = self.compiled_by_root.get(&ip) {
+            return Some(trace_id);
+        }
+        if self.blocked_roots.contains(&ip) {
+            return None;
+        }
+
+        let line = program
+            .debug
+            .as_ref()
+            .and_then(|debug| debug.line_for_offset(ip));
+        let result = if self.config.hot_loop_threshold == 0 {
+            Err(JitNyiReason::HotLoopThresholdZero)
+        } else {
+            self.compile_trace(program, ip)
+        };
+
+        match result {
+            Ok(trace_id) => {
+                self.attempts.push(JitAttempt {
+                    root_ip: ip,
+                    line,
+                    result: Ok(trace_id),
+                });
+                self.compiled_by_root.insert(ip, trace_id);
+                Some(trace_id)
+            }
+            Err(reason) => {
+                self.attempts.push(JitAttempt {
+                    root_ip: ip,
+                    line,
+                    result: Err(reason),
+                });
+                self.blocked_roots.insert(ip);
+                None
+            }
+        }
+    }
+
     pub fn trace_has_call(&self, trace_id: usize) -> bool {
         self.traces
             .get(trace_id)
