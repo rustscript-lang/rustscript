@@ -4,6 +4,7 @@ use super::{
     STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_OUT_OF_FUEL, STATUS_TRACE_EXIT,
     STATUS_WAITING, STATUS_YIELDED, store_bridge_error,
 };
+use crate::builtins::BuiltinFunction;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
     AbiParam, Block, BlockArg, FuncRef, InstBuilder, MemFlags, Signature, types,
@@ -39,6 +40,7 @@ const OP_STLOC: i64 = 18;
 const OP_CALL: i64 = 19;
 const OP_GUARD_FALSE: i64 = 20;
 const OP_JUMP: i64 = 21;
+const OP_BUILTIN_CALL: i64 = 22;
 
 pub(crate) struct CraneliftCompiledTrace {
     pub(crate) entry: *const u8,
@@ -620,7 +622,7 @@ fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
-        TraceStep::Call { .. } => Ok(false),
+        TraceStep::Call { .. } | TraceStep::BuiltinCall { .. } => Ok(false),
     }
 }
 
@@ -1926,6 +1928,20 @@ fn step_to_call(step: &TraceStep, root_ip: usize) -> VmResult<(i64, i64, i64, i6
                 .map_err(|_| VmError::JitNative("call ip out of range for i64".to_string()))?;
             (OP_CALL, i64::from(*index), i64::from(*argc), call_ip)
         }
+        TraceStep::BuiltinCall {
+            index,
+            argc,
+            call_ip,
+        } => {
+            let call_ip = i64::try_from(*call_ip)
+                .map_err(|_| VmError::JitNative("call ip out of range for i64".to_string()))?;
+            (
+                OP_BUILTIN_CALL,
+                i64::from(*index),
+                i64::from(*argc),
+                call_ip,
+            )
+        }
         TraceStep::GuardFalse { exit_ip } => {
             let exit_ip = i64::try_from(*exit_ip).map_err(|_| {
                 VmError::JitNative("guard exit ip out of range for i64".to_string())
@@ -2268,6 +2284,7 @@ fn bridge_name_for_op(op: i64) -> Option<&'static str> {
         OP_LDLOC => Some("ldloc"),
         OP_STLOC => Some("stloc"),
         OP_CALL => Some("call"),
+        OP_BUILTIN_CALL => Some("builtin_call"),
         OP_GUARD_FALSE => Some("guard_false"),
         OP_JUMP => Some("jump_ip"),
         _ => None,
@@ -2276,7 +2293,14 @@ fn bridge_name_for_op(op: i64) -> Option<&'static str> {
 
 extern "C" fn pd_vm_cranelift_step(vm: *mut Vm, op: i64, a: i64, b: i64, c: i64) -> i32 {
     run_step(vm, "step", |vm| {
-        if let Some(name) = bridge_name_for_op(op) {
+        if op == OP_BUILTIN_CALL {
+            let bridge_name = u16::try_from(a)
+                .ok()
+                .and_then(BuiltinFunction::from_call_index)
+                .map(BuiltinFunction::name)
+                .unwrap_or("builtin_call");
+            vm.record_jit_native_bridge_hit(bridge_name);
+        } else if let Some(name) = bridge_name_for_op(op) {
             vm.record_jit_native_bridge_hit(name);
         }
 
@@ -2433,6 +2457,20 @@ extern "C" fn pd_vm_cranelift_step(vm: *mut Vm, op: i64, a: i64, b: i64, c: i64)
                 .map_err(|_| VmError::JitNative("call argc out of range".to_string()))?;
             let call_ip = usize::try_from(c)
                 .map_err(|_| VmError::JitNative("call ip out of range".to_string()))?;
+            match vm.execute_host_call(index, argc, call_ip)? {
+                HostCallExecOutcome::Returned => Ok(STATUS_CONTINUE),
+                HostCallExecOutcome::Yielded => Ok(STATUS_YIELDED),
+                HostCallExecOutcome::Pending(_) => Ok(STATUS_WAITING),
+            }
+        }
+        OP_BUILTIN_CALL => {
+            let index = u16::try_from(a).map_err(|_| {
+                VmError::JitNative("builtin call index out of range".to_string())
+            })?;
+            let argc = u8::try_from(b)
+                .map_err(|_| VmError::JitNative("builtin call argc out of range".to_string()))?;
+            let call_ip = usize::try_from(c)
+                .map_err(|_| VmError::JitNative("builtin call ip out of range".to_string()))?;
             match vm.execute_host_call(index, argc, call_ip)? {
                 HostCallExecOutcome::Returned => Ok(STATUS_CONTINUE),
                 HostCallExecOutcome::Yielded => Ok(STATUS_YIELDED),

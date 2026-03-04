@@ -309,6 +309,21 @@ fn emit_native_trace_bytes(
                     status_checks => emit_native_step_call_inline(&mut code, *index, *argc, *call_ip)
                 );
             }
+            TraceStep::BuiltinCall {
+                index,
+                argc,
+                call_ip,
+            } => {
+                emit_step_with_status!(
+                    code,
+                    status_checks => emit_native_step_call_inline(
+                        &mut code,
+                        *index,
+                        *argc,
+                        *call_ip,
+                    )
+                );
+            }
             TraceStep::GuardFalse { exit_ip } => {
                 let exit_ip = trace_ip_to_u64(*exit_ip, "guard exit ip")?;
                 emit_step_with_status!(
