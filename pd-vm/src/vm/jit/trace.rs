@@ -95,6 +95,11 @@ pub enum TraceStep {
     Dup,
     Ldloc(u8),
     Stloc(u8),
+    BuiltinCall {
+        index: u16,
+        argc: u8,
+        call_ip: usize,
+    },
     Call {
         index: u16,
         argc: u8,
@@ -527,11 +532,21 @@ impl TraceJitEngine {
                     read_u16(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("call index"))?;
                 let argc =
                     read_u8(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("call argc"))?;
-                steps.push(TraceStep::Call {
-                    index,
-                    argc,
-                    call_ip,
-                });
+                if let Some(builtin) = BuiltinFunction::from_call_index(index)
+                    && argc == builtin.arity()
+                {
+                    steps.push(TraceStep::BuiltinCall {
+                        index,
+                        argc,
+                        call_ip,
+                    });
+                } else {
+                    steps.push(TraceStep::Call {
+                        index,
+                        argc,
+                        call_ip,
+                    });
+                }
                 continue;
             }
 
@@ -687,11 +702,21 @@ impl TraceJitEngine {
                     read_u16(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("call index"))?;
                 let argc =
                     read_u8(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("call argc"))?;
-                steps.push(TraceStep::Call {
-                    index,
-                    argc,
-                    call_ip,
-                });
+                if let Some(builtin) = BuiltinFunction::from_call_index(index)
+                    && argc == builtin.arity()
+                {
+                    steps.push(TraceStep::BuiltinCall {
+                        index,
+                        argc,
+                        call_ip,
+                    });
+                } else {
+                    steps.push(TraceStep::Call {
+                        index,
+                        argc,
+                        call_ip,
+                    });
+                }
                 continue;
             }
 
@@ -717,7 +742,7 @@ impl TraceJitEngine {
             .and_then(|debug| debug.line_for_offset(root_ip));
         let has_call = steps
             .iter()
-            .any(|step| matches!(step, TraceStep::Call { .. }));
+            .any(|step| matches!(step, TraceStep::Call { .. } | TraceStep::BuiltinCall { .. }));
         let has_yielding_call = steps.iter().any(|step| {
             if let TraceStep::Call { index, .. } = step {
                 BuiltinFunction::from_call_index(*index).is_none()
@@ -784,6 +809,7 @@ fn trace_step_name(step: &TraceStep) -> &'static str {
         TraceStep::Dup => "dup",
         TraceStep::Ldloc(_) => "ldloc",
         TraceStep::Stloc(_) => "stloc",
+        TraceStep::BuiltinCall { .. } => "call",
         TraceStep::Call { .. } => "call",
         TraceStep::GuardFalse { .. } => "guard_false",
         TraceStep::JumpToIp { .. } => "jump_ip",
