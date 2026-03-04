@@ -360,7 +360,8 @@ pub struct Vm {
     waiting_host_op: Option<WaitingHostOp>,
     next_host_op_id: HostOpId,
     io_state: builtins_impl::IoState,
-    fuel_remaining: Option<u64>,
+    fuel_enabled: bool,
+    fuel_remaining: u64,
     fuel_check_interval: u32,
     fuel_ops_until_check: u32,
 }
@@ -481,7 +482,8 @@ impl Vm {
             waiting_host_op: None,
             next_host_op_id: 1,
             io_state: builtins_impl::IoState::default(),
-            fuel_remaining: None,
+            fuel_enabled: false,
+            fuel_remaining: 0,
             fuel_check_interval: 1,
             fuel_ops_until_check: 1,
         }
@@ -622,12 +624,14 @@ impl Vm {
     }
 
     pub fn set_fuel(&mut self, fuel: u64) {
-        self.fuel_remaining = Some(fuel);
+        self.fuel_enabled = true;
+        self.fuel_remaining = fuel;
         self.fuel_ops_until_check = self.fuel_check_interval;
     }
 
     pub fn clear_fuel(&mut self) {
-        self.fuel_remaining = None;
+        self.fuel_enabled = false;
+        self.fuel_remaining = 0;
         self.fuel_ops_until_check = self.fuel_check_interval;
     }
 
@@ -645,18 +649,22 @@ impl Vm {
     }
 
     pub fn get_fuel(&self) -> Option<u64> {
-        self.fuel_remaining
-            .map(|remaining| remaining.saturating_sub(self.pending_fuel_debt()))
+        self.fuel_enabled
+            .then_some(self.fuel_remaining.saturating_sub(self.pending_fuel_debt()))
     }
 
     pub fn add_fuel(&mut self, fuel: u64) -> VmResult<()> {
         if fuel == 0 {
             return Ok(());
         }
-        self.fuel_remaining = Some(match self.fuel_remaining {
-            Some(remaining) => remaining.checked_add(fuel).ok_or(VmError::FuelOverflow)?,
-            None => fuel,
-        });
+        self.fuel_remaining = if self.fuel_enabled {
+            self.fuel_remaining
+                .checked_add(fuel)
+                .ok_or(VmError::FuelOverflow)?
+        } else {
+            self.fuel_enabled = true;
+            fuel
+        };
         Ok(())
     }
 
@@ -670,7 +678,7 @@ impl Vm {
 
     pub fn fuel_checkpoint(&self) -> FuelCheckpoint {
         FuelCheckpoint {
-            remaining: self.fuel_remaining,
+            remaining: self.fuel_enabled.then_some(self.fuel_remaining),
             check_interval: self.fuel_check_interval,
             ops_until_check: self.fuel_ops_until_check,
         }
@@ -681,7 +689,8 @@ impl Vm {
     }
 
     pub fn restore_fuel(&mut self, checkpoint: FuelCheckpoint) {
-        self.fuel_remaining = checkpoint.remaining;
+        self.fuel_enabled = checkpoint.remaining.is_some();
+        self.fuel_remaining = checkpoint.remaining.unwrap_or(0);
         self.fuel_check_interval = checkpoint.check_interval.max(1);
         self.fuel_ops_until_check = checkpoint
             .ops_until_check
@@ -849,7 +858,7 @@ impl Vm {
                 return Err(VmError::BytecodeBounds);
             }
 
-            if self.fuel_remaining.is_some()
+            if self.fuel_enabled
                 && let Err(err) = self.charge_fuel_tick()
             {
                 if self.handle_debugger_error(&mut debugger, &err) {
@@ -1062,7 +1071,7 @@ impl Vm {
     }
 
     fn pending_fuel_debt(&self) -> u64 {
-        if self.fuel_remaining.is_none() {
+        if !self.fuel_enabled {
             return 0;
         }
         let executed_since_last_check = self
@@ -1080,23 +1089,23 @@ impl Vm {
             return Ok(());
         }
 
-        let Some(remaining) = self.fuel_remaining else {
+        if !self.fuel_enabled {
             return Ok(());
-        };
+        }
+        let remaining = self.fuel_remaining;
 
         if remaining < amount {
-            self.fuel_remaining = Some(remaining);
             return Err(VmError::OutOfFuel {
                 needed: amount,
                 remaining,
             });
         }
-        self.fuel_remaining = Some(remaining - amount);
+        self.fuel_remaining = remaining - amount;
         Ok(())
     }
 
     pub(in crate::vm) fn charge_fuel_tick(&mut self) -> VmResult<()> {
-        if self.fuel_remaining.is_none() {
+        if !self.fuel_enabled {
             return Ok(());
         }
         if self.fuel_ops_until_check > 1 {
