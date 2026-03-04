@@ -251,14 +251,18 @@ fn emit_fuel_tick_inline(
     let countdown_block = b.create_block();
     let charge_block = b.create_block();
 
-    let ops_until_check = b
-        .ins()
-        .load(types::I32, MemFlags::new(), vm_ptr, offsets.fuel_ops_until_check);
+    let ops_until_check = b.ins().load(
+        types::I32,
+        MemFlags::new(),
+        vm_ptr,
+        offsets.fuel_ops_until_check,
+    );
     let chunk_steps = b.ins().iconst(types::I32, i64::from(steps_to_advance));
     let no_charge = b
         .ins()
         .icmp(IntCC::UnsignedGreaterThan, ops_until_check, chunk_steps);
-    b.ins().brif(no_charge, countdown_block, &[], charge_block, &[]);
+    b.ins()
+        .brif(no_charge, countdown_block, &[], charge_block, &[]);
 
     b.switch_to_block(countdown_block);
     let new_ops = b.ins().isub(ops_until_check, chunk_steps);
@@ -271,12 +275,9 @@ fn emit_fuel_tick_inline(
     b.ins().jump(continue_block, &[]);
 
     b.switch_to_block(charge_block);
-    let remaining = b.ins().load(
-        types::I64,
-        MemFlags::new(),
-        vm_ptr,
-        offsets.fuel_remaining,
-    );
+    let remaining = b
+        .ins()
+        .load(types::I64, MemFlags::new(), vm_ptr, offsets.fuel_remaining);
     let interval_i32 = b.ins().iconst(types::I32, i64::from(fuel_check_interval));
     let charge_amount = b.ins().uextend(types::I64, interval_i32);
     let enough_fuel = b

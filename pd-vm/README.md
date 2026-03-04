@@ -133,10 +133,41 @@ Backend parity notes:
 Library hooks:
 
 - `vm.set_jit_config(...)`
+- `vm.prepare_aot()`
 - `vm.jit_snapshot()`
 - `vm.dump_jit_info()`
 - `vm.jit_native_trace_count()`
 - `vm.jit_native_exec_count()`
+
+### AOT
+
+Ahead-of-time mode compiles whole-program bytecode blocks up front (entry + branch targets),
+then executes through the same native backend used by JIT.
+
+Run source in AOT mode:
+
+```powershell
+cargo run -p pd-vm --bin pd-vm-run -- --aot examples/example.rss
+```
+
+Emit an AOT bundle:
+
+```powershell
+cargo run -p pd-vm --bin pd-vm-run -- --emit-aot out/example.pat examples/example.rss
+```
+
+Run an emitted AOT bundle:
+
+```powershell
+cargo run -p pd-vm --bin pd-vm-run -- --run-aot out/example.pat --jit-dump
+```
+
+- AOT uses the same native backend selector as JIT (`PD_VM_JIT_CODEGEN`).
+- Opcode/native support coverage is shared with the existing native JIT backend.
+- `.pat` stores VM program data (`local_count` + encoded VM bytecode), not process-specific native
+  pointers. Native traces are regenerated per process.
+- Control-flow targets are bytecode instruction offsets (effectively base+offset with bytecode base
+  at `0`), so emitted bundles are portable across runs on the same architecture/backend support.
 
 ### Fuel Metering
 
@@ -463,3 +494,4 @@ Current NYI in trace compiler:
 - backward `brfalse` targets (only forward guard exits are supported)
 - traces longer than configured max trace length
 - unsupported native targets (currently `x86_64` Windows/Unix-non-macOS and `aarch64` Linux/macOS)
+

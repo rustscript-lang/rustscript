@@ -1053,7 +1053,12 @@ fn emit_native_step_binary_numeric_inline(
     let float_done = emit_jmp_rel32(code);
 
     let error_label = code.len();
-    emit_status_error(code);
+    if matches!(op, NativeBinaryNumericOp::Add) {
+        let helper_addr = helper_ptr_to_u64(jit_native_add_bridge as *const (), "add helper")?;
+        emit_vm_helper_call0(code, helper_addr);
+    } else {
+        emit_status_error(code);
+    }
     let done_label = code.len();
     patch_rel32(code, lhs_not_float, error_label)?;
     patch_rel32(code, rhs_not_float, error_label)?;
@@ -1618,8 +1623,9 @@ fn emit_native_step_ceq_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
     emit_status_continue(code);
     let ok_done = emit_jmp_rel32(code);
 
-    let error_label = code.len();
-    emit_status_error(code);
+    let fallback_label = code.len();
+    let helper_addr = helper_ptr_to_u64(jit_native_ceq_bridge as *const (), "ceq helper")?;
+    emit_vm_helper_call0(code, helper_addr);
     let done_label = code.len();
 
     patch_rel32(code, cmp_int, cmp_int_label)?;
@@ -1630,10 +1636,10 @@ fn emit_native_step_ceq_inline(code: &mut Vec<u8>, layout: NativeStackLayout) ->
     patch_rel32(code, float_ready, result_label)?;
     patch_rel32(code, bool_ready, result_label)?;
     patch_rel32(code, ne_ready, result_label)?;
-    patch_rel32(code, underflow, error_label)?;
-    patch_rel32(code, lhs_string, error_label)?;
-    patch_rel32(code, rhs_string, error_label)?;
-    patch_rel32(code, unknown_tag, error_label)?;
+    patch_rel32(code, underflow, fallback_label)?;
+    patch_rel32(code, lhs_string, fallback_label)?;
+    patch_rel32(code, rhs_string, fallback_label)?;
+    patch_rel32(code, unknown_tag, fallback_label)?;
     patch_rel32(code, ok_done, done_label)?;
     Ok(())
 }
@@ -2425,6 +2431,7 @@ extern "C" fn jit_native_pop_bridge(vm_ptr: *mut Vm) -> i32 {
     }
 
     let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("pop");
     match vm.pop_value() {
         Ok(_) => STATUS_CONTINUE,
         Err(err) => {
@@ -2443,6 +2450,7 @@ extern "C" fn jit_native_dup_bridge(vm_ptr: *mut Vm) -> i32 {
     }
 
     let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("dup");
     let value = match vm.peek_value() {
         Ok(value) => value.clone(),
         Err(err) => {
@@ -2451,6 +2459,88 @@ extern "C" fn jit_native_dup_bridge(vm_ptr: *mut Vm) -> i32 {
         }
     };
     vm.stack.push(value);
+    STATUS_CONTINUE
+}
+
+extern "C" fn jit_native_add_bridge(vm_ptr: *mut Vm) -> i32 {
+    if vm_ptr.is_null() {
+        set_bridge_error(VmError::JitNative(
+            "native trace add helper received null vm pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+
+    let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("add");
+    let rhs = match vm.pop_value() {
+        Ok(value) => value,
+        Err(err) => {
+            set_bridge_error(err);
+            return STATUS_ERROR;
+        }
+    };
+    let lhs = match vm.pop_value() {
+        Ok(value) => value,
+        Err(err) => {
+            set_bridge_error(err);
+            return STATUS_ERROR;
+        }
+    };
+
+    match (lhs, rhs) {
+        (Value::Int(lhs), Value::Int(rhs)) => {
+            vm.stack.push(Value::Int(lhs.wrapping_add(rhs)));
+        }
+        (Value::Int(lhs), Value::Float(rhs)) => {
+            vm.stack.push(Value::Float(lhs as f64 + rhs));
+        }
+        (Value::Float(lhs), Value::Int(rhs)) => {
+            vm.stack.push(Value::Float(lhs + rhs as f64));
+        }
+        (Value::Float(lhs), Value::Float(rhs)) => {
+            vm.stack.push(Value::Float(lhs + rhs));
+        }
+        (Value::String(mut lhs), Value::String(rhs)) => {
+            lhs.push_str(&rhs);
+            vm.stack.push(Value::String(lhs));
+        }
+        (Value::Array(mut lhs), Value::Array(rhs)) => {
+            lhs.extend(rhs);
+            vm.stack.push(Value::Array(lhs));
+        }
+        _ => {
+            set_bridge_error(VmError::TypeMismatch("number/string or array/array"));
+            return STATUS_ERROR;
+        }
+    }
+    STATUS_CONTINUE
+}
+
+extern "C" fn jit_native_ceq_bridge(vm_ptr: *mut Vm) -> i32 {
+    if vm_ptr.is_null() {
+        set_bridge_error(VmError::JitNative(
+            "native trace ceq helper received null vm pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+
+    let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("ceq");
+    let rhs = match vm.pop_value() {
+        Ok(value) => value,
+        Err(err) => {
+            set_bridge_error(err);
+            return STATUS_ERROR;
+        }
+    };
+    let lhs = match vm.pop_value() {
+        Ok(value) => value,
+        Err(err) => {
+            set_bridge_error(err);
+            return STATUS_ERROR;
+        }
+    };
+    vm.stack.push(Value::Bool(lhs == rhs));
     STATUS_CONTINUE
 }
 
@@ -2463,6 +2553,7 @@ extern "C" fn jit_native_ldc_bridge(vm_ptr: *mut Vm, const_index: u32) -> i32 {
     }
 
     let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("ldc");
     let value = match vm.program.constants.get(const_index as usize) {
         Some(value) => value.clone(),
         None => {
@@ -2493,6 +2584,7 @@ extern "C" fn jit_native_ldloc_bridge(vm_ptr: *mut Vm, local_index: u32) -> i32 
     };
 
     let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("ldloc");
     let value = match vm.locals.get(index as usize) {
         Some(value) => value.clone(),
         None => {
@@ -2523,6 +2615,7 @@ extern "C" fn jit_native_stloc_bridge(vm_ptr: *mut Vm, local_index: u32) -> i32 
     };
 
     let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("stloc");
     let value = match vm.pop_value() {
         Ok(value) => value,
         Err(err) => {
@@ -2547,6 +2640,7 @@ extern "C" fn jit_native_builtin_len_bridge(vm_ptr: *mut Vm) -> i32 {
     }
 
     let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("builtin_len");
     let value = match vm.pop_value() {
         Ok(value) => value,
         Err(err) => {
@@ -2576,6 +2670,7 @@ extern "C" fn jit_native_builtin_count_bridge(vm_ptr: *mut Vm) -> i32 {
     }
 
     let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("builtin_count");
     let value = match vm.pop_value() {
         Ok(value) => value,
         Err(err) => {
@@ -2604,6 +2699,7 @@ extern "C" fn jit_native_builtin_slice_bridge(vm_ptr: *mut Vm) -> i32 {
     }
 
     let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("builtin_slice");
     let len = match vm.pop_value() {
         Ok(value) => match value.as_int() {
             Ok(value) => value,
@@ -2696,6 +2792,7 @@ extern "C" fn jit_native_builtin_concat_bridge(vm_ptr: *mut Vm) -> i32 {
     }
 
     let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("builtin_concat");
     let rhs = match vm.pop_value() {
         Ok(value) => value,
         Err(err) => {
@@ -2739,6 +2836,7 @@ extern "C" fn jit_native_builtin_get_bridge(vm_ptr: *mut Vm) -> i32 {
     }
 
     let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("builtin_get");
     let key = match vm.pop_value() {
         Ok(value) => value,
         Err(err) => {
@@ -2845,6 +2943,7 @@ extern "C" fn jit_native_builtin_set_bridge(vm_ptr: *mut Vm) -> i32 {
     }
 
     let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("builtin_set");
     let value = match vm.pop_value() {
         Ok(value) => value,
         Err(err) => {
@@ -2934,6 +3033,7 @@ extern "C" fn jit_native_builtin_array_new_bridge(vm_ptr: *mut Vm) -> i32 {
     }
 
     let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("builtin_array_new");
     vm.stack.push(Value::Array(Vec::new()));
     STATUS_CONTINUE
 }
@@ -2947,6 +3047,7 @@ extern "C" fn jit_native_builtin_array_push_bridge(vm_ptr: *mut Vm) -> i32 {
     }
 
     let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("builtin_array_push");
     let value = match vm.pop_value() {
         Ok(value) => value,
         Err(err) => {
@@ -2979,6 +3080,7 @@ extern "C" fn jit_native_builtin_map_new_bridge(vm_ptr: *mut Vm) -> i32 {
     }
 
     let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("builtin_map_new");
     vm.stack.push(Value::Map(Vec::new()));
     STATUS_CONTINUE
 }
@@ -2992,6 +3094,7 @@ extern "C" fn jit_native_builtin_assert_bridge(vm_ptr: *mut Vm) -> i32 {
     }
 
     let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("builtin_assert");
     let condition = match vm.pop_value() {
         Ok(value) => match value.as_bool() {
             Ok(value) => value,
@@ -3031,6 +3134,7 @@ extern "C" fn jit_native_call_bridge(vm_ptr: *mut Vm, index: u16, argc: u8, call
     };
 
     let vm = unsafe { &mut *vm_ptr };
+    vm.record_jit_native_bridge_hit("call");
     match vm.execute_host_call(index, argc, call_ip) {
         Ok(HostCallExecOutcome::Returned) => STATUS_CONTINUE,
         Ok(HostCallExecOutcome::Yielded) => STATUS_YIELDED,
@@ -3307,16 +3411,16 @@ mod tests {
     }
 
     #[test]
-    fn add_step_emits_no_helper_calls() {
+    fn add_step_emits_helper_call_for_fallback_path() {
         let trace = build_single_step_trace(TraceStep::Add);
         let code = emit_native_trace_bytes(&trace, None).expect("native add trace should compile");
         let call_count = code
             .windows(2)
             .filter(|window| *window == [0xFF, 0xD0])
             .count();
-        assert_eq!(
-            call_count, 0,
-            "add should emit no call-outs, code bytes: {:02X?}",
+        assert!(
+            call_count >= 1,
+            "add should emit a fallback helper call path, code bytes: {:02X?}",
             code
         );
     }
@@ -3339,7 +3443,8 @@ mod tests {
     #[test]
     fn larger_fuel_intervals_emit_fewer_tick_blocks() {
         let trace = build_trace(vec![TraceStep::Nop; 32]);
-        let every_step = emit_native_trace_bytes(&trace, Some(1)).expect("native trace should compile");
+        let every_step =
+            emit_native_trace_bytes(&trace, Some(1)).expect("native trace should compile");
         let every_eight =
             emit_native_trace_bytes(&trace, Some(8)).expect("native trace should compile");
         assert!(
@@ -3353,7 +3458,6 @@ mod tests {
     #[test]
     fn arithmetic_steps_emit_without_helper_calls() {
         let steps = [
-            TraceStep::Add,
             TraceStep::Sub,
             TraceStep::Mul,
             TraceStep::Div,
@@ -3379,9 +3483,19 @@ mod tests {
     }
 
     #[test]
+    fn add_step_bridge_supports_string_concat() {
+        let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        vm.stack.push(Value::String("ab".to_string()));
+        vm.stack.push(Value::String("cd".to_string()));
+
+        let status = execute_single_step(&mut vm, TraceStep::Add).expect("native add should run");
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(vm.stack(), &[Value::String("abcd".to_string())]);
+    }
+
+    #[test]
     fn non_arithmetic_steps_emit_without_helper_calls() {
         let steps = [
-            TraceStep::Ceq,
             TraceStep::GuardFalse { exit_ip: 0 },
             TraceStep::JumpToIp { target_ip: 0 },
             TraceStep::JumpToRoot,
@@ -3400,6 +3514,21 @@ mod tests {
                 step, code
             );
         }
+    }
+
+    #[test]
+    fn ceq_step_emits_helper_call_for_fallback_path() {
+        let trace = build_single_step_trace(TraceStep::Ceq);
+        let code = emit_native_trace_bytes(&trace, None).expect("native trace should compile");
+        let call_count = code
+            .windows(2)
+            .filter(|window| *window == [0xFF, 0xD0])
+            .count();
+        assert!(
+            call_count >= 1,
+            "ceq should emit a fallback helper call path, code bytes: {:02X?}",
+            code
+        );
     }
 
     #[test]

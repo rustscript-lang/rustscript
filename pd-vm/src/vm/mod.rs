@@ -356,6 +356,8 @@ pub struct Vm {
     jit: jit::TraceJitEngine,
     native_traces: HashMap<usize, jit::NativeTrace>,
     native_trace_exec_count: u64,
+    jit_native_bridge_stats_enabled: bool,
+    jit_native_bridge_counts: HashMap<&'static str, u64>,
     async_bridge: Option<Box<dyn HostAsyncBridge>>,
     waiting_host_op: Option<WaitingHostOp>,
     next_host_op_id: HostOpId,
@@ -478,6 +480,8 @@ impl Vm {
             jit: jit::TraceJitEngine::default(),
             native_traces: HashMap::new(),
             native_trace_exec_count: 0,
+            jit_native_bridge_stats_enabled: false,
+            jit_native_bridge_counts: HashMap::new(),
             async_bridge: None,
             waiting_host_op: None,
             next_host_op_id: 1,
@@ -495,6 +499,42 @@ impl Vm {
             self.program_cache_key_ready = true;
         }
         self.program_cache_key
+    }
+
+    pub fn set_jit_native_bridge_stats_enabled(&mut self, enabled: bool) {
+        self.jit_native_bridge_stats_enabled = enabled;
+        if !enabled {
+            self.jit_native_bridge_counts.clear();
+        }
+    }
+
+    pub fn jit_native_bridge_stats_enabled(&self) -> bool {
+        self.jit_native_bridge_stats_enabled
+    }
+
+    pub fn clear_jit_native_bridge_stats(&mut self) {
+        self.jit_native_bridge_counts.clear();
+    }
+
+    pub fn jit_native_bridge_stats_snapshot(&self) -> Vec<(&'static str, u64)> {
+        let mut entries: Vec<(&'static str, u64)> = self
+            .jit_native_bridge_counts
+            .iter()
+            .map(|(name, count)| (*name, *count))
+            .collect();
+        entries.sort_unstable_by_key(|(name, _)| *name);
+        entries
+    }
+
+    pub(in crate::vm) fn record_jit_native_bridge_hit(&mut self, bridge_name: &'static str) {
+        if !self.jit_native_bridge_stats_enabled {
+            return;
+        }
+        let entry = self
+            .jit_native_bridge_counts
+            .entry(bridge_name)
+            .or_insert(0);
+        *entry = entry.saturating_add(1);
     }
 
     /// Reset VM execution state to allow rerunning the same program instance while

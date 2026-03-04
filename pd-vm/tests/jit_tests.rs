@@ -35,6 +35,83 @@ impl HostFunction for PrintNoReturn {
 }
 
 #[test]
+fn aot_compiles_whole_non_loop_program() {
+    let source = r#"
+        let x = 3;
+        if x < 2 {
+            x = x + 10;
+        } else {
+            x = x + 1;
+        }
+        x;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: native_jit_supported(),
+        hot_loop_threshold: 1_000,
+        max_trace_len: 512,
+    });
+
+    let prepared = vm.prepare_aot().expect("AOT precompile should succeed");
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(4)]);
+
+    if native_jit_supported() {
+        let snapshot = vm.jit_snapshot();
+        assert!(prepared > 0, "expected at least one AOT-compiled block");
+        assert!(
+            snapshot.traces.iter().any(|trace| trace.root_ip == 0),
+            "expected an AOT block rooted at ip 0"
+        );
+        assert!(
+            vm.jit_native_trace_count() >= prepared,
+            "expected native traces for prepared AOT blocks"
+        );
+        assert!(
+            vm.jit_native_exec_count() > 0,
+            "expected at least one native AOT execution"
+        );
+    }
+}
+
+#[test]
+fn aot_handles_string_equality_paths() {
+    let source = r#"
+        let lhs = "javascript";
+        let rhs = "javascript";
+        if lhs == rhs {
+            1;
+        } else {
+            0;
+        }
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: native_jit_supported(),
+        hot_loop_threshold: 1_000,
+        max_trace_len: 512,
+    });
+
+    let prepared = vm.prepare_aot().expect("AOT precompile should succeed");
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1)]);
+
+    if native_jit_supported() {
+        assert!(prepared > 0, "expected at least one AOT-compiled block");
+        assert!(
+            vm.jit_native_exec_count() > 0,
+            "expected at least one native AOT execution"
+        );
+    }
+}
+
+#[test]
 fn trace_jit_compiles_hot_loop_and_is_dumpable() {
     let source = r#"
         let i = 0;
@@ -84,7 +161,7 @@ fn trace_jit_native_path_honors_fuel_metering() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -128,7 +205,7 @@ fn changing_fuel_interval_recompiles_native_trace_variant() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::with_locals(compiled.program, compiled.locals);
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,

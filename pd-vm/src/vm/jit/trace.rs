@@ -187,6 +187,53 @@ impl TraceJitEngine {
         self.attempts.clear();
     }
 
+    pub fn prepare_aot(&mut self, program: &Program) -> Vec<usize> {
+        self.hot_counts.clear();
+        self.compiled_by_root.clear();
+        self.blocked_roots.clear();
+        self.loop_headers = Some(scan_loop_headers(program));
+        self.traces.clear();
+        self.attempts.clear();
+
+        if !self.config.enabled || !native_jit_supported() {
+            return Vec::new();
+        }
+
+        let mut roots = scan_program_block_roots(program)
+            .into_iter()
+            .collect::<Vec<_>>();
+        roots.sort_unstable();
+
+        let mut compiled = Vec::with_capacity(roots.len());
+        for root_ip in roots {
+            let line = program
+                .debug
+                .as_ref()
+                .and_then(|debug| debug.line_for_offset(root_ip));
+            match self.compile_aot_block(program, root_ip) {
+                Ok(trace_id) => {
+                    self.attempts.push(JitAttempt {
+                        root_ip,
+                        line,
+                        result: Ok(trace_id),
+                    });
+                    self.compiled_by_root.insert(root_ip, trace_id);
+                    compiled.push(trace_id);
+                }
+                Err(reason) => {
+                    self.attempts.push(JitAttempt {
+                        root_ip,
+                        line,
+                        result: Err(reason),
+                    });
+                    self.blocked_roots.insert(root_ip);
+                }
+            }
+        }
+
+        compiled
+    }
+
     pub fn observe_hot_ip(&mut self, ip: usize, program: &Program) -> Option<usize> {
         if !self.config.enabled {
             return None;
@@ -252,6 +299,10 @@ impl TraceJitEngine {
         self.traces
             .get(trace_id)
             .is_some_and(|trace| trace.has_call)
+    }
+
+    pub fn compiled_trace_for_ip(&self, ip: usize) -> Option<usize> {
+        self.compiled_by_root.get(&ip).copied()
     }
 
     pub fn mark_trace_executed(&mut self, trace_id: usize) {
@@ -334,6 +385,162 @@ impl TraceJitEngine {
         }
 
         out
+    }
+
+    fn compile_aot_block(
+        &mut self,
+        program: &Program,
+        root_ip: usize,
+    ) -> Result<usize, JitNyiReason> {
+        let code = &program.code;
+        let mut ip = root_ip;
+        let mut steps = Vec::new();
+
+        while steps.len() < self.config.max_trace_len {
+            let opcode = *code
+                .get(ip)
+                .ok_or(JitNyiReason::InvalidJumpTarget { target: ip })?;
+            ip = ip.saturating_add(1);
+
+            if opcode == OpCode::Nop as u8 {
+                steps.push(TraceStep::Nop);
+                continue;
+            }
+            if opcode == OpCode::Ret as u8 {
+                steps.push(TraceStep::Ret);
+                return Ok(self.finish_trace(program, root_ip, steps, JitTraceTerminal::Halt));
+            }
+            if opcode == OpCode::Ldc as u8 {
+                let value = read_u32(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("ldc"))?;
+                steps.push(TraceStep::Ldc(value));
+                continue;
+            }
+            if opcode == OpCode::Add as u8 {
+                steps.push(TraceStep::Add);
+                continue;
+            }
+            if opcode == OpCode::Sub as u8 {
+                steps.push(TraceStep::Sub);
+                continue;
+            }
+            if opcode == OpCode::Mul as u8 {
+                steps.push(TraceStep::Mul);
+                continue;
+            }
+            if opcode == OpCode::Div as u8 {
+                steps.push(TraceStep::Div);
+                continue;
+            }
+            if opcode == OpCode::Mod as u8 {
+                steps.push(TraceStep::Mod);
+                continue;
+            }
+            if opcode == OpCode::Shl as u8 {
+                steps.push(TraceStep::Shl);
+                continue;
+            }
+            if opcode == OpCode::Shr as u8 {
+                steps.push(TraceStep::Shr);
+                continue;
+            }
+            if opcode == OpCode::And as u8 {
+                steps.push(TraceStep::And);
+                continue;
+            }
+            if opcode == OpCode::Or as u8 {
+                steps.push(TraceStep::Or);
+                continue;
+            }
+            if opcode == OpCode::Neg as u8 {
+                steps.push(TraceStep::Neg);
+                continue;
+            }
+            if opcode == OpCode::Ceq as u8 {
+                steps.push(TraceStep::Ceq);
+                continue;
+            }
+            if opcode == OpCode::Clt as u8 {
+                steps.push(TraceStep::Clt);
+                continue;
+            }
+            if opcode == OpCode::Cgt as u8 {
+                steps.push(TraceStep::Cgt);
+                continue;
+            }
+            if opcode == OpCode::Pop as u8 {
+                steps.push(TraceStep::Pop);
+                continue;
+            }
+            if opcode == OpCode::Dup as u8 {
+                steps.push(TraceStep::Dup);
+                continue;
+            }
+            if opcode == OpCode::Ldloc as u8 {
+                let index =
+                    read_u8(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("ldloc"))?;
+                steps.push(TraceStep::Ldloc(index));
+                continue;
+            }
+            if opcode == OpCode::Stloc as u8 {
+                let index =
+                    read_u8(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("stloc"))?;
+                steps.push(TraceStep::Stloc(index));
+                continue;
+            }
+            if opcode == OpCode::Brfalse as u8 {
+                let target_u32 =
+                    read_u32(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("brfalse"))?;
+                let target = target_u32 as usize;
+                if target >= code.len() {
+                    return Err(JitNyiReason::InvalidJumpTarget { target });
+                }
+                steps.push(TraceStep::GuardFalse { exit_ip: target });
+                continue;
+            }
+            if opcode == OpCode::Br as u8 {
+                let target_u32 =
+                    read_u32(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("br"))?;
+                let target = target_u32 as usize;
+                if target >= code.len() {
+                    return Err(JitNyiReason::InvalidJumpTarget { target });
+                }
+                if target == root_ip {
+                    steps.push(TraceStep::JumpToRoot);
+                    return Ok(self.finish_trace(program, root_ip, steps, JitTraceTerminal::LoopBack));
+                }
+                if target < ip {
+                    steps.push(TraceStep::JumpToIp { target_ip: target });
+                    return Ok(self.finish_trace(
+                        program,
+                        root_ip,
+                        steps,
+                        JitTraceTerminal::BranchExit,
+                    ));
+                }
+                // Follow forward unconditional branches to avoid creating tiny branch-exit traces.
+                ip = target;
+                continue;
+            }
+            if opcode == OpCode::Call as u8 {
+                let call_ip = ip.saturating_sub(1);
+                let index =
+                    read_u16(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("call index"))?;
+                let argc =
+                    read_u8(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("call argc"))?;
+                steps.push(TraceStep::Call {
+                    index,
+                    argc,
+                    call_ip,
+                });
+                continue;
+            }
+
+            return Err(JitNyiReason::UnsupportedOpcode(opcode));
+        }
+
+        Err(JitNyiReason::TraceTooLong {
+            limit: self.config.max_trace_len,
+        })
     }
 
     fn compile_trace(&mut self, program: &Program, root_ip: usize) -> Result<usize, JitNyiReason> {
@@ -583,6 +790,68 @@ fn trace_step_name(step: &TraceStep) -> &'static str {
         TraceStep::JumpToRoot => "jump_root",
         TraceStep::Ret => "ret",
     }
+}
+
+fn scan_program_block_roots(program: &Program) -> HashSet<usize> {
+    let mut roots = HashSet::new();
+    if program.code.is_empty() {
+        return roots;
+    }
+    roots.insert(0);
+
+    let code = &program.code;
+    let mut ip = 0usize;
+    while ip < code.len() {
+        let opcode = code[ip];
+        ip = ip.saturating_add(1);
+        match opcode {
+            x if x == OpCode::Ldc as u8 => {
+                if read_u32(code, &mut ip).is_none() {
+                    break;
+                }
+            }
+            x if x == OpCode::Br as u8 => {
+                let Some(target) = read_u32(code, &mut ip) else {
+                    break;
+                };
+                let target = target as usize;
+                if target < code.len() {
+                    roots.insert(target);
+                }
+                if ip < code.len() {
+                    roots.insert(ip);
+                }
+            }
+            x if x == OpCode::Brfalse as u8 => {
+                let Some(target) = read_u32(code, &mut ip) else {
+                    break;
+                };
+                let target = target as usize;
+                if target < code.len() {
+                    roots.insert(target);
+                }
+                if ip < code.len() {
+                    roots.insert(ip);
+                }
+            }
+            x if x == OpCode::Ldloc as u8 || x == OpCode::Stloc as u8 => {
+                if read_u8(code, &mut ip).is_none() {
+                    break;
+                }
+            }
+            x if x == OpCode::Call as u8 => {
+                if read_u16(code, &mut ip).is_none() {
+                    break;
+                }
+                if read_u8(code, &mut ip).is_none() {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    roots
 }
 
 fn scan_loop_headers(program: &Program) -> HashSet<usize> {
