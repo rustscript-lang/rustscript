@@ -6,6 +6,7 @@
 *.wasm
 *.vmbc
 *.pdr
+*.pat
 *.txt
 *.json
 node_modules

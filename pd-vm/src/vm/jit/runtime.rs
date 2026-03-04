@@ -235,6 +235,10 @@ impl Vm {
     }
 
     pub fn dump_jit_info(&self) -> String {
+        self.dump_jit_info_with_machine_code(true)
+    }
+
+    pub fn dump_jit_info_with_machine_code(&self, include_machine_code: bool) -> String {
         let mut out = self.jit.dump_text(self.program.debug.as_ref());
         out.push_str(&format!(
             "  native codegen backend: {:?}\n",
@@ -244,6 +248,25 @@ impl Vm {
             "  native trace executions: {}\n",
             self.native_trace_exec_count
         ));
+        if self.jit_native_bridge_stats_enabled {
+            let mut bridge_entries: Vec<(&'static str, u64)> = self
+                .jit_native_bridge_counts
+                .iter()
+                .map(|(name, count)| (*name, *count))
+                .collect();
+            bridge_entries.sort_unstable_by_key(|(name, _)| *name);
+            let total_bridge_hits = bridge_entries
+                .iter()
+                .fold(0u64, |acc, (_, count)| acc.saturating_add(*count));
+            out.push_str(&format!(
+                "  native bridge hits: {} (helpers={})\n",
+                total_bridge_hits,
+                bridge_entries.len()
+            ));
+            for (name, count) in bridge_entries {
+                out.push_str(&format!("    bridge {}: {}\n", name, count));
+            }
+        }
         if self.native_traces.is_empty() {
             out.push_str("  native traces: 0\n");
             return out;
@@ -260,14 +283,40 @@ impl Vm {
                     native.entry as usize,
                     native.code.len()
                 ));
-                out.push_str("    code:");
-                for byte in native.code.iter() {
-                    out.push_str(&format!(" {:02X}", byte));
+                if include_machine_code {
+                    out.push_str("    code:");
+                    for byte in native.code.iter() {
+                        out.push_str(&format!(" {:02X}", byte));
+                    }
+                    out.push('\n');
                 }
-                out.push('\n');
             }
         }
         out
+    }
+
+    pub fn prepare_aot(&mut self) -> VmResult<usize> {
+        if !self.jit_config().enabled {
+            return Ok(0);
+        }
+        self.ensure_program_cache_key();
+        let trace_ids = {
+            let program = &self.program;
+            self.jit.prepare_aot(program)
+        };
+        #[cfg(any(
+            all(
+                target_arch = "x86_64",
+                any(target_os = "windows", all(unix, not(target_os = "macos")))
+            ),
+            all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+        ))]
+        {
+            for trace_id in trace_ids.iter().copied() {
+                self.ensure_native_trace(trace_id)?;
+            }
+        }
+        Ok(trace_ids.len())
     }
 
     #[cfg_attr(
@@ -482,27 +531,30 @@ impl Vm {
         all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
     ))]
     fn execute_jit_native(&mut self, trace_id: usize) -> VmResult<ExecOutcome> {
-        self.ensure_native_trace(trace_id)?;
-        let (entry, root_ip, terminal, has_yielding_call) = {
-            let native = self.native_traces.get(&trace_id).ok_or_else(|| {
-                VmError::JitNative(format!("native trace entry for id {} missing", trace_id))
-            })?;
-            (
-                native.entry,
-                native.root_ip,
-                native.terminal.clone(),
-                native.has_yielding_call,
-            )
-        };
-
+        let mut current_trace_id = trace_id;
+        self.ensure_native_trace(current_trace_id)?;
+        let (mut entry, mut root_ip, mut terminal, mut has_yielding_call) =
+            self.native_trace_state(current_trace_id)?;
         loop {
             native::clear_bridge_error();
             let status = unsafe { entry(self as *mut Vm) };
             self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
-            self.jit.mark_trace_executed(trace_id);
+            self.jit.mark_trace_executed(current_trace_id);
 
             match status {
-                native::STATUS_CONTINUE => return Ok(ExecOutcome::Continue),
+                native::STATUS_CONTINUE => {
+                    if !has_yielding_call
+                        && let Some(next_trace_id) = self.jit.compiled_trace_for_ip(self.ip)
+                        && next_trace_id != current_trace_id
+                    {
+                        current_trace_id = next_trace_id;
+                        self.ensure_native_trace(current_trace_id)?;
+                        (entry, root_ip, terminal, has_yielding_call) =
+                            self.native_trace_state(current_trace_id)?;
+                        continue;
+                    }
+                    return Ok(ExecOutcome::Continue);
+                }
                 native::STATUS_TRACE_EXIT => {
                     // Fast path: if this trace looped back to its own root and cannot yield via host
                     // calls, keep executing in native mode without bouncing through the interpreter.
@@ -510,6 +562,17 @@ impl Vm {
                         && terminal == JitTraceTerminal::LoopBack
                         && self.ip == root_ip
                     {
+                        continue;
+                    }
+                    // Chain directly into another already-compiled trace at the current ip.
+                    if !has_yielding_call
+                        && let Some(next_trace_id) = self.jit.compiled_trace_for_ip(self.ip)
+                        && next_trace_id != current_trace_id
+                    {
+                        current_trace_id = next_trace_id;
+                        self.ensure_native_trace(current_trace_id)?;
+                        (entry, root_ip, terminal, has_yielding_call) =
+                            self.native_trace_state(current_trace_id)?;
                         continue;
                     }
                     return Ok(ExecOutcome::Continue);
@@ -532,9 +595,21 @@ impl Vm {
                 }
                 native::STATUS_ERROR => {
                     let err = native::take_bridge_error().unwrap_or_else(|| {
-                        VmError::JitNative(
-                            "jit bridge reported failure without VmError".to_string(),
-                        )
+                        let trace_meta = self.jit.trace_clone(current_trace_id).map(|trace| {
+                            format!(
+                                "trace_id={} root_ip={} terminal={:?} steps={}",
+                                trace.id,
+                                trace.root_ip,
+                                trace.terminal,
+                                trace.steps.len()
+                            )
+                        });
+                        VmError::JitNative(format!(
+                            "jit bridge reported failure without VmError (ip={} stack_len={} {})",
+                            self.ip,
+                            self.stack.len(),
+                            trace_meta.unwrap_or_else(|| "trace=<missing>".to_string())
+                        ))
                     });
                     return Err(err);
                 }
@@ -555,11 +630,33 @@ impl Vm {
         ),
         all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
     ))]
+    fn native_trace_state(
+        &self,
+        trace_id: usize,
+    ) -> VmResult<(NativeTraceEntry, usize, JitTraceTerminal, bool)> {
+        let native = self.native_traces.get(&trace_id).ok_or_else(|| {
+            VmError::JitNative(format!("native trace entry for id {} missing", trace_id))
+        })?;
+        Ok((
+            native.entry,
+            native.root_ip,
+            native.terminal.clone(),
+            native.has_yielding_call,
+        ))
+    }
+
+    #[cfg(any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "windows", all(unix, not(target_os = "macos")))
+        ),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+    ))]
     fn ensure_native_trace(&mut self, trace_id: usize) -> VmResult<()> {
-        if let Some(native) = self.native_traces.get(&trace_id) {
-            if native.fuel_check_interval == self.fuel_enabled.then_some(self.fuel_check_interval) {
-                return Ok(());
-            }
+        if let Some(native) = self.native_traces.get(&trace_id)
+            && native.fuel_check_interval == self.fuel_enabled.then_some(self.fuel_check_interval)
+        {
+            return Ok(());
         }
         self.native_traces.remove(&trace_id);
 

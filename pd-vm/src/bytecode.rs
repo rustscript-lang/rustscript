@@ -97,14 +97,12 @@ fn infer_local_count_from_code(code: &[u8]) -> usize {
                 || x == OpCode::Mod as u8
                 || x == OpCode::And as u8
                 || x == OpCode::Or as u8 => {}
-            x if x == OpCode::Ldc as u8
-                || x == OpCode::Br as u8
-                || x == OpCode::Brfalse as u8 => {
-                    if ip + 4 > code.len() {
-                        break;
-                    }
-                    ip += 4;
+            x if x == OpCode::Ldc as u8 || x == OpCode::Br as u8 || x == OpCode::Brfalse as u8 => {
+                if ip + 4 > code.len() {
+                    break;
                 }
+                ip += 4;
+            }
             x if x == OpCode::Ldloc as u8 || x == OpCode::Stloc as u8 => {
                 let Some(&index) = code.get(ip) else {
                     break;
