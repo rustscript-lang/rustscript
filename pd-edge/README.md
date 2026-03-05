@@ -156,6 +156,30 @@ cargo run -p pd-edge --bin pd-edge-http-proxy -- `
   --control-plane-rpc-timeout-ms "5000"
 ```
 
+## HTTP Proxy Performance Framework
+
+Run the built-in framework to benchmark these scenarios:
+
+- raw `pd-edge-http-proxy` (no program loaded)
+- proxy with a compute-only program (no host calls; baseline workload)
+- proxy with additive async HTTP host calls on top of the same workload (`get_method/get_path/get_header/get_body` + `set_header/set_body`) and explicit termination (no upstream target)
+
+Example:
+
+```bash
+cargo run -p pd-edge --example http_proxy_perf_framework --release -- \
+  --requests 20000 \
+  --warmup-requests 2000 \
+  --concurrency 128 \
+  --json-out target/http_proxy_perf_results.json
+```
+
+Reported metrics per scenario include:
+
+- latency: `median (p50)`, `p90`, `p95`, `p99`, `mean`, `min`, `max`
+- memory: process RSS `start/end/min/avg/max/peak`
+- status breakdown, request errors, throughput, and telemetry snapshot
+
 ## ABI Source of Truth
 
 Host-call ABI metadata is centralized in `pd-edge-abi`:

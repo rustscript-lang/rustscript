@@ -1,0 +1,1050 @@
+use std::{
+    collections::BTreeMap,
+    env, fs, io,
+    net::{SocketAddr, TcpListener},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use edge::HOST_FUNCTION_COUNT;
+use reqwest::{Client, StatusCode};
+use serde::{Deserialize, Serialize};
+use tokio::{task::JoinSet, time::sleep};
+use vm::{compile_source, encode_program, validate_program};
+
+const LOAD_REQUEST_BODY: &str = "edge-perf-payload";
+
+const BASE_WORKLOAD_SOURCE: &str = r#"
+let outer = 0;
+let acc = 1;
+while outer < 12 {
+    let inner = 0;
+    while inner < 24 {
+        let mixed = (outer * 31 + inner * 17) % 97;
+        if (mixed % 2) == 0 {
+            acc = acc + mixed;
+        } else {
+            acc = acc - mixed;
+        }
+        inner = inner + 1;
+    }
+    outer = outer + 1;
+}
+"#;
+
+fn no_host_calls_program_source() -> String {
+    format!(
+        r#"
+{BASE_WORKLOAD_SOURCE}
+let parity = acc % 2;
+if parity == 0 {{
+    acc;
+}} else {{
+    acc + 1;
+}}
+"#
+    )
+}
+
+fn host_calls_terminate_program_source() -> String {
+    format!(
+        r#"
+use vm;
+
+{BASE_WORKLOAD_SOURCE}
+
+let method = vm::http::request::get_method();
+let path = vm::http::request::get_path();
+let client_id = vm::http::request::get_header("x-client-id");
+let body = vm::http::request::get_body();
+
+if (acc % 2) == 0 {{
+    vm::http::response::set_header("x-perf-acc", "even");
+}} else {{
+    vm::http::response::set_header("x-perf-acc", "odd");
+}}
+    vm::http::response::set_header("x-perf-method", method);
+    vm::http::response::set_header("x-perf-path", path);
+    vm::http::response::set_header("x-perf-client-id", client_id);
+    vm::http::response::set_body("host-calls-terminate|" + body);
+"#
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ProgramVariant {
+    None,
+    NoHostCallsBase,
+    HostCallsAdditive,
+}
+
+#[derive(Clone, Copy)]
+struct Scenario {
+    id: &'static str,
+    description: &'static str,
+    expected_status: u16,
+    program_variant: ProgramVariant,
+}
+
+const SCENARIOS: [Scenario; 3] = [
+    Scenario {
+        id: "raw_no_program",
+        description: "raw pd-edge-http-proxy (no program loaded)",
+        expected_status: 404,
+        program_variant: ProgramVariant::None,
+    },
+    Scenario {
+        id: "no_host_calls_program",
+        description: "pd-edge-http-proxy with no host calls (compute-only program)",
+        expected_status: 404,
+        program_variant: ProgramVariant::NoHostCallsBase,
+    },
+    Scenario {
+        id: "host_calls_terminate",
+        description: "pd-edge-http-proxy with additive host calls and terminate (no upstream)",
+        expected_status: 200,
+        program_variant: ProgramVariant::HostCallsAdditive,
+    },
+];
+
+#[derive(Debug, Clone)]
+struct BenchConfig {
+    requests: usize,
+    warmup_requests: usize,
+    concurrency: usize,
+    request_timeout_ms: u64,
+    startup_timeout_ms: u64,
+    memory_sample_interval_ms: u64,
+    binary_path: Option<PathBuf>,
+    auto_build: bool,
+    release_build: bool,
+    json_out: Option<PathBuf>,
+}
+
+impl Default for BenchConfig {
+    fn default() -> Self {
+        Self {
+            requests: 10_000,
+            warmup_requests: 1_000,
+            concurrency: 64,
+            request_timeout_ms: 10_000,
+            startup_timeout_ms: 15_000,
+            memory_sample_interval_ms: 100,
+            binary_path: None,
+            auto_build: true,
+            release_build: true,
+            json_out: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct BenchConfigReport {
+    requests: usize,
+    warmup_requests: usize,
+    concurrency: usize,
+    request_timeout_ms: u64,
+    startup_timeout_ms: u64,
+    memory_sample_interval_ms: u64,
+    binary_path: String,
+    auto_build: bool,
+    release_build: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchReport {
+    generated_at_unix_ms: u128,
+    config: BenchConfigReport,
+    scenarios: Vec<ScenarioReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct ScenarioReport {
+    id: String,
+    description: String,
+    expected_status: u16,
+    requests_sent: usize,
+    responses_received: usize,
+    request_errors: usize,
+    unexpected_status_responses: usize,
+    throughput_rps: f64,
+    status_counts: Vec<StatusCount>,
+    latency_ms: Option<LatencyStats>,
+    memory: MemoryStats,
+    telemetry: Option<TelemetrySummary>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusCount {
+    status: u16,
+    count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct LatencyStats {
+    min: f64,
+    mean: f64,
+    median: f64,
+    p90: f64,
+    p95: f64,
+    p99: f64,
+    max: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryStats {
+    samples: usize,
+    start_rss_mib: Option<f64>,
+    end_rss_mib: Option<f64>,
+    min_rss_mib: Option<f64>,
+    avg_rss_mib: Option<f64>,
+    max_rss_mib: Option<f64>,
+    peak_rss_mib: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct TelemetrySummary {
+    program_loaded: bool,
+    data_requests_total: u64,
+    vm_execution_errors_total: u64,
+}
+
+#[derive(Default)]
+struct WorkerRun {
+    latencies_us: Vec<u64>,
+    status_counts: BTreeMap<u16, usize>,
+    request_errors: usize,
+}
+
+struct LoadRunResult {
+    elapsed: Duration,
+    latencies_us: Vec<u64>,
+    status_counts: BTreeMap<u16, usize>,
+    request_errors: usize,
+}
+
+struct ProxyProcess {
+    child: Child,
+}
+
+impl ProxyProcess {
+    fn spawn(
+        binary_path: &Path,
+        data_addr: SocketAddr,
+        admin_addr: SocketAddr,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let child = Command::new(binary_path)
+            .arg("--data-addr")
+            .arg(data_addr.to_string())
+            .arg("--admin-addr")
+            .arg(admin_addr.to_string())
+            .env("RUST_LOG", "error")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        Ok(Self { child })
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, io::Error> {
+        self.child.try_wait()
+    }
+}
+
+impl Drop for ProxyProcess {
+    fn drop(&mut self) {
+        if let Ok(None) = self.child.try_wait() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = match parse_args() {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("{message}");
+            print_help();
+            return Err(io::Error::other("invalid arguments").into());
+        }
+    };
+
+    let binary_path = resolve_proxy_binary_path(&config)?;
+    println!("proxy binary: {}", binary_path.display());
+    println!(
+        "requests={}, warmup_requests={}, concurrency={}, request_timeout_ms={}, memory_sample_interval_ms={}",
+        config.requests,
+        config.warmup_requests,
+        config.concurrency,
+        config.request_timeout_ms,
+        config.memory_sample_interval_ms
+    );
+
+    let client = Client::builder()
+        .pool_max_idle_per_host(config.concurrency.max(1))
+        .tcp_nodelay(true)
+        .timeout(Duration::from_millis(config.request_timeout_ms))
+        .build()?;
+
+    let mut reports = Vec::new();
+    for scenario in SCENARIOS {
+        println!();
+        println!("=== {} ===", scenario.description);
+        let report = match run_scenario(&config, &binary_path, &client, scenario).await {
+            Ok(report) => report,
+            Err(err) => ScenarioReport {
+                id: scenario.id.to_string(),
+                description: scenario.description.to_string(),
+                expected_status: scenario.expected_status,
+                requests_sent: 0,
+                responses_received: 0,
+                request_errors: 0,
+                unexpected_status_responses: 0,
+                throughput_rps: 0.0,
+                status_counts: Vec::new(),
+                latency_ms: None,
+                memory: MemoryStats {
+                    samples: 0,
+                    start_rss_mib: None,
+                    end_rss_mib: None,
+                    min_rss_mib: None,
+                    avg_rss_mib: None,
+                    max_rss_mib: None,
+                    peak_rss_mib: None,
+                },
+                telemetry: None,
+                error: Some(err.to_string()),
+            },
+        };
+        print_scenario_report(&report);
+        reports.push(report);
+    }
+
+    let generated_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+
+    let report = BenchReport {
+        generated_at_unix_ms,
+        config: BenchConfigReport {
+            requests: config.requests,
+            warmup_requests: config.warmup_requests,
+            concurrency: config.concurrency,
+            request_timeout_ms: config.request_timeout_ms,
+            startup_timeout_ms: config.startup_timeout_ms,
+            memory_sample_interval_ms: config.memory_sample_interval_ms,
+            binary_path: binary_path.display().to_string(),
+            auto_build: config.auto_build,
+            release_build: config.release_build,
+        },
+        scenarios: reports,
+    };
+
+    if let Some(path) = config.json_out {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&report)?;
+        fs::write(&path, json)?;
+        println!();
+        println!("json report written to {}", path.display());
+    }
+
+    Ok(())
+}
+
+async fn run_scenario(
+    config: &BenchConfig,
+    binary_path: &Path,
+    client: &Client,
+    scenario: Scenario,
+) -> Result<ScenarioReport, Box<dyn std::error::Error>> {
+    let program_bytes = match scenario.program_variant {
+        ProgramVariant::None => None,
+        ProgramVariant::NoHostCallsBase => {
+            let source = no_host_calls_program_source();
+            Some(compile_program_to_vmbc(&source)?)
+        }
+        ProgramVariant::HostCallsAdditive => {
+            let source = host_calls_terminate_program_source();
+            Some(compile_program_to_vmbc(&source)?)
+        }
+    };
+
+    let data_addr = reserve_loopback_addr()?;
+    let admin_addr = reserve_loopback_addr()?;
+    let mut proxy = ProxyProcess::spawn(binary_path, data_addr, admin_addr)?;
+
+    wait_until_proxy_ready(
+        client,
+        admin_addr,
+        Duration::from_millis(config.startup_timeout_ms),
+        &mut proxy,
+    )
+    .await?;
+
+    if let Some(bytes) = program_bytes {
+        upload_program(client, admin_addr, bytes).await?;
+    }
+
+    let request_url = format!("http://{data_addr}/perf?scenario={}", scenario.id);
+    if config.warmup_requests > 0 {
+        let warmup = run_load(
+            client,
+            &request_url,
+            config.warmup_requests,
+            config.concurrency,
+            false,
+        )
+        .await?;
+        if warmup.request_errors > 0 {
+            println!(
+                "warmup had {} request errors (continuing)",
+                warmup.request_errors
+            );
+        }
+    }
+
+    let pid = proxy.pid();
+    let start_rss_kib = read_process_rss_kib(pid);
+    let stop_sampler = Arc::new(AtomicBool::new(false));
+    let rss_samples = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let sampler_handle = spawn_memory_sampler(
+        pid,
+        Duration::from_millis(config.memory_sample_interval_ms.max(10)),
+        stop_sampler.clone(),
+        rss_samples.clone(),
+    );
+
+    let run = run_load(
+        client,
+        &request_url,
+        config.requests,
+        config.concurrency,
+        true,
+    )
+    .await?;
+    stop_sampler.store(true, Ordering::Relaxed);
+    let _ = sampler_handle.await;
+    let end_rss_kib = read_process_rss_kib(pid);
+
+    let samples = {
+        let guard = rss_samples
+            .lock()
+            .map_err(|_| io::Error::other("memory sample lock poisoned"))?;
+        guard.clone()
+    };
+    let memory = build_memory_stats(samples, start_rss_kib, end_rss_kib);
+    let telemetry = fetch_telemetry_summary(client, admin_addr).await;
+
+    let responses_received: usize = run.status_counts.values().copied().sum();
+    let unexpected_status_responses = run
+        .status_counts
+        .iter()
+        .filter(|(status, _)| **status != scenario.expected_status)
+        .map(|(_, count)| *count)
+        .sum();
+    let throughput_rps = if run.elapsed.is_zero() {
+        0.0
+    } else {
+        config.requests as f64 / run.elapsed.as_secs_f64()
+    };
+
+    Ok(ScenarioReport {
+        id: scenario.id.to_string(),
+        description: scenario.description.to_string(),
+        expected_status: scenario.expected_status,
+        requests_sent: config.requests,
+        responses_received,
+        request_errors: run.request_errors,
+        unexpected_status_responses,
+        throughput_rps,
+        status_counts: run
+            .status_counts
+            .into_iter()
+            .map(|(status, count)| StatusCount { status, count })
+            .collect(),
+        latency_ms: build_latency_stats(run.latencies_us),
+        memory,
+        telemetry,
+        error: None,
+    })
+}
+
+fn build_latency_stats(mut latencies_us: Vec<u64>) -> Option<LatencyStats> {
+    if latencies_us.is_empty() {
+        return None;
+    }
+    latencies_us.sort_unstable();
+
+    let min = latencies_us[0];
+    let max = latencies_us[latencies_us.len() - 1];
+    let sum: u128 = latencies_us.iter().map(|value| *value as u128).sum();
+    let mean = (sum as f64) / (latencies_us.len() as f64);
+    let median = percentile_us(&latencies_us, 50);
+    let p90 = percentile_us(&latencies_us, 90);
+    let p95 = percentile_us(&latencies_us, 95);
+    let p99 = percentile_us(&latencies_us, 99);
+
+    Some(LatencyStats {
+        min: us_to_ms(min),
+        mean: mean / 1_000.0,
+        median: us_to_ms(median),
+        p90: us_to_ms(p90),
+        p95: us_to_ms(p95),
+        p99: us_to_ms(p99),
+        max: us_to_ms(max),
+    })
+}
+
+fn percentile_us(sorted: &[u64], percentile: usize) -> u64 {
+    let len = sorted.len();
+    if len == 0 {
+        return 0;
+    }
+    let idx = ((len - 1) * percentile) / 100;
+    sorted[idx]
+}
+
+fn build_memory_stats(
+    mut samples_kib: Vec<u64>,
+    start_rss_kib: Option<u64>,
+    end_rss_kib: Option<u64>,
+) -> MemoryStats {
+    if let Some(value) = start_rss_kib {
+        samples_kib.push(value);
+    }
+    if let Some(value) = end_rss_kib {
+        samples_kib.push(value);
+    }
+
+    let (min_rss, avg_rss, max_rss) = if samples_kib.is_empty() {
+        (None, None, None)
+    } else {
+        let min_value = samples_kib.iter().min().copied();
+        let max_value = samples_kib.iter().max().copied();
+        let sum: u128 = samples_kib.iter().map(|value| *value as u128).sum();
+        let avg_value = Some((sum / samples_kib.len() as u128) as u64);
+        (min_value, avg_value, max_value)
+    };
+
+    MemoryStats {
+        samples: samples_kib.len(),
+        start_rss_mib: start_rss_kib.map(kib_to_mib),
+        end_rss_mib: end_rss_kib.map(kib_to_mib),
+        min_rss_mib: min_rss.map(kib_to_mib),
+        avg_rss_mib: avg_rss.map(kib_to_mib),
+        max_rss_mib: max_rss.map(kib_to_mib),
+        peak_rss_mib: max_rss.map(kib_to_mib),
+    }
+}
+
+fn us_to_ms(value: u64) -> f64 {
+    value as f64 / 1_000.0
+}
+
+fn kib_to_mib(value: u64) -> f64 {
+    value as f64 / 1024.0
+}
+
+fn compile_program_to_vmbc(source: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let compiled = compile_source(source).map_err(|err| {
+        io::Error::other(format!("failed to compile benchmark program source: {err}"))
+    })?;
+    validate_program(&compiled.program, HOST_FUNCTION_COUNT)?;
+    let bytes = encode_program(&compiled.program)?;
+    Ok(bytes)
+}
+
+async fn upload_program(
+    client: &Client,
+    admin_addr: SocketAddr,
+    bytes: Vec<u8>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = client
+        .put(format!("http://{admin_addr}/program"))
+        .header("content-type", "application/octet-stream")
+        .body(bytes)
+        .send()
+        .await?;
+    if response.status() != StatusCode::NO_CONTENT {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(io::Error::other(format!(
+            "program upload failed: status={status}, body={body}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+async fn wait_until_proxy_ready(
+    client: &Client,
+    admin_addr: SocketAddr,
+    timeout: Duration,
+    proxy: &mut ProxyProcess,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = proxy.try_wait()? {
+            return Err(
+                io::Error::other(format!("proxy process exited before ready: {status}")).into(),
+            );
+        }
+
+        if let Ok(response) = client
+            .get(format!("http://{admin_addr}/healthz"))
+            .send()
+            .await
+            && response.status().is_success()
+        {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out waiting for proxy admin endpoint at {admin_addr}"),
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn spawn_memory_sampler(
+    pid: u32,
+    interval: Duration,
+    stop: Arc<AtomicBool>,
+    samples: Arc<Mutex<Vec<u64>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Some(rss_kib) = read_process_rss_kib(pid)
+                && let Ok(mut guard) = samples.lock()
+            {
+                guard.push(rss_kib);
+            }
+            sleep(interval).await;
+        }
+    })
+}
+
+async fn run_load(
+    client: &Client,
+    url: &str,
+    requests: usize,
+    concurrency: usize,
+    collect_latencies: bool,
+) -> Result<LoadRunResult, Box<dyn std::error::Error>> {
+    let shared_counter = Arc::new(AtomicUsize::new(0));
+    let worker_count = concurrency.max(1);
+    let started = Instant::now();
+    let mut tasks = JoinSet::new();
+
+    for _ in 0..worker_count {
+        let shared_counter = shared_counter.clone();
+        let url = url.to_string();
+        let client = client.clone();
+        tasks.spawn(async move {
+            let mut worker = WorkerRun {
+                latencies_us: if collect_latencies {
+                    Vec::with_capacity(requests / worker_count + 1)
+                } else {
+                    Vec::new()
+                },
+                status_counts: BTreeMap::new(),
+                request_errors: 0,
+            };
+
+            loop {
+                let index = shared_counter.fetch_add(1, Ordering::Relaxed);
+                if index >= requests {
+                    break;
+                }
+
+                let request_started = Instant::now();
+                match client
+                    .post(&url)
+                    .header("x-client-id", "perf-client")
+                    .header("content-type", "text/plain")
+                    .body(LOAD_REQUEST_BODY)
+                    .send()
+                    .await
+                {
+                    Ok(response) => {
+                        let status = response.status().as_u16();
+                        if response.bytes().await.is_ok() {
+                            *worker.status_counts.entry(status).or_insert(0) += 1;
+                            if collect_latencies {
+                                worker
+                                    .latencies_us
+                                    .push(request_started.elapsed().as_micros() as u64);
+                            }
+                        } else {
+                            worker.request_errors += 1;
+                        }
+                    }
+                    Err(_) => {
+                        worker.request_errors += 1;
+                    }
+                }
+            }
+
+            worker
+        });
+    }
+
+    let mut merged = WorkerRun::default();
+    while let Some(joined) = tasks.join_next().await {
+        let worker =
+            joined.map_err(|err| io::Error::other(format!("worker task failed: {err}")))?;
+        merged.latencies_us.extend(worker.latencies_us);
+        merged.request_errors += worker.request_errors;
+        for (status, count) in worker.status_counts {
+            *merged.status_counts.entry(status).or_insert(0) += count;
+        }
+    }
+
+    Ok(LoadRunResult {
+        elapsed: started.elapsed(),
+        latencies_us: merged.latencies_us,
+        status_counts: merged.status_counts,
+        request_errors: merged.request_errors,
+    })
+}
+
+async fn fetch_telemetry_summary(
+    client: &Client,
+    admin_addr: SocketAddr,
+) -> Option<TelemetrySummary> {
+    let response = client
+        .get(format!("http://{admin_addr}/telemetry"))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json::<TelemetrySummary>().await.ok()
+}
+
+fn reserve_loopback_addr() -> Result<SocketAddr, io::Error> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    drop(listener);
+    Ok(addr)
+}
+
+fn read_process_rss_kib(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = format!("/proc/{pid}/status");
+        if let Ok(text) = fs::read_to_string(path) {
+            for line in text.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    let value = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+                    return Some(value);
+                }
+            }
+        }
+    }
+
+    let output = Command::new("ps")
+        .arg("-o")
+        .arg("rss=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    text.split_whitespace().next()?.parse::<u64>().ok()
+}
+
+fn resolve_proxy_binary_path(config: &BenchConfig) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(path) = &config.binary_path {
+        if path.exists() {
+            return Ok(path.clone());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("specified --binary does not exist: {}", path.display()),
+        )
+        .into());
+    }
+
+    let workspace_root = workspace_root();
+    let profile = if config.release_build {
+        "release"
+    } else {
+        "debug"
+    };
+    let binary_path = workspace_root
+        .join("target")
+        .join(profile)
+        .join(proxy_binary_name());
+
+    if !binary_path.exists() {
+        if config.auto_build {
+            build_proxy_binary(&workspace_root, config.release_build)?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "proxy binary not found at {} (set --binary or run cargo build)",
+                    binary_path.display()
+                ),
+            )
+            .into());
+        }
+    }
+
+    Ok(binary_path)
+}
+
+fn build_proxy_binary(
+    workspace_root: &Path,
+    release_build: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::new("cargo");
+    command
+        .current_dir(workspace_root)
+        .arg("build")
+        .arg("-p")
+        .arg("pd-edge")
+        .arg("--bin")
+        .arg("pd-edge-http-proxy");
+    if release_build {
+        command.arg("--release");
+    }
+
+    let status = command.status()?;
+    if !status.success() {
+        return Err(io::Error::other("cargo build failed for pd-edge-http-proxy").into());
+    }
+    Ok(())
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root should exist")
+        .to_path_buf()
+}
+
+fn proxy_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "pd-edge-http-proxy.exe"
+    } else {
+        "pd-edge-http-proxy"
+    }
+}
+
+fn print_scenario_report(report: &ScenarioReport) {
+    if let Some(error) = &report.error {
+        println!("error: {error}");
+        return;
+    }
+
+    println!(
+        "requests_sent={}, responses_received={}, request_errors={}, expected_status={}",
+        report.requests_sent,
+        report.responses_received,
+        report.request_errors,
+        report.expected_status
+    );
+    println!(
+        "unexpected_status_responses={}, throughput_rps={:.2}",
+        report.unexpected_status_responses, report.throughput_rps
+    );
+
+    if report.status_counts.is_empty() {
+        println!("status_counts: (none)");
+    } else {
+        let rendered = report
+            .status_counts
+            .iter()
+            .map(|entry| format!("{}={}", entry.status, entry.count))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("status_counts: {rendered}");
+    }
+
+    if let Some(latency) = &report.latency_ms {
+        println!(
+            "latency_ms: median={:.3}, p90={:.3}, p95={:.3}, p99={:.3}, mean={:.3}, min={:.3}, max={:.3}",
+            latency.median,
+            latency.p90,
+            latency.p95,
+            latency.p99,
+            latency.mean,
+            latency.min,
+            latency.max
+        );
+    } else {
+        println!("latency_ms: (no successful samples)");
+    }
+
+    println!(
+        "memory_rss_mib: start={}, end={}, min={}, avg={}, max={}, peak={}, samples={}",
+        format_optional_f64(report.memory.start_rss_mib),
+        format_optional_f64(report.memory.end_rss_mib),
+        format_optional_f64(report.memory.min_rss_mib),
+        format_optional_f64(report.memory.avg_rss_mib),
+        format_optional_f64(report.memory.max_rss_mib),
+        format_optional_f64(report.memory.peak_rss_mib),
+        report.memory.samples
+    );
+
+    if let Some(telemetry) = &report.telemetry {
+        println!(
+            "telemetry: program_loaded={}, data_requests_total={}, vm_execution_errors_total={}",
+            telemetry.program_loaded,
+            telemetry.data_requests_total,
+            telemetry.vm_execution_errors_total
+        );
+    }
+}
+
+fn format_optional_f64(value: Option<f64>) -> String {
+    value
+        .map(|number| format!("{number:.2}"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn parse_args() -> Result<BenchConfig, String> {
+    let mut config = BenchConfig::default();
+    let mut args = env::args().skip(1).peekable();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
+            "--requests" => {
+                config.requests = parse_next_usize("--requests", &mut args)?;
+            }
+            "--warmup-requests" => {
+                config.warmup_requests = parse_next_usize("--warmup-requests", &mut args)?;
+            }
+            "--concurrency" => {
+                config.concurrency = parse_next_usize("--concurrency", &mut args)?;
+            }
+            "--request-timeout-ms" => {
+                config.request_timeout_ms = parse_next_u64("--request-timeout-ms", &mut args)?;
+            }
+            "--startup-timeout-ms" => {
+                config.startup_timeout_ms = parse_next_u64("--startup-timeout-ms", &mut args)?;
+            }
+            "--memory-sample-interval-ms" => {
+                config.memory_sample_interval_ms =
+                    parse_next_u64("--memory-sample-interval-ms", &mut args)?;
+            }
+            "--binary" => {
+                let path = parse_next_string("--binary", &mut args)?;
+                config.binary_path = Some(PathBuf::from(path));
+            }
+            "--json-out" => {
+                let path = parse_next_string("--json-out", &mut args)?;
+                config.json_out = Some(PathBuf::from(path));
+            }
+            "--skip-build" => {
+                config.auto_build = false;
+            }
+            "--build-debug" => {
+                config.release_build = false;
+                config.auto_build = true;
+            }
+            "--build-release" => {
+                config.release_build = true;
+                config.auto_build = true;
+            }
+            _ => {
+                return Err(format!("unknown argument: {arg}"));
+            }
+        }
+    }
+
+    if config.requests == 0 {
+        return Err("--requests must be > 0".to_string());
+    }
+    if config.concurrency == 0 {
+        return Err("--concurrency must be > 0".to_string());
+    }
+
+    Ok(config)
+}
+
+fn parse_next_string(
+    flag: &str,
+    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+) -> Result<String, String> {
+    let value = args
+        .next()
+        .ok_or_else(|| format!("missing value for {flag}"))?;
+    if value.trim().is_empty() {
+        return Err(format!("value for {flag} cannot be empty"));
+    }
+    Ok(value)
+}
+
+fn parse_next_usize(
+    flag: &str,
+    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+) -> Result<usize, String> {
+    let value = parse_next_string(flag, args)?;
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid {flag}: {value}"))
+}
+
+fn parse_next_u64(
+    flag: &str,
+    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+) -> Result<u64, String> {
+    let value = parse_next_string(flag, args)?;
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid {flag}: {value}"))
+}
+
+fn print_help() {
+    eprintln!(concat!(
+        "Usage: cargo run -p pd-edge --example http_proxy_perf_framework -- [options]\n\n",
+        "Options:\n",
+        "  --requests <N>                    Measured requests per scenario (default: 10000)\n",
+        "  --warmup-requests <N>             Warmup requests per scenario (default: 1000)\n",
+        "  --concurrency <N>                 Concurrent workers (default: 64)\n",
+        "  --request-timeout-ms <MS>         Per-request timeout (default: 10000)\n",
+        "  --startup-timeout-ms <MS>         Proxy readiness timeout (default: 15000)\n",
+        "  --memory-sample-interval-ms <MS>  RSS sample interval (default: 100)\n",
+        "  --binary <PATH>                   Explicit pd-edge-http-proxy binary path\n",
+        "  --json-out <PATH>                 Write JSON report to path\n",
+        "  --skip-build                      Do not auto-build pd-edge-http-proxy\n",
+        "  --build-release                   Auto-build release binary (default)\n",
+        "  --build-debug                     Auto-build debug binary\n",
+        "  -h, --help                        Show help\n"
+    ));
+}

@@ -24,6 +24,7 @@ http-body-util = "0.1"
 vm = { package = "pd-vm", path = "../pd-vm" }
 edge_abi = { package = "pd-edge-abi", path = "../pd-edge-abi" }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
 owo-colors = "4"
