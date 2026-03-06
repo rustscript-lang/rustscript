@@ -1,8 +1,10 @@
+use std::{future::Future, pin::Pin};
+
 use axum::http::HeaderMap;
 use tracing::warn;
 use vm::{Store, Vm, VmStatus};
 
-use super::{LoadedProgram, VmExecutionConfig};
+use super::{LoadedProgram, VmExecutionConfig, VmExecutionMode};
 use crate::{
     abi_impl::{
         SharedProxyVmContext, SharedVmAsyncOps, VmAsyncOpBridge, VmExecutionOutcome,
@@ -31,6 +33,21 @@ impl VmRunnerStoreData {
 }
 
 type VmRunnerStore = Store<VmRunnerStoreData>;
+type VmExecutionModeFuture =
+    Pin<Box<dyn Future<Output = Result<VmExecutionOutcome, VmExecutionError>> + Send + 'static>>;
+
+trait VmModeRunner {
+    fn execute(
+        vm_store: VmRunnerStore,
+        debug_session: SharedDebugSession,
+        debug: VmDebugInvocation,
+        register_host_modules: HostModuleRegistrar,
+        vm_execution: VmExecutionConfig,
+    ) -> VmExecutionModeFuture;
+}
+
+struct AsyncModeRunner;
+struct ThreadingModeRunner;
 
 #[derive(Debug)]
 pub enum VmExecutionError {
@@ -57,6 +74,70 @@ pub async fn execute_vm_with_context(
     let program = program.program.clone();
     let async_ops = new_shared_vm_async_ops();
     let vm_store = new_vm_runner_store(program, vm_context, async_ops);
+
+    match vm_execution.execution_mode {
+        VmExecutionMode::Async => AsyncModeRunner::execute(
+            vm_store,
+            debug_session,
+            debug,
+            register_host_modules,
+            vm_execution,
+        )
+        .await,
+        VmExecutionMode::Threading => ThreadingModeRunner::execute(
+            vm_store,
+            debug_session,
+            debug,
+            register_host_modules,
+            vm_execution,
+        )
+        .await,
+    }
+}
+
+impl VmModeRunner for AsyncModeRunner {
+    fn execute(
+        vm_store: VmRunnerStore,
+        debug_session: SharedDebugSession,
+        debug: VmDebugInvocation,
+        register_host_modules: HostModuleRegistrar,
+        vm_execution: VmExecutionConfig,
+    ) -> VmExecutionModeFuture {
+        Box::pin(execute_vm_with_async_mode(
+            vm_store,
+            debug_session,
+            debug,
+            register_host_modules,
+            vm_execution,
+        ))
+    }
+}
+
+impl VmModeRunner for ThreadingModeRunner {
+    fn execute(
+        vm_store: VmRunnerStore,
+        debug_session: SharedDebugSession,
+        debug: VmDebugInvocation,
+        register_host_modules: HostModuleRegistrar,
+        vm_execution: VmExecutionConfig,
+    ) -> VmExecutionModeFuture {
+        Box::pin(execute_vm_with_threading_mode(
+            vm_store,
+            debug_session,
+            debug,
+            register_host_modules,
+            vm_execution,
+        ))
+    }
+}
+
+async fn execute_vm_with_async_mode(
+    vm_store: VmRunnerStore,
+    debug_session: SharedDebugSession,
+    debug: VmDebugInvocation,
+    register_host_modules: HostModuleRegistrar,
+    vm_execution: VmExecutionConfig,
+) -> Result<VmExecutionOutcome, VmExecutionError> {
     let started = std::time::Instant::now();
     let request_id = debug.request_id.clone();
     let (outcome, mut profile) = run_vm_async(
@@ -72,6 +153,45 @@ pub async fn execute_vm_with_context(
     profile.blocking_run_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
     maybe_log_tail_profile(&request_id, &profile);
     Ok(outcome)
+}
+
+async fn execute_vm_with_threading_mode(
+    vm_store: VmRunnerStore,
+    debug_session: SharedDebugSession,
+    debug: VmDebugInvocation,
+    register_host_modules: HostModuleRegistrar,
+    vm_execution: VmExecutionConfig,
+) -> Result<VmExecutionOutcome, VmExecutionError> {
+    let queued_at = std::time::Instant::now();
+    let task = tokio::task::spawn_blocking(move || {
+        let queue_wait_us = u64::try_from(queued_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let threading_started = std::time::Instant::now();
+        let request_id = debug.request_id.clone();
+        let result = run_vm_threading(
+            vm_store,
+            debug_session,
+            debug,
+            register_host_modules,
+            vm_execution,
+        );
+
+        match result {
+            Ok((outcome, mut profile)) => {
+                profile.queue_wait_us = queue_wait_us;
+                profile.blocking_run_us =
+                    u64::try_from(threading_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                maybe_log_tail_profile(&request_id, &profile);
+                Ok(outcome)
+            }
+            Err(err) => Err(err),
+        }
+    });
+
+    task.await.map_err(|err| {
+        VmExecutionError::Vm(vm::VmError::HostError(format!(
+            "vm threading execution task failed: {err}"
+        )))
+    })?
 }
 
 async fn run_vm_async(
@@ -122,6 +242,68 @@ async fn run_vm_async(
                     .vm_mut()
                     .await_waiting_host_op()
                     .await
+                    .map_err(VmExecutionError::Vm)?;
+                let wait_us =
+                    u64::try_from(waiting_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                profile.waiting_host_us = profile.waiting_host_us.saturating_add(wait_us);
+                profile.waiting_host_count = profile.waiting_host_count.saturating_add(1);
+            }
+        }
+    }
+
+    Ok((
+        snapshot_execution_outcome(&vm_store.data().vm_context),
+        profile,
+    ))
+}
+
+fn run_vm_threading(
+    mut vm_store: VmRunnerStore,
+    debug_session: SharedDebugSession,
+    debug: VmDebugInvocation,
+    register_host_modules: HostModuleRegistrar,
+    vm_execution: VmExecutionConfig,
+) -> Result<(VmExecutionOutcome, VmExecutionProfile), VmExecutionError> {
+    if let Some(fuel) = vm_execution.fuel_per_yield {
+        vm_store
+            .set_fuel_check_interval(vm_execution.fuel_check_interval)
+            .map_err(VmExecutionError::Vm)?;
+        vm_store.set_fuel(fuel);
+    }
+    register_host_modules_from_store(&mut vm_store, register_host_modules)?;
+    let mut profile = VmExecutionProfile::default();
+
+    loop {
+        let status = if debug.attach_debugger {
+            run_vm_with_optional_debugger(
+                &debug_session,
+                &debug.request_headers,
+                &debug.request_path,
+                &debug.request_id,
+                vm_store.vm_mut(),
+            )
+        } else {
+            vm_store.run()
+        }
+        .map_err(VmExecutionError::Vm)?;
+
+        match status {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => {
+                profile.vm_yield_count = profile.vm_yield_count.saturating_add(1);
+                if let Some(fuel) = vm_execution.fuel_per_yield
+                    && vm_store.get_fuel() == Some(0)
+                {
+                    vm_store.recharge(fuel).map_err(VmExecutionError::Vm)?;
+                    profile.vm_fuel_recharge_count =
+                        profile.vm_fuel_recharge_count.saturating_add(1);
+                }
+                std::thread::yield_now();
+            }
+            VmStatus::Waiting(_op_id) => {
+                let waiting_started = std::time::Instant::now();
+                tokio::runtime::Handle::current()
+                    .block_on(vm_store.vm_mut().await_waiting_host_op())
                     .map_err(VmExecutionError::Vm)?;
                 let wait_us =
                     u64::try_from(waiting_started.elapsed().as_micros()).unwrap_or(u64::MAX);

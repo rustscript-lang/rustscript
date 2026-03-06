@@ -5,7 +5,7 @@ use std::{
 };
 
 use edge::{
-    ActiveControlPlaneConfig, SharedState, VmExecutionConfig, build_admin_app,
+    ActiveControlPlaneConfig, SharedState, VmExecutionConfig, VmExecutionMode, build_admin_app,
     build_http_proxy_app, init_logging, spawn_active_control_plane_client,
 };
 use tracing::{info, warn};
@@ -66,9 +66,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vm_execution = VmExecutionConfig {
         fuel_per_yield: cli.vm_fuel,
         fuel_check_interval: cli.vm_fuel_check_interval.unwrap_or(1),
+        execution_mode: cli.vm_execution_mode.unwrap_or_default(),
     };
 
     let state = SharedState::new(max_program_bytes).with_vm_execution_config(vm_execution);
+    info!("vm execution mode={}", vm_execution.execution_mode.as_str());
     if let Some(fuel_per_yield) = vm_execution.fuel_per_yield {
         info!(
             "vm cooperative scheduling enabled fuel_per_yield={} fuel_check_interval={}",
@@ -122,6 +124,7 @@ struct CliArgs {
     max_program_bytes: Option<usize>,
     vm_fuel: Option<u64>,
     vm_fuel_check_interval: Option<u32>,
+    vm_execution_mode: Option<VmExecutionMode>,
     control_plane_url: Option<String>,
     edge_id: Option<String>,
     edge_name: Option<String>,
@@ -204,6 +207,10 @@ where
                 }
                 cli.vm_fuel_check_interval = Some(parsed);
             }
+            "--vm-execution-mode" => {
+                let value = next_arg_value("--vm-execution-mode", &mut args)?;
+                cli.vm_execution_mode = Some(parse_vm_execution_mode(&value)?);
+            }
             "--edge-id" => {
                 cli.edge_id = Some(next_arg_value("--edge-id", &mut args)?);
             }
@@ -250,6 +257,19 @@ fn next_arg_value(
     Ok(value)
 }
 
+fn parse_vm_execution_mode(value: &str) -> Result<VmExecutionMode, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "async" => Ok(VmExecutionMode::Async),
+        "threading" | "spawn-blocking" => {
+            Ok(VmExecutionMode::Threading)
+        }
+        _ => Err(format!(
+            "invalid --vm-execution-mode: {value} (expected async|threading)"
+        )),
+    }
+}
+
 fn print_cli_help() {
     eprintln!(concat!(
         "Usage: pd-edge-http-proxy [options]\n\n",
@@ -260,6 +280,7 @@ fn print_cli_help() {
         "  --max-program-bytes <BYTES>               Max upload/program size in bytes (default: 1048576)\n",
         "  --vm-fuel <UNITS>                         Enable cooperative VM fuel slices per request\n",
         "  --vm-fuel-check-interval <OPS>            Fuel check interval when --vm-fuel is enabled (default: 1)\n",
+        "  --vm-execution-mode <MODE>                VM execution mode: async|threading (default: async)\n",
         "  --control-plane-url <URL>                 Enable active control-plane RPC client\n",
         "  --edge-id <UUID>                          Explicit edge UUID used by active control-plane client\n",
         "  --edge-name <NAME>                        Friendly edge name (default: hostname)\n",
@@ -408,6 +429,7 @@ mod tests {
                 max_program_bytes: Some(2048),
                 vm_fuel: None,
                 vm_fuel_check_interval: None,
+                vm_execution_mode: None,
                 control_plane_url: Some("http://127.0.0.1:9100".to_string()),
                 edge_id: Some("123e4567-e89b-12d3-a456-426614174000".to_string()),
                 edge_name: Some("test-edge".to_string()),
@@ -433,6 +455,30 @@ mod tests {
         };
         assert_eq!(cli.vm_fuel, Some(1000));
         assert_eq!(cli.vm_fuel_check_interval, Some(8));
+    }
+
+    #[test]
+    fn parse_cli_args_from_parses_vm_execution_mode() {
+        let action = parse_cli_args_from([
+            "--vm-execution-mode".to_string(),
+            "threading".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        let CliAction::Run(cli) = action else {
+            panic!("expected run action");
+        };
+        assert_eq!(cli.vm_execution_mode, Some(VmExecutionMode::Threading));
+    }
+
+    #[test]
+    fn parse_cli_args_from_rejects_invalid_vm_execution_mode() {
+        let err = parse_cli_args_from([
+            "--vm-execution-mode".to_string(),
+            "threadpool".to_string(),
+        ])
+        .expect_err("invalid vm execution mode should fail");
+        assert!(err.contains("invalid --vm-execution-mode"));
     }
 
     #[test]
