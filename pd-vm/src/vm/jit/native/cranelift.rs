@@ -9,6 +9,7 @@ use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
     AbiParam, Block, BlockArg, FuncRef, InstBuilder, MemFlags, Signature, types,
 };
+use cranelift_codegen::isa::OwnedTargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -18,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static CRANELIFT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 static NATIVE_STACK_LAYOUT: OnceLock<Result<NativeStackLayout, String>> = OnceLock::new();
+static CRANELIFT_NATIVE_ISA: OnceLock<Result<OwnedTargetIsa, String>> = OnceLock::new();
 
 const OP_LDC: i64 = 1;
 const OP_ADD: i64 = 2;
@@ -111,16 +113,7 @@ pub(crate) fn compile_trace(
 
     let layout = detect_native_stack_layout()?;
     let offsets = resolve_offsets(layout)?;
-
-    let mut flag_builder = settings::builder();
-    flag_builder
-        .set("opt_level", "speed")
-        .map_err(|err| VmError::JitNative(format!("failed to set cranelift opt_level: {err}")))?;
-    let isa_builder = cranelift_native::builder()
-        .map_err(|err| VmError::JitNative(format!("failed to build native ISA: {err}")))?;
-    let isa = isa_builder
-        .finish(settings::Flags::new(flag_builder))
-        .map_err(|err| VmError::JitNative(format!("failed to finalize cranelift ISA: {err}")))?;
+    let isa = native_isa()?;
 
     let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     jit_builder.symbol("pd_vm_cranelift_step", pd_vm_cranelift_step as *const u8);
@@ -220,6 +213,21 @@ pub(crate) fn compile_trace(
         keepalive: CraneliftTraceKeepAlive { _module: module },
         code,
     })
+}
+
+fn native_isa() -> VmResult<OwnedTargetIsa> {
+    let cached = CRANELIFT_NATIVE_ISA.get_or_init(|| {
+        let mut flag_builder = settings::builder();
+        flag_builder
+            .set("opt_level", "speed")
+            .map_err(|err| format!("failed to set cranelift opt_level: {err}"))?;
+        let isa_builder = cranelift_native::builder()
+            .map_err(|err| format!("failed to build native ISA: {err}"))?;
+        isa_builder
+            .finish(settings::Flags::new(flag_builder))
+            .map_err(|err| format!("failed to finalize cranelift ISA: {err}"))
+    });
+    cached.clone().map_err(VmError::JitNative)
 }
 
 fn emit_fuel_tick_inline(

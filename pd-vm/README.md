@@ -112,23 +112,11 @@ Dump trace-JIT activity:
 cargo run -p pd-vm --bin pd-vm-run -- --jit-hot-loop 2 --jit-dump examples/example.rss
 ```
 
-Select native JIT codegen backend:
+Native JIT codegen uses Cranelift.
 
-```powershell
-$env:PD_VM_JIT_CODEGEN="handwritten"  # or "cranelift"
-cargo run -p pd-vm --features cranelift-jit --bin pd-vm-run -- --jit-hot-loop 2 --jit-dump examples/example.rss
-```
-
-- Accepted values: `handwritten` (default), `native` (alias of handwritten), `cranelift`
-- `cranelift` requires `--features cranelift-jit`
 - Cranelift is part of the Bytecode Alliance/Wasmtime ecosystem
-
-Backend parity notes:
-
 - NYI behavior is shared by the trace recorder (`TraceJitEngine`) and is backend-independent.
-- In practice, `nyi` counts should match between `handwritten` and `cranelift` for the same program/config.
-- Cranelift supports the same current `TraceStep` set as handwritten emission. Some operations may use helper fallback paths internally, but that is not counted as trace-recorder NYI.
-- Cranelift trace-code cache is currently per-thread; handwritten cache is process-global.
+- Some operations may use helper fallback paths internally, but that is not counted as trace-recorder NYI.
 
 Library hooks:
 
@@ -162,12 +150,12 @@ Run an emitted AOT bundle:
 cargo run -p pd-vm --bin pd-vm-run -- --run-aot out/example.pat --jit-dump
 ```
 
-- AOT uses the same native backend selector as JIT (`PD_VM_JIT_CODEGEN`).
-- Opcode/native support coverage is shared with the existing native JIT backend.
+- AOT uses the same native backend as JIT (Cranelift).
+- Opcode/native support coverage is shared with the JIT backend.
 - `.pat` stores VM program data (`local_count` + encoded VM bytecode), not process-specific native
   pointers. Native traces are regenerated per process.
 - Control-flow targets are bytecode instruction offsets (effectively base+offset with bytecode base
-  at `0`), so emitted bundles are portable across runs on the same architecture/backend support.
+  at `0`), so emitted bundles are portable across runs on the same architecture/support matrix.
 
 ### Fuel Metering
 
@@ -266,13 +254,9 @@ Manual perf characterization (ignored by default):
 cargo test -p pd-vm --test perf_tests -- --ignored --nocapture
 ```
 
-Compare handwritten vs cranelift on the same ignored perf test:
+Migration perf record (handwritten vs Cranelift baseline before handwritten backend removal):
 
-```powershell
-pd-vm/scripts/compare-jit-backends.sh
-# or choose a specific ignored perf test:
-pd-vm/scripts/compare-jit-backends.sh perf_manual_aes_128_cbc_rustscript_matches_in_interpreter_and_jit
-```
+- `docs/JIT_BACKEND_MIGRATION_PERF_2026-03-06.md`
 
 ## Internals
 

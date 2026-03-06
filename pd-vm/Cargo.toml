@@ -8,10 +8,9 @@ name = "vm"
 
 [features]
 default = ["runtime", "cli"]
-runtime = []
+runtime = ["cranelift-jit"]
 cli = ["dep:rustyline", "runtime"]
 cranelift-jit = [
-    "runtime",
     "dep:cranelift-codegen",
     "dep:cranelift-frontend",
     "dep:cranelift-jit",
