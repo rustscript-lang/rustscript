@@ -8,8 +8,9 @@ use std::{
 use axum::http::HeaderMap;
 use edge::{
     ActiveControlPlaneConfig, ProxyVmContext, SharedProxyVmContext, SharedState, SharedVmAsyncOps,
-    VmAsyncOpBridge, VmExecutionConfig, apply_program_from_bytes, compile_edge_source_file,
-    init_logging, new_shared_vm_async_ops, register_host_module, spawn_active_control_plane_client,
+    VmAsyncOpBridge, VmExecutionConfig, VmExecutionMode, apply_program_from_bytes,
+    compile_edge_source_file, init_logging, new_shared_vm_async_ops, register_host_module,
+    spawn_active_control_plane_client,
 };
 use tracing::info;
 use uuid::Uuid;
@@ -41,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vm_execution = VmExecutionConfig {
         fuel_per_yield: cli.vm_fuel,
         fuel_check_interval: cli.vm_fuel_check_interval.unwrap_or(1),
+        execution_mode: VmExecutionMode::Async,
     };
     let state = SharedState::new(max_program_bytes).with_vm_execution_config(vm_execution);
     if let Some(fuel_per_yield) = vm_execution.fuel_per_yield {

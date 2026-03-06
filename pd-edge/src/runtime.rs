@@ -28,9 +28,31 @@ const MAX_LATENCY_SAMPLES: usize = 4096;
 pub use http_plane::{build_admin_app, build_http_proxy_app};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmExecutionMode {
+    Async,
+    Threading,
+}
+
+impl VmExecutionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VmExecutionMode::Async => "async",
+            VmExecutionMode::Threading => "threading",
+        }
+    }
+}
+
+impl Default for VmExecutionMode {
+    fn default() -> Self {
+        Self::Async
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VmExecutionConfig {
     pub fuel_per_yield: Option<u64>,
     pub fuel_check_interval: u32,
+    pub execution_mode: VmExecutionMode,
 }
 
 impl Default for VmExecutionConfig {
@@ -38,6 +60,7 @@ impl Default for VmExecutionConfig {
         Self {
             fuel_per_yield: None,
             fuel_check_interval: 1,
+            execution_mode: VmExecutionMode::default(),
         }
     }
 }
