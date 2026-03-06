@@ -120,6 +120,11 @@ struct BenchConfig {
     request_timeout_ms: u64,
     startup_timeout_ms: u64,
     memory_sample_interval_ms: u64,
+    vm_fuel: Option<u64>,
+    vm_fuel_check_interval: u32,
+    fuel_latency_sweep: bool,
+    fuel_latency_fuels: Vec<u64>,
+    fuel_latency_check_intervals: Vec<u32>,
     binary_path: Option<PathBuf>,
     auto_build: bool,
     release_build: bool,
@@ -136,6 +141,14 @@ impl Default for BenchConfig {
             request_timeout_ms: 10_000,
             startup_timeout_ms: 15_000,
             memory_sample_interval_ms: 100,
+            vm_fuel: Some(50_000),
+            vm_fuel_check_interval: 32,
+            fuel_latency_sweep: false,
+            fuel_latency_fuels: vec![
+                1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768,
+                50_000,
+            ],
+            fuel_latency_check_intervals: vec![1, 2, 4, 8, 16, 32, 64, 128],
             binary_path: None,
             auto_build: true,
             release_build: true,
@@ -153,6 +166,11 @@ struct BenchConfigReport {
     request_timeout_ms: u64,
     startup_timeout_ms: u64,
     memory_sample_interval_ms: u64,
+    vm_fuel: Option<u64>,
+    vm_fuel_check_interval: u32,
+    fuel_latency_sweep: bool,
+    fuel_latency_fuels: Vec<u64>,
+    fuel_latency_check_intervals: Vec<u32>,
     binary_path: String,
     auto_build: bool,
     release_build: bool,
@@ -163,6 +181,21 @@ struct BenchConfigReport {
 struct BenchReport {
     generated_at_unix_ms: u128,
     config: BenchConfigReport,
+    scenarios: Vec<ScenarioReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct FuelLatencySweepReport {
+    generated_at_unix_ms: u128,
+    config: BenchConfigReport,
+    fuel_sweep_cases: Vec<FuelSweepCaseReport>,
+    fuel_check_interval_sweep_cases: Vec<FuelSweepCaseReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct FuelSweepCaseReport {
+    vm_fuel: Option<u64>,
+    vm_fuel_check_interval: u32,
     scenarios: Vec<ScenarioReport>,
 }
 
@@ -241,6 +274,8 @@ impl ProxyProcess {
         binary_path: &Path,
         data_addr: SocketAddr,
         admin_addr: SocketAddr,
+        vm_fuel: Option<u64>,
+        vm_fuel_check_interval: u32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let rust_log = env::var("PD_EDGE_PROXY_RUST_LOG").unwrap_or_else(|_| "error".to_string());
         let inherit_stdout = env_flag("PD_EDGE_PROXY_STDOUT_INHERIT");
@@ -259,6 +294,12 @@ impl ProxyProcess {
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(Stdio::inherit());
+        if let Some(fuel) = vm_fuel {
+            command.arg("--vm-fuel").arg(fuel.to_string());
+            command
+                .arg("--vm-fuel-check-interval")
+                .arg(vm_fuel_check_interval.to_string());
+        }
         if let Ok(value) = env::var("PD_EDGE_PROFILE_VM_TAIL") {
             command.env("PD_EDGE_PROFILE_VM_TAIL", value);
         }
@@ -301,12 +342,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let binary_path = resolve_proxy_binary_path(&config)?;
     println!("proxy binary: {}", binary_path.display());
     println!(
-        "requests={}, warmup_requests={}, concurrency={}, request_timeout_ms={}, memory_sample_interval_ms={}",
+        "requests={}, warmup_requests={}, concurrency={}, request_timeout_ms={}, memory_sample_interval_ms={}, vm_fuel={:?}, vm_fuel_check_interval={}, fuel_latency_sweep={}, fuel_latency_fuels={:?}, fuel_latency_check_intervals={:?}",
         config.requests,
         config.warmup_requests,
         config.concurrency,
         config.request_timeout_ms,
-        config.memory_sample_interval_ms
+        config.memory_sample_interval_ms,
+        config.vm_fuel,
+        config.vm_fuel_check_interval,
+        config.fuel_latency_sweep,
+        config.fuel_latency_fuels,
+        config.fuel_latency_check_intervals
     );
 
     let client = Client::builder()
@@ -315,84 +361,289 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(Duration::from_millis(config.request_timeout_ms))
         .build()?;
 
-    let mut reports = Vec::new();
-    let scenarios: Vec<Scenario> = if let Some(filter) = &config.scenario {
+    if config.fuel_latency_sweep {
+        run_fuel_latency_sweep(&config, &binary_path, &client).await?;
+    } else {
+        run_standard_bench(&config, &binary_path, &client).await?;
+    }
+
+    Ok(())
+}
+
+async fn run_standard_bench(
+    config: &BenchConfig,
+    binary_path: &Path,
+    client: &Client,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let scenarios = select_scenarios(config)?;
+    let reports = run_case_scenarios(config, binary_path, client, &scenarios, None).await;
+    let report = BenchReport {
+        generated_at_unix_ms: generated_at_unix_ms(),
+        config: build_bench_config_report(config, binary_path),
+        scenarios: reports,
+    };
+    if let Some(path) = &config.json_out {
+        write_json_report(path, &report)?;
+    }
+    Ok(())
+}
+
+async fn run_fuel_latency_sweep(
+    config: &BenchConfig,
+    binary_path: &Path,
+    client: &Client,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let scenarios = select_sweep_scenarios(config)?;
+    let fixed_interval = 1_u32;
+    let fixed_fuel = config.vm_fuel.unwrap_or(50_000);
+    println!(
+        "fuel latency sweep mode: scenarios={:?}, fixed_interval_for_fuel_sweep={}, fixed_fuel_for_interval_sweep={}",
+        scenarios.iter().map(|item| item.id).collect::<Vec<_>>(),
+        fixed_interval,
+        fixed_fuel
+    );
+
+    let mut fuel_sweep_cases = Vec::new();
+    for fuel in &config.fuel_latency_fuels {
+        let mut case_config = config.clone();
+        case_config.vm_fuel = Some(*fuel);
+        case_config.vm_fuel_check_interval = fixed_interval;
+        let label = format!(
+            "fuel sweep case vm_fuel={} vm_fuel_check_interval={fixed_interval}",
+            fuel
+        );
+        let reports =
+            run_case_scenarios(&case_config, binary_path, client, &scenarios, Some(&label)).await;
+        fuel_sweep_cases.push(FuelSweepCaseReport {
+            vm_fuel: Some(*fuel),
+            vm_fuel_check_interval: fixed_interval,
+            scenarios: reports,
+        });
+    }
+
+    let mut fuel_check_interval_sweep_cases = Vec::new();
+    for interval in &config.fuel_latency_check_intervals {
+        let mut case_config = config.clone();
+        case_config.vm_fuel = Some(fixed_fuel);
+        case_config.vm_fuel_check_interval = *interval;
+        let label =
+            format!("interval sweep case vm_fuel={fixed_fuel} vm_fuel_check_interval={interval}");
+        let reports =
+            run_case_scenarios(&case_config, binary_path, client, &scenarios, Some(&label)).await;
+        fuel_check_interval_sweep_cases.push(FuelSweepCaseReport {
+            vm_fuel: Some(fixed_fuel),
+            vm_fuel_check_interval: *interval,
+            scenarios: reports,
+        });
+    }
+
+    print_sweep_summary("fuel sweep", &fuel_sweep_cases);
+    print_sweep_summary(
+        "fuel check interval sweep",
+        &fuel_check_interval_sweep_cases,
+    );
+
+    let report = FuelLatencySweepReport {
+        generated_at_unix_ms: generated_at_unix_ms(),
+        config: build_bench_config_report(config, binary_path),
+        fuel_sweep_cases,
+        fuel_check_interval_sweep_cases,
+    };
+    if let Some(path) = &config.json_out {
+        write_json_report(path, &report)?;
+    }
+    Ok(())
+}
+
+async fn run_case_scenarios(
+    config: &BenchConfig,
+    binary_path: &Path,
+    client: &Client,
+    scenarios: &[Scenario],
+    case_label: Option<&str>,
+) -> Vec<ScenarioReport> {
+    let mut reports = Vec::with_capacity(scenarios.len());
+    for scenario in scenarios {
+        println!();
+        if let Some(label) = case_label {
+            println!("=== {label} | {} ===", scenario.description);
+        } else {
+            println!("=== {} ===", scenario.description);
+        }
+        let report = match run_scenario(config, binary_path, client, *scenario).await {
+            Ok(report) => report,
+            Err(err) => scenario_error_report(*scenario, err.to_string()),
+        };
+        print_scenario_report(&report);
+        reports.push(report);
+    }
+    reports
+}
+
+fn select_scenarios(config: &BenchConfig) -> Result<Vec<Scenario>, Box<dyn std::error::Error>> {
+    if let Some(filter) = &config.scenario {
         let matched = SCENARIOS
             .iter()
             .copied()
             .find(|scenario| scenario.id == filter)
             .ok_or_else(|| io::Error::other(format!("unknown --scenario: {filter}")))?;
-        vec![matched]
+        Ok(vec![matched])
     } else {
-        SCENARIOS.to_vec()
-    };
-    for scenario in scenarios {
-        println!();
-        println!("=== {} ===", scenario.description);
-        let report = match run_scenario(&config, &binary_path, &client, scenario).await {
-            Ok(report) => report,
-            Err(err) => ScenarioReport {
-                id: scenario.id.to_string(),
-                description: scenario.description.to_string(),
-                expected_status: scenario.expected_status,
-                requests_sent: 0,
-                responses_received: 0,
-                request_errors: 0,
-                unexpected_status_responses: 0,
-                throughput_rps: 0.0,
-                status_counts: Vec::new(),
-                latency_ms: None,
-                memory: MemoryStats {
-                    samples: 0,
-                    start_rss_mib: None,
-                    end_rss_mib: None,
-                    min_rss_mib: None,
-                    avg_rss_mib: None,
-                    max_rss_mib: None,
-                    peak_rss_mib: None,
-                },
-                telemetry: None,
-                error: Some(err.to_string()),
-            },
-        };
-        print_scenario_report(&report);
-        reports.push(report);
+        Ok(SCENARIOS.to_vec())
+    }
+}
+
+fn select_sweep_scenarios(
+    config: &BenchConfig,
+) -> Result<Vec<Scenario>, Box<dyn std::error::Error>> {
+    if config.scenario.is_some() {
+        return select_scenarios(config);
+    }
+    let scenario = SCENARIOS
+        .iter()
+        .copied()
+        .find(|item| item.id == "no_host_calls_program")
+        .ok_or_else(|| io::Error::other("missing no_host_calls_program scenario"))?;
+    Ok(vec![scenario])
+}
+
+fn scenario_error_report(scenario: Scenario, error: String) -> ScenarioReport {
+    ScenarioReport {
+        id: scenario.id.to_string(),
+        description: scenario.description.to_string(),
+        expected_status: scenario.expected_status,
+        requests_sent: 0,
+        responses_received: 0,
+        request_errors: 0,
+        unexpected_status_responses: 0,
+        throughput_rps: 0.0,
+        status_counts: Vec::new(),
+        latency_ms: None,
+        memory: MemoryStats {
+            samples: 0,
+            start_rss_mib: None,
+            end_rss_mib: None,
+            min_rss_mib: None,
+            avg_rss_mib: None,
+            max_rss_mib: None,
+            peak_rss_mib: None,
+        },
+        telemetry: None,
+        error: Some(error),
+    }
+}
+
+fn print_sweep_summary(title: &str, cases: &[FuelSweepCaseReport]) {
+    if cases.is_empty() {
+        return;
+    }
+    println!();
+    println!("=== {title} summary ===");
+
+    let baseline = &cases[0];
+    let mut baseline_latency_by_scenario = BTreeMap::<String, (f64, f64, f64, f64)>::new();
+    for scenario in &baseline.scenarios {
+        if let Some(latency) = &scenario.latency_ms {
+            baseline_latency_by_scenario.insert(
+                scenario.id.clone(),
+                (
+                    latency.median,
+                    latency.p95,
+                    latency.p99,
+                    scenario.throughput_rps,
+                ),
+            );
+        }
     }
 
-    let generated_at_unix_ms = SystemTime::now()
+    for case in cases {
+        for scenario in &case.scenarios {
+            if let Some(latency) = &scenario.latency_ms {
+                let baseline = baseline_latency_by_scenario.get(&scenario.id).copied();
+                let median_delta = baseline
+                    .and_then(|(median, _, _, _)| percent_delta(latency.median, median))
+                    .map(|value| format!("{value:+.2}%"))
+                    .unwrap_or_else(|| "n/a".to_string());
+                let p99_delta = baseline
+                    .and_then(|(_, _, p99, _)| percent_delta(latency.p99, p99))
+                    .map(|value| format!("{value:+.2}%"))
+                    .unwrap_or_else(|| "n/a".to_string());
+                let throughput_delta = baseline
+                    .and_then(|(_, _, _, throughput)| {
+                        percent_delta(scenario.throughput_rps, throughput)
+                    })
+                    .map(|value| format!("{value:+.2}%"))
+                    .unwrap_or_else(|| "n/a".to_string());
+                println!(
+                    "scenario={} vm_fuel={:?} vm_fuel_check_interval={} median_ms={:.3} p95_ms={:.3} p99_ms={:.3} throughput_rps={:.2} delta_median={} delta_p99={} delta_throughput={}",
+                    scenario.id,
+                    case.vm_fuel,
+                    case.vm_fuel_check_interval,
+                    latency.median,
+                    latency.p95,
+                    latency.p99,
+                    scenario.throughput_rps,
+                    median_delta,
+                    p99_delta,
+                    throughput_delta
+                );
+            } else {
+                println!(
+                    "scenario={} vm_fuel={:?} vm_fuel_check_interval={} latency=no_samples throughput_rps={:.2}",
+                    scenario.id, case.vm_fuel, case.vm_fuel_check_interval, scenario.throughput_rps
+                );
+            }
+        }
+    }
+}
+
+fn percent_delta(current: f64, baseline: f64) -> Option<f64> {
+    if baseline.abs() < f64::MIN_POSITIVE {
+        return None;
+    }
+    Some(((current - baseline) / baseline) * 100.0)
+}
+
+fn generated_at_unix_ms() -> u128 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_millis())
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
 
-    let report = BenchReport {
-        generated_at_unix_ms,
-        config: BenchConfigReport {
-            requests: config.requests,
-            warmup_requests: config.warmup_requests,
-            concurrency: config.concurrency,
-            request_timeout_ms: config.request_timeout_ms,
-            startup_timeout_ms: config.startup_timeout_ms,
-            memory_sample_interval_ms: config.memory_sample_interval_ms,
-            binary_path: binary_path.display().to_string(),
-            auto_build: config.auto_build,
-            release_build: config.release_build,
-            scenario: config.scenario.clone(),
-        },
-        scenarios: reports,
-    };
-
-    if let Some(path) = config.json_out {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_string_pretty(&report)?;
-        fs::write(&path, json)?;
-        println!();
-        println!("json report written to {}", path.display());
+fn build_bench_config_report(config: &BenchConfig, binary_path: &Path) -> BenchConfigReport {
+    BenchConfigReport {
+        requests: config.requests,
+        warmup_requests: config.warmup_requests,
+        concurrency: config.concurrency,
+        request_timeout_ms: config.request_timeout_ms,
+        startup_timeout_ms: config.startup_timeout_ms,
+        memory_sample_interval_ms: config.memory_sample_interval_ms,
+        vm_fuel: config.vm_fuel,
+        vm_fuel_check_interval: config.vm_fuel_check_interval,
+        fuel_latency_sweep: config.fuel_latency_sweep,
+        fuel_latency_fuels: config.fuel_latency_fuels.clone(),
+        fuel_latency_check_intervals: config.fuel_latency_check_intervals.clone(),
+        binary_path: binary_path.display().to_string(),
+        auto_build: config.auto_build,
+        release_build: config.release_build,
+        scenario: config.scenario.clone(),
     }
+}
 
+fn write_json_report<T: Serialize>(
+    path: &Path,
+    report: &T,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(report)?;
+    fs::write(path, json)?;
+    println!();
+    println!("json report written to {}", path.display());
     Ok(())
 }
 
@@ -416,7 +667,13 @@ async fn run_scenario(
 
     let data_addr = reserve_loopback_addr()?;
     let admin_addr = reserve_loopback_addr()?;
-    let mut proxy = ProxyProcess::spawn(binary_path, data_addr, admin_addr)?;
+    let mut proxy = ProxyProcess::spawn(
+        binary_path,
+        data_addr,
+        admin_addr,
+        config.vm_fuel,
+        config.vm_fuel_check_interval,
+    )?;
 
     wait_until_proxy_ready(
         client,
@@ -1042,6 +1299,35 @@ fn parse_args() -> Result<BenchConfig, String> {
                 config.memory_sample_interval_ms =
                     parse_next_u64("--memory-sample-interval-ms", &mut args)?;
             }
+            "--vm-fuel" => {
+                let value = parse_next_u64("--vm-fuel", &mut args)?;
+                if value == 0 {
+                    return Err("--vm-fuel must be > 0".to_string());
+                }
+                config.vm_fuel = Some(value);
+            }
+            "--no-vm-fuel" => {
+                config.vm_fuel = None;
+            }
+            "--vm-fuel-check-interval" => {
+                let value = parse_next_u32("--vm-fuel-check-interval", &mut args)?;
+                if value == 0 {
+                    return Err("--vm-fuel-check-interval must be > 0".to_string());
+                }
+                config.vm_fuel_check_interval = value;
+            }
+            "--fuel-latency-sweep" => {
+                config.fuel_latency_sweep = true;
+            }
+            "--fuel-latency-fuels" => {
+                let raw = parse_next_string("--fuel-latency-fuels", &mut args)?;
+                config.fuel_latency_fuels = parse_csv_u64_list("--fuel-latency-fuels", &raw)?;
+            }
+            "--fuel-latency-check-intervals" => {
+                let raw = parse_next_string("--fuel-latency-check-intervals", &mut args)?;
+                config.fuel_latency_check_intervals =
+                    parse_csv_u32_list("--fuel-latency-check-intervals", &raw)?;
+            }
             "--binary" => {
                 let path = parse_next_string("--binary", &mut args)?;
                 config.binary_path = Some(PathBuf::from(path));
@@ -1075,6 +1361,16 @@ fn parse_args() -> Result<BenchConfig, String> {
     }
     if config.concurrency == 0 {
         return Err("--concurrency must be > 0".to_string());
+    }
+    if config.fuel_latency_sweep {
+        if config.fuel_latency_fuels.is_empty() {
+            return Err("--fuel-latency-fuels must include at least one value".to_string());
+        }
+        if config.fuel_latency_check_intervals.is_empty() {
+            return Err(
+                "--fuel-latency-check-intervals must include at least one value".to_string(),
+            );
+        }
     }
 
     Ok(config)
@@ -1113,6 +1409,62 @@ fn parse_next_u64(
         .map_err(|_| format!("invalid {flag}: {value}"))
 }
 
+fn parse_next_u32(
+    flag: &str,
+    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+) -> Result<u32, String> {
+    let value = parse_next_string(flag, args)?;
+    value
+        .parse::<u32>()
+        .map_err(|_| format!("invalid {flag}: {value}"))
+}
+
+fn parse_csv_u64_list(flag: &str, raw: &str) -> Result<Vec<u64>, String> {
+    let mut values = Vec::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            return Err(format!("{flag} contains an empty list element: '{raw}'"));
+        }
+        let parsed = trimmed
+            .parse::<u64>()
+            .map_err(|_| format!("invalid {flag}: {trimmed}"))?;
+        if parsed == 0 {
+            return Err(format!("{flag} values must be > 0"));
+        }
+        if !values.contains(&parsed) {
+            values.push(parsed);
+        }
+    }
+    if values.is_empty() {
+        return Err(format!("{flag} must include at least one value"));
+    }
+    Ok(values)
+}
+
+fn parse_csv_u32_list(flag: &str, raw: &str) -> Result<Vec<u32>, String> {
+    let mut values = Vec::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            return Err(format!("{flag} contains an empty list element: '{raw}'"));
+        }
+        let parsed = trimmed
+            .parse::<u32>()
+            .map_err(|_| format!("invalid {flag}: {trimmed}"))?;
+        if parsed == 0 {
+            return Err(format!("{flag} values must be > 0"));
+        }
+        if !values.contains(&parsed) {
+            values.push(parsed);
+        }
+    }
+    if values.is_empty() {
+        return Err(format!("{flag} must include at least one value"));
+    }
+    Ok(values)
+}
+
 fn env_flag(name: &str) -> bool {
     env::var(name)
         .map(|value| {
@@ -1132,6 +1484,12 @@ fn print_help() {
         "  --request-timeout-ms <MS>         Per-request timeout (default: 10000)\n",
         "  --startup-timeout-ms <MS>         Proxy readiness timeout (default: 15000)\n",
         "  --memory-sample-interval-ms <MS>  RSS sample interval (default: 100)\n",
+        "  --vm-fuel <UNITS>                 Enable cooperative VM fuel slices (default: 50000)\n",
+        "  --no-vm-fuel                      Disable VM fuel slices\n",
+        "  --vm-fuel-check-interval <OPS>    Fuel check interval for proxy VM (default: 32)\n",
+        "  --fuel-latency-sweep              Run latency sweeps for fuel and fuel-check-interval (defaults to scenario no_host_calls_program)\n",
+        "  --fuel-latency-fuels <CSV>        CSV list for fuel sweep; must be > 0 (default starts at 1)\n",
+        "  --fuel-latency-check-intervals <CSV> CSV list for check-interval sweep; must be > 0 (default starts at 1)\n",
         "  --binary <PATH>                   Explicit pd-edge-http-proxy binary path\n",
         "  --json-out <PATH>                 Write JSON report to path\n",
         "  --scenario <ID>                   Run a single scenario id (raw_no_program | no_host_calls_program | host_calls_terminate)\n",

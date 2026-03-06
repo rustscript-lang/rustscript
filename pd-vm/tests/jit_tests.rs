@@ -171,13 +171,10 @@ fn trace_jit_native_path_honors_fuel_metering() {
         .expect("fuel interval update should succeed");
     vm.set_fuel(12);
 
-    let err = vm
+    let status = vm
         .run()
-        .expect_err("run should stop when fuel is exhausted");
-    assert!(
-        matches!(err, vm::VmError::OutOfFuel { .. }),
-        "expected out-of-fuel, got {err:?}"
-    );
+        .expect("run should cooperatively yield when fuel is exhausted");
+    assert_eq!(status, VmStatus::Yielded);
     if native_jit_supported() {
         assert!(
             vm.jit_native_exec_count() > 0,

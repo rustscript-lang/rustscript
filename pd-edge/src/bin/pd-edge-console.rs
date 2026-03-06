@@ -8,8 +8,8 @@ use std::{
 use axum::http::HeaderMap;
 use edge::{
     ActiveControlPlaneConfig, ProxyVmContext, SharedProxyVmContext, SharedState, SharedVmAsyncOps,
-    VmAsyncOpBridge, apply_program_from_bytes, compile_edge_source_file, init_logging,
-    new_shared_vm_async_ops, register_host_module, spawn_active_control_plane_client,
+    VmAsyncOpBridge, VmExecutionConfig, apply_program_from_bytes, compile_edge_source_file,
+    init_logging, new_shared_vm_async_ops, register_host_module, spawn_active_control_plane_client,
 };
 use tracing::info;
 use uuid::Uuid;
@@ -38,7 +38,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("{}", binary_version_text());
 
     let max_program_bytes = cli.max_program_bytes.unwrap_or(1024 * 1024);
-    let state = SharedState::new(max_program_bytes);
+    let vm_execution = VmExecutionConfig {
+        fuel_per_yield: cli.vm_fuel,
+        fuel_check_interval: cli.vm_fuel_check_interval.unwrap_or(1),
+    };
+    let state = SharedState::new(max_program_bytes).with_vm_execution_config(vm_execution);
+    if let Some(fuel_per_yield) = vm_execution.fuel_per_yield {
+        info!(
+            "vm cooperative scheduling enabled fuel_per_yield={} fuel_check_interval={}",
+            fuel_per_yield, vm_execution.fuel_check_interval
+        );
+    }
 
     let active_control_url = cli.control_plane_url.clone();
     let edge_id_path = cli
@@ -83,6 +93,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct CliArgs {
     program_path: Option<PathBuf>,
     max_program_bytes: Option<usize>,
+    vm_fuel: Option<u64>,
+    vm_fuel_check_interval: Option<u32>,
     control_plane_url: Option<String>,
     edge_id: Option<String>,
     edge_name: Option<String>,
@@ -124,6 +136,26 @@ where
                         .parse::<usize>()
                         .map_err(|_| format!("invalid --max-program-bytes: {value}"))?,
                 );
+            }
+            "--vm-fuel" => {
+                let value = next_arg_value("--vm-fuel", &mut args)?;
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --vm-fuel: {value}"))?;
+                if parsed == 0 {
+                    return Err("--vm-fuel must be > 0".to_string());
+                }
+                cli.vm_fuel = Some(parsed);
+            }
+            "--vm-fuel-check-interval" => {
+                let value = next_arg_value("--vm-fuel-check-interval", &mut args)?;
+                let parsed = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid --vm-fuel-check-interval: {value}"))?;
+                if parsed == 0 {
+                    return Err("--vm-fuel-check-interval must be > 0".to_string());
+                }
+                cli.vm_fuel_check_interval = Some(parsed);
             }
             "--control-plane-url" => {
                 cli.control_plane_url = Some(next_arg_value("--control-plane-url", &mut args)?);
@@ -181,6 +213,8 @@ fn print_cli_help() {
         "Options:\n",
         "  --program <PATH>                          Optional local program source/.vmbc to load at startup\n",
         "  --max-program-bytes <BYTES>               Max upload/program size in bytes (default: 1048576)\n",
+        "  --vm-fuel <UNITS>                         Enable cooperative VM fuel slices per run\n",
+        "  --vm-fuel-check-interval <OPS>            Fuel check interval when --vm-fuel is enabled (default: 1)\n",
         "  --control-plane-url <URL>                 Enable active control-plane RPC client\n",
         "  --edge-id <UUID>                          Explicit edge UUID used by active control-plane client\n",
         "  --edge-name <NAME>                        Friendly edge name (default: hostname)\n",
@@ -339,6 +373,10 @@ async fn run_loaded_program_once(state: &SharedState) -> Result<(), Box<dyn std:
     let async_ops = new_shared_vm_async_ops();
     let mut vm = Vm::new_shared(loaded.program.clone());
     vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));
+    if let Some(fuel) = state.vm_execution.fuel_per_yield {
+        vm.set_fuel_check_interval(state.vm_execution.fuel_check_interval)?;
+        vm.set_fuel(fuel);
+    }
 
     register_host_module(&mut vm, context, async_ops.clone())?;
     register_console_host_module(&mut vm, async_ops)?;
@@ -350,6 +388,11 @@ async fn run_loaded_program_once(state: &SharedState) -> Result<(), Box<dyn std:
                 break;
             }
             Ok(VmStatus::Yielded) => {
+                if let Some(fuel) = state.vm_execution.fuel_per_yield
+                    && vm.get_fuel() == Some(0)
+                {
+                    vm.recharge_fuel(fuel)?;
+                }
                 tokio::task::yield_now().await;
             }
             Ok(VmStatus::Waiting(_op_id)) => {
@@ -701,6 +744,8 @@ mod tests {
             CliArgs {
                 program_path: Some(PathBuf::from("examples/demo.rss")),
                 max_program_bytes: Some(4096),
+                vm_fuel: None,
+                vm_fuel_check_interval: None,
                 control_plane_url: Some("http://127.0.0.1:9100".to_string()),
                 edge_id: Some("123e4567-e89b-12d3-a456-426614174000".to_string()),
                 edge_name: Some("console-edge".to_string()),
@@ -709,6 +754,30 @@ mod tests {
                 control_plane_rpc_timeout_ms: Some(3400),
             }
         );
+    }
+
+    #[test]
+    fn parse_cli_args_from_parses_vm_fuel_flags() {
+        let action = parse_cli_args_from([
+            "--vm-fuel".to_string(),
+            "1200".to_string(),
+            "--vm-fuel-check-interval".to_string(),
+            "4".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        let CliAction::Run(cli) = action else {
+            panic!("expected run action");
+        };
+        assert_eq!(cli.vm_fuel, Some(1200));
+        assert_eq!(cli.vm_fuel_check_interval, Some(4));
+    }
+
+    #[test]
+    fn parse_cli_args_from_rejects_zero_vm_fuel() {
+        let err = parse_cli_args_from(["--vm-fuel".to_string(), "0".to_string()])
+            .expect_err("zero vm fuel should fail");
+        assert!(err.contains("--vm-fuel must be > 0"));
     }
 
     #[test]

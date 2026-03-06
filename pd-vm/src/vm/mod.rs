@@ -340,7 +340,7 @@ enum VmHostFunction {
 
 pub struct Vm {
     program: Arc<Program>,
-    program_constants_ptr: *const Value,
+    program_constants_ptr: usize,
     program_constants_len: usize,
     program_cache_key: u64,
     program_cache_key_ready: bool,
@@ -464,7 +464,7 @@ impl Vm {
         let local_count = program.local_count;
         Self {
             program,
-            program_constants_ptr,
+            program_constants_ptr: program_constants_ptr as usize,
             program_constants_len,
             program_cache_key: 0,
             program_cache_key_ready: false,
@@ -881,6 +881,16 @@ impl Vm {
                     let outcome = match self.execute_jit_entry(trace_id) {
                         Ok(outcome) => outcome,
                         Err(err) => {
+                            if matches!(err, VmError::OutOfFuel { .. }) {
+                                // Fuel exhaustion is cooperative: surface as a yield so callers
+                                // can top up budget and resume without treating it as a hard fault.
+                                if self.handle_debugger_error(&mut debugger, &err) {
+                                    continue;
+                                }
+                                let status = VmStatus::Yielded;
+                                self.notify_debugger_status(&mut debugger, status);
+                                return Ok(status);
+                            }
                             if self.handle_debugger_error(&mut debugger, &err) {
                                 continue;
                             }
@@ -901,6 +911,16 @@ impl Vm {
             if self.fuel_enabled
                 && let Err(err) = self.charge_fuel_tick()
             {
+                if matches!(err, VmError::OutOfFuel { .. }) {
+                    // Fuel exhaustion is cooperative: surface as a yield so callers
+                    // can top up budget and resume without treating it as a hard fault.
+                    if self.handle_debugger_error(&mut debugger, &err) {
+                        continue;
+                    }
+                    let status = VmStatus::Yielded;
+                    self.notify_debugger_status(&mut debugger, status);
+                    return Ok(status);
+                }
                 if self.handle_debugger_error(&mut debugger, &err) {
                     continue;
                 }

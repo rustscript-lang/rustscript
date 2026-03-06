@@ -633,6 +633,113 @@ fn perf_manual_aes_128_cbc_rustscript_matches_in_interpreter_jit_and_aot() {
     }
 }
 
+#[test]
+#[ignore = "performance characterization test; run manually"]
+fn perf_cooperative_fuel_configuration_impacts_latency() {
+    const INNER_LOOP_ITERS: i64 = 25_000;
+    const OUTER_LOOPS: i64 = 4;
+    const TRIALS: usize = 5;
+    const FIXED_INTERVAL_FOR_FUEL_SWEEP: u32 = 1;
+    const FIXED_FUEL_FOR_INTERVAL_SWEEP: u64 = 4_096;
+
+    let source = format!(
+        r#"
+        let outer = 0;
+        let i = 0;
+        let sum = 0;
+        while outer < {OUTER_LOOPS} {{
+            i = 0;
+            while i < {INNER_LOOP_ITERS} {{
+                let a = i + 7;
+                let b = a - 3;
+                let c = b * 8;
+                let d = c / 8;
+                let e = d + i;
+                let n = 0 - e;
+                let p = 0 - n;
+                sum = sum + p;
+                i = i + 1;
+            }}
+            outer = outer + 1;
+        }}
+        sum;
+    "#
+    );
+
+    let compiled = compile_source(&source).expect("compile should succeed");
+    let expected_per_outer = INNER_LOOP_ITERS * INNER_LOOP_ITERS + 3 * INNER_LOOP_ITERS;
+    let expected = OUTER_LOOPS * expected_per_outer;
+
+    let baseline = sample_fuel_perf_median(
+        &compiled.program,
+        compiled.locals,
+        expected,
+        None,
+        1,
+        TRIALS,
+    );
+    println!(
+        "cooperative fuel baseline: fuel=disabled interval=n/a median_latency_us={} median_yields={} median_recharges={}",
+        baseline.elapsed.as_micros(),
+        baseline.yield_count,
+        baseline.recharge_count
+    );
+
+    let fuel_values = [
+        1_u64, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192,
+    ];
+    println!(
+        "cooperative fuel sweep: fixed_check_interval={} (fuel starts at 1)",
+        FIXED_INTERVAL_FOR_FUEL_SWEEP
+    );
+    for fuel in fuel_values {
+        let median = sample_fuel_perf_median(
+            &compiled.program,
+            compiled.locals,
+            expected,
+            Some(fuel),
+            FIXED_INTERVAL_FOR_FUEL_SWEEP,
+            TRIALS,
+        );
+        let slowdown = median.elapsed.as_secs_f64() / baseline.elapsed.as_secs_f64().max(1e-12);
+        println!(
+            "  fuel={} interval={} median_latency_us={} median_yields={} median_recharges={} slowdown_vs_no_fuel={:.2}x",
+            fuel,
+            FIXED_INTERVAL_FOR_FUEL_SWEEP,
+            median.elapsed.as_micros(),
+            median.yield_count,
+            median.recharge_count,
+            slowdown
+        );
+    }
+
+    let interval_values = [1_u32, 2, 4, 8, 16, 32, 64, 128, 256];
+    println!(
+        "cooperative interval sweep: fixed_fuel={} (check interval starts at 1)",
+        FIXED_FUEL_FOR_INTERVAL_SWEEP
+    );
+    for interval in interval_values {
+        let median = sample_fuel_perf_median(
+            &compiled.program,
+            compiled.locals,
+            expected,
+            Some(FIXED_FUEL_FOR_INTERVAL_SWEEP),
+            interval,
+            TRIALS,
+        );
+        let slowdown = median.elapsed.as_secs_f64() / baseline.elapsed.as_secs_f64().max(1e-12);
+        println!(
+            "  fuel={} interval={} median_latency_us={} median_yields={} median_recharges={} slowdown_vs_no_fuel={:.2}x",
+            FIXED_FUEL_FOR_INTERVAL_SWEEP,
+            interval,
+            median.elapsed.as_micros(),
+            median.yield_count,
+            median.recharge_count,
+            slowdown
+        );
+    }
+}
+
 fn native_jit_supported() -> bool {
     (cfg!(target_arch = "x86_64")
         && (cfg!(target_os = "windows") || (cfg!(unix) && !cfg!(target_os = "macos"))))
@@ -694,6 +801,115 @@ struct PerfRun {
 }
 
 fn median_duration(samples: &mut [std::time::Duration]) -> std::time::Duration {
+    samples.sort_unstable();
+    samples[samples.len() / 2]
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FuelPerfRun {
+    elapsed: std::time::Duration,
+    yield_count: u64,
+    recharge_count: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FuelPerfMedian {
+    elapsed: std::time::Duration,
+    yield_count: u64,
+    recharge_count: u64,
+}
+
+fn sample_fuel_perf_median(
+    program: &Program,
+    local_count: usize,
+    expected: i64,
+    fuel_per_yield: Option<u64>,
+    fuel_check_interval: u32,
+    trials: usize,
+) -> FuelPerfMedian {
+    let mut elapsed_samples = Vec::with_capacity(trials);
+    let mut yield_samples = Vec::with_capacity(trials);
+    let mut recharge_samples = Vec::with_capacity(trials);
+
+    for _ in 0..trials {
+        let run = run_sum_loop_with_cooperative_fuel(
+            program,
+            local_count,
+            expected,
+            fuel_per_yield,
+            fuel_check_interval,
+        );
+        elapsed_samples.push(run.elapsed);
+        yield_samples.push(run.yield_count);
+        recharge_samples.push(run.recharge_count);
+    }
+
+    FuelPerfMedian {
+        elapsed: median_duration(&mut elapsed_samples),
+        yield_count: median_u64(&mut yield_samples),
+        recharge_count: median_u64(&mut recharge_samples),
+    }
+}
+
+fn run_sum_loop_with_cooperative_fuel(
+    program: &Program,
+    local_count: usize,
+    expected: i64,
+    fuel_per_yield: Option<u64>,
+    fuel_check_interval: u32,
+) -> FuelPerfRun {
+    let mut vm = Vm::new(program.clone().with_local_count(local_count));
+    vm.set_jit_config(JitConfig {
+        enabled: false,
+        hot_loop_threshold: 1,
+        max_trace_len: 1_024,
+    });
+    if let Some(fuel) = fuel_per_yield {
+        vm.set_fuel_check_interval(fuel_check_interval)
+            .expect("fuel check interval should be valid");
+        vm.set_fuel(fuel);
+    }
+
+    let started = Instant::now();
+    let mut yield_count = 0_u64;
+    let mut recharge_count = 0_u64;
+    let max_yields = 5_000_000_u64;
+
+    loop {
+        let status = vm.run().expect("vm should run");
+        match status {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => {
+                yield_count = yield_count.saturating_add(1);
+                if yield_count > max_yields {
+                    panic!(
+                        "fuel configuration appears to make no forward progress: fuel_per_yield={fuel_per_yield:?}, fuel_check_interval={fuel_check_interval}"
+                    );
+                }
+                if let Some(fuel) = fuel_per_yield
+                    && vm.get_fuel() == Some(0)
+                {
+                    vm.recharge_fuel(fuel)
+                        .expect("fuel recharge should succeed");
+                    recharge_count = recharge_count.saturating_add(1);
+                }
+            }
+            VmStatus::Waiting(op_id) => {
+                panic!("unexpected waiting host op in perf loop: op_id={op_id}");
+            }
+        }
+    }
+
+    assert_eq!(vm.stack(), &[Value::Int(expected)]);
+
+    FuelPerfRun {
+        elapsed: started.elapsed(),
+        yield_count,
+        recharge_count,
+    }
+}
+
+fn median_u64(samples: &mut [u64]) -> u64 {
     samples.sort_unstable();
     samples[samples.len() / 2]
 }

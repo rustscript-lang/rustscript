@@ -180,6 +180,22 @@ Reported metrics per scenario include:
 - memory: process RSS `start/end/min/avg/max/peak`
 - status breakdown, request errors, throughput, and telemetry snapshot
 
+Fuel-impact latency sweep (fuel values start at `1` by default):
+
+```bash
+cargo run -p pd-edge --example http_proxy_perf_framework --release -- \
+  --fuel-latency-sweep \
+  --requests 3000 \
+  --warmup-requests 300 \
+  --concurrency 64 \
+  --json-out target/http_proxy_fuel_latency_sweep.json
+```
+
+You can override sweep vectors with:
+
+- `--fuel-latency-fuels "1,2,4,8,16,32,64,128,256,512,1024"`
+- `--fuel-latency-check-intervals "1,2,4,8,16,32,64,128"`
+
 ## ABI Source of Truth
 
 Host-call ABI metadata is centralized in `pd-edge-abi`:

@@ -5,8 +5,8 @@ use std::{
 };
 
 use edge::{
-    ActiveControlPlaneConfig, SharedState, build_admin_app, build_http_proxy_app, init_logging,
-    spawn_active_control_plane_client,
+    ActiveControlPlaneConfig, SharedState, VmExecutionConfig, build_admin_app,
+    build_http_proxy_app, init_logging, spawn_active_control_plane_client,
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -63,8 +63,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let poll_interval_ms = cli.control_plane_poll_interval_ms.unwrap_or(1_000);
     let request_timeout_ms = cli.control_plane_rpc_timeout_ms.unwrap_or(5_000);
+    let vm_execution = VmExecutionConfig {
+        fuel_per_yield: cli.vm_fuel,
+        fuel_check_interval: cli.vm_fuel_check_interval.unwrap_or(1),
+    };
 
-    let state = SharedState::new(max_program_bytes);
+    let state = SharedState::new(max_program_bytes).with_vm_execution_config(vm_execution);
+    if let Some(fuel_per_yield) = vm_execution.fuel_per_yield {
+        info!(
+            "vm cooperative scheduling enabled fuel_per_yield={} fuel_check_interval={}",
+            fuel_per_yield, vm_execution.fuel_check_interval
+        );
+    }
     if let Some(control_plane_url) = active_control_url {
         let edge_name = cli.edge_name.clone().unwrap_or_else(default_edge_name);
         let edge_id = resolve_edge_id(cli.edge_id.as_deref(), edge_id_path.as_path())?;
@@ -110,6 +120,8 @@ struct CliArgs {
     proxy_addr: Option<SocketAddr>,
     admin_addr: Option<SocketAddr>,
     max_program_bytes: Option<usize>,
+    vm_fuel: Option<u64>,
+    vm_fuel_check_interval: Option<u32>,
     control_plane_url: Option<String>,
     edge_id: Option<String>,
     edge_name: Option<String>,
@@ -172,6 +184,26 @@ where
                         .map_err(|_| format!("invalid --max-program-bytes: {value}"))?,
                 );
             }
+            "--vm-fuel" => {
+                let value = next_arg_value("--vm-fuel", &mut args)?;
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --vm-fuel: {value}"))?;
+                if parsed == 0 {
+                    return Err("--vm-fuel must be > 0".to_string());
+                }
+                cli.vm_fuel = Some(parsed);
+            }
+            "--vm-fuel-check-interval" => {
+                let value = next_arg_value("--vm-fuel-check-interval", &mut args)?;
+                let parsed = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid --vm-fuel-check-interval: {value}"))?;
+                if parsed == 0 {
+                    return Err("--vm-fuel-check-interval must be > 0".to_string());
+                }
+                cli.vm_fuel_check_interval = Some(parsed);
+            }
             "--edge-id" => {
                 cli.edge_id = Some(next_arg_value("--edge-id", &mut args)?);
             }
@@ -226,6 +258,8 @@ fn print_cli_help() {
         "  --data-addr <ADDR>                        Alias for --proxy-addr\n",
         "  --admin-addr <ADDR>                       Admin endpoint listen address (default: 127.0.0.1:8081)\n",
         "  --max-program-bytes <BYTES>               Max upload/program size in bytes (default: 1048576)\n",
+        "  --vm-fuel <UNITS>                         Enable cooperative VM fuel slices per request\n",
+        "  --vm-fuel-check-interval <OPS>            Fuel check interval when --vm-fuel is enabled (default: 1)\n",
         "  --control-plane-url <URL>                 Enable active control-plane RPC client\n",
         "  --edge-id <UUID>                          Explicit edge UUID used by active control-plane client\n",
         "  --edge-name <NAME>                        Friendly edge name (default: hostname)\n",
@@ -372,6 +406,8 @@ mod tests {
                 proxy_addr: Some("127.0.0.1:7001".parse().expect("valid addr")),
                 admin_addr: Some("127.0.0.1:7002".parse().expect("valid addr")),
                 max_program_bytes: Some(2048),
+                vm_fuel: None,
+                vm_fuel_check_interval: None,
                 control_plane_url: Some("http://127.0.0.1:9100".to_string()),
                 edge_id: Some("123e4567-e89b-12d3-a456-426614174000".to_string()),
                 edge_name: Some("test-edge".to_string()),
@@ -380,6 +416,30 @@ mod tests {
                 control_plane_rpc_timeout_ms: Some(2500),
             }
         );
+    }
+
+    #[test]
+    fn parse_cli_args_from_parses_vm_fuel_flags() {
+        let action = parse_cli_args_from([
+            "--vm-fuel".to_string(),
+            "1000".to_string(),
+            "--vm-fuel-check-interval".to_string(),
+            "8".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        let CliAction::Run(cli) = action else {
+            panic!("expected run action");
+        };
+        assert_eq!(cli.vm_fuel, Some(1000));
+        assert_eq!(cli.vm_fuel_check_interval, Some(8));
+    }
+
+    #[test]
+    fn parse_cli_args_from_rejects_zero_vm_fuel() {
+        let err = parse_cli_args_from(["--vm-fuel".to_string(), "0".to_string()])
+            .expect_err("zero vm fuel should fail");
+        assert!(err.contains("--vm-fuel must be > 0"));
     }
 
     #[test]

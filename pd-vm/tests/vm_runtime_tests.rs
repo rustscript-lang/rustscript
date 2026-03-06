@@ -320,16 +320,10 @@ fn fuel_budget_exhausts_and_recharge_allows_resume() {
     let mut vm = Vm::new(program);
     vm.set_fuel(2);
 
-    let err = vm
+    let status = vm
         .run()
-        .expect_err("run should stop once fuel reaches zero");
-    assert!(matches!(
-        err,
-        vm::VmError::OutOfFuel {
-            needed: 1,
-            remaining: 0
-        }
-    ));
+        .expect("run should cooperatively yield once fuel reaches zero");
+    assert_eq!(status, VmStatus::Yielded);
     assert_eq!(vm.get_fuel(), Some(0));
 
     vm.recharge_fuel(1).expect("recharge should succeed");
@@ -364,16 +358,10 @@ fn store_api_exposes_fuel_checkpoint_and_recharge() {
     store.set_fuel(1);
     let checkpoint = store.checkpoint();
 
-    let err = store
+    let status = store
         .run()
-        .expect_err("first run should stop when fuel is depleted");
-    assert!(matches!(
-        err,
-        vm::VmError::OutOfFuel {
-            needed: 1,
-            remaining: 0
-        }
-    ));
+        .expect("first run should cooperatively yield when fuel is depleted");
+    assert_eq!(status, VmStatus::Yielded);
     assert_eq!(store.get_fuel(), Some(0));
 
     store.recharge(1).expect("store recharge should succeed");
@@ -418,14 +406,10 @@ fn coarse_fuel_checking_trades_precision_for_overhead() {
         .expect("interval update should succeed");
     vm.set_fuel(2);
 
-    let err = vm.run().expect_err("vm should stop on batched fuel charge");
-    assert!(matches!(
-        err,
-        vm::VmError::OutOfFuel {
-            needed: 3,
-            remaining: 2
-        }
-    ));
+    let status = vm
+        .run()
+        .expect("vm should cooperatively yield on batched fuel charge");
+    assert_eq!(status, VmStatus::Yielded);
     assert_eq!(vm.get_fuel(), Some(0));
 
     vm.recharge_fuel(1).expect("recharge should succeed");

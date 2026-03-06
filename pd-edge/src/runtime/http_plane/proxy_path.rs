@@ -106,6 +106,7 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
             state.debug_session.clone(),
             debug,
             register_http_plane_host_module,
+            state.vm_execution,
         )
         .await
         {

@@ -27,6 +27,21 @@ const MAX_LATENCY_SAMPLES: usize = 4096;
 
 pub use http_plane::{build_admin_app, build_http_proxy_app};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VmExecutionConfig {
+    pub fuel_per_yield: Option<u64>,
+    pub fuel_check_interval: u32,
+}
+
+impl Default for VmExecutionConfig {
+    fn default() -> Self {
+        Self {
+            fuel_per_yield: None,
+            fuel_check_interval: 1,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SharedState {
     pub active_program: Arc<RwLock<Option<Arc<LoadedProgram>>>>,
@@ -34,6 +49,7 @@ pub struct SharedState {
     pub client: reqwest::Client,
     pub rate_limiter: SharedRateLimiter,
     pub debug_session: SharedDebugSession,
+    pub vm_execution: VmExecutionConfig,
     runtime_metrics: Arc<RuntimeMetrics>,
 }
 
@@ -88,8 +104,14 @@ impl SharedState {
             client: reqwest::Client::new(),
             rate_limiter: Arc::new(std::sync::Mutex::new(RateLimiterStore::new())),
             debug_session: new_debug_session_store(),
+            vm_execution: VmExecutionConfig::default(),
             runtime_metrics: Arc::new(RuntimeMetrics::default()),
         }
+    }
+
+    pub fn with_vm_execution_config(mut self, vm_execution: VmExecutionConfig) -> Self {
+        self.vm_execution = vm_execution;
+        self
     }
 
     pub fn record_data_plane_request(&self) {

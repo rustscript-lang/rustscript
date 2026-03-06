@@ -221,8 +221,9 @@ Fuel charging semantics:
   code at the configured check cadence.
 - With interval `> 1`, out-of-fuel detection is coarse-grained: execution may run up to
   `interval - 1` extra instructions before the next fuel check.
-- If there is not enough fuel, execution returns `VmError::OutOfFuel { needed, remaining }`
-  before the next instruction runs (instruction pointer is not advanced).
+- If there is not enough fuel, execution returns `VmStatus::Yielded` before the next instruction
+  runs (instruction pointer is not advanced). Top up fuel (`set_fuel` / `add_fuel`) and call
+  `run()` / `resume()` again.
 - `FuelCheckpoint` snapshots only fuel-accounting state (remaining budget, check interval, and
   current check-phase cursor). Restoring a checkpoint does not rewind VM stack, locals, or
   instruction pointer.
