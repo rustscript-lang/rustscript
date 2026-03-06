@@ -3,8 +3,8 @@ use io;
 
 assert(io::exists("stdlib/rss/strings.rss"));
 
-let handle = io::popen("echo rustscript_io_builtin", "r");
-let output = io::read_all(handle);
-let closed = io::close(handle);
+let mut handle = io::popen("echo rustscript_io_builtin", "r");
+let mut output = io::read_all(handle);
+let mut closed = io::close(handle);
 assert(closed);
 assert(string::contains(output, "rustscript_io_builtin"));

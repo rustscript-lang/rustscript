@@ -57,6 +57,38 @@ fn assignment_updates_existing_local_without_new_slot() {
 }
 
 #[test]
+fn non_rustscript_frontends_keep_mutable_bindings_by_default() {
+    let javascript = r#"
+        let a = 1;
+        a = 2;
+        a;
+    "#;
+    let lua = r#"
+        local a = 1
+        a = 2
+        a
+    "#;
+    let scheme = r#"
+        (define a 1)
+        (set! a 2)
+        a
+    "#;
+
+    let cases = [
+        (SourceFlavor::JavaScript, javascript),
+        (SourceFlavor::Lua, lua),
+        (SourceFlavor::Scheme, scheme),
+    ];
+    for (flavor, source) in cases {
+        let compiled = compile_source_with_flavor(source, flavor).expect("compile should succeed");
+        let mut vm = Vm::new(compiled.program);
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::Int(2)]);
+    }
+}
+
+#[test]
 fn compiler_reuses_slots_when_declared_locals_exceed_bytecode_limit() {
     let mut source = String::from("let out = 0;\n");
     for idx in 0..600usize {

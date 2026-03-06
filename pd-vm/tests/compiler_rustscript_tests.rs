@@ -132,7 +132,7 @@ fn rustscript_builtin_and_namespace_runtime_cases_work() {
                 let d = re::split("x", "aXb", "i");
                 let e = re::captures("^(foo)-([0-9]+)$", "FoO-42", "i");
 
-                let score = 0;
+                let mut score = 0;
                 if a {
                     score = score + 1;
                 }
@@ -283,7 +283,7 @@ fn rustscript_literal_and_slice_runtime_cases_work() {
         RuntimeCase {
             name: "array primitives are supported without namespace",
             source: r#"
-                let values = [];
+                let mut values = [];
                 values[values.length] = 7;
                 values[0] + values.length;
             "#,
@@ -360,7 +360,7 @@ fn closure_captures_outer_value_at_definition_time() {
     let case = RuntimeCase {
         name: "closure captures outer value at definition time",
         source: r#"
-            let base = 7;
+            let mut base = 7;
             let add = |value| value + base;
             base = 8;
             print!(add(5));
@@ -412,9 +412,23 @@ fn rustscript_closure_value_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
+            name: "closure capture can feed named function call",
+            source: r#"
+                fn add(value, delta) {
+                    value + delta;
+                }
+                let delta = 1;
+                let apply = |value| add(value, delta);
+                apply(41);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
+        },
+        RuntimeCase {
             name: "closure capture numeric field is copy by default",
             source: r#"
-                let p = { a: 1 };
+                let mut p = { a: 1 };
                 let f = |_| p.a + p.a;
                 f(0);
             "#,
@@ -447,7 +461,7 @@ fn rustscript_closure_value_runtime_cases_work() {
         RuntimeCase {
             name: "closure capture string concat with mut borrowed rhs is allowed",
             source: r#"
-                let p = { a: "x" };
+                let mut p = { a: "x" };
                 let f = |_| p.a + &mut p.a;
                 f(0);
             "#,
@@ -468,6 +482,17 @@ fn rustscript_closure_value_parse_rejection_cases_work() {
                 let p = { a: "x" };
                 let _moved = p.a;
                 let f = |_| p.a;
+                f(0);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["moved"],
+        },
+        ParseErrorCase {
+            name: "closure mut borrow still respects non numeric field move checks",
+            source: r#"
+                let mut p = { a: "x" };
+                let _moved = p.a;
+                let f = |_| &mut p.a;
                 f(0);
             "#,
             flavor: SourceFlavor::RustScript,
@@ -501,6 +526,40 @@ fn rustscript_closure_value_parse_rejection_cases_work() {
     ];
     for case in &cases {
         expect_parse_error_case(case);
+    }
+}
+
+#[test]
+fn rustscript_closure_captured_callable_invocation_is_rejected() {
+    let cases = vec![
+        SourceErrorCase {
+            name: "captured function-valued local cannot be invoked from closure body",
+            source: r#"
+                fn add_one(value) {
+                    value + 1;
+                }
+                let func = add_one;
+                let apply = |value| func(value);
+                apply(41);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::NonCallableLocal),
+            expected_contains_all: &[],
+        },
+        SourceErrorCase {
+            name: "captured closure-valued local cannot be invoked from closure body",
+            source: r#"
+                let inc = |x| x + 1;
+                let apply = |value| inc(value);
+                apply(41);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::NonCallableLocal),
+            expected_contains_all: &[],
+        },
+    ];
+    for case in &cases {
+        expect_source_error_case(case);
     }
 }
 
@@ -592,7 +651,7 @@ fn rustscript_move_and_alias_runtime_cases_work() {
         RuntimeCase {
             name: "non numeric field access can be borrowed with rust style mut ampersand",
             source: r#"
-                let p = { a: "x" };
+                let mut p = { a: "x" };
                 let first = &mut p.a;
                 let second = p.a;
                 first + second;
@@ -604,8 +663,35 @@ fn rustscript_move_and_alias_runtime_cases_work() {
         RuntimeCase {
             name: "non numeric field access can be borrowed with spaced mut ampersand",
             source: r#"
-                let p = { a: "x" };
+                let mut p = { a: "x" };
                 let first = & mut p.a;
+                let second = p.a;
+                first + second;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("xx".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "non numeric field access can be mut borrowed with parenthesized field",
+            source: r#"
+                let mut p = { a: "x" };
+                let first = &mut (p.a);
+                let second = p.a;
+                first + second;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("xx".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "non numeric field mut borrow can be passed through function call",
+            source: r#"
+                fn id(x) {
+                    x;
+                }
+                let mut p = { a: "x" };
+                let first = id(&mut p.a);
                 let second = p.a;
                 first + second;
             "#,
@@ -616,7 +702,7 @@ fn rustscript_move_and_alias_runtime_cases_work() {
         RuntimeCase {
             name: "moved field can be reinitialized with indexed assignment",
             source: r#"
-                let p = { a: "222", b: "666" };
+                let mut p = { a: "222", b: "666" };
                 let _moved = p.a;
                 p.a = "444";
                 let y = p.a;
@@ -629,8 +715,8 @@ fn rustscript_move_and_alias_runtime_cases_work() {
         RuntimeCase {
             name: "moved field reinitialized inside loop remains usable",
             source: r#"
-                let p = { a: "start" };
-                let i = 0;
+                let mut p = { a: "start" };
+                let mut i = 0;
                 while i < 2 {
                     let _moved = p.a;
                     p.a = "new";
@@ -645,8 +731,8 @@ fn rustscript_move_and_alias_runtime_cases_work() {
         RuntimeCase {
             name: "mutating after copy detach is allowed",
             source: r#"
-                let p = { a: 1 };
-                let q = p;
+                let mut p = { a: 1 };
+                let mut q = p;
                 q = q.copy();
                 p.a = 2;
                 p.a + q.a;
@@ -658,7 +744,7 @@ fn rustscript_move_and_alias_runtime_cases_work() {
         RuntimeCase {
             name: "reassigning collection breaks old alias for target local",
             source: r#"
-                let a = [1];
+                let mut a = [1];
                 let b = a;
                 a = [2];
                 a[0] = 3;
@@ -712,7 +798,7 @@ fn rustscript_move_and_alias_parse_rejection_cases_work() {
         ParseErrorCase {
             name: "mut borrowed field still respects prior move errors",
             source: r#"
-                let p = { a: "x" };
+                let mut p = { a: "x" };
                 let _moved = p.a;
                 let again = &mut p.a;
                 again;
@@ -721,10 +807,42 @@ fn rustscript_move_and_alias_parse_rejection_cases_work() {
             expected_contains_all: &["moved"],
         },
         ParseErrorCase {
+            name: "mut borrow rejects temporary expression target",
+            source: r#"
+                let value = &mut (1 + 2);
+                value;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["mutable borrow target"],
+        },
+        ParseErrorCase {
+            name: "mut borrow rejects readonly borrow expression target",
+            source: r#"
+                let p = { a: "x" };
+                let value = &mut &p.a;
+                value;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["mutable borrow target"],
+        },
+        ParseErrorCase {
+            name: "mut borrowed function argument still respects prior move errors",
+            source: r#"
+                fn id(x) {
+                    x;
+                }
+                let mut p = { a: "x" };
+                let _moved = p.a;
+                id(&mut p.a);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["moved"],
+        },
+        ParseErrorCase {
             name: "while loop repeated field move is rejected",
             source: r#"
                 let p = { a: "x" };
-                let i = 0;
+                let mut i = 0;
                 while i < 2 {
                     let _moved = p.a;
                     i = i + 1;
@@ -737,7 +855,7 @@ fn rustscript_move_and_alias_parse_rejection_cases_work() {
             name: "for loop repeated field move is rejected",
             source: r#"
                 let p = { a: "x" };
-                for (let i = 0; i < 2; i = i + 1) {
+                for (let mut i = 0; i < 2; i = i + 1) {
                     let _moved = p.a;
                 }
             "#,
@@ -762,7 +880,7 @@ fn rustscript_move_and_alias_parse_rejection_cases_work() {
             name: "continue path rechecks moved field on next iteration",
             source: r#"
                 let p = { a: "x" };
-                let i = 0;
+                let mut i = 0;
                 while i < 2 {
                     let _moved = p.a;
                     i = i + 1;
@@ -776,7 +894,7 @@ fn rustscript_move_and_alias_parse_rejection_cases_work() {
             name: "move in one loop branch is visible after loop",
             source: r#"
                 let p = { a: "x" };
-                let i = 0;
+                let mut i = 0;
                 while i < 2 {
                     if i == 0 {
                         let _moved = p.a;
@@ -805,7 +923,7 @@ fn rustscript_move_and_alias_parse_rejection_cases_work() {
         ParseErrorCase {
             name: "map mutation is rejected while collection alias exists",
             source: r#"
-                let p = { a: 1 };
+                let mut p = { a: 1 };
                 let q = p;
                 p.a = 2;
                 p.a + q.a;
@@ -816,7 +934,7 @@ fn rustscript_move_and_alias_parse_rejection_cases_work() {
         ParseErrorCase {
             name: "array mutation is rejected while collection alias exists",
             source: r#"
-                let a = [1];
+                let mut a = [1];
                 let b = a;
                 a[0] = 2;
                 a[0] + b[0];
@@ -827,9 +945,20 @@ fn rustscript_move_and_alias_parse_rejection_cases_work() {
         ParseErrorCase {
             name: "array append is rejected while collection alias exists",
             source: r#"
-                let a = [1];
+                let mut a = [1];
                 let b = a;
                 a[a.length] = 2;
+                b[0];
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["aliased", "a"],
+        },
+        ParseErrorCase {
+            name: "array mutation is rejected while mut borrow alias exists",
+            source: r#"
+                let mut a = [1];
+                let b = &mut a;
+                a[0] = 2;
                 b[0];
             "#,
             flavor: SourceFlavor::RustScript,
@@ -841,13 +970,151 @@ fn rustscript_move_and_alias_parse_rejection_cases_work() {
                 fn id(x) {
                     x;
                 }
-                let a = [1];
+                let mut a = [1];
                 let b = id(a);
                 a[0] = 2;
                 a[0] + b[0];
             "#,
             flavor: SourceFlavor::RustScript,
             expected_contains_all: &["aliased", "a"],
+        },
+        ParseErrorCase {
+            name: "collection alias from passthrough mut borrow function is tracked",
+            source: r#"
+                fn id(x) {
+                    x;
+                }
+                let mut a = [1];
+                let b = id(&mut a);
+                a[0] = 2;
+                a[0] + b[0];
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["aliased", "a"],
+        },
+    ];
+    for case in &cases {
+        expect_parse_error_case(case);
+    }
+}
+
+#[test]
+fn rustscript_mutability_runtime_cases_work() {
+    let cases = vec![
+        RuntimeCase {
+            name: "mutable local assignment requires and supports let mut",
+            source: r#"
+                let mut value = 1;
+                value = value + 1;
+                value;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(2)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "mutable member assignment supports let mut binding",
+            source: r#"
+                let mut profile = { score: 1 };
+                profile.score = 2;
+                profile.score;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(2)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "mutable index assignment supports let mut binding",
+            source: r#"
+                let mut arr = [1];
+                arr[0] = 2;
+                arr[0];
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(2)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "mutable borrow requires mutable root binding and succeeds with let mut",
+            source: r#"
+                let mut p = { a: "x" };
+                let first = &mut p.a;
+                let second = p.a;
+                first + second;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("xx".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "for loop mutating iterator local supports let mut initializer",
+            source: r#"
+                let mut total = 0;
+                for (let mut i = 0; i < 3; i = i + 1) {
+                    total = total + i;
+                }
+                total;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(3)],
+            expected_locals: None,
+        },
+    ];
+    run_runtime_cases(&cases);
+}
+
+#[test]
+fn rustscript_mutability_parse_rejection_cases_work() {
+    let cases = vec![
+        ParseErrorCase {
+            name: "assignment to immutable local is rejected",
+            source: r#"
+                let value = 1;
+                value = 2;
+                value;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["immutable local", "let mut value"],
+        },
+        ParseErrorCase {
+            name: "member assignment through immutable local is rejected",
+            source: r#"
+                let profile = { score: 1 };
+                profile.score = 2;
+                profile.score;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["immutable local", "let mut profile"],
+        },
+        ParseErrorCase {
+            name: "index assignment through immutable local is rejected",
+            source: r#"
+                let arr = [1];
+                arr[0] = 2;
+                arr[0];
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["immutable local", "let mut arr"],
+        },
+        ParseErrorCase {
+            name: "mutable borrow of immutable local is rejected",
+            source: r#"
+                let profile = { score: 1 };
+                let b = &mut profile.score;
+                b;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["immutable local", "let mut profile"],
+        },
+        ParseErrorCase {
+            name: "mutable borrow of immutable collection local is rejected",
+            source: r#"
+                let arr = [1];
+                let b = &mut arr;
+                b[0];
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["immutable local", "let mut arr"],
         },
     ];
     for case in &cases {
@@ -862,7 +1129,7 @@ fn liveness_clears_local_after_closure_value_last_use() {
             func(value);
         }
 
-        let closure = "stale";
+        let mut closure = "stale";
         let base = 1;
         closure = |x| x + base;
         let out = apply_once(closure, 41);
@@ -907,7 +1174,7 @@ fn liveness_clears_local_after_function_value_last_use() {
             func(value);
         }
 
-        let func = "stale";
+        let mut func = "stale";
         func = add_one;
         let out = apply_once(func, 41);
         out;
@@ -1015,7 +1282,7 @@ fn rustscript_if_and_match_runtime_cases_work() {
         RuntimeCase {
             name: "if expression assignment executes else branch",
             source: r#"
-                let marker = 0;
+                let mut marker = 0;
                 let out = if false => {
                     marker = 1;
                     10

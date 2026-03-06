@@ -123,6 +123,10 @@ pub(super) trait ParserDialect {
     fn allow_namespace_path_separator(&self) -> bool {
         true
     }
+
+    fn allow_let_mut_binding(&self) -> bool {
+        false
+    }
 }
 
 struct Lexer<'a> {
@@ -581,6 +585,7 @@ pub(super) struct Parser {
     closure_capture_contexts: Vec<ClosureCaptureContext>,
     allow_implicit_externs: bool,
     allow_implicit_semicolons: bool,
+    enforce_mutable_bindings: bool,
     dialect: &'static dyn ParserDialect,
     loop_depth: usize,
     function_body_depth: usize,
@@ -588,6 +593,7 @@ pub(super) struct Parser {
     host_namespace_aliases: HashMap<String, String>,
     vm_named_imports: HashMap<String, String>,
     vm_wildcard_import: bool,
+    mutable_locals: Vec<bool>,
 }
 
 struct ClosureCaptureContext {
@@ -601,6 +607,7 @@ impl Parser {
         source_id: SourceId,
         allow_implicit_externs: bool,
         allow_implicit_semicolons: bool,
+        enforce_mutable_bindings: bool,
         dialect: &'static dyn ParserDialect,
     ) -> Result<Self, ParseError> {
         let mut lexer = Lexer::new(source, source_id, dialect);
@@ -626,6 +633,7 @@ impl Parser {
             closure_capture_contexts: Vec::new(),
             allow_implicit_externs,
             allow_implicit_semicolons,
+            enforce_mutable_bindings,
             dialect,
             loop_depth: 0,
             function_body_depth: 0,
@@ -633,6 +641,7 @@ impl Parser {
             host_namespace_aliases: HashMap::new(),
             vm_named_imports: HashMap::new(),
             vm_wildcard_import: false,
+            mutable_locals: Vec::new(),
         })
     }
 
@@ -1224,7 +1233,12 @@ impl Parser {
 
     fn parse_let_with_terminator(&mut self, expect_terminator: bool) -> Result<Stmt, ParseError> {
         let line = self.last_line();
-        let name = self.expect_ident("expected identifier after 'let'")?;
+        let declared_mutable = self.dialect.allow_let_mut_binding() && self.match_ident_literal("mut");
+        let name = if declared_mutable {
+            self.expect_ident("expected identifier after 'let mut'")?
+        } else {
+            self.expect_ident("expected identifier after 'let'")?
+        };
         self.expect(&TokenKind::Equal, "expected '=' after identifier")?;
         let expr = self.parse_expr()?;
         if expect_terminator {
@@ -1238,16 +1252,19 @@ impl Parser {
                 .and_then(|scope| scope.get(&name))
                 .copied()
             {
+                self.apply_let_binding_mutability(index, declared_mutable, false);
                 return Ok(Stmt::Let { index, expr, line });
             }
             let index = self.allocate_hidden_local()?;
             if let Some(scope) = self.closure_scopes.last_mut() {
                 scope.insert(name, index);
             }
+            self.apply_let_binding_mutability(index, declared_mutable, true);
             return Ok(Stmt::Let { index, expr, line });
         }
 
-        let index = self.get_or_assign_local(&name)?;
+        let (index, created) = self.get_or_assign_local(&name)?;
+        self.apply_let_binding_mutability(index, declared_mutable, created);
         Ok(Stmt::Let { index, expr, line })
     }
 
@@ -1264,6 +1281,7 @@ impl Parser {
         }
 
         let index = self.get_local(&name)?;
+        self.require_local_mutable_for_operation(index, Some(name.as_str()), line, "assign to")?;
         Ok(Stmt::Assign { index, expr, line })
     }
 
@@ -1446,6 +1464,8 @@ impl Parser {
         if self.match_kind(&TokenKind::Ampersand) {
             if self.match_ident_literal("mut") {
                 let inner = self.parse_unary()?;
+                self.require_mut_borrow_target(&inner)?;
+                self.require_mut_borrow_binding_mutable(&inner)?;
                 return Ok(Expr::BorrowMut(Box::new(inner)));
             }
             let inner = self.parse_unary()?;
@@ -1464,6 +1484,133 @@ impl Parser {
         } else {
             self.parse_primary()
         }
+    }
+
+    fn require_mut_borrow_target(&self, expr: &Expr) -> Result<(), ParseError> {
+        if self.is_mut_borrow_target(expr) {
+            return Ok(());
+        }
+        Err(ParseError {
+            span: None,
+            code: None,
+            line: self.current_line(),
+            message:
+                "mutable borrow target must be a local, local field, or local index".to_string(),
+        })
+    }
+
+    fn is_mut_borrow_target(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Var(_) => true,
+            Expr::Call(index, args) => {
+                if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get)
+                    || args.len() != 2
+                {
+                    return false;
+                }
+                matches!(args.first(), Some(Expr::Var(_)))
+            }
+            _ => false,
+        }
+    }
+
+    fn require_mut_borrow_binding_mutable(&self, expr: &Expr) -> Result<(), ParseError> {
+        let Some(root_slot) = self.extract_mut_borrow_root_slot(expr) else {
+            return Ok(());
+        };
+        self.require_local_mutable_for_operation(
+            root_slot,
+            None,
+            self.current_line_u32(),
+            "take a mutable borrow of",
+        )
+    }
+
+    fn extract_mut_borrow_root_slot(&self, expr: &Expr) -> Option<LocalSlot> {
+        match expr {
+            Expr::Var(slot) => Some(*slot),
+            Expr::Call(index, args) => {
+                if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get)
+                    || args.len() != 2
+                {
+                    return None;
+                }
+                match args.first() {
+                    Some(Expr::Var(slot)) => Some(*slot),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn require_local_mutable_for_operation(
+        &self,
+        index: LocalSlot,
+        name_hint: Option<&str>,
+        line: u32,
+        action: &str,
+    ) -> Result<(), ParseError> {
+        if !self.enforce_mutable_bindings || self.is_local_slot_mutable(index) {
+            return Ok(());
+        }
+        let display = name_hint
+            .map(str::to_string)
+            .or_else(|| self.find_local_name_by_slot(index))
+            .unwrap_or_else(|| format!("#{index}"));
+        Err(ParseError {
+            span: None,
+            code: Some("E_IMMUTABLE_LOCAL".to_string()),
+            line: line as usize,
+            message: format!(
+                "cannot {action} immutable local '{display}'; declare it as 'let mut {display} = ...'"
+            ),
+        })
+    }
+
+    fn apply_let_binding_mutability(
+        &mut self,
+        index: LocalSlot,
+        declared_mutable: bool,
+        created: bool,
+    ) {
+        if !self.enforce_mutable_bindings {
+            return;
+        }
+        if created {
+            self.set_local_slot_mutable(index, declared_mutable);
+            return;
+        }
+        if declared_mutable {
+            self.set_local_slot_mutable(index, true);
+        }
+    }
+
+    fn is_local_slot_mutable(&self, index: LocalSlot) -> bool {
+        self.mutable_locals
+            .get(index as usize)
+            .copied()
+            .unwrap_or(true)
+    }
+
+    fn set_local_slot_mutable(&mut self, index: LocalSlot, is_mutable: bool) {
+        let slot = index as usize;
+        if slot >= self.mutable_locals.len() {
+            self.mutable_locals.resize(slot + 1, true);
+        }
+        self.mutable_locals[slot] = is_mutable;
+    }
+
+    fn find_local_name_by_slot(&self, index: LocalSlot) -> Option<String> {
+        for scope in self.closure_scopes.iter().rev() {
+            if let Some((name, _)) = scope.iter().find(|(_, slot)| **slot == index) {
+                return Some(name.clone());
+            }
+        }
+        self.locals
+            .iter()
+            .find(|(_, slot)| **slot == index)
+            .map(|(name, _)| name.clone())
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
@@ -2528,6 +2675,7 @@ impl Parser {
         }
 
         let index = self.get_local(&name)?;
+        self.require_local_mutable_for_operation(index, Some(name.as_str()), line, "mutate")?;
         let expr =
             self.build_builtin_call_expr(BuiltinFunction::Set, vec![Expr::Var(index), key, value])?;
         Ok(Stmt::Assign { index, expr, line })
@@ -2906,6 +3054,8 @@ impl Parser {
                     return Ok(captured_slot);
                 }
                 let captured_slot = self.allocate_hidden_local()?;
+                let source_mutable = self.is_local_slot_mutable(source_index);
+                self.set_local_slot_mutable(captured_slot, source_mutable);
                 self.closure_capture_contexts[capture_idx]
                     .by_name
                     .insert(name.to_string(), captured_slot);
@@ -3110,13 +3260,13 @@ impl Parser {
         Ok(decl)
     }
 
-    fn get_or_assign_local(&mut self, name: &str) -> Result<LocalSlot, ParseError> {
+    fn get_or_assign_local(&mut self, name: &str) -> Result<(LocalSlot, bool), ParseError> {
         if let Some(&index) = self.locals.get(name) {
-            return Ok(index);
+            return Ok((index, false));
         }
         let index = self.allocate_hidden_local()?;
         self.locals.insert(name.to_string(), index);
-        Ok(index)
+        Ok((index, true))
     }
 
     fn allocate_hidden_local(&mut self) -> Result<LocalSlot, ParseError> {
@@ -3127,6 +3277,7 @@ impl Parser {
             line: self.current_line(),
             message: "local index overflow".to_string(),
         })?;
+        self.mutable_locals.push(true);
         Ok(index)
     }
 

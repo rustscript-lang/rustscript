@@ -1,9 +1,9 @@
 // Iteration helpers implemented in pure RustScript.
 
 pub fn range_step(start, stop, step) {
-    let out = [];
+    let mut out = [];
     if step != 0 {
-        let value = start;
+        let mut value = start;
         if step > 0 {
             while value < stop {
                 out[(out).length] = value;
@@ -24,8 +24,8 @@ pub fn range(stop) {
 }
 
 pub fn enumerate(values) {
-    let out = [];
-    let index = 0;
+    let mut out = [];
+    let mut index = 0;
     while index < (values).length {
         out[(out).length] = [index, values[index]];
         index = index + 1;
@@ -34,7 +34,7 @@ pub fn enumerate(values) {
 }
 
 pub fn take(values, count) {
-    let out = [];
+    let mut out = [];
     if count > 0 {
         out = values[0:count];
     }
@@ -42,7 +42,7 @@ pub fn take(values, count) {
 }
 
 pub fn skip(values, count) {
-    let start = 0;
+    let mut start = 0;
     if count > 0 {
         start = count;
     }
@@ -53,12 +53,12 @@ pub fn skip(values, count) {
 }
 
 pub fn chunk(values, size) {
-    let out = [];
+    let mut out = [];
     if size > 0 {
-        let index = 0;
-        let value_len = (values).length;
+        let mut index = 0;
+        let mut value_len = (values).length;
         while index < value_len {
-            let next = index + size;
+            let mut next = index + size;
             if next > value_len {
                 next = value_len;
             }
@@ -70,8 +70,8 @@ pub fn chunk(values, size) {
 }
 
 pub fn sum(values) {
-    let out = 0;
-    let index = 0;
+    let mut out = 0;
+    let mut index = 0;
     while index < (values).length {
         out = out + values[index];
         index = index + 1;
@@ -80,8 +80,8 @@ pub fn sum(values) {
 }
 
 pub fn any_true(values) {
-    let out = false;
-    let index = 0;
+    let mut out = false;
+    let mut index = 0;
     while index < (values).length {
         if values[index] {
             out = true;
@@ -93,8 +93,8 @@ pub fn any_true(values) {
 }
 
 pub fn all_true(values) {
-    let out = true;
-    let index = 0;
+    let mut out = true;
+    let mut index = 0;
     while index < (values).length {
         if values[index] == false {
             out = false;
@@ -106,8 +106,8 @@ pub fn all_true(values) {
 }
 
 pub fn map(values, func) {
-    let out = [];
-    let index = 0;
+    let mut out = [];
+    let mut index = 0;
     while index < (values).length {
         out[(out).length] = func(values[index]);
         index = index + 1;
@@ -116,10 +116,10 @@ pub fn map(values, func) {
 }
 
 pub fn filter(values, pred) {
-    let out = [];
-    let index = 0;
+    let mut out = [];
+    let mut index = 0;
     while index < (values).length {
-        let value = values[index];
+        let mut value = values[index];
         if pred(value) {
             out[(out).length] = value;
         }
@@ -129,8 +129,8 @@ pub fn filter(values, pred) {
 }
 
 pub fn reduce(values, init, func) {
-    let acc = init;
-    let index = 0;
+    let mut acc = init;
+    let mut index = 0;
     while index < (values).length {
         acc = func(acc, values[index]);
         index = index + 1;
@@ -139,9 +139,9 @@ pub fn reduce(values, init, func) {
 }
 
 pub fn each(values, func) {
-    let index = 0;
+    let mut index = 0;
     while index < (values).length {
-        let each_result = func(values[index]);
+        let mut each_result = func(values[index]);
         index = index + 1;
     }
     null;

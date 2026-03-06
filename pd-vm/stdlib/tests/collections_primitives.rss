@@ -1,9 +1,9 @@
-let array_from_braces = {1, 2, 3};
+let mut array_from_braces = {1, 2, 3};
 assert(array_from_braces.length == 3);
 assert(array_from_braces[0] == 1);
 assert(array_from_braces[2] == 3);
 
-let values = [];
+let mut values = [];
 values[values.length] = 10;
 values[values.length] = 20;
 assert(values.length == 2);
@@ -11,7 +11,7 @@ assert(values[0] == 10);
 values[1] = values[1] + 5;
 assert(values[1] == 25);
 
-let map = {lang: "rss", score = 7};
+let mut map = {lang: "rss", score = 7};
 assert(map.lang == "rss");
 assert(map["score"] == 7);
 map.extra = "ok";

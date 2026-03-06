@@ -2,34 +2,34 @@
 use io;
 
 pub fn read_text(path) {
-    let handle = io::open(path, "r");
-    let out = io::read_all(handle);
-    let read_text_closed = io::close(handle);
+    let mut handle = io::open(path, "r");
+    let mut out = io::read_all(handle);
+    let mut read_text_closed = io::close(handle);
     out;
 }
 
 pub fn write_text(path, text) {
-    let handle = io::open(path, "w");
-    let written = io::write(handle, text);
-    let write_text_flushed = io::flush(handle);
-    let write_text_closed = io::close(handle);
+    let mut handle = io::open(path, "w");
+    let mut written = io::write(handle, text);
+    let mut write_text_flushed = io::flush(handle);
+    let mut write_text_closed = io::close(handle);
     written;
 }
 
 pub fn append_text(path, text) {
-    let handle = io::open(path, "a");
-    let written = io::write(handle, text);
-    let append_text_flushed = io::flush(handle);
-    let append_text_closed = io::close(handle);
+    let mut handle = io::open(path, "a");
+    let mut written = io::write(handle, text);
+    let mut append_text_flushed = io::flush(handle);
+    let mut append_text_closed = io::close(handle);
     written;
 }
 
 pub fn read_lines(path) {
-    let text = read_text(path);
-    let lines = [];
-    let text_len = (text).length;
-    let start = 0;
-    let index = 0;
+    let mut text = read_text(path);
+    let mut lines = [];
+    let mut text_len = (text).length;
+    let mut start = 0;
+    let mut index = 0;
     while index < text_len {
         if (text)[index:(index + 1)] == "\n" {
             lines[(lines).length] = (text)[start:index];

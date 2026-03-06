@@ -5,7 +5,11 @@ use crate::compiler::source_map::LoweredSource;
 
 struct RustScriptDialect;
 
-impl ParserDialect for RustScriptDialect {}
+impl ParserDialect for RustScriptDialect {
+    fn allow_let_mut_binding(&self) -> bool {
+        true
+    }
+}
 
 static RUSTSCRIPT_DIALECT: RustScriptDialect = RustScriptDialect;
 

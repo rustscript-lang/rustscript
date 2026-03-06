@@ -1,7 +1,7 @@
 // Numeric helpers implemented in pure RustScript.
 
 pub fn abs(value) {
-    let out = value;
+    let mut out = value;
     if value < 0 {
         out = -value;
     }
@@ -9,7 +9,7 @@ pub fn abs(value) {
 }
 
 pub fn min(lhs, rhs) {
-    let out = rhs;
+    let mut out = rhs;
     if lhs < rhs || lhs == rhs {
         out = lhs;
     }
@@ -17,7 +17,7 @@ pub fn min(lhs, rhs) {
 }
 
 pub fn max(lhs, rhs) {
-    let out = rhs;
+    let mut out = rhs;
     if lhs > rhs || lhs == rhs {
         out = lhs;
     }
@@ -25,7 +25,7 @@ pub fn max(lhs, rhs) {
 }
 
 pub fn clamp(value, lower, upper) {
-    let out = value;
+    let mut out = value;
     if value < lower {
         out = lower;
     } else if value > upper {
@@ -35,7 +35,7 @@ pub fn clamp(value, lower, upper) {
 }
 
 pub fn sign(value) {
-    let out = 0;
+    let mut out = 0;
     if value < 0 {
         out = -1;
     } else if value > 0 {
@@ -45,8 +45,8 @@ pub fn sign(value) {
 }
 
 pub fn in_range(value, lower, upper) {
-    let lower_ok = value > lower || value == lower;
-    let upper_ok = value < upper || value == upper;
+    let mut lower_ok = value > lower || value == lower;
+    let mut upper_ok = value < upper || value == upper;
     lower_ok && upper_ok;
 }
 
@@ -59,8 +59,8 @@ pub fn is_odd(value) {
 }
 
 pub fn sum(values) {
-    let out = 0;
-    let index = 0;
+    let mut out = 0;
+    let mut index = 0;
     while index < (values).length {
         out = out + values[index];
         index = index + 1;
@@ -69,10 +69,10 @@ pub fn sum(values) {
 }
 
 pub fn floor(value) {
-    let out = value;
-    let value_type = type(value);
+    let mut out = value;
+    let mut value_type = type(value);
     if value_type == "float" {
-        let remainder = value % 1;
+        let mut remainder = value % 1;
         if remainder == 0 {
             out = value;
         } else if value > 0 {
@@ -85,10 +85,10 @@ pub fn floor(value) {
 }
 
 pub fn ceil(value) {
-    let out = value;
-    let value_type = type(value);
+    let mut out = value;
+    let mut value_type = type(value);
     if value_type == "float" {
-        let remainder = value % 1;
+        let mut remainder = value % 1;
         if remainder == 0 {
             out = value;
         } else if value > 0 {

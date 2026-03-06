@@ -6,43 +6,43 @@ use re;
 use json;
 
 // Complex RustScript example with closure capture, stdlib module use, and host calls.
-let total = 0;
-for (let i = 0; i < 4; i = i + 1) {
+let mut total = 0;
+for (let mut i = 0; i < 4; i = i + 1) {
     total = total + i;
 }
 
-let total = if !string::non_empty("rustscript") => {
-    let zeroed = 0;
+let mut total = if !string::non_empty("rustscript") => {
+    let mut zeroed = 0;
     zeroed
 } else => {
-    let bumped = add_one(total);
+    let mut bumped = add_one(total);
     bumped
 };
 
-let base = 7;
-let add = |value| value + base;
-let base = 8;
-let closure_value = add(5);
+let mut base = 7;
+let mut add = |value| value + base;
+let mut base = 8;
+let mut closure_value = add(5);
 
-let profile = { stats: { score: closure_value } };
-let chained_score = profile?.stats?.score;
-let missing_score = profile?.missing?.value;
+let mut profile = { stats: { score: closure_value } };
+let mut chained_score = profile?.stats?.score;
+let mut missing_score = profile?.missing?.value;
 
-let matched = match chained_score {
+let mut matched = match chained_score {
     12 => closure_value,
     _ => 0,
 };
 
-let regex_ok = re::match("^rustscript$", "RUSTSCRIPT", "i");
-let payload = {
+let mut regex_ok = re::match("^rustscript$", "RUSTSCRIPT", "i");
+let mut payload = {
     lang: "rustscript",
     score: closure_value,
     matched: matched,
 };
-let payload_json = json::encode(payload);
-let payload_decoded = json::decode(payload_json);
-let json_score = payload_decoded.score;
-let io_ok = if false => {
+let mut payload_json = json::encode(payload);
+let mut payload_decoded = json::decode(payload_json);
+let mut json_score = payload_decoded.score;
+let mut io_ok = if false => {
     io::exists(".");
 } else => {
     true

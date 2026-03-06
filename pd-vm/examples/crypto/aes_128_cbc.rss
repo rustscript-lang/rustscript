@@ -5,7 +5,7 @@ fn modn(value, base) {
 }
 
 fn normalize_byte(value) {
-    let out = modn(value, 256);
+    let mut out = modn(value, 256);
     if out < 0 {
         out = out + 256;
     }
@@ -17,14 +17,14 @@ fn table_get(table, index) {
 }
 
 fn xor_byte(lhs, rhs) {
-    let a = normalize_byte(lhs);
-    let b = normalize_byte(rhs);
-    let out = 0;
-    let bit = 1;
-    let i = 0;
+    let mut a = normalize_byte(lhs);
+    let mut b = normalize_byte(rhs);
+    let mut out = 0;
+    let mut bit = 1;
+    let mut i = 0;
     while i < 8 {
-        let a_bit = modn(a, 2);
-        let b_bit = modn(b, 2);
+        let mut a_bit = modn(a, 2);
+        let mut b_bit = modn(b, 2);
         if a_bit != b_bit {
             out = out + bit;
         }
@@ -85,13 +85,13 @@ fn hex_digit_to_int_table() {
 }
 
 fn hex_to_bytes(text) {
-    let out = [];
-    let i = 0;
-    let n = (text).length;
-    let hex_lookup = hex_digit_to_int_table();
+    let mut out = [];
+    let mut i = 0;
+    let mut n = (text).length;
+    let mut hex_lookup = hex_digit_to_int_table();
     while i + 1 < n {
-        let hi = hex_lookup[(text)[i:(i + 1)]];
-        let lo = hex_lookup[(text)[(i + 1):(i + 2)]];
+        let mut hi = hex_lookup[(text)[i:(i + 1)]];
+        let mut lo = hex_lookup[(text)[(i + 1):(i + 2)]];
         out[(out).length] = hi * 16 + lo;
         i = i + 2;
     }
@@ -99,12 +99,12 @@ fn hex_to_bytes(text) {
 }
 
 fn bytes_to_hex(values) {
-    let out = "";
-    let hex_digits = hex_digit_text_table();
-    let i = 0;
-    let n = (values).length;
+    let mut out = "";
+    let mut hex_digits = hex_digit_text_table();
+    let mut i = 0;
+    let mut n = (values).length;
     while i < n {
-        let byte = normalize_byte(values[i]);
+        let mut byte = normalize_byte(values[i]);
         out = out + hex_digits[byte / 16];
         out = out + hex_digits[modn(byte, 16)];
         i = i + 1;
@@ -113,9 +113,9 @@ fn bytes_to_hex(values) {
 }
 
 fn append_array(dst, src) {
-    let out = dst;
-    let i = 0;
-    let n = (src).length;
+    let mut out = dst;
+    let mut i = 0;
+    let mut n = (src).length;
     while i < n {
         out[(out).length] = src[i];
         i = i + 1;
@@ -128,9 +128,9 @@ fn copy_array(values) {
 }
 
 fn add_round_key(state, expanded_key, round_index) {
-    let out = state;
-    let i = 0;
-    let base = round_index * 16;
+    let mut out = state;
+    let mut i = 0;
+    let mut base = round_index * 16;
     while i < 16 {
         out[i] = safe_xor(out[i], expanded_key[base + i]);
         i = i + 1;
@@ -139,8 +139,8 @@ fn add_round_key(state, expanded_key, round_index) {
 }
 
 fn sub_bytes(state, sbox) {
-    let out = state;
-    let i = 0;
+    let mut out = state;
+    let mut i = 0;
     while i < 16 {
         out[i] = table_get(sbox, out[i]);
         i = i + 1;
@@ -149,8 +149,8 @@ fn sub_bytes(state, sbox) {
 }
 
 fn inv_sub_bytes(state, inv_sbox) {
-    let out = state;
-    let i = 0;
+    let mut out = state;
+    let mut i = 0;
     while i < 16 {
         out[i] = table_get(inv_sbox, out[i]);
         i = i + 1;
@@ -159,7 +159,7 @@ fn inv_sub_bytes(state, inv_sbox) {
 }
 
 fn shift_rows(state) {
-    let out = state;
+    let mut out = state;
     out[0] = state[0];
     out[4] = state[4];
     out[8] = state[8];
@@ -180,7 +180,7 @@ fn shift_rows(state) {
 }
 
 fn inv_shift_rows(state) {
-    let out = state;
+    let mut out = state;
     out[0] = state[0];
     out[4] = state[4];
     out[8] = state[8];
@@ -201,31 +201,31 @@ fn inv_shift_rows(state) {
 }
 
 fn mix_columns(state, mul2, mul3) {
-    let out = state;
-    let col = 0;
+    let mut out = state;
+    let mut col = 0;
     while col < 4 {
-        let base = col * 4;
-        let a0 = state[base];
-        let a1 = state[base + 1];
-        let a2 = state[base + 2];
-        let a3 = state[base + 3];
+        let mut base = col * 4;
+        let mut a0 = state[base];
+        let mut a1 = state[base + 1];
+        let mut a2 = state[base + 2];
+        let mut a3 = state[base + 3];
 
-        let v0 = table_get(mul2, a0);
+        let mut v0 = table_get(mul2, a0);
         v0 = safe_xor(v0, table_get(mul3, a1));
         v0 = safe_xor(v0, a2);
         v0 = safe_xor(v0, a3);
 
-        let v1 = a0;
+        let mut v1 = a0;
         v1 = safe_xor(v1, table_get(mul2, a1));
         v1 = safe_xor(v1, table_get(mul3, a2));
         v1 = safe_xor(v1, a3);
 
-        let v2 = a0;
+        let mut v2 = a0;
         v2 = safe_xor(v2, a1);
         v2 = safe_xor(v2, table_get(mul2, a2));
         v2 = safe_xor(v2, table_get(mul3, a3));
 
-        let v3 = table_get(mul3, a0);
+        let mut v3 = table_get(mul3, a0);
         v3 = safe_xor(v3, a1);
         v3 = safe_xor(v3, a2);
         v3 = safe_xor(v3, table_get(mul2, a3));
@@ -240,31 +240,31 @@ fn mix_columns(state, mul2, mul3) {
 }
 
 fn inv_mix_columns(state, mul9, mul11, mul13, mul14) {
-    let out = state;
-    let col = 0;
+    let mut out = state;
+    let mut col = 0;
     while col < 4 {
-        let base = col * 4;
-        let a0 = state[base];
-        let a1 = state[base + 1];
-        let a2 = state[base + 2];
-        let a3 = state[base + 3];
+        let mut base = col * 4;
+        let mut a0 = state[base];
+        let mut a1 = state[base + 1];
+        let mut a2 = state[base + 2];
+        let mut a3 = state[base + 3];
 
-        let v0 = table_get(mul14, a0);
+        let mut v0 = table_get(mul14, a0);
         v0 = safe_xor(v0, table_get(mul11, a1));
         v0 = safe_xor(v0, table_get(mul13, a2));
         v0 = safe_xor(v0, table_get(mul9, a3));
 
-        let v1 = table_get(mul9, a0);
+        let mut v1 = table_get(mul9, a0);
         v1 = safe_xor(v1, table_get(mul14, a1));
         v1 = safe_xor(v1, table_get(mul11, a2));
         v1 = safe_xor(v1, table_get(mul13, a3));
 
-        let v2 = table_get(mul13, a0);
+        let mut v2 = table_get(mul13, a0);
         v2 = safe_xor(v2, table_get(mul9, a1));
         v2 = safe_xor(v2, table_get(mul14, a2));
         v2 = safe_xor(v2, table_get(mul11, a3));
 
-        let v3 = table_get(mul11, a0);
+        let mut v3 = table_get(mul11, a0);
         v3 = safe_xor(v3, table_get(mul13, a1));
         v3 = safe_xor(v3, table_get(mul9, a2));
         v3 = safe_xor(v3, table_get(mul14, a3));
@@ -280,30 +280,30 @@ fn inv_mix_columns(state, mul9, mul11, mul13, mul14) {
 
 fn expand_key_128(key_bytes, sbox) {
     assert((key_bytes).length == 16);
-    let expanded = [];
-    let i = 0;
+    let mut expanded = [];
+    let mut i = 0;
     while i < 16 {
         expanded[(expanded).length] = normalize_byte(key_bytes[i]);
         i = i + 1;
     }
 
-    let bytes_generated = 16;
-    let rcon = [0, 1, 2, 4, 8, 16, 32, 64, 128, 27, 54];
-    let rcon_index = 1;
-    let temp = [0, 0, 0, 0];
+    let mut bytes_generated = 16;
+    let mut rcon = [0, 1, 2, 4, 8, 16, 32, 64, 128, 27, 54];
+    let mut rcon_index = 1;
+    let mut temp = [0, 0, 0, 0];
 
     while bytes_generated < 176 {
-        let j = 0;
+        let mut j = 0;
         while j < 4 {
             temp[j] = expanded[bytes_generated - 4 + j];
             j = j + 1;
         }
 
         if modn(bytes_generated, 16) == 0 {
-            let t0 = temp[0];
-            let t1 = temp[1];
-            let t2 = temp[2];
-            let t3 = temp[3];
+            let mut t0 = temp[0];
+            let mut t1 = temp[1];
+            let mut t2 = temp[2];
+            let mut t3 = temp[3];
             temp[0] = table_get(sbox, t1);
             temp[1] = table_get(sbox, t2);
             temp[2] = table_get(sbox, t3);
@@ -312,9 +312,9 @@ fn expand_key_128(key_bytes, sbox) {
             rcon_index = rcon_index + 1;
         }
 
-        let k = 0;
+        let mut k = 0;
         while k < 4 {
-            let value = safe_xor(expanded[bytes_generated - 16], temp[k]);
+            let mut value = safe_xor(expanded[bytes_generated - 16], temp[k]);
             expanded[(expanded).length] = value;
             bytes_generated = bytes_generated + 1;
             k = k + 1;
@@ -325,10 +325,10 @@ fn expand_key_128(key_bytes, sbox) {
 }
 
 fn encrypt_block(block, expanded_key, sbox, mul2, mul3) {
-    let state = copy_array(block);
+    let mut state = copy_array(block);
     state = add_round_key(state, expanded_key, 0);
 
-    let round = 1;
+    let mut round = 1;
     while round < 10 {
         state = sub_bytes(state, sbox);
         state = shift_rows(state);
@@ -344,10 +344,10 @@ fn encrypt_block(block, expanded_key, sbox, mul2, mul3) {
 }
 
 fn decrypt_block(block, expanded_key, inv_sbox, mul9, mul11, mul13, mul14) {
-    let state = copy_array(block);
+    let mut state = copy_array(block);
     state = add_round_key(state, expanded_key, 10);
 
-    let round = 9;
+    let mut round = 9;
     while round > 0 {
         state = inv_shift_rows(state);
         state = inv_sub_bytes(state, inv_sbox);
@@ -363,9 +363,9 @@ fn decrypt_block(block, expanded_key, inv_sbox, mul9, mul11, mul13, mul14) {
 }
 
 fn pkcs7_pad(values) {
-    let out = copy_array(values);
-    let pad_len = 16 - modn((out).length, 16);
-    let i = 0;
+    let mut out = copy_array(values);
+    let mut pad_len = 16 - modn((out).length, 16);
+    let mut i = 0;
     while i < pad_len {
         out[(out).length] = pad_len;
         i = i + 1;
@@ -396,11 +396,11 @@ fn clamp_pkcs7_pad_len(pad_len) {
 }
 
 fn pkcs7_unpad(values) {
-    let out = copy_array(values);
-    let total = (out).length;
+    let mut out = copy_array(values);
+    let mut total = (out).length;
     if total > 0 {
-        let raw_pad_len = out[total - 1];
-        let pad_len = clamp_pkcs7_pad_len(raw_pad_len);
+        let mut raw_pad_len = out[total - 1];
+        let mut pad_len = clamp_pkcs7_pad_len(raw_pad_len);
         if pad_len > 0 {
             out = (out)[0:(total - pad_len)];
         }
@@ -412,24 +412,24 @@ fn aes_128_cbc_encrypt_bytes(plaintext, key_bytes, iv_bytes) {
     assert((key_bytes).length == 16);
     assert((iv_bytes).length == 16);
 
-    let sbox = sbox_table();
-    let mul2 = mul2_table();
-    let mul3 = mul3_table();
-    let expanded_key = expand_key_128(key_bytes, sbox);
+    let mut sbox = sbox_table();
+    let mut mul2 = mul2_table();
+    let mut mul3 = mul3_table();
+    let mut expanded_key = expand_key_128(key_bytes, sbox);
 
-    let padded = pkcs7_pad(plaintext);
-    let out = [];
-    let previous = copy_array(iv_bytes);
-    let offset = 0;
-    let total = (padded).length;
+    let mut padded = pkcs7_pad(plaintext);
+    let mut out = [];
+    let mut previous = copy_array(iv_bytes);
+    let mut offset = 0;
+    let mut total = (padded).length;
     while offset < total {
-        let block = (padded)[offset:(offset + 16)];
-        let i = 0;
+        let mut block = (padded)[offset:(offset + 16)];
+        let mut i = 0;
         while i < 16 {
             block[i] = safe_xor(block[i], previous[i]);
             i = i + 1;
         }
-        let encrypted = encrypt_block(block, expanded_key, sbox, mul2, mul3);
+        let mut encrypted = encrypt_block(block, expanded_key, sbox, mul2, mul3);
         out = append_array(out, encrypted);
         previous = copy_array(encrypted);
         offset = offset + 16;
@@ -442,22 +442,22 @@ fn aes_128_cbc_decrypt_bytes(ciphertext, key_bytes, iv_bytes) {
     assert((iv_bytes).length == 16);
     assert(modn((ciphertext).length, 16) == 0);
 
-    let sbox = sbox_table();
-    let inv_sbox = inv_sbox_table();
-    let mul9 = mul9_table();
-    let mul11 = mul11_table();
-    let mul13 = mul13_table();
-    let mul14 = mul14_table();
-    let expanded_key = expand_key_128(key_bytes, sbox);
+    let mut sbox = sbox_table();
+    let mut inv_sbox = inv_sbox_table();
+    let mut mul9 = mul9_table();
+    let mut mul11 = mul11_table();
+    let mut mul13 = mul13_table();
+    let mut mul14 = mul14_table();
+    let mut expanded_key = expand_key_128(key_bytes, sbox);
 
-    let out = [];
-    let previous = copy_array(iv_bytes);
-    let offset = 0;
-    let total = (ciphertext).length;
+    let mut out = [];
+    let mut previous = copy_array(iv_bytes);
+    let mut offset = 0;
+    let mut total = (ciphertext).length;
     while offset < total {
-        let block = (ciphertext)[offset:(offset + 16)];
-        let decrypted = decrypt_block(block, expanded_key, inv_sbox, mul9, mul11, mul13, mul14);
-        let i = 0;
+        let mut block = (ciphertext)[offset:(offset + 16)];
+        let mut decrypted = decrypt_block(block, expanded_key, inv_sbox, mul9, mul11, mul13, mul14);
+        let mut i = 0;
         while i < 16 {
             decrypted[i] = safe_xor(decrypted[i], previous[i]);
             i = i + 1;
@@ -470,17 +470,17 @@ fn aes_128_cbc_decrypt_bytes(ciphertext, key_bytes, iv_bytes) {
 }
 
 pub fn encrypt_cbc_hex(plaintext_hex, key_hex, iv_hex) {
-    let plaintext = hex_to_bytes(plaintext_hex);
-    let key_bytes = hex_to_bytes(key_hex);
-    let iv_bytes = hex_to_bytes(iv_hex);
-    let ciphertext = aes_128_cbc_encrypt_bytes(plaintext, key_bytes, iv_bytes);
+    let mut plaintext = hex_to_bytes(plaintext_hex);
+    let mut key_bytes = hex_to_bytes(key_hex);
+    let mut iv_bytes = hex_to_bytes(iv_hex);
+    let mut ciphertext = aes_128_cbc_encrypt_bytes(plaintext, key_bytes, iv_bytes);
     bytes_to_hex(ciphertext);
 }
 
 pub fn decrypt_cbc_hex(ciphertext_hex, key_hex, iv_hex) {
-    let ciphertext = hex_to_bytes(ciphertext_hex);
-    let key_bytes = hex_to_bytes(key_hex);
-    let iv_bytes = hex_to_bytes(iv_hex);
-    let plaintext = aes_128_cbc_decrypt_bytes(ciphertext, key_bytes, iv_bytes);
+    let mut ciphertext = hex_to_bytes(ciphertext_hex);
+    let mut key_bytes = hex_to_bytes(key_hex);
+    let mut iv_bytes = hex_to_bytes(iv_hex);
+    let mut plaintext = aes_128_cbc_decrypt_bytes(ciphertext, key_bytes, iv_bytes);
     bytes_to_hex(plaintext);
 }

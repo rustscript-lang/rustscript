@@ -1,7 +1,7 @@
 // String helpers implemented in pure RustScript using language syntax.
 
 fn is_whitespace(ch) {
-    let is_whitespace_value = false;
+    let mut is_whitespace_value = false;
     if ch == " " {
         is_whitespace_value = true;
     }
@@ -30,15 +30,15 @@ pub fn non_empty(value) {
 }
 
 pub fn contains(haystack, needle) {
-    let contains_haystack_len = (haystack).length;
-    let contains_needle_len = (needle).length;
-    let contains_found = false;
+    let mut contains_haystack_len = (haystack).length;
+    let mut contains_needle_len = (needle).length;
+    let mut contains_found = false;
     if contains_needle_len == 0 {
         contains_found = true;
     }
     if contains_needle_len > 0 {
-        let contains_limit = contains_haystack_len - contains_needle_len + 1;
-        let contains_index = 0;
+        let mut contains_limit = contains_haystack_len - contains_needle_len + 1;
+        let mut contains_index = 0;
         while contains_index < contains_limit {
             if equals((haystack)[contains_index:(contains_index + contains_needle_len)], needle) {
                 contains_found = true;
@@ -51,19 +51,19 @@ pub fn contains(haystack, needle) {
 }
 
 pub fn split(value, separator) {
-    let split_output = [];
-    let split_value_len = (value).length;
-    let split_separator_len = (separator).length;
+    let mut split_output = [];
+    let mut split_value_len = (value).length;
+    let mut split_separator_len = (separator).length;
     if split_separator_len == 0 {
-        let split_char_index = 0;
+        let mut split_char_index = 0;
         while split_char_index < split_value_len {
             split_output[(split_output).length] = (value)[split_char_index:(split_char_index + 1)];
             split_char_index = split_char_index + 1;
         }
     } else {
-        let split_cursor = 0;
-        let split_part_start = 0;
-        let split_limit = split_value_len - split_separator_len + 1;
+        let mut split_cursor = 0;
+        let mut split_part_start = 0;
+        let mut split_limit = split_value_len - split_separator_len + 1;
         while split_cursor < split_limit {
             if equals((value)[split_cursor:(split_cursor + split_separator_len)], separator) {
                 split_output[(split_output).length] =
@@ -81,8 +81,8 @@ pub fn split(value, separator) {
 }
 
 pub fn trim(value) {
-    let trim_len = (value).length;
-    let trim_start = 0;
+    let mut trim_len = (value).length;
+    let mut trim_start = 0;
     while trim_start < trim_len {
         if is_whitespace((value)[trim_start:(trim_start + 1)]) {
             trim_start = trim_start + 1;
@@ -91,7 +91,7 @@ pub fn trim(value) {
         }
     }
 
-    let trim_end = trim_len;
+    let mut trim_end = trim_len;
     while trim_end > trim_start {
         if is_whitespace((value)[(trim_end - 1):trim_end]) {
             trim_end = trim_end - 1;
@@ -103,12 +103,12 @@ pub fn trim(value) {
 }
 
 pub fn replace(value, needle, replacement) {
-    let replace_value_len = (value).length;
-    let replace_needle_len = (needle).length;
-    let replace_result = value;
+    let mut replace_value_len = (value).length;
+    let mut replace_needle_len = (needle).length;
+    let mut replace_result = value;
     if replace_needle_len > 0 {
-        let replace_index = 0;
-        let replace_output = "";
+        let mut replace_index = 0;
+        let mut replace_output = "";
         while replace_index < replace_value_len {
             if replace_index + replace_needle_len > replace_value_len {
                 replace_output = replace_output + (value)[replace_index:(replace_index + 1)];

@@ -11,12 +11,12 @@ assert(contains("hello", "zzz") == false);
 assert(equals(trim("  rustscript\n"), "rustscript"));
 assert(equals(replace("go gopher go", "go", "rs"), "rs rspher rs"));
 
-let parts = split("a,b,c", ",");
+let mut parts = split("a,b,c", ",");
 assert(parts.length == 3);
 assert(equals(parts[0], "a"));
 assert(equals(parts[2], "c"));
 
-let chars = split("ab", "");
+let mut chars = split("ab", "");
 assert(chars.length == 2);
 assert(equals(chars[0], "a"));
 assert(equals(chars[1], "b"));

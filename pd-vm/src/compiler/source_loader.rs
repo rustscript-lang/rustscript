@@ -1,13 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::builtins::is_builtin_namespace;
 use crate::compiler::source_map::SourceMap;
 
 use super::frontends::{is_ident_continue, is_ident_start};
 use super::{
     CompileSourceFileOptions, SourceError, SourceFlavor, SourcePathError, frontends,
-    ir::{Expr, FrontendIr, Stmt},
     linker::{ParsedUnit, sanitize_scope_prefix},
 };
 
@@ -68,23 +66,19 @@ pub(super) fn load_units_for_source_file(
         &collect_state.module_exports,
         options,
     )?;
-    let mut prelude = match flavor {
-        SourceFlavor::Scheme => build_scheme_import_prelude(
-            path,
-            &source,
-            &root_imports,
-            &collect_state.module_exports,
-            options,
-        )?,
-        SourceFlavor::Lua => build_lua_import_prelude(
-            path,
-            &source,
-            &root_imports,
-            &collect_state.module_exports,
-            options,
-        )?,
-        SourceFlavor::RustScript | SourceFlavor::JavaScript => {
-            let mut generated = build_rustscript_import_prelude(
+    let root_parse_source = match flavor {
+        SourceFlavor::Scheme => {
+            let mut prelude = build_scheme_import_prelude(
+                path,
+                &root_imports,
+                &collect_state.module_exports,
+                options,
+            )?;
+            prelude.push_str(&rewritten_root.source);
+            prelude
+        }
+        SourceFlavor::RustScript | SourceFlavor::JavaScript | SourceFlavor::Lua => {
+            let mut prelude = build_rustscript_import_prelude(
                 path,
                 &root_imports,
                 &collect_state.module_exports,
@@ -94,189 +88,27 @@ pub(super) fn load_units_for_source_file(
                 && rewritten_root.requires_vm_namespace
                 && !vm_namespace_direct_calls_supported(&root_imports)
             {
-                generated.push_str("use vm;\n");
+                prelude.push_str("use vm;\n");
             }
-            generated
+            prelude.push_str(&rewritten_root.source);
+            prelude
         }
     };
-    let prelude_line_count = count_lines(&prelude);
-    prelude.push_str(&rewritten_root.source);
-    let root_parse_source = prelude;
 
     let mut root_source_map = SourceMap::new();
     let root_source_id =
         root_source_map.add_source(path.display().to_string(), root_parse_source.clone());
-    let mut root_parsed = frontends::parse_source(&root_parse_source, flavor)
+    let root_parsed = frontends::parse_source(&root_parse_source, flavor)
         .map_err(|err| {
             SourceError::Parse(err.with_line_span_from_source(&root_source_map, root_source_id))
         })
         .map_err(SourcePathError::Source)?;
-    shift_frontend_ir_lines(&mut root_parsed, prelude_line_count);
     collect_state.units.push(ParsedUnit {
         parsed: root_parsed,
         scope_prefix: None,
     });
 
     Ok((root_parse_source, collect_state.units))
-}
-
-fn count_lines(text: &str) -> u32 {
-    if text.is_empty() {
-        0
-    } else {
-        text.lines().count() as u32
-    }
-}
-
-fn shift_frontend_ir_lines(ir: &mut FrontendIr, shift_down: u32) {
-    if shift_down == 0 {
-        return;
-    }
-    for stmt in &mut ir.stmts {
-        shift_stmt_lines(stmt, shift_down);
-    }
-    for function_impl in ir.function_impls.values_mut() {
-        for stmt in &mut function_impl.body_stmts {
-            shift_stmt_lines(stmt, shift_down);
-        }
-        shift_expr_lines(&mut function_impl.body_expr, shift_down);
-    }
-}
-
-fn shift_stmt_lines(stmt: &mut Stmt, shift_down: u32) {
-    match stmt {
-        Stmt::Noop { line }
-        | Stmt::ClosureLet { line, .. }
-        | Stmt::FuncDecl { line, .. }
-        | Stmt::Break { line }
-        | Stmt::Continue { line } => {
-            *line = shifted_line(*line, shift_down);
-        }
-        Stmt::Let { expr, line, .. }
-        | Stmt::Assign { expr, line, .. }
-        | Stmt::Expr { expr, line } => {
-            *line = shifted_line(*line, shift_down);
-            shift_expr_lines(expr, shift_down);
-        }
-        Stmt::IfElse {
-            condition,
-            then_branch,
-            else_branch,
-            line,
-        } => {
-            *line = shifted_line(*line, shift_down);
-            shift_expr_lines(condition, shift_down);
-            for nested in then_branch {
-                shift_stmt_lines(nested, shift_down);
-            }
-            for nested in else_branch {
-                shift_stmt_lines(nested, shift_down);
-            }
-        }
-        Stmt::For {
-            init,
-            condition,
-            post,
-            body,
-            line,
-        } => {
-            *line = shifted_line(*line, shift_down);
-            shift_stmt_lines(init, shift_down);
-            shift_expr_lines(condition, shift_down);
-            shift_stmt_lines(post, shift_down);
-            for nested in body {
-                shift_stmt_lines(nested, shift_down);
-            }
-        }
-        Stmt::While {
-            condition,
-            body,
-            line,
-        } => {
-            *line = shifted_line(*line, shift_down);
-            shift_expr_lines(condition, shift_down);
-            for nested in body {
-                shift_stmt_lines(nested, shift_down);
-            }
-        }
-    }
-}
-
-fn shift_expr_lines(expr: &mut Expr, shift_down: u32) {
-    match expr {
-        Expr::Call(_, args) | Expr::LocalCall(_, args) => {
-            for arg in args {
-                shift_expr_lines(arg, shift_down);
-            }
-        }
-        Expr::Closure(closure) => {
-            shift_expr_lines(&mut closure.body, shift_down);
-        }
-        Expr::ClosureCall(closure, args) => {
-            shift_expr_lines(&mut closure.body, shift_down);
-            for arg in args {
-                shift_expr_lines(arg, shift_down);
-            }
-        }
-        Expr::Add(lhs, rhs)
-        | Expr::Sub(lhs, rhs)
-        | Expr::Mul(lhs, rhs)
-        | Expr::Div(lhs, rhs)
-        | Expr::Mod(lhs, rhs)
-        | Expr::And(lhs, rhs)
-        | Expr::Or(lhs, rhs)
-        | Expr::Eq(lhs, rhs)
-        | Expr::Lt(lhs, rhs)
-        | Expr::Gt(lhs, rhs) => {
-            shift_expr_lines(lhs, shift_down);
-            shift_expr_lines(rhs, shift_down);
-        }
-        Expr::Neg(inner)
-        | Expr::Not(inner)
-        | Expr::ToOwned(inner)
-        | Expr::Borrow(inner)
-        | Expr::BorrowMut(inner) => {
-            shift_expr_lines(inner, shift_down);
-        }
-        Expr::IfElse {
-            condition,
-            then_expr,
-            else_expr,
-        } => {
-            shift_expr_lines(condition, shift_down);
-            shift_expr_lines(then_expr, shift_down);
-            shift_expr_lines(else_expr, shift_down);
-        }
-        Expr::Match {
-            value,
-            arms,
-            default,
-            ..
-        } => {
-            shift_expr_lines(value, shift_down);
-            for (_, arm_expr) in arms {
-                shift_expr_lines(arm_expr, shift_down);
-            }
-            shift_expr_lines(default, shift_down);
-        }
-        Expr::Block { stmts, expr } => {
-            for stmt in stmts {
-                shift_stmt_lines(stmt, shift_down);
-            }
-            shift_expr_lines(expr, shift_down);
-        }
-        Expr::Null
-        | Expr::Int(_)
-        | Expr::Float(_)
-        | Expr::Bool(_)
-        | Expr::String(_)
-        | Expr::FunctionRef(_)
-        | Expr::Var(_) => {}
-    }
-}
-
-fn shifted_line(line: u32, shift_down: u32) -> u32 {
-    line.saturating_sub(shift_down).max(1)
 }
 
 fn parse_module_imports(
@@ -308,9 +140,6 @@ fn parse_rustscript_imports(
             });
         }
         if !line.starts_with("use ") {
-            continue;
-        }
-        if is_builtin_namespace_use_directive_line(line) {
             continue;
         }
         let tail = line["use ".len()..].trim();
@@ -705,8 +534,6 @@ struct SchemeTopLevelForm {
     text: String,
     head: String,
     start_line: usize,
-    start_byte: usize,
-    end_byte: usize,
 }
 
 fn collect_scheme_top_level_forms(source: &str) -> Vec<SchemeTopLevelForm> {
@@ -781,8 +608,6 @@ fn collect_scheme_top_level_forms(source: &str) -> Vec<SchemeTopLevelForm> {
                         text,
                         head,
                         start_line,
-                        start_byte: start,
-                        end_byte: end,
                     });
                 }
             }
@@ -1201,7 +1026,7 @@ fn strip_import_directives(source: &str, flavor: SourceFlavor) -> String {
             .lines()
             .map(|line| {
                 if line.trim_start().starts_with("use ")
-                    && !is_preserved_rustscript_use_directive_line(line.trim_start())
+                    && !is_vm_use_directive_line(line.trim_start())
                 {
                     String::new()
                 } else {
@@ -1210,48 +1035,9 @@ fn strip_import_directives(source: &str, flavor: SourceFlavor) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n"),
-        SourceFlavor::Lua => strip_lua_import_directives(source),
-        SourceFlavor::Scheme => strip_scheme_import_directives(source),
-        SourceFlavor::JavaScript => source.to_string(),
+        SourceFlavor::Scheme => source.to_string(),
+        SourceFlavor::JavaScript | SourceFlavor::Lua => source.to_string(),
     }
-}
-
-fn strip_lua_import_directives(source: &str) -> String {
-    source
-        .lines()
-        .map(|raw_line| {
-            let line = raw_line.trim().trim_end_matches(';').trim();
-            if let Some((name, rhs)) = parse_lua_local_assignment(line)
-                && parse_lua_require_binding(name, rhs, 1).is_some()
-            {
-                return String::new();
-            }
-            if parse_require_spec(line).is_some() {
-                return String::new();
-            }
-            raw_line.to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn strip_scheme_import_directives(source: &str) -> String {
-    let mut bytes = source.as_bytes().to_vec();
-    for form in collect_scheme_top_level_forms(source) {
-        if form.head != "import" && form.head != "require" {
-            continue;
-        }
-        for byte in &mut bytes[form.start_byte..form.end_byte] {
-            if *byte != b'\n' && *byte != b'\r' {
-                *byte = b' ';
-            }
-        }
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-fn is_preserved_rustscript_use_directive_line(line: &str) -> bool {
-    is_vm_use_directive_line(line) || is_builtin_namespace_use_directive_line(line)
 }
 
 fn is_vm_use_directive_line(line: &str) -> bool {
@@ -1270,28 +1056,6 @@ fn is_vm_use_directive_line(line: &str) -> bool {
         return true;
     }
     directive_body.starts_with("vm::")
-}
-
-fn is_builtin_namespace_use_directive_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    if !trimmed.starts_with("use ") {
-        return false;
-    }
-    let Some((directive_body, _)) = trimmed["use ".len()..].split_once(';') else {
-        return false;
-    };
-    let directive_body = directive_body.trim();
-    if is_builtin_host_namespace_spec(directive_body) {
-        return true;
-    }
-    if let Some((root, alias)) = directive_body.rsplit_once(" as ") {
-        return is_builtin_host_namespace_spec(root.trim()) && is_valid_ident(alias.trim());
-    }
-    false
-}
-
-fn is_builtin_host_namespace_spec(spec: &str) -> bool {
-    is_builtin_namespace(spec)
 }
 
 fn vm_namespace_direct_calls_supported(imports: &[ModuleImport]) -> bool {
@@ -1419,569 +1183,22 @@ fn build_rustscript_import_prelude(
     Ok(prelude)
 }
 
-fn build_lua_import_prelude(
-    path: &Path,
-    source: &str,
-    imports: &[ModuleImport],
-    module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
-    options: &CompileSourceFileOptions,
-) -> Result<String, SourcePathError> {
-    let declared = collect_declared_import_functions(
-        path,
-        SourceFlavor::Lua,
-        source,
-        imports,
-        module_exports,
-        options,
-    )?;
-    let mut prelude = String::new();
-    if source_uses_print_call(source, SourceFlavor::Lua) {
-        prelude.push_str("declare print 1\n");
-    }
-    for (name, arity) in declared {
-        if let Some(arity) = arity {
-            prelude.push_str(&format!("declare {name} {arity}\n"));
-        } else {
-            prelude.push_str(&format!("declare {name}\n"));
-        }
-    }
-    Ok(prelude)
-}
-
 fn build_scheme_import_prelude(
     path: &Path,
-    source: &str,
     imports: &[ModuleImport],
     module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
     options: &CompileSourceFileOptions,
 ) -> Result<String, SourcePathError> {
-    let declared = collect_declared_import_functions(
-        path,
-        SourceFlavor::Scheme,
-        source,
-        imports,
-        module_exports,
-        options,
-    )?;
+    let declared = collect_imported_module_functions(path, imports, module_exports, options)?;
     let mut prelude = String::new();
-    if source_uses_print_call(source, SourceFlavor::Scheme) {
-        prelude.push_str("(declare (print value))\n");
-    }
     for (name, arity) in declared {
-        if let Some(arity) = arity {
-            let args = (0..arity)
-                .map(|idx| format!("arg{idx}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            prelude.push_str(&format!("(declare ({name} {args}))\n"));
-        } else {
-            prelude.push_str(&format!("(declare {name})\n"));
-        }
+        let args = (0..arity)
+            .map(|idx| format!("arg{idx}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        prelude.push_str(&format!("(declare ({name} {args}))\n"));
     }
     Ok(prelude)
-}
-
-fn collect_declared_import_functions(
-    path: &Path,
-    flavor: SourceFlavor,
-    source: &str,
-    imports: &[ModuleImport],
-    module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
-    options: &CompileSourceFileOptions,
-) -> Result<Vec<(String, Option<u8>)>, SourcePathError> {
-    let mut declared = HashMap::<String, Option<u8>>::new();
-
-    for import in imports {
-        if is_module_specifier(&import.spec) {
-            let resolved = resolve_module_path(path, &import.spec, options)?;
-            let Some(exports) = module_exports.get(&resolved) else {
-                return Err(SourcePathError::InvalidImportSyntax {
-                    path: path.to_path_buf(),
-                    line: import.line,
-                    message: format!("module '{}' did not load", import.spec),
-                });
-            };
-
-            match &import.clause {
-                ImportClause::AllPublic | ImportClause::Namespace(_) | ImportClause::Prefix(_) => {
-                    for (name, arity) in exports {
-                        merge_declared_arity(&mut declared, name.clone(), Some(*arity));
-                    }
-                }
-                ImportClause::Named(named) => {
-                    for binding in named {
-                        let arity = exports.get(&binding.imported).copied().ok_or_else(|| {
-                            SourcePathError::InvalidImportSyntax {
-                                path: path.to_path_buf(),
-                                line: import.line,
-                                message: format!(
-                                    "module '{}' has no public function '{}'",
-                                    import.spec, binding.imported
-                                ),
-                            }
-                        })?;
-                        merge_declared_arity(&mut declared, binding.imported.clone(), Some(arity));
-                    }
-                }
-            }
-            continue;
-        }
-
-        match &import.clause {
-            ImportClause::Named(named) => {
-                for binding in named {
-                    merge_declared_arity(&mut declared, binding.imported.clone(), None);
-                }
-            }
-            ImportClause::Namespace(namespace) => {
-                for member in collect_namespace_member_calls(source, flavor, namespace) {
-                    merge_declared_arity(&mut declared, member, None);
-                }
-            }
-            ImportClause::Prefix(prefix) => {
-                for member in collect_prefixed_call_targets(source, flavor, prefix) {
-                    merge_declared_arity(&mut declared, member, None);
-                }
-            }
-            ImportClause::AllPublic => {}
-        }
-    }
-
-    let mut out = declared.into_iter().collect::<Vec<_>>();
-    out.sort_by(|(lhs_name, _), (rhs_name, _)| lhs_name.cmp(rhs_name));
-    Ok(out)
-}
-
-fn merge_declared_arity(
-    declared: &mut HashMap<String, Option<u8>>,
-    name: String,
-    arity: Option<u8>,
-) {
-    declared
-        .entry(name)
-        .and_modify(|existing| {
-            *existing = match (*existing, arity) {
-                (Some(lhs), Some(rhs)) => Some(lhs.max(rhs)),
-                (Some(lhs), None) => Some(lhs),
-                (None, Some(rhs)) => Some(rhs),
-                (None, None) => None,
-            };
-        })
-        .or_insert(arity);
-}
-
-fn collect_namespace_member_calls(
-    source: &str,
-    flavor: SourceFlavor,
-    namespace: &str,
-) -> HashSet<String> {
-    if namespace.is_empty() {
-        return HashSet::new();
-    }
-    match flavor {
-        SourceFlavor::Lua => collect_lua_namespace_member_calls(source, namespace),
-        SourceFlavor::Scheme => collect_scheme_namespace_member_calls(source, namespace),
-        SourceFlavor::RustScript | SourceFlavor::JavaScript => HashSet::new(),
-    }
-}
-
-fn collect_prefixed_call_targets(
-    source: &str,
-    flavor: SourceFlavor,
-    prefix: &str,
-) -> HashSet<String> {
-    if prefix.is_empty() {
-        return HashSet::new();
-    }
-    match flavor {
-        SourceFlavor::Lua => collect_lua_prefixed_call_targets(source, prefix),
-        SourceFlavor::Scheme => collect_scheme_prefixed_call_targets(source, prefix),
-        SourceFlavor::RustScript | SourceFlavor::JavaScript => HashSet::new(),
-    }
-}
-
-fn source_uses_print_call(source: &str, flavor: SourceFlavor) -> bool {
-    match flavor {
-        SourceFlavor::Lua => source_uses_lua_function_call(source, "print"),
-        SourceFlavor::Scheme => collect_scheme_call_head_symbols(source)
-            .iter()
-            .any(|symbol| symbol == "print"),
-        SourceFlavor::RustScript | SourceFlavor::JavaScript => false,
-    }
-}
-
-fn source_uses_lua_function_call(source: &str, target: &str) -> bool {
-    let bytes = source.as_bytes();
-    let mut i = 0usize;
-    let mut string_delim: Option<u8> = None;
-    let mut escaped = false;
-    let mut in_line_comment = false;
-    let mut in_block_comment = false;
-
-    while i < bytes.len() {
-        let b = bytes[i];
-
-        if in_line_comment {
-            if b == b'\n' {
-                in_line_comment = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if in_block_comment {
-            if b == b']' && i + 1 < bytes.len() && bytes[i + 1] == b']' {
-                in_block_comment = false;
-                i += 2;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-
-        if let Some(delim) = string_delim {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == delim {
-                string_delim = None;
-            }
-            i += 1;
-            continue;
-        }
-
-        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-            if i + 3 < bytes.len() && bytes[i + 2] == b'[' && bytes[i + 3] == b'[' {
-                in_block_comment = true;
-                i += 4;
-                continue;
-            }
-            in_line_comment = true;
-            i += 2;
-            continue;
-        }
-
-        if b == b'"' || b == b'\'' {
-            string_delim = Some(b);
-            escaped = false;
-            i += 1;
-            continue;
-        }
-
-        if !is_ident_start(b as char) {
-            i += 1;
-            continue;
-        }
-
-        let ident_start = i;
-        i += 1;
-        while i < bytes.len() && is_ident_continue(bytes[i] as char) {
-            i += 1;
-        }
-        if &source[ident_start..i] != target {
-            continue;
-        }
-        let mut cursor = i;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if cursor < bytes.len() && bytes[cursor] == b'(' {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn collect_lua_namespace_member_calls(source: &str, namespace: &str) -> HashSet<String> {
-    let bytes = source.as_bytes();
-    let mut out = HashSet::new();
-    let mut i = 0usize;
-    let mut string_delim: Option<u8> = None;
-    let mut escaped = false;
-    let mut in_line_comment = false;
-    let mut in_block_comment = false;
-
-    while i < bytes.len() {
-        let b = bytes[i];
-
-        if in_line_comment {
-            if b == b'\n' {
-                in_line_comment = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if in_block_comment {
-            if b == b']' && i + 1 < bytes.len() && bytes[i + 1] == b']' {
-                in_block_comment = false;
-                i += 2;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-
-        if let Some(delim) = string_delim {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == delim {
-                string_delim = None;
-            }
-            i += 1;
-            continue;
-        }
-
-        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-            if i + 3 < bytes.len() && bytes[i + 2] == b'[' && bytes[i + 3] == b'[' {
-                in_block_comment = true;
-                i += 4;
-                continue;
-            }
-            in_line_comment = true;
-            i += 2;
-            continue;
-        }
-
-        if b == b'"' || b == b'\'' {
-            string_delim = Some(b);
-            escaped = false;
-            i += 1;
-            continue;
-        }
-
-        if !is_ident_start(b as char) {
-            i += 1;
-            continue;
-        }
-
-        let ident_start = i;
-        i += 1;
-        while i < bytes.len() && is_ident_continue(bytes[i] as char) {
-            i += 1;
-        }
-        let ident = &source[ident_start..i];
-        if ident != namespace {
-            continue;
-        }
-
-        let mut cursor = i;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if cursor >= bytes.len() || bytes[cursor] != b'.' {
-            continue;
-        }
-        cursor += 1;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if cursor >= bytes.len() || !is_ident_start(bytes[cursor] as char) {
-            continue;
-        }
-        let member_start = cursor;
-        cursor += 1;
-        while cursor < bytes.len() && is_ident_continue(bytes[cursor] as char) {
-            cursor += 1;
-        }
-        let member = &source[member_start..cursor];
-        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if cursor < bytes.len() && bytes[cursor] == b'(' {
-            out.insert(member.to_string());
-        }
-    }
-
-    out
-}
-
-fn collect_lua_prefixed_call_targets(source: &str, prefix: &str) -> HashSet<String> {
-    let bytes = source.as_bytes();
-    let mut out = HashSet::new();
-    let mut i = 0usize;
-    let mut string_delim: Option<u8> = None;
-    let mut escaped = false;
-    let mut in_line_comment = false;
-    let mut in_block_comment = false;
-
-    while i < bytes.len() {
-        let b = bytes[i];
-
-        if in_line_comment {
-            if b == b'\n' {
-                in_line_comment = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if in_block_comment {
-            if b == b']' && i + 1 < bytes.len() && bytes[i + 1] == b']' {
-                in_block_comment = false;
-                i += 2;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-
-        if let Some(delim) = string_delim {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == delim {
-                string_delim = None;
-            }
-            i += 1;
-            continue;
-        }
-
-        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-            if i + 3 < bytes.len() && bytes[i + 2] == b'[' && bytes[i + 3] == b'[' {
-                in_block_comment = true;
-                i += 4;
-                continue;
-            }
-            in_line_comment = true;
-            i += 2;
-            continue;
-        }
-
-        if b == b'"' || b == b'\'' {
-            string_delim = Some(b);
-            escaped = false;
-            i += 1;
-            continue;
-        }
-
-        if !is_ident_start(b as char) {
-            i += 1;
-            continue;
-        }
-
-        let ident_start = i;
-        i += 1;
-        while i < bytes.len() && is_ident_continue(bytes[i] as char) {
-            i += 1;
-        }
-        let ident = &source[ident_start..i];
-        let Some(rem) = ident.strip_prefix(prefix) else {
-            continue;
-        };
-        if rem.is_empty() || !is_valid_ident(rem) {
-            continue;
-        }
-        let mut cursor = i;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if cursor < bytes.len() && bytes[cursor] == b'(' {
-            out.insert(rem.to_string());
-        }
-    }
-
-    out
-}
-
-fn collect_scheme_namespace_member_calls(source: &str, namespace: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
-    for symbol in collect_scheme_call_head_symbols(source) {
-        let Some((target_namespace, member)) = symbol.split_once('.') else {
-            continue;
-        };
-        if target_namespace == namespace && is_valid_ident(member) {
-            out.insert(member.to_string());
-        }
-    }
-    out
-}
-
-fn collect_scheme_prefixed_call_targets(source: &str, prefix: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
-    for symbol in collect_scheme_call_head_symbols(source) {
-        let Some(member) = symbol.strip_prefix(prefix) else {
-            continue;
-        };
-        if !member.is_empty() && is_valid_ident(member) {
-            out.insert(member.to_string());
-        }
-    }
-    out
-}
-
-fn collect_scheme_call_head_symbols(source: &str) -> Vec<String> {
-    let bytes = source.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let mut in_line_comment = false;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    while i < bytes.len() {
-        let b = bytes[i];
-
-        if in_line_comment {
-            if b == b'\n' {
-                in_line_comment = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if b == b';' {
-            in_line_comment = true;
-            i += 1;
-            continue;
-        }
-
-        if b == b'"' {
-            in_string = true;
-            escaped = false;
-            i += 1;
-            continue;
-        }
-
-        if b != b'(' {
-            i += 1;
-            continue;
-        }
-
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        let symbol_start = i;
-        while i < bytes.len() {
-            let ch = bytes[i];
-            if ch.is_ascii_whitespace() || ch == b'(' || ch == b')' || ch == b';' {
-                break;
-            }
-            i += 1;
-        }
-        if i > symbol_start {
-            out.push(source[symbol_start..i].to_string());
-        }
-    }
-
-    out
 }
 
 fn collect_imported_module_functions(
@@ -2055,20 +1272,14 @@ fn rewrite_imported_call_sites(
     let mut alias_calls = HashMap::<String, String>::new();
     let mut namespace_calls = HashMap::<String, HashSet<String>>::new();
     let mut namespace_prefix_calls = HashMap::<String, String>::new();
-    let mut namespace_wildcards = HashSet::<String>::new();
+    let namespace_wildcards = HashSet::<String>::new();
     let mut prefix_aliases = Vec::<String>::new();
     let mut requires_vm_namespace = false;
 
     for import in imports {
         if import.spec == VM_HOST_NAMESPACE_SPEC {
             match &import.clause {
-                ImportClause::AllPublic => {
-                    if matches!(flavor, SourceFlavor::Lua | SourceFlavor::Scheme)
-                        && let Some(namespace) = module_default_namespace(&import.spec)
-                    {
-                        namespace_wildcards.insert(namespace);
-                    }
-                }
+                ImportClause::AllPublic => {}
                 ImportClause::Named(named) => {
                     for binding in named {
                         if binding.local != binding.imported {
@@ -2076,21 +1287,8 @@ fn rewrite_imported_call_sites(
                         }
                     }
                 }
-                ImportClause::Namespace(namespace) => {
-                    if matches!(flavor, SourceFlavor::Lua | SourceFlavor::Scheme) {
-                        namespace_wildcards.insert(namespace.clone());
-                    }
-                }
-                ImportClause::Prefix(prefix) => {
-                    if matches!(flavor, SourceFlavor::Lua | SourceFlavor::Scheme) {
-                        prefix_aliases.push(prefix.clone());
-                        if let Some(namespace) = prefix.strip_suffix('.')
-                            && is_valid_ident(namespace)
-                        {
-                            namespace_wildcards.insert(namespace.to_string());
-                        }
-                    }
-                }
+                ImportClause::Namespace(_) => {}
+                ImportClause::Prefix(_) => {}
             }
             continue;
         }
@@ -2103,59 +1301,30 @@ fn rewrite_imported_call_sites(
             if let Some(host_root) = host_namespace_root_from_spec(&import.spec)
                 && is_virtual_host_namespace_spec(&import.spec, options)
             {
-                if matches!(flavor, SourceFlavor::Lua | SourceFlavor::Scheme) {
-                    match &import.clause {
-                        ImportClause::AllPublic => {
-                            if let Some(namespace) = module_default_namespace(&import.spec) {
-                                namespace_wildcards.insert(namespace);
-                            }
-                        }
-                        ImportClause::Named(named) => {
-                            for binding in named {
-                                if binding.local != binding.imported {
-                                    alias_calls
-                                        .insert(binding.local.clone(), binding.imported.clone());
-                                }
-                            }
-                        }
-                        ImportClause::Namespace(namespace) => {
-                            namespace_wildcards.insert(namespace.clone());
-                        }
-                        ImportClause::Prefix(prefix) => {
-                            prefix_aliases.push(prefix.clone());
-                            if let Some(namespace) = prefix.strip_suffix('.')
-                                && is_valid_ident(namespace)
-                            {
-                                namespace_wildcards.insert(namespace.to_string());
-                            }
-                        }
-                    }
-                } else {
-                    let vm_prefix = format!("vm::{host_root}");
-                    match &import.clause {
-                        ImportClause::AllPublic => {
-                            if let Some(namespace) = module_default_namespace(&import.spec) {
-                                namespace_prefix_calls.insert(namespace, vm_prefix.clone());
-                                requires_vm_namespace = true;
-                            }
-                        }
-                        ImportClause::Named(named) => {
-                            for binding in named {
-                                alias_calls.insert(
-                                    binding.local.clone(),
-                                    format!("{vm_prefix}::{}", binding.imported),
-                                );
-                            }
-                            if !named.is_empty() {
-                                requires_vm_namespace = true;
-                            }
-                        }
-                        ImportClause::Namespace(namespace) => {
-                            namespace_prefix_calls.insert(namespace.clone(), vm_prefix.clone());
+                let vm_prefix = format!("vm::{host_root}");
+                match &import.clause {
+                    ImportClause::AllPublic => {
+                        if let Some(namespace) = module_default_namespace(&import.spec) {
+                            namespace_prefix_calls.insert(namespace, vm_prefix.clone());
                             requires_vm_namespace = true;
                         }
-                        ImportClause::Prefix(_) => {}
                     }
+                    ImportClause::Named(named) => {
+                        for binding in named {
+                            alias_calls.insert(
+                                binding.local.clone(),
+                                format!("{vm_prefix}::{}", binding.imported),
+                            );
+                        }
+                        if !named.is_empty() {
+                            requires_vm_namespace = true;
+                        }
+                    }
+                    ImportClause::Namespace(namespace) => {
+                        namespace_prefix_calls.insert(namespace.clone(), vm_prefix.clone());
+                        requires_vm_namespace = true;
+                    }
+                    ImportClause::Prefix(_) => {}
                 }
             }
             continue;

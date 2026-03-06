@@ -1,33 +1,33 @@
 use super::rss::iter::{all_true, any_true, chunk, each, enumerate, filter, map, range, range_step, reduce, skip, sum, take};
 
-let ascending = range(5);
+let mut ascending = range(5);
 assert(ascending.length == 5);
 assert(ascending[0] == 0);
 assert(ascending[4] == 4);
 
-let descending = range_step(10, 0, -3);
+let mut descending = range_step(10, 0, -3);
 assert(descending.length == 4);
 assert(descending[0] == 10);
 assert(descending[1] == 7);
 assert(descending[2] == 4);
 assert(descending[3] == 1);
 
-let pairs = enumerate(["a", "b"]);
+let mut pairs = enumerate(["a", "b"]);
 assert(pairs.length == 2);
 assert(pairs[1][0] == 1);
 assert(pairs[1][1] == "b");
 
-let head = take([1, 2, 3, 4], 2);
+let mut head = take([1, 2, 3, 4], 2);
 assert(head.length == 2);
 assert(head[0] == 1);
 assert(head[1] == 2);
 
-let tail = skip([1, 2, 3, 4], 2);
+let mut tail = skip([1, 2, 3, 4], 2);
 assert(tail.length == 2);
 assert(tail[0] == 3);
 assert(tail[1] == 4);
 
-let groups = chunk([1, 2, 3, 4, 5], 2);
+let mut groups = chunk([1, 2, 3, 4, 5], 2);
 assert(groups.length == 3);
 assert(groups[0].length == 2);
 assert(groups[1].length == 2);
@@ -40,7 +40,7 @@ assert(any_true([false, false]) == false);
 assert(all_true([true, true]));
 assert(all_true([true, false]) == false);
 
-let plus_one = map([1, 2, 3], |value| value + 1);
+let mut plus_one = map([1, 2, 3], |value| value + 1);
 assert(plus_one.length == 3);
 assert(plus_one[0] == 2);
 assert(plus_one[2] == 4);
@@ -48,17 +48,17 @@ assert(plus_one[2] == 4);
 fn double(value) {
     value * 2;
 }
-let doubled = map([1, 2, 3], double);
+let mut doubled = map([1, 2, 3], double);
 assert(doubled.length == 3);
 assert(doubled[1] == 4);
 
-let evens = filter([1, 2, 3, 4, 5, 6], |value| value % 2 == 0);
+let mut evens = filter([1, 2, 3, 4, 5, 6], |value| value % 2 == 0);
 assert(evens.length == 3);
 assert(evens[0] == 2);
 assert(evens[2] == 6);
 
-let total = reduce([1, 2, 3, 4], 0, |acc, value| acc + value);
+let mut total = reduce([1, 2, 3, 4], 0, |acc, value| acc + value);
 assert(total == 10);
 
-let each_result = each([7, 8], |value| value + 1);
+let mut each_result = each([7, 8], |value| value + 1);
 assert(type(each_result) == "null");

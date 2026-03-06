@@ -7,46 +7,46 @@ assert(re::match("^foo$", "FoO", "i"));
 assert(re::match("^foo.bar$", "FoO\nbar", "is"));
 assert(re::match("^bar$", "foo\nbar\nbaz", "m"));
 
-let first = re::find("bar+", "foobarr");
+let mut first = re::find("bar+", "foobarr");
 assert(first == "barr");
 
-let first_icase = re::find("^foo", "FoO bar", "i");
+let mut first_icase = re::find("^foo", "FoO bar", "i");
 assert(first_icase == "FoO");
 
-let missing = re::find("z+", "foobarr");
+let mut missing = re::find("z+", "foobarr");
 assert(type(missing) == "null");
 
-let replaced = re::replace("(foo)+", "foofoo bar", "x");
+let mut replaced = re::replace("(foo)+", "foofoo bar", "x");
 assert(replaced == "x bar");
 
-let replaced_icase = re::replace("foo", "FoO bar", "x", "i");
+let mut replaced_icase = re::replace("foo", "FoO bar", "x", "i");
 assert(replaced_icase == "x bar");
 
-let parts = re::split(" +", "a   b c");
+let mut parts = re::split(" +", "a   b c");
 assert(parts.length == 3);
 assert(parts[0] == "a");
 assert(parts[1] == "b");
 assert(parts[2] == "c");
 
-let parts_icase = re::split("x", "aXb", "i");
+let mut parts_icase = re::split("x", "aXb", "i");
 assert(parts_icase.length == 2);
 assert(parts_icase[0] == "a");
 assert(parts_icase[1] == "b");
 
-let groups = re::captures("([a-z]+)-([0-9]+)", "item-42");
+let mut groups = re::captures("([a-z]+)-([0-9]+)", "item-42");
 assert(groups.length == 3);
 assert(groups[0] == "item-42");
 assert(groups[1] == "item");
 assert(groups[2] == "42");
 
-let groups_icase = re::captures("^(foo)-([0-9]+)$", "FoO-42", "i");
+let mut groups_icase = re::captures("^(foo)-([0-9]+)$", "FoO-42", "i");
 assert(groups_icase.length == 3);
 assert(groups_icase[1] == "FoO");
 assert(groups_icase[2] == "42");
 
-let no_groups = re::captures("(foo)", "bar");
+let mut no_groups = re::captures("(foo)", "bar");
 assert(no_groups.length == 0);
 
-let optional = re::captures("(a)?b", "b");
+let mut optional = re::captures("(a)?b", "b");
 assert(optional.length == 2);
 assert(type(optional[1]) == "null");
