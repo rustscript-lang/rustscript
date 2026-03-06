@@ -241,8 +241,8 @@ fn perf_compiler_speed_and_ram_usage() {
 #[test]
 fn jit_emitted_machine_code_is_executed_on_native_targets() {
     let source = r#"
-        let i = 0;
-        let sum = 0;
+        let mut i = 0;
+        let mut sum = 0;
         while i < 200 {
             sum = sum + i;
             i = i + 1;
@@ -297,9 +297,9 @@ fn perf_jit_native_reduces_tight_loop_latency() {
     const TRIALS: usize = 7;
     let source = format!(
         r#"
-        let outer = 0;
-        let i = 0;
-        let sum = 0;
+        let mut outer = 0;
+        let mut i = 0;
+        let mut sum = 0;
         while outer < {OUTER_LOOPS} {{
             i = 0;
             while i < {INNER_LOOP_ITERS} {{

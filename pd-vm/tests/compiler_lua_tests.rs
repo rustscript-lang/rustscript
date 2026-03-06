@@ -3,7 +3,7 @@ mod common;
 use common::*;
 
 #[test]
-fn lua_direct_subset_runtime_cases_work() {
+fn lua_runtime_cases_work() {
     let cases = vec![
         RuntimeCase {
             name: "assignment_and_arithmetic",
@@ -74,52 +74,45 @@ fn lua_direct_subset_runtime_cases_work() {
             ],
             expected_locals: None,
         },
+        RuntimeCase {
+            name: "elseif_and_elif_alias",
+            source: r#"
+                local a = 2
+                if a == 1 then
+                    0
+                elseif a == 2 then
+                    1
+                else
+                    2
+                end
+
+                if a == 1 then
+                    0
+                elif a == 2 then
+                    42
+                else
+                    0
+                end
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_stack: vec![Value::Int(1), Value::Int(42)],
+            expected_locals: None,
+        },
     ];
 
     run_runtime_cases(&cases);
 }
 
 #[test]
-fn lua_direct_subset_rejection_cases_work() {
-    let cases = [
-        ParseErrorCase {
-            name: "assignment_to_undeclared_local",
-            source: r#"
+fn lua_rejection_cases_work() {
+    let cases = [ParseErrorCase {
+        name: "assignment_to_undeclared_local",
+        source: r#"
                 value = 1
             "#,
-            flavor: SourceFlavor::Lua,
-            expected_contains_all: &["unknown local 'value'"],
-        },
-        ParseErrorCase {
-            name: "require_syntax_not_supported",
-            source: r#"
-                local vm = require("vm")
-                vm.add_one(41)
-            "#,
-            flavor: SourceFlavor::Lua,
-            expected_contains_all: &["unsupported Lua syntax"],
-        },
-        ParseErrorCase {
-            name: "function_syntax_not_supported",
-            source: r#"
-                function inc(v)
-                    return v + 1
-                end
-                inc(41)
-            "#,
-            flavor: SourceFlavor::Lua,
-            expected_contains_all: &["unsupported Lua syntax"],
-        },
-        ParseErrorCase {
-            name: "general_calls_not_supported_in_direct_subset",
-            source: r#"
-                local value = "hello"
-                len(value)
-            "#,
-            flavor: SourceFlavor::Lua,
-            expected_contains_all: &["unsupported Lua syntax"],
-        },
-    ];
+        flavor: SourceFlavor::Lua,
+        expected_contains_all: &["unknown local 'value'"],
+    }];
 
     for case in &cases {
         expect_parse_error_case(case);
@@ -127,41 +120,30 @@ fn lua_direct_subset_rejection_cases_work() {
 }
 
 #[test]
-fn lua_complex_fixture_is_rejected_without_rewrite_path() {
+fn lua_complex_fixture_runs() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.lua");
-    let err = match compile_source_file(&path) {
-        Ok(_) => panic!("fixture should be rejected in direct subset"),
-        Err(err) => err,
-    };
-
-    match err {
-        vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
-            assert!(
-                parse.message.contains("unsupported Lua syntax"),
-                "{}",
-                parse.message
-            );
-        }
-        vm::SourcePathError::Source(vm::SourceError::Compile(other)) => {
-            panic!("unexpected nested compile error: {other:?}");
-        }
-        vm::SourcePathError::Io(other) => panic!("unexpected io error: {other}"),
-        vm::SourcePathError::MissingExtension => panic!("unexpected missing extension"),
-        vm::SourcePathError::UnsupportedExtension(other) => {
-            panic!("unexpected unsupported extension: {other}")
-        }
-        vm::SourcePathError::ImportCycle(other) => {
-            panic!("unexpected import cycle at: {}", other.display())
-        }
-        vm::SourcePathError::NonRustScriptModule(other) => {
-            panic!("unexpected non-rustscript module: {}", other.display())
-        }
-        vm::SourcePathError::ImportWithoutParent(other) => {
-            panic!("unexpected import-without-parent path: {}", other.display())
-        }
-        vm::SourcePathError::InvalidImportSyntax { message, .. } => {
-            panic!("unexpected invalid import syntax: {message}")
+    let compiled = compile_source_file(&path).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    for func in &compiled.functions {
+        match func.name.as_str() {
+            "add_one" => {
+                vm.register_function(Box::new(AddOne));
+            }
+            "print" => {
+                vm.register_function(Box::new(PrintBuiltin));
+            }
+            other => panic!("unexpected function {other}"),
         }
     }
+    loop {
+        match vm.run().expect("vm should run") {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => continue,
+            VmStatus::Waiting(_op_id) => vm
+                .wait_for_host_op_blocking()
+                .expect("vm should complete host operation"),
+        }
+    }
+    assert_eq!(vm.stack(), &[Value::Int(12)]);
 }

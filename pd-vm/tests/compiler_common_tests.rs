@@ -42,7 +42,7 @@ fn compile_source_program() {
 #[test]
 fn assignment_updates_existing_local_without_new_slot() {
     let source = r#"
-        let a = 1;
+        let mut a = 1;
         a = 2;
         a;
     "#;
@@ -90,7 +90,7 @@ fn non_rustscript_frontends_keep_mutable_bindings_by_default() {
 
 #[test]
 fn compiler_reuses_slots_when_declared_locals_exceed_bytecode_limit() {
-    let mut source = String::from("let out = 0;\n");
+    let mut source = String::from("let mut out = 0;\n");
     for idx in 0..600usize {
         source.push_str(&format!("let v{idx} = {idx};\n"));
         source.push_str(&format!("out = v{idx};\n"));
@@ -185,7 +185,7 @@ fn compiler_rejects_programs_with_more_than_256_simultaneously_live_locals() {
 
 #[test]
 fn compiler_reuses_slots_with_large_programs_that_inline_functions() {
-    let mut source = String::from("fn id(x) { x; }\nlet out = 0;\n");
+    let mut source = String::from("fn id(x) { x; }\nlet mut out = 0;\n");
     for idx in 0..400usize {
         source.push_str(&format!("let v{idx} = {idx};\n"));
         source.push_str(&format!("out = id(v{idx});\n"));
@@ -328,7 +328,7 @@ fn host_function_registry_caches_static_function_pointer_plan_across_vms() {
 fn not_not_equal_and_else_if_are_supported_across_frontends() {
     let rustscript = r#"
         let a = 2;
-        let out = 0;
+        let mut out = 0;
         if !(a != 2) {
             out = 10;
         } else if a == 3 {
@@ -367,10 +367,10 @@ fn not_not_equal_and_else_if_are_supported_across_frontends() {
 #[test]
 fn collections_are_created_and_accessed_in_all_frontends() {
     let rustscript = r#"
-        let arr = [1, 2, 3];
+        let mut arr = [1, 2, 3];
         let second = arr[1];
         arr[1] = 9;
-        let m = {"x": 1, "y": 2};
+        let mut m = {"x": 1, "y": 2};
         m.z = 7;
         m["x"] = 4;
         let v1 = m.x;
@@ -682,7 +682,7 @@ fn local_declared_only_in_loop_body_is_rejected_after_loop() {
 fn path_dependent_local_assignment_requires_redeclaration() {
     let source = r#"
         if true {
-            let path_local = 1;
+            let mut path_local = 1;
         }
         path_local = 9;
         path_local;
@@ -695,7 +695,9 @@ fn path_dependent_local_assignment_requires_redeclaration() {
     match err {
         vm::SourceError::Parse(parse) => {
             assert!(
-                parse.message.contains("path_local") && parse.message.contains("before assignment"),
+                parse.message.contains("path_local")
+                    && (parse.message.contains("before assignment")
+                        || parse.message.contains("unavailable")),
                 "{}",
                 parse.message
             );
@@ -896,8 +898,8 @@ fn collect_null_store_pairs(
 #[test]
 fn liveness_avoids_in_loop_null_clears_but_clears_after_loop_exit() {
     let source = r#"
-        let iter = 0;
-        let carry = 0;
+        let mut iter = 0;
+        let mut carry = 0;
         while iter < 2 {
             let a = iter + 1;
             let b = a + carry;

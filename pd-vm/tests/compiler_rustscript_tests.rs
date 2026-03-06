@@ -350,8 +350,15 @@ fn compile_source_file_with_rustscript_complex_fixture() {
         };
     }
 
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
+    loop {
+        match vm.run().expect("vm should run") {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => continue,
+            VmStatus::Waiting(_op_id) => vm
+                .wait_for_host_op_blocking()
+                .expect("vm should complete host operation"),
+        }
+    }
     assert_eq!(vm.stack(), &[Value::Int(12)]);
 }
 

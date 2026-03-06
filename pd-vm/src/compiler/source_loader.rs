@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::builtins::is_builtin_namespace;
 use crate::compiler::source_map::SourceMap;
 
 use super::frontends::{is_ident_continue, is_ident_start};
 use super::{
     CompileSourceFileOptions, SourceError, SourceFlavor, SourcePathError, frontends,
+    ir::{Expr, FrontendIr, Stmt},
     linker::{ParsedUnit, sanitize_scope_prefix},
 };
 
@@ -66,7 +68,7 @@ pub(super) fn load_units_for_source_file(
         &collect_state.module_exports,
         options,
     )?;
-    let root_parse_source = match flavor {
+    let (root_parse_source, root_prelude_lines) = match flavor {
         SourceFlavor::Scheme => {
             let mut prelude = build_scheme_import_prelude(
                 path,
@@ -74,8 +76,9 @@ pub(super) fn load_units_for_source_file(
                 &collect_state.module_exports,
                 options,
             )?;
+            let prelude_lines = prelude.lines().count();
             prelude.push_str(&rewritten_root.source);
-            prelude
+            (prelude, prelude_lines)
         }
         SourceFlavor::RustScript | SourceFlavor::JavaScript | SourceFlavor::Lua => {
             let mut prelude = build_rustscript_import_prelude(
@@ -90,25 +93,182 @@ pub(super) fn load_units_for_source_file(
             {
                 prelude.push_str("use vm;\n");
             }
+            let prelude_lines = prelude.lines().count();
             prelude.push_str(&rewritten_root.source);
-            prelude
+            (prelude, prelude_lines)
         }
     };
 
     let mut root_source_map = SourceMap::new();
-    let root_source_id =
-        root_source_map.add_source(path.display().to_string(), root_parse_source.clone());
-    let root_parsed = frontends::parse_source(&root_parse_source, flavor)
-        .map_err(|err| {
+    let root_source_id = root_source_map.add_source(path.display().to_string(), source_raw);
+    let mut root_parsed = frontends::parse_source(&root_parse_source, flavor)
+        .map_err(|mut err| {
+            if root_prelude_lines > 0 {
+                err.line = err.line.saturating_sub(root_prelude_lines).max(1);
+                // Reattach span against original source text for diagnostics.
+                err.span = None;
+            }
             SourceError::Parse(err.with_line_span_from_source(&root_source_map, root_source_id))
         })
         .map_err(SourcePathError::Source)?;
+    if root_prelude_lines > 0 {
+        remap_frontend_ir_line_numbers(&mut root_parsed, root_prelude_lines);
+    }
     collect_state.units.push(ParsedUnit {
         parsed: root_parsed,
         scope_prefix: None,
     });
 
     Ok((root_parse_source, collect_state.units))
+}
+
+fn remap_frontend_ir_line_numbers(ir: &mut FrontendIr, prelude_lines: usize) {
+    let offset = u32::try_from(prelude_lines).unwrap_or(u32::MAX);
+    for stmt in &mut ir.stmts {
+        remap_stmt_line_numbers(stmt, offset);
+    }
+    for function in ir.function_impls.values_mut() {
+        for stmt in &mut function.body_stmts {
+            remap_stmt_line_numbers(stmt, offset);
+        }
+        remap_expr_line_numbers(&mut function.body_expr, offset);
+    }
+}
+
+fn remap_line(line: &mut u32, offset: u32) {
+    *line = (*line).saturating_sub(offset).max(1);
+}
+
+fn remap_stmt_line_numbers(stmt: &mut Stmt, offset: u32) {
+    match stmt {
+        Stmt::Noop { line }
+        | Stmt::Break { line }
+        | Stmt::Continue { line }
+        | Stmt::ClosureLet { line, .. }
+        | Stmt::FuncDecl { line, .. } => remap_line(line, offset),
+        Stmt::Let { expr, line, .. }
+        | Stmt::Assign { expr, line, .. }
+        | Stmt::Expr { expr, line } => {
+            remap_line(line, offset);
+            remap_expr_line_numbers(expr, offset);
+        }
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            line,
+        } => {
+            remap_line(line, offset);
+            remap_expr_line_numbers(condition, offset);
+            for stmt in then_branch {
+                remap_stmt_line_numbers(stmt, offset);
+            }
+            for stmt in else_branch {
+                remap_stmt_line_numbers(stmt, offset);
+            }
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            line,
+        } => {
+            remap_line(line, offset);
+            remap_stmt_line_numbers(init, offset);
+            remap_expr_line_numbers(condition, offset);
+            remap_stmt_line_numbers(post, offset);
+            for stmt in body {
+                remap_stmt_line_numbers(stmt, offset);
+            }
+        }
+        Stmt::While {
+            condition,
+            body,
+            line,
+        } => {
+            remap_line(line, offset);
+            remap_expr_line_numbers(condition, offset);
+            for stmt in body {
+                remap_stmt_line_numbers(stmt, offset);
+            }
+        }
+    }
+}
+
+fn remap_expr_line_numbers(expr: &mut Expr, offset: u32) {
+    match expr {
+        Expr::Call(_, args) | Expr::LocalCall(_, args) => {
+            for arg in args {
+                remap_expr_line_numbers(arg, offset);
+            }
+        }
+        Expr::ClosureCall(closure, args) => {
+            remap_closure_line_numbers(closure, offset);
+            for arg in args {
+                remap_expr_line_numbers(arg, offset);
+            }
+        }
+        Expr::Closure(closure) => remap_closure_line_numbers(closure, offset),
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            remap_expr_line_numbers(lhs, offset);
+            remap_expr_line_numbers(rhs, offset);
+        }
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => {
+            remap_expr_line_numbers(inner, offset);
+        }
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            remap_expr_line_numbers(condition, offset);
+            remap_expr_line_numbers(then_expr, offset);
+            remap_expr_line_numbers(else_expr, offset);
+        }
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            remap_expr_line_numbers(value, offset);
+            for (_, arm_expr) in arms {
+                remap_expr_line_numbers(arm_expr, offset);
+            }
+            remap_expr_line_numbers(default, offset);
+        }
+        Expr::Block { stmts, expr } => {
+            for stmt in stmts {
+                remap_stmt_line_numbers(stmt, offset);
+            }
+            remap_expr_line_numbers(expr, offset);
+        }
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::FunctionRef(_)
+        | Expr::Var(_) => {}
+    }
+}
+
+fn remap_closure_line_numbers(closure: &mut crate::compiler::ir::ClosureExpr, offset: u32) {
+    remap_expr_line_numbers(&mut closure.body, offset);
 }
 
 fn parse_module_imports(
@@ -1027,6 +1187,7 @@ fn strip_import_directives(source: &str, flavor: SourceFlavor) -> String {
             .map(|line| {
                 if line.trim_start().starts_with("use ")
                     && !is_vm_use_directive_line(line.trim_start())
+                    && !is_builtin_namespace_use_directive_line(line.trim_start())
                 {
                     String::new()
                 } else {
@@ -1056,6 +1217,21 @@ fn is_vm_use_directive_line(line: &str) -> bool {
         return true;
     }
     directive_body.starts_with("vm::")
+}
+
+fn is_builtin_namespace_use_directive_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("use ") {
+        return false;
+    }
+    let Some((directive_body, _)) = trimmed["use ".len()..].split_once(';') else {
+        return false;
+    };
+    let directive_body = directive_body.trim();
+    if let Some((namespace, _alias)) = directive_body.split_once(" as ") {
+        return is_builtin_namespace(namespace.trim());
+    }
+    is_builtin_namespace(directive_body)
 }
 
 fn vm_namespace_direct_calls_supported(imports: &[ModuleImport]) -> bool {
@@ -1089,6 +1265,12 @@ fn is_virtual_host_namespace_spec(spec: &str, options: &CompileSourceFileOptions
     options.module_override_path(spec).is_none() && host_namespace_root_from_spec(spec).is_some()
 }
 
+fn is_builtin_host_namespace_spec(spec: &str) -> bool {
+    host_namespace_root_from_spec(spec)
+        .as_deref()
+        .is_some_and(is_builtin_namespace)
+}
+
 fn should_treat_missing_module_as_host_namespace(
     spec: &str,
     options: &CompileSourceFileOptions,
@@ -1107,11 +1289,19 @@ fn collect_module_units(
     let imports = parse_module_imports(source, flavor, path)?;
     for import in imports {
         let spec = import.spec;
+        if is_builtin_host_namespace_spec(&spec) {
+            continue;
+        }
         if !is_module_specifier(&spec) {
             continue;
         }
         let resolved = resolve_module_path(path, &spec, options)?;
         let key = resolved.clone();
+        if key == path && is_virtual_host_namespace_spec(&spec, options) {
+            // `use io;` / `use re;` inside files named `io.rss` / `re.rss` should
+            // keep behaving as host-namespace imports instead of self-module cycles.
+            continue;
+        }
         if state.visiting.contains(&key) {
             return Err(SourcePathError::ImportCycle(key));
         }
@@ -1210,6 +1400,9 @@ fn collect_imported_module_functions(
     let mut imported_functions = HashMap::<String, u8>::new();
 
     for import in imports {
+        if is_builtin_host_namespace_spec(&import.spec) {
+            continue;
+        }
         if !is_module_specifier(&import.spec) {
             continue;
         }
@@ -1277,6 +1470,9 @@ fn rewrite_imported_call_sites(
     let mut requires_vm_namespace = false;
 
     for import in imports {
+        if is_builtin_host_namespace_spec(&import.spec) {
+            continue;
+        }
         if import.spec == VM_HOST_NAMESPACE_SPEC {
             match &import.clause {
                 ImportClause::AllPublic => {}

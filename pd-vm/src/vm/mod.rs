@@ -1576,18 +1576,18 @@ mod tests {
         jit::runtime::clear_native_trace_cache_for_tests();
 
         let source_one = r#"
-            let i = 0;
+            let mut i = 0;
             while i < 8 {
                 i = i + 1;
             }
-            let j = 0;
+            let mut j = 0;
             while j < 8 {
                 j = j + 1;
             }
             i + j;
         "#;
         let source_two = r#"
-            let k = 0;
+            let mut k = 0;
             while k < 8 {
                 k = k + 1;
             }
@@ -1669,8 +1669,8 @@ mod tests {
         jit::runtime::clear_native_trace_cache_for_tests();
 
         let source = r#"
-            let i = 0;
-            let sum = 0;
+            let mut i = 0;
+            let mut sum = 0;
             while i < 10 {
                 sum = sum + i;
                 i = i + 1;

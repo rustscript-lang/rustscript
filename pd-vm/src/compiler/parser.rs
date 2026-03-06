@@ -1233,7 +1233,8 @@ impl Parser {
 
     fn parse_let_with_terminator(&mut self, expect_terminator: bool) -> Result<Stmt, ParseError> {
         let line = self.last_line();
-        let declared_mutable = self.dialect.allow_let_mut_binding() && self.match_ident_literal("mut");
+        let declared_mutable =
+            self.dialect.allow_let_mut_binding() && self.match_ident_literal("mut");
         let name = if declared_mutable {
             self.expect_ident("expected identifier after 'let mut'")?
         } else {
@@ -1494,8 +1495,8 @@ impl Parser {
             span: None,
             code: None,
             line: self.current_line(),
-            message:
-                "mutable borrow target must be a local, local field, or local index".to_string(),
+            message: "mutable borrow target must be a local, local field, or local index"
+                .to_string(),
         })
     }
 

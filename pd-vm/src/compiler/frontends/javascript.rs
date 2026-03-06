@@ -59,5 +59,5 @@ pub(super) fn parser_dialect() -> &'static dyn ParserDialect {
 pub(super) fn lower_to_ir(source: &str) -> Result<FrontendIr, ParseError> {
     // JavaScript now lowers directly through the shared parser with JS dialect behavior.
     // No RustScript text rewriting layer is used.
-    super::parse_with_parser(source, 0, false, true, parser_dialect())
+    super::parse_with_parser(source, 0, false, true, false, parser_dialect())
 }

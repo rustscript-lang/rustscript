@@ -75,10 +75,10 @@ fn boolean_precedence_and_grouping_match_across_frontends() {
 #[test]
 fn nested_loop_break_semantics_match_across_frontends() {
     let rustscript = r#"
-        let outer = 0;
-        let total = 0;
+        let mut outer = 0;
+        let mut total = 0;
         while outer < 4 {
-            let inner = 0;
+            let mut inner = 0;
             while inner < 6 {
                 if inner == 4 {
                     break;
@@ -145,8 +145,8 @@ fn nested_loop_break_semantics_match_across_frontends() {
 #[test]
 fn interpreter_and_jit_match_for_loop_branch_arithmetic_program() {
     let source = r#"
-        let i = 1;
-        let acc = 0;
+        let mut i = 1;
+        let mut acc = 0;
         while i < 80 {
             let v = i * 3;
             if (v % 5) == 0 {
@@ -223,8 +223,8 @@ impl HostFunction for YieldThenOne {
 fn jit_handles_yielding_host_calls_without_replaying_extra_returns() {
     let source = r#"
         fn tick();
-        let i = 0;
-        let sum = 0;
+        let mut i = 0;
+        let mut sum = 0;
         while i < 8 {
             sum = sum + tick();
             i = i + 1;
@@ -301,8 +301,8 @@ impl HostFunction for PendingOnceThenAddOne {
 fn jit_pending_host_call_waits_and_resumes_without_replay() {
     let source = r#"
         fn maybe_wait(x);
-        let i = 0;
-        let sum = 0;
+        let mut i = 0;
+        let mut sum = 0;
         while i < 5 {
             sum = sum + maybe_wait(i);
             i = i + 1;
@@ -361,8 +361,8 @@ fn builtin_exists_override(_vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome,
 #[test]
 fn jit_uses_interpreter_trace_path_when_builtin_override_is_bound() {
     let source = r#"
-        let i = 0;
-        let sum = 0;
+        let mut i = 0;
+        let mut sum = 0;
         while i < 32 {
             sum = sum + i;
             i = i + 1;
