@@ -8,30 +8,71 @@ pub(super) fn emit_fuel_tick_inline(
     offsets: ResolvedOffsets,
     steps_to_advance: u32,
     fuel_check_interval: u32,
-    check_runtime_fuel_enabled: bool,
 ) {
     if steps_to_advance == 0 {
         return;
     }
 
     let continue_block = b.create_block();
+    emit_fuel_tick_inline_core(
+        b,
+        vm_ptr,
+        exit_block,
+        offsets,
+        steps_to_advance,
+        fuel_check_interval,
+        continue_block,
+    );
+    b.switch_to_block(continue_block);
+}
 
-    if check_runtime_fuel_enabled {
-        let metering_enabled_block = b.create_block();
-        let fuel_enabled = b
-            .ins()
-            .load(types::I8, MemFlags::new(), vm_ptr, offsets.fuel_enabled);
-        let metering_enabled = b.ins().icmp_imm(IntCC::NotEqual, fuel_enabled, 0);
-        b.ins().brif(
-            metering_enabled,
-            metering_enabled_block,
-            &[],
-            continue_block,
-            &[],
-        );
-        b.switch_to_block(metering_enabled_block);
+pub(super) fn emit_fuel_tick_inline_guarded(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    exit_block: Block,
+    offsets: ResolvedOffsets,
+    steps_to_advance: u32,
+    fuel_check_interval: u32,
+) {
+    if steps_to_advance == 0 {
+        return;
     }
 
+    let metering_enabled_block = b.create_block();
+    let continue_block = b.create_block();
+    let fuel_enabled = b
+        .ins()
+        .load(types::I8, MemFlags::new(), vm_ptr, offsets.fuel_enabled);
+    let metering_enabled = b.ins().icmp_imm(IntCC::NotEqual, fuel_enabled, 0);
+    b.ins().brif(
+        metering_enabled,
+        metering_enabled_block,
+        &[],
+        continue_block,
+        &[],
+    );
+    b.switch_to_block(metering_enabled_block);
+    emit_fuel_tick_inline_core(
+        b,
+        vm_ptr,
+        exit_block,
+        offsets,
+        steps_to_advance,
+        fuel_check_interval,
+        continue_block,
+    );
+    b.switch_to_block(continue_block);
+}
+
+fn emit_fuel_tick_inline_core(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    exit_block: Block,
+    offsets: ResolvedOffsets,
+    steps_to_advance: u32,
+    fuel_check_interval: u32,
+    continue_block: Block,
+) {
     let countdown_block = b.create_block();
     let charge_block = b.create_block();
 
@@ -93,8 +134,6 @@ pub(super) fn emit_fuel_tick_inline(
     b.switch_to_block(out_of_fuel);
     let status = b.ins().iconst(types::I32, STATUS_OUT_OF_FUEL as i64);
     jump_with_status(b, exit_block, status);
-
-    b.switch_to_block(continue_block);
 }
 
 #[allow(clippy::too_many_arguments)]

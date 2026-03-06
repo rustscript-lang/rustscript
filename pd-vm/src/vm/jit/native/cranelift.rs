@@ -26,8 +26,9 @@ mod layout;
 
 use bridge::pd_vm_cranelift_step;
 use codegen::{
-    emit_fuel_tick_inline, emit_helper_step, emit_inline_or_helper_step, entry_signature,
-    helper_signature, jump_with_status, resolve_offsets,
+    emit_fuel_tick_inline, emit_fuel_tick_inline_guarded, emit_helper_step,
+    emit_inline_or_helper_step, entry_signature, helper_signature, jump_with_status,
+    resolve_offsets,
 };
 use layout::detect_native_stack_layout;
 
@@ -177,15 +178,15 @@ pub(crate) fn compile_trace(
                 if step_index % stride == 0 {
                     let remaining = trace.steps.len().saturating_sub(step_index);
                     let chunk_len = remaining.min(stride) as u32;
-                    emit_fuel_tick_inline(
-                        &mut b,
-                        vm_ptr,
-                        exit_block,
-                        offsets,
-                        chunk_len,
-                        interval,
-                        check_runtime_fuel_enabled,
-                    );
+                    if check_runtime_fuel_enabled {
+                        emit_fuel_tick_inline_guarded(
+                            &mut b, vm_ptr, exit_block, offsets, chunk_len, interval,
+                        );
+                    } else {
+                        emit_fuel_tick_inline(
+                            &mut b, vm_ptr, exit_block, offsets, chunk_len, interval,
+                        );
+                    }
                 }
             }
             if emit_inline_or_helper_step(
