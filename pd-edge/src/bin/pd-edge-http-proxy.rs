@@ -261,9 +261,7 @@ fn parse_vm_execution_mode(value: &str) -> Result<VmExecutionMode, String> {
     let normalized = value.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "async" => Ok(VmExecutionMode::Async),
-        "threading" | "spawn-blocking" => {
-            Ok(VmExecutionMode::Threading)
-        }
+        "threading" | "spawn-blocking" => Ok(VmExecutionMode::Threading),
         _ => Err(format!(
             "invalid --vm-execution-mode: {value} (expected async|threading)"
         )),
@@ -459,11 +457,9 @@ mod tests {
 
     #[test]
     fn parse_cli_args_from_parses_vm_execution_mode() {
-        let action = parse_cli_args_from([
-            "--vm-execution-mode".to_string(),
-            "threading".to_string(),
-        ])
-        .expect("parse should succeed");
+        let action =
+            parse_cli_args_from(["--vm-execution-mode".to_string(), "threading".to_string()])
+                .expect("parse should succeed");
 
         let CliAction::Run(cli) = action else {
             panic!("expected run action");
@@ -473,11 +469,9 @@ mod tests {
 
     #[test]
     fn parse_cli_args_from_rejects_invalid_vm_execution_mode() {
-        let err = parse_cli_args_from([
-            "--vm-execution-mode".to_string(),
-            "threadpool".to_string(),
-        ])
-        .expect_err("invalid vm execution mode should fail");
+        let err =
+            parse_cli_args_from(["--vm-execution-mode".to_string(), "threadpool".to_string()])
+                .expect_err("invalid vm execution mode should fail");
         assert!(err.contains("invalid --vm-execution-mode"));
     }
 

@@ -33,6 +33,5 @@ pub use debug_session::{
 pub use logging::init as init_logging;
 pub use runtime::{
     HealthStatus, ProgramApplyReport, SharedState, TelemetrySnapshot, VmExecutionConfig,
-    VmExecutionMode,
-    apply_program_from_bytes, build_admin_app, build_http_proxy_app,
+    VmExecutionMode, apply_program_from_bytes, build_admin_app, build_http_proxy_app,
 };

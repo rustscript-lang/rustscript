@@ -27,8 +27,9 @@ const MAX_LATENCY_SAMPLES: usize = 4096;
 
 pub use http_plane::{build_admin_app, build_http_proxy_app};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum VmExecutionMode {
+    #[default]
     Async,
     Threading,
 }
@@ -39,12 +40,6 @@ impl VmExecutionMode {
             VmExecutionMode::Async => "async",
             VmExecutionMode::Threading => "threading",
         }
-    }
-}
-
-impl Default for VmExecutionMode {
-    fn default() -> Self {
-        Self::Async
     }
 }
 

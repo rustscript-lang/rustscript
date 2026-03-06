@@ -122,6 +122,7 @@ struct BenchConfig {
     memory_sample_interval_ms: u64,
     vm_fuel: Option<u64>,
     vm_fuel_check_interval: u32,
+    vm_execution_mode: VmExecutionModeArg,
     fuel_latency_sweep: bool,
     fuel_latency_fuels: Vec<u64>,
     fuel_latency_check_intervals: Vec<u32>,
@@ -143,6 +144,7 @@ impl Default for BenchConfig {
             memory_sample_interval_ms: 100,
             vm_fuel: Some(50_000),
             vm_fuel_check_interval: 32,
+            vm_execution_mode: VmExecutionModeArg::Async,
             fuel_latency_sweep: false,
             fuel_latency_fuels: vec![
                 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768,
@@ -158,6 +160,35 @@ impl Default for BenchConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum VmExecutionModeArg {
+    Async,
+    Threading,
+}
+
+impl VmExecutionModeArg {
+    fn as_flag_value(self) -> &'static str {
+        match self {
+            VmExecutionModeArg::Async => "async",
+            VmExecutionModeArg::Threading => "threading",
+        }
+    }
+}
+
+fn parse_vm_execution_mode_arg(value: &str) -> Result<VmExecutionModeArg, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "async" => Ok(VmExecutionModeArg::Async),
+        "threading" | "blocking" | "spawn-blocking" | "spawn_blocking" => {
+            Ok(VmExecutionModeArg::Threading)
+        }
+        _ => Err(format!(
+            "invalid --vm-execution-mode: {value} (expected async|threading)"
+        )),
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct BenchConfigReport {
     requests: usize,
@@ -168,6 +199,7 @@ struct BenchConfigReport {
     memory_sample_interval_ms: u64,
     vm_fuel: Option<u64>,
     vm_fuel_check_interval: u32,
+    vm_execution_mode: VmExecutionModeArg,
     fuel_latency_sweep: bool,
     fuel_latency_fuels: Vec<u64>,
     fuel_latency_check_intervals: Vec<u32>,
@@ -276,6 +308,7 @@ impl ProxyProcess {
         admin_addr: SocketAddr,
         vm_fuel: Option<u64>,
         vm_fuel_check_interval: u32,
+        vm_execution_mode: VmExecutionModeArg,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let rust_log = env::var("PD_EDGE_PROXY_RUST_LOG").unwrap_or_else(|_| "error".to_string());
         let inherit_stdout = env_flag("PD_EDGE_PROXY_STDOUT_INHERIT");
@@ -290,6 +323,8 @@ impl ProxyProcess {
             .arg(data_addr.to_string())
             .arg("--admin-addr")
             .arg(admin_addr.to_string())
+            .arg("--vm-execution-mode")
+            .arg(vm_execution_mode.as_flag_value())
             .env("RUST_LOG", rust_log)
             .stdin(Stdio::null())
             .stdout(stdout)
@@ -342,12 +377,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let binary_path = resolve_proxy_binary_path(&config)?;
     println!("proxy binary: {}", binary_path.display());
     println!(
-        "requests={}, warmup_requests={}, concurrency={}, request_timeout_ms={}, memory_sample_interval_ms={}, vm_fuel={:?}, vm_fuel_check_interval={}, fuel_latency_sweep={}, fuel_latency_fuels={:?}, fuel_latency_check_intervals={:?}",
+        "requests={}, warmup_requests={}, concurrency={}, request_timeout_ms={}, memory_sample_interval_ms={}, vm_execution_mode={}, vm_fuel={:?}, vm_fuel_check_interval={}, fuel_latency_sweep={}, fuel_latency_fuels={:?}, fuel_latency_check_intervals={:?}",
         config.requests,
         config.warmup_requests,
         config.concurrency,
         config.request_timeout_ms,
         config.memory_sample_interval_ms,
+        config.vm_execution_mode.as_flag_value(),
         config.vm_fuel,
         config.vm_fuel_check_interval,
         config.fuel_latency_sweep,
@@ -621,6 +657,7 @@ fn build_bench_config_report(config: &BenchConfig, binary_path: &Path) -> BenchC
         memory_sample_interval_ms: config.memory_sample_interval_ms,
         vm_fuel: config.vm_fuel,
         vm_fuel_check_interval: config.vm_fuel_check_interval,
+        vm_execution_mode: config.vm_execution_mode,
         fuel_latency_sweep: config.fuel_latency_sweep,
         fuel_latency_fuels: config.fuel_latency_fuels.clone(),
         fuel_latency_check_intervals: config.fuel_latency_check_intervals.clone(),
@@ -673,6 +710,7 @@ async fn run_scenario(
         admin_addr,
         config.vm_fuel,
         config.vm_fuel_check_interval,
+        config.vm_execution_mode,
     )?;
 
     wait_until_proxy_ready(
@@ -1316,6 +1354,10 @@ fn parse_args() -> Result<BenchConfig, String> {
                 }
                 config.vm_fuel_check_interval = value;
             }
+            "--vm-execution-mode" => {
+                let value = parse_next_string("--vm-execution-mode", &mut args)?;
+                config.vm_execution_mode = parse_vm_execution_mode_arg(&value)?;
+            }
             "--fuel-latency-sweep" => {
                 config.fuel_latency_sweep = true;
             }
@@ -1487,6 +1529,7 @@ fn print_help() {
         "  --vm-fuel <UNITS>                 Enable cooperative VM fuel slices (default: 50000)\n",
         "  --no-vm-fuel                      Disable VM fuel slices\n",
         "  --vm-fuel-check-interval <OPS>    Fuel check interval for proxy VM (default: 32)\n",
+        "  --vm-execution-mode <MODE>        Proxy VM execution mode: async|threading (default: async)\n",
         "  --fuel-latency-sweep              Run latency sweeps for fuel and fuel-check-interval (defaults to scenario no_host_calls_program)\n",
         "  --fuel-latency-fuels <CSV>        CSV list for fuel sweep; must be > 0 (default starts at 1)\n",
         "  --fuel-latency-check-intervals <CSV> CSV list for check-interval sweep; must be > 0 (default starts at 1)\n",

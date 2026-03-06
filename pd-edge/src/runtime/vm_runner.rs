@@ -76,22 +76,26 @@ pub async fn execute_vm_with_context(
     let vm_store = new_vm_runner_store(program, vm_context, async_ops);
 
     match vm_execution.execution_mode {
-        VmExecutionMode::Async => AsyncModeRunner::execute(
-            vm_store,
-            debug_session,
-            debug,
-            register_host_modules,
-            vm_execution,
-        )
-        .await,
-        VmExecutionMode::Threading => ThreadingModeRunner::execute(
-            vm_store,
-            debug_session,
-            debug,
-            register_host_modules,
-            vm_execution,
-        )
-        .await,
+        VmExecutionMode::Async => {
+            AsyncModeRunner::execute(
+                vm_store,
+                debug_session,
+                debug,
+                register_host_modules,
+                vm_execution,
+            )
+            .await
+        }
+        VmExecutionMode::Threading => {
+            ThreadingModeRunner::execute(
+                vm_store,
+                debug_session,
+                debug,
+                register_host_modules,
+                vm_execution,
+            )
+            .await
+        }
     }
 }
 
