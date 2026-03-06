@@ -1,9 +1,12 @@
 mod analyzer;
+mod completions;
+mod stdlib;
 
 use serde::Serialize;
 use vm::SourceFlavor;
 
 use crate::analyzer::{LintReport, lint_source_with_flavor};
+use crate::completions::{CompletionCatalog, build_completion_catalog};
 
 #[derive(Serialize)]
 struct LintResponse {
@@ -74,6 +77,12 @@ fn report_to_json(report: LintReport) -> Vec<u8> {
     serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"diagnostics\":[]}".to_vec())
 }
 
+fn completion_catalog_to_json(catalog: CompletionCatalog) -> Vec<u8> {
+    serde_json::to_vec(&catalog).unwrap_or_else(|_| {
+        b"{\"rustscript\":[],\"javascript\":[],\"lua\":[],\"scheme\":[]}".to_vec()
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn wasm_alloc(len: u32) -> *mut u8 {
     let mut buf = Vec::<u8>::with_capacity(len as usize);
@@ -123,8 +132,15 @@ pub extern "C" fn lint_source_json(
     leak_bytes(report_to_json(report))
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn completion_catalog_json() -> u64 {
+    leak_bytes(completion_catalog_to_json(build_completion_catalog()))
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::completions::build_completion_catalog;
+
     use super::parse_flavor;
     use crate::analyzer::lint_source_with_flavor;
     use vm::SourceFlavor;
@@ -187,5 +203,24 @@ mod tests {
                 "expected span diagnostics for {flavor:?}"
             );
         }
+    }
+
+    #[test]
+    fn completion_catalog_reports_host_and_stdlib_entries() {
+        let catalog = build_completion_catalog();
+        assert!(
+            catalog
+                .rustscript
+                .iter()
+                .any(|entry| entry.label == "vm::http::request::get_id"),
+            "expected RustScript pd-edge host completion"
+        );
+        assert!(
+            catalog
+                .rustscript
+                .iter()
+                .any(|entry| entry.label == "string::trim"),
+            "expected RustScript stdlib completion"
+        );
     }
 }

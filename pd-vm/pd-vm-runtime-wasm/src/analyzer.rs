@@ -33,7 +33,6 @@ impl LintReport {
         }
     }
 
-    // used for tests
     #[allow(dead_code)]
     pub fn has_errors(&self) -> bool {
         !self.diagnostics.is_empty()

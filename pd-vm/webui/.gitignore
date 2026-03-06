@@ -1,0 +1,6 @@
+node_modules/
+dist/
+!package.json
+!bun.lock
+!tsconfig.json
+!src/monaco/*.json

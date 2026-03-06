@@ -1,0 +1,220 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@500;700&display=swap");
+
+:root {
+  --bg-0: #f3efe6;
+  --bg-1: #d8e6d2;
+  --bg-2: #c6d5ef;
+  --ink-0: #102331;
+  --ink-1: #2f4450;
+  --panel: rgba(255, 255, 255, 0.84);
+  --panel-border: rgba(16, 35, 49, 0.17);
+  --accent: #0f766e;
+  --accent-soft: #2d9087;
+  --warn: #b45309;
+  --danger: #b91c1c;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  color: var(--ink-0);
+  font-family: "Space Grotesk", "Trebuchet MS", sans-serif;
+  background:
+    radial-gradient(circle at 18% 15%, rgba(31, 132, 155, 0.25), transparent 44%),
+    radial-gradient(circle at 84% 12%, rgba(22, 163, 74, 0.2), transparent 38%),
+    linear-gradient(160deg, var(--bg-0), var(--bg-1) 42%, var(--bg-2));
+}
+
+.page {
+  min-height: 100%;
+  padding: 1.4rem;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  gap: 1rem;
+}
+
+.hero {
+  border: 1px solid var(--panel-border);
+  border-radius: 1rem;
+  background: var(--panel);
+  backdrop-filter: blur(3px);
+  padding: 1rem 1.2rem;
+  box-shadow: 0 12px 32px rgba(18, 59, 76, 0.12);
+}
+
+.hero h1 {
+  margin: 0;
+  font-size: clamp(1.4rem, 2.8vw, 2rem);
+  letter-spacing: 0.02em;
+}
+
+.hero p {
+  margin: 0.45rem 0 0;
+  line-height: 1.45;
+  color: var(--ink-1);
+}
+
+.workspace {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 0.75rem;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.7rem;
+  border-radius: 0.9rem;
+  border: 1px solid var(--panel-border);
+  background: var(--panel);
+  backdrop-filter: blur(3px);
+  box-shadow: 0 10px 24px rgba(18, 59, 76, 0.1);
+}
+
+.toolbar label {
+  font-size: 0.88rem;
+  letter-spacing: 0.03em;
+}
+
+.toolbar select,
+.toolbar button {
+  border-radius: 0.55rem;
+  border: 1px solid rgba(13, 57, 70, 0.22);
+  font: inherit;
+}
+
+.toolbar select {
+  min-width: 12rem;
+  padding: 0.44rem 0.58rem;
+  color: var(--ink-0);
+  background: #ffffff;
+}
+
+.toolbar button {
+  padding: 0.44rem 0.9rem;
+  color: #f7fffd;
+  background: linear-gradient(135deg, var(--accent), var(--accent-soft));
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.toolbar button:disabled {
+  opacity: 0.62;
+  cursor: not-allowed;
+}
+
+.status {
+  padding: 0.32rem 0.52rem;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-family: "IBM Plex Mono", monospace;
+  letter-spacing: 0.02em;
+  border: 1px solid rgba(16, 35, 49, 0.18);
+}
+
+.status.neutral {
+  color: var(--ink-1);
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.status.ok {
+  color: #125f3a;
+  background: rgba(22, 163, 74, 0.14);
+}
+
+.status.error {
+  color: var(--danger);
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.status.busy {
+  color: var(--warn);
+  background: rgba(245, 158, 11, 0.16);
+}
+
+.editor-shell {
+  min-height: 0;
+  border-radius: 0.9rem;
+  overflow: hidden;
+  border: 1px solid var(--panel-border);
+  box-shadow: 0 16px 32px rgba(18, 59, 76, 0.14);
+}
+
+.editor {
+  height: min(60vh, 36rem);
+  width: 100%;
+}
+
+.panels {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.panel {
+  border-radius: 0.85rem;
+  border: 1px solid var(--panel-border);
+  background: var(--panel);
+  backdrop-filter: blur(3px);
+  box-shadow: 0 12px 28px rgba(18, 59, 76, 0.1);
+  min-width: 0;
+}
+
+.panel h2 {
+  margin: 0;
+  padding: 0.58rem 0.74rem;
+  font-size: 0.95rem;
+  border-bottom: 1px solid rgba(16, 35, 49, 0.1);
+}
+
+.panel-content {
+  margin: 0;
+  min-height: 8rem;
+  max-height: 12rem;
+  padding: 0.7rem 0.74rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-size: 0.83rem;
+  line-height: 1.4;
+  font-family: "IBM Plex Mono", monospace;
+}
+
+@media (max-width: 1024px) {
+  .panels {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .page {
+    padding: 0.85rem;
+  }
+
+  .toolbar {
+    gap: 0.45rem;
+  }
+
+  .toolbar select {
+    min-width: 100%;
+  }
+
+  .editor {
+    height: 54vh;
+  }
+
+  .panels {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "pd-vm-webui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "bun@1.2.9",
+  "scripts": {
+    "build:wasm-playground": "bun ./scripts/build-wasm-playground.mjs",
+    "dev": "bun ./scripts/build-wasm-playground.mjs && vite",
+    "build": "bun ./scripts/build-wasm-playground.mjs && tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "monaco-editor": "^0.55.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}
