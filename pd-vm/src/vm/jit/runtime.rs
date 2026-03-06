@@ -464,15 +464,13 @@ impl Vm {
                     index,
                     argc,
                     call_ip,
-                } => {
-                    match self.execute_host_call(*index, *argc, *call_ip)? {
-                        HostCallExecOutcome::Returned => {}
-                        HostCallExecOutcome::Yielded => return Ok(ExecOutcome::Yielded),
-                        HostCallExecOutcome::Pending(op_id) => {
-                            return Ok(ExecOutcome::Waiting(op_id));
-                        }
+                } => match self.execute_host_call(*index, *argc, *call_ip)? {
+                    HostCallExecOutcome::Returned => {}
+                    HostCallExecOutcome::Yielded => return Ok(ExecOutcome::Yielded),
+                    HostCallExecOutcome::Pending(op_id) => {
+                        return Ok(ExecOutcome::Waiting(op_id));
                     }
-                }
+                },
                 TraceStep::Call {
                     index,
                     argc,

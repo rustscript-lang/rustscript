@@ -559,7 +559,12 @@ impl TraceJitEngine {
                 }
                 if target == root_ip {
                     steps.push(TraceStep::JumpToRoot);
-                    return Ok(self.finish_trace(program, root_ip, steps, JitTraceTerminal::LoopBack));
+                    return Ok(self.finish_trace(
+                        program,
+                        root_ip,
+                        steps,
+                        JitTraceTerminal::LoopBack,
+                    ));
                 }
                 if target < ip {
                     steps.push(TraceStep::JumpToIp { target_ip: target });

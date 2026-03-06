@@ -124,6 +124,7 @@ struct BenchConfig {
     auto_build: bool,
     release_build: bool,
     json_out: Option<PathBuf>,
+    scenario: Option<String>,
 }
 
 impl Default for BenchConfig {
@@ -139,6 +140,7 @@ impl Default for BenchConfig {
             auto_build: true,
             release_build: true,
             json_out: None,
+            scenario: None,
         }
     }
 }
@@ -154,6 +156,7 @@ struct BenchConfigReport {
     binary_path: String,
     auto_build: bool,
     release_build: bool,
+    scenario: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -239,16 +242,30 @@ impl ProxyProcess {
         data_addr: SocketAddr,
         admin_addr: SocketAddr,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let child = Command::new(binary_path)
+        let rust_log = env::var("PD_EDGE_PROXY_RUST_LOG").unwrap_or_else(|_| "error".to_string());
+        let inherit_stdout = env_flag("PD_EDGE_PROXY_STDOUT_INHERIT");
+        let mut command = Command::new(binary_path);
+        let stdout = if inherit_stdout {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        };
+        command
             .arg("--data-addr")
             .arg(data_addr.to_string())
             .arg("--admin-addr")
             .arg(admin_addr.to_string())
-            .env("RUST_LOG", "error")
+            .env("RUST_LOG", rust_log)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+            .stdout(stdout)
+            .stderr(Stdio::inherit());
+        if let Ok(value) = env::var("PD_EDGE_PROFILE_VM_TAIL") {
+            command.env("PD_EDGE_PROFILE_VM_TAIL", value);
+        }
+        if let Ok(value) = env::var("PD_EDGE_PROFILE_VM_TAIL_THRESHOLD_US") {
+            command.env("PD_EDGE_PROFILE_VM_TAIL_THRESHOLD_US", value);
+        }
+        let child = command.spawn()?;
         Ok(Self { child })
     }
 
@@ -299,7 +316,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let mut reports = Vec::new();
-    for scenario in SCENARIOS {
+    let scenarios: Vec<Scenario> = if let Some(filter) = &config.scenario {
+        let matched = SCENARIOS
+            .iter()
+            .copied()
+            .find(|scenario| scenario.id == filter)
+            .ok_or_else(|| io::Error::other(format!("unknown --scenario: {filter}")))?;
+        vec![matched]
+    } else {
+        SCENARIOS.to_vec()
+    };
+    for scenario in scenarios {
         println!();
         println!("=== {} ===", scenario.description);
         let report = match run_scenario(&config, &binary_path, &client, scenario).await {
@@ -349,6 +376,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             binary_path: binary_path.display().to_string(),
             auto_build: config.auto_build,
             release_build: config.release_build,
+            scenario: config.scenario.clone(),
         },
         scenarios: reports,
     };
@@ -403,6 +431,8 @@ async fn run_scenario(
     }
 
     let request_url = format!("http://{data_addr}/perf?scenario={}", scenario.id);
+    verify_scenario_probe(client, &request_url, scenario).await?;
+
     if config.warmup_requests > 0 {
         let warmup = run_load(
             client,
@@ -569,6 +599,56 @@ fn compile_program_to_vmbc(source: &str) -> Result<Vec<u8>, Box<dyn std::error::
     validate_program(&compiled.program, HOST_FUNCTION_COUNT)?;
     let bytes = encode_program(&compiled.program)?;
     Ok(bytes)
+}
+
+async fn verify_scenario_probe(
+    client: &Client,
+    url: &str,
+    scenario: Scenario,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = client
+        .post(url)
+        .header("x-client-id", "perf-client")
+        .header("content-type", "text/plain")
+        .body(LOAD_REQUEST_BODY)
+        .send()
+        .await?;
+
+    let status = response.status().as_u16();
+    if status != scenario.expected_status {
+        let body = response.text().await.unwrap_or_default();
+        return Err(io::Error::other(format!(
+            "probe status mismatch for {}: expected {}, got {}, body={}",
+            scenario.id, scenario.expected_status, status, body
+        ))
+        .into());
+    }
+
+    if matches!(scenario.program_variant, ProgramVariant::HostCallsAdditive) {
+        let header_value = response
+            .headers()
+            .get("x-perf-client-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = response.text().await.unwrap_or_default();
+        if header_value != "perf-client" {
+            return Err(io::Error::other(format!(
+                "host-call probe missing expected x-perf-client-id header: got '{}'",
+                header_value
+            ))
+            .into());
+        }
+        if !body.contains(LOAD_REQUEST_BODY) {
+            return Err(io::Error::other(format!(
+                "host-call probe body missing request payload marker '{}': body='{}'",
+                LOAD_REQUEST_BODY, body
+            ))
+            .into());
+        }
+    }
+
+    Ok(())
 }
 
 async fn upload_program(
@@ -970,6 +1050,9 @@ fn parse_args() -> Result<BenchConfig, String> {
                 let path = parse_next_string("--json-out", &mut args)?;
                 config.json_out = Some(PathBuf::from(path));
             }
+            "--scenario" => {
+                config.scenario = Some(parse_next_string("--scenario", &mut args)?);
+            }
             "--skip-build" => {
                 config.auto_build = false;
             }
@@ -1030,6 +1113,15 @@ fn parse_next_u64(
         .map_err(|_| format!("invalid {flag}: {value}"))
 }
 
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 fn print_help() {
     eprintln!(concat!(
         "Usage: cargo run -p pd-edge --example http_proxy_perf_framework -- [options]\n\n",
@@ -1042,6 +1134,7 @@ fn print_help() {
         "  --memory-sample-interval-ms <MS>  RSS sample interval (default: 100)\n",
         "  --binary <PATH>                   Explicit pd-edge-http-proxy binary path\n",
         "  --json-out <PATH>                 Write JSON report to path\n",
+        "  --scenario <ID>                   Run a single scenario id (raw_no_program | no_host_calls_program | host_calls_terminate)\n",
         "  --skip-build                      Do not auto-build pd-edge-http-proxy\n",
         "  --build-release                   Auto-build release binary (default)\n",
         "  --build-debug                     Auto-build debug binary\n",
