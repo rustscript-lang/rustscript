@@ -4,85 +4,97 @@ use common::*;
 
 #[test]
 fn rustscript_vm_namespace_host_calls_are_supported() {
-    let source = r#"
-        use vm;
-        vm::add_one(41);
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    vm.bind_function("add_one", Box::new(AddOne));
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
+    let case = RuntimeCase {
+        name: "vm namespace host calls are supported",
+        source: r#"
+            use vm;
+            vm::add_one(41);
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_stack: vec![Value::Int(42)],
+        expected_locals: None,
+    };
+    let bindings = [HostBindingCase {
+        name: "add_one",
+        factory: make_add_one,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
 }
 
 #[test]
 fn rustscript_vm_http_subnamespace_host_calls_are_supported() {
-    let source = r#"
-        use vm;
-        vm::http::request::get_header("x-client-id");
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    vm.bind_function("http::request::get_header", Box::new(EchoString));
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("x-client-id".to_string())]);
+    let case = RuntimeCase {
+        name: "vm http subnamespace host calls are supported",
+        source: r#"
+            use vm;
+            vm::http::request::get_header("x-client-id");
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_stack: vec![Value::String("x-client-id".to_string())],
+        expected_locals: None,
+    };
+    let bindings = [HostBindingCase {
+        name: "http::request::get_header",
+        factory: make_echo_string,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
 }
 
 #[test]
 fn rustscript_host_namespace_import_without_vm_prefix_is_supported() {
-    let source = r#"
-        use runtime;
-        runtime::sleep(41);
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    vm.bind_function("runtime::sleep", Box::new(AddOne));
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
+    let case = RuntimeCase {
+        name: "host namespace import without vm prefix is supported",
+        source: r#"
+            use runtime;
+            runtime::sleep(41);
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_stack: vec![Value::Int(42)],
+        expected_locals: None,
+    };
+    let bindings = [HostBindingCase {
+        name: "runtime::sleep",
+        factory: make_add_one,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
 }
 
 #[test]
 fn rustscript_host_namespace_alias_import_is_supported() {
-    struct AlwaysAllow;
-
-    impl HostFunction for AlwaysAllow {
-        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-            Ok(CallOutcome::Return(vec![Value::Bool(true)]))
-        }
-    }
-
-    let source = r#"
-        use rate_limit as rl;
-        rl::allow("client-1", 3, 60);
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    vm.bind_function("rate_limit::allow", Box::new(AlwaysAllow));
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Bool(true)]);
+    let case = RuntimeCase {
+        name: "host namespace alias import is supported",
+        source: r#"
+            use rate_limit as rl;
+            rl::allow("client-1", 3, 60);
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_stack: vec![Value::Bool(true)],
+        expected_locals: None,
+    };
+    let bindings = [HostBindingCase {
+        name: "rate_limit::allow",
+        factory: make_always_allow,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
 }
 
 #[test]
 fn rustscript_vm_named_host_imports_are_supported() {
-    let source = r#"
-        use vm::{add_one as inc};
-        inc(41);
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    vm.bind_function("add_one", Box::new(AddOne));
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
+    let case = RuntimeCase {
+        name: "vm named host imports are supported",
+        source: r#"
+            use vm::{add_one as inc};
+            inc(41);
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_stack: vec![Value::Int(42)],
+        expected_locals: None,
+    };
+    let bindings = [HostBindingCase {
+        name: "add_one",
+        factory: make_add_one,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
 }
 
 #[test]
@@ -108,104 +120,92 @@ fn rustscript_io_namespace_builtin_calls_are_supported() {
 }
 
 #[test]
-fn rustscript_builtin_namespace_calls_require_use_import() {
-    let source = r#"
-        json::encode("ok");
-    "#;
-    let err = match compile_source(source) {
-        Ok(_) => panic!("builtin namespace calls should require explicit use import"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("import builtin namespaces first"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("unexpected error: {other}"),
+fn rustscript_builtin_and_namespace_runtime_cases_work() {
+    let cases = vec![
+        RuntimeCase {
+            name: "re namespace supports optional inline flags across functions",
+            source: r#"
+                use re;
+                let a = re::match("^foo$", "FoO", "i");
+                let b = re::find("^foo", "FoO bar", "i");
+                let c = re::replace("foo", "FoO bar", "x", "i");
+                let d = re::split("x", "aXb", "i");
+                let e = re::captures("^(foo)-([0-9]+)$", "FoO-42", "i");
+
+                let score = 0;
+                if a {
+                    score = score + 1;
+                }
+                if b == "FoO" {
+                    score = score + 1;
+                }
+                if c == "x bar" {
+                    score = score + 1;
+                }
+                if d.length == 2 && d[0] == "a" && d[1] == "b" {
+                    score = score + 1;
+                }
+                if e.length == 3 && e[1] == "FoO" && e[2] == "42" {
+                    score = score + 1;
+                }
+                score;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(5)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "json encode decode builtins are supported",
+            source: r#"
+                use json;
+                let payload = {
+                    answer: 42,
+                    ok: true,
+                    arr: [1, 2],
+                    inner: { name: "pd" },
+                };
+                let text = json::encode(payload);
+                let decoded = json::decode(text);
+                decoded.answer + decoded.arr[1];
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(44)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "jit namespace builtins can configure and read jit",
+            source: r#"
+                use jit;
+                let _set = jit::set_hot_loop_threshold(3);
+                let after = jit::get_hot_loop_threshold();
+                let cfg = jit::get_config();
+                if after == 3 && cfg.hot_loop_threshold == 3 {
+                    1;
+                } else {
+                    0;
+                }
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(1)],
+            expected_locals: None,
+        },
+    ];
+    run_runtime_cases(&cases);
+}
+
+#[test]
+fn rustscript_builtin_and_namespace_parse_rejection_cases_work() {
+    let cases = vec![ParseErrorCase {
+        name: "builtin namespace calls require use import",
+        source: r#"
+            json::encode("ok");
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_contains_all: &["import builtin namespaces first"],
+    }];
+    for case in &cases {
+        expect_parse_error_case(case);
     }
-}
-
-#[test]
-fn rustscript_re_namespace_supports_optional_inline_flags_across_functions() {
-    let source = r#"
-        use re;
-        let a = re::match("^foo$", "FoO", "i");
-        let b = re::find("^foo", "FoO bar", "i");
-        let c = re::replace("foo", "FoO bar", "x", "i");
-        let d = re::split("x", "aXb", "i");
-        let e = re::captures("^(foo)-([0-9]+)$", "FoO-42", "i");
-
-        let score = 0;
-        if a {
-            score = score + 1;
-        }
-        if b == "FoO" {
-            score = score + 1;
-        }
-        if c == "x bar" {
-            score = score + 1;
-        }
-        if d.length == 2 && d[0] == "a" && d[1] == "b" {
-            score = score + 1;
-        }
-        if e.length == 3 && e[1] == "FoO" && e[2] == "42" {
-            score = score + 1;
-        }
-        score;
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(5)]);
-}
-
-#[test]
-fn rustscript_json_encode_decode_builtins_are_supported() {
-    let source = r#"
-        use json;
-        let payload = {
-            answer: 42,
-            ok: true,
-            arr: [1, 2],
-            inner: { name: "pd" },
-        };
-        let text = json::encode(payload);
-        let decoded = json::decode(text);
-        decoded.answer + decoded.arr[1];
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(44)]);
-}
-
-#[test]
-fn rustscript_jit_namespace_builtins_can_configure_and_read_jit() {
-    let source = r#"
-        use jit;
-        let _set = jit::set_hot_loop_threshold(3);
-        let after = jit::get_hot_loop_threshold();
-        let cfg = jit::get_config();
-        if after == 3 && cfg.hot_loop_threshold == 3 {
-            1;
-        } else {
-            0;
-        }
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(1)]);
 }
 
 #[test]
@@ -253,100 +253,86 @@ fn compile_source_file_preserves_jit_builtin_namespace_use_directive() {
 }
 
 #[test]
-fn rustscript_float_literal_binding_is_supported() {
-    let source = r#"
-        let a=1.1;
-        a;
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+fn rustscript_literal_and_slice_runtime_cases_work() {
+    let cases = vec![
+        RuntimeCase {
+            name: "float literal binding is supported",
+            source: r#"
+                let a=1.1;
+                a;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Float(1.1)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "char and hex escape literals are supported",
+            source: r#"
+                let c = '\x41';
+                let s = "\x42";
+                c;
+                s;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![
+                Value::String("A".to_string()),
+                Value::String("B".to_string()),
+            ],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "array primitives are supported without namespace",
+            source: r#"
+                let values = [];
+                values[values.length] = 7;
+                values[0] + values.length;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(8)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "bracket slice syntax is supported",
+            source: r#"
+                let text = "abcdef";
+                let end = -2;
+                let a = text[1:4];
+                let b = text[:3];
+                let c = text[2:];
+                let d = text[:-1];
+                let e = text[1:end];
 
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Float(1.1)]);
-}
-
-#[test]
-fn rustscript_char_and_hex_escape_literals_are_supported() {
-    let source = r#"
-        let c = '\x41';
-        let s = "\x42";
-        c;
-        s;
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(
-        vm.stack(),
-        &[
-            Value::String("A".to_string()),
-            Value::String("B".to_string())
-        ]
-    );
-}
-
-#[test]
-fn rustscript_array_primitives_are_supported_without_namespace() {
-    let source = r#"
-        let values = [];
-        values[values.length] = 7;
-        values[0] + values.length;
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(8)]);
-}
-
-#[test]
-fn rustscript_bracket_slice_syntax_is_supported() {
-    let source = r#"
-        let text = "abcdef";
-        let end = -2;
-        let a = text[1:4];
-        let b = text[:3];
-        let c = text[2:];
-        let d = text[:-1];
-        let e = text[1:end];
-
-        let arr = [1, 2, 3, 4, 5];
-        let f = arr[1:4];
-        let g = arr[:2];
-        let h = arr[3:];
-        let i = arr[:-2];
-        a.length + b.length + c.length + d.length + e.length + f.length + g.length + h.length + i.length;
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(28)]);
+                let arr = [1, 2, 3, 4, 5];
+                let f = arr[1:4];
+                let g = arr[:2];
+                let h = arr[3:];
+                let i = arr[:-2];
+                a.length + b.length + c.length + d.length + e.length + f.length + g.length + h.length + i.length;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(28)],
+            expected_locals: None,
+        },
+    ];
+    run_runtime_cases(&cases);
 }
 
 #[test]
 fn rss_print_macro_works_without_decl() {
-    let source = r#"
-        print!(40 + 2);
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    for func in &compiled.functions {
-        match func.name.as_str() {
-            "print" => vm.register_function(Box::new(PrintBuiltin)),
-            _ => panic!("unexpected function {}", func.name),
-        };
-    }
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
+    let case = RuntimeCase {
+        name: "print macro works without decl",
+        source: r#"
+            print!(40 + 2);
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_stack: vec![Value::Int(42)],
+        expected_locals: None,
+    };
+    let bindings = [HostBindingCase {
+        name: "print",
+        factory: make_print_builtin,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
 }
 
 #[test]
@@ -371,781 +357,514 @@ fn compile_source_file_with_rustscript_complex_fixture() {
 
 #[test]
 fn closure_captures_outer_value_at_definition_time() {
-    let source = r#"
-        let base = 7;
-        let add = |value| value + base;
-        base = 8;
-        print!(add(5));
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    for func in &compiled.functions {
-        match func.name.as_str() {
-            "print" => vm.register_function(Box::new(PrintBuiltin)),
-            _ => panic!("unexpected function {}", func.name),
-        };
-    }
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(12)]);
-}
-
-#[test]
-fn closure_values_are_first_class_and_can_be_passed_to_functions() {
-    let source = r#"
-        fn apply_twice(func, value) {
-            let once = func(value);
-            func(once);
-        }
-
-        let inc = |x| x + 1;
-        apply_twice(inc, 40);
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
-}
-
-#[test]
-fn named_functions_are_first_class_and_can_be_passed_to_functions() {
-    let source = r#"
-        fn add_one(value) {
-            value + 1;
-        }
-        fn apply_twice(func, value) {
-            let once = func(value);
-            func(once);
-        }
-
-        apply_twice(add_one, 40);
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
-}
-
-#[test]
-fn closure_capture_respects_non_numeric_field_move_checks() {
-    let source = r#"
-        let p = { a: "x" };
-        let _moved = p.a;
-        let f = |_| p.a;
-        f(0);
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("captured non-numeric field should be moved on first read"),
-        Err(err) => err,
+    let case = RuntimeCase {
+        name: "closure captures outer value at definition time",
+        source: r#"
+            let base = 7;
+            let add = |value| value + base;
+            base = 8;
+            print!(add(5));
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_stack: vec![Value::Int(12)],
+        expected_locals: None,
     };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("moved"),
-                "unexpected parse error: {parse:?}"
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
+    let bindings = [HostBindingCase {
+        name: "print",
+        factory: make_print_builtin,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
 }
 
 #[test]
-fn closure_capture_numeric_field_is_copy_by_default() {
-    let source = r#"
-        let p = { a: 1 };
-        let f = |_| p.a + p.a;
-        f(0);
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(2)]);
+fn rustscript_closure_value_runtime_cases_work() {
+    let cases = vec![
+        RuntimeCase {
+            name: "closure values are first class and can be passed to functions",
+            source: r#"
+                fn apply_twice(func, value) {
+                    let once = func(value);
+                    func(once);
+                }
+
+                let inc = |x| x + 1;
+                apply_twice(inc, 40);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "named functions are first class and can be passed to functions",
+            source: r#"
+                fn add_one(value) {
+                    value + 1;
+                }
+                fn apply_twice(func, value) {
+                    let once = func(value);
+                    func(once);
+                }
+
+                apply_twice(add_one, 40);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "closure capture numeric field is copy by default",
+            source: r#"
+                let p = { a: 1 };
+                let f = |_| p.a + p.a;
+                f(0);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(2)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "closure capture string concat auto copies field reads",
+            source: r#"
+                let p = { a: "x" };
+                let f = |_| p.a + p.a;
+                f(0);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("xx".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "closure capture string concat with borrowed rhs is allowed",
+            source: r#"
+                let p = { a: "x" };
+                let f = |_| p.a + &p.a;
+                f(0);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("xx".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "closure capture string concat with mut borrowed rhs is allowed",
+            source: r#"
+                let p = { a: "x" };
+                let f = |_| p.a + &mut p.a;
+                f(0);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("xx".to_string())],
+            expected_locals: None,
+        },
+    ];
+    run_runtime_cases(&cases);
 }
 
 #[test]
-fn closure_capture_string_concat_auto_copies_field_reads() {
-    let source = r#"
-        let p = { a: "x" };
-        let f = |_| p.a + p.a;
-        f(0);
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
-}
-
-#[test]
-fn closure_capture_string_concat_with_borrowed_rhs_is_allowed() {
-    let source = r#"
-        let p = { a: "x" };
-        let f = |_| p.a + &p.a;
-        f(0);
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
-}
-
-#[test]
-fn closure_capture_string_concat_with_mut_borrowed_rhs_is_allowed() {
-    let source = r#"
-        let p = { a: "x" };
-        let f = |_| p.a + &mut p.a;
-        f(0);
-    "#;
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
-}
-
-#[test]
-fn closure_value_from_partial_control_flow_is_rejected_on_call() {
-    let source = r#"
-        if true {
-            let inc = |x| x + 1;
-        }
-        inc(1);
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("branch-local closure call should fail"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("inc") && parse.message.contains("unavailable"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn function_value_from_partial_control_flow_is_rejected_on_call() {
-    let source = r#"
-        fn add_one(value) {
-            value + 1;
-        }
-        if true {
-            let f = add_one;
-        }
-        f(1);
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("branch-local function value call should fail"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("f") && parse.message.contains("unavailable"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn non_numeric_field_access_is_moved_by_default() {
-    let source = r#"
-        let p = { a: "x" };
-        let first = p.a;
-        let second = p.a;
-        second;
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("second access to moved field should fail"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("p.a") && parse.message.contains("moved"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn numeric_field_access_is_copy_by_default() {
-    let source = r#"
-        let p = { a: 1, b: 1.5 };
-        let first = p.a;
-        let second = p.a;
-        let sum = p.b + p.b;
-        first + second;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(2)]);
-}
-
-#[test]
-fn numeric_field_access_is_copy_by_default_when_initialized_from_numeric_local() {
-    let source = r#"
-        let n = 1;
-        let p = { a: n };
-        let first = p.a;
-        let second = p.a;
-        first + second;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(2)]);
-}
-
-#[test]
-fn copyable_field_access_remains_copyable_through_local_roundtrip() {
-    let source = r#"
-        let p = { a: 1 };
-        let x = p.a;
-        let q = { b: x };
-        let first = q.b;
-        let second = q.b;
-        first + second;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(2)]);
-}
-
-#[test]
-fn bool_and_null_fields_are_copy_by_default() {
-    let source = r#"
-        let p = { b: true, n: null };
-        let b1 = p.b;
-        let b2 = p.b;
-        let n1 = p.n;
-        let n2 = p.n;
-        if b1 && b2 && n1 == null && n2 == null {
-            1;
-        } else {
-            0;
-        }
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(1)]);
-}
-
-#[test]
-fn non_numeric_field_access_can_be_copied_with_copy() {
-    let source = r#"
-        let p = { a: "x" };
-        let first = p.a.copy();
-        let second = p.a;
-        first + second;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
-}
-
-#[test]
-fn non_numeric_field_access_can_be_borrowed_with_ampersand() {
-    let source = r#"
-        let p = { a: "x" };
-        let first = &p.a;
-        let second = p.a;
-        first + second;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
-}
-
-#[test]
-fn non_numeric_field_access_can_be_borrowed_with_rust_style_mut_ampersand() {
-    let source = r#"
-        let p = { a: "x" };
-        let first = &mut p.a;
-        let second = p.a;
-        first + second;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
-}
-
-#[test]
-fn non_numeric_field_access_can_be_borrowed_with_spaced_mut_ampersand() {
-    let source = r#"
-        let p = { a: "x" };
-        let first = & mut p.a;
-        let second = p.a;
-        first + second;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
-}
-
-#[test]
-fn non_numeric_field_access_can_still_use_legacy_mut_ampersand() {
-    let source = r#"
-        let p = { a: "x" };
-        let first = mut&p.a;
-        let second = p.a;
-        first + second;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
-}
-
-#[test]
-fn borrowed_then_moved_then_second_move_still_fails() {
-    let source = r#"
-        let p = { a: "x" };
-        let _loan = &p.a;
-        let _move = p.a;
-        let again = p.a;
-        again;
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("second move should fail after one loan and one move"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(parse.message.contains("moved"), "{}", parse.message);
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn borrowed_field_still_respects_prior_move_errors() {
-    let source = r#"
-        let p = { a: "x" };
-        let _moved = p.a;
-        let again = &p.a;
-        again;
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("borrowing after move should fail"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(parse.message.contains("moved"), "{}", parse.message);
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn mut_borrowed_field_still_respects_prior_move_errors() {
-    let source = r#"
-        let p = { a: "x" };
-        let _moved = p.a;
-        let again = &mut p.a;
-        again;
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("mutable borrowing after move should fail"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(parse.message.contains("moved"), "{}", parse.message);
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn moved_field_can_be_reinitialized_with_indexed_assignment() {
-    let source = r#"
-        let p = { a: "222", b: "666" };
-        let _moved = p.a;
-        p.a = "444";
-        let y = p.a;
-        y + p.b;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("444666".to_string())]);
-}
-
-#[test]
-fn while_loop_repeated_field_move_is_rejected() {
-    let source = r#"
-        let p = { a: "x" };
-        let i = 0;
-        while i < 2 {
-            let _moved = p.a;
-            i = i + 1;
-        }
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("loop should reject use-after-move across iterations"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("p.a") && parse.message.contains("moved"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn for_loop_repeated_field_move_is_rejected() {
-    let source = r#"
-        let p = { a: "x" };
-        for (let i = 0; i < 2; i = i + 1) {
-            let _moved = p.a;
-        }
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("loop should reject use-after-move across iterations"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("p.a") && parse.message.contains("moved"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn break_path_preserves_moved_field_state_after_loop() {
-    let source = r#"
-        let p = { a: "x" };
-        while true {
-            let _moved = p.a;
-            break;
-        }
-        let again = p.a;
-        again;
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("break exit should preserve moved-field state"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("p.a") && parse.message.contains("moved"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn continue_path_rechecks_moved_field_on_next_iteration() {
-    let source = r#"
-        let p = { a: "x" };
-        let i = 0;
-        while i < 2 {
-            let _moved = p.a;
-            i = i + 1;
-            continue;
-        }
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("continue path should preserve moved-field state"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("p.a") && parse.message.contains("moved"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn moved_field_reinitialized_inside_loop_remains_usable() {
-    let source = r#"
-        let p = { a: "start" };
-        let i = 0;
-        while i < 2 {
-            let _moved = p.a;
-            p.a = "new";
-            i = i + 1;
-        }
-        p.a;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("new".to_string())]);
-}
-
-#[test]
-fn move_in_one_loop_branch_is_visible_after_loop() {
-    let source = r#"
-        let p = { a: "x" };
-        let i = 0;
-        while i < 2 {
-            if i == 0 {
+fn rustscript_closure_value_parse_rejection_cases_work() {
+    let cases = vec![
+        ParseErrorCase {
+            name: "closure capture respects non numeric field move checks",
+            source: r#"
+                let p = { a: "x" };
                 let _moved = p.a;
-            }
-            i = i + 1;
-        }
-        p.a;
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("field moved on one loop path should remain possibly moved"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("p.a") && parse.message.contains("moved"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
+                let f = |_| p.a;
+                f(0);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["moved"],
+        },
+        ParseErrorCase {
+            name: "closure value from partial control flow is rejected on call",
+            source: r#"
+                if true {
+                    let inc = |x| x + 1;
+                }
+                inc(1);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["inc", "unavailable"],
+        },
+        ParseErrorCase {
+            name: "function value from partial control flow is rejected on call",
+            source: r#"
+                fn add_one(value) {
+                    value + 1;
+                }
+                if true {
+                    let f = add_one;
+                }
+                f(1);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["f", "unavailable"],
+        },
+    ];
+    for case in &cases {
+        expect_parse_error_case(case);
     }
 }
 
 #[test]
-fn match_arm_move_marks_field_as_possibly_moved() {
-    let source = r#"
-        let p = { a: "x" };
-        let key = 1;
-        let _v = match key {
-            1 => p.a,
-            _ => "fallback",
-        };
-        p.a;
-    "#;
+fn rustscript_move_and_alias_runtime_cases_work() {
+    let cases = vec![
+        RuntimeCase {
+            name: "numeric field access is copy by default",
+            source: r#"
+                let p = { a: 1, b: 1.5 };
+                let first = p.a;
+                let second = p.a;
+                let sum = p.b + p.b;
+                first + second;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(2)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "numeric field access is copy by default when initialized from numeric local",
+            source: r#"
+                let n = 1;
+                let p = { a: n };
+                let first = p.a;
+                let second = p.a;
+                first + second;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(2)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "copyable field access remains copyable through local roundtrip",
+            source: r#"
+                let p = { a: 1 };
+                let x = p.a;
+                let q = { b: x };
+                let first = q.b;
+                let second = q.b;
+                first + second;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(2)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "bool and null fields are copy by default",
+            source: r#"
+                let p = { b: true, n: null };
+                let b1 = p.b;
+                let b2 = p.b;
+                let n1 = p.n;
+                let n2 = p.n;
+                if b1 && b2 && n1 == null && n2 == null {
+                    1;
+                } else {
+                    0;
+                }
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(1)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "non numeric field access can be copied with copy",
+            source: r#"
+                let p = { a: "x" };
+                let first = p.a.copy();
+                let second = p.a;
+                first + second;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("xx".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "non numeric field access can be borrowed with ampersand",
+            source: r#"
+                let p = { a: "x" };
+                let first = &p.a;
+                let second = p.a;
+                first + second;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("xx".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "non numeric field access can be borrowed with rust style mut ampersand",
+            source: r#"
+                let p = { a: "x" };
+                let first = &mut p.a;
+                let second = p.a;
+                first + second;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("xx".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "non numeric field access can be borrowed with spaced mut ampersand",
+            source: r#"
+                let p = { a: "x" };
+                let first = & mut p.a;
+                let second = p.a;
+                first + second;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("xx".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "non numeric field access can still use legacy mut ampersand",
+            source: r#"
+                let p = { a: "x" };
+                let first = mut&p.a;
+                let second = p.a;
+                first + second;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("xx".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "moved field can be reinitialized with indexed assignment",
+            source: r#"
+                let p = { a: "222", b: "666" };
+                let _moved = p.a;
+                p.a = "444";
+                let y = p.a;
+                y + p.b;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("444666".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "moved field reinitialized inside loop remains usable",
+            source: r#"
+                let p = { a: "start" };
+                let i = 0;
+                while i < 2 {
+                    let _moved = p.a;
+                    p.a = "new";
+                    i = i + 1;
+                }
+                p.a;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("new".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "mutating after copy detach is allowed",
+            source: r#"
+                let p = { a: 1 };
+                let q = p;
+                q = q.copy();
+                p.a = 2;
+                p.a + q.a;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(3)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "reassigning collection breaks old alias for target local",
+            source: r#"
+                let a = [1];
+                let b = a;
+                a = [2];
+                a[0] = 3;
+                a[0] + b[0];
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(4)],
+            expected_locals: None,
+        },
+    ];
+    run_runtime_cases(&cases);
+}
 
-    let err = match compile_source(source) {
-        Ok(_) => panic!("move in match arm should mark field as possibly moved"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("p.a") && parse.message.contains("moved"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
+#[test]
+fn rustscript_move_and_alias_parse_rejection_cases_work() {
+    let cases = vec![
+        ParseErrorCase {
+            name: "non numeric field access is moved by default",
+            source: r#"
+                let p = { a: "x" };
+                let first = p.a;
+                let second = p.a;
+                second;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["p.a", "moved"],
+        },
+        ParseErrorCase {
+            name: "borrowed then moved then second move still fails",
+            source: r#"
+                let p = { a: "x" };
+                let _loan = &p.a;
+                let _move = p.a;
+                let again = p.a;
+                again;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["moved"],
+        },
+        ParseErrorCase {
+            name: "borrowed field still respects prior move errors",
+            source: r#"
+                let p = { a: "x" };
+                let _moved = p.a;
+                let again = &p.a;
+                again;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["moved"],
+        },
+        ParseErrorCase {
+            name: "mut borrowed field still respects prior move errors",
+            source: r#"
+                let p = { a: "x" };
+                let _moved = p.a;
+                let again = &mut p.a;
+                again;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["moved"],
+        },
+        ParseErrorCase {
+            name: "while loop repeated field move is rejected",
+            source: r#"
+                let p = { a: "x" };
+                let i = 0;
+                while i < 2 {
+                    let _moved = p.a;
+                    i = i + 1;
+                }
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["p.a", "moved"],
+        },
+        ParseErrorCase {
+            name: "for loop repeated field move is rejected",
+            source: r#"
+                let p = { a: "x" };
+                for (let i = 0; i < 2; i = i + 1) {
+                    let _moved = p.a;
+                }
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["p.a", "moved"],
+        },
+        ParseErrorCase {
+            name: "break path preserves moved field state after loop",
+            source: r#"
+                let p = { a: "x" };
+                while true {
+                    let _moved = p.a;
+                    break;
+                }
+                let again = p.a;
+                again;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["p.a", "moved"],
+        },
+        ParseErrorCase {
+            name: "continue path rechecks moved field on next iteration",
+            source: r#"
+                let p = { a: "x" };
+                let i = 0;
+                while i < 2 {
+                    let _moved = p.a;
+                    i = i + 1;
+                    continue;
+                }
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["p.a", "moved"],
+        },
+        ParseErrorCase {
+            name: "move in one loop branch is visible after loop",
+            source: r#"
+                let p = { a: "x" };
+                let i = 0;
+                while i < 2 {
+                    if i == 0 {
+                        let _moved = p.a;
+                    }
+                    i = i + 1;
+                }
+                p.a;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["p.a", "moved"],
+        },
+        ParseErrorCase {
+            name: "match arm move marks field as possibly moved",
+            source: r#"
+                let p = { a: "x" };
+                let key = 1;
+                let _v = match key {
+                    1 => p.a,
+                    _ => "fallback",
+                };
+                p.a;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["p.a", "moved"],
+        },
+        ParseErrorCase {
+            name: "map mutation is rejected while collection alias exists",
+            source: r#"
+                let p = { a: 1 };
+                let q = p;
+                p.a = 2;
+                p.a + q.a;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["aliased", "p"],
+        },
+        ParseErrorCase {
+            name: "array mutation is rejected while collection alias exists",
+            source: r#"
+                let a = [1];
+                let b = a;
+                a[0] = 2;
+                a[0] + b[0];
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["aliased", "a"],
+        },
+        ParseErrorCase {
+            name: "array append is rejected while collection alias exists",
+            source: r#"
+                let a = [1];
+                let b = a;
+                a[a.length] = 2;
+                b[0];
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["aliased", "a"],
+        },
+        ParseErrorCase {
+            name: "collection alias from passthrough function is tracked",
+            source: r#"
+                fn id(x) {
+                    x;
+                }
+                let a = [1];
+                let b = id(a);
+                a[0] = 2;
+                a[0] + b[0];
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["aliased", "a"],
+        },
+    ];
+    for case in &cases {
+        expect_parse_error_case(case);
     }
-}
-
-#[test]
-fn map_mutation_is_rejected_while_collection_alias_exists() {
-    let source = r#"
-        let p = { a: 1 };
-        let q = p;
-        p.a = 2;
-        p.a + q.a;
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("mutating an aliased map should fail"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("aliased") && parse.message.contains("p"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn array_mutation_is_rejected_while_collection_alias_exists() {
-    let source = r#"
-        let a = [1];
-        let b = a;
-        a[0] = 2;
-        a[0] + b[0];
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("mutating an aliased array should fail"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("aliased") && parse.message.contains("a"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn mutating_after_copy_detach_is_allowed() {
-    let source = r#"
-        let p = { a: 1 };
-        let q = p;
-        q = q.copy();
-        p.a = 2;
-        p.a + q.a;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(3)]);
-}
-
-#[test]
-fn array_append_is_rejected_while_collection_alias_exists() {
-    let source = r#"
-        let a = [1];
-        let b = a;
-        a[a.length] = 2;
-        b[0];
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("appending to an aliased array should fail"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("aliased") && parse.message.contains("a"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn collection_alias_from_passthrough_function_is_tracked() {
-    let source = r#"
-        fn id(x) {
-            x;
-        }
-        let a = [1];
-        let b = id(a);
-        a[0] = 2;
-        a[0] + b[0];
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("mutating through one alias should fail after passthrough call"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("aliased") && parse.message.contains("a"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn reassigning_collection_breaks_old_alias_for_target_local() {
-    let source = r#"
-        let a = [1];
-        let b = a;
-        a = [2];
-        a[0] = 3;
-        a[0] + b[0];
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(4)]);
 }
 
 #[test]
@@ -1236,237 +955,186 @@ fn liveness_clears_local_after_function_value_last_use() {
 
 #[test]
 fn rustscript_callable_values_cannot_be_stored_in_arrays() {
-    let source = r#"
-        fn add_one(value) {
-            value + 1;
-        }
-        let func = add_one;
-        let values = [func];
-        values.length;
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("storing callable in array should fail in current subset"),
-        Err(err) => err,
+    let case = SourceErrorCase {
+        name: "callable values cannot be stored in arrays",
+        source: r#"
+            fn add_one(value) {
+                value + 1;
+            }
+            let func = add_one;
+            let values = [func];
+            values.length;
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_kind: SourceErrorKind::Compile(CompileErrorKind::CallableUsedAsValue),
+        expected_contains_all: &[],
     };
-    match err {
-        vm::SourceError::Compile(vm::CompileError::CallableUsedAsValue) => {}
-        other => panic!("unexpected error: {other}"),
-    }
+    expect_source_error_case(&case);
 }
 
 #[test]
 fn rustscript_callable_values_cannot_be_returned_from_functions() {
-    let source = r#"
-        fn add_one(value) {
-            value + 1;
-        }
-        fn get_adder() {
-            add_one;
-        }
+    let case = SourceErrorCase {
+        name: "callable values cannot be returned from functions",
+        source: r#"
+            fn add_one(value) {
+                value + 1;
+            }
+            fn get_adder() {
+                add_one;
+            }
 
-        let func = get_adder();
-        func(41);
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("returning callable should fail in current subset"),
-        Err(err) => err,
+            let func = get_adder();
+            func(41);
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_kind: SourceErrorKind::Compile(CompileErrorKind::CallableUsedAsValue),
+        expected_contains_all: &[],
     };
-    match err {
-        vm::SourceError::Compile(vm::CompileError::CallableUsedAsValue) => {}
-        other => panic!("unexpected error: {other}"),
+    expect_source_error_case(&case);
+}
+
+#[test]
+fn rustscript_if_and_match_runtime_cases_work() {
+    let cases = vec![
+        RuntimeCase {
+            name: "if expression assignment syntax is supported",
+            source: r#"
+                let x = if 2 > 1 => { 42 } else => { 0 };
+                x;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "if expression branch blocks support multiline statements",
+            source: r#"
+                let base = 40;
+                let out = if true => {
+                    let bump = base + 2;
+                    bump
+                } else => {
+                    let fallback = base - 1;
+                    fallback
+                };
+                out;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "if expression assignment executes else branch",
+            source: r#"
+                let marker = 0;
+                let out = if false => {
+                    marker = 1;
+                    10
+                } else => {
+                    marker = 2;
+                    20
+                };
+                marker + out;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(22)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "if expression supports else if chains",
+            source: r#"
+                let key = 2;
+                let out = if key == 1 => { 10 } else if key == 2 => { 20 } else => { 0 };
+                out;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(20)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "match expression supports int and wildcard patterns",
+            source: r#"
+                let value = 2;
+                let out = match value {
+                    1 => 10,
+                    2 => 20,
+                    _ => 0,
+                };
+                out;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(20)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "match expression supports string patterns",
+            source: r#"
+                let key = "beta";
+                let out = match key {
+                    "alpha" => 1,
+                    "beta" => 2,
+                    _ => 0,
+                };
+                out;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(2)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "match expression supports type patterns",
+            source: r#"
+                let a = match "value" {
+                    Some(String) => 1,
+                    _ => 0,
+                };
+                let b = match 7 {
+                    Some(Number) => 2,
+                    _ => 0,
+                };
+                let c = match true {
+                    Some(Number) => 100,
+                    _ => 3,
+                };
+                a + b + c;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(6)],
+            expected_locals: None,
+        },
+    ];
+    run_runtime_cases(&cases);
+}
+
+#[test]
+fn rustscript_if_and_match_parse_rejection_cases_work() {
+    let cases = vec![
+        ParseErrorCase {
+            name: "if expression requires else branch",
+            source: r#"
+                let x = if true => { 1 };
+                x;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["requires an else branch"],
+        },
+        ParseErrorCase {
+            name: "match expression rejects unsupported patterns",
+            source: r#"
+                let value = 1;
+                match value {
+                    true => 10,
+                    _ => 0,
+                };
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["int/string/null literals, type patterns"],
+        },
+    ];
+    for case in &cases {
+        expect_parse_error_case(case);
     }
-}
-
-#[test]
-fn rustscript_if_expression_assignment_syntax_is_supported() {
-    let source = r#"
-        let x = if 2 > 1 => { 42 } else => { 0 };
-        x;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
-}
-
-#[test]
-fn rustscript_if_expression_branch_blocks_support_multiline_statements() {
-    let source = r#"
-        let base = 40;
-        let out = if true => {
-            let bump = base + 2;
-            bump
-        } else => {
-            let fallback = base - 1;
-            fallback
-        };
-        out;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
-}
-
-#[test]
-fn rustscript_if_expression_assignment_executes_else_branch() {
-    let source = r#"
-        let marker = 0;
-        let out = if false => {
-            marker = 1;
-            10
-        } else => {
-            marker = 2;
-            20
-        };
-        marker + out;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(22)]);
-}
-
-#[test]
-fn rustscript_if_expression_supports_else_if_chains() {
-    let source = r#"
-        let key = 2;
-        let out = if key == 1 => { 10 } else if key == 2 => { 20 } else => { 0 };
-        out;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(20)]);
-}
-
-#[test]
-fn rustscript_if_expression_requires_else_branch() {
-    let source = r#"
-        let x = if true => { 1 };
-        x;
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("if expression without else should be rejected"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("requires an else branch"),
-                "unexpected parse error: {parse:?}"
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn rustscript_match_expression_supports_int_and_wildcard_patterns() {
-    let source = r#"
-        let value = 2;
-        let out = match value {
-            1 => 10,
-            2 => 20,
-            _ => 0,
-        };
-        out;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(20)]);
-}
-
-#[test]
-fn rustscript_match_expression_supports_string_patterns() {
-    let source = r#"
-        let key = "beta";
-        let out = match key {
-            "alpha" => 1,
-            "beta" => 2,
-            _ => 0,
-        };
-        out;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(2)]);
-}
-
-#[test]
-fn rustscript_match_expression_rejects_unsupported_patterns() {
-    let source = r#"
-        let value = 1;
-        match value {
-            true => 10,
-            _ => 0,
-        };
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("bool patterns should be rejected"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse
-                    .message
-                    .contains("int/string/null literals, type patterns"),
-                "unexpected parse error: {parse:?}"
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn rustscript_match_expression_supports_type_patterns() {
-    let source = r#"
-        let a = match "value" {
-            Some(String) => 1,
-            _ => 0,
-        };
-        let b = match 7 {
-            Some(Number) => 2,
-            _ => 0,
-        };
-        let c = match true {
-            Some(Number) => 100,
-            _ => 3,
-        };
-        a + b + c;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(6)]);
 }
 
 #[test]
@@ -1948,146 +1616,114 @@ fn rss_function_definition_is_inlined_without_host_imports() {
 }
 
 #[test]
-fn rustscript_modulo_and_logical_operators_work() {
-    let source = r#"
-        let a = 17 % 5;
-        let b = true && false;
-        let c = true || false;
-        let d = (10 > 5) && (3 < 7);
-        let e = (10 < 5) || (3 > 7);
-        let f = 100 % 7;
-        a + f;
-    "#;
+fn rustscript_language_runtime_cases_work() {
+    let cases = vec![
+        RuntimeCase {
+            name: "modulo and logical operators work",
+            source: r#"
+                let a = 17 % 5;
+                let b = true && false;
+                let c = true || false;
+                let d = (10 > 5) && (3 < 7);
+                let e = (10 < 5) || (3 > 7);
+                let f = 100 % 7;
+                a + f;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(4)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "null literal is supported",
+            source: r#"
+                let v = null;
+                type(v) == "null";
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Bool(true)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "option namespace style is supported",
+            source: r#"
+                let some = Option::Some(1 + 1);
+                let none = Option::None;
+                let some2 = Option::Some(40);
 
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(4)]);
+                let a = match none {
+                    null => 1,
+                    _ => 0,
+                };
+                let b = match some {
+                    null => 0,
+                    _ => 1,
+                };
+                let c = match some2 {
+                    Some(Number) => 1,
+                    _ => 0,
+                };
+
+                let t = type(Option::None);
+                if t == "null" {
+                    (a + b + c) + some2;
+                } else {
+                    0;
+                }
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(43)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "match type pattern is not shadowed by local name",
+            source: r#"
+                let String = 3;
+                let b = match "" {
+                    Some(String) => 2,
+                    _ => 3,
+                };
+                b;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(2)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "null literal can be used as map key",
+            source: r#"
+                let m = { null: 42 };
+                m[null];
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
+        },
+    ];
+    run_runtime_cases(&cases);
 }
 
 #[test]
-fn rustscript_null_literal_is_supported() {
-    let source = r#"
-        let v = null;
-        type(v) == "null";
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Bool(true)]);
-}
-
-#[test]
-fn rustscript_option_namespace_style_is_supported() {
-    let source = r#"
-        let some = Option::Some(1 + 1);
-        let none = Option::None;
-        let some2 = Option::Some(40);
-
-        let a = match none {
-            null => 1,
-            _ => 0,
-        };
-        let b = match some {
-            null => 0,
-            _ => 1,
-        };
-        let c = match some2 {
-            Some(Number) => 1,
-            _ => 0,
-        };
-
-        let t = type(Option::None);
-        if t == "null" {
-            (a + b + c) + some2;
-        } else {
-            0;
-        }
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(43)]);
-}
-
-#[test]
-fn rustscript_match_type_pattern_is_not_shadowed_by_local_name() {
-    let source = r#"
-        let String = 3;
-        let b = match "" {
-            Some(String) => 2,
-            _ => 3,
-        };
-        b;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(2)]);
-}
-
-#[test]
-fn rustscript_legacy_option_aliases_are_rejected() {
-    let source = r#"
-        let some = Some(1);
-        some;
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("bare Some(...) should be rejected"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("unknown function 'Some'"),
-                "unexpected parse error: {parse:?}"
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
+fn rustscript_language_parse_rejection_cases_work() {
+    let cases = vec![
+        ParseErrorCase {
+            name: "legacy option aliases are rejected",
+            source: r#"
+                let some = Some(1);
+                some;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["unknown function 'Some'"],
+        },
+        ParseErrorCase {
+            name: "type name of val alias is rejected",
+            source: r#"
+                type_name_of_val(null);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["unknown function 'type_name_of_val'"],
+        },
+    ];
+    for case in &cases {
+        expect_parse_error_case(case);
     }
-}
-
-#[test]
-fn rustscript_type_name_of_val_alias_is_rejected() {
-    let source = r#"
-        type_name_of_val(null);
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("type_name_of_val alias should be rejected"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse
-                    .message
-                    .contains("unknown function 'type_name_of_val'"),
-                "unexpected parse error: {parse:?}"
-            );
-        }
-        other => panic!("expected parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn rustscript_null_literal_can_be_used_as_map_key() {
-    let source = r#"
-        let m = { null: 42 };
-        m[null];
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
 }

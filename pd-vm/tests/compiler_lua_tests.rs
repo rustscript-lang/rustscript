@@ -2,178 +2,128 @@
 mod common;
 use common::*;
 
-fn expect_lua_direct_only_error(source: &str) {
-    let err = match compile_source_with_flavor(source, SourceFlavor::Lua) {
-        Ok(_) => panic!("source should be rejected by Lua direct frontend"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("unsupported Lua syntax"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("unexpected error: {other}"),
+#[test]
+fn lua_direct_subset_runtime_cases_work() {
+    let cases = vec![
+        RuntimeCase {
+            name: "assignment_and_arithmetic",
+            source: r#"
+                local a = 1
+                a = a + 41
+                a
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: Some(1),
+        },
+        RuntimeCase {
+            name: "if_else_and_logic",
+            source: r#"
+                local a = 2
+                if a > 1 and a < 3 then
+                    42
+                else
+                    0
+                end
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "while_loop",
+            source: r#"
+                local i = 0
+                while i < 3 do
+                    i = i + 1
+                end
+                i
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_stack: vec![Value::Int(3)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "do_end_block",
+            source: r#"
+                local value = 1
+                do
+                    value = value + 41
+                end
+                value
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "float_char_and_hex_escape_literals",
+            source: r#"
+                local f = 1.25
+                local c = '\x41'
+                local s = "\x42"
+                f
+                c
+                s
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_stack: vec![
+                Value::Float(1.25),
+                Value::String("A".to_string()),
+                Value::String("B".to_string()),
+            ],
+            expected_locals: None,
+        },
+    ];
+
+    run_runtime_cases(&cases);
+}
+
+#[test]
+fn lua_direct_subset_rejection_cases_work() {
+    let cases = [
+        ParseErrorCase {
+            name: "assignment_to_undeclared_local",
+            source: r#"
+                value = 1
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_contains_all: &["unknown local 'value'"],
+        },
+        ParseErrorCase {
+            name: "require_syntax_not_supported",
+            source: r#"
+                local vm = require("vm")
+                vm.add_one(41)
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_contains_all: &["unsupported Lua syntax"],
+        },
+        ParseErrorCase {
+            name: "function_syntax_not_supported",
+            source: r#"
+                function inc(v)
+                    return v + 1
+                end
+                inc(41)
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_contains_all: &["unsupported Lua syntax"],
+        },
+        ParseErrorCase {
+            name: "general_calls_not_supported_in_direct_subset",
+            source: r#"
+                local value = "hello"
+                len(value)
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_contains_all: &["unsupported Lua syntax"],
+        },
+    ];
+
+    for case in &cases {
+        expect_parse_error_case(case);
     }
-}
-
-#[test]
-fn lua_direct_subset_assignment_and_arithmetic_work() {
-    let source = r#"
-        local a = 1
-        a = a + 41
-        a
-    "#;
-
-    let compiled =
-        compile_source_with_flavor(source, SourceFlavor::Lua).expect("compile should succeed");
-    assert_eq!(compiled.locals, 1);
-
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
-}
-
-#[test]
-fn lua_direct_subset_if_else_and_logic_work() {
-    let source = r#"
-        local a = 2
-        if a > 1 and a < 3 then
-            42
-        else
-            0
-        end
-    "#;
-
-    let compiled =
-        compile_source_with_flavor(source, SourceFlavor::Lua).expect("compile should succeed");
-
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
-}
-
-#[test]
-fn lua_direct_subset_while_loop_work() {
-    let source = r#"
-        local i = 0
-        while i < 3 do
-            i = i + 1
-        end
-        i
-    "#;
-
-    let compiled =
-        compile_source_with_flavor(source, SourceFlavor::Lua).expect("compile should succeed");
-
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(3)]);
-}
-
-#[test]
-fn lua_direct_subset_do_end_block_work() {
-    let source = r#"
-        local value = 1
-        do
-            value = value + 41
-        end
-        value
-    "#;
-
-    let compiled =
-        compile_source_with_flavor(source, SourceFlavor::Lua).expect("compile should succeed");
-
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
-}
-
-#[test]
-fn lua_direct_subset_float_char_and_hex_escape_literals_work() {
-    let source = r#"
-        local f = 1.25
-        local c = '\x41'
-        local s = "\x42"
-        f
-        c
-        s
-    "#;
-
-    let compiled =
-        compile_source_with_flavor(source, SourceFlavor::Lua).expect("compile should succeed");
-
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(
-        vm.stack(),
-        &[
-            Value::Float(1.25),
-            Value::String("A".to_string()),
-            Value::String("B".to_string())
-        ]
-    );
-}
-
-#[test]
-fn lua_assignment_to_undeclared_local_is_rejected() {
-    let source = r#"
-        value = 1
-    "#;
-
-    let err = match compile_source_with_flavor(source, SourceFlavor::Lua) {
-        Ok(_) => panic!("assignment to undeclared local should fail"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("unknown local 'value'"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("unexpected error: {other}"),
-    }
-}
-
-#[test]
-fn lua_require_syntax_is_not_supported_anymore() {
-    let source = r#"
-        local vm = require("vm")
-        vm.add_one(41)
-    "#;
-
-    expect_lua_direct_only_error(source);
-}
-
-#[test]
-fn lua_function_syntax_is_not_supported_anymore() {
-    let source = r#"
-        function inc(v)
-            return v + 1
-        end
-        inc(41)
-    "#;
-
-    expect_lua_direct_only_error(source);
-}
-
-#[test]
-fn lua_calls_are_not_supported_in_direct_subset() {
-    let source = r#"
-        local value = "hello"
-        len(value)
-    "#;
-
-    expect_lua_direct_only_error(source);
 }
 
 #[test]

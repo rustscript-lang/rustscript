@@ -37,299 +37,284 @@ fn javascript_vm_namespace_host_calls_are_supported() {
 
 #[test]
 fn javascript_vm_http_subnamespace_host_calls_are_supported() {
-    let source = r#"
-        import * as vm from "vm";
-        vm.http.request.get_header("x-client-id");
-    "#;
-    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
-        .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    vm.bind_function("http::request::get_header", Box::new(EchoString));
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("x-client-id".to_string())]);
-}
-
-#[test]
-fn javascript_builtin_namespace_calls_require_import() {
-    let source = r#"
-        json.encode("ok");
-    "#;
-    let err = match compile_source_with_flavor(source, SourceFlavor::JavaScript) {
-        Ok(_) => panic!("builtin namespace calls should require explicit import"),
-        Err(err) => err,
+    let case = RuntimeCase {
+        name: "vm http subnamespace host calls are supported",
+        source: r#"
+            import * as vm from "vm";
+            vm.http.request.get_header("x-client-id");
+        "#,
+        flavor: SourceFlavor::JavaScript,
+        expected_stack: vec![Value::String("x-client-id".to_string())],
+        expected_locals: None,
     };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse.message.contains("unknown local 'json'"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("unexpected error: {other}"),
+    let bindings = [HostBindingCase {
+        name: "http::request::get_header",
+        factory: make_echo_string,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
+}
+
+#[test]
+fn javascript_runtime_cases_work() {
+    let cases = vec![
+        RuntimeCase {
+            name: "builtin namespace calls work with import",
+            source: r#"
+                import * as json from "json";
+                let text = json.encode("ok");
+                text;
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_stack: vec![Value::String("\"ok\"".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "jit namespace builtins work with import",
+            source: r#"
+                import * as jit from "jit";
+                const _set = jit.set_hot_loop_threshold(4);
+                const cfg = jit.get_config();
+                if (cfg.hot_loop_threshold == 4) {
+                    1;
+                } else {
+                    0;
+                }
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_stack: vec![Value::Int(1)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "assignment updates existing local without new slot",
+            source: r#"
+                let a = 1;
+                a = 2;
+                a;
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_stack: vec![Value::Int(2)],
+            expected_locals: Some(1),
+        },
+        RuntimeCase {
+            name: "float literal binding is supported",
+            source: r#"
+                let a=1.1;
+                a;
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_stack: vec![Value::Float(1.1)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "char and hex escape literals are supported",
+            source: r#"
+                let c = '\x41';
+                let s = "\x42";
+                c;
+                s;
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_stack: vec![
+                Value::String("A".to_string()),
+                Value::String("B".to_string()),
+            ],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "empty param arrow closure is supported",
+            source: r#"
+                let make = () => 42;
+                make();
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "function return statement is lowered",
+            source: r#"
+                function inc(v) { return v + 1; }
+                inc(41);
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "object property named return is not rewritten",
+            source: r#"
+                const obj = { return: 42 };
+                obj.return;
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "allows omitted semicolons at line end",
+            source: r#"
+                let out = 40
+                out = out + 1
+                if (out < 50) {
+                    out = out + 1
+                }
+                out
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "modulo and logical operators work",
+            source: r#"
+                const a = 17 % 5;
+                const b = true && false;
+                const c = true || false;
+                const d = (10 > 5) && (3 < 7);
+                const e = (10 < 5) || (3 > 7);
+                const f = 100 % 7;
+                a + f;
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_stack: vec![Value::Int(4)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "typeof operator is supported",
+            source: r#"
+                const value = null;
+                typeof value == "null";
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_stack: vec![Value::Bool(true)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "typeof property name is not rewritten as operator",
+            source: r#"
+                const obj = { typeof: 42 };
+                obj.typeof;
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
+        },
+    ];
+    run_runtime_cases(&cases);
+}
+
+#[test]
+fn javascript_parse_rejection_cases_work() {
+    let cases = vec![
+        ParseErrorCase {
+            name: "builtin namespace calls require import",
+            source: r#"
+                json.encode("ok");
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_contains_all: &["unknown local 'json'"],
+        },
+        ParseErrorCase {
+            name: "builtin namespace calls reject path separator",
+            source: r#"
+                import * as json from "json";
+                json::encode("ok");
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_contains_all: &["namespace calls use '.' in this language"],
+        },
+        ParseErrorCase {
+            name: "block body arrow closure is rejected",
+            source: r#"
+                let inc = (value) => { value + 1; };
+                inc(41);
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_contains_all: &["block bodies are not supported"],
+        },
+        ParseErrorCase {
+            name: "undeclared host call is rejected",
+            source: r#"
+                add_one(41);
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_contains_all: &["unknown function 'add_one'"],
+        },
+        ParseErrorCase {
+            name: "direct builtin len call is rejected",
+            source: r#"
+                let value = "hello";
+                len(value);
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_contains_all: &["unknown function 'len'"],
+        },
+    ];
+    for case in &cases {
+        expect_parse_error_case(case);
     }
-}
-
-#[test]
-fn javascript_builtin_namespace_calls_reject_path_separator() {
-    let source = r#"
-        import * as json from "json";
-        json::encode("ok");
-    "#;
-    let err = match compile_source_with_flavor(source, SourceFlavor::JavaScript) {
-        Ok(_) => panic!("JavaScript namespace separator should be '.'"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(
-                parse
-                    .message
-                    .contains("namespace calls use '.' in this language"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("unexpected error: {other}"),
-    }
-}
-
-#[test]
-fn javascript_builtin_namespace_calls_work_with_import() {
-    let source = r#"
-        import * as json from "json";
-        let text = json.encode("ok");
-        text;
-    "#;
-    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
-        .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("\"ok\"".to_string())]);
-}
-
-#[test]
-fn javascript_jit_namespace_builtins_work_with_import() {
-    let source = r#"
-        import * as jit from "jit";
-        const _set = jit.set_hot_loop_threshold(4);
-        const cfg = jit.get_config();
-        if (cfg.hot_loop_threshold == 4) {
-            1;
-        } else {
-            0;
-        }
-    "#;
-    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
-        .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(1)]);
 }
 
 #[test]
 fn compile_source_with_javascript_flavor() {
-    let source = include_str!("../examples/example.js");
-
-    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
-        .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    for func in &compiled.functions {
-        match func.name.as_str() {
-            "add_one" => vm.register_function(Box::new(AddOne)),
-            "print" => vm.register_function(Box::new(PrintBuiltin)),
-            _ => panic!("unexpected function {}", func.name),
-        };
-    }
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(6)]);
-}
-
-#[test]
-fn javascript_assignment_updates_existing_local_without_new_slot() {
-    let source = r#"
-        let a = 1;
-        a = 2;
-        a;
-    "#;
-    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
-        .expect("compile should succeed");
-    assert_eq!(compiled.locals, 1);
-
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(2)]);
-}
-
-#[test]
-fn javascript_float_literal_binding_is_supported() {
-    let source = r#"
-        let a=1.1;
-        a;
-    "#;
-    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
-        .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Float(1.1)]);
-}
-
-#[test]
-fn javascript_char_and_hex_escape_literals_are_supported() {
-    let source = r#"
-        let c = '\x41';
-        let s = "\x42";
-        c;
-        s;
-    "#;
-    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
-        .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(
-        vm.stack(),
-        &[
-            Value::String("A".to_string()),
-            Value::String("B".to_string())
-        ]
-    );
-}
-
-#[test]
-fn javascript_empty_param_arrow_closure_is_supported() {
-    let source = r#"
-        let make = () => 42;
-        make();
-    "#;
-    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
-        .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
-}
-
-#[test]
-fn javascript_function_return_statement_is_lowered() {
-    let source = r#"
-        function inc(v) { return v + 1; }
-        inc(41);
-    "#;
-    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
-        .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
-}
-
-#[test]
-fn javascript_object_property_named_return_is_not_rewritten() {
-    let source = r#"
-        const obj = { return: 42 };
-        obj.return;
-    "#;
-    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
-        .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
-}
-
-#[test]
-fn javascript_block_body_arrow_closure_is_rejected() {
-    let source = r#"
-        let inc = (value) => { value + 1; };
-        inc(41);
-    "#;
-    let err = match compile_source_with_flavor(source, SourceFlavor::JavaScript) {
-        Ok(_) => panic!("block-body arrow closure should fail in this subset"),
-        Err(err) => err,
+    let case = RuntimeCase {
+        name: "compile source with javascript flavor",
+        source: include_str!("../examples/example.js"),
+        flavor: SourceFlavor::JavaScript,
+        expected_stack: vec![Value::Int(6)],
+        expected_locals: None,
     };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(parse.message.contains("block bodies are not supported"));
-        }
-        other => panic!("unexpected error: {other}"),
-    }
-}
-
-#[test]
-fn javascript_allows_omitted_semicolons_at_line_end() {
-    let source = r#"
-        let out = 40
-        out = out + 1
-        if (out < 50) {
-            out = out + 1
-        }
-        out
-    "#;
-    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
-        .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
+    let bindings = [
+        HostBindingCase {
+            name: "add_one",
+            factory: make_add_one,
+        },
+        HostBindingCase {
+            name: "print",
+            factory: make_print_builtin,
+        },
+    ];
+    run_runtime_case_with_bindings(&case, &bindings);
 }
 
 #[test]
 fn javascript_allows_omitted_semicolons_with_multiline_calls() {
-    let source = r#"
-        import * as vm from "vm"
-        let value = vm.add_one(
-            41
-        )
-        value
-    "#;
-
-    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
-        .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    vm.bind_function("add_one", Box::new(AddOne));
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
+    let case = RuntimeCase {
+        name: "allows omitted semicolons with multiline calls",
+        source: r#"
+            import * as vm from "vm"
+            let value = vm.add_one(
+                41
+            )
+            value
+        "#,
+        flavor: SourceFlavor::JavaScript,
+        expected_stack: vec![Value::Int(42)],
+        expected_locals: None,
+    };
+    let bindings = [HostBindingCase {
+        name: "add_one",
+        factory: make_add_one,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
 }
 
 #[test]
 fn javascript_console_log_works_without_decl() {
-    let source = r#"
-        console.log(40 + 2);
-    "#;
-    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
-        .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    for func in &compiled.functions {
-        match func.name.as_str() {
-            "print" => vm.register_function(Box::new(PrintBuiltin)),
-            _ => panic!("unexpected function {}", func.name),
-        };
-    }
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
+    let case = RuntimeCase {
+        name: "console log works without decl",
+        source: r#"
+            console.log(40 + 2);
+        "#,
+        flavor: SourceFlavor::JavaScript,
+        expected_stack: vec![Value::Int(42)],
+        expected_locals: None,
+    };
+    let bindings = [HostBindingCase {
+        name: "print",
+        factory: make_print_builtin,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
 }
 
 #[test]
@@ -465,28 +450,30 @@ fn compile_source_file_js_complex_replay_break_line_resolves_non_executable_line
 
 #[test]
 fn javascript_module_declarations_are_ignored() {
-    let source = r#"
-        import {
-            add_one
-        } from "vm";
-        const { ignored } = require("vm");
-        console.log(add_one(41));
-    "#;
-    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
-        .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-
-    for func in &compiled.functions {
-        match func.name.as_str() {
-            "add_one" => vm.register_function(Box::new(AddOne)),
-            "print" => vm.register_function(Box::new(PrintBuiltin)),
-            _ => panic!("unexpected function {}", func.name),
-        };
-    }
-
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
+    let case = RuntimeCase {
+        name: "module declarations are ignored",
+        source: r#"
+            import {
+                add_one
+            } from "vm";
+            const { ignored } = require("vm");
+            console.log(add_one(41));
+        "#,
+        flavor: SourceFlavor::JavaScript,
+        expected_stack: vec![Value::Int(42)],
+        expected_locals: None,
+    };
+    let bindings = [
+        HostBindingCase {
+            name: "add_one",
+            factory: make_add_one,
+        },
+        HostBindingCase {
+            name: "print",
+            factory: make_print_builtin,
+        },
+    ];
+    run_runtime_case_with_bindings(&case, &bindings);
 }
 
 #[test]
@@ -545,90 +532,4 @@ fn compile_source_file_js_supports_namespace_and_named_alias_imports() {
     let _ = std::fs::remove_file(main_path);
     let _ = std::fs::remove_file(module_path);
     let _ = std::fs::remove_dir(root);
-}
-
-#[test]
-fn javascript_undeclared_host_call_is_rejected() {
-    let source = r#"
-        add_one(41);
-    "#;
-    let err = match compile_source_with_flavor(source, SourceFlavor::JavaScript) {
-        Ok(_) => panic!("undeclared host call should fail"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(parse.message.contains("unknown function 'add_one'"));
-        }
-        other => panic!("unexpected error: {other}"),
-    }
-}
-
-#[test]
-fn javascript_modulo_and_logical_operators_work() {
-    let source = r#"
-        const a = 17 % 5;
-        const b = true && false;
-        const c = true || false;
-        const d = (10 > 5) && (3 < 7);
-        const e = (10 < 5) || (3 > 7);
-        const f = 100 % 7;
-        a + f;
-    "#;
-
-    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
-        .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(4)]);
-}
-
-#[test]
-fn javascript_typeof_operator_is_supported() {
-    let source = r#"
-        const value = null;
-        typeof value == "null";
-    "#;
-
-    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
-        .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Bool(true)]);
-}
-
-#[test]
-fn javascript_typeof_property_name_is_not_rewritten_as_operator() {
-    let source = r#"
-        const obj = { typeof: 42 };
-        obj.typeof;
-    "#;
-
-    let compiled = compile_source_with_flavor(source, SourceFlavor::JavaScript)
-        .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
-}
-
-#[test]
-fn javascript_direct_builtin_len_call_is_rejected() {
-    let source = r#"
-        let value = "hello";
-        len(value);
-    "#;
-
-    let err = match compile_source_with_flavor(source, SourceFlavor::JavaScript) {
-        Ok(_) => panic!("direct builtin len call should be rejected in JavaScript frontend"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourceError::Parse(parse) => {
-            assert!(parse.message.contains("unknown function 'len'"));
-        }
-        other => panic!("unexpected error: {other}"),
-    }
 }
