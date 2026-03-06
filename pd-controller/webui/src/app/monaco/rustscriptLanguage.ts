@@ -29,7 +29,7 @@ const FALLBACK_STRING_BEGIN = "\"";
 const FALLBACK_STRING_END = "\"";
 const FALLBACK_STRING_ESCAPE = "\\\\(?:[nrt\\\\\"0])";
 const FALLBACK_NUMBERS = "\\b(?:\\d+\\.\\d+|\\d+)\\b";
-const FALLBACK_OPERATORS = "=>|==|!=|&&|\\|\\||=|\\+|-|\\*|/|%|<|>|!|\\?";
+const FALLBACK_OPERATORS = "=>|==|!=|&&|\\|\\||&|=|\\+|-|\\*|/|%|<|>|!|\\?";
 const IDENT = "[A-Za-z_][A-Za-z0-9_]*";
 const PATH_IDENT = `(?:self|super|crate|${IDENT})`;
 const PATH = `(?:${PATH_IDENT})(?:::(?:${PATH_IDENT}))*`;
@@ -128,6 +128,10 @@ export function ensureRustScriptLanguage(monaco: typeof import("monaco-editor"))
       ["keyword", "", "keyword", "", "function"],
     ],
     [new RegExp(`\\b(fn)(\\s+)(${IDENT})\\s*(?=\\()`), ["keyword", "", "function"]],
+    [
+      new RegExp(`\\b(let)(\\s+)(mut)(\\s+)(${IDENT})\\b`),
+      ["keyword", "", "keyword", "", "identifier"],
+    ],
     [new RegExp(`\\b(let)(\\s+)(${IDENT})\\b`), ["keyword", "", "identifier"]],
     [
       new RegExp(`\\b(${IDENT})(\\s*)(::)(\\s*)(${PATH_CALL})(?=\\s*\\()`),
@@ -139,7 +143,7 @@ export function ensureRustScriptLanguage(monaco: typeof import("monaco-editor"))
       ["delimiter", "", "variable"],
     ],
     [
-      /\b(?!pub\b|fn\b|let\b|for\b|if\b|else\b|match\b|while\b|break\b|continue\b|use\b|as\b|true\b|false\b|null\b)([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()/,
+      /\b(?!pub\b|fn\b|let\b|mut\b|for\b|if\b|else\b|match\b|while\b|break\b|continue\b|use\b|as\b|true\b|false\b|null\b)([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()/,
       "function",
     ],
   ];

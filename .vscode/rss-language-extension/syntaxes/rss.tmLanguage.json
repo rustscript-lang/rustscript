@@ -192,6 +192,10 @@
           "match": "\\blet\\b"
         },
         {
+          "name": "storage.modifier.rss",
+          "match": "\\bmut\\b"
+        },
+        {
           "name": "keyword.control.rss",
           "match": "\\b(?:for|if|else|match|while|break|continue|use|as)\\b"
         }
@@ -244,7 +248,7 @@
       "patterns": [
         {
           "name": "entity.name.function.rss",
-          "match": "\\b(?!pub\\b|fn\\b|let\\b|for\\b|if\\b|else\\b|match\\b|while\\b|break\\b|continue\\b|use\\b|as\\b|true\\b|false\\b|null\\b)([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()"
+          "match": "\\b(?!pub\\b|fn\\b|let\\b|mut\\b|for\\b|if\\b|else\\b|match\\b|while\\b|break\\b|continue\\b|use\\b|as\\b|true\\b|false\\b|null\\b)([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()"
         }
       ]
     },
@@ -287,6 +291,21 @@
       "patterns": [
         {
           "name": "meta.variable.declaration.rss",
+          "match": "\\b(let)(\\s+)(mut)(\\s+)([A-Za-z_][A-Za-z0-9_]*)\\b",
+          "captures": {
+            "1": {
+              "name": "storage.modifier.rss"
+            },
+            "3": {
+              "name": "storage.modifier.rss"
+            },
+            "5": {
+              "name": "variable.other.definition.rss"
+            }
+          }
+        },
+        {
+          "name": "meta.variable.declaration.rss",
           "match": "\\b(let)(\\s+)([A-Za-z_][A-Za-z0-9_]*)\\b",
           "captures": {
             "1": {
@@ -325,7 +344,7 @@
     },
     "operators": {
       "name": "keyword.operator.rss",
-      "match": "=>|==|!=|&&|\\|\\||=|\\+|-|\\*|/|%|<|>|!|\\?"
+      "match": "=>|==|!=|&&|\\|\\||&|=|\\+|-|\\*|/|%|<|>|!|\\?"
     },
     "punctuation": {
       "name": "punctuation.separator.rss",
