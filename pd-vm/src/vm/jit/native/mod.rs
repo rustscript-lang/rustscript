@@ -11,28 +11,20 @@ pub(super) const STATUS_WAITING: i32 = 4;
 pub(super) const STATUS_OUT_OF_FUEL: i32 = 5;
 pub(super) const STATUS_ERROR: i32 = -1;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum NativeCodegenBackend {
-    Cranelift,
+pub(super) fn selected_codegen_backend() -> &'static str {
+    "native"
 }
 
-pub(super) fn selected_codegen_backend() -> NativeCodegenBackend {
-    NativeCodegenBackend::Cranelift
-}
-
-pub(crate) use cranelift::{CraneliftCompiledTrace, CraneliftTraceKeepAlive};
-
-pub(super) enum CompiledNativeTrace {
-    Cranelift(Box<CraneliftCompiledTrace>),
-}
+pub(crate) use cranelift::{CompiledTrace, TraceKeepAlive};
 
 pub(super) fn compile_native_trace(
     trace: &super::JitTrace,
     fuel_check_interval: Option<u32>,
-) -> VmResult<CompiledNativeTrace> {
-    Ok(CompiledNativeTrace::Cranelift(Box::new(
-        cranelift::compile_trace(trace, fuel_check_interval)?,
-    )))
+) -> VmResult<Box<CompiledTrace>> {
+    Ok(Box::new(cranelift::compile_trace(
+        trace,
+        fuel_check_interval,
+    )?))
 }
 
 static GENERIC_BRIDGE_ERROR: OnceLock<Mutex<Option<VmError>>> = OnceLock::new();
@@ -62,10 +54,10 @@ pub(super) fn take_bridge_error() -> Option<VmError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeCodegenBackend, selected_codegen_backend};
+    use super::selected_codegen_backend;
 
     #[test]
-    fn selected_backend_is_cranelift() {
-        assert_eq!(selected_codegen_backend(), NativeCodegenBackend::Cranelift);
+    fn selected_backend_is_native() {
+        assert_eq!(selected_codegen_backend(), "native");
     }
 }

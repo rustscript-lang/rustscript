@@ -30,7 +30,7 @@ type NativeTraceEntry = unsafe extern "C" fn(*mut Vm) -> i32;
 type NativeTraceEntry = fn(*mut Vm) -> i32;
 
 pub(crate) struct NativeTrace {
-    _keepalive: Arc<Mutex<native::CraneliftTraceKeepAlive>>,
+    _keepalive: Arc<Mutex<native::TraceKeepAlive>>,
     entry: NativeTraceEntry,
     code: Arc<[u8]>,
     root_ip: usize,
@@ -64,7 +64,7 @@ struct NativeTraceCacheKey {
 #[derive(Clone)]
 struct NativeTraceCacheEntry {
     entry: NativeTraceEntry,
-    keepalive: Arc<Mutex<native::CraneliftTraceKeepAlive>>,
+    keepalive: Arc<Mutex<native::TraceKeepAlive>>,
     code: Arc<[u8]>,
 }
 
@@ -145,7 +145,7 @@ impl Vm {
     pub fn dump_jit_info_with_machine_code(&self, include_machine_code: bool) -> String {
         let mut out = self.jit.dump_text(self.program.debug.as_ref());
         out.push_str(&format!(
-            "  native codegen backend: {:?}\n",
+            "  native codegen backend: {}\n",
             native::selected_codegen_backend()
         ));
         out.push_str(&format!(
@@ -613,7 +613,6 @@ impl Vm {
         }
 
         let compiled = native::compile_native_trace(&trace, fuel_check_interval)?;
-        let native::CompiledNativeTrace::Cranelift(compiled) = compiled;
         let entry = unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(compiled.entry) };
         let code = Arc::<[u8]>::from(compiled.code.into_boxed_slice());
         let keepalive = Arc::new(Mutex::new(compiled.keepalive));
