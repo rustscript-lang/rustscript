@@ -37,6 +37,7 @@ pub(crate) struct NativeTrace {
     terminal: JitTraceTerminal,
     has_yielding_call: bool,
     fuel_check_interval: Option<u32>,
+    compile_profile: native::NativeCompileProfile,
 }
 
 #[cfg(any(
@@ -49,6 +50,7 @@ pub(crate) struct NativeTrace {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct NativeTraceCacheKey {
     fuel_check_interval: Option<u32>,
+    compile_profile: native::NativeCompileProfile,
     root_ip: usize,
     terminal: JitTraceTerminal,
     steps: Vec<TraceStep>,
@@ -66,6 +68,7 @@ struct NativeTraceCacheEntry {
     entry: NativeTraceEntry,
     keepalive: Arc<Mutex<native::TraceKeepAlive>>,
     code: Arc<[u8]>,
+    compile_profile: native::NativeCompileProfile,
 }
 
 #[cfg(any(
@@ -113,13 +116,36 @@ fn with_native_trace_cache<R>(f: impl FnOnce(&mut NativeTraceCache) -> R) -> R {
 fn native_trace_cache_key(
     trace: &JitTrace,
     fuel_check_interval: Option<u32>,
+    compile_profile: native::NativeCompileProfile,
 ) -> NativeTraceCacheKey {
     NativeTraceCacheKey {
         fuel_check_interval,
+        compile_profile,
         root_ip: trace.root_ip,
         terminal: trace.terminal.clone(),
         steps: trace.steps.clone(),
     }
+}
+
+#[cfg(any(
+    all(
+        target_arch = "x86_64",
+        any(target_os = "windows", all(unix, not(target_os = "macos")))
+    ),
+    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+))]
+fn compile_profile_satisfies(
+    compiled: native::NativeCompileProfile,
+    requested: native::NativeCompileProfile,
+) -> bool {
+    compiled == requested
+        || matches!(
+            (compiled, requested),
+            (
+                native::NativeCompileProfile::Aot,
+                native::NativeCompileProfile::Jit
+            )
+        )
 }
 
 impl Vm {
@@ -217,7 +243,7 @@ impl Vm {
         ))]
         {
             for trace_id in trace_ids.iter().copied() {
-                self.ensure_native_trace(trace_id)?;
+                self.ensure_native_trace(trace_id, native::NativeCompileProfile::Aot)?;
             }
         }
         Ok(trace_ids.len())
@@ -447,7 +473,7 @@ impl Vm {
     ))]
     fn execute_jit_native(&mut self, trace_id: usize) -> VmResult<ExecOutcome> {
         let mut current_trace_id = trace_id;
-        self.ensure_native_trace(current_trace_id)?;
+        self.ensure_native_trace(current_trace_id, native::NativeCompileProfile::Jit)?;
         let (mut entry, mut root_ip, mut terminal, mut has_yielding_call) =
             self.native_trace_state(current_trace_id)?;
         loop {
@@ -463,7 +489,10 @@ impl Vm {
                         && next_trace_id != current_trace_id
                     {
                         current_trace_id = next_trace_id;
-                        self.ensure_native_trace(current_trace_id)?;
+                        self.ensure_native_trace(
+                            current_trace_id,
+                            native::NativeCompileProfile::Jit,
+                        )?;
                         (entry, root_ip, terminal, has_yielding_call) =
                             self.native_trace_state(current_trace_id)?;
                         continue;
@@ -492,7 +521,10 @@ impl Vm {
                             && next_trace_id != current_trace_id
                         {
                             current_trace_id = next_trace_id;
-                            self.ensure_native_trace(current_trace_id)?;
+                            self.ensure_native_trace(
+                                current_trace_id,
+                                native::NativeCompileProfile::Jit,
+                            )?;
                             (entry, root_ip, terminal, has_yielding_call) =
                                 self.native_trace_state(current_trace_id)?;
                             continue;
@@ -575,9 +607,14 @@ impl Vm {
         ),
         all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
     ))]
-    fn ensure_native_trace(&mut self, trace_id: usize) -> VmResult<()> {
+    fn ensure_native_trace(
+        &mut self,
+        trace_id: usize,
+        compile_profile: native::NativeCompileProfile,
+    ) -> VmResult<()> {
         if let Some(native) = self.native_traces.get(&trace_id)
             && native.fuel_check_interval == self.fuel_enabled.then_some(self.fuel_check_interval)
+            && compile_profile_satisfies(native.compile_profile, compile_profile)
         {
             return Ok(());
         }
@@ -588,13 +625,23 @@ impl Vm {
         let trace = self.jit.trace_clone(trace_id).ok_or_else(|| {
             VmError::JitNative(format!("trace {} missing for native compile", trace_id))
         })?;
-        let key = native_trace_cache_key(&trace, fuel_check_interval);
+        let key = native_trace_cache_key(&trace, fuel_check_interval, compile_profile);
+        let fallback_key = (compile_profile == native::NativeCompileProfile::Jit).then_some(
+            native_trace_cache_key(
+                &trace,
+                fuel_check_interval,
+                native::NativeCompileProfile::Aot,
+            ),
+        );
         let cached = with_native_trace_cache(|cache| {
             if cache.active_program_key != Some(program_cache_key) {
                 cache.entries.clear();
                 cache.active_program_key = Some(program_cache_key);
             }
-            cache.entries.get(&key).cloned()
+            if let Some(cached) = cache.entries.get(&key).cloned() {
+                return Some(cached);
+            }
+            fallback_key.and_then(|fallback| cache.entries.get(&fallback).cloned())
         });
         if let Some(cached) = cached {
             self.native_traces.insert(
@@ -607,12 +654,13 @@ impl Vm {
                     terminal: trace.terminal,
                     has_yielding_call: trace.has_yielding_call,
                     fuel_check_interval,
+                    compile_profile: cached.compile_profile,
                 },
             );
             return Ok(());
         }
 
-        let compiled = native::compile_native_trace(&trace, fuel_check_interval)?;
+        let compiled = native::compile_native_trace(&trace, fuel_check_interval, compile_profile)?;
         let entry = unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(compiled.entry) };
         let code = Arc::<[u8]>::from(compiled.code.into_boxed_slice());
         let keepalive = Arc::new(Mutex::new(compiled.keepalive));
@@ -620,6 +668,7 @@ impl Vm {
             entry,
             keepalive: Arc::clone(&keepalive),
             code: Arc::clone(&code),
+            compile_profile,
         };
         with_native_trace_cache(|cache| {
             if cache.active_program_key != Some(program_cache_key) {
@@ -638,6 +687,7 @@ impl Vm {
                 terminal: trace.terminal,
                 has_yielding_call: trace.has_yielding_call,
                 fuel_check_interval,
+                compile_profile,
             },
         );
         Ok(())

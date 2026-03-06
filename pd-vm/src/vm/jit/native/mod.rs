@@ -11,6 +11,12 @@ pub(super) const STATUS_WAITING: i32 = 4;
 pub(super) const STATUS_OUT_OF_FUEL: i32 = 5;
 pub(super) const STATUS_ERROR: i32 = -1;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum NativeCompileProfile {
+    Jit,
+    Aot,
+}
+
 pub(super) fn selected_codegen_backend() -> &'static str {
     "native"
 }
@@ -20,10 +26,12 @@ pub(crate) use cranelift::{CompiledTrace, TraceKeepAlive};
 pub(super) fn compile_native_trace(
     trace: &super::JitTrace,
     fuel_check_interval: Option<u32>,
+    profile: NativeCompileProfile,
 ) -> VmResult<Box<CompiledTrace>> {
     Ok(Box::new(cranelift::compile_trace(
         trace,
         fuel_check_interval,
+        profile,
     )?))
 }
 

@@ -1,8 +1,8 @@
 use super::super::super::{HostCallExecOutcome, NumericValue, Value, Vm, VmError, VmResult};
 use super::super::{JitTrace, TraceStep};
 use super::{
-    STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_OUT_OF_FUEL, STATUS_TRACE_EXIT,
-    STATUS_WAITING, STATUS_YIELDED, store_bridge_error,
+    NativeCompileProfile, STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_OUT_OF_FUEL,
+    STATUS_TRACE_EXIT, STATUS_WAITING, STATUS_YIELDED, store_bridge_error,
 };
 use crate::builtins::BuiltinFunction;
 use cranelift_codegen::ir::condcodes::IntCC;
@@ -33,7 +33,8 @@ use layout::detect_native_stack_layout;
 
 static CRANELIFT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 static NATIVE_STACK_LAYOUT: OnceLock<Result<NativeStackLayout, String>> = OnceLock::new();
-static CRANELIFT_NATIVE_ISA: OnceLock<Result<OwnedTargetIsa, String>> = OnceLock::new();
+static CRANELIFT_JIT_ISA: OnceLock<Result<OwnedTargetIsa, String>> = OnceLock::new();
+static CRANELIFT_AOT_ISA: OnceLock<Result<OwnedTargetIsa, String>> = OnceLock::new();
 
 const OP_LDC: i64 = 1;
 const OP_ADD: i64 = 2;
@@ -120,6 +121,7 @@ struct ResolvedOffsets {
 pub(crate) fn compile_trace(
     trace: &JitTrace,
     fuel_check_interval: Option<u32>,
+    profile: NativeCompileProfile,
 ) -> VmResult<CompiledTrace> {
     if matches!(fuel_check_interval, Some(0)) {
         return Err(VmError::InvalidFuelCheckInterval(0));
@@ -132,7 +134,7 @@ pub(crate) fn compile_trace(
 
     let layout = detect_native_stack_layout()?;
     let offsets = resolve_offsets(layout)?;
-    let isa = native_isa()?;
+    let isa = native_isa(profile)?;
 
     let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     jit_builder.symbol("pd_vm_cranelift_step", pd_vm_cranelift_step as *const u8);
@@ -242,11 +244,15 @@ pub(crate) fn compile_trace(
     })
 }
 
-fn native_isa() -> VmResult<OwnedTargetIsa> {
-    let cached = CRANELIFT_NATIVE_ISA.get_or_init(|| {
+fn native_isa(profile: NativeCompileProfile) -> VmResult<OwnedTargetIsa> {
+    let (cached, opt_level) = match profile {
+        NativeCompileProfile::Jit => (&CRANELIFT_JIT_ISA, "speed"),
+        NativeCompileProfile::Aot => (&CRANELIFT_AOT_ISA, "speed_and_size"),
+    };
+    let cached = cached.get_or_init(|| {
         let mut flag_builder = settings::builder();
         flag_builder
-            .set("opt_level", "speed")
+            .set("opt_level", opt_level)
             .map_err(|err| format!("failed to set cranelift opt_level: {err}"))?;
         let isa_builder = cranelift_native::builder()
             .map_err(|err| format!("failed to build native ISA: {err}"))?;
