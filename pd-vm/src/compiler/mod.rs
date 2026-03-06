@@ -279,13 +279,29 @@ fn normalize_import_spec(spec: String) -> String {
     spec.trim().replace('\\', "/")
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CompileBehavior {
+    clear_dead_locals: bool,
+}
+
+impl CompileBehavior {
+    const DEFAULT: Self = Self {
+        clear_dead_locals: true,
+    };
+    const REPL: Self = Self {
+        clear_dead_locals: false,
+    };
+}
+
 fn compile_parsed_output(
     source: String,
     parsed: FrontendIr,
+    behavior: CompileBehavior,
 ) -> Result<CompiledProgram, SourceError> {
     let local_debug_ranges = collect_named_local_debug_ranges(&parsed);
     let parsed = opt::legalize_builtins_and_bind_types(parsed);
-    let parsed = lifetime::enforce_local_availability(parsed).map_err(SourceError::Parse)?;
+    let parsed = lifetime::enforce_local_availability(parsed, behavior.clear_dead_locals)
+        .map_err(SourceError::Parse)?;
     let FrontendIr {
         stmts,
         locals,
@@ -357,24 +373,39 @@ pub fn compile_source(source: &str) -> Result<CompiledProgram, SourceError> {
     compile_source_with_flavor(source, SourceFlavor::RustScript)
 }
 
+pub fn compile_source_for_repl(source: &str) -> Result<CompiledProgram, SourceError> {
+    compile_source_with_flavor_and_behavior(source, SourceFlavor::RustScript, CompileBehavior::REPL)
+}
+
 pub fn compile_source_with_flavor(
     source: &str,
     flavor: SourceFlavor,
 ) -> Result<CompiledProgram, SourceError> {
+    compile_source_with_flavor_and_behavior(source, flavor, CompileBehavior::DEFAULT)
+}
+
+fn compile_source_with_flavor_and_behavior(
+    source: &str,
+    flavor: SourceFlavor,
+    behavior: CompileBehavior,
+) -> Result<CompiledProgram, SourceError> {
     let owned_source = source.to_string();
-    run_with_compiler_stack(move || compile_source_with_flavor_impl(&owned_source, flavor))
+    run_with_compiler_stack(move || {
+        compile_source_with_flavor_impl(&owned_source, flavor, behavior)
+    })
 }
 
 fn compile_source_with_flavor_impl(
     source: &str,
     flavor: SourceFlavor,
+    behavior: CompileBehavior,
 ) -> Result<CompiledProgram, SourceError> {
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
     let parsed = frontends::parse_source(source, flavor).map_err(|err| {
         SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
     })?;
-    match compile_parsed_output(source.to_string(), parsed) {
+    match compile_parsed_output(source.to_string(), parsed, behavior) {
         Err(SourceError::Parse(err)) => Err(SourceError::Parse(
             err.with_line_span_from_source(&source_map, source_id),
         )),
@@ -403,7 +434,8 @@ fn compile_source_file_impl(
     let (_root_parse_source, units) =
         source_loader::load_units_for_source_file(path, flavor, &source_raw, options)?;
     let merged = merge_units(units)?;
-    compile_parsed_output(source_raw, merged).map_err(SourcePathError::Source)
+    compile_parsed_output(source_raw, merged, CompileBehavior::DEFAULT)
+        .map_err(SourcePathError::Source)
 }
 
 fn run_with_compiler_stack<T, F>(f: F) -> T

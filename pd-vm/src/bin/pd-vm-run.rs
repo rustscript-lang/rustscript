@@ -7,8 +7,8 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use vm::{
     CallOutcome, Debugger, DisassembleOptions, FunctionDecl, HostFunction, HostImport, Program,
-    SourceMap, SourcePathError, Value, Vm, VmError, VmRecording, VmStatus, compile_source,
-    compile_source_file, decode_program, disassemble_vmbc_with_options, encode_program,
+    SourceMap, SourcePathError, Value, Vm, VmError, VmRecording, VmStatus, compile_source_file,
+    compile_source_for_repl, decode_program, disassemble_vmbc_with_options, encode_program,
     render_source_error, render_vm_error, replay_recording_stdio,
 };
 
@@ -754,7 +754,7 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                 };
-                let mut vm = Vm::new(compiled.program);
+                let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
                 if let Err(err) = register_functions(&mut vm, &compiled.functions) {
                     println!("{err}");
                     continue;
@@ -863,7 +863,7 @@ fn compile_repl_snippet(
 ) -> Result<vm::CompiledProgram, vm::SourceError> {
     let trimmed = input.trim_end();
     let source = build_repl_source(trimmed, locals);
-    match compile_source(&source) {
+    match compile_source_for_repl(&source) {
         Ok(compiled) => Ok(compiled),
         Err(first_err) => {
             if trimmed.ends_with(';') {
@@ -871,7 +871,7 @@ fn compile_repl_snippet(
             }
             let fallback = format!("{trimmed};");
             let fallback_source = build_repl_source(&fallback, locals);
-            compile_source(&fallback_source)
+            compile_source_for_repl(&fallback_source)
                 .map_err(|_| remap_repl_source_error(first_err, locals.len()))
         }
     }
@@ -1175,10 +1175,28 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{decode_aot_bundle, encode_aot_bundle, parse_cli_args};
-    use vm::{OpCode, Program, Value};
+    use vm::{OpCode, Program, Value, Vm, VmStatus};
 
     fn s(value: &str) -> String {
         value.to_string()
+    }
+
+    fn run_repl_snippet_and_sync(session: &mut super::ReplSession, snippet: &str) -> Vm {
+        let compiled =
+            super::compile_repl_snippet(snippet, &session.locals).expect("compile should succeed");
+        let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+        super::register_functions(&mut vm, &compiled.functions).expect("register should succeed");
+        loop {
+            match vm.run().expect("snippet should run") {
+                VmStatus::Halted => break,
+                VmStatus::Yielded => continue,
+                VmStatus::Waiting(_) => vm
+                    .wait_for_host_op_blocking()
+                    .expect("snippet should not block"),
+            }
+        }
+        super::sync_repl_session(&vm, session);
+        vm
     }
 
     #[test]
@@ -1495,6 +1513,16 @@ mod tests {
         let compiled =
             super::compile_repl_snippet("x + 1", &locals).expect("compile should succeed");
         assert!(compiled.locals >= 1);
+    }
+
+    #[test]
+    fn repl_session_persists_locals_between_entries() {
+        let mut session = super::ReplSession::default();
+        let _ = run_repl_snippet_and_sync(&mut session, "let x = 41;");
+        assert_eq!(session.locals.get("x"), Some(&Value::Int(41)));
+
+        let vm = run_repl_snippet_and_sync(&mut session, "x + 1");
+        assert_eq!(vm.stack().last(), Some(&Value::Int(42)));
     }
 
     #[test]

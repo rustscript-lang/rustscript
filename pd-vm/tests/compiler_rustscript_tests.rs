@@ -826,6 +826,192 @@ fn moved_field_can_be_reinitialized_with_indexed_assignment() {
 }
 
 #[test]
+fn while_loop_repeated_field_move_is_rejected() {
+    let source = r#"
+        let p = { a: "x" };
+        let i = 0;
+        while i < 2 {
+            let _moved = p.a;
+            i = i + 1;
+        }
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("loop should reject use-after-move across iterations"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("p.a") && parse.message.contains("moved"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn for_loop_repeated_field_move_is_rejected() {
+    let source = r#"
+        let p = { a: "x" };
+        for (let i = 0; i < 2; i = i + 1) {
+            let _moved = p.a;
+        }
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("loop should reject use-after-move across iterations"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("p.a") && parse.message.contains("moved"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn break_path_preserves_moved_field_state_after_loop() {
+    let source = r#"
+        let p = { a: "x" };
+        while true {
+            let _moved = p.a;
+            break;
+        }
+        let again = p.a;
+        again;
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("break exit should preserve moved-field state"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("p.a") && parse.message.contains("moved"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn continue_path_rechecks_moved_field_on_next_iteration() {
+    let source = r#"
+        let p = { a: "x" };
+        let i = 0;
+        while i < 2 {
+            let _moved = p.a;
+            i = i + 1;
+            continue;
+        }
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("continue path should preserve moved-field state"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("p.a") && parse.message.contains("moved"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn moved_field_reinitialized_inside_loop_remains_usable() {
+    let source = r#"
+        let p = { a: "start" };
+        let i = 0;
+        while i < 2 {
+            let _moved = p.a;
+            p.a = "new";
+            i = i + 1;
+        }
+        p.a;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("new".to_string())]);
+}
+
+#[test]
+fn move_in_one_loop_branch_is_visible_after_loop() {
+    let source = r#"
+        let p = { a: "x" };
+        let i = 0;
+        while i < 2 {
+            if i == 0 {
+                let _moved = p.a;
+            }
+            i = i + 1;
+        }
+        p.a;
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("field moved on one loop path should remain possibly moved"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("p.a") && parse.message.contains("moved"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn match_arm_move_marks_field_as_possibly_moved() {
+    let source = r#"
+        let p = { a: "x" };
+        let key = 1;
+        let _v = match key {
+            1 => p.a,
+            _ => "fallback",
+        };
+        p.a;
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("move in match arm should mark field as possibly moved"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("p.a") && parse.message.contains("moved"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
 fn map_mutation_is_rejected_while_collection_alias_exists() {
     let source = r#"
         let p = { a: 1 };
@@ -890,6 +1076,76 @@ fn mutating_after_copy_detach_is_allowed() {
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(3)]);
+}
+
+#[test]
+fn array_append_is_rejected_while_collection_alias_exists() {
+    let source = r#"
+        let a = [1];
+        let b = a;
+        a[a.length] = 2;
+        b[0];
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("appending to an aliased array should fail"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("aliased") && parse.message.contains("a"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn collection_alias_from_passthrough_function_is_tracked() {
+    let source = r#"
+        fn id(x) {
+            x;
+        }
+        let a = [1];
+        let b = id(a);
+        a[0] = 2;
+        a[0] + b[0];
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("mutating through one alias should fail after passthrough call"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("aliased") && parse.message.contains("a"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn reassigning_collection_breaks_old_alias_for_target_local() {
+    let source = r#"
+        let a = [1];
+        let b = a;
+        a = [2];
+        a[0] = 3;
+        a[0] + b[0];
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(4)]);
 }
 
 #[test]

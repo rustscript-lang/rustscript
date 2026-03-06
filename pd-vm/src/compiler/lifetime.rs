@@ -7,7 +7,7 @@ use crate::builtins::BuiltinFunction;
 use super::ParseError;
 use super::ir::{ClosureExpr, Expr, FrontendIr, FunctionImpl, LocalSlot, Stmt};
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct FlowState {
     reachable: bool,
     definite: Vec<bool>,
@@ -17,6 +17,12 @@ struct FlowState {
     moved_definite: HashSet<MovedFieldPath>,
     moved_possible: HashSet<MovedFieldPath>,
     copyable_fields: HashSet<MovedFieldPath>,
+}
+
+#[derive(Default)]
+struct LoopControlFlow {
+    break_state: Option<FlowState>,
+    continue_state: Option<FlowState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -45,8 +51,21 @@ impl FlowState {
     }
 }
 
-pub(super) fn enforce_local_availability(mut ir: FrontendIr) -> Result<FrontendIr, ParseError> {
-    let analyzer = AvailabilityAnalyzer::new(ir.locals, &ir.local_bindings);
+fn extract_passthrough_return_slot(function_impl: &FunctionImpl) -> Option<LocalSlot> {
+    if !function_impl.body_stmts.is_empty() {
+        return None;
+    }
+    let Expr::Var(slot) = function_impl.body_expr else {
+        return None;
+    };
+    Some(slot)
+}
+
+pub(super) fn enforce_local_availability(
+    mut ir: FrontendIr,
+    clear_dead_locals: bool,
+) -> Result<FrontendIr, ParseError> {
+    let analyzer = AvailabilityAnalyzer::new(ir.locals, &ir.local_bindings, &ir.function_impls);
     let (rewritten_stmts, _) =
         analyzer.analyze_block(&ir.stmts, FlowState::reachable(ir.locals), true)?;
     ir.stmts = rewritten_stmts;
@@ -59,10 +78,12 @@ pub(super) fn enforce_local_availability(mut ir: FrontendIr) -> Result<FrontendI
     }
     ir.function_impls = rewritten_impls;
 
-    let liveness = LivenessRewriter::new(ir.locals, &ir.local_bindings);
-    ir.stmts = liveness.rewrite_program_block(&ir.stmts);
-    for function_impl in ir.function_impls.values_mut() {
-        *function_impl = liveness.rewrite_function_impl(function_impl.clone());
+    if clear_dead_locals {
+        let liveness = LivenessRewriter::new(ir.locals, &ir.local_bindings);
+        ir.stmts = liveness.rewrite_program_block(&ir.stmts);
+        for function_impl in ir.function_impls.values_mut() {
+            *function_impl = liveness.rewrite_function_impl(function_impl.clone());
+        }
     }
 
     if ir.locals > (u8::MAX as usize + 1) {
@@ -75,18 +96,38 @@ pub(super) fn enforce_local_availability(mut ir: FrontendIr) -> Result<FrontendI
 struct AvailabilityAnalyzer {
     local_count: usize,
     local_names: HashMap<LocalSlot, String>,
+    collection_passthrough_params: HashMap<u16, usize>,
     next_collection_alias_id: Cell<u32>,
 }
 
 impl AvailabilityAnalyzer {
-    fn new(local_count: usize, local_bindings: &[(String, LocalSlot)]) -> Self {
+    fn new(
+        local_count: usize,
+        local_bindings: &[(String, LocalSlot)],
+        function_impls: &HashMap<u16, FunctionImpl>,
+    ) -> Self {
         let mut local_names = HashMap::with_capacity(local_bindings.len());
         for (name, index) in local_bindings {
             local_names.insert(*index, name.clone());
         }
+        let mut collection_passthrough_params = HashMap::new();
+        for (index, function_impl) in function_impls {
+            let Some(return_slot) = self::extract_passthrough_return_slot(function_impl) else {
+                continue;
+            };
+            let Some(param_index) = function_impl
+                .param_slots
+                .iter()
+                .position(|slot| *slot == return_slot)
+            else {
+                continue;
+            };
+            collection_passthrough_params.insert(*index, param_index);
+        }
         Self {
             local_count,
             local_names,
+            collection_passthrough_params,
             next_collection_alias_id: Cell::new(1),
         }
     }
@@ -116,8 +157,18 @@ impl AvailabilityAnalyzer {
     fn analyze_block(
         &self,
         stmts: &[Stmt],
+        state: FlowState,
+        rewrite_clears: bool,
+    ) -> Result<(Vec<Stmt>, FlowState), ParseError> {
+        self.analyze_block_with_loop_control(stmts, state, rewrite_clears, None)
+    }
+
+    fn analyze_block_with_loop_control(
+        &self,
+        stmts: &[Stmt],
         mut state: FlowState,
         rewrite_clears: bool,
+        mut loop_control: Option<&mut LoopControlFlow>,
     ) -> Result<(Vec<Stmt>, FlowState), ParseError> {
         let mut rewritten = Vec::with_capacity(stmts.len());
         for stmt in stmts {
@@ -127,7 +178,11 @@ impl AvailabilityAnalyzer {
             }
 
             let before = state.clone();
-            let (rewritten_stmt, next_state) = self.analyze_stmt(stmt, state, rewrite_clears)?;
+            let (rewritten_stmt, next_state) = if let Some(control) = loop_control.as_deref_mut() {
+                self.analyze_stmt(stmt, state, rewrite_clears, Some(control))?
+            } else {
+                self.analyze_stmt(stmt, state, rewrite_clears, None)?
+            };
             state = next_state;
             rewritten.push(rewritten_stmt);
 
@@ -159,6 +214,7 @@ impl AvailabilityAnalyzer {
         stmt: &Stmt,
         state: FlowState,
         rewrite_clears: bool,
+        loop_control: Option<&mut LoopControlFlow>,
     ) -> Result<(Stmt, FlowState), ParseError> {
         match stmt {
             Stmt::Noop { .. } | Stmt::FuncDecl { .. } => Ok((stmt.clone(), state)),
@@ -206,10 +262,28 @@ impl AvailabilityAnalyzer {
                 line,
             } => {
                 let cond_state = self.analyze_expr(condition, &state, *line)?;
-                let (rewritten_then, then_state) =
-                    self.analyze_block(then_branch, cond_state.clone(), rewrite_clears)?;
-                let (rewritten_else, else_state) =
-                    self.analyze_block(else_branch, cond_state, rewrite_clears)?;
+                let (rewritten_then, then_state, rewritten_else, else_state) =
+                    if let Some(control) = loop_control {
+                        let (rewritten_then, then_state) = self.analyze_block_with_loop_control(
+                            then_branch,
+                            cond_state.clone(),
+                            rewrite_clears,
+                            Some(&mut *control),
+                        )?;
+                        let (rewritten_else, else_state) = self.analyze_block_with_loop_control(
+                            else_branch,
+                            cond_state,
+                            rewrite_clears,
+                            Some(&mut *control),
+                        )?;
+                        (rewritten_then, then_state, rewritten_else, else_state)
+                    } else {
+                        let (rewritten_then, then_state) =
+                            self.analyze_block(then_branch, cond_state.clone(), rewrite_clears)?;
+                        let (rewritten_else, else_state) =
+                            self.analyze_block(else_branch, cond_state, rewrite_clears)?;
+                        (rewritten_then, then_state, rewritten_else, else_state)
+                    };
                 let merged = self.merge_states(then_state, else_state);
 
                 let rewritten = Stmt::IfElse {
@@ -226,127 +300,159 @@ impl AvailabilityAnalyzer {
                 post,
                 body,
                 line,
-            } => {
-                let (rewritten_init, init_state) =
-                    self.analyze_stmt(init.as_ref(), state.clone(), rewrite_clears)?;
-                let cond_state = self.analyze_expr(condition, &init_state, *line)?;
-                let (rewritten_body, body_state) =
-                    self.analyze_block(body, cond_state.clone(), rewrite_clears)?;
-                let (rewritten_post, post_state) =
-                    self.analyze_stmt(post.as_ref(), body_state, rewrite_clears)?;
-
-                // `for` loop condition executes before each iteration and at least once.
-                // Body/post execution is optional, so only condition-side availability is guaranteed after loop.
-                let mut possible = cond_state.possible.clone();
-                for (possible_slot, post_possible) in
-                    possible.iter_mut().zip(post_state.possible.iter())
-                {
-                    *possible_slot = *possible_slot || *post_possible;
-                }
-                let moved_possible = cond_state
-                    .moved_possible
-                    .union(&post_state.moved_possible)
-                    .cloned()
-                    .collect::<HashSet<_>>();
-                let copyable_fields = cond_state
-                    .copyable_fields
-                    .intersection(&post_state.copyable_fields)
-                    .cloned()
-                    .collect::<HashSet<_>>();
-                let copyable_locals = cond_state
-                    .copyable_locals
-                    .iter()
-                    .zip(post_state.copyable_locals.iter())
-                    .map(|(lhs, rhs)| *lhs && *rhs)
-                    .collect::<Vec<_>>();
-                let collection_aliases = cond_state
-                    .collection_aliases
-                    .iter()
-                    .zip(post_state.collection_aliases.iter())
-                    .map(|(lhs, rhs)| lhs.union(rhs).copied().collect::<HashSet<_>>())
-                    .collect::<Vec<_>>();
-                let out = FlowState {
-                    reachable: state.reachable && cond_state.reachable,
-                    definite: cond_state.definite.clone(),
-                    possible,
-                    copyable_locals,
-                    collection_aliases,
-                    moved_definite: cond_state.moved_definite.clone(),
-                    moved_possible,
-                    copyable_fields,
-                };
-
-                let rewritten = Stmt::For {
-                    init: Box::new(rewritten_init),
-                    condition: condition.clone(),
-                    post: Box::new(rewritten_post),
-                    body: rewritten_body,
-                    line: *line,
-                };
-                Ok((rewritten, out))
-            }
+            } => self.analyze_for_loop(init, condition, post, body, *line, state, rewrite_clears),
             Stmt::While {
                 condition,
                 body,
                 line,
-            } => {
-                let cond_state = self.analyze_expr(condition, &state, *line)?;
-                let (rewritten_body, body_state) =
-                    self.analyze_block(body, cond_state.clone(), rewrite_clears)?;
-
-                // `while` condition executes at least once; body execution is optional.
-                let mut possible = cond_state.possible.clone();
-                for (possible_slot, body_possible) in
-                    possible.iter_mut().zip(body_state.possible.iter())
-                {
-                    *possible_slot = *possible_slot || *body_possible;
+            } => self.analyze_while_loop(condition, body, *line, state, rewrite_clears),
+            Stmt::Break { .. } => {
+                if let Some(control) = loop_control {
+                    self.merge_optional_state(&mut control.break_state, &state);
                 }
-                let moved_possible = cond_state
-                    .moved_possible
-                    .union(&body_state.moved_possible)
-                    .cloned()
-                    .collect::<HashSet<_>>();
-                let copyable_fields = cond_state
-                    .copyable_fields
-                    .intersection(&body_state.copyable_fields)
-                    .cloned()
-                    .collect::<HashSet<_>>();
-                let copyable_locals = cond_state
-                    .copyable_locals
-                    .iter()
-                    .zip(body_state.copyable_locals.iter())
-                    .map(|(lhs, rhs)| *lhs && *rhs)
-                    .collect::<Vec<_>>();
-                let collection_aliases = cond_state
-                    .collection_aliases
-                    .iter()
-                    .zip(body_state.collection_aliases.iter())
-                    .map(|(lhs, rhs)| lhs.union(rhs).copied().collect::<HashSet<_>>())
-                    .collect::<Vec<_>>();
-                let out = FlowState {
-                    reachable: state.reachable && cond_state.reachable,
-                    definite: cond_state.definite.clone(),
-                    possible,
-                    copyable_locals,
-                    collection_aliases,
-                    moved_definite: cond_state.moved_definite.clone(),
-                    moved_possible,
-                    copyable_fields,
-                };
-
-                let rewritten = Stmt::While {
-                    condition: condition.clone(),
-                    body: rewritten_body,
-                    line: *line,
-                };
-                Ok((rewritten, out))
+                let mut out = state;
+                out.reachable = false;
+                Ok((stmt.clone(), out))
             }
-            Stmt::Break { .. } | Stmt::Continue { .. } => {
+            Stmt::Continue { .. } => {
+                if let Some(control) = loop_control {
+                    self.merge_optional_state(&mut control.continue_state, &state);
+                }
                 let mut out = state;
                 out.reachable = false;
                 Ok((stmt.clone(), out))
             }
         }
+    }
+
+    fn merge_optional_state(&self, merged: &mut Option<FlowState>, next: &FlowState) {
+        if !next.reachable {
+            return;
+        }
+        *merged = Some(match merged.take() {
+            Some(existing) => self.merge_states(existing, next.clone()),
+            None => next.clone(),
+        });
+    }
+
+    fn analyze_while_loop(
+        &self,
+        condition: &Expr,
+        body: &[Stmt],
+        line: u32,
+        state: FlowState,
+        rewrite_clears: bool,
+    ) -> Result<(Stmt, FlowState), ParseError> {
+        let alias_seed = self.next_collection_alias_id.get();
+        let mut loop_entry = state.clone();
+        loop {
+            self.next_collection_alias_id.set(alias_seed);
+            let cond_state = self.analyze_expr(condition, &loop_entry, line)?;
+            let mut loop_control = LoopControlFlow::default();
+            let (_, body_state) = self.analyze_block_with_loop_control(
+                body,
+                cond_state.clone(),
+                false,
+                Some(&mut loop_control),
+            )?;
+            let mut backedge_state = body_state;
+            if let Some(continue_state) = loop_control.continue_state {
+                backedge_state = self.merge_states(backedge_state, continue_state);
+            }
+            let next_loop_entry = self.merge_states(state.clone(), backedge_state);
+            if next_loop_entry == loop_entry {
+                break;
+            }
+            loop_entry = next_loop_entry;
+        }
+
+        self.next_collection_alias_id.set(alias_seed);
+        let cond_state = self.analyze_expr(condition, &loop_entry, line)?;
+        let mut loop_control = LoopControlFlow::default();
+        let (rewritten_body, _) = self.analyze_block_with_loop_control(
+            body,
+            cond_state.clone(),
+            rewrite_clears,
+            Some(&mut loop_control),
+        )?;
+        let out = if let Some(break_state) = loop_control.break_state {
+            self.merge_states(cond_state, break_state)
+        } else {
+            cond_state
+        };
+
+        let rewritten = Stmt::While {
+            condition: condition.clone(),
+            body: rewritten_body,
+            line,
+        };
+        Ok((rewritten, out))
+    }
+
+    fn analyze_for_loop(
+        &self,
+        init: &Stmt,
+        condition: &Expr,
+        post: &Stmt,
+        body: &[Stmt],
+        line: u32,
+        state: FlowState,
+        rewrite_clears: bool,
+    ) -> Result<(Stmt, FlowState), ParseError> {
+        let (rewritten_init, init_state) = self.analyze_stmt(init, state, rewrite_clears, None)?;
+        let alias_seed = self.next_collection_alias_id.get();
+        let mut loop_entry = init_state.clone();
+
+        loop {
+            self.next_collection_alias_id.set(alias_seed);
+            let cond_state = self.analyze_expr(condition, &loop_entry, line)?;
+            let mut loop_control = LoopControlFlow::default();
+            let (_, body_state) = self.analyze_block_with_loop_control(
+                body,
+                cond_state.clone(),
+                false,
+                Some(&mut loop_control),
+            )?;
+            let mut post_entry = body_state;
+            if let Some(continue_state) = loop_control.continue_state {
+                post_entry = self.merge_states(post_entry, continue_state);
+            }
+            let (_, post_state) = self.analyze_stmt(post, post_entry, false, None)?;
+            let next_loop_entry = self.merge_states(init_state.clone(), post_state);
+            if next_loop_entry == loop_entry {
+                break;
+            }
+            loop_entry = next_loop_entry;
+        }
+
+        self.next_collection_alias_id.set(alias_seed);
+        let cond_state = self.analyze_expr(condition, &loop_entry, line)?;
+        let mut loop_control = LoopControlFlow::default();
+        let (rewritten_body, body_state) = self.analyze_block_with_loop_control(
+            body,
+            cond_state.clone(),
+            rewrite_clears,
+            Some(&mut loop_control),
+        )?;
+        let mut post_entry = body_state;
+        if let Some(continue_state) = loop_control.continue_state {
+            post_entry = self.merge_states(post_entry, continue_state);
+        }
+        let (rewritten_post, _) = self.analyze_stmt(post, post_entry, rewrite_clears, None)?;
+        let out = if let Some(break_state) = loop_control.break_state {
+            self.merge_states(cond_state, break_state)
+        } else {
+            cond_state
+        };
+
+        let rewritten = Stmt::For {
+            init: Box::new(rewritten_init),
+            condition: condition.clone(),
+            post: Box::new(rewritten_post),
+            body: rewritten_body,
+            line,
+        };
+        Ok((rewritten, out))
     }
 
     fn analyze_expr(
@@ -600,12 +706,36 @@ impl AvailabilityAnalyzer {
             self.copy_local_collection_aliases(state, *source, target);
             return;
         }
+        if let Expr::Call(index, args) = expr
+            && let Some(param_index) = self.collection_passthrough_params.get(index).copied()
+            && let Some(source_expr) = args.get(param_index)
+            && self.is_definitely_collection_expr(source_expr, state)
+        {
+            if let Some(source_slot) = self.extract_collection_alias_local(source_expr) {
+                self.copy_local_collection_aliases(state, source_slot, target);
+            } else {
+                self.set_local_collection_aliases(state, target, self.fresh_collection_aliases());
+            }
+            return;
+        }
         match expr {
-            Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner)
-                if self.is_definitely_collection_expr(inner, state) =>
-            {
+            Expr::ToOwned(inner) if self.is_definitely_collection_expr(inner, state) => {
                 self.set_local_collection_aliases(state, target, self.fresh_collection_aliases());
                 return;
+            }
+            Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+                if let Expr::Var(source) = inner.as_ref() {
+                    self.copy_local_collection_aliases(state, *source, target);
+                    return;
+                }
+                if self.is_definitely_collection_expr(inner, state) {
+                    self.set_local_collection_aliases(
+                        state,
+                        target,
+                        self.fresh_collection_aliases(),
+                    );
+                    return;
+                }
             }
             _ => {}
         }
@@ -614,6 +744,20 @@ impl AvailabilityAnalyzer {
             return;
         }
         self.clear_local_collection_aliases(state, target);
+    }
+
+    fn extract_collection_alias_local(&self, expr: &Expr) -> Option<LocalSlot> {
+        match expr {
+            Expr::Var(slot) => Some(*slot),
+            Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+                if let Expr::Var(slot) = inner.as_ref() {
+                    Some(*slot)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     fn copy_local_field_moves(&self, state: &mut FlowState, source: LocalSlot, target: LocalSlot) {
@@ -726,8 +870,10 @@ impl AvailabilityAnalyzer {
     fn fresh_collection_aliases(&self) -> HashSet<u32> {
         let mut out = HashSet::with_capacity(1);
         let alias_id = self.next_collection_alias_id.get();
-        self.next_collection_alias_id
-            .set(alias_id.saturating_add(1));
+        let next = alias_id
+            .checked_add(1)
+            .expect("collection alias id overflow");
+        self.next_collection_alias_id.set(next);
         out.insert(alias_id);
         out
     }
@@ -899,6 +1045,8 @@ impl AvailabilityAnalyzer {
 
     fn is_definitely_copyable_expr(&self, expr: &Expr, state: &FlowState) -> bool {
         match expr {
+            // RustScript models string values as move-by-default. String-specific ergonomics
+            // (for example `p.a + p.a`) are handled by `analyze_expr_to_owned`.
             Expr::Null | Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) => true,
             Expr::Neg(inner)
             | Expr::ToOwned(inner)
@@ -1629,64 +1777,9 @@ impl LivenessRewriter {
                 self.add_expr_uses(default, live);
             }
             Expr::Block { stmts, expr } => {
-                for stmt in stmts {
-                    self.add_stmt_uses(stmt, live);
-                }
-                self.add_expr_uses(expr, live);
-            }
-        }
-    }
-
-    fn add_stmt_uses(&self, stmt: &Stmt, live: &mut LiveSet) {
-        match stmt {
-            Stmt::Noop { .. }
-            | Stmt::FuncDecl { .. }
-            | Stmt::Break { .. }
-            | Stmt::Continue { .. } => {}
-            Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
-                self.add_expr_uses(expr, live);
-            }
-            Stmt::ClosureLet { closure, .. } => {
-                for (source_slot, _) in &closure.capture_copies {
-                    self.mark_live(live, *source_slot);
-                }
-                self.add_expr_uses(&closure.body, live);
-            }
-            Stmt::IfElse {
-                condition,
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                self.add_expr_uses(condition, live);
-                for stmt in then_branch {
-                    self.add_stmt_uses(stmt, live);
-                }
-                for stmt in else_branch {
-                    self.add_stmt_uses(stmt, live);
-                }
-            }
-            Stmt::For {
-                init,
-                condition,
-                post,
-                body,
-                ..
-            } => {
-                self.add_stmt_uses(init, live);
-                self.add_expr_uses(condition, live);
-                self.add_stmt_uses(post, live);
-                for stmt in body {
-                    self.add_stmt_uses(stmt, live);
-                }
-            }
-            Stmt::While {
-                condition, body, ..
-            } => {
-                self.add_expr_uses(condition, live);
-                for stmt in body {
-                    self.add_stmt_uses(stmt, live);
-                }
+                let live_out = self.uses_expr(expr);
+                let live_before = self.compute_live_before_block(stmts, &live_out);
+                self.union_inplace(live, &live_before);
             }
         }
     }
