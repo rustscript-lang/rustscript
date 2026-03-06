@@ -1451,14 +1451,6 @@ impl Parser {
             let inner = self.parse_unary()?;
             return Ok(Expr::Borrow(Box::new(inner)));
         }
-        if self.check_ident_literal("mut")
-            && self.check_kind_at(self.pos + 1, &TokenKind::Ampersand)
-        {
-            self.pos += 1; // consume `mut`
-            self.pos += 1; // consume `&`
-            let inner = self.parse_unary()?;
-            return Ok(Expr::BorrowMut(Box::new(inner)));
-        }
         if self.dialect.allow_typeof_operator() && self.match_ident_literal("typeof") {
             let inner = self.parse_unary()?;
             return self.build_builtin_call_expr(BuiltinFunction::TypeOf, vec![inner]);
@@ -1863,7 +1855,7 @@ impl Parser {
         Err(ParseError { span: None, code: None,
             line: self.current_line(),
             message:
-                "match patterns currently support int/string/null literals, type patterns via Some(TypeName) or Option::Some(TypeName), and '_'"
+                "match patterns currently support int/string/null literals, type patterns via Some(TypeName), and '_'"
                     .to_string(),
         })
     }
@@ -1873,22 +1865,6 @@ impl Parser {
         head: &str,
     ) -> Result<Option<MatchTypePattern>, ParseError> {
         if head == "Some" {
-            return self.parse_some_type_pattern();
-        }
-        if head == "Option" && self.dialect.allow_namespace_path_separator() {
-            if !self.match_path_separator() {
-                return Ok(None);
-            }
-            let member = self.expect_ident("expected 'Some' after 'Option::' in match pattern")?;
-            if member != "Some" {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: self.current_line(),
-                    message: "match type patterns use Option::Some(TypeName) or Some(TypeName)"
-                        .to_string(),
-                });
-            }
             return self.parse_some_type_pattern();
         }
         Ok(None)

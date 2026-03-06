@@ -38,7 +38,7 @@ Supported syntax and features:
   logical (`! && ||`), comparison (`== != < >`), function calls, closures (`|...| expr`),
   if-expression form (`if cond => { ... } else => { ... }`), match expressions.
 - Match patterns: int/string/null literals, wildcard `_`, and type constructors
-  `Some(TypeName)` / `Option::Some(TypeName)`.
+  `Some(TypeName)`.
 - Collections: array literal `[]`, brace literals for arrays/maps, `obj.member`, `obj[key]`,
   optional chaining (`?.` and `?.[key]`), slice syntax (`[a:b]`, `[:b]`, `[a:]`), map key
   literals including `null`.
@@ -48,8 +48,6 @@ Supported syntax and features:
   - additional host namespaces via `use <namespace>;` / `use <namespace> as <alias>;`
 - RustScript frontend rewrites:
   - `print!(x)` -> `print(x)`
-  - `Option::None` -> `null`
-  - `Option::Some(expr)` -> `(expr)`
 - Module import syntax (for `.rss` modules): `use module;`, `use module::*;`, `use module::{...}`,
   plus relative paths with `self::` / `super::`.
 

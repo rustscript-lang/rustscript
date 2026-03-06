@@ -614,18 +614,6 @@ fn rustscript_move_and_alias_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
-            name: "non numeric field access can still use legacy mut ampersand",
-            source: r#"
-                let p = { a: "x" };
-                let first = mut&p.a;
-                let second = p.a;
-                first + second;
-            "#,
-            flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("xx".to_string())],
-            expected_locals: None,
-        },
-        RuntimeCase {
             name: "moved field can be reinitialized with indexed assignment",
             source: r#"
                 let p = { a: "222", b: "666" };
@@ -1644,11 +1632,11 @@ fn rustscript_language_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
-            name: "option namespace style is supported",
+            name: "null values and type patterns are supported",
             source: r#"
-                let some = Option::Some(1 + 1);
-                let none = Option::None;
-                let some2 = Option::Some(40);
+                let some = 1 + 1;
+                let none = null;
+                let some2 = 40;
 
                 let a = match none {
                     null => 1,
@@ -1663,7 +1651,7 @@ fn rustscript_language_runtime_cases_work() {
                     _ => 0,
                 };
 
-                let t = type(Option::None);
+                let t = type(null);
                 if t == "null" {
                     (a + b + c) + some2;
                 } else {

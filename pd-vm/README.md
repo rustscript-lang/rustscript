@@ -439,7 +439,7 @@ Core compiler/IR:
 - recursive RustScript function declarations are not supported by current inlining-based lowering
 - nested function declarations are not supported
 - RustScript function declarations cannot capture outer locals
-- `match` patterns are limited to int/string/null literals, `_`, and type constructors (`Some(TypeName)` / `Option::Some(TypeName)`)
+- `match` patterns are limited to int/string/null literals, `_`, and type constructors (`Some(TypeName)`)
 - `break` and `continue` are only valid inside loops
 - host import namespace support in parser is limited to `vm` (builtin namespaces are `io::`, `re::`, `json::`, and `jit::`)
 

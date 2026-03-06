@@ -1538,7 +1538,7 @@ mod tests {
 
     #[test]
     fn repl_input_complete_for_balanced_match_block() {
-        let input = "let b = match a {\n    Option::Some(String) => 2,\n    _ => 3,\n};";
+        let input = "let b = match a {\n    Some(String) => 2,\n    _ => 3,\n};";
         assert!(super::is_repl_input_complete(input));
     }
 
