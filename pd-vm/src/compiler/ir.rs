@@ -69,6 +69,9 @@ pub enum Expr {
         arms: Vec<(MatchPattern, Expr)>,
         default: Box<Expr>,
     },
+    ToOwned(Box<Expr>),
+    Borrow(Box<Expr>),
+    BorrowMut(Box<Expr>),
     Block {
         stmts: Vec<Stmt>,
         expr: Box<Expr>,

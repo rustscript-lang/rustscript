@@ -38,7 +38,10 @@ struct LocalTypeState {
 
 impl LocalTypeState {
     fn get(&self, slot: LocalSlot) -> BoundType {
-        self.by_slot.get(&slot).copied().unwrap_or(BoundType::Unknown)
+        self.by_slot
+            .get(&slot)
+            .copied()
+            .unwrap_or(BoundType::Unknown)
     }
 
     fn set(&mut self, slot: LocalSlot, ty: BoundType) {
@@ -170,6 +173,9 @@ fn legalize_expr(expr: &mut Expr, state: &LocalTypeState) -> BoundType {
             let inner_ty = legalize_expr(inner, state);
             infer_unary_type(expr, inner_ty)
         }
+        Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+            legalize_expr(inner, state)
+        }
         Expr::Var(slot) => state.get(*slot),
         Expr::IfElse {
             condition,
@@ -297,6 +303,9 @@ fn infer_static_len(expr: &Expr) -> Option<usize> {
                 _ => None,
             }
         }
+        Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+            infer_static_len(inner)
+        }
         _ => None,
     }
 }
@@ -308,6 +317,9 @@ fn infer_expr_type_only(expr: &Expr, state: &LocalTypeState) -> BoundType {
         Expr::Float(_) => BoundType::Float,
         Expr::Bool(_) => BoundType::Bool,
         Expr::String(_) => BoundType::String,
+        Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+            infer_expr_type_only(inner, state)
+        }
         Expr::Var(slot) => state.get(*slot),
         Expr::Call(index, args) => {
             let Some(builtin) = BuiltinFunction::from_call_index(*index) else {
@@ -373,11 +385,9 @@ fn infer_binary_type(expr: &Expr, lhs: BoundType, rhs: BoundType) -> BoundType {
                 BoundType::Unknown
             }
         }
-        Expr::And(_, _)
-        | Expr::Or(_, _)
-        | Expr::Eq(_, _)
-        | Expr::Lt(_, _)
-        | Expr::Gt(_, _) => BoundType::Bool,
+        Expr::And(_, _) | Expr::Or(_, _) | Expr::Eq(_, _) | Expr::Lt(_, _) | Expr::Gt(_, _) => {
+            BoundType::Bool
+        }
         _ => BoundType::Unknown,
     }
 }

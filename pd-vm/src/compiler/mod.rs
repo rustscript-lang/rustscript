@@ -742,6 +742,12 @@ impl Compiler {
                 self.assembler.push_const(Value::Bool(false));
                 self.assembler.ceq();
             }
+            Expr::ToOwned(inner) => {
+                self.compile_expr(inner)?;
+            }
+            Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+                self.compile_expr(inner)?;
+            }
             Expr::And(lhs, rhs) => {
                 self.compile_expr(lhs)?;
                 self.compile_expr(rhs)?;
@@ -1242,7 +1248,11 @@ fn record_expr_local_debug_ranges(
             record_expr_local_debug_ranges(lhs, line, ranges);
             record_expr_local_debug_ranges(rhs, line, ranges);
         }
-        Expr::Neg(inner) | Expr::Not(inner) => {
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => {
             record_expr_local_debug_ranges(inner, line, ranges);
         }
         Expr::IfElse {
@@ -1341,6 +1351,9 @@ fn shift_amount_for_power_of_two(value: i64) -> Option<u32> {
 fn is_definitely_string_expr(expr: &Expr) -> bool {
     match expr {
         Expr::String(_) => true,
+        Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+            is_definitely_string_expr(inner)
+        }
         Expr::Add(lhs, rhs) => {
             (is_definitely_string_expr(lhs) && is_definitely_string_expr(rhs))
                 || (is_definitely_string_expr(lhs) && eval_const_int_expr(rhs).is_some())
@@ -1353,6 +1366,9 @@ fn is_definitely_string_expr(expr: &Expr) -> bool {
 fn eval_const_int_expr(expr: &Expr) -> Option<i64> {
     match expr {
         Expr::Int(value) => Some(*value),
+        Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+            eval_const_int_expr(inner)
+        }
         Expr::Neg(inner) => eval_const_int_expr(inner)?.checked_neg(),
         Expr::Add(lhs, rhs) => eval_const_int_expr(lhs)?.checked_add(eval_const_int_expr(rhs)?),
         Expr::Sub(lhs, rhs) => eval_const_int_expr(lhs)?.checked_sub(eval_const_int_expr(rhs)?),

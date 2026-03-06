@@ -1,5 +1,8 @@
+use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+
+use crate::builtins::BuiltinFunction;
 
 use super::ParseError;
 use super::ir::{ClosureExpr, Expr, FrontendIr, FunctionImpl, LocalSlot, Stmt};
@@ -9,6 +12,22 @@ struct FlowState {
     reachable: bool,
     definite: Vec<bool>,
     possible: Vec<bool>,
+    copyable_locals: Vec<bool>,
+    collection_aliases: Vec<HashSet<u32>>,
+    moved_definite: HashSet<MovedFieldPath>,
+    moved_possible: HashSet<MovedFieldPath>,
+    copyable_fields: HashSet<MovedFieldPath>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct MovedFieldPath {
+    root: LocalSlot,
+    key: MovedFieldKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum MovedFieldKey {
+    String(String),
 }
 
 impl FlowState {
@@ -17,6 +36,11 @@ impl FlowState {
             reachable: true,
             definite: vec![false; local_count],
             possible: vec![false; local_count],
+            copyable_locals: vec![false; local_count],
+            collection_aliases: vec![HashSet::new(); local_count],
+            moved_definite: HashSet::new(),
+            moved_possible: HashSet::new(),
+            copyable_fields: HashSet::new(),
         }
     }
 }
@@ -51,6 +75,7 @@ pub(super) fn enforce_local_availability(mut ir: FrontendIr) -> Result<FrontendI
 struct AvailabilityAnalyzer {
     local_count: usize,
     local_names: HashMap<LocalSlot, String>,
+    next_collection_alias_id: Cell<u32>,
 }
 
 impl AvailabilityAnalyzer {
@@ -62,6 +87,7 @@ impl AvailabilityAnalyzer {
         Self {
             local_count,
             local_names,
+            next_collection_alias_id: Cell::new(1),
         }
     }
 
@@ -140,6 +166,10 @@ impl AvailabilityAnalyzer {
                 let mut out = self.analyze_expr(expr, &state, *line)?;
                 if out.reachable {
                     self.mark_available(&mut out, *index, *line)?;
+                    self.handle_local_rebind_field_moves(&mut out, *index, expr);
+                    self.handle_local_rebind_collection_aliases(&mut out, *index, expr);
+                    let is_copyable = self.is_definitely_copyable_expr(expr, &out);
+                    self.set_local_copyable_state(&mut out, *index, is_copyable);
                 }
                 Ok((stmt.clone(), out))
             }
@@ -148,6 +178,10 @@ impl AvailabilityAnalyzer {
                 let mut out = self.analyze_expr(expr, &state, *line)?;
                 if out.reachable {
                     self.mark_available(&mut out, *index, *line)?;
+                    self.handle_local_rebind_field_moves(&mut out, *index, expr);
+                    self.handle_local_rebind_collection_aliases(&mut out, *index, expr);
+                    let is_copyable = self.is_definitely_copyable_expr(expr, &out);
+                    self.set_local_copyable_state(&mut out, *index, is_copyable);
                 }
                 Ok((stmt.clone(), out))
             }
@@ -209,10 +243,37 @@ impl AvailabilityAnalyzer {
                 {
                     *possible_slot = *possible_slot || *post_possible;
                 }
+                let moved_possible = cond_state
+                    .moved_possible
+                    .union(&post_state.moved_possible)
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                let copyable_fields = cond_state
+                    .copyable_fields
+                    .intersection(&post_state.copyable_fields)
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                let copyable_locals = cond_state
+                    .copyable_locals
+                    .iter()
+                    .zip(post_state.copyable_locals.iter())
+                    .map(|(lhs, rhs)| *lhs && *rhs)
+                    .collect::<Vec<_>>();
+                let collection_aliases = cond_state
+                    .collection_aliases
+                    .iter()
+                    .zip(post_state.collection_aliases.iter())
+                    .map(|(lhs, rhs)| lhs.union(rhs).copied().collect::<HashSet<_>>())
+                    .collect::<Vec<_>>();
                 let out = FlowState {
                     reachable: state.reachable && cond_state.reachable,
                     definite: cond_state.definite.clone(),
                     possible,
+                    copyable_locals,
+                    collection_aliases,
+                    moved_definite: cond_state.moved_definite.clone(),
+                    moved_possible,
+                    copyable_fields,
                 };
 
                 let rewritten = Stmt::For {
@@ -240,10 +301,37 @@ impl AvailabilityAnalyzer {
                 {
                     *possible_slot = *possible_slot || *body_possible;
                 }
+                let moved_possible = cond_state
+                    .moved_possible
+                    .union(&body_state.moved_possible)
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                let copyable_fields = cond_state
+                    .copyable_fields
+                    .intersection(&body_state.copyable_fields)
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                let copyable_locals = cond_state
+                    .copyable_locals
+                    .iter()
+                    .zip(body_state.copyable_locals.iter())
+                    .map(|(lhs, rhs)| *lhs && *rhs)
+                    .collect::<Vec<_>>();
+                let collection_aliases = cond_state
+                    .collection_aliases
+                    .iter()
+                    .zip(body_state.collection_aliases.iter())
+                    .map(|(lhs, rhs)| lhs.union(rhs).copied().collect::<HashSet<_>>())
+                    .collect::<Vec<_>>();
                 let out = FlowState {
                     reachable: state.reachable && cond_state.reachable,
                     definite: cond_state.definite.clone(),
                     possible,
+                    copyable_locals,
+                    collection_aliases,
+                    moved_definite: cond_state.moved_definite.clone(),
+                    moved_possible,
+                    copyable_fields,
                 };
 
                 let rewritten = Stmt::While {
@@ -281,7 +369,24 @@ impl AvailabilityAnalyzer {
                 self.require_available(*index, state, line)?;
                 Ok(state.clone())
             }
-            Expr::Call(_, args) => self.analyze_args(args, state, line),
+            Expr::Call(index, args) => {
+                if let Some((root_slot, field_key)) = self.extract_moved_field_access(*index, args)
+                {
+                    let mut out = self.analyze_args(args, state, line)?;
+                    self.require_field_available(root_slot, &field_key, &out, line)?;
+                    if !self.is_copyable_field(root_slot, &field_key, &out) {
+                        self.mark_field_moved(&mut out, root_slot, field_key);
+                    }
+                    Ok(out)
+                } else if let Some(root_slot) = self.extract_collection_mutation_root(*index, args)
+                {
+                    let out = self.analyze_args(args, state, line)?;
+                    self.require_collection_mutation_permitted(root_slot, &out, line)?;
+                    Ok(out)
+                } else {
+                    self.analyze_args(args, state, line)
+                }
+            }
             Expr::LocalCall(index, args) => {
                 self.require_available(*index, state, line)?;
                 self.analyze_args(args, state, line)
@@ -302,8 +407,14 @@ impl AvailabilityAnalyzer {
                 }
                 Ok(out)
             }
-            Expr::Add(lhs, rhs)
-            | Expr::Sub(lhs, rhs)
+            Expr::Add(lhs, rhs) => {
+                // `+` is commonly used for string concatenation in the subset.
+                // Treat field reads in concat/add operands as copied to keep
+                // capture ergonomics reasonable (`p.a + p.a`).
+                let lhs_state = self.analyze_expr_to_owned(lhs, state, line)?;
+                self.analyze_expr_to_owned(rhs, &lhs_state, line)
+            }
+            Expr::Sub(lhs, rhs)
             | Expr::Mul(lhs, rhs)
             | Expr::Div(lhs, rhs)
             | Expr::Mod(lhs, rhs)
@@ -316,6 +427,9 @@ impl AvailabilityAnalyzer {
                 self.analyze_expr(rhs, &lhs_state, line)
             }
             Expr::Neg(inner) | Expr::Not(inner) => self.analyze_expr(inner, state, line),
+            Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+                self.analyze_expr_to_owned(inner, state, line)
+            }
             Expr::IfElse {
                 condition,
                 then_expr,
@@ -355,10 +469,516 @@ impl AvailabilityAnalyzer {
                 }
                 Ok(out)
             }
+            Expr::ToOwned(inner) => self.analyze_expr_to_owned(inner, state, line),
             Expr::Block { stmts, expr } => {
                 let (_, block_state) = self.analyze_block(stmts, state.clone(), false)?;
                 self.analyze_expr(expr, &block_state, line)
             }
+        }
+    }
+
+    fn analyze_expr_to_owned(
+        &self,
+        inner: &Expr,
+        state: &FlowState,
+        line: u32,
+    ) -> Result<FlowState, ParseError> {
+        if let Expr::Call(index, args) = inner
+            && let Some((root_slot, field_key)) = self.extract_moved_field_access(*index, args)
+        {
+            let out = self.analyze_args(args, state, line)?;
+            self.require_field_available(root_slot, &field_key, &out, line)?;
+            return Ok(out);
+        }
+        self.analyze_expr(inner, state, line)
+    }
+
+    fn extract_moved_field_access(
+        &self,
+        call_index: u16,
+        args: &[Expr],
+    ) -> Option<(LocalSlot, MovedFieldKey)> {
+        if BuiltinFunction::from_call_index(call_index) != Some(BuiltinFunction::Get) {
+            return None;
+        }
+        if args.len() != 2 {
+            return None;
+        }
+        let Expr::Var(root_slot) = args.first()? else {
+            return None;
+        };
+        let key = self.extract_literal_moved_field_key(args.get(1)?)?;
+        Some((*root_slot, key))
+    }
+
+    fn extract_set_field_write_with_value<'a>(
+        &self,
+        expr: &'a Expr,
+    ) -> Option<(LocalSlot, MovedFieldKey, &'a Expr)> {
+        let Expr::Call(index, args) = expr else {
+            return None;
+        };
+        if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Set) {
+            return None;
+        }
+        if args.len() != 3 {
+            return None;
+        }
+        let Expr::Var(root_slot) = args.first()? else {
+            return None;
+        };
+        let key = self.extract_literal_moved_field_key(args.get(1)?)?;
+        let value = args.get(2)?;
+        Some((*root_slot, key, value))
+    }
+
+    fn extract_collection_mutation_root(
+        &self,
+        call_index: u16,
+        args: &[Expr],
+    ) -> Option<LocalSlot> {
+        let builtin = BuiltinFunction::from_call_index(call_index)?;
+        let expected_arity = match builtin {
+            BuiltinFunction::Set => 3,
+            BuiltinFunction::ArrayPush => 2,
+            _ => return None,
+        };
+        if args.len() != expected_arity {
+            return None;
+        }
+        let Expr::Var(root_slot) = args.first()? else {
+            return None;
+        };
+        Some(*root_slot)
+    }
+
+    fn extract_literal_moved_field_key(&self, expr: &Expr) -> Option<MovedFieldKey> {
+        match expr {
+            Expr::String(value) => Some(MovedFieldKey::String(value.clone())),
+            _ => None,
+        }
+    }
+
+    fn handle_local_rebind_field_moves(
+        &self,
+        state: &mut FlowState,
+        target: LocalSlot,
+        expr: &Expr,
+    ) {
+        if let Some((root_slot, key, value_expr)) = self.extract_set_field_write_with_value(expr)
+            && root_slot == target
+        {
+            self.mark_field_available(state, target, &key);
+            if self.is_definitely_copyable_expr(value_expr, state) {
+                self.mark_copyable_field(state, target, &key);
+            } else {
+                self.clear_copyable_field(state, target, &key);
+            }
+            return;
+        }
+
+        if let Expr::Var(source) = expr {
+            self.copy_local_field_moves(state, *source, target);
+            return;
+        }
+
+        self.clear_local_field_moves(state, target);
+        if let Some(keys) = self.collect_copyable_fields_for_expr(expr, state) {
+            self.set_local_copyable_fields(state, target, &keys);
+        } else {
+            self.clear_local_copyable_fields(state, target);
+        }
+    }
+
+    fn handle_local_rebind_collection_aliases(
+        &self,
+        state: &mut FlowState,
+        target: LocalSlot,
+        expr: &Expr,
+    ) {
+        if let Expr::Var(source) = expr {
+            self.copy_local_collection_aliases(state, *source, target);
+            return;
+        }
+        match expr {
+            Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner)
+                if self.is_definitely_collection_expr(inner, state) =>
+            {
+                self.set_local_collection_aliases(state, target, self.fresh_collection_aliases());
+                return;
+            }
+            _ => {}
+        }
+        if self.is_definitely_collection_expr(expr, state) {
+            self.set_local_collection_aliases(state, target, self.fresh_collection_aliases());
+            return;
+        }
+        self.clear_local_collection_aliases(state, target);
+    }
+
+    fn copy_local_field_moves(&self, state: &mut FlowState, source: LocalSlot, target: LocalSlot) {
+        if source == target {
+            return;
+        }
+        self.clear_local_field_moves(state, target);
+        self.clear_local_copyable_fields(state, target);
+        if !self.is_trackable_local(target) {
+            return;
+        }
+
+        let definite_from_source = state
+            .moved_definite
+            .iter()
+            .filter(|entry| entry.root == source)
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut entry in definite_from_source {
+            entry.root = target;
+            state.moved_definite.insert(entry);
+        }
+
+        let possible_from_source = state
+            .moved_possible
+            .iter()
+            .filter(|entry| entry.root == source)
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut entry in possible_from_source {
+            entry.root = target;
+            state.moved_possible.insert(entry);
+        }
+
+        let copyable_from_source = state
+            .copyable_fields
+            .iter()
+            .filter(|entry| entry.root == source)
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut entry in copyable_from_source {
+            entry.root = target;
+            state.copyable_fields.insert(entry);
+        }
+    }
+
+    fn copy_local_collection_aliases(
+        &self,
+        state: &mut FlowState,
+        source: LocalSlot,
+        target: LocalSlot,
+    ) {
+        let source_slot = source as usize;
+        let target_slot = target as usize;
+        if source_slot >= self.local_count || target_slot >= self.local_count {
+            return;
+        }
+        if source_slot == target_slot {
+            return;
+        }
+        state.collection_aliases[target_slot] = state.collection_aliases[source_slot].clone();
+    }
+
+    fn clear_local_field_moves(&self, state: &mut FlowState, target: LocalSlot) {
+        state.moved_definite.retain(|entry| entry.root != target);
+        state.moved_possible.retain(|entry| entry.root != target);
+    }
+
+    fn clear_local_copyable_fields(&self, state: &mut FlowState, target: LocalSlot) {
+        state.copyable_fields.retain(|entry| entry.root != target);
+    }
+
+    fn clear_local_collection_aliases(&self, state: &mut FlowState, target: LocalSlot) {
+        let slot = target as usize;
+        if slot < self.local_count {
+            state.collection_aliases[slot].clear();
+        }
+    }
+
+    fn set_local_copyable_fields(
+        &self,
+        state: &mut FlowState,
+        target: LocalSlot,
+        keys: &HashSet<MovedFieldKey>,
+    ) {
+        self.clear_local_copyable_fields(state, target);
+        if !self.is_trackable_local(target) {
+            return;
+        }
+        for key in keys {
+            state.copyable_fields.insert(MovedFieldPath {
+                root: target,
+                key: key.clone(),
+            });
+        }
+    }
+
+    fn set_local_collection_aliases(
+        &self,
+        state: &mut FlowState,
+        target: LocalSlot,
+        aliases: HashSet<u32>,
+    ) {
+        let slot = target as usize;
+        if slot < self.local_count {
+            state.collection_aliases[slot] = aliases;
+        }
+    }
+
+    fn fresh_collection_aliases(&self) -> HashSet<u32> {
+        let mut out = HashSet::with_capacity(1);
+        let alias_id = self.next_collection_alias_id.get();
+        self.next_collection_alias_id
+            .set(alias_id.saturating_add(1));
+        out.insert(alias_id);
+        out
+    }
+
+    fn mark_field_moved(&self, state: &mut FlowState, root: LocalSlot, key: MovedFieldKey) {
+        if !self.is_trackable_local(root) {
+            return;
+        }
+        let path = MovedFieldPath {
+            root,
+            key: key.clone(),
+        };
+        state.moved_definite.insert(path);
+        state.moved_possible.insert(MovedFieldPath { root, key });
+    }
+
+    fn mark_field_available(&self, state: &mut FlowState, root: LocalSlot, key: &MovedFieldKey) {
+        let path = MovedFieldPath {
+            root,
+            key: key.clone(),
+        };
+        state.moved_definite.remove(&path);
+        state.moved_possible.remove(&path);
+    }
+
+    fn mark_copyable_field(&self, state: &mut FlowState, root: LocalSlot, key: &MovedFieldKey) {
+        if !self.is_trackable_local(root) {
+            return;
+        }
+        state.copyable_fields.insert(MovedFieldPath {
+            root,
+            key: key.clone(),
+        });
+    }
+
+    fn clear_copyable_field(&self, state: &mut FlowState, root: LocalSlot, key: &MovedFieldKey) {
+        state.copyable_fields.remove(&MovedFieldPath {
+            root,
+            key: key.clone(),
+        });
+    }
+
+    fn is_copyable_field(&self, root: LocalSlot, key: &MovedFieldKey, state: &FlowState) -> bool {
+        state.copyable_fields.contains(&MovedFieldPath {
+            root,
+            key: key.clone(),
+        })
+    }
+
+    fn require_field_available(
+        &self,
+        root: LocalSlot,
+        key: &MovedFieldKey,
+        state: &FlowState,
+        line: u32,
+    ) -> Result<(), ParseError> {
+        if !self.is_trackable_local(root) {
+            return Ok(());
+        }
+        let path = MovedFieldPath {
+            root,
+            key: key.clone(),
+        };
+        if !state.moved_possible.contains(&path) {
+            return Ok(());
+        }
+        let local_name = self
+            .local_names
+            .get(&root)
+            .cloned()
+            .unwrap_or_else(|| format!("#{root}"));
+        let field_display = self.format_field_display(&local_name, key);
+        Err(ParseError {
+            span: None,
+            code: Some("E_FIELD_MOVED".to_string()),
+            line: line as usize,
+            message: format!(
+                "field '{field_display}' was moved earlier; use '{field_display}.copy()' to copy it before moving"
+            ),
+        })
+    }
+
+    fn require_collection_mutation_permitted(
+        &self,
+        root: LocalSlot,
+        state: &FlowState,
+        line: u32,
+    ) -> Result<(), ParseError> {
+        let root_slot = root as usize;
+        if root_slot >= self.local_count {
+            return Ok(());
+        }
+        let root_aliases = &state.collection_aliases[root_slot];
+        if root_aliases.is_empty() {
+            return Ok(());
+        }
+        let conflict = (0..self.local_count).find(|other_slot| {
+            if *other_slot == root_slot || !state.possible[*other_slot] {
+                return false;
+            }
+            !state.collection_aliases[*other_slot].is_empty()
+                && state.collection_aliases[*other_slot]
+                    .intersection(root_aliases)
+                    .next()
+                    .is_some()
+        });
+        let Some(conflict_slot) = conflict else {
+            return Ok(());
+        };
+        let root_name = self.display_local_name(root);
+        let alias_name = self.display_local_name(conflict_slot as LocalSlot);
+        Err(ParseError {
+            span: None,
+            code: Some("E_MUTATE_ALIASED_COLLECTION".to_string()),
+            line: line as usize,
+            message: format!(
+                "cannot mutate local '{root_name}' while aliased by '{alias_name}'; detach one side with '.copy()' first"
+            ),
+        })
+    }
+
+    fn format_field_display(&self, local_name: &str, key: &MovedFieldKey) -> String {
+        match key {
+            MovedFieldKey::String(value) => {
+                if is_simple_ident(value) {
+                    format!("{local_name}.{value}")
+                } else {
+                    format!("{local_name}[\"{value}\"]")
+                }
+            }
+        }
+    }
+
+    fn is_trackable_local(&self, index: LocalSlot) -> bool {
+        (index as usize) < self.local_count
+    }
+
+    fn display_local_name(&self, index: LocalSlot) -> String {
+        self.local_names
+            .get(&index)
+            .cloned()
+            .unwrap_or_else(|| format!("#{index}"))
+    }
+
+    fn collect_copyable_fields_for_expr(
+        &self,
+        expr: &Expr,
+        state: &FlowState,
+    ) -> Option<HashSet<MovedFieldKey>> {
+        let Expr::Call(index, args) = expr else {
+            return None;
+        };
+        let builtin = BuiltinFunction::from_call_index(*index)?;
+        match builtin {
+            BuiltinFunction::MapNew if args.is_empty() => Some(HashSet::new()),
+            BuiltinFunction::Set if args.len() == 3 => {
+                let mut keys = self.collect_copyable_fields_for_expr(&args[0], state)?;
+                let key = self.extract_literal_moved_field_key(&args[1])?;
+                if self.is_definitely_copyable_expr(&args[2], state) {
+                    keys.insert(key);
+                } else {
+                    keys.remove(&key);
+                }
+                Some(keys)
+            }
+            _ => None,
+        }
+    }
+
+    fn is_definitely_copyable_expr(&self, expr: &Expr, state: &FlowState) -> bool {
+        match expr {
+            Expr::Null | Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) => true,
+            Expr::Neg(inner)
+            | Expr::ToOwned(inner)
+            | Expr::Borrow(inner)
+            | Expr::BorrowMut(inner) => self.is_definitely_copyable_expr(inner, state),
+            Expr::Not(_)
+            | Expr::And(_, _)
+            | Expr::Or(_, _)
+            | Expr::Eq(_, _)
+            | Expr::Lt(_, _)
+            | Expr::Gt(_, _) => true,
+            Expr::Add(lhs, rhs)
+            | Expr::Sub(lhs, rhs)
+            | Expr::Mul(lhs, rhs)
+            | Expr::Div(lhs, rhs)
+            | Expr::Mod(lhs, rhs) => {
+                self.is_definitely_copyable_expr(lhs, state)
+                    && self.is_definitely_copyable_expr(rhs, state)
+            }
+            Expr::Call(index, args) => self
+                .extract_moved_field_access(*index, args)
+                .map(|(root_slot, field_key)| self.is_copyable_field(root_slot, &field_key, state))
+                .unwrap_or(false),
+            Expr::IfElse {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.is_definitely_copyable_expr(then_expr, state)
+                    && self.is_definitely_copyable_expr(else_expr, state)
+            }
+            Expr::Match { arms, default, .. } => {
+                arms.iter()
+                    .all(|(_, arm_expr)| self.is_definitely_copyable_expr(arm_expr, state))
+                    && self.is_definitely_copyable_expr(default, state)
+            }
+            Expr::Var(index) => state
+                .copyable_locals
+                .get(*index as usize)
+                .copied()
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    fn is_definitely_collection_expr(&self, expr: &Expr, state: &FlowState) -> bool {
+        match expr {
+            Expr::Var(index) => state
+                .collection_aliases
+                .get(*index as usize)
+                .is_some_and(|aliases| !aliases.is_empty()),
+            Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+                self.is_definitely_collection_expr(inner, state)
+            }
+            Expr::Call(index, args) => match BuiltinFunction::from_call_index(*index) {
+                Some(BuiltinFunction::MapNew) => args.is_empty(),
+                Some(BuiltinFunction::ArrayNew) => args.is_empty(),
+                Some(BuiltinFunction::Set) if args.len() == 3 => {
+                    self.is_definitely_collection_expr(&args[0], state)
+                }
+                Some(BuiltinFunction::ArrayPush) if args.len() == 2 => {
+                    self.is_definitely_collection_expr(&args[0], state)
+                }
+                _ => false,
+            },
+            Expr::IfElse {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.is_definitely_collection_expr(then_expr, state)
+                    && self.is_definitely_collection_expr(else_expr, state)
+            }
+            Expr::Match { arms, default, .. } => {
+                arms.iter()
+                    .all(|(_, arm_expr)| self.is_definitely_collection_expr(arm_expr, state))
+                    && self.is_definitely_collection_expr(default, state)
+            }
+            Expr::Block { expr, .. } => self.is_definitely_collection_expr(expr, state),
+            _ => false,
         }
     }
 
@@ -392,8 +1012,45 @@ impl AvailabilityAnalyzer {
         for slot in &closure.param_slots {
             self.mark_available(&mut closure_state, *slot, line)?;
         }
-        for (_, captured_slot) in &closure.capture_copies {
+        for (source_slot, captured_slot) in &closure.capture_copies {
             self.mark_available(&mut closure_state, *captured_slot, line)?;
+            let source_idx = *source_slot as usize;
+            let captured_idx = *captured_slot as usize;
+            if source_idx < self.local_count && captured_idx < self.local_count {
+                closure_state.copyable_locals[captured_idx] = state.copyable_locals[source_idx];
+                closure_state.collection_aliases[captured_idx] =
+                    state.collection_aliases[source_idx].clone();
+            }
+            for path in state
+                .moved_definite
+                .iter()
+                .filter(|path| path.root == *source_slot)
+            {
+                closure_state.moved_definite.insert(MovedFieldPath {
+                    root: *captured_slot,
+                    key: path.key.clone(),
+                });
+            }
+            for path in state
+                .moved_possible
+                .iter()
+                .filter(|path| path.root == *source_slot)
+            {
+                closure_state.moved_possible.insert(MovedFieldPath {
+                    root: *captured_slot,
+                    key: path.key.clone(),
+                });
+            }
+            for path in state
+                .copyable_fields
+                .iter()
+                .filter(|path| path.root == *source_slot)
+            {
+                closure_state.copyable_fields.insert(MovedFieldPath {
+                    root: *captured_slot,
+                    key: path.key.clone(),
+                });
+            }
         }
         self.analyze_expr(&closure.body, &closure_state, line)?;
         Ok(())
@@ -485,26 +1142,65 @@ impl AvailabilityAnalyzer {
         Ok(())
     }
 
+    fn set_local_copyable_state(&self, state: &mut FlowState, index: LocalSlot, is_copyable: bool) {
+        let slot = index as usize;
+        if slot < self.local_count {
+            state.copyable_locals[slot] = is_copyable;
+        }
+    }
+
     fn merge_states(&self, lhs: FlowState, rhs: FlowState) -> FlowState {
         match (lhs.reachable, rhs.reachable) {
             (false, false) => FlowState {
                 reachable: false,
                 definite: vec![false; self.local_count],
                 possible: vec![false; self.local_count],
+                copyable_locals: vec![false; self.local_count],
+                collection_aliases: vec![HashSet::new(); self.local_count],
+                moved_definite: HashSet::new(),
+                moved_possible: HashSet::new(),
+                copyable_fields: HashSet::new(),
             },
             (true, false) => lhs,
             (false, true) => rhs,
             (true, true) => {
                 let mut definite = vec![false; self.local_count];
                 let mut possible = vec![false; self.local_count];
+                let mut copyable_locals = vec![false; self.local_count];
+                let mut collection_aliases = vec![HashSet::new(); self.local_count];
                 for idx in 0..self.local_count {
                     definite[idx] = lhs.definite[idx] && rhs.definite[idx];
                     possible[idx] = lhs.possible[idx] || rhs.possible[idx];
+                    copyable_locals[idx] = lhs.copyable_locals[idx] && rhs.copyable_locals[idx];
+                    collection_aliases[idx] = lhs.collection_aliases[idx]
+                        .union(&rhs.collection_aliases[idx])
+                        .copied()
+                        .collect::<HashSet<_>>();
                 }
+                let moved_possible = lhs
+                    .moved_possible
+                    .union(&rhs.moved_possible)
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                let moved_definite = lhs
+                    .moved_definite
+                    .intersection(&rhs.moved_definite)
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                let copyable_fields = lhs
+                    .copyable_fields
+                    .intersection(&rhs.copyable_fields)
+                    .cloned()
+                    .collect::<HashSet<_>>();
                 FlowState {
                     reachable: true,
                     definite,
                     possible,
+                    copyable_locals,
+                    collection_aliases,
+                    moved_definite,
+                    moved_possible,
+                    copyable_fields,
                 }
             }
         }
@@ -906,7 +1602,11 @@ impl LivenessRewriter {
                 self.add_expr_uses(lhs, live);
                 self.add_expr_uses(rhs, live);
             }
-            Expr::Neg(inner) | Expr::Not(inner) => self.add_expr_uses(inner, live),
+            Expr::Neg(inner)
+            | Expr::Not(inner)
+            | Expr::ToOwned(inner)
+            | Expr::Borrow(inner)
+            | Expr::BorrowMut(inner) => self.add_expr_uses(inner, live),
             Expr::IfElse {
                 condition,
                 then_expr,
@@ -1045,6 +1745,17 @@ impl LivenessRewriter {
             live[slot] = true;
         }
     }
+}
+
+fn is_simple_ident(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn stmt_line(stmt: &Stmt) -> u32 {
@@ -1248,7 +1959,11 @@ impl LocalSlotAllocator {
                 self.collect_expr_constraints(lhs, live)?;
                 self.collect_expr_constraints(rhs, live)?;
             }
-            Expr::Neg(inner) | Expr::Not(inner) => {
+            Expr::Neg(inner)
+            | Expr::Not(inner)
+            | Expr::ToOwned(inner)
+            | Expr::Borrow(inner)
+            | Expr::BorrowMut(inner) => {
                 self.collect_expr_constraints(inner, live)?;
             }
             Expr::IfElse {
@@ -1435,7 +2150,11 @@ impl LocalSlotAllocator {
                 self.collect_expr_footprint(lhs, set, stack);
                 self.collect_expr_footprint(rhs, set, stack);
             }
-            Expr::Neg(inner) | Expr::Not(inner) => self.collect_expr_footprint(inner, set, stack),
+            Expr::Neg(inner)
+            | Expr::Not(inner)
+            | Expr::ToOwned(inner)
+            | Expr::Borrow(inner)
+            | Expr::BorrowMut(inner) => self.collect_expr_footprint(inner, set, stack),
             Expr::IfElse {
                 condition,
                 then_expr,
@@ -1725,7 +2444,11 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
             remap_expr_slots(lhs, mapping)?;
             remap_expr_slots(rhs, mapping)?;
         }
-        Expr::Neg(inner) | Expr::Not(inner) => {
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => {
             remap_expr_slots(inner, mapping)?;
         }
         Expr::Var(index) => {

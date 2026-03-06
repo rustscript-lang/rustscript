@@ -44,6 +44,7 @@ enum TokenKind {
     Star,
     Slash,
     Percent,
+    Ampersand,
     AmpersandAmpersand,
     PipePipe,
     Pipe,
@@ -195,12 +196,7 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     TokenKind::AmpersandAmpersand
                 } else {
-                    return Err(ParseError {
-                        message: "unexpected character '&', did you mean '&&'?".to_string(),
-                        line,
-                        span: Some(Span::new(self.source_id, start, self.offset.max(start + 1))),
-                        code: None,
-                    });
+                    TokenKind::Ampersand
                 }
             }
             '|' => {
@@ -1447,6 +1443,22 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        if self.match_kind(&TokenKind::Ampersand) {
+            if self.match_ident_literal("mut") {
+                let inner = self.parse_unary()?;
+                return Ok(Expr::BorrowMut(Box::new(inner)));
+            }
+            let inner = self.parse_unary()?;
+            return Ok(Expr::Borrow(Box::new(inner)));
+        }
+        if self.check_ident_literal("mut")
+            && self.check_kind_at(self.pos + 1, &TokenKind::Ampersand)
+        {
+            self.pos += 1; // consume `mut`
+            self.pos += 1; // consume `&`
+            let inner = self.parse_unary()?;
+            return Ok(Expr::BorrowMut(Box::new(inner)));
+        }
         if self.dialect.allow_typeof_operator() && self.match_ident_literal("typeof") {
             let inner = self.parse_unary()?;
             return self.build_builtin_call_expr(BuiltinFunction::TypeOf, vec![inner]);
@@ -1935,7 +1947,17 @@ impl Parser {
             }
             if self.match_kind(&TokenKind::Dot) {
                 let member = self.expect_namespace_segment("expected member name after '.'")?;
-                if member == "length" {
+                if member == "copy" {
+                    self.expect(
+                        &TokenKind::LParen,
+                        "expected '(' after '.copy' (use '.copy()')",
+                    )?;
+                    self.expect(
+                        &TokenKind::RParen,
+                        "copy does not take arguments; use '.copy()'",
+                    )?;
+                    expr = Expr::ToOwned(Box::new(expr));
+                } else if member == "length" {
                     expr = self.build_builtin_call_expr(BuiltinFunction::Len, vec![expr])?;
                 } else if member == "keys" {
                     expr = self.build_builtin_call_expr(BuiltinFunction::Keys, vec![expr])?;

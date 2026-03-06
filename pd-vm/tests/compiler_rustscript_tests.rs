@@ -433,6 +433,86 @@ fn named_functions_are_first_class_and_can_be_passed_to_functions() {
 }
 
 #[test]
+fn closure_capture_respects_non_numeric_field_move_checks() {
+    let source = r#"
+        let p = { a: "x" };
+        let _moved = p.a;
+        let f = |_| p.a;
+        f(0);
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("captured non-numeric field should be moved on first read"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("moved"),
+                "unexpected parse error: {parse:?}"
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn closure_capture_numeric_field_is_copy_by_default() {
+    let source = r#"
+        let p = { a: 1 };
+        let f = |_| p.a + p.a;
+        f(0);
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(2)]);
+}
+
+#[test]
+fn closure_capture_string_concat_auto_copies_field_reads() {
+    let source = r#"
+        let p = { a: "x" };
+        let f = |_| p.a + p.a;
+        f(0);
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
+}
+
+#[test]
+fn closure_capture_string_concat_with_borrowed_rhs_is_allowed() {
+    let source = r#"
+        let p = { a: "x" };
+        let f = |_| p.a + &p.a;
+        f(0);
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
+}
+
+#[test]
+fn closure_capture_string_concat_with_mut_borrowed_rhs_is_allowed() {
+    let source = r#"
+        let p = { a: "x" };
+        let f = |_| p.a + &mut p.a;
+        f(0);
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
+}
+
+#[test]
 fn closure_value_from_partial_control_flow_is_rejected_on_call() {
     let source = r#"
         if true {
@@ -483,6 +563,333 @@ fn function_value_from_partial_control_flow_is_rejected_on_call() {
         }
         other => panic!("expected parse error, got {other:?}"),
     }
+}
+
+#[test]
+fn non_numeric_field_access_is_moved_by_default() {
+    let source = r#"
+        let p = { a: "x" };
+        let first = p.a;
+        let second = p.a;
+        second;
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("second access to moved field should fail"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("p.a") && parse.message.contains("moved"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn numeric_field_access_is_copy_by_default() {
+    let source = r#"
+        let p = { a: 1, b: 1.5 };
+        let first = p.a;
+        let second = p.a;
+        let sum = p.b + p.b;
+        first + second;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(2)]);
+}
+
+#[test]
+fn numeric_field_access_is_copy_by_default_when_initialized_from_numeric_local() {
+    let source = r#"
+        let n = 1;
+        let p = { a: n };
+        let first = p.a;
+        let second = p.a;
+        first + second;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(2)]);
+}
+
+#[test]
+fn copyable_field_access_remains_copyable_through_local_roundtrip() {
+    let source = r#"
+        let p = { a: 1 };
+        let x = p.a;
+        let q = { b: x };
+        let first = q.b;
+        let second = q.b;
+        first + second;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(2)]);
+}
+
+#[test]
+fn bool_and_null_fields_are_copy_by_default() {
+    let source = r#"
+        let p = { b: true, n: null };
+        let b1 = p.b;
+        let b2 = p.b;
+        let n1 = p.n;
+        let n2 = p.n;
+        if b1 && b2 && n1 == null && n2 == null {
+            1;
+        } else {
+            0;
+        }
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1)]);
+}
+
+#[test]
+fn non_numeric_field_access_can_be_copied_with_copy() {
+    let source = r#"
+        let p = { a: "x" };
+        let first = p.a.copy();
+        let second = p.a;
+        first + second;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
+}
+
+#[test]
+fn non_numeric_field_access_can_be_borrowed_with_ampersand() {
+    let source = r#"
+        let p = { a: "x" };
+        let first = &p.a;
+        let second = p.a;
+        first + second;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
+}
+
+#[test]
+fn non_numeric_field_access_can_be_borrowed_with_rust_style_mut_ampersand() {
+    let source = r#"
+        let p = { a: "x" };
+        let first = &mut p.a;
+        let second = p.a;
+        first + second;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
+}
+
+#[test]
+fn non_numeric_field_access_can_be_borrowed_with_spaced_mut_ampersand() {
+    let source = r#"
+        let p = { a: "x" };
+        let first = & mut p.a;
+        let second = p.a;
+        first + second;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
+}
+
+#[test]
+fn non_numeric_field_access_can_still_use_legacy_mut_ampersand() {
+    let source = r#"
+        let p = { a: "x" };
+        let first = mut&p.a;
+        let second = p.a;
+        first + second;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
+}
+
+#[test]
+fn borrowed_then_moved_then_second_move_still_fails() {
+    let source = r#"
+        let p = { a: "x" };
+        let _loan = &p.a;
+        let _move = p.a;
+        let again = p.a;
+        again;
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("second move should fail after one loan and one move"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(parse.message.contains("moved"), "{}", parse.message);
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn borrowed_field_still_respects_prior_move_errors() {
+    let source = r#"
+        let p = { a: "x" };
+        let _moved = p.a;
+        let again = &p.a;
+        again;
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("borrowing after move should fail"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(parse.message.contains("moved"), "{}", parse.message);
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn mut_borrowed_field_still_respects_prior_move_errors() {
+    let source = r#"
+        let p = { a: "x" };
+        let _moved = p.a;
+        let again = &mut p.a;
+        again;
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("mutable borrowing after move should fail"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(parse.message.contains("moved"), "{}", parse.message);
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn moved_field_can_be_reinitialized_with_indexed_assignment() {
+    let source = r#"
+        let p = { a: "222", b: "666" };
+        let _moved = p.a;
+        p.a = "444";
+        let y = p.a;
+        y + p.b;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("444666".to_string())]);
+}
+
+#[test]
+fn map_mutation_is_rejected_while_collection_alias_exists() {
+    let source = r#"
+        let p = { a: 1 };
+        let q = p;
+        p.a = 2;
+        p.a + q.a;
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("mutating an aliased map should fail"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("aliased") && parse.message.contains("p"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn array_mutation_is_rejected_while_collection_alias_exists() {
+    let source = r#"
+        let a = [1];
+        let b = a;
+        a[0] = 2;
+        a[0] + b[0];
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("mutating an aliased array should fail"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("aliased") && parse.message.contains("a"),
+                "{}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn mutating_after_copy_detach_is_allowed() {
+    let source = r#"
+        let p = { a: 1 };
+        let q = p;
+        q = q.copy();
+        p.a = 2;
+        p.a + q.a;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(3)]);
 }
 
 #[test]

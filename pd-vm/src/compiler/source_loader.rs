@@ -231,7 +231,11 @@ fn shift_expr_lines(expr: &mut Expr, shift_down: u32) {
             shift_expr_lines(lhs, shift_down);
             shift_expr_lines(rhs, shift_down);
         }
-        Expr::Neg(inner) | Expr::Not(inner) => {
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => {
             shift_expr_lines(inner, shift_down);
         }
         Expr::IfElse {
