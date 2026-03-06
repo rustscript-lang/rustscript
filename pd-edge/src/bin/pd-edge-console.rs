@@ -13,7 +13,7 @@ use edge::{
 };
 use tracing::info;
 use uuid::Uuid;
-use vm::{CallOutcome, HostFunction, Value, Vm, VmError, VmStatus, encode_program};
+use vm::{CallOutcome, HostFunction, Store, Value, Vm, VmError, VmStatus, encode_program};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -357,6 +357,21 @@ fn resolve_program_path(path: &Path) -> Result<PathBuf, Box<dyn std::error::Erro
     Err(format!("program path not found: {}", path.display()).into())
 }
 
+#[derive(Clone)]
+struct ConsoleVmStoreData {
+    vm_context: SharedProxyVmContext,
+    async_ops: SharedVmAsyncOps,
+}
+
+impl ConsoleVmStoreData {
+    fn new(vm_context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) -> Self {
+        Self {
+            vm_context,
+            async_ops,
+        }
+    }
+}
+
 async fn run_loaded_program_once(state: &SharedState) -> Result<(), Box<dyn std::error::Error>> {
     let loaded = {
         let guard = state.active_program.read().await;
@@ -373,30 +388,33 @@ async fn run_loaded_program_once(state: &SharedState) -> Result<(), Box<dyn std:
     let async_ops = new_shared_vm_async_ops();
     let mut vm = Vm::new_shared(loaded.program.clone());
     vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));
+    let mut store = Store::new(vm, ConsoleVmStoreData::new(context, async_ops));
     if let Some(fuel) = state.vm_execution.fuel_per_yield {
-        vm.set_fuel_check_interval(state.vm_execution.fuel_check_interval)?;
-        vm.set_fuel(fuel);
+        store.set_fuel_check_interval(state.vm_execution.fuel_check_interval)?;
+        store.set_fuel(fuel);
     }
 
-    register_host_module(&mut vm, context, async_ops.clone())?;
-    register_console_host_module(&mut vm, async_ops)?;
+    let vm_context = store.data().vm_context.clone();
+    let async_ops = store.data().async_ops.clone();
+    register_host_module(store.vm_mut(), vm_context, async_ops.clone())?;
+    register_console_host_module(store.vm_mut(), async_ops)?;
 
     loop {
-        match vm.run() {
+        match store.run() {
             Ok(VmStatus::Halted) => {
-                println!("vm halted; stack={:?}", vm.stack());
+                println!("vm halted; stack={:?}", store.vm().stack());
                 break;
             }
             Ok(VmStatus::Yielded) => {
                 if let Some(fuel) = state.vm_execution.fuel_per_yield
-                    && vm.get_fuel() == Some(0)
+                    && store.get_fuel() == Some(0)
                 {
-                    vm.recharge_fuel(fuel)?;
+                    store.recharge(fuel)?;
                 }
                 tokio::task::yield_now().await;
             }
             Ok(VmStatus::Waiting(_op_id)) => {
-                vm.await_waiting_host_op().await?;
+                store.vm_mut().await_waiting_host_op().await?;
             }
             Err(err) => {
                 return Err(format!("vm execution failed: {err}").into());

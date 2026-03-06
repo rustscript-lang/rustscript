@@ -1,6 +1,6 @@
 use axum::http::HeaderMap;
 use tracing::warn;
-use vm::{Vm, VmStatus};
+use vm::{Store, Vm, VmStatus};
 
 use super::{LoadedProgram, VmExecutionConfig};
 use crate::{
@@ -14,6 +14,23 @@ use crate::{
 
 pub type HostModuleRegistrar =
     fn(&mut Vm, SharedProxyVmContext, SharedVmAsyncOps) -> Result<(), vm::VmError>;
+
+#[derive(Clone)]
+struct VmRunnerStoreData {
+    vm_context: SharedProxyVmContext,
+    async_ops: SharedVmAsyncOps,
+}
+
+impl VmRunnerStoreData {
+    fn new(vm_context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) -> Self {
+        Self {
+            vm_context,
+            async_ops,
+        }
+    }
+}
+
+type VmRunnerStore = Store<VmRunnerStoreData>;
 
 #[derive(Debug)]
 pub enum VmExecutionError {
@@ -39,14 +56,13 @@ pub async fn execute_vm_with_context(
 ) -> Result<VmExecutionOutcome, VmExecutionError> {
     let program = program.program.clone();
     let async_ops = new_shared_vm_async_ops();
+    let vm_store = new_vm_runner_store(program, vm_context, async_ops);
     let started = std::time::Instant::now();
     let request_id = debug.request_id.clone();
     let (outcome, mut profile) = run_vm_async(
-        program,
-        vm_context,
+        vm_store,
         debug_session,
         debug,
-        async_ops,
         register_host_modules,
         vm_execution,
     )
@@ -59,23 +75,19 @@ pub async fn execute_vm_with_context(
 }
 
 async fn run_vm_async(
-    program: std::sync::Arc<vm::Program>,
-    vm_context: SharedProxyVmContext,
+    mut vm_store: VmRunnerStore,
     debug_session: SharedDebugSession,
     debug: VmDebugInvocation,
-    async_ops: SharedVmAsyncOps,
     register_host_modules: HostModuleRegistrar,
     vm_execution: VmExecutionConfig,
 ) -> Result<(VmExecutionOutcome, VmExecutionProfile), VmExecutionError> {
-    let mut vm = Vm::new_shared(program);
-    vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));
     if let Some(fuel) = vm_execution.fuel_per_yield {
-        vm.set_fuel_check_interval(vm_execution.fuel_check_interval)
+        vm_store
+            .set_fuel_check_interval(vm_execution.fuel_check_interval)
             .map_err(VmExecutionError::Vm)?;
-        vm.set_fuel(fuel);
+        vm_store.set_fuel(fuel);
     }
-    register_host_modules(&mut vm, vm_context.clone(), async_ops)
-        .map_err(VmExecutionError::HostRegistration)?;
+    register_host_modules_from_store(&mut vm_store, register_host_modules)?;
     let mut profile = VmExecutionProfile::default();
 
     loop {
@@ -85,10 +97,10 @@ async fn run_vm_async(
                 &debug.request_headers,
                 &debug.request_path,
                 &debug.request_id,
-                &mut vm,
+                vm_store.vm_mut(),
             )
         } else {
-            vm.run()
+            vm_store.run()
         }
         .map_err(VmExecutionError::Vm)?;
         match status {
@@ -96,9 +108,9 @@ async fn run_vm_async(
             VmStatus::Yielded => {
                 profile.vm_yield_count = profile.vm_yield_count.saturating_add(1);
                 if let Some(fuel) = vm_execution.fuel_per_yield
-                    && vm.get_fuel() == Some(0)
+                    && vm_store.get_fuel() == Some(0)
                 {
-                    vm.recharge_fuel(fuel).map_err(VmExecutionError::Vm)?;
+                    vm_store.recharge(fuel).map_err(VmExecutionError::Vm)?;
                     profile.vm_fuel_recharge_count =
                         profile.vm_fuel_recharge_count.saturating_add(1);
                 }
@@ -106,7 +118,9 @@ async fn run_vm_async(
             }
             VmStatus::Waiting(_op_id) => {
                 let waiting_started = std::time::Instant::now();
-                vm.await_waiting_host_op()
+                vm_store
+                    .vm_mut()
+                    .await_waiting_host_op()
                     .await
                     .map_err(VmExecutionError::Vm)?;
                 let wait_us =
@@ -117,7 +131,30 @@ async fn run_vm_async(
         }
     }
 
-    Ok((snapshot_execution_outcome(&vm_context), profile))
+    Ok((
+        snapshot_execution_outcome(&vm_store.data().vm_context),
+        profile,
+    ))
+}
+
+fn new_vm_runner_store(
+    program: std::sync::Arc<vm::Program>,
+    vm_context: SharedProxyVmContext,
+    async_ops: SharedVmAsyncOps,
+) -> VmRunnerStore {
+    let mut vm = Vm::new_shared(program);
+    vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));
+    Store::new(vm, VmRunnerStoreData::new(vm_context, async_ops))
+}
+
+fn register_host_modules_from_store(
+    vm_store: &mut VmRunnerStore,
+    register_host_modules: HostModuleRegistrar,
+) -> Result<(), VmExecutionError> {
+    let vm_context = vm_store.data().vm_context.clone();
+    let async_ops = vm_store.data().async_ops.clone();
+    register_host_modules(vm_store.vm_mut(), vm_context, async_ops)
+        .map_err(VmExecutionError::HostRegistration)
 }
 
 #[derive(Debug, Default)]

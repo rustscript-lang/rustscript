@@ -738,7 +738,6 @@ pub struct VmExecutionOutcome {
     pub request_method: Method,
     pub request_path: String,
     pub request_query: String,
-    pub request_body: Vec<u8>,
 }
 
 pub fn snapshot_execution_outcome(context: &SharedProxyVmContext) -> VmExecutionOutcome {
@@ -753,7 +752,6 @@ pub fn snapshot_execution_outcome(context: &SharedProxyVmContext) -> VmExecution
         request_method: context.outbound_request_method.clone(),
         request_path: context.outbound_request_path.clone(),
         request_query: context.outbound_request_query.clone(),
-        request_body: context.outbound_request_body.clone(),
     }
 }
 
