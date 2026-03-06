@@ -36,7 +36,7 @@ const payloadJson = json.encode(payload);
 const payloadDecoded = json.decode(payloadJson);
 const jsonScore = payloadDecoded.score;
 let ioOk = true;
-if (false) {
+if (true) {
     ioOk = io.exists(".");
 }
 

@@ -40,6 +40,18 @@ fn register_functions(vm: &mut Vm, functions: &[FunctionDecl]) {
     }
 }
 
+fn run_vm_until_halted(vm: &mut Vm) {
+    loop {
+        match vm.run().expect("vm should run") {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => continue,
+            VmStatus::Waiting(_op_id) => vm
+                .wait_for_host_op_blocking()
+                .expect("vm should complete host operation"),
+        }
+    }
+}
+
 fn run_compiled_file(path: &Path) -> Vec<Value> {
     let compiled = compile_source_file(path).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
@@ -47,8 +59,7 @@ fn run_compiled_file(path: &Path) -> Vec<Value> {
     jit_config.enabled = false;
     vm.set_jit_config(jit_config);
     register_functions(&mut vm, &compiled.functions);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
+    run_vm_until_halted(&mut vm);
     vm.stack().to_vec()
 }
 
@@ -59,29 +70,8 @@ fn run_compiled_source(flavor: SourceFlavor, source: &str) -> Vec<Value> {
     jit_config.enabled = false;
     vm.set_jit_config(jit_config);
     register_functions(&mut vm, &compiled.functions);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
+    run_vm_until_halted(&mut vm);
     vm.stack().to_vec()
-}
-
-fn expect_direct_only_source_file_error(path: &Path) {
-    let err = match compile_source_file(path) {
-        Ok(_) => panic!("source file should be rejected in direct subset"),
-        Err(err) => err,
-    };
-    match err {
-        vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
-            assert!(
-                parse.message.contains("unsupported Lua syntax")
-                    || parse.message.contains("unsupported Scheme syntax")
-                    || parse.message.contains("unsupported identifier")
-                    || parse.message.contains("reserved"),
-                "{}",
-                parse.message
-            );
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
 }
 
 #[test]
@@ -95,17 +85,14 @@ fn examples_run() {
         ("example.scm", vec![Value::Int(6)]),
         ("example_complex.rss", vec![Value::Int(12)]),
         ("example_complex.js", vec![Value::Int(12)]),
+        ("example_complex.lua", vec![Value::Int(12)]),
+        ("example_complex.scm", vec![Value::Int(12)]),
     ];
-    let direct_only_rejected_examples = ["example_complex.lua", "example_complex.scm"];
 
     let mut covered = HashSet::new();
     for (name, expected_stack) in runnable_examples {
         let stack = run_compiled_file(&root.join(name));
         assert_eq!(stack, expected_stack, "unexpected stack for {name}");
-        covered.insert(name);
-    }
-    for name in direct_only_rejected_examples {
-        expect_direct_only_source_file_error(&root.join(name));
         covered.insert(name);
     }
 

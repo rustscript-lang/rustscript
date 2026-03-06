@@ -331,8 +331,15 @@ fn compile_source_file_with_javascript_complex_fixture() {
         };
     }
 
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
+    loop {
+        match vm.run().expect("vm should run") {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => continue,
+            VmStatus::Waiting(_op_id) => vm
+                .wait_for_host_op_blocking()
+                .expect("vm should complete host operation"),
+        }
+    }
     assert_eq!(vm.stack(), &[Value::Int(12)]);
 }
 
@@ -371,10 +378,18 @@ console.log(value);
     }
 
     let mut debugger = vm::Debugger::with_recording(recording_program);
-    let status = vm
-        .run_with_debugger(&mut debugger)
-        .expect("vm should run under debugger recording");
-    assert_eq!(status, VmStatus::Halted);
+    loop {
+        match vm
+            .run_with_debugger(&mut debugger)
+            .expect("vm should run under debugger recording")
+        {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => continue,
+            VmStatus::Waiting(_op_id) => vm
+                .wait_for_host_op_blocking()
+                .expect("vm should complete host operation"),
+        }
+    }
 
     let recording = debugger
         .take_recording()
@@ -415,10 +430,18 @@ fn compile_source_file_js_complex_replay_break_line_resolves_non_executable_line
     }
 
     let mut debugger = vm::Debugger::with_recording(recording_program);
-    let status = vm
-        .run_with_debugger(&mut debugger)
-        .expect("vm should run under debugger recording");
-    assert_eq!(status, VmStatus::Halted);
+    loop {
+        match vm
+            .run_with_debugger(&mut debugger)
+            .expect("vm should run under debugger recording")
+        {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => continue,
+            VmStatus::Waiting(_op_id) => vm
+                .wait_for_host_op_blocking()
+                .expect("vm should complete host operation"),
+        }
+    }
 
     let recording = debugger
         .take_recording()

@@ -42,10 +42,10 @@ let mut payload = {
 let mut payload_json = json::encode(payload);
 let mut payload_decoded = json::decode(payload_json);
 let mut json_score = payload_decoded.score;
-let mut io_ok = if false => {
+let mut io_ok = if true => {
     io::exists(".");
 } else => {
-    true
+    false
 };
 
 if regex_ok && io_ok && json_score == matched {

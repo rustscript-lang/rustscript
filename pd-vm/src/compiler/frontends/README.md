@@ -18,7 +18,7 @@ All frontends lower to the same frontend IR and VM bytecode model.
 | Assignment | `x = 2;` | `x = 2;` | `x = 2` | `(set! x 2)` |
 | Function declaration | `fn add(x) { x + 1; }` | `function add(x) { x + 1; }` | `local function add(x) return x + 1 end` | `(define (add x) (+ x 1))` |
 | Closure literal | `|x| x + 1` | `(x) => x + 1` | `function(x) return x + 1 end` | `(lambda (x) (+ x 1))` |
-| If statement | `if cond { ... } else { ... }` | `if (cond) { ... } else { ... }` | `if cond then ... else ... end` | `(if cond then else)` |
+| If statement | `if cond { ... } else { ... }` | `if (cond) { ... } else { ... }` | `if cond then ... elseif/elif ... else ... end` | `(if cond then else)` |
 | While loop | `while cond { ... }` | `while (cond) { ... }` | `while cond do ... end` | `(while cond ...)` |
 | For loop | `for (let i = 0; i < n; i = i + 1) { ... }` | same style | `for i = 0, n, 1 do ... end` / `for k,v in pairs(t) do ... end` | `(for (i 0 n [step]) ...)` / `(do ...)` |
 | Collection literals | `[1, 2]`, `{x: 1}` | `[1, 2]`, `{ x: 1 }` | `{1, 2, x = 1}` | `(vector 1 2)`, `(list 1 2)`, `(hash (x 1))` |
@@ -38,7 +38,7 @@ Supported syntax and features:
   logical (`! && ||`), comparison (`== != < >`), function calls, closures (`|...| expr`),
   if-expression form (`if cond => { ... } else => { ... }`), match expressions.
 - Match patterns: int/string/null literals, wildcard `_`, and type constructors
-  `Some(TypeName)`.
+  `Some(TypeName)` / `Option::Some(TypeName)`.
 - Collections: array literal `[]`, brace literals for arrays/maps, `obj.member`, `obj[key]`,
   optional chaining (`?.` and `?.[key]`), slice syntax (`[a:b]`, `[:b]`, `[a:]`), map key
   literals including `null`.
@@ -48,6 +48,23 @@ Supported syntax and features:
   - additional host namespaces via `use <namespace>;` / `use <namespace> as <alias>;`
 - RustScript frontend rewrites:
   - `print!(x)` -> `print(x)`
+  - `Option::None` -> `null`
+  - `Option::Some(expr)` -> `(expr)`
+- RustScript ownership and liveness behavior (current):
+  - `let` bindings are immutable by default; use `let mut` for mutable bindings.
+  - Reassignment (`x = ...`), indexed/member mutation (`x[i] = ...`, `x.k = ...`), and `&mut`
+    borrows require a mutable binding.
+  - Non-copyable field reads (for example `p.a`) are move-by-default.
+  - Use `.copy()` to explicitly clone/detach a value before reusing or mutating related state.
+  - `&expr` and `&mut expr` are accepted borrow forms; in the current subset they act as
+    non-consuming access forms and still participate in move/liveness checks.
+  - `&mut` requires a mutable-place target (`local`, `local.field`, `local[index]`) and rejects
+    temporaries/derived expressions (for example `&mut (a + b)`).
+  - Collection aliases are tracked through assignment, borrow binding, and passthrough calls;
+    mutating a collection while an alias exists is rejected unless one side is detached (for
+    example via `.copy()`) or reassigned.
+  - Locals must be definitely available on every control-flow path before use.
+  - Closures capture outer locals at definition time; `fn` declarations do not capture outer locals.
 - Module import syntax (for `.rss` modules): `use module;`, `use module::*;`, `use module::{...}`,
   plus relative paths with `self::` / `super::`.
 
@@ -57,6 +74,7 @@ Current subset limits:
 - Nested function declarations are not supported.
 - `fn` declarations cannot capture outer locals (closures can).
 - Callable values cannot currently be stored in arrays/maps or returned.
+- Calling callable-valued locals captured inside closure bodies is currently rejected.
 - Match patterns are limited to the forms listed above.
 - `break`/`continue` are only valid inside loops.
 - `crate::...` module paths are not supported in RustScript module loading.
@@ -100,7 +118,7 @@ Supported syntax and features:
 - Statements:
   - `local` bindings, assignment, indexed/member assignment
   - `local function` and `function` declarations
-  - `if`/`elseif`/`else`/`end`
+  - `if`/`elseif`/`elif`/`else`/`end` (`elif` is accepted as an alias)
   - `while ... do ... end`
   - numeric `for i = start, end [, step] do ... end`
   - generic loops with `pairs(...)` and `ipairs(...)` (single or key/value loop vars)

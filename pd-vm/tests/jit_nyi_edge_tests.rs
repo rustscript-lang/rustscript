@@ -54,8 +54,8 @@ fn jit_records_backward_guard_nyi_and_falls_back_to_interpreter() {
 #[test]
 fn jit_records_trace_too_long_nyi_and_preserves_results() {
     let source = r#"
-        let i = 0;
-        let sum = 0;
+        let mut i = 0;
+        let mut sum = 0;
         while i < 6 {
             sum = sum + i;
             i = i + 1;
@@ -95,7 +95,7 @@ fn jit_records_trace_too_long_nyi_and_preserves_results() {
 #[test]
 fn jit_rejects_zero_hot_loop_threshold_with_explicit_nyi_reason() {
     let source = r#"
-        let i = 0;
+        let mut i = 0;
         while i < 4 {
             i = i + 1;
         }

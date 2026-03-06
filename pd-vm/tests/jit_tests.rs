@@ -37,7 +37,7 @@ impl HostFunction for PrintNoReturn {
 #[test]
 fn aot_compiles_whole_non_loop_program() {
     let source = r#"
-        let x = 3;
+        let mut x = 3;
         if x < 2 {
             x = x + 10;
         } else {
@@ -114,8 +114,8 @@ fn aot_handles_string_equality_paths() {
 #[test]
 fn trace_jit_compiles_hot_loop_and_is_dumpable() {
     let source = r#"
-        let i = 0;
-        let sum = 0;
+        let mut i = 0;
+        let mut sum = 0;
         while i < 20 {
             sum = sum + i;
             i = i + 1;
@@ -153,7 +153,7 @@ fn trace_jit_compiles_hot_loop_and_is_dumpable() {
 #[test]
 fn trace_jit_native_path_honors_fuel_metering() {
     let source = r#"
-        let i = 0;
+        let mut i = 0;
         while i < 100 {
             i = i + 1;
         }
@@ -191,8 +191,8 @@ fn changing_fuel_interval_recompiles_native_trace_variant() {
     }
 
     let source = r#"
-        let i = 0;
-        let acc = 0;
+        let mut i = 0;
+        let mut acc = 0;
         while i < 40 {
             acc = acc + i;
             acc = acc + 1;
@@ -237,8 +237,8 @@ fn changing_fuel_interval_recompiles_native_trace_variant() {
 #[test]
 fn compiler_uses_shl_for_power_of_two_multiply_and_jit_accepts_it() {
     let source = r#"
-        let i = 0;
-        let sum = 0;
+        let mut i = 0;
+        let mut sum = 0;
         while i < 8 {
             sum = sum + i * 8;
             i = i + 1;
@@ -272,8 +272,8 @@ fn compiler_uses_shl_for_power_of_two_multiply_and_jit_accepts_it() {
 #[test]
 fn compiler_emits_mod_and_or_and_jit_accepts_them() {
     let source = r#"
-        let i = 1;
-        let sum = 0;
+        let mut i = 1;
+        let mut sum = 0;
         while i < 12 {
             let is_evenish = ((i % 2) == 0) && true;
             let is_small = (i < 3) || is_evenish;
@@ -324,7 +324,7 @@ fn compiler_emits_mod_and_or_and_jit_accepts_them() {
 fn trace_jit_supports_host_calls_with_native_mixed_mode() {
     let source = r#"
         fn print(x);
-        let i = 0;
+        let mut i = 0;
         while i < 4 {
             print(i);
             i = i + 1;
@@ -383,10 +383,10 @@ fn trace_jit_supports_host_calls_with_native_mixed_mode() {
 fn trace_jit_nested_loops_use_branch_exit_segments() {
     let source = r#"
         fn print(x);
-        let i = 0;
-        let sum = 0;
+        let mut i = 0;
+        let mut sum = 0;
         while i < 3 {
-            let j = 0;
+            let mut j = 0;
             while j < 4 {
                 print(j);
                 sum = sum + j;

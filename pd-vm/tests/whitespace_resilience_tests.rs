@@ -16,7 +16,7 @@ fn rustscript_spacing_variants_produce_same_result() {
         let a=1;
         let b=2;
         let c=if a<b=>{a+b}else=>{0};
-        let arr=[];
+        let mut arr=[];
         arr[arr.length]=c;
         let m={value:arr[0]};
         m.value+match c{3=>1,_=>0};
@@ -25,7 +25,7 @@ fn rustscript_spacing_variants_produce_same_result() {
         let        a = 1 ;
         let    b    =    2 ;
         let c = if    a < b    => { a + b } else   => { 0 } ;
-        let arr = [ ] ;
+        let mut arr = [ ] ;
         arr [ arr . length ] = c ;
         let m = { value : arr [ 0 ] } ;
         m . value + match c { 3 => 1 , _ => 0 , } ;
