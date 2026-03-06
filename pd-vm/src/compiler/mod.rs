@@ -244,6 +244,7 @@ impl CompiledProgram {
 #[derive(Clone, Debug, Default)]
 pub struct CompileSourceFileOptions {
     module_path_overrides: HashMap<String, PathBuf>,
+    module_source_overrides: HashMap<String, String>,
 }
 
 impl CompileSourceFileOptions {
@@ -269,9 +270,36 @@ impl CompileSourceFileOptions {
         self.module_path_overrides.insert(key, module_path.into());
     }
 
+    pub fn with_module_override_source(
+        mut self,
+        import_spec: impl Into<String>,
+        module_source: impl Into<String>,
+    ) -> Self {
+        self.set_module_override_source(import_spec, module_source);
+        self
+    }
+
+    pub fn set_module_override_source(
+        &mut self,
+        import_spec: impl Into<String>,
+        module_source: impl Into<String>,
+    ) {
+        let key = normalize_import_spec(import_spec.into());
+        self.module_source_overrides.insert(key, module_source.into());
+    }
+
     pub fn module_override_path(&self, import_spec: &str) -> Option<&Path> {
         let key = normalize_import_spec(import_spec.to_string());
         self.module_path_overrides.get(&key).map(PathBuf::as_path)
+    }
+
+    pub fn module_override_source(&self, import_spec: &str) -> Option<&str> {
+        let key = normalize_import_spec(import_spec.to_string());
+        self.module_source_overrides.get(&key).map(String::as_str)
+    }
+
+    fn has_module_overrides(&self) -> bool {
+        !self.module_path_overrides.is_empty() || !self.module_source_overrides.is_empty()
     }
 }
 
@@ -384,6 +412,17 @@ pub fn compile_source_with_flavor(
     compile_source_with_flavor_and_behavior(source, flavor, CompileBehavior::DEFAULT)
 }
 
+pub fn compile_source_with_flavor_and_options(
+    source: &str,
+    flavor: SourceFlavor,
+    options: CompileSourceFileOptions,
+) -> Result<CompiledProgram, SourcePathError> {
+    let source_owned = source.to_string();
+    run_with_compiler_stack(move || {
+        compile_source_with_flavor_and_options_impl(&source_owned, flavor, &options)
+    })
+}
+
 fn compile_source_with_flavor_and_behavior(
     source: &str,
     flavor: SourceFlavor,
@@ -411,6 +450,34 @@ fn compile_source_with_flavor_impl(
         )),
         other => other,
     }
+}
+
+fn compile_source_with_flavor_and_options_impl(
+    source: &str,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+) -> Result<CompiledProgram, SourcePathError> {
+    if !options.has_module_overrides() {
+        return compile_source_with_flavor_impl(source, flavor, CompileBehavior::DEFAULT)
+            .map_err(SourcePathError::Source);
+    }
+
+    let path = virtual_inmemory_entry_path(flavor);
+    let (_root_parse_source, units) =
+        source_loader::load_units_for_source_file(&path, flavor, source, options)?;
+    let merged = merge_units(units)?;
+    compile_parsed_output(source.to_string(), merged, CompileBehavior::DEFAULT)
+        .map_err(SourcePathError::Source)
+}
+
+fn virtual_inmemory_entry_path(flavor: SourceFlavor) -> PathBuf {
+    let ext = match flavor {
+        SourceFlavor::RustScript => "rss",
+        SourceFlavor::JavaScript => "js",
+        SourceFlavor::Lua => "lua",
+        SourceFlavor::Scheme => "scm",
+    };
+    PathBuf::from("__pd_vm_inmemory__").join(format!("main.{ext}"))
 }
 
 pub fn compile_source_file(path: impl AsRef<Path>) -> Result<CompiledProgram, SourcePathError> {
