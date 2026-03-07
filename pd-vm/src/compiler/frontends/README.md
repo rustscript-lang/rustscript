@@ -55,6 +55,10 @@ Supported syntax and features:
   - Reassignment (`x = ...`), indexed/member mutation (`x[i] = ...`, `x.k = ...`), and `&mut`
     borrows require a mutable binding.
   - Non-copyable field reads (for example `p.a`) are move-by-default.
+  - Non-copyable local-to-local rebinds (for example `let b = a`, `b = a`) move the source local
+    by default.
+  - Collection locals continue to use alias tracking semantics on plain local reads and local
+    rebinds.
   - Use `.copy()` to explicitly clone/detach a value before reusing or mutating related state.
   - `&expr` and `&mut expr` are accepted borrow forms; in the current subset they act as
     non-consuming access forms and still participate in move/liveness checks.

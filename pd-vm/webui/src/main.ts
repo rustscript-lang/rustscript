@@ -191,8 +191,10 @@ app.innerHTML = `
     </section>
     <section class="workspace">
       <div class="toolbar">
-        <label for="flavor-select">Flavor</label>
-        <select id="flavor-select" aria-label="source flavor"></select>
+        <div class="flavor-control flavor-control--hidden" aria-hidden="true">
+          <label for="flavor-select">Flavor</label>
+          <select id="flavor-select" aria-label="source flavor"></select>
+        </div>
         <button id="run-button" type="button">Run</button>
         <span id="lint-status" class="status neutral">lint: idle</span>
         <span id="run-status" class="status neutral">run: idle</span>

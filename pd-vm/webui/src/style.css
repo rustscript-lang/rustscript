@@ -83,6 +83,16 @@ body {
   box-shadow: 0 10px 24px rgba(18, 59, 76, 0.1);
 }
 
+.flavor-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.flavor-control--hidden {
+  display: none;
+}
+
 .toolbar label {
   font-size: 0.88rem;
   letter-spacing: 0.03em;

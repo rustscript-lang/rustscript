@@ -457,7 +457,12 @@ fn build_scheme_optional_member_expr(
     let idx_slot = builder.alloc_local_named(&gensym("scheme_opt_idx"))?;
     let found_slot = builder.alloc_local_named(&gensym("scheme_opt_found"))?;
 
-    let keys_len_expr = || Expr::Call(BuiltinFunction::Len.call_index(), vec![Expr::Var(keys_slot)]);
+    let keys_len_expr = || {
+        Expr::Call(
+            BuiltinFunction::Len.call_index(),
+            vec![Expr::Var(keys_slot)],
+        )
+    };
     let current_key_expr = || {
         Expr::Call(
             BuiltinFunction::Get.call_index(),
@@ -988,12 +993,8 @@ fn lower_scheme_direct_namespace_call(
         let namespace = member;
         let vm_member = segments[2].as_str();
         if is_builtin_namespace(namespace)
-            && let Some(expr) = lower_scheme_direct_regex_or_builtin_call(
-                namespace,
-                vm_member,
-                args.clone(),
-                line,
-            )?
+            && let Some(expr) =
+                lower_scheme_direct_regex_or_builtin_call(namespace, vm_member, args.clone(), line)?
         {
             return Ok(expr);
         }
@@ -1006,12 +1007,14 @@ fn lower_scheme_direct_namespace_call(
             message: "too many call arguments".to_string(),
         })?;
         builder.declare_function(&call_name, Some(arity))?;
-        return builder.resolve_call_expr(&call_name, args).ok_or_else(|| ParseError {
-            span: None,
-            code: None,
-            line,
-            message: format!("unknown function '{call_name}'"),
-        });
+        return builder
+            .resolve_call_expr(&call_name, args)
+            .ok_or_else(|| ParseError {
+                span: None,
+                code: None,
+                line,
+                message: format!("unknown function '{call_name}'"),
+            });
     }
 
     if segments.len() == 2 {
@@ -1085,9 +1088,7 @@ fn lower_scheme_direct_regex_or_builtin_call(
                 span: None,
                 code: None,
                 line,
-                message: format!(
-                    "function '{namespace}::{member}' expects {expected} arguments"
-                ),
+                message: format!("function '{namespace}::{member}' expects {expected} arguments"),
             });
         }
         return Ok(Some(Expr::Call(builtin.call_index(), args)));
@@ -1104,10 +1105,7 @@ fn apply_regex_flags_to_pattern_expr_direct(pattern: Expr, flags: Expr) -> Expr 
         BuiltinFunction::Concat.call_index(),
         vec![prefix, Expr::String(")".to_string())],
     );
-    Expr::Call(
-        BuiltinFunction::Concat.call_index(),
-        vec![prefix, pattern],
-    )
+    Expr::Call(BuiltinFunction::Concat.call_index(), vec![prefix, pattern])
 }
 
 fn lower_scheme_direct_hash_expr(
@@ -1184,13 +1182,8 @@ fn lower_scheme_direct_lambda_expr_from_params(
     }
 
     let mut captures = HashMap::new();
-    let Some(body_expr) = lower_scheme_direct_expr(
-        &body_forms[0],
-        builder,
-        &param_lookup,
-        &mut captures,
-        true,
-    )?
+    let Some(body_expr) =
+        lower_scheme_direct_expr(&body_forms[0], builder, &param_lookup, &mut captures, true)?
     else {
         return Ok(None);
     };
@@ -1219,13 +1212,23 @@ where
     if args.len() != 2 {
         return Ok(None);
     }
-    let Some(lhs) =
-        lower_scheme_direct_expr(&args[0], builder, param_slots, capture_slots, capture_enabled)?
+    let Some(lhs) = lower_scheme_direct_expr(
+        &args[0],
+        builder,
+        param_slots,
+        capture_slots,
+        capture_enabled,
+    )?
     else {
         return Ok(None);
     };
-    let Some(rhs) =
-        lower_scheme_direct_expr(&args[1], builder, param_slots, capture_slots, capture_enabled)?
+    let Some(rhs) = lower_scheme_direct_expr(
+        &args[1],
+        builder,
+        param_slots,
+        capture_slots,
+        capture_enabled,
+    )?
     else {
         return Ok(None);
     };
@@ -1338,7 +1341,6 @@ impl SchemeForm {
             _ => None,
         }
     }
-
 }
 
 #[derive(Clone, Debug)]
@@ -1947,8 +1949,3 @@ mod tests {
         assert!(!forms.is_empty(), "scheme source should not be empty");
     }
 }
-
-
-
-
-

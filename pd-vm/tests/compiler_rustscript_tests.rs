@@ -734,6 +734,17 @@ fn rustscript_move_and_alias_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
+            name: "non copy local can be explicitly copied before local move",
+            source: r#"
+                let a = "2";
+                let b = a.copy();
+                a + b;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("22".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
             name: "non numeric field access can be borrowed with ampersand",
             source: r#"
                 let p = { a: "x" };
@@ -868,6 +879,16 @@ fn rustscript_move_and_alias_parse_rejection_cases_work() {
             "#,
             flavor: SourceFlavor::RustScript,
             expected_contains_all: &["p.a", "moved"],
+        },
+        ParseErrorCase {
+            name: "non copy local assignment moves source by default",
+            source: r#"
+                let a = "2";
+                let b = a;
+                a + b;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["local 'a'", "moved"],
         },
         ParseErrorCase {
             name: "borrowed then moved then second move still fails",

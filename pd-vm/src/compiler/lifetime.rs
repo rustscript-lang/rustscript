@@ -13,7 +13,10 @@ struct FlowState {
     definite: Vec<bool>,
     possible: Vec<bool>,
     copyable_locals: Vec<bool>,
+    movable_locals: Vec<bool>,
     collection_aliases: Vec<HashSet<u32>>,
+    moved_local_definite: Vec<bool>,
+    moved_local_possible: Vec<bool>,
     moved_definite: HashSet<MovedFieldPath>,
     moved_possible: HashSet<MovedFieldPath>,
     copyable_fields: HashSet<MovedFieldPath>,
@@ -51,7 +54,10 @@ impl FlowState {
             definite: vec![false; local_count],
             possible: vec![false; local_count],
             copyable_locals: vec![false; local_count],
+            movable_locals: vec![false; local_count],
             collection_aliases: vec![HashSet::new(); local_count],
+            moved_local_definite: vec![false; local_count],
+            moved_local_possible: vec![false; local_count],
             moved_definite: HashSet::new(),
             moved_possible: HashSet::new(),
             copyable_fields: HashSet::new(),
@@ -230,10 +236,14 @@ impl AvailabilityAnalyzer {
                 let mut out = self.analyze_expr(expr, &state, *line)?;
                 if out.reachable {
                     self.mark_available(&mut out, *index, *line)?;
+                    self.clear_local_moved_state(&mut out, *index);
                     self.handle_local_rebind_field_moves(&mut out, *index, expr);
                     self.handle_local_rebind_collection_aliases(&mut out, *index, expr);
                     let is_copyable = self.is_definitely_copyable_expr(expr, &out);
                     self.set_local_copyable_state(&mut out, *index, is_copyable);
+                    let is_movable = self.is_definitely_movable_local_expr(expr, &out);
+                    self.set_local_movable_state(&mut out, *index, is_movable);
+                    self.mark_local_source_moved_on_rebind(&mut out, *index, expr);
                 }
                 Ok((stmt.clone(), out))
             }
@@ -242,10 +252,14 @@ impl AvailabilityAnalyzer {
                 let mut out = self.analyze_expr(expr, &state, *line)?;
                 if out.reachable {
                     self.mark_available(&mut out, *index, *line)?;
+                    self.clear_local_moved_state(&mut out, *index);
                     self.handle_local_rebind_field_moves(&mut out, *index, expr);
                     self.handle_local_rebind_collection_aliases(&mut out, *index, expr);
                     let is_copyable = self.is_definitely_copyable_expr(expr, &out);
                     self.set_local_copyable_state(&mut out, *index, is_copyable);
+                    let is_movable = self.is_definitely_movable_local_expr(expr, &out);
+                    self.set_local_movable_state(&mut out, *index, is_movable);
+                    self.mark_local_source_moved_on_rebind(&mut out, *index, expr);
                 }
                 Ok((stmt.clone(), out))
             }
@@ -494,6 +508,7 @@ impl AvailabilityAnalyzer {
             | Expr::FunctionRef(_) => Ok(state.clone()),
             Expr::Var(index) => {
                 self.require_available(*index, state, line)?;
+                self.require_local_not_moved(*index, state, line)?;
                 Ok(state.clone())
             }
             Expr::Call(index, args) => {
@@ -536,8 +551,8 @@ impl AvailabilityAnalyzer {
             }
             Expr::Add(lhs, rhs) => {
                 // `+` is commonly used for string concatenation in the subset.
-                // Treat field reads in concat/add operands as copied to keep
-                // capture ergonomics reasonable (`p.a + p.a`).
+                // Treat local/field reads in concat/add operands as copied to keep
+                // ergonomics reasonable (`a + a`, `p.a + p.a`).
                 let lhs_state = self.analyze_expr_to_owned(lhs, state, line)?;
                 self.analyze_expr_to_owned(rhs, &lhs_state, line)
             }
@@ -610,6 +625,11 @@ impl AvailabilityAnalyzer {
         state: &FlowState,
         line: u32,
     ) -> Result<FlowState, ParseError> {
+        if let Expr::Var(index) = inner {
+            self.require_available(*index, state, line)?;
+            self.require_local_not_moved(*index, state, line)?;
+            return Ok(state.clone());
+        }
         if let Expr::Call(index, args) = inner
             && let Some((root_slot, field_key)) = self.extract_moved_field_access(*index, args)
         {
@@ -1175,6 +1195,7 @@ impl AvailabilityAnalyzer {
         }
         for (source_slot, _) in &closure.capture_copies {
             self.require_available(*source_slot, state, line)?;
+            self.require_local_not_moved(*source_slot, state, line)?;
         }
 
         let mut closure_state = FlowState::reachable(self.local_count);
@@ -1187,8 +1208,13 @@ impl AvailabilityAnalyzer {
             let captured_idx = *captured_slot as usize;
             if source_idx < self.local_count && captured_idx < self.local_count {
                 closure_state.copyable_locals[captured_idx] = state.copyable_locals[source_idx];
+                closure_state.movable_locals[captured_idx] = state.movable_locals[source_idx];
                 closure_state.collection_aliases[captured_idx] =
                     state.collection_aliases[source_idx].clone();
+                closure_state.moved_local_definite[captured_idx] =
+                    state.moved_local_definite[source_idx];
+                closure_state.moved_local_possible[captured_idx] =
+                    state.moved_local_possible[source_idx];
             }
             for path in state
                 .moved_definite
@@ -1291,6 +1317,30 @@ impl AvailabilityAnalyzer {
         })
     }
 
+    fn require_local_not_moved(
+        &self,
+        index: LocalSlot,
+        state: &FlowState,
+        line: u32,
+    ) -> Result<(), ParseError> {
+        let slot = index as usize;
+        if slot >= self.local_count {
+            return Ok(());
+        }
+        if !state.moved_local_possible[slot] {
+            return Ok(());
+        }
+        let display = self.display_local_name(index);
+        Err(ParseError {
+            span: None,
+            code: Some("E_LOCAL_MOVED".to_string()),
+            line: line as usize,
+            message: format!(
+                "local '{display}' was moved earlier; use '{display}.copy()' to copy it before moving"
+            ),
+        })
+    }
+
     fn mark_available(
         &self,
         state: &mut FlowState,
@@ -1311,10 +1361,90 @@ impl AvailabilityAnalyzer {
         Ok(())
     }
 
+    fn should_move_local_on_rebind_source(&self, index: LocalSlot, state: &FlowState) -> bool {
+        let slot = index as usize;
+        if slot >= self.local_count {
+            return false;
+        }
+        if !state.movable_locals[slot] {
+            return false;
+        }
+        // Collection locals use alias tracking in the current model.
+        state.collection_aliases[slot].is_empty()
+    }
+
+    fn mark_local_source_moved_on_rebind(
+        &self,
+        state: &mut FlowState,
+        target: LocalSlot,
+        expr: &Expr,
+    ) {
+        let Expr::Var(source) = expr else {
+            return;
+        };
+        if *source == target {
+            return;
+        }
+        if self.should_move_local_on_rebind_source(*source, state) {
+            self.mark_local_moved(state, *source);
+        }
+    }
+
+    fn mark_local_moved(&self, state: &mut FlowState, index: LocalSlot) {
+        let slot = index as usize;
+        if slot >= self.local_count {
+            return;
+        }
+        state.moved_local_definite[slot] = true;
+        state.moved_local_possible[slot] = true;
+    }
+
+    fn clear_local_moved_state(&self, state: &mut FlowState, index: LocalSlot) {
+        let slot = index as usize;
+        if slot >= self.local_count {
+            return;
+        }
+        state.moved_local_definite[slot] = false;
+        state.moved_local_possible[slot] = false;
+    }
+
     fn set_local_copyable_state(&self, state: &mut FlowState, index: LocalSlot, is_copyable: bool) {
         let slot = index as usize;
         if slot < self.local_count {
             state.copyable_locals[slot] = is_copyable;
+        }
+    }
+
+    fn set_local_movable_state(&self, state: &mut FlowState, index: LocalSlot, is_movable: bool) {
+        let slot = index as usize;
+        if slot < self.local_count {
+            state.movable_locals[slot] = is_movable;
+        }
+    }
+
+    fn is_definitely_movable_local_expr(&self, expr: &Expr, state: &FlowState) -> bool {
+        match expr {
+            Expr::String(_) => true,
+            Expr::Var(index) => state
+                .movable_locals
+                .get(*index as usize)
+                .copied()
+                .unwrap_or(false),
+            Expr::IfElse {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.is_definitely_movable_local_expr(then_expr, state)
+                    && self.is_definitely_movable_local_expr(else_expr, state)
+            }
+            Expr::Match { arms, default, .. } => {
+                arms.iter()
+                    .all(|(_, arm_expr)| self.is_definitely_movable_local_expr(arm_expr, state))
+                    && self.is_definitely_movable_local_expr(default, state)
+            }
+            Expr::Block { expr, .. } => self.is_definitely_movable_local_expr(expr, state),
+            _ => false,
         }
     }
 
@@ -1325,7 +1455,10 @@ impl AvailabilityAnalyzer {
                 definite: vec![false; self.local_count],
                 possible: vec![false; self.local_count],
                 copyable_locals: vec![false; self.local_count],
+                movable_locals: vec![false; self.local_count],
                 collection_aliases: vec![HashSet::new(); self.local_count],
+                moved_local_definite: vec![false; self.local_count],
+                moved_local_possible: vec![false; self.local_count],
                 moved_definite: HashSet::new(),
                 moved_possible: HashSet::new(),
                 copyable_fields: HashSet::new(),
@@ -1336,15 +1469,23 @@ impl AvailabilityAnalyzer {
                 let mut definite = vec![false; self.local_count];
                 let mut possible = vec![false; self.local_count];
                 let mut copyable_locals = vec![false; self.local_count];
+                let mut movable_locals = vec![false; self.local_count];
                 let mut collection_aliases = vec![HashSet::new(); self.local_count];
+                let mut moved_local_definite = vec![false; self.local_count];
+                let mut moved_local_possible = vec![false; self.local_count];
                 for idx in 0..self.local_count {
                     definite[idx] = lhs.definite[idx] && rhs.definite[idx];
                     possible[idx] = lhs.possible[idx] || rhs.possible[idx];
                     copyable_locals[idx] = lhs.copyable_locals[idx] && rhs.copyable_locals[idx];
+                    movable_locals[idx] = lhs.movable_locals[idx] && rhs.movable_locals[idx];
                     collection_aliases[idx] = lhs.collection_aliases[idx]
                         .union(&rhs.collection_aliases[idx])
                         .copied()
                         .collect::<HashSet<_>>();
+                    moved_local_definite[idx] =
+                        lhs.moved_local_definite[idx] && rhs.moved_local_definite[idx];
+                    moved_local_possible[idx] =
+                        lhs.moved_local_possible[idx] || rhs.moved_local_possible[idx];
                 }
                 let moved_possible = lhs
                     .moved_possible
@@ -1366,7 +1507,10 @@ impl AvailabilityAnalyzer {
                     definite,
                     possible,
                     copyable_locals,
+                    movable_locals,
                     collection_aliases,
+                    moved_local_definite,
+                    moved_local_possible,
                     moved_definite,
                     moved_possible,
                     copyable_fields,

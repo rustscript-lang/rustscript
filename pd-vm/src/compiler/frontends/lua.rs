@@ -39,10 +39,7 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
 
         if let Some((name, params)) = parse_lua_pub_fn_declaration(trimmed) {
             builder
-                .declare_function(
-                    &name,
-                    Some(u8::try_from(params.len()).unwrap_or(u8::MAX)),
-                )
+                .declare_function(&name, Some(u8::try_from(params.len()).unwrap_or(u8::MAX)))
                 .ok();
             continue;
         }
@@ -275,7 +272,8 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
             else {
                 return Ok(None);
             };
-            let Some(start) = parse_lua_direct_expr_top(&start_raw, &mut builder, &namespace_aliases)?
+            let Some(start) =
+                parse_lua_direct_expr_top(&start_raw, &mut builder, &namespace_aliases)?
             else {
                 return Ok(None);
             };
@@ -462,7 +460,8 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
             if !is_valid_lua_ident(name) {
                 return Ok(None);
             }
-            let expr = parse_lua_direct_expr_top(expr_raw.trim(), &mut builder, &namespace_aliases)?;
+            let expr =
+                parse_lua_direct_expr_top(expr_raw.trim(), &mut builder, &namespace_aliases)?;
             let Some(expr) = expr else {
                 return Ok(None);
             };
@@ -1328,10 +1327,7 @@ fn apply_lua_regex_flags_to_pattern_expr(pattern: Expr, flags: Expr) -> Expr {
         BuiltinFunction::Concat.call_index(),
         vec![prefix, Expr::String(")".to_string())],
     );
-    Expr::Call(
-        BuiltinFunction::Concat.call_index(),
-        vec![prefix, pattern],
-    )
+    Expr::Call(BuiltinFunction::Concat.call_index(), vec![prefix, pattern])
 }
 
 fn build_lua_optional_member_expr(
@@ -1356,7 +1352,12 @@ fn build_lua_optional_member_expr(
         .alloc_local_named(&fresh_lua_direct_temp("opt_found"))
         .ok()?;
 
-    let keys_len_expr = || Expr::Call(BuiltinFunction::Len.call_index(), vec![Expr::Var(keys_slot)]);
+    let keys_len_expr = || {
+        Expr::Call(
+            BuiltinFunction::Len.call_index(),
+            vec![Expr::Var(keys_slot)],
+        )
+    };
     let current_key_expr = || {
         Expr::Call(
             BuiltinFunction::Get.call_index(),
@@ -2149,4 +2150,3 @@ fn remove_lua_comments(source: &str) -> Result<String, ParseError> {
     }
     Ok(out)
 }
-
