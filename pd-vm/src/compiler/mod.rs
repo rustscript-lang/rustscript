@@ -761,6 +761,10 @@ impl Compiler {
                     .ok_or(CompileError::ContinueOutsideLoop)?;
                 self.assembler.br_label(&loop_ctx.continue_label);
             }
+            Stmt::Drop { index, line } => {
+                self.assembler.mark_line(*line);
+                self.assign_expr_to_slot(*index, &Expr::Null)?;
+            }
         }
         Ok(())
     }
@@ -1294,6 +1298,9 @@ fn collect_stmt_slot_footprint(stmt: &Stmt, slots: &mut BTreeSet<LocalSlot>) {
     match stmt {
         Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {
         }
+        Stmt::Drop { index, .. } => {
+            slots.insert(*index);
+        }
         Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
             slots.insert(*index);
             collect_expr_slot_footprint(expr, slots);
@@ -1486,6 +1493,9 @@ fn collect_local_debug_ranges(
 fn record_stmt_local_debug_ranges(stmt: &Stmt, ranges: &mut HashMap<LocalSlot, LocalDebugRange>) {
     match stmt {
         Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        Stmt::Drop { index, line } => {
+            note_local_use(ranges, *index, *line);
+        }
         Stmt::Let { index, expr, line } => {
             note_local_decl(ranges, *index, *line);
             record_expr_local_debug_ranges(expr, *line, ranges);
@@ -1689,7 +1699,8 @@ fn stmt_source_line(stmt: &Stmt) -> u32 {
         | Stmt::For { line, .. }
         | Stmt::While { line, .. }
         | Stmt::Break { line }
-        | Stmt::Continue { line } => *line,
+        | Stmt::Continue { line }
+        | Stmt::Drop { line, .. } => *line,
     }
 }
 

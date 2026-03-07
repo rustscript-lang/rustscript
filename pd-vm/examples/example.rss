@@ -12,8 +12,3 @@ if total != 3 {
 } else {
     print(add_one(5));
 }
-
-
-let a = [1,2,3,4,5];
-let b = a[0];
-let c = a;

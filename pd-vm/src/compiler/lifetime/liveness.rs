@@ -79,9 +79,8 @@ impl LivenessRewriter {
             };
             let clear_line = stmt_line(stmt);
             for slot in clear_slots.iter().rev() {
-                rewritten_rev.push(Stmt::Assign {
+                rewritten_rev.push(Stmt::Drop {
                     index: *slot,
-                    expr: Expr::Null,
                     line: clear_line,
                 });
             }
@@ -103,6 +102,21 @@ impl LivenessRewriter {
             | Stmt::FuncDecl { .. }
             | Stmt::Break { .. }
             | Stmt::Continue { .. } => (stmt.clone(), live_after.clone(), Vec::new()),
+            Stmt::Drop { index, line } => {
+                let mut live_before = live_after.clone();
+                self.kill_slot(&mut live_before, *index);
+                (
+                    Stmt::Drop {
+                        index: *index,
+                        line: *line,
+                    },
+                    live_before,
+                    vec![DefInfo {
+                        slot: *index,
+                        explicit_null: true,
+                    }],
+                )
+            }
             Stmt::Expr { expr, line } => {
                 let mut live_before = live_after.clone();
                 self.union_inplace(&mut live_before, &self.uses_expr(expr));
@@ -278,6 +292,11 @@ impl LivenessRewriter {
             | Stmt::FuncDecl { .. }
             | Stmt::Break { .. }
             | Stmt::Continue { .. } => live_after.clone(),
+            Stmt::Drop { index, .. } => {
+                let mut live_before = live_after.clone();
+                self.kill_slot(&mut live_before, *index);
+                live_before
+            }
             Stmt::Expr { expr, .. } => {
                 let mut live_before = live_after.clone();
                 self.union_inplace(&mut live_before, &self.uses_expr(expr));
@@ -524,7 +543,8 @@ fn function_impl_uses_local_call(function_impl: &FunctionImpl) -> bool {
 
 fn stmt_contains_local_call(stmt: &Stmt) -> bool {
     match stmt {
-        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {
+        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. }
+        | Stmt::Drop { .. } => {
             false
         }
         Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
@@ -631,7 +651,8 @@ fn stmt_line(stmt: &Stmt) -> u32 {
         | Stmt::For { line, .. }
         | Stmt::While { line, .. }
         | Stmt::Break { line }
-        | Stmt::Continue { line } => *line,
+        | Stmt::Continue { line }
+        | Stmt::Drop { line, .. } => *line,
     }
 }
 
@@ -699,7 +720,8 @@ impl LocalSlotAllocator {
             Stmt::Noop { .. }
             | Stmt::FuncDecl { .. }
             | Stmt::Break { .. }
-            | Stmt::Continue { .. } => {}
+            | Stmt::Continue { .. }
+            | Stmt::Drop { .. } => {}
             Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
                 self.collect_expr_constraints(expr, live_before)?;
             }
@@ -909,6 +931,9 @@ impl LocalSlotAllocator {
             | Stmt::FuncDecl { .. }
             | Stmt::Break { .. }
             | Stmt::Continue { .. } => {}
+            Stmt::Drop { index, .. } => {
+                self.mark_set_slot(set, *index);
+            }
             Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
                 self.mark_set_slot(set, *index);
                 self.collect_expr_footprint(expr, set, stack);
@@ -1059,7 +1084,7 @@ impl LocalSlotAllocator {
 
     fn add_stmt_def_edges(&mut self, stmt: &Stmt, live_after: &LiveSet) {
         match stmt {
-            Stmt::Let { index, .. } | Stmt::Assign { index, .. } => {
+            Stmt::Let { index, .. } | Stmt::Assign { index, .. } | Stmt::Drop { index, .. } => {
                 self.add_slot_live_edges(*index, live_after);
             }
             Stmt::ClosureLet { closure, .. } => {
@@ -1216,6 +1241,9 @@ fn remap_slot(index: LocalSlot, mapping: &[LocalSlot]) -> Result<LocalSlot, Pars
 fn remap_stmt_slots(stmt: &mut Stmt, mapping: &[LocalSlot]) -> Result<(), ParseError> {
     match stmt {
         Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        Stmt::Drop { index, .. } => {
+            *index = remap_slot(*index, mapping)?;
+        }
         Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
             *index = remap_slot(*index, mapping)?;
             remap_expr_slots(expr, mapping)?;

@@ -87,7 +87,8 @@ fn legalize_stmts(stmts: &mut [Stmt], state: &mut LocalTypeState) {
             Stmt::Noop { .. }
             | Stmt::FuncDecl { .. }
             | Stmt::Break { .. }
-            | Stmt::Continue { .. } => {}
+            | Stmt::Continue { .. }
+            | Stmt::Drop { .. } => {}
             Stmt::ClosureLet { closure, .. } => {
                 let _ = legalize_expr(&mut closure.body, state);
             }

@@ -135,6 +135,12 @@ pub enum Stmt {
     Continue {
         line: u32,
     },
+    /// Explicit compile-time drop: null-out the local slot and trigger the
+    /// runtime drop-contract for whatever value was previously stored there.
+    Drop {
+        index: LocalSlot,
+        line: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

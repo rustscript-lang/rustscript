@@ -22,6 +22,7 @@ fn remap_stmt_line_numbers(stmt: &mut Stmt, offset: u32) {
         Stmt::Noop { line }
         | Stmt::Break { line }
         | Stmt::Continue { line }
+        | Stmt::Drop { line, .. }
         | Stmt::ClosureLet { line, .. }
         | Stmt::FuncDecl { line, .. } => remap_line(line, offset),
         Stmt::Let { expr, line, .. }

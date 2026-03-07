@@ -249,6 +249,9 @@ fn remap_stmt_indices(
             }
         }
         Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        Stmt::Drop { index, .. } => {
+            *index = remap_local_index(*index, local_base)?;
+        }
     }
     Ok(())
 }

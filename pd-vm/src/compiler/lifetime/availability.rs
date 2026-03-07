@@ -185,6 +185,7 @@ fn stmt_uses_slot(stmt: &Stmt, slot: LocalSlot) -> bool {
         Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {
             false
         }
+        Stmt::Drop { index, .. } => *index == slot,
         Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
             expr_uses_slot(expr, slot)
         }
@@ -294,7 +295,8 @@ fn collect_consumed_positions_from_stmt(
     out: &mut HashSet<usize>,
 ) {
     match stmt {
-        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. }
+        | Stmt::Drop { .. } => {}
         Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
             collect_consumed_positions_from_expr(expr, function_impl, known_consumed_positions, out);
         }
@@ -717,9 +719,8 @@ impl AvailabilityAnalyzer {
                 let entered_uncertain =
                     after_possible && !after_definite && (!before_possible || before_definite);
                 if entered_uncertain {
-                    rewritten.push(Stmt::Assign {
+                    rewritten.push(Stmt::Drop {
                         index: slot as LocalSlot,
-                        expr: Expr::Null,
                         line: clear_line,
                     });
                 }
@@ -736,7 +737,7 @@ impl AvailabilityAnalyzer {
         loop_control: Option<&mut LoopControlFlow>,
     ) -> Result<(Stmt, FlowState), ParseError> {
         match stmt {
-            Stmt::Noop { .. } | Stmt::FuncDecl { .. } => Ok((stmt.clone(), state)),
+            Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Drop { .. } => Ok((stmt.clone(), state)),
             Stmt::Let { index, expr, line } => {
                 let mut out = self.analyze_expr(expr, &state, *line)?;
                 let mut rewritten_expr = expr.clone();
@@ -2301,7 +2302,8 @@ fn stmt_line(stmt: &Stmt) -> u32 {
         | Stmt::For { line, .. }
         | Stmt::While { line, .. }
         | Stmt::Break { line }
-        | Stmt::Continue { line } => *line,
+        | Stmt::Continue { line }
+        | Stmt::Drop { line, .. } => *line,
     }
 }
 
