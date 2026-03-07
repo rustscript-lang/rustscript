@@ -190,11 +190,11 @@ pub(super) extern "C" fn pd_vm_cranelift_step(vm: *mut Vm, op: i64, a: i64, b: i
             OP_LDLOC => {
                 let index = u8::try_from(a)
                     .map_err(|_| VmError::JitNative("ldloc index out of range".to_string()))?;
-                let value = vm
+                let slot = vm
                     .locals
-                    .get(index as usize)
-                    .cloned()
+                    .get_mut(index as usize)
                     .ok_or(VmError::InvalidLocal(index))?;
+                let value = std::mem::replace(slot, crate::bytecode::Value::Null);
                 vm.stack.push(value);
                 Ok(STATUS_CONTINUE)
             }

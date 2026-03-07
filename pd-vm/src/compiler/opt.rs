@@ -176,7 +176,8 @@ fn legalize_expr(expr: &mut Expr, state: &LocalTypeState) -> BoundType {
         Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
             legalize_expr(inner, state)
         }
-        Expr::Var(slot) => state.get(*slot),
+        Expr::Var(slot) | Expr::MoveVar(slot) => state.get(*slot),
+        Expr::MoveField { .. } | Expr::MoveIndex { .. } => BoundType::Unknown,
         Expr::IfElse {
             condition,
             then_expr,
@@ -320,7 +321,8 @@ fn infer_expr_type_only(expr: &Expr, state: &LocalTypeState) -> BoundType {
         Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
             infer_expr_type_only(inner, state)
         }
-        Expr::Var(slot) => state.get(*slot),
+        Expr::Var(slot) | Expr::MoveVar(slot) => state.get(*slot),
+        Expr::MoveField { .. } | Expr::MoveIndex { .. } => BoundType::Unknown,
         Expr::Call(index, args) => {
             let Some(builtin) = BuiltinFunction::from_call_index(*index) else {
                 return BoundType::Unknown;

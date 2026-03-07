@@ -263,7 +263,10 @@ fn remap_expr_line_numbers(expr: &mut Expr, offset: u32) {
         | Expr::Bool(_)
         | Expr::String(_)
         | Expr::FunctionRef(_)
-        | Expr::Var(_) => {}
+        | Expr::Var(_)
+        | Expr::MoveVar(_)
+        | Expr::MoveField { .. }
+        | Expr::MoveIndex { .. } => {}
     }
 }
 

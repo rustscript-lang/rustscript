@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use self::source_map::{SourceMap, Span};
@@ -326,11 +326,16 @@ fn compile_parsed_output(
     source: String,
     parsed: FrontendIr,
     behavior: CompileBehavior,
+    enable_local_move_semantics: bool,
 ) -> Result<CompiledProgram, SourceError> {
     let local_debug_ranges = collect_named_local_debug_ranges(&parsed);
     let parsed = opt::legalize_builtins_and_bind_types(parsed);
-    let parsed = lifetime::enforce_local_availability(parsed, behavior.clear_dead_locals)
-        .map_err(SourceError::Parse)?;
+    let parsed = lifetime::enforce_local_availability(
+        parsed,
+        behavior.clear_dead_locals,
+        enable_local_move_semantics,
+    )
+    .map_err(SourceError::Parse)?;
     let FrontendIr {
         stmts,
         locals,
@@ -445,7 +450,12 @@ fn compile_source_with_flavor_impl(
     let parsed = frontends::parse_source(source, flavor).map_err(|err| {
         SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
     })?;
-    match compile_parsed_output(source.to_string(), parsed, behavior) {
+    match compile_parsed_output(
+        source.to_string(),
+        parsed,
+        behavior,
+        matches!(flavor, SourceFlavor::RustScript),
+    ) {
         Err(SourceError::Parse(err)) => Err(SourceError::Parse(
             err.with_line_span_from_source(&source_map, source_id),
         )),
@@ -467,8 +477,13 @@ fn compile_source_with_flavor_and_options_impl(
     let (_root_parse_source, units) =
         source_loader::load_units_for_source_file(&path, flavor, source, options)?;
     let merged = merge_units(units)?;
-    compile_parsed_output(source.to_string(), merged, CompileBehavior::DEFAULT)
-        .map_err(SourcePathError::Source)
+    compile_parsed_output(
+        source.to_string(),
+        merged,
+        CompileBehavior::DEFAULT,
+        matches!(flavor, SourceFlavor::RustScript),
+    )
+    .map_err(SourcePathError::Source)
 }
 
 fn virtual_inmemory_entry_path(flavor: SourceFlavor) -> PathBuf {
@@ -502,8 +517,13 @@ fn compile_source_file_impl(
     let (_root_parse_source, units) =
         source_loader::load_units_for_source_file(path, flavor, &source_raw, options)?;
     let merged = merge_units(units)?;
-    compile_parsed_output(source_raw, merged, CompileBehavior::DEFAULT)
-        .map_err(SourcePathError::Source)
+    compile_parsed_output(
+        source_raw,
+        merged,
+        CompileBehavior::DEFAULT,
+        matches!(flavor, SourceFlavor::RustScript),
+    )
+    .map_err(SourcePathError::Source)
 }
 
 fn run_with_compiler_stack<T, F>(f: F) -> T
@@ -877,7 +897,35 @@ impl Compiler {
                 if self.callable_bindings.contains_key(index) {
                     return Err(CompileError::CallableUsedAsValue);
                 }
-                self.emit_ldloc(*index)?;
+                self.emit_copy_ldloc(*index)?;
+            }
+            Expr::MoveVar(index) => {
+                if self.callable_bindings.contains_key(index) {
+                    return Err(CompileError::CallableUsedAsValue);
+                }
+                self.emit_move_ldloc(*index)?;
+            }
+            Expr::MoveField { root, key } => {
+                self.emit_copy_ldloc(*root)?;
+                self.assembler.push_const(Value::String(key.clone()));
+                self.assembler.call(BuiltinFunction::Get.call_index(), 2);
+
+                self.emit_copy_ldloc(*root)?;
+                self.assembler.push_const(Value::String(key.clone()));
+                self.assembler.push_const(Value::Null);
+                self.assembler.call(BuiltinFunction::Set.call_index(), 3);
+                self.emit_stloc(*root)?;
+            }
+            Expr::MoveIndex { root, index } => {
+                self.emit_copy_ldloc(*root)?;
+                self.assembler.push_const(Value::Int(*index));
+                self.assembler.call(BuiltinFunction::Get.call_index(), 2);
+
+                self.emit_copy_ldloc(*root)?;
+                self.assembler.push_const(Value::Int(*index));
+                self.assembler.push_const(Value::Null);
+                self.assembler.call(BuiltinFunction::Set.call_index(), 3);
+                self.emit_stloc(*root)?;
             }
             Expr::IfElse {
                 condition,
@@ -924,7 +972,7 @@ impl Compiler {
                 self.assembler
                     .label(&end_label)
                     .map_err(CompileError::Assembler)?;
-                self.emit_ldloc(*result_slot)?;
+                self.emit_copy_ldloc(*result_slot)?;
             }
             Expr::Block { stmts, expr } => {
                 self.compile_stmts(stmts)?;
@@ -936,7 +984,7 @@ impl Compiler {
 
     fn bind_closure_captures(&mut self, closure: &ClosureExpr) -> Result<(), CompileError> {
         for (source_index, captured_slot) in &closure.capture_copies {
-            self.emit_ldloc(*source_index)?;
+            self.emit_copy_ldloc(*source_index)?;
             self.emit_stloc(*captured_slot)?;
         }
         Ok(())
@@ -987,6 +1035,7 @@ impl Compiler {
                 got: args.len(),
             });
         }
+        let frame_slots = collect_function_frame_slots(function_impl);
         let callable_snapshot = self.callable_bindings.clone();
         for (arg, slot) in args.iter().zip(function_impl.param_slots.iter()) {
             self.assign_expr_to_slot(*slot, arg)?;
@@ -1005,7 +1054,9 @@ impl Compiler {
         })();
         self.inline_call_stack.pop();
         self.callable_bindings = callable_snapshot;
-        result
+        result?;
+        self.emit_inline_frame_clears(&frame_slots)?;
+        Ok(())
     }
 
     fn compile_inline_closure_call(
@@ -1019,13 +1070,16 @@ impl Compiler {
                 got: args.len(),
             });
         }
+        let frame_slots = collect_closure_frame_slots(closure);
         let callable_snapshot = self.callable_bindings.clone();
         for (arg, slot) in args.iter().zip(closure.param_slots.iter()) {
             self.assign_expr_to_slot(*slot, arg)?;
         }
         let result = self.compile_expr(&closure.body);
         self.callable_bindings = callable_snapshot;
-        result
+        result?;
+        self.emit_inline_frame_clears(&frame_slots)?;
+        Ok(())
     }
 
     fn compile_direct_call(&mut self, index: u16, args: &[Expr]) -> Result<(), CompileError> {
@@ -1061,17 +1115,17 @@ impl Compiler {
     ) -> Result<(), CompileError> {
         match pattern {
             MatchPattern::Int(v) => {
-                self.emit_ldloc(value_slot)?;
+                self.emit_copy_ldloc(value_slot)?;
                 self.assembler.push_const(Value::Int(*v));
                 self.assembler.ceq();
             }
             MatchPattern::String(v) => {
-                self.emit_ldloc(value_slot)?;
+                self.emit_copy_ldloc(value_slot)?;
                 self.assembler.push_const(Value::String(v.clone()));
                 self.assembler.ceq();
             }
             MatchPattern::Null => {
-                self.emit_ldloc(value_slot)?;
+                self.emit_copy_ldloc(value_slot)?;
                 self.assembler.push_const(Value::Null);
                 self.assembler.ceq();
             }
@@ -1119,7 +1173,7 @@ impl Compiler {
         value_slot: LocalSlot,
         expected: &str,
     ) -> Result<(), CompileError> {
-        self.emit_ldloc(value_slot)?;
+        self.emit_copy_ldloc(value_slot)?;
         self.assembler.call(BuiltinFunction::TypeOf.call_index(), 1);
         self.assembler
             .push_const(Value::String(expected.to_string()));
@@ -1133,13 +1187,27 @@ impl Compiler {
         label
     }
 
-    fn emit_ldloc(&mut self, slot: LocalSlot) -> Result<(), CompileError> {
+    fn emit_move_ldloc(&mut self, slot: LocalSlot) -> Result<(), CompileError> {
         self.assembler.ldloc(local_slot_operand(slot)?);
         Ok(())
     }
 
+    fn emit_copy_ldloc(&mut self, slot: LocalSlot) -> Result<(), CompileError> {
+        self.emit_move_ldloc(slot)?;
+        self.assembler.dup();
+        self.emit_stloc(slot)
+    }
+
     fn emit_stloc(&mut self, slot: LocalSlot) -> Result<(), CompileError> {
         self.assembler.stloc(local_slot_operand(slot)?);
+        Ok(())
+    }
+
+    fn emit_inline_frame_clears(&mut self, slots: &[LocalSlot]) -> Result<(), CompileError> {
+        for slot in slots {
+            self.assembler.push_const(Value::Null);
+            self.emit_stloc(*slot)?;
+        }
         Ok(())
     }
 
@@ -1192,6 +1260,191 @@ impl Compiler {
 
 fn local_slot_operand(index: LocalSlot) -> Result<u8, CompileError> {
     u8::try_from(index).map_err(|_| CompileError::LocalSlotOverflow(index))
+}
+
+fn collect_function_frame_slots(function_impl: &FunctionImpl) -> Vec<LocalSlot> {
+    let mut slots = BTreeSet::new();
+    for slot in &function_impl.param_slots {
+        slots.insert(*slot);
+    }
+    for stmt in &function_impl.body_stmts {
+        collect_stmt_slot_footprint(stmt, &mut slots);
+    }
+    collect_expr_slot_footprint(&function_impl.body_expr, &mut slots);
+    let mut out = slots.into_iter().collect::<Vec<_>>();
+    out.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+    out
+}
+
+fn collect_closure_frame_slots(closure: &ClosureExpr) -> Vec<LocalSlot> {
+    let mut slots = BTreeSet::new();
+    for slot in &closure.param_slots {
+        slots.insert(*slot);
+    }
+    collect_expr_slot_footprint(&closure.body, &mut slots);
+    for (_, captured_slot) in &closure.capture_copies {
+        slots.remove(captured_slot);
+    }
+    let mut out = slots.into_iter().collect::<Vec<_>>();
+    out.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+    out
+}
+
+fn collect_stmt_slot_footprint(stmt: &Stmt, slots: &mut BTreeSet<LocalSlot>) {
+    match stmt {
+        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {
+        }
+        Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
+            slots.insert(*index);
+            collect_expr_slot_footprint(expr, slots);
+        }
+        Stmt::ClosureLet { closure, .. } => {
+            for slot in &closure.param_slots {
+                slots.insert(*slot);
+            }
+            for (source_slot, captured_slot) in &closure.capture_copies {
+                slots.insert(*source_slot);
+                slots.insert(*captured_slot);
+            }
+            collect_expr_slot_footprint(&closure.body, slots);
+        }
+        Stmt::Expr { expr, .. } => collect_expr_slot_footprint(expr, slots),
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_expr_slot_footprint(condition, slots);
+            for stmt in then_branch {
+                collect_stmt_slot_footprint(stmt, slots);
+            }
+            for stmt in else_branch {
+                collect_stmt_slot_footprint(stmt, slots);
+            }
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            ..
+        } => {
+            collect_stmt_slot_footprint(init, slots);
+            collect_expr_slot_footprint(condition, slots);
+            collect_stmt_slot_footprint(post, slots);
+            for stmt in body {
+                collect_stmt_slot_footprint(stmt, slots);
+            }
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            collect_expr_slot_footprint(condition, slots);
+            for stmt in body {
+                collect_stmt_slot_footprint(stmt, slots);
+            }
+        }
+    }
+}
+
+fn collect_expr_slot_footprint(expr: &Expr, slots: &mut BTreeSet<LocalSlot>) {
+    match expr {
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::FunctionRef(_) => {}
+        Expr::Var(index) | Expr::MoveVar(index) => {
+            slots.insert(*index);
+        }
+        Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
+            slots.insert(*root);
+        }
+        Expr::Call(_, args) => {
+            for arg in args {
+                collect_expr_slot_footprint(arg, slots);
+            }
+        }
+        Expr::LocalCall(index, args) => {
+            slots.insert(*index);
+            for arg in args {
+                collect_expr_slot_footprint(arg, slots);
+            }
+        }
+        Expr::Closure(closure) => {
+            for slot in &closure.param_slots {
+                slots.insert(*slot);
+            }
+            for (source_slot, captured_slot) in &closure.capture_copies {
+                slots.insert(*source_slot);
+                slots.insert(*captured_slot);
+            }
+            collect_expr_slot_footprint(&closure.body, slots);
+        }
+        Expr::ClosureCall(closure, args) => {
+            for slot in &closure.param_slots {
+                slots.insert(*slot);
+            }
+            for (source_slot, captured_slot) in &closure.capture_copies {
+                slots.insert(*source_slot);
+                slots.insert(*captured_slot);
+            }
+            for arg in args {
+                collect_expr_slot_footprint(arg, slots);
+            }
+            collect_expr_slot_footprint(&closure.body, slots);
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            collect_expr_slot_footprint(lhs, slots);
+            collect_expr_slot_footprint(rhs, slots);
+        }
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => collect_expr_slot_footprint(inner, slots),
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            collect_expr_slot_footprint(condition, slots);
+            collect_expr_slot_footprint(then_expr, slots);
+            collect_expr_slot_footprint(else_expr, slots);
+        }
+        Expr::Match {
+            value_slot,
+            result_slot,
+            value,
+            arms,
+            default,
+        } => {
+            slots.insert(*value_slot);
+            slots.insert(*result_slot);
+            collect_expr_slot_footprint(value, slots);
+            for (_, arm_expr) in arms {
+                collect_expr_slot_footprint(arm_expr, slots);
+            }
+            collect_expr_slot_footprint(default, slots);
+        }
+        Expr::Block { stmts, expr } => {
+            for stmt in stmts {
+                collect_stmt_slot_footprint(stmt, slots);
+            }
+            collect_expr_slot_footprint(expr, slots);
+        }
+    }
 }
 
 fn collect_named_local_debug_ranges(parsed: &FrontendIr) -> HashMap<String, LocalDebugRange> {
@@ -1304,8 +1557,11 @@ fn record_expr_local_debug_ranges(
         | Expr::Bool(_)
         | Expr::String(_)
         | Expr::FunctionRef(_) => {}
-        Expr::Var(index) => {
+        Expr::Var(index) | Expr::MoveVar(index) => {
             note_local_use(ranges, *index, line);
+        }
+        Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
+            note_local_use(ranges, *root, line);
         }
         Expr::Call(_, args) => {
             for arg in args {

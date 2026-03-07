@@ -18,6 +18,12 @@
   box-sizing: border-box;
 }
 
+/* Monaco layout assumes content-box metrics; global border-box can shift caret/text alignment. */
+.monaco-editor,
+.monaco-editor * {
+  box-sizing: content-box;
+}
+
 html,
 body,
 #app {

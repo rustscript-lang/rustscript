@@ -366,6 +366,7 @@ pub struct Vm {
     fuel_remaining: u64,
     fuel_check_interval: u32,
     fuel_ops_until_check: u32,
+    drop_contract_events: u64,
 }
 
 enum ExecOutcome {
@@ -490,6 +491,7 @@ impl Vm {
             fuel_remaining: 0,
             fuel_check_interval: 1,
             fuel_ops_until_check: 1,
+            drop_contract_events: 0,
         }
     }
 
@@ -544,14 +546,16 @@ impl Vm {
     /// rewound to the program entry.
     pub fn reset_for_reuse(&mut self) {
         self.ip = 0;
-        self.stack.clear();
-        for local in &mut self.locals {
-            *local = Value::Null;
-        }
+        self.clear_stack_with_drop_contract();
+        self.clear_locals_with_drop_contract();
         self.call_depth = 0;
         self.waiting_host_op = None;
         self.next_host_op_id = 1;
         self.io_state = builtins_impl::IoState::default();
+    }
+
+    pub fn drop_contract_event_count(&self) -> u64 {
+        self.drop_contract_events
     }
 
     pub fn register_function(&mut self, function: Box<dyn HostFunction>) -> u16 {
@@ -1072,11 +1076,11 @@ impl Vm {
             }
             x if x == OpCode::Ldloc as u8 => {
                 let index = self.read_u8()?;
-                let value = self
+                let slot = self
                     .locals
-                    .get(index as usize)
-                    .cloned()
+                    .get_mut(index as usize)
                     .ok_or(VmError::InvalidLocal(index))?;
+                let value = std::mem::replace(slot, Value::Null);
                 self.stack.push(value);
             }
             x if x == OpCode::Stloc as u8 => {
@@ -1086,7 +1090,8 @@ impl Vm {
                     .locals
                     .get_mut(index as usize)
                     .ok_or(VmError::InvalidLocal(index))?;
-                *slot = value;
+                let previous = std::mem::replace(slot, value);
+                self.drop_value_with_contract(previous);
             }
             x if x == OpCode::Call as u8 => {
                 let call_ip = self.ip - 1;
@@ -1153,6 +1158,42 @@ impl Vm {
 
     fn pop_value(&mut self) -> VmResult<Value> {
         self.stack.pop().ok_or(VmError::StackUnderflow)
+    }
+
+    fn clear_stack_with_drop_contract(&mut self) {
+        let drained = self.stack.drain(..).collect::<Vec<_>>();
+        for value in drained {
+            self.drop_value_with_contract(value);
+        }
+    }
+
+    fn clear_locals_with_drop_contract(&mut self) {
+        for slot in 0..self.locals.len() {
+            let previous = std::mem::replace(&mut self.locals[slot], Value::Null);
+            self.drop_value_with_contract(previous);
+        }
+    }
+
+    fn drop_value_with_contract(&mut self, value: Value) {
+        match value {
+            Value::Null => {}
+            Value::Array(values) => {
+                self.drop_contract_events = self.drop_contract_events.saturating_add(1);
+                for item in values {
+                    self.drop_value_with_contract(item);
+                }
+            }
+            Value::Map(entries) => {
+                self.drop_contract_events = self.drop_contract_events.saturating_add(1);
+                for (key, value) in entries {
+                    self.drop_value_with_contract(key);
+                    self.drop_value_with_contract(value);
+                }
+            }
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::String(_) => {
+                self.drop_contract_events = self.drop_contract_events.saturating_add(1);
+            }
+        }
     }
 
     pub(in crate::vm) fn charge_fuel(&mut self, amount: u64) -> VmResult<()> {
@@ -1558,6 +1599,8 @@ impl Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        self.clear_stack_with_drop_contract();
+        self.clear_locals_with_drop_contract();
         builtins_impl::close_all_handles(self);
     }
 }

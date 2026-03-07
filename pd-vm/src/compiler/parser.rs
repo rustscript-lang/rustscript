@@ -2173,7 +2173,10 @@ impl Parser {
         start: Option<Expr>,
         end: Option<Expr>,
     ) -> Result<Expr, ParseError> {
-        let container_slot = self.allocate_hidden_local()?;
+        let (container_slot, container_bind) = match container {
+            Expr::Var(slot) => (slot, None),
+            other => (self.allocate_hidden_local()?, Some(other)),
+        };
         let start_slot = self.allocate_hidden_local()?;
         let start_expr = start.unwrap_or(Expr::Int(0));
 
@@ -2205,7 +2208,11 @@ impl Parser {
             )?;
             self.bind_hidden_local_expr(start_slot, start_expr, slice_expr)?
         };
-        self.bind_hidden_local_expr(container_slot, container, slice_len)
+        if let Some(container_expr) = container_bind {
+            self.bind_hidden_local_expr(container_slot, container_expr, slice_len)
+        } else {
+            Ok(slice_len)
+        }
     }
 
     fn build_optional_get_expr(&mut self, container: Expr, key: Expr) -> Result<Expr, ParseError> {
