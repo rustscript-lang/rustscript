@@ -26,7 +26,7 @@ All frontends lower to the same frontend IR and VM bytecode model.
 | Optional chain | `a?.b?.c` | `a?.b?.c` | `a?.b?.c` | `a?.b?.c` |
 | Slice | `v[start:end]` | `v[start:end]` | `v[start:end]` | `(slice-range v s e)` / `(slice-to v e)` / `(slice-from v s)` |
 | Host import | `use vm::{f};` | `import { f } from "vm";` | `local f = require("vm").f` | `(require (only-in "vm" f))` |
-| Print | `print!(x);` / `print(x);` | `console.log(x);` / `print(x);` | `print(x)` | `(print x)` / `(display x)` |
+| Print | `print(x);` / `print("{}", x);` / `println(x);` / `println("{}", x);` | `console.log(x);` / `print(x);` | `print(x)` | `(print x)` / `(display x)` |
 
 ## RustScript (`.rss`)
 
@@ -47,9 +47,9 @@ Supported syntax and features:
   - builtins via namespaces: `io::...`, `re::...`, `json::...`, `jit::...` (regex supports optional flags arg)
   - additional host namespaces via `use <namespace>;` / `use <namespace> as <alias>;`
 - RustScript frontend rewrites:
-  - `print!(x)` -> `print(x)`
   - `Option::None` -> `null`
   - `Option::Some(expr)` -> `(expr)`
+  - `print("...", ...)` and `println("...", ...)` support Rust-style `std::fmt` formatting
 - RustScript ownership and liveness behavior (current):
   - `let` bindings are immutable by default; use `let mut` for mutable bindings.
   - Reassignment (`x = ...`), indexed/member mutation (`x[i] = ...`, `x.k = ...`), and `&mut`

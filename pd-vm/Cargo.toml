@@ -7,10 +7,11 @@ edition.workspace = true
 name = "vm"
 
 [features]
-default = ["runtime", "cli"]
-runtime = ["cranelift-jit"]
+default = ["runtime", "cli", "cranelift-jit"]
+runtime = []
 cli = ["dep:rustyline", "runtime"]
 cranelift-jit = [
+    "runtime",
     "dep:cranelift-codegen",
     "dep:cranelift-frontend",
     "dep:cranelift-jit",
@@ -32,6 +33,7 @@ cranelift-native = { version = "0.129.1", optional = true }
 futures-channel = "0.3"
 regex = "1"
 serde_json = "1"
+rt-format = "0.3.1"
 rustyline = { version = "14", optional = true }
 
 [target.'cfg(windows)'.dependencies]

@@ -1,6 +1,7 @@
 use super::super::super::{VmError, VmResult};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(feature = "cranelift-jit")]
 mod cranelift;
 
 pub(super) const STATUS_CONTINUE: i32 = 0;
@@ -17,12 +18,30 @@ pub(super) enum NativeCompileProfile {
     Aot,
 }
 
+#[cfg(feature = "cranelift-jit")]
 pub(super) fn selected_codegen_backend() -> &'static str {
     "native"
 }
 
+#[cfg(not(feature = "cranelift-jit"))]
+pub(super) fn selected_codegen_backend() -> &'static str {
+    "native-disabled"
+}
+
+#[cfg(feature = "cranelift-jit")]
 pub(crate) use cranelift::{CompiledTrace, TraceKeepAlive};
 
+#[cfg(not(feature = "cranelift-jit"))]
+pub(crate) struct TraceKeepAlive;
+
+#[cfg(not(feature = "cranelift-jit"))]
+pub(crate) struct CompiledTrace {
+    pub entry: *const u8,
+    pub code: Vec<u8>,
+    pub keepalive: TraceKeepAlive,
+}
+
+#[cfg(feature = "cranelift-jit")]
 pub(super) fn compile_native_trace(
     trace: &super::JitTrace,
     fuel_check_interval: Option<u32>,
@@ -33,6 +52,17 @@ pub(super) fn compile_native_trace(
         fuel_check_interval,
         profile,
     )?))
+}
+
+#[cfg(not(feature = "cranelift-jit"))]
+pub(super) fn compile_native_trace(
+    _trace: &super::JitTrace,
+    _fuel_check_interval: Option<u32>,
+    _profile: NativeCompileProfile,
+) -> VmResult<Box<CompiledTrace>> {
+    Err(VmError::JitNative(
+        "native JIT backend is disabled (feature 'cranelift-jit' is not enabled)".to_string(),
+    ))
 }
 
 static GENERIC_BRIDGE_ERROR: OnceLock<Mutex<Option<VmError>>> = OnceLock::new();
@@ -66,6 +96,9 @@ mod tests {
 
     #[test]
     fn selected_backend_is_native() {
+        #[cfg(feature = "cranelift-jit")]
         assert_eq!(selected_codegen_backend(), "native");
+        #[cfg(not(feature = "cranelift-jit"))]
+        assert_eq!(selected_codegen_backend(), "native-disabled");
     }
 }

@@ -241,6 +241,32 @@ cargo check -p pd-vm --target wasm32-unknown-unknown --no-default-features
 Browser/editor lint integration is provided by sibling crate `pd-vm-lint-wasm` via
 `lint_source_json`.
 
+### Wasm Runtime Playground
+
+Runtime-enabled wasm build (without native JIT backend):
+
+```powershell
+cargo check -p pd-vm --target wasm32-unknown-unknown --no-default-features --features runtime
+```
+
+Browser playground wasm runtime is provided by sibling crate `pd-vm-runtime-wasm` via:
+
+- `lint_source_json`
+- `run_source_json`
+
+### WebUI Playground
+
+Standalone Monaco playground lives in `pd-vm/webui`:
+
+```powershell
+cd pd-vm/webui
+bun install
+bun run dev
+```
+
+This runs `scripts/build-wasm-playground.mjs`, which builds `pd-vm-runtime-wasm`, copies wasm
+artifacts into `public/wasm`, and syncs RustScript Monaco grammar assets.
+
 ### Test and Perf Commands
 
 Integration example tests:
@@ -358,7 +384,7 @@ local add = function(value) return value + base end
 
 Built-in print aliases (no declaration needed):
 
-- RustScript: `print!(value);`
+- RustScript: `print(value);`, `print("... {}", a);`, `println(value);`, `println("... {}", a);`
 - JavaScript subset: `console.log(value);` and `print(value);`
 - Lua subset: `print(value)`
 - Scheme subset: `(print value)`

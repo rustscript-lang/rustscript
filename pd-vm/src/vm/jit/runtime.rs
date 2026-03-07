@@ -1,5 +1,20 @@
 use super::super::{ExecOutcome, HostCallExecOutcome, Vm, VmError, VmResult};
-use super::{JitTrace, JitTraceTerminal, TraceStep, native};
+#[cfg(any(
+    all(
+        target_arch = "x86_64",
+        any(target_os = "windows", all(unix, not(target_os = "macos")))
+    ),
+    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+))]
+use super::JitTrace;
+use super::{JitTraceTerminal, TraceStep, native};
+#[cfg(any(
+    all(
+        target_arch = "x86_64",
+        any(target_os = "windows", all(unix, not(target_os = "macos")))
+    ),
+    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+))]
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 #[cfg(any(
@@ -83,6 +98,13 @@ struct NativeTraceCache {
     entries: HashMap<NativeTraceCacheKey, NativeTraceCacheEntry>,
 }
 
+#[cfg(any(
+    all(
+        target_arch = "x86_64",
+        any(target_os = "windows", all(unix, not(target_os = "macos")))
+    ),
+    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+))]
 thread_local! {
     static NATIVE_TRACE_CACHE: RefCell<NativeTraceCache> = RefCell::new(
         NativeTraceCache {

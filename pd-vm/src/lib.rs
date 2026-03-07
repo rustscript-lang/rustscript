@@ -26,7 +26,7 @@ pub use compiler::{
     CompileError, CompileSourceFileOptions, CompiledProgram, Compiler, Expr, FunctionDecl,
     ParseError, SourceError, SourceFlavor, SourcePathError, Stmt, compile_source,
     compile_source_file, compile_source_file_with_options, compile_source_for_repl,
-    compile_source_with_flavor,
+    compile_source_with_flavor, compile_source_with_flavor_and_options,
 };
 pub use debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 #[cfg(feature = "runtime")]
@@ -41,6 +41,8 @@ pub use jit::{
     JitAttempt, JitConfig, JitNyiDoc, JitNyiReason, JitSnapshot, JitTrace, JitTraceTerminal,
     TraceJitEngine,
 };
+#[cfg(feature = "runtime")]
+pub use vm::builtins_impl::print::{PrintHostFunction, PrintlnHostFunction, format_value};
 #[cfg(feature = "runtime")]
 pub use vm::diagnostics::render_vm_error;
 #[cfg(feature = "runtime")]

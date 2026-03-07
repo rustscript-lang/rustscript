@@ -271,6 +271,8 @@ const editor = monaco.editor.create(editorHostEl, {
   theme: "vs",
   minimap: { enabled: false },
   automaticLayout: true,
+  fixedOverflowWidgets: true,
+  overflowWidgetsDomNode: document.body,
   wordWrap: "on",
   scrollBeyondLastLine: false,
   fontFamily: "\"IBM Plex Mono\", monospace",
