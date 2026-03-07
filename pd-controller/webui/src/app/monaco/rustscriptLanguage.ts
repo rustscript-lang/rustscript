@@ -137,7 +137,6 @@ export function ensureRustScriptLanguage(monaco: typeof import("monaco-editor"))
       new RegExp(`\\b(${IDENT})(\\s*)(::)(\\s*)(${PATH_CALL})(?=\\s*\\()`),
       ["type.identifier", "", "delimiter", "", "function"],
     ],
-    [new RegExp(`\\b(${IDENT})(\\s*)(!)(?=\\s*\\()`), ["function", "", "operator"]],
     [
       /(\?\.|\.)(\s*)([A-Za-z_][A-Za-z0-9_]*)/,
       ["delimiter", "", "variable"],

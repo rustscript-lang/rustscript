@@ -19,9 +19,6 @@
       "include": "#function-declaration"
     },
     {
-      "include": "#macro-call"
-    },
-    {
       "include": "#variable-declaration"
     },
     {
@@ -266,22 +263,6 @@
             },
             "5": {
               "name": "entity.name.function.rss"
-            }
-          }
-        }
-      ]
-    },
-    "macro-call": {
-      "patterns": [
-        {
-          "name": "meta.macro.call.rss",
-          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(\\s*)(!)(?=\\s*\\()",
-          "captures": {
-            "1": {
-              "name": "entity.name.function.macro.rss"
-            },
-            "3": {
-              "name": "punctuation.definition.macro.rss"
             }
           }
         }

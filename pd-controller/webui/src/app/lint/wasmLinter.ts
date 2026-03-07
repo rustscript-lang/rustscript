@@ -18,11 +18,29 @@ export type LintReport = {
   diagnostics: LintDiagnostic[];
 };
 
+export type CompletionEntryKind = "function" | "module" | "snippet";
+
+export type CompletionEntry = {
+  label: string;
+  insertText: string;
+  detail: string;
+  documentation: string;
+  kind: CompletionEntryKind;
+};
+
+export type CompletionCatalog = {
+  rustscript: CompletionEntry[];
+  javascript: CompletionEntry[];
+  lua: CompletionEntry[];
+  scheme: CompletionEntry[];
+};
+
 type WasmLinterExports = {
   memory: WebAssembly.Memory;
   wasm_alloc(len: number): number;
   wasm_dealloc(ptr: number, len: number): void;
   lint_source_json(sourcePtr: number, sourceLen: number, flavorPtr: number, flavorLen: number): bigint;
+  completion_catalog_json?: () => bigint;
 };
 
 const encoder = new TextEncoder();
@@ -104,6 +122,71 @@ function normalizeReport(parsed: unknown): LintReport {
   return { diagnostics };
 }
 
+function normalizeCompletionKind(raw: unknown): CompletionEntryKind {
+  if (raw === "function" || raw === "module" || raw === "snippet") {
+    return raw;
+  }
+  return "snippet";
+}
+
+function normalizeCompletionEntry(raw: unknown): CompletionEntry | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const label = (raw as { label?: unknown }).label;
+  const insertText = (raw as { insert_text?: unknown }).insert_text;
+  const detail = (raw as { detail?: unknown }).detail;
+  const documentation = (raw as { documentation?: unknown }).documentation;
+  const kind = (raw as { kind?: unknown }).kind;
+
+  if (typeof label !== "string" || typeof insertText !== "string") {
+    return null;
+  }
+
+  return {
+    label,
+    insertText,
+    detail: typeof detail === "string" ? detail : "",
+    documentation: typeof documentation === "string" ? documentation : "",
+    kind: normalizeCompletionKind(kind)
+  };
+}
+
+function normalizeCompletionEntries(raw: unknown): CompletionEntry[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const entries: CompletionEntry[] = [];
+  for (const candidate of raw) {
+    const normalized = normalizeCompletionEntry(candidate);
+    if (normalized) {
+      entries.push(normalized);
+    }
+  }
+  return entries;
+}
+
+function emptyCompletionCatalog(): CompletionCatalog {
+  return {
+    rustscript: [],
+    javascript: [],
+    lua: [],
+    scheme: []
+  };
+}
+
+function normalizeCompletionCatalog(raw: unknown): CompletionCatalog {
+  if (!raw || typeof raw !== "object") {
+    return emptyCompletionCatalog();
+  }
+  return {
+    rustscript: normalizeCompletionEntries((raw as { rustscript?: unknown }).rustscript),
+    javascript: normalizeCompletionEntries((raw as { javascript?: unknown }).javascript),
+    lua: normalizeCompletionEntries((raw as { lua?: unknown }).lua),
+    scheme: normalizeCompletionEntries((raw as { scheme?: unknown }).scheme)
+  };
+}
+
 async function loadWasm(): Promise<WasmLinterExports> {
   if (!wasmPromise) {
     wasmPromise = (async () => {
@@ -159,5 +242,25 @@ export async function lintWithWasm(source: string, flavor: SourceFlavor): Promis
     if (resultPtr !== 0 && resultLen > 0) {
       wasm.wasm_dealloc(resultPtr, resultLen);
     }
+  }
+}
+
+export async function completionCatalogWithWasm(): Promise<CompletionCatalog> {
+  const wasm = await loadWasm();
+  if (typeof wasm.completion_catalog_json !== "function") {
+    return emptyCompletionCatalog();
+  }
+
+  const packed = wasm.completion_catalog_json();
+  const { ptr, len } = unpackPtrLen(packed);
+  if (ptr === 0 || len === 0) {
+    return emptyCompletionCatalog();
+  }
+
+  try {
+    const json = decoder.decode(readBytes(wasm, ptr, len));
+    return normalizeCompletionCatalog(JSON.parse(json));
+  } finally {
+    wasm.wasm_dealloc(ptr, len);
   }
 }
