@@ -147,7 +147,7 @@ body {
 .editor-shell {
   min-height: 0;
   border-radius: 0.9rem;
-  overflow: visible;
+  overflow: hidden;
   border: 1px solid var(--panel-border);
   box-shadow: 0 16px 32px rgba(18, 59, 76, 0.14);
 }
@@ -158,9 +158,7 @@ body {
 }
 
 .monaco-editor .overflowingContentWidgets,
-.monaco-editor .overflowingOverlayWidgets,
-.monaco-editor .suggest-widget,
-.monaco-editor .monaco-hover {
+.monaco-editor .overflowingOverlayWidgets {
   z-index: 2000 !important;
 }
 
