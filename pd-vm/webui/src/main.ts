@@ -29,7 +29,57 @@ const FLAVOR_OPTIONS: Array<{ value: SourceFlavor; label: string }> = [
 ];
 
 const SAMPLE_SOURCES: Record<SourceFlavor, string> = {
-  rustscript: ["let value = 21;", "print(value + 21);", "value + 21;"].join("\n"),
+  rustscript: `
+use stdlib::rss::strings as string;
+
+use vm::{add_one};
+use re;
+use json;
+
+// Complex RustScript example with closure capture, stdlib module use, and host calls.
+let mut total = 0;
+for (let mut i = 0; i < 4; i = i + 1) {
+    total = total + i;
+}
+
+let total = if !string::non_empty("rustscript") => {
+    let mut zeroed = 0;
+    zeroed
+} else => {
+    let mut bumped = add_one(total);
+    bumped
+};
+
+let mut base = 7;
+let add = |value| value + base;
+base = 8;
+let mut closure_value = add(5);
+
+let profile = { stats: { score: closure_value } };
+let chained_score = profile?.stats?.score;
+let missing_score = profile?.missing?.value;
+
+let matched = match chained_score {
+    12 => closure_value,
+    _ => 0,
+};
+
+let regex_ok = re::match("^rustscript$", "RUSTSCRIPT", "i");
+let payload = {
+    lang: "rustscript",
+    score: closure_value,
+    matched: matched,
+};
+let payload_json = json::encode(payload);
+let payload_decoded = json::decode(payload_json);
+let json_score = payload_decoded.score;
+
+if regex_ok && json_score == matched {
+    print("closure_value is {:3}", closure_value);
+} else {
+    print(0);
+}
+`,
   javascript: ["let value = 21;", "console.log(value + 21);", "value + 21;"].join("\n"),
   lua: ["local value = 21", "print(value + 21)", "value + 21"].join("\n"),
   scheme: ["(define value 21)", "(print (+ value 21))", "(+ value 21)"].join("\n")
@@ -280,6 +330,21 @@ const editor = monaco.editor.create(editorHostEl, {
   fontSize: 13,
   lineNumbersMinChars: 3
 });
+
+function refreshEditorGeometry(): void {
+  monaco.editor.remeasureFonts();
+  editor.layout();
+}
+
+refreshEditorGeometry();
+if (typeof document !== "undefined" && "fonts" in document) {
+  void document.fonts.ready.then(() => {
+    refreshEditorGeometry();
+  });
+  document.fonts.addEventListener("loadingdone", () => {
+    refreshEditorGeometry();
+  });
+}
 
 let currentFlavor: SourceFlavor = "rustscript";
 let lintSequence = 0;

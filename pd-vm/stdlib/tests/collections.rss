@@ -2,8 +2,8 @@ use super::rss::collections::{append, contains, dedup, entries, get_or, has, ind
 
 let mut appended = append([1, 2], [3, 4]);
 assert(appended.length == 4);
-assert(appended[0] == 1);
-assert(appended[3] == 4);
+assert(appended.copy()[0] == 1);
+assert(appended.copy()[3] == 4);
 
 assert(index_of(appended, 3) == 2);
 assert(index_of(appended, 9) == -1);

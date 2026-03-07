@@ -14,8 +14,9 @@ assert(descending[3] == 1);
 
 let mut pairs = enumerate(["a", "b"]);
 assert(pairs.length == 2);
-assert(pairs[1][0] == 1);
-assert(pairs[1][1] == "b");
+let mut second_pair = pairs[1].copy();
+assert(second_pair[0] == 1);
+assert(second_pair[1] == "b");
 
 let mut head = take([1, 2, 3, 4], 2);
 assert(head.length == 2);
@@ -31,8 +32,9 @@ let mut groups = chunk([1, 2, 3, 4, 5], 2);
 assert(groups.length == 3);
 assert(groups[0].length == 2);
 assert(groups[1].length == 2);
-assert(groups[2].length == 1);
-assert(groups[2][0] == 5);
+let mut tail_group = groups[2].copy();
+assert(tail_group.length == 1);
+assert(tail_group[0] == 5);
 
 assert(sum([2, 3, 4]) == 9);
 assert(any_true([false, false, true]));

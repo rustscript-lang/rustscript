@@ -45,6 +45,9 @@ struct MovedFieldPath {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum MovedFieldKey {
     String(String),
+    Index(i64),
+    Dynamic,
+    Slice,
 }
 
 impl FlowState {
@@ -75,25 +78,520 @@ fn extract_passthrough_return_slot(function_impl: &FunctionImpl) -> Option<Local
     Some(slot)
 }
 
+fn compute_function_consumed_param_positions(
+    function_impls: &HashMap<u16, FunctionImpl>,
+    enable_local_move_semantics: bool,
+) -> HashMap<u16, HashSet<usize>> {
+    if !enable_local_move_semantics {
+        return HashMap::new();
+    }
+
+    let mut consumed_positions: HashMap<u16, HashSet<usize>> = function_impls
+        .keys()
+        .map(|index| (*index, HashSet::new()))
+        .collect();
+
+    loop {
+        let snapshot = consumed_positions.clone();
+        let mut changed = false;
+
+        for (index, function_impl) in function_impls {
+            let mut next = snapshot.get(index).cloned().unwrap_or_default();
+            collect_consumed_positions_from_function(function_impl, &snapshot, &mut next);
+            let entry = consumed_positions.entry(*index).or_default();
+            let before = entry.len();
+            entry.extend(next);
+            changed |= entry.len() != before;
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    consumed_positions.retain(|_, positions| !positions.is_empty());
+    consumed_positions
+}
+
+fn collect_consumed_positions_from_function(
+    function_impl: &FunctionImpl,
+    known_consumed_positions: &HashMap<u16, HashSet<usize>>,
+    out: &mut HashSet<usize>,
+) {
+    for stmt in &function_impl.body_stmts {
+        collect_consumed_positions_from_stmt(stmt, function_impl, known_consumed_positions, out);
+    }
+    collect_consumed_positions_from_expr(
+        &function_impl.body_expr,
+        function_impl,
+        known_consumed_positions,
+        out,
+    );
+    collect_return_rebind_consumed_positions(function_impl, out);
+}
+
+fn collect_return_rebind_consumed_positions(
+    function_impl: &FunctionImpl,
+    out: &mut HashSet<usize>,
+) {
+    let Expr::Var(return_slot) = function_impl.body_expr else {
+        return;
+    };
+    for (stmt_index, stmt) in function_impl.body_stmts.iter().enumerate() {
+        let (target_slot, source_slot) = match stmt {
+            Stmt::Let {
+                index,
+                expr: Expr::Var(source),
+                ..
+            }
+            | Stmt::Assign {
+                index,
+                expr: Expr::Var(source),
+                ..
+            } => (*index, *source),
+            _ => continue,
+        };
+        if target_slot != return_slot {
+            continue;
+        }
+        let Some(param_position) = function_impl
+            .param_slots
+            .iter()
+            .position(|param| *param == source_slot)
+        else {
+            continue;
+        };
+        if !slot_is_used_after_statement(function_impl, source_slot, stmt_index + 1) {
+            out.insert(param_position);
+        }
+    }
+}
+
+fn slot_is_used_after_statement(
+    function_impl: &FunctionImpl,
+    slot: LocalSlot,
+    next_stmt_index: usize,
+) -> bool {
+    function_impl
+        .body_stmts
+        .iter()
+        .skip(next_stmt_index)
+        .any(|stmt| stmt_uses_slot(stmt, slot))
+        || expr_uses_slot(&function_impl.body_expr, slot)
+}
+
+fn stmt_uses_slot(stmt: &Stmt, slot: LocalSlot) -> bool {
+    match stmt {
+        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {
+            false
+        }
+        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+            expr_uses_slot(expr, slot)
+        }
+        Stmt::ClosureLet { closure, .. } => {
+            closure.capture_copies.iter().any(|(source, _)| *source == slot)
+                || expr_uses_slot(&closure.body, slot)
+        }
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_uses_slot(condition, slot)
+                || then_branch.iter().any(|nested| stmt_uses_slot(nested, slot))
+                || else_branch.iter().any(|nested| stmt_uses_slot(nested, slot))
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            ..
+        } => {
+            stmt_uses_slot(init, slot)
+                || expr_uses_slot(condition, slot)
+                || stmt_uses_slot(post, slot)
+                || body.iter().any(|nested| stmt_uses_slot(nested, slot))
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            expr_uses_slot(condition, slot)
+                || body.iter().any(|nested| stmt_uses_slot(nested, slot))
+        }
+    }
+}
+
+fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
+    match expr {
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::FunctionRef(_) => false,
+        Expr::Var(index) | Expr::MoveVar(index) => *index == slot,
+        Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => *root == slot,
+        Expr::Call(_, args) | Expr::LocalCall(_, args) => {
+            args.iter().any(|arg| expr_uses_slot(arg, slot))
+        }
+        Expr::Closure(closure) => {
+            closure.capture_copies.iter().any(|(source, _)| *source == slot)
+                || expr_uses_slot(&closure.body, slot)
+        }
+        Expr::ClosureCall(closure, args) => {
+            args.iter().any(|arg| expr_uses_slot(arg, slot))
+                || closure.capture_copies.iter().any(|(source, _)| *source == slot)
+                || expr_uses_slot(&closure.body, slot)
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => expr_uses_slot(lhs, slot) || expr_uses_slot(rhs, slot),
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => expr_uses_slot(inner, slot),
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            expr_uses_slot(condition, slot)
+                || expr_uses_slot(then_expr, slot)
+                || expr_uses_slot(else_expr, slot)
+        }
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            expr_uses_slot(value, slot)
+                || arms
+                    .iter()
+                    .any(|(_, arm_expr)| expr_uses_slot(arm_expr, slot))
+                || expr_uses_slot(default, slot)
+        }
+        Expr::Block { stmts, expr } => {
+            stmts.iter().any(|stmt| stmt_uses_slot(stmt, slot)) || expr_uses_slot(expr, slot)
+        }
+    }
+}
+
+fn collect_consumed_positions_from_stmt(
+    stmt: &Stmt,
+    function_impl: &FunctionImpl,
+    known_consumed_positions: &HashMap<u16, HashSet<usize>>,
+    out: &mut HashSet<usize>,
+) {
+    match stmt {
+        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+            collect_consumed_positions_from_expr(expr, function_impl, known_consumed_positions, out);
+        }
+        Stmt::ClosureLet { closure, .. } => {
+            collect_consumed_positions_from_expr(
+                &closure.body,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
+        }
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_consumed_positions_from_expr(
+                condition,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
+            for nested in then_branch {
+                collect_consumed_positions_from_stmt(
+                    nested,
+                    function_impl,
+                    known_consumed_positions,
+                    out,
+                );
+            }
+            for nested in else_branch {
+                collect_consumed_positions_from_stmt(
+                    nested,
+                    function_impl,
+                    known_consumed_positions,
+                    out,
+                );
+            }
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            ..
+        } => {
+            collect_consumed_positions_from_stmt(init, function_impl, known_consumed_positions, out);
+            collect_consumed_positions_from_expr(
+                condition,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
+            collect_consumed_positions_from_stmt(post, function_impl, known_consumed_positions, out);
+            for nested in body {
+                collect_consumed_positions_from_stmt(
+                    nested,
+                    function_impl,
+                    known_consumed_positions,
+                    out,
+                );
+            }
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            collect_consumed_positions_from_expr(
+                condition,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
+            for nested in body {
+                collect_consumed_positions_from_stmt(
+                    nested,
+                    function_impl,
+                    known_consumed_positions,
+                    out,
+                );
+            }
+        }
+    }
+}
+
+fn collect_consumed_positions_from_expr(
+    expr: &Expr,
+    function_impl: &FunctionImpl,
+    known_consumed_positions: &HashMap<u16, HashSet<usize>>,
+    out: &mut HashSet<usize>,
+) {
+    match expr {
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::FunctionRef(_)
+        | Expr::Var(_) => {}
+        Expr::MoveVar(slot) => {
+            if let Some(position) = function_impl.param_slots.iter().position(|param| param == slot)
+            {
+                out.insert(position);
+            }
+        }
+        Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
+            if let Some(position) = function_impl
+                .param_slots
+                .iter()
+                .position(|param| param == root)
+            {
+                out.insert(position);
+            }
+        }
+        Expr::Call(index, args) => {
+            for arg in args {
+                collect_consumed_positions_from_expr(
+                    arg,
+                    function_impl,
+                    known_consumed_positions,
+                    out,
+                );
+            }
+            let Some(consumed_arg_positions) = known_consumed_positions.get(index) else {
+                return;
+            };
+            for position in consumed_arg_positions {
+                let Some(arg_expr) = args.get(*position) else {
+                    continue;
+                };
+                match arg_expr {
+                    Expr::Var(slot) | Expr::MoveVar(slot) => {
+                        if let Some(param_position) = function_impl
+                            .param_slots
+                            .iter()
+                            .position(|param| param == slot)
+                        {
+                            out.insert(param_position);
+                        }
+                    }
+                    Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
+                        if let Some(param_position) = function_impl
+                            .param_slots
+                            .iter()
+                            .position(|param| param == root)
+                        {
+                            out.insert(param_position);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Expr::LocalCall(_, args) => {
+            for arg in args {
+                collect_consumed_positions_from_expr(
+                    arg,
+                    function_impl,
+                    known_consumed_positions,
+                    out,
+                );
+            }
+        }
+        Expr::Closure(_) => {}
+        Expr::ClosureCall(closure, args) => {
+            for arg in args {
+                collect_consumed_positions_from_expr(
+                    arg,
+                    function_impl,
+                    known_consumed_positions,
+                    out,
+                );
+            }
+            collect_consumed_positions_from_expr(
+                &closure.body,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            collect_consumed_positions_from_expr(lhs, function_impl, known_consumed_positions, out);
+            collect_consumed_positions_from_expr(rhs, function_impl, known_consumed_positions, out);
+        }
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => {
+            collect_consumed_positions_from_expr(inner, function_impl, known_consumed_positions, out);
+        }
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            collect_consumed_positions_from_expr(
+                condition,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
+            collect_consumed_positions_from_expr(
+                then_expr,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
+            collect_consumed_positions_from_expr(
+                else_expr,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
+        }
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            collect_consumed_positions_from_expr(
+                value,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
+            for (_, arm_expr) in arms {
+                collect_consumed_positions_from_expr(
+                    arm_expr,
+                    function_impl,
+                    known_consumed_positions,
+                    out,
+                );
+            }
+            collect_consumed_positions_from_expr(
+                default,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
+        }
+        Expr::Block { stmts, expr } => {
+            for nested in stmts {
+                collect_consumed_positions_from_stmt(
+                    nested,
+                    function_impl,
+                    known_consumed_positions,
+                    out,
+                );
+            }
+            collect_consumed_positions_from_expr(expr, function_impl, known_consumed_positions, out);
+        }
+    }
+}
+
 pub(super) fn enforce_local_availability(
     mut ir: FrontendIr,
     clear_dead_locals: bool,
+    enable_local_move_semantics: bool,
 ) -> Result<FrontendIr, ParseError> {
-    let analyzer = AvailabilityAnalyzer::new(ir.locals, &ir.local_bindings, &ir.function_impls);
+    let initial_impls = std::mem::take(&mut ir.function_impls);
+
+    let bootstrap_analyzer = AvailabilityAnalyzer::new(
+        ir.locals,
+        &ir.local_bindings,
+        &initial_impls,
+        enable_local_move_semantics,
+    );
+    let mut rewritten_impls = HashMap::with_capacity(initial_impls.len());
+    for (index, function_impl) in initial_impls {
+        let rewritten = bootstrap_analyzer.analyze_function_impl(function_impl)?;
+        rewritten_impls.insert(index, rewritten);
+    }
+
+    let analyzer = AvailabilityAnalyzer::new(
+        ir.locals,
+        &ir.local_bindings,
+        &rewritten_impls,
+        enable_local_move_semantics,
+    );
     let (rewritten_stmts, _) =
         analyzer.analyze_block(&ir.stmts, FlowState::reachable(ir.locals), true)?;
     ir.stmts = rewritten_stmts;
-
-    let function_impls = std::mem::take(&mut ir.function_impls);
-    let mut rewritten_impls = HashMap::with_capacity(function_impls.len());
-    for (index, function_impl) in function_impls {
-        let rewritten = analyzer.analyze_function_impl(function_impl)?;
-        rewritten_impls.insert(index, rewritten);
-    }
     ir.function_impls = rewritten_impls;
 
     if clear_dead_locals {
-        let liveness = LivenessRewriter::new(ir.locals, &ir.local_bindings);
+        let liveness = LivenessRewriter::new(ir.locals, &ir.local_bindings, &ir.function_impls);
         ir.stmts = liveness.rewrite_program_block(&ir.stmts);
         for function_impl in ir.function_impls.values_mut() {
             *function_impl = liveness.rewrite_function_impl(function_impl.clone());
@@ -111,7 +609,9 @@ struct AvailabilityAnalyzer {
     local_count: usize,
     local_names: HashMap<LocalSlot, String>,
     collection_passthrough_params: HashMap<u16, usize>,
+    function_consumed_params: HashMap<u16, HashSet<usize>>,
     next_collection_alias_id: Cell<u32>,
+    enable_local_move_semantics: bool,
 }
 
 impl AvailabilityAnalyzer {
@@ -119,6 +619,7 @@ impl AvailabilityAnalyzer {
         local_count: usize,
         local_bindings: &[(String, LocalSlot)],
         function_impls: &HashMap<u16, FunctionImpl>,
+        enable_local_move_semantics: bool,
     ) -> Self {
         let mut local_names = HashMap::with_capacity(local_bindings.len());
         for (name, index) in local_bindings {
@@ -138,11 +639,15 @@ impl AvailabilityAnalyzer {
             };
             collection_passthrough_params.insert(*index, param_index);
         }
+        let function_consumed_params =
+            compute_function_consumed_param_positions(function_impls, enable_local_move_semantics);
         Self {
             local_count,
             local_names,
             collection_passthrough_params,
+            function_consumed_params,
             next_collection_alias_id: Cell::new(1),
+            enable_local_move_semantics,
         }
     }
 
@@ -234,6 +739,7 @@ impl AvailabilityAnalyzer {
             Stmt::Noop { .. } | Stmt::FuncDecl { .. } => Ok((stmt.clone(), state)),
             Stmt::Let { index, expr, line } => {
                 let mut out = self.analyze_expr(expr, &state, *line)?;
+                let mut rewritten_expr = expr.clone();
                 if out.reachable {
                     self.mark_available(&mut out, *index, *line)?;
                     self.clear_local_moved_state(&mut out, *index);
@@ -243,13 +749,23 @@ impl AvailabilityAnalyzer {
                     self.set_local_copyable_state(&mut out, *index, is_copyable);
                     let is_movable = self.is_definitely_movable_local_expr(expr, &out);
                     self.set_local_movable_state(&mut out, *index, is_movable);
-                    self.mark_local_source_moved_on_rebind(&mut out, *index, expr);
+                    rewritten_expr =
+                        self.rewrite_local_source_move_on_rebind(&mut out, *index, expr);
+                    rewritten_expr = self.rewrite_runtime_field_move_expr(&rewritten_expr, &state);
                 }
-                Ok((stmt.clone(), out))
+                Ok((
+                    Stmt::Let {
+                        index: *index,
+                        expr: rewritten_expr,
+                        line: *line,
+                    },
+                    out,
+                ))
             }
             Stmt::Assign { index, expr, line } => {
                 self.require_assignable(*index, &state, *line)?;
                 let mut out = self.analyze_expr(expr, &state, *line)?;
+                let mut rewritten_expr = expr.clone();
                 if out.reachable {
                     self.mark_available(&mut out, *index, *line)?;
                     self.clear_local_moved_state(&mut out, *index);
@@ -259,9 +775,18 @@ impl AvailabilityAnalyzer {
                     self.set_local_copyable_state(&mut out, *index, is_copyable);
                     let is_movable = self.is_definitely_movable_local_expr(expr, &out);
                     self.set_local_movable_state(&mut out, *index, is_movable);
-                    self.mark_local_source_moved_on_rebind(&mut out, *index, expr);
+                    rewritten_expr =
+                        self.rewrite_local_source_move_on_rebind(&mut out, *index, expr);
+                    rewritten_expr = self.rewrite_runtime_field_move_expr(&rewritten_expr, &state);
                 }
-                Ok((stmt.clone(), out))
+                Ok((
+                    Stmt::Assign {
+                        index: *index,
+                        expr: rewritten_expr,
+                        line: *line,
+                    },
+                    out,
+                ))
             }
             Stmt::ClosureLet { line, closure } => {
                 let mut out = state.clone();
@@ -275,7 +800,14 @@ impl AvailabilityAnalyzer {
             }
             Stmt::Expr { expr, line } => {
                 let out = self.analyze_expr(expr, &state, *line)?;
-                Ok((stmt.clone(), out))
+                let rewritten_expr = self.rewrite_runtime_field_move_expr(expr, &state);
+                Ok((
+                    Stmt::Expr {
+                        expr: rewritten_expr,
+                        line: *line,
+                    },
+                    out,
+                ))
             }
             Stmt::IfElse {
                 condition,
@@ -509,24 +1041,72 @@ impl AvailabilityAnalyzer {
             Expr::Var(index) => {
                 self.require_available(*index, state, line)?;
                 self.require_local_not_moved(*index, state, line)?;
+                self.require_local_not_partially_moved(*index, state, line)?;
                 Ok(state.clone())
             }
+            Expr::MoveVar(index) => {
+                self.require_available(*index, state, line)?;
+                self.require_local_not_moved(*index, state, line)?;
+                self.require_local_not_partially_moved(*index, state, line)?;
+                let mut out = state.clone();
+                self.mark_local_moved(&mut out, *index);
+                Ok(out)
+            }
+            Expr::MoveField { root, key } => {
+                self.require_available(*root, state, line)?;
+                self.require_local_not_moved(*root, state, line)?;
+                let field_key = MovedFieldKey::String(key.clone());
+                self.require_field_available(*root, &field_key, state, line)?;
+                let mut out = state.clone();
+                self.mark_field_moved(&mut out, *root, field_key);
+                Ok(out)
+            }
+            Expr::MoveIndex { root, index } => {
+                self.require_available(*root, state, line)?;
+                self.require_local_not_moved(*root, state, line)?;
+                let field_key = MovedFieldKey::Index(*index);
+                self.require_field_available(*root, &field_key, state, line)?;
+                let mut out = state.clone();
+                self.mark_field_moved(&mut out, *root, field_key);
+                Ok(out)
+            }
             Expr::Call(index, args) => {
+                if !self.enable_local_move_semantics {
+                    if let Some(root_slot) = self.extract_collection_mutation_root(*index, args) {
+                        let mut out = self.analyze_args(args, state, line)?;
+                        self.apply_interprocedural_consumed_call_effects(*index, args, &mut out);
+                        self.require_collection_mutation_permitted(root_slot, &out, line)?;
+                        return Ok(out);
+                    }
+                    let mut out = self.analyze_args(args, state, line)?;
+                    self.apply_interprocedural_consumed_call_effects(*index, args, &mut out);
+                    return Ok(out);
+                }
                 if let Some((root_slot, field_key)) = self.extract_moved_field_access(*index, args)
                 {
-                    let mut out = self.analyze_args(args, state, line)?;
+                    let mut out = self.analyze_projection_args(args, state, line)?;
                     self.require_field_available(root_slot, &field_key, &out, line)?;
                     if !self.is_copyable_field(root_slot, &field_key, &out) {
                         self.mark_field_moved(&mut out, root_slot, field_key);
                     }
+                    self.apply_interprocedural_consumed_call_effects(*index, args, &mut out);
                     Ok(out)
                 } else if let Some(root_slot) = self.extract_collection_mutation_root(*index, args)
                 {
-                    let out = self.analyze_args(args, state, line)?;
+                    let mut out = if BuiltinFunction::from_call_index(*index)
+                        == Some(BuiltinFunction::Set)
+                    {
+                        self.analyze_projection_args(args, state, line)?
+                    } else {
+                        self.analyze_args(args, state, line)?
+                    };
+                    self.apply_interprocedural_consumed_call_effects(*index, args, &mut out);
                     self.require_collection_mutation_permitted(root_slot, &out, line)?;
                     Ok(out)
                 } else {
-                    self.analyze_args(args, state, line)
+                    let mut out = self.analyze_args(args, state, line)?;
+                    self.apply_interprocedural_consumed_call_effects(*index, args, &mut out);
+                    Ok(out)
                 }
             }
             Expr::LocalCall(index, args) => {
@@ -625,15 +1205,19 @@ impl AvailabilityAnalyzer {
         state: &FlowState,
         line: u32,
     ) -> Result<FlowState, ParseError> {
+        if !self.enable_local_move_semantics {
+            return self.analyze_expr(inner, state, line);
+        }
         if let Expr::Var(index) = inner {
             self.require_available(*index, state, line)?;
             self.require_local_not_moved(*index, state, line)?;
+            self.require_local_not_partially_moved(*index, state, line)?;
             return Ok(state.clone());
         }
         if let Expr::Call(index, args) = inner
             && let Some((root_slot, field_key)) = self.extract_moved_field_access(*index, args)
         {
-            let out = self.analyze_args(args, state, line)?;
+            let out = self.analyze_projection_args(args, state, line)?;
             self.require_field_available(root_slot, &field_key, &out, line)?;
             return Ok(out);
         }
@@ -645,17 +1229,28 @@ impl AvailabilityAnalyzer {
         call_index: u16,
         args: &[Expr],
     ) -> Option<(LocalSlot, MovedFieldKey)> {
-        if BuiltinFunction::from_call_index(call_index) != Some(BuiltinFunction::Get) {
-            return None;
+        match BuiltinFunction::from_call_index(call_index)? {
+            BuiltinFunction::Get => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let Expr::Var(root_slot) = args.first()? else {
+                    return None;
+                };
+                let key = self.extract_moved_field_key_for_access(args.get(1)?);
+                Some((*root_slot, key))
+            }
+            BuiltinFunction::Slice => {
+                if args.len() != 3 {
+                    return None;
+                }
+                let Expr::Var(root_slot) = args.first()? else {
+                    return None;
+                };
+                Some((*root_slot, MovedFieldKey::Slice))
+            }
+            _ => None,
         }
-        if args.len() != 2 {
-            return None;
-        }
-        let Expr::Var(root_slot) = args.first()? else {
-            return None;
-        };
-        let key = self.extract_literal_moved_field_key(args.get(1)?)?;
-        Some((*root_slot, key))
     }
 
     fn extract_set_field_write_with_value<'a>(
@@ -702,7 +1297,16 @@ impl AvailabilityAnalyzer {
     fn extract_literal_moved_field_key(&self, expr: &Expr) -> Option<MovedFieldKey> {
         match expr {
             Expr::String(value) => Some(MovedFieldKey::String(value.clone())),
+            Expr::Int(value) => Some(MovedFieldKey::Index(*value)),
             _ => None,
+        }
+    }
+
+    fn extract_moved_field_key_for_access(&self, expr: &Expr) -> MovedFieldKey {
+        match expr {
+            Expr::String(value) => MovedFieldKey::String(value.clone()),
+            Expr::Int(value) => MovedFieldKey::Index(*value),
+            _ => MovedFieldKey::Dynamic,
         }
     }
 
@@ -964,6 +1568,26 @@ impl AvailabilityAnalyzer {
         })
     }
 
+    fn moved_possible_for_root<'a>(
+        &'a self,
+        state: &'a FlowState,
+        root: LocalSlot,
+    ) -> impl Iterator<Item = &'a MovedFieldPath> {
+        state.moved_possible.iter().filter(move |entry| entry.root == root)
+    }
+
+    fn moved_field_keys_conflict(lhs: &MovedFieldKey, rhs: &MovedFieldKey) -> bool {
+        match (lhs, rhs) {
+            (MovedFieldKey::Dynamic, _)
+            | (_, MovedFieldKey::Dynamic)
+            | (MovedFieldKey::Slice, _)
+            | (_, MovedFieldKey::Slice) => true,
+            (MovedFieldKey::String(lhs), MovedFieldKey::String(rhs)) => lhs == rhs,
+            (MovedFieldKey::Index(lhs), MovedFieldKey::Index(rhs)) => lhs == rhs,
+            _ => false,
+        }
+    }
+
     fn require_field_available(
         &self,
         root: LocalSlot,
@@ -974,11 +1598,10 @@ impl AvailabilityAnalyzer {
         if !self.is_trackable_local(root) {
             return Ok(());
         }
-        let path = MovedFieldPath {
-            root,
-            key: key.clone(),
-        };
-        if !state.moved_possible.contains(&path) {
+        if !self
+            .moved_possible_for_root(state, root)
+            .any(|entry| Self::moved_field_keys_conflict(&entry.key, key))
+        {
             return Ok(());
         }
         let local_name = self
@@ -1045,11 +1668,14 @@ impl AvailabilityAnalyzer {
                     format!("{local_name}[\"{value}\"]")
                 }
             }
+            MovedFieldKey::Index(value) => format!("{local_name}[{value}]"),
+            MovedFieldKey::Dynamic => format!("{local_name}[<dynamic>]"),
+            MovedFieldKey::Slice => format!("{local_name}[..]"),
         }
     }
 
     fn is_trackable_local(&self, index: LocalSlot) -> bool {
-        (index as usize) < self.local_count
+        (index as usize) < self.local_count && self.local_names.contains_key(&index)
     }
 
     fn display_local_name(&self, index: LocalSlot) -> String {
@@ -1184,6 +1810,37 @@ impl AvailabilityAnalyzer {
         Ok(out)
     }
 
+    fn analyze_projection_args(
+        &self,
+        args: &[Expr],
+        state: &FlowState,
+        line: u32,
+    ) -> Result<FlowState, ParseError> {
+        let mut out = state.clone();
+        let Some((root, rest)) = args.split_first() else {
+            return Ok(out);
+        };
+        out = self.analyze_projection_root_expr(root, &out, line)?;
+        for arg in rest {
+            out = self.analyze_expr(arg, &out, line)?;
+        }
+        Ok(out)
+    }
+
+    fn analyze_projection_root_expr(
+        &self,
+        expr: &Expr,
+        state: &FlowState,
+        line: u32,
+    ) -> Result<FlowState, ParseError> {
+        if let Expr::Var(index) = expr {
+            self.require_available(*index, state, line)?;
+            self.require_local_not_moved(*index, state, line)?;
+            return Ok(state.clone());
+        }
+        self.analyze_expr(expr, state, line)
+    }
+
     fn analyze_closure(
         &self,
         closure: &ClosureExpr,
@@ -1196,6 +1853,7 @@ impl AvailabilityAnalyzer {
         for (source_slot, _) in &closure.capture_copies {
             self.require_available(*source_slot, state, line)?;
             self.require_local_not_moved(*source_slot, state, line)?;
+            self.require_local_not_partially_moved(*source_slot, state, line)?;
         }
 
         let mut closure_state = FlowState::reachable(self.local_count);
@@ -1323,6 +1981,9 @@ impl AvailabilityAnalyzer {
         state: &FlowState,
         line: u32,
     ) -> Result<(), ParseError> {
+        if !self.enable_local_move_semantics {
+            return Ok(());
+        }
         let slot = index as usize;
         if slot >= self.local_count {
             return Ok(());
@@ -1337,6 +1998,32 @@ impl AvailabilityAnalyzer {
             line: line as usize,
             message: format!(
                 "local '{display}' was moved earlier; use '{display}.copy()' to copy it before moving"
+            ),
+        })
+    }
+
+    fn require_local_not_partially_moved(
+        &self,
+        index: LocalSlot,
+        state: &FlowState,
+        line: u32,
+    ) -> Result<(), ParseError> {
+        if !self.enable_local_move_semantics {
+            return Ok(());
+        }
+        if !self.local_names.contains_key(&index) {
+            return Ok(());
+        }
+        if !self.moved_possible_for_root(state, index).any(|_| true) {
+            return Ok(());
+        }
+        let display = self.display_local_name(index);
+        Err(ParseError {
+            span: None,
+            code: Some("E_LOCAL_PARTIALLY_MOVED".to_string()),
+            line: line as usize,
+            message: format!(
+                "local '{display}' is partially moved; access remaining fields/elements directly or reinitialize moved children before using '{display}' as a whole"
             ),
         })
     }
@@ -1362,6 +2049,9 @@ impl AvailabilityAnalyzer {
     }
 
     fn should_move_local_on_rebind_source(&self, index: LocalSlot, state: &FlowState) -> bool {
+        if !self.enable_local_move_semantics {
+            return false;
+        }
         let slot = index as usize;
         if slot >= self.local_count {
             return false;
@@ -1373,20 +2063,54 @@ impl AvailabilityAnalyzer {
         state.collection_aliases[slot].is_empty()
     }
 
-    fn mark_local_source_moved_on_rebind(
+    fn rewrite_local_source_move_on_rebind(
         &self,
         state: &mut FlowState,
         target: LocalSlot,
         expr: &Expr,
-    ) {
+    ) -> Expr {
+        if !self.enable_local_move_semantics {
+            return expr.clone();
+        }
         let Expr::Var(source) = expr else {
-            return;
+            return expr.clone();
         };
         if *source == target {
-            return;
+            return expr.clone();
         }
         if self.should_move_local_on_rebind_source(*source, state) {
             self.mark_local_moved(state, *source);
+            return Expr::MoveVar(*source);
+        }
+        expr.clone()
+    }
+
+    fn rewrite_runtime_field_move_expr(&self, expr: &Expr, state: &FlowState) -> Expr {
+        if !self.enable_local_move_semantics {
+            return expr.clone();
+        }
+        let Expr::Call(index, args) = expr else {
+            return expr.clone();
+        };
+        if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get) {
+            return expr.clone();
+        }
+        let Some((root_slot, field_key)) = self.extract_moved_field_access(*index, args) else {
+            return expr.clone();
+        };
+        if self.is_copyable_field(root_slot, &field_key, state) {
+            return expr.clone();
+        }
+        match field_key {
+            MovedFieldKey::String(key) => Expr::MoveField {
+                root: root_slot,
+                key,
+            },
+            MovedFieldKey::Index(index) => Expr::MoveIndex {
+                root: root_slot,
+                index,
+            },
+            MovedFieldKey::Dynamic | MovedFieldKey::Slice => expr.clone(),
         }
     }
 
@@ -1397,6 +2121,32 @@ impl AvailabilityAnalyzer {
         }
         state.moved_local_definite[slot] = true;
         state.moved_local_possible[slot] = true;
+    }
+
+    fn apply_interprocedural_consumed_call_effects(
+        &self,
+        call_index: u16,
+        args: &[Expr],
+        state: &mut FlowState,
+    ) {
+        if !self.enable_local_move_semantics {
+            return;
+        }
+        let Some(consumed_arg_positions) = self.function_consumed_params.get(&call_index) else {
+            return;
+        };
+        for position in consumed_arg_positions {
+            let Some(arg_expr) = args.get(*position) else {
+                continue;
+            };
+            let source_slot = match arg_expr {
+                Expr::Var(slot) | Expr::MoveVar(slot) => *slot,
+                _ => continue,
+            };
+            if self.should_move_local_on_rebind_source(source_slot, state) {
+                self.mark_local_moved(state, source_slot);
+            }
+        }
     }
 
     fn clear_local_moved_state(&self, state: &mut FlowState, index: LocalSlot) {
@@ -1423,9 +2173,17 @@ impl AvailabilityAnalyzer {
     }
 
     fn is_definitely_movable_local_expr(&self, expr: &Expr, state: &FlowState) -> bool {
+        if !self.enable_local_move_semantics {
+            return false;
+        }
         match expr {
             Expr::String(_) => true,
             Expr::Var(index) => state
+                .movable_locals
+                .get(*index as usize)
+                .copied()
+                .unwrap_or(false),
+            Expr::MoveVar(index) => state
                 .movable_locals
                 .get(*index as usize)
                 .copied()
@@ -1531,20 +2289,29 @@ struct DefInfo {
 struct LivenessRewriter {
     local_count: usize,
     clearable_slots: Vec<bool>,
+    conservative_call_indices: HashSet<u16>,
 }
 
 impl LivenessRewriter {
-    fn new(local_count: usize, local_bindings: &[(String, LocalSlot)]) -> Self {
-        let mut clearable_slots = vec![false; local_count];
-        for (_, index) in local_bindings {
-            let slot = *index as usize;
-            if slot < local_count {
-                clearable_slots[slot] = true;
-            }
-        }
+    fn new(
+        local_count: usize,
+        _local_bindings: &[(String, LocalSlot)],
+        function_impls: &HashMap<u16, FunctionImpl>,
+    ) -> Self {
+        // Clear hidden and named slots alike. Hidden slots back closure captures,
+        // inline-call parameters, and parser-generated temporaries, so excluding
+        // them leaves stale values past their last use.
+        let clearable_slots = vec![true; local_count];
+        let conservative_call_indices = function_impls
+            .iter()
+            .filter_map(|(index, function_impl)| {
+                function_impl_uses_local_call(function_impl).then_some(*index)
+            })
+            .collect::<HashSet<_>>();
         Self {
             local_count,
             clearable_slots,
+            conservative_call_indices,
         }
     }
 
@@ -1875,10 +2642,21 @@ impl LivenessRewriter {
             | Expr::Bool(_)
             | Expr::String(_)
             | Expr::FunctionRef(_) => {}
-            Expr::Var(index) => self.mark_live(live, *index),
+            Expr::Var(index) | Expr::MoveVar(index) => self.mark_live(live, *index),
+            Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
+                self.mark_live(live, *root)
+            }
             Expr::Call(_, args) => {
                 for arg in args {
                     self.add_expr_uses(arg, live);
+                }
+                if let Expr::Call(index, _) = expr
+                    && self.conservative_call_indices.contains(index)
+                {
+                    // Calls that inline a local-call body can consume callable
+                    // arguments and hidden capture slots not directly visible at
+                    // the call site. Keep these boundaries conservative.
+                    live.fill(true);
                 }
             }
             Expr::LocalCall(index, args) => {
@@ -2010,6 +2788,111 @@ impl LivenessRewriter {
     }
 }
 
+fn function_impl_uses_local_call(function_impl: &FunctionImpl) -> bool {
+    function_impl
+        .body_stmts
+        .iter()
+        .any(stmt_contains_local_call)
+        || expr_contains_local_call(&function_impl.body_expr)
+}
+
+fn stmt_contains_local_call(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {
+            false
+        }
+        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+            expr_contains_local_call(expr)
+        }
+        Stmt::ClosureLet { closure, .. } => expr_contains_local_call(&closure.body),
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_contains_local_call(condition)
+                || then_branch.iter().any(stmt_contains_local_call)
+                || else_branch.iter().any(stmt_contains_local_call)
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            ..
+        } => {
+            stmt_contains_local_call(init)
+                || expr_contains_local_call(condition)
+                || stmt_contains_local_call(post)
+                || body.iter().any(stmt_contains_local_call)
+        }
+        Stmt::While {
+            condition, body, ..
+        } => expr_contains_local_call(condition) || body.iter().any(stmt_contains_local_call),
+    }
+}
+
+fn expr_contains_local_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::LocalCall(_, _) => true,
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::FunctionRef(_)
+        | Expr::Var(_)
+        | Expr::MoveVar(_)
+        | Expr::MoveField { .. }
+        | Expr::MoveIndex { .. } => false,
+        Expr::Call(_, args) => args.iter().any(expr_contains_local_call),
+        Expr::Closure(closure) => expr_contains_local_call(&closure.body),
+        Expr::ClosureCall(closure, args) => {
+            args.iter().any(expr_contains_local_call) || expr_contains_local_call(&closure.body)
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => expr_contains_local_call(lhs) || expr_contains_local_call(rhs),
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => expr_contains_local_call(inner),
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            expr_contains_local_call(condition)
+                || expr_contains_local_call(then_expr)
+                || expr_contains_local_call(else_expr)
+        }
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            expr_contains_local_call(value)
+                || arms
+                    .iter()
+                    .any(|(_, arm_expr)| expr_contains_local_call(arm_expr))
+                || expr_contains_local_call(default)
+        }
+        Expr::Block { stmts, expr } => {
+            stmts.iter().any(stmt_contains_local_call) || expr_contains_local_call(expr)
+        }
+    }
+}
+
 fn is_simple_ident(value: &str) -> bool {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
@@ -2052,7 +2935,7 @@ impl LocalSlotAllocator {
         local_bindings: &[(String, LocalSlot)],
         function_impls: &HashMap<u16, FunctionImpl>,
     ) -> Self {
-        let liveness = LivenessRewriter::new(local_count, local_bindings);
+        let liveness = LivenessRewriter::new(local_count, local_bindings, function_impls);
         Self {
             local_count,
             liveness,
@@ -2179,8 +3062,11 @@ impl LocalSlotAllocator {
             | Expr::Bool(_)
             | Expr::String(_)
             | Expr::FunctionRef(_) => {}
-            Expr::Var(index) => {
+            Expr::Var(index) | Expr::MoveVar(index) => {
                 self.add_slot_live_edges(*index, live);
+            }
+            Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
+                self.add_slot_live_edges(*root, live);
             }
             Expr::Call(index, args) => {
                 for arg in args {
@@ -2366,7 +3252,12 @@ impl LocalSlotAllocator {
             | Expr::Bool(_)
             | Expr::String(_)
             | Expr::FunctionRef(_) => {}
-            Expr::Var(index) | Expr::LocalCall(index, _) => self.mark_set_slot(set, *index),
+            Expr::Var(index) | Expr::MoveVar(index) | Expr::LocalCall(index, _) => {
+                self.mark_set_slot(set, *index)
+            }
+            Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
+                self.mark_set_slot(set, *root);
+            }
             Expr::Call(index, args) => {
                 if self.function_impls.contains_key(index) {
                     let footprint = self.function_footprint(*index, stack);
@@ -2714,8 +3605,11 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
         | Expr::BorrowMut(inner) => {
             remap_expr_slots(inner, mapping)?;
         }
-        Expr::Var(index) => {
+        Expr::Var(index) | Expr::MoveVar(index) => {
             *index = remap_slot(*index, mapping)?;
+        }
+        Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
+            *root = remap_slot(*root, mapping)?;
         }
         Expr::IfElse {
             condition,

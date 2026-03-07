@@ -185,6 +185,66 @@ fn trace_jit_native_path_honors_fuel_metering() {
 }
 
 #[test]
+fn trace_jit_preserves_local_move_semantics_across_fuel_yields() {
+    let source = r#"
+        let mut i = 0;
+        let mut sum = 0;
+        while i < 50 {
+            let a = "x";
+            let b = a;
+            if b == "x" {
+                sum = sum + 1;
+            }
+            i = i + 1;
+        }
+        sum;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: native_jit_supported(),
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.set_fuel_check_interval(1)
+        .expect("fuel interval update should succeed");
+    vm.set_fuel(8);
+
+    let mut yielded = 0_u64;
+    loop {
+        match vm.run().expect("run should succeed") {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => {
+                yielded = yielded.saturating_add(1);
+                assert!(
+                    yielded < 256,
+                    "move/yield loop made no progress after {yielded} yields, dump:\n{}",
+                    vm.dump_jit_info()
+                );
+                vm.recharge_fuel(10_000).expect("recharge should succeed");
+            }
+            VmStatus::Waiting(op_id) => panic!("unexpected host wait on op {op_id}"),
+        }
+    }
+
+    assert!(yielded > 0, "expected at least one cooperative fuel yield");
+    assert_eq!(
+        vm.stack().last(),
+        Some(&Value::Int(50)),
+        "move-heavy loop should preserve final result across yields"
+    );
+
+    if native_jit_supported() {
+        assert!(
+            vm.jit_native_exec_count() > 0,
+            "expected native trace execution for move-heavy loop, dump:\n{}",
+            vm.dump_jit_info()
+        );
+    }
+}
+
+#[test]
 fn changing_fuel_interval_recompiles_native_trace_variant() {
     if !native_jit_supported() {
         return;

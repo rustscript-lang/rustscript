@@ -57,6 +57,9 @@ pub enum Expr {
     Lt(Box<Expr>, Box<Expr>),
     Gt(Box<Expr>, Box<Expr>),
     Var(LocalSlot),
+    MoveVar(LocalSlot),
+    MoveField { root: LocalSlot, key: String },
+    MoveIndex { root: LocalSlot, index: i64 },
     IfElse {
         condition: Box<Expr>,
         then_expr: Box<Expr>,

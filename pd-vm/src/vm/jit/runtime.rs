@@ -387,11 +387,11 @@ impl Vm {
                     self.stack.push(value);
                 }
                 TraceStep::Ldloc(index) => {
-                    let value = self
+                    let slot = self
                         .locals
-                        .get(*index as usize)
-                        .cloned()
+                        .get_mut(*index as usize)
                         .ok_or(VmError::InvalidLocal(*index))?;
+                    let value = std::mem::replace(slot, crate::bytecode::Value::Null);
                     self.stack.push(value);
                 }
                 TraceStep::Stloc(index) => {

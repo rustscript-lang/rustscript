@@ -55,8 +55,17 @@ Supported syntax and features:
   - Reassignment (`x = ...`), indexed/member mutation (`x[i] = ...`, `x.k = ...`), and `&mut`
     borrows require a mutable binding.
   - Non-copyable field reads (for example `p.a`) are move-by-default.
+  - Direct moved field reads (`let x = p.a;`, `p.a;`) also update runtime local state by
+    clearing the moved field on the owning container.
+  - Literal index element moves (`let x = arr[0];`) now also update runtime local state by
+    clearing the moved element on the owning container.
   - Non-copyable local-to-local rebinds (for example `let b = a`, `b = a`) move the source local
     by default.
+  - RustScript function calls now apply consumed-parameter inference at call sites (based on
+    direct move ops and return-forwarded parameter rebinds), so reusing a consumed caller local
+    after the call is rejected.
+  - The source-local move above is compiled as a consuming local load at runtime; plain local
+    reads remain copy-like by default.
   - Collection locals continue to use alias tracking semantics on plain local reads and local
     rebinds.
   - Use `.copy()` to explicitly clone/detach a value before reusing or mutating related state.
@@ -69,6 +78,12 @@ Supported syntax and features:
     example via `.copy()`) or reassigned.
   - Locals must be definitely available on every control-flow path before use.
   - Closures capture outer locals at definition time; `fn` declarations do not capture outer locals.
+  - Inline `fn` and closure calls clear per-call frame slots after producing the call result
+    (deterministic descending-slot order). Closure capture slots are excluded from per-call clears.
+  - Closure capture slots and other hidden locals now participate in liveness null-clears once
+    the owning closure/value is dead.
+  - While waiting on pending host operations, VM local state is stable (no replayed drop/clear)
+    until completion and resume.
 - Module import syntax (for `.rss` modules): `use module;`, `use module::*;`, `use module::{...}`,
   plus relative paths with `self::` / `super::`.
 

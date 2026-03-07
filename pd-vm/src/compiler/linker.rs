@@ -338,8 +338,11 @@ fn remap_expr_indices(
         | Expr::BorrowMut(inner) => {
             remap_expr_indices(inner, local_base, function_map)?;
         }
-        Expr::Var(index) => {
+        Expr::Var(index) | Expr::MoveVar(index) => {
             *index = remap_local_index(*index, local_base)?;
+        }
+        Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
+            *root = remap_local_index(*root, local_base)?;
         }
         Expr::IfElse {
             condition,

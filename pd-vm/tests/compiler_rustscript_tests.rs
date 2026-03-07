@@ -296,17 +296,17 @@ fn rustscript_literal_and_slice_runtime_cases_work() {
             source: r#"
                 let text = "abcdef";
                 let end = -2;
-                let a = text[1:4];
-                let b = text[:3];
-                let c = text[2:];
-                let d = text[:-1];
-                let e = text[1:end];
+                let a = text.copy()[1:4];
+                let b = text.copy()[:3];
+                let c = text.copy()[2:];
+                let d = text.copy()[:-1];
+                let e = text.copy()[1:end];
 
                 let arr = [1, 2, 3, 4, 5];
-                let f = arr[1:4];
-                let g = arr[:2];
-                let h = arr[3:];
-                let i = arr[:-2];
+                let f = arr.copy()[1:4];
+                let g = arr.copy()[:2];
+                let h = arr.copy()[3:];
+                let i = arr.copy()[:-2];
                 a.length + b.length + c.length + d.length + e.length + f.length + g.length + h.length + i.length;
             "#,
             flavor: SourceFlavor::RustScript,
@@ -745,6 +745,30 @@ fn rustscript_move_and_alias_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
+            name: "array sibling index remains accessible after partial move",
+            source: r#"
+                let arr = [1, 2, 3, 4];
+                let first = arr[0];
+                let second = arr[1];
+                first + second;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(3)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "map sibling field remains accessible after partial move",
+            source: r#"
+                let m = { a: 1, b: 2 };
+                let first = m.a;
+                let second = m.b;
+                first + second;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(3)],
+            expected_locals: None,
+        },
+        RuntimeCase {
             name: "non numeric field access can be borrowed with ampersand",
             source: r#"
                 let p = { a: "x" };
@@ -867,6 +891,147 @@ fn rustscript_move_and_alias_runtime_cases_work() {
 }
 
 #[test]
+fn rustscript_local_move_consumes_source_slot_at_runtime() {
+    let source = r#"
+        let a = "2";
+        let b = a;
+        b;
+    "#;
+    let compiled = vm::compile_source_for_repl(source).expect("compile should succeed");
+    assert!(
+        compiled.locals >= 2,
+        "expected at least two locals for source/binding pair"
+    );
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("2".to_string())]);
+    assert_eq!(vm.locals().first(), Some(&Value::Null));
+    assert_eq!(vm.locals().get(1), Some(&Value::String("2".to_string())));
+}
+
+#[test]
+fn rustscript_interprocedural_consumed_param_moves_caller_local_at_runtime() {
+    let source = r#"
+        fn consume_once(value) {
+            let taken = value;
+            taken;
+        }
+
+        let a = "2";
+        let b = consume_once(a);
+        b;
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug info should exist");
+    let a_index = debug.local_index("a").expect("a binding should exist");
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("2".to_string())]);
+    assert_eq!(vm.locals()[a_index as usize], Value::Null);
+}
+
+#[test]
+fn rustscript_field_move_updates_runtime_container_state() {
+    let source = r#"
+        let mut p = { a: "x", b: "y" };
+        let moved = p.a;
+        moved;
+    "#;
+    let compiled = vm::compile_source_for_repl(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("x".to_string())]);
+
+    let Some(Value::Map(entries)) = vm.locals().first() else {
+        panic!("expected first local to be moved map container");
+    };
+    let mut saw_a_null = false;
+    let mut saw_b_y = false;
+    for (key, value) in entries {
+        match (key, value) {
+            (Value::String(name), Value::Null) if name == "a" => saw_a_null = true,
+            (Value::String(name), Value::String(text)) if name == "b" && text == "y" => {
+                saw_b_y = true
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_a_null,
+        "expected moved field 'a' to be null in local container"
+    );
+    assert!(
+        saw_b_y,
+        "expected untouched field 'b' to remain present in local container"
+    );
+}
+
+#[test]
+fn rustscript_field_move_expr_statement_updates_runtime_container_state() {
+    let source = r#"
+        let mut p = { a: "x", b: "y" };
+        p.a;
+    "#;
+    let compiled = vm::compile_source_for_repl(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("x".to_string())]);
+
+    let Some(Value::Map(entries)) = vm.locals().first() else {
+        panic!("expected first local to be moved map container");
+    };
+    let mut saw_a_null = false;
+    let mut saw_b_y = false;
+    for (key, value) in entries {
+        match (key, value) {
+            (Value::String(name), Value::Null) if name == "a" => saw_a_null = true,
+            (Value::String(name), Value::String(text)) if name == "b" && text == "y" => {
+                saw_b_y = true
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_a_null,
+        "expected moved field 'a' to be null in local container"
+    );
+    assert!(
+        saw_b_y,
+        "expected untouched field 'b' to remain present in local container"
+    );
+}
+
+#[test]
+fn rustscript_index_move_updates_runtime_container_state() {
+    let source = r#"
+        let mut arr = ["x", "y"];
+        let moved = arr[0];
+        moved;
+    "#;
+    let compiled = vm::compile_source_for_repl(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::String("x".to_string())]);
+
+    let Some(Value::Array(values)) = vm.locals().first() else {
+        panic!("expected first local to be moved array container");
+    };
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0], Value::Null);
+    assert_eq!(values[1], Value::String("y".to_string()));
+}
+
+#[test]
 fn rustscript_move_and_alias_parse_rejection_cases_work() {
     let cases = vec![
         ParseErrorCase {
@@ -881,6 +1046,36 @@ fn rustscript_move_and_alias_parse_rejection_cases_work() {
             expected_contains_all: &["p.a", "moved"],
         },
         ParseErrorCase {
+            name: "whole local use after field move is rejected",
+            source: r#"
+                let p = { a: "x", b: "y" };
+                let _moved = p.a;
+                p;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["p", "partially moved"],
+        },
+        ParseErrorCase {
+            name: "whole local use after index move is rejected",
+            source: r#"
+                let arr = [1, 2, 3];
+                let _moved = arr[0];
+                arr.length;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["arr", "partially moved"],
+        },
+        ParseErrorCase {
+            name: "whole local use after slice move is rejected",
+            source: r#"
+                let arr = [1, 2, 3, 4];
+                let _moved = arr[1:3];
+                arr.length;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["arr", "partially moved"],
+        },
+        ParseErrorCase {
             name: "non copy local assignment moves source by default",
             source: r#"
                 let a = "2";
@@ -889,6 +1084,68 @@ fn rustscript_move_and_alias_parse_rejection_cases_work() {
             "#,
             flavor: SourceFlavor::RustScript,
             expected_contains_all: &["local 'a'", "moved"],
+        },
+        ParseErrorCase {
+            name: "local move in one branch is rejected after merge",
+            source: r#"
+                let value = "x";
+                if true {
+                    let _moved = value;
+                } else {
+                    0;
+                }
+                value;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["local 'value'", "moved"],
+        },
+        ParseErrorCase {
+            name: "callee consumed parameter moves caller local",
+            source: r#"
+                fn consume_once(value) {
+                    let taken = value;
+                    taken;
+                }
+
+                let a = "x";
+                consume_once(a);
+                a;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["local 'a'", "moved"],
+        },
+        ParseErrorCase {
+            name: "transitive consumed parameter moves caller local",
+            source: r#"
+                fn consume_once(value) {
+                    let taken = value;
+                    taken;
+                }
+
+                fn forward(input) {
+                    consume_once(input);
+                    0;
+                }
+
+                let a = "x";
+                forward(a);
+                a;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["local 'a'", "moved"],
+        },
+        ParseErrorCase {
+            name: "local move in loop body is rejected on next iteration",
+            source: r#"
+                let value = "x";
+                let mut i = 0;
+                while i < 2 {
+                    let _moved = value;
+                    i = i + 1;
+                }
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["local 'value'", "moved"],
         },
         ParseErrorCase {
             name: "borrowed then moved then second move still fails",
@@ -1324,6 +1581,56 @@ fn liveness_clears_local_after_function_value_last_use() {
         "stack should not retain pre-call placeholder values"
     );
     assert_eq!(vm.locals()[func_index as usize], Value::Null);
+}
+
+#[test]
+fn inline_function_call_frame_slots_are_cleared_after_return() {
+    let source = r#"
+        fn make_pair() {
+            let left = "L";
+            let right = "R";
+            left + right;
+        }
+
+        make_pair();
+        0;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack().last(), Some(&Value::Int(0)));
+    assert!(
+        vm.locals().iter().all(|value| matches!(value, Value::Null)),
+        "expected all inline call-frame locals to be cleared after return, got {:?}",
+        vm.locals()
+    );
+}
+
+#[test]
+fn interprocedural_closure_capture_slots_are_cleared_after_last_use() {
+    let source = r#"
+        fn apply_once(func, value) {
+            func(value);
+        }
+
+        let seed = "!";
+        let closure = |x| x + seed;
+        apply_once(closure, "a");
+        0;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack().last(), Some(&Value::Int(0)));
+    assert!(
+        vm.locals().iter().all(|value| matches!(value, Value::Null)),
+        "expected closure capture and call-frame slots to clear after last use, got {:?}",
+        vm.locals()
+    );
 }
 
 #[test]

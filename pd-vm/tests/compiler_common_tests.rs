@@ -89,6 +89,47 @@ fn non_rustscript_frontends_keep_mutable_bindings_by_default() {
 }
 
 #[test]
+fn non_rustscript_frontends_keep_copy_semantics_for_local_rebinds() {
+    let javascript = r#"
+        let a = "2";
+        let b = a;
+        a;
+        b;
+    "#;
+    let lua = r#"
+        local a = "2"
+        local b = a
+        a
+        b
+    "#;
+    let scheme = r#"
+        (define a "2")
+        (define b a)
+        a
+        b
+    "#;
+
+    let cases = [
+        (SourceFlavor::JavaScript, javascript),
+        (SourceFlavor::Lua, lua),
+        (SourceFlavor::Scheme, scheme),
+    ];
+    for (flavor, source) in cases {
+        let compiled = compile_source_with_flavor(source, flavor).expect("compile should succeed");
+        let mut vm = Vm::new(compiled.program);
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(
+            vm.stack(),
+            &[
+                Value::String("2".to_string()),
+                Value::String("2".to_string())
+            ]
+        );
+    }
+}
+
+#[test]
 fn compiler_reuses_slots_when_declared_locals_exceed_bytecode_limit() {
     let mut source = String::from("let mut out = 0;\n");
     for idx in 0..600usize {
@@ -566,16 +607,16 @@ fn slice_ranges_work_in_all_frontends() {
     let rustscript = r#"
         let text = "abcdef";
         let end_pos = -2;
-        let a = text[1:4];
-        let b = text[:3];
-        let c = text[2:];
-        let d = text[:-1];
-        let e = text[1:end_pos];
+        let a = text.copy()[1:4];
+        let b = text.copy()[:3];
+        let c = text.copy()[2:];
+        let d = text.copy()[:-1];
+        let e = text.copy()[1:end_pos];
         let arr = [1, 2, 3, 4, 5];
-        let f = arr[1:4];
-        let g = arr[:2];
-        let h = arr[3:];
-        let i = arr[:-2];
+        let f = arr.copy()[1:4];
+        let g = arr.copy()[:2];
+        let h = arr.copy()[3:];
+        let i = arr.copy()[:-2];
         a.length + b.length + c.length + d.length + e.length + f.length + g.length + h.length + i.length;
     "#;
     let javascript = r#"
