@@ -71,7 +71,7 @@ fn lint_diagnostic_to_json(item: LintDiagnostic) -> LintDiagnosticJson {
     LintDiagnosticJson {
         line: item.line,
         message: item.message,
-        span: item.span.map(|span| lint_span_to_json(span)),
+        span: item.span.map(lint_span_to_json),
         rendered: item.rendered,
     }
 }

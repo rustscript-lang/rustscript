@@ -159,6 +159,7 @@ pub struct FrontendIr {
     pub function_impls: HashMap<u16, FunctionImpl>,
 }
 
+#[allow(dead_code)]
 pub(super) struct LocalIrBuilder {
     locals: HashMap<String, LocalSlot>,
     next_local: LocalSlot,
@@ -166,6 +167,7 @@ pub(super) struct LocalIrBuilder {
     function_meta: HashMap<String, (u16, Option<u8>)>,
 }
 
+#[allow(dead_code)]
 impl LocalIrBuilder {
     pub(super) fn new() -> Self {
         Self {

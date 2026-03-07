@@ -25,6 +25,14 @@ struct LoopControlFlow {
     continue_state: Option<FlowState>,
 }
 
+struct ForLoopParts<'a> {
+    init: &'a Stmt,
+    condition: &'a Expr,
+    post: &'a Stmt,
+    body: &'a [Stmt],
+    line: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct MovedFieldPath {
     root: LocalSlot,
@@ -300,7 +308,17 @@ impl AvailabilityAnalyzer {
                 post,
                 body,
                 line,
-            } => self.analyze_for_loop(init, condition, post, body, *line, state, rewrite_clears),
+            } => self.analyze_for_loop(
+                ForLoopParts {
+                    init,
+                    condition,
+                    post,
+                    body,
+                    line: *line,
+                },
+                state,
+                rewrite_clears,
+            ),
             Stmt::While {
                 condition,
                 body,
@@ -391,14 +409,17 @@ impl AvailabilityAnalyzer {
 
     fn analyze_for_loop(
         &self,
-        init: &Stmt,
-        condition: &Expr,
-        post: &Stmt,
-        body: &[Stmt],
-        line: u32,
+        for_loop: ForLoopParts<'_>,
         state: FlowState,
         rewrite_clears: bool,
     ) -> Result<(Stmt, FlowState), ParseError> {
+        let ForLoopParts {
+            init,
+            condition,
+            post,
+            body,
+            line,
+        } = for_loop;
         let (rewritten_init, init_state) = self.analyze_stmt(init, state, rewrite_clears, None)?;
         let alias_seed = self.next_collection_alias_id.get();
         let mut loop_entry = init_state.clone();

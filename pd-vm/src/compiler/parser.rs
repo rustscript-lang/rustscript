@@ -2594,7 +2594,7 @@ impl Parser {
         let rendered = match args.as_slice() {
             [] => Expr::String("\n".to_string()),
             [value] => {
-                let value = self.to_string_expr(value.clone())?;
+                let value = self.build_to_string_expr(value.clone())?;
                 self.append_newline_expr(value)
             }
             [format_expr, format_args @ ..] => {
@@ -2672,7 +2672,7 @@ impl Parser {
         Ok(Expr::Call(decl.index, vec![argument]))
     }
 
-    fn to_string_expr(&mut self, value: Expr) -> Result<Expr, ParseError> {
+    fn build_to_string_expr(&mut self, value: Expr) -> Result<Expr, ParseError> {
         self.build_builtin_call_expr(BuiltinFunction::ToString, vec![value])
     }
 
