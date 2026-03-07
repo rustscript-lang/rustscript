@@ -27,7 +27,8 @@ mod layout;
 use bridge::pd_vm_cranelift_step;
 use codegen::{
     emit_fuel_tick_inline, emit_fuel_tick_inline_guarded, emit_helper_step,
-    emit_inline_or_helper_step, entry_signature, helper_signature, jump_with_status,
+    emit_inline_ldloc_copy, emit_inline_or_helper_step, entry_signature, helper_signature,
+    jump_with_status,
     resolve_offsets,
 };
 use layout::detect_native_stack_layout;
@@ -59,6 +60,30 @@ const OP_CALL: i64 = 19;
 const OP_GUARD_FALSE: i64 = 20;
 const OP_JUMP: i64 = 21;
 const OP_BUILTIN_CALL: i64 = 22;
+
+fn fused_ldloc_copy_slot(steps: &[TraceStep], index: usize) -> Option<u8> {
+    let Some(TraceStep::Ldloc(slot)) = steps.get(index) else {
+        return None;
+    };
+    if !matches!(steps.get(index + 1), Some(TraceStep::Dup)) {
+        return None;
+    }
+    let Some(TraceStep::Stloc(stored_slot)) = steps.get(index + 2) else {
+        return None;
+    };
+    (stored_slot == slot).then_some(*slot)
+}
+
+fn fused_ldloc_copy_slot_if_allowed(
+    fuel_check_interval: Option<u32>,
+    steps: &[TraceStep],
+    index: usize,
+) -> Option<u8> {
+    if fuel_check_interval.is_some() {
+        return None;
+    }
+    fused_ldloc_copy_slot(steps, index)
+}
 
 pub(crate) struct CompiledTrace {
     pub(crate) entry: *const u8,
@@ -172,7 +197,8 @@ pub(crate) fn compile_trace(
 
         let helper_ref = module.declare_func_in_func(helper_id, b.func);
 
-        for (step_index, step) in trace.steps.iter().enumerate() {
+        let mut step_index = 0usize;
+        while step_index < trace.steps.len() {
             if let Some(interval) = fuel_check_interval {
                 let stride = interval as usize;
                 if step_index % stride == 0 {
@@ -189,6 +215,25 @@ pub(crate) fn compile_trace(
                     }
                 }
             }
+            if let Some(slot) =
+                fused_ldloc_copy_slot_if_allowed(fuel_check_interval, &trace.steps, step_index)
+            {
+                emit_inline_ldloc_copy(
+                    &mut b,
+                    vm_ptr,
+                    helper_ref,
+                    exit_block,
+                    pointer_type,
+                    layout,
+                    offsets,
+                    slot,
+                    trace.root_ip,
+                )?;
+                step_index += 3;
+                continue;
+            }
+
+            let step = &trace.steps[step_index];
             if emit_inline_or_helper_step(
                 &mut b,
                 vm_ptr,
@@ -200,9 +245,11 @@ pub(crate) fn compile_trace(
                 trace.root_ip,
                 step,
             )? {
+                step_index += 1;
                 continue;
             }
             emit_helper_step(&mut b, vm_ptr, helper_ref, exit_block, trace.root_ip, step)?;
+            step_index += 1;
         }
 
         let continue_status = b.ins().iconst(types::I32, STATUS_CONTINUE as i64);
@@ -262,4 +309,48 @@ fn native_isa(profile: NativeCompileProfile) -> VmResult<OwnedTargetIsa> {
             .map_err(|err| format!("failed to finalize cranelift ISA: {err}"))
     });
     cached.clone().map_err(VmError::JitNative)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fused_ldloc_copy_slot_matches_only_dup_stloc_same_slot() {
+        let steps = vec![
+            TraceStep::Ldloc(3),
+            TraceStep::Dup,
+            TraceStep::Stloc(3),
+            TraceStep::Add,
+        ];
+        assert_eq!(fused_ldloc_copy_slot(&steps, 0), Some(3));
+        assert_eq!(fused_ldloc_copy_slot(&steps, 1), None);
+
+        let mismatch = vec![TraceStep::Ldloc(3), TraceStep::Dup, TraceStep::Stloc(2)];
+        assert_eq!(fused_ldloc_copy_slot(&mismatch, 0), None);
+
+        let wrong_middle = vec![TraceStep::Ldloc(3), TraceStep::Pop, TraceStep::Stloc(3)];
+        assert_eq!(fused_ldloc_copy_slot(&wrong_middle, 0), None);
+    }
+
+    #[test]
+    fn fused_ldloc_copy_slot_is_disabled_when_fuel_metering_is_active() {
+        let steps = vec![TraceStep::Ldloc(1), TraceStep::Dup, TraceStep::Stloc(1)];
+
+        assert_eq!(
+            fused_ldloc_copy_slot_if_allowed(None, &steps, 0),
+            Some(1),
+            "fusion should be available without fuel metering"
+        );
+        assert_eq!(
+            fused_ldloc_copy_slot_if_allowed(Some(1), &steps, 0),
+            None,
+            "fuel metering must disable fused emission"
+        );
+        assert_eq!(
+            fused_ldloc_copy_slot_if_allowed(Some(8), &steps, 0),
+            None,
+            "all fuel metering variants must disable fused emission"
+        );
+    }
 }

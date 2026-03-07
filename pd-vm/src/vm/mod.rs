@@ -1076,12 +1076,22 @@ impl Vm {
             }
             x if x == OpCode::Ldloc as u8 => {
                 let index = self.read_u8()?;
-                let slot = self
-                    .locals
-                    .get_mut(index as usize)
-                    .ok_or(VmError::InvalidLocal(index))?;
-                let value = std::mem::replace(slot, Value::Null);
-                self.stack.push(value);
+                if !self.fuel_enabled && self.can_fuse_ldloc_copy_pattern(index) {
+                    let value = self
+                        .locals
+                        .get(index as usize)
+                        .cloned()
+                        .ok_or(VmError::InvalidLocal(index))?;
+                    self.stack.push(value);
+                    self.ip = self.ip.saturating_add(3);
+                } else {
+                    let slot = self
+                        .locals
+                        .get_mut(index as usize)
+                        .ok_or(VmError::InvalidLocal(index))?;
+                    let value = std::mem::replace(slot, Value::Null);
+                    self.stack.push(value);
+                }
             }
             x if x == OpCode::Stloc as u8 => {
                 let index = self.read_u8()?;
@@ -1158,6 +1168,16 @@ impl Vm {
 
     fn pop_value(&mut self) -> VmResult<Value> {
         self.stack.pop().ok_or(VmError::StackUnderflow)
+    }
+
+    fn can_fuse_ldloc_copy_pattern(&self, index: u8) -> bool {
+        let code = &self.program.code;
+        if self.ip + 2 >= code.len() {
+            return false;
+        }
+        code[self.ip] == OpCode::Dup as u8
+            && code[self.ip + 1] == OpCode::Stloc as u8
+            && code[self.ip + 2] == index
     }
 
     fn clear_stack_with_drop_contract(&mut self) {
@@ -1789,5 +1809,130 @@ mod tests {
             cache_entries_after_two, cache_entries_after_one,
             "cache entries should be reused instead of duplicated"
         );
+    }
+
+    fn step_once(vm: &mut Vm) -> VmResult<ExecOutcome> {
+        let opcode = vm.read_u8()?;
+        vm.execute_interpreter_instruction(opcode)
+    }
+
+    #[test]
+    fn interpreter_fuses_ldloc_dup_stloc_same_slot_without_fuel() {
+        let program = Program::new(
+            vec![],
+            vec![
+                OpCode::Ldloc as u8,
+                0,
+                OpCode::Dup as u8,
+                OpCode::Stloc as u8,
+                0,
+                OpCode::Ret as u8,
+            ],
+        )
+        .with_local_count(1);
+        let mut vm = Vm::new(program);
+        let map_value = Value::Map(vec![(Value::String("k".to_string()), Value::Int(9))]);
+        vm.locals[0] = map_value.clone();
+
+        let outcome = step_once(&mut vm).expect("ldloc should execute");
+        assert!(matches!(outcome, ExecOutcome::Continue));
+        assert_eq!(vm.ip, 5, "fusion should skip dup+stloc bytes");
+        assert_eq!(vm.locals[0], map_value, "local value should remain in slot");
+        assert_eq!(vm.stack(), &[map_value], "stack should receive copied value");
+        assert_eq!(
+            vm.drop_contract_event_count(),
+            0,
+            "copy fusion should not synthesize drop events"
+        );
+
+        let halted = step_once(&mut vm).expect("ret should execute");
+        assert!(matches!(halted, ExecOutcome::Halted));
+    }
+
+    #[test]
+    fn interpreter_does_not_fuse_ldloc_dup_stloc_when_fuel_enabled() {
+        let program = Program::new(
+            vec![],
+            vec![
+                OpCode::Ldloc as u8,
+                0,
+                OpCode::Dup as u8,
+                OpCode::Stloc as u8,
+                0,
+                OpCode::Ret as u8,
+            ],
+        )
+        .with_local_count(1);
+        let mut vm = Vm::new(program);
+        vm.locals[0] = Value::Int(42);
+        vm.set_fuel(32);
+
+        let ldloc = step_once(&mut vm).expect("ldloc should execute");
+        assert!(matches!(ldloc, ExecOutcome::Continue));
+        assert_eq!(vm.ip, 2, "fuel metering path must not skip dup+stloc");
+        assert_eq!(vm.locals[0], Value::Null, "ldloc move should clear local slot");
+        assert_eq!(vm.stack(), &[Value::Int(42)]);
+
+        let dup = step_once(&mut vm).expect("dup should execute");
+        assert!(matches!(dup, ExecOutcome::Continue));
+        assert_eq!(vm.ip, 3);
+        assert_eq!(vm.stack(), &[Value::Int(42), Value::Int(42)]);
+
+        let stloc = step_once(&mut vm).expect("stloc should execute");
+        assert!(matches!(stloc, ExecOutcome::Continue));
+        assert_eq!(vm.ip, 5);
+        assert_eq!(vm.locals[0], Value::Int(42));
+        assert_eq!(vm.stack(), &[Value::Int(42)]);
+    }
+
+    #[test]
+    fn ldloc_copy_pattern_match_is_strict_to_dup_stloc_same_slot() {
+        let base = Program::new(
+            vec![],
+            vec![
+                OpCode::Ldloc as u8,
+                0,
+                OpCode::Dup as u8,
+                OpCode::Stloc as u8,
+                0,
+                OpCode::Ret as u8,
+            ],
+        )
+        .with_local_count(1);
+        let mut vm = Vm::new(base);
+        vm.ip = 2;
+        assert!(vm.can_fuse_ldloc_copy_pattern(0));
+
+        let mismatch_slot = Program::new(
+            vec![],
+            vec![
+                OpCode::Ldloc as u8,
+                0,
+                OpCode::Dup as u8,
+                OpCode::Stloc as u8,
+                1,
+                OpCode::Ret as u8,
+            ],
+        )
+        .with_local_count(2);
+        let mut vm_slot_mismatch = Vm::new(mismatch_slot);
+        vm_slot_mismatch.ip = 2;
+        assert!(!vm_slot_mismatch.can_fuse_ldloc_copy_pattern(0));
+
+        let wrong_middle = Program::new(
+            vec![],
+            vec![
+                OpCode::Ldloc as u8,
+                0,
+                OpCode::Pop as u8,
+                OpCode::Stloc as u8,
+                0,
+                OpCode::Ret as u8,
+            ],
+        )
+        .with_local_count(1);
+        let mut vm_wrong_middle = Vm::new(wrong_middle);
+        vm_wrong_middle.ip = 2;
+        assert!(!vm_wrong_middle.can_fuse_ldloc_copy_pattern(0));
     }
 }
