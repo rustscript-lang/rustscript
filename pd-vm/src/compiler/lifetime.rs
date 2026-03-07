@@ -1742,6 +1742,11 @@ impl LivenessRewriter {
                 for arg in args {
                     self.add_expr_uses(arg, live);
                 }
+                // Local-call targets can be inline closures whose captured
+                // slots are not directly visible from the call expression.
+                // Keep locals live conservatively so closure captures are not
+                // cleared before the call executes.
+                live.fill(true);
             }
             Expr::Closure(closure) => {
                 for (source_slot, _) in &closure.capture_copies {

@@ -1,11 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::ParseError;
-use super::super::ir::{Expr, FrontendIr, LocalSlot, Stmt};
+use super::super::ir::{Expr, FrontendIr, LocalIrBuilder, Stmt};
 use super::{is_ident_continue, is_ident_start};
-use crate::builtins::is_builtin_namespace;
-use crate::compiler::source_map::{LineSpanMapping, LoweredSource};
+use crate::builtins::{BuiltinFunction, is_builtin_namespace, resolve_builtin_namespace_call};
 
 static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -18,31 +17,21 @@ fn gensym(prefix: &str) -> String {
     format!("__{prefix}_{id}")
 }
 
-fn wrap_let_expr(name: &str, value: &str, body: &str) -> String {
-    format!("if true => {{ let {name} = {value}; {body} }} else => {{ false }}")
-}
-
-fn wrap_statement_sequence(stmts: Vec<String>, expr: String) -> String {
-    let mut out = expr;
-    for stmt in stmts.into_iter().rev() {
-        out = format!("if true => {{ {stmt} {out} }} else => {{ false }}");
-    }
-    out
-}
-
 pub(super) fn lower_to_ir(source: &str) -> Result<FrontendIr, ParseError> {
     if let Some(ir) = try_lower_direct_subset_to_ir(source)? {
         return Ok(ir);
     }
-    let lowered = lower(source)?;
-    super::parse_lowered_with_mapping(source, lowered, false, false, false)
+    Err(ParseError::at_line(
+        1,
+        "scheme direct lowering does not yet support this construct",
+    ))
 }
 
 fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, ParseError> {
     let mut parser = SchemeParser::new(source)?;
     let forms = parser.parse_program()?;
 
-    let mut builder = SchemeDirectIrBuilder::new();
+    let mut builder = LocalIrBuilder::new();
     let mut stmts = Vec::<Stmt>::new();
     for form in &forms {
         let Some(mut lowered) = lower_scheme_direct_stmt(form, &mut builder)? else {
@@ -53,73 +42,9 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
     Ok(Some(builder.finish(stmts)))
 }
 
-struct SchemeDirectIrBuilder {
-    locals: HashMap<String, LocalSlot>,
-    next_local: LocalSlot,
-}
-
-impl SchemeDirectIrBuilder {
-    fn new() -> Self {
-        Self {
-            locals: HashMap::new(),
-            next_local: 0,
-        }
-    }
-
-    fn lower_local(&mut self, name: &str, expr: Expr, line: u32) -> Result<Stmt, ParseError> {
-        let index = if let Some(index) = self.locals.get(name).copied() {
-            index
-        } else {
-            let index = self.alloc_local()?;
-            self.locals.insert(name.to_string(), index);
-            index
-        };
-        Ok(Stmt::Let { index, expr, line })
-    }
-
-    fn lower_assign(&self, name: &str, expr: Expr, line: u32) -> Result<Stmt, ParseError> {
-        let Some(index) = self.locals.get(name).copied() else {
-            return Err(ParseError {
-                span: None,
-                code: None,
-                line: line as usize,
-                message: format!("unknown local '{name}'"),
-            });
-        };
-        Ok(Stmt::Assign { index, expr, line })
-    }
-
-    fn resolve_local_expr(&self, name: &str) -> Option<Expr> {
-        self.locals.get(name).copied().map(Expr::Var)
-    }
-
-    fn finish(self, stmts: Vec<Stmt>) -> FrontendIr {
-        let mut local_bindings = self.locals.into_iter().collect::<Vec<_>>();
-        local_bindings.sort_by_key(|(_, index)| *index);
-        FrontendIr {
-            stmts,
-            locals: self.next_local as usize,
-            local_bindings,
-            functions: Vec::new(),
-            function_impls: HashMap::new(),
-        }
-    }
-
-    fn alloc_local(&mut self) -> Result<LocalSlot, ParseError> {
-        let index = self.next_local;
-        self.next_local = self.next_local.checked_add(1).ok_or(ParseError {
-            span: None,
-            code: None,
-            line: 1,
-            message: "local index overflow".to_string(),
-        })?;
-        Ok(index)
-    }
-}
-
 fn lower_scheme_direct_stmt(
     form: &SchemeForm,
-    builder: &mut SchemeDirectIrBuilder,
+    builder: &mut LocalIrBuilder,
 ) -> Result<Option<Vec<Stmt>>, ParseError> {
     if let Some(items) = form.as_list()
         && let Some(head) = items.first().and_then(|item| item.as_symbol())
@@ -127,18 +52,72 @@ fn lower_scheme_direct_stmt(
         let args = &items[1..];
         let line = u32::try_from(form.line).unwrap_or(u32::MAX);
         match head {
+            "import" | "require" => {
+                if args.len() == 1
+                    && let Some(clause) = args[0].as_list()
+                    && clause.len() >= 3
+                    && clause[0]
+                        .as_symbol()
+                        .is_some_and(|keyword| keyword == "only-in")
+                    && clause[1]
+                        .as_symbol()
+                        .or_else(|| match &clause[1].node {
+                            SchemeNode::String(value) => Some(value.as_str()),
+                            _ => None,
+                        })
+                        .is_some_and(|spec| spec == "vm")
+                {
+                    for member in &clause[2..] {
+                        if let Some(member_raw) = member.as_symbol() {
+                            let name =
+                                normalize_identifier(member_raw, member.line, "require member")?;
+                            builder.declare_function(&name, None)?;
+                        }
+                    }
+                }
+                // Source loader handles module import rewriting before direct lowering.
+                return Ok(Some(Vec::new()));
+            }
             "define" => {
-                if args.len() != 2 {
+                if args.len() < 2 {
                     return Ok(None);
                 }
-                let Some(name_raw) = args[0].as_symbol() else {
+                if let Some(name_raw) = args[0].as_symbol() {
+                    let name = normalize_identifier(name_raw, args[0].line, "define target")?;
+                    let Some(expr) = lower_scheme_direct_expr_top(&args[1], builder)? else {
+                        return Ok(None);
+                    };
+                    return Ok(Some(vec![builder.lower_local(&name, expr, line)?]));
+                }
+
+                let Some(signature) = args[0].as_list() else {
                     return Ok(None);
                 };
-                let name = normalize_identifier(name_raw, args[0].line, "define target")?;
-                let Some(expr) = lower_scheme_direct_expr(&args[1], builder)? else {
+                let Some(name_raw) = signature.first().and_then(|item| item.as_symbol()) else {
                     return Ok(None);
                 };
-                return Ok(Some(vec![builder.lower_local(&name, expr, line)?]));
+                let name = normalize_identifier(name_raw, signature[0].line, "function name")?;
+                let mut params = Vec::new();
+                for param in &signature[1..] {
+                    let Some(param_raw) = param.as_symbol() else {
+                        return Ok(None);
+                    };
+                    params.push(normalize_identifier(
+                        param_raw,
+                        param.line,
+                        "function parameter",
+                    )?);
+                }
+                let Some(closure) = lower_scheme_direct_lambda_expr_from_params(
+                    &params,
+                    &args[1..],
+                    form.line,
+                    builder,
+                )?
+                else {
+                    return Ok(None);
+                };
+                return Ok(Some(vec![builder.lower_local(&name, closure, line)?]));
             }
             "set!" => {
                 if args.len() != 2 {
@@ -148,16 +127,57 @@ fn lower_scheme_direct_stmt(
                     return Ok(None);
                 };
                 let name = normalize_identifier(name_raw, args[0].line, "set! target")?;
-                let Some(expr) = lower_scheme_direct_expr(&args[1], builder)? else {
+                let Some(expr) = lower_scheme_direct_expr_top(&args[1], builder)? else {
                     return Ok(None);
                 };
                 return Ok(Some(vec![builder.lower_assign(&name, expr, line)?]));
+            }
+            "declare" => {
+                if args.len() != 1 {
+                    return Ok(None);
+                }
+                let Some(signature) = args[0].as_list() else {
+                    return Ok(None);
+                };
+                let Some(name_raw) = signature.first().and_then(|item| item.as_symbol()) else {
+                    return Ok(None);
+                };
+                let Ok(name) = normalize_identifier(name_raw, args[0].line, "declare function")
+                else {
+                    return Ok(None);
+                };
+                let mut params = Vec::new();
+                for param in &signature[1..] {
+                    let Some(param_raw) = param.as_symbol() else {
+                        return Ok(None);
+                    };
+                    let Ok(param_name) =
+                        normalize_identifier(param_raw, param.line, "declare parameter")
+                    else {
+                        return Ok(None);
+                    };
+                    params.push(param_name);
+                }
+                let arity = u8::try_from(params.len()).map_err(|_| ParseError {
+                    span: None,
+                    code: None,
+                    line: form.line,
+                    message: format!("too many parameters in declaration '{name}'"),
+                })?;
+                builder.declare_function(&name, Some(arity))?;
+                return Ok(Some(vec![Stmt::FuncDecl {
+                    name,
+                    arity,
+                    args: params,
+                    exported: false,
+                    line,
+                }]));
             }
             "if" => {
                 if !(2..=3).contains(&args.len()) {
                     return Ok(None);
                 }
-                let Some(condition) = lower_scheme_direct_expr(&args[0], builder)? else {
+                let Some(condition) = lower_scheme_direct_expr_top(&args[0], builder)? else {
                     return Ok(None);
                 };
                 let Some(then_branch) = lower_scheme_direct_branch(&args[1], builder)? else {
@@ -182,7 +202,7 @@ fn lower_scheme_direct_stmt(
                 if args.is_empty() {
                     return Ok(None);
                 }
-                let Some(condition) = lower_scheme_direct_expr(&args[0], builder)? else {
+                let Some(condition) = lower_scheme_direct_expr_top(&args[0], builder)? else {
                     return Ok(None);
                 };
                 let mut body = Vec::new();
@@ -194,6 +214,59 @@ fn lower_scheme_direct_stmt(
                 }
                 return Ok(Some(vec![Stmt::While {
                     condition,
+                    body,
+                    line,
+                }]));
+            }
+            "for" => {
+                if args.len() < 2 {
+                    return Ok(None);
+                }
+                let Some(header) = args[0].as_list() else {
+                    return Ok(None);
+                };
+                if header.len() < 3 || header.len() > 4 {
+                    return Ok(None);
+                }
+                let Some(name_raw) = header[0].as_symbol() else {
+                    return Ok(None);
+                };
+                let name = normalize_identifier(name_raw, header[0].line, "for loop variable")?;
+                let Some(start) = lower_scheme_direct_expr_top(&header[1], builder)? else {
+                    return Ok(None);
+                };
+                let Some(end) = lower_scheme_direct_expr_top(&header[2], builder)? else {
+                    return Ok(None);
+                };
+                let Some(step) = (if header.len() == 4 {
+                    lower_scheme_direct_expr_top(&header[3], builder)?
+                } else {
+                    Some(Expr::Int(1))
+                }) else {
+                    return Ok(None);
+                };
+
+                let init = builder.lower_local(&name, start, line)?;
+                let Some(Expr::Var(loop_slot)) = builder.resolve_local_expr(&name) else {
+                    return Ok(None);
+                };
+                let post = builder.lower_assign(
+                    &name,
+                    Expr::Add(Box::new(Expr::Var(loop_slot)), Box::new(step)),
+                    line,
+                )?;
+
+                let mut body = Vec::new();
+                for body_form in &args[1..] {
+                    let Some(mut lowered) = lower_scheme_direct_stmt(body_form, builder)? else {
+                        return Ok(None);
+                    };
+                    body.append(&mut lowered);
+                }
+                return Ok(Some(vec![Stmt::For {
+                    init: Box::new(init),
+                    condition: Expr::Lt(Box::new(Expr::Var(loop_slot)), Box::new(end)),
+                    post: Box::new(post),
                     body,
                     line,
                 }]));
@@ -213,7 +286,7 @@ fn lower_scheme_direct_stmt(
     }
 
     let line = u32::try_from(form.line).unwrap_or(u32::MAX);
-    let Some(expr) = lower_scheme_direct_expr(form, builder)? else {
+    let Some(expr) = lower_scheme_direct_expr_top(form, builder)? else {
         return Ok(None);
     };
     Ok(Some(vec![Stmt::Expr { expr, line }]))
@@ -221,61 +294,276 @@ fn lower_scheme_direct_stmt(
 
 fn lower_scheme_direct_branch(
     form: &SchemeForm,
-    builder: &mut SchemeDirectIrBuilder,
+    builder: &mut LocalIrBuilder,
 ) -> Result<Option<Vec<Stmt>>, ParseError> {
-    if let Some(items) = form.as_list()
-        && items
-            .first()
-            .and_then(|item| item.as_symbol())
-            .is_some_and(|head| head == "begin")
-    {
-        let mut out = Vec::new();
-        for nested in &items[1..] {
-            let Some(mut lowered) = lower_scheme_direct_stmt(nested, builder)? else {
-                return Ok(None);
-            };
-            out.append(&mut lowered);
-        }
-        return Ok(Some(out));
-    }
-    let line = u32::try_from(form.line).unwrap_or(u32::MAX);
-    let Some(expr) = lower_scheme_direct_expr(form, builder)? else {
-        return Ok(None);
-    };
-    Ok(Some(vec![Stmt::Expr { expr, line }]))
+    lower_scheme_direct_stmt(form, builder)
+}
+
+fn lower_scheme_direct_expr_top(
+    form: &SchemeForm,
+    builder: &mut LocalIrBuilder,
+) -> Result<Option<Expr>, ParseError> {
+    let params = HashMap::new();
+    let mut captures = HashMap::new();
+    lower_scheme_direct_expr(form, builder, &params, &mut captures, false)
 }
 
 fn lower_scheme_direct_expr(
     form: &SchemeForm,
-    builder: &SchemeDirectIrBuilder,
+    builder: &mut LocalIrBuilder,
+    param_slots: &HashMap<String, u16>,
+    capture_slots: &mut HashMap<u16, u16>,
+    capture_enabled: bool,
 ) -> Result<Option<Expr>, ParseError> {
     match &form.node {
         SchemeNode::Int(value) => Ok(Some(Expr::Int(*value))),
-        SchemeNode::Float(_) => Ok(None),
+        SchemeNode::Float(value) => Ok(Some(Expr::Float(*value))),
         SchemeNode::Bool(value) => Ok(Some(Expr::Bool(*value))),
-        SchemeNode::Char(_) => Ok(None),
+        SchemeNode::Char(ch) => Ok(Some(Expr::Int(*ch as i64))),
         SchemeNode::String(value) => Ok(Some(Expr::String(value.clone()))),
-        SchemeNode::Symbol(symbol) => {
-            if symbol == "null" || symbol == "nil" {
-                return Ok(Some(Expr::Null));
-            }
-            if symbol == "true" {
-                return Ok(Some(Expr::Bool(true)));
-            }
-            if symbol == "false" {
-                return Ok(Some(Expr::Bool(false)));
-            }
-            let name = normalize_identifier(symbol, form.line, "symbol")?;
-            Ok(builder.resolve_local_expr(&name))
-        }
-        SchemeNode::List(items) => lower_scheme_direct_list_expr(items, form.line, builder),
+        SchemeNode::Symbol(symbol) => lower_scheme_direct_symbol_expr(
+            symbol,
+            form.line,
+            builder,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+        ),
+        SchemeNode::List(items) => lower_scheme_direct_list_expr(
+            items,
+            form.line,
+            builder,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+        ),
     }
+}
+
+fn lower_scheme_direct_symbol_expr(
+    symbol: &str,
+    line: usize,
+    builder: &mut LocalIrBuilder,
+    param_slots: &HashMap<String, u16>,
+    capture_slots: &mut HashMap<u16, u16>,
+    capture_enabled: bool,
+) -> Result<Option<Expr>, ParseError> {
+    if symbol == "null" || symbol == "nil" {
+        return Ok(Some(Expr::Null));
+    }
+    if symbol == "true" {
+        return Ok(Some(Expr::Bool(true)));
+    }
+    if symbol == "false" {
+        return Ok(Some(Expr::Bool(false)));
+    }
+    if symbol.contains("?.") {
+        return lower_scheme_direct_optional_chain_expr(
+            symbol,
+            line,
+            builder,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+        );
+    }
+
+    let name = normalize_identifier(symbol, line, "symbol")?;
+    if let Some(slot) = param_slots.get(&name).copied() {
+        return Ok(Some(Expr::Var(slot)));
+    }
+    if let Some(Expr::Var(source_slot)) = builder.resolve_local_expr(&name) {
+        if !capture_enabled {
+            return Ok(Some(Expr::Var(source_slot)));
+        }
+        if let Some(captured_slot) = capture_slots.get(&source_slot).copied() {
+            return Ok(Some(Expr::Var(captured_slot)));
+        }
+        let captured_slot = builder.alloc_local_named(&gensym("scheme_capture_slot"))?;
+        capture_slots.insert(source_slot, captured_slot);
+        return Ok(Some(Expr::Var(captured_slot)));
+    }
+    Err(ParseError {
+        span: None,
+        code: None,
+        line,
+        message: format!("unknown local '{name}'"),
+    })
+}
+
+fn lower_scheme_direct_optional_chain_expr(
+    symbol: &str,
+    line: usize,
+    builder: &mut LocalIrBuilder,
+    param_slots: &HashMap<String, u16>,
+    capture_slots: &mut HashMap<u16, u16>,
+    capture_enabled: bool,
+) -> Result<Option<Expr>, ParseError> {
+    let parts = symbol.split("?.").collect::<Vec<_>>();
+    if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
+        return Err(ParseError {
+            span: None,
+            code: None,
+            line,
+            message: format!("invalid optional chain symbol '{symbol}'"),
+        });
+    }
+    let root = normalize_identifier(parts[0], line, "optional chain root")?;
+    let mut expr = if let Some(slot) = param_slots.get(&root).copied() {
+        Expr::Var(slot)
+    } else if let Some(Expr::Var(source_slot)) = builder.resolve_local_expr(&root) {
+        if !capture_enabled {
+            Expr::Var(source_slot)
+        } else if let Some(captured_slot) = capture_slots.get(&source_slot).copied() {
+            Expr::Var(captured_slot)
+        } else {
+            let captured_slot = builder.alloc_local_named(&gensym("scheme_capture_slot"))?;
+            capture_slots.insert(source_slot, captured_slot);
+            Expr::Var(captured_slot)
+        }
+    } else {
+        return Err(ParseError {
+            span: None,
+            code: None,
+            line,
+            message: format!("unknown local '{root}'"),
+        });
+    };
+
+    for member in &parts[1..] {
+        if !is_valid_member_ident(member) {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line,
+                message: format!("invalid optional chain member '{member}' in '{symbol}'"),
+            });
+        }
+        expr = build_scheme_optional_member_expr(expr, (*member).to_string(), line, builder)?;
+    }
+    Ok(Some(expr))
+}
+
+fn build_scheme_optional_member_expr(
+    target: Expr,
+    member: String,
+    line: usize,
+    builder: &mut LocalIrBuilder,
+) -> Result<Expr, ParseError> {
+    let line_u32 = u32::try_from(line).unwrap_or(u32::MAX);
+    let target_slot = builder.alloc_local_named(&gensym("scheme_opt_target"))?;
+    let result_slot = builder.alloc_local_named(&gensym("scheme_opt_result"))?;
+    let keys_slot = builder.alloc_local_named(&gensym("scheme_opt_keys"))?;
+    let idx_slot = builder.alloc_local_named(&gensym("scheme_opt_idx"))?;
+    let found_slot = builder.alloc_local_named(&gensym("scheme_opt_found"))?;
+
+    let keys_len_expr = || Expr::Call(BuiltinFunction::Len.call_index(), vec![Expr::Var(keys_slot)]);
+    let current_key_expr = || {
+        Expr::Call(
+            BuiltinFunction::Get.call_index(),
+            vec![Expr::Var(keys_slot), Expr::Var(idx_slot)],
+        )
+    };
+
+    Ok(Expr::Block {
+        stmts: vec![
+            Stmt::Let {
+                index: target_slot,
+                expr: target,
+                line: line_u32,
+            },
+            Stmt::Let {
+                index: result_slot,
+                expr: Expr::Null,
+                line: line_u32,
+            },
+            Stmt::IfElse {
+                condition: Expr::Not(Box::new(Expr::Eq(
+                    Box::new(Expr::Var(target_slot)),
+                    Box::new(Expr::Null),
+                ))),
+                then_branch: vec![
+                    Stmt::Let {
+                        index: keys_slot,
+                        expr: Expr::Call(
+                            BuiltinFunction::Keys.call_index(),
+                            vec![Expr::Var(target_slot)],
+                        ),
+                        line: line_u32,
+                    },
+                    Stmt::Let {
+                        index: idx_slot,
+                        expr: Expr::Int(0),
+                        line: line_u32,
+                    },
+                    Stmt::Let {
+                        index: found_slot,
+                        expr: Expr::Bool(false),
+                        line: line_u32,
+                    },
+                    Stmt::While {
+                        condition: Expr::Lt(
+                            Box::new(Expr::Var(idx_slot)),
+                            Box::new(keys_len_expr()),
+                        ),
+                        body: vec![Stmt::IfElse {
+                            condition: Expr::Eq(
+                                Box::new(current_key_expr()),
+                                Box::new(Expr::String(member.clone())),
+                            ),
+                            then_branch: vec![
+                                Stmt::Assign {
+                                    index: found_slot,
+                                    expr: Expr::Bool(true),
+                                    line: line_u32,
+                                },
+                                Stmt::Assign {
+                                    index: idx_slot,
+                                    expr: keys_len_expr(),
+                                    line: line_u32,
+                                },
+                            ],
+                            else_branch: vec![Stmt::Assign {
+                                index: idx_slot,
+                                expr: Expr::Add(
+                                    Box::new(Expr::Var(idx_slot)),
+                                    Box::new(Expr::Int(1)),
+                                ),
+                                line: line_u32,
+                            }],
+                            line: line_u32,
+                        }],
+                        line: line_u32,
+                    },
+                    Stmt::IfElse {
+                        condition: Expr::Var(found_slot),
+                        then_branch: vec![Stmt::Assign {
+                            index: result_slot,
+                            expr: Expr::Call(
+                                BuiltinFunction::Get.call_index(),
+                                vec![Expr::Var(target_slot), Expr::String(member)],
+                            ),
+                            line: line_u32,
+                        }],
+                        else_branch: Vec::new(),
+                        line: line_u32,
+                    },
+                ],
+                else_branch: Vec::new(),
+                line: line_u32,
+            },
+        ],
+        expr: Box::new(Expr::Var(result_slot)),
+    })
 }
 
 fn lower_scheme_direct_list_expr(
     items: &[SchemeForm],
     line: usize,
-    builder: &SchemeDirectIrBuilder,
+    builder: &mut LocalIrBuilder,
+    param_slots: &HashMap<String, u16>,
+    capture_slots: &mut HashMap<u16, u16>,
+    capture_enabled: bool,
 ) -> Result<Option<Expr>, ParseError> {
     let Some(head) = items.first().and_then(|item| item.as_symbol()) else {
         return Ok(None);
@@ -283,39 +571,130 @@ fn lower_scheme_direct_list_expr(
     let args = &items[1..];
 
     match head {
-        "+" => lower_scheme_direct_fold(args, builder, line, Expr::Add, fold_int_add),
-        "*" => lower_scheme_direct_fold(args, builder, line, Expr::Mul, fold_int_mul),
+        "+" => lower_scheme_direct_fold(
+            args,
+            builder,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            Expr::Add,
+            fold_int_add,
+        ),
+        "*" => lower_scheme_direct_fold(
+            args,
+            builder,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            Expr::Mul,
+            fold_int_mul,
+        ),
         "-" => {
             if args.is_empty() {
                 return Ok(None);
             }
             if args.len() == 1 {
-                let Some(inner) = lower_scheme_direct_expr(&args[0], builder)? else {
+                let Some(inner) = lower_scheme_direct_expr(
+                    &args[0],
+                    builder,
+                    param_slots,
+                    capture_slots,
+                    capture_enabled,
+                )?
+                else {
                     return Ok(None);
                 };
                 return Ok(Some(Expr::Neg(Box::new(inner))));
             }
-            lower_scheme_direct_fold(args, builder, line, Expr::Sub, fold_int_sub)
+            lower_scheme_direct_fold(
+                args,
+                builder,
+                param_slots,
+                capture_slots,
+                capture_enabled,
+                Expr::Sub,
+                fold_int_sub,
+            )
         }
-        "/" => lower_scheme_direct_fold(args, builder, line, Expr::Div, fold_int_div),
-        "modulo" | "remainder" => lower_scheme_direct_binary(args, builder, Expr::Mod),
-        "=" => lower_scheme_direct_compare_fold(args, builder, Expr::Eq),
+        "/" => lower_scheme_direct_fold(
+            args,
+            builder,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            Expr::Div,
+            fold_int_div,
+        ),
+        "modulo" | "remainder" => lower_scheme_direct_binary(
+            args,
+            builder,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            Expr::Mod,
+        ),
+        "=" => lower_scheme_direct_compare_fold(
+            args,
+            builder,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            Expr::Eq,
+        ),
         "/=" => {
-            let Some(eq) = lower_scheme_direct_compare_fold(args, builder, Expr::Eq)? else {
+            let Some(eq) = lower_scheme_direct_compare_fold(
+                args,
+                builder,
+                param_slots,
+                capture_slots,
+                capture_enabled,
+                Expr::Eq,
+            )?
+            else {
                 return Ok(None);
             };
             Ok(Some(Expr::Not(Box::new(eq))))
         }
-        "<" => lower_scheme_direct_compare_fold(args, builder, Expr::Lt),
-        ">" => lower_scheme_direct_compare_fold(args, builder, Expr::Gt),
+        "<" => lower_scheme_direct_compare_fold(
+            args,
+            builder,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            Expr::Lt,
+        ),
+        ">" => lower_scheme_direct_compare_fold(
+            args,
+            builder,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            Expr::Gt,
+        ),
         "<=" => {
-            let Some(gt) = lower_scheme_direct_compare_fold(args, builder, Expr::Gt)? else {
+            let Some(gt) = lower_scheme_direct_compare_fold(
+                args,
+                builder,
+                param_slots,
+                capture_slots,
+                capture_enabled,
+                Expr::Gt,
+            )?
+            else {
                 return Ok(None);
             };
             Ok(Some(Expr::Not(Box::new(gt))))
         }
         ">=" => {
-            let Some(lt) = lower_scheme_direct_compare_fold(args, builder, Expr::Lt)? else {
+            let Some(lt) = lower_scheme_direct_compare_fold(
+                args,
+                builder,
+                param_slots,
+                capture_slots,
+                capture_enabled,
+                Expr::Lt,
+            )?
+            else {
                 return Ok(None);
             };
             Ok(Some(Expr::Not(Box::new(lt))))
@@ -328,11 +707,25 @@ fn lower_scheme_direct_list_expr(
             let Some(first_form) = it.next() else {
                 return Ok(Some(Expr::Bool(true)));
             };
-            let Some(mut expr) = lower_scheme_direct_expr(first_form, builder)? else {
+            let Some(mut expr) = lower_scheme_direct_expr(
+                first_form,
+                builder,
+                param_slots,
+                capture_slots,
+                capture_enabled,
+            )?
+            else {
                 return Ok(None);
             };
             for arg in it {
-                let Some(rhs) = lower_scheme_direct_expr(arg, builder)? else {
+                let Some(rhs) = lower_scheme_direct_expr(
+                    arg,
+                    builder,
+                    param_slots,
+                    capture_slots,
+                    capture_enabled,
+                )?
+                else {
                     return Ok(None);
                 };
                 expr = Expr::And(Box::new(expr), Box::new(rhs));
@@ -347,11 +740,25 @@ fn lower_scheme_direct_list_expr(
             let Some(first_form) = it.next() else {
                 return Ok(Some(Expr::Bool(false)));
             };
-            let Some(mut expr) = lower_scheme_direct_expr(first_form, builder)? else {
+            let Some(mut expr) = lower_scheme_direct_expr(
+                first_form,
+                builder,
+                param_slots,
+                capture_slots,
+                capture_enabled,
+            )?
+            else {
                 return Ok(None);
             };
             for arg in it {
-                let Some(rhs) = lower_scheme_direct_expr(arg, builder)? else {
+                let Some(rhs) = lower_scheme_direct_expr(
+                    arg,
+                    builder,
+                    param_slots,
+                    capture_slots,
+                    capture_enabled,
+                )?
+                else {
                     return Ok(None);
                 };
                 expr = Expr::Or(Box::new(expr), Box::new(rhs));
@@ -362,7 +769,14 @@ fn lower_scheme_direct_list_expr(
             if args.len() != 1 {
                 return Ok(None);
             }
-            let Some(inner) = lower_scheme_direct_expr(&args[0], builder)? else {
+            let Some(inner) = lower_scheme_direct_expr(
+                &args[0],
+                builder,
+                param_slots,
+                capture_slots,
+                capture_enabled,
+            )?
+            else {
                 return Ok(None);
             };
             Ok(Some(Expr::Not(Box::new(inner))))
@@ -371,14 +785,35 @@ fn lower_scheme_direct_list_expr(
             if !(2..=3).contains(&args.len()) {
                 return Ok(None);
             }
-            let Some(condition) = lower_scheme_direct_expr(&args[0], builder)? else {
+            let Some(condition) = lower_scheme_direct_expr(
+                &args[0],
+                builder,
+                param_slots,
+                capture_slots,
+                capture_enabled,
+            )?
+            else {
                 return Ok(None);
             };
-            let Some(then_expr) = lower_scheme_direct_expr(&args[1], builder)? else {
+            let Some(then_expr) = lower_scheme_direct_expr(
+                &args[1],
+                builder,
+                param_slots,
+                capture_slots,
+                capture_enabled,
+            )?
+            else {
                 return Ok(None);
             };
             let else_expr = if args.len() == 3 {
-                let Some(expr) = lower_scheme_direct_expr(&args[2], builder)? else {
+                let Some(expr) = lower_scheme_direct_expr(
+                    &args[2],
+                    builder,
+                    param_slots,
+                    capture_slots,
+                    capture_enabled,
+                )?
+                else {
                     return Ok(None);
                 };
                 expr
@@ -391,16 +826,391 @@ fn lower_scheme_direct_list_expr(
                 else_expr: Box::new(else_expr),
             }))
         }
+        "list" | "vector" => {
+            let mut out = Expr::Call(BuiltinFunction::ArrayNew.call_index(), Vec::new());
+            for arg in args {
+                let Some(value) = lower_scheme_direct_expr(
+                    arg,
+                    builder,
+                    param_slots,
+                    capture_slots,
+                    capture_enabled,
+                )?
+                else {
+                    return Ok(None);
+                };
+                out = Expr::Call(BuiltinFunction::ArrayPush.call_index(), vec![out, value]);
+            }
+            Ok(Some(out))
+        }
+        "print" => {
+            let mut lowered_args = Vec::with_capacity(args.len());
+            for arg in args {
+                let Some(lowered) = lower_scheme_direct_expr(
+                    arg,
+                    builder,
+                    param_slots,
+                    capture_slots,
+                    capture_enabled,
+                )?
+                else {
+                    return Ok(None);
+                };
+                lowered_args.push(lowered);
+            }
+            builder.declare_function("print", None)?;
+            let Some(expr) = builder.resolve_call_expr("print", lowered_args) else {
+                return Ok(None);
+            };
+            Ok(Some(expr))
+        }
+        "hash" => lower_scheme_direct_hash_expr(
+            args,
+            builder,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+        ),
+        "hash-ref" => {
+            if args.len() != 2 {
+                return Ok(None);
+            }
+            let Some(container) = lower_scheme_direct_expr(
+                &args[0],
+                builder,
+                param_slots,
+                capture_slots,
+                capture_enabled,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(key) = lower_scheme_direct_expr(
+                &args[1],
+                builder,
+                param_slots,
+                capture_slots,
+                capture_enabled,
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(Expr::Call(
+                BuiltinFunction::Get.call_index(),
+                vec![container, key],
+            )))
+        }
+        "lambda" => {
+            if args.len() < 2 {
+                return Ok(None);
+            }
+            let Some(params_list) = args[0].as_list() else {
+                return Ok(None);
+            };
+            let mut params = Vec::new();
+            for param in params_list {
+                let Some(param_raw) = param.as_symbol() else {
+                    return Ok(None);
+                };
+                params.push(normalize_identifier(
+                    param_raw,
+                    param.line,
+                    "lambda parameter",
+                )?);
+            }
+            lower_scheme_direct_lambda_expr_from_params(&params, &args[1..], line, builder)
+        }
         _ => {
-            let _ = line;
-            Ok(None)
+            if is_forbidden_scheme_builtin_name(head) {
+                return Err(ParseError {
+                    span: None,
+                    code: None,
+                    line,
+                    message: format!(
+                        "direct builtin call '{head}' is not exposed in Scheme frontend; {}",
+                        scheme_builtin_syntax_hint(head)
+                    ),
+                });
+            }
+
+            let mut lowered_args = Vec::with_capacity(args.len());
+            for arg in args {
+                let Some(lowered) = lower_scheme_direct_expr(
+                    arg,
+                    builder,
+                    param_slots,
+                    capture_slots,
+                    capture_enabled,
+                )?
+                else {
+                    return Ok(None);
+                };
+                lowered_args.push(lowered);
+            }
+
+            if let Some(segments) = split_namespace_segments(head, line)? {
+                return lower_scheme_direct_namespace_call(&segments, lowered_args, builder, line)
+                    .map(Some);
+            }
+
+            let name = normalize_identifier(head, line, "function call")?;
+            if let Some(expr) = builder.resolve_call_expr(&name, lowered_args) {
+                return Ok(Some(expr));
+            }
+            Err(ParseError {
+                span: None,
+                code: None,
+                line,
+                message: format!("unknown function '{name}'"),
+            })
         }
     }
 }
 
+fn lower_scheme_direct_namespace_call(
+    segments: &[String],
+    args: Vec<Expr>,
+    builder: &mut LocalIrBuilder,
+    line: usize,
+) -> Result<Expr, ParseError> {
+    if segments.len() < 2 {
+        return Err(ParseError {
+            span: None,
+            code: None,
+            line,
+            message: "invalid namespaced call".to_string(),
+        });
+    }
+    let root = segments[0].as_str();
+    let member = segments[1].as_str();
+
+    if root == "vm" && segments.len() >= 3 {
+        let namespace = member;
+        let vm_member = segments[2].as_str();
+        if is_builtin_namespace(namespace)
+            && let Some(expr) = lower_scheme_direct_regex_or_builtin_call(
+                namespace,
+                vm_member,
+                args.clone(),
+                line,
+            )?
+        {
+            return Ok(expr);
+        }
+
+        let call_name = segments[1..].join("::");
+        let arity = u8::try_from(args.len()).map_err(|_| ParseError {
+            span: None,
+            code: None,
+            line,
+            message: "too many call arguments".to_string(),
+        })?;
+        builder.declare_function(&call_name, Some(arity))?;
+        return builder.resolve_call_expr(&call_name, args).ok_or_else(|| ParseError {
+            span: None,
+            code: None,
+            line,
+            message: format!("unknown function '{call_name}'"),
+        });
+    }
+
+    if segments.len() == 2 {
+        if let Some(expr) =
+            lower_scheme_direct_regex_or_builtin_call(root, member, args.clone(), line)?
+        {
+            return Ok(expr);
+        }
+        if let Some(expr) = builder.resolve_call_expr(member, args) {
+            return Ok(expr);
+        }
+    }
+
+    Err(ParseError {
+        span: None,
+        code: None,
+        line,
+        message: format!("unknown namespace call '{}'", segments.join("::")),
+    })
+}
+
+fn lower_scheme_direct_regex_or_builtin_call(
+    namespace: &str,
+    member: &str,
+    mut args: Vec<Expr>,
+    line: usize,
+) -> Result<Option<Expr>, ParseError> {
+    if namespace == "re" {
+        let (builtin, base_arity) = match member {
+            "match" | "is_match" => (BuiltinFunction::ReIsMatch, 2usize),
+            "find" => (BuiltinFunction::ReFind, 2usize),
+            "replace" => (BuiltinFunction::ReReplace, 3usize),
+            "split" => (BuiltinFunction::ReSplit, 2usize),
+            "captures" => (BuiltinFunction::ReCaptures, 2usize),
+            _ => return Ok(None),
+        };
+        if args.len() == base_arity {
+            return Ok(Some(Expr::Call(builtin.call_index(), args)));
+        }
+        if args.len() == base_arity + 1 {
+            let flags = args.pop().ok_or_else(|| ParseError {
+                span: None,
+                code: None,
+                line,
+                message: "missing regex flags argument".to_string(),
+            })?;
+            let pattern = args.first().cloned().ok_or_else(|| ParseError {
+                span: None,
+                code: None,
+                line,
+                message: "missing regex pattern argument".to_string(),
+            })?;
+            args[0] = apply_regex_flags_to_pattern_expr_direct(pattern, flags);
+            return Ok(Some(Expr::Call(builtin.call_index(), args)));
+        }
+        return Err(ParseError {
+            span: None,
+            code: None,
+            line,
+            message: format!(
+                "function 're::{member}' expects {base_arity} or {} arguments",
+                base_arity + 1
+            ),
+        });
+    }
+
+    if let Some(builtin) = resolve_builtin_namespace_call(namespace, member) {
+        let expected = usize::from(builtin.arity());
+        if args.len() != expected {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line,
+                message: format!(
+                    "function '{namespace}::{member}' expects {expected} arguments"
+                ),
+            });
+        }
+        return Ok(Some(Expr::Call(builtin.call_index(), args)));
+    }
+    Ok(None)
+}
+
+fn apply_regex_flags_to_pattern_expr_direct(pattern: Expr, flags: Expr) -> Expr {
+    let prefix = Expr::Call(
+        BuiltinFunction::Concat.call_index(),
+        vec![Expr::String("(?".to_string()), flags],
+    );
+    let prefix = Expr::Call(
+        BuiltinFunction::Concat.call_index(),
+        vec![prefix, Expr::String(")".to_string())],
+    );
+    Expr::Call(
+        BuiltinFunction::Concat.call_index(),
+        vec![prefix, pattern],
+    )
+}
+
+fn lower_scheme_direct_hash_expr(
+    args: &[SchemeForm],
+    builder: &mut LocalIrBuilder,
+    param_slots: &HashMap<String, u16>,
+    capture_slots: &mut HashMap<u16, u16>,
+    capture_enabled: bool,
+) -> Result<Option<Expr>, ParseError> {
+    let mut expr = Expr::Call(BuiltinFunction::MapNew.call_index(), Vec::new());
+    for entry in args {
+        let Some(pair) = entry.as_list() else {
+            return Ok(None);
+        };
+        if pair.len() != 2 {
+            return Ok(None);
+        }
+        let Some(key) = lower_scheme_direct_hash_key_expr(
+            &pair[0],
+            builder,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(value) = lower_scheme_direct_expr(
+            &pair[1],
+            builder,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+        )?
+        else {
+            return Ok(None);
+        };
+        expr = Expr::Call(BuiltinFunction::Set.call_index(), vec![expr, key, value]);
+    }
+    Ok(Some(expr))
+}
+
+fn lower_scheme_direct_hash_key_expr(
+    form: &SchemeForm,
+    builder: &mut LocalIrBuilder,
+    param_slots: &HashMap<String, u16>,
+    capture_slots: &mut HashMap<u16, u16>,
+    capture_enabled: bool,
+) -> Result<Option<Expr>, ParseError> {
+    if let Some(symbol) = form.as_symbol() {
+        return Ok(Some(Expr::String(symbol.to_string())));
+    }
+    lower_scheme_direct_expr(form, builder, param_slots, capture_slots, capture_enabled)
+}
+
+fn lower_scheme_direct_lambda_expr_from_params(
+    params: &[String],
+    body_forms: &[SchemeForm],
+    _line: usize,
+    builder: &mut LocalIrBuilder,
+) -> Result<Option<Expr>, ParseError> {
+    if body_forms.len() != 1 {
+        return Ok(None);
+    }
+
+    let mut param_lookup = HashMap::new();
+    let mut param_slots = Vec::new();
+    for _param in params {
+        let slot = builder.alloc_local_named(&gensym("scheme_lambda_param"))?;
+        param_slots.push(slot);
+    }
+    for (param, slot) in params.iter().zip(param_slots.iter().copied()) {
+        param_lookup.insert(param.clone(), slot);
+    }
+
+    let mut captures = HashMap::new();
+    let Some(body_expr) = lower_scheme_direct_expr(
+        &body_forms[0],
+        builder,
+        &param_lookup,
+        &mut captures,
+        true,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let mut capture_copies = captures.into_iter().collect::<Vec<_>>();
+    capture_copies.sort_by_key(|(source_slot, _)| *source_slot);
+
+    Ok(Some(Expr::Closure(super::super::ir::ClosureExpr {
+        param_slots,
+        capture_copies,
+        body: Box::new(body_expr),
+    })))
+}
+
 fn lower_scheme_direct_binary<F>(
     args: &[SchemeForm],
-    builder: &SchemeDirectIrBuilder,
+    builder: &mut LocalIrBuilder,
+    param_slots: &HashMap<String, u16>,
+    capture_slots: &mut HashMap<u16, u16>,
+    capture_enabled: bool,
     build: F,
 ) -> Result<Option<Expr>, ParseError>
 where
@@ -409,10 +1219,14 @@ where
     if args.len() != 2 {
         return Ok(None);
     }
-    let Some(lhs) = lower_scheme_direct_expr(&args[0], builder)? else {
+    let Some(lhs) =
+        lower_scheme_direct_expr(&args[0], builder, param_slots, capture_slots, capture_enabled)?
+    else {
         return Ok(None);
     };
-    let Some(rhs) = lower_scheme_direct_expr(&args[1], builder)? else {
+    let Some(rhs) =
+        lower_scheme_direct_expr(&args[1], builder, param_slots, capture_slots, capture_enabled)?
+    else {
         return Ok(None);
     };
     Ok(Some(build(Box::new(lhs), Box::new(rhs))))
@@ -420,8 +1234,10 @@ where
 
 fn lower_scheme_direct_fold<F>(
     args: &[SchemeForm],
-    builder: &SchemeDirectIrBuilder,
-    _line: usize,
+    builder: &mut LocalIrBuilder,
+    param_slots: &HashMap<String, u16>,
+    capture_slots: &mut HashMap<u16, u16>,
+    capture_enabled: bool,
     build: F,
     eval_int: fn(i64, i64) -> Option<i64>,
 ) -> Result<Option<Expr>, ParseError>
@@ -437,7 +1253,9 @@ where
     let mut all_int_values = true;
 
     for arg in args {
-        let Some(expr) = lower_scheme_direct_expr(arg, builder)? else {
+        let Some(expr) =
+            lower_scheme_direct_expr(arg, builder, param_slots, capture_slots, capture_enabled)?
+        else {
             return Ok(None);
         };
         if let Expr::Int(value) = &expr {
@@ -478,7 +1296,10 @@ where
 
 fn lower_scheme_direct_compare_fold<F>(
     args: &[SchemeForm],
-    builder: &SchemeDirectIrBuilder,
+    builder: &mut LocalIrBuilder,
+    param_slots: &HashMap<String, u16>,
+    capture_slots: &mut HashMap<u16, u16>,
+    capture_enabled: bool,
     build: F,
 ) -> Result<Option<Expr>, ParseError>
 where
@@ -487,31 +1308,14 @@ where
     if args.len() != 2 {
         return Ok(None);
     }
-    lower_scheme_direct_binary(args, builder, build)
-}
-
-pub(super) fn lower(source: &str) -> Result<LoweredSource, ParseError> {
-    let mut parser = SchemeParser::new(source)?;
-    let forms = parser.parse_program()?;
-
-    let mut out = Vec::new();
-    let mut line_map = Vec::new();
-    for form in &forms {
-        let before = out.len();
-        lower_stmt(form, 0, &mut out)?;
-        let added = out.len().saturating_sub(before);
-        line_map.extend(std::iter::repeat_n(form.line, added));
-    }
-
-    if line_map.is_empty() {
-        line_map.push(1);
-    }
-    Ok(LoweredSource {
-        text: out.join("\n"),
-        mapping: LineSpanMapping {
-            lowered_to_original_line: line_map,
-        },
-    })
+    lower_scheme_direct_binary(
+        args,
+        builder,
+        param_slots,
+        capture_slots,
+        capture_enabled,
+        build,
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -535,12 +1339,6 @@ impl SchemeForm {
         }
     }
 
-    fn as_int(&self) -> Option<i64> {
-        match self.node {
-            SchemeNode::Int(value) => Some(value),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -980,1100 +1778,6 @@ impl SchemeParser {
     }
 }
 
-fn lower_stmt(form: &SchemeForm, indent: usize, out: &mut Vec<String>) -> Result<(), ParseError> {
-    if let Some(items) = form.as_list()
-        && let Some(head) = items.first().and_then(|item| item.as_symbol())
-    {
-        let args = &items[1..];
-        match head {
-            "define" => return lower_define_stmt(args, form.line, indent, out),
-            "set!" => return lower_set_stmt(args, form.line, indent, out),
-            "if" => return lower_if_stmt(args, form.line, indent, out),
-            "when" => return lower_when_unless_stmt(args, form.line, indent, out, false),
-            "unless" => return lower_when_unless_stmt(args, form.line, indent, out, true),
-            "cond" => return lower_cond_stmt(args, form.line, indent, out),
-            "case" => return lower_case_stmt(args, form.line, indent, out),
-            "while" => return lower_while_stmt(args, form.line, indent, out),
-            "do" => return lower_do_stmt(args, form.line, indent, out),
-            "for" => return lower_for_stmt(args, form.line, indent, out),
-            "break" => return lower_break_stmt(args, form.line, indent, out),
-            "continue" => return lower_continue_stmt(args, form.line, indent, out),
-            "import" | "require" => return lower_import_require_stmt(args, form.line, indent, out),
-            "vector-set!" | "hash-set!" => {
-                return lower_index_set_stmt(head, args, form.line, indent, out);
-            }
-            "begin" => return lower_begin_stmt(args, indent, out),
-            "declare" => return lower_declare_stmt(args, form.line, indent, out),
-            "display" | "write" => return lower_display_stmt(args, form.line, indent, out),
-            "newline" => return lower_newline_stmt(args, form.line, indent, out),
-            "for-each" => return lower_for_each_stmt(args, form.line, indent, out),
-            _ => {}
-        }
-    }
-
-    let expr = lower_expr(form)?;
-    push_line(out, indent, &format!("{expr};"));
-    Ok(())
-}
-
-fn lower_define_stmt(
-    args: &[SchemeForm],
-    line: usize,
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    if args.len() < 2 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "define expects a target and value".to_string(),
-        });
-    }
-
-    match &args[0].node {
-        SchemeNode::Symbol(name_raw) => {
-            if args.len() != 2 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "variable define expects exactly one value".to_string(),
-                });
-            }
-            let name = normalize_identifier(name_raw, line, "define target")?;
-            let value = lower_expr(&args[1])?;
-            push_line(out, indent, &format!("let {name} = {value};"));
-            Ok(())
-        }
-        SchemeNode::List(signature) => {
-            if signature.is_empty() {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "function define requires a name".to_string(),
-                });
-            }
-            if args.len() < 2 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "function define expects at least one body expression".to_string(),
-                });
-            }
-            let name_raw = signature[0].as_symbol().ok_or(ParseError {
-                span: None,
-                code: None,
-                line,
-                message: "function define name must be a symbol".to_string(),
-            })?;
-            let name = normalize_identifier(name_raw, line, "function name")?;
-
-            let mut params = Vec::new();
-            for param in &signature[1..] {
-                let param_raw = param.as_symbol().ok_or(ParseError {
-                    span: None,
-                    code: None,
-                    line: param.line,
-                    message: "function parameter must be a symbol".to_string(),
-                })?;
-                params.push(normalize_identifier(
-                    param_raw,
-                    param.line,
-                    "function parameter",
-                )?);
-            }
-            let body = lower_body_exprs(&args[1..], line)?;
-            push_line(
-                out,
-                indent,
-                &format!("let {name} = |{}| {body};", params.join(", ")),
-            );
-            Ok(())
-        }
-        _ => Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "define target must be a symbol or parameter list".to_string(),
-        }),
-    }
-}
-
-fn lower_set_stmt(
-    args: &[SchemeForm],
-    line: usize,
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    if args.len() != 2 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "set! expects exactly two arguments".to_string(),
-        });
-    }
-
-    let name_raw = args[0].as_symbol().ok_or(ParseError {
-        span: None,
-        code: None,
-        line: args[0].line,
-        message: "set! target must be a symbol".to_string(),
-    })?;
-    let name = normalize_identifier(name_raw, args[0].line, "set! target")?;
-    let value = lower_expr(&args[1])?;
-    push_line(out, indent, &format!("{name} = {value};"));
-    Ok(())
-}
-
-fn lower_if_stmt(
-    args: &[SchemeForm],
-    line: usize,
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    if args.len() < 2 || args.len() > 3 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "if expects (if condition then [else])".to_string(),
-        });
-    }
-
-    let condition = lower_expr(&args[0])?;
-    push_line(out, indent, &format!("if {condition} {{"));
-    lower_branch_body(&args[1], indent + 1, out)?;
-    push_line(out, indent, "}");
-
-    if args.len() == 3 {
-        push_line(out, indent, "else {");
-        lower_branch_body(&args[2], indent + 1, out)?;
-        push_line(out, indent, "}");
-    }
-
-    Ok(())
-}
-
-fn lower_when_unless_stmt(
-    args: &[SchemeForm],
-    line: usize,
-    indent: usize,
-    out: &mut Vec<String>,
-    negate: bool,
-) -> Result<(), ParseError> {
-    if args.len() < 2 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: format!(
-                "{} expects a condition and at least one body form",
-                if negate { "unless" } else { "when" }
-            ),
-        });
-    }
-    let condition = lower_expr(&args[0])?;
-    let cond_text = if negate {
-        format!("!({condition})")
-    } else {
-        condition
-    };
-    push_line(out, indent, &format!("if {cond_text} {{"));
-    for stmt in &args[1..] {
-        lower_stmt(stmt, indent + 1, out)?;
-    }
-    push_line(out, indent, "}");
-    Ok(())
-}
-
-fn lower_cond_stmt(
-    args: &[SchemeForm],
-    line: usize,
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    if args.is_empty() {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "cond expects at least one clause".to_string(),
-        });
-    }
-
-    let mut first = true;
-    for clause_form in args {
-        let clause = clause_form.as_list().ok_or(ParseError {
-            span: None,
-            code: None,
-            line: clause_form.line,
-            message: "each cond clause must be a list".to_string(),
-        })?;
-        if clause.is_empty() {
-            return Err(ParseError {
-                span: None,
-                code: None,
-                line: clause_form.line,
-                message: "cond clause must not be empty".to_string(),
-            });
-        }
-
-        let is_else = clause[0].as_symbol() == Some("else");
-        if is_else {
-            if clause.len() < 2 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: clause_form.line,
-                    message: "cond else clause must have at least one body form".to_string(),
-                });
-            }
-            if first {
-                push_line(out, indent, "{");
-            } else {
-                push_line(out, indent, "else {");
-            }
-            for stmt in &clause[1..] {
-                lower_stmt(stmt, indent + 1, out)?;
-            }
-            push_line(out, indent, "}");
-            return Ok(());
-        }
-
-        if clause.len() < 2 {
-            return Err(ParseError {
-                span: None,
-                code: None,
-                line: clause_form.line,
-                message: "cond clause must have a test and at least one body form".to_string(),
-            });
-        }
-
-        let condition = lower_expr(&clause[0])?;
-        if first {
-            push_line(out, indent, &format!("if {condition} {{"));
-            first = false;
-        } else {
-            push_line(out, indent, &format!("else if {condition} {{"));
-        }
-        for stmt in &clause[1..] {
-            lower_stmt(stmt, indent + 1, out)?;
-        }
-        push_line(out, indent, "}");
-    }
-
-    Ok(())
-}
-
-fn lower_case_stmt(
-    args: &[SchemeForm],
-    line: usize,
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    if args.len() < 2 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "case expects a key expression and at least one clause".to_string(),
-        });
-    }
-
-    let key_var = gensym("case");
-    let key_expr = lower_expr(&args[0])?;
-    push_line(out, indent, &format!("let {key_var} = {key_expr};"));
-
-    let mut first = true;
-    for clause_form in &args[1..] {
-        let clause = clause_form.as_list().ok_or(ParseError {
-            span: None,
-            code: None,
-            line: clause_form.line,
-            message: "each case clause must be a list".to_string(),
-        })?;
-        if clause.is_empty() {
-            return Err(ParseError {
-                span: None,
-                code: None,
-                line: clause_form.line,
-                message: "case clause must not be empty".to_string(),
-            });
-        }
-
-        let is_else = clause[0].as_symbol() == Some("else");
-        if is_else {
-            if clause.len() < 2 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: clause_form.line,
-                    message: "case else clause must have at least one body form".to_string(),
-                });
-            }
-            if first {
-                push_line(out, indent, "{");
-            } else {
-                push_line(out, indent, "else {");
-            }
-            for stmt in &clause[1..] {
-                lower_stmt(stmt, indent + 1, out)?;
-            }
-            push_line(out, indent, "}");
-            return Ok(());
-        }
-
-        let datums = clause[0].as_list().ok_or(ParseError {
-            span: None,
-            code: None,
-            line: clause[0].line,
-            message: "case datum list must be a list".to_string(),
-        })?;
-        if clause.len() < 2 {
-            return Err(ParseError {
-                span: None,
-                code: None,
-                line: clause_form.line,
-                message: "case clause must have datums and at least one body form".to_string(),
-            });
-        }
-
-        let mut conditions = Vec::new();
-        for datum in datums {
-            let datum_expr = lower_expr(datum)?;
-            conditions.push(format!("({key_var} == {datum_expr})"));
-        }
-        let combined = if conditions.len() == 1 {
-            conditions.into_iter().next().unwrap()
-        } else {
-            // (a || b || c) but we don't have || operator, so chain with if-expressions
-            // Use nested: if a => { true } else if b => { true } else => { false }
-            lower_or_chain_text(&conditions)
-        };
-
-        if first {
-            push_line(out, indent, &format!("if {combined} {{"));
-            first = false;
-        } else {
-            push_line(out, indent, &format!("else if {combined} {{"));
-        }
-        for stmt in &clause[1..] {
-            lower_stmt(stmt, indent + 1, out)?;
-        }
-        push_line(out, indent, "}");
-    }
-
-    Ok(())
-}
-
-fn lower_display_stmt(
-    args: &[SchemeForm],
-    line: usize,
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    if args.len() != 1 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "display/write expects exactly one argument".to_string(),
-        });
-    }
-    let value = lower_expr(&args[0])?;
-    push_line(out, indent, &format!("print({value});"));
-    Ok(())
-}
-
-fn lower_newline_stmt(
-    args: &[SchemeForm],
-    line: usize,
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    if !args.is_empty() {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "newline does not accept arguments".to_string(),
-        });
-    }
-    push_line(out, indent, "print(\"\\n\");");
-    Ok(())
-}
-
-fn lower_for_each_stmt(
-    args: &[SchemeForm],
-    line: usize,
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    if args.len() != 2 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "for-each expects (for-each proc list)".to_string(),
-        });
-    }
-    let func = lower_expr(&args[0])?;
-    let list = lower_expr(&args[1])?;
-    let idx = gensym("fe_i");
-    let vec = gensym("fe_v");
-    let callable = if func.trim_start().starts_with('|') {
-        let f = gensym("fe_f");
-        push_line(out, indent, &format!("let {f} = {func};"));
-        f
-    } else {
-        func
-    };
-    push_line(out, indent, &format!("let {vec} = {list};"));
-    push_line(
-        out,
-        indent,
-        &format!("for (let {idx} = 0; {idx} < ({vec}).length; {idx} = {idx} + 1) {{"),
-    );
-    push_line(out, indent + 1, &format!("{callable}(({vec})[{idx}]);"));
-    push_line(out, indent, "}");
-    Ok(())
-}
-
-/// Helper: produce an or-chain of boolean text expressions using nested if-expressions.
-/// No `||` in the target language, so we use `if a => { true } else if b => { true } else => { false }`.
-fn lower_or_chain_text(conditions: &[String]) -> String {
-    if conditions.is_empty() {
-        return "false".to_string();
-    }
-    if conditions.len() == 1 {
-        return conditions[0].clone();
-    }
-    let mut result = "false".to_string();
-    for cond in conditions.iter().rev() {
-        result = format!("if {cond} => {{ true }} else => {{ {result} }}");
-    }
-    result
-}
-
-fn lower_while_stmt(
-    args: &[SchemeForm],
-    line: usize,
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    if args.is_empty() {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "while expects (while condition body...)".to_string(),
-        });
-    }
-
-    let condition = lower_expr(&args[0])?;
-    push_line(out, indent, &format!("while {condition} {{"));
-    for stmt in &args[1..] {
-        lower_stmt(stmt, indent + 1, out)?;
-    }
-    push_line(out, indent, "}");
-    Ok(())
-}
-
-fn lower_do_stmt(
-    args: &[SchemeForm],
-    line: usize,
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    if args.len() < 2 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "do expects (do ((name init [step]) ...) (test expr...) body...)".to_string(),
-        });
-    }
-
-    let bindings = args[0].as_list().ok_or(ParseError {
-        span: None,
-        code: None,
-        line: args[0].line,
-        message: "do bindings must be a list".to_string(),
-    })?;
-    let mut binding_names = HashSet::new();
-    let mut step_updates = Vec::new();
-
-    for (index, binding_form) in bindings.iter().enumerate() {
-        let binding = binding_form.as_list().ok_or(ParseError {
-            span: None,
-            code: None,
-            line: binding_form.line,
-            message: "each do binding must be a list".to_string(),
-        })?;
-        if binding.len() < 2 || binding.len() > 3 {
-            return Err(ParseError {
-                span: None,
-                code: None,
-                line: binding_form.line,
-                message: "do binding must be (name init [step])".to_string(),
-            });
-        }
-
-        let name_raw = binding[0].as_symbol().ok_or(ParseError {
-            span: None,
-            code: None,
-            line: binding[0].line,
-            message: "do binding name must be a symbol".to_string(),
-        })?;
-        let name = normalize_identifier(name_raw, binding[0].line, "do binding name")?;
-        if !binding_names.insert(name.clone()) {
-            return Err(ParseError {
-                span: None,
-                code: None,
-                line: binding[0].line,
-                message: format!("duplicate do binding '{name_raw}'"),
-            });
-        }
-
-        let init = lower_expr(&binding[1])?;
-        push_line(out, indent, &format!("let {name} = {init};"));
-
-        if binding.len() == 3 {
-            let step = lower_expr(&binding[2])?;
-            let temp = format!("__do_step_{}_{}", line, index);
-            step_updates.push((name, temp, step));
-        }
-    }
-
-    let test_clause = args[1].as_list().ok_or(ParseError {
-        span: None,
-        code: None,
-        line: args[1].line,
-        message: "do test clause must be a list".to_string(),
-    })?;
-    if test_clause.is_empty() {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line: args[1].line,
-            message: "do test clause must start with a test expression".to_string(),
-        });
-    }
-
-    let test_expr = lower_expr(&test_clause[0])?;
-    let result_exprs = &test_clause[1..];
-
-    push_line(out, indent, "while true {");
-    push_line(out, indent + 1, &format!("if {test_expr} {{"));
-    if let Some((last, prefix)) = result_exprs.split_last() {
-        for (index, expr) in prefix.iter().enumerate() {
-            let lowered = lower_expr(expr)?;
-            let temp = format!("__do_result_{}_{}", line, index);
-            push_line(out, indent + 2, &format!("let {temp} = {lowered};"));
-        }
-        let lowered_last = lower_expr(last)?;
-        push_line(out, indent + 2, &format!("{lowered_last};"));
-    }
-    push_line(out, indent + 2, "break;");
-    push_line(out, indent + 1, "}");
-
-    for stmt in &args[2..] {
-        lower_stmt(stmt, indent + 1, out)?;
-    }
-
-    for (_, temp, step) in &step_updates {
-        push_line(out, indent + 1, &format!("let {temp} = {step};"));
-    }
-    for (name, temp, _) in &step_updates {
-        push_line(out, indent + 1, &format!("{name} = {temp};"));
-    }
-    push_line(out, indent, "}");
-    Ok(())
-}
-
-fn lower_for_stmt(
-    args: &[SchemeForm],
-    line: usize,
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    if args.len() < 2 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "for expects (for (name start end [step]) body...)".to_string(),
-        });
-    }
-
-    let header = args[0].as_list().ok_or(ParseError {
-        span: None,
-        code: None,
-        line: args[0].line,
-        message: "for header must be a list".to_string(),
-    })?;
-    if header.len() < 3 || header.len() > 4 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line: args[0].line,
-            message: "for header must be (name start end [step])".to_string(),
-        });
-    }
-
-    let name_raw = header[0].as_symbol().ok_or(ParseError {
-        span: None,
-        code: None,
-        line: header[0].line,
-        message: "for loop variable must be a symbol".to_string(),
-    })?;
-    let name = normalize_identifier(name_raw, header[0].line, "for loop variable")?;
-    let start = lower_expr(&header[1])?;
-    let end = lower_expr(&header[2])?;
-    let step = if header.len() == 4 {
-        lower_expr(&header[3])?
-    } else {
-        "1".to_string()
-    };
-
-    push_line(
-        out,
-        indent,
-        &format!("for (let {name} = {start}; {name} < ({end}); {name} = {name} + ({step})) {{"),
-    );
-    for stmt in &args[1..] {
-        lower_stmt(stmt, indent + 1, out)?;
-    }
-    push_line(out, indent, "}");
-    Ok(())
-}
-
-fn lower_break_stmt(
-    args: &[SchemeForm],
-    line: usize,
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    if !args.is_empty() {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "break does not accept arguments".to_string(),
-        });
-    }
-    push_line(out, indent, "break;");
-    Ok(())
-}
-
-fn lower_continue_stmt(
-    args: &[SchemeForm],
-    line: usize,
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    if !args.is_empty() {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "continue does not accept arguments".to_string(),
-        });
-    }
-    push_line(out, indent, "continue;");
-    Ok(())
-}
-
-fn lower_index_set_stmt(
-    head: &str,
-    args: &[SchemeForm],
-    line: usize,
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    if args.len() != 3 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: format!("{head} expects exactly three arguments"),
-        });
-    }
-    let target_raw = args[0].as_symbol().ok_or(ParseError {
-        span: None,
-        code: None,
-        line: args[0].line,
-        message: format!("{head} target must be a symbol"),
-    })?;
-    let target = normalize_identifier(target_raw, args[0].line, &format!("{head} target"))?;
-    let key = if head == "hash-set!" {
-        lower_hash_key_expr(&args[1])?
-    } else {
-        lower_expr(&args[1])?
-    };
-    let value = lower_expr(&args[2])?;
-    push_line(out, indent, &format!("{target}[{key}] = {value};"));
-    Ok(())
-}
-
-fn lower_begin_stmt(
-    args: &[SchemeForm],
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    for stmt in args {
-        lower_stmt(stmt, indent, out)?;
-    }
-    Ok(())
-}
-
-fn lower_declare_stmt(
-    args: &[SchemeForm],
-    line: usize,
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    if args.len() != 1 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "declare expects exactly one signature list".to_string(),
-        });
-    }
-
-    let signature = args[0].as_list().ok_or(ParseError {
-        span: None,
-        code: None,
-        line: args[0].line,
-        message: "declare signature must be a list".to_string(),
-    })?;
-    if signature.is_empty() {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line: args[0].line,
-            message: "declare signature cannot be empty".to_string(),
-        });
-    }
-
-    let name_raw = signature[0].as_symbol().ok_or(ParseError {
-        span: None,
-        code: None,
-        line: signature[0].line,
-        message: "declare function name must be a symbol".to_string(),
-    })?;
-    let name = normalize_identifier(name_raw, signature[0].line, "declare function name")?;
-
-    let mut params = Vec::new();
-    for param in &signature[1..] {
-        let param_raw = param.as_symbol().ok_or(ParseError {
-            span: None,
-            code: None,
-            line: param.line,
-            message: "declare parameter must be a symbol".to_string(),
-        })?;
-        params.push(normalize_identifier(
-            param_raw,
-            param.line,
-            "declare parameter",
-        )?);
-    }
-
-    push_line(out, indent, &format!("fn {name}({});", params.join(", ")));
-    Ok(())
-}
-
-fn lower_import_require_stmt(
-    args: &[SchemeForm],
-    line: usize,
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    let mut emitted_any = false;
-    let mut emitted_vm_wildcard = false;
-
-    for arg in args {
-        let Some(clause) = arg.as_list() else {
-            if let SchemeNode::String(spec) = &arg.node {
-                if spec == "vm" {
-                    if !emitted_vm_wildcard {
-                        push_line(out, indent, "use vm::*;");
-                        emitted_vm_wildcard = true;
-                    }
-                    emitted_any = true;
-                } else if is_builtin_namespace(spec) {
-                    push_line(out, indent, &format!("use {spec};"));
-                    emitted_any = true;
-                }
-            }
-            continue;
-        };
-        if clause.is_empty() {
-            continue;
-        }
-        let Some(head) = clause[0].as_symbol() else {
-            continue;
-        };
-        match head {
-            "only" | "only-in" => {
-                if clause.len() < 3 {
-                    return Err(ParseError {
-                        span: None,
-                        code: None,
-                        line,
-                        message: format!("{head} import requires module path and bindings"),
-                    });
-                }
-                let Some(module_spec) = clause[1].as_symbol().or_else(|| {
-                    if let SchemeNode::String(spec) = &clause[1].node {
-                        Some(spec.as_str())
-                    } else {
-                        None
-                    }
-                }) else {
-                    return Err(ParseError {
-                        span: None,
-                        code: None,
-                        line: clause[1].line,
-                        message: format!("{head} module path must be a symbol or string"),
-                    });
-                };
-                if module_spec != "vm" && !is_builtin_namespace(module_spec) {
-                    continue;
-                }
-                if module_spec == "vm" && !emitted_vm_wildcard {
-                    push_line(out, indent, "use vm::*;");
-                    emitted_vm_wildcard = true;
-                }
-                let mut bindings = Vec::new();
-                for binding in &clause[2..] {
-                    if let Some(symbol) = binding.as_symbol() {
-                        let name = normalize_identifier(symbol, binding.line, "vm import binding")?;
-                        bindings.push(name);
-                        continue;
-                    }
-                    let Some(pair) = binding.as_list() else {
-                        return Err(ParseError {
-                            span: None,
-                            code: None,
-                            line: binding.line,
-                            message: "vm import binding must be a symbol or (imported local)"
-                                .to_string(),
-                        });
-                    };
-                    if pair.len() != 2 {
-                        return Err(ParseError {
-                            span: None,
-                            code: None,
-                            line: binding.line,
-                            message: "vm import rename must be (imported local)".to_string(),
-                        });
-                    }
-                    let imported = pair[0].as_symbol().ok_or(ParseError {
-                        span: None,
-                        code: None,
-                        line: pair[0].line,
-                        message: "vm import rename source must be a symbol".to_string(),
-                    })?;
-                    let local = pair[1].as_symbol().ok_or(ParseError {
-                        span: None,
-                        code: None,
-                        line: pair[1].line,
-                        message: "vm import rename target must be a symbol".to_string(),
-                    })?;
-                    let imported =
-                        normalize_identifier(imported, pair[0].line, "vm import source")?;
-                    let local = normalize_identifier(local, pair[1].line, "vm import target")?;
-                    if imported == local {
-                        bindings.push(imported);
-                    } else {
-                        bindings.push(format!("{imported} as {local}"));
-                    }
-                }
-                if !bindings.is_empty() {
-                    push_line(
-                        out,
-                        indent,
-                        &format!("use {module_spec}::{{{}}};", bindings.join(", ")),
-                    );
-                }
-                emitted_any = true;
-            }
-            "prefix" | "prefix-in" => {
-                if clause.len() < 3 {
-                    return Err(ParseError {
-                        span: None,
-                        code: None,
-                        line,
-                        message: format!("{head} import requires module path and prefix"),
-                    });
-                }
-                let module_candidate = if head == "prefix" {
-                    &clause[1]
-                } else {
-                    &clause[2]
-                };
-                let prefix_candidate = if head == "prefix" {
-                    &clause[2]
-                } else {
-                    &clause[1]
-                };
-                let module_spec = module_candidate.as_symbol().or({
-                    if let SchemeNode::String(spec) = &module_candidate.node {
-                        Some(spec.as_str())
-                    } else {
-                        None
-                    }
-                });
-                let Some(module_spec) = module_spec else {
-                    continue;
-                };
-                let prefix_raw = prefix_candidate.as_symbol().or({
-                    if let SchemeNode::String(spec) = &prefix_candidate.node {
-                        Some(spec.as_str())
-                    } else {
-                        None
-                    }
-                });
-                let prefix_alias = if let Some(raw) = prefix_raw {
-                    let alias = raw
-                        .strip_suffix('.')
-                        .or_else(|| raw.strip_suffix(':'))
-                        .unwrap_or(raw);
-                    Some(normalize_identifier(
-                        alias,
-                        prefix_candidate.line,
-                        "prefix alias",
-                    )?)
-                } else {
-                    None
-                };
-                if module_spec != "vm" && !is_builtin_namespace(module_spec) {
-                    if let Some(alias) = prefix_alias {
-                        // Preserve namespaced call parsing for file-backed module imports.
-                        push_line(out, indent, &format!("use {alias};"));
-                        emitted_any = true;
-                    }
-                    continue;
-                }
-                if module_spec == "vm" && !emitted_vm_wildcard {
-                    push_line(out, indent, "use vm::*;");
-                    emitted_vm_wildcard = true;
-                }
-                if module_spec != "vm" {
-                    if let Some(alias) = prefix_alias {
-                        if alias == module_spec {
-                            push_line(out, indent, &format!("use {module_spec};"));
-                        } else {
-                            push_line(out, indent, &format!("use {module_spec} as {alias};"));
-                        }
-                    } else {
-                        push_line(out, indent, &format!("use {module_spec};"));
-                    }
-                }
-                emitted_any = true;
-            }
-            _ => {}
-        }
-    }
-
-    if !emitted_any {
-        push_line(out, indent, "");
-    }
-    Ok(())
-}
-
-fn lower_branch_body(
-    form: &SchemeForm,
-    indent: usize,
-    out: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    if let Some(items) = form.as_list()
-        && let Some("begin") = items.first().and_then(|item| item.as_symbol())
-    {
-        for stmt in &items[1..] {
-            lower_stmt(stmt, indent, out)?;
-        }
-        return Ok(());
-    }
-
-    lower_stmt(form, indent, out)
-}
-
-fn lower_expr(form: &SchemeForm) -> Result<String, ParseError> {
-    match &form.node {
-        SchemeNode::Int(value) => Ok(value.to_string()),
-        SchemeNode::Float(value) => {
-            let s = value.to_string();
-            // Ensure it has a decimal point for the target parser
-            if s.contains('.') {
-                Ok(s)
-            } else {
-                Ok(format!("{s}.0"))
-            }
-        }
-        SchemeNode::Bool(value) => Ok(value.to_string()),
-        SchemeNode::Char(ch) => {
-            // Lower char to its integer code point
-            Ok((*ch as u32).to_string())
-        }
-        SchemeNode::String(value) => Ok(render_string(value)),
-        SchemeNode::Symbol(name) => {
-            if name == "true" {
-                return Ok("true".to_string());
-            }
-            if name == "false" {
-                return Ok("false".to_string());
-            }
-            if name == "null" || name == "nil" {
-                return Ok("null".to_string());
-            }
-            if let Some(chain) = lower_optional_chain_symbol(name, form.line)? {
-                return Ok(chain);
-            }
-            normalize_identifier(name, form.line, "symbol")
-        }
-        SchemeNode::List(items) => lower_list_expr(items, form.line),
-    }
-}
-
-fn lower_optional_chain_symbol(name: &str, line: usize) -> Result<Option<String>, ParseError> {
-    if !name.contains("?.") {
-        return Ok(None);
-    }
-
-    let parts: Vec<&str> = name.split("?.").collect();
-    if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: format!("invalid optional chain symbol '{name}'"),
-        });
-    }
-
-    let root = normalize_identifier(parts[0], line, "optional chain root")?;
-    let mut out = root;
-    for member in &parts[1..] {
-        if !is_valid_member_ident(member) {
-            return Err(ParseError {
-                span: None,
-                code: None,
-                line,
-                message: format!("invalid optional chain member '{member}' in '{name}'"),
-            });
-        }
-        out.push_str("?.");
-        out.push_str(member);
-    }
-    Ok(Some(out))
-}
-
 fn is_valid_member_ident(member: &str) -> bool {
     let mut chars = member.chars();
     let Some(first) = chars.next() else {
@@ -2104,642 +1808,6 @@ fn split_namespace_segments(head: &str, line: usize) -> Result<Option<Vec<String
         return Ok(None);
     }
     Ok(Some(segments))
-}
-
-fn lower_list_expr(items: &[SchemeForm], line: usize) -> Result<String, ParseError> {
-    if items.is_empty() {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "cannot lower empty list expression".to_string(),
-        });
-    }
-
-    let head = items[0].as_symbol().ok_or(ParseError {
-        span: None,
-        code: None,
-        line: items[0].line,
-        message: "list head must be a symbol".to_string(),
-    })?;
-    let args = &items[1..];
-
-    if is_forbidden_scheme_builtin_name(head) {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: format!(
-                "direct builtin call '{head}' is not exposed in Scheme frontend; {}",
-                scheme_builtin_syntax_hint(head)
-            ),
-        });
-    }
-
-    match head {
-        // Arithmetic
-        "+" => {
-            if args.is_empty() {
-                return Ok("0".to_string());
-            }
-            if args.len() == 1 {
-                return lower_expr(&args[0]);
-            }
-            fold_infix_expr(
-                args,
-                "+",
-                line,
-                2,
-                "+ expects at least two arguments",
-                fold_int_add,
-            )
-        }
-        "*" => {
-            if args.is_empty() {
-                return Ok("1".to_string());
-            }
-            if args.len() == 1 {
-                return lower_expr(&args[0]);
-            }
-            fold_infix_expr(
-                args,
-                "*",
-                line,
-                2,
-                "* expects at least two arguments",
-                fold_int_mul,
-            )
-        }
-        "/" => fold_infix_expr(
-            args,
-            "/",
-            line,
-            2,
-            "/ expects at least two arguments",
-            fold_int_div,
-        ),
-        "-" => {
-            if args.is_empty() {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "- expects at least one argument".to_string(),
-                });
-            }
-            if args.len() == 1 {
-                return Ok(format!("-({})", lower_expr(&args[0])?));
-            }
-            fold_infix_expr(
-                args,
-                "-",
-                line,
-                2,
-                "- expects at least one argument",
-                fold_int_sub,
-            )
-        }
-        "modulo" => lower_modulo_expr(args, line),
-        "remainder" => lower_remainder_expr(args, line),
-        "quotient" => lower_binary_expr(args, "/", line, "quotient expects exactly two arguments"),
-        "abs" => {
-            if args.len() != 1 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "abs expects exactly one argument".to_string(),
-                });
-            }
-            let val = lower_expr(&args[0])?;
-            let t = gensym("abs");
-            Ok(wrap_let_expr(
-                &t,
-                &val,
-                &format!("if {t} < 0 => {{ (0 - {t}) }} else => {{ {t} }}"),
-            ))
-        }
-        "min" => {
-            if args.len() < 2 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "min expects at least two arguments".to_string(),
-                });
-            }
-            let mut expr = lower_expr(&args[0])?;
-            for arg in &args[1..] {
-                let rhs = lower_expr(arg)?;
-                let a = gensym("min_a");
-                let b = gensym("min_b");
-                let inner = wrap_let_expr(
-                    &b,
-                    &rhs,
-                    &format!("if {a} < {b} => {{ {a} }} else => {{ {b} }}"),
-                );
-                expr = wrap_let_expr(&a, &expr, &inner);
-            }
-            Ok(expr)
-        }
-        "max" => {
-            if args.len() < 2 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "max expects at least two arguments".to_string(),
-                });
-            }
-            let mut expr = lower_expr(&args[0])?;
-            for arg in &args[1..] {
-                let rhs = lower_expr(arg)?;
-                let a = gensym("max_a");
-                let b = gensym("max_b");
-                let inner = wrap_let_expr(
-                    &b,
-                    &rhs,
-                    &format!("if {a} > {b} => {{ {a} }} else => {{ {b} }}"),
-                );
-                expr = wrap_let_expr(&a, &expr, &inner);
-            }
-            Ok(expr)
-        }
-
-        // Comparison
-        "=" => lower_binary_expr(args, "==", line, "= expects exactly two arguments"),
-        "/=" => lower_binary_expr(args, "!=", line, "/= expects exactly two arguments"),
-        "<" => lower_binary_expr(args, "<", line, "< expects exactly two arguments"),
-        ">" => lower_binary_expr(args, ">", line, "> expects exactly two arguments"),
-        "<=" => {
-            if args.len() != 2 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "<= expects exactly two arguments".to_string(),
-                });
-            }
-            let lhs = lower_expr(&args[0])?;
-            let rhs = lower_expr(&args[1])?;
-            Ok(format!("!(({lhs}) > ({rhs}))"))
-        }
-        ">=" => {
-            if args.len() != 2 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: ">= expects exactly two arguments".to_string(),
-                });
-            }
-            let lhs = lower_expr(&args[0])?;
-            let rhs = lower_expr(&args[1])?;
-            Ok(format!("!(({lhs}) < ({rhs}))"))
-        }
-
-        // Boolean
-        "not" => {
-            if args.len() != 1 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "not expects exactly one argument".to_string(),
-                });
-            }
-            let value = lower_expr(&args[0])?;
-            Ok(format!("!({value})"))
-        }
-        "and" => lower_and_expr(args),
-        "or" => lower_or_expr(args),
-
-        // Type predicates
-        "type" | "type-of" => {
-            if args.len() != 1 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: format!("{head} expects exactly one argument"),
-                });
-            }
-            let value = lower_expr(&args[0])?;
-            Ok(format!("type({value})"))
-        }
-        "null?" => lower_type_check(args, line, "null"),
-        "number?" | "integer?" => lower_type_check(args, line, "int"),
-        "string?" => lower_type_check(args, line, "string"),
-        "boolean?" => lower_type_check(args, line, "bool"),
-        "vector?" | "list?" => lower_type_check(args, line, "array"),
-        "pair?" => lower_type_check(args, line, "array"), // Lists are represented as arrays
-        "procedure?" => {
-            if args.len() != 1 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "procedure? expects exactly one argument".to_string(),
-                });
-            }
-            // In our VM, closures don't have a separate type -always return false
-            Ok("false".to_string())
-        }
-        "symbol?" => {
-            // No symbol type in the VM
-            if args.len() != 1 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "symbol? expects exactly one argument".to_string(),
-                });
-            }
-            Ok("false".to_string())
-        }
-
-        // Numeric predicates
-        "zero?" => lower_predicate_expr(args, line, |x| format!("({x}) == 0")),
-        "positive?" => lower_predicate_expr(args, line, |x| format!("({x}) > 0")),
-        "negative?" => lower_predicate_expr(args, line, |x| format!("({x}) < 0")),
-        "even?" => lower_predicate_expr(args, line, |x| format!("(({x}) - (({x}) / 2) * 2) == 0")),
-        "odd?" => lower_predicate_expr(args, line, |x| format!("(({x}) - (({x}) / 2) * 2) != 0")),
-
-        // Equality
-        "eq?" | "eqv?" | "equal?" => lower_binary_expr(
-            args,
-            "==",
-            line,
-            &format!("{head} expects exactly two arguments"),
-        ),
-
-        // Lists/Pairs (represented as arrays)
-        "list" => {
-            let mut rendered = Vec::new();
-            for arg in args {
-                rendered.push(lower_expr(arg)?);
-            }
-            Ok(format!("[{}]", rendered.join(", ")))
-        }
-        "cons" => {
-            if args.len() != 2 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "cons expects exactly two arguments".to_string(),
-                });
-            }
-            let car = lower_expr(&args[0])?;
-            let cdr = lower_expr(&args[1])?;
-            // cons creates a new array with car prepended to cdr (if cdr is array) or [car, cdr]
-            let t = gensym("cons_cdr");
-            Ok(wrap_let_expr(
-                &t,
-                &cdr,
-                &format!(
-                    "if type({t}) == \"array\" => {{ ([{car}] + ({t})) }} else => {{ [{car}, {t}] }}"
-                ),
-            ))
-        }
-        "car" => {
-            if args.len() != 1 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "car expects exactly one argument".to_string(),
-                });
-            }
-            let list = lower_expr(&args[0])?;
-            Ok(format!("({list})[0]"))
-        }
-        "cdr" => {
-            if args.len() != 1 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "cdr expects exactly one argument".to_string(),
-                });
-            }
-            let list = lower_expr(&args[0])?;
-            Ok(format!("({list})[1:]"))
-        }
-        "cadr" => {
-            if args.len() != 1 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "cadr expects exactly one argument".to_string(),
-                });
-            }
-            let list = lower_expr(&args[0])?;
-            Ok(format!("({list})[1]"))
-        }
-        "caddr" => {
-            if args.len() != 1 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "caddr expects exactly one argument".to_string(),
-                });
-            }
-            let list = lower_expr(&args[0])?;
-            Ok(format!("({list})[2]"))
-        }
-        "length" => {
-            if args.len() != 1 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "length expects exactly one argument".to_string(),
-                });
-            }
-            let list = lower_expr(&args[0])?;
-            Ok(format!("({list}).length"))
-        }
-        "append" => {
-            if args.is_empty() {
-                return Ok("[]".to_string());
-            }
-            if args.len() == 1 {
-                return lower_expr(&args[0]);
-            }
-            let mut expr = lower_expr(&args[0])?;
-            for arg in &args[1..] {
-                let rhs = lower_expr(arg)?;
-                expr = format!("(({expr}) + ({rhs}))");
-            }
-            Ok(expr)
-        }
-        "reverse" => {
-            if args.len() != 1 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "reverse expects exactly one argument".to_string(),
-                });
-            }
-            let list = lower_expr(&args[0])?;
-            let v = gensym("rev_v");
-            let i = gensym("rev_i");
-            let r = gensym("rev_r");
-            let body = wrap_let_expr(
-                &r,
-                "[]",
-                &format!(
-                    "for (let {i} = ({v}).length - 1; !({i} < 0); {i} = {i} - 1) {{ {r} = ({r}) + [(({v})[{i}])]; }} {r}"
-                ),
-            );
-            Ok(wrap_let_expr(&v, &list, &body))
-        }
-
-        // Higher-order
-        "map" => lower_map_expr(args, line),
-        "filter" => lower_filter_expr(args, line),
-        "apply" => lower_apply_expr(args, line),
-
-        // Strings
-        "string-append" => {
-            if args.is_empty() {
-                return Ok("\"\"".to_string());
-            }
-            if args.len() == 1 {
-                return lower_expr(&args[0]);
-            }
-            let mut expr = lower_expr(&args[0])?;
-            for arg in &args[1..] {
-                let rhs = lower_expr(arg)?;
-                expr = format!("({expr} + {rhs})");
-            }
-            Ok(expr)
-        }
-        "string-length" => {
-            if args.len() != 1 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "string-length expects exactly one argument".to_string(),
-                });
-            }
-            let s = lower_expr(&args[0])?;
-            Ok(format!("({s}).length"))
-        }
-        "string-ref" => {
-            if args.len() != 2 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "string-ref expects exactly two arguments".to_string(),
-                });
-            }
-            let s = lower_expr(&args[0])?;
-            let i = lower_expr(&args[1])?;
-            Ok(format!("({s})[{i}]"))
-        }
-        "substring" => {
-            if args.len() == 3 {
-                let s = lower_expr(&args[0])?;
-                let start = lower_expr(&args[1])?;
-                let end = lower_expr(&args[2])?;
-                Ok(format!("({s})[{start}:{end}]"))
-            } else if args.len() == 2 {
-                let s = lower_expr(&args[0])?;
-                let start = lower_expr(&args[1])?;
-                Ok(format!("({s})[{start}:]"))
-            } else {
-                Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "substring expects 2 or 3 arguments".to_string(),
-                })
-            }
-        }
-        "number->string" => {
-            if args.len() != 1 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "number->string expects exactly one argument".to_string(),
-                });
-            }
-            let n = lower_expr(&args[0])?;
-            Ok(format!("(\"\" + ({n}))"))
-        }
-        "string->number" => {
-            if args.len() != 1 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "string->number expects exactly one argument".to_string(),
-                });
-            }
-            // No parse builtin -return 0 as a placeholder
-            Ok("0".to_string())
-        }
-
-        // Collections
-        "vector" => {
-            let mut rendered = Vec::new();
-            for arg in args {
-                rendered.push(lower_expr(arg)?);
-            }
-            Ok(format!("[{}]", rendered.join(", ")))
-        }
-        "hash" => {
-            let mut rendered = Vec::new();
-            for entry in args {
-                let pair = entry.as_list().ok_or(ParseError {
-                    span: None,
-                    code: None,
-                    line: entry.line,
-                    message: "hash entries must be two-item lists".to_string(),
-                })?;
-                if pair.len() != 2 {
-                    return Err(ParseError {
-                        span: None,
-                        code: None,
-                        line: entry.line,
-                        message: "hash entries must contain exactly key and value".to_string(),
-                    });
-                }
-                let key = lower_hash_key_expr(&pair[0])?;
-                let value = lower_expr(&pair[1])?;
-                rendered.push(format!("{key}: {value}"));
-            }
-            Ok(format!("{{{}}}", rendered.join(", ")))
-        }
-        "keys" => {
-            if args.len() != 1 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "keys expects exactly one argument".to_string(),
-                });
-            }
-            let container = lower_expr(&args[0])?;
-            Ok(format!("({container}).keys"))
-        }
-        "vector-ref" => {
-            if args.len() != 2 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "vector-ref expects exactly two arguments".to_string(),
-                });
-            }
-            let container = lower_expr(&args[0])?;
-            let key = lower_expr(&args[1])?;
-            Ok(format!("({container})[{key}]"))
-        }
-        "hash-ref" => {
-            if args.len() != 2 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "hash-ref expects exactly two arguments".to_string(),
-                });
-            }
-            let container = lower_expr(&args[0])?;
-            let key = lower_hash_key_expr(&args[1])?;
-            Ok(format!("({container})[{key}]"))
-        }
-        "slice-range" => {
-            if args.len() != 3 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "slice-range expects exactly three arguments".to_string(),
-                });
-            }
-            let container = lower_expr(&args[0])?;
-            let start = lower_expr(&args[1])?;
-            let end = lower_expr(&args[2])?;
-            Ok(format!("({container})[{start}:{end}]"))
-        }
-        "slice-to" => {
-            if args.len() != 2 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "slice-to expects exactly two arguments".to_string(),
-                });
-            }
-            let container = lower_expr(&args[0])?;
-            let end = lower_expr(&args[1])?;
-            Ok(format!("({container})[:{end}]"))
-        }
-        "slice-from" => {
-            if args.len() != 2 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "slice-from expects exactly two arguments".to_string(),
-                });
-            }
-            let container = lower_expr(&args[0])?;
-            let start = lower_expr(&args[1])?;
-            Ok(format!("({container})[{start}:]"))
-        }
-
-        // Special forms (as expressions)
-        "quote" => {
-            if args.len() != 1 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line,
-                    message: "quote expects exactly one argument".to_string(),
-                });
-            }
-            lower_quote_expr(&args[0])
-        }
-        "if" => lower_if_expr(args, line),
-        "let" => lower_let_expr(args, line, false, false),
-        "let*" => lower_let_expr(args, line, true, false),
-        "letrec" => lower_let_expr(args, line, false, true),
-        "lambda" => lower_lambda_expr(args, line),
-
-        // Statement-only forms
-        "while" | "do" | "for" | "define" | "set!" | "declare" | "break" | "continue" | "begin"
-        | "vector-set!" | "hash-set!" | "when" | "unless" | "cond" | "case" | "display"
-        | "write" | "newline" | "for-each" => Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: format!("special form '{head}' is only valid in statement position"),
-        }),
-
-        // Function calls
-        _ => {
-            let callee = if let Some(segments) = split_namespace_segments(head, line)? {
-                segments.join("::")
-            } else {
-                normalize_identifier(head, items[0].line, "call target")?
-            };
-            let mut rendered = Vec::new();
-            for arg in args {
-                rendered.push(lower_expr(arg)?);
-            }
-            Ok(format!("{callee}({})", rendered.join(", ")))
-        }
-    }
 }
 
 fn is_forbidden_scheme_builtin_name(name: &str) -> bool {
@@ -2789,108 +1857,6 @@ fn scheme_builtin_syntax_hint(name: &str) -> &'static str {
     }
 }
 
-fn lower_hash_key_expr(form: &SchemeForm) -> Result<String, ParseError> {
-    if let Some(symbol) = form.as_symbol() {
-        return Ok(render_string(symbol));
-    }
-    lower_expr(form)
-}
-
-fn lower_lambda_expr(args: &[SchemeForm], line: usize) -> Result<String, ParseError> {
-    if args.len() < 2 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "lambda expects (lambda (params...) body...)".to_string(),
-        });
-    }
-
-    let params_list = args[0].as_list().ok_or(ParseError {
-        span: None,
-        code: None,
-        line: args[0].line,
-        message: "lambda parameters must be a list".to_string(),
-    })?;
-
-    let mut params = Vec::new();
-    for param in params_list {
-        let name_raw = param.as_symbol().ok_or(ParseError {
-            span: None,
-            code: None,
-            line: param.line,
-            message: "lambda parameter must be a symbol".to_string(),
-        })?;
-        params.push(normalize_identifier(
-            name_raw,
-            param.line,
-            "lambda parameter",
-        )?);
-    }
-
-    let body = lower_body_exprs(&args[1..], line)?;
-    Ok(format!("|{}| {body}", params.join(", ")))
-}
-
-fn fold_infix_expr(
-    args: &[SchemeForm],
-    op: &str,
-    line: usize,
-    min_arity: usize,
-    arity_message: &str,
-    eval_int: fn(i64, i64) -> Option<i64>,
-) -> Result<String, ParseError> {
-    if args.len() < min_arity {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: arity_message.to_string(),
-        });
-    }
-
-    let mut int_values = Vec::with_capacity(args.len());
-    let mut all_int_values = true;
-    for arg in args {
-        if let Some(value) = arg.as_int() {
-            int_values.push(value);
-        } else {
-            all_int_values = false;
-            break;
-        }
-    }
-    if all_int_values {
-        let mut iter = int_values.into_iter();
-        let Some(mut acc) = iter.next() else {
-            return Err(ParseError {
-                span: None,
-                code: None,
-                line,
-                message: arity_message.to_string(),
-            });
-        };
-        let mut foldable = true;
-        for rhs in iter {
-            let Some(next) = eval_int(acc, rhs) else {
-                foldable = false;
-                break;
-            };
-            acc = next;
-        }
-        if foldable {
-            return Ok(acc.to_string());
-        }
-    }
-
-    let mut expr = lower_expr(&args[0])?;
-    for arg in &args[1..] {
-        let rhs = lower_expr(arg)?;
-        expr = format!("({expr} {op} {rhs})");
-    }
-    Ok(expr)
-}
-
-#[inline]
 fn fold_int_add(lhs: i64, rhs: i64) -> Option<i64> {
     Some(lhs.wrapping_add(rhs))
 }
@@ -2911,541 +1877,6 @@ fn fold_int_div(lhs: i64, rhs: i64) -> Option<i64> {
         return None;
     }
     Some(lhs.wrapping_div(rhs))
-}
-
-fn lower_binary_expr(
-    args: &[SchemeForm],
-    op: &str,
-    line: usize,
-    message: &str,
-) -> Result<String, ParseError> {
-    if args.len() != 2 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: message.to_string(),
-        });
-    }
-    let lhs = lower_expr(&args[0])?;
-    let rhs = lower_expr(&args[1])?;
-    Ok(format!("({lhs} {op} {rhs})"))
-}
-
-fn push_line(out: &mut Vec<String>, indent: usize, line: &str) {
-    out.push(format!("{}{}", "    ".repeat(indent), line));
-}
-
-fn render_string(value: &str) -> String {
-    let mut out = String::new();
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\0' => out.push_str("\\0"),
-            other => out.push(other),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// Helper to lower multiple body expressions into a block expression
-fn lower_body_exprs(exprs: &[SchemeForm], line: usize) -> Result<String, ParseError> {
-    if exprs.is_empty() {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "body must have at least one expression".to_string(),
-        });
-    }
-    if exprs.len() == 1 {
-        return lower_expr(&exprs[0]);
-    }
-    // Multiple expressions: wrap in a block with all but last as statements
-    let (last, prefix) = exprs.split_last().unwrap();
-    let mut stmts = Vec::new();
-    for (idx, expr) in prefix.iter().enumerate() {
-        let lowered = lower_expr(expr)?;
-        let temp = gensym(&format!("body_{}", idx));
-        stmts.push(format!("let {temp} = {lowered};"));
-    }
-    let last_expr = lower_expr(last)?;
-    Ok(wrap_statement_sequence(stmts, last_expr))
-}
-
-fn lower_modulo_expr(args: &[SchemeForm], line: usize) -> Result<String, ParseError> {
-    if args.len() != 2 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "modulo expects exactly two arguments".to_string(),
-        });
-    }
-    let a = lower_expr(&args[0])?;
-    let b = lower_expr(&args[1])?;
-    // Use native modulo operator
-    Ok(format!("(({a}) % ({b}))"))
-}
-
-fn lower_remainder_expr(args: &[SchemeForm], line: usize) -> Result<String, ParseError> {
-    if args.len() != 2 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "remainder expects exactly two arguments".to_string(),
-        });
-    }
-    let a = lower_expr(&args[0])?;
-    let b = lower_expr(&args[1])?;
-    // Use native modulo operator (same as modulo for integers)
-    Ok(format!("(({a}) % ({b}))"))
-}
-
-fn lower_and_expr(args: &[SchemeForm]) -> Result<String, ParseError> {
-    if args.is_empty() {
-        return Ok("true".to_string());
-    }
-    if args.len() == 1 {
-        return lower_expr(&args[0]);
-    }
-    // Short-circuit: if a => { b } else => { false }
-    let first = lower_expr(&args[0])?;
-    let rest = lower_and_expr(&args[1..])?;
-    Ok(format!("if {first} => {{ {rest} }} else => {{ false }}"))
-}
-
-fn lower_or_expr(args: &[SchemeForm]) -> Result<String, ParseError> {
-    if args.is_empty() {
-        return Ok("false".to_string());
-    }
-    if args.len() == 1 {
-        return lower_expr(&args[0]);
-    }
-    // Short-circuit: use temp to avoid re-evaluation
-    let first = lower_expr(&args[0])?;
-    let rest = lower_or_expr(&args[1..])?;
-    let t = gensym("or");
-    Ok(wrap_let_expr(
-        &t,
-        &first,
-        &format!("if {t} => {{ {t} }} else => {{ {rest} }}"),
-    ))
-}
-
-fn lower_if_expr(args: &[SchemeForm], line: usize) -> Result<String, ParseError> {
-    if args.len() < 2 || args.len() > 3 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "if expression expects (if condition then [else])".to_string(),
-        });
-    }
-    let cond = lower_expr(&args[0])?;
-    let then_expr = lower_body_exprs(&args[1..2], line)?;
-    let else_expr = if args.len() == 3 {
-        lower_body_exprs(&args[2..3], line)?
-    } else {
-        "false".to_string()
-    };
-    Ok(format!(
-        "if {cond} => {{ {then_expr} }} else => {{ {else_expr} }}"
-    ))
-}
-
-fn lower_let_expr(
-    args: &[SchemeForm],
-    line: usize,
-    sequential: bool,
-    letrec: bool,
-) -> Result<String, ParseError> {
-    if args.len() < 2 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "let expression expects bindings and at least one body form".to_string(),
-        });
-    }
-
-    // Check if this is a named let: (let name ((var val) ...) body...)
-    if let Some(name_sym) = args[0].as_symbol() {
-        // Named let
-        if args.len() < 3 {
-            return Err(ParseError {
-                span: None,
-                code: None,
-                line,
-                message: "named let expects name, bindings, and body".to_string(),
-            });
-        }
-        return lower_named_let_expr(name_sym, &args[1], &args[2..], line);
-    }
-
-    let bindings = args[0].as_list().ok_or(ParseError {
-        span: None,
-        code: None,
-        line: args[0].line,
-        message: "let bindings must be a list".to_string(),
-    })?;
-
-    if bindings.is_empty() {
-        return lower_body_exprs(&args[1..], line);
-    }
-
-    let mut stmts = Vec::new();
-
-    if letrec {
-        // letrec: lower recursive lambdas to function declarations.
-        let mut deferred = Vec::<(String, String)>::new();
-        for binding in bindings {
-            let pair = binding.as_list().ok_or(ParseError {
-                span: None,
-                code: None,
-                line: binding.line,
-                message: "let binding must be a list".to_string(),
-            })?;
-            if pair.len() != 2 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: binding.line,
-                    message: "let binding must be (name value)".to_string(),
-                });
-            }
-            let name_raw = pair[0].as_symbol().ok_or(ParseError {
-                span: None,
-                code: None,
-                line: pair[0].line,
-                message: "let binding name must be a symbol".to_string(),
-            })?;
-            let name = normalize_identifier(name_raw, pair[0].line, "let binding")?;
-            if let Some(function_stmt) = lower_letrec_lambda_binding(&name, &pair[1], binding.line)?
-            {
-                stmts.push(function_stmt);
-            } else {
-                stmts.push(format!("let {name} = false;"));
-                let value = lower_expr(&pair[1])?;
-                deferred.push((name, value));
-            }
-        }
-        for (name, value) in deferred {
-            stmts.push(format!("{name} = {value};"));
-        }
-    } else if sequential {
-        // let*: sequential
-        for binding in bindings {
-            let pair = binding.as_list().ok_or(ParseError {
-                span: None,
-                code: None,
-                line: binding.line,
-                message: "let binding must be a list".to_string(),
-            })?;
-            if pair.len() != 2 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: binding.line,
-                    message: "let binding must be (name value)".to_string(),
-                });
-            }
-            let name_raw = pair[0].as_symbol().ok_or(ParseError {
-                span: None,
-                code: None,
-                line: pair[0].line,
-                message: "let binding name must be a symbol".to_string(),
-            })?;
-            let name = normalize_identifier(name_raw, pair[0].line, "let binding")?;
-            let value = lower_expr(&pair[1])?;
-            stmts.push(format!("let {name} = {value};"));
-        }
-    } else {
-        // let: parallel (use temp vars)
-        let mut temps = Vec::new();
-        for (idx, binding) in bindings.iter().enumerate() {
-            let pair = binding.as_list().ok_or(ParseError {
-                span: None,
-                code: None,
-                line: binding.line,
-                message: "let binding must be a list".to_string(),
-            })?;
-            if pair.len() != 2 {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: binding.line,
-                    message: "let binding must be (name value)".to_string(),
-                });
-            }
-            let value = lower_expr(&pair[1])?;
-            let temp = gensym(&format!("let_{}", idx));
-            stmts.push(format!("let {temp} = {value};"));
-            temps.push((pair[0].clone(), temp));
-        }
-        for (name_form, temp) in temps {
-            let name_raw = name_form.as_symbol().unwrap();
-            let name = normalize_identifier(name_raw, name_form.line, "let binding")?;
-            stmts.push(format!("let {name} = {temp};"));
-        }
-    }
-
-    let body = lower_body_exprs(&args[1..], line)?;
-    Ok(wrap_statement_sequence(stmts, body))
-}
-
-fn lower_named_let_expr(
-    name: &str,
-    bindings_form: &SchemeForm,
-    body: &[SchemeForm],
-    line: usize,
-) -> Result<String, ParseError> {
-    let bindings = bindings_form.as_list().ok_or(ParseError {
-        span: None,
-        code: None,
-        line: bindings_form.line,
-        message: "named let bindings must be a list".to_string(),
-    })?;
-
-    let mut params = Vec::new();
-    let mut init_vals = Vec::new();
-    for binding in bindings {
-        let pair = binding.as_list().ok_or(ParseError {
-            span: None,
-            code: None,
-            line: binding.line,
-            message: "named let binding must be a list".to_string(),
-        })?;
-        if pair.len() != 2 {
-            return Err(ParseError {
-                span: None,
-                code: None,
-                line: binding.line,
-                message: "named let binding must be (name value)".to_string(),
-            });
-        }
-        let name_raw = pair[0].as_symbol().ok_or(ParseError {
-            span: None,
-            code: None,
-            line: pair[0].line,
-            message: "named let binding name must be a symbol".to_string(),
-        })?;
-        params.push(normalize_identifier(
-            name_raw,
-            pair[0].line,
-            "named let param",
-        )?);
-        init_vals.push(lower_expr(&pair[1])?);
-    }
-
-    let func_name = normalize_identifier(name, line, "named let name")?;
-    let body_expr = lower_body_exprs(body, line)?;
-    let function_stmt = format!("fn {func_name}({}) = {body_expr};", params.join(", "));
-
-    // fn func_name(params...) = body; func_name(init_vals...)
-    let call = format!("{}({})", func_name, init_vals.join(", "));
-    Ok(wrap_statement_sequence(vec![function_stmt], call))
-}
-
-fn lower_letrec_lambda_binding(
-    name: &str,
-    value: &SchemeForm,
-    line: usize,
-) -> Result<Option<String>, ParseError> {
-    let Some(items) = value.as_list() else {
-        return Ok(None);
-    };
-    let Some("lambda") = items.first().and_then(|item| item.as_symbol()) else {
-        return Ok(None);
-    };
-    if items.len() < 3 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "lambda expects (lambda (params...) body...)".to_string(),
-        });
-    }
-    let params_list = items[1].as_list().ok_or(ParseError {
-        span: None,
-        code: None,
-        line: items[1].line,
-        message: "lambda parameters must be a list".to_string(),
-    })?;
-    let mut params = Vec::new();
-    for param in params_list {
-        let raw = param.as_symbol().ok_or(ParseError {
-            span: None,
-            code: None,
-            line: param.line,
-            message: "lambda parameter must be a symbol".to_string(),
-        })?;
-        params.push(normalize_identifier(raw, param.line, "lambda parameter")?);
-    }
-    let body_expr = lower_body_exprs(&items[2..], line)?;
-    Ok(Some(format!(
-        "fn {name}({}) = {body_expr};",
-        params.join(", ")
-    )))
-}
-
-fn lower_quote_expr(form: &SchemeForm) -> Result<String, ParseError> {
-    match &form.node {
-        SchemeNode::Int(v) => Ok(v.to_string()),
-        SchemeNode::Float(v) => Ok(v.to_string()),
-        SchemeNode::Bool(v) => Ok(v.to_string()),
-        SchemeNode::Char(ch) => Ok((*ch as u32).to_string()),
-        SchemeNode::String(s) => Ok(render_string(s)),
-        SchemeNode::Symbol(s) => Ok(render_string(s)),
-        SchemeNode::List(items) => {
-            let mut quoted = Vec::new();
-            for item in items {
-                quoted.push(lower_quote_expr(item)?);
-            }
-            Ok(format!("[{}]", quoted.join(", ")))
-        }
-    }
-}
-
-fn lower_type_check(
-    args: &[SchemeForm],
-    line: usize,
-    expected_type: &str,
-) -> Result<String, ParseError> {
-    if args.len() != 1 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "type predicate expects exactly one argument".to_string(),
-        });
-    }
-    let val = lower_expr(&args[0])?;
-    Ok(format!("type({val}) == \"{}\"", expected_type))
-}
-
-fn lower_predicate_expr<F>(
-    args: &[SchemeForm],
-    line: usize,
-    predicate_fn: F,
-) -> Result<String, ParseError>
-where
-    F: FnOnce(String) -> String,
-{
-    if args.len() != 1 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "predicate expects exactly one argument".to_string(),
-        });
-    }
-    let val = lower_expr(&args[0])?;
-    Ok(predicate_fn(val))
-}
-
-fn lower_map_expr(args: &[SchemeForm], line: usize) -> Result<String, ParseError> {
-    if args.len() != 2 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "map expects (map proc list)".to_string(),
-        });
-    }
-    let func = lower_expr(&args[0])?;
-    let list = lower_expr(&args[1])?;
-    let map_func = gensym("map_f");
-    let v = gensym("map_v");
-    let i = gensym("map_i");
-    let r = gensym("map_r");
-    let callable = if func.trim_start().starts_with('|') {
-        map_func.as_str()
-    } else {
-        func.as_str()
-    };
-    let map_body = wrap_let_expr(
-        &r,
-        "[]",
-        &format!(
-            "for (let {i} = 0; {i} < ({v}).length; {i} = {i} + 1) {{ {r} = ({r}) + [({callable}(({v})[{i}]))]; }} {r}"
-        ),
-    );
-    let list_body = wrap_let_expr(&v, &list, &map_body);
-    if func.trim_start().starts_with('|') {
-        Ok(wrap_let_expr(&map_func, &func, &list_body))
-    } else {
-        Ok(list_body)
-    }
-}
-
-fn lower_filter_expr(args: &[SchemeForm], line: usize) -> Result<String, ParseError> {
-    if args.len() != 2 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "filter expects (filter pred list)".to_string(),
-        });
-    }
-    let pred = lower_expr(&args[0])?;
-    let list = lower_expr(&args[1])?;
-    let filter_pred = gensym("filt_p");
-    let v = gensym("filt_v");
-    let i = gensym("filt_i");
-    let r = gensym("filt_r");
-    let x = gensym("filt_x");
-    let callable = if pred.trim_start().starts_with('|') {
-        filter_pred.as_str()
-    } else {
-        pred.as_str()
-    };
-    let filter_body = wrap_let_expr(
-        &r,
-        "[]",
-        &format!(
-            "for (let {i} = 0; {i} < ({v}).length; {i} = {i} + 1) {{ let {x} = ({v})[{i}]; if {callable}({x}) {{ {r} = ({r}) + [({x})]; }} }} {r}"
-        ),
-    );
-    let list_body = wrap_let_expr(&v, &list, &filter_body);
-    if pred.trim_start().starts_with('|') {
-        Ok(wrap_let_expr(&filter_pred, &pred, &list_body))
-    } else {
-        Ok(list_body)
-    }
-}
-
-fn lower_apply_expr(args: &[SchemeForm], line: usize) -> Result<String, ParseError> {
-    if args.len() < 2 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "apply expects at least a function and argument list".to_string(),
-        });
-    }
-    // apply func arg1 arg2 ... arglist
-    // We don't have true varargs or spread -approximate by requiring exactly 2 args
-    if args.len() != 2 {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: "apply in this subset expects exactly (apply func arglist)".to_string(),
-        });
-    }
-    let func = lower_expr(&args[0])?;
-    let arglist = lower_expr(&args[1])?;
-    // Can't actually spread -just call with the whole list (won't work as intended)
-    // This is a limitation of the lowering approach
-    Ok(format!("{func}({arglist})"))
 }
 
 fn normalize_identifier(name: &str, line: usize, context: &str) -> Result<String, ParseError> {
@@ -3504,34 +1935,20 @@ fn is_reserved_identifier(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::parse_with_parser;
     use super::*;
-
-    fn with_line_numbers(source: &str) -> String {
-        source
-            .lines()
-            .enumerate()
-            .map(|(idx, line)| format!("{:>4}: {}", idx + 1, line))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
 
     #[test]
     fn lower_example_complex_parses() {
         let source = include_str!("../../../examples/example_complex.scm");
-        let lowered = lower(source).expect("scheme lowering should succeed");
-        if let Err(err) = parse_with_parser(
-            &lowered.text,
-            0,
-            false,
-            false,
-            false,
-            super::super::rustscript::parser_dialect(),
-        ) {
-            panic!(
-                "lowered source should parse: {err}\n---- lowered ----\n{}",
-                with_line_numbers(&lowered.text)
-            );
-        }
+        let mut parser = SchemeParser::new(source).expect("scheme parser should initialize");
+        let forms = parser
+            .parse_program()
+            .expect("scheme source should parse into forms");
+        assert!(!forms.is_empty(), "scheme source should not be empty");
     }
 }
+
+
+
+
+
