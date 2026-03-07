@@ -318,11 +318,11 @@ fn rustscript_literal_and_slice_runtime_cases_work() {
 }
 
 #[test]
-fn rss_print_macro_works_without_decl() {
+fn rss_print_builtin_works_without_decl() {
     let case = RuntimeCase {
-        name: "print macro works without decl",
+        name: "print builtin works without decl",
         source: r#"
-            print!(40 + 2);
+            print(40 + 2);
         "#,
         flavor: SourceFlavor::RustScript,
         expected_stack: vec![Value::Int(42)],
@@ -333,6 +333,96 @@ fn rss_print_macro_works_without_decl() {
         factory: make_print_builtin,
     }];
     run_runtime_case_with_bindings(&case, &bindings);
+}
+
+#[test]
+fn rustscript_println_function_adds_newline() {
+    let case = RuntimeCase {
+        name: "println function adds newline",
+        source: r#"
+            println(40 + 2);
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_stack: vec![Value::String("42\n".to_string())],
+        expected_locals: None,
+    };
+    let bindings = [HostBindingCase {
+        name: "print",
+        factory: make_print_builtin,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
+}
+
+#[test]
+fn rustscript_println_function_supports_basic_rust_style_formatting() {
+    let case = RuntimeCase {
+        name: "println function supports basic rust style formatting",
+        source: r#"
+            let foo = "hello";
+            let bar = 42;
+            println("{} {}!", foo, bar);
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_stack: vec![Value::String("hello 42!\n".to_string())],
+        expected_locals: None,
+    };
+    let bindings = [HostBindingCase {
+        name: "print",
+        factory: make_print_builtin,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
+}
+
+#[test]
+fn rustscript_print_function_supports_rust_style_formatting() {
+    let case = RuntimeCase {
+        name: "print function supports rust style formatting",
+        source: r#"
+            print("hex={:#x} bin={:08b} sci={:.1e}", 42, 5, 1234.0);
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_stack: vec![Value::String("hex=0x2a bin=00000101 sci=1.2e3".to_string())],
+        expected_locals: None,
+    };
+    let bindings = [HostBindingCase {
+        name: "print",
+        factory: make_print_builtin,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
+}
+
+#[test]
+fn rustscript_println_function_supports_rust_style_formatting() {
+    let case = RuntimeCase {
+        name: "println function supports rust style formatting",
+        source: r#"
+            println("{1} {0}", "left", "right");
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_stack: vec![Value::String("right left\n".to_string())],
+        expected_locals: None,
+    };
+    let bindings = [HostBindingCase {
+        name: "print",
+        factory: make_print_builtin,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
+}
+
+#[test]
+fn rustscript_print_rejects_non_literal_format_string() {
+    let case = ParseErrorCase {
+        name: "print rejects non literal format string",
+        source: r#"
+            let fmt = "{}";
+            print(fmt, 1);
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_contains_all: &[
+            "print formatting requires a string literal as the first argument",
+        ],
+    };
+    expect_parse_error_case(&case);
 }
 
 #[test]
@@ -370,7 +460,7 @@ fn closure_captures_outer_value_at_definition_time() {
             let mut base = 7;
             let add = |value| value + base;
             base = 8;
-            print!(add(5));
+            print(add(5));
         "#,
         flavor: SourceFlavor::RustScript,
         expected_stack: vec![Value::Int(12)],

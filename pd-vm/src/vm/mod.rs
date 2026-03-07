@@ -794,7 +794,18 @@ impl Vm {
         loop {
             match self.poll_waiting_host_op(&mut cx) {
                 Poll::Ready(result) => return result,
-                Poll::Pending => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Poll::Pending => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        return Err(VmError::HostError(
+                            "blocking host-op wait is unsupported on wasm32 runtime".to_string(),
+                        ));
+                    }
+                }
             }
         }
     }

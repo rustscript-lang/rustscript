@@ -7,10 +7,17 @@ use crate::builtins::BuiltinFunction;
 use super::{HostOpId, Value, Vm, VmError, VmResult};
 
 mod core;
+#[cfg(not(target_arch = "wasm32"))]
 mod io;
+#[cfg(target_arch = "wasm32")]
+mod io_wasm;
 mod jit;
 mod json;
+pub(crate) mod print;
 mod regex;
+
+#[cfg(target_arch = "wasm32")]
+use io_wasm as io;
 
 pub(in crate::vm) use io::IoState;
 
@@ -81,6 +88,9 @@ pub(super) fn execute_builtin_call(
         BuiltinFunction::JitGetHotLoopThreshold => jit::builtin_jit_get_hot_loop_threshold(vm),
         BuiltinFunction::JitSetMaxTraceLen => jit::builtin_jit_set_max_trace_len(vm, args),
         BuiltinFunction::JitGetMaxTraceLen => jit::builtin_jit_get_max_trace_len(vm),
+        BuiltinFunction::FormatTemplate => {
+            core::builtin_format_template(args).map(BuiltinCallOutcome::Return)
+        }
         BuiltinFunction::ToString => core::builtin_to_string(&args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::TypeOf => core::builtin_type_of(&args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Assert => core::builtin_assert(&args).map(BuiltinCallOutcome::Return),

@@ -49,7 +49,7 @@ let mut io_ok = if true => {
 };
 
 if regex_ok && io_ok && json_score == matched {
-    print!(closure_value);
+    print(closure_value);
 } else {
-    print!(0);
+    print(0);
 }

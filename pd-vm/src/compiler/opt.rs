@@ -330,9 +330,13 @@ fn infer_expr_type_only(expr: &Expr, state: &LocalTypeState) -> BoundType {
                 BuiltinFunction::MapNew => BoundType::Map,
                 BuiltinFunction::Len
                 | BuiltinFunction::Count
+                | BuiltinFunction::FormatTemplate
                 | BuiltinFunction::ToString
                 | BuiltinFunction::TypeOf => {
-                    if builtin == BuiltinFunction::ToString || builtin == BuiltinFunction::TypeOf {
+                    if builtin == BuiltinFunction::ToString
+                        || builtin == BuiltinFunction::TypeOf
+                        || builtin == BuiltinFunction::FormatTemplate
+                    {
                         BoundType::String
                     } else {
                         BoundType::Int

@@ -1162,6 +1162,23 @@ fn resolve_module_path(
         }
         return Ok(path);
     }
+    if options.module_override_source(spec).is_some() {
+        let parent = base_path
+            .parent()
+            .ok_or_else(|| SourcePathError::ImportWithoutParent(base_path.to_path_buf()))?;
+        let mut path = if Path::new(spec).is_absolute() {
+            PathBuf::from(spec)
+        } else {
+            parent.join(spec)
+        };
+        if path.extension().is_none() {
+            path.set_extension("rss");
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("rss") {
+            return Err(SourcePathError::NonRustScriptModule(path));
+        }
+        return Ok(path);
+    }
 
     let parent = base_path
         .parent()
@@ -1262,7 +1279,9 @@ fn host_namespace_root_from_spec(spec: &str) -> Option<String> {
 }
 
 fn is_virtual_host_namespace_spec(spec: &str, options: &CompileSourceFileOptions) -> bool {
-    options.module_override_path(spec).is_none() && host_namespace_root_from_spec(spec).is_some()
+    options.module_override_path(spec).is_none()
+        && options.module_override_source(spec).is_none()
+        && host_namespace_root_from_spec(spec).is_some()
 }
 
 fn is_builtin_host_namespace_spec(spec: &str) -> bool {
@@ -1309,15 +1328,20 @@ fn collect_module_units(
             continue;
         }
 
-        let module_source_raw = match std::fs::read_to_string(&resolved) {
-            Ok(source) => source,
-            Err(err) => {
-                if should_treat_missing_module_as_host_namespace(&spec, options, &err) {
-                    continue;
+        let module_source_raw =
+            if let Some(source) = module_source_override(options, &spec, &resolved) {
+                source.to_string()
+            } else {
+                match std::fs::read_to_string(&resolved) {
+                    Ok(source) => source,
+                    Err(err) => {
+                        if should_treat_missing_module_as_host_namespace(&spec, options, &err) {
+                            continue;
+                        }
+                        return Err(SourcePathError::Io(err));
+                    }
                 }
-                return Err(SourcePathError::Io(err));
-            }
-        };
+            };
         state.visiting.push(key.clone());
         collect_module_units(
             &resolved,
@@ -1353,6 +1377,16 @@ fn collect_module_units(
         state.seen.insert(key);
     }
     Ok(())
+}
+
+fn module_source_override<'a>(
+    options: &'a CompileSourceFileOptions,
+    spec: &str,
+    resolved_path: &Path,
+) -> Option<&'a str> {
+    options.module_override_source(spec).or_else(|| {
+        options.module_override_source(&resolved_path.to_string_lossy().replace('\\', "/"))
+    })
 }
 
 fn build_rustscript_import_prelude(

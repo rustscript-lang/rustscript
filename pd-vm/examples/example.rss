@@ -8,7 +8,7 @@ while i < 3 {
 }
 
 if total != 3 {
-    print!(0);
+    print(0);
 } else {
-    print!(add_one(5));
+    print(add_one(5));
 }

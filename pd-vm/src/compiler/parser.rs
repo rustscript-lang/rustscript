@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use rt_format::{FormatArgument, NoNamedArguments, ParsedFormat, Specifier};
+
 use crate::builtins::{
     BuiltinFunction, builtin_namespace_hint, is_builtin_namespace, namespace_supports_regex_flags,
     resolve_builtin_namespace_call,
@@ -79,6 +81,51 @@ enum NumberLiteral {
     Float(f64),
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ParserFormatArg;
+
+impl FormatArgument for ParserFormatArg {
+    fn supports_format(&self, _specifier: &Specifier) -> bool {
+        true
+    }
+
+    fn fmt_display(&self, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        Ok(())
+    }
+
+    fn fmt_debug(&self, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        Ok(())
+    }
+
+    fn fmt_octal(&self, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        Ok(())
+    }
+
+    fn fmt_lower_hex(&self, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        Ok(())
+    }
+
+    fn fmt_upper_hex(&self, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        Ok(())
+    }
+
+    fn fmt_binary(&self, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        Ok(())
+    }
+
+    fn fmt_lower_exp(&self, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        Ok(())
+    }
+
+    fn fmt_upper_exp(&self, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        Ok(())
+    }
+
+    fn to_usize(&self) -> Result<usize, ()> {
+        Ok(0)
+    }
+}
+
 pub(super) trait ParserDialect {
     fn is_import_keyword(&self, _ident: &str) -> bool {
         false
@@ -125,6 +172,10 @@ pub(super) trait ParserDialect {
     }
 
     fn allow_let_mut_binding(&self) -> bool {
+        false
+    }
+
+    fn allow_macro_calls(&self) -> bool {
         false
     }
 }
@@ -1735,7 +1786,10 @@ impl Parser {
                 return Ok(expr);
             }
 
-            let mut expr = if self.match_kind(&TokenKind::LParen) {
+            let mut expr = if self.dialect.allow_macro_calls() && self.match_kind(&TokenKind::Bang)
+            {
+                self.parse_macro_call(&name)?
+            } else if self.match_kind(&TokenKind::LParen) {
                 let args = self.parse_call_args()?;
                 if self.has_local_binding(&name) {
                     let local = self.get_local(&name)?;
@@ -2479,6 +2533,12 @@ impl Parser {
         args: &[Expr],
     ) -> Result<Option<Expr>, ParseError> {
         match name {
+            "print" if self.dialect.allow_macro_calls() => {
+                Ok(Some(self.lower_print_call(args.to_vec())?))
+            }
+            "println" if self.dialect.allow_macro_calls() => {
+                Ok(Some(self.lower_println_call(args.to_vec())?))
+            }
             "type" | "typeof" => {
                 if args.len() != 1 {
                     return Err(ParseError {
@@ -2498,6 +2558,126 @@ impl Parser {
             )),
             _ => Ok(None),
         }
+    }
+
+    fn parse_macro_call(&mut self, name: &str) -> Result<Expr, ParseError> {
+        self.expect(&TokenKind::LParen, "expected '(' after macro name")?;
+        let _args = self.parse_call_args()?;
+        Err(ParseError {
+            span: None,
+            code: None,
+            line: self.current_line(),
+            message: format!("unknown macro '{name}!'"),
+        })
+    }
+
+    fn lower_print_call(&mut self, args: Vec<Expr>) -> Result<Expr, ParseError> {
+        let rendered = match args.as_slice() {
+            [] => {
+                return Err(ParseError {
+                    span: None,
+                    code: None,
+                    line: self.current_line(),
+                    message: "print expects at least one argument".to_string(),
+                });
+            }
+            [value] => value.clone(),
+            [format_expr, format_args @ ..] => {
+                let format_literal = self.expect_format_literal("print", format_expr)?;
+                self.build_ruststyle_format_expr("print", format_literal, format_args.to_vec())?
+            }
+        };
+        self.build_print_call_expr(rendered)
+    }
+
+    fn lower_println_call(&mut self, args: Vec<Expr>) -> Result<Expr, ParseError> {
+        let rendered = match args.as_slice() {
+            [] => Expr::String("\n".to_string()),
+            [value] => {
+                let value = self.to_string_expr(value.clone())?;
+                self.append_newline_expr(value)
+            }
+            [format_expr, format_args @ ..] => {
+                let format_literal = self.expect_format_literal("println", format_expr)?;
+                let rendered = self.build_ruststyle_format_expr(
+                    "println",
+                    format_literal,
+                    format_args.to_vec(),
+                )?;
+                self.append_newline_expr(rendered)
+            }
+        };
+        self.build_print_call_expr(rendered)
+    }
+
+    fn expect_format_literal<'a>(
+        &self,
+        callee: &str,
+        format_expr: &'a Expr,
+    ) -> Result<&'a str, ParseError> {
+        match format_expr {
+            Expr::String(value) => Ok(value.as_str()),
+            _ => Err(ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: format!(
+                    "{callee} formatting requires a string literal as the first argument"
+                ),
+            }),
+        }
+    }
+
+    fn build_ruststyle_format_expr(
+        &mut self,
+        callee: &str,
+        format_literal: &str,
+        args: Vec<Expr>,
+    ) -> Result<Expr, ParseError> {
+        self.validate_ruststyle_format_template(callee, format_literal, args.len())?;
+        let positional_args = self.build_array_expr(args)?;
+        self.build_builtin_call_expr(
+            BuiltinFunction::FormatTemplate,
+            vec![Expr::String(format_literal.to_string()), positional_args],
+        )
+    }
+
+    fn validate_ruststyle_format_template(
+        &self,
+        callee: &str,
+        format_literal: &str,
+        arg_count: usize,
+    ) -> Result<(), ParseError> {
+        let template_args = vec![ParserFormatArg; arg_count];
+        ParsedFormat::parse(format_literal, template_args.as_slice(), &NoNamedArguments)
+            .map(|_| ())
+            .map_err(|offset| ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: format!("{callee} format string is invalid near byte {offset}"),
+            })
+    }
+
+    fn build_array_expr(&mut self, values: Vec<Expr>) -> Result<Expr, ParseError> {
+        let mut out = self.build_builtin_call_expr(BuiltinFunction::ArrayNew, Vec::new())?;
+        for value in values {
+            out = self.build_builtin_call_expr(BuiltinFunction::ArrayPush, vec![out, value])?;
+        }
+        Ok(out)
+    }
+
+    fn build_print_call_expr(&mut self, argument: Expr) -> Result<Expr, ParseError> {
+        let decl = self.resolve_function_for_call(STDLIB_PRINT_NAME, 1)?;
+        Ok(Expr::Call(decl.index, vec![argument]))
+    }
+
+    fn to_string_expr(&mut self, value: Expr) -> Result<Expr, ParseError> {
+        self.build_builtin_call_expr(BuiltinFunction::ToString, vec![value])
+    }
+
+    fn append_newline_expr(&self, value: Expr) -> Expr {
+        Expr::Add(Box::new(value), Box::new(Expr::String("\n".to_string())))
     }
 
     fn build_vm_host_call_expr(

@@ -285,7 +285,8 @@ impl CompileSourceFileOptions {
         module_source: impl Into<String>,
     ) {
         let key = normalize_import_spec(import_spec.into());
-        self.module_source_overrides.insert(key, module_source.into());
+        self.module_source_overrides
+            .insert(key, module_source.into());
     }
 
     pub fn module_override_path(&self, import_spec: &str) -> Option<&Path> {

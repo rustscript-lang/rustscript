@@ -151,14 +151,15 @@ pub(crate) enum BuiltinFunction {
     JitGetHotLoopThreshold = 30,
     JitSetMaxTraceLen = 31,
     JitGetMaxTraceLen = 32,
-    ToString = 33,
-    TypeOf = 34,
-    Assert = 35,
+    FormatTemplate = 33,
+    ToString = 34,
+    TypeOf = 35,
+    Assert = 36,
 }
 
 pub(crate) const BUILTIN_CALL_BASE: u16 = 0xFFE0;
 /// Number of builtins in the main range (indices 0..32 above BUILTIN_CALL_BASE).
-/// ToString, TypeOf, and Assert live at special indices below BUILTIN_CALL_BASE.
+/// FormatTemplate, ToString, TypeOf, and Assert live at special indices below BUILTIN_CALL_BASE.
 pub(crate) const BUILTIN_CALL_COUNT: u16 = 33;
 
 impl BuiltinFunction {
@@ -201,6 +202,7 @@ impl BuiltinFunction {
             BuiltinFunction::JitGetHotLoopThreshold => "jit_get_hot_loop_threshold",
             BuiltinFunction::JitSetMaxTraceLen => "jit_set_max_trace_len",
             BuiltinFunction::JitGetMaxTraceLen => "jit_get_max_trace_len",
+            BuiltinFunction::FormatTemplate => "__format_template",
             BuiltinFunction::ToString => "__to_string",
             BuiltinFunction::TypeOf => "type_of",
             BuiltinFunction::Assert => "assert",
@@ -242,6 +244,7 @@ impl BuiltinFunction {
             BuiltinFunction::JitGetHotLoopThreshold => 0,
             BuiltinFunction::JitSetMaxTraceLen => 1,
             BuiltinFunction::JitGetMaxTraceLen => 0,
+            BuiltinFunction::FormatTemplate => 2,
             BuiltinFunction::ToString => 1,
             BuiltinFunction::TypeOf => 1,
             BuiltinFunction::Assert => 1,
@@ -250,6 +253,7 @@ impl BuiltinFunction {
 
     pub(crate) fn call_index(self) -> u16 {
         match self {
+            BuiltinFunction::FormatTemplate => BUILTIN_CALL_BASE - 4,
             BuiltinFunction::ToString => BUILTIN_CALL_BASE - 3,
             BuiltinFunction::TypeOf => BUILTIN_CALL_BASE - 2,
             BuiltinFunction::Assert => BUILTIN_CALL_BASE - 1,
@@ -258,6 +262,9 @@ impl BuiltinFunction {
     }
 
     pub(crate) fn from_call_index(index: u16) -> Option<Self> {
+        if index == BUILTIN_CALL_BASE - 4 {
+            return Some(BuiltinFunction::FormatTemplate);
+        }
         if index == BUILTIN_CALL_BASE - 3 {
             return Some(BuiltinFunction::ToString);
         }
