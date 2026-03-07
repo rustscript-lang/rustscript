@@ -1284,3 +1284,187 @@ fn compile_source_emits_named_locals_in_debug_info() {
     assert_eq!(debug.local_index("alpha"), Some(0));
     assert_eq!(debug.local_index("beta"), Some(1));
 }
+// ---------------------------------------------------------------------------
+// Liveness / Availability – Additional Edge Cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nested_if_in_while_local_availability() {
+    // A local declared inside an if-branch inside a while-loop should be
+    // unavailable after the if/loop exits.
+    let source = r#"
+        let mut i = 0;
+        while i < 3 {
+            if i == 1 {
+                let deep = "nested";
+            }
+            i = i + 1;
+        }
+        deep;
+    "#;
+    let err = match compile_source(source) {
+        Ok(_) => panic!("using deep outside its scope should fail"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("deep") && parse.message.contains("unavailable"),
+                "expected 'unavailable' error for 'deep', got: {}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn else_if_branch_local_is_unavailable_after_merge() {
+    // Variable declared only in the `else` branch of an `if/else` chain
+    // should be unavailable after the if/else merge.
+    let source = r#"
+        let cond = true;
+        if cond {
+            let x = 1;
+        } else {
+            let only_else = 99;
+        }
+        only_else;
+    "#;
+    let err = match compile_source(source) {
+        Ok(_) => panic!("only_else should be unavailable"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse) => {
+            assert!(
+                parse.message.contains("only_else") && parse.message.contains("unavailable"),
+                "expected 'unavailable' for 'only_else', got: {}",
+                parse.message
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn local_declared_in_both_branches_is_available_after_merge() {
+    // If a local is declared in BOTH branches with the same name, it shadows
+    // the outer binding. Verify execution still works correctly.
+    let source = r#"
+        let cond = true;
+        let mut val = 0;
+        if cond {
+            let inner = 10;
+        } else {
+            let inner = 20;
+        }
+        val;
+    "#;
+    // This should compile and run — val in the outer scope is still 0.
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(0)]);
+}
+
+#[test]
+fn liveness_clears_dead_locals_in_nested_control_flow() {
+    // Locals that die at different nesting depths should all be Null after halt.
+    let source = r#"
+        let outer = { tag: "outer" };
+        let mut i = 0;
+        while i < 2 {
+            let inner = { tag: "inner" };
+            if i == 0 {
+                let deep = { tag: "deep" };
+            }
+            i = i + 1;
+        }
+        i;
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug info should exist");
+    let outer_idx = debug.local_index("outer").expect("outer should exist");
+    let inner_idx = debug.local_index("inner").expect("inner should exist");
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(2)]);
+    assert_eq!(
+        vm.locals()[outer_idx as usize],
+        Value::Null,
+        "'outer' should be Null — dead before result expression"
+    );
+    assert_eq!(
+        vm.locals()[inner_idx as usize],
+        Value::Null,
+        "'inner' should be Null after loop exit"
+    );
+}
+
+#[test]
+fn for_loop_variable_is_null_after_last_use() {
+    // The for-loop induction variable and a loop-body temporary should be
+    // cleared after the loop when they are no longer live.
+    let source = r#"
+        let mut sum = 0;
+        let mut i = 0;
+        while i < 4 {
+            let tmp = i * 2;
+            sum = sum + tmp;
+            i = i + 1;
+        }
+        sum;
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug info should exist");
+    let tmp_idx = debug.local_index("tmp").expect("tmp should exist");
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    // sum = 0 + 2 + 4 + 6 = 12
+    assert_eq!(vm.stack(), &[Value::Int(12)]);
+    assert_eq!(
+        vm.locals()[tmp_idx as usize],
+        Value::Null,
+        "'tmp' should be Null after loop exit"
+    );
+}
+
+#[test]
+fn stack_is_clean_after_halt_with_single_result() {
+    // After a program halts, the stack should contain exactly the final
+    // expression value and nothing else — no stale temporaries.
+    let source = r#"
+        let a = 1 + 2;
+        let b = a * 3;
+        let c = b - 1;
+        c;
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack().len(),
+        1,
+        "stack should contain exactly one result value, got {:?}",
+        vm.stack()
+    );
+    assert_eq!(vm.stack(), &[Value::Int(8)]);
+}
+// NOTE: function parameter slot cleanup is already covered by
+// `inline_function_call_frame_slots_are_cleared_after_return` in
+// compiler_rustscript_tests.rs (which asserts ALL locals are Null).

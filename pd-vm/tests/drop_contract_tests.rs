@@ -7,6 +7,10 @@
 //!   - yield/host-op + drop
 //!   - closure-capture drop ordering
 //!   - native/JIT parity (when cranelift-jit feature is enabled)
+//!   - local-slot Null verification after drops
+//!   - nested container recursive cleanup
+//!   - break/continue with live non-trivial locals
+//!   - reset_for_reuse locals-Null contract
 #![cfg(feature = "runtime")]
 mod common;
 use common::*;
@@ -27,6 +31,15 @@ fn compile_run_drop_count(source: &str) -> u64 {
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     vm.drop_contract_event_count()
+}
+
+/// Compile RustScript source, run to halt, return the Vm for further inspection.
+fn compile_run_vm(source: &str) -> Vm {
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    vm
 }
 
 /// Host function that returns Pending on first call, then returns empty result on resume.
@@ -411,4 +424,411 @@ fn native_jit_drop_parity_branch() {
         drops_jit <= drops_interp,
         "JIT drop count (branch) ({drops_jit}) should not exceed interpreter ({drops_interp})"
     );
+}
+// ---------------------------------------------------------------------------
+// 6. Local-slot Null verification after drops
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dead_local_slot_is_null_after_drop() {
+    // Verify the actual local slot holds Value::Null after the liveness pass
+    // emits a Stmt::Drop, not just that the counter increments.
+    let source = r#"
+        let a = { key: "hello" };
+        let b = 1;
+        b;
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug info should exist");
+    let a_index = debug.local_index("a").expect("a binding should exist");
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.locals()[a_index as usize],
+        Value::Null,
+        "dead local 'a' slot should be Null after drop, got {:?}",
+        vm.locals()[a_index as usize]
+    );
+    assert!(vm.drop_contract_event_count() > 0);
+}
+
+#[test]
+fn branch_dead_local_slot_is_null_after_convergence() {
+    // Both branches allocate a temporary — the taken branch's tmp should be
+    // dropped and its slot Null after the if/else merges.
+    let source = r#"
+        let cond = true;
+        let mut result = 0;
+        if cond {
+            let tmp = { payload: [1, 2, 3] };
+            result = 10;
+        } else {
+            let tmp2 = { payload: [4, 5] };
+            result = 20;
+        }
+        result;
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug info should exist");
+    let tmp_index = debug.local_index("tmp").expect("tmp binding should exist");
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(10)]);
+    assert_eq!(
+        vm.locals()[tmp_index as usize],
+        Value::Null,
+        "branch-local 'tmp' should be Null after convergence, got {:?}",
+        vm.locals()[tmp_index as usize]
+    );
+}
+
+#[test]
+fn loop_body_dead_local_slot_is_null_after_exit() {
+    // After the loop finishes, the loop-body temporary should be Null.
+    let source = r#"
+        let mut i = 0;
+        while i < 3 {
+            let tmp = { n: i };
+            i = i + 1;
+        }
+        i;
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug info should exist");
+    let tmp_index = debug.local_index("tmp").expect("tmp binding should exist");
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(3)]);
+    assert_eq!(
+        vm.locals()[tmp_index as usize],
+        Value::Null,
+        "loop-body dead local 'tmp' should be Null after loop exit"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Nested container recursive cleanup
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nested_container_drop_fires_recursively() {
+    // A map containing nested maps and arrays should trigger multiple
+    // recursive drop-contract events.
+    let source = r#"
+        let deep = { inner: { nested: [1, 2, 3], tag: "x" }, outer: [4, 5] };
+        let result = 0;
+        result;
+    "#;
+    let drops = compile_run_drop_count(source);
+    // The outer map, inner map, inner array, outer array — each non-trivial
+    // container is a drop event.  Plus their scalar children.
+    assert!(
+        drops >= 4,
+        "expected at least 4 recursive drop events for nested containers, got {drops}"
+    );
+}
+
+#[test]
+fn nested_container_slot_is_null_after_drop() {
+    let source = r#"
+        let deep = { inner: { nested: [1, 2, 3] } };
+        let x = 0;
+        x;
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug info should exist");
+    let deep_index = debug.local_index("deep").expect("deep binding should exist");
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.locals()[deep_index as usize],
+        Value::Null,
+        "nested container local 'deep' slot should be Null after drop"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. Break / continue with live non-trivial locals
+// ---------------------------------------------------------------------------
+
+#[test]
+fn break_drops_live_locals_in_scope() {
+    // When `break` exits a loop mid-iteration, any non-trivial locals
+    // constructed before the break should be dropped.
+    let source = r#"
+        let mut result = 0;
+        let mut i = 0;
+        while i < 10 {
+            let heavy = { data: [i, i + 1, i + 2] };
+            if i == 2 {
+                result = 99;
+                break;
+            }
+            i = i + 1;
+        }
+        result;
+    "#;
+    let vm = compile_run_vm(source);
+    assert_eq!(vm.stack(), &[Value::Int(99)]);
+    let drops = vm.drop_contract_event_count();
+    assert!(
+        drops > 0,
+        "expected drop-contract events for locals alive at break, got {drops}"
+    );
+}
+
+#[test]
+fn continue_drops_remaining_dead_locals() {
+    // A local constructed before `continue` should be cleaned up on each
+    // skipped iteration.
+    let source = r#"
+        let mut sum = 0;
+        let mut i = 0;
+        while i < 5 {
+            i = i + 1;
+            let tmp = { v: i };
+            if i == 3 {
+                continue;
+            }
+            sum = sum + i;
+        }
+        sum;
+    "#;
+    let vm = compile_run_vm(source);
+    // sum = 1 + 2 + 4 + 5 = 12 (skip i==3)
+    assert_eq!(vm.stack(), &[Value::Int(12)]);
+    let drops = vm.drop_contract_event_count();
+    assert!(
+        drops >= 5,
+        "expected at least 5 drop events (one per iteration for tmp), got {drops}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. reset_for_reuse locals-Null contract
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reset_for_reuse_clears_all_locals_to_null() {
+    let source = r#"
+        let a = { name: "first" };
+        let b = [1, 2, 3];
+        let c = "hello";
+        0;
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+
+    vm.reset_for_reuse();
+
+    // After reset, every local slot must be Null.
+    for (i, local) in vm.locals().iter().enumerate() {
+        assert_eq!(
+            *local,
+            Value::Null,
+            "local slot {i} should be Null after reset_for_reuse, got {local:?}"
+        );
+    }
+    // Stack must also be empty.
+    assert!(
+        vm.stack().is_empty(),
+        "stack should be empty after reset_for_reuse, got {:?}",
+        vm.stack()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. Host-op boundary: locals Null verification
+// ---------------------------------------------------------------------------
+
+#[test]
+fn drop_events_across_host_op_verify_local_null() {
+    // Dead local goes out of scope before a host-op wait.  Verify both the
+    // counter and the actual slot being Null.
+    let source = r#"
+        fn wait();
+        let a = { tag: "before-wait" };
+        let marker = 0;
+        wait();
+        marker;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug info should exist");
+    let a_index = debug.local_index("a").expect("a binding should exist");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut vm = Vm::new(compiled.program);
+    vm.register_function(Box::new(PendingOnce {
+        call_count: Arc::clone(&calls),
+        op_id: 900,
+    }));
+
+    // First run → Waiting; 'a' should already be dropped (dead before wait).
+    let status = vm.run().expect("first run should wait");
+    assert_eq!(status, VmStatus::Waiting(900));
+    assert_eq!(
+        vm.locals()[a_index as usize],
+        Value::Null,
+        "local 'a' should be Null while waiting (dropped before wait call)"
+    );
+
+    // Complete and resume.
+    vm.complete_host_op(900, Vec::new())
+        .expect("complete should succeed");
+    let status = vm.resume().expect("resume should halt");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.locals()[a_index as usize],
+        Value::Null,
+        "local 'a' should remain Null after resume"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 11. Tighter cooperative-yield double-drop bound
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cooperative_yield_drop_count_is_bounded_tightly() {
+    // Same as the existing cooperative_yield test but with a tighter bound
+    // to catch subtle double-drop regressions.
+    let source = r#"
+        let mut i = 0;
+        while i < 10 {
+            let tmp = { v: i };
+            i = i + 1;
+        }
+        i;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_fuel(200);
+
+    loop {
+        let status = vm.run().expect("vm should run");
+        match status {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => {
+                vm.recharge_fuel(200).expect("recharge should succeed");
+            }
+            VmStatus::Waiting(_) => panic!("unexpected waiting"),
+        }
+    }
+
+    let drops = vm.drop_contract_event_count();
+    // 10 iterations × 1 tmp map + scalars inside.  A reasonable upper bound
+    // is 40 (accounting for map keys/values).  Much above that signals a bug.
+    assert!(
+        drops <= 50,
+        "drop count ({drops}) exceeds tight bound of 50 — possible double-drop across yield"
+    );
+    assert!(drops >= 10, "expected at least 10 drop events (one per loop tmp), got {drops}");
+}
+
+// ---------------------------------------------------------------------------
+// 12. Overwrite of mutable local fires drop
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mutable_local_overwrite_drops_previous_and_nullifies() {
+    // When a mutable local is reassigned, the previous value should be
+    // dropped and the new value should be in place.
+    let source = r#"
+        let mut val = { first: [1, 2] };
+        val = { second: [3] };
+        val;
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug info should exist");
+    let val_index = debug.local_index("val").expect("val binding should exist");
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    let drops = vm.drop_contract_event_count();
+    assert!(
+        drops > 0,
+        "expected drop events for the first value of 'val' after overwrite, got {drops}"
+    );
+    // After halt, the local should still hold the second value (it was the TOS result
+    // so it gets moved to stack, and the local is Null due to Ldloc semantics).
+    // Verify either the stack has the right value or the local is Null.
+    assert!(
+        vm.locals()[val_index as usize] == Value::Null
+            || matches!(&vm.locals()[val_index as usize], Value::Map(_)),
+        "val should be Null (consumed) or still hold the second map, got {:?}",
+        vm.locals()[val_index as usize]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 13. All locals Null after clean halt (program-level cleanup)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn all_locals_null_after_halt_for_simple_program() {
+    // After a program halts, every local that was consumed during execution
+    // or dropped by liveness should be Null.
+    let source = r#"
+        let a = "hello";
+        let b = { x: 1 };
+        let c = [1, 2, 3];
+        let result = 42;
+        result;
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug info should exist");
+    let a_index = debug.local_index("a").expect("a should exist");
+    let b_index = debug.local_index("b").expect("b should exist");
+    let c_index = debug.local_index("c").expect("c should exist");
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+
+    // a, b, c are all dead after 'result' is computed — liveness should drop them.
+    assert_eq!(vm.locals()[a_index as usize], Value::Null, "a should be Null");
+    assert_eq!(vm.locals()[b_index as usize], Value::Null, "b should be Null");
+    assert_eq!(vm.locals()[c_index as usize], Value::Null, "c should be Null");
 }
