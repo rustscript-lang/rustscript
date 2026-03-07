@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_imports)]
+#![allow(unused_imports)]
 
 pub use vm::{
     Assembler, BytecodeBuilder, CallOutcome, CompileSourceFileOptions, Compiler, Expr,
@@ -289,4 +289,57 @@ pub fn make_print_builtin() -> Box<dyn HostFunction> {
 
 pub fn make_always_allow() -> Box<dyn HostFunction> {
     Box::new(AlwaysAllow)
+}
+
+#[test]
+fn common_helpers_are_referenced() {
+    let _runtime_case = RuntimeCase {
+        name: "smoke",
+        source: "1;",
+        flavor: SourceFlavor::RustScript,
+        expected_stack: Vec::new(),
+        expected_locals: None,
+    };
+    let _parse_case = ParseErrorCase {
+        name: "smoke",
+        source: "let =",
+        flavor: SourceFlavor::RustScript,
+        expected_contains_all: &[],
+    };
+    let _source_case = SourceErrorCase {
+        name: "smoke",
+        source: "let =",
+        flavor: SourceFlavor::RustScript,
+        expected_kind: SourceErrorKind::Parse,
+        expected_contains_all: &[],
+    };
+    let _host_binding = HostBindingCase {
+        name: "x",
+        factory: make_add_one,
+    };
+    let _host_factory: HostFactory = make_add_one;
+
+    let _ = run_runtime_case as for<'a> fn(&RuntimeCase<'a>);
+    let _ =
+        run_runtime_case_with_bindings as for<'a, 'b> fn(&RuntimeCase<'a>, &[HostBindingCase<'b>]);
+    let _ = run_runtime_cases as for<'a> fn(&[RuntimeCase<'a>]);
+    let _ = compile_error_kind as fn(&vm::CompileError) -> CompileErrorKind;
+    let _ = expect_source_error_case as for<'a> fn(&SourceErrorCase<'a>);
+    let _ = expect_parse_error_case as for<'a> fn(&ParseErrorCase<'a>);
+    let _ = expect_parse_error_contains_any_with_flavor as fn(&str, SourceFlavor, &[&str]);
+    let _ = expect_parse_error_contains_any_case as fn(&str, &str, SourceFlavor, &[&str]);
+    let _ = static_add_one as fn(&mut Vm, &[Value]) -> Result<CallOutcome, vm::VmError>;
+    let _ = make_add_one as fn() -> Box<dyn HostFunction>;
+    let _ = make_echo_string as fn() -> Box<dyn HostFunction>;
+    let _ = make_print_builtin as fn() -> Box<dyn HostFunction>;
+    let _ = make_always_allow as fn() -> Box<dyn HostFunction>;
+
+    let _ = SourceErrorKind::CompileAny;
+    let _ = SourceErrorKind::Compile(CompileErrorKind::Assembler);
+
+    let _ = YieldOnce { yielded: false };
+    let _ = AddOne;
+    let _ = EchoString;
+    let _ = PrintBuiltin;
+    let _ = AlwaysAllow;
 }

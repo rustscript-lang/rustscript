@@ -32,12 +32,6 @@ impl LintReport {
             diagnostics: Vec::new(),
         }
     }
-
-    // used for tests
-    #[allow(dead_code)]
-    pub fn has_errors(&self) -> bool {
-        !self.diagnostics.is_empty()
-    }
 }
 
 pub fn lint_source_with_flavor(source: &str, flavor: SourceFlavor) -> LintReport {

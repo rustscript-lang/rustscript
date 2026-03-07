@@ -271,16 +271,6 @@ impl Vm {
         Ok(trace_ids.len())
     }
 
-    #[cfg_attr(
-        any(
-            all(
-                target_arch = "x86_64",
-                any(target_os = "windows", all(unix, not(target_os = "macos")))
-            ),
-            all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-        ),
-        allow(dead_code)
-    )]
     fn execute_jit_trace(&mut self, trace_id: usize) -> VmResult<ExecOutcome> {
         let Some(trace) = self.jit.trace_clone(trace_id) else {
             return Ok(ExecOutcome::Continue);

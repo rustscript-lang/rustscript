@@ -171,7 +171,7 @@ mod tests {
         for (flavor, source) in cases {
             let report = lint_source_with_flavor(source, flavor);
             assert!(
-                !report.has_errors(),
+                report.diagnostics.is_empty(),
                 "lint should succeed for {flavor:?}, got diagnostics: {:?}",
                 report.diagnostics
             );
@@ -189,7 +189,10 @@ mod tests {
 
         for (flavor, source) in cases {
             let report = lint_source_with_flavor(source, flavor);
-            assert!(report.has_errors(), "lint should fail for {flavor:?}");
+            assert!(
+                !report.diagnostics.is_empty(),
+                "lint should fail for {flavor:?}"
+            );
             assert!(
                 !report.diagnostics[0].message.trim().is_empty(),
                 "expected non-empty diagnostic message for {flavor:?}",

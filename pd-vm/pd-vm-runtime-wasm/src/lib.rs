@@ -245,7 +245,7 @@ mod tests {
         for (flavor, source) in cases {
             let report = lint_source_with_flavor(source, flavor);
             assert!(
-                !report.has_errors(),
+                report.diagnostics.is_empty(),
                 "lint should succeed for {flavor:?}, got diagnostics: {:?}",
                 report.diagnostics
             );
@@ -318,7 +318,7 @@ mod tests {
         "#;
         let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
         assert!(
-            !report.has_errors(),
+            report.diagnostics.is_empty(),
             "expected embedded stdlib import lint to pass, got {:?}",
             report.diagnostics
         );
@@ -361,7 +361,7 @@ mod tests {
         "#;
         let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
         assert!(
-            !report.has_errors(),
+            report.diagnostics.is_empty(),
             "expected json/re builtin lint to pass, got {:?}",
             report.diagnostics
         );
