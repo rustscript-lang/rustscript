@@ -530,7 +530,52 @@ fn emit_inline_ldloc(
     index: u8,
     root_ip: usize,
 ) -> VmResult<()> {
+    let slow = b.create_block();
+    let fast = b.create_block();
     let next = b.create_block();
+
+    let locals_len = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_len);
+    let idx = b.ins().iconst(pointer_type, i64::from(index));
+    let in_bounds = b.ins().icmp(IntCC::UnsignedLessThan, idx, locals_len);
+    b.ins().brif(in_bounds, fast, &[], slow, &[]);
+
+    b.switch_to_block(fast);
+    let stack_len = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_len);
+    let stack_cap = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_cap);
+    let has_capacity = b.ins().icmp(IntCC::UnsignedLessThan, stack_len, stack_cap);
+    let cap_ok = b.create_block();
+    b.ins().brif(has_capacity, cap_ok, &[], slow, &[]);
+
+    b.switch_to_block(cap_ok);
+    let locals_ptr = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_ptr);
+    let src_addr = value_addr(b, pointer_type, locals_ptr, idx, layout.value.size);
+    let src_tag = load_tag_i32(b, layout.value, src_addr);
+    let scalar = is_scalar_tag(b, layout.value, src_tag);
+    let scalar_ok = b.create_block();
+    b.ins().brif(scalar, scalar_ok, &[], slow, &[]);
+
+    b.switch_to_block(scalar_ok);
+    let stack_ptr = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_ptr);
+    let dst_addr = value_addr(b, pointer_type, stack_ptr, stack_len, layout.value.size);
+    copy_value_bytes(b, src_addr, dst_addr, layout.value.size);
+    store_tag(b, layout.value, src_addr, layout.value.null_tag);
+    let one = b.ins().iconst(pointer_type, 1);
+    let new_len = b.ins().iadd(stack_len, one);
+    b.ins()
+        .store(MemFlags::new(), new_len, vm_ptr, offsets.stack_len);
+    b.ins().jump(next, &[]);
+
+    b.switch_to_block(slow);
     emit_helper_step_from_call_tuple(
         b,
         vm_ptr,
@@ -541,7 +586,7 @@ fn emit_inline_ldloc(
     );
 
     b.switch_to_block(next);
-    let _ = (pointer_type, layout, offsets, root_ip);
+    let _ = root_ip;
     Ok(())
 }
 
