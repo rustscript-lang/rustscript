@@ -1070,6 +1070,7 @@ dependencies = [
  "futures-channel",
  "libc",
  "regex",
+ "rt-format",
  "rustyline",
  "serde_json",
  "tokio",
@@ -1078,6 +1079,16 @@ dependencies = [
 
 [[package]]
 name = "pd-vm-lint-wasm"
+version = "0.1.0"
+dependencies = [
+ "pd-edge-abi",
+ "pd-vm",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "pd-vm-runtime-wasm"
 version = "0.1.0"
 dependencies = [
  "pd-vm",
@@ -1393,6 +1404,16 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rt-format"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45087cee619d316fa4bd1675494acff4a5eaa0892fa53bc364bd246f13e452e2"
+dependencies = [
+ "lazy_static",
+ "regex",
 ]
 
 [[package]]
