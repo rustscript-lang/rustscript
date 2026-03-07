@@ -714,13 +714,13 @@ async fn ui_deploy_compiles_graph_code_for_all_flavors() {
             "lua",
             "dp-ui-lua",
             "local vm = require(\"vm\")",
-            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::ACCEPTED,
         ),
         (
             "scheme",
             "dp-ui-scm",
             "(require (prefix-in vm. \"vm\"))",
-            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::ACCEPTED,
         ),
     ];
 
@@ -766,7 +766,7 @@ async fn ui_deploy_compiles_graph_code_for_all_flavors() {
                 .expect("error payload should include message");
             assert!(
                 message.contains("source compile failed"),
-                "lua/scheme deploy should fail during compile, got: {message}"
+                "deploy should fail during compile, got: {message}"
             );
         }
     }
