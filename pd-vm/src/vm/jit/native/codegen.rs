@@ -591,6 +591,99 @@ fn emit_inline_ldloc(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(super) fn emit_inline_ldloc_copy(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    helper_ref: FuncRef,
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    layout: NativeStackLayout,
+    offsets: ResolvedOffsets,
+    index: u8,
+    root_ip: usize,
+) -> VmResult<()> {
+    let slow = b.create_block();
+    let fast = b.create_block();
+    let next = b.create_block();
+
+    let locals_len = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_len);
+    let idx = b.ins().iconst(pointer_type, i64::from(index));
+    let in_bounds = b.ins().icmp(IntCC::UnsignedLessThan, idx, locals_len);
+    b.ins().brif(in_bounds, fast, &[], slow, &[]);
+
+    b.switch_to_block(fast);
+    let stack_len = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_len);
+    let stack_cap = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_cap);
+    let has_capacity = b.ins().icmp(IntCC::UnsignedLessThan, stack_len, stack_cap);
+    let cap_ok = b.create_block();
+    b.ins().brif(has_capacity, cap_ok, &[], slow, &[]);
+
+    b.switch_to_block(cap_ok);
+    let locals_ptr = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_ptr);
+    let src_addr = value_addr(b, pointer_type, locals_ptr, idx, layout.value.size);
+    let src_tag = load_tag_i32(b, layout.value, src_addr);
+    let scalar = is_scalar_tag(b, layout.value, src_tag);
+    let scalar_ok = b.create_block();
+    b.ins().brif(scalar, scalar_ok, &[], slow, &[]);
+
+    b.switch_to_block(scalar_ok);
+    let stack_ptr = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_ptr);
+    let dst_addr = value_addr(b, pointer_type, stack_ptr, stack_len, layout.value.size);
+    copy_value_bytes(b, src_addr, dst_addr, layout.value.size);
+    let one = b.ins().iconst(pointer_type, 1);
+    let new_len = b.ins().iadd(stack_len, one);
+    b.ins()
+        .store(MemFlags::new(), new_len, vm_ptr, offsets.stack_len);
+    b.ins().jump(next, &[]);
+
+    b.switch_to_block(slow);
+    let after_ldloc = b.create_block();
+    emit_helper_step_from_call_tuple(
+        b,
+        vm_ptr,
+        helper_ref,
+        exit_block,
+        after_ldloc,
+        (OP_LDLOC, i64::from(index), 0, 0),
+    );
+
+    b.switch_to_block(after_ldloc);
+    let after_dup = b.create_block();
+    emit_helper_step_from_call_tuple(
+        b,
+        vm_ptr,
+        helper_ref,
+        exit_block,
+        after_dup,
+        (OP_DUP, 0, 0, 0),
+    );
+
+    b.switch_to_block(after_dup);
+    emit_helper_step_from_call_tuple(
+        b,
+        vm_ptr,
+        helper_ref,
+        exit_block,
+        next,
+        (OP_STLOC, i64::from(index), 0, 0),
+    );
+
+    b.switch_to_block(next);
+    let _ = root_ip;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_inline_stloc(
     b: &mut FunctionBuilder,
     vm_ptr: cranelift_codegen::ir::Value,
