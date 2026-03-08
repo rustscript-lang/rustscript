@@ -9,6 +9,9 @@ use crate::builtins::{
     BuiltinFunction, BuiltinNamespace, BuiltinNamespaceMember, BuiltinNamespaceRegistry,
 };
 
+/// Encodes a `Value` into a JSON string.
+/// Note: When encoding a `Value::Map`, this function enforces a strict unique-keys contract.
+/// If the map contains duplicate keys, it will return an error rather than silently omitting data.
 pub(super) fn builtin_json_encode(args: &[Value]) -> VmResult<Vec<Value>> {
     let value = args
         .first()
@@ -19,6 +22,9 @@ pub(super) fn builtin_json_encode(args: &[Value]) -> VmResult<Vec<Value>> {
     Ok(vec![Value::String(text)])
 }
 
+/// Decodes a JSON string into a `Value`.
+/// Note: This function enforces a strict unique-keys contract for JSON objects.
+/// If the JSON string contains duplicate keys, it will return an error instead of letting the last key win.
 pub(super) fn builtin_json_decode(args: &[Value]) -> VmResult<Vec<Value>> {
     let text = arg_string(args, 0, "json_decode input")?;
     let json_value = serde_json::from_str::<DecodedJsonValue>(text)

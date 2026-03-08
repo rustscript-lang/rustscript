@@ -824,6 +824,10 @@ impl Vm {
         self.charge_fuel(fuel)
     }
 
+    pub fn consume_fuel_tick(&mut self) -> VmResult<()> {
+        self.charge_fuel_tick()
+    }
+
     pub fn fuel_checkpoint(&self) -> FuelCheckpoint {
         FuelCheckpoint {
             remaining: self.fuel_enabled.then_some(self.fuel_remaining),

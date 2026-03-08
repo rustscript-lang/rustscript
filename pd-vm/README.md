@@ -197,6 +197,7 @@ cargo run -p pd-vm --bin pd-vm-run -- --run-aot out/example.pat --jit-dump
 - `fuel_check_interval`
 - `get_fuel`
 - `consume_fuel`
+- `consume_fuel_tick`
 - `add_fuel` / `recharge_fuel` (`Store::recharge`)
 - `fuel_checkpoint` / `checkpoint`
 - `restore_fuel` / `restore_checkpoint`

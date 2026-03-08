@@ -395,6 +395,30 @@ fn fuel_checkpoint_and_restore_work() {
 }
 
 #[test]
+fn consume_fuel_tick_advances_checkpointed_metering() {
+    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    vm.set_fuel_check_interval(3)
+        .expect("interval update should succeed");
+    vm.set_fuel(6);
+
+    let checkpoint = vm.fuel_checkpoint();
+    vm.consume_fuel_tick()
+        .expect("first tick should only advance coarse-grained debt");
+    assert_eq!(vm.get_fuel(), Some(5));
+
+    vm.consume_fuel_tick()
+        .expect("second tick should only advance coarse-grained debt");
+    assert_eq!(vm.get_fuel(), Some(4));
+
+    vm.restore_fuel(checkpoint);
+    assert_eq!(vm.get_fuel(), Some(6));
+
+    vm.consume_fuel_tick()
+        .expect("restored checkpoint should still advance one tick");
+    assert_eq!(vm.get_fuel(), Some(5));
+}
+
+#[test]
 fn store_api_exposes_fuel_checkpoint_and_recharge() {
     let constants = vec![Value::Int(1)];
     let mut bc = BytecodeBuilder::new();

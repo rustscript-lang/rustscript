@@ -13,13 +13,18 @@ import {
   completionCatalogWithWasm,
   debugCommandWithWasm,
   lintWithWasm,
+  runCommandWithWasm,
   runWithWasm,
   startDebugWithWasm,
   type CompletionCatalog,
   type CompletionEntry,
   type DebugCommandRequest,
   type DebugReport,
+  type FuelConfig,
+  type FuelState,
   type LintDiagnostic,
+  type RunReport,
+  type RunCommandRequest,
   type SourceFlavor
 } from "./wasmRuntime";
 
@@ -30,6 +35,10 @@ const CURRENT_LINE_MARKER_CLASS = "pd-debug-current-line-marker";
 const THEME_STORAGE_KEY = "pd-vm-webui-theme";
 const FLAVOR_STORAGE_KEY = "pd-vm-webui-flavor";
 const SOURCE_STORAGE_KEY_PREFIX = "pd-vm-webui-source:";
+const FUEL_AMOUNT_STORAGE_KEY = "pd-vm-webui-fuel-amount";
+const FUEL_INTERVAL_STORAGE_KEY = "pd-vm-webui-fuel-interval";
+const DEFAULT_FUEL_HINT =
+  "New runs and debug sessions start with the current amount and interval. Resume run adds the current amount before continuing.";
 
 type ThemePreference = "light" | "dark" | "system";
 type ResolvedTheme = "light" | "dark";
@@ -125,6 +134,9 @@ const ICONS: Record<string, string> = {
   ),
   output: iconSvg(
     '<rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="m7 10 3 2-3 2"></path><path d="M13 14h4"></path>'
+  ),
+  fuel: iconSvg(
+    '<path d="M12 3c2.7 3.3 5 5.7 5 9a5 5 0 1 1-10 0c0-3.3 2.3-5.7 5-9"></path><path d="M10 14c.5 1 1.3 1.8 2.5 2.2"></path>'
   ),
   where: iconSvg(
     '<circle cx="12" cy="12" r="9"></circle><line x1="12" y1="3" x2="12" y2="7"></line><line x1="12" y1="17" x2="12" y2="21"></line><line x1="3" y1="12" x2="7" y2="12"></line><line x1="17" y1="12" x2="21" y2="12"></line>'
@@ -227,6 +239,22 @@ function loadSourceForFlavor(flavor: SourceFlavor): string {
     // Ignore storage failures and fall back to the bundled sample.
   }
   return SAMPLE_SOURCES[flavor];
+}
+
+function loadFuelAmountInput(): string {
+  try {
+    return window.localStorage.getItem(FUEL_AMOUNT_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function loadFuelIntervalInput(): string {
+  try {
+    return window.localStorage.getItem(FUEL_INTERVAL_STORAGE_KEY) ?? "1";
+  } catch {
+    return "1";
+  }
 }
 
 function resolveTheme(preference: ThemePreference, query: MediaQueryList | null): ResolvedTheme {
@@ -385,6 +413,8 @@ const systemThemeQuery =
     ? window.matchMedia("(prefers-color-scheme: dark)")
     : null;
 const initialFlavor = loadCurrentFlavor();
+const initialFuelAmount = loadFuelAmountInput();
+const initialFuelInterval = loadFuelIntervalInput();
 const initialThemePreference = loadThemePreference();
 const initialResolvedTheme = resolveTheme(initialThemePreference, systemThemeQuery);
 applyDocumentTheme(initialResolvedTheme);
@@ -399,6 +429,7 @@ app.innerHTML = `
     <section class="hero">
       <h1>RustScript playground</h1>
       <p>Run or debug directly in wasm runtime with Monaco breakpoints, stepping controls, and hover variable inspect.</p>
+      <p><a href="./about.html" style="color: #58a6ff; text-decoration: underline;">Read more about the VM & RustScript here.</a></p>
     </section>
     <section class="workspace">
       <div class="toolbar">
@@ -451,6 +482,45 @@ app.innerHTML = `
             <pre id="debug-output" class="panel-content">&lt;no debugger output&gt;</pre>
             <div id="debug-hover" class="debug-hover">hover inspect: (none)</div>
           </article>
+          <article class="panel panel--fuel">
+            <h2>${panelTitle("fuel", "Fuel")}</h2>
+            <div class="fuel-panel">
+              <label class="fuel-field" for="fuel-amount-input">
+                <span>Fuel Amount</span>
+                <input
+                  id="fuel-amount-input"
+                  class="fuel-input"
+                  type="number"
+                  min="0"
+                  step="1"
+                  inputmode="numeric"
+                  placeholder="disabled"
+                />
+              </label>
+              <label class="fuel-field" for="fuel-interval-input">
+                <span>Check Interval</span>
+                <input
+                  id="fuel-interval-input"
+                  class="fuel-input"
+                  type="number"
+                  min="1"
+                  step="1"
+                  inputmode="numeric"
+                />
+              </label>
+              <div class="fuel-actions">
+                <button id="debug-fuel-set-button" class="panel-button" type="button">Set Debug Fuel</button>
+                <button id="debug-fuel-add-button" class="panel-button panel-button--secondary" type="button">Add Debug Fuel</button>
+                <button id="debug-fuel-interval-button" class="panel-button panel-button--secondary" type="button">Apply Debug Interval</button>
+                <button id="run-resume-button" class="panel-button" type="button">Resume Run</button>
+              </div>
+              <div id="fuel-hint" class="fuel-hint">${DEFAULT_FUEL_HINT}</div>
+              <div class="fuel-state-list">
+                <div id="run-fuel-state" class="fuel-state-line">Run session: idle</div>
+                <div id="debug-fuel-state" class="fuel-state-line">Debugger fuel: idle</div>
+              </div>
+            </div>
+          </article>
         </aside>
       </div>
     </section>
@@ -480,6 +550,15 @@ const outputEl = document.querySelector<HTMLElement>("#run-output");
 const stackEl = document.querySelector<HTMLElement>("#run-stack");
 const debugOutputEl = document.querySelector<HTMLElement>("#debug-output");
 const debugHoverEl = document.querySelector<HTMLElement>("#debug-hover");
+const fuelAmountInput = document.querySelector<HTMLInputElement>("#fuel-amount-input");
+const fuelIntervalInput = document.querySelector<HTMLInputElement>("#fuel-interval-input");
+const debugFuelSetButton = document.querySelector<HTMLButtonElement>("#debug-fuel-set-button");
+const debugFuelAddButton = document.querySelector<HTMLButtonElement>("#debug-fuel-add-button");
+const debugFuelIntervalButton = document.querySelector<HTMLButtonElement>("#debug-fuel-interval-button");
+const runResumeButton = document.querySelector<HTMLButtonElement>("#run-resume-button");
+const fuelHintEl = document.querySelector<HTMLElement>("#fuel-hint");
+const runFuelStateEl = document.querySelector<HTMLElement>("#run-fuel-state");
+const debugFuelStateEl = document.querySelector<HTMLElement>("#debug-fuel-state");
 const editorHost = document.querySelector<HTMLElement>("#editor");
 
 if (
@@ -506,6 +585,15 @@ if (
   !stackEl ||
   !debugOutputEl ||
   !debugHoverEl ||
+  !fuelAmountInput ||
+  !fuelIntervalInput ||
+  !debugFuelSetButton ||
+  !debugFuelAddButton ||
+  !debugFuelIntervalButton ||
+  !runResumeButton ||
+  !fuelHintEl ||
+  !runFuelStateEl ||
+  !debugFuelStateEl ||
   !editorHost
 ) {
   throw new Error("playground UI nodes are missing");
@@ -548,7 +636,19 @@ const outputPanelEl: HTMLElement = outputEl;
 const stackPanelEl: HTMLElement = stackEl;
 const debugOutputPanelEl: HTMLElement = debugOutputEl;
 const debugHoverPanelEl: HTMLElement = debugHoverEl;
+const fuelAmountInputEl: HTMLInputElement = fuelAmountInput;
+const fuelIntervalInputEl: HTMLInputElement = fuelIntervalInput;
+const debugFuelSetButtonEl: HTMLButtonElement = debugFuelSetButton;
+const debugFuelAddButtonEl: HTMLButtonElement = debugFuelAddButton;
+const debugFuelIntervalButtonEl: HTMLButtonElement = debugFuelIntervalButton;
+const runResumeButtonEl: HTMLButtonElement = runResumeButton;
+const fuelHintPanelEl: HTMLElement = fuelHintEl;
+const runFuelStatePanelEl: HTMLElement = runFuelStateEl;
+const debugFuelStatePanelEl: HTMLElement = debugFuelStateEl;
 const editorHostEl: HTMLElement = editorHost;
+
+fuelAmountInputEl.value = initialFuelAmount;
+fuelIntervalInputEl.value = initialFuelInterval;
 
 for (const flavor of FLAVOR_OPTIONS) {
   const option = document.createElement("option");
@@ -625,9 +725,23 @@ let resolvedTheme: ResolvedTheme = initialResolvedTheme;
 let lintSequence = 0;
 let lintTimer: number | null = null;
 const sourcePersistTimers = new Map<SourceFlavor, number>();
+let runBusy = false;
+let runSessionActive = false;
+let runSessionYielded = false;
+let runFuelState: FuelState = {
+  enabled: false,
+  remaining: null,
+  checkInterval: 1
+};
+let runSessionMessage = "Run session: idle";
 let debugBusy = false;
 let debugSessionActive = false;
 let debugCurrentLine: number | null = null;
+let debugFuelState: FuelState = {
+  enabled: false,
+  remaining: null,
+  checkInterval: 1
+};
 let debugHoveredVar = "";
 let debugHoverActiveKey = "";
 let debugDecorationIds: string[] = [];
@@ -669,6 +783,22 @@ function persistSourceForFlavor(flavor: SourceFlavor, value: string): void {
   }
 }
 
+function persistFuelAmount(value: string): void {
+  try {
+    window.localStorage.setItem(FUEL_AMOUNT_STORAGE_KEY, value);
+  } catch {
+    // Ignore storage failures; the current session still works.
+  }
+}
+
+function persistFuelInterval(value: string): void {
+  try {
+    window.localStorage.setItem(FUEL_INTERVAL_STORAGE_KEY, value);
+  } catch {
+    // Ignore storage failures; the current session still works.
+  }
+}
+
 function scheduleSourcePersist(flavor: SourceFlavor): void {
   const pendingTimer = sourcePersistTimers.get(flavor);
   if (pendingTimer !== undefined) {
@@ -691,6 +821,81 @@ function flushPersistedSources(): void {
   for (const flavor of FLAVOR_OPTIONS) {
     persistSourceForFlavor(flavor.value, models[flavor.value].getValue());
   }
+}
+
+function defaultFuelState(): FuelState {
+  return {
+    enabled: false,
+    remaining: null,
+    checkInterval: 1
+  };
+}
+
+function formatFuelState(fuel: FuelState): string {
+  if (!fuel.enabled) {
+    return `disabled (interval ${fuel.checkInterval})`;
+  }
+  return `${fuel.remaining ?? 0} left (interval ${fuel.checkInterval})`;
+}
+
+function setFuelHint(message: string | null): void {
+  fuelHintPanelEl.textContent = message ?? DEFAULT_FUEL_HINT;
+}
+
+function syncFuelPanel(): void {
+  runFuelStatePanelEl.textContent = runSessionActive
+    ? `Run session: ${runSessionMessage} | ${formatFuelState(runFuelState)}`
+    : "Run session: idle";
+  debugFuelStatePanelEl.textContent = debugSessionActive
+    ? `Debugger fuel: ${formatFuelState(debugFuelState)}`
+    : "Debugger fuel: idle";
+  runResumeButtonEl.disabled = !runSessionActive || runBusy;
+  debugFuelSetButtonEl.disabled = !debugSessionActive || debugBusy;
+  debugFuelAddButtonEl.disabled = !debugSessionActive || debugBusy;
+  debugFuelIntervalButtonEl.disabled = !debugSessionActive || debugBusy;
+}
+
+type ParsedFuelForm = {
+  amount: number | null;
+  interval: number;
+};
+
+function readFuelForm(): ParsedFuelForm | null {
+  const rawAmount = fuelAmountInputEl.value.trim();
+  const rawInterval = fuelIntervalInputEl.value.trim();
+
+  let amount: number | null = null;
+  if (rawAmount.length > 0) {
+    const parsedAmount = Number(rawAmount);
+    if (!Number.isSafeInteger(parsedAmount) || parsedAmount < 0) {
+      setFuelHint("Fuel amount must be a non-negative integer.");
+      return null;
+    }
+    amount = parsedAmount;
+  }
+
+  const parsedInterval = Number(rawInterval);
+  if (!Number.isSafeInteger(parsedInterval) || parsedInterval < 1) {
+    setFuelHint("Fuel check interval must be an integer greater than or equal to 1.");
+    return null;
+  }
+
+  setFuelHint(runSessionYielded ? "Run paused. Enter more fuel and click Resume Run." : null);
+  return {
+    amount,
+    interval: parsedInterval
+  };
+}
+
+function currentFuelConfig(): FuelConfig | null {
+  const parsed = readFuelForm();
+  if (!parsed) {
+    return null;
+  }
+  return {
+    fuel: parsed.amount,
+    fuelCheckInterval: parsed.interval
+  };
 }
 
 function syncThemeButtons(preference: ThemePreference): void {
@@ -746,6 +951,12 @@ function applyDebugControlState(): void {
   debugOutButtonEl.disabled = disableCommands;
   debugContinueButtonEl.disabled = disableCommands;
   debugStopButtonEl.disabled = !hasSession || debugBusy;
+  syncFuelPanel();
+}
+
+function applyRunControlState(): void {
+  runButtonEl.disabled = runBusy;
+  syncFuelPanel();
 }
 
 function applyDebugDecorations(): void {
@@ -798,7 +1009,9 @@ function applyDebugReport(report: DebugReport, options: ApplyDebugReportOptions 
   }
 
   debugCurrentLine = report.currentLine;
+  debugFuelState = report.fuel;
   applyDebugDecorations();
+  syncFuelPanel();
 
   const model = activeModel();
   const markers = report.diagnostics.map((item) => markerFromDiagnostic(item, model));
@@ -832,21 +1045,22 @@ function applyDebugReport(report: DebugReport, options: ApplyDebugReportOptions 
     setStatus(debugStatusEl, `debug: error (${report.error})`, "error");
     return;
   }
-  if (report.halted) {
-    if (report.currentLine) {
-      setStatus(debugStatusEl, `debug: paused @ ${report.currentLine}`, "ok");
-    } else {
-      setStatus(debugStatusEl, "debug: halted", "ok");
-    }
+  if (report.currentLine) {
+    setStatus(debugStatusEl, `debug: paused @ ${report.currentLine}`, "ok");
     return;
   }
-  setStatus(debugStatusEl, "debug: running", "busy");
+  if (report.halted) {
+    setStatus(debugStatusEl, "debug: halted", "ok");
+    return;
+  }
+  setStatus(debugStatusEl, "debug: attached", "ok");
 }
 
 function applyInactiveDebugState(message: string): void {
   debugSessionActive = false;
   debugCurrentLine = null;
   debugBusy = false;
+  debugFuelState = defaultFuelState();
   applyDebugControlState();
   applyDebugDecorations();
   clearHoverInspect();
@@ -854,6 +1068,95 @@ function applyInactiveDebugState(message: string): void {
     debugOutputPanelEl.textContent = message;
   }
   setStatus(debugStatusEl, "debug: idle", "neutral");
+}
+
+function applyInactiveRunState(): void {
+  runBusy = false;
+  runSessionActive = false;
+  runSessionYielded = false;
+  runFuelState = defaultFuelState();
+  runSessionMessage = "Run session: idle";
+  setFuelHint(null);
+  applyRunControlState();
+}
+
+function applyRunReport(report: RunReport): void {
+  const model = activeModel();
+  const markers = report.diagnostics.map((item) => markerFromDiagnostic(item, model));
+  monaco.editor.setModelMarkers(model, MARKER_OWNER, markers);
+  renderDiagnosticsList(diagnosticsPanelEl, report.diagnostics);
+  setRunPanel(outputPanelEl, stackPanelEl, report.output, report.stack);
+
+  if (report.diagnostics.length > 0) {
+    setStatus(lintStatusEl, `lint: ${report.diagnostics.length} error(s)`, "error");
+  } else {
+    setStatus(lintStatusEl, "lint: ok", "ok");
+  }
+
+  runFuelState = report.fuel;
+  runSessionActive = !report.halted && report.error === null;
+  if (!runSessionActive) {
+    runSessionYielded = false;
+  } else if (report.yielded) {
+    runSessionYielded = true;
+  }
+
+  const commandOutput = report.commandOutput.trim();
+  if (commandOutput.length > 0) {
+    runSessionMessage = commandOutput;
+  } else if (runSessionActive) {
+    runSessionMessage = runSessionYielded ? "paused" : "active";
+  } else if (report.halted) {
+    runSessionMessage = "program halted";
+  } else {
+    runSessionMessage = "idle";
+  }
+
+  if (report.error) {
+    setStatus(runStatusEl, `run: error (${report.error})`, "error");
+  } else if (report.halted) {
+    setStatus(runStatusEl, "run: ok", "ok");
+  } else if (runSessionYielded) {
+    setStatus(runStatusEl, "run: yielded", "busy");
+  } else {
+    setStatus(runStatusEl, "run: paused", "busy");
+  }
+
+  setFuelHint(runSessionYielded ? "Run paused. Enter more fuel and click Resume Run." : null);
+  syncFuelPanel();
+}
+
+async function sendRunCommand(command: RunCommandRequest): Promise<RunReport | null> {
+  if (!runSessionActive && command.kind !== "stop") {
+    return null;
+  }
+
+  runBusy = true;
+  applyRunControlState();
+  setStatus(runStatusEl, `run: ${command.kind}...`, "busy");
+
+  try {
+    const report = await runCommandWithWasm(command);
+    if (command.kind === "stop" || report.error === "run session is not active") {
+      applyInactiveRunState();
+      if (report.error) {
+        setStatus(runStatusEl, `run: error (${report.error})`, "error");
+      } else {
+        setStatus(runStatusEl, "run: idle", "neutral");
+      }
+      return report;
+    }
+
+    applyRunReport(report);
+    return report;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "run command failed";
+    setStatus(runStatusEl, `run: wasm error (${message})`, "error");
+    return null;
+  } finally {
+    runBusy = false;
+    applyRunControlState();
+  }
 }
 
 async function runLintNow(): Promise<void> {
@@ -931,8 +1234,11 @@ async function sendDebugCommand(command: DebugCommandRequest): Promise<DebugRepo
       return report;
     }
 
-    debugSessionActive = !report.error;
+    debugSessionActive = !report.halted && !report.error;
     applyDebugReport(report);
+    if (!debugSessionActive && !report.error) {
+      applyDebugControlState();
+    }
     return report;
   } catch (error) {
     const message = error instanceof Error ? error.message : "debug command failed";
@@ -1104,6 +1410,11 @@ flavorSelectEl.addEventListener("change", () => {
     return;
   }
 
+  if (runSessionActive) {
+    void runCommandWithWasm({ kind: "stop" }).catch(() => {
+      // best effort stop
+    });
+  }
   if (debugSessionActive) {
     void debugCommandWithWasm({ kind: "stop" }).catch(() => {
       // best effort stop
@@ -1113,6 +1424,7 @@ flavorSelectEl.addEventListener("change", () => {
   currentFlavor = next;
   persistCurrentFlavor(currentFlavor);
   editor.setModel(models[currentFlavor]);
+  applyInactiveRunState();
   applyInactiveDebugState("<no debugger output>");
   applyDebugDecorations();
   setStatus(runStatusEl, "run: idle", "neutral");
@@ -1122,6 +1434,8 @@ flavorSelectEl.addEventListener("change", () => {
 window.addEventListener("pagehide", () => {
   persistCurrentFlavor(currentFlavor);
   flushPersistedSources();
+  persistFuelAmount(fuelAmountInputEl.value);
+  persistFuelInterval(fuelIntervalInputEl.value);
 });
 
 for (const option of THEME_OPTIONS) {
@@ -1129,6 +1443,14 @@ for (const option of THEME_OPTIONS) {
     applyThemePreference(option.value, true);
   });
 }
+
+fuelAmountInputEl.addEventListener("input", () => {
+  persistFuelAmount(fuelAmountInputEl.value);
+});
+
+fuelIntervalInputEl.addEventListener("input", () => {
+  persistFuelInterval(fuelIntervalInputEl.value);
+});
 
 const handleSystemThemeChange = () => {
   if (themePreference !== "system") {
@@ -1146,40 +1468,37 @@ if (systemThemeQuery) {
 }
 
 runButtonEl.addEventListener("click", async () => {
-  runButtonEl.disabled = true;
+  const fuelConfig = currentFuelConfig();
+  if (!fuelConfig) {
+    setStatus(runStatusEl, "run: invalid fuel settings", "error");
+    return;
+  }
+
+  runBusy = true;
+  applyRunControlState();
   setStatus(runStatusEl, "run: running...", "busy");
 
   const source = activeModel().getValue();
   try {
-    const report = await runWithWasm(source, currentFlavor);
-    const model = activeModel();
-    const markers = report.diagnostics.map((item) => markerFromDiagnostic(item, model));
-    monaco.editor.setModelMarkers(model, MARKER_OWNER, markers);
-    renderDiagnosticsList(diagnosticsPanelEl, report.diagnostics);
-    setRunPanel(outputPanelEl, stackPanelEl, report.output, report.stack);
-
-    if (!report.ok || report.error) {
-      const errorMessage = report.error ?? "runtime failed";
-      setStatus(runStatusEl, `run: error (${errorMessage})`, "error");
-    } else {
-      setStatus(runStatusEl, "run: ok", "ok");
-    }
-
-    if (report.diagnostics.length > 0) {
-      setStatus(lintStatusEl, `lint: ${report.diagnostics.length} error(s)`, "error");
-    } else {
-      setStatus(lintStatusEl, "lint: ok", "ok");
-    }
+    const report = await runWithWasm(source, currentFlavor, fuelConfig);
+    applyRunReport(report);
   } catch (error) {
     const message = error instanceof Error ? error.message : "run failed";
     setStatus(runStatusEl, `run: wasm error (${message})`, "error");
   } finally {
-    runButtonEl.disabled = false;
+    runBusy = false;
+    applyRunControlState();
   }
 });
 
 async function startDebugSession(): Promise<void> {
   if (debugBusy) {
+    return;
+  }
+
+  const fuelConfig = currentFuelConfig();
+  if (!fuelConfig) {
+    setStatus(debugStatusEl, "debug: invalid fuel settings", "error");
     return;
   }
 
@@ -1194,7 +1513,7 @@ async function startDebugSession(): Promise<void> {
   clearHoverInspect();
 
   try {
-    const startReport = await startDebugWithWasm(source, currentFlavor);
+    const startReport = await startDebugWithWasm(source, currentFlavor, fuelConfig);
 
     if (startReport.error) {
       debugSessionActive = false;
@@ -1202,7 +1521,7 @@ async function startDebugSession(): Promise<void> {
       return;
     }
 
-    debugSessionActive = true;
+    debugSessionActive = !startReport.halted;
     applyDebugReport(startReport, { syncBreakpoints: false });
 
     let latestReport = startReport;
@@ -1214,7 +1533,7 @@ async function startDebugSession(): Promise<void> {
     }
 
     applyDebugReport(latestReport);
-    debugSessionActive = !latestReport.error;
+    debugSessionActive = !latestReport.halted && !latestReport.error;
     if (latestReport.error === "debug session is not active") {
       applyInactiveDebugState("debug session is not active");
       return;
@@ -1286,6 +1605,70 @@ debugStopButtonEl.addEventListener("click", () => {
   void sendDebugCommand({ kind: "stop" });
 });
 
+debugFuelSetButtonEl.addEventListener("click", () => {
+  const parsed = readFuelForm();
+  if (!parsed) {
+    setStatus(debugStatusEl, "debug: invalid fuel settings", "error");
+    return;
+  }
+  if (parsed.amount === null) {
+    void sendDebugCommand({ kind: "clear_fuel" });
+    return;
+  }
+  void sendDebugCommand({ kind: "set_fuel", amount: parsed.amount });
+});
+
+debugFuelAddButtonEl.addEventListener("click", () => {
+  const parsed = readFuelForm();
+  if (!parsed || parsed.amount === null) {
+    setStatus(debugStatusEl, "debug: enter fuel to add", "error");
+    return;
+  }
+  void sendDebugCommand({ kind: "add_fuel", amount: parsed.amount });
+});
+
+debugFuelIntervalButtonEl.addEventListener("click", () => {
+  const parsed = readFuelForm();
+  if (!parsed) {
+    setStatus(debugStatusEl, "debug: invalid fuel settings", "error");
+    return;
+  }
+  void sendDebugCommand({ kind: "set_fuel_check_interval", interval: parsed.interval });
+});
+
+runResumeButtonEl.addEventListener("click", () => {
+  const parsed = readFuelForm();
+  if (!parsed) {
+    setStatus(runStatusEl, "run: invalid fuel settings", "error");
+    return;
+  }
+  if (!runSessionActive) {
+    return;
+  }
+
+  void (async () => {
+    if (parsed.interval !== runFuelState.checkInterval) {
+      const intervalReport = await sendRunCommand({
+        kind: "set_fuel_check_interval",
+        interval: parsed.interval
+      });
+      if (!intervalReport || intervalReport.error) {
+        return;
+      }
+    }
+
+    if (parsed.amount !== null) {
+      const addReport = await sendRunCommand({ kind: "add_fuel", amount: parsed.amount });
+      if (!addReport || addReport.error) {
+        return;
+      }
+    }
+
+    await sendRunCommand({ kind: "resume" });
+  })();
+});
+
+applyInactiveRunState();
 applyDebugControlState();
 applyDebugDecorations();
 scheduleLint();

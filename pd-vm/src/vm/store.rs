@@ -75,6 +75,10 @@ impl<T> Store<T> {
         self.vm.consume_fuel(fuel)
     }
 
+    pub fn consume_fuel_tick(&mut self) -> VmResult<()> {
+        self.vm.consume_fuel_tick()
+    }
+
     pub fn fuel_checkpoint(&self) -> FuelCheckpoint {
         self.vm.fuel_checkpoint()
     }

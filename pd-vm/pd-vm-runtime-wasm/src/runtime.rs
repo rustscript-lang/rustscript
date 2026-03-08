@@ -14,6 +14,30 @@ use crate::stdlib::embedded_stdlib_compile_options;
 
 const MAX_DEBUG_STEPS_PER_COMMAND: usize = 200_000;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct FuelConfig {
+    pub fuel: Option<u64>,
+    pub fuel_check_interval: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FuelState {
+    pub enabled: bool,
+    pub remaining: Option<u64>,
+    pub check_interval: u32,
+}
+
+impl FuelState {
+    fn disabled(check_interval: u32) -> Self {
+        Self {
+            enabled: false,
+            remaining: None,
+            check_interval,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PlaygroundHostFunctionSpec {
     pub name: &'static str,
@@ -49,15 +73,23 @@ pub struct RunReport {
     pub output: Vec<String>,
     pub stack: Vec<String>,
     pub error: Option<String>,
+    pub halted: bool,
+    pub yielded: bool,
+    pub fuel: FuelState,
+    pub command_output: String,
 }
 
 impl RunReport {
-    pub fn success(output: Vec<String>, stack: Vec<String>) -> Self {
+    pub fn success(output: Vec<String>, stack: Vec<String>, fuel: FuelState) -> Self {
         Self {
             diagnostics: Vec::new(),
             output,
             stack,
             error: None,
+            halted: true,
+            yielded: false,
+            fuel,
+            command_output: String::new(),
         }
     }
 
@@ -68,15 +100,41 @@ impl RunReport {
             output: Vec::new(),
             stack: Vec::new(),
             error: Some(err.to_string()),
+            halted: true,
+            yielded: false,
+            fuel: FuelState::disabled(1),
+            command_output: String::new(),
         }
     }
 
-    pub fn runtime_error(message: String, output: Vec<String>, stack: Vec<String>) -> Self {
+    pub fn runtime_error(
+        message: String,
+        output: Vec<String>,
+        stack: Vec<String>,
+        fuel: FuelState,
+    ) -> Self {
         Self {
             diagnostics: Vec::new(),
             output,
             stack,
             error: Some(message),
+            halted: true,
+            yielded: false,
+            fuel,
+            command_output: String::new(),
+        }
+    }
+
+    fn inactive(error: Option<String>, command_output: impl Into<String>) -> Self {
+        Self {
+            diagnostics: Vec::new(),
+            output: Vec::new(),
+            stack: Vec::new(),
+            error,
+            halted: true,
+            yielded: false,
+            fuel: FuelState::disabled(1),
+            command_output: command_output.into(),
         }
     }
 }
@@ -91,6 +149,7 @@ pub struct DebugReport {
     pub breakpoints: Vec<u32>,
     pub halted: bool,
     pub command_output: String,
+    pub fuel: FuelState,
 }
 
 impl DebugReport {
@@ -104,6 +163,7 @@ impl DebugReport {
             breakpoints: Vec::new(),
             halted: true,
             command_output: String::new(),
+            fuel: FuelState::disabled(1),
         }
     }
 
@@ -117,8 +177,20 @@ impl DebugReport {
             breakpoints: Vec::new(),
             halted: true,
             command_output: command_output.into(),
+            fuel: FuelState::disabled(1),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RunCommand {
+    Resume,
+    SetFuel { amount: u64 },
+    AddFuel { amount: u64 },
+    ClearFuel,
+    SetFuelCheckInterval { interval: u32 },
+    Stop,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -135,6 +207,10 @@ pub enum DebugCommand {
     PrintVar { name: String },
     BreakLine { line: u32 },
     ClearLine { line: u32 },
+    SetFuel { amount: u64 },
+    AddFuel { amount: u64 },
+    ClearFuel,
+    SetFuelCheckInterval { interval: u32 },
     Stop,
 }
 
@@ -148,7 +224,15 @@ enum ResumeMode {
 enum StepExecution {
     Advanced,
     Halted,
+    Paused(String),
     Error(String),
+}
+
+struct RunSession {
+    vm: Vm,
+    output_lines: Arc<Mutex<Vec<String>>>,
+    halted: bool,
+    error: Option<String>,
 }
 
 struct DebugSession {
@@ -160,7 +244,76 @@ struct DebugSession {
 }
 
 thread_local! {
+    static RUN_SESSION: RefCell<Option<RunSession>> = const { RefCell::new(None) };
     static DEBUG_SESSION: RefCell<Option<DebugSession>> = const { RefCell::new(None) };
+}
+
+impl RunSession {
+    fn new(vm: Vm, output_lines: Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            vm,
+            output_lines,
+            halted: false,
+            error: None,
+        }
+    }
+
+    fn snapshot(
+        &self,
+        diagnostics: Vec<LintDiagnostic>,
+        command_output: String,
+        yielded: bool,
+    ) -> RunReport {
+        RunReport {
+            diagnostics,
+            output: drain_output(&self.output_lines),
+            stack: self.vm.stack().iter().map(format_value).collect(),
+            error: self.error.clone(),
+            halted: self.halted,
+            yielded,
+            fuel: capture_fuel_state(&self.vm),
+            command_output,
+        }
+    }
+
+    fn resume(&mut self) -> (String, bool) {
+        if self.halted {
+            return ("program halted".to_string(), false);
+        }
+        if let Some(error) = self.error.as_ref() {
+            return (format!("run session is unavailable: {error}"), false);
+        }
+
+        match self.vm.run() {
+            Ok(VmStatus::Halted) => {
+                self.halted = true;
+                ("program halted".to_string(), false)
+            }
+            Ok(VmStatus::Yielded) => {
+                let message = match self.vm.get_fuel() {
+                    Some(0) => {
+                        "execution interrupted: out of fuel. add more fuel and resume".to_string()
+                    }
+                    _ => "execution yielded; resume to continue".to_string(),
+                };
+                (message, true)
+            }
+            Ok(VmStatus::Waiting(op_id)) => {
+                self.halted = true;
+                let message = format!(
+                    "vm is waiting on host op {op_id}; asynchronous host ops are unavailable in the wasm playground runtime"
+                );
+                self.error = Some(message.clone());
+                (message, false)
+            }
+            Err(err) => {
+                self.halted = true;
+                let message = render_vm_error(&self.vm, &err);
+                self.error = Some(message.clone());
+                (message, false)
+            }
+        }
+    }
 }
 
 impl DebugSession {
@@ -192,6 +345,12 @@ impl DebugSession {
             DebugCommand::PrintVar { name } => self.command_print_var(&name),
             DebugCommand::BreakLine { line } => self.add_line_breakpoint(line),
             DebugCommand::ClearLine { line } => self.clear_line_breakpoint(line),
+            DebugCommand::SetFuel { amount } => self.command_set_fuel(amount),
+            DebugCommand::AddFuel { amount } => self.command_add_fuel(amount),
+            DebugCommand::ClearFuel => self.command_clear_fuel(),
+            DebugCommand::SetFuelCheckInterval { interval } => {
+                self.command_set_fuel_check_interval(interval)
+            }
             DebugCommand::Stop => String::new(),
         }
     }
@@ -212,6 +371,7 @@ impl DebugSession {
             breakpoints,
             halted: self.halted,
             command_output,
+            fuel: capture_fuel_state(&self.vm),
         }
     }
 
@@ -279,6 +439,7 @@ impl DebugSession {
             match self.execute_single_instruction() {
                 StepExecution::Advanced => {}
                 StepExecution::Halted => return "program halted".to_string(),
+                StepExecution::Paused(message) => return message,
                 StepExecution::Error(message) => return message,
             }
 
@@ -307,8 +468,18 @@ impl DebugSession {
     }
 
     fn execute_single_instruction(&mut self) -> StepExecution {
+        let original_fuel = self.vm.fuel_checkpoint();
+        let stepped_fuel = match self.prepare_debug_step_fuel() {
+            Ok(checkpoint) => checkpoint,
+            Err(message) => return StepExecution::Paused(message),
+        };
+
+        self.vm
+            .set_fuel_check_interval(1)
+            .expect("exact debugger step interval should be valid");
         self.vm.set_fuel(1);
-        match self.vm.run() {
+
+        let outcome = match self.vm.run() {
             Ok(VmStatus::Yielded) => StepExecution::Advanced,
             Ok(VmStatus::Halted) => {
                 self.halted = true;
@@ -327,6 +498,37 @@ impl DebugSession {
                 let message = render_vm_error(&self.vm, &err);
                 self.error = Some(message.clone());
                 StepExecution::Error(message)
+            }
+        };
+
+        self.vm.restore_fuel(stepped_fuel.unwrap_or(original_fuel));
+        outcome
+    }
+
+    fn prepare_debug_step_fuel(&mut self) -> Result<Option<vm::FuelCheckpoint>, String> {
+        let checkpoint = self.vm.fuel_checkpoint();
+        if checkpoint.fuel().is_none() {
+            return Ok(None);
+        }
+
+        match self.vm.consume_fuel_tick() {
+            Ok(()) => {
+                let stepped = self.vm.fuel_checkpoint();
+                self.vm.restore_fuel(checkpoint);
+                Ok(Some(stepped))
+            }
+            Err(VmError::OutOfFuel { needed, remaining }) => {
+                self.vm.restore_fuel(checkpoint);
+                Err(format!(
+                    "execution interrupted: out of fuel (needed {needed}, remaining {remaining}). add more fuel, then continue"
+                ))
+            }
+            Err(err) => {
+                let message = render_vm_error(&self.vm, &err);
+                self.vm.restore_fuel(checkpoint);
+                self.halted = true;
+                self.error = Some(message.clone());
+                Err(message)
             }
         }
     }
@@ -389,6 +591,33 @@ impl DebugSession {
             None => format!("local '{name}' is out of range for this VM instance"),
         }
     }
+
+    fn command_set_fuel(&mut self, amount: u64) -> String {
+        self.vm.set_fuel(amount);
+        format!("fuel set to {amount}\n{}", format_fuel_state(&self.vm))
+    }
+
+    fn command_add_fuel(&mut self, amount: u64) -> String {
+        match self.vm.add_fuel(amount) {
+            Ok(()) => format!("fuel added: {amount}\n{}", format_fuel_state(&self.vm)),
+            Err(err) => format!("fuel add failed: {err}"),
+        }
+    }
+
+    fn command_clear_fuel(&mut self) -> String {
+        self.vm.clear_fuel();
+        format!("fuel metering disabled\n{}", format_fuel_state(&self.vm))
+    }
+
+    fn command_set_fuel_check_interval(&mut self, interval: u32) -> String {
+        match self.vm.set_fuel_check_interval(interval) {
+            Ok(()) => format!(
+                "fuel check interval set to {interval}\n{}",
+                format_fuel_state(&self.vm)
+            ),
+            Err(err) => format!("fuel interval update failed: {err}"),
+        }
+    }
 }
 
 fn local_visible_at_line(local: &LocalInfo, line: Option<u32>) -> bool {
@@ -408,6 +637,34 @@ fn local_visible_at_line(local: &LocalInfo, line: Option<u32>) -> bool {
     true
 }
 
+fn capture_fuel_state(vm: &Vm) -> FuelState {
+    let remaining = vm.get_fuel();
+    FuelState {
+        enabled: remaining.is_some(),
+        remaining,
+        check_interval: vm.fuel_check_interval(),
+    }
+}
+
+fn format_fuel_state(vm: &Vm) -> String {
+    let fuel = capture_fuel_state(vm);
+    match fuel.remaining {
+        Some(remaining) => format!("fuel: {remaining}, check_interval={}", fuel.check_interval),
+        None => format!("fuel: disabled, check_interval={}", fuel.check_interval),
+    }
+}
+
+fn apply_fuel_config(vm: &mut Vm, config: FuelConfig) -> Result<(), String> {
+    if let Some(interval) = config.fuel_check_interval {
+        vm.set_fuel_check_interval(interval)
+            .map_err(|err| render_vm_error(vm, &err))?;
+    }
+    if let Some(fuel) = config.fuel {
+        vm.set_fuel(fuel);
+    }
+    Ok(())
+}
+
 pub fn run_source_with_flavor(source: &str, flavor: SourceFlavor) -> RunReport {
     let compiled = match compile_source_with_flavor_and_options(
         source,
@@ -421,7 +678,7 @@ pub fn run_source_with_flavor(source: &str, flavor: SourceFlavor) -> RunReport {
     let output_lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
     if let Err(err) = register_functions(&mut vm, &compiled.functions, &output_lines) {
-        return RunReport::runtime_error(err, Vec::new(), Vec::new());
+        return RunReport::runtime_error(err, Vec::new(), Vec::new(), capture_fuel_state(&vm));
     }
 
     loop {
@@ -430,14 +687,19 @@ pub fn run_source_with_flavor(source: &str, flavor: SourceFlavor) -> RunReport {
             Err(err) => {
                 let output = drain_output(&output_lines);
                 let stack = vm.stack().iter().map(format_value).collect::<Vec<_>>();
-                return RunReport::runtime_error(render_vm_error(&vm, &err), output, stack);
+                return RunReport::runtime_error(
+                    render_vm_error(&vm, &err),
+                    output,
+                    stack,
+                    capture_fuel_state(&vm),
+                );
             }
         };
         match status {
             VmStatus::Halted => {
                 let output = drain_output(&output_lines);
                 let stack = vm.stack().iter().map(format_value).collect::<Vec<_>>();
-                return RunReport::success(output, stack);
+                return RunReport::success(output, stack, capture_fuel_state(&vm));
             }
             VmStatus::Yielded => {}
             VmStatus::Waiting(op_id) => {
@@ -449,13 +711,121 @@ pub fn run_source_with_flavor(source: &str, flavor: SourceFlavor) -> RunReport {
                     ),
                     output,
                     stack,
+                    capture_fuel_state(&vm),
                 );
             }
         }
     }
 }
 
-pub fn start_debug_source_with_flavor(source: &str, flavor: SourceFlavor) -> DebugReport {
+pub fn start_run_source_with_flavor(
+    source: &str,
+    flavor: SourceFlavor,
+    fuel_config: FuelConfig,
+) -> RunReport {
+    let compiled = match compile_source_with_flavor_and_options(
+        source,
+        flavor,
+        embedded_stdlib_compile_options(),
+    ) {
+        Ok(compiled) => compiled,
+        Err(err) => {
+            RUN_SESSION.with(|state| {
+                *state.borrow_mut() = None;
+            });
+            return RunReport::source_error(source, flavor, err);
+        }
+    };
+
+    let output_lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    if let Err(err) = register_functions(&mut vm, &compiled.functions, &output_lines) {
+        RUN_SESSION.with(|state| {
+            *state.borrow_mut() = None;
+        });
+        return RunReport::runtime_error(err, Vec::new(), Vec::new(), capture_fuel_state(&vm));
+    }
+    if let Err(err) = apply_fuel_config(&mut vm, fuel_config) {
+        RUN_SESSION.with(|state| {
+            *state.borrow_mut() = None;
+        });
+        return RunReport::runtime_error(err, Vec::new(), Vec::new(), capture_fuel_state(&vm));
+    }
+
+    let mut session = RunSession::new(vm, output_lines);
+    let (command_output, yielded) = session.resume();
+    let report = session.snapshot(Vec::new(), command_output, yielded);
+    RUN_SESSION.with(|state| {
+        *state.borrow_mut() = if report.halted || report.error.is_some() {
+            None
+        } else {
+            Some(session)
+        };
+    });
+    report
+}
+
+pub fn run_command(command: RunCommand) -> RunReport {
+    if matches!(command, RunCommand::Stop) {
+        RUN_SESSION.with(|state| {
+            *state.borrow_mut() = None;
+        });
+        return RunReport::inactive(None, "run session stopped");
+    }
+
+    RUN_SESSION.with(|state| {
+        let mut slot = state.borrow_mut();
+        let Some(session) = slot.as_mut() else {
+            return RunReport::inactive(
+                Some("run session is not active".to_string()),
+                String::new(),
+            );
+        };
+
+        let mut yielded = false;
+        let command_output = match command {
+            RunCommand::Resume => {
+                let (output, resumed_yielded) = session.resume();
+                yielded = resumed_yielded;
+                output
+            }
+            RunCommand::SetFuel { amount } => {
+                session.vm.set_fuel(amount);
+                format!("fuel set to {amount}\n{}", format_fuel_state(&session.vm))
+            }
+            RunCommand::AddFuel { amount } => match session.vm.add_fuel(amount) {
+                Ok(()) => format!("fuel added: {amount}\n{}", format_fuel_state(&session.vm)),
+                Err(err) => format!("fuel add failed: {err}"),
+            },
+            RunCommand::ClearFuel => {
+                session.vm.clear_fuel();
+                format!("fuel metering disabled\n{}", format_fuel_state(&session.vm))
+            }
+            RunCommand::SetFuelCheckInterval { interval } => {
+                match session.vm.set_fuel_check_interval(interval) {
+                    Ok(()) => format!(
+                        "fuel check interval set to {interval}\n{}",
+                        format_fuel_state(&session.vm)
+                    ),
+                    Err(err) => format!("fuel interval update failed: {err}"),
+                }
+            }
+            RunCommand::Stop => unreachable!("handled above"),
+        };
+
+        let report = session.snapshot(Vec::new(), command_output, yielded);
+        if report.halted || report.error.is_some() {
+            *slot = None;
+        }
+        report
+    })
+}
+
+pub fn start_debug_source_with_flavor(
+    source: &str,
+    flavor: SourceFlavor,
+    fuel_config: FuelConfig,
+) -> DebugReport {
     let compiled = match compile_source_with_flavor_and_options(
         source,
         flavor,
@@ -473,6 +843,12 @@ pub fn start_debug_source_with_flavor(source: &str, flavor: SourceFlavor) -> Deb
     let output_lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
     if let Err(err) = register_functions(&mut vm, &compiled.functions, &output_lines) {
+        DEBUG_SESSION.with(|state| {
+            *state.borrow_mut() = None;
+        });
+        return DebugReport::inactive(Some(err), "debugger initialization failed");
+    }
+    if let Err(err) = apply_fuel_config(&mut vm, fuel_config) {
         DEBUG_SESSION.with(|state| {
             *state.borrow_mut() = None;
         });
@@ -504,7 +880,11 @@ pub fn run_debug_command(command: DebugCommand) -> DebugReport {
             );
         };
         let command_output = session.run_command(command);
-        session.snapshot(Vec::new(), command_output)
+        let report = session.snapshot(Vec::new(), command_output);
+        if report.halted || report.error.is_some() {
+            *slot = None;
+        }
+        report
     })
 }
 

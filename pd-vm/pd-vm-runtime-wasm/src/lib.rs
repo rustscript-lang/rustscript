@@ -9,8 +9,8 @@ use vm::SourceFlavor;
 use crate::analyzer::{LintDiagnostic, LintReport, LintSpan, lint_source_with_flavor};
 use crate::completions::{CompletionCatalog, build_completion_catalog};
 use crate::runtime::{
-    DebugCommand, DebugReport, RunReport, debug_state, run_debug_command, run_source_with_flavor,
-    start_debug_source_with_flavor,
+    DebugCommand, DebugReport, FuelConfig, FuelState, RunCommand, RunReport, debug_state,
+    run_command, run_debug_command, start_debug_source_with_flavor, start_run_source_with_flavor,
 };
 
 #[derive(Serialize)]
@@ -41,6 +41,10 @@ struct RunResponse {
     output: Vec<String>,
     stack: Vec<String>,
     error: Option<String>,
+    halted: bool,
+    yielded: bool,
+    command_output: String,
+    fuel: FuelStateJson,
 }
 
 #[derive(Serialize)]
@@ -53,6 +57,14 @@ struct DebugResponse {
     breakpoints: Vec<u32>,
     halted: bool,
     command_output: String,
+    fuel: FuelStateJson,
+}
+
+#[derive(Serialize)]
+struct FuelStateJson {
+    enabled: bool,
+    remaining: Option<u64>,
+    check_interval: u32,
 }
 
 fn parse_flavor(raw: &str) -> SourceFlavor {
@@ -123,9 +135,13 @@ fn run_response_to_json(report: RunReport) -> Vec<u8> {
         output: report.output,
         stack: report.stack,
         error: report.error,
+        halted: report.halted,
+        yielded: report.yielded,
+        command_output: report.command_output,
+        fuel: fuel_state_to_json(report.fuel),
     };
     serde_json::to_vec(&response).unwrap_or_else(|_| {
-        b"{\"ok\":false,\"diagnostics\":[],\"output\":[],\"stack\":[]}".to_vec()
+        b"{\"ok\":false,\"diagnostics\":[],\"output\":[],\"stack\":[],\"halted\":true,\"yielded\":false,\"command_output\":\"\",\"fuel\":{\"enabled\":false,\"remaining\":null,\"check_interval\":1}}".to_vec()
     })
 }
 
@@ -143,10 +159,19 @@ fn debug_response_to_json(report: DebugReport) -> Vec<u8> {
         breakpoints: report.breakpoints,
         halted: report.halted,
         command_output: report.command_output,
+        fuel: fuel_state_to_json(report.fuel),
     };
     serde_json::to_vec(&response).unwrap_or_else(|_| {
-        b"{\"diagnostics\":[],\"output\":[],\"stack\":[],\"breakpoints\":[],\"halted\":true,\"command_output\":\"\"}".to_vec()
+        b"{\"diagnostics\":[],\"output\":[],\"stack\":[],\"breakpoints\":[],\"halted\":true,\"command_output\":\"\",\"fuel\":{\"enabled\":false,\"remaining\":null,\"check_interval\":1}}".to_vec()
     })
+}
+
+fn fuel_state_to_json(fuel: FuelState) -> FuelStateJson {
+    FuelStateJson {
+        enabled: fuel.enabled,
+        remaining: fuel.remaining,
+        check_interval: fuel.check_interval,
+    }
 }
 
 fn completion_catalog_to_json(catalog: CompletionCatalog) -> Vec<u8> {
@@ -179,9 +204,17 @@ fn invalid_utf8_run_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8> 
         output: Vec::new(),
         stack: Vec::new(),
         error: Some(format!("invalid utf-8 {label}: {err}")),
+        halted: true,
+        yielded: false,
+        command_output: String::new(),
+        fuel: fuel_state_to_json(FuelState {
+            enabled: false,
+            remaining: None,
+            check_interval: 1,
+        }),
     };
     serde_json::to_vec(&response).unwrap_or_else(|_| {
-        b"{\"ok\":false,\"diagnostics\":[],\"output\":[],\"stack\":[]}".to_vec()
+        b"{\"ok\":false,\"diagnostics\":[],\"output\":[],\"stack\":[],\"halted\":true,\"yielded\":false,\"command_output\":\"\",\"fuel\":{\"enabled\":false,\"remaining\":null,\"check_interval\":1}}".to_vec()
     })
 }
 
@@ -200,9 +233,37 @@ fn invalid_utf8_debug_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8
         breakpoints: Vec::new(),
         halted: true,
         command_output: String::new(),
+        fuel: fuel_state_to_json(FuelState {
+            enabled: false,
+            remaining: None,
+            check_interval: 1,
+        }),
     };
     serde_json::to_vec(&response).unwrap_or_else(|_| {
-        b"{\"diagnostics\":[],\"output\":[],\"stack\":[],\"breakpoints\":[],\"halted\":true,\"command_output\":\"\"}".to_vec()
+        b"{\"diagnostics\":[],\"output\":[],\"stack\":[],\"breakpoints\":[],\"halted\":true,\"command_output\":\"\",\"fuel\":{\"enabled\":false,\"remaining\":null,\"check_interval\":1}}".to_vec()
+    })
+}
+
+fn invalid_run_command_response(command_json: &str, error: &str) -> Vec<u8> {
+    let response = RunResponse {
+        ok: false,
+        diagnostics: Vec::new(),
+        output: Vec::new(),
+        stack: Vec::new(),
+        error: Some(format!(
+            "invalid run command: {error}; payload={command_json}"
+        )),
+        halted: true,
+        yielded: false,
+        command_output: String::new(),
+        fuel: fuel_state_to_json(FuelState {
+            enabled: false,
+            remaining: None,
+            check_interval: 1,
+        }),
+    };
+    serde_json::to_vec(&response).unwrap_or_else(|_| {
+        b"{\"ok\":false,\"diagnostics\":[],\"output\":[],\"stack\":[],\"halted\":true,\"yielded\":false,\"command_output\":\"\",\"fuel\":{\"enabled\":false,\"remaining\":null,\"check_interval\":1}}".to_vec()
     })
 }
 
@@ -218,9 +279,60 @@ fn invalid_debug_command_response(command_json: &str, error: &str) -> Vec<u8> {
         breakpoints: Vec::new(),
         halted: true,
         command_output: String::new(),
+        fuel: fuel_state_to_json(FuelState {
+            enabled: false,
+            remaining: None,
+            check_interval: 1,
+        }),
     };
     serde_json::to_vec(&response).unwrap_or_else(|_| {
-        b"{\"diagnostics\":[],\"output\":[],\"stack\":[],\"breakpoints\":[],\"halted\":true,\"command_output\":\"\"}".to_vec()
+        b"{\"diagnostics\":[],\"output\":[],\"stack\":[],\"breakpoints\":[],\"halted\":true,\"command_output\":\"\",\"fuel\":{\"enabled\":false,\"remaining\":null,\"check_interval\":1}}".to_vec()
+    })
+}
+
+fn invalid_run_options_response(options_json: &str, error: &str) -> Vec<u8> {
+    let response = RunResponse {
+        ok: false,
+        diagnostics: Vec::new(),
+        output: Vec::new(),
+        stack: Vec::new(),
+        error: Some(format!(
+            "invalid run options: {error}; payload={options_json}"
+        )),
+        halted: true,
+        yielded: false,
+        command_output: String::new(),
+        fuel: fuel_state_to_json(FuelState {
+            enabled: false,
+            remaining: None,
+            check_interval: 1,
+        }),
+    };
+    serde_json::to_vec(&response).unwrap_or_else(|_| {
+        b"{\"ok\":false,\"diagnostics\":[],\"output\":[],\"stack\":[],\"halted\":true,\"yielded\":false,\"command_output\":\"\",\"fuel\":{\"enabled\":false,\"remaining\":null,\"check_interval\":1}}".to_vec()
+    })
+}
+
+fn invalid_debug_options_response(options_json: &str, error: &str) -> Vec<u8> {
+    let response = DebugResponse {
+        diagnostics: Vec::new(),
+        output: Vec::new(),
+        stack: Vec::new(),
+        error: Some(format!(
+            "invalid debug options: {error}; payload={options_json}"
+        )),
+        current_line: None,
+        breakpoints: Vec::new(),
+        halted: true,
+        command_output: String::new(),
+        fuel: fuel_state_to_json(FuelState {
+            enabled: false,
+            remaining: None,
+            check_interval: 1,
+        }),
+    };
+    serde_json::to_vec(&response).unwrap_or_else(|_| {
+        b"{\"diagnostics\":[],\"output\":[],\"stack\":[],\"breakpoints\":[],\"halted\":true,\"command_output\":\"\",\"fuel\":{\"enabled\":false,\"remaining\":null,\"check_interval\":1}}".to_vec()
     })
 }
 
@@ -267,6 +379,8 @@ pub extern "C" fn run_source_json(
     source_len: u32,
     flavor_ptr: u32,
     flavor_len: u32,
+    options_ptr: u32,
+    options_len: u32,
 ) -> u64 {
     let source = match std::str::from_utf8(unpack_input(source_ptr, source_len)) {
         Ok(value) => value,
@@ -276,7 +390,21 @@ pub extern "C" fn run_source_json(
         Ok(value) => value,
         Err(err) => return leak_bytes(invalid_utf8_run_response("flavor", &err)),
     };
-    let report = run_source_with_flavor(source, parse_flavor(flavor_raw));
+    let fuel_config = if options_len == 0 {
+        FuelConfig::default()
+    } else {
+        let options_json = match std::str::from_utf8(unpack_input(options_ptr, options_len)) {
+            Ok(value) => value,
+            Err(err) => return leak_bytes(invalid_utf8_run_response("options", &err)),
+        };
+        match serde_json::from_str::<FuelConfig>(options_json) {
+            Ok(value) => value,
+            Err(err) => {
+                return leak_bytes(invalid_run_options_response(options_json, &err.to_string()));
+            }
+        }
+    };
+    let report = start_run_source_with_flavor(source, parse_flavor(flavor_raw), fuel_config);
     leak_bytes(run_response_to_json(report))
 }
 
@@ -286,6 +414,8 @@ pub extern "C" fn debug_start_json(
     source_len: u32,
     flavor_ptr: u32,
     flavor_len: u32,
+    options_ptr: u32,
+    options_len: u32,
 ) -> u64 {
     let source = match std::str::from_utf8(unpack_input(source_ptr, source_len)) {
         Ok(value) => value,
@@ -295,8 +425,41 @@ pub extern "C" fn debug_start_json(
         Ok(value) => value,
         Err(err) => return leak_bytes(invalid_utf8_debug_response("flavor", &err)),
     };
-    let report = start_debug_source_with_flavor(source, parse_flavor(flavor_raw));
+    let fuel_config = if options_len == 0 {
+        FuelConfig::default()
+    } else {
+        let options_json = match std::str::from_utf8(unpack_input(options_ptr, options_len)) {
+            Ok(value) => value,
+            Err(err) => return leak_bytes(invalid_utf8_debug_response("options", &err)),
+        };
+        match serde_json::from_str::<FuelConfig>(options_json) {
+            Ok(value) => value,
+            Err(err) => {
+                return leak_bytes(invalid_debug_options_response(
+                    options_json,
+                    &err.to_string(),
+                ));
+            }
+        }
+    };
+    let report = start_debug_source_with_flavor(source, parse_flavor(flavor_raw), fuel_config);
     leak_bytes(debug_response_to_json(report))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn run_command_json(command_ptr: u32, command_len: u32) -> u64 {
+    let command_json = match std::str::from_utf8(unpack_input(command_ptr, command_len)) {
+        Ok(value) => value,
+        Err(err) => return leak_bytes(invalid_utf8_run_response("command", &err)),
+    };
+    let parsed = match serde_json::from_str::<RunCommand>(command_json) {
+        Ok(value) => value,
+        Err(err) => {
+            return leak_bytes(invalid_run_command_response(command_json, &err.to_string()));
+        }
+    };
+    let report = run_command(parsed);
+    leak_bytes(run_response_to_json(report))
 }
 
 #[unsafe(no_mangle)]
@@ -334,8 +497,8 @@ mod tests {
     use crate::analyzer::lint_source_with_flavor;
     use crate::completions::build_completion_catalog;
     use crate::runtime::{
-        DebugCommand, debug_state, run_debug_command, run_source_with_flavor,
-        start_debug_source_with_flavor,
+        DebugCommand, FuelConfig, RunCommand, debug_state, run_command, run_debug_command,
+        run_source_with_flavor, start_debug_source_with_flavor, start_run_source_with_flavor,
     };
     use vm::SourceFlavor;
 
@@ -581,7 +744,8 @@ mod tests {
             print(value);
             value;
         "#;
-        let start = start_debug_source_with_flavor(source, SourceFlavor::RustScript);
+        let start =
+            start_debug_source_with_flavor(source, SourceFlavor::RustScript, FuelConfig::default());
         assert!(
             start.error.is_none(),
             "debug start should succeed, got {:?}",
@@ -622,6 +786,111 @@ mod tests {
         assert!(
             state_after_stop.error.is_some(),
             "state should report inactive session after stop"
+        );
+    }
+
+    #[test]
+    fn run_session_can_resume_after_out_of_fuel() {
+        let source = r#"
+            let value = 1 + 1;
+            print(value);
+            value;
+        "#;
+        let start = start_run_source_with_flavor(
+            source,
+            SourceFlavor::RustScript,
+            FuelConfig {
+                fuel: Some(0),
+                fuel_check_interval: Some(1),
+            },
+        );
+        assert!(start.error.is_none(), "run start should not error");
+        assert!(
+            start.yielded,
+            "run should yield immediately when fuel is zero"
+        );
+        assert_eq!(start.fuel.remaining, Some(0));
+        assert!(
+            start.command_output.contains("out of fuel"),
+            "expected out-of-fuel prompt, got {:?}",
+            start.command_output
+        );
+
+        let add = run_command(RunCommand::AddFuel { amount: 16 });
+        assert!(add.error.is_none(), "adding run fuel should not error");
+        assert_eq!(add.fuel.remaining, Some(16));
+
+        let resumed = run_command(RunCommand::Resume);
+        assert!(resumed.error.is_none(), "resumed run should not error");
+        assert!(resumed.halted, "run should halt after resuming");
+        assert!(
+            resumed.output.iter().any(|line| line == "2"),
+            "expected resumed output to contain 2, got {:?}",
+            resumed.output
+        );
+        assert!(
+            resumed.stack.iter().any(|value| value == "2"),
+            "expected resumed stack to contain 2, got {:?}",
+            resumed.stack
+        );
+    }
+
+    #[test]
+    fn debug_session_reports_and_updates_fuel() {
+        let source = r#"
+            let mut value = 1;
+            value = value + 2;
+            print(value);
+            value;
+        "#;
+        let start = start_debug_source_with_flavor(
+            source,
+            SourceFlavor::RustScript,
+            FuelConfig {
+                fuel: Some(0),
+                fuel_check_interval: Some(2),
+            },
+        );
+        assert!(start.error.is_none(), "debug start should succeed");
+        assert_eq!(start.fuel.remaining, Some(0));
+        assert_eq!(start.fuel.check_interval, 2);
+
+        let blocked = run_debug_command(DebugCommand::Continue);
+        assert!(blocked.error.is_none(), "continue should pause, not error");
+        assert_eq!(blocked.fuel.remaining, Some(0));
+        assert!(
+            blocked.command_output.contains("out of fuel"),
+            "expected out-of-fuel pause, got {:?}",
+            blocked.command_output
+        );
+
+        let add = run_debug_command(DebugCommand::AddFuel { amount: 64 });
+        assert!(add.error.is_none(), "fuel add should succeed");
+        assert!(
+            add.fuel.remaining.is_some_and(|remaining| remaining >= 63),
+            "expected substantial fuel after top-up, got {:?}",
+            add.fuel.remaining
+        );
+        assert!(
+            add.command_output.contains("fuel added: 64"),
+            "expected fuel add output, got {:?}",
+            add.command_output
+        );
+
+        let interval = run_debug_command(DebugCommand::SetFuelCheckInterval { interval: 1 });
+        assert!(interval.error.is_none(), "interval update should succeed");
+        assert_eq!(interval.fuel.check_interval, 1);
+
+        let resumed = run_debug_command(DebugCommand::Continue);
+        assert!(
+            resumed.error.is_none(),
+            "resumed debug run should not error"
+        );
+        assert!(resumed.halted, "resumed debug run should halt");
+        assert!(
+            resumed.output.iter().any(|line| line == "3"),
+            "expected debug output to contain 3, got {:?}",
+            resumed.output
         );
     }
 }

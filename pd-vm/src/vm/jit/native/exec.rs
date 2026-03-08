@@ -8,6 +8,7 @@ pub(crate) struct ExecutableBuffer {
 unsafe impl Send for ExecutableBuffer {}
 unsafe impl Sync for ExecutableBuffer {}
 
+#[cfg(any(windows, unix))]
 impl ExecutableBuffer {
     pub(crate) fn new(code: &[u8]) -> VmResult<Self> {
         if code.is_empty() {
@@ -33,6 +34,20 @@ impl ExecutableBuffer {
     }
 }
 
+#[cfg(not(any(windows, unix)))]
+impl ExecutableBuffer {
+    pub(crate) fn new(_code: &[u8]) -> VmResult<Self> {
+        Err(VmError::JitNative(
+            "executable trace buffers are unavailable on this target".to_string(),
+        ))
+    }
+
+    pub(crate) fn entry(&self) -> *const u8 {
+        self.ptr.cast_const()
+    }
+}
+
+#[cfg(any(windows, unix))]
 impl Drop for ExecutableBuffer {
     fn drop(&mut self) {
         if self.ptr.is_null() || self.len == 0 {
