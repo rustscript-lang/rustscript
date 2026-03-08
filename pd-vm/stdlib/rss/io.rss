@@ -2,23 +2,23 @@
 use io;
 
 pub fn read_text(path) {
-    let mut handle = io::open(path, "r");
-    let mut out = io::read_all(handle);
+    let handle = io::open(path, "r");
+    let out = io::read_all(handle);
     let mut read_text_closed = io::close(handle);
     out;
 }
 
 pub fn write_text(path, text) {
-    let mut handle = io::open(path, "w");
-    let mut written = io::write(handle, text);
+    let handle = io::open(path, "w");
+    let written = io::write(handle, text);
     let mut write_text_flushed = io::flush(handle);
     let mut write_text_closed = io::close(handle);
     written;
 }
 
 pub fn append_text(path, text) {
-    let mut handle = io::open(path, "a");
-    let mut written = io::write(handle, text);
+    let handle = io::open(path, "a");
+    let written = io::write(handle, text);
     let mut append_text_flushed = io::flush(handle);
     let mut append_text_closed = io::close(handle);
     written;
@@ -29,13 +29,11 @@ pub fn read_lines(path) {
     let mut lines = [];
     let mut text_len = (text).length;
     let mut start = 0;
-    let mut index = 0;
-    while index < text_len {
+    for (let mut index = 0; index < text_len; index = index + 1) {
         if (text)[index:(index + 1)] == "\n" {
             lines[(lines).length] = (text)[start:index];
             start = index + 1;
         }
-        index = index + 1;
     }
     if start < text_len {
         lines[(lines).length] = (text)[start:text_len];

@@ -1,0 +1,140 @@
+use super::stdlib::rss::math as math_std;
+
+fn nearly_equal(lhs, rhs) {
+    math_std::abs(lhs - rhs) < 0.000001;
+}
+
+fn nearly_zero(value) {
+    nearly_equal(value, 0.0);
+}
+
+fn clean(value) {
+    let mut out = value;
+    if nearly_zero(value) {
+        out = 0.0;
+    }
+    out;
+}
+
+fn exact_log2(value) {
+    let mut bits = 0;
+    let mut remaining = value;
+    let mut valid = remaining > 0;
+    while remaining > 1 {
+        if remaining % 2 == 0 {
+            remaining = remaining / 2;
+            bits = bits + 1;
+        } else {
+            valid = false;
+            remaining = 1;
+        }
+    }
+    let mut out = -1;
+    if valid {
+        out = bits;
+    }
+    out;
+}
+
+fn reverse_bits(index, bit_count) {
+    let mut out = 0;
+    let mut value = index;
+    let mut i = 0;
+    while i < bit_count {
+        out = out * 2 + value % 2;
+        value = value / 2;
+        i = i + 1;
+    }
+    out;
+}
+
+fn ifft(freq_re, freq_im) {
+    let mut n = (freq_re).length;
+    assert(n == (freq_im).length);
+
+    let mut bit_count = exact_log2(n);
+    assert(bit_count >= 0);
+
+    let mut out_re = [];
+    let mut out_im = [];
+    let mut i = 0;
+    while i < n {
+        let mut j = reverse_bits(i, bit_count);
+        out_re[i] = freq_re[j];
+        out_im[i] = freq_im[j];
+        i = i + 1;
+    }
+
+    let mut size = 2;
+    while size <= n {
+        let mut half = size / 2;
+        let mut j = 0;
+        while j < half {
+            let mut angle = 2.0 * math_std::pi() * j / size;
+            let mut wr = math_std::cos(angle);
+            let mut wi = math_std::sin(angle);
+            let mut k = j;
+            while k < n {
+                let mut pair = k + half;
+                let mut even_re = out_re[k];
+                let mut even_im = out_im[k];
+                let mut odd_re = out_re[pair];
+                let mut odd_im = out_im[pair];
+                let mut t_re = odd_re * wr - odd_im * wi;
+                let mut t_im = odd_re * wi + odd_im * wr;
+
+                out_re[k] = even_re + t_re;
+                out_im[k] = even_im + t_im;
+                out_re[pair] = even_re - t_re;
+                out_im[pair] = even_im - t_im;
+
+                k = k + size;
+            }
+            j = j + 1;
+        }
+        size = size * 2;
+    }
+
+    let mut scale = 1.0 / n;
+    i = 0;
+    while i < n {
+        out_re[i] = clean(out_re[i] * scale);
+        out_im[i] = clean(out_im[i] * scale);
+        i = i + 1;
+    }
+
+    { re: out_re, im: out_im };
+}
+
+// These bins are the forward DFT of [1, 2, 3, 4].
+let mut spectrum_re = [10.0, -2.0, -2.0, -2.0];
+let mut spectrum_im = [0.0, 2.0, 0.0, -2.0];
+
+let mut signal = ifft(spectrum_re, spectrum_im);
+let mut signal_re = signal.re;
+let mut signal_im = signal.im;
+
+let sample0 = signal_re[0];
+let sample1 = signal_re[1];
+let sample2 = signal_re[2];
+let sample3 = signal_re[3];
+
+let imag0 = signal_im[0];
+let imag1 = signal_im[1];
+let imag2 = signal_im[2];
+let imag3 = signal_im[3];
+
+assert(nearly_equal(sample0, 1.0));
+assert(nearly_equal(sample1, 2.0));
+assert(nearly_equal(sample2, 3.0));
+assert(nearly_equal(sample3, 4.0));
+
+assert(nearly_zero(imag0));
+assert(nearly_zero(imag1));
+assert(nearly_zero(imag2));
+assert(nearly_zero(imag3));
+
+print(math_std::round(sample0));
+print(math_std::round(sample1));
+print(math_std::round(sample2));
+print(math_std::round(sample3));

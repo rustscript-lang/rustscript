@@ -1,14 +1,12 @@
 // Set helpers implemented in pure RustScript using arrays with stable insertion order.
 
 fn index_of(values, needle) {
-    let mut index = 0;
     let mut out = -1;
-    while index < (values).length {
+    for (let mut index = 0; index < (values).length; index = index + 1) {
         if values[index] == needle {
             out = index;
             break;
         }
-        index = index + 1;
     }
     out;
 }
@@ -19,13 +17,11 @@ pub fn has(values, needle) {
 
 pub fn from(values) {
     let mut out = [];
-    let mut index = 0;
-    while index < (values).length {
+    for (let mut index = 0; index < (values).length; index = index + 1) {
         let mut value = values[index];
         if has(out, value) == false {
             out[(out).length] = value;
         }
-        index = index + 1;
     }
     out;
 }
@@ -40,26 +36,22 @@ pub fn add(values, needle) {
 
 pub fn remove(values, needle) {
     let mut out = [];
-    let mut index = 0;
-    while index < (values).length {
+    for (let mut index = 0; index < (values).length; index = index + 1) {
         let mut value = values[index];
         if value != needle && has(out, value) == false {
             out[(out).length] = value;
         }
-        index = index + 1;
     }
     out;
 }
 
 pub fn union(lhs, rhs) {
     let mut out = from(lhs);
-    let mut index = 0;
-    while index < (rhs).length {
+    for (let mut index = 0; index < (rhs).length; index = index + 1) {
         let mut value = rhs[index];
         if has(out, value) == false {
             out[(out).length] = value;
         }
-        index = index + 1;
     }
     out;
 }
@@ -68,13 +60,11 @@ pub fn intersect(lhs, rhs) {
     let mut left = from(lhs);
     let mut right = from(rhs);
     let mut out = [];
-    let mut index = 0;
-    while index < (left).length {
+    for (let mut index = 0; index < (left).length; index = index + 1) {
         let mut value = left[index];
         if has(right, value) {
             out[(out).length] = value;
         }
-        index = index + 1;
     }
     out;
 }
@@ -83,13 +73,11 @@ pub fn difference(lhs, rhs) {
     let mut left = from(lhs);
     let mut right = from(rhs);
     let mut out = [];
-    let mut index = 0;
-    while index < (left).length {
+    for (let mut index = 0; index < (left).length; index = index + 1) {
         let mut value = left[index];
         if has(right, value) == false {
             out[(out).length] = value;
         }
-        index = index + 1;
     }
     out;
 }
@@ -98,13 +86,11 @@ pub fn is_subset(lhs, rhs) {
     let mut left = from(lhs);
     let mut right = from(rhs);
     let mut out = true;
-    let mut index = 0;
-    while index < (left).length {
+    for (let mut index = 0; index < (left).length; index = index + 1) {
         if has(right, left[index]) == false {
             out = false;
             break;
         }
-        index = index + 1;
     }
     out;
 }

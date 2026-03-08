@@ -2,14 +2,12 @@
 
 fn map_has_key(map, key) {
     let mut keys = (map).keys;
-    let mut key_index = 0;
     let mut found = false;
-    while key_index < (keys).length {
+    for (let mut key_index = 0; key_index < (keys).length; key_index = key_index + 1) {
         if keys[key_index] == key {
             found = true;
             break;
         }
-        key_index = key_index + 1;
     }
     found;
 }
@@ -19,14 +17,12 @@ pub fn append(lhs, rhs) {
 }
 
 pub fn index_of(values, needle) {
-    let mut find_index = 0;
     let mut found = -1;
-    while find_index < (values).length {
+    for (let mut find_index = 0; find_index < (values).length; find_index = find_index + 1) {
         if values[find_index] == needle {
             found = find_index;
             break;
         }
-        find_index = find_index + 1;
     }
     found;
 }
@@ -37,57 +33,46 @@ pub fn contains(values, needle) {
 
 pub fn reverse(values) {
     let mut out = [];
-    let mut reverse_index = (values).length - 1;
-    while reverse_index > -1 {
+    for (
+        let mut reverse_index = (values).length - 1;
+        reverse_index > -1;
+        reverse_index = reverse_index - 1
+    ) {
         out[(out).length] = values[reverse_index];
-        reverse_index = reverse_index - 1;
     }
     out;
 }
 
 pub fn dedup(values) {
     let mut out = [];
-    let mut dedup_index = 0;
-    while dedup_index < (values).length {
+    for (let mut dedup_index = 0; dedup_index < (values).length; dedup_index = dedup_index + 1) {
         let mut value = values[dedup_index];
         if contains(out, value) == false {
             out[(out).length] = value;
         }
-        dedup_index = dedup_index + 1;
     }
     out;
 }
 
 pub fn has(map, key) {
-    let mut keys = (map).keys;
-    let mut key_index = 0;
-    let mut found = false;
-    while key_index < (keys).length {
-        if keys[key_index] == key {
-            found = true;
-            break;
-        }
-        key_index = key_index + 1;
-    }
-    found;
+    map_has_key(map, key);
 }
 
 pub fn get_or(map, key, fallback) {
-    let mut out = fallback;
-    if has(map, key) {
-        out = map[key];
-    }
+    let out = if has(map, key) => {
+        map[key]
+    } else => {
+        fallback
+    };
     out;
 }
 
 pub fn values(map) {
     let mut keys = (map).keys;
     let mut out = [];
-    let mut value_index = 0;
-    while value_index < (keys).length {
+    for (let mut value_index = 0; value_index < (keys).length; value_index = value_index + 1) {
         let mut key = keys[value_index];
         out[(out).length] = map[key];
-        value_index = value_index + 1;
     }
     out;
 }
@@ -95,11 +80,9 @@ pub fn values(map) {
 pub fn entries(map) {
     let mut keys = (map).keys;
     let mut out = [];
-    let mut entry_index = 0;
-    while entry_index < (keys).length {
+    for (let mut entry_index = 0; entry_index < (keys).length; entry_index = entry_index + 1) {
         let mut key = keys[entry_index];
         out[(out).length] = [key, map[key]];
-        entry_index = entry_index + 1;
     }
     out;
 }
@@ -108,19 +91,15 @@ pub fn merge(lhs, rhs) {
     let mut out = {};
 
     let mut lhs_keys = (lhs).keys;
-    let mut left_index = 0;
-    while left_index < (lhs_keys).length {
+    for (let mut left_index = 0; left_index < (lhs_keys).length; left_index = left_index + 1) {
         let mut key = lhs_keys[left_index];
         out[key] = lhs[key];
-        left_index = left_index + 1;
     }
 
     let mut rhs_keys = (rhs).keys;
-    let mut right_index = 0;
-    while right_index < (rhs_keys).length {
+    for (let mut right_index = 0; right_index < (rhs_keys).length; right_index = right_index + 1) {
         let mut key = rhs_keys[right_index];
         out[key] = rhs[key];
-        right_index = right_index + 1;
     }
     out;
 }

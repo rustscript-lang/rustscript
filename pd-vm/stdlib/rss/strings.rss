@@ -1,20 +1,13 @@
 // String helpers implemented in pure RustScript using language syntax.
 
 fn is_whitespace(ch) {
-    let mut is_whitespace_value = false;
-    if ch == " " {
-        is_whitespace_value = true;
-    }
-    if ch == "\n" {
-        is_whitespace_value = true;
-    }
-    if ch == "\r" {
-        is_whitespace_value = true;
-    }
-    if ch == "\t" {
-        is_whitespace_value = true;
-    }
-    is_whitespace_value;
+    match ch {
+        " " => true,
+        "\n" => true,
+        "\r" => true,
+        "\t" => true,
+        _ => false,
+    };
 }
 
 pub fn equals(lhs, rhs) {
@@ -26,62 +19,59 @@ pub fn is_empty(value) {
 }
 
 pub fn non_empty(value) {
-    is_empty(value) == false;
+    !is_empty(value);
 }
 
 pub fn contains(haystack, needle) {
-    let mut contains_haystack_len = (haystack).length;
-    let mut contains_needle_len = (needle).length;
-    let mut contains_found = false;
-    if contains_needle_len == 0 {
-        contains_found = true;
-    }
-    if contains_needle_len > 0 {
-        let mut contains_limit = contains_haystack_len - contains_needle_len + 1;
-        let mut contains_index = 0;
-        while contains_index < contains_limit {
-            if equals((haystack)[contains_index:(contains_index + contains_needle_len)], needle) {
-                contains_found = true;
+    let haystack_len = (haystack).length;
+    let needle_len = (needle).length;
+    let out = if needle_len == 0 => {
+        true
+    } else => {
+        let mut found = false;
+        let limit = haystack_len - needle_len + 1;
+        for (let mut index = 0; index < limit; index = index + 1) {
+            if equals((haystack)[index:(index + needle_len)], needle) {
+                found = true;
                 break;
             }
-            contains_index = contains_index + 1;
         }
-    }
-    contains_found;
+        found
+    };
+    out;
 }
 
 pub fn split(value, separator) {
-    let mut split_output = [];
-    let mut split_value_len = (value).length;
-    let mut split_separator_len = (separator).length;
-    if split_separator_len == 0 {
-        let mut split_char_index = 0;
-        while split_char_index < split_value_len {
-            split_output[(split_output).length] = (value)[split_char_index:(split_char_index + 1)];
-            split_char_index = split_char_index + 1;
+    let value_len = (value).length;
+    let separator_len = (separator).length;
+    let out = if separator_len == 0 => {
+        let mut out = [];
+        for (let mut char_index = 0; char_index < value_len; char_index = char_index + 1) {
+            out[(out).length] = (value)[char_index:(char_index + 1)];
         }
-    } else {
-        let mut split_cursor = 0;
-        let mut split_part_start = 0;
-        let mut split_limit = split_value_len - split_separator_len + 1;
-        while split_cursor < split_limit {
-            if equals((value)[split_cursor:(split_cursor + split_separator_len)], separator) {
-                split_output[(split_output).length] =
-                    (value)[split_part_start:split_cursor];
-                split_part_start = split_cursor + split_separator_len;
-                split_cursor = split_part_start;
+        out
+    } else => {
+        let mut out = [];
+        let mut cursor = 0;
+        let mut part_start = 0;
+        let limit = value_len - separator_len + 1;
+        while cursor < limit {
+            if equals((value)[cursor:(cursor + separator_len)], separator) {
+                out[(out).length] = (value)[part_start:cursor];
+                part_start = cursor + separator_len;
+                cursor = part_start;
             } else {
-                split_cursor = split_cursor + 1;
+                cursor = cursor + 1;
             }
         }
-        split_output[(split_output).length] =
-            (value)[split_part_start:split_value_len];
-    }
-    split_output;
+        out[(out).length] = (value)[part_start:value_len];
+        out
+    };
+    out;
 }
 
 pub fn trim(value) {
-    let mut trim_len = (value).length;
+    let trim_len = (value).length;
     let mut trim_start = 0;
     while trim_start < trim_len {
         if is_whitespace((value)[trim_start:(trim_start + 1)]) {
@@ -103,28 +93,26 @@ pub fn trim(value) {
 }
 
 pub fn replace(value, needle, replacement) {
-    let mut replace_value_len = (value).length;
-    let mut replace_needle_len = (needle).length;
-    let mut replace_result = value;
-    if replace_needle_len > 0 {
-        let mut replace_index = 0;
-        let mut replace_output = "";
-        while replace_index < replace_value_len {
-            if replace_index + replace_needle_len > replace_value_len {
-                replace_output = replace_output + (value)[replace_index:(replace_index + 1)];
-                replace_index = replace_index + 1;
+    let value_len = (value).length;
+    let needle_len = (needle).length;
+    let out = if needle_len == 0 => {
+        value
+    } else => {
+        let mut index = 0;
+        let mut output = "";
+        while index < value_len {
+            if index + needle_len > value_len {
+                output = output + (value)[index:(index + 1)];
+                index = index + 1;
+            } else if equals((value)[index:(index + needle_len)], needle) {
+                output = output + replacement;
+                index = index + needle_len;
             } else {
-                if equals((value)[replace_index:(replace_index + replace_needle_len)], needle) {
-                    replace_output = replace_output + replacement;
-                    replace_index = replace_index + replace_needle_len;
-                } else {
-                    replace_output =
-                        replace_output + (value)[replace_index:(replace_index + 1)];
-                    replace_index = replace_index + 1;
-                }
+                output = output + (value)[index:(index + 1)];
+                index = index + 1;
             }
         }
-        replace_result = replace_output;
-    }
-    replace_result;
+        output
+    };
+    out;
 }

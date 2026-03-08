@@ -5,54 +5,41 @@ fn is_separator(ch) {
 }
 
 fn trim_trailing_separators(path) {
-    let mut out = path;
-    let mut path_len = (path).length;
-    let mut end = path_len;
+    let mut end = (path).length;
     while end > 1 && is_separator((path)[(end - 1):end]) {
         end = end - 1;
     }
-    out = (path)[0:end];
-    out;
+    (path)[0:end];
 }
 
 pub fn normalize_sep(path) {
     let mut out = "";
-    let mut index = 0;
-    while index < (path).length {
-        let mut ch = (path)[index:(index + 1)];
-        if ch == "\\" {
-            out = out + "/";
-        } else {
-            out = out + ch;
-        }
-        index = index + 1;
+    for (let mut index = 0; index < (path).length; index = index + 1) {
+        let ch = (path)[index:(index + 1)];
+        let segment = if ch == "\\" => { "/" } else => { ch };
+        out = out + segment;
     }
     out;
 }
 
 pub fn join(lhs, rhs) {
-    let mut left = normalize_sep(lhs);
-    let mut right = normalize_sep(rhs);
-    let mut out = "";
-    if (left).length == 0 {
-        out = right;
-    } else {
-        if (right).length == 0 {
-            out = left;
-        } else {
-            let mut left_last = (left)[((left).length - 1):(left).length];
-            let mut right_first = (right)[0:1];
-            if is_separator(left_last) && is_separator(right_first) {
-                out = left + (right)[1:(right).length];
-            } else {
-                if is_separator(left_last) || is_separator(right_first) {
-                    out = left + right;
-                } else {
-                    out = left + "/" + right;
-                }
-            }
+    let left = normalize_sep(lhs);
+    let right = normalize_sep(rhs);
+    let out = if (left).length == 0 => {
+        right
+    } else if (right).length == 0 => {
+        left
+    } else => {
+        let left_last = (left)[((left).length - 1):(left).length];
+        let right_first = (right)[0:1];
+        if is_separator(left_last) && is_separator(right_first) => {
+            left + (right)[1:(right).length]
+        } else if is_separator(left_last) || is_separator(right_first) => {
+            left + right
+        } else => {
+            left + "/" + right
         }
-    }
+    };
     out;
 }
 
@@ -73,7 +60,6 @@ pub fn basename(path) {
 pub fn dirname(path) {
     let mut normalized = trim_trailing_separators(normalize_sep(path));
     let mut cut = -1;
-    let mut out = "";
     let mut index = (normalized).length - 1;
     while index > -1 {
         if (normalized)[index:(index + 1)] == "/" {
@@ -82,23 +68,19 @@ pub fn dirname(path) {
         }
         index = index - 1;
     }
-
-    if cut < 0 {
-        out = "";
-    } else {
-        if cut == 0 {
-            out = "/";
-        } else {
-            out = (normalized)[0:cut];
-        }
-    }
+    let out = if cut < 0 => {
+        ""
+    } else if cut == 0 => {
+        "/"
+    } else => {
+        (normalized)[0:cut]
+    };
     out;
 }
 
 pub fn extname(path) {
     let mut name = basename(path);
     let mut dot = -1;
-    let mut out = "";
     let mut index = (name).length - 1;
     while index > -1 {
         if (name)[index:(index + 1)] == "." {
@@ -107,10 +89,10 @@ pub fn extname(path) {
         }
         index = index - 1;
     }
-    if dot < 1 {
-        out = "";
-    } else {
-        out = (name)[dot:(name).length];
-    }
+    let out = if dot < 1 => {
+        ""
+    } else => {
+        (name)[dot:(name).length]
+    };
     out;
 }

@@ -121,6 +121,21 @@ fn examples_run() {
 }
 
 #[test]
+fn ifft_math_example_runs() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    let stack = run_compiled_file(&root.join("ifft_math.rss"));
+    assert_eq!(
+        stack,
+        vec![
+            Value::Float(1.0),
+            Value::Float(2.0),
+            Value::Float(3.0),
+            Value::Float(4.0),
+        ]
+    );
+}
+
+#[test]
 fn nullable_chain_maps_in_all_frontends() {
     let rss_source = r#"
 let a = { b: { c: 7 } };

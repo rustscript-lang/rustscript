@@ -3,16 +3,13 @@
 pub fn range_step(start, stop, step) {
     let mut out = [];
     if step != 0 {
-        let mut value = start;
         if step > 0 {
-            while value < stop {
+            for (let mut value = start; value < stop; value = value + step) {
                 out[(out).length] = value;
-                value = value + step;
             }
         } else {
-            while value > stop {
+            for (let mut value = start; value > stop; value = value + step) {
                 out[(out).length] = value;
-                value = value + step;
             }
         }
     }
@@ -25,59 +22,53 @@ pub fn range(stop) {
 
 pub fn enumerate(values) {
     let mut out = [];
-    let mut index = 0;
-    while index < (values).length {
+    for (let mut index = 0; index < (values).length; index = index + 1) {
         out[(out).length] = [index, values[index]];
-        index = index + 1;
     }
     out;
 }
 
 pub fn zip(lhs, rhs) {
     let mut out = [];
-    let mut index = 0;
     let mut limit = (lhs).length;
     if (rhs).length < limit {
         limit = (rhs).length;
     }
-    while index < limit {
+    for (let mut index = 0; index < limit; index = index + 1) {
         out[(out).length] = [lhs[index], rhs[index]];
-        index = index + 1;
     }
     out;
 }
 
 pub fn take(values, count) {
-    let mut out = [];
-    if count > 0 {
-        out = values[0:count];
-    }
+    let out = if count > 0 => {
+        values[0:count]
+    } else => {
+        []
+    };
     out;
 }
 
 pub fn skip(values, count) {
-    let mut start = 0;
-    if count > 0 {
-        start = count;
-    }
-    if start > (values).length {
-        start = (values).length;
-    }
-    values[start:(values).length];
+    let start = if count > 0 => { count } else => { 0 };
+    let bounded_start = if start > (values).length => {
+        (values).length
+    } else => {
+        start
+    };
+    values[bounded_start:(values).length];
 }
 
 pub fn chunk(values, size) {
     let mut out = [];
     if size > 0 {
-        let mut index = 0;
-        let mut value_len = (values).length;
-        while index < value_len {
+        let value_len = (values).length;
+        for (let mut index = 0; index < value_len; index = index + size) {
             let mut next = index + size;
             if next > value_len {
                 next = value_len;
             }
             out[(out).length] = values[index:next];
-            index = next;
         }
     }
     out;
@@ -85,78 +76,64 @@ pub fn chunk(values, size) {
 
 pub fn sum(values) {
     let mut out = 0;
-    let mut index = 0;
-    while index < (values).length {
+    for (let mut index = 0; index < (values).length; index = index + 1) {
         out = out + values[index];
-        index = index + 1;
     }
     out;
 }
 
 pub fn any_true(values) {
     let mut out = false;
-    let mut index = 0;
-    while index < (values).length {
+    for (let mut index = 0; index < (values).length; index = index + 1) {
         if values[index] {
             out = true;
             break;
         }
-        index = index + 1;
     }
     out;
 }
 
 pub fn all_true(values) {
     let mut out = true;
-    let mut index = 0;
-    while index < (values).length {
+    for (let mut index = 0; index < (values).length; index = index + 1) {
         if values[index] == false {
             out = false;
             break;
         }
-        index = index + 1;
     }
     out;
 }
 
 pub fn map(values, func) {
     let mut out = [];
-    let mut index = 0;
-    while index < (values).length {
+    for (let mut index = 0; index < (values).length; index = index + 1) {
         out[(out).length] = func(values[index]);
-        index = index + 1;
     }
     out;
 }
 
 pub fn filter(values, pred) {
     let mut out = [];
-    let mut index = 0;
-    while index < (values).length {
+    for (let mut index = 0; index < (values).length; index = index + 1) {
         let mut value = values[index];
         if pred(value) {
             out[(out).length] = value;
         }
-        index = index + 1;
     }
     out;
 }
 
 pub fn reduce(values, init, func) {
     let mut acc = init;
-    let mut index = 0;
-    while index < (values).length {
+    for (let mut index = 0; index < (values).length; index = index + 1) {
         acc = func(acc, values[index]);
-        index = index + 1;
     }
     acc;
 }
 
 pub fn each(values, func) {
-    let mut index = 0;
-    while index < (values).length {
+    for (let mut index = 0; index < (values).length; index = index + 1) {
         let mut each_result = func(values[index]);
-        index = index + 1;
     }
     null;
 }

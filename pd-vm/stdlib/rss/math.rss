@@ -51,19 +51,18 @@ pub fn signum(value) {
 }
 
 pub fn sign(value) {
-    let mut out = 0;
-    if value < 0 {
-        out = -1;
-    } else if value > 0 {
-        out = 1;
-    }
+    let out = if value < 0 => {
+        -1
+    } else if value > 0 => {
+        1
+    } else => {
+        0
+    };
     out;
 }
 
 pub fn in_range(value, lower, upper) {
-    let mut lower_ok = value > lower || value == lower;
-    let mut upper_ok = value < upper || value == upper;
-    lower_ok && upper_ok;
+    value >= lower && value <= upper;
 }
 
 pub fn is_even(value) {
@@ -71,15 +70,13 @@ pub fn is_even(value) {
 }
 
 pub fn is_odd(value) {
-    is_even(value) == false;
+    !is_even(value);
 }
 
 pub fn sum(values) {
     let mut out = 0;
-    let mut index = 0;
-    while index < (values).length {
+    for (let mut index = 0; index < (values).length; index = index + 1) {
         out = out + values[index];
-        index = index + 1;
     }
     out;
 }
