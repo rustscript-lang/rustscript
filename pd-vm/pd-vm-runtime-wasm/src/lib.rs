@@ -676,8 +676,8 @@ mod tests {
     fn run_supports_embedded_stdlib_imports_with_named_runtime_host_import() {
         let source = r#"
             use stdlib::rss::strings as string;
-            use runtime::{sleep};
-            sleep(0);
+            use runtime;
+            runtime::sleep(0);
             let value = string::trim("  hello wasm  ");
             print(value);
             value;
@@ -697,6 +697,23 @@ mod tests {
             report.stack.iter().any(|value| value == "hello wasm"),
             "expected stack to include trimmed string, got {:?}",
             report.stack
+        );
+    }
+
+    #[test]
+    fn lint_accepts_embedded_parse_and_set_stdlib_imports() {
+        let source = r#"
+            use stdlib::rss::parse as parse;
+            use stdlib::rss::set as set;
+            let value = parse::try_parse_int_base("ff", 16);
+            let joined = set::union([1, 2, 2], [2, 3, 4]);
+            value == 255 && joined.length == 4;
+        "#;
+        let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
+        assert!(
+            report.diagnostics.is_empty(),
+            "expected embedded parse/set stdlib lint to pass, got {:?}",
+            report.diagnostics
         );
     }
 
@@ -779,6 +796,20 @@ mod tests {
                 .iter()
                 .any(|entry| entry.label == "string::trim"),
             "expected RustScript stdlib completion entry"
+        );
+        assert!(
+            catalog
+                .rustscript
+                .iter()
+                .any(|entry| entry.label == "parse::try_parse_int_base"),
+            "expected RustScript parse stdlib completion entry"
+        );
+        assert!(
+            catalog
+                .rustscript
+                .iter()
+                .any(|entry| entry.label == "set::union"),
+            "expected RustScript set stdlib completion entry"
         );
         assert!(
             catalog
