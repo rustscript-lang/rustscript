@@ -131,6 +131,239 @@ const IO_MEMBERS: &[BuiltinNamespaceMemberSpec] = &[
     },
 ];
 
+const MATH_MEMBERS: &[BuiltinNamespaceMemberSpec] = &[
+    BuiltinNamespaceMemberSpec {
+        name: "pi",
+        arity: 0,
+        docs: "Return pi.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "tau",
+        arity: 0,
+        docs: "Return tau.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "e",
+        arity: 0,
+        docs: "Return Euler's number.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "epsilon",
+        arity: 0,
+        docs: "Return f64 epsilon.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "inf",
+        arity: 0,
+        docs: "Return positive infinity.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "neg_inf",
+        arity: 0,
+        docs: "Return negative infinity.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "nan",
+        arity: 0,
+        docs: "Return NaN.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "abs",
+        arity: 1,
+        docs: "Absolute value.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "sqrt",
+        arity: 1,
+        docs: "Square root.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "cbrt",
+        arity: 1,
+        docs: "Cube root.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "exp",
+        arity: 1,
+        docs: "e raised to the value.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "exp2",
+        arity: 1,
+        docs: "2 raised to the value.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "ln",
+        arity: 1,
+        docs: "Natural logarithm.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "ln_1p",
+        arity: 1,
+        docs: "Natural logarithm of 1 + value.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "log2",
+        arity: 1,
+        docs: "Base-2 logarithm.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "log10",
+        arity: 1,
+        docs: "Base-10 logarithm.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "sin",
+        arity: 1,
+        docs: "Sine.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "cos",
+        arity: 1,
+        docs: "Cosine.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "tan",
+        arity: 1,
+        docs: "Tangent.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "asin",
+        arity: 1,
+        docs: "Arc sine.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "acos",
+        arity: 1,
+        docs: "Arc cosine.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "atan",
+        arity: 1,
+        docs: "Arc tangent.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "sinh",
+        arity: 1,
+        docs: "Hyperbolic sine.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "cosh",
+        arity: 1,
+        docs: "Hyperbolic cosine.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "tanh",
+        arity: 1,
+        docs: "Hyperbolic tangent.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "floor",
+        arity: 1,
+        docs: "Round toward negative infinity.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "ceil",
+        arity: 1,
+        docs: "Round toward positive infinity.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "round",
+        arity: 1,
+        docs: "Round to nearest integer.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "trunc",
+        arity: 1,
+        docs: "Truncate fractional digits.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "fract",
+        arity: 1,
+        docs: "Fractional part.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "signum",
+        arity: 1,
+        docs: "Sign of the number.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "to_degrees",
+        arity: 1,
+        docs: "Convert radians to degrees.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "to_radians",
+        arity: 1,
+        docs: "Convert degrees to radians.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "is_nan",
+        arity: 1,
+        docs: "Check for NaN.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "is_infinite",
+        arity: 1,
+        docs: "Check for infinity.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "is_finite",
+        arity: 1,
+        docs: "Check for finite numbers.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "atan2",
+        arity: 2,
+        docs: "Arc tangent of y/x using both signs.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "powf",
+        arity: 2,
+        docs: "Raise value to a floating-point exponent.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "powi",
+        arity: 2,
+        docs: "Raise value to an integer exponent.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "hypot",
+        arity: 2,
+        docs: "Euclidean length of a right triangle.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "log",
+        arity: 2,
+        docs: "Logarithm in the provided base.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "min",
+        arity: 2,
+        docs: "Minimum numeric value.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "max",
+        arity: 2,
+        docs: "Maximum numeric value.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "copysign",
+        arity: 2,
+        docs: "Return value with the sign of another number.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "clamp",
+        arity: 3,
+        docs: "Clamp value between min and max.",
+    },
+    BuiltinNamespaceMemberSpec {
+        name: "mul_add",
+        arity: 3,
+        docs: "Fused multiply-add.",
+    },
+];
+
 const BUILTIN_NAMESPACE_SPECS: &[BuiltinNamespaceSpec] = &[
     BuiltinNamespaceSpec {
         namespace: "re",
@@ -152,6 +385,13 @@ const BUILTIN_NAMESPACE_SPECS: &[BuiltinNamespaceSpec] = &[
         docs: "I/O builtin namespace.",
         runtime_supported_on_wasm: false,
         members: IO_MEMBERS,
+    },
+    BuiltinNamespaceSpec {
+        namespace: "math",
+        alias: "math",
+        docs: "Numeric math builtin namespace.",
+        runtime_supported_on_wasm: true,
+        members: MATH_MEMBERS,
     },
 ];
 
@@ -822,6 +1062,13 @@ mod tests {
                 .any(|entry| entry.label == "set.union"),
             "expected JavaScript stdlib completion for set.union",
         );
+        assert!(
+            catalog
+                .rustscript
+                .iter()
+                .any(|entry| entry.label == "math::sqrt"),
+            "expected RustScript builtin completion for math::sqrt",
+        );
     }
 
     #[test]
@@ -868,6 +1115,13 @@ mod tests {
                 .iter()
                 .any(|entry| entry.label == "json::encode"),
             "expected RustScript completion for json::encode",
+        );
+        assert!(
+            catalog
+                .rustscript
+                .iter()
+                .any(|entry| entry.label == "use math;"),
+            "expected RustScript completion for use math;",
         );
     }
 }

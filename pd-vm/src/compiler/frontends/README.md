@@ -52,7 +52,8 @@ Supported syntax and features:
   optional chaining (`?.` and `?.[key]`), slice syntax (`[a:b]`, `[:b]`, `[a:]`), map key
   literals including `null`.
 - Host/runtime calls:
-  - builtins via namespaces: `io::...`, `re::...`, `json::...`, `jit::...` (regex supports optional flags arg)
+  - builtins via namespaces: `io::...`, `re::...`, `json::...`, `jit::...`, `math::...`
+    (regex supports optional flags arg)
   - host namespaces via `use <namespace>;` / `use <namespace> as <alias>;` / `use <namespace>::{name as local};`
 - RustScript frontend rewrites:
   - `Option::None` -> `null`

@@ -1,30 +1,89 @@
-use super::rss::math::{abs, ceil, clamp, floor, in_range, is_even, is_odd, max, min, sign, sum};
+use super::rss::math as math_std;
+use math as native_math;
 
-assert(abs(-7) == 7);
-assert(abs(3) == 3);
+fn approx_eq(lhs, rhs) {
+    math_std::abs(lhs - rhs) < 0.0000001;
+}
 
-assert(min(3, 5) == 3);
-assert(max(3, 5) == 5);
+assert(math_std::abs(-7) == 7);
+assert(math_std::abs(3) == 3);
+assert(approx_eq(math_std::abs(-2.5), 2.5));
 
-assert(clamp(10, 0, 5) == 5);
-assert(clamp(-2, 0, 5) == 0);
-assert(clamp(3, 0, 5) == 3);
+assert(math_std::min(3, 5) == 3);
+assert(math_std::max(3, 5) == 5);
+assert(approx_eq(math_std::min(3.5, 2.25), 2.25));
+assert(approx_eq(math_std::max(3.5, 2.25), 3.5));
 
-assert(sign(-3) == -1);
-assert(sign(0) == 0);
-assert(sign(9) == 1);
+assert(math_std::clamp(10, 0, 5) == 5);
+assert(math_std::clamp(-2, 0, 5) == 0);
+assert(math_std::clamp(3, 0, 5) == 3);
+assert(approx_eq(math_std::clamp(10.5, 0.0, 5.0), 5.0));
 
-assert(in_range(5, 1, 5));
-assert(in_range(0, 1, 5) == false);
+assert(math_std::sign(-3) == -1);
+assert(math_std::sign(0) == 0);
+assert(math_std::sign(9) == 1);
+assert(approx_eq(math_std::signum(-2.5), -1.0));
 
-assert(is_even(10));
-assert(is_even(11) == false);
-assert(is_odd(11));
-assert(is_odd(10) == false);
+assert(math_std::in_range(5, 1, 5));
+assert(math_std::in_range(0, 1, 5) == false);
 
-assert(sum([2, 4, 6]) == 12);
+assert(math_std::is_even(10));
+assert(math_std::is_even(11) == false);
+assert(math_std::is_odd(11));
+assert(math_std::is_odd(10) == false);
 
-assert(floor(7) == 7);
-assert(ceil(7) == 7);
-assert(floor(-3) == -3);
-assert(ceil(-3) == -3);
+assert(math_std::sum([2, 4, 6]) == 12);
+
+assert(math_std::floor(7) == 7);
+assert(math_std::ceil(7) == 7);
+assert(math_std::floor(-3) == -3);
+assert(math_std::ceil(-3) == -3);
+assert(approx_eq(math_std::floor(7.9), 7.0));
+assert(approx_eq(math_std::ceil(-3.2), -3.0));
+assert(approx_eq(math_std::round(1.6), 2.0));
+assert(approx_eq(math_std::trunc(-3.8), -3.0));
+assert(approx_eq(math_std::fract(7.25), 0.25));
+
+assert(approx_eq(native_math::sqrt(81), 9.0));
+assert(approx_eq(math_std::sqrt(81), 9.0));
+assert(approx_eq(math_std::cbrt(27), 3.0));
+assert(approx_eq(math_std::powf(9, 0.5), 3.0));
+assert(approx_eq(math_std::powi(2, 5), 32.0));
+assert(approx_eq(math_std::exp(1), math_std::e()));
+assert(approx_eq(math_std::exp2(5), 32.0));
+assert(approx_eq(math_std::ln(math_std::e()), 1.0));
+assert(approx_eq(math_std::ln_1p(1), math_std::ln(2.0)));
+assert(approx_eq(math_std::log(8, 2), 3.0));
+assert(approx_eq(math_std::log2(8), 3.0));
+assert(approx_eq(math_std::log10(1000), 3.0));
+
+assert(approx_eq(math_std::sin(0), 0.0));
+assert(approx_eq(math_std::cos(0), 1.0));
+assert(approx_eq(math_std::tan(math_std::pi() / 4.0), 1.0));
+assert(approx_eq(math_std::asin(1), math_std::pi() / 2.0));
+assert(approx_eq(math_std::acos(1), 0.0));
+assert(approx_eq(math_std::atan(1), math_std::pi() / 4.0));
+assert(approx_eq(math_std::atan2(1, 1), math_std::pi() / 4.0));
+assert(approx_eq(math_std::sinh(0), 0.0));
+assert(approx_eq(math_std::cosh(0), 1.0));
+assert(approx_eq(math_std::tanh(0), 0.0));
+
+assert(approx_eq(math_std::hypot(3, 4), 5.0));
+assert(approx_eq(math_std::copysign(3, -2), -3.0));
+assert(approx_eq(math_std::mul_add(2, 3, 4), 10.0));
+
+assert(approx_eq(math_std::to_degrees(math_std::pi()), 180.0));
+assert(approx_eq(math_std::to_radians(180), math_std::pi()));
+assert(approx_eq(math_std::deg(math_std::pi()), 180.0));
+assert(approx_eq(math_std::rad(180), math_std::pi()));
+assert(approx_eq(math_std::fmod(5.5, 2.0), 1.5));
+
+assert(approx_eq(math_std::pi(), 3.141592653589793));
+assert(approx_eq(math_std::tau(), 6.283185307179586));
+assert(approx_eq(math_std::e(), 2.718281828459045));
+assert(math_std::epsilon() > 0.0);
+assert(math_std::is_infinite(math_std::inf()));
+assert(math_std::is_infinite(math_std::neg_inf()));
+assert(math_std::is_finite(math_std::inf()) == false);
+assert(math_std::is_finite(42));
+assert(math_std::is_nan(math_std::nan()));
