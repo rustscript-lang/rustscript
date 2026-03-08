@@ -240,6 +240,43 @@ impl TraceJitEngine {
         compiled
     }
 
+    pub(crate) fn ensure_aot_root(&mut self, program: &Program, root_ip: usize) -> Option<usize> {
+        if !self.config.enabled || !native_jit_supported() {
+            return None;
+        }
+        if let Some(&trace_id) = self.compiled_by_root.get(&root_ip) {
+            return Some(trace_id);
+        }
+        if self.blocked_roots.contains(&root_ip) {
+            return None;
+        }
+
+        let line = program
+            .debug
+            .as_ref()
+            .and_then(|debug| debug.line_for_offset(root_ip));
+        match self.compile_aot_block(program, root_ip) {
+            Ok(trace_id) => {
+                self.attempts.push(JitAttempt {
+                    root_ip,
+                    line,
+                    result: Ok(trace_id),
+                });
+                self.compiled_by_root.insert(root_ip, trace_id);
+                Some(trace_id)
+            }
+            Err(reason) => {
+                self.attempts.push(JitAttempt {
+                    root_ip,
+                    line,
+                    result: Err(reason),
+                });
+                self.blocked_roots.insert(root_ip);
+                None
+            }
+        }
+    }
+
     pub fn observe_hot_ip(&mut self, ip: usize, program: &Program) -> Option<usize> {
         if !self.config.enabled {
             return None;
@@ -363,6 +400,56 @@ impl TraceJitEngine {
         if let Some(trace) = self.traces.get_mut(trace_id) {
             trace.executions = trace.executions.saturating_add(1);
         }
+    }
+
+    pub(crate) fn install_precompiled_traces(
+        &mut self,
+        traces: Vec<JitTrace>,
+    ) -> Result<(), String> {
+        let mut compiled_by_root = HashMap::with_capacity(traces.len());
+        for (expected_id, trace) in traces.iter().enumerate() {
+            if trace.id != expected_id {
+                return Err(format!(
+                    "invalid precompiled trace id {}, expected {}",
+                    trace.id, expected_id
+                ));
+            }
+            if trace.steps.len() != trace.step_ips.len() {
+                return Err(format!(
+                    "precompiled trace {} has misaligned steps and step_ips",
+                    trace.id
+                ));
+            }
+            if compiled_by_root.insert(trace.root_ip, trace.id).is_some() {
+                return Err(format!(
+                    "duplicate precompiled trace root_ip {}",
+                    trace.root_ip
+                ));
+            }
+        }
+
+        let max_trace_len = traces
+            .iter()
+            .map(|trace| trace.steps.len())
+            .max()
+            .unwrap_or(1);
+        self.config.enabled = true;
+        self.config.hot_loop_threshold = self.config.hot_loop_threshold.max(1);
+        self.config.max_trace_len = self.config.max_trace_len.max(max_trace_len);
+        self.hot_counts.clear();
+        self.compiled_by_root = compiled_by_root;
+        self.blocked_roots.clear();
+        self.loop_headers = None;
+        self.attempts = traces
+            .iter()
+            .map(|trace| JitAttempt {
+                root_ip: trace.root_ip,
+                line: trace.start_line,
+                result: Ok(trace.id),
+            })
+            .collect();
+        self.traces = traces;
+        Ok(())
     }
 
     pub fn snapshot(&self) -> JitSnapshot {
@@ -1002,6 +1089,9 @@ fn scan_program_block_roots(program: &Program) -> HashSet<usize> {
                 }
                 if read_u8(code, &mut ip).is_none() {
                     break;
+                }
+                if ip < code.len() {
+                    roots.insert(ip);
                 }
             }
             _ => {}

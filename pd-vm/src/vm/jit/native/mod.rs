@@ -3,6 +3,7 @@ use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "cranelift-jit")]
 mod cranelift;
+mod exec;
 
 pub(super) const STATUS_CONTINUE: i32 = 0;
 pub(super) const STATUS_HALTED: i32 = 1;
@@ -30,6 +31,11 @@ pub(super) fn selected_codegen_backend() -> &'static str {
 
 #[cfg(feature = "cranelift-jit")]
 pub(crate) use cranelift::{CompiledTrace, TraceKeepAlive};
+
+#[cfg(feature = "cranelift-jit")]
+pub(crate) fn load_compiled_trace(code: &[u8]) -> VmResult<Box<CompiledTrace>> {
+    Ok(Box::new(cranelift::load_compiled_trace(code)?))
+}
 
 #[cfg(not(feature = "cranelift-jit"))]
 pub(crate) struct TraceKeepAlive;
@@ -60,6 +66,35 @@ pub(super) fn compile_native_trace(
     _fuel_check_interval: Option<u32>,
     _profile: NativeCompileProfile,
 ) -> VmResult<Box<CompiledTrace>> {
+    Err(VmError::JitNative(
+        "native JIT backend is disabled (feature 'cranelift-jit' is not enabled)".to_string(),
+    ))
+}
+
+#[cfg(not(feature = "cranelift-jit"))]
+pub(crate) fn load_compiled_trace(_code: &[u8]) -> VmResult<Box<CompiledTrace>> {
+    Err(VmError::JitNative(
+        "native JIT backend is disabled (feature 'cranelift-jit' is not enabled)".to_string(),
+    ))
+}
+
+#[cfg(feature = "cranelift-jit")]
+pub(crate) fn helper_entry_address() -> usize {
+    cranelift::helper_entry_address()
+}
+
+#[cfg(not(feature = "cranelift-jit"))]
+pub(crate) fn helper_entry_address() -> usize {
+    0
+}
+
+#[cfg(feature = "cranelift-jit")]
+pub(crate) fn layout_fingerprint() -> VmResult<u64> {
+    cranelift::layout_fingerprint()
+}
+
+#[cfg(not(feature = "cranelift-jit"))]
+pub(crate) fn layout_fingerprint() -> VmResult<u64> {
     Err(VmError::JitNative(
         "native JIT backend is disabled (feature 'cranelift-jit' is not enabled)".to_string(),
     ))

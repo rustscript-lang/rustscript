@@ -342,6 +342,7 @@ pub struct Vm {
     program: Arc<Program>,
     program_constants_ptr: usize,
     program_constants_len: usize,
+    native_helper_fn: usize,
     program_cache_key: u64,
     program_cache_key_ready: bool,
     ip: usize,
@@ -366,6 +367,8 @@ pub struct Vm {
     fuel_remaining: u64,
     fuel_check_interval: u32,
     fuel_ops_until_check: u32,
+    native_only_aot: bool,
+    native_aot_fuel_check_interval: Option<u32>,
     drop_contract_events: u64,
 }
 
@@ -467,6 +470,7 @@ impl Vm {
             program,
             program_constants_ptr: program_constants_ptr as usize,
             program_constants_len,
+            native_helper_fn: jit::native::helper_entry_address(),
             program_cache_key: 0,
             program_cache_key_ready: false,
             ip: 0,
@@ -491,6 +495,8 @@ impl Vm {
             fuel_remaining: 0,
             fuel_check_interval: 1,
             fuel_ops_until_check: 1,
+            native_only_aot: false,
+            native_aot_fuel_check_interval: None,
             drop_contract_events: 0,
         }
     }
@@ -501,6 +507,35 @@ impl Vm {
             self.program_cache_key_ready = true;
         }
         self.program_cache_key
+    }
+
+    fn validate_native_aot_fuel_interval(&self, interval: u32) -> VmResult<()> {
+        if let Some(expected) = self.native_aot_fuel_check_interval {
+            if expected == 0 {
+                return Err(VmError::JitNative(
+                    "native-only AOT bundle was emitted without fuel checks".to_string(),
+                ));
+            }
+            if interval != expected {
+                return Err(VmError::JitNative(format!(
+                    "native-only AOT bundles require fuel_check_interval={expected}, got {interval}",
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_native_aot_fuel_runtime(&self) -> VmResult<()> {
+        if self.native_only_aot
+            && self.fuel_enabled
+            && self.native_aot_fuel_check_interval == Some(0)
+        {
+            return Err(VmError::JitNative(
+                "native-only AOT bundle was emitted without fuel checks and cannot run with fuel enabled"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn set_jit_native_bridge_stats_enabled(&mut self, enabled: bool) {
@@ -683,13 +718,22 @@ impl Vm {
         if interval == 0 {
             return Err(VmError::InvalidFuelCheckInterval(interval));
         }
+        self.validate_native_aot_fuel_interval(interval)?;
         self.fuel_check_interval = interval;
         self.fuel_ops_until_check = interval;
         Ok(())
     }
 
     pub fn fuel_check_interval(&self) -> u32 {
-        self.fuel_check_interval
+        if self.native_aot_fuel_check_interval == Some(0) {
+            0
+        } else {
+            self.fuel_check_interval
+        }
+    }
+
+    pub fn aot_fuel_check_interval(&self) -> Option<u32> {
+        self.native_aot_fuel_check_interval
     }
 
     pub fn get_fuel(&self) -> Option<u64> {
@@ -723,7 +767,7 @@ impl Vm {
     pub fn fuel_checkpoint(&self) -> FuelCheckpoint {
         FuelCheckpoint {
             remaining: self.fuel_enabled.then_some(self.fuel_remaining),
-            check_interval: self.fuel_check_interval,
+            check_interval: self.fuel_check_interval(),
             ops_until_check: self.fuel_ops_until_check,
         }
     }
@@ -735,7 +779,14 @@ impl Vm {
     pub fn restore_fuel(&mut self, checkpoint: FuelCheckpoint) {
         self.fuel_enabled = checkpoint.remaining.is_some();
         self.fuel_remaining = checkpoint.remaining.unwrap_or(0);
-        self.fuel_check_interval = checkpoint.check_interval.max(1);
+        if self.native_aot_fuel_check_interval == Some(0) {
+            self.fuel_check_interval = 1;
+            self.fuel_ops_until_check = 1;
+            return;
+        }
+        self.fuel_check_interval = self
+            .native_aot_fuel_check_interval
+            .unwrap_or(checkpoint.check_interval.max(1));
         self.fuel_ops_until_check = checkpoint
             .ops_until_check
             .clamp(1, self.fuel_check_interval);
@@ -875,6 +926,7 @@ impl Vm {
         mut debugger: Option<&mut crate::debugger::Debugger>,
         allow_jit: bool,
     ) -> VmResult<VmStatus> {
+        self.validate_native_aot_fuel_runtime()?;
         self.ensure_call_bindings()?;
         if let Some(waiting) = self.waiting_host_op {
             let status = VmStatus::Waiting(waiting.op_id);
@@ -917,6 +969,13 @@ impl Vm {
                     }
                     continue;
                 }
+            }
+
+            if self.native_only_aot {
+                return Err(VmError::JitNative(format!(
+                    "native-only AOT bundle has no compiled trace for ip {}",
+                    self.ip
+                )));
             }
 
             if self.ip >= self.program.code.len() {
@@ -1475,6 +1534,12 @@ impl Vm {
             CallOutcome::Yield => {
                 for value in args {
                     self.stack.push(value);
+                }
+                if self.native_only_aot {
+                    return Err(VmError::JitNative(
+                        "native-only AOT bundles do not support host CallOutcome::Yield"
+                            .to_string(),
+                    ));
                 }
                 self.ip = call_ip;
                 Ok(HostCallExecOutcome::Yielded)

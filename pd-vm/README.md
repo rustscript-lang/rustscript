@@ -152,19 +152,19 @@ Library hooks:
 
 ### AOT
 
-Ahead-of-time mode compiles whole-program bytecode blocks up front (entry + branch targets),
-then executes through the same native backend used by JIT.
-
-Run source in AOT mode:
-
-```powershell
-cargo run -p pd-vm --bin pd-vm-run -- --aot examples/example.rss
-```
+Ahead-of-time bundles compile whole-program bytecode blocks up front (entry + branch targets),
+then execute through the same native backend used by JIT.
 
 Emit an AOT bundle:
 
 ```powershell
 cargo run -p pd-vm --bin pd-vm-run -- --emit-aot out/example.pat examples/example.rss
+```
+
+Set a custom AOT fuel checkpoint interval while emitting:
+
+```powershell
+cargo run -p pd-vm --bin pd-vm-run -- --emit-aot out/example.pat --fuel-check-interval 64 examples/example.rss
 ```
 
 Run an emitted AOT bundle:
@@ -177,6 +177,9 @@ cargo run -p pd-vm --bin pd-vm-run -- --run-aot out/example.pat --jit-dump
 - Opcode/native support coverage is shared with the JIT backend.
 - `.pat` stores native trace machine code, constants/import metadata, local count, and trace
   metadata. Emitted bundles do not persist VM bytecode.
+- `--emit-aot` defaults to `--fuel-check-interval 64`.
+- `--fuel-check-interval 0` emits native code without inline fuel-check sequences. Such bundles
+  cannot be run with `--fuel` because no native checkpoints exist.
 - Bundles are validated against target arch/os/pointer width plus a VM-layout fingerprint before
   loading, so they are only portable across compatible builds on the same native support matrix.
 - Control-flow targets remain instruction offsets inside a synthetic code space (`ip` labels are
@@ -509,7 +512,9 @@ JavaScript frontend:
 Lua frontend:
 
 - Lua pattern API string methods (`:match`, `:gsub`, etc.) are not supported
-- function literal bodies are limited to `function(...) end`, `function(...) return end`, or `function(...) return <expr> end`
+- function literal bodies are limited to `function(...) end`, `function(...) return end`, or `function(...) return <expr[, expr...]> end`
+- direct `function`/`local function` bodies are still minimal: empty/fallthrough, `return`, `return <expr[, expr...]>`, or a single return-only `if`/`elseif`/`else` chain
+- multi-return unpacking is currently limited to compiler-known Lua function/closure return shapes; extra return values are dropped, missing locals are filled with `null`, but plain assignment destructuring and arbitrary host-call unpacking are not supported
 
 Scheme frontend:
 

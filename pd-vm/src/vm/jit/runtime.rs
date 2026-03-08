@@ -47,7 +47,7 @@ type NativeTraceEntry = fn(*mut Vm) -> i32;
 pub(crate) struct NativeTrace {
     _keepalive: Arc<Mutex<native::TraceKeepAlive>>,
     entry: NativeTraceEntry,
-    code: Arc<[u8]>,
+    pub(super) code: Arc<[u8]>,
     root_ip: usize,
     terminal: JitTraceTerminal,
     has_yielding_call: bool,
@@ -175,6 +175,7 @@ impl Vm {
         if config.enabled {
             self.ensure_program_cache_key();
         }
+        self.native_traces.clear();
         self.jit.set_config(config);
     }
 
@@ -252,6 +253,7 @@ impl Vm {
             return Ok(0);
         }
         self.ensure_program_cache_key();
+        self.native_traces.clear();
         let trace_ids = {
             let program = &self.program;
             self.jit.prepare_aot(program)
@@ -629,8 +631,25 @@ impl Vm {
         trace_id: usize,
         compile_profile: native::NativeCompileProfile,
     ) -> VmResult<()> {
+        let fuel_check_interval = self.fuel_enabled.then_some(self.fuel_check_interval);
+        self.ensure_native_trace_with_settings(trace_id, compile_profile, fuel_check_interval)
+    }
+
+    #[cfg(any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "windows", all(unix, not(target_os = "macos")))
+        ),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+    ))]
+    pub(super) fn ensure_native_trace_with_settings(
+        &mut self,
+        trace_id: usize,
+        compile_profile: native::NativeCompileProfile,
+        fuel_check_interval: Option<u32>,
+    ) -> VmResult<()> {
         if let Some(native) = self.native_traces.get(&trace_id)
-            && native.fuel_check_interval == self.fuel_enabled.then_some(self.fuel_check_interval)
+            && native.fuel_check_interval == fuel_check_interval
             && compile_profile_satisfies(native.compile_profile, compile_profile)
         {
             return Ok(());
@@ -638,7 +657,6 @@ impl Vm {
         self.native_traces.remove(&trace_id);
 
         let program_cache_key = self.ensure_program_cache_key();
-        let fuel_check_interval = self.fuel_enabled.then_some(self.fuel_check_interval);
         let trace = self.jit.trace_clone(trace_id).ok_or_else(|| {
             VmError::JitNative(format!("trace {} missing for native compile", trace_id))
         })?;
@@ -708,6 +726,34 @@ impl Vm {
             },
         );
         Ok(())
+    }
+
+    #[cfg(any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "windows", all(unix, not(target_os = "macos")))
+        ),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+    ))]
+    pub(super) fn build_loaded_native_aot_trace(
+        trace: &JitTrace,
+        compiled: Box<native::CompiledTrace>,
+        fuel_check_interval: Option<u32>,
+    ) -> NativeTrace {
+        let compiled = *compiled;
+        let entry = unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(compiled.entry) };
+        let code = Arc::<[u8]>::from(compiled.code.into_boxed_slice());
+        let keepalive = Arc::new(Mutex::new(compiled.keepalive));
+        NativeTrace {
+            _keepalive: keepalive,
+            entry,
+            code,
+            root_ip: trace.root_ip,
+            terminal: trace.terminal.clone(),
+            has_yielding_call: trace.has_yielding_call,
+            fuel_check_interval,
+            compile_profile: native::NativeCompileProfile::Aot,
+        }
     }
 
     pub fn jit_native_trace_count(&self) -> usize {
