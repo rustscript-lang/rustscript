@@ -25,6 +25,7 @@ pub(super) fn native_layout_fingerprint() -> VmResult<u64> {
     layout.vm_fuel_ops_until_check_offset.hash(&mut hasher);
     layout.vm_epoch_deadline_offset.hash(&mut hasher);
     layout.vm_epoch_counter_ptr_offset.hash(&mut hasher);
+    layout.vm_drop_contract_events_offset.hash(&mut hasher);
     layout.stack_vec.ptr_offset.hash(&mut hasher);
     layout.stack_vec.len_offset.hash(&mut hasher);
     layout.stack_vec.cap_offset.hash(&mut hasher);
@@ -78,6 +79,10 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         std::mem::offset_of!(Vm, epoch_counter_ptr),
         "Vm::epoch_counter_ptr offset",
     )?;
+    let vm_drop_contract_events_offset = usize_to_i32(
+        std::mem::offset_of!(Vm, drop_contract_events),
+        "Vm::drop_contract_events offset",
+    )?;
     let stack_vec = detect_vec_layout()?;
     let value = detect_value_layout()?;
     Ok(NativeStackLayout {
@@ -92,6 +97,7 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         vm_fuel_ops_until_check_offset,
         vm_epoch_deadline_offset,
         vm_epoch_counter_ptr_offset,
+        vm_drop_contract_events_offset,
         stack_vec,
         value,
     })

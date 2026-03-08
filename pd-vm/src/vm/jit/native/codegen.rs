@@ -884,6 +884,31 @@ fn emit_inline_stloc(
     b.ins().brif(dst_scalar, scalar_ok, &[], slow, &[]);
 
     b.switch_to_block(scalar_ok);
+    let count_drop_block = b.create_block();
+    let copy_block = b.create_block();
+    let dst_is_null = b
+        .ins()
+        .icmp_imm(IntCC::Equal, dst_tag, i64::from(layout.value.null_tag));
+    b.ins()
+        .brif(dst_is_null, copy_block, &[], count_drop_block, &[]);
+
+    b.switch_to_block(count_drop_block);
+    let drop_count = b.ins().load(
+        types::I64,
+        MemFlags::new(),
+        vm_ptr,
+        offsets.drop_contract_events,
+    );
+    let next_drop_count = b.ins().iadd_imm(drop_count, 1);
+    b.ins().store(
+        MemFlags::new(),
+        next_drop_count,
+        vm_ptr,
+        offsets.drop_contract_events,
+    );
+    b.ins().jump(copy_block, &[]);
+
+    b.switch_to_block(copy_block);
     copy_value_bytes(b, src_addr, dst_addr, layout.value.size);
     let new_len = b.ins().isub(stack_len, one);
     b.ins()
@@ -1964,6 +1989,7 @@ pub(super) fn resolve_offsets(layout: NativeStackLayout) -> VmResult<ResolvedOff
         fuel_ops_until_check: layout.vm_fuel_ops_until_check_offset,
         epoch_deadline: layout.vm_epoch_deadline_offset,
         epoch_counter_ptr: layout.vm_epoch_counter_ptr_offset,
+        drop_contract_events: layout.vm_drop_contract_events_offset,
     })
 }
 

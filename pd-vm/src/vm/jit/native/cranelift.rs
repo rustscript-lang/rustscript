@@ -144,6 +144,7 @@ struct NativeStackLayout {
     vm_fuel_ops_until_check_offset: i32,
     vm_epoch_deadline_offset: i32,
     vm_epoch_counter_ptr_offset: i32,
+    vm_drop_contract_events_offset: i32,
     stack_vec: VecLayout,
     value: ValueLayout,
 }
@@ -164,6 +165,7 @@ struct ResolvedOffsets {
     fuel_ops_until_check: i32,
     epoch_deadline: i32,
     epoch_counter_ptr: i32,
+    drop_contract_events: i32,
 }
 
 pub(crate) fn helper_entry_address() -> usize {
