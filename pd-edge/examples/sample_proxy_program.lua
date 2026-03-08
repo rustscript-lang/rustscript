@@ -1,11 +1,12 @@
-local vm = require("vm")
+local http = require("http")
+local rate_limit = require("rate_limit")
 
-local header = vm.http.request.get_header("x-client-id")
+local header = http.request.get_header("x-client-id")
 
-if vm.rate_limit.allow(header, 3, 60) then
-    vm.http.response.set_header("x-vm", "allowed")
-    vm.http.response.set_body("request allowed")
+if rate_limit.allow(header, 3, 60) then
+    http.response.set_header("x-vm", "allowed")
+    http.response.set_body("request allowed")
 else
-    vm.http.response.set_header("x-vm", "rate-limited")
-    vm.http.response.set_body("rate limit exceeded")
+    http.response.set_header("x-vm", "rate-limited")
+    http.response.set_body("rate limit exceeded")
 end

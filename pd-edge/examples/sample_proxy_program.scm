@@ -1,11 +1,12 @@
-(require (prefix-in vm. "vm"))
+(require (prefix-in http. "http"))
+(require (prefix-in rate_limit. "rate_limit"))
 
-(define header (vm.http.request.get_header "x-client-id"))
+(define header (http.request.get_header "x-client-id"))
 
-(if (vm.rate_limit.allow header 3 60)
+(if (rate_limit.allow header 3 60)
     (begin
-      (vm.http.response.set_header "x-vm" "allowed")
-      (vm.http.response.set_body "request allowed"))
+      (http.response.set_header "x-vm" "allowed")
+      (http.response.set_body "request allowed"))
     (begin
-      (vm.http.response.set_header "x-vm" "rate-limited")
-      (vm.http.response.set_body "rate limit exceeded")))
+      (http.response.set_header "x-vm" "rate-limited")
+      (http.response.set_body "rate limit exceeded")))

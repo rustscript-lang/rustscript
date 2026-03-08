@@ -3,9 +3,9 @@ mod common;
 use common::*;
 
 #[test]
-fn javascript_vm_namespace_host_calls_are_supported() {
+fn javascript_runtime_namespace_custom_host_calls_are_supported() {
     let unique = format!(
-        "vm_js_host_namespace_test_{}_{}",
+        "runtime_js_host_namespace_test_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -18,15 +18,15 @@ fn javascript_vm_namespace_host_calls_are_supported() {
     std::fs::write(
         &path,
         r#"
-        import * as vm from "vm";
-        vm.add_one(41);
+        import * as runtime from "runtime";
+        runtime.add_one(41);
     "#,
     )
     .expect("js source should write");
 
     let compiled = compile_source_file(&path).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
-    vm.bind_function("add_one", Box::new(AddOne));
+    vm.bind_function("runtime::add_one", Box::new(AddOne));
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -36,12 +36,12 @@ fn javascript_vm_namespace_host_calls_are_supported() {
 }
 
 #[test]
-fn javascript_vm_http_subnamespace_host_calls_are_supported() {
+fn javascript_http_subnamespace_host_calls_are_supported() {
     let case = RuntimeCase {
-        name: "vm http subnamespace host calls are supported",
+        name: "http subnamespace host calls are supported",
         source: r#"
-            import * as vm from "vm";
-            vm.http.request.get_header("x-client-id");
+            import * as http from "http";
+            http.request.get_header("x-client-id");
         "#,
         flavor: SourceFlavor::JavaScript,
         expected_stack: vec![Value::String("x-client-id".to_string())],
@@ -312,8 +312,8 @@ fn javascript_allows_omitted_semicolons_with_multiline_calls() {
     let case = RuntimeCase {
         name: "allows omitted semicolons with multiline calls",
         source: r#"
-            import * as vm from "vm"
-            let value = vm.add_one(
+            import * as runtime from "runtime"
+            let value = runtime.add_one(
                 41
             )
             value
@@ -323,7 +323,7 @@ fn javascript_allows_omitted_semicolons_with_multiline_calls() {
         expected_locals: None,
     };
     let bindings = [HostBindingCase {
-        name: "add_one",
+        name: "runtime::add_one",
         factory: make_add_one,
     }];
     run_runtime_case_with_bindings(&case, &bindings);
@@ -355,11 +355,11 @@ fn compile_source_file_with_javascript_complex_fixture() {
 
     for func in &compiled.functions {
         match func.name.as_str() {
-            "print" => {
-                vm.register_function(Box::new(PrintBuiltin));
-            }
             "add_one" => {
                 vm.register_function(Box::new(AddOne));
+            }
+            "print" => {
+                vm.register_function(Box::new(PrintBuiltin));
             }
             "runtime::sleep" => {
                 vm.register_function(Box::new(RuntimeSleep));
@@ -467,9 +467,6 @@ fn compile_source_file_js_complex_replay_break_line_resolves_non_executable_line
     let mut vm = Vm::new(compiled.program);
     for func in &compiled.functions {
         match func.name.as_str() {
-            "add_one" => {
-                vm.register_function(Box::new(AddOne));
-            }
             "print" => {
                 vm.register_function(Box::new(PrintBuiltin));
             }
@@ -529,8 +526,8 @@ fn javascript_module_declarations_are_ignored() {
         source: r#"
             import {
                 add_one
-            } from "vm";
-            const { ignored } = require("vm");
+            } from "runtime";
+            const { ignored } = require("runtime");
             console.log(add_one(41));
         "#,
         flavor: SourceFlavor::JavaScript,
@@ -539,7 +536,7 @@ fn javascript_module_declarations_are_ignored() {
     };
     let bindings = [
         HostBindingCase {
-            name: "add_one",
+            name: "runtime::add_one",
             factory: make_add_one,
         },
         HostBindingCase {

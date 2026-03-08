@@ -16,7 +16,6 @@ use support::{
 };
 
 static LUA_DIRECT_TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
-const ROOT_HOST_NAMESPACE_SPEC: &str = "vm";
 
 fn fresh_lua_direct_temp(prefix: &str) -> String {
     let id = LUA_DIRECT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -24,7 +23,7 @@ fn fresh_lua_direct_temp(prefix: &str) -> String {
 }
 
 fn is_virtual_host_namespace_spec(spec: &str) -> bool {
-    if spec == ROOT_HOST_NAMESPACE_SPEC || spec.contains('/') || spec.ends_with(".rss") {
+    if spec.contains('/') || spec.ends_with(".rss") {
         return false;
     }
     is_valid_lua_ident(spec)
@@ -102,20 +101,6 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
         if let Some((name, rhs)) = parse_lua_local_assignment(trimmed)
             && let Some((spec, remainder)) = parse_lua_require_call(rhs)
         {
-            if spec == ROOT_HOST_NAMESPACE_SPEC {
-                if let Some(member) = remainder.strip_prefix('.') {
-                    let member = member.trim();
-                    if is_valid_lua_ident(member) {
-                        builder.declare_function(member, None).ok();
-                        continue;
-                    }
-                }
-                if remainder.is_empty() && is_valid_lua_ident(name) {
-                    namespace_aliases
-                        .insert(name.to_string(), ROOT_HOST_NAMESPACE_SPEC.to_string());
-                    continue;
-                }
-            }
             if (spec == "io"
                 || spec == "re"
                 || spec == "json"
@@ -129,13 +114,7 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
             continue;
         }
 
-        if let Some((spec, remainder)) = parse_lua_require_call(trimmed) {
-            if spec == ROOT_HOST_NAMESPACE_SPEC && remainder.is_empty() {
-                namespace_aliases.insert(
-                    ROOT_HOST_NAMESPACE_SPEC.to_string(),
-                    ROOT_HOST_NAMESPACE_SPEC.to_string(),
-                );
-            }
+        if let Some((_spec, _remainder)) = parse_lua_require_call(trimmed) {
             continue;
         }
 

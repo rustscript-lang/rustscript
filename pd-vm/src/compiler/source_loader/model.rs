@@ -31,9 +31,6 @@ pub(super) struct ModuleCollectState {
     pub(super) units: Vec<ParsedUnit>,
     pub(super) module_exports: HashMap<PathBuf, HashMap<String, u8>>,
 }
-
-pub(super) const ROOT_HOST_NAMESPACE_SPEC: &str = "vm";
-
 pub(super) struct ImportRewriteResult {
     pub(super) source: String,
 }
