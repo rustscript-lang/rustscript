@@ -169,7 +169,7 @@ struct ResolvedOffsets {
 }
 
 pub(crate) fn helper_entry_address() -> usize {
-    pd_vm_cranelift_step as usize
+    pd_vm_cranelift_step as *const () as usize
 }
 
 pub(crate) fn layout_fingerprint() -> VmResult<u64> {

@@ -256,6 +256,7 @@ pub trait HostAsyncBridge: Send {
 pub type StaticHostFunction = fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>;
 
 type HostFactory = dyn Fn() -> Box<dyn HostFunction> + Send + Sync;
+type RuntimePrintSink = dyn FnMut(String) + Send;
 
 enum RegistryEntryKind {
     Factory(Box<HostFactory>),
@@ -463,6 +464,7 @@ pub struct Vm {
     jit_native_bridge_stats_enabled: bool,
     jit_native_bridge_counts: HashMap<&'static str, u64>,
     async_bridge: Option<Box<dyn HostAsyncBridge>>,
+    runtime_print_sink: Option<Box<RuntimePrintSink>>,
     waiting_host_op: Option<WaitingHostOp>,
     next_host_op_id: HostOpId,
     io_state: builtins_impl::IoState,
@@ -658,6 +660,7 @@ impl Vm {
             jit_native_bridge_stats_enabled: false,
             jit_native_bridge_counts: HashMap::new(),
             async_bridge: None,
+            runtime_print_sink: None,
             waiting_host_op: None,
             next_host_op_id: 1,
             io_state: builtins_impl::IoState::default(),
@@ -896,6 +899,27 @@ impl Vm {
 
     pub fn clear_async_bridge(&mut self) {
         self.async_bridge = None;
+    }
+
+    pub fn set_runtime_print_sink<F>(&mut self, sink: F)
+    where
+        F: FnMut(String) + Send + 'static,
+    {
+        self.runtime_print_sink = Some(Box::new(sink));
+    }
+
+    pub fn clear_runtime_print_sink(&mut self) {
+        self.runtime_print_sink = None;
+    }
+
+    pub(crate) fn write_runtime_print(&mut self, rendered: String) -> VmResult<()> {
+        let Some(sink) = self.runtime_print_sink.as_mut() else {
+            return Err(VmError::HostError(
+                "runtime print sink is not configured".to_string(),
+            ));
+        };
+        sink(rendered);
+        Ok(())
     }
 
     pub fn allocate_host_op_id(&mut self) -> HostOpId {

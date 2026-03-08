@@ -99,14 +99,16 @@ unsafe fn flush_instruction_cache(ptr: *mut u8, len: usize) {
 
 #[cfg(unix)]
 unsafe fn alloc_executable(len: usize) -> VmResult<*mut u8> {
-    let ptr = libc::mmap(
-        std::ptr::null_mut(),
-        len,
-        libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-        libc::MAP_PRIVATE | map_anon_flag(),
-        -1,
-        0,
-    );
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            libc::MAP_PRIVATE | map_anon_flag(),
+            -1,
+            0,
+        )
+    };
     if ptr == libc::MAP_FAILED {
         return Err(VmError::JitNative(
             "mmap failed for executable trace buffer".to_string(),
@@ -117,18 +119,20 @@ unsafe fn alloc_executable(len: usize) -> VmResult<*mut u8> {
 
 #[cfg(unix)]
 unsafe fn free_executable(ptr: *mut u8, len: usize) {
-    let _ = libc::munmap(ptr.cast(), len);
+    let _ = unsafe { libc::munmap(ptr.cast(), len) };
 }
 
 #[cfg(unix)]
 unsafe fn flush_instruction_cache(ptr: *mut u8, len: usize) {
+    let _ = (ptr, len);
+
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     {
         unsafe extern "C" {
             fn sys_icache_invalidate(start: *mut core::ffi::c_void, len: usize);
         }
 
-        sys_icache_invalidate(ptr.cast(), len);
+        unsafe { sys_icache_invalidate(ptr.cast(), len) };
     }
 
     #[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
@@ -137,7 +141,7 @@ unsafe fn flush_instruction_cache(ptr: *mut u8, len: usize) {
             fn __clear_cache(start: *mut u8, end: *mut u8);
         }
 
-        __clear_cache(ptr, ptr.add(len));
+        unsafe { __clear_cache(ptr, ptr.add(len)) };
     }
 }
 

@@ -1,21 +1,52 @@
 use std::time::Duration;
 
 use super::super::{CallOutcome, HostFunctionRegistry, Value, Vm, VmError, VmResult};
+use super::print::format_value;
 
+pub(crate) const PRINT_NAME: &str = "print";
+pub(crate) const PRINTLN_NAME: &str = "println";
 pub(crate) const RUNTIME_SLEEP_NAME: &str = "runtime::sleep";
 
 pub(crate) fn register_default_host_functions(registry: &mut HostFunctionRegistry) {
+    registry.register_static(PRINT_NAME, 1, runtime_print);
+    registry.register_static(PRINTLN_NAME, 1, runtime_println);
     registry.register_static(RUNTIME_SLEEP_NAME, 1, runtime_sleep);
 }
 
 pub(crate) fn bind_default_host_function(vm: &mut Vm, name: &str) -> bool {
     match name {
+        PRINT_NAME => {
+            vm.bind_static_function(PRINT_NAME, runtime_print);
+            true
+        }
+        PRINTLN_NAME => {
+            vm.bind_static_function(PRINTLN_NAME, runtime_println);
+            true
+        }
         RUNTIME_SLEEP_NAME => {
             vm.bind_static_function(RUNTIME_SLEEP_NAME, runtime_sleep);
             true
         }
         _ => false,
     }
+}
+
+fn render_print_args(args: &[Value], newline: bool) -> String {
+    let mut rendered = args.iter().map(format_value).collect::<Vec<_>>().join(" ");
+    if newline {
+        rendered.push('\n');
+    }
+    rendered
+}
+
+fn runtime_print(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    vm.write_runtime_print(render_print_args(args, false))?;
+    Ok(CallOutcome::Return(args.to_vec()))
+}
+
+fn runtime_println(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    vm.write_runtime_print(render_print_args(args, true))?;
+    Ok(CallOutcome::Return(args.to_vec()))
 }
 
 fn sleep_duration(args: &[Value]) -> VmResult<Duration> {
@@ -47,10 +78,29 @@ fn runtime_sleep(_vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
 
 #[cfg(test)]
 mod tests {
-    use crate::bytecode::Program;
-    use crate::vm::{Value, Vm};
+    use std::sync::{Arc, Mutex};
 
-    use super::{RUNTIME_SLEEP_NAME, runtime_sleep};
+    use crate::assembler::BytecodeBuilder;
+    use crate::bytecode::{HostImport, Program};
+    use crate::vm::{HostFunctionRegistry, Value, Vm, VmStatus};
+
+    use super::{PRINT_NAME, PRINTLN_NAME, RUNTIME_SLEEP_NAME, runtime_sleep};
+
+    fn host_call_program(name: &str) -> Program {
+        let mut bc = BytecodeBuilder::new();
+        bc.ldc(0);
+        bc.call(0, 1);
+        bc.ret();
+        Program::with_imports_and_debug(
+            vec![Value::string("line")],
+            bc.finish(),
+            vec![HostImport {
+                name: name.to_string(),
+                arity: 1,
+            }],
+            None,
+        )
+    }
 
     #[test]
     fn runtime_sleep_rejects_negative_milliseconds() {
@@ -70,5 +120,69 @@ mod tests {
     #[test]
     fn runtime_sleep_name_is_stable() {
         assert_eq!(RUNTIME_SLEEP_NAME, "runtime::sleep");
+    }
+
+    #[test]
+    fn default_print_binding_uses_vm_runtime_sink() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink_lines = Arc::clone(&lines);
+        let mut vm = Vm::new(host_call_program(PRINT_NAME));
+        vm.set_runtime_print_sink(move |rendered| {
+            sink_lines
+                .lock()
+                .expect("sink should be lockable")
+                .push(rendered);
+        });
+
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(
+            lines.lock().expect("sink should be lockable").as_slice(),
+            ["line"]
+        );
+    }
+
+    #[test]
+    fn host_function_registry_includes_default_print_binding() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink_lines = Arc::clone(&lines);
+        let mut vm = Vm::new(host_call_program(PRINT_NAME));
+        vm.set_runtime_print_sink(move |rendered| {
+            sink_lines
+                .lock()
+                .expect("sink should be lockable")
+                .push(rendered);
+        });
+        let mut registry = HostFunctionRegistry::new();
+        registry
+            .bind_vm_cached(&mut vm)
+            .expect("registry should bind print");
+
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(
+            lines.lock().expect("sink should be lockable").as_slice(),
+            ["line"]
+        );
+    }
+
+    #[test]
+    fn default_println_binding_appends_newline_before_sink() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink_lines = Arc::clone(&lines);
+        let mut vm = Vm::new(host_call_program(PRINTLN_NAME));
+        vm.set_runtime_print_sink(move |rendered| {
+            sink_lines
+                .lock()
+                .expect("sink should be lockable")
+                .push(rendered);
+        });
+
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(
+            lines.lock().expect("sink should be lockable").as_slice(),
+            ["line\n"]
+        );
     }
 }
