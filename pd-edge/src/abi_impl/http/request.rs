@@ -53,7 +53,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
                 .get(&header_name)
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or("");
-            Ok(CallOutcome::Return(vec![Value::String(value.to_string())]))
+            Ok(CallOutcome::Return(vec![Value::string(value)]))
         }
     );
     bind_request_handler!(
@@ -87,7 +87,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
                     }
                 })
                 .unwrap_or_default();
-            Ok(CallOutcome::Return(vec![Value::String(value)]))
+            Ok(CallOutcome::Return(vec![Value::string(value)]))
         }
     );
     bind_request_handler!(
@@ -169,7 +169,7 @@ fn bind_request_field(
             RequestField::Host => context.inbound_request_host.clone(),
             RequestField::ClientIp => context.inbound_request_client_ip.clone(),
         };
-        Ok(CallOutcome::Return(vec![Value::String(value)]))
+        Ok(CallOutcome::Return(vec![Value::string(value)]))
     });
 }
 
@@ -190,7 +190,7 @@ fn bind_get_request_body(
             let context = context.clone();
             schedule_future_call(vm, &async_ops_for_call, async move {
                 let body = read_request_body_all(&context).await?;
-                Ok(vec![Value::String(
+                Ok(vec![Value::string(
                     String::from_utf8_lossy(&body).into_owned(),
                 )])
             })
@@ -221,7 +221,7 @@ fn bind_get_request_body_chunk(
             let context = context.clone();
             schedule_future_call(vm, &async_ops_for_call, async move {
                 let chunk = read_request_body_next_chunk(&context, max_bytes as usize).await?;
-                Ok(vec![Value::String(
+                Ok(vec![Value::string(
                     String::from_utf8_lossy(&chunk).into_owned(),
                 )])
             })

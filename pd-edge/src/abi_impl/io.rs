@@ -426,7 +426,7 @@ fn bind_builtin_io_read_all(
             let text = match &source {
                 Value::String(literal) => match edge_io_target_from_string(literal) {
                     Some(target) => read_io_target_all(&context, target).await?,
-                    None => literal.clone(),
+                    None => literal.to_string(),
                 },
                 Value::Int(handle) => {
                     let mut guard = context.lock().expect("vm context lock poisoned");
@@ -440,7 +440,7 @@ fn bind_builtin_io_read_all(
                 }
                 _ => return Err(VmError::TypeMismatch("string/int")),
             };
-            Ok(vec![Value::String(text)])
+            Ok(vec![Value::string(text)])
         })
     });
 }
@@ -480,7 +480,7 @@ fn bind_builtin_io_read_line(
                 }
                 _ => return Err(VmError::TypeMismatch("string/int")),
             };
-            Ok(vec![Value::String(text)])
+            Ok(vec![Value::string(text)])
         })
     });
 }

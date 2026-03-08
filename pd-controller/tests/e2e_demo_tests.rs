@@ -30,7 +30,7 @@ fn build_short_circuit_program(body: &str) -> Program {
     let mut constants = Vec::new();
     let mut bc = BytecodeBuilder::new();
     let body_idx = constants.len() as u32;
-    constants.push(Value::String(body.to_string()));
+    constants.push(Value::string(body));
     bc.ldc(body_idx);
     bc.call(FN_HTTP_RESPONSE_SET_BODY, 1);
     bc.ret();
