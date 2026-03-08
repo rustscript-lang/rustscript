@@ -1612,10 +1612,19 @@ fn emit_helper_step_from_call_tuple(
     let a_val = b.ins().iconst(types::I64, a);
     let b_val = b.ins().iconst(types::I64, b_arg);
     let c_val = b.ins().iconst(types::I64, c);
+    let pointer_type = b.func.signature.params[0].value_type;
+    let helper_ptr = b.ins().load(
+        pointer_type,
+        MemFlags::new(),
+        vm_ptr,
+        native_helper_fn_offset(),
+    );
 
-    let call = b
-        .ins()
-        .call(helper_ref, &[vm_ptr, op_val, a_val, b_val, c_val]);
+    let call = b.ins().call_indirect(
+        helper_ref,
+        helper_ptr,
+        &[vm_ptr, op_val, a_val, b_val, c_val],
+    );
     let status = b.inst_results(call)[0];
 
     let is_continue = b

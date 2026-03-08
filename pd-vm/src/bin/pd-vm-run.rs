@@ -1,34 +1,31 @@
 use std::collections::BTreeMap;
 use std::io;
-use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use vm::{
-    CallOutcome, Debugger, DisassembleOptions, FunctionDecl, HostFunction, HostImport, Program,
-    SourceMap, SourcePathError, Value, Vm, VmError, VmRecording, VmStatus, compile_source_file,
-    compile_source_for_repl, decode_program, disassemble_vmbc_with_options, encode_program,
-    render_source_error, render_vm_error, replay_recording_stdio,
+    CallOutcome, Debugger, DisassembleOptions, FunctionDecl, HostFunction, HostImport, SourceMap,
+    SourcePathError, Value, Vm, VmError, VmRecording, VmStatus, compile_source_file,
+    compile_source_for_repl, disassemble_vmbc_with_options, encode_program, render_source_error,
+    render_vm_error, replay_recording_stdio,
 };
 
 const DEFAULT_SOURCE: &str = "examples/example.rss";
-const AOT_MAGIC: [u8; 4] = *b"VMAO";
-const AOT_VERSION: u16 = 1;
-const AOT_FLAGS: u16 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliConfig {
     source: Option<String>,
     emit_vmbc_path: Option<String>,
     emit_aot_path: Option<String>,
+    aot_fuel_check_interval: Option<u32>,
     disasm_vmbc_path: Option<String>,
     run_aot_path: Option<String>,
     record_path: Option<String>,
     view_recording_path: Option<String>,
     show_source: bool,
     repl: bool,
-    aot: bool,
     debug: bool,
     tcp_addr: Option<String>,
     stop_on_entry: bool,
@@ -45,13 +42,13 @@ impl Default for CliConfig {
             source: None,
             emit_vmbc_path: None,
             emit_aot_path: None,
+            aot_fuel_check_interval: None,
             disasm_vmbc_path: None,
             run_aot_path: None,
             record_path: None,
             view_recording_path: None,
             show_source: false,
             repl: false,
-            aot: false,
             debug: false,
             tcp_addr: None,
             stop_on_entry: true,
@@ -100,15 +97,11 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(aot_path) = cli.run_aot_path.as_ref() {
         let bytes = std::fs::read(aot_path)?;
-        let (program, local_count) = decode_aot_bundle(&bytes)?;
-        let mut vm = Vm::new(program.with_local_count(local_count));
-        apply_runtime_flags(&mut vm, &cli);
+        let mut vm = Vm::from_aot_bundle_bytes(&bytes).map_err(io::Error::other)?;
+        apply_runtime_flags(&mut vm, &cli)?;
         let imports = vm.program().imports.clone();
         register_imports(&mut vm, &imports)?;
-        if cli.aot {
-            prepare_aot_vm(&mut vm)?;
-        }
-        run_vm_loop(&mut vm, None)?;
+        run_vm_loop(&mut vm, None, cli.fuel)?;
         if cli.jit_dump {
             println!(
                 "{}",
@@ -119,12 +112,26 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let source_path = resolve_source_path(cli.source.as_deref())?;
+    let compile_started = Instant::now();
     let compiled = compile_source_file(&source_path)
         .map_err(|err| io::Error::other(render_source_path_error(&source_path, &err)))?;
     if let Some(output_path) = cli.emit_aot_path.as_ref() {
-        let encoded = encode_aot_bundle(&compiled.program, compiled.locals)?;
+        let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+        let encoded = match cli.aot_fuel_check_interval {
+            Some(interval) => vm
+                .emit_aot_bundle_with_fuel_check_interval(interval)
+                .map_err(|err| io::Error::other(render_vm_error(&vm, &err)))?,
+            None => vm
+                .emit_aot_bundle()
+                .map_err(|err| io::Error::other(render_vm_error(&vm, &err)))?,
+        };
         std::fs::write(output_path, &encoded)?;
-        println!("wrote {} bytes to {}", encoded.len(), output_path);
+        println!(
+            "wrote {} bytes to {} (compile {})",
+            encoded.len(),
+            output_path,
+            format_elapsed_duration(compile_started.elapsed())
+        );
         return Ok(());
     }
     if let Some(output_path) = cli.emit_vmbc_path.as_ref() {
@@ -135,16 +142,13 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let recording_program = cli.record_path.as_ref().map(|_| compiled.program.clone());
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
-    apply_runtime_flags(&mut vm, &cli);
+    apply_runtime_flags(&mut vm, &cli)?;
     register_functions(&mut vm, &compiled.functions)?;
-    if cli.aot {
-        prepare_aot_vm(&mut vm)?;
-    }
 
     if let Some(record_path) = cli.record_path.as_ref() {
         let program = recording_program.expect("recording mode should clone program");
         let mut debugger = Debugger::with_recording(program);
-        run_vm_loop(&mut vm, Some(&mut debugger))?;
+        run_vm_loop(&mut vm, Some(&mut debugger), cli.fuel)?;
         let recording = debugger
             .take_recording()
             .ok_or_else(|| io::Error::other("recording state unavailable"))?;
@@ -172,7 +176,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    run_vm_loop(&mut vm, debugger.as_mut())?;
+    run_vm_loop(&mut vm, debugger.as_mut(), cli.fuel)?;
     if cli.jit_dump {
         println!(
             "{}",
@@ -182,7 +186,12 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn apply_runtime_flags(vm: &mut Vm, cli: &CliConfig) {
+fn apply_runtime_flags(vm: &mut Vm, cli: &CliConfig) -> Result<(), io::Error> {
+    if cli.fuel.is_some() && vm.aot_fuel_check_interval() == Some(0) {
+        return Err(io::Error::other(
+            "native-only AOT bundle was emitted without fuel checks; rerun without --fuel or re-emit with --fuel-check-interval > 0",
+        ));
+    }
     vm.set_jit_native_bridge_stats_enabled(cli.jit_dump);
     if let Some(fuel) = cli.fuel {
         vm.set_fuel(fuel);
@@ -192,15 +201,14 @@ fn apply_runtime_flags(vm: &mut Vm, cli: &CliConfig) {
         jit_config.hot_loop_threshold = hot_loop;
         vm.set_jit_config(jit_config);
     }
+    Ok(())
 }
 
-fn prepare_aot_vm(vm: &mut Vm) -> Result<(), io::Error> {
-    vm.prepare_aot()
-        .map(|_| ())
-        .map_err(|err| io::Error::other(render_vm_error(vm, &err)))
-}
-
-fn run_vm_loop(vm: &mut Vm, mut debugger: Option<&mut Debugger>) -> Result<(), io::Error> {
+fn run_vm_loop(
+    vm: &mut Vm,
+    mut debugger: Option<&mut Debugger>,
+    fuel_recharge: Option<u64>,
+) -> Result<(), io::Error> {
     loop {
         let status = if let Some(active_debugger) = debugger.as_deref_mut() {
             vm.run_with_debugger(active_debugger)
@@ -216,7 +224,16 @@ fn run_vm_loop(vm: &mut Vm, mut debugger: Option<&mut Debugger>) -> Result<(), i
                 return Ok(());
             }
             VmStatus::Yielded => {
-                println!("vm yielded, resuming...");
+                if let Some(recharge) = fuel_recharge
+                    && vm.get_fuel() == Some(0)
+                    && recharge > 0
+                {
+                    vm.recharge_fuel(recharge)
+                        .map_err(|err| io::Error::other(render_vm_error(vm, &err)))?;
+                    println!("vm yielded, recharged {recharge} fuel, resuming...");
+                } else {
+                    println!("vm yielded, resuming...");
+                }
             }
             VmStatus::Waiting(_op_id) => {
                 vm.wait_for_host_op_blocking()
@@ -274,8 +291,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
     } else if let Some(first) = args.first()
         && first == "aot"
     {
-        cfg.aot = true;
-        index = 1;
+        return Err("legacy 'aot' CLI mode was removed; use --emit-aot or --run-aot".to_string());
     }
 
     while index < args.len() {
@@ -349,6 +365,14 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
                 cfg.emit_aot_path = Some(path.clone());
                 index += 2;
             }
+            "--fuel-check-interval" => {
+                let raw = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --fuel-check-interval".to_string())?;
+                cfg.aot_fuel_check_interval =
+                    Some(parse_cli_u32_flag("--fuel-check-interval", raw)?);
+                index += 2;
+            }
             "--disasm-vmbc" => {
                 let path = args
                     .get(index + 1)
@@ -356,12 +380,17 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
                 cfg.disasm_vmbc_path = Some(path.clone());
                 index += 2;
             }
+            value if value.starts_with("--fuel-check-interval=") => {
+                let raw = value.trim_start_matches("--fuel-check-interval=");
+                cfg.aot_fuel_check_interval =
+                    Some(parse_cli_u32_flag("--fuel-check-interval", raw)?);
+                index += 1;
+            }
             "--run-aot" => {
                 let path = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --run-aot".to_string())?;
                 cfg.run_aot_path = Some(path.clone());
-                cfg.aot = true;
                 index += 2;
             }
             "--record" => {
@@ -387,8 +416,9 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
                 index += 1;
             }
             "--aot" => {
-                cfg.aot = true;
-                index += 1;
+                return Err(
+                    "legacy '--aot' CLI mode was removed; use --emit-aot or --run-aot".to_string(),
+                );
             }
             value if value.starts_with('-') => {
                 return Err(format!("unknown flag '{value}'"));
@@ -413,7 +443,6 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
         }
         if cfg.debug
             || cfg.tcp_addr.is_some()
-            || cfg.aot
             || cfg.jit_dump
             || cfg.jit_hot_loop_threshold.is_some()
             || cfg.fuel.is_some()
@@ -425,7 +454,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
             || cfg.view_recording_path.is_some()
         {
             return Err(
-                "repl mode cannot be combined with debug/aot/jit/fuel/emit/disasm runtime flags"
+                "repl mode cannot be combined with debug/jit/fuel/emit/disasm runtime flags"
                     .to_string(),
             );
         }
@@ -437,7 +466,6 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
         if cfg.repl
             || cfg.debug
             || cfg.tcp_addr.is_some()
-            || cfg.aot
             || cfg.jit_dump
             || cfg.jit_hot_loop_threshold.is_some()
             || cfg.fuel.is_some()
@@ -448,7 +476,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
             || cfg.view_recording_path.is_some()
         {
             return Err(
-                "disasm mode cannot be combined with repl/debug/aot/jit/fuel/emit runtime flags"
+                "disasm mode cannot be combined with repl/debug/jit/fuel/emit runtime flags"
                     .to_string(),
             );
         }
@@ -459,10 +487,12 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
     if cfg.emit_vmbc_path.is_some() && cfg.emit_aot_path.is_some() {
         return Err("cannot combine --emit-vmbc with --emit-aot".to_string());
     }
+    if cfg.aot_fuel_check_interval.is_some() && cfg.emit_aot_path.is_none() {
+        return Err("--fuel-check-interval requires --emit-aot".to_string());
+    }
     if cfg.emit_aot_path.is_some()
         && (cfg.debug
             || cfg.tcp_addr.is_some()
-            || cfg.aot
             || cfg.jit_dump
             || cfg.jit_hot_loop_threshold.is_some()
             || cfg.fuel.is_some()
@@ -473,7 +503,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
             || cfg.show_source)
     {
         return Err(
-            "emit-aot mode cannot be combined with debug/aot/jit/fuel/disasm/run-aot/record flags"
+            "emit-aot mode cannot be combined with debug/jit/fuel/disasm/run-aot/record flags"
                 .to_string(),
         );
     }
@@ -497,26 +527,9 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
             );
         }
     }
-    if cfg.aot
-        && cfg.run_aot_path.is_none()
-        && (cfg.debug
-            || cfg.tcp_addr.is_some()
-            || cfg.emit_vmbc_path.is_some()
-            || cfg.emit_aot_path.is_some()
-            || cfg.disasm_vmbc_path.is_some()
-            || cfg.record_path.is_some()
-            || cfg.view_recording_path.is_some()
-            || cfg.show_source)
-    {
-        return Err(
-            "aot mode cannot be combined with debug/emit/disasm/record/view-record flags"
-                .to_string(),
-        );
-    }
     if cfg.record_path.is_some()
         && (cfg.debug
             || cfg.tcp_addr.is_some()
-            || cfg.aot
             || cfg.jit_dump
             || cfg.jit_hot_loop_threshold.is_some()
             || cfg.emit_vmbc_path.is_some()
@@ -527,7 +540,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
             || cfg.show_source)
     {
         return Err(
-            "record mode cannot be combined with debug/aot/jit/emit/disasm/view-record flags"
+            "record mode cannot be combined with debug/jit/emit/disasm/view-record flags"
                 .to_string(),
         );
     }
@@ -535,7 +548,6 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
         && (cfg.source.is_some()
             || cfg.debug
             || cfg.tcp_addr.is_some()
-            || cfg.aot
             || cfg.jit_dump
             || cfg.jit_hot_loop_threshold.is_some()
             || cfg.fuel.is_some()
@@ -547,7 +559,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
             || cfg.show_source)
     {
         return Err(
-            "view-record mode cannot be combined with source/debug/aot/jit/emit/disasm flags"
+            "view-record mode cannot be combined with source/debug/jit/emit/disasm flags"
                 .to_string(),
         );
     }
@@ -568,6 +580,11 @@ fn resolve_source_path(arg: Option<&str>) -> Result<PathBuf, io::Error> {
     }
 
     Ok(Path::new(env!("CARGO_MANIFEST_DIR")).join(provided))
+}
+
+fn parse_cli_u32_flag(flag: &str, raw: &str) -> Result<u32, String> {
+    raw.parse::<u32>()
+        .map_err(|_| format!("invalid {flag} value '{raw}'"))
 }
 
 fn register_functions(vm: &mut Vm, functions: &[FunctionDecl]) -> Result<(), io::Error> {
@@ -606,85 +623,14 @@ fn register_named_function(vm: &mut Vm, name: &str) -> Result<(), io::Error> {
     Ok(())
 }
 
-fn encode_aot_bundle(program: &Program, local_count: usize) -> Result<Vec<u8>, io::Error> {
-    let local_count = u32::try_from(local_count)
-        .map_err(|_| io::Error::other("local count exceeds u32 range for AOT format"))?;
-    let program_bytes = encode_program(program).map_err(io::Error::other)?;
-    let program_len = u32::try_from(program_bytes.len())
-        .map_err(|_| io::Error::other("encoded program exceeds u32 range for AOT format"))?;
-
-    let mut out = Vec::with_capacity(16usize.saturating_add(program_bytes.len()));
-    out.extend_from_slice(&AOT_MAGIC);
-    out.extend_from_slice(&AOT_VERSION.to_le_bytes());
-    out.extend_from_slice(&AOT_FLAGS.to_le_bytes());
-    out.extend_from_slice(&local_count.to_le_bytes());
-    out.extend_from_slice(&program_len.to_le_bytes());
-    out.extend_from_slice(&program_bytes);
-    Ok(out)
-}
-
-fn decode_aot_bundle(bytes: &[u8]) -> Result<(Program, usize), io::Error> {
-    let mut cursor = io::Cursor::new(bytes);
-    let mut magic = [0u8; 4];
-    cursor
-        .read_exact(&mut magic)
-        .map_err(|_| io::Error::other("truncated AOT file (missing magic)"))?;
-    if magic != AOT_MAGIC {
-        return Err(io::Error::other("invalid AOT magic, expected VMAO"));
-    }
-
-    let version = read_aot_u16(&mut cursor, "version")?;
-    if version != AOT_VERSION {
-        return Err(io::Error::other(format!(
-            "unsupported AOT version {version}, expected {AOT_VERSION}",
-        )));
-    }
-
-    let flags = read_aot_u16(&mut cursor, "flags")?;
-    if flags != AOT_FLAGS {
-        return Err(io::Error::other(format!("unsupported AOT flags {flags}",)));
-    }
-
-    let local_count = read_aot_u32(&mut cursor, "local count")? as usize;
-    let program_len = read_aot_u32(&mut cursor, "program length")? as usize;
-    let mut program_bytes = vec![0u8; program_len];
-    cursor
-        .read_exact(&mut program_bytes)
-        .map_err(|_| io::Error::other("truncated AOT file (program bytes)"))?;
-    if cursor.position() as usize != bytes.len() {
-        return Err(io::Error::other("trailing bytes after AOT payload"));
-    }
-
-    let program = decode_program(&program_bytes).map_err(io::Error::other)?;
-    Ok((program, local_count))
-}
-
-fn read_aot_u16(cursor: &mut io::Cursor<&[u8]>, field: &str) -> Result<u16, io::Error> {
-    let mut raw = [0u8; 2];
-    cursor
-        .read_exact(&mut raw)
-        .map_err(|_| io::Error::other(format!("truncated AOT file ({field})")))?;
-    Ok(u16::from_le_bytes(raw))
-}
-
-fn read_aot_u32(cursor: &mut io::Cursor<&[u8]>, field: &str) -> Result<u32, io::Error> {
-    let mut raw = [0u8; 4];
-    cursor
-        .read_exact(&mut raw)
-        .map_err(|_| io::Error::other(format!("truncated AOT file ({field})")))?;
-    Ok(u32::from_le_bytes(raw))
-}
-
 fn print_usage() {
     println!("Usage:");
     println!("  pd-vm-run                  (defaults to REPL)");
     println!("  pd-vm-run [source_path]");
-    println!("  pd-vm-run --aot [source_path]");
-    println!("  pd-vm-run aot [source_path]");
     println!("  pd-vm-run --repl");
     println!("  pd-vm-run repl");
     println!("  pd-vm-run --emit-vmbc <output.vmbc> [source_path]");
-    println!("  pd-vm-run --emit-aot <output.pat> [source_path]");
+    println!("  pd-vm-run --emit-aot <output.pat> [--fuel-check-interval <n>] [source_path]");
     println!(
         "  pd-vm-run --run-aot <input.pat> [--fuel <n>] [--jit-dump|--dump-jit] [--jit-dump-no-code]"
     );
@@ -694,7 +640,7 @@ fn print_usage() {
     println!("  pd-vm-run --debug [--stop-on-entry|--no-stop-on-entry] [source_path]");
     println!("  pd-vm-run --debug --tcp <addr> [source_path]");
     println!(
-        "  pd-vm-run [--aot] [--jit-hot-loop <n>] [--jit-dump|--dump-jit] [--jit-dump-no-code] [--emit-vmbc <output.vmbc>] [source_path]"
+        "  pd-vm-run [--jit-hot-loop <n>] [--jit-dump|--dump-jit] [--jit-dump-no-code] [--emit-vmbc <output.vmbc>] [source_path]"
     );
     println!("  pd-vm-run [--fuel <n>] [source_path]");
     println!("  pd-vm-run debug [--tcp <addr>] [source_path]");
@@ -1170,12 +1116,21 @@ fn format_value(value: &Value) -> String {
     }
 }
 
+fn format_elapsed_duration(elapsed: Duration) -> String {
+    if elapsed.as_secs() > 0 {
+        format!("{:.3}s", elapsed.as_secs_f64())
+    } else {
+        format!("{}ms", elapsed.as_millis())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{decode_aot_bundle, encode_aot_bundle, parse_cli_args};
-    use vm::{OpCode, Program, Value, Vm, VmStatus};
+    use super::{Path, compile_source_file, parse_cli_args, register_imports};
+    use vm::{Value, Vm, VmStatus};
 
     fn s(value: &str) -> String {
         value.to_string()
@@ -1199,6 +1154,18 @@ mod tests {
         vm
     }
 
+    fn temp_aot_path(name: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "pd_vm_{name}_{}_{}.pat",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique)
+    }
+
     #[test]
     fn parse_cli_defaults() {
         let cfg = parse_cli_args(&[]).expect("parse should succeed");
@@ -1211,9 +1178,9 @@ mod tests {
         assert!(cfg.jit_hot_loop_threshold.is_none());
         assert!(cfg.fuel.is_none());
         assert!(cfg.source.is_none());
-        assert!(!cfg.aot);
         assert!(cfg.run_aot_path.is_none());
         assert!(cfg.emit_aot_path.is_none());
+        assert!(cfg.aot_fuel_check_interval.is_none());
         assert!(cfg.emit_vmbc_path.is_none());
         assert!(cfg.disasm_vmbc_path.is_none());
         assert!(!cfg.show_source);
@@ -1320,6 +1287,7 @@ mod tests {
         ])
         .expect("parse should succeed");
         assert_eq!(cfg.emit_aot_path.as_deref(), Some("out/program.pat"));
+        assert!(cfg.aot_fuel_check_interval.is_none());
         assert_eq!(cfg.source.as_deref(), Some("examples/example.rss"));
     }
 
@@ -1327,6 +1295,44 @@ mod tests {
     fn parse_cli_emit_aot_requires_path() {
         let err = parse_cli_args(&[s("--emit-aot")]).expect_err("parse should fail");
         assert!(err.contains("missing value for --emit-aot"));
+    }
+
+    #[test]
+    fn parse_cli_emit_aot_fuel_check_interval_path() {
+        let cfg = parse_cli_args(&[
+            s("--emit-aot"),
+            s("out/program.pat"),
+            s("--fuel-check-interval"),
+            s("0"),
+            s("examples/example.rss"),
+        ])
+        .expect("parse should succeed");
+        assert_eq!(cfg.emit_aot_path.as_deref(), Some("out/program.pat"));
+        assert_eq!(cfg.aot_fuel_check_interval, Some(0));
+        assert_eq!(cfg.source.as_deref(), Some("examples/example.rss"));
+    }
+
+    #[test]
+    fn parse_cli_emit_aot_fuel_check_interval_equals_syntax() {
+        let cfg = parse_cli_args(&[
+            s("--emit-aot"),
+            s("out/program.pat"),
+            s("--fuel-check-interval=64"),
+            s("examples/example.rss"),
+        ])
+        .expect("parse should succeed");
+        assert_eq!(cfg.aot_fuel_check_interval, Some(64));
+    }
+
+    #[test]
+    fn parse_cli_fuel_check_interval_requires_emit_aot() {
+        let err = parse_cli_args(&[
+            s("--fuel-check-interval"),
+            s("64"),
+            s("examples/example.rss"),
+        ])
+        .expect_err("parse should fail");
+        assert!(err.contains("requires --emit-aot"));
     }
 
     #[test]
@@ -1347,7 +1353,7 @@ mod tests {
         let cfg = parse_cli_args(&[s("--run-aot"), s("out/program.pat"), s("--jit-dump")])
             .expect("parse should succeed");
         assert_eq!(cfg.run_aot_path.as_deref(), Some("out/program.pat"));
-        assert!(cfg.aot);
+        assert!(cfg.aot_fuel_check_interval.is_none());
         assert!(cfg.jit_dump);
         assert!(cfg.jit_dump_show_machine_code);
         assert!(cfg.source.is_none());
@@ -1365,26 +1371,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_cli_aot_flag_with_source() {
-        let cfg =
-            parse_cli_args(&[s("--aot"), s("examples/example.rss")]).expect("parse should succeed");
-        assert!(cfg.aot);
-        assert_eq!(cfg.source.as_deref(), Some("examples/example.rss"));
-    }
-
-    #[test]
-    fn parse_cli_aot_legacy_command() {
-        let cfg =
-            parse_cli_args(&[s("aot"), s("examples/example.rss")]).expect("parse should succeed");
-        assert!(cfg.aot);
-        assert_eq!(cfg.source.as_deref(), Some("examples/example.rss"));
-    }
-
-    #[test]
-    fn parse_cli_aot_rejects_debug() {
-        let err = parse_cli_args(&[s("--aot"), s("--debug"), s("examples/example.rss")])
+    fn parse_cli_aot_flag_is_rejected() {
+        let err = parse_cli_args(&[s("--aot"), s("examples/example.rss")])
             .expect_err("parse should fail");
-        assert!(err.contains("aot mode"));
+        assert!(err.contains("removed"));
+        assert!(err.contains("--emit-aot"));
+    }
+
+    #[test]
+    fn parse_cli_aot_legacy_command_is_rejected() {
+        let err =
+            parse_cli_args(&[s("aot"), s("examples/example.rss")]).expect_err("parse should fail");
+        assert!(err.contains("removed"));
+        assert!(err.contains("--run-aot"));
     }
 
     #[test]
@@ -1486,17 +1485,137 @@ mod tests {
     }
 
     #[test]
-    fn aot_bundle_roundtrips_program_and_local_count() {
-        let program = Program::new(
-            vec![Value::Int(7)],
-            vec![OpCode::Ldc as u8, 0, 0, 0, 0, OpCode::Ret as u8],
+    fn native_aot_bundle_roundtrips_through_vm_api() {
+        let compiled = vm::compile_source("let x = 7; x;").expect("compile should succeed");
+        let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+        let encoded = vm.emit_aot_bundle().expect("AOT emit should succeed");
+
+        let mut loaded = Vm::from_aot_bundle_bytes(&encoded).expect("AOT load should succeed");
+        assert_eq!(loaded.aot_fuel_check_interval(), Some(64));
+        assert_eq!(loaded.fuel_check_interval(), 64);
+        assert!(
+            loaded.program().code.iter().all(|byte| *byte == 0xFF),
+            "loaded AOT bundle should use placeholder code bytes instead of persisted bytecode"
         );
-        let encoded = encode_aot_bundle(&program, 3).expect("encode should succeed");
-        let (decoded, locals) = decode_aot_bundle(&encoded).expect("decode should succeed");
-        assert_eq!(locals, 3);
-        assert_eq!(decoded.constants, program.constants);
-        assert_eq!(decoded.code, program.code);
-        assert_eq!(decoded.imports, program.imports);
+        let status = loaded.run().expect("native-only AOT bundle should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(loaded.stack(), &[Value::Int(7)]);
+    }
+
+    #[test]
+    fn native_aot_bundle_can_disable_fuel_checks() {
+        let compiled = vm::compile_source("let x = 7; x;").expect("compile should succeed");
+        let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+        let encoded = vm
+            .emit_aot_bundle_with_fuel_check_interval(0)
+            .expect("AOT emit with disabled fuel checks should succeed");
+
+        let mut loaded = Vm::from_aot_bundle_bytes(&encoded).expect("AOT load should succeed");
+        assert_eq!(loaded.aot_fuel_check_interval(), Some(0));
+        assert_eq!(loaded.fuel_check_interval(), 0);
+        let status = loaded.run().expect("native-only AOT bundle should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(loaded.stack(), &[Value::Int(7)]);
+
+        let mut fueled = Vm::from_aot_bundle_bytes(&encoded).expect("AOT reload should succeed");
+        fueled.set_fuel(1);
+        let err = fueled
+            .run()
+            .expect_err("bundle without fuel checks should reject fuel-enabled execution");
+        assert!(
+            err.to_string()
+                .contains("emitted without fuel checks and cannot run with fuel enabled")
+        );
+    }
+
+    #[test]
+    fn native_aot_bundle_resumes_after_out_of_fuel_yield_mid_trace() {
+        let compiled = vm::compile_source(
+            "let a = 1; let b = 2; let c = 3; let d = 4; let e = 5; a + b + c + d + e;",
+        )
+        .expect("compile should succeed");
+        let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+        let encoded = vm
+            .emit_aot_bundle_with_fuel_check_interval(1)
+            .expect("AOT emit should succeed");
+
+        let mut loaded = Vm::from_aot_bundle_bytes(&encoded).expect("AOT load should succeed");
+        loaded.set_fuel(1);
+
+        let mut yielded_ips = Vec::new();
+        loop {
+            match loaded.resume().expect("AOT resume should succeed") {
+                VmStatus::Halted => break,
+                VmStatus::Yielded => {
+                    yielded_ips.push(loaded.ip());
+                    loaded
+                        .recharge_fuel(1)
+                        .expect("recharging fuel should succeed");
+                }
+                VmStatus::Waiting(op_id) => {
+                    panic!("unexpected waiting host op {op_id} in pure AOT fuel test");
+                }
+            }
+        }
+
+        assert!(
+            yielded_ips.iter().any(|&ip| ip != 0),
+            "expected at least one mid-trace fuel yield, got {yielded_ips:?}"
+        );
+        assert_eq!(loaded.stack(), &[Value::Int(15)]);
+    }
+
+    #[test]
+    fn native_aot_bundle_runs_complex_javascript_fixture() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.js");
+        let compiled = compile_source_file(&path).expect("fixture should compile");
+        let imports = compiled.program.imports.clone();
+        let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+        let encoded = vm
+            .emit_aot_bundle()
+            .expect("complex fixture AOT emit should succeed");
+
+        let mut loaded = Vm::from_aot_bundle_bytes(&encoded).expect("AOT load should succeed");
+        register_imports(&mut loaded, &imports).expect("imports should register");
+        loop {
+            match loaded.run().expect("native-only AOT bundle should run") {
+                VmStatus::Halted => break,
+                VmStatus::Yielded => continue,
+                VmStatus::Waiting(_) => loaded
+                    .wait_for_host_op_blocking()
+                    .expect("fixture host calls should complete"),
+            }
+        }
+        assert_eq!(loaded.stack(), &[Value::Int(12)]);
+    }
+
+    #[test]
+    fn native_aot_bundle_saves_reads_and_runs_complex_rustscript_fixture() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.rss");
+        let compiled = compile_source_file(&path).expect("fixture should compile");
+        let imports = compiled.program.imports.clone();
+        let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+        let encoded = vm
+            .emit_aot_bundle()
+            .expect("complex rustscript fixture AOT emit should succeed");
+        let aot_path = temp_aot_path("complex_rustscript_aot");
+        std::fs::write(&aot_path, &encoded).expect("AOT bundle should write to disk");
+
+        let bytes = std::fs::read(&aot_path).expect("AOT bundle should read from disk");
+        let _ = std::fs::remove_file(&aot_path);
+
+        let mut loaded = Vm::from_aot_bundle_bytes(&bytes).expect("AOT load should succeed");
+        register_imports(&mut loaded, &imports).expect("imports should register");
+        loop {
+            match loaded.run().expect("native-only AOT bundle should run") {
+                VmStatus::Halted => break,
+                VmStatus::Yielded => continue,
+                VmStatus::Waiting(_) => loaded
+                    .wait_for_host_op_blocking()
+                    .expect("fixture host calls should complete"),
+            }
+        }
+        assert_eq!(loaded.stack(), &[Value::Int(12)]);
     }
 
     #[test]

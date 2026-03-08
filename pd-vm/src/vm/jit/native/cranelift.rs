@@ -7,7 +7,7 @@ use super::{
 use crate::builtins::BuiltinFunction;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    AbiParam, Block, BlockArg, FuncRef, InstBuilder, MemFlags, Signature, types,
+    AbiParam, Block, BlockArg, InstBuilder, MemFlags, SigRef, Signature, types,
 };
 use cranelift_codegen::isa::OwnedTargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
@@ -24,13 +24,16 @@ mod codegen;
 #[path = "layout.rs"]
 mod layout;
 
+use super::exec::ExecutableBuffer;
 use bridge::pd_vm_cranelift_step;
 use codegen::{
     emit_fuel_tick_inline, emit_fuel_tick_inline_guarded, emit_helper_step, emit_inline_ldloc_copy,
     emit_inline_or_helper_step, entry_signature, helper_signature, jump_with_status,
     resolve_offsets,
 };
-use layout::detect_native_stack_layout;
+use layout::{detect_native_stack_layout, native_layout_fingerprint};
+
+type FuncRef = SigRef;
 
 static CRANELIFT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 static NATIVE_STACK_LAYOUT: OnceLock<Result<NativeStackLayout, String>> = OnceLock::new();
@@ -91,7 +94,19 @@ pub(crate) struct CompiledTrace {
 }
 
 pub(crate) struct TraceKeepAlive {
-    _module: JITModule,
+    exec: ExecutableBuffer,
+}
+
+impl TraceKeepAlive {
+    fn from_code(code: &[u8]) -> VmResult<Self> {
+        Ok(Self {
+            exec: ExecutableBuffer::new(code)?,
+        })
+    }
+
+    fn entry(&self) -> *const u8 {
+        self.exec.entry()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -143,6 +158,19 @@ struct ResolvedOffsets {
     fuel_ops_until_check: i32,
 }
 
+pub(crate) fn helper_entry_address() -> usize {
+    pd_vm_cranelift_step as usize
+}
+
+pub(crate) fn layout_fingerprint() -> VmResult<u64> {
+    native_layout_fingerprint()
+}
+
+pub(super) fn native_helper_fn_offset() -> i32 {
+    i32::try_from(std::mem::offset_of!(Vm, native_helper_fn))
+        .expect("Vm::native_helper_fn offset must fit i32")
+}
+
 pub(crate) fn compile_trace(
     trace: &JitTrace,
     fuel_check_interval: Option<u32>,
@@ -161,17 +189,13 @@ pub(crate) fn compile_trace(
     let offsets = resolve_offsets(layout)?;
     let isa = native_isa(profile)?;
 
-    let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-    jit_builder.symbol("pd_vm_cranelift_step", pd_vm_cranelift_step as *const u8);
+    let jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
 
     let mut module = JITModule::new(jit_builder);
     let pointer_type = module.target_config().pointer_type();
     let call_conv = module.target_config().default_call_conv;
 
     let helper_sig = helper_signature(pointer_type, call_conv);
-    let helper_id = module
-        .declare_function("pd_vm_cranelift_step", Linkage::Import, &helper_sig)
-        .map_err(|err| VmError::JitNative(format!("declare import failed: {err}")))?;
 
     let mut ctx = module.make_context();
     ctx.func.signature = entry_signature(pointer_type, call_conv);
@@ -194,7 +218,7 @@ pub(crate) fn compile_trace(
         b.append_block_params_for_function_params(entry_block);
         let vm_ptr = b.block_params(entry_block)[0];
 
-        let helper_ref = module.declare_func_in_func(helper_id, b.func);
+        let helper_ref = b.import_signature(helper_sig.clone());
 
         let mut step_index = 0usize;
         while step_index < trace.steps.len() {
@@ -291,14 +315,26 @@ pub(crate) fn compile_trace(
         Vec::new()
     } else {
         // SAFETY: `entry` points to a finalized function body and remains valid for the lifetime
-        // of `module` (held by `keepalive`); `code_len` is the exact emitted function size.
+        // of `module` until copied out; `code_len` is the exact emitted function size.
         unsafe { std::slice::from_raw_parts(entry, code_len).to_vec() }
     };
+    let keepalive = TraceKeepAlive::from_code(&code)?;
+    let entry = keepalive.entry();
 
     Ok(CompiledTrace {
         entry,
-        keepalive: TraceKeepAlive { _module: module },
+        keepalive,
         code,
+    })
+}
+
+pub(crate) fn load_compiled_trace(code: &[u8]) -> VmResult<CompiledTrace> {
+    let keepalive = TraceKeepAlive::from_code(code)?;
+    let entry = keepalive.entry();
+    Ok(CompiledTrace {
+        entry,
+        keepalive,
+        code: code.to_vec(),
     })
 }
 
