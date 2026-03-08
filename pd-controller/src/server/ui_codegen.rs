@@ -2550,7 +2550,7 @@ fn render_flow_node(
             let mut statements = FlowStatements::default();
             statements.rustscript.push(indent_line(
                 indent,
-                format!("for (let i = 0; i < {count}; i = i + 1) {{"),
+                format!("for (let mut i = 0; i < {count}; i = i + 1) {{"),
             ));
             statements.rustscript.extend(body_branch.rustscript.clone());
             statements
@@ -3702,7 +3702,7 @@ fn render_single_block(
         "string_length" => {
             let var = sanitize_identifier(block.values.get("var"), "text_len");
             let value = block_value(block, "value", "hello");
-            rss.push(format!("let {var} = len({});", render_expr_rss(value)));
+            rss.push(format!("let {var} = ({}).length;", render_expr_rss(value)));
             js.push(format!("let {var} = len({});", render_expr_js(value)));
             lua.push(format!("local {var} = len({})", render_expr_lua(value)));
             scm.push(format!(
@@ -3813,8 +3813,11 @@ fn render_single_block(
             let var = sanitize_identifier(block.values.get("var"), "items_next");
             let array = block_value(block, "array", "$items");
             let value = block_value(block, "value", "item");
-            rss.push(format!("let {var} = {};", render_expr_rss(array)));
-            rss.push(format!("{var}[len({var})] = {};", render_expr_rss(value)));
+            rss.push(format!(
+                "let mut {var} = {};",
+                render_detached_expr_rss(array)
+            ));
+            rss.push(format!("{var}[{var}.length] = {};", render_expr_rss(value)));
             js.push(format!("let {var} = {};", render_expr_js(array)));
             js.push(format!("{var}[len({var})] = {};", render_expr_js(value)));
             lua.push(format!("local {var} = {}", render_expr_lua(array)));
@@ -3830,7 +3833,7 @@ fn render_single_block(
             let array = block_value(block, "array", "$items");
             let index = render_number_expr(block_value(block, "index", "0"), "0");
             rss.push(format!(
-                "let {var} = ({})[{index}];",
+                "let {var} = (({})[{index}]).copy();",
                 render_expr_rss(array)
             ));
             js.push(format!("let {var} = ({})[{index}];", render_expr_js(array)));
@@ -3848,7 +3851,10 @@ fn render_single_block(
             let array = block_value(block, "array", "$items");
             let index = render_number_expr(block_value(block, "index", "0"), "0");
             let value = block_value(block, "value", "item");
-            rss.push(format!("let {var} = {};", render_expr_rss(array)));
+            rss.push(format!(
+                "let mut {var} = {};",
+                render_detached_expr_rss(array)
+            ));
             rss.push(format!("{var}[{index}] = {};", render_expr_rss(value)));
             js.push(format!("let {var} = {};", render_expr_js(array)));
             js.push(format!("{var}[{index}] = {};", render_expr_js(value)));
@@ -3871,10 +3877,8 @@ fn render_single_block(
             let var = sanitize_identifier(block.values.get("var"), "map_item");
             let map = block_value(block, "map", "$map_value");
             let key = block_value(block, "key", "key");
-            rss.push(format!(
-                "let {var} = {};",
-                render_key_access_expr(render_expr_rss(map), key, render_expr_rss)
-            ));
+            let rss_access = render_key_access_expr(render_expr_rss(map), key, render_expr_rss);
+            rss.push(format!("let {var} = ({rss_access}).copy();"));
             js.push(format!(
                 "let {var} = {};",
                 render_key_access_expr(render_expr_js(map), key, render_expr_js)
@@ -3894,7 +3898,10 @@ fn render_single_block(
             let map = block_value(block, "map", "$map_value");
             let key = block_value(block, "key", "key");
             let value = block_value(block, "value", "value");
-            rss.push(format!("let {var} = {};", render_expr_rss(map)));
+            rss.push(format!(
+                "let mut {var} = {};",
+                render_detached_expr_rss(map)
+            ));
             rss.push(format!(
                 "{} = {};",
                 render_key_assignment_target(&var, key, render_expr_rss),
@@ -4124,7 +4131,7 @@ fn render_single_block(
         "loop" => {
             let count = render_number_expr(block_value(block, "count", "1"), "1");
 
-            rss.push(format!("for (let i = 0; i < {count}; i = i + 1) {{"));
+            rss.push(format!("for (let mut i = 0; i < {count}; i = i + 1) {{"));
             rss.push("}".to_string());
 
             js.push(format!("for (let i = 0; i < {count}; i = i + 1) {{"));
@@ -4222,7 +4229,7 @@ fn render_single_block(
             let header_name = block_value(block, "header_name", "x-loop");
             let header_value = block_value(block, "header_value", "on");
 
-            rss.push(format!("for (let i = 0; i < {count}; i = i + 1) {{"));
+            rss.push(format!("for (let mut i = 0; i < {count}; i = i + 1) {{"));
             rss.push(format!(
                 "    vm::http::response::set_header({}, {});",
                 rust_string(header_name),
@@ -4338,6 +4345,10 @@ fn block_value<'a>(block: &'a UiBlockInstance, key: &str, fallback: &'a str) -> 
 
 fn render_expr_rss(raw: &str) -> String {
     render_expr_common(raw, rust_string)
+}
+
+fn render_detached_expr_rss(raw: &str) -> String {
+    format!("({}).copy()", render_expr_rss(raw))
 }
 
 fn render_expr_js(raw: &str) -> String {
