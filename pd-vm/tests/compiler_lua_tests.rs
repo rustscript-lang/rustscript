@@ -171,6 +171,52 @@ fn lua_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
+            name: "pcall_prefixes_success_and_forwards_multi_return",
+            source: r#"
+                local function x()
+                    return 1, 2
+                end
+                local ok, a, b = pcall(x)
+                ok
+                a
+                b
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_stack: vec![Value::Bool(true), Value::Int(1), Value::Int(2)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "pcall_scalar_context_keeps_success_flag",
+            source: r#"
+                local function x()
+                    return 1, 2
+                end
+                local ok = pcall(x)
+                ok
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_stack: vec![Value::Bool(true)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "xpcall_ignores_handler_and_forwards_args",
+            source: r#"
+                local function add_pair(a, b)
+                    return a + b, b
+                end
+                local function handler(err)
+                    return err
+                end
+                local ok, sum, rhs = xpcall(add_pair, handler, 3, 4)
+                ok
+                sum
+                rhs
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_stack: vec![Value::Bool(true), Value::Int(7), Value::Int(4)],
+            expected_locals: None,
+        },
+        RuntimeCase {
             name: "inline_function_literal_empty_body_returns_null",
             source: r#"
                 local f = function() end
