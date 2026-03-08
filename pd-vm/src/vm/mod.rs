@@ -1837,6 +1837,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rustscript_function_calls_multiple_other_functions() {
+        let source = r#"
+            fn inc(x) { x + 1; }
+            fn twice(x) { x * 2; }
+            fn combine(a, b) {
+                let left = inc(a);
+                let right = twice(b);
+                left + right;
+            }
+            combine(3, 4);
+        "#;
+        let compiled = crate::compile_source(source).expect("source should compile");
+        let mut vm = Vm::new(compiled.program);
+
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::Int(12)]);
+    }
+
+    #[test]
+    fn rustscript_nested_non_recursive_function_calls_work() {
+        let source = r#"
+            fn inc(x) { x + 1; }
+            fn double_inc(x) { inc(inc(x)); }
+            fn score(x) {
+                let a = double_inc(x);
+                let b = inc(x);
+                a + b;
+            }
+            score(5);
+        "#;
+        let compiled = crate::compile_source(source).expect("source should compile");
+        let mut vm = Vm::new(compiled.program);
+
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::Int(13)]);
+    }
+
     fn step_once(vm: &mut Vm) -> VmResult<ExecOutcome> {
         let opcode = vm.read_u8()?;
         vm.execute_interpreter_instruction(opcode)
