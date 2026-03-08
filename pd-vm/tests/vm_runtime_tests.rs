@@ -639,7 +639,10 @@ fn store_api_exposes_epoch_checkpoint_and_deadline() {
         .run()
         .expect("first run should cooperatively yield when the epoch reaches the deadline");
     assert_eq!(status, VmStatus::Yielded);
-    assert_eq!(store.vm().last_yield_reason(), Some(vm::VmYieldReason::Epoch));
+    assert_eq!(
+        store.vm().last_yield_reason(),
+        Some(vm::VmYieldReason::Epoch)
+    );
 
     let status = store
         .run()
@@ -690,7 +693,9 @@ fn epoch_deadline_zero_auto_rearms_without_manual_reconfiguration() {
     vm.set_epoch_deadline(0)
         .expect("setting epoch deadline should succeed");
 
-    let first = vm.run().expect("first run should yield at the expired epoch deadline");
+    let first = vm
+        .run()
+        .expect("first run should yield at the expired epoch deadline");
     assert_eq!(first, VmStatus::Yielded);
     assert_eq!(vm.last_yield_reason(), Some(vm::VmYieldReason::Epoch));
 
@@ -701,7 +706,9 @@ fn epoch_deadline_zero_auto_rearms_without_manual_reconfiguration() {
     assert_eq!(vm.last_yield_reason(), Some(vm::VmYieldReason::Epoch));
 
     vm.clear_epoch_deadline();
-    let halted = vm.run().expect("run should halt once epoch interruption is cleared");
+    let halted = vm
+        .run()
+        .expect("run should halt once epoch interruption is cleared");
     assert_eq!(halted, VmStatus::Halted);
 }
 

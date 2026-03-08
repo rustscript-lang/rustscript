@@ -57,22 +57,13 @@ pub(super) fn emit_interrupt_tick_inline_guarded(
         .ins()
         .load(types::I8, MemFlags::new(), vm_ptr, offsets.interrupt_mode);
     let metering_enabled = b.ins().icmp_imm(IntCC::NotEqual, interrupt_mode, 0);
-    b.ins().brif(
-        metering_enabled,
-        mode_match_block,
-        &[],
-        continue_block,
-        &[],
-    );
+    b.ins()
+        .brif(metering_enabled, mode_match_block, &[], continue_block, &[]);
 
     b.switch_to_block(mode_match_block);
     let expected_mode = match interrupt_settings.mode {
-        super::super::NativeInterruptMode::Fuel => {
-            crate::vm::InterruptMode::Fuel as u8
-        }
-        super::super::NativeInterruptMode::Epoch => {
-            crate::vm::InterruptMode::Epoch as u8
-        }
+        super::super::NativeInterruptMode::Fuel => crate::vm::InterruptMode::Fuel as u8,
+        super::super::NativeInterruptMode::Epoch => crate::vm::InterruptMode::Epoch as u8,
     };
     let mode_matches = b
         .ins()
@@ -92,8 +83,13 @@ pub(super) fn emit_interrupt_tick_inline_guarded(
         .iconst(types::I32, i64::from(interrupt_settings.check_interval));
     let interval_matches = b.ins().icmp(IntCC::Equal, live_interval, expected_interval);
     let specialized_block = b.create_block();
-    b.ins()
-        .brif(interval_matches, specialized_block, &[], mismatch_block, &[]);
+    b.ins().brif(
+        interval_matches,
+        specialized_block,
+        &[],
+        mismatch_block,
+        &[],
+    );
 
     b.switch_to_block(specialized_block);
     match interrupt_settings.mode {
@@ -245,9 +241,11 @@ fn emit_epoch_tick_inline_core(
     let epoch_deadline = b
         .ins()
         .load(types::I64, MemFlags::new(), vm_ptr, offsets.epoch_deadline);
-    let reached_deadline = b
-        .ins()
-        .icmp(IntCC::UnsignedGreaterThanOrEqual, current_epoch, epoch_deadline);
+    let reached_deadline = b.ins().icmp(
+        IntCC::UnsignedGreaterThanOrEqual,
+        current_epoch,
+        epoch_deadline,
+    );
     let epoch_ok = b.create_block();
     let epoch_tripped = b.create_block();
     b.ins()
@@ -840,13 +838,59 @@ fn emit_inline_stloc(
     vm_ptr: cranelift_codegen::ir::Value,
     helper_ref: FuncRef,
     exit_block: Block,
-    _pointer_type: cranelift_codegen::ir::Type,
-    _layout: NativeStackLayout,
-    _offsets: ResolvedOffsets,
+    pointer_type: cranelift_codegen::ir::Type,
+    layout: NativeStackLayout,
+    offsets: ResolvedOffsets,
     index: u8,
     root_ip: usize,
 ) -> VmResult<()> {
+    let slow = b.create_block();
+    let fast = b.create_block();
     let next = b.create_block();
+
+    let stack_len = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_len);
+    let has_stack = b
+        .ins()
+        .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, stack_len, 1);
+    b.ins().brif(has_stack, fast, &[], slow, &[]);
+
+    b.switch_to_block(fast);
+    let locals_len = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_len);
+    let idx = b.ins().iconst(pointer_type, i64::from(index));
+    let in_bounds = b.ins().icmp(IntCC::UnsignedLessThan, idx, locals_len);
+    let bounds_ok = b.create_block();
+    b.ins().brif(in_bounds, bounds_ok, &[], slow, &[]);
+
+    b.switch_to_block(bounds_ok);
+    let one = b.ins().iconst(pointer_type, 1);
+    let src_index = b.ins().isub(stack_len, one);
+    let stack_ptr = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_ptr);
+    let src_addr = value_addr(b, pointer_type, stack_ptr, src_index, layout.value.size);
+
+    let locals_ptr = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_ptr);
+    let dst_addr = value_addr(b, pointer_type, locals_ptr, idx, layout.value.size);
+    let dst_tag = load_tag_i32(b, layout.value, dst_addr);
+
+    let dst_scalar = is_scalar_tag(b, layout.value, dst_tag);
+    let scalar_ok = b.create_block();
+    b.ins().brif(dst_scalar, scalar_ok, &[], slow, &[]);
+
+    b.switch_to_block(scalar_ok);
+    copy_value_bytes(b, src_addr, dst_addr, layout.value.size);
+    let new_len = b.ins().isub(stack_len, one);
+    b.ins()
+        .store(MemFlags::new(), new_len, vm_ptr, offsets.stack_len);
+    b.ins().jump(next, &[]);
+
+    b.switch_to_block(slow);
     emit_helper_step_from_call_tuple(
         b,
         vm_ptr,

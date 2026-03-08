@@ -191,7 +191,9 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn apply_runtime_flags(vm: &mut Vm, cli: &CliConfig) -> Result<(), io::Error> {
-    if (cli.fuel.is_some() || cli.epoch_deadline.is_some()) && vm.aot_fuel_check_interval() == Some(0) {
+    if (cli.fuel.is_some() || cli.epoch_deadline.is_some())
+        && vm.aot_fuel_check_interval() == Some(0)
+    {
         return Err(io::Error::other(
             "native-only AOT bundle was emitted without interruption checks; rerun without --fuel/--epoch-deadline or re-emit with --fuel-check-interval/--epoch-check-interval > 0",
         ));
@@ -235,36 +237,34 @@ fn run_vm_loop(
                 println!("stack: {:?}", vm.stack());
                 return Ok(());
             }
-            VmStatus::Yielded => {
-                match vm.last_yield_reason() {
-                    Some(vm::VmYieldReason::Fuel)
-                        if fuel_recharge.is_some() && vm.get_fuel() == Some(0) =>
-                    {
-                        let recharge = fuel_recharge.unwrap_or(0);
-                        if recharge > 0 {
-                            vm.recharge_fuel(recharge)
-                                .map_err(|err| io::Error::other(render_vm_error(vm, &err)))?;
-                            println!("vm yielded, recharged {recharge} fuel, resuming...");
-                        } else {
-                            println!("vm yielded, resuming...");
-                        }
-                    }
-                    Some(vm::VmYieldReason::Epoch) => {
-                        let deadline = vm
-                            .epoch_deadline()
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "disabled".to_string());
-                        println!(
-                            "vm yielded at epoch deadline (current={}, deadline={deadline})",
-                            vm.current_epoch()
-                        );
-                        return Ok(());
-                    }
-                    _ => {
+            VmStatus::Yielded => match vm.last_yield_reason() {
+                Some(vm::VmYieldReason::Fuel)
+                    if fuel_recharge.is_some() && vm.get_fuel() == Some(0) =>
+                {
+                    let recharge = fuel_recharge.unwrap_or(0);
+                    if recharge > 0 {
+                        vm.recharge_fuel(recharge)
+                            .map_err(|err| io::Error::other(render_vm_error(vm, &err)))?;
+                        println!("vm yielded, recharged {recharge} fuel, resuming...");
+                    } else {
                         println!("vm yielded, resuming...");
                     }
                 }
-            }
+                Some(vm::VmYieldReason::Epoch) => {
+                    let deadline = vm
+                        .epoch_deadline()
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "disabled".to_string());
+                    println!(
+                        "vm yielded at epoch deadline (current={}, deadline={deadline})",
+                        vm.current_epoch()
+                    );
+                    return Ok(());
+                }
+                _ => {
+                    println!("vm yielded, resuming...");
+                }
+            },
             VmStatus::Waiting(_op_id) => {
                 vm.wait_for_host_op_blocking()
                     .map_err(|err| io::Error::other(render_vm_error(vm, &err)))?;
@@ -417,8 +417,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
                 let raw = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --epoch-check-interval".to_string())?;
-                cfg.epoch_check_interval =
-                    Some(parse_cli_u32_flag("--epoch-check-interval", raw)?);
+                cfg.epoch_check_interval = Some(parse_cli_u32_flag("--epoch-check-interval", raw)?);
                 index += 2;
             }
             "--disasm-vmbc" => {
@@ -436,8 +435,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
             }
             value if value.starts_with("--epoch-check-interval=") => {
                 let raw = value.trim_start_matches("--epoch-check-interval=");
-                cfg.epoch_check_interval =
-                    Some(parse_cli_u32_flag("--epoch-check-interval", raw)?);
+                cfg.epoch_check_interval = Some(parse_cli_u32_flag("--epoch-check-interval", raw)?);
                 index += 1;
             }
             "--run-aot" => {
@@ -565,8 +563,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
         && !cfg.debug
     {
         return Err(
-            "--epoch-check-interval requires --emit-aot, --epoch-deadline, or --debug"
-                .to_string(),
+            "--epoch-check-interval requires --emit-aot, --epoch-deadline, or --debug".to_string(),
         );
     }
     if cfg.emit_aot_path.is_some()
@@ -727,7 +724,9 @@ fn print_usage() {
     println!(
         "  pd-vm-run [--jit-hot-loop <n>] [--jit-dump|--dump-jit] [--jit-dump-no-code] [--emit-vmbc <output.vmbc>] [source_path]"
     );
-    println!("  pd-vm-run [--fuel <n>|--epoch-deadline <n>] [--epoch-check-interval <n>] [source_path]");
+    println!(
+        "  pd-vm-run [--fuel <n>|--epoch-deadline <n>] [--epoch-check-interval <n>] [source_path]"
+    );
     println!("  pd-vm-run debug [--tcp <addr>] [source_path]");
 }
 
@@ -1349,12 +1348,8 @@ mod tests {
 
     #[test]
     fn parse_cli_epoch_deadline_flag() {
-        let cfg = parse_cli_args(&[
-            s("--epoch-deadline"),
-            s("3"),
-            s("examples/example.rss"),
-        ])
-        .expect("parse should succeed");
+        let cfg = parse_cli_args(&[s("--epoch-deadline"), s("3"), s("examples/example.rss")])
+            .expect("parse should succeed");
         assert_eq!(cfg.epoch_deadline, Some(3));
         assert_eq!(cfg.source.as_deref(), Some("examples/example.rss"));
     }
@@ -1653,7 +1648,8 @@ mod tests {
                 .contains("emitted without interruption checks and cannot run with cooperative interruption enabled")
         );
 
-        let mut epoch_enabled = Vm::from_aot_bundle_bytes(&encoded).expect("AOT reload should succeed");
+        let mut epoch_enabled =
+            Vm::from_aot_bundle_bytes(&encoded).expect("AOT reload should succeed");
         epoch_enabled
             .set_epoch_deadline(0)
             .expect("setting epoch deadline should succeed");
@@ -1761,7 +1757,8 @@ mod tests {
         let fuel_encoded = fuel_vm
             .emit_aot_bundle_with_fuel_check_interval(4)
             .expect("fuel AOT emit should succeed");
-        let mut fuel_loaded = Vm::from_aot_bundle_bytes(&fuel_encoded).expect("AOT load should succeed");
+        let mut fuel_loaded =
+            Vm::from_aot_bundle_bytes(&fuel_encoded).expect("AOT load should succeed");
         fuel_loaded
             .set_epoch_check_interval(4)
             .expect("epoch interval update should succeed");
@@ -1771,11 +1768,9 @@ mod tests {
         let fuel_err = fuel_loaded
             .run()
             .expect_err("fuel-specialized bundle should reject epoch interruption");
-        assert!(
-            fuel_err
-                .to_string()
-                .contains("emitted for fuel interruption and cannot run with epoch interruption enabled")
-        );
+        assert!(fuel_err.to_string().contains(
+            "emitted for fuel interruption and cannot run with epoch interruption enabled"
+        ));
 
         let mut epoch_vm = Vm::new(compiled.program.with_local_count(compiled.locals));
         let epoch_encoded = epoch_vm
@@ -1790,11 +1785,9 @@ mod tests {
         let epoch_err = epoch_loaded
             .run()
             .expect_err("epoch-specialized bundle should reject fuel interruption");
-        assert!(
-            epoch_err
-                .to_string()
-                .contains("emitted for epoch interruption and cannot run with fuel interruption enabled")
-        );
+        assert!(epoch_err.to_string().contains(
+            "emitted for epoch interruption and cannot run with fuel interruption enabled"
+        ));
     }
 
     #[test]

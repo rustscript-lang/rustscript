@@ -174,12 +174,12 @@ impl Vm {
     fn active_native_interrupt_settings(&self) -> Option<native::NativeInterruptSettings> {
         match self.interrupt_mode {
             super::super::InterruptMode::None => None,
-            super::super::InterruptMode::Fuel => {
-                Some(native::NativeInterruptSettings::fuel(self.fuel_check_interval))
-            }
-            super::super::InterruptMode::Epoch => {
-                Some(native::NativeInterruptSettings::epoch(self.fuel_check_interval))
-            }
+            super::super::InterruptMode::Fuel => Some(native::NativeInterruptSettings::fuel(
+                self.fuel_check_interval,
+            )),
+            super::super::InterruptMode::Epoch => Some(native::NativeInterruptSettings::epoch(
+                self.fuel_check_interval,
+            )),
         }
     }
 
@@ -569,12 +569,10 @@ impl Vm {
                             needed: u64::from(self.fuel_check_interval),
                             remaining: self.fuel_remaining,
                         }),
-                        super::super::InterruptMode::Epoch => Err(
-                            VmError::EpochDeadlineReached {
-                                current: self.current_epoch(),
-                                deadline: self.epoch_deadline,
-                            },
-                        ),
+                        super::super::InterruptMode::Epoch => Err(VmError::EpochDeadlineReached {
+                            current: self.current_epoch(),
+                            deadline: self.epoch_deadline,
+                        }),
                         super::super::InterruptMode::None => Err(VmError::JitNative(
                             "native interruption checkpoint fired while interruption was disabled"
                                 .to_string(),
@@ -709,8 +707,7 @@ impl Vm {
             return Ok(());
         }
 
-        let compiled =
-            native::compile_native_trace(&trace, interrupt_settings, compile_profile)?;
+        let compiled = native::compile_native_trace(&trace, interrupt_settings, compile_profile)?;
         let entry = unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(compiled.entry) };
         let code = Arc::<[u8]>::from(compiled.code.into_boxed_slice());
         let keepalive = Arc::new(Mutex::new(compiled.keepalive));

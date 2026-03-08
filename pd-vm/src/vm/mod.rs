@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use crate::builtins::BuiltinFunction;
@@ -539,10 +539,12 @@ impl Hasher for StableHasher {
     }
 }
 
+#[inline(always)]
 fn logical_shr_i64(value: i64, amount: u32) -> i64 {
     ((value as u64) >> amount) as i64
 }
 
+#[inline(always)]
 pub(crate) fn checked_int_div(lhs: i64, rhs: i64) -> VmResult<i64> {
     if rhs == 0 {
         return Err(VmError::DivisionByZero);
@@ -553,6 +555,7 @@ pub(crate) fn checked_int_div(lhs: i64, rhs: i64) -> VmResult<i64> {
     Ok(lhs / rhs)
 }
 
+#[inline(always)]
 pub(crate) fn checked_int_rem(lhs: i64, rhs: i64) -> VmResult<i64> {
     if rhs == 0 {
         return Err(VmError::DivisionByZero);
@@ -683,14 +686,17 @@ impl Vm {
         self.program_cache_key
     }
 
+    #[inline(always)]
     fn fuel_metering_enabled(&self) -> bool {
         self.interrupt_mode == InterruptMode::Fuel
     }
 
+    #[inline(always)]
     fn epoch_interruption_enabled(&self) -> bool {
         self.interrupt_mode == InterruptMode::Epoch
     }
 
+    #[inline(always)]
     fn interruption_enabled(&self) -> bool {
         self.interrupt_mode != InterruptMode::None
     }
@@ -1086,7 +1092,8 @@ impl Vm {
     }
 
     pub fn epoch_deadline(&self) -> Option<u64> {
-        self.epoch_interruption_enabled().then_some(self.epoch_deadline)
+        self.epoch_interruption_enabled()
+            .then_some(self.epoch_deadline)
     }
 
     pub fn epoch_deadline_delta(&self) -> Option<u64> {
@@ -1117,7 +1124,9 @@ impl Vm {
 
     pub fn epoch_checkpoint(&self) -> EpochCheckpoint {
         EpochCheckpoint {
-            deadline: self.epoch_interruption_enabled().then_some(self.epoch_deadline),
+            deadline: self
+                .epoch_interruption_enabled()
+                .then_some(self.epoch_deadline),
             deadline_delta: self.epoch_deadline_delta,
             rearm_pending: self.epoch_rearm_pending,
             check_interval: self.epoch_check_interval(),
@@ -1258,6 +1267,7 @@ impl Vm {
         }
     }
 
+    #[inline(always)]
     fn yielded_interrupt_reason(err: &VmError) -> Option<VmYieldReason> {
         match err {
             VmError::OutOfFuel { .. } => Some(VmYieldReason::Fuel),
@@ -1266,6 +1276,7 @@ impl Vm {
         }
     }
 
+    #[inline(always)]
     fn mark_interrupt_yield(&mut self, reason: VmYieldReason) {
         self.last_yield_reason = Some(reason);
         if matches!(reason, VmYieldReason::Epoch) {
@@ -1273,8 +1284,13 @@ impl Vm {
         }
     }
 
+    #[inline(always)]
     fn rearm_epoch_after_yield_if_needed(&mut self) {
-        if !self.epoch_interruption_enabled() || !self.epoch_rearm_pending {
+        if !self.epoch_rearm_pending {
+            return;
+        }
+        if !self.epoch_interruption_enabled() {
+            self.epoch_rearm_pending = false;
             return;
         }
         self.epoch_deadline = self
@@ -1330,7 +1346,9 @@ impl Vm {
         self.last_yield_reason = None;
 
         loop {
-            self.rearm_epoch_after_yield_if_needed();
+            if self.epoch_rearm_pending {
+                self.rearm_epoch_after_yield_if_needed();
+            }
             if let Some(active_debugger) = debugger.as_deref_mut() {
                 active_debugger.on_instruction(self);
             }
@@ -1547,7 +1565,12 @@ impl Vm {
             x if x == OpCode::Stloc as u8 => {
                 let index = self.read_u8()?;
                 let value = self.pop_value()?;
-                self.store_local_with_drop_contract(index, value)?;
+                let slot = self
+                    .locals
+                    .get_mut(index as usize)
+                    .ok_or(VmError::InvalidLocal(index))?;
+                let previous = std::mem::replace(slot, value);
+                self.drop_value_with_contract(previous);
             }
             x if x == OpCode::Call as u8 => {
                 let call_ip = self.ip - 1;
@@ -1617,6 +1640,7 @@ impl Vm {
         self.call_depth
     }
 
+    #[inline(always)]
     fn pending_fuel_debt(&self) -> u64 {
         if !self.fuel_metering_enabled() {
             return 0;
@@ -1682,6 +1706,7 @@ impl Vm {
         }
     }
 
+    #[inline(always)]
     pub(in crate::vm) fn charge_fuel(&mut self, amount: u64) -> VmResult<()> {
         if amount == 0 {
             return Ok(());
@@ -1702,6 +1727,7 @@ impl Vm {
         Ok(())
     }
 
+    #[inline(always)]
     pub(in crate::vm) fn charge_fuel_tick(&mut self) -> VmResult<()> {
         if !self.fuel_metering_enabled() {
             return Ok(());
@@ -1717,6 +1743,7 @@ impl Vm {
         Ok(())
     }
 
+    #[inline(always)]
     pub(in crate::vm) fn charge_epoch_tick(&mut self) -> VmResult<()> {
         if !self.epoch_interruption_enabled() {
             return Ok(());
@@ -1737,6 +1764,7 @@ impl Vm {
         Ok(())
     }
 
+    #[inline(always)]
     pub(in crate::vm) fn charge_interrupt_tick(&mut self) -> VmResult<()> {
         match self.interrupt_mode {
             InterruptMode::None => Ok(()),
@@ -1761,6 +1789,7 @@ impl Vm {
         self.pop_value()?.as_bool()
     }
 
+    #[inline(always)]
     fn unary_not_op(&mut self) -> VmResult<()> {
         let value = self.pop_bool()?;
         self.stack.push(Value::Bool(!value));
@@ -1857,6 +1886,7 @@ impl Vm {
         Ok(value as u32)
     }
 
+    #[inline(always)]
     fn store_local_with_drop_contract(&mut self, index: u8, value: Value) -> VmResult<()> {
         let slot = self
             .locals

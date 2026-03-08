@@ -1034,7 +1034,10 @@ fn handle_command(
                     if let Some(value) = parse_u64(parts.next()) {
                         match vm.set_epoch_deadline(value) {
                             Ok(()) => {
-                                let _ = writeln!(out, "epoch deadline set {value} ticks beyond current epoch");
+                                let _ = writeln!(
+                                    out,
+                                    "epoch deadline set {value} ticks beyond current epoch"
+                                );
                                 print_epoch_state(vm, out);
                             }
                             Err(err) => {
@@ -1067,7 +1070,8 @@ fn handle_command(
                             }
                         }
                     } else {
-                        let _ = writeln!(out, "epoch check interval: {}", vm.epoch_check_interval());
+                        let _ =
+                            writeln!(out, "epoch check interval: {}", vm.epoch_check_interval());
                     }
                 }
                 _ => {
@@ -2898,7 +2902,10 @@ mod tests {
         );
         assert_eq!(vm.epoch_deadline(), Some(7));
         let text = String::from_utf8(out.clone()).expect("output should be utf-8");
-        assert!(text.contains("epoch deadline set 4 ticks beyond current epoch"), "{text}");
+        assert!(
+            text.contains("epoch deadline set 4 ticks beyond current epoch"),
+            "{text}"
+        );
 
         out.clear();
         handle_command(

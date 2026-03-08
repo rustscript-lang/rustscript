@@ -363,7 +363,9 @@ fn trace_jit_native_path_honors_epoch_interruption() {
         vm.dump_jit_info()
     );
 
-    let status = vm.run().expect("second run should halt after auto re-arming");
+    let status = vm
+        .run()
+        .expect("second run should halt after auto re-arming");
     assert_eq!(status, VmStatus::Halted);
 }
 
@@ -388,7 +390,9 @@ fn native_trace_epoch_zero_deadline_auto_rearms_without_manual_reconfiguration()
         hot_loop_threshold: 1,
         max_trace_len: 512,
     });
-    let warmup = vm.run().expect("warmup run should halt and compile native traces");
+    let warmup = vm
+        .run()
+        .expect("warmup run should halt and compile native traces");
     assert_eq!(warmup, VmStatus::Halted);
     assert!(
         vm.jit_native_exec_count() > 0,
@@ -418,7 +422,9 @@ fn native_trace_epoch_zero_deadline_auto_rearms_without_manual_reconfiguration()
     );
 
     vm.clear_epoch_deadline();
-    let halted = vm.run().expect("run should halt after clearing epoch interruption");
+    let halted = vm
+        .run()
+        .expect("run should halt after clearing epoch interruption");
     assert_eq!(halted, VmStatus::Halted);
 }
 
