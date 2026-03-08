@@ -272,6 +272,7 @@ export type DebugCommandRequest =
   | { kind: "next" }
   | { kind: "continue" }
   | { kind: "out" }
+  | { kind: "text"; command: string }
   | { kind: "select_recording"; recording_id: string }
   | { kind: "break_line"; line: number }
   | { kind: "clear_line"; line: number }

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import Editor, { type OnMount } from "@monaco-editor/react";
 import {
   ArrowLeft,
@@ -87,6 +88,7 @@ export function DebugSessionsView({
   debugHoverValue,
   onSelectRecording
 }: DebugSessionsViewProps) {
+  const [customCommand, setCustomCommand] = useState("epoch");
   let activeCount = 0;
   let waitingCount = 0;
   let stoppedCount = 0;
@@ -478,6 +480,52 @@ export function DebugSessionsView({
                     }
                   >
                     <Square className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+
+              <div className="rounded-md border bg-background/70 p-2">
+                <div className="mb-2 text-[11px] uppercase tracking-wide text-muted-foreground">Raw Debugger Command</div>
+                <div className="flex flex-col gap-2 sm:flex-row">
+                  <Input
+                    value={customCommand}
+                    onChange={(event) => setCustomCommand(event.target.value)}
+                    onKeyDown={(event) => {
+                      const canControl =
+                        selectedDebugSession.phase === "attached" || selectedDebugSession.phase === "replay_ready";
+                      if (event.key !== "Enter" || debugCommandLoading || !canControl) {
+                        return;
+                      }
+                      const command = customCommand.trim();
+                      if (!command) {
+                        return;
+                      }
+                      runDebugCommand({ kind: "text", command }).catch(() => {
+                        // handled by callback
+                      });
+                    }}
+                    placeholder="epoch | epoch tick 1 | epoch deadline 3 | fuel"
+                    className="font-mono text-xs"
+                  />
+                  <Button
+                    variant="outline"
+                    onClick={() => {
+                      const command = customCommand.trim();
+                      if (!command) {
+                        return;
+                      }
+                      runDebugCommand({ kind: "text", command }).catch(() => {
+                        // handled by callback
+                      });
+                    }}
+                    disabled={
+                      debugCommandLoading ||
+                      !customCommand.trim() ||
+                      (selectedDebugSession.phase !== "attached" &&
+                        selectedDebugSession.phase !== "replay_ready")
+                    }
+                  >
+                    Send
                   </Button>
                 </div>
               </div>
