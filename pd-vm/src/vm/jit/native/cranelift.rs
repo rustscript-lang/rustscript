@@ -211,7 +211,7 @@ pub(crate) fn compile_trace(
 
             if let Some(interval) = fuel_check_interval {
                 let stride = interval as usize;
-                if step_index % stride == 0 {
+                if step_index.is_multiple_of(stride) {
                     let remaining = trace.steps.len().saturating_sub(step_index);
                     let chunk_len = remaining.min(stride) as u32;
                     if check_runtime_fuel_enabled {

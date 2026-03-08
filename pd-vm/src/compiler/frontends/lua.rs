@@ -560,10 +560,8 @@ fn emit_lua_direct_stmt(stmt: Stmt, root: &mut Vec<Stmt>, blocks: &mut [LuaDirec
         } => {
             if *in_else {
                 else_branch.push(stmt);
-            } else {
-                if let Some((_, branch_body)) = branches.get_mut(*active_branch) {
-                    branch_body.push(stmt);
-                }
+            } else if let Some((_, branch_body)) = branches.get_mut(*active_branch) {
+                branch_body.push(stmt);
             }
         }
         LuaDirectBlock::While { body, .. }
