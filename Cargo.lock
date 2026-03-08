@@ -1072,6 +1072,7 @@ dependencies = [
  "regex",
  "rt-format",
  "rustyline",
+ "serde",
  "serde_json",
  "tokio",
  "windows-sys 0.59.0",

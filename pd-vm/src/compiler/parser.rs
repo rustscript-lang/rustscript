@@ -20,6 +20,7 @@ use super::{
 enum TokenKind {
     Ident(String),
     Int(i64),
+    IntMinMagnitude(String),
     Float(f64),
     String(String),
     True,
@@ -65,7 +66,9 @@ enum TokenKind {
     EqualEqual,
     FatArrow,
     Less,
+    LessEqual,
     Greater,
+    GreaterEqual,
     Eof,
 }
 
@@ -78,6 +81,7 @@ struct Token {
 
 enum NumberLiteral {
     Int(i64),
+    IntMinMagnitude(String),
     Float(f64),
 }
 
@@ -309,11 +313,21 @@ impl<'a> Lexer<'a> {
             }
             '<' => {
                 self.advance();
-                TokenKind::Less
+                if self.current == Some('=') {
+                    self.advance();
+                    TokenKind::LessEqual
+                } else {
+                    TokenKind::Less
+                }
             }
             '>' => {
                 self.advance();
-                TokenKind::Greater
+                if self.current == Some('=') {
+                    self.advance();
+                    TokenKind::GreaterEqual
+                } else {
+                    TokenKind::Greater
+                }
             }
             '=' => {
                 self.advance();
@@ -333,6 +347,7 @@ impl<'a> Lexer<'a> {
             }
             c if c.is_ascii_digit() => match self.consume_number()? {
                 NumberLiteral::Int(value) => TokenKind::Int(value),
+                NumberLiteral::IntMinMagnitude(value) => TokenKind::IntMinMagnitude(value),
                 NumberLiteral::Float(value) => TokenKind::Float(value),
             },
             c if is_ident_start(c) => {
@@ -437,6 +452,41 @@ impl<'a> Lexer<'a> {
     fn consume_number(&mut self) -> Result<NumberLiteral, ParseError> {
         let line = self.line;
         let mut text = String::new();
+        if self.current == Some('0') {
+            let mut peek = self.chars.clone();
+            if matches!(peek.next(), Some('x' | 'X')) {
+                text.push('0');
+                self.advance();
+                let Some(prefix) = self.current else {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line,
+                        message: "invalid number '0x'".to_string(),
+                    });
+                };
+                text.push(prefix);
+                self.advance();
+                let start_len = text.len();
+                while let Some(ch) = self.current {
+                    if ch.is_ascii_hexdigit() {
+                        text.push(ch);
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                if text.len() == start_len {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line,
+                        message: format!("invalid number '{text}'"),
+                    });
+                }
+                return Self::parse_integer_literal(&text, &text[2..], 16, line);
+            }
+        }
         while let Some(ch) = self.current {
             if ch.is_ascii_digit() {
                 text.push(ch);
@@ -475,14 +525,33 @@ impl<'a> Lexer<'a> {
                 });
         }
 
-        text.parse::<i64>()
-            .map(NumberLiteral::Int)
-            .map_err(|_| ParseError {
+        Self::parse_integer_literal(&text, &text, 10, line)
+    }
+
+    fn parse_integer_literal(
+        text: &str,
+        digits: &str,
+        radix: u32,
+        line: usize,
+    ) -> Result<NumberLiteral, ParseError> {
+        match u64::from_str_radix(digits, radix) {
+            Ok(value) if value <= i64::MAX as u64 => Ok(NumberLiteral::Int(value as i64)),
+            Ok(value) if value == (i64::MAX as u64) + 1 => {
+                Ok(NumberLiteral::IntMinMagnitude(text.to_string()))
+            }
+            Ok(_) => Err(ParseError {
+                span: None,
+                code: None,
+                line,
+                message: format!("integer literal '{text}' is out of range for i64"),
+            }),
+            Err(_) => Err(ParseError {
                 span: None,
                 code: None,
                 line,
                 message: format!("invalid number '{text}'"),
-            })
+            }),
+        }
     }
 
     fn consume_string(&mut self, delimiter: char) -> Result<String, ParseError> {
@@ -1449,14 +1518,54 @@ impl Parser {
             } else if self.match_kind(&TokenKind::Less) {
                 let rhs = self.parse_term()?;
                 expr = Expr::Lt(Box::new(expr), Box::new(rhs));
+            } else if self.match_kind(&TokenKind::LessEqual) {
+                let rhs = self.parse_term()?;
+                expr = self.build_non_strict_comparison(expr, rhs, Expr::Lt)?;
             } else if self.match_kind(&TokenKind::Greater) {
                 let rhs = self.parse_term()?;
                 expr = Expr::Gt(Box::new(expr), Box::new(rhs));
+            } else if self.match_kind(&TokenKind::GreaterEqual) {
+                let rhs = self.parse_term()?;
+                expr = self.build_non_strict_comparison(expr, rhs, Expr::Gt)?;
             } else {
                 break;
             }
         }
         Ok(expr)
+    }
+
+    fn build_non_strict_comparison(
+        &mut self,
+        lhs: Expr,
+        rhs: Expr,
+        build_strict: fn(Box<Expr>, Box<Expr>) -> Expr,
+    ) -> Result<Expr, ParseError> {
+        let lhs_slot = self.allocate_hidden_local()?;
+        let rhs_slot = self.allocate_hidden_local()?;
+        let line = self.last_line();
+        let lhs_var = Expr::Var(lhs_slot);
+        let rhs_var = Expr::Var(rhs_slot);
+        Ok(Expr::Block {
+            stmts: vec![
+                Stmt::Let {
+                    index: lhs_slot,
+                    expr: lhs,
+                    line,
+                },
+                Stmt::Let {
+                    index: rhs_slot,
+                    expr: rhs,
+                    line,
+                },
+            ],
+            expr: Box::new(Expr::Or(
+                Box::new(build_strict(
+                    Box::new(lhs_var.clone()),
+                    Box::new(rhs_var.clone()),
+                )),
+                Box::new(Expr::Eq(Box::new(lhs_var), Box::new(rhs_var))),
+            )),
+        })
     }
 
     fn parse_term(&mut self) -> Result<Expr, ParseError> {
@@ -1510,6 +1619,10 @@ impl Parser {
             return self.build_builtin_call_expr(BuiltinFunction::TypeOf, vec![inner]);
         }
         if self.match_kind(&TokenKind::Minus) {
+            if let Some(text) = self.match_int_min_magnitude() {
+                let _ = text;
+                return Ok(Expr::Int(i64::MIN));
+            }
             let inner = self.parse_unary()?;
             Ok(Expr::Neg(Box::new(inner)))
         } else if self.match_kind(&TokenKind::Bang) {
@@ -1663,6 +1776,7 @@ impl Parser {
         if self.match_kind(&TokenKind::Null) {
             return Ok(Expr::Null);
         }
+        self.reject_out_of_range_int_literal()?;
         if let Some(value) = self.match_int() {
             return Ok(Expr::Int(value));
         }
@@ -2025,6 +2139,7 @@ impl Parser {
         if let Some(value) = self.match_int() {
             return Ok(Some(MatchPattern::Int(value)));
         }
+        self.reject_out_of_range_int_literal()?;
         if let Some(value) = self.match_string() {
             return Ok(Some(MatchPattern::String(value)));
         }
@@ -2427,6 +2542,7 @@ impl Parser {
         if let Some(value) = self.match_int() {
             return Ok(Expr::Int(value));
         }
+        self.reject_out_of_range_int_literal()?;
         if let Some(value) = self.match_float() {
             return Ok(Expr::Float(value));
         }
@@ -2484,6 +2600,7 @@ impl Parser {
             TokenKind::Ident(_)
                 | TokenKind::String(_)
                 | TokenKind::Int(_)
+                | TokenKind::IntMinMagnitude(_)
                 | TokenKind::Float(_)
                 | TokenKind::True
                 | TokenKind::False
@@ -3523,6 +3640,20 @@ impl Parser {
         }
     }
 
+    fn match_int_min_magnitude(&mut self) -> Option<String> {
+        match self.tokens.get(self.pos) {
+            Some(Token {
+                kind: TokenKind::IntMinMagnitude(value),
+                ..
+            }) => {
+                let value = value.clone();
+                self.pos += 1;
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+
     fn match_float(&mut self) -> Option<f64> {
         match self.tokens.get(self.pos) {
             Some(Token {
@@ -3614,6 +3745,24 @@ impl Parser {
 
     fn check_ident_literal(&self, literal: &str) -> bool {
         self.check_ident_literal_at(self.pos, literal)
+    }
+
+    fn reject_out_of_range_int_literal(&self) -> Result<(), ParseError> {
+        let Some(Token {
+            kind: TokenKind::IntMinMagnitude(text),
+            ..
+        }) = self.tokens.get(self.pos)
+        else {
+            return Ok(());
+        };
+        Err(ParseError {
+            span: Some(self.current_span()),
+            code: None,
+            line: self.current_line(),
+            message: format!(
+                "integer literal '{text}' is out of range for i64; write '-{text}' for i64::MIN"
+            ),
+        })
     }
 
     fn match_ident_literal(&mut self, literal: &str) -> bool {

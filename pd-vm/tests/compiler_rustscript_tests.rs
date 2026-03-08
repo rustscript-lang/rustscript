@@ -2601,3 +2601,36 @@ fn rustscript_language_parse_rejection_cases_work() {
         expect_parse_error_case(case);
     }
 }
+
+#[test]
+fn rustscript_non_strict_comparisons_and_integer_edge_literals_work() {
+    let cases = vec![RuntimeCase {
+        name: "non strict comparisons and integer edge literals",
+        source: r#"
+            let le = 1 <= 1;
+            let ge = 2 >= 1;
+            let hex = 0x2a;
+            let min_dec = -9223372036854775808;
+            let min_hex = -0x8000000000000000;
+            if le && ge && hex == 42 && min_dec == min_hex {
+                min_dec;
+            } else {
+                0;
+            }
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_stack: vec![Value::Int(i64::MIN)],
+        expected_locals: None,
+    }];
+    run_runtime_cases(&cases);
+}
+
+#[test]
+fn rustscript_positive_min_magnitude_literal_is_rejected_with_hint() {
+    expect_parse_error_contains_any_case(
+        "positive min magnitude literal is rejected with hint",
+        "0x8000000000000000;",
+        SourceFlavor::RustScript,
+        &["out of range", "i64::MIN"],
+    );
+}

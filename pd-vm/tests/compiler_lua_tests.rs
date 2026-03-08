@@ -285,3 +285,19 @@ fn lua_complex_fixture_runs() {
     }
     assert_eq!(vm.stack(), &[Value::Int(12)]);
 }
+
+#[test]
+fn lua_non_strict_comparisons_treat_nan_as_false() {
+    let case = RuntimeCase {
+        name: "non strict comparisons treat nan as false",
+        source: r#"
+            local nan = 0.0 / 0.0
+            nan <= 1.0
+            nan >= 1.0
+        "#,
+        flavor: SourceFlavor::Lua,
+        expected_stack: vec![Value::Bool(false), Value::Bool(false)],
+        expected_locals: None,
+    };
+    run_runtime_case(&case);
+}

@@ -1000,8 +1000,7 @@ fn emit_inline_int_divrem(
     let overflow_case = b.ins().band(lhs_is_min, rhs_is_neg_one);
 
     let normal_block = b.create_block();
-    b.ins()
-        .brif(overflow_case, slow, &[], normal_block, &[]);
+    b.ins().brif(overflow_case, slow, &[], normal_block, &[]);
 
     b.switch_to_block(normal_block);
     let out = if is_mod {

@@ -1116,10 +1116,7 @@ impl Vm {
                 )?;
             }
             x if x == OpCode::Div as u8 => {
-                self.binary_numeric_op(
-                    checked_int_div,
-                    |lhs, rhs| Ok(lhs / rhs),
-                )?;
+                self.binary_numeric_op(checked_int_div, |lhs, rhs| Ok(lhs / rhs))?;
             }
             x if x == OpCode::Shl as u8 => {
                 let rhs = self.pop_shift_amount()?;
@@ -1137,15 +1134,7 @@ impl Vm {
                 self.stack.push(Value::Int(logical_shr_i64(lhs, rhs)));
             }
             x if x == OpCode::Mod as u8 => {
-                self.binary_numeric_op(
-                    checked_int_rem,
-                    |lhs, rhs| {
-                        if rhs == 0.0 {
-                            return Err(VmError::DivisionByZero);
-                        }
-                        Ok(lhs % rhs)
-                    },
-                )?;
+                self.binary_numeric_op(checked_int_rem, |lhs, rhs| Ok(lhs % rhs))?;
             }
             x if x == OpCode::And as u8 => {
                 let rhs = self.pop_bool()?;

@@ -130,3 +130,21 @@ fn scheme_complex_fixture_runs() {
     }
     assert_eq!(vm.stack(), &[Value::Int(12)]);
 }
+
+#[test]
+fn scheme_non_strict_comparisons_work() {
+    let case = RuntimeCase {
+        name: "non strict comparisons work",
+        source: r#"
+            (define le (<= 1 1))
+            (define ge (>= 2 1))
+            (if (and le ge)
+                42
+                0)
+        "#,
+        flavor: SourceFlavor::Scheme,
+        expected_stack: vec![Value::Int(42)],
+        expected_locals: None,
+    };
+    run_runtime_case(&case);
+}

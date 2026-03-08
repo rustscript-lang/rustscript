@@ -477,19 +477,54 @@ pub(super) fn lower_lua_direct_expr(
         }
         LuaDirectExpr::Lt(lhs, rhs) => lower_lua_binary_expr(*lhs, *rhs, lowering, Expr::Lt),
         LuaDirectExpr::Gt(lhs, rhs) => lower_lua_binary_expr(*lhs, *rhs, lowering, Expr::Gt),
-        LuaDirectExpr::Le(lhs, rhs) => {
-            let gt = lower_lua_binary_expr(*lhs, *rhs, lowering, Expr::Gt)?;
-            Some(LuaLoweredExpr::scalar(Expr::Not(Box::new(gt.expr))))
-        }
-        LuaDirectExpr::Ge(lhs, rhs) => {
-            let lt = lower_lua_binary_expr(*lhs, *rhs, lowering, Expr::Lt)?;
-            Some(LuaLoweredExpr::scalar(Expr::Not(Box::new(lt.expr))))
-        }
+        LuaDirectExpr::Le(lhs, rhs) => lower_lua_non_strict_compare(*lhs, *rhs, lowering, Expr::Lt),
+        LuaDirectExpr::Ge(lhs, rhs) => lower_lua_non_strict_compare(*lhs, *rhs, lowering, Expr::Gt),
         LuaDirectExpr::And(lhs, rhs) => lower_lua_binary_expr(*lhs, *rhs, lowering, Expr::And),
         LuaDirectExpr::Or(lhs, rhs) => lower_lua_binary_expr(*lhs, *rhs, lowering, Expr::Or),
         LuaDirectExpr::Neg(inner) => lower_lua_unary_expr(*inner, lowering, Expr::Neg),
         LuaDirectExpr::Not(inner) => lower_lua_unary_expr(*inner, lowering, Expr::Not),
     }
+}
+
+fn lower_lua_non_strict_compare(
+    lhs: LuaDirectExpr,
+    rhs: LuaDirectExpr,
+    lowering: &mut LuaDirectLowering<'_>,
+    build_strict: fn(Box<Expr>, Box<Expr>) -> Expr,
+) -> Option<LuaLoweredExpr> {
+    let lhs = lower_lua_direct_expr(lhs, lowering, false)?;
+    let rhs = lower_lua_direct_expr(rhs, lowering, false)?;
+    let lhs_slot = lowering
+        .builder
+        .alloc_local_named(&fresh_lua_direct_temp("cmp_lhs"))
+        .ok()?;
+    let rhs_slot = lowering
+        .builder
+        .alloc_local_named(&fresh_lua_direct_temp("cmp_rhs"))
+        .ok()?;
+    let lhs_var = Expr::Var(lhs_slot);
+    let rhs_var = Expr::Var(rhs_slot);
+    Some(LuaLoweredExpr::scalar(Expr::Block {
+        stmts: vec![
+            Stmt::Let {
+                index: lhs_slot,
+                expr: lhs.expr,
+                line: 1,
+            },
+            Stmt::Let {
+                index: rhs_slot,
+                expr: rhs.expr,
+                line: 1,
+            },
+        ],
+        expr: Box::new(Expr::Or(
+            Box::new(build_strict(
+                Box::new(lhs_var.clone()),
+                Box::new(rhs_var.clone()),
+            )),
+            Box::new(Expr::Eq(Box::new(lhs_var), Box::new(rhs_var))),
+        )),
+    }))
 }
 
 fn lower_lua_binary_expr(

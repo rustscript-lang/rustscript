@@ -234,6 +234,28 @@ fn json_encode_rejects_duplicate_map_keys() {
 }
 
 #[test]
+fn json_decode_rejects_duplicate_object_keys() {
+    let compiled = compile_source(
+        r#"
+        use json;
+        json::decode("{\"k\":1,\"k\":2}");
+    "#,
+    )
+    .expect("source should compile");
+
+    let mut vm = Vm::new(compiled.program);
+    let err = vm
+        .run()
+        .expect_err("json::decode should reject duplicate object keys");
+    match err {
+        vm::VmError::HostError(message) => {
+            assert!(message.contains("duplicate object key 'k'"), "{message}");
+        }
+        other => panic!("unexpected vm error: {other}"),
+    }
+}
+
+#[test]
 fn bind_builtin_override_rejects_unknown_namespaced_builtin() {
     struct Dummy;
 
@@ -493,6 +515,26 @@ fn float_division_by_zero_produces_signed_infinities() {
     };
     assert!(pos_inf.is_infinite() && pos_inf.is_sign_positive());
     assert!(neg_inf.is_infinite() && neg_inf.is_sign_negative());
+}
+
+#[test]
+fn float_modulo_by_zero_produces_nan() {
+    let constants = vec![Value::Float(1.0), Value::Float(0.0)];
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.ldc(1);
+    bc.modulo();
+    bc.ret();
+
+    let program = Program::new(constants, bc.finish());
+    let mut vm = Vm::new(program);
+    let status = vm.run().expect("vm should run");
+
+    assert_eq!(status, VmStatus::Halted);
+    let [Value::Float(value)] = vm.stack() else {
+        panic!("expected NaN on the stack, got {:?}", vm.stack());
+    };
+    assert!(value.is_nan(), "expected NaN, got {value}");
 }
 
 #[test]
@@ -765,9 +807,7 @@ fn int_div_and_mod_overflow_report_integer_overflow() {
             vec![Value::Int(i64::MIN), Value::Int(-1)],
             bc.finish(),
         ));
-        let err = vm
-            .run()
-            .expect_err("i64::MIN with -1 should overflow");
+        let err = vm.run().expect_err("i64::MIN with -1 should overflow");
         assert!(
             matches!(err, vm::VmError::IntegerOverflow(found) if found == operation),
             "expected integer overflow in {operation}, got {err:?}"

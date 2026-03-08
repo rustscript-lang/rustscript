@@ -841,36 +841,24 @@ fn lower_scheme_direct_list_expr(
             import_context,
             Expr::Gt,
         ),
-        "<=" => {
-            let Some(gt) = lower_scheme_direct_compare_fold(
-                args,
-                builder,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-                import_context,
-                Expr::Gt,
-            )?
-            else {
-                return Ok(None);
-            };
-            Ok(Some(Expr::Not(Box::new(gt))))
-        }
-        ">=" => {
-            let Some(lt) = lower_scheme_direct_compare_fold(
-                args,
-                builder,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-                import_context,
-                Expr::Lt,
-            )?
-            else {
-                return Ok(None);
-            };
-            Ok(Some(Expr::Not(Box::new(lt))))
-        }
+        "<=" => lower_scheme_non_strict_compare(
+            args,
+            builder,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            import_context,
+            Expr::Lt,
+        ),
+        ">=" => lower_scheme_non_strict_compare(
+            args,
+            builder,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            import_context,
+            Expr::Gt,
+        ),
         "and" => {
             if args.is_empty() {
                 return Ok(Some(Expr::Bool(true)));
@@ -1584,6 +1572,68 @@ where
         import_context,
         build,
     )
+}
+
+fn lower_scheme_non_strict_compare(
+    args: &[SchemeForm],
+    builder: &mut LocalIrBuilder,
+    param_slots: &HashMap<String, u16>,
+    capture_slots: &mut HashMap<u16, u16>,
+    capture_enabled: bool,
+    import_context: Option<&NormalizedSchemeImportContext>,
+    build_strict: fn(Box<Expr>, Box<Expr>) -> Expr,
+) -> Result<Option<Expr>, ParseError> {
+    if args.len() != 2 {
+        return Ok(None);
+    }
+    let Some(lhs) = lower_scheme_direct_expr(
+        &args[0],
+        builder,
+        param_slots,
+        capture_slots,
+        capture_enabled,
+        import_context,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(rhs) = lower_scheme_direct_expr(
+        &args[1],
+        builder,
+        param_slots,
+        capture_slots,
+        capture_enabled,
+        import_context,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let lhs_slot = builder.alloc_local_named(&gensym("scheme_cmp_lhs"))?;
+    let rhs_slot = builder.alloc_local_named(&gensym("scheme_cmp_rhs"))?;
+    let lhs_var = Expr::Var(lhs_slot);
+    let rhs_var = Expr::Var(rhs_slot);
+    Ok(Some(Expr::Block {
+        stmts: vec![
+            Stmt::Let {
+                index: lhs_slot,
+                expr: lhs,
+                line: 1,
+            },
+            Stmt::Let {
+                index: rhs_slot,
+                expr: rhs,
+                line: 1,
+            },
+        ],
+        expr: Box::new(Expr::Or(
+            Box::new(build_strict(
+                Box::new(lhs_var.clone()),
+                Box::new(rhs_var.clone()),
+            )),
+            Box::new(Expr::Eq(Box::new(lhs_var), Box::new(rhs_var))),
+        )),
+    }))
 }
 
 #[derive(Clone, Debug)]

@@ -95,22 +95,11 @@ pub(super) extern "C" fn pd_vm_cranelift_step(vm: *mut Vm, op: i64, a: i64, b: i
                 Ok(STATUS_CONTINUE)
             }
             OP_DIV => {
-                vm.binary_numeric_op(
-                    crate::vm::checked_int_div,
-                    |lhs, rhs| Ok(lhs / rhs),
-                )?;
+                vm.binary_numeric_op(crate::vm::checked_int_div, |lhs, rhs| Ok(lhs / rhs))?;
                 Ok(STATUS_CONTINUE)
             }
             OP_MOD => {
-                vm.binary_numeric_op(
-                    crate::vm::checked_int_rem,
-                    |lhs, rhs| {
-                        if rhs == 0.0 {
-                            return Err(VmError::DivisionByZero);
-                        }
-                        Ok(lhs % rhs)
-                    },
-                )?;
+                vm.binary_numeric_op(crate::vm::checked_int_rem, |lhs, rhs| Ok(lhs % rhs))?;
                 Ok(STATUS_CONTINUE)
             }
             OP_SHL => {

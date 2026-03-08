@@ -567,3 +567,26 @@ fn compile_source_file_js_supports_namespace_and_named_alias_imports() {
     let _ = std::fs::remove_file(module_path);
     let _ = std::fs::remove_dir(root);
 }
+
+#[test]
+fn javascript_non_strict_comparisons_and_integer_edge_literals_work() {
+    let case = RuntimeCase {
+        name: "non strict comparisons and integer edge literals",
+        source: r#"
+            const le = 1 <= 1;
+            const ge = 2 >= 1;
+            const hex = 0x2a;
+            const minDec = -9223372036854775808;
+            const minHex = -0x8000000000000000;
+            if (le && ge && hex == 42 && minDec == minHex) {
+                minDec;
+            } else {
+                0;
+            }
+        "#,
+        flavor: SourceFlavor::JavaScript,
+        expected_stack: vec![Value::Int(i64::MIN)],
+        expected_locals: None,
+    };
+    run_runtime_case(&case);
+}
