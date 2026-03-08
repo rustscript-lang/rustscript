@@ -31,14 +31,20 @@ export type RunReport = {
 };
 
 export type FuelConfig = {
+  mode?: "fuel" | "epoch" | null;
   fuel: number | null;
   fuelCheckInterval: number | null;
+  epochDeadline?: number | null;
+  epochCheckInterval?: number | null;
 };
 
 export type FuelState = {
   enabled: boolean;
+  mode: "none" | "fuel" | "epoch";
   remaining: number | null;
   checkInterval: number;
+  epochCurrent: number;
+  epochDeadline: number | null;
 };
 
 export type RunCommandRequest =
@@ -47,6 +53,10 @@ export type RunCommandRequest =
   | { kind: "add_fuel"; amount: number }
   | { kind: "clear_fuel" }
   | { kind: "set_fuel_check_interval"; interval: number }
+  | { kind: "set_epoch_deadline"; ticks: number }
+  | { kind: "clear_epoch_deadline" }
+  | { kind: "tick_epoch"; amount: number }
+  | { kind: "set_epoch_check_interval"; interval: number }
   | { kind: "stop" };
 
 export type DebugCommandRequest =
@@ -65,6 +75,10 @@ export type DebugCommandRequest =
   | { kind: "add_fuel"; amount: number }
   | { kind: "clear_fuel" }
   | { kind: "set_fuel_check_interval"; interval: number }
+  | { kind: "set_epoch_deadline"; ticks: number }
+  | { kind: "clear_epoch_deadline" }
+  | { kind: "tick_epoch"; amount: number }
+  | { kind: "set_epoch_check_interval"; interval: number }
   | { kind: "stop" };
 
 export type DebugReport = {
@@ -324,8 +338,11 @@ function normalizeDebugReport(raw: unknown): DebugReport {
 function defaultFuelState(): FuelState {
   return {
     enabled: false,
+    mode: "none",
     remaining: null,
-    checkInterval: 1
+    checkInterval: 1,
+    epochCurrent: 0,
+    epochDeadline: null
   };
 }
 
@@ -335,14 +352,18 @@ function normalizeFuelState(raw: unknown): FuelState {
   }
 
   const rawEnabled = (raw as { enabled?: unknown }).enabled;
+  const rawMode = (raw as { mode?: unknown }).mode;
   const rawRemaining = (raw as { remaining?: unknown }).remaining;
   const rawCheckInterval = (raw as { check_interval?: unknown }).check_interval;
+  const rawEpochCurrent = (raw as { epoch_current?: unknown }).epoch_current;
+  const rawEpochDeadline = (raw as { epoch_deadline?: unknown }).epoch_deadline;
 
   return {
     enabled:
       typeof rawEnabled === "boolean"
         ? rawEnabled
         : rawRemaining !== null && rawRemaining !== undefined,
+    mode: rawMode === "fuel" || rawMode === "epoch" || rawMode === "none" ? rawMode : "none",
     remaining:
       typeof rawRemaining === "number" && Number.isFinite(rawRemaining)
         ? Math.max(0, Math.trunc(rawRemaining))
@@ -350,7 +371,15 @@ function normalizeFuelState(raw: unknown): FuelState {
     checkInterval:
       typeof rawCheckInterval === "number" && Number.isFinite(rawCheckInterval)
         ? Math.max(1, Math.trunc(rawCheckInterval))
-        : 1
+        : 1,
+    epochCurrent:
+      typeof rawEpochCurrent === "number" && Number.isFinite(rawEpochCurrent)
+        ? Math.max(0, Math.trunc(rawEpochCurrent))
+        : 0,
+    epochDeadline:
+      typeof rawEpochDeadline === "number" && Number.isFinite(rawEpochDeadline)
+        ? Math.max(0, Math.trunc(rawEpochDeadline))
+        : null
   };
 }
 
