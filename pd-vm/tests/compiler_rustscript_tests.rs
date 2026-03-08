@@ -453,6 +453,128 @@ fn compile_source_file_with_rustscript_complex_fixture() {
 }
 
 #[test]
+fn rustscript_named_function_capture_runtime_cases_work() {
+    let cases = [
+        RuntimeCase {
+            name: "named functions can compose other named functions",
+            source: r#"
+                fn inc(x) { x + 1; }
+                fn twice(x) { x * 2; }
+                fn combine(a, b) {
+                    let left = inc(a);
+                    let right = twice(b);
+                    left + right;
+                }
+                combine(3, 4);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(12)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "named function calls can nest without recursion",
+            source: r#"
+                fn inc(x) { x + 1; }
+                fn double_inc(x) { inc(inc(x)); }
+                fn score(x) {
+                    let a = double_inc(x);
+                    let b = inc(x);
+                    a + b;
+                }
+                score(5);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(13)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "nested named function implicitly captures outer local",
+            source: r#"
+                fn outer(base) {
+                    fn add(v) { v + base; }
+                    add(2);
+                }
+                outer(5);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(7)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "top-level named function capture snapshots at declaration time",
+            source: r#"
+                let mut base = 5;
+                fn add(v) { v + base; }
+                base = 100;
+                add(1);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(6)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "named function capture via copy keeps source reusable",
+            source: r#"
+                let a = "x";
+                fn add(v) { v + a.copy(); }
+                let d = a;
+                add(d);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("xx".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "nested named functions can capture outer locals and call siblings",
+            source: r#"
+                fn outer(base) {
+                    fn inc(v) { v + 1; }
+                    fn add_base(v) { inc(v) + base; }
+                    add_base(2);
+                }
+                outer(3);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(6)],
+            expected_locals: None,
+        },
+    ];
+    run_runtime_cases(&cases);
+}
+
+#[test]
+fn rustscript_named_function_capture_error_cases_work() {
+    let cases = [
+        SourceErrorCase {
+            name: "named function default capture moves movable local",
+            source: r#"
+                let a = "";
+                fn add(v) { v + a; }
+                let d = a;
+                d;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Parse,
+            expected_contains_all: &[],
+        },
+        SourceErrorCase {
+            name: "named function recursion is still rejected",
+            source: r#"
+                fn recurse(x) { recurse(x); }
+                recurse(1);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InlineFunctionRecursion),
+            expected_contains_all: &[],
+        },
+    ];
+
+    for case in &cases {
+        expect_source_error_case(case);
+    }
+}
+
+#[test]
 fn closure_captures_outer_value_at_definition_time() {
     let case = RuntimeCase {
         name: "closure captures outer value at definition time",
