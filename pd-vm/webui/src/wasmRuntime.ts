@@ -45,6 +45,7 @@ export type FuelState = {
   checkInterval: number;
   epochCurrent: number;
   epochDeadline: number | null;
+  epochSlice: number | null;
 };
 
 export type RunCommandRequest =
@@ -342,7 +343,8 @@ function defaultFuelState(): FuelState {
     remaining: null,
     checkInterval: 1,
     epochCurrent: 0,
-    epochDeadline: null
+    epochDeadline: null,
+    epochSlice: null
   };
 }
 
@@ -357,6 +359,7 @@ function normalizeFuelState(raw: unknown): FuelState {
   const rawCheckInterval = (raw as { check_interval?: unknown }).check_interval;
   const rawEpochCurrent = (raw as { epoch_current?: unknown }).epoch_current;
   const rawEpochDeadline = (raw as { epoch_deadline?: unknown }).epoch_deadline;
+  const rawEpochSlice = (raw as { epoch_slice?: unknown }).epoch_slice;
 
   return {
     enabled:
@@ -379,6 +382,10 @@ function normalizeFuelState(raw: unknown): FuelState {
     epochDeadline:
       typeof rawEpochDeadline === "number" && Number.isFinite(rawEpochDeadline)
         ? Math.max(0, Math.trunc(rawEpochDeadline))
+        : null,
+    epochSlice:
+      typeof rawEpochSlice === "number" && Number.isFinite(rawEpochSlice)
+        ? Math.max(0, Math.trunc(rawEpochSlice))
         : null
   };
 }

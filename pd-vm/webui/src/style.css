@@ -520,6 +520,11 @@ body {
     box-shadow var(--theme-transition-duration) var(--theme-transition-ease);
 }
 
+.panel--debug {
+  flex: 1.5 1 0;
+  min-height: 12.75rem;
+}
+
 .panel h2 {
   margin: 0;
   font-size: 0.95rem;

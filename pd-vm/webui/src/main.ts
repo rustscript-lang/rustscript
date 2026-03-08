@@ -40,8 +40,11 @@ const FUEL_AMOUNT_STORAGE_KEY = "pd-vm-webui-fuel-amount";
 const FUEL_INTERVAL_STORAGE_KEY = "pd-vm-webui-fuel-interval";
 const VIEWPORT_HEIGHT_CSS_VAR = "--pd-app-height";
 const RUN_POLL_INTERVAL_MS = 25;
+const EPOCH_TICK_INTERVAL_MS = 1;
+const EPOCH_UI_REFRESH_INTERVAL_MS = 250;
+const EPOCH_FLUSH_INTERVAL_MS = 250;
 const DEFAULT_FUEL_HINT =
-  "New runs and debug sessions start with the current interruption mode, amount, and interval. Browser epoch control is manual and cannot preempt a compute-only run mid-call on the main thread.";
+  "New runs and debug sessions start with the current interruption mode, amount, and interval. In browser epoch mode, one epoch tick is driven by a 1ms timer on the JS side, but compute-only wasm cannot be preempted mid-call while the main thread is busy.";
 
 type InterruptModeChoice = "fuel" | "epoch";
 
@@ -865,15 +868,21 @@ let runFuelState: FuelState = defaultFuelState();
 let runSessionMessage = "Run session: idle";
 let runPollTimer: number | null = null;
 let runPollGeneration = 0;
+let pendingRunEpochTicks = 0;
 let debugBusy = false;
 let debugSessionActive = false;
 let debugCurrentLine: number | null = null;
 let debugFuelState: FuelState = defaultFuelState();
+let pendingDebugEpochTicks = 0;
 let debugHoveredVar = "";
 let debugHoverActiveKey = "";
 let debugDecorationIds: string[] = [];
 const debugHoverCache = new Map<string, string | null>();
 const debugHoverInflight = new Map<string, Promise<string | null>>();
+let epochTickTimer: number | null = null;
+let epochFlushInFlight = false;
+let lastEpochUiRefreshAt = 0;
+let lastEpochFlushAt = 0;
 const themeButtons: Record<ThemePreference, HTMLButtonElement> = {
   system: themeSystemButtonEl,
   light: themeLightButtonEl,
@@ -965,14 +974,16 @@ function defaultFuelState(): FuelState {
     remaining: null,
     checkInterval: 1,
     epochCurrent: 0,
-    epochDeadline: null
+    epochDeadline: null,
+    epochSlice: null
   };
 }
 
-function formatFuelState(fuel: FuelState): string {
+function formatFuelState(fuel: FuelState, pendingEpochTicks = 0): string {
   if (fuel.mode === "epoch") {
     const deadline = fuel.epochDeadline === null ? "disabled" : String(fuel.epochDeadline);
-    return `epoch current=${fuel.epochCurrent} deadline=${deadline} (interval ${fuel.checkInterval})`;
+    const slice = fuel.epochSlice === null ? "disabled" : String(fuel.epochSlice);
+    return `epoch current=${fuel.epochCurrent + pendingEpochTicks} deadline=${deadline} slice=${slice} (interval ${fuel.checkInterval})`;
   }
   if (fuel.mode === "fuel") {
     return `${fuel.remaining ?? 0} left (interval ${fuel.checkInterval})`;
@@ -997,7 +1008,134 @@ function syncInterruptFormUi(): void {
 }
 
 function epochResumeHint(): string {
-  return "Run paused at an epoch deadline. Re-arm a deadline before resuming. Browser wasm cannot advance epoch concurrently while the VM is running.";
+  return "Run paused at an epoch deadline. Resume automatically re-arms the same epoch slice. Browser epoch ticks come from a 1ms JS timer and only advance while the main thread can process them.";
+}
+
+function runEpochTimerActive(): boolean {
+  return runSessionActive && runFuelState.mode === "epoch";
+}
+
+function debugEpochTimerActive(): boolean {
+  return debugSessionActive && debugFuelState.mode === "epoch";
+}
+
+function epochTimerShouldRun(): boolean {
+  return runEpochTimerActive() || debugEpochTimerActive();
+}
+
+function syncEpochPendingState(): void {
+  if (!runEpochTimerActive()) {
+    pendingRunEpochTicks = 0;
+  }
+  if (!debugEpochTimerActive()) {
+    pendingDebugEpochTicks = 0;
+  }
+}
+
+async function flushPendingRunEpochTicks(): Promise<void> {
+  if (!runEpochTimerActive() || runBusy || pendingRunEpochTicks <= 0) {
+    return;
+  }
+
+  const amount = pendingRunEpochTicks;
+  const report = await runCommandWithWasm({ kind: "tick_epoch", amount });
+  if (report.error === "run session is not active" || report.halted) {
+    applyInactiveRunState();
+    return;
+  }
+  if (report.error) {
+    return;
+  }
+
+  pendingRunEpochTicks = Math.max(0, pendingRunEpochTicks - amount);
+  runFuelState = report.fuel;
+  syncFuelPanel();
+}
+
+async function flushPendingDebugEpochTicks(): Promise<void> {
+  if (!debugEpochTimerActive() || debugBusy || pendingDebugEpochTicks <= 0) {
+    return;
+  }
+
+  const amount = pendingDebugEpochTicks;
+  const report = await debugCommandWithWasm({ kind: "tick_epoch", amount });
+  if (report.error === "debug session is not active" || report.halted) {
+    applyInactiveDebugState("debug session is not active");
+    return;
+  }
+  if (report.error) {
+    return;
+  }
+
+  pendingDebugEpochTicks = Math.max(0, pendingDebugEpochTicks - amount);
+  debugFuelState = report.fuel;
+  syncFuelPanel();
+}
+
+async function flushPendingEpochTicks(): Promise<void> {
+  if (epochFlushInFlight) {
+    return;
+  }
+  if (!epochTimerShouldRun()) {
+    return;
+  }
+
+  epochFlushInFlight = true;
+  try {
+    await flushPendingRunEpochTicks();
+    await flushPendingDebugEpochTicks();
+  } finally {
+    epochFlushInFlight = false;
+  }
+}
+
+function stopEpochTicker(): void {
+  if (epochTickTimer !== null) {
+    window.clearTimeout(epochTickTimer);
+    epochTickTimer = null;
+  }
+}
+
+function scheduleEpochTicker(): void {
+  if (epochTickTimer !== null || !epochTimerShouldRun()) {
+    return;
+  }
+
+  epochTickTimer = window.setTimeout(() => {
+    epochTickTimer = null;
+    if (!epochTimerShouldRun()) {
+      syncEpochPendingState();
+      syncFuelPanel();
+      return;
+    }
+
+    if (runEpochTimerActive()) {
+      pendingRunEpochTicks += 1;
+    }
+    if (debugEpochTimerActive()) {
+      pendingDebugEpochTicks += 1;
+    }
+
+    const now = Date.now();
+    if (now - lastEpochUiRefreshAt >= EPOCH_UI_REFRESH_INTERVAL_MS) {
+      lastEpochUiRefreshAt = now;
+      syncFuelPanel();
+    }
+    if (now - lastEpochFlushAt >= EPOCH_FLUSH_INTERVAL_MS) {
+      lastEpochFlushAt = now;
+      void flushPendingEpochTicks();
+    }
+    scheduleEpochTicker();
+  }, EPOCH_TICK_INTERVAL_MS);
+}
+
+function syncEpochTicker(): void {
+  syncEpochPendingState();
+  if (!epochTimerShouldRun()) {
+    stopEpochTicker();
+    return;
+  }
+  scheduleEpochTicker();
 }
 
 function cancelRunPolling(): void {
@@ -1030,11 +1168,12 @@ function scheduleRunPollingIfActive(): void {
 }
 
 function syncFuelPanel(): void {
+  syncEpochPendingState();
   runFuelStatePanelEl.textContent = runSessionActive
-    ? `Run session: ${runSessionMessage} | ${formatFuelState(runFuelState)}`
+    ? `Run session: ${runSessionMessage} | ${formatFuelState(runFuelState, pendingRunEpochTicks)}`
     : "Run session: idle";
   debugFuelStatePanelEl.textContent = debugSessionActive
-    ? `Debugger: ${formatFuelState(debugFuelState)}`
+    ? `Debugger: ${formatFuelState(debugFuelState, pendingDebugEpochTicks)}`
     : "Debugger: idle";
   runResumeButtonEl.disabled = !runSessionActive || runBusy;
   debugFuelSetButtonEl.disabled = !debugSessionActive || debugBusy;
@@ -1042,6 +1181,7 @@ function syncFuelPanel(): void {
   debugFuelIntervalButtonEl.disabled = !debugSessionActive || debugBusy;
   debugEpochTickButtonEl.disabled = interruptMode !== "epoch" || debugBusy || (!debugSessionActive && !runSessionActive);
   syncInterruptFormUi();
+  syncEpochTicker();
 }
 
 type ParsedFuelForm = {
@@ -1345,6 +1485,13 @@ async function sendRunCommand(command: RunCommandRequest): Promise<RunReport | n
     return null;
   }
 
+  if (command.kind !== "stop" && command.kind !== "tick_epoch" && runFuelState.mode === "epoch") {
+    await flushPendingRunEpochTicks();
+  }
+  if (!runSessionActive && command.kind !== "stop") {
+    return null;
+  }
+
   cancelRunPolling();
   runBusy = true;
   applyRunControlState();
@@ -1430,6 +1577,13 @@ function scheduleLint(): void {
 }
 
 async function sendDebugCommand(command: DebugCommandRequest): Promise<DebugReport | null> {
+  if (!debugSessionActive && command.kind !== "stop") {
+    return null;
+  }
+
+  if (command.kind !== "stop" && command.kind !== "tick_epoch" && debugFuelState.mode === "epoch") {
+    await flushPendingDebugEpochTicks();
+  }
   if (!debugSessionActive && command.kind !== "stop") {
     return null;
   }
@@ -1931,7 +2085,12 @@ runResumeButtonEl.addEventListener("click", () => {
         }
       }
 
-      if (parsed.amount !== null) {
+      if (
+        parsed.amount !== null &&
+        (runFuelState.mode !== "epoch" ||
+          runFuelState.epochDeadline === null ||
+          runFuelState.epochSlice !== parsed.amount)
+      ) {
         const deadlineReport = await sendRunCommand({
           kind: "set_epoch_deadline",
           ticks: parsed.amount
