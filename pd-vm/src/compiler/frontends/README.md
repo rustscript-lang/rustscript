@@ -166,6 +166,7 @@ Supported syntax and features:
 - Lua-specific lowering helpers:
   - string methods `:sub(...)` and `:len()`
   - length operator `#value` with Lua-style helpers for arrays/maps/strings
+  - `pcall(func, ...)` / `xpcall(func, handler, ...)` lowering with success-only semantics (`true, ...results`)
 - Imports/host calls:
   - `local vm = require("vm")`
   - `local alias = require("vm").name`

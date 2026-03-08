@@ -298,9 +298,7 @@ impl DebugSession {
             };
 
             if should_pause {
-                if hit_line_breakpoint
-                    && let Some(line) = current_line
-                {
+                if hit_line_breakpoint && let Some(line) = current_line {
                     return format!("line breakpoint hit at {line}");
                 }
                 return String::new();

@@ -514,6 +514,7 @@ Lua frontend:
 - Lua pattern API string methods (`:match`, `:gsub`, etc.) are not supported
 - function literal bodies are limited to `function(...) end`, `function(...) return end`, or `function(...) return <expr[, expr...]> end`
 - direct `function`/`local function` bodies are still minimal: empty/fallthrough, `return`, `return <expr[, expr...]>`, or a single return-only `if`/`elseif`/`else` chain
+- `pcall(...)` / `xpcall(...)` lower with success-only semantics and always prefix `true` before the callee return values
 - multi-return unpacking is currently limited to compiler-known Lua function/closure return shapes; extra return values are dropped, missing locals are filled with `null`, but plain assignment destructuring and arbitrary host-call unpacking are not supported
 
 Scheme frontend:
