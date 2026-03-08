@@ -1,0 +1,40 @@
+use super::rss::parse::{is_bool_literal, is_int_literal, is_int_literal_base, parse_bool_or, parse_int_base_or, parse_int_or, try_parse_bool, try_parse_int, try_parse_int_base};
+
+assert(is_int_literal("0"));
+assert(is_int_literal("42"));
+assert(is_int_literal("  -17\t"));
+assert(is_int_literal("+9"));
+assert(is_int_literal("") == false);
+assert(is_int_literal("+") == false);
+assert(is_int_literal("12x") == false);
+assert(is_int_literal("3.14") == false);
+
+assert(try_parse_int("0") == 0);
+assert(try_parse_int(" 42 ") == 42);
+assert(try_parse_int("-17") == -17);
+assert(try_parse_int("+9") == 9);
+assert(type(try_parse_int("nope")) == "null");
+assert(parse_int_or("nope", 7) == 7);
+
+assert(is_int_literal_base("1011", 2));
+assert(is_int_literal_base("7f", 16));
+assert(is_int_literal_base("7g", 16) == false);
+assert(is_int_literal_base("19", 8) == false);
+assert(is_int_literal_base("10", 1) == false);
+assert(is_int_literal_base("10", 37) == false);
+
+assert(try_parse_int_base("1011", 2) == 11);
+assert(try_parse_int_base("7f", 16) == 127);
+assert(try_parse_int_base("zz", 36) == 1295);
+assert(try_parse_int_base(" -1A ", 16) == -26);
+assert(type(try_parse_int_base("19", 8)) == "null");
+assert(parse_int_base_or("19", 8, 99) == 99);
+
+assert(is_bool_literal("true"));
+assert(is_bool_literal(" false "));
+assert(is_bool_literal("TRUE") == false);
+assert(try_parse_bool("true"));
+assert(try_parse_bool(" false ") == false);
+assert(type(try_parse_bool("yes")) == "null");
+assert(parse_bool_or("yes", true));
+assert(parse_bool_or("yes", false) == false);

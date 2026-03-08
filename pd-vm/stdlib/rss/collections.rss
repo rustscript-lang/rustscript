@@ -1,5 +1,19 @@
 // Collection helpers implemented in pure RustScript.
 
+fn map_has_key(map, key) {
+    let mut keys = (map).keys;
+    let mut key_index = 0;
+    let mut found = false;
+    while key_index < (keys).length {
+        if keys[key_index] == key {
+            found = true;
+            break;
+        }
+        key_index = key_index + 1;
+    }
+    found;
+}
+
 pub fn append(lhs, rhs) {
     lhs + rhs;
 }
@@ -107,6 +121,63 @@ pub fn merge(lhs, rhs) {
         let mut key = rhs_keys[right_index];
         out[key] = rhs[key];
         right_index = right_index + 1;
+    }
+    out;
+}
+
+pub fn deep_compare(lhs, rhs) {
+    let mut pending = [[lhs, rhs]];
+    let mut out = true;
+
+    while (pending).length > 0 {
+        let mut next_index = (pending).length - 1;
+        let mut next = pending[next_index].copy();
+        pending = pending[0:next_index];
+
+        let mut left = next[0];
+        let mut right = next[1];
+        let mut lhs_type = type(left);
+        let mut rhs_type = type(right);
+
+        if lhs_type != rhs_type {
+            out = false;
+            break;
+        }
+
+        if lhs_type == "array" {
+            if (left).length != (right).length {
+                out = false;
+                break;
+            }
+            let mut index = (left).length - 1;
+            while index > -1 {
+                pending[(pending).length] = [left[index], right[index]];
+                index = index - 1;
+            }
+        } else if lhs_type == "map" {
+            let mut lhs_keys = (left).keys;
+            let mut rhs_keys = (right).keys;
+            if (lhs_keys).length != (rhs_keys).length {
+                out = false;
+                break;
+            }
+            let mut index = (lhs_keys).length - 1;
+            while index > -1 {
+                let mut key = lhs_keys[index];
+                if map_has_key(right, key) == false {
+                    out = false;
+                    break;
+                }
+                pending[(pending).length] = [left[key], right[key]];
+                index = index - 1;
+            }
+            if out == false {
+                break;
+            }
+        } else if left != right {
+            out = false;
+            break;
+        }
     }
     out;
 }

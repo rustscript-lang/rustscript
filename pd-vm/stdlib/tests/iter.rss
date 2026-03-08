@@ -1,4 +1,4 @@
-use super::rss::iter::{all_true, any_true, chunk, each, enumerate, filter, map, range, range_step, reduce, skip, sum, take};
+use super::rss::iter::{all_true, any_true, chunk, each, enumerate, filter, map, range, range_step, reduce, skip, sum, take, zip};
 
 let mut ascending = range(5);
 assert(ascending.length == 5);
@@ -17,6 +17,15 @@ assert(pairs.length == 2);
 let mut second_pair = pairs[1].copy();
 assert(second_pair[0] == 1);
 assert(second_pair[1] == "b");
+
+let mut zipped = zip([1, 2, 3], ["a", "b"]);
+assert(zipped.length == 2);
+let mut first_zip = zipped[0].copy();
+assert(first_zip[0] == 1);
+assert(first_zip[1] == "a");
+let mut second_zip = zipped[1].copy();
+assert(second_zip[0] == 2);
+assert(second_zip[1] == "b");
 
 let mut head = take([1, 2, 3, 4], 2);
 assert(head.length == 2);
