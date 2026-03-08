@@ -48,8 +48,8 @@ pub use vm::diagnostics::render_vm_error;
 #[cfg(feature = "runtime")]
 pub use vm::{
     CallOutcome, EpochCheckpoint, EpochHandle, FuelCheckpoint, HostAsyncBridge, HostBindingPlan,
-    HostFunction, HostFunctionRegistry, HostOpId, StaticHostFunction, Store, Vm, VmError,
-    VmResult, VmStatus, VmYieldReason,
+    HostFunction, HostFunctionRegistry, HostOpId, StaticHostFunction, Store, Vm, VmError, VmResult,
+    VmStatus, VmYieldReason,
 };
 #[cfg(feature = "runtime")]
 pub use vmbc::{

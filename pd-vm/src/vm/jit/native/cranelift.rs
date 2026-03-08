@@ -397,20 +397,12 @@ mod tests {
             "fusion should be available without fuel metering"
         );
         assert_eq!(
-            fused_ldloc_copy_slot_if_allowed(
-                Some(NativeInterruptSettings::fuel(1)),
-                &steps,
-                0
-            ),
+            fused_ldloc_copy_slot_if_allowed(Some(NativeInterruptSettings::fuel(1)), &steps, 0),
             None,
             "fuel metering must disable fused emission"
         );
         assert_eq!(
-            fused_ldloc_copy_slot_if_allowed(
-                Some(NativeInterruptSettings::epoch(8)),
-                &steps,
-                0
-            ),
+            fused_ldloc_copy_slot_if_allowed(Some(NativeInterruptSettings::epoch(8)), &steps, 0),
             None,
             "all cooperative interruption variants must disable fused emission"
         );
