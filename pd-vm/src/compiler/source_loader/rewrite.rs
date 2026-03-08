@@ -1,27 +1,79 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use super::super::frontends::{is_ident_continue, is_ident_start};
+use super::super::frontends::{SchemeImportContext, is_ident_continue, is_ident_start};
 use super::super::{CompileSourceFileOptions, SourceFlavor, SourcePathError};
+use super::graph::collect_imported_module_functions;
 use super::imports::{
     host_namespace_root_from_spec, is_builtin_host_namespace_spec, is_module_specifier,
     is_valid_ident, is_virtual_host_namespace_spec, resolve_module_path,
 };
 use super::model::{ImportClause, ImportRewriteResult, ModuleImport, VM_HOST_NAMESPACE_SPEC};
 
-pub(super) fn rewrite_imported_call_sites(
-    source: &str,
-    flavor: SourceFlavor,
+struct ImportCallResolution {
+    alias_calls: HashMap<String, String>,
+    namespace_calls: HashMap<String, HashSet<String>>,
+    namespace_prefix_calls: HashMap<String, String>,
+    requires_vm_namespace: bool,
+}
+
+pub(super) fn build_scheme_import_context(
     path: &Path,
     imports: &[ModuleImport],
     module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
     options: &CompileSourceFileOptions,
-) -> Result<ImportRewriteResult, SourcePathError> {
+) -> Result<SchemeImportContext, SourcePathError> {
+    let resolution = resolve_import_call_paths(path, imports, module_exports, options)?;
+
+    let mut declared_functions = HashMap::<String, Option<u8>>::new();
+    for (name, arity) in collect_imported_module_functions(path, imports, module_exports, options)?
+    {
+        declared_functions
+            .entry(name)
+            .and_modify(|existing| {
+                if let Some(existing_arity) = existing {
+                    *existing_arity = (*existing_arity).max(arity);
+                } else {
+                    *existing = Some(arity);
+                }
+            })
+            .or_insert(Some(arity));
+    }
+
+    for import in imports {
+        if import.spec != VM_HOST_NAMESPACE_SPEC {
+            continue;
+        }
+        let ImportClause::Named(named) = &import.clause else {
+            continue;
+        };
+        for binding in named {
+            declared_functions
+                .entry(binding.imported.clone())
+                .or_insert(None);
+        }
+    }
+
+    let mut declared_functions = declared_functions.into_iter().collect::<Vec<_>>();
+    declared_functions.sort_by(|(lhs_name, _), (rhs_name, _)| lhs_name.cmp(rhs_name));
+
+    Ok(SchemeImportContext {
+        declared_functions,
+        direct_aliases: resolution.alias_calls,
+        namespace_imports: resolution.namespace_calls,
+        namespace_prefixes: resolution.namespace_prefix_calls,
+    })
+}
+
+fn resolve_import_call_paths(
+    path: &Path,
+    imports: &[ModuleImport],
+    module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
+    options: &CompileSourceFileOptions,
+) -> Result<ImportCallResolution, SourcePathError> {
     let mut alias_calls = HashMap::<String, String>::new();
     let mut namespace_calls = HashMap::<String, HashSet<String>>::new();
     let mut namespace_prefix_calls = HashMap::<String, String>::new();
-    let namespace_wildcards = HashSet::<String>::new();
-    let mut prefix_aliases = Vec::<String>::new();
     let mut requires_vm_namespace = false;
 
     for import in imports {
@@ -43,41 +95,42 @@ pub(super) fn rewrite_imported_call_sites(
             }
             continue;
         }
+        if let Some(host_root) = host_namespace_root_from_spec(&import.spec)
+            && is_virtual_host_namespace_spec(&import.spec, options)
+        {
+            let vm_prefix = format!("vm::{host_root}");
+            match &import.clause {
+                ImportClause::AllPublic => {
+                    if let Some(namespace) = module_default_namespace(&import.spec) {
+                        namespace_prefix_calls.insert(namespace, vm_prefix.clone());
+                        requires_vm_namespace = true;
+                    }
+                }
+                ImportClause::Named(named) => {
+                    for binding in named {
+                        alias_calls.insert(
+                            binding.local.clone(),
+                            format!("{vm_prefix}::{}", binding.imported),
+                        );
+                    }
+                    if !named.is_empty() {
+                        requires_vm_namespace = true;
+                    }
+                }
+                ImportClause::Namespace(namespace) => {
+                    namespace_prefix_calls.insert(namespace.clone(), vm_prefix.clone());
+                    requires_vm_namespace = true;
+                }
+                ImportClause::Prefix(_) => {}
+            }
+            continue;
+        }
         if !is_module_specifier(&import.spec) {
             continue;
         }
 
         let resolved = resolve_module_path(path, &import.spec, options)?;
         let Some(exports) = module_exports.get(&resolved) else {
-            if let Some(host_root) = host_namespace_root_from_spec(&import.spec)
-                && is_virtual_host_namespace_spec(&import.spec, options)
-            {
-                let vm_prefix = format!("vm::{host_root}");
-                match &import.clause {
-                    ImportClause::AllPublic => {
-                        if let Some(namespace) = module_default_namespace(&import.spec) {
-                            namespace_prefix_calls.insert(namespace, vm_prefix.clone());
-                            requires_vm_namespace = true;
-                        }
-                    }
-                    ImportClause::Named(named) => {
-                        for binding in named {
-                            alias_calls.insert(
-                                binding.local.clone(),
-                                format!("{vm_prefix}::{}", binding.imported),
-                            );
-                        }
-                        if !named.is_empty() {
-                            requires_vm_namespace = true;
-                        }
-                    }
-                    ImportClause::Namespace(namespace) => {
-                        namespace_prefix_calls.insert(namespace.clone(), vm_prefix.clone());
-                        requires_vm_namespace = true;
-                    }
-                    ImportClause::Prefix(_) => {}
-                }
-            }
             continue;
         };
 
@@ -123,8 +176,29 @@ pub(super) fn rewrite_imported_call_sites(
         }
     }
 
-    prefix_aliases.sort();
-    prefix_aliases.dedup();
+    Ok(ImportCallResolution {
+        alias_calls,
+        namespace_calls,
+        namespace_prefix_calls,
+        requires_vm_namespace,
+    })
+}
+
+pub(super) fn rewrite_imported_call_sites(
+    source: &str,
+    flavor: SourceFlavor,
+    path: &Path,
+    imports: &[ModuleImport],
+    module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
+    options: &CompileSourceFileOptions,
+) -> Result<ImportRewriteResult, SourcePathError> {
+    let resolution = resolve_import_call_paths(path, imports, module_exports, options)?;
+    let alias_calls = resolution.alias_calls;
+    let namespace_calls = resolution.namespace_calls;
+    let namespace_prefix_calls = resolution.namespace_prefix_calls;
+    let namespace_wildcards = HashSet::<String>::new();
+    let prefix_aliases = Vec::<String>::new();
+    let requires_vm_namespace = resolution.requires_vm_namespace;
 
     let rewritten = rewrite_host_namespace_call_paths(source, flavor, &namespace_prefix_calls);
 

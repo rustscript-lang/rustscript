@@ -11,6 +11,8 @@ use super::{
     parser::{Parser, ParserDialect},
 };
 
+pub(crate) use scheme::SchemeImportContext;
+
 trait FrontendCompiler {
     fn lower_to_ir(&self, source: &str) -> Result<FrontendIr, ParseError>;
 }
@@ -28,6 +30,21 @@ pub(super) fn parse_source(source: &str, flavor: SourceFlavor) -> Result<Fronten
         SourceFlavor::Scheme => &SchemeCompiler,
     };
     frontend.lower_to_ir(source)
+}
+
+pub(super) fn parse_source_with_scheme_import_context(
+    source: &str,
+    flavor: SourceFlavor,
+    scheme_import_context: Option<&SchemeImportContext>,
+) -> Result<FrontendIr, ParseError> {
+    match flavor {
+        SourceFlavor::Scheme => {
+            scheme::lower_to_ir_with_import_context(source, scheme_import_context)
+        }
+        SourceFlavor::RustScript | SourceFlavor::JavaScript | SourceFlavor::Lua => {
+            parse_source(source, flavor)
+        }
+    }
 }
 
 pub(super) fn is_ident_start(ch: char) -> bool {

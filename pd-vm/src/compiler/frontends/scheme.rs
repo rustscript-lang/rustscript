@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::ParseError;
@@ -7,6 +7,101 @@ use super::{is_ident_continue, is_ident_start};
 use crate::builtins::{BuiltinFunction, is_builtin_namespace, resolve_builtin_namespace_call};
 
 static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SchemeImportContext {
+    pub(crate) declared_functions: Vec<(String, Option<u8>)>,
+    pub(crate) direct_aliases: HashMap<String, String>,
+    pub(crate) namespace_imports: HashMap<String, HashSet<String>>,
+    pub(crate) namespace_prefixes: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NormalizedSchemeImportContext {
+    declared_functions: Vec<(String, Option<u8>)>,
+    direct_aliases_exact: HashMap<String, String>,
+    direct_aliases_normalized: HashMap<String, String>,
+    namespace_imports: HashMap<String, HashSet<String>>,
+    namespace_prefixes: HashMap<String, Vec<String>>,
+}
+
+enum SchemeResolvedCallHead {
+    Direct(String),
+    Namespace(Vec<String>),
+}
+
+impl NormalizedSchemeImportContext {
+    fn from_raw(raw: &SchemeImportContext) -> Self {
+        let mut direct_aliases_exact = HashMap::new();
+        let mut direct_aliases_normalized = HashMap::new();
+        for (alias, target) in &raw.direct_aliases {
+            direct_aliases_exact.insert(alias.clone(), target.clone());
+            if let Some(normalized_alias) = canonicalize_identifier(alias) {
+                direct_aliases_normalized.insert(normalized_alias, target.clone());
+            }
+        }
+
+        let mut namespace_imports = HashMap::<String, HashSet<String>>::new();
+        for (namespace, members) in &raw.namespace_imports {
+            let Some(normalized_namespace) = canonicalize_identifier(namespace) else {
+                continue;
+            };
+            let entry = namespace_imports.entry(normalized_namespace).or_default();
+            for member in members {
+                if let Some(normalized_member) = canonicalize_identifier(member) {
+                    entry.insert(normalized_member);
+                }
+            }
+        }
+
+        let mut namespace_prefixes = HashMap::<String, Vec<String>>::new();
+        for (namespace, prefix) in &raw.namespace_prefixes {
+            let Some(normalized_namespace) = canonicalize_identifier(namespace) else {
+                continue;
+            };
+            let Some(prefix_segments) = canonicalize_call_path(prefix) else {
+                continue;
+            };
+            namespace_prefixes.insert(normalized_namespace, prefix_segments);
+        }
+
+        Self {
+            declared_functions: raw.declared_functions.clone(),
+            direct_aliases_exact,
+            direct_aliases_normalized,
+            namespace_imports,
+            namespace_prefixes,
+        }
+    }
+
+    fn resolve_direct_alias<'a>(&'a self, head: &'a str) -> Option<&'a str> {
+        self.direct_aliases_exact
+            .get(head)
+            .map(String::as_str)
+            .or_else(|| {
+                let normalized = canonicalize_identifier(head)?;
+                self.direct_aliases_normalized
+                    .get(&normalized)
+                    .map(String::as_str)
+            })
+    }
+
+    fn resolve_namespace_import(&self, segments: &[String]) -> Option<Vec<String>> {
+        if segments.len() == 2
+            && self
+                .namespace_imports
+                .get(&segments[0])
+                .is_some_and(|members| members.contains(&segments[1]))
+        {
+            return Some(vec![segments[1].clone()]);
+        }
+
+        let prefix = self.namespace_prefixes.get(&segments[0])?;
+        let mut rewritten = prefix.clone();
+        rewritten.extend(segments.iter().skip(1).cloned());
+        Some(rewritten)
+    }
+}
 
 fn gensym(prefix: &str) -> String {
     let id = GENSYM_COUNTER
@@ -18,7 +113,14 @@ fn gensym(prefix: &str) -> String {
 }
 
 pub(super) fn lower_to_ir(source: &str) -> Result<FrontendIr, ParseError> {
-    if let Some(ir) = try_lower_direct_subset_to_ir(source)? {
+    lower_to_ir_with_import_context(source, None)
+}
+
+pub(super) fn lower_to_ir_with_import_context(
+    source: &str,
+    import_context: Option<&SchemeImportContext>,
+) -> Result<FrontendIr, ParseError> {
+    if let Some(ir) = try_lower_direct_subset_to_ir(source, import_context)? {
         return Ok(ir);
     }
     Err(ParseError::at_line(
@@ -27,14 +129,25 @@ pub(super) fn lower_to_ir(source: &str) -> Result<FrontendIr, ParseError> {
     ))
 }
 
-fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, ParseError> {
+fn try_lower_direct_subset_to_ir(
+    source: &str,
+    import_context: Option<&SchemeImportContext>,
+) -> Result<Option<FrontendIr>, ParseError> {
     let mut parser = SchemeParser::new(source)?;
     let forms = parser.parse_program()?;
+    let normalized_import_context = import_context.map(NormalizedSchemeImportContext::from_raw);
 
     let mut builder = LocalIrBuilder::new();
+    if let Some(imports) = normalized_import_context.as_ref() {
+        for (name, arity) in &imports.declared_functions {
+            builder.declare_function(name, *arity)?;
+        }
+    }
     let mut stmts = Vec::<Stmt>::new();
     for form in &forms {
-        let Some(mut lowered) = lower_scheme_direct_stmt(form, &mut builder)? else {
+        let Some(mut lowered) =
+            lower_scheme_direct_stmt(form, &mut builder, normalized_import_context.as_ref())?
+        else {
             return Ok(None);
         };
         stmts.append(&mut lowered);
@@ -45,6 +158,7 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
 fn lower_scheme_direct_stmt(
     form: &SchemeForm,
     builder: &mut LocalIrBuilder,
+    import_context: Option<&NormalizedSchemeImportContext>,
 ) -> Result<Option<Vec<Stmt>>, ParseError> {
     if let Some(items) = form.as_list()
         && let Some(head) = items.first().and_then(|item| item.as_symbol())
@@ -84,7 +198,9 @@ fn lower_scheme_direct_stmt(
                 }
                 if let Some(name_raw) = args[0].as_symbol() {
                     let name = normalize_identifier(name_raw, args[0].line, "define target")?;
-                    let Some(expr) = lower_scheme_direct_expr_top(&args[1], builder)? else {
+                    let Some(expr) =
+                        lower_scheme_direct_expr_top(&args[1], builder, import_context)?
+                    else {
                         return Ok(None);
                     };
                     return Ok(Some(vec![builder.lower_local(&name, expr, line)?]));
@@ -113,6 +229,7 @@ fn lower_scheme_direct_stmt(
                     &args[1..],
                     form.line,
                     builder,
+                    import_context,
                 )?
                 else {
                     return Ok(None);
@@ -127,7 +244,8 @@ fn lower_scheme_direct_stmt(
                     return Ok(None);
                 };
                 let name = normalize_identifier(name_raw, args[0].line, "set! target")?;
-                let Some(expr) = lower_scheme_direct_expr_top(&args[1], builder)? else {
+                let Some(expr) = lower_scheme_direct_expr_top(&args[1], builder, import_context)?
+                else {
                     return Ok(None);
                 };
                 return Ok(Some(vec![builder.lower_assign(&name, expr, line)?]));
@@ -184,14 +302,20 @@ fn lower_scheme_direct_stmt(
                 if !(2..=3).contains(&args.len()) {
                     return Ok(None);
                 }
-                let Some(condition) = lower_scheme_direct_expr_top(&args[0], builder)? else {
+                let Some(condition) =
+                    lower_scheme_direct_expr_top(&args[0], builder, import_context)?
+                else {
                     return Ok(None);
                 };
-                let Some(then_branch) = lower_scheme_direct_branch(&args[1], builder)? else {
+                let Some(then_branch) =
+                    lower_scheme_direct_branch(&args[1], builder, import_context)?
+                else {
                     return Ok(None);
                 };
                 let else_branch = if args.len() == 3 {
-                    let Some(branch) = lower_scheme_direct_branch(&args[2], builder)? else {
+                    let Some(branch) =
+                        lower_scheme_direct_branch(&args[2], builder, import_context)?
+                    else {
                         return Ok(None);
                     };
                     branch
@@ -209,12 +333,16 @@ fn lower_scheme_direct_stmt(
                 if args.is_empty() {
                     return Ok(None);
                 }
-                let Some(condition) = lower_scheme_direct_expr_top(&args[0], builder)? else {
+                let Some(condition) =
+                    lower_scheme_direct_expr_top(&args[0], builder, import_context)?
+                else {
                     return Ok(None);
                 };
                 let mut body = Vec::new();
                 for body_form in &args[1..] {
-                    let Some(mut lowered) = lower_scheme_direct_stmt(body_form, builder)? else {
+                    let Some(mut lowered) =
+                        lower_scheme_direct_stmt(body_form, builder, import_context)?
+                    else {
                         return Ok(None);
                     };
                     body.append(&mut lowered);
@@ -239,14 +367,17 @@ fn lower_scheme_direct_stmt(
                     return Ok(None);
                 };
                 let name = normalize_identifier(name_raw, header[0].line, "for loop variable")?;
-                let Some(start) = lower_scheme_direct_expr_top(&header[1], builder)? else {
+                let Some(start) =
+                    lower_scheme_direct_expr_top(&header[1], builder, import_context)?
+                else {
                     return Ok(None);
                 };
-                let Some(end) = lower_scheme_direct_expr_top(&header[2], builder)? else {
+                let Some(end) = lower_scheme_direct_expr_top(&header[2], builder, import_context)?
+                else {
                     return Ok(None);
                 };
                 let Some(step) = (if header.len() == 4 {
-                    lower_scheme_direct_expr_top(&header[3], builder)?
+                    lower_scheme_direct_expr_top(&header[3], builder, import_context)?
                 } else {
                     Some(Expr::Int(1))
                 }) else {
@@ -265,7 +396,9 @@ fn lower_scheme_direct_stmt(
 
                 let mut body = Vec::new();
                 for body_form in &args[1..] {
-                    let Some(mut lowered) = lower_scheme_direct_stmt(body_form, builder)? else {
+                    let Some(mut lowered) =
+                        lower_scheme_direct_stmt(body_form, builder, import_context)?
+                    else {
                         return Ok(None);
                     };
                     body.append(&mut lowered);
@@ -281,7 +414,9 @@ fn lower_scheme_direct_stmt(
             "begin" => {
                 let mut out = Vec::new();
                 for expr in args {
-                    let Some(mut lowered) = lower_scheme_direct_stmt(expr, builder)? else {
+                    let Some(mut lowered) =
+                        lower_scheme_direct_stmt(expr, builder, import_context)?
+                    else {
                         return Ok(None);
                     };
                     out.append(&mut lowered);
@@ -293,7 +428,7 @@ fn lower_scheme_direct_stmt(
     }
 
     let line = u32::try_from(form.line).unwrap_or(u32::MAX);
-    let Some(expr) = lower_scheme_direct_expr_top(form, builder)? else {
+    let Some(expr) = lower_scheme_direct_expr_top(form, builder, import_context)? else {
         return Ok(None);
     };
     Ok(Some(vec![Stmt::Expr { expr, line }]))
@@ -302,17 +437,19 @@ fn lower_scheme_direct_stmt(
 fn lower_scheme_direct_branch(
     form: &SchemeForm,
     builder: &mut LocalIrBuilder,
+    import_context: Option<&NormalizedSchemeImportContext>,
 ) -> Result<Option<Vec<Stmt>>, ParseError> {
-    lower_scheme_direct_stmt(form, builder)
+    lower_scheme_direct_stmt(form, builder, import_context)
 }
 
 fn lower_scheme_direct_expr_top(
     form: &SchemeForm,
     builder: &mut LocalIrBuilder,
+    import_context: Option<&NormalizedSchemeImportContext>,
 ) -> Result<Option<Expr>, ParseError> {
     let params = HashMap::new();
     let mut captures = HashMap::new();
-    lower_scheme_direct_expr(form, builder, &params, &mut captures, false)
+    lower_scheme_direct_expr(form, builder, &params, &mut captures, false, import_context)
 }
 
 fn lower_scheme_direct_expr(
@@ -321,6 +458,7 @@ fn lower_scheme_direct_expr(
     param_slots: &HashMap<String, u16>,
     capture_slots: &mut HashMap<u16, u16>,
     capture_enabled: bool,
+    import_context: Option<&NormalizedSchemeImportContext>,
 ) -> Result<Option<Expr>, ParseError> {
     match &form.node {
         SchemeNode::Int(value) => Ok(Some(Expr::Int(*value))),
@@ -343,6 +481,7 @@ fn lower_scheme_direct_expr(
             param_slots,
             capture_slots,
             capture_enabled,
+            import_context,
         ),
     }
 }
@@ -576,6 +715,7 @@ fn lower_scheme_direct_list_expr(
     param_slots: &HashMap<String, u16>,
     capture_slots: &mut HashMap<u16, u16>,
     capture_enabled: bool,
+    import_context: Option<&NormalizedSchemeImportContext>,
 ) -> Result<Option<Expr>, ParseError> {
     let Some(head) = items.first().and_then(|item| item.as_symbol()) else {
         return Ok(None);
@@ -589,6 +729,7 @@ fn lower_scheme_direct_list_expr(
             param_slots,
             capture_slots,
             capture_enabled,
+            import_context,
             Expr::Add,
             fold_int_add,
         ),
@@ -598,6 +739,7 @@ fn lower_scheme_direct_list_expr(
             param_slots,
             capture_slots,
             capture_enabled,
+            import_context,
             Expr::Mul,
             fold_int_mul,
         ),
@@ -612,6 +754,7 @@ fn lower_scheme_direct_list_expr(
                     param_slots,
                     capture_slots,
                     capture_enabled,
+                    import_context,
                 )?
                 else {
                     return Ok(None);
@@ -624,6 +767,7 @@ fn lower_scheme_direct_list_expr(
                 param_slots,
                 capture_slots,
                 capture_enabled,
+                import_context,
                 Expr::Sub,
                 fold_int_sub,
             )
@@ -634,6 +778,7 @@ fn lower_scheme_direct_list_expr(
             param_slots,
             capture_slots,
             capture_enabled,
+            import_context,
             Expr::Div,
             fold_int_div,
         ),
@@ -643,6 +788,7 @@ fn lower_scheme_direct_list_expr(
             param_slots,
             capture_slots,
             capture_enabled,
+            import_context,
             Expr::Mod,
         ),
         "=" => lower_scheme_direct_compare_fold(
@@ -651,6 +797,7 @@ fn lower_scheme_direct_list_expr(
             param_slots,
             capture_slots,
             capture_enabled,
+            import_context,
             Expr::Eq,
         ),
         "/=" => {
@@ -660,6 +807,7 @@ fn lower_scheme_direct_list_expr(
                 param_slots,
                 capture_slots,
                 capture_enabled,
+                import_context,
                 Expr::Eq,
             )?
             else {
@@ -673,6 +821,7 @@ fn lower_scheme_direct_list_expr(
             param_slots,
             capture_slots,
             capture_enabled,
+            import_context,
             Expr::Lt,
         ),
         ">" => lower_scheme_direct_compare_fold(
@@ -681,6 +830,7 @@ fn lower_scheme_direct_list_expr(
             param_slots,
             capture_slots,
             capture_enabled,
+            import_context,
             Expr::Gt,
         ),
         "<=" => {
@@ -690,6 +840,7 @@ fn lower_scheme_direct_list_expr(
                 param_slots,
                 capture_slots,
                 capture_enabled,
+                import_context,
                 Expr::Gt,
             )?
             else {
@@ -704,6 +855,7 @@ fn lower_scheme_direct_list_expr(
                 param_slots,
                 capture_slots,
                 capture_enabled,
+                import_context,
                 Expr::Lt,
             )?
             else {
@@ -725,6 +877,7 @@ fn lower_scheme_direct_list_expr(
                 param_slots,
                 capture_slots,
                 capture_enabled,
+                import_context,
             )?
             else {
                 return Ok(None);
@@ -736,6 +889,7 @@ fn lower_scheme_direct_list_expr(
                     param_slots,
                     capture_slots,
                     capture_enabled,
+                    import_context,
                 )?
                 else {
                     return Ok(None);
@@ -758,6 +912,7 @@ fn lower_scheme_direct_list_expr(
                 param_slots,
                 capture_slots,
                 capture_enabled,
+                import_context,
             )?
             else {
                 return Ok(None);
@@ -769,6 +924,7 @@ fn lower_scheme_direct_list_expr(
                     param_slots,
                     capture_slots,
                     capture_enabled,
+                    import_context,
                 )?
                 else {
                     return Ok(None);
@@ -787,6 +943,7 @@ fn lower_scheme_direct_list_expr(
                 param_slots,
                 capture_slots,
                 capture_enabled,
+                import_context,
             )?
             else {
                 return Ok(None);
@@ -803,6 +960,7 @@ fn lower_scheme_direct_list_expr(
                 param_slots,
                 capture_slots,
                 capture_enabled,
+                import_context,
             )?
             else {
                 return Ok(None);
@@ -813,6 +971,7 @@ fn lower_scheme_direct_list_expr(
                 param_slots,
                 capture_slots,
                 capture_enabled,
+                import_context,
             )?
             else {
                 return Ok(None);
@@ -824,6 +983,7 @@ fn lower_scheme_direct_list_expr(
                     param_slots,
                     capture_slots,
                     capture_enabled,
+                    import_context,
                 )?
                 else {
                     return Ok(None);
@@ -847,6 +1007,7 @@ fn lower_scheme_direct_list_expr(
                     param_slots,
                     capture_slots,
                     capture_enabled,
+                    import_context,
                 )?
                 else {
                     return Ok(None);
@@ -864,6 +1025,7 @@ fn lower_scheme_direct_list_expr(
                     param_slots,
                     capture_slots,
                     capture_enabled,
+                    import_context,
                 )?
                 else {
                     return Ok(None);
@@ -882,6 +1044,7 @@ fn lower_scheme_direct_list_expr(
             param_slots,
             capture_slots,
             capture_enabled,
+            import_context,
         ),
         "hash-ref" => {
             if args.len() != 2 {
@@ -893,6 +1056,7 @@ fn lower_scheme_direct_list_expr(
                 param_slots,
                 capture_slots,
                 capture_enabled,
+                import_context,
             )?
             else {
                 return Ok(None);
@@ -903,6 +1067,7 @@ fn lower_scheme_direct_list_expr(
                 param_slots,
                 capture_slots,
                 capture_enabled,
+                import_context,
             )?
             else {
                 return Ok(None);
@@ -930,7 +1095,13 @@ fn lower_scheme_direct_list_expr(
                     "lambda parameter",
                 )?);
             }
-            lower_scheme_direct_lambda_expr_from_params(&params, &args[1..], line, builder)
+            lower_scheme_direct_lambda_expr_from_params(
+                &params,
+                &args[1..],
+                line,
+                builder,
+                import_context,
+            )
         }
         _ => {
             if is_forbidden_scheme_builtin_name(head) {
@@ -953,6 +1124,7 @@ fn lower_scheme_direct_list_expr(
                     param_slots,
                     capture_slots,
                     capture_enabled,
+                    import_context,
                 )?
                 else {
                     return Ok(None);
@@ -960,23 +1132,67 @@ fn lower_scheme_direct_list_expr(
                 lowered_args.push(lowered);
             }
 
-            if let Some(segments) = split_namespace_segments(head, line)? {
-                return lower_scheme_direct_namespace_call(&segments, lowered_args, builder, line)
-                    .map(Some);
+            match resolve_scheme_call_head(head, line, import_context)? {
+                SchemeResolvedCallHead::Direct(name) => {
+                    if let Some(expr) = builder.resolve_call_expr(&name, lowered_args) {
+                        return Ok(Some(expr));
+                    }
+                    Err(ParseError {
+                        span: None,
+                        code: None,
+                        line,
+                        message: format!("unknown function '{name}'"),
+                    })
+                }
+                SchemeResolvedCallHead::Namespace(segments) => {
+                    lower_scheme_direct_namespace_call(&segments, lowered_args, builder, line)
+                        .map(Some)
+                }
             }
-
-            let name = normalize_identifier(head, line, "function call")?;
-            if let Some(expr) = builder.resolve_call_expr(&name, lowered_args) {
-                return Ok(Some(expr));
-            }
-            Err(ParseError {
-                span: None,
-                code: None,
-                line,
-                message: format!("unknown function '{name}'"),
-            })
         }
     }
+}
+
+fn resolve_scheme_call_head(
+    head: &str,
+    line: usize,
+    import_context: Option<&NormalizedSchemeImportContext>,
+) -> Result<SchemeResolvedCallHead, ParseError> {
+    if let Some(target) = import_context.and_then(|imports| imports.resolve_direct_alias(head)) {
+        return parse_resolved_scheme_call_target(target, line);
+    }
+
+    if let Some(segments) = split_namespace_segments(head, line)? {
+        if let Some(rewritten) =
+            import_context.and_then(|imports| imports.resolve_namespace_import(&segments))
+        {
+            return Ok(match rewritten.as_slice() {
+                [name] => SchemeResolvedCallHead::Direct(name.clone()),
+                _ => SchemeResolvedCallHead::Namespace(rewritten),
+            });
+        }
+        return Ok(SchemeResolvedCallHead::Namespace(segments));
+    }
+
+    Ok(SchemeResolvedCallHead::Direct(normalize_identifier(
+        head,
+        line,
+        "function call",
+    )?))
+}
+
+fn parse_resolved_scheme_call_target(
+    target: &str,
+    line: usize,
+) -> Result<SchemeResolvedCallHead, ParseError> {
+    if let Some(segments) = split_namespace_segments(target, line)? {
+        return Ok(SchemeResolvedCallHead::Namespace(segments));
+    }
+    Ok(SchemeResolvedCallHead::Direct(normalize_identifier(
+        target,
+        line,
+        "imported function",
+    )?))
 }
 
 fn lower_scheme_direct_namespace_call(
@@ -1121,6 +1337,7 @@ fn lower_scheme_direct_hash_expr(
     param_slots: &HashMap<String, u16>,
     capture_slots: &mut HashMap<u16, u16>,
     capture_enabled: bool,
+    import_context: Option<&NormalizedSchemeImportContext>,
 ) -> Result<Option<Expr>, ParseError> {
     let mut expr = Expr::Call(BuiltinFunction::MapNew.call_index(), Vec::new());
     for entry in args {
@@ -1136,6 +1353,7 @@ fn lower_scheme_direct_hash_expr(
             param_slots,
             capture_slots,
             capture_enabled,
+            import_context,
         )?
         else {
             return Ok(None);
@@ -1146,6 +1364,7 @@ fn lower_scheme_direct_hash_expr(
             param_slots,
             capture_slots,
             capture_enabled,
+            import_context,
         )?
         else {
             return Ok(None);
@@ -1161,11 +1380,19 @@ fn lower_scheme_direct_hash_key_expr(
     param_slots: &HashMap<String, u16>,
     capture_slots: &mut HashMap<u16, u16>,
     capture_enabled: bool,
+    import_context: Option<&NormalizedSchemeImportContext>,
 ) -> Result<Option<Expr>, ParseError> {
     if let Some(symbol) = form.as_symbol() {
         return Ok(Some(Expr::String(symbol.to_string())));
     }
-    lower_scheme_direct_expr(form, builder, param_slots, capture_slots, capture_enabled)
+    lower_scheme_direct_expr(
+        form,
+        builder,
+        param_slots,
+        capture_slots,
+        capture_enabled,
+        import_context,
+    )
 }
 
 fn lower_scheme_direct_lambda_expr_from_params(
@@ -1173,6 +1400,7 @@ fn lower_scheme_direct_lambda_expr_from_params(
     body_forms: &[SchemeForm],
     _line: usize,
     builder: &mut LocalIrBuilder,
+    import_context: Option<&NormalizedSchemeImportContext>,
 ) -> Result<Option<Expr>, ParseError> {
     if body_forms.len() != 1 {
         return Ok(None);
@@ -1189,8 +1417,14 @@ fn lower_scheme_direct_lambda_expr_from_params(
     }
 
     let mut captures = HashMap::new();
-    let Some(body_expr) =
-        lower_scheme_direct_expr(&body_forms[0], builder, &param_lookup, &mut captures, true)?
+    let Some(body_expr) = lower_scheme_direct_expr(
+        &body_forms[0],
+        builder,
+        &param_lookup,
+        &mut captures,
+        true,
+        import_context,
+    )?
     else {
         return Ok(None);
     };
@@ -1211,6 +1445,7 @@ fn lower_scheme_direct_binary<F>(
     param_slots: &HashMap<String, u16>,
     capture_slots: &mut HashMap<u16, u16>,
     capture_enabled: bool,
+    import_context: Option<&NormalizedSchemeImportContext>,
     build: F,
 ) -> Result<Option<Expr>, ParseError>
 where
@@ -1225,6 +1460,7 @@ where
         param_slots,
         capture_slots,
         capture_enabled,
+        import_context,
     )?
     else {
         return Ok(None);
@@ -1235,6 +1471,7 @@ where
         param_slots,
         capture_slots,
         capture_enabled,
+        import_context,
     )?
     else {
         return Ok(None);
@@ -1248,6 +1485,7 @@ fn lower_scheme_direct_fold<F>(
     param_slots: &HashMap<String, u16>,
     capture_slots: &mut HashMap<u16, u16>,
     capture_enabled: bool,
+    import_context: Option<&NormalizedSchemeImportContext>,
     build: F,
     eval_int: fn(i64, i64) -> Option<i64>,
 ) -> Result<Option<Expr>, ParseError>
@@ -1263,8 +1501,14 @@ where
     let mut all_int_values = true;
 
     for arg in args {
-        let Some(expr) =
-            lower_scheme_direct_expr(arg, builder, param_slots, capture_slots, capture_enabled)?
+        let Some(expr) = lower_scheme_direct_expr(
+            arg,
+            builder,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            import_context,
+        )?
         else {
             return Ok(None);
         };
@@ -1310,6 +1554,7 @@ fn lower_scheme_direct_compare_fold<F>(
     param_slots: &HashMap<String, u16>,
     capture_slots: &mut HashMap<u16, u16>,
     capture_enabled: bool,
+    import_context: Option<&NormalizedSchemeImportContext>,
     build: F,
 ) -> Result<Option<Expr>, ParseError>
 where
@@ -1324,6 +1569,7 @@ where
         param_slots,
         capture_slots,
         capture_enabled,
+        import_context,
         build,
     )
 }
@@ -1795,28 +2041,37 @@ fn is_valid_member_ident(member: &str) -> bool {
     is_ident_start(first) && chars.all(is_ident_continue)
 }
 
-fn split_namespace_segments(head: &str, line: usize) -> Result<Option<Vec<String>>, ParseError> {
-    let canonical = head.replace("::", ".").replace(':', ".");
+fn canonicalize_call_path(path: &str) -> Option<Vec<String>> {
+    let canonical = path.replace("::", ".").replace(':', ".");
     if !canonical.contains('.') {
-        return Ok(None);
+        return canonicalize_identifier(path).map(|value| vec![value]);
     }
+
     let mut segments = Vec::new();
     for segment in canonical.split('.') {
         if segment.is_empty() {
-            return Err(ParseError {
-                span: None,
-                code: None,
-                line,
-                message: format!("invalid namespace call target '{head}'"),
-            });
+            return None;
         }
-        let normalized = normalize_identifier(segment, line, "namespace call target")?;
-        segments.push(normalized);
+        segments.push(canonicalize_identifier(segment)?);
     }
     if segments.len() < 2 {
+        return None;
+    }
+    Some(segments)
+}
+
+fn split_namespace_segments(head: &str, line: usize) -> Result<Option<Vec<String>>, ParseError> {
+    if !head.replace("::", ".").replace(':', ".").contains('.') {
         return Ok(None);
     }
-    Ok(Some(segments))
+    canonicalize_call_path(head)
+        .map(Some)
+        .ok_or_else(|| ParseError {
+            span: None,
+            code: None,
+            line,
+            message: format!("invalid namespace call target '{head}'"),
+        })
 }
 
 fn is_forbidden_scheme_builtin_name(name: &str) -> bool {
@@ -1898,30 +2153,14 @@ fn normalize_identifier(name: &str, line: usize, context: &str) -> Result<String
         });
     }
 
-    let mut out = String::new();
-    for ch in name.chars() {
-        let mapped = if ch == '-' { '_' } else { ch };
-        out.push(mapped);
-    }
-
-    let mut chars = out.chars();
-    let Some(first) = chars.next() else {
-        return Err(ParseError {
-            span: None,
-            code: None,
-            line,
-            message: format!("{context} cannot be empty"),
-        });
-    };
-
-    if !is_ident_start(first) || !chars.all(is_ident_continue) {
+    let Some(out) = canonicalize_identifier(name) else {
         return Err(ParseError {
             span: None,
             code: None,
             line,
             message: format!("unsupported identifier '{name}' in {context}"),
         });
-    }
+    };
 
     if is_reserved_identifier(&out) {
         return Err(ParseError {
@@ -1933,6 +2172,25 @@ fn normalize_identifier(name: &str, line: usize, context: &str) -> Result<String
     }
 
     Ok(out)
+}
+
+fn canonicalize_identifier(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    for ch in name.chars() {
+        let mapped = if ch == '-' { '_' } else { ch };
+        out.push(mapped);
+    }
+
+    let mut chars = out.chars();
+    let first = chars.next()?;
+    if !is_ident_start(first) || !chars.all(is_ident_continue) {
+        return None;
+    }
+    Some(out)
 }
 
 fn is_reserved_identifier(name: &str) -> bool {

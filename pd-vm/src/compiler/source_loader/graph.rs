@@ -123,25 +123,7 @@ pub(super) fn build_rustscript_import_prelude(
     Ok(prelude)
 }
 
-pub(super) fn build_scheme_import_prelude(
-    path: &Path,
-    imports: &[ModuleImport],
-    module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
-    options: &CompileSourceFileOptions,
-) -> Result<String, SourcePathError> {
-    let declared = collect_imported_module_functions(path, imports, module_exports, options)?;
-    let mut prelude = String::new();
-    for (name, arity) in declared {
-        let args = (0..arity)
-            .map(|idx| format!("arg{idx}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        prelude.push_str(&format!("(declare ({name} {args}))\n"));
-    }
-    Ok(prelude)
-}
-
-fn collect_imported_module_functions(
+pub(super) fn collect_imported_module_functions(
     path: &Path,
     imports: &[ModuleImport],
     module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
