@@ -19,7 +19,7 @@ pub(super) fn builtin_json_encode(args: &[Value]) -> VmResult<Vec<Value>> {
     let json_value = vm_to_json_value(value)?;
     let text = serde_json::to_string(&json_value)
         .map_err(|err| VmError::HostError(format!("json_encode failed: {err}")))?;
-    Ok(vec![Value::String(text)])
+    Ok(vec![Value::string(text)])
 }
 
 /// Decodes a JSON string into a `Value`.
@@ -43,7 +43,7 @@ fn vm_to_json_value(value: &Value) -> VmResult<JsonValue> {
             Ok(JsonValue::Number(number))
         }
         Value::Bool(value) => Ok(JsonValue::Bool(*value)),
-        Value::String(value) => Ok(JsonValue::String(value.clone())),
+        Value::String(value) => Ok(JsonValue::String(value.as_str().to_string())),
         Value::Array(values) => values
             .iter()
             .map(vm_to_json_value)
@@ -51,7 +51,7 @@ fn vm_to_json_value(value: &Value) -> VmResult<JsonValue> {
             .map(JsonValue::Array),
         Value::Map(entries) => {
             let mut out = JsonMap::new();
-            for (key, value) in entries {
+            for (key, value) in entries.iter() {
                 let key = match key {
                     Value::String(key) => key,
                     _ => {
@@ -60,12 +60,12 @@ fn vm_to_json_value(value: &Value) -> VmResult<JsonValue> {
                         ));
                     }
                 };
-                if out.contains_key(key) {
+                if out.contains_key(key.as_str()) {
                     return Err(VmError::HostError(format!(
                         "json_encode map keys must be unique strings; duplicate key '{key}'"
                     )));
                 }
-                out.insert(key.clone(), vm_to_json_value(value)?);
+                out.insert(key.as_str().to_string(), vm_to_json_value(value)?);
             }
             Ok(JsonValue::Object(out))
         }
@@ -126,11 +126,11 @@ impl<'de> Visitor<'de> for JsonValueVisitor {
     where
         E: de::Error,
     {
-        Ok(DecodedJsonValue(Value::String(value.to_string())))
+        Ok(DecodedJsonValue(Value::string(value.to_string())))
     }
 
     fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
-        Ok(DecodedJsonValue(Value::String(value)))
+        Ok(DecodedJsonValue(Value::string(value)))
     }
 
     fn visit_none<E>(self) -> Result<Self::Value, E> {
@@ -149,7 +149,7 @@ impl<'de> Visitor<'de> for JsonValueVisitor {
         while let Some(DecodedJsonValue(value)) = seq.next_element::<DecodedJsonValue>()? {
             values.push(value);
         }
-        Ok(DecodedJsonValue(Value::Array(values)))
+        Ok(DecodedJsonValue(Value::array(values)))
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -165,9 +165,9 @@ impl<'de> Visitor<'de> for JsonValueVisitor {
                 )));
             }
             let DecodedJsonValue(value) = map.next_value::<DecodedJsonValue>()?;
-            entries.push((Value::String(key), value));
+            entries.push((Value::string(key), value));
         }
-        Ok(DecodedJsonValue(Value::Map(entries)))
+        Ok(DecodedJsonValue(Value::map(entries)))
     }
 }
 

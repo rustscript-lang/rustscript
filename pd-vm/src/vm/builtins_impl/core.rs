@@ -1,4 +1,5 @@
 use super::super::{Value, VmError, VmResult};
+use crate::bytecode::unwrap_or_clone_shared;
 use rt_format::{Format, FormatArgument, NoNamedArguments, ParsedFormat, Specifier};
 
 pub(super) fn builtin_len(args: &[Value]) -> VmResult<Vec<Value>> {
@@ -30,8 +31,8 @@ pub(super) fn builtin_slice(args: Vec<Value>) -> VmResult<Vec<Value>> {
 
     if start < 0 || len <= 0 {
         return match source {
-            Value::String(_) => Ok(vec![Value::String(String::new())]),
-            Value::Array(_) => Ok(vec![Value::Array(Vec::new())]),
+            Value::String(_) => Ok(vec![Value::string("")]),
+            Value::Array(_) => Ok(vec![Value::array(Vec::new())]),
             _ => Err(VmError::TypeMismatch("string/array")),
         };
     }
@@ -45,11 +46,15 @@ pub(super) fn builtin_slice(args: Vec<Value>) -> VmResult<Vec<Value>> {
     match source {
         Value::String(text) => {
             let out = text.chars().skip(start).take(len).collect::<String>();
-            Ok(vec![Value::String(out)])
+            Ok(vec![Value::string(out)])
         }
         Value::Array(values) => {
-            let out = values.into_iter().skip(start).take(len).collect::<Vec<_>>();
-            Ok(vec![Value::Array(out)])
+            let out = unwrap_or_clone_shared(values)
+                .into_iter()
+                .skip(start)
+                .take(len)
+                .collect::<Vec<_>>();
+            Ok(vec![Value::array(out)])
         }
         _ => Err(VmError::TypeMismatch("string/array")),
     }
@@ -66,14 +71,14 @@ pub(super) fn builtin_concat(args: Vec<Value>) -> VmResult<Vec<Value>> {
     match (lhs, rhs) {
         (Value::String(lhs), Value::String(rhs)) => {
             let mut out = String::with_capacity(lhs.len() + rhs.len());
-            out.push_str(&lhs);
-            out.push_str(&rhs);
-            Ok(vec![Value::String(out)])
+            out.push_str(lhs.as_str());
+            out.push_str(rhs.as_str());
+            Ok(vec![Value::string(out)])
         }
         (Value::Array(lhs), Value::Array(rhs)) => {
-            let mut out = lhs;
-            out.extend(rhs);
-            Ok(vec![Value::Array(out)])
+            let mut out = unwrap_or_clone_shared(lhs);
+            out.extend(unwrap_or_clone_shared(rhs));
+            Ok(vec![Value::array(out)])
         }
         _ => Err(VmError::TypeMismatch("string/string or array/array")),
     }
@@ -85,14 +90,14 @@ pub(super) fn builtin_array_push(args: Vec<Value>) -> VmResult<Vec<Value>> {
         .next()
         .ok_or_else(|| VmError::HostError("missing array argument".to_string()))?
     {
-        Value::Array(values) => values,
+        Value::Array(values) => unwrap_or_clone_shared(values),
         _ => return Err(VmError::TypeMismatch("array")),
     };
     let value = iter
         .next()
         .ok_or_else(|| VmError::HostError("missing value argument".to_string()))?;
     out.push(value);
-    Ok(vec![Value::Array(out)])
+    Ok(vec![Value::array(out)])
 }
 
 pub(super) fn builtin_get(args: Vec<Value>) -> VmResult<Vec<Value>> {
@@ -114,7 +119,7 @@ pub(super) fn builtin_get(args: Vec<Value>) -> VmResult<Vec<Value>> {
             }
             let index = usize::try_from(index)
                 .map_err(|_| VmError::HostError("array index overflow".to_string()))?;
-            let mut values = values;
+            let mut values = unwrap_or_clone_shared(values);
             if index >= values.len() {
                 return Err(VmError::HostError(format!(
                     "array index {index} out of bounds"
@@ -124,9 +129,9 @@ pub(super) fn builtin_get(args: Vec<Value>) -> VmResult<Vec<Value>> {
             Ok(vec![value])
         }
         Value::Map(entries) => {
-            for (existing_key, value) in entries {
-                if existing_key == key {
-                    return Ok(vec![value]);
+            for (existing_key, value) in entries.iter() {
+                if *existing_key == key {
+                    return Ok(vec![value.clone()]);
                 }
             }
             Err(VmError::HostError("map key not found".to_string()))
@@ -143,7 +148,7 @@ pub(super) fn builtin_get(args: Vec<Value>) -> VmResult<Vec<Value>> {
             let value = text
                 .chars()
                 .nth(index)
-                .map(|ch| Value::String(ch.to_string()))
+                .map(|ch| Value::string(ch.to_string()))
                 .ok_or_else(|| VmError::HostError(format!("string index {index} out of bounds")))?;
             Ok(vec![value])
         }
@@ -164,7 +169,7 @@ pub(super) fn builtin_type_of(args: &[Value]) -> VmResult<Vec<Value>> {
         Value::Array(_) => "array",
         Value::Map(_) => "map",
     };
-    Ok(vec![Value::String(ty.to_string())])
+    Ok(vec![Value::string(ty)])
 }
 
 pub(super) fn builtin_to_string(args: &[Value]) -> VmResult<Vec<Value>> {
@@ -172,7 +177,7 @@ pub(super) fn builtin_to_string(args: &[Value]) -> VmResult<Vec<Value>> {
         .first()
         .ok_or_else(|| VmError::HostError("missing argument to __to_string".to_string()))?;
     let text = render_value_for_display(value);
-    Ok(vec![Value::String(text)])
+    Ok(vec![Value::string(text)])
 }
 
 pub(super) fn builtin_format_template(args: Vec<Value>) -> VmResult<Vec<Value>> {
@@ -202,7 +207,7 @@ pub(super) fn builtin_format_template(args: Vec<Value>) -> VmResult<Vec<Value>> 
                 "format string and arguments are incompatible at byte {offset}: {template}"
             ))
         })?;
-    Ok(vec![Value::String(rendered)])
+    Ok(vec![Value::string(rendered)])
 }
 
 fn render_value_for_display(value: &Value) -> String {
@@ -211,7 +216,7 @@ fn render_value_for_display(value: &Value) -> String {
         Value::Int(v) => v.to_string(),
         Value::Float(v) => v.to_string(),
         Value::Bool(v) => v.to_string(),
-        Value::String(v) => v.clone(),
+        Value::String(v) => v.as_str().to_string(),
         Value::Array(values) => {
             let parts = values
                 .iter()
@@ -260,7 +265,7 @@ impl FormatArgument for Value {
             Value::Int(value) => std::fmt::Display::fmt(value, f),
             Value::Float(value) => std::fmt::Display::fmt(value, f),
             Value::Bool(value) => std::fmt::Display::fmt(value, f),
-            Value::String(value) => std::fmt::Display::fmt(value, f),
+            Value::String(value) => std::fmt::Display::fmt(value.as_str(), f),
             Value::Array(_) | Value::Map(_) => f.write_str(render_value_for_display(self).as_str()),
         }
     }
@@ -271,17 +276,17 @@ impl FormatArgument for Value {
             Value::Int(value) => std::fmt::Debug::fmt(value, f),
             Value::Float(value) => std::fmt::Debug::fmt(value, f),
             Value::Bool(value) => std::fmt::Debug::fmt(value, f),
-            Value::String(value) => std::fmt::Debug::fmt(value, f),
+            Value::String(value) => std::fmt::Debug::fmt(value.as_str(), f),
             Value::Array(values) => {
                 let mut list = f.debug_list();
-                for value in values {
+                for value in values.iter() {
                     list.entry(value);
                 }
                 list.finish()
             }
             Value::Map(entries) => {
                 let mut map = f.debug_map();
-                for (key, value) in entries {
+                for (key, value) in entries.iter() {
                     map.entry(key, value);
                 }
                 map.finish()
@@ -363,7 +368,7 @@ pub(super) fn builtin_set(args: Vec<Value>) -> VmResult<Vec<Value>> {
             }
             let index = usize::try_from(index)
                 .map_err(|_| VmError::HostError("array index overflow".to_string()))?;
-            let mut out = values;
+            let mut out = unwrap_or_clone_shared(values);
             if index < out.len() {
                 out[index] = value;
             } else if index == out.len() {
@@ -373,10 +378,10 @@ pub(super) fn builtin_set(args: Vec<Value>) -> VmResult<Vec<Value>> {
                     "array index {index} out of bounds"
                 )));
             }
-            Ok(vec![Value::Array(out)])
+            Ok(vec![Value::array(out)])
         }
         Value::Map(entries) => {
-            let mut out = entries;
+            let mut out = unwrap_or_clone_shared(entries);
             if let Some((_, existing_value)) = out
                 .iter_mut()
                 .find(|(existing_key, _)| *existing_key == key)
@@ -385,7 +390,7 @@ pub(super) fn builtin_set(args: Vec<Value>) -> VmResult<Vec<Value>> {
             } else {
                 out.push((key, value));
             }
-            Ok(vec![Value::Map(out)])
+            Ok(vec![Value::map(out)])
         }
         _ => Err(VmError::TypeMismatch("array/map")),
     }
@@ -401,10 +406,13 @@ pub(super) fn builtin_keys(args: Vec<Value>) -> VmResult<Vec<Value>> {
         Value::Array(values) => (0..values.len())
             .map(|index| Value::Int(index as i64))
             .collect::<Vec<_>>(),
-        Value::Map(entries) => entries.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
+        Value::Map(entries) => unwrap_or_clone_shared(entries)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>(),
         _ => return Err(VmError::TypeMismatch("array/map")),
     };
-    Ok(vec![Value::Array(keys)])
+    Ok(vec![Value::array(keys)])
 }
 
 pub(super) fn builtin_count(args: &[Value]) -> VmResult<Vec<Value>> {
@@ -428,5 +436,79 @@ pub(super) fn builtin_assert(args: &[Value]) -> VmResult<Vec<Value>> {
         Ok(Vec::new())
     } else {
         Err(VmError::HostError("assertion failed".to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn array_push_detaches_shared_array_before_write() {
+        let shared = Value::array(vec![Value::Int(1)]);
+        let alias = shared.clone();
+
+        let out = builtin_array_push(vec![shared, Value::Int(2)]).expect("array push should work");
+        let [Value::Array(result)] = out.as_slice() else {
+            panic!("expected array result");
+        };
+        let Value::Array(alias_values) = &alias else {
+            panic!("expected array alias");
+        };
+
+        assert_eq!(alias_values.as_ref(), &vec![Value::Int(1)]);
+        assert_eq!(result.as_ref(), &vec![Value::Int(1), Value::Int(2)]);
+        assert!(
+            !Arc::ptr_eq(alias_values, result),
+            "mutating a shared array should detach backing storage"
+        );
+    }
+
+    #[test]
+    fn set_detaches_shared_array_before_write() {
+        let shared = Value::array(vec![Value::Int(1), Value::Int(2)]);
+        let alias = shared.clone();
+
+        let out =
+            builtin_set(vec![shared, Value::Int(0), Value::Int(9)]).expect("array set should work");
+        let [Value::Array(result)] = out.as_slice() else {
+            panic!("expected array result");
+        };
+        let Value::Array(alias_values) = &alias else {
+            panic!("expected array alias");
+        };
+
+        assert_eq!(alias_values.as_ref(), &vec![Value::Int(1), Value::Int(2)]);
+        assert_eq!(result.as_ref(), &vec![Value::Int(9), Value::Int(2)]);
+        assert!(
+            !Arc::ptr_eq(alias_values, result),
+            "mutating a shared array should detach backing storage"
+        );
+    }
+
+    #[test]
+    fn set_detaches_shared_map_before_write() {
+        let shared = Value::map(vec![(Value::string("k"), Value::Int(1))]);
+        let alias = shared.clone();
+
+        let out = builtin_set(vec![shared, Value::string("k"), Value::Int(9)])
+            .expect("map set should work");
+        let [Value::Map(result)] = out.as_slice() else {
+            panic!("expected map result");
+        };
+        let Value::Map(alias_entries) = &alias else {
+            panic!("expected map alias");
+        };
+
+        assert_eq!(
+            alias_entries.as_ref(),
+            &vec![(Value::string("k"), Value::Int(1))]
+        );
+        assert_eq!(result.as_ref(), &vec![(Value::string("k"), Value::Int(9))]);
+        assert!(
+            !Arc::ptr_eq(alias_entries, result),
+            "mutating a shared map should detach backing storage"
+        );
     }
 }

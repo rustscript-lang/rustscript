@@ -20,7 +20,7 @@ pub(super) fn builtin_re_find(args: &[Value]) -> VmResult<Vec<Value>> {
     let regex = Regex::new(pattern)
         .map_err(|err| VmError::HostError(format!("re_find invalid pattern: {err}")))?;
     let value = match regex.find(text) {
-        Some(matched) => Value::String(matched.as_str().to_string()),
+        Some(matched) => Value::string(matched.as_str().to_string()),
         None => Value::Null,
     };
     Ok(vec![value])
@@ -33,7 +33,7 @@ pub(super) fn builtin_re_replace(args: &[Value]) -> VmResult<Vec<Value>> {
     let regex = Regex::new(pattern)
         .map_err(|err| VmError::HostError(format!("re_replace invalid pattern: {err}")))?;
     let replaced = regex.replace_all(text, replacement).into_owned();
-    Ok(vec![Value::String(replaced)])
+    Ok(vec![Value::string(replaced)])
 }
 
 pub(super) fn builtin_re_split(args: &[Value]) -> VmResult<Vec<Value>> {
@@ -43,9 +43,9 @@ pub(super) fn builtin_re_split(args: &[Value]) -> VmResult<Vec<Value>> {
         .map_err(|err| VmError::HostError(format!("re_split invalid pattern: {err}")))?;
     let parts = regex
         .split(text)
-        .map(|part| Value::String(part.to_string()))
+        .map(|part| Value::string(part.to_string()))
         .collect::<Vec<_>>();
-    Ok(vec![Value::Array(parts)])
+    Ok(vec![Value::array(parts)])
 }
 
 pub(super) fn builtin_re_captures(args: &[Value]) -> VmResult<Vec<Value>> {
@@ -54,18 +54,18 @@ pub(super) fn builtin_re_captures(args: &[Value]) -> VmResult<Vec<Value>> {
     let regex = Regex::new(pattern)
         .map_err(|err| VmError::HostError(format!("re_captures invalid pattern: {err}")))?;
     let Some(captures) = regex.captures(text) else {
-        return Ok(vec![Value::Array(Vec::new())]);
+        return Ok(vec![Value::array(Vec::new())]);
     };
 
     let mut groups = Vec::with_capacity(captures.len());
     for index in 0..captures.len() {
         let group_value = match captures.get(index) {
-            Some(group) => Value::String(group.as_str().to_string()),
+            Some(group) => Value::string(group.as_str().to_string()),
             None => Value::Null,
         };
         groups.push(group_value);
     }
-    Ok(vec![Value::Array(groups)])
+    Ok(vec![Value::array(groups)])
 }
 
 const NAMESPACE_MEMBERS: &[BuiltinNamespaceMember] = &[

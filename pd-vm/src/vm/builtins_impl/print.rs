@@ -6,7 +6,7 @@ pub fn format_value(value: &Value) -> String {
         Value::Int(value) => value.to_string(),
         Value::Float(value) => value.to_string(),
         Value::Bool(value) => value.to_string(),
-        Value::String(value) => value.clone(),
+        Value::String(value) => value.as_str().to_string(),
         Value::Array(values) => {
             let parts = values
                 .iter()
@@ -103,9 +103,9 @@ mod tests {
 
     #[test]
     fn format_value_renders_nested_values() {
-        let value = Value::Map(vec![(
-            Value::String("items".to_string()),
-            Value::Array(vec![Value::Int(1), Value::Bool(true)]),
+        let value = Value::map(vec![(
+            Value::string("items"),
+            Value::array(vec![Value::Int(1), Value::Bool(true)]),
         )]);
         assert_eq!(format_value(&value), "{items: [1, true]}");
     }
@@ -121,7 +121,7 @@ mod tests {
         });
         let mut vm = vm_for_host_call();
 
-        host.call(&mut vm, &[Value::Int(2), Value::String("ok".to_string())])
+        host.call(&mut vm, &[Value::Int(2), Value::string("ok")])
             .expect("print host call should succeed");
 
         let guard = lines.lock().expect("sink should be lockable");
@@ -139,7 +139,7 @@ mod tests {
         });
         let mut vm = vm_for_host_call();
 
-        host.call(&mut vm, &[Value::String("line".to_string())])
+        host.call(&mut vm, &[Value::string("line")])
             .expect("println host call should succeed");
 
         let guard = lines.lock().expect("sink should be lockable");

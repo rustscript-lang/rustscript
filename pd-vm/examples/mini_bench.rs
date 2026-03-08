@@ -342,9 +342,7 @@ fn benchmark_runtime(config: &BenchConfig) -> Result<(), String> {
             aes_path.display()
         )
     })?;
-    let aes_expected = vec![Value::String(
-        "7649abac8119b246cee98e9b12e9197d".to_string(),
-    )];
+    let aes_expected = vec![Value::string("7649abac8119b246cee98e9b12e9197d")];
 
     let hot_loop = build_hot_loop_workload(config.hot_loop_inner, config.hot_loop_outer)?;
     let hot_expected = vec![Value::Int(hot_loop.expected)];

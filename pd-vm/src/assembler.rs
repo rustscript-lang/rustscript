@@ -123,12 +123,12 @@ impl Assembler {
                 index
             }
             Value::String(text) => {
-                if let Some(index) = self.string_constants.get(&text).copied() {
+                if let Some(index) = self.string_constants.get(text.as_str()).copied() {
                     return index;
                 }
                 let index = self.constants.len() as u32;
                 self.constants.push(Value::String(text.clone()));
-                self.string_constants.insert(text, index);
+                self.string_constants.insert(text.as_ref().clone(), index);
                 index
             }
             other => {
@@ -614,7 +614,7 @@ pub fn assemble(source: &str) -> Result<Program, AsmParseError> {
                             message: "missing string literal".to_string(),
                         });
                     }
-                    let value = Value::String(parse_string_literal(rest, line_no)?);
+                    let value = Value::string(parse_string_literal(rest, line_no)?);
                     let index = assembler.add_constant(value);
                     consts.insert(name.to_string(), index);
                 }
@@ -780,7 +780,7 @@ fn parse_f64(token: &str, line_no: usize, what: &str) -> Result<f64, AsmParseErr
 fn parse_literal(token: &str, line_no: usize) -> Result<Value, AsmParseError> {
     let token = token.trim();
     if token.starts_with('"') {
-        return Ok(Value::String(parse_string_literal(token, line_no)?));
+        return Ok(Value::string(parse_string_literal(token, line_no)?));
     }
     if token.eq_ignore_ascii_case("true") {
         Ok(Value::Bool(true))

@@ -601,7 +601,7 @@ fn hash_value(value: &Value, state: &mut impl Hasher) {
         Value::Array(values) => {
             4u8.hash(state);
             values.len().hash(state);
-            for value in values {
+            for value in values.iter() {
                 hash_value(value, state);
             }
         }
@@ -1685,19 +1685,23 @@ impl Vm {
     }
 
     fn drop_value_with_contract(&mut self, value: Value) {
+        self.count_value_drop_contract(&value);
+    }
+
+    fn count_value_drop_contract(&mut self, value: &Value) {
         match value {
             Value::Null => {}
             Value::Array(values) => {
                 self.drop_contract_events = self.drop_contract_events.saturating_add(1);
-                for item in values {
-                    self.drop_value_with_contract(item);
+                for item in values.iter() {
+                    self.count_value_drop_contract(item);
                 }
             }
             Value::Map(entries) => {
                 self.drop_contract_events = self.drop_contract_events.saturating_add(1);
-                for (key, value) in entries {
-                    self.drop_value_with_contract(key);
-                    self.drop_value_with_contract(value);
+                for (key, value) in entries.iter() {
+                    self.count_value_drop_contract(key);
+                    self.count_value_drop_contract(value);
                 }
             }
             Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::String(_) => {
@@ -1812,13 +1816,16 @@ impl Vm {
             (Value::Float(lhs), Value::Float(rhs)) => {
                 self.stack.push(Value::Float(lhs + rhs));
             }
-            (Value::String(mut lhs), Value::String(rhs)) => {
-                lhs.push_str(&rhs);
-                self.stack.push(Value::String(lhs));
+            (Value::String(lhs), Value::String(rhs)) => {
+                let mut out = String::with_capacity(lhs.len() + rhs.len());
+                out.push_str(lhs.as_str());
+                out.push_str(rhs.as_str());
+                self.stack.push(Value::string(out));
             }
-            (Value::Array(mut lhs), Value::Array(rhs)) => {
-                lhs.extend(rhs);
-                self.stack.push(Value::Array(lhs));
+            (Value::Array(lhs), Value::Array(rhs)) => {
+                let mut out = crate::bytecode::unwrap_or_clone_shared(lhs);
+                out.extend(crate::bytecode::unwrap_or_clone_shared(rhs));
+                self.stack.push(Value::array(out));
             }
             _ => {
                 return Err(VmError::TypeMismatch("number/string or array/array"));
@@ -2192,7 +2199,7 @@ impl Drop for Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     fn native_cache_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2380,6 +2387,157 @@ mod tests {
         vm.execute_interpreter_instruction(opcode)
     }
 
+    fn assert_shared_heap_backing(lhs: &Value, rhs: &Value) {
+        match (lhs, rhs) {
+            (Value::String(lhs), Value::String(rhs)) => {
+                assert!(Arc::ptr_eq(lhs, rhs), "expected shared string backing");
+            }
+            (Value::Array(lhs), Value::Array(rhs)) => {
+                assert!(Arc::ptr_eq(lhs, rhs), "expected shared array backing");
+            }
+            (Value::Map(lhs), Value::Map(rhs)) => {
+                assert!(Arc::ptr_eq(lhs, rhs), "expected shared map backing");
+            }
+            _ => panic!("expected matching heap values, got lhs={lhs:?} rhs={rhs:?}"),
+        }
+    }
+
+    #[test]
+    fn interpreter_ldc_shares_string_constant_backing() {
+        let program = Program::new(
+            vec![Value::string("shared")],
+            vec![OpCode::Ldc as u8, 0, 0, 0, 0, OpCode::Ret as u8],
+        );
+        let mut vm = Vm::new(program);
+
+        let outcome = step_once(&mut vm).expect("ldc should execute");
+        assert!(matches!(outcome, ExecOutcome::Continue));
+        let constant = vm
+            .program
+            .constants
+            .first()
+            .expect("program should keep a constant");
+        assert_shared_heap_backing(constant, &vm.stack()[0]);
+    }
+
+    #[test]
+    fn interpreter_dup_shares_array_backing() {
+        let program = Program::new(vec![], vec![OpCode::Dup as u8, OpCode::Ret as u8]);
+        let mut vm = Vm::new(program);
+        vm.stack
+            .push(Value::array(vec![Value::Int(1), Value::Int(2)]));
+
+        let outcome = step_once(&mut vm).expect("dup should execute");
+        assert!(matches!(outcome, ExecOutcome::Continue));
+        assert_eq!(vm.stack().len(), 2);
+        assert_shared_heap_backing(&vm.stack()[0], &vm.stack()[1]);
+    }
+
+    #[test]
+    fn shared_string_survives_local_overwrite_after_copy_like_read() {
+        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
+        let program = Program::new(
+            vec![Value::Null],
+            vec![
+                OpCode::Ldloc as u8,
+                0,
+                OpCode::Dup as u8,
+                OpCode::Stloc as u8,
+                0,
+                OpCode::Ldc as u8,
+                0,
+                0,
+                0,
+                0,
+                OpCode::Stloc as u8,
+                0,
+                OpCode::Call as u8,
+                call_lo,
+                call_hi,
+                1,
+                OpCode::Ret as u8,
+            ],
+        )
+        .with_local_count(1);
+        let mut vm = Vm::new(program);
+        vm.locals[0] = Value::string("alive");
+
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(vm.locals()[0], Value::Null);
+        assert_eq!(vm.stack(), &[Value::Int(5)]);
+    }
+
+    #[test]
+    fn shared_array_survives_local_overwrite_after_copy_like_read() {
+        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
+        let program = Program::new(
+            vec![Value::Null],
+            vec![
+                OpCode::Ldloc as u8,
+                0,
+                OpCode::Dup as u8,
+                OpCode::Stloc as u8,
+                0,
+                OpCode::Ldc as u8,
+                0,
+                0,
+                0,
+                0,
+                OpCode::Stloc as u8,
+                0,
+                OpCode::Call as u8,
+                call_lo,
+                call_hi,
+                1,
+                OpCode::Ret as u8,
+            ],
+        )
+        .with_local_count(1);
+        let mut vm = Vm::new(program);
+        vm.locals[0] = Value::array(vec![Value::Int(1), Value::Int(2)]);
+
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(vm.locals()[0], Value::Null);
+        assert_eq!(vm.stack(), &[Value::Int(2)]);
+    }
+
+    #[test]
+    fn shared_map_survives_local_overwrite_after_copy_like_read() {
+        let [call_lo, call_hi] = BuiltinFunction::Count.call_index().to_le_bytes();
+        let program = Program::new(
+            vec![Value::Null],
+            vec![
+                OpCode::Ldloc as u8,
+                0,
+                OpCode::Dup as u8,
+                OpCode::Stloc as u8,
+                0,
+                OpCode::Ldc as u8,
+                0,
+                0,
+                0,
+                0,
+                OpCode::Stloc as u8,
+                0,
+                OpCode::Call as u8,
+                call_lo,
+                call_hi,
+                1,
+                OpCode::Ret as u8,
+            ],
+        )
+        .with_local_count(1);
+        let mut vm = Vm::new(program);
+        vm.locals[0] = Value::map(vec![(Value::string("k"), Value::Int(9))]);
+
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(vm.locals()[0], Value::Null);
+        assert_eq!(vm.stack(), &[Value::Int(1)]);
+    }
+
     #[test]
     fn interpreter_fuses_ldloc_dup_stloc_same_slot_without_fuel() {
         let program = Program::new(
@@ -2395,7 +2553,7 @@ mod tests {
         )
         .with_local_count(1);
         let mut vm = Vm::new(program);
-        let map_value = Value::Map(vec![(Value::String("k".to_string()), Value::Int(9))]);
+        let map_value = Value::map(vec![(Value::string("k"), Value::Int(9))]);
         vm.locals[0] = map_value.clone();
 
         let outcome = step_once(&mut vm).expect("ldloc should execute");
@@ -2407,6 +2565,7 @@ mod tests {
             &[map_value],
             "stack should receive copied value"
         );
+        assert_shared_heap_backing(&vm.locals[0], &vm.stack()[0]);
         assert_eq!(
             vm.drop_contract_event_count(),
             0,
@@ -2458,6 +2617,32 @@ mod tests {
     }
 
     #[test]
+    fn interpreter_copy_like_ldloc_dup_stloc_shares_map_backing_with_fuel() {
+        let program = Program::new(
+            vec![],
+            vec![
+                OpCode::Ldloc as u8,
+                0,
+                OpCode::Dup as u8,
+                OpCode::Stloc as u8,
+                0,
+                OpCode::Ret as u8,
+            ],
+        )
+        .with_local_count(1);
+        let mut vm = Vm::new(program);
+        vm.locals[0] = Value::map(vec![(Value::string("k"), Value::Int(9))]);
+        vm.set_fuel(32);
+
+        let _ = step_once(&mut vm).expect("ldloc should execute");
+        let _ = step_once(&mut vm).expect("dup should execute");
+        let _ = step_once(&mut vm).expect("stloc should execute");
+
+        assert_eq!(vm.stack().len(), 1);
+        assert_shared_heap_backing(&vm.locals[0], &vm.stack()[0]);
+    }
+
+    #[test]
     fn interpreter_does_not_fuse_ldloc_dup_stloc_when_epoch_enabled() {
         let program = Program::new(
             vec![],
@@ -2491,7 +2676,7 @@ mod tests {
             vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
         );
         let mut vm = Vm::new(program);
-        vm.stack.push(Value::String("tail".to_string()));
+        vm.stack.push(Value::string("tail"));
 
         let outcome = step_once(&mut vm).expect("call should execute");
         assert!(matches!(outcome, ExecOutcome::Halted));
@@ -2508,7 +2693,7 @@ mod tests {
         );
         let mut vm = Vm::new(program);
         vm.set_fuel(1);
-        vm.stack.push(Value::String("tail".to_string()));
+        vm.stack.push(Value::string("tail"));
 
         // `step_once` bypasses the outer run-loop pre-tick, so this fuel only covers fused `ret`.
         let call = step_once(&mut vm).expect("call should execute");
@@ -2527,7 +2712,7 @@ mod tests {
         );
         let mut vm = Vm::new(program);
         vm.set_fuel(0);
-        vm.stack.push(Value::String("tail".to_string()));
+        vm.stack.push(Value::string("tail"));
 
         let err = match step_once(&mut vm) {
             Ok(_) => panic!("tail tick should fail with out-of-fuel"),
@@ -2551,7 +2736,7 @@ mod tests {
         let mut vm = Vm::new(program);
         vm.set_epoch_deadline(0)
             .expect("setting epoch deadline should succeed");
-        vm.stack.push(Value::String("tail".to_string()));
+        vm.stack.push(Value::string("tail"));
 
         let err = match step_once(&mut vm) {
             Ok(_) => panic!("tail tick should fail with epoch deadline reached"),
@@ -2574,7 +2759,7 @@ mod tests {
         );
         let mut vm = Vm::new(program);
         vm.set_fuel(2);
-        vm.stack.push(Value::String("tail".to_string()));
+        vm.stack.push(Value::string("tail"));
 
         let status = vm.run().expect("run should complete");
         assert_eq!(status, VmStatus::Halted);
@@ -2596,7 +2781,7 @@ mod tests {
         );
         let mut vm = Vm::new(program);
         vm.set_fuel(1);
-        vm.stack.push(Value::String("tail".to_string()));
+        vm.stack.push(Value::string("tail"));
 
         let status = vm.run().expect("first run should yield");
         assert_eq!(status, VmStatus::Yielded);
@@ -2627,7 +2812,7 @@ mod tests {
         vm.set_epoch_deadline(1)
             .expect("setting epoch deadline should succeed");
         assert_eq!(vm.increment_epoch(), 1);
-        vm.stack.push(Value::String("tail".to_string()));
+        vm.stack.push(Value::string("tail"));
 
         let status = vm.run().expect("first run should yield");
         assert_eq!(status, VmStatus::Yielded);

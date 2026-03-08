@@ -13,7 +13,7 @@ fn wire_roundtrip_preserves_constants_and_code() {
             Value::Int(42),
             Value::Float(3.5),
             Value::Bool(true),
-            Value::String("hello".to_string()),
+            Value::string("hello"),
         ],
         vec![0x00, 0x01, 0x02],
         vec![HostImport {
@@ -112,7 +112,7 @@ fn validate_accepts_known_good_program() {
     bc.ret();
 
     let program = Program::with_imports_and_debug(
-        vec![Value::String("x".to_string())],
+        vec![Value::string("x")],
         bc.finish(),
         vec![HostImport {
             name: "print".to_string(),
@@ -168,7 +168,7 @@ fn disassemble_vmbc_outputs_readable_listing() {
     bc.call(0, 1);
     bc.ret();
     let program = Program::with_imports_and_debug(
-        vec![Value::String("x".to_string())],
+        vec![Value::string("x")],
         bc.finish(),
         vec![HostImport {
             name: "print".to_string(),
@@ -254,15 +254,15 @@ fn disassemble_vmbc_hides_source_without_flag() {
 #[test]
 fn assembler_deduplicates_equal_string_constants() {
     let mut asm = Assembler::new();
-    let idx0 = asm.add_constant(Value::String("same".to_string()));
-    let idx1 = asm.add_constant(Value::String("same".to_string()));
+    let idx0 = asm.add_constant(Value::string("same"));
+    let idx1 = asm.add_constant(Value::string("same"));
     assert_eq!(idx0, idx1);
     asm.ldc(idx0);
     asm.ldc(idx1);
     asm.ret();
 
     let program = asm.finish_program().expect("assembler should finish");
-    assert_eq!(program.constants, vec![Value::String("same".to_string())]);
+    assert_eq!(program.constants, vec![Value::string("same")]);
 }
 
 #[test]

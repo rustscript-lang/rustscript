@@ -1,12 +1,60 @@
+use std::sync::Arc;
+
+pub type SharedString = Arc<String>;
+pub type SharedArray = Arc<Vec<Value>>;
+pub type SharedMap = Arc<Vec<(Value, Value)>>;
+
 #[derive(Clone, Debug)]
 pub enum Value {
     Null,
     Int(i64),
     Float(f64),
     Bool(bool),
-    String(String),
-    Array(Vec<Value>),
-    Map(Vec<(Value, Value)>),
+    String(SharedString),
+    Array(SharedArray),
+    Map(SharedMap),
+}
+
+impl Value {
+    pub fn string(value: impl Into<String>) -> Self {
+        Self::String(Arc::new(value.into()))
+    }
+
+    pub fn array(values: Vec<Value>) -> Self {
+        Self::Array(Arc::new(values))
+    }
+
+    pub fn map(entries: Vec<(Value, Value)>) -> Self {
+        Self::Map(Arc::new(entries))
+    }
+
+    pub fn into_owned_string(self) -> Result<String, Self> {
+        match self {
+            Self::String(value) => Ok(unwrap_or_clone_shared(value)),
+            other => Err(other),
+        }
+    }
+
+    pub fn into_owned_array(self) -> Result<Vec<Value>, Self> {
+        match self {
+            Self::Array(values) => Ok(unwrap_or_clone_shared(values)),
+            other => Err(other),
+        }
+    }
+
+    pub fn into_owned_map(self) -> Result<Vec<(Value, Value)>, Self> {
+        match self {
+            Self::Map(entries) => Ok(unwrap_or_clone_shared(entries)),
+            other => Err(other),
+        }
+    }
+}
+
+pub(crate) fn unwrap_or_clone_shared<T: Clone>(value: Arc<T>) -> T {
+    match Arc::try_unwrap(value) {
+        Ok(inner) => inner,
+        Err(shared) => (*shared).clone(),
+    }
 }
 
 impl PartialEq for Value {
@@ -18,7 +66,7 @@ impl PartialEq for Value {
             (Self::Bool(lhs), Self::Bool(rhs)) => lhs == rhs,
             (Self::String(lhs), Self::String(rhs)) => lhs == rhs,
             (Self::Array(lhs), Self::Array(rhs)) => lhs == rhs,
-            (Self::Map(lhs), Self::Map(rhs)) => map_entries_eq(lhs, rhs),
+            (Self::Map(lhs), Self::Map(rhs)) => map_entries_eq(lhs.as_slice(), rhs.as_slice()),
             _ => false,
         }
     }
@@ -284,5 +332,34 @@ impl OpCode {
             "lshr" => Some(OpCode::Lshr),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heap_value_clone_shares_backing() {
+        let string = Value::string("hello");
+        let string_clone = string.clone();
+        let (Value::String(lhs), Value::String(rhs)) = (&string, &string_clone) else {
+            panic!("expected string values");
+        };
+        assert!(Arc::ptr_eq(lhs, rhs));
+
+        let array = Value::array(vec![Value::Int(1), Value::Int(2)]);
+        let array_clone = array.clone();
+        let (Value::Array(lhs), Value::Array(rhs)) = (&array, &array_clone) else {
+            panic!("expected array values");
+        };
+        assert!(Arc::ptr_eq(lhs, rhs));
+
+        let map = Value::map(vec![(Value::string("k"), Value::Int(9))]);
+        let map_clone = map.clone();
+        let (Value::Map(lhs), Value::Map(rhs)) = (&map, &map_clone) else {
+            panic!("expected map values");
+        };
+        assert!(Arc::ptr_eq(lhs, rhs));
     }
 }

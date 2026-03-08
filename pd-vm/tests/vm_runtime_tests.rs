@@ -137,7 +137,7 @@ fn namespaced_builtin_io_call_can_be_overridden_by_host_binding() {
 
     impl HostFunction for ExistsOverride {
         fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-            assert_eq!(args, &[Value::String("request_body".to_string())]);
+            assert_eq!(args, &[Value::string("request_body")]);
             Ok(CallOutcome::Return(vec![Value::Bool(false)]))
         }
     }
@@ -163,10 +163,8 @@ fn namespaced_builtin_json_encode_call_can_be_overridden_by_host_binding() {
 
     impl HostFunction for JsonEncodeOverride {
         fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-            assert_eq!(args, &[Value::String("request_body".to_string())]);
-            Ok(CallOutcome::Return(vec![Value::String(
-                "\"override\"".to_string(),
-            )]))
+            assert_eq!(args, &[Value::string("request_body")]);
+            Ok(CallOutcome::Return(vec![Value::string("\"override\"")]))
         }
     }
 
@@ -182,7 +180,7 @@ fn namespaced_builtin_json_encode_call_can_be_overridden_by_host_binding() {
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("\"override\"".to_string())]);
+    assert_eq!(vm.stack(), &[Value::string("\"override\"")]);
 }
 
 #[test]
@@ -274,9 +272,9 @@ fn json_encode_rejects_non_string_map_keys() {
 fn json_encode_rejects_duplicate_map_keys() {
     const BUILTIN_JSON_ENCODE: u16 = 0xFFF7;
 
-    let duplicate_map = Value::Map(vec![
-        (Value::String("k".to_string()), Value::Int(1)),
-        (Value::String("k".to_string()), Value::Int(2)),
+    let duplicate_map = Value::map(vec![
+        (Value::string("k"), Value::Int(1)),
+        (Value::string("k"), Value::Int(2)),
     ]);
     let mut bc = BytecodeBuilder::new();
     bc.ldc(0);
@@ -405,7 +403,7 @@ fn assemble_text_with_data_and_string() {
     let status = vm.run().expect("vm should run");
 
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("hello".to_string())]);
+    assert_eq!(vm.stack(), &[Value::string("hello")]);
 }
 
 #[test]
@@ -943,13 +941,13 @@ fn resume_on_halted_vm_returns_bytecode_bounds() {
 #[test]
 fn map_equality_ignores_entry_order() {
     let constants = vec![
-        Value::Map(vec![
-            (Value::String("a".to_string()), Value::Int(1)),
-            (Value::String("b".to_string()), Value::Int(2)),
+        Value::map(vec![
+            (Value::string("a"), Value::Int(1)),
+            (Value::string("b"), Value::Int(2)),
         ]),
-        Value::Map(vec![
-            (Value::String("b".to_string()), Value::Int(2)),
-            (Value::String("a".to_string()), Value::Int(1)),
+        Value::map(vec![
+            (Value::string("b"), Value::Int(2)),
+            (Value::string("a"), Value::Int(1)),
         ]),
     ];
     let mut bc = BytecodeBuilder::new();
@@ -971,12 +969,12 @@ fn get_and_set_use_the_first_duplicate_map_entry() {
     const BUILTIN_GET: u16 = 0xFFE6;
     const BUILTIN_SET: u16 = 0xFFE7;
 
-    let map = Value::Map(vec![
-        (Value::String("k".to_string()), Value::Int(1)),
-        (Value::String("k".to_string()), Value::Int(2)),
-        (Value::String("z".to_string()), Value::Int(3)),
+    let map = Value::map(vec![
+        (Value::string("k"), Value::Int(1)),
+        (Value::string("k"), Value::Int(2)),
+        (Value::string("z"), Value::Int(3)),
     ]);
-    let constants = vec![map, Value::String("k".to_string()), Value::Int(9)];
+    let constants = vec![map, Value::string("k"), Value::Int(9)];
 
     let mut get_bc = BytecodeBuilder::new();
     get_bc.ldc(0);
@@ -1001,11 +999,11 @@ fn get_and_set_use_the_first_duplicate_map_entry() {
         panic!("expected map result, got {:?}", set_vm.stack());
     };
     assert_eq!(
-        entries,
+        entries.as_ref(),
         &vec![
-            (Value::String("k".to_string()), Value::Int(9)),
-            (Value::String("k".to_string()), Value::Int(2)),
-            (Value::String("z".to_string()), Value::Int(3)),
+            (Value::string("k"), Value::Int(9)),
+            (Value::string("k"), Value::Int(2)),
+            (Value::string("z"), Value::Int(3)),
         ]
     );
 }
@@ -1015,7 +1013,7 @@ fn set_rejects_sparse_array_indexes() {
     const BUILTIN_SET: u16 = 0xFFE7;
 
     let constants = vec![
-        Value::Array(vec![Value::Int(10), Value::Int(20)]),
+        Value::array(vec![Value::Int(10), Value::Int(20)]),
         Value::Int(4),
         Value::Int(99),
     ];

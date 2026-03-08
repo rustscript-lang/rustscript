@@ -249,10 +249,10 @@ impl HostFunction for AddOne {
 impl HostFunction for EchoString {
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
         let value = match args.first() {
-            Some(Value::String(value)) => value.clone(),
+            Some(Value::String(value)) => value.as_str().to_string(),
             _ => return Err(vm::VmError::TypeMismatch("string")),
         };
-        Ok(CallOutcome::Return(vec![Value::String(value)]))
+        Ok(CallOutcome::Return(vec![Value::string(value)]))
     }
 }
 

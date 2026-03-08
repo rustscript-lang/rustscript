@@ -417,9 +417,64 @@ Instruction set:
 
 Host calls and resuming:
 
-- `call` dispatches to builtin or bound host function
-- host functions can yield
-- `vm.resume()` continues from the next instruction
+The `call` opcode pops its arguments, dispatches to a builtin or bound host function via
+`Vm::execute_host_call`, and handles three distinct outcomes:
+
+| `CallOutcome` | Meaning | IP after suspension | Stack after suspension |
+|---|---|---|---|
+| `Return(values)` | Synchronous result | Advanced past `call` | Return values pushed |
+| `Yield` | Retry next `run()` | **Rewound to `call` opcode** | **Args re-pushed** |
+| `Pending(op_id)` | Async result pending | Advanced past `call` | Empty (result injected via `complete_host_op`) |
+
+**`CallOutcome::Yield`** — cooperative "retry me later":
+
+- The VM re-pushes the original args onto the stack and rewinds `self.ip` to the start of the
+  `call` opcode (`call_ip`). The next `run()` / `resume()` re-executes the entire `call` from
+  scratch, re-popping args and re-invoking the host function.
+- The host function must be idempotent with respect to yield (it will be called again).
+- Returns `VmStatus::Yielded` with `last_yield_reason() == Some(VmYieldReason::Host)`.
+- **Not supported in native-only AOT bundles** — such bundles require bytecode replay to rewind
+  IP, which is unavailable without persisted bytecode. Returning `Yield` from a host function
+  while running a native-only AOT bundle is a hard runtime error.
+
+**`CallOutcome::Pending(op_id)`** — async host operation:
+
+- The VM advances `self.ip` past the `call` instruction (to `call_ip + 4`) and records
+  `waiting_host_op = Some(op_id)`.
+- Subsequent calls to `run()` immediately return `VmStatus::Waiting(op_id)` until the caller
+  resolves the op via `vm.complete_host_op(op_id, values)` (which pushes return values) or via
+  `vm.poll_waiting_host_op()` / `vm.await_waiting_host_op()`.
+- Supported in native-only AOT bundles.
+
+**Cooperative interruption yields (fuel / epoch)**:
+
+- The fuel/epoch check fires in the interpreter loop **before** each opcode fetch, so no
+  instruction is partially executed when a budget yield occurs. The IP is unchanged; refueling
+  and calling `run()` again resumes from exactly the same instruction.
+- A special case exists for the **fused `call; ret` tail pattern**: when the call immediately
+  precedes `ret`, the VM consumes the trailing `ret` inline and charges an extra interrupt tick.
+  If that extra tick fires an out-of-fuel/epoch error, it is caught and surfaced as
+  `VmStatus::Yielded` after the call already completed and return values are on the stack. The
+  IP at that point is past the `ret`, so the resumed `run()` halts cleanly.
+
+**Context-switch safety invariant**:
+
+There are two distinct suspension categories, each safe for a different reason:
+
+1. **Host-driven suspension** (`CallOutcome::Yield` and `CallOutcome::Pending`) is only
+   triggered from within `execute_host_call`, which is only reachable via the `call` opcode
+   handler. Every other instruction either completes fully or returns a hard `VmError`, so
+   host-driven suspension never interrupts a partially-executed instruction.
+
+2. **Cooperative interruption** (fuel / epoch) fires at **any instruction boundary** — the
+   check runs in the interpreter loop before the next opcode is fetched, so the VM can pause
+   before an assignment, an arithmetic op, a branch, etc. This is safe because no instruction
+   has started executing: the IP points at the unconsumed opcode and the stack is in a fully
+   consistent state from the previous instruction's completion.
+
+In both cases there is never a partially-executed instruction left in flight when the VM
+suspends. If a new instruction or path ever needs to trigger a suspension, it must ensure the
+stack and IP are fully coherent before doing so.
 
 ### Compiler Internals
 

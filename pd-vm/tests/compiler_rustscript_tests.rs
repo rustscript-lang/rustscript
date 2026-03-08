@@ -30,7 +30,7 @@ fn rustscript_http_subnamespace_host_calls_are_supported() {
             http::request::get_header("x-client-id");
         "#,
         flavor: SourceFlavor::RustScript,
-        expected_stack: vec![Value::String("x-client-id".to_string())],
+        expected_stack: vec![Value::string("x-client-id")],
         expected_locals: None,
     };
     let bindings = [HostBindingCase {
@@ -274,10 +274,7 @@ fn rustscript_literal_and_slice_runtime_cases_work() {
                 s;
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![
-                Value::String("A".to_string()),
-                Value::String("B".to_string()),
-            ],
+            expected_stack: vec![Value::string("A"), Value::string("B")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -343,7 +340,7 @@ fn rustscript_println_function_adds_newline() {
             println(40 + 2);
         "#,
         flavor: SourceFlavor::RustScript,
-        expected_stack: vec![Value::String("42\n".to_string())],
+        expected_stack: vec![Value::string("42\n")],
         expected_locals: None,
     };
     let bindings = [HostBindingCase {
@@ -363,7 +360,7 @@ fn rustscript_println_function_supports_basic_rust_style_formatting() {
             println("{} {}!", foo, bar);
         "#,
         flavor: SourceFlavor::RustScript,
-        expected_stack: vec![Value::String("hello 42!\n".to_string())],
+        expected_stack: vec![Value::string("hello 42!\n")],
         expected_locals: None,
     };
     let bindings = [HostBindingCase {
@@ -381,7 +378,7 @@ fn rustscript_print_function_supports_rust_style_formatting() {
             print("hex={:#x} bin={:08b} sci={:.1e}", 42, 5, 1234.0);
         "#,
         flavor: SourceFlavor::RustScript,
-        expected_stack: vec![Value::String("hex=0x2a bin=00000101 sci=1.2e3".to_string())],
+        expected_stack: vec![Value::string("hex=0x2a bin=00000101 sci=1.2e3")],
         expected_locals: None,
     };
     let bindings = [HostBindingCase {
@@ -399,7 +396,7 @@ fn rustscript_println_function_supports_rust_style_formatting() {
             println("{1} {0}", "left", "right");
         "#,
         flavor: SourceFlavor::RustScript,
-        expected_stack: vec![Value::String("right left\n".to_string())],
+        expected_stack: vec![Value::string("right left\n")],
         expected_locals: None,
     };
     let bindings = [HostBindingCase {
@@ -528,7 +525,7 @@ fn rustscript_named_function_capture_runtime_cases_work() {
                 add(d);
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("xx".to_string())],
+            expected_stack: vec![Value::string("xx")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -681,7 +678,7 @@ fn rustscript_closure_value_runtime_cases_work() {
                 f(0);
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("xx".to_string())],
+            expected_stack: vec![Value::string("xx")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -692,7 +689,7 @@ fn rustscript_closure_value_runtime_cases_work() {
                 f(0);
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("xx".to_string())],
+            expected_stack: vec![Value::string("xx")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -703,7 +700,7 @@ fn rustscript_closure_value_runtime_cases_work() {
                 f(0);
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("xx".to_string())],
+            expected_stack: vec![Value::string("xx")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -715,7 +712,7 @@ fn rustscript_closure_value_runtime_cases_work() {
                 f(d);
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("xx".to_string())],
+            expected_stack: vec![Value::string("xx")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -727,7 +724,7 @@ fn rustscript_closure_value_runtime_cases_work() {
                 f(d);
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("xx".to_string())],
+            expected_stack: vec![Value::string("xx")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -739,7 +736,7 @@ fn rustscript_closure_value_runtime_cases_work() {
                 f(d);
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("xx".to_string())],
+            expected_stack: vec![Value::string("xx")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -753,7 +750,7 @@ fn rustscript_closure_value_runtime_cases_work() {
                 apply_once(closure, "a");
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("a!".to_string())],
+            expected_stack: vec![Value::string("a!")],
             expected_locals: None,
         },
     ];
@@ -931,7 +928,7 @@ fn rustscript_move_and_alias_runtime_cases_work() {
                 first + second;
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("xx".to_string())],
+            expected_stack: vec![Value::string("xx")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -942,7 +939,7 @@ fn rustscript_move_and_alias_runtime_cases_work() {
                 a + b;
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("22".to_string())],
+            expected_stack: vec![Value::string("22")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -978,7 +975,7 @@ fn rustscript_move_and_alias_runtime_cases_work() {
                 first + second;
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("xx".to_string())],
+            expected_stack: vec![Value::string("xx")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -990,7 +987,7 @@ fn rustscript_move_and_alias_runtime_cases_work() {
                 first + second;
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("xx".to_string())],
+            expected_stack: vec![Value::string("xx")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -1002,7 +999,7 @@ fn rustscript_move_and_alias_runtime_cases_work() {
                 first + second;
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("xx".to_string())],
+            expected_stack: vec![Value::string("xx")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -1014,7 +1011,7 @@ fn rustscript_move_and_alias_runtime_cases_work() {
                 first + second;
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("xx".to_string())],
+            expected_stack: vec![Value::string("xx")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -1029,7 +1026,7 @@ fn rustscript_move_and_alias_runtime_cases_work() {
                 first + second;
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("xx".to_string())],
+            expected_stack: vec![Value::string("xx")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -1042,7 +1039,7 @@ fn rustscript_move_and_alias_runtime_cases_work() {
                 y + p.b;
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("444666".to_string())],
+            expected_stack: vec![Value::string("444666")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -1058,7 +1055,7 @@ fn rustscript_move_and_alias_runtime_cases_work() {
                 p.a;
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("new".to_string())],
+            expected_stack: vec![Value::string("new")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -1106,9 +1103,9 @@ fn rustscript_local_move_consumes_source_slot_at_runtime() {
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("2".to_string())]);
+    assert_eq!(vm.stack(), &[Value::string("2")]);
     assert_eq!(vm.locals().first(), Some(&Value::Null));
-    assert_eq!(vm.locals().get(1), Some(&Value::String("2".to_string())));
+    assert_eq!(vm.locals().get(1), Some(&Value::string("2")));
 }
 
 #[test]
@@ -1134,7 +1131,7 @@ fn rustscript_interprocedural_consumed_param_moves_caller_local_at_runtime() {
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("2".to_string())]);
+    assert_eq!(vm.stack(), &[Value::string("2")]);
     assert_eq!(vm.locals()[a_index as usize], Value::Null);
 }
 
@@ -1149,17 +1146,19 @@ fn rustscript_field_move_updates_runtime_container_state() {
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("x".to_string())]);
+    assert_eq!(vm.stack(), &[Value::string("x")]);
 
     let Some(Value::Map(entries)) = vm.locals().first() else {
         panic!("expected first local to be moved map container");
     };
     let mut saw_a_null = false;
     let mut saw_b_y = false;
-    for (key, value) in entries {
+    for (key, value) in entries.iter() {
         match (key, value) {
-            (Value::String(name), Value::Null) if name == "a" => saw_a_null = true,
-            (Value::String(name), Value::String(text)) if name == "b" && text == "y" => {
+            (Value::String(name), Value::Null) if name.as_str() == "a" => saw_a_null = true,
+            (Value::String(name), Value::String(text))
+                if name.as_str() == "b" && text.as_str() == "y" =>
+            {
                 saw_b_y = true
             }
             _ => {}
@@ -1185,17 +1184,19 @@ fn rustscript_field_move_expr_statement_updates_runtime_container_state() {
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("x".to_string())]);
+    assert_eq!(vm.stack(), &[Value::string("x")]);
 
     let Some(Value::Map(entries)) = vm.locals().first() else {
         panic!("expected first local to be moved map container");
     };
     let mut saw_a_null = false;
     let mut saw_b_y = false;
-    for (key, value) in entries {
+    for (key, value) in entries.iter() {
         match (key, value) {
-            (Value::String(name), Value::Null) if name == "a" => saw_a_null = true,
-            (Value::String(name), Value::String(text)) if name == "b" && text == "y" => {
+            (Value::String(name), Value::Null) if name.as_str() == "a" => saw_a_null = true,
+            (Value::String(name), Value::String(text))
+                if name.as_str() == "b" && text.as_str() == "y" =>
+            {
                 saw_b_y = true
             }
             _ => {}
@@ -1222,14 +1223,14 @@ fn rustscript_index_move_updates_runtime_container_state() {
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("x".to_string())]);
+    assert_eq!(vm.stack(), &[Value::string("x")]);
 
     let Some(Value::Array(values)) = vm.locals().first() else {
         panic!("expected first local to be moved array container");
     };
     assert_eq!(values.len(), 2);
     assert_eq!(values[0], Value::Null);
-    assert_eq!(values[1], Value::String("y".to_string()));
+    assert_eq!(values[1], Value::string("y"));
 }
 
 #[test]
@@ -1619,7 +1620,7 @@ fn rustscript_mutability_runtime_cases_work() {
                 first + second;
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::String("xx".to_string())],
+            expected_stack: vec![Value::string("xx")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -1734,7 +1735,7 @@ fn liveness_clears_local_after_closure_value_last_use() {
     assert!(
         !vm.stack()
             .iter()
-            .any(|value| matches!(value, Value::String(text) if text == "stale")),
+            .any(|value| matches!(value, Value::String(text) if text.as_str() == "stale")),
         "stack should not retain pre-call placeholder values"
     );
     assert_eq!(vm.locals()[closure_index as usize], Value::Null);
@@ -1778,7 +1779,7 @@ fn liveness_clears_local_after_function_value_last_use() {
     assert!(
         !vm.stack()
             .iter()
-            .any(|value| matches!(value, Value::String(text) if text == "stale")),
+            .any(|value| matches!(value, Value::String(text) if text.as_str() == "stale")),
         "stack should not retain pre-call placeholder values"
     );
     assert_eq!(vm.locals()[func_index as usize], Value::Null);
@@ -2333,7 +2334,7 @@ fn compile_source_file_module_override_path_redirects_import_spec() {
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("override-body".to_string())]);
+    assert_eq!(vm.stack(), &[Value::string("override-body")]);
 
     let _ = std::fs::remove_file(main_path);
     let _ = std::fs::remove_file(override_module_path);

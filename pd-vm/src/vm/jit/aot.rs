@@ -693,14 +693,14 @@ fn encode_aot_value(value: &Value, out: &mut Vec<u8>) -> VmResult<()> {
         Value::Array(values) => {
             out.push(5);
             write_aot_len(values.len(), "array value", out)?;
-            for value in values {
+            for value in values.iter() {
                 encode_aot_value(value, out)?;
             }
         }
         Value::Map(entries) => {
             out.push(6);
             write_aot_len(entries.len(), "map value", out)?;
-            for (key, value) in entries {
+            for (key, value) in entries.iter() {
                 encode_aot_value(key, out)?;
                 encode_aot_value(value, out)?;
             }
@@ -721,14 +721,14 @@ fn decode_aot_value(cursor: &mut AotCursor<'_>) -> VmResult<Value> {
                 return Err(VmError::JitNative(format!("invalid AOT bool tag {other}",)));
             }
         },
-        4 => Value::String(cursor.read_string("string value")?),
+        4 => Value::string(cursor.read_string("string value")?),
         5 => {
             let len = cursor.read_u32("array len")? as usize;
             let mut values = Vec::with_capacity(len);
             for _ in 0..len {
                 values.push(decode_aot_value(cursor)?);
             }
-            Value::Array(values)
+            Value::array(values)
         }
         6 => {
             let len = cursor.read_u32("map len")? as usize;
@@ -738,7 +738,7 @@ fn decode_aot_value(cursor: &mut AotCursor<'_>) -> VmResult<Value> {
                 let value = decode_aot_value(cursor)?;
                 entries.push((key, value));
             }
-            Value::Map(entries)
+            Value::map(entries)
         }
         other => {
             return Err(VmError::JitNative(

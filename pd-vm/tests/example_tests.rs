@@ -116,9 +116,7 @@ fn examples_run() {
     let stack = run_compiled_file(&root.join("aes_128_cbc_usage.rss"));
     assert_eq!(
         stack,
-        vec![Value::String(
-            "7649abac8119b246cee98e9b12e9197d".to_string()
-        )]
+        vec![Value::string("7649abac8119b246cee98e9b12e9197d")]
     );
 }
 
@@ -164,7 +162,7 @@ text?.[5];
             Value::Int(20),
             Value::Null,
             Value::Null,
-            Value::String("b".to_string()),
+            Value::string("b"),
             Value::Null,
         ]
     );
@@ -184,7 +182,7 @@ text?.[5];
             Value::Int(20),
             Value::Null,
             Value::Null,
-            Value::String("b".to_string()),
+            Value::string("b"),
             Value::Null,
         ]
     );

@@ -1087,17 +1087,17 @@ fn render_repl_value_literal(value: &Value) -> Option<String> {
         }
         Value::Float(_) => None,
         Value::Bool(flag) => Some(flag.to_string()),
-        Value::String(text) => Some(format!("\"{}\"", escape_repl_string_literal(text))),
+        Value::String(text) => Some(format!("\"{}\"", escape_repl_string_literal(text.as_str()))),
         Value::Array(items) => {
             let mut rendered = Vec::with_capacity(items.len());
-            for item in items {
+            for item in items.iter() {
                 rendered.push(render_repl_value_literal(item)?);
             }
             Some(format!("[{}]", rendered.join(", ")))
         }
         Value::Map(entries) => {
             let mut rendered = Vec::with_capacity(entries.len());
-            for (key, item) in entries {
+            for (key, item) in entries.iter() {
                 let rendered_key = render_repl_map_key_literal(key)?;
                 let rendered_value = render_repl_value_literal(item)?;
                 rendered.push(format!("{rendered_key}: {rendered_value}"));
@@ -1118,7 +1118,7 @@ fn render_repl_map_key_literal(value: &Value) -> Option<String> {
             }
         }
         Value::Bool(flag) => Some(flag.to_string()),
-        Value::String(text) => Some(format!("\"{}\"", escape_repl_string_literal(text))),
+        Value::String(text) => Some(format!("\"{}\"", escape_repl_string_literal(text.as_str()))),
         Value::Float(_) | Value::Array(_) | Value::Map(_) => None,
     }
 }
@@ -1180,7 +1180,7 @@ fn format_value(value: &Value) -> String {
         Value::Int(value) => value.to_string(),
         Value::Float(value) => value.to_string(),
         Value::Bool(value) => value.to_string(),
-        Value::String(value) => value.clone(),
+        Value::String(value) => value.as_str().to_string(),
         Value::Array(values) => {
             let parts = values
                 .iter()

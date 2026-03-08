@@ -198,7 +198,7 @@ pub(super) fn builtin_io_read_all(vm: &mut Vm, args: Vec<Value>) -> VmResult<Bui
             IoHandle::File(file) => file
                 .read_to_string(&mut out)
                 .map_err(|err| VmError::HostError(format!("io_read_all failed: {err}")))
-                .map(|_| vec![Value::String(out)]),
+                .map(|_| vec![Value::string(out)]),
             IoHandle::PopenRead { child } => {
                 let stdout = match child.stdout.as_mut() {
                     Some(stdout) => stdout,
@@ -214,7 +214,7 @@ pub(super) fn builtin_io_read_all(vm: &mut Vm, args: Vec<Value>) -> VmResult<Bui
                 stdout
                     .read_to_string(&mut out)
                     .map_err(|err| VmError::HostError(format!("io_read_all failed: {err}")))
-                    .map(|_| vec![Value::String(out)])
+                    .map(|_| vec![Value::string(out)])
             }
             IoHandle::PopenWrite { .. } => Err(VmError::HostError(
                 "io_read_all requires a readable handle".to_string(),
@@ -235,7 +235,7 @@ pub(super) fn builtin_io_read_line(vm: &mut Vm, args: Vec<Value>) -> VmResult<Bu
         let mut handle = handle;
         let result = match &mut handle {
             IoHandle::File(file) => {
-                read_line_from_reader(file).map(|line| vec![Value::String(line)])
+                read_line_from_reader(file).map(|line| vec![Value::string(line)])
             }
             IoHandle::PopenRead { child } => {
                 let stdout = match child.stdout.as_mut() {
@@ -249,7 +249,7 @@ pub(super) fn builtin_io_read_line(vm: &mut Vm, args: Vec<Value>) -> VmResult<Bu
                         };
                     }
                 };
-                read_line_from_reader(stdout).map(|line| vec![Value::String(line)])
+                read_line_from_reader(stdout).map(|line| vec![Value::string(line)])
             }
             IoHandle::PopenWrite { .. } => Err(VmError::HostError(
                 "io_read_line requires a readable handle".to_string(),

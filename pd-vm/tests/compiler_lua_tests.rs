@@ -67,11 +67,7 @@ fn lua_runtime_cases_work() {
                 s
             "#,
             flavor: SourceFlavor::Lua,
-            expected_stack: vec![
-                Value::Float(1.25),
-                Value::String("A".to_string()),
-                Value::String("B".to_string()),
-            ],
+            expected_stack: vec![Value::Float(1.25), Value::string("A"), Value::string("B")],
             expected_locals: None,
         },
         RuntimeCase {

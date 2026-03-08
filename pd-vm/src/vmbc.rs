@@ -230,7 +230,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
                 let text_bytes = cursor.read_exact(len)?;
                 let text =
                     String::from_utf8(text_bytes.to_vec()).map_err(|_| WireError::InvalidUtf8)?;
-                Value::String(text)
+                Value::string(text)
             }
             other => return Err(WireError::InvalidConstantTag(other)),
         };

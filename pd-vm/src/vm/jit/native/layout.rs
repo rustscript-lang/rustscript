@@ -182,8 +182,8 @@ fn detect_value_layout() -> VmResult<ValueLayout> {
     let float_b_bytes = encode_value_bytes(Value::Float(float_b));
     let bool_false_bytes = encode_value_bytes(Value::Bool(false));
     let bool_true_bytes = encode_value_bytes(Value::Bool(true));
-    let string_a_bytes = encode_value_bytes(Value::String("a".to_string()));
-    let string_b_bytes = encode_value_bytes(Value::String("b".to_string()));
+    let string_a_bytes = encode_value_bytes(Value::string("a"));
+    let string_b_bytes = encode_value_bytes(Value::string("b"));
 
     let stable_tag_pairs = [
         (&null_a_bytes[..], &null_b_bytes[..]),

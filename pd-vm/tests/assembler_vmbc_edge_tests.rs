@@ -69,7 +69,7 @@ fn assemble_supports_string_escapes_and_case_insensitive_bools() {
     assert_eq!(program.constants[1], Value::Bool(false));
     assert_eq!(
         program.constants[2],
-        Value::String("line\n\t\"quote\"\\slash".to_string())
+        Value::string("line\n\t\"quote\"\\slash")
     );
 }
 
@@ -101,14 +101,14 @@ fn assemble_reports_local_index_overflow() {
 
 #[test]
 fn encode_rejects_array_and_map_constants() {
-    let array_program = Program::new(vec![Value::Array(vec![])], vec![OpCode::Ret as u8]);
+    let array_program = Program::new(vec![Value::array(vec![])], vec![OpCode::Ret as u8]);
     let array_err = encode_program(&array_program).expect_err("array constants should be rejected");
     assert!(matches!(
         array_err,
         WireError::UnsupportedConstantType("array")
     ));
 
-    let map_program = Program::new(vec![Value::Map(vec![])], vec![OpCode::Ret as u8]);
+    let map_program = Program::new(vec![Value::map(vec![])], vec![OpCode::Ret as u8]);
     let map_err = encode_program(&map_program).expect_err("map constants should be rejected");
     assert!(matches!(map_err, WireError::UnsupportedConstantType("map")));
 }
@@ -149,10 +149,7 @@ fn decode_rejects_invalid_flag_tag_bool_utf8_and_trailing_bytes() {
         Err(WireError::InvalidConstantTag(255))
     ));
 
-    let string_program = Program::new(
-        vec![Value::String("x".to_string())],
-        vec![OpCode::Ret as u8],
-    );
+    let string_program = Program::new(vec![Value::string("x")], vec![OpCode::Ret as u8]);
     let mut bad_utf8 = encode_program(&string_program).expect("encode should succeed");
     bad_utf8[17] = 0xFF;
     assert!(matches!(

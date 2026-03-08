@@ -53,11 +53,11 @@ pub(super) fn execute_builtin_call(
         BuiltinFunction::Len => core::builtin_len(&args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Slice => core::builtin_slice(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Concat => core::builtin_concat(args).map(BuiltinCallOutcome::Return),
-        BuiltinFunction::ArrayNew => Ok(BuiltinCallOutcome::Return(vec![Value::Array(Vec::new())])),
+        BuiltinFunction::ArrayNew => Ok(BuiltinCallOutcome::Return(vec![Value::array(Vec::new())])),
         BuiltinFunction::ArrayPush => {
             core::builtin_array_push(args).map(BuiltinCallOutcome::Return)
         }
-        BuiltinFunction::MapNew => Ok(BuiltinCallOutcome::Return(vec![Value::Map(Vec::new())])),
+        BuiltinFunction::MapNew => Ok(BuiltinCallOutcome::Return(vec![Value::map(Vec::new())])),
         BuiltinFunction::Get => core::builtin_get(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Set => core::builtin_set(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Keys => core::builtin_keys(args).map(BuiltinCallOutcome::Return),

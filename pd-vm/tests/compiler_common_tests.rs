@@ -119,13 +119,7 @@ fn non_rustscript_frontends_keep_copy_semantics_for_local_rebinds() {
         let mut vm = Vm::new(compiled.program);
         let status = vm.run().expect("vm should run");
         assert_eq!(status, VmStatus::Halted);
-        assert_eq!(
-            vm.stack(),
-            &[
-                Value::String("2".to_string()),
-                Value::String("2".to_string())
-            ]
-        );
+        assert_eq!(vm.stack(), &[Value::string("2"), Value::string("2")]);
     }
 }
 
@@ -153,7 +147,7 @@ fn non_rustscript_frontends_keep_copy_capture_semantics_for_closures() {
         let mut vm = Vm::new(compiled.program);
         let status = vm.run().expect("vm should run");
         assert_eq!(status, VmStatus::Halted);
-        assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
+        assert_eq!(vm.stack(), &[Value::string("xx")]);
     }
 }
 
@@ -839,7 +833,7 @@ fn liveness_pass_clears_dead_locals_after_last_use() {
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("23232".to_string())]);
+    assert_eq!(vm.stack(), &[Value::string("23232")]);
     assert_eq!(vm.locals()[d_index as usize], Value::Null);
     assert_eq!(vm.locals()[e_index as usize], Value::Null);
 }
@@ -1291,7 +1285,7 @@ fn compile_source_with_string_literals() {
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("hello".to_string())]);
+    assert_eq!(vm.stack(), &[Value::string("hello")]);
 }
 
 #[test]

@@ -7,19 +7,13 @@ use crate::builtins::{
 fn config_as_value(vm: &Vm) -> Value {
     let config = vm.jit_config();
     let max_trace_len = i64::try_from(config.max_trace_len).unwrap_or(i64::MAX);
-    Value::Map(vec![
+    Value::map(vec![
+        (Value::string("enabled"), Value::Bool(config.enabled)),
         (
-            Value::String("enabled".to_string()),
-            Value::Bool(config.enabled),
-        ),
-        (
-            Value::String("hot_loop_threshold".to_string()),
+            Value::string("hot_loop_threshold"),
             Value::Int(i64::from(config.hot_loop_threshold)),
         ),
-        (
-            Value::String("max_trace_len".to_string()),
-            Value::Int(max_trace_len),
-        ),
+        (Value::string("max_trace_len"), Value::Int(max_trace_len)),
     ])
 }
 

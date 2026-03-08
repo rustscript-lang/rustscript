@@ -417,9 +417,7 @@ fn perf_manual_aes_128_cbc_rustscript_matches_in_interpreter_jit_and_aot() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/aes_128_cbc_usage.rss");
     let compiled = compile_source_file(&path).expect("aes RustScript usage example should compile");
 
-    let expected = vec![Value::String(
-        "7649abac8119b246cee98e9b12e9197d".to_string(),
-    )];
+    let expected = vec![Value::string("7649abac8119b246cee98e9b12e9197d")];
 
     const TRIALS: usize = 7;
     let diag_enabled = std::env::var_os("PDVM_PERF_AES_JIT_DIAG").is_some();

@@ -1785,14 +1785,14 @@ fn encode_value(value: &Value, out: &mut Vec<u8>) -> Result<(), VmRecordingError
         Value::Array(values) => {
             out.push(5);
             write_u32_len(values.len(), out)?;
-            for value in values {
+            for value in values.iter() {
                 encode_value(value, out)?;
             }
         }
         Value::Map(entries) => {
             out.push(6);
             write_u32_len(entries.len(), out)?;
-            for (key, value) in entries {
+            for (key, value) in entries.iter() {
                 encode_value(key, out)?;
                 encode_value(value, out)?;
             }
@@ -1817,7 +1817,7 @@ fn decode_value(cursor: &mut RecordingCursor<'_>) -> Result<Value, VmRecordingEr
             let bytes = cursor.read_exact(len)?;
             let text = String::from_utf8(bytes.to_vec())
                 .map_err(|_| VmRecordingError::InvalidFormat("invalid utf-8 string"))?;
-            Ok(Value::String(text))
+            Ok(Value::string(text))
         }
         5 => {
             let len = cursor.read_u32()? as usize;
@@ -1825,7 +1825,7 @@ fn decode_value(cursor: &mut RecordingCursor<'_>) -> Result<Value, VmRecordingEr
             for _ in 0..len {
                 values.push(decode_value(cursor)?);
             }
-            Ok(Value::Array(values))
+            Ok(Value::array(values))
         }
         6 => {
             let len = cursor.read_u32()? as usize;
@@ -1835,7 +1835,7 @@ fn decode_value(cursor: &mut RecordingCursor<'_>) -> Result<Value, VmRecordingEr
                 let value = decode_value(cursor)?;
                 entries.push((key, value));
             }
-            Ok(Value::Map(entries))
+            Ok(Value::map(entries))
         }
         _ => Err(VmRecordingError::InvalidFormat("invalid value tag")),
     }
@@ -2145,11 +2145,8 @@ mod tests {
                 VmRecordingFrame {
                     ip: 0,
                     call_depth: 0,
-                    stack: vec![Value::Array(vec![Value::Int(7), Value::Bool(true)])],
-                    locals: vec![Value::Map(vec![(
-                        Value::String("k".to_string()),
-                        Value::Int(9),
-                    )])],
+                    stack: vec![Value::array(vec![Value::Int(7), Value::Bool(true)])],
+                    locals: vec![Value::map(vec![(Value::string("k"), Value::Int(9))])],
                 },
                 VmRecordingFrame {
                     ip: 1,

@@ -175,10 +175,7 @@ fn waiting_host_op_preserves_single_drop_state_for_moved_locals() {
     assert_eq!(first, VmStatus::Waiting(700));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(vm.locals()[a_index as usize], Value::Null);
-    assert_eq!(
-        vm.locals()[b_index as usize],
-        Value::String("payload".to_string())
-    );
+    assert_eq!(vm.locals()[b_index as usize], Value::string("payload"));
 
     let second = vm.run().expect("second run should still wait");
     assert_eq!(second, VmStatus::Waiting(700));
@@ -194,7 +191,7 @@ fn waiting_host_op_preserves_single_drop_state_for_moved_locals() {
     );
     assert_eq!(
         vm.locals()[b_index as usize],
-        Value::String("payload".to_string()),
+        Value::string("payload"),
         "moved target local should stay intact while waiting"
     );
 
@@ -202,7 +199,7 @@ fn waiting_host_op_preserves_single_drop_state_for_moved_locals() {
         .expect("host completion should succeed");
     let resumed = vm.resume().expect("resume should halt");
     assert_eq!(resumed, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::String("payload".to_string())]);
+    assert_eq!(vm.stack(), &[Value::string("payload")]);
     assert_eq!(vm.locals()[a_index as usize], Value::Null);
 }
 
@@ -287,11 +284,11 @@ fn drop_contract_counts_overwrites_and_reset_clears_counter() {
 
 #[test]
 fn reset_for_reuse_counts_cleanup_drops_from_live_state() {
-    let live_map = Value::Map(vec![(
-        Value::String("k".to_string()),
-        Value::Array(vec![Value::Int(1)]),
+    let live_map = Value::map(vec![(
+        Value::string("k"),
+        Value::array(vec![Value::Int(1)]),
     )]);
-    let live_stack_value = Value::String("live".to_string());
+    let live_stack_value = Value::string("live");
     let mut bc = BytecodeBuilder::new();
     bc.ldc(0);
     bc.stloc(0);

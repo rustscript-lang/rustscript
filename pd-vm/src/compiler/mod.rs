@@ -874,7 +874,7 @@ impl Compiler {
                 self.assembler.push_const(Value::Bool(*value));
             }
             Expr::String(value) => {
-                self.assembler.push_const(Value::String(value.clone()));
+                self.assembler.push_const(Value::string(value.clone()));
             }
             Expr::FunctionRef(_) => {
                 return Err(CompileError::CallableUsedAsValue);
@@ -996,11 +996,11 @@ impl Compiler {
             }
             Expr::MoveField { root, key } => {
                 self.emit_copy_ldloc(*root)?;
-                self.assembler.push_const(Value::String(key.clone()));
+                self.assembler.push_const(Value::string(key.clone()));
                 self.assembler.call(BuiltinFunction::Get.call_index(), 2);
 
                 self.emit_copy_ldloc(*root)?;
-                self.assembler.push_const(Value::String(key.clone()));
+                self.assembler.push_const(Value::string(key.clone()));
                 self.assembler.push_const(Value::Null);
                 self.assembler.call(BuiltinFunction::Set.call_index(), 3);
                 self.emit_stloc(*root)?;
@@ -1547,7 +1547,7 @@ impl Compiler {
             }
             MatchPattern::String(v) => {
                 self.emit_copy_ldloc(value_slot)?;
-                self.assembler.push_const(Value::String(v.clone()));
+                self.assembler.push_const(Value::string(v.clone()));
                 self.assembler.ceq();
             }
             MatchPattern::Null => {
@@ -1602,7 +1602,7 @@ impl Compiler {
         self.emit_copy_ldloc(value_slot)?;
         self.assembler.call(BuiltinFunction::TypeOf.call_index(), 1);
         self.assembler
-            .push_const(Value::String(expected.to_string()));
+            .push_const(Value::string(expected.to_string()));
         self.assembler.ceq();
         Ok(())
     }
@@ -1639,7 +1639,7 @@ impl Compiler {
 
     fn compile_string_concat_operand(&mut self, expr: &Expr) -> Result<(), CompileError> {
         if let Some(value) = eval_const_int_expr(expr) {
-            self.assembler.push_const(Value::String(value.to_string()));
+            self.assembler.push_const(Value::string(value.to_string()));
             return Ok(());
         }
 
@@ -1655,7 +1655,7 @@ impl Compiler {
 
         self.assembler.dup();
         self.assembler.call(BuiltinFunction::TypeOf.call_index(), 1);
-        self.assembler.push_const(Value::String("int".to_string()));
+        self.assembler.push_const(Value::string("int"));
         self.assembler.ceq();
         self.assembler.brfalse_label(&not_int_label);
         self.assembler
@@ -1667,8 +1667,7 @@ impl Compiler {
             .expect("compiler-generated label should be valid");
         self.assembler.dup();
         self.assembler.call(BuiltinFunction::TypeOf.call_index(), 1);
-        self.assembler
-            .push_const(Value::String("float".to_string()));
+        self.assembler.push_const(Value::string("float"));
         self.assembler.ceq();
         self.assembler.brfalse_label(&not_float_label);
         self.assembler

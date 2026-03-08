@@ -77,11 +77,7 @@ fn scheme_runtime_cases_work() {
                 s
             "#,
             flavor: SourceFlavor::Scheme,
-            expected_stack: vec![
-                Value::Float(1.25),
-                Value::Int(65),
-                Value::String("B".to_string()),
-            ],
+            expected_stack: vec![Value::Float(1.25), Value::Int(65), Value::string("B")],
             expected_locals: None,
         },
         RuntimeCase {

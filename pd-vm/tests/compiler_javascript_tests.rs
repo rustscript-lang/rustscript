@@ -44,7 +44,7 @@ fn javascript_http_subnamespace_host_calls_are_supported() {
             http.request.get_header("x-client-id");
         "#,
         flavor: SourceFlavor::JavaScript,
-        expected_stack: vec![Value::String("x-client-id".to_string())],
+        expected_stack: vec![Value::string("x-client-id")],
         expected_locals: None,
     };
     let bindings = [HostBindingCase {
@@ -84,7 +84,7 @@ fn javascript_runtime_cases_work() {
                 text;
             "#,
             flavor: SourceFlavor::JavaScript,
-            expected_stack: vec![Value::String("\"ok\"".to_string())],
+            expected_stack: vec![Value::string("\"ok\"")],
             expected_locals: None,
         },
         RuntimeCase {
@@ -133,10 +133,7 @@ fn javascript_runtime_cases_work() {
                 s;
             "#,
             flavor: SourceFlavor::JavaScript,
-            expected_stack: vec![
-                Value::String("A".to_string()),
-                Value::String("B".to_string()),
-            ],
+            expected_stack: vec![Value::string("A"), Value::string("B")],
             expected_locals: None,
         },
         RuntimeCase {
