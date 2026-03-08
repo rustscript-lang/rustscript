@@ -420,6 +420,9 @@ impl Debugger {
             VmError::OutOfFuel { needed, remaining } => Some(format!(
                 "execution interrupted: out of fuel (needed {needed}, remaining {remaining}). use `fuel set <n>` or `fuel add <n>`, then `continue`"
             )),
+            VmError::EpochDeadlineReached { current, deadline } => Some(format!(
+                "execution interrupted: epoch deadline reached (current {current}, deadline {deadline}). use `epoch deadline <ticks>` to re-arm interruption, optionally `epoch tick <n>` to advance the global epoch, then `continue`"
+            )),
             _ => None,
         };
         self.client_detached = self.repl(vm, banner.as_deref());
@@ -1015,6 +1018,66 @@ fn handle_command(
                 }
             }
         }
+        "epoch" => {
+            let Some(sub) = parts.next() else {
+                print_epoch_state(vm, out);
+                return ReplAction::Continue;
+            };
+            match sub {
+                "tick" => {
+                    let delta = parse_u64(parts.next()).unwrap_or(1);
+                    let current = vm.increment_epoch_by(delta);
+                    let _ = writeln!(out, "epoch advanced by {delta} to {current}");
+                    print_epoch_state(vm, out);
+                }
+                "deadline" | "set" => {
+                    if let Some(value) = parse_u64(parts.next()) {
+                        match vm.set_epoch_deadline(value) {
+                            Ok(()) => {
+                                let _ = writeln!(out, "epoch deadline set {value} ticks beyond current epoch");
+                                print_epoch_state(vm, out);
+                            }
+                            Err(err) => {
+                                let _ = writeln!(out, "epoch deadline update failed: {err}");
+                            }
+                        }
+                    } else {
+                        let _ = writeln!(out, "usage: epoch deadline <ticks>");
+                    }
+                }
+                "clear" => {
+                    vm.clear_epoch_deadline();
+                    let _ = writeln!(out, "epoch interruption disabled");
+                    print_epoch_state(vm, out);
+                }
+                "interval" => {
+                    if let Some(raw) = parts.next() {
+                        match raw.parse::<u32>() {
+                            Ok(interval) => match vm.set_epoch_check_interval(interval) {
+                                Ok(()) => {
+                                    let _ = writeln!(out, "epoch check interval set to {interval}");
+                                    print_epoch_state(vm, out);
+                                }
+                                Err(err) => {
+                                    let _ = writeln!(out, "epoch interval update failed: {err}");
+                                }
+                            },
+                            Err(_) => {
+                                let _ = writeln!(out, "usage: epoch interval <n>");
+                            }
+                        }
+                    } else {
+                        let _ = writeln!(out, "epoch check interval: {}", vm.epoch_check_interval());
+                    }
+                }
+                _ => {
+                    let _ = writeln!(
+                        out,
+                        "usage: epoch | epoch tick [n] | epoch deadline <ticks> | epoch clear | epoch interval [n]"
+                    );
+                }
+            }
+        }
         "where" => {
             if let Some(info) = vm.debug_info() {
                 let line = info.line_for_offset(vm.ip());
@@ -1043,7 +1106,7 @@ fn handle_command(
         "help" => {
             let _ = writeln!(
                 out,
-                "commands: break, break line, bl, clear, clear line, cl, breaks, continue, step, next, out, stack, locals, print, ip, where, funcs, fuel, help"
+                "commands: break, break line, bl, clear, clear line, cl, breaks, continue, step, next, out, stack, locals, print, ip, where, funcs, fuel, epoch, help"
             );
         }
         _ => {
@@ -1123,6 +1186,20 @@ fn print_fuel_state(vm: &Vm, out: &mut dyn Write) {
         out,
         "fuel: {remaining}, check_interval={}",
         vm.fuel_check_interval()
+    );
+}
+
+fn print_epoch_state(vm: &Vm, out: &mut dyn Write) {
+    let deadline = vm
+        .epoch_deadline()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "disabled".to_string());
+    let _ = writeln!(
+        out,
+        "epoch: current={}, deadline={}, check_interval={}",
+        vm.current_epoch(),
+        deadline,
+        vm.epoch_check_interval()
     );
 }
 
@@ -2772,6 +2849,65 @@ mod tests {
     }
 
     #[test]
+    fn handle_command_epoch_queries_and_updates_deadline() {
+        let mut vm = Vm::new(Program::new(vec![], vec![crate::vm::OpCode::Ret as u8]));
+        vm.set_epoch_deadline(2)
+            .expect("setting epoch deadline should succeed");
+        let mut out = Vec::<u8>::new();
+        let mut breakpoints = HashSet::new();
+        let mut line_breakpoints = HashSet::new();
+        let mut step_mode = StepMode::Running;
+
+        let action = handle_command(
+            "epoch",
+            &mut vm,
+            &mut breakpoints,
+            &mut line_breakpoints,
+            &mut step_mode,
+            &mut out,
+        );
+        assert_eq!(action, ReplAction::Continue);
+        let text = String::from_utf8(out.clone()).expect("output should be utf-8");
+        assert!(text.contains("epoch: current=0, deadline=2"), "{text}");
+
+        out.clear();
+        handle_command(
+            "epoch tick 3",
+            &mut vm,
+            &mut breakpoints,
+            &mut line_breakpoints,
+            &mut step_mode,
+            &mut out,
+        );
+        let text = String::from_utf8(out.clone()).expect("output should be utf-8");
+        assert!(text.contains("epoch advanced by 3 to 3"), "{text}");
+
+        out.clear();
+        handle_command(
+            "epoch deadline 4",
+            &mut vm,
+            &mut breakpoints,
+            &mut line_breakpoints,
+            &mut step_mode,
+            &mut out,
+        );
+        assert_eq!(vm.epoch_deadline(), Some(7));
+        let text = String::from_utf8(out.clone()).expect("output should be utf-8");
+        assert!(text.contains("epoch deadline set 4 ticks beyond current epoch"), "{text}");
+
+        out.clear();
+        handle_command(
+            "epoch interval 5",
+            &mut vm,
+            &mut breakpoints,
+            &mut line_breakpoints,
+            &mut step_mode,
+            &mut out,
+        );
+        assert_eq!(vm.epoch_check_interval(), 5);
+    }
+
+    #[test]
     fn debugger_bridge_can_recover_from_out_of_fuel_by_adding_fuel() {
         let program = Program::new(
             vec![],
@@ -2809,6 +2945,57 @@ mod tests {
             add_response.output.contains("fuel added: 2"),
             "{}",
             add_response.output
+        );
+
+        let continue_response = bridge
+            .execute("continue", Duration::from_millis(200))
+            .expect("continue command should succeed");
+        assert!(continue_response.resumed);
+        assert!(!continue_response.attached);
+
+        let status = join.join().expect("debugger thread should join");
+        assert_eq!(status, VmStatus::Halted);
+    }
+
+    #[test]
+    fn debugger_bridge_can_recover_from_epoch_deadline_by_rearming() {
+        let program = Program::new(
+            vec![],
+            vec![
+                crate::vm::OpCode::Nop as u8,
+                crate::vm::OpCode::Nop as u8,
+                crate::vm::OpCode::Ret as u8,
+            ],
+        );
+        let bridge = super::DebugCommandBridge::new();
+        let mut debugger = Debugger::with_command_bridge(bridge.clone());
+
+        let join = std::thread::spawn(move || {
+            let mut vm = Vm::new(program);
+            vm.set_epoch_deadline(0)
+                .expect("setting epoch deadline should succeed");
+            vm.run_with_debugger(&mut debugger)
+                .expect("debugged vm run should recover and succeed")
+        });
+
+        wait_for_bridge_attachment(&bridge, true);
+
+        let epoch_response = bridge
+            .execute("epoch", Duration::from_millis(200))
+            .expect("epoch command should succeed");
+        assert!(
+            epoch_response.output.contains("deadline=0"),
+            "{}",
+            epoch_response.output
+        );
+
+        let deadline_response = bridge
+            .execute("epoch deadline 1", Duration::from_millis(200))
+            .expect("epoch deadline command should succeed");
+        assert!(
+            deadline_response.output.contains("epoch deadline set 1 ticks beyond current epoch"),
+            "{}",
+            deadline_response.output
         );
 
         let continue_response = bridge

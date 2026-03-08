@@ -11,7 +11,8 @@ use serde::Deserialize;
 use vm::{
     CallOutcome, FunctionDecl, HostAsyncBridge, HostFunction, HostOpId, LocalInfo,
     PrintHostFunction, PrintlnHostFunction, SourceFlavor, SourcePathError, Value, Vm, VmError,
-    VmResult, VmStatus, compile_source_with_flavor_and_options, format_value, render_vm_error,
+    VmResult, VmStatus, VmYieldReason, compile_source_with_flavor_and_options, format_value,
+    render_vm_error,
 };
 
 use crate::analyzer::{LintDiagnostic, lint_source_with_flavor};
@@ -19,26 +20,49 @@ use crate::stdlib::embedded_stdlib_compile_options;
 
 const MAX_DEBUG_STEPS_PER_COMMAND: usize = 200_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptConfigMode {
+    Fuel,
+    Epoch,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct FuelConfig {
+    pub mode: Option<InterruptConfigMode>,
     pub fuel: Option<u64>,
     pub fuel_check_interval: Option<u32>,
+    pub epoch_deadline: Option<u64>,
+    pub epoch_check_interval: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterruptModeState {
+    None,
+    Fuel,
+    Epoch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FuelState {
     pub enabled: bool,
+    pub mode: InterruptModeState,
     pub remaining: Option<u64>,
     pub check_interval: u32,
+    pub epoch_current: u64,
+    pub epoch_deadline: Option<u64>,
 }
 
 impl FuelState {
     fn disabled(check_interval: u32) -> Self {
         Self {
             enabled: false,
+            mode: InterruptModeState::None,
             remaining: None,
             check_interval,
+            epoch_current: 0,
+            epoch_deadline: None,
         }
     }
 }
@@ -190,6 +214,10 @@ pub enum RunCommand {
     AddFuel { amount: u64 },
     ClearFuel,
     SetFuelCheckInterval { interval: u32 },
+    SetEpochDeadline { ticks: u64 },
+    ClearEpochDeadline,
+    TickEpoch { amount: u64 },
+    SetEpochCheckInterval { interval: u32 },
     Stop,
 }
 
@@ -211,6 +239,10 @@ pub enum DebugCommand {
     AddFuel { amount: u64 },
     ClearFuel,
     SetFuelCheckInterval { interval: u32 },
+    SetEpochDeadline { ticks: u64 },
+    ClearEpochDeadline,
+    TickEpoch { amount: u64 },
+    SetEpochCheckInterval { interval: u32 },
     Stop,
 }
 
@@ -226,6 +258,11 @@ enum StepExecution {
     Halted,
     Paused(String),
     Error(String),
+}
+
+enum DebugStepCheckpoint {
+    Fuel(vm::FuelCheckpoint),
+    Epoch(vm::EpochCheckpoint),
 }
 
 enum RunProgress {
@@ -431,9 +468,12 @@ impl RunSession {
                     return ("program halted".to_string(), RunProgress::Halted);
                 }
                 Ok(VmStatus::Yielded) => {
-                    let message = match self.vm.get_fuel() {
-                        Some(0) => "execution interrupted: out of fuel. add more fuel and resume"
-                            .to_string(),
+                    let message = match self.vm.last_yield_reason() {
+                        Some(VmYieldReason::Fuel) if self.vm.get_fuel() == Some(0) => {
+                            "execution interrupted: out of fuel. add more fuel and resume"
+                                .to_string()
+                        }
+                        Some(VmYieldReason::Epoch) => format_epoch_yield_message(&self.vm),
                         _ => "execution yielded; resume to continue".to_string(),
                     };
                     return (message, RunProgress::Yielded);
@@ -484,6 +524,12 @@ impl DebugSession {
             DebugCommand::ClearFuel => self.command_clear_fuel(),
             DebugCommand::SetFuelCheckInterval { interval } => {
                 self.command_set_fuel_check_interval(interval)
+            }
+            DebugCommand::SetEpochDeadline { ticks } => self.command_set_epoch_deadline(ticks),
+            DebugCommand::ClearEpochDeadline => self.command_clear_epoch_deadline(),
+            DebugCommand::TickEpoch { amount } => self.command_tick_epoch(amount),
+            DebugCommand::SetEpochCheckInterval { interval } => {
+                self.command_set_epoch_check_interval(interval)
             }
             DebugCommand::Stop => String::new(),
         }
@@ -615,12 +661,14 @@ impl DebugSession {
             };
         }
 
-        let original_fuel = self.vm.fuel_checkpoint();
-        let stepped_fuel = match self.prepare_debug_step_fuel() {
+        let stepped_interrupt = match self.prepare_debug_step_interrupt() {
             Ok(checkpoint) => checkpoint,
             Err(message) => return StepExecution::Paused(message),
         };
 
+        if matches!(stepped_interrupt, DebugStepCheckpoint::Epoch(_)) {
+            self.vm.clear_epoch_deadline();
+        }
         self.vm
             .set_fuel_check_interval(1)
             .expect("exact debugger step interval should be valid");
@@ -641,21 +689,45 @@ impl DebugSession {
             }
         };
 
-        self.vm.restore_fuel(stepped_fuel.unwrap_or(original_fuel));
+        self.vm.clear_fuel();
+        match stepped_interrupt {
+            DebugStepCheckpoint::Fuel(checkpoint) => self.vm.restore_fuel(checkpoint),
+            DebugStepCheckpoint::Epoch(checkpoint) => self.vm.restore_epoch(checkpoint),
+        }
         outcome
     }
 
-    fn prepare_debug_step_fuel(&mut self) -> Result<Option<vm::FuelCheckpoint>, String> {
-        let checkpoint = self.vm.fuel_checkpoint();
-        if checkpoint.fuel().is_none() {
-            return Ok(None);
+    fn prepare_debug_step_interrupt(&mut self) -> Result<DebugStepCheckpoint, String> {
+        if self.vm.epoch_deadline().is_some() {
+            let checkpoint = self.vm.epoch_checkpoint();
+            return match self.vm.consume_epoch_tick() {
+                Ok(()) => {
+                    let stepped = self.vm.epoch_checkpoint();
+                    self.vm.restore_epoch(checkpoint);
+                    Ok(DebugStepCheckpoint::Epoch(stepped))
+                }
+                Err(VmError::EpochDeadlineReached { current, deadline }) => {
+                    self.vm.restore_epoch(checkpoint);
+                    Err(format!(
+                        "execution interrupted: epoch deadline reached (current {current}, deadline {deadline}). advance epoch or re-arm deadline, then continue"
+                    ))
+                }
+                Err(err) => {
+                    let message = render_vm_error(&self.vm, &err);
+                    self.vm.restore_epoch(checkpoint);
+                    self.halted = true;
+                    self.error = Some(message.clone());
+                    Err(message)
+                }
+            };
         }
 
+        let checkpoint = self.vm.fuel_checkpoint();
         match self.vm.consume_fuel_tick() {
             Ok(()) => {
                 let stepped = self.vm.fuel_checkpoint();
                 self.vm.restore_fuel(checkpoint);
-                Ok(Some(stepped))
+                Ok(DebugStepCheckpoint::Fuel(stepped))
             }
             Err(VmError::OutOfFuel { needed, remaining }) => {
                 self.vm.restore_fuel(checkpoint);
@@ -758,6 +830,42 @@ impl DebugSession {
             Err(err) => format!("fuel interval update failed: {err}"),
         }
     }
+
+    fn command_set_epoch_deadline(&mut self, ticks: u64) -> String {
+        match self.vm.set_epoch_deadline(ticks) {
+            Ok(()) => format!(
+                "epoch deadline set {ticks} ticks beyond current epoch\n{}",
+                format_fuel_state(&self.vm)
+            ),
+            Err(err) => format!("epoch deadline update failed: {err}"),
+        }
+    }
+
+    fn command_clear_epoch_deadline(&mut self) -> String {
+        self.vm.clear_epoch_deadline();
+        format!("epoch interruption disabled\n{}", format_fuel_state(&self.vm))
+    }
+
+    fn command_tick_epoch(&mut self, amount: u64) -> String {
+        if amount == 0 {
+            return format!("epoch unchanged\n{}", format_fuel_state(&self.vm));
+        }
+        let current = self.vm.increment_epoch_by(amount);
+        format!(
+            "epoch advanced by {amount} to {current}\n{}",
+            format_fuel_state(&self.vm)
+        )
+    }
+
+    fn command_set_epoch_check_interval(&mut self, interval: u32) -> String {
+        match self.vm.set_epoch_check_interval(interval) {
+            Ok(()) => format!(
+                "epoch check interval set to {interval}\n{}",
+                format_fuel_state(&self.vm)
+            ),
+            Err(err) => format!("epoch interval update failed: {err}"),
+        }
+    }
 }
 
 fn local_visible_at_line(local: &LocalInfo, line: Option<u32>) -> bool {
@@ -779,30 +887,110 @@ fn local_visible_at_line(local: &LocalInfo, line: Option<u32>) -> bool {
 
 fn capture_fuel_state(vm: &Vm) -> FuelState {
     let remaining = vm.get_fuel();
+    let epoch_deadline = vm.epoch_deadline();
+    let mode = if remaining.is_some() {
+        InterruptModeState::Fuel
+    } else if epoch_deadline.is_some() {
+        InterruptModeState::Epoch
+    } else {
+        InterruptModeState::None
+    };
     FuelState {
-        enabled: remaining.is_some(),
+        enabled: !matches!(mode, InterruptModeState::None),
+        mode,
         remaining,
-        check_interval: vm.fuel_check_interval(),
+        check_interval: if matches!(mode, InterruptModeState::Epoch) {
+            vm.epoch_check_interval()
+        } else {
+            vm.fuel_check_interval()
+        },
+        epoch_current: vm.current_epoch(),
+        epoch_deadline,
     }
 }
 
 fn format_fuel_state(vm: &Vm) -> String {
     let fuel = capture_fuel_state(vm);
-    match fuel.remaining {
-        Some(remaining) => format!("fuel: {remaining}, check_interval={}", fuel.check_interval),
-        None => format!("fuel: disabled, check_interval={}", fuel.check_interval),
+    match fuel.mode {
+        InterruptModeState::Fuel => {
+            format!(
+                "fuel: {}, check_interval={}",
+                fuel.remaining.unwrap_or(0),
+                fuel.check_interval
+            )
+        }
+        InterruptModeState::Epoch => {
+            let deadline = fuel
+                .epoch_deadline
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "disabled".to_string());
+            format!(
+                "epoch: current={}, deadline={}, check_interval={}",
+                fuel.epoch_current, deadline, fuel.check_interval
+            )
+        }
+        InterruptModeState::None => {
+            format!("interruption: disabled, check_interval={}", fuel.check_interval)
+        }
     }
 }
 
 fn apply_fuel_config(vm: &mut Vm, config: FuelConfig) -> Result<(), String> {
-    if let Some(interval) = config.fuel_check_interval {
-        vm.set_fuel_check_interval(interval)
-            .map_err(|err| render_vm_error(vm, &err))?;
-    }
-    if let Some(fuel) = config.fuel {
-        vm.set_fuel(fuel);
+    let mode = config.mode.or_else(|| {
+        if config.epoch_deadline.is_some() || config.epoch_check_interval.is_some() {
+            Some(InterruptConfigMode::Epoch)
+        } else if config.fuel.is_some() || config.fuel_check_interval.is_some() {
+            Some(InterruptConfigMode::Fuel)
+        } else {
+            None
+        }
+    });
+
+    match mode {
+        Some(InterruptConfigMode::Fuel) => {
+            if config.epoch_deadline.is_some() || config.epoch_check_interval.is_some() {
+                return Err(
+                    "epoch settings cannot be combined with fuel interruption".to_string(),
+                );
+            }
+            if let Some(interval) = config.fuel_check_interval {
+                vm.set_fuel_check_interval(interval)
+                    .map_err(|err| render_vm_error(vm, &err))?;
+            }
+            if let Some(fuel) = config.fuel {
+                vm.set_fuel(fuel);
+            }
+        }
+        Some(InterruptConfigMode::Epoch) => {
+            if config.fuel.is_some() || config.fuel_check_interval.is_some() {
+                return Err(
+                    "fuel settings cannot be combined with epoch interruption".to_string(),
+                );
+            }
+            if let Some(interval) = config.epoch_check_interval {
+                vm.set_epoch_check_interval(interval)
+                    .map_err(|err| render_vm_error(vm, &err))?;
+            }
+            if let Some(deadline) = config.epoch_deadline {
+                vm.set_epoch_deadline(deadline)
+                    .map_err(|err| render_vm_error(vm, &err))?;
+            }
+        }
+        None => {}
     }
     Ok(())
+}
+
+fn format_epoch_yield_message(vm: &Vm) -> String {
+    let deadline = vm
+        .epoch_deadline()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "disabled".to_string());
+    format!(
+        "execution interrupted: epoch deadline reached (current {}, deadline {}). adjust epoch state and resume",
+        vm.current_epoch(),
+        deadline
+    )
 }
 
 pub fn run_source_with_flavor(source: &str, flavor: SourceFlavor) -> RunReport {
@@ -975,6 +1163,33 @@ pub fn run_command(command: RunCommand) -> RunReport {
                         format_fuel_state(&session.vm)
                     ),
                     Err(err) => format!("fuel interval update failed: {err}"),
+                }
+            }
+            RunCommand::SetEpochDeadline { ticks } => match session.vm.set_epoch_deadline(ticks) {
+                Ok(()) => format!(
+                    "epoch deadline set {ticks} ticks beyond current epoch\n{}",
+                    format_fuel_state(&session.vm)
+                ),
+                Err(err) => format!("epoch deadline update failed: {err}"),
+            },
+            RunCommand::ClearEpochDeadline => {
+                session.vm.clear_epoch_deadline();
+                format!("epoch interruption disabled\n{}", format_fuel_state(&session.vm))
+            }
+            RunCommand::TickEpoch { amount } => {
+                let current = session.vm.increment_epoch_by(amount);
+                format!(
+                    "epoch advanced by {amount} to {current}\n{}",
+                    format_fuel_state(&session.vm)
+                )
+            }
+            RunCommand::SetEpochCheckInterval { interval } => {
+                match session.vm.set_epoch_check_interval(interval) {
+                    Ok(()) => format!(
+                        "epoch check interval set to {interval}\n{}",
+                        format_fuel_state(&session.vm)
+                    ),
+                    Err(err) => format!("epoch interval update failed: {err}"),
                 }
             }
             RunCommand::Stop => unreachable!("handled above"),

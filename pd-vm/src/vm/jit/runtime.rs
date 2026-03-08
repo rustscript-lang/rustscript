@@ -283,7 +283,7 @@ impl Vm {
                 .get(step_index)
                 .copied()
                 .unwrap_or(trace.root_ip);
-            self.charge_fuel_tick()?;
+            self.charge_interrupt_tick()?;
             match step {
                 TraceStep::Nop => {}
                 TraceStep::Ldc(index) => {
@@ -396,7 +396,10 @@ impl Vm {
                     call_ip,
                 } => match self.execute_host_call(*index, *argc, *call_ip)? {
                     HostCallExecOutcome::Returned => {}
-                    HostCallExecOutcome::Yielded => return Ok(ExecOutcome::Yielded),
+                    HostCallExecOutcome::Yielded => {
+                        self.last_yield_reason = Some(super::super::VmYieldReason::Host);
+                        return Ok(ExecOutcome::Yielded);
+                    }
                     HostCallExecOutcome::Pending(op_id) => {
                         return Ok(ExecOutcome::Waiting(op_id));
                     }
@@ -407,7 +410,10 @@ impl Vm {
                     call_ip,
                 } => match self.execute_host_call(*index, *argc, *call_ip)? {
                     HostCallExecOutcome::Returned => {}
-                    HostCallExecOutcome::Yielded => return Ok(ExecOutcome::Yielded),
+                    HostCallExecOutcome::Yielded => {
+                        self.last_yield_reason = Some(super::super::VmYieldReason::Host);
+                        return Ok(ExecOutcome::Yielded);
+                    }
                     HostCallExecOutcome::Pending(op_id) => return Ok(ExecOutcome::Waiting(op_id)),
                 },
                 TraceStep::GuardFalse { exit_ip } => {
@@ -533,7 +539,10 @@ impl Vm {
                     return Ok(ExecOutcome::Continue);
                 }
                 native::STATUS_HALTED => return Ok(ExecOutcome::Halted),
-                native::STATUS_YIELDED => return Ok(ExecOutcome::Yielded),
+                native::STATUS_YIELDED => {
+                    self.last_yield_reason = Some(super::super::VmYieldReason::Host);
+                    return Ok(ExecOutcome::Yielded);
+                }
                 native::STATUS_WAITING => {
                     let op_id = self.waiting_host_op.map(|op| op.op_id).ok_or_else(|| {
                         VmError::JitNative(
@@ -543,10 +552,22 @@ impl Vm {
                     return Ok(ExecOutcome::Waiting(op_id));
                 }
                 native::STATUS_OUT_OF_FUEL => {
-                    return Err(VmError::OutOfFuel {
-                        needed: u64::from(self.fuel_check_interval),
-                        remaining: self.fuel_remaining,
-                    });
+                    return match self.interrupt_mode {
+                        super::super::InterruptMode::Fuel => Err(VmError::OutOfFuel {
+                            needed: u64::from(self.fuel_check_interval),
+                            remaining: self.fuel_remaining,
+                        }),
+                        super::super::InterruptMode::Epoch => Err(
+                            VmError::EpochDeadlineReached {
+                                current: self.current_epoch(),
+                                deadline: self.epoch_deadline,
+                            },
+                        ),
+                        super::super::InterruptMode::None => Err(VmError::JitNative(
+                            "native interruption checkpoint fired while interruption was disabled"
+                                .to_string(),
+                        )),
+                    };
                 }
                 native::STATUS_ERROR => {
                     let err = native::take_bridge_error().unwrap_or_else(|| {
@@ -612,7 +633,7 @@ impl Vm {
         trace_id: usize,
         compile_profile: native::NativeCompileProfile,
     ) -> VmResult<()> {
-        let fuel_check_interval = self.fuel_enabled.then_some(self.fuel_check_interval);
+        let fuel_check_interval = self.interruption_enabled().then_some(self.fuel_check_interval);
         self.ensure_native_trace_with_settings(trace_id, compile_profile, fuel_check_interval)
     }
 

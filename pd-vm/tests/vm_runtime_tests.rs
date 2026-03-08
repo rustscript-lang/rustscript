@@ -580,6 +580,138 @@ fn fuel_checkpoint_restores_interval() {
 }
 
 #[test]
+fn epoch_deadline_exhausts_and_rearm_allows_resume() {
+    let constants = vec![Value::Int(9)];
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.pop();
+    bc.ret();
+
+    let program = Program::new(constants, bc.finish());
+    let mut vm = Vm::new(program);
+    vm.set_epoch_deadline(1)
+        .expect("setting epoch deadline should succeed");
+    assert_eq!(vm.increment_epoch(), 1);
+
+    let status = vm
+        .run()
+        .expect("run should cooperatively yield once the epoch reaches the deadline");
+    assert_eq!(status, VmStatus::Yielded);
+    assert_eq!(vm.last_yield_reason(), Some(vm::VmYieldReason::Epoch));
+
+    vm.set_epoch_deadline(1)
+        .expect("re-arming epoch deadline should succeed");
+    let status = vm.run().expect("run should halt after re-arming");
+    assert_eq!(status, VmStatus::Halted);
+}
+
+#[test]
+fn epoch_checkpoint_and_restore_work() {
+    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    assert_eq!(vm.increment_epoch_by(10), 10);
+    vm.set_epoch_deadline(5)
+        .expect("setting epoch deadline should succeed");
+    let checkpoint = vm.epoch_checkpoint();
+
+    assert_eq!(vm.increment_epoch_by(3), 13);
+    vm.set_epoch_deadline(1)
+        .expect("updating epoch deadline should succeed");
+    assert_eq!(vm.epoch_deadline(), Some(14));
+
+    vm.restore_epoch(checkpoint);
+    assert_eq!(vm.epoch_deadline(), Some(15));
+}
+
+#[test]
+fn store_api_exposes_epoch_checkpoint_and_deadline() {
+    let constants = vec![Value::Int(1)];
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.ret();
+
+    let program = Program::new(constants, bc.finish());
+    let mut store = Store::new(Vm::new(program), String::from("ctx"));
+    store
+        .set_epoch_deadline(1)
+        .expect("setting epoch deadline should succeed");
+    let checkpoint = store.epoch_checkpoint();
+    assert_eq!(store.increment_epoch(), 1);
+
+    let status = store
+        .run()
+        .expect("first run should cooperatively yield when the epoch reaches the deadline");
+    assert_eq!(status, VmStatus::Yielded);
+    assert_eq!(store.vm().last_yield_reason(), Some(vm::VmYieldReason::Epoch));
+
+    store
+        .set_epoch_deadline(1)
+        .expect("re-arming epoch deadline should succeed");
+    let status = store.run().expect("store run should finish after re-arming");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(store.data(), "ctx");
+
+    store.restore_epoch(checkpoint);
+    assert_eq!(store.epoch_deadline(), Some(1));
+}
+
+#[test]
+fn epoch_check_interval_can_be_configured() {
+    let constants = vec![Value::Int(1)];
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.pop();
+    bc.ret();
+
+    let program = Program::new(constants, bc.finish());
+    let mut vm = Vm::new(program);
+    vm.set_epoch_check_interval(3)
+        .expect("interval update should succeed");
+    vm.set_epoch_deadline(0)
+        .expect("setting epoch deadline should succeed");
+
+    let status = vm
+        .run()
+        .expect("vm should cooperatively yield on the coarse epoch checkpoint");
+    assert_eq!(status, VmStatus::Yielded);
+    assert_eq!(vm.last_yield_reason(), Some(vm::VmYieldReason::Epoch));
+
+    vm.set_epoch_deadline(1)
+        .expect("re-arming epoch deadline should succeed");
+    let resumed = vm.run().expect("run should halt after re-arming");
+    assert_eq!(resumed, VmStatus::Halted);
+}
+
+#[test]
+fn epoch_check_interval_zero_is_rejected() {
+    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let err = vm
+        .set_epoch_check_interval(0)
+        .expect_err("zero interval should fail");
+    assert!(matches!(err, vm::VmError::InvalidEpochCheckInterval(0)));
+}
+
+#[test]
+fn epoch_checkpoint_restores_interval() {
+    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    assert_eq!(vm.increment_epoch_by(3), 3);
+    vm.set_epoch_check_interval(7)
+        .expect("interval update should succeed");
+    vm.set_epoch_deadline(4)
+        .expect("setting epoch deadline should succeed");
+    let checkpoint = vm.epoch_checkpoint();
+
+    vm.set_epoch_check_interval(2)
+        .expect("interval update should succeed");
+    vm.set_epoch_deadline(1)
+        .expect("updating epoch deadline should succeed");
+    assert_eq!(vm.epoch_check_interval(), 2);
+
+    vm.restore_epoch(checkpoint);
+    assert_eq!(vm.epoch_check_interval(), 7);
+    assert_eq!(vm.epoch_deadline(), Some(7));
+}
+
+#[test]
 fn float_division_by_zero_produces_signed_infinities() {
     let constants = vec![Value::Float(1.0), Value::Float(0.0), Value::Float(-0.0)];
     let mut bc = BytecodeBuilder::new();

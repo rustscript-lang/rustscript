@@ -1,4 +1,4 @@
-use super::{FuelCheckpoint, Vm, VmResult, VmStatus};
+use super::{EpochCheckpoint, EpochHandle, FuelCheckpoint, Vm, VmResult, VmStatus};
 
 /// Lightweight Wasmtime-style store wrapper for VM state and host context data.
 pub struct Store<T = ()> {
@@ -77,6 +77,54 @@ impl<T> Store<T> {
 
     pub fn consume_fuel_tick(&mut self) -> VmResult<()> {
         self.vm.consume_fuel_tick()
+    }
+
+    pub fn epoch_handle(&self) -> EpochHandle {
+        self.vm.epoch_handle()
+    }
+
+    pub fn current_epoch(&self) -> u64 {
+        self.vm.current_epoch()
+    }
+
+    pub fn increment_epoch(&self) -> u64 {
+        self.vm.increment_epoch()
+    }
+
+    pub fn increment_epoch_by(&self, delta: u64) -> u64 {
+        self.vm.increment_epoch_by(delta)
+    }
+
+    pub fn set_epoch_deadline(&mut self, ticks_beyond_current: u64) -> VmResult<()> {
+        self.vm.set_epoch_deadline(ticks_beyond_current)
+    }
+
+    pub fn clear_epoch_deadline(&mut self) {
+        self.vm.clear_epoch_deadline();
+    }
+
+    pub fn epoch_deadline(&self) -> Option<u64> {
+        self.vm.epoch_deadline()
+    }
+
+    pub fn set_epoch_check_interval(&mut self, interval: u32) -> VmResult<()> {
+        self.vm.set_epoch_check_interval(interval)
+    }
+
+    pub fn epoch_check_interval(&self) -> u32 {
+        self.vm.epoch_check_interval()
+    }
+
+    pub fn consume_epoch_tick(&mut self) -> VmResult<()> {
+        self.vm.consume_epoch_tick()
+    }
+
+    pub fn epoch_checkpoint(&self) -> EpochCheckpoint {
+        self.vm.epoch_checkpoint()
+    }
+
+    pub fn restore_epoch(&mut self, checkpoint: EpochCheckpoint) {
+        self.vm.restore_epoch(checkpoint);
     }
 
     pub fn fuel_checkpoint(&self) -> FuelCheckpoint {

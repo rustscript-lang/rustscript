@@ -40,10 +40,10 @@ pub(super) fn emit_fuel_tick_inline_guarded(
 
     let metering_enabled_block = b.create_block();
     let continue_block = b.create_block();
-    let fuel_enabled = b
+    let interrupt_mode = b
         .ins()
-        .load(types::I8, MemFlags::new(), vm_ptr, offsets.fuel_enabled);
-    let metering_enabled = b.ins().icmp_imm(IntCC::NotEqual, fuel_enabled, 0);
+        .load(types::I8, MemFlags::new(), vm_ptr, offsets.interrupt_mode);
+    let metering_enabled = b.ins().icmp_imm(IntCC::NotEqual, interrupt_mode, 0);
     b.ins().brif(
         metering_enabled,
         metering_enabled_block,
@@ -74,7 +74,7 @@ fn emit_fuel_tick_inline_core(
     continue_block: Block,
 ) {
     let countdown_block = b.create_block();
-    let charge_block = b.create_block();
+    let check_block = b.create_block();
 
     let ops_until_check = b.ins().load(
         types::I32,
@@ -87,7 +87,7 @@ fn emit_fuel_tick_inline_core(
         .ins()
         .icmp(IntCC::UnsignedGreaterThan, ops_until_check, chunk_steps);
     b.ins()
-        .brif(no_charge, countdown_block, &[], charge_block, &[]);
+        .brif(no_charge, countdown_block, &[], check_block, &[]);
 
     b.switch_to_block(countdown_block);
     let new_ops = b.ins().isub(ops_until_check, chunk_steps);
@@ -99,11 +99,26 @@ fn emit_fuel_tick_inline_core(
     );
     b.ins().jump(continue_block, &[]);
 
-    b.switch_to_block(charge_block);
+    b.switch_to_block(check_block);
+    let interval_i32 = b.ins().iconst(types::I32, i64::from(fuel_check_interval));
+    let interrupt_mode = b
+        .ins()
+        .load(types::I8, MemFlags::new(), vm_ptr, offsets.interrupt_mode);
+    let fuel_mode = b
+        .ins()
+        .icmp_imm(
+            IntCC::Equal,
+            interrupt_mode,
+            i64::from(crate::vm::InterruptMode::Fuel as u8),
+        );
+    let fuel_block = b.create_block();
+    let epoch_block = b.create_block();
+    b.ins().brif(fuel_mode, fuel_block, &[], epoch_block, &[]);
+
+    b.switch_to_block(fuel_block);
     let remaining = b
         .ins()
         .load(types::I64, MemFlags::new(), vm_ptr, offsets.fuel_remaining);
-    let interval_i32 = b.ins().iconst(types::I32, i64::from(fuel_check_interval));
     let charge_amount = b.ins().uextend(types::I64, interval_i32);
     let enough_fuel = b
         .ins()
@@ -134,6 +149,42 @@ fn emit_fuel_tick_inline_core(
     b.switch_to_block(out_of_fuel);
     let status = b.ins().iconst(types::I32, STATUS_OUT_OF_FUEL as i64);
     jump_with_status(b, exit_block, status);
+
+    b.switch_to_block(epoch_block);
+    let epoch_counter_ptr = b.ins().load(
+        types::I64,
+        MemFlags::new(),
+        vm_ptr,
+        offsets.epoch_counter_ptr,
+    );
+    let current_epoch = b
+        .ins()
+        .atomic_load(types::I64, MemFlags::new(), epoch_counter_ptr);
+    let epoch_deadline = b
+        .ins()
+        .load(types::I64, MemFlags::new(), vm_ptr, offsets.epoch_deadline);
+    let reached_deadline = b
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, current_epoch, epoch_deadline);
+    let epoch_ok = b.create_block();
+    let epoch_tripped = b.create_block();
+    b.ins()
+        .brif(reached_deadline, epoch_tripped, &[], epoch_ok, &[]);
+
+    b.switch_to_block(epoch_ok);
+    let epoch_overrun = b.ins().isub(chunk_steps, ops_until_check);
+    let epoch_next_ops = b.ins().isub(interval_i32, epoch_overrun);
+    b.ins().store(
+        MemFlags::new(),
+        epoch_next_ops,
+        vm_ptr,
+        offsets.fuel_ops_until_check,
+    );
+    b.ins().jump(continue_block, &[]);
+
+    b.switch_to_block(epoch_tripped);
+    let epoch_status = b.ins().iconst(types::I32, STATUS_OUT_OF_FUEL as i64);
+    jump_with_status(b, exit_block, epoch_status);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1781,9 +1832,11 @@ pub(super) fn resolve_offsets(layout: NativeStackLayout) -> VmResult<ResolvedOff
         constants_ptr,
         constants_len,
         vm_ip: layout.vm_ip_offset,
-        fuel_enabled: layout.vm_fuel_enabled_offset,
+        interrupt_mode: layout.vm_interrupt_mode_offset,
         fuel_remaining: layout.vm_fuel_remaining_offset,
         fuel_ops_until_check: layout.vm_fuel_ops_until_check_offset,
+        epoch_deadline: layout.vm_epoch_deadline_offset,
+        epoch_counter_ptr: layout.vm_epoch_counter_ptr_offset,
     })
 }
 

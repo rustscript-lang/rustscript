@@ -315,6 +315,165 @@ fn changing_fuel_interval_recompiles_native_trace_variant() {
 }
 
 #[test]
+fn trace_jit_native_path_honors_epoch_interruption() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let mut i = 0;
+        while i < 100 {
+            i = i + 1;
+        }
+        i;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.set_epoch_check_interval(8)
+        .expect("epoch interval update should succeed");
+    vm.set_epoch_deadline(0)
+        .expect("setting epoch deadline should succeed");
+
+    let status = vm
+        .run()
+        .expect("run should cooperatively yield under an expired epoch deadline");
+    assert_eq!(status, VmStatus::Yielded);
+    assert_eq!(vm.last_yield_reason(), Some(vm::VmYieldReason::Epoch));
+    assert!(
+        vm.jit_native_exec_count() > 0,
+        "expected native JIT execution under epoch interruption, dump:\n{}",
+        vm.dump_jit_info()
+    );
+
+    vm.set_epoch_deadline(1)
+        .expect("re-arming epoch deadline should succeed");
+    let status = vm.run().expect("second run should halt");
+    assert_eq!(status, VmStatus::Halted);
+}
+
+#[test]
+fn trace_jit_preserves_local_move_semantics_across_epoch_yields() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let mut i = 0;
+        let mut sum = 0;
+        while i < 50 {
+            let a = "x";
+            let b = a;
+            if b == "x" {
+                sum = sum + 1;
+            }
+            i = i + 1;
+        }
+        sum;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.set_epoch_check_interval(8)
+        .expect("epoch interval update should succeed");
+    vm.set_epoch_deadline(0)
+        .expect("setting epoch deadline should succeed");
+
+    let mut yielded = 0_u64;
+    loop {
+        match vm.run().expect("run should succeed") {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => {
+                yielded = yielded.saturating_add(1);
+                assert_eq!(vm.last_yield_reason(), Some(vm::VmYieldReason::Epoch));
+                assert!(
+                    yielded < 2_048,
+                    "move/yield loop made no progress after {yielded} yields, dump:\n{}",
+                    vm.dump_jit_info()
+                );
+                vm.set_epoch_deadline(if yielded < 4 { 0 } else { 1 })
+                    .expect("re-arming epoch deadline should succeed");
+            }
+            VmStatus::Waiting(op_id) => panic!("unexpected host wait on op {op_id}"),
+        }
+    }
+
+    assert!(yielded > 0, "expected at least one cooperative epoch yield");
+    assert_eq!(
+        vm.stack().last(),
+        Some(&Value::Int(50)),
+        "move-heavy loop should preserve final result across epoch yields"
+    );
+    assert!(
+        vm.jit_native_exec_count() > 0,
+        "expected native trace execution for move-heavy loop, dump:\n{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
+fn changing_epoch_interval_recompiles_native_trace_variant() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let mut i = 0;
+        let mut acc = 0;
+        while i < 40 {
+            acc = acc + i;
+            acc = acc + 1;
+            i = i + 1;
+        }
+        acc;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    vm.set_epoch_check_interval(1)
+        .expect("epoch interval update should succeed");
+    vm.set_epoch_deadline(1)
+        .expect("setting epoch deadline should succeed");
+    let status = vm.run().expect("first run should halt");
+    assert_eq!(status, VmStatus::Halted);
+    let dump_first = vm.dump_jit_info();
+    let bytes_first =
+        first_native_code_bytes(&dump_first).expect("first run should produce native code bytes");
+
+    vm.reset_for_reuse();
+    vm.set_epoch_check_interval(8)
+        .expect("epoch interval update should succeed");
+    vm.set_epoch_deadline(1)
+        .expect("setting epoch deadline should succeed");
+    let status = vm.run().expect("second run should halt");
+    assert_eq!(status, VmStatus::Halted);
+    let dump_second = vm.dump_jit_info();
+    let bytes_second =
+        first_native_code_bytes(&dump_second).expect("second run should produce native code bytes");
+
+    assert!(
+        bytes_second < bytes_first,
+        "expected fewer injected epoch checks with interval 8; interval=1 bytes={bytes_first}, interval=8 bytes={bytes_second}\nfirst dump:\n{dump_first}\nsecond dump:\n{dump_second}"
+    );
+}
+
+#[test]
 fn compiler_uses_shl_for_power_of_two_multiply_and_jit_accepts_it() {
     let source = r#"
         let mut i = 0;

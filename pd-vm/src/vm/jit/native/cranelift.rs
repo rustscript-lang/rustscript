@@ -138,9 +138,11 @@ struct NativeStackLayout {
     vm_program_constants_ptr_offset: i32,
     vm_program_constants_len_offset: i32,
     vm_ip_offset: i32,
-    vm_fuel_enabled_offset: i32,
+    vm_interrupt_mode_offset: i32,
     vm_fuel_remaining_offset: i32,
     vm_fuel_ops_until_check_offset: i32,
+    vm_epoch_deadline_offset: i32,
+    vm_epoch_counter_ptr_offset: i32,
     stack_vec: VecLayout,
     value: ValueLayout,
 }
@@ -155,9 +157,11 @@ struct ResolvedOffsets {
     constants_ptr: i32,
     constants_len: i32,
     vm_ip: i32,
-    fuel_enabled: i32,
+    interrupt_mode: i32,
     fuel_remaining: i32,
     fuel_ops_until_check: i32,
+    epoch_deadline: i32,
+    epoch_counter_ptr: i32,
 }
 
 pub(crate) fn helper_entry_address() -> usize {

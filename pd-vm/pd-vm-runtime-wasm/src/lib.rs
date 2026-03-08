@@ -9,8 +9,9 @@ use vm::SourceFlavor;
 use crate::analyzer::{LintDiagnostic, LintReport, LintSpan, lint_source_with_flavor};
 use crate::completions::{CompletionCatalog, build_completion_catalog};
 use crate::runtime::{
-    DebugCommand, DebugReport, FuelConfig, FuelState, RunCommand, RunReport, debug_state,
-    run_command, run_debug_command, start_debug_source_with_flavor, start_run_source_with_flavor,
+    DebugCommand, DebugReport, FuelConfig, FuelState, InterruptModeState, RunCommand, RunReport,
+    debug_state, run_command, run_debug_command, start_debug_source_with_flavor,
+    start_run_source_with_flavor,
 };
 
 #[derive(Serialize)]
@@ -63,8 +64,11 @@ struct DebugResponse {
 #[derive(Serialize)]
 struct FuelStateJson {
     enabled: bool,
+    mode: &'static str,
     remaining: Option<u64>,
     check_interval: u32,
+    epoch_current: u64,
+    epoch_deadline: Option<u64>,
 }
 
 fn parse_flavor(raw: &str) -> SourceFlavor {
@@ -169,8 +173,15 @@ fn debug_response_to_json(report: DebugReport) -> Vec<u8> {
 fn fuel_state_to_json(fuel: FuelState) -> FuelStateJson {
     FuelStateJson {
         enabled: fuel.enabled,
+        mode: match fuel.mode {
+            InterruptModeState::None => "none",
+            InterruptModeState::Fuel => "fuel",
+            InterruptModeState::Epoch => "epoch",
+        },
         remaining: fuel.remaining,
         check_interval: fuel.check_interval,
+        epoch_current: fuel.epoch_current,
+        epoch_deadline: fuel.epoch_deadline,
     }
 }
 
@@ -209,8 +220,11 @@ fn invalid_utf8_run_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8> 
         command_output: String::new(),
         fuel: fuel_state_to_json(FuelState {
             enabled: false,
+            mode: InterruptModeState::None,
             remaining: None,
             check_interval: 1,
+            epoch_current: 0,
+            epoch_deadline: None,
         }),
     };
     serde_json::to_vec(&response).unwrap_or_else(|_| {
@@ -235,8 +249,11 @@ fn invalid_utf8_debug_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8
         command_output: String::new(),
         fuel: fuel_state_to_json(FuelState {
             enabled: false,
+            mode: InterruptModeState::None,
             remaining: None,
             check_interval: 1,
+            epoch_current: 0,
+            epoch_deadline: None,
         }),
     };
     serde_json::to_vec(&response).unwrap_or_else(|_| {
@@ -258,8 +275,11 @@ fn invalid_run_command_response(command_json: &str, error: &str) -> Vec<u8> {
         command_output: String::new(),
         fuel: fuel_state_to_json(FuelState {
             enabled: false,
+            mode: InterruptModeState::None,
             remaining: None,
             check_interval: 1,
+            epoch_current: 0,
+            epoch_deadline: None,
         }),
     };
     serde_json::to_vec(&response).unwrap_or_else(|_| {
@@ -281,8 +301,11 @@ fn invalid_debug_command_response(command_json: &str, error: &str) -> Vec<u8> {
         command_output: String::new(),
         fuel: fuel_state_to_json(FuelState {
             enabled: false,
+            mode: InterruptModeState::None,
             remaining: None,
             check_interval: 1,
+            epoch_current: 0,
+            epoch_deadline: None,
         }),
     };
     serde_json::to_vec(&response).unwrap_or_else(|_| {
@@ -304,8 +327,11 @@ fn invalid_run_options_response(options_json: &str, error: &str) -> Vec<u8> {
         command_output: String::new(),
         fuel: fuel_state_to_json(FuelState {
             enabled: false,
+            mode: InterruptModeState::None,
             remaining: None,
             check_interval: 1,
+            epoch_current: 0,
+            epoch_deadline: None,
         }),
     };
     serde_json::to_vec(&response).unwrap_or_else(|_| {
@@ -327,8 +353,11 @@ fn invalid_debug_options_response(options_json: &str, error: &str) -> Vec<u8> {
         command_output: String::new(),
         fuel: fuel_state_to_json(FuelState {
             enabled: false,
+            mode: InterruptModeState::None,
             remaining: None,
             check_interval: 1,
+            epoch_current: 0,
+            epoch_deadline: None,
         }),
     };
     serde_json::to_vec(&response).unwrap_or_else(|_| {
@@ -854,6 +883,7 @@ mod tests {
             FuelConfig {
                 fuel: Some(0),
                 fuel_check_interval: Some(1),
+                ..FuelConfig::default()
             },
         );
         assert!(start.error.is_none(), "run start should not error");
@@ -884,6 +914,46 @@ mod tests {
             resumed.stack.iter().any(|value| value == "2"),
             "expected resumed stack to contain 2, got {:?}",
             resumed.stack
+        );
+    }
+
+    #[test]
+    fn run_session_can_resume_after_epoch_deadline() {
+        let source = r#"
+            let value = 1 + 1;
+            print(value);
+            value;
+        "#;
+        let start = start_run_source_with_flavor(
+            source,
+            SourceFlavor::RustScript,
+            FuelConfig {
+                mode: Some(crate::runtime::InterruptConfigMode::Epoch),
+                epoch_deadline: Some(0),
+                epoch_check_interval: Some(1),
+                ..FuelConfig::default()
+            },
+        );
+        assert!(start.error.is_none(), "run start should not error");
+        assert!(start.yielded, "run should yield immediately at epoch deadline");
+        assert_eq!(start.fuel.mode, crate::runtime::InterruptModeState::Epoch);
+        assert!(
+            start.command_output.contains("epoch deadline reached"),
+            "expected epoch pause prompt, got {:?}",
+            start.command_output
+        );
+
+        let rearm = run_command(RunCommand::SetEpochDeadline { ticks: 1 });
+        assert!(rearm.error.is_none(), "re-arming epoch should not error");
+        assert_eq!(rearm.fuel.mode, crate::runtime::InterruptModeState::Epoch);
+
+        let resumed = run_command(RunCommand::Resume);
+        assert!(resumed.error.is_none(), "resumed run should not error");
+        assert!(resumed.halted, "run should halt after resuming");
+        assert!(
+            resumed.output.iter().any(|line| line == "2"),
+            "expected resumed output to contain 2, got {:?}",
+            resumed.output
         );
     }
 
@@ -953,6 +1023,7 @@ mod tests {
             FuelConfig {
                 fuel: Some(0),
                 fuel_check_interval: Some(2),
+                ..FuelConfig::default()
             },
         );
         assert!(start.error.is_none(), "debug start should succeed");
@@ -990,6 +1061,61 @@ mod tests {
             resumed.error.is_none(),
             "resumed debug run should not error"
         );
+        assert!(resumed.halted, "resumed debug run should halt");
+        assert!(
+            resumed.output.iter().any(|line| line == "3"),
+            "expected debug output to contain 3, got {:?}",
+            resumed.output
+        );
+    }
+
+    #[test]
+    fn debug_session_reports_and_updates_epoch() {
+        let source = r#"
+            let mut value = 1;
+            value = value + 2;
+            print(value);
+            value;
+        "#;
+        let start = start_debug_source_with_flavor(
+            source,
+            SourceFlavor::RustScript,
+            FuelConfig {
+                mode: Some(crate::runtime::InterruptConfigMode::Epoch),
+                epoch_deadline: Some(0),
+                epoch_check_interval: Some(2),
+                ..FuelConfig::default()
+            },
+        );
+        assert!(start.error.is_none(), "debug start should succeed");
+        assert_eq!(start.fuel.mode, crate::runtime::InterruptModeState::Epoch);
+        assert_eq!(start.fuel.check_interval, 2);
+
+        let blocked = run_debug_command(DebugCommand::Continue);
+        assert!(blocked.error.is_none(), "continue should pause, not error");
+        assert!(
+            blocked.command_output.contains("epoch deadline reached"),
+            "expected epoch pause, got {:?}",
+            blocked.command_output
+        );
+
+        let ticked = run_debug_command(DebugCommand::TickEpoch { amount: 3 });
+        assert!(ticked.error.is_none(), "epoch tick should succeed");
+        assert!(
+            ticked.command_output.contains("epoch advanced by 3"),
+            "expected epoch tick output, got {:?}",
+            ticked.command_output
+        );
+
+        let interval = run_debug_command(DebugCommand::SetEpochCheckInterval { interval: 1 });
+        assert!(interval.error.is_none(), "epoch interval update should succeed");
+        assert_eq!(interval.fuel.check_interval, 1);
+
+        let rearm = run_debug_command(DebugCommand::SetEpochDeadline { ticks: 1 });
+        assert!(rearm.error.is_none(), "epoch deadline update should succeed");
+
+        let resumed = run_debug_command(DebugCommand::Continue);
+        assert!(resumed.error.is_none(), "resumed debug run should not error");
         assert!(resumed.halted, "resumed debug run should halt");
         assert!(
             resumed.output.iter().any(|line| line == "3"),

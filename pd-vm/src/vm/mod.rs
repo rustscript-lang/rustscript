@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
@@ -64,10 +65,19 @@ pub enum VmError {
     HostError(String),
     JitNative(String),
     InvalidFuelCheckInterval(u32),
+    InvalidEpochCheckInterval(u32),
+    InterruptionModeConflict {
+        active: &'static str,
+        requested: &'static str,
+    },
     FuelOverflow,
     OutOfFuel {
         needed: u64,
         remaining: u64,
+    },
+    EpochDeadlineReached {
+        current: u64,
+        deadline: u64,
     },
 }
 
@@ -102,10 +112,21 @@ impl std::fmt::Display for VmError {
             VmError::InvalidFuelCheckInterval(value) => {
                 write!(f, "invalid fuel check interval {value}, expected >= 1")
             }
+            VmError::InvalidEpochCheckInterval(value) => {
+                write!(f, "invalid epoch check interval {value}, expected >= 1")
+            }
+            VmError::InterruptionModeConflict { active, requested } => write!(
+                f,
+                "{requested} interruption cannot be enabled while {active} interruption is active"
+            ),
             VmError::FuelOverflow => write!(f, "fuel arithmetic overflow"),
             VmError::OutOfFuel { needed, remaining } => write!(
                 f,
                 "out of fuel: needed {needed} units, remaining {remaining}"
+            ),
+            VmError::EpochDeadlineReached { current, deadline } => write!(
+                f,
+                "epoch deadline reached: current epoch {current}, deadline {deadline}"
             ),
         }
     }
@@ -135,10 +156,84 @@ impl FuelCheckpoint {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpochCheckpoint {
+    deadline: Option<u64>,
+    check_interval: u32,
+    ops_until_check: u32,
+}
+
+impl EpochCheckpoint {
+    pub fn deadline(&self) -> Option<u64> {
+        self.deadline
+    }
+
+    pub fn check_interval(&self) -> u32 {
+        self.check_interval
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct EpochHandle {
+    current: Arc<AtomicU64>,
+}
+
+impl EpochHandle {
+    pub fn current(&self) -> u64 {
+        self.current.load(Ordering::Acquire)
+    }
+
+    pub fn increment(&self) -> u64 {
+        self.increment_by(1)
+    }
+
+    pub fn increment_by(&self, delta: u64) -> u64 {
+        if delta == 0 {
+            return self.current();
+        }
+        let previous = self
+            .current
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_add(delta))
+            })
+            .unwrap_or_else(|current| current);
+        previous.saturating_add(delta)
+    }
+
+    fn as_ptr(&self) -> *const AtomicU64 {
+        Arc::as_ptr(&self.current)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmStatus {
     Halted,
     Yielded,
     Waiting(HostOpId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmYieldReason {
+    Fuel,
+    Epoch,
+    Host,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum InterruptMode {
+    None = 0,
+    Fuel = 1,
+    Epoch = 2,
+}
+
+impl InterruptMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Fuel => "fuel",
+            Self::Epoch => "epoch",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -369,12 +464,16 @@ pub struct Vm {
     waiting_host_op: Option<WaitingHostOp>,
     next_host_op_id: HostOpId,
     io_state: builtins_impl::IoState,
-    fuel_enabled: bool,
+    epoch_handle: EpochHandle,
+    epoch_counter_ptr: usize,
+    interrupt_mode: InterruptMode,
     fuel_remaining: u64,
     fuel_check_interval: u32,
     fuel_ops_until_check: u32,
+    epoch_deadline: u64,
+    last_yield_reason: Option<VmYieldReason>,
     native_only_aot: bool,
-    native_aot_fuel_check_interval: Option<u32>,
+    native_aot_interrupt_check_interval: Option<u32>,
     drop_contract_events: u64,
 }
 
@@ -527,6 +626,8 @@ impl Vm {
         let program_constants_ptr = program.constants.as_ptr();
         let program_constants_len = program.constants.len();
         let local_count = program.local_count;
+        let epoch_handle = EpochHandle::default();
+        let epoch_counter_ptr = epoch_handle.as_ptr() as usize;
         Self {
             program,
             program_constants_ptr: program_constants_ptr as usize,
@@ -552,12 +653,16 @@ impl Vm {
             waiting_host_op: None,
             next_host_op_id: 1,
             io_state: builtins_impl::IoState::default(),
-            fuel_enabled: false,
+            epoch_handle,
+            epoch_counter_ptr,
+            interrupt_mode: InterruptMode::None,
             fuel_remaining: 0,
             fuel_check_interval: 1,
             fuel_ops_until_check: 1,
+            epoch_deadline: 0,
+            last_yield_reason: None,
             native_only_aot: false,
-            native_aot_fuel_check_interval: None,
+            native_aot_interrupt_check_interval: None,
             drop_contract_events: 0,
         }
     }
@@ -570,29 +675,41 @@ impl Vm {
         self.program_cache_key
     }
 
-    fn validate_native_aot_fuel_interval(&self, interval: u32) -> VmResult<()> {
-        if let Some(expected) = self.native_aot_fuel_check_interval {
+    fn fuel_metering_enabled(&self) -> bool {
+        self.interrupt_mode == InterruptMode::Fuel
+    }
+
+    fn epoch_interruption_enabled(&self) -> bool {
+        self.interrupt_mode == InterruptMode::Epoch
+    }
+
+    fn interruption_enabled(&self) -> bool {
+        self.interrupt_mode != InterruptMode::None
+    }
+
+    fn validate_native_aot_interrupt_interval(&self, interval: u32) -> VmResult<()> {
+        if let Some(expected) = self.native_aot_interrupt_check_interval {
             if expected == 0 {
                 return Err(VmError::JitNative(
-                    "native-only AOT bundle was emitted without fuel checks".to_string(),
+                    "native-only AOT bundle was emitted without interruption checks".to_string(),
                 ));
             }
             if interval != expected {
                 return Err(VmError::JitNative(format!(
-                    "native-only AOT bundles require fuel_check_interval={expected}, got {interval}",
+                    "native-only AOT bundles require interrupt_check_interval={expected}, got {interval}",
                 )));
             }
         }
         Ok(())
     }
 
-    fn validate_native_aot_fuel_runtime(&self) -> VmResult<()> {
+    fn validate_native_aot_interrupt_runtime(&self) -> VmResult<()> {
         if self.native_only_aot
-            && self.fuel_enabled
-            && self.native_aot_fuel_check_interval == Some(0)
+            && self.interruption_enabled()
+            && self.native_aot_interrupt_check_interval == Some(0)
         {
             return Err(VmError::JitNative(
-                "native-only AOT bundle was emitted without fuel checks and cannot run with fuel enabled"
+                "native-only AOT bundle was emitted without interruption checks and cannot run with cooperative interruption enabled"
                     .to_string(),
             ));
         }
@@ -643,6 +760,7 @@ impl Vm {
     pub fn reset_for_reuse(&mut self) {
         self.ip = 0;
         self.drop_contract_events = 0;
+        self.last_yield_reason = None;
         self.clear_stack_with_drop_contract();
         self.clear_locals_with_drop_contract();
         self.call_depth = 0;
@@ -764,30 +882,59 @@ impl Vm {
         self.waiting_host_op.map(|op| op.op_id)
     }
 
+    fn interruption_mode_conflict(&self, requested: InterruptMode) -> VmError {
+        VmError::InterruptionModeConflict {
+            active: self.interrupt_mode.label(),
+            requested: requested.label(),
+        }
+    }
+
+    fn reset_interrupt_countdown(&mut self) {
+        self.fuel_ops_until_check = self.fuel_check_interval.max(1);
+    }
+
+    fn clear_epoch_deadline_internal(&mut self) {
+        if self.epoch_interruption_enabled() {
+            self.interrupt_mode = InterruptMode::None;
+        }
+        self.epoch_deadline = 0;
+        self.reset_interrupt_countdown();
+    }
+
+    fn clear_fuel_internal(&mut self) {
+        if self.fuel_metering_enabled() {
+            self.interrupt_mode = InterruptMode::None;
+        }
+        self.fuel_remaining = 0;
+        self.reset_interrupt_countdown();
+    }
+
     pub fn set_fuel(&mut self, fuel: u64) {
-        self.fuel_enabled = true;
+        self.clear_epoch_deadline_internal();
+        self.interrupt_mode = InterruptMode::Fuel;
         self.fuel_remaining = fuel;
-        self.fuel_ops_until_check = self.fuel_check_interval;
+        self.reset_interrupt_countdown();
     }
 
     pub fn clear_fuel(&mut self) {
-        self.fuel_enabled = false;
-        self.fuel_remaining = 0;
-        self.fuel_ops_until_check = self.fuel_check_interval;
+        self.clear_fuel_internal();
     }
 
     pub fn set_fuel_check_interval(&mut self, interval: u32) -> VmResult<()> {
         if interval == 0 {
             return Err(VmError::InvalidFuelCheckInterval(interval));
         }
-        self.validate_native_aot_fuel_interval(interval)?;
+        if self.epoch_interruption_enabled() {
+            return Err(self.interruption_mode_conflict(InterruptMode::Fuel));
+        }
+        self.validate_native_aot_interrupt_interval(interval)?;
         self.fuel_check_interval = interval;
-        self.fuel_ops_until_check = interval;
+        self.reset_interrupt_countdown();
         Ok(())
     }
 
     pub fn fuel_check_interval(&self) -> u32 {
-        if self.native_aot_fuel_check_interval == Some(0) {
+        if self.native_aot_interrupt_check_interval == Some(0) {
             0
         } else {
             self.fuel_check_interval
@@ -795,11 +942,11 @@ impl Vm {
     }
 
     pub fn aot_fuel_check_interval(&self) -> Option<u32> {
-        self.native_aot_fuel_check_interval
+        self.native_aot_interrupt_check_interval
     }
 
     pub fn get_fuel(&self) -> Option<u64> {
-        self.fuel_enabled
+        self.fuel_metering_enabled()
             .then_some(self.fuel_remaining.saturating_sub(self.pending_fuel_debt()))
     }
 
@@ -807,12 +954,16 @@ impl Vm {
         if fuel == 0 {
             return Ok(());
         }
-        self.fuel_remaining = if self.fuel_enabled {
+        if self.epoch_interruption_enabled() {
+            return Err(self.interruption_mode_conflict(InterruptMode::Fuel));
+        }
+        self.fuel_remaining = if self.fuel_metering_enabled() {
             self.fuel_remaining
                 .checked_add(fuel)
                 .ok_or(VmError::FuelOverflow)?
         } else {
-            self.fuel_enabled = true;
+            self.interrupt_mode = InterruptMode::Fuel;
+            self.reset_interrupt_countdown();
             fuel
         };
         Ok(())
@@ -823,16 +974,29 @@ impl Vm {
     }
 
     pub fn consume_fuel(&mut self, fuel: u64) -> VmResult<()> {
+        if self.epoch_interruption_enabled() {
+            return Err(self.interruption_mode_conflict(InterruptMode::Fuel));
+        }
         self.charge_fuel(fuel)
     }
 
     pub fn consume_fuel_tick(&mut self) -> VmResult<()> {
+        if self.epoch_interruption_enabled() {
+            return Err(self.interruption_mode_conflict(InterruptMode::Fuel));
+        }
         self.charge_fuel_tick()
+    }
+
+    pub fn consume_epoch_tick(&mut self) -> VmResult<()> {
+        if self.fuel_metering_enabled() {
+            return Err(self.interruption_mode_conflict(InterruptMode::Epoch));
+        }
+        self.charge_epoch_tick()
     }
 
     pub fn fuel_checkpoint(&self) -> FuelCheckpoint {
         FuelCheckpoint {
-            remaining: self.fuel_enabled.then_some(self.fuel_remaining),
+            remaining: self.fuel_metering_enabled().then_some(self.fuel_remaining),
             check_interval: self.fuel_check_interval(),
             ops_until_check: self.fuel_ops_until_check,
         }
@@ -843,15 +1007,20 @@ impl Vm {
     }
 
     pub fn restore_fuel(&mut self, checkpoint: FuelCheckpoint) {
-        self.fuel_enabled = checkpoint.remaining.is_some();
+        self.clear_epoch_deadline_internal();
+        self.interrupt_mode = if checkpoint.remaining.is_some() {
+            InterruptMode::Fuel
+        } else {
+            InterruptMode::None
+        };
         self.fuel_remaining = checkpoint.remaining.unwrap_or(0);
-        if self.native_aot_fuel_check_interval == Some(0) {
+        if self.native_aot_interrupt_check_interval == Some(0) {
             self.fuel_check_interval = 1;
             self.fuel_ops_until_check = 1;
             return;
         }
         self.fuel_check_interval = self
-            .native_aot_fuel_check_interval
+            .native_aot_interrupt_check_interval
             .unwrap_or(checkpoint.check_interval.max(1));
         self.fuel_ops_until_check = checkpoint
             .ops_until_check
@@ -860,6 +1029,94 @@ impl Vm {
 
     pub fn restore_checkpoint(&mut self, checkpoint: FuelCheckpoint) {
         self.restore_fuel(checkpoint);
+    }
+
+    pub fn epoch_handle(&self) -> EpochHandle {
+        self.epoch_handle.clone()
+    }
+
+    pub fn current_epoch(&self) -> u64 {
+        self.epoch_handle.current()
+    }
+
+    pub fn increment_epoch(&self) -> u64 {
+        self.epoch_handle.increment()
+    }
+
+    pub fn increment_epoch_by(&self, delta: u64) -> u64 {
+        self.epoch_handle.increment_by(delta)
+    }
+
+    pub fn set_epoch_deadline(&mut self, ticks_beyond_current: u64) -> VmResult<()> {
+        if self.fuel_metering_enabled() {
+            return Err(self.interruption_mode_conflict(InterruptMode::Epoch));
+        }
+        self.interrupt_mode = InterruptMode::Epoch;
+        self.epoch_deadline = self.current_epoch().saturating_add(ticks_beyond_current);
+        self.reset_interrupt_countdown();
+        Ok(())
+    }
+
+    pub fn clear_epoch_deadline(&mut self) {
+        self.clear_epoch_deadline_internal();
+    }
+
+    pub fn epoch_deadline(&self) -> Option<u64> {
+        self.epoch_interruption_enabled().then_some(self.epoch_deadline)
+    }
+
+    pub fn set_epoch_check_interval(&mut self, interval: u32) -> VmResult<()> {
+        if interval == 0 {
+            return Err(VmError::InvalidEpochCheckInterval(interval));
+        }
+        if self.fuel_metering_enabled() {
+            return Err(self.interruption_mode_conflict(InterruptMode::Epoch));
+        }
+        self.validate_native_aot_interrupt_interval(interval)?;
+        self.fuel_check_interval = interval;
+        self.reset_interrupt_countdown();
+        Ok(())
+    }
+
+    pub fn epoch_check_interval(&self) -> u32 {
+        self.fuel_check_interval()
+    }
+
+    pub fn aot_epoch_check_interval(&self) -> Option<u32> {
+        self.native_aot_interrupt_check_interval
+    }
+
+    pub fn epoch_checkpoint(&self) -> EpochCheckpoint {
+        EpochCheckpoint {
+            deadline: self.epoch_interruption_enabled().then_some(self.epoch_deadline),
+            check_interval: self.epoch_check_interval(),
+            ops_until_check: self.fuel_ops_until_check,
+        }
+    }
+
+    pub fn restore_epoch(&mut self, checkpoint: EpochCheckpoint) {
+        self.clear_fuel_internal();
+        self.interrupt_mode = if checkpoint.deadline.is_some() {
+            InterruptMode::Epoch
+        } else {
+            InterruptMode::None
+        };
+        self.epoch_deadline = checkpoint.deadline.unwrap_or(0);
+        if self.native_aot_interrupt_check_interval == Some(0) {
+            self.fuel_check_interval = 1;
+            self.fuel_ops_until_check = 1;
+            return;
+        }
+        self.fuel_check_interval = self
+            .native_aot_interrupt_check_interval
+            .unwrap_or(checkpoint.check_interval.max(1));
+        self.fuel_ops_until_check = checkpoint
+            .ops_until_check
+            .clamp(1, self.fuel_check_interval);
+    }
+
+    pub fn last_yield_reason(&self) -> Option<VmYieldReason> {
+        self.last_yield_reason
     }
 
     pub fn complete_host_op(&mut self, op_id: HostOpId, values: Vec<Value>) -> VmResult<()> {
@@ -958,13 +1215,21 @@ impl Vm {
         err: &VmError,
     ) -> bool {
         match err {
-            VmError::OutOfFuel { .. } => {
+            VmError::OutOfFuel { .. } | VmError::EpochDeadlineReached { .. } => {
                 if let Some(active_debugger) = debugger.as_deref_mut() {
                     return active_debugger.on_vm_error(self, err);
                 }
                 false
             }
             _ => false,
+        }
+    }
+
+    fn yielded_interrupt_reason(err: &VmError) -> Option<VmYieldReason> {
+        match err {
+            VmError::OutOfFuel { .. } => Some(VmYieldReason::Fuel),
+            VmError::EpochDeadlineReached { .. } => Some(VmYieldReason::Epoch),
+            _ => None,
         }
     }
 
@@ -982,6 +1247,17 @@ impl Vm {
         debugger: &mut Option<&mut crate::debugger::Debugger>,
         outcome: ExecOutcome,
     ) -> Option<VmStatus> {
+        match outcome {
+            ExecOutcome::Continue => {}
+            ExecOutcome::Halted | ExecOutcome::Waiting(_) => {
+                self.last_yield_reason = None;
+            }
+            ExecOutcome::Yielded => {
+                if self.last_yield_reason.is_none() {
+                    self.last_yield_reason = Some(VmYieldReason::Host);
+                }
+            }
+        }
         let status = Self::outcome_to_status(outcome)?;
         self.notify_debugger_status(debugger, status);
         Some(status)
@@ -992,9 +1268,10 @@ impl Vm {
         mut debugger: Option<&mut crate::debugger::Debugger>,
         allow_jit: bool,
     ) -> VmResult<VmStatus> {
-        self.validate_native_aot_fuel_runtime()?;
+        self.validate_native_aot_interrupt_runtime()?;
         self.ensure_call_bindings()?;
         if let Some(waiting) = self.waiting_host_op {
+            self.last_yield_reason = None;
             let status = VmStatus::Waiting(waiting.op_id);
             self.notify_debugger_status(&mut debugger, status);
             return Ok(status);
@@ -1014,12 +1291,14 @@ impl Vm {
                     let outcome = match self.execute_jit_entry(trace_id) {
                         Ok(outcome) => outcome,
                         Err(err) => {
-                            if matches!(err, VmError::OutOfFuel { .. }) {
-                                // Fuel exhaustion is cooperative: surface as a yield so callers
-                                // can top up budget and resume without treating it as a hard fault.
+                            if let Some(reason) = Self::yielded_interrupt_reason(&err) {
+                                // Cooperative interruption surfaces as a yield so callers can
+                                // adjust fuel/epoch state and resume without treating it as a
+                                // hard fault.
                                 if self.handle_debugger_error(&mut debugger, &err) {
                                     continue;
                                 }
+                                self.last_yield_reason = Some(reason);
                                 let status = VmStatus::Yielded;
                                 self.notify_debugger_status(&mut debugger, status);
                                 return Ok(status);
@@ -1048,15 +1327,16 @@ impl Vm {
                 return Err(VmError::BytecodeBounds);
             }
 
-            if self.fuel_enabled
-                && let Err(err) = self.charge_fuel_tick()
+            if self.interruption_enabled()
+                && let Err(err) = self.charge_interrupt_tick()
             {
-                if matches!(err, VmError::OutOfFuel { .. }) {
-                    // Fuel exhaustion is cooperative: surface as a yield so callers
-                    // can top up budget and resume without treating it as a hard fault.
+                if let Some(reason) = Self::yielded_interrupt_reason(&err) {
+                    // Cooperative interruption surfaces as a yield so callers can
+                    // adjust fuel/epoch state and resume without treating it as a hard fault.
                     if self.handle_debugger_error(&mut debugger, &err) {
                         continue;
                     }
+                    self.last_yield_reason = Some(reason);
                     let status = VmStatus::Yielded;
                     self.notify_debugger_status(&mut debugger, status);
                     return Ok(status);
@@ -1070,12 +1350,13 @@ impl Vm {
             let outcome = match self.execute_interpreter_instruction(opcode) {
                 Ok(outcome) => outcome,
                 Err(err) => {
-                    if matches!(err, VmError::OutOfFuel { .. }) {
-                        // Fuel exhaustion stays cooperative even when raised during
+                    if let Some(reason) = Self::yielded_interrupt_reason(&err) {
+                        // Cooperative interruption stays resumable even when raised during
                         // instruction execution (for example, fused call+ret tail tick).
                         if self.handle_debugger_error(&mut debugger, &err) {
                             continue;
                         }
+                        self.last_yield_reason = Some(reason);
                         let status = VmStatus::Yielded;
                         self.notify_debugger_status(&mut debugger, status);
                         return Ok(status);
@@ -1193,7 +1474,7 @@ impl Vm {
             }
             x if x == OpCode::Ldloc as u8 => {
                 let index = self.read_u8()?;
-                if !self.fuel_enabled && self.can_fuse_ldloc_copy_pattern(index) {
+                if !self.interruption_enabled() && self.can_fuse_ldloc_copy_pattern(index) {
                     let value = self
                         .locals
                         .get(index as usize)
@@ -1223,16 +1504,20 @@ impl Vm {
                 match self.execute_host_call(index, argc_u8, call_ip)? {
                     HostCallExecOutcome::Returned => {
                         if can_fuse_tail_halt {
-                            if self.fuel_enabled {
-                                // Preserve per-instruction fuel semantics when folding `call; ret`.
-                                self.charge_fuel_tick()?;
+                            if self.interruption_enabled() {
+                                // Preserve per-instruction interruption semantics when folding
+                                // `call; ret`.
+                                self.charge_interrupt_tick()?;
                             }
                             // Consume the trailing `ret` so a resumed run does not halt twice.
                             self.ip = self.ip.saturating_add(1);
                             return Ok(ExecOutcome::Halted);
                         }
                     }
-                    HostCallExecOutcome::Yielded => return Ok(ExecOutcome::Yielded),
+                    HostCallExecOutcome::Yielded => {
+                        self.last_yield_reason = Some(VmYieldReason::Host);
+                        return Ok(ExecOutcome::Yielded);
+                    }
                     HostCallExecOutcome::Pending(op_id) => {
                         return Ok(ExecOutcome::Waiting(op_id));
                     }
@@ -1280,7 +1565,7 @@ impl Vm {
     }
 
     fn pending_fuel_debt(&self) -> u64 {
-        if !self.fuel_enabled {
+        if !self.fuel_metering_enabled() {
             return 0;
         }
         let executed_since_last_check = self
@@ -1349,7 +1634,7 @@ impl Vm {
             return Ok(());
         }
 
-        if !self.fuel_enabled {
+        if !self.fuel_metering_enabled() {
             return Ok(());
         }
         let remaining = self.fuel_remaining;
@@ -1365,7 +1650,7 @@ impl Vm {
     }
 
     pub(in crate::vm) fn charge_fuel_tick(&mut self) -> VmResult<()> {
-        if !self.fuel_enabled {
+        if !self.fuel_metering_enabled() {
             return Ok(());
         }
         if self.fuel_ops_until_check > 1 {
@@ -1377,6 +1662,34 @@ impl Vm {
         self.charge_fuel(amount)?;
         self.fuel_ops_until_check = self.fuel_check_interval;
         Ok(())
+    }
+
+    pub(in crate::vm) fn charge_epoch_tick(&mut self) -> VmResult<()> {
+        if !self.epoch_interruption_enabled() {
+            return Ok(());
+        }
+        if self.fuel_ops_until_check > 1 {
+            self.fuel_ops_until_check -= 1;
+            return Ok(());
+        }
+
+        let current = self.current_epoch();
+        if current >= self.epoch_deadline {
+            return Err(VmError::EpochDeadlineReached {
+                current,
+                deadline: self.epoch_deadline,
+            });
+        }
+        self.fuel_ops_until_check = self.fuel_check_interval;
+        Ok(())
+    }
+
+    pub(in crate::vm) fn charge_interrupt_tick(&mut self) -> VmResult<()> {
+        match self.interrupt_mode {
+            InterruptMode::None => Ok(()),
+            InterruptMode::Fuel => self.charge_fuel_tick(),
+            InterruptMode::Epoch => self.charge_epoch_tick(),
+        }
     }
 
     fn peek_value(&self) -> VmResult<&Value> {
@@ -2062,6 +2375,32 @@ mod tests {
     }
 
     #[test]
+    fn interpreter_does_not_fuse_ldloc_dup_stloc_when_epoch_enabled() {
+        let program = Program::new(
+            vec![],
+            vec![
+                OpCode::Ldloc as u8,
+                0,
+                OpCode::Dup as u8,
+                OpCode::Stloc as u8,
+                0,
+                OpCode::Ret as u8,
+            ],
+        )
+        .with_local_count(1);
+        let mut vm = Vm::new(program);
+        vm.locals[0] = Value::Int(42);
+        vm.set_epoch_deadline(1)
+            .expect("setting epoch deadline should succeed");
+
+        let ldloc = step_once(&mut vm).expect("ldloc should execute");
+        assert!(matches!(ldloc, ExecOutcome::Continue));
+        assert_eq!(vm.ip, 2, "epoch interruption must not skip dup+stloc");
+        assert_eq!(vm.locals[0], Value::Null);
+        assert_eq!(vm.stack(), &[Value::Int(42)]);
+    }
+
+    #[test]
     fn interpreter_fuses_call_ret_without_fuel() {
         let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
         let program = Program::new(
@@ -2120,6 +2459,30 @@ mod tests {
     }
 
     #[test]
+    fn interpreter_call_ret_fusion_preserves_ip_when_epoch_deadline_is_reached() {
+        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
+        let program = Program::new(
+            vec![],
+            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
+        );
+        let mut vm = Vm::new(program);
+        vm.set_epoch_deadline(0)
+            .expect("setting epoch deadline should succeed");
+        vm.stack.push(Value::String("tail".to_string()));
+
+        let err = match step_once(&mut vm) {
+            Ok(_) => panic!("tail tick should fail with epoch deadline reached"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, VmError::EpochDeadlineReached { .. }));
+        assert_eq!(
+            vm.ip, 4,
+            "ret must remain pending when the epoch check trips during fused tail execution"
+        );
+        assert_eq!(vm.stack(), &[Value::Int(4)]);
+    }
+
+    #[test]
     fn run_consumes_two_ticks_for_call_ret_when_fuel_enabled() {
         let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
         let program = Program::new(
@@ -2162,6 +2525,37 @@ mod tests {
         assert_eq!(vm.get_fuel(), Some(0));
 
         vm.add_fuel(1).expect("recharging fuel should succeed");
+        let resumed = vm.resume().expect("resume should execute trailing ret");
+        assert_eq!(resumed, VmStatus::Halted);
+        assert_eq!(vm.ip, 5);
+        assert_eq!(vm.stack(), &[Value::Int(4)]);
+    }
+
+    #[test]
+    fn run_yields_before_ret_in_call_ret_sequence_when_epoch_deadline_is_reached() {
+        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
+        let program = Program::new(
+            vec![],
+            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
+        );
+        let mut vm = Vm::new(program);
+        vm.set_epoch_check_interval(2)
+            .expect("epoch interval update should succeed");
+        vm.set_epoch_deadline(0)
+            .expect("setting epoch deadline should succeed");
+        vm.stack.push(Value::String("tail".to_string()));
+
+        let status = vm.run().expect("first run should yield");
+        assert_eq!(status, VmStatus::Yielded);
+        assert_eq!(
+            vm.ip, 4,
+            "epoch interruption should happen before trailing ret"
+        );
+        assert_eq!(vm.last_yield_reason(), Some(VmYieldReason::Epoch));
+        assert_eq!(vm.stack(), &[Value::Int(4)]);
+
+        vm.set_epoch_deadline(1)
+            .expect("re-arming epoch deadline should succeed");
         let resumed = vm.resume().expect("resume should execute trailing ret");
         assert_eq!(resumed, VmStatus::Halted);
         assert_eq!(vm.ip, 5);

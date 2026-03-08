@@ -29,6 +29,13 @@ impl Vm {
         self.emit_aot_bundle_with_fuel_check_interval(DEFAULT_AOT_BUNDLE_FUEL_CHECK_INTERVAL)
     }
 
+    pub fn emit_aot_bundle_with_epoch_check_interval(
+        &mut self,
+        epoch_check_interval: u32,
+    ) -> VmResult<Vec<u8>> {
+        self.emit_aot_bundle_with_fuel_check_interval(epoch_check_interval)
+    }
+
     pub fn emit_aot_bundle_with_fuel_check_interval(
         &mut self,
         fuel_check_interval: u32,
@@ -166,7 +173,7 @@ impl Vm {
                 debug: None,
             });
             vm.native_only_aot = true;
-            vm.native_aot_fuel_check_interval = Some(fuel_check_interval);
+            vm.native_aot_interrupt_check_interval = Some(fuel_check_interval);
             vm.fuel_check_interval = runtime_fuel_check_interval(fuel_check_interval);
             vm.fuel_ops_until_check = runtime_fuel_check_interval(fuel_check_interval);
             vm.jit

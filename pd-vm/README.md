@@ -16,6 +16,7 @@ source syntaxes (`.rss`, `.js`, `.lua`, `.scm`).
   - [JIT](#jit)
   - [AOT](#aot)
   - [Fuel Metering](#fuel-metering)
+  - [Epoch Interruption](#epoch-interruption)
   - [Wasm Lint](#wasm-lint)
   - [Wasm Runtime Playground](#wasm-runtime-playground)
   - [WebUI Playground](#webui-playground)
@@ -41,7 +42,7 @@ Includes rich debugging and profiling tools: interactive debugger, recording and
 
 - [ ] Optional type annotation (rustscript) for function boundaries / host APIs.
 - [ ] host call fuel budgeting.
-- [ ] Epoch-based interruption API.
+- [x] Epoch-based interruption API.
 - [ ] Callable-as-value support.
 
 ## How To Use
@@ -85,7 +86,7 @@ Run debugger over TCP:
 cargo run -p pd-vm --bin pd-vm-run -- --debug --tcp 127.0.0.1:9002 examples/example.lua
 ```
 
-Useful commands: `break`, `break line`, `step`, `next`, `out`, `stack`, `locals`, `where`, `continue`, `fuel`.
+Useful commands: `break`, `break line`, `step`, `next`, `out`, `stack`, `locals`, `where`, `continue`, `fuel`, `epoch`.
 
 ### Recording and Replay
 
@@ -167,6 +168,9 @@ Set a custom AOT fuel checkpoint interval while emitting:
 cargo run -p pd-vm --bin pd-vm-run -- --emit-aot out/example.pat --fuel-check-interval 64 examples/example.rss
 ```
 
+`--epoch-check-interval <n>` is also accepted in `--emit-aot` mode as an equivalent alias for the
+same native interruption checkpoint cadence.
+
 Run an emitted AOT bundle:
 
 ```powershell
@@ -206,6 +210,8 @@ cargo run -p pd-vm --bin pd-vm-run -- --run-aot out/example.pat --jit-dump
 and forwards `run()` / `resume()`.
 
 `pd-vm-run` supports `--fuel <n>` to set the initial VM fuel budget.
+`pd-vm-run` also supports `--epoch-deadline <n>` plus `--epoch-check-interval <n>` for
+Wasmtime-style epoch interruption.
 
 Debugger fuel commands:
 
@@ -243,6 +249,8 @@ store.restore_checkpoint(checkpoint);
 Fuel charging semantics:
 
 - Fuel metering is disabled by default (`get_fuel() == None`).
+- Fuel metering and epoch interruption are mutually exclusive. Enabling one disables or rejects the
+  other API surface, depending on the operation.
 - `set_fuel` sets an explicit budget; `add_fuel` also enables metering if it was disabled.
 - Fuel is consumed in chunks at the configured check cadence.
   Chunk size = `fuel_check_interval`.
@@ -261,6 +269,39 @@ Fuel charging semantics:
   instruction pointer.
 - Host-side work is not automatically metered beyond VM instruction execution; host code can call
   `consume_fuel` explicitly for additional charging policy.
+
+### Epoch Interruption
+
+`pd-vm` also provides a Wasmtime-style epoch API:
+
+- `epoch_handle`
+- `current_epoch`
+- `increment_epoch` / `increment_epoch_by`
+- `set_epoch_deadline`
+- `clear_epoch_deadline`
+- `epoch_deadline`
+- `set_epoch_check_interval`
+- `epoch_check_interval`
+- `epoch_checkpoint` / `restore_epoch`
+- `last_yield_reason`
+
+Semantics:
+
+- `EpochHandle` is shared engine-style state. Callers advance it externally.
+- `set_epoch_deadline(n)` arms the VM to yield once `current_epoch >= current_epoch_at_arm + n`.
+- Epoch interruption reuses `VmStatus::Yielded`; inspect `last_yield_reason()` if the caller needs
+  to distinguish fuel vs epoch vs host yields.
+- Re-arm the deadline after a yield to continue execution.
+- The interpreter, trace interpreter, native JIT, and native AOT all use the same inline
+  checkpoint cadence (`epoch_check_interval`).
+
+Debugger epoch commands:
+
+- `epoch` (show current epoch, deadline, and check interval)
+- `epoch tick [n]`
+- `epoch deadline <n>`
+- `epoch clear`
+- `epoch interval [n]`
 
 ### Wasm Lint
 

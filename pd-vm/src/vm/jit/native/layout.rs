@@ -19,9 +19,11 @@ pub(super) fn native_layout_fingerprint() -> VmResult<u64> {
     layout.vm_program_constants_ptr_offset.hash(&mut hasher);
     layout.vm_program_constants_len_offset.hash(&mut hasher);
     layout.vm_ip_offset.hash(&mut hasher);
-    layout.vm_fuel_enabled_offset.hash(&mut hasher);
+    layout.vm_interrupt_mode_offset.hash(&mut hasher);
     layout.vm_fuel_remaining_offset.hash(&mut hasher);
     layout.vm_fuel_ops_until_check_offset.hash(&mut hasher);
+    layout.vm_epoch_deadline_offset.hash(&mut hasher);
+    layout.vm_epoch_counter_ptr_offset.hash(&mut hasher);
     layout.stack_vec.ptr_offset.hash(&mut hasher);
     layout.stack_vec.len_offset.hash(&mut hasher);
     layout.stack_vec.cap_offset.hash(&mut hasher);
@@ -51,9 +53,9 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         "Vm::program_constants_len offset",
     )?;
     let vm_ip_offset = usize_to_i32(std::mem::offset_of!(Vm, ip), "Vm::ip offset")?;
-    let vm_fuel_enabled_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, fuel_enabled),
-        "Vm::fuel_enabled offset",
+    let vm_interrupt_mode_offset = usize_to_i32(
+        std::mem::offset_of!(Vm, interrupt_mode),
+        "Vm::interrupt_mode offset",
     )?;
     let vm_fuel_remaining_offset = usize_to_i32(
         std::mem::offset_of!(Vm, fuel_remaining),
@@ -63,6 +65,14 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         std::mem::offset_of!(Vm, fuel_ops_until_check),
         "Vm::fuel_ops_until_check offset",
     )?;
+    let vm_epoch_deadline_offset = usize_to_i32(
+        std::mem::offset_of!(Vm, epoch_deadline),
+        "Vm::epoch_deadline offset",
+    )?;
+    let vm_epoch_counter_ptr_offset = usize_to_i32(
+        std::mem::offset_of!(Vm, epoch_counter_ptr),
+        "Vm::epoch_counter_ptr offset",
+    )?;
     let stack_vec = detect_vec_layout()?;
     let value = detect_value_layout()?;
     Ok(NativeStackLayout {
@@ -71,9 +81,11 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         vm_program_constants_ptr_offset,
         vm_program_constants_len_offset,
         vm_ip_offset,
-        vm_fuel_enabled_offset,
+        vm_interrupt_mode_offset,
         vm_fuel_remaining_offset,
         vm_fuel_ops_until_check_offset,
+        vm_epoch_deadline_offset,
+        vm_epoch_counter_ptr_offset,
         stack_vec,
         value,
     })
