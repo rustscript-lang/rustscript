@@ -14,7 +14,7 @@ use edge::{
 use pd_controller::{ControllerConfig, ControllerState, EdgeDetailResponse, build_controller_app};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
-use vm::decode_program;
+use vm::{SourceFlavor, compile_source_with_flavor, decode_program};
 
 static TEST_STATE_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -952,7 +952,7 @@ async fn ui_render_extended_value_blocks_work_with_flow_graph() {
         "expected string concat line, got: {rustscript}"
     );
     assert!(
-        rustscript.contains("let joined_len = len(joined);"),
+        rustscript.contains("let joined_len = (joined).length;"),
         "expected string length line, got: {rustscript}"
     );
     assert!(
@@ -964,32 +964,32 @@ async fn ui_render_extended_value_blocks_work_with_flow_graph() {
         "expected array_new line, got: {rustscript}"
     );
     assert!(
-        rustscript.contains("let items_with_msg = items;"),
-        "expected array_push clone line, got: {rustscript}"
+        rustscript.contains("let mut items_with_msg = (items).copy();"),
+        "expected borrow-safe array_push clone line, got: {rustscript}"
     );
     assert!(
-        rustscript.contains("items_with_msg[len(items_with_msg)] = joined;"),
+        rustscript.contains("items_with_msg[items_with_msg.length] = joined;"),
         "expected array_push append line, got: {rustscript}"
     );
     assert!(
-        rustscript.contains("let first_item = (items_with_msg)[0];"),
-        "expected array_get line, got: {rustscript}"
+        rustscript.contains("let first_item = ((items_with_msg)[0]).copy();"),
+        "expected borrow-safe array_get line, got: {rustscript}"
     );
     assert!(
         rustscript.contains("let result_map = {};"),
         "expected map_new line, got: {rustscript}"
     );
     assert!(
-        rustscript.contains("let result_map_next = result_map;"),
-        "expected map_set clone line, got: {rustscript}"
+        rustscript.contains("let mut result_map_next = (result_map).copy();"),
+        "expected borrow-safe map_set clone line, got: {rustscript}"
     );
     assert!(
         rustscript.contains("result_map_next.body = first_item;"),
         "expected map_set assignment line, got: {rustscript}"
     );
     assert!(
-        rustscript.contains("let response_body = (result_map_next).body;"),
-        "expected map_get access line, got: {rustscript}"
+        rustscript.contains("let response_body = ((result_map_next).body).copy();"),
+        "expected borrow-safe map_get access line, got: {rustscript}"
     );
     assert!(
         !rustscript.contains("array_push("),
@@ -999,6 +999,9 @@ async fn ui_render_extended_value_blocks_work_with_flow_graph() {
         rustscript.contains("vm::http::response::set_body(status_plus_len);"),
         "expected data edge into flow action, got: {rustscript}"
     );
+    if let Err(err) = compile_source_with_flavor(rustscript, SourceFlavor::RustScript) {
+        panic!("expected generated rustscript to compile, got: {err}\nsource:\n{rustscript}");
+    }
 
     handle.abort();
 }
@@ -1622,7 +1625,7 @@ async fn ui_render_plain_if_and_loop_flow() {
         "expected plain if compare in rustscript, got: {rustscript}"
     );
     assert!(
-        rustscript.contains("for (let i = 0; i < 2; i = i + 1) {"),
+        rustscript.contains("for (let mut i = 0; i < 2; i = i + 1) {"),
         "expected plain loop in rustscript, got: {rustscript}"
     );
     assert!(
@@ -1637,6 +1640,9 @@ async fn ui_render_plain_if_and_loop_flow() {
         rustscript.contains("vm::http::response::set_status(403);"),
         "expected if false branch action in rustscript, got: {rustscript}"
     );
+    if let Err(err) = compile_source_with_flavor(rustscript, SourceFlavor::RustScript) {
+        panic!("expected flow rustscript to compile, got: {err}\nsource:\n{rustscript}");
+    }
 
     let javascript = render_json["source"]["javascript"]
         .as_str()
