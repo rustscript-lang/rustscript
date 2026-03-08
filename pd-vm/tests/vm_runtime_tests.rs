@@ -186,6 +186,68 @@ fn namespaced_builtin_json_encode_call_can_be_overridden_by_host_binding() {
 }
 
 #[test]
+fn runtime_sleep_host_import_is_available_by_default() {
+    let compiled = compile_source(
+        r#"
+        use runtime;
+        runtime::sleep(0);
+    "#,
+    )
+    .expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Bool(true)]);
+}
+
+#[test]
+fn runtime_sleep_host_import_can_be_overridden_by_host_binding() {
+    struct RuntimeSleepOverride;
+
+    impl HostFunction for RuntimeSleepOverride {
+        fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            assert_eq!(args, &[Value::Int(3)]);
+            Ok(CallOutcome::Return(vec![Value::Int(7)]))
+        }
+    }
+
+    let compiled = compile_source(
+        r#"
+        use runtime;
+        runtime::sleep(3);
+    "#,
+    )
+    .expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.bind_function("runtime::sleep", Box::new(RuntimeSleepOverride));
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(7)]);
+}
+
+#[test]
+fn host_function_registry_includes_default_runtime_sleep() {
+    let compiled = compile_source(
+        r#"
+        use runtime;
+        runtime::sleep(0);
+    "#,
+    )
+    .expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("registry should bind runtime::sleep");
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Bool(true)]);
+}
+
+#[test]
 fn json_encode_rejects_non_string_map_keys() {
     let compiled = compile_source(
         r#"

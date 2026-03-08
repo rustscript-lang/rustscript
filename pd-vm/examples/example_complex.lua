@@ -1,5 +1,6 @@
 local string = require("../stdlib/rss/strings.rss")
 local add_one = require("vm").add_one
+local vm = require("vm")
 local io = require("io")
 local re = require("re")
 local json = require("json")
@@ -48,6 +49,7 @@ local payload = { lang = "lua", score = closure_value, chained = chained_score }
 local payload_json = json.encode(payload)
 local payload_decoded = json.decode(payload_json)
 local json_score = payload_decoded.score
+local sleep_ok = vm.runtime.sleep(100)
 local io_ok = true
 if true then
     io_ok = io.exists(".")
@@ -55,7 +57,7 @@ end
 
 local unpack_ok = first_only == closure_value and first_score == closure_value and second_score == total and third_score == nil and branch_a == closure_value and branch_b == nil and branch_c == nil
 
-if regex_ok and io_ok and json_score == chained_score and unpack_ok then
+if regex_ok and io_ok and sleep_ok and json_score == chained_score and unpack_ok then
     print(keep(branch_a))
 else
     print(0)

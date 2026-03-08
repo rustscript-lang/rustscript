@@ -4,6 +4,7 @@ use vm::{add_one};
 use io;
 use re;
 use json;
+use runtime;
 
 // Complex RustScript example with closure capture, stdlib module use, and host calls.
 let mut total = 0;
@@ -12,10 +13,10 @@ for (let mut i = 0; i < 4; i = i + 1) {
 }
 
 let mut total = if !string::non_empty("rustscript") => {
-    let mut zeroed = 0;
+    let zeroed = 0;
     zeroed
 } else => {
-    let mut bumped = add_one(total);
+    let bumped = add_one(total);
     bumped
 };
 
@@ -42,13 +43,14 @@ let mut payload = {
 let mut payload_json = json::encode(payload);
 let mut payload_decoded = json::decode(payload_json);
 let mut json_score = payload_decoded.score;
+let mut sleep_ok = runtime::sleep(100);
 let mut io_ok = if true => {
     io::exists(".");
 } else => {
     false
 };
 
-if regex_ok && io_ok && json_score == matched {
+if regex_ok && io_ok && sleep_ok && json_score == matched {
     print(closure_value);
 } else {
     print(0);

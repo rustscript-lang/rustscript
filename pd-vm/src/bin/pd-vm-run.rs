@@ -609,6 +609,7 @@ fn register_named_function(vm: &mut Vm, name: &str) -> Result<(), io::Error> {
         "print" => vm.bind_function("print", Box::new(PrintFunction)),
         "add_one" => vm.bind_function("add_one", Box::new(AddOneFunction)),
         "echo" => vm.bind_function("echo", Box::new(EchoFunction)),
+        "runtime::sleep" => {}
         value if value.starts_with("http::") => {
             return Err(io::Error::other(format!(
                 "host function '{value}' requires pd-edge runtime context",

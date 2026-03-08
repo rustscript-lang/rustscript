@@ -634,6 +634,34 @@ mod tests {
     }
 
     #[test]
+    fn run_supports_embedded_stdlib_imports_with_named_runtime_host_import() {
+        let source = r#"
+            use stdlib::rss::strings as string;
+            use runtime::{sleep};
+            sleep(0);
+            let value = string::trim("  hello wasm  ");
+            print(value);
+            value;
+        "#;
+        let report = run_source_with_flavor(source, SourceFlavor::RustScript);
+        assert!(
+            report.error.is_none(),
+            "expected run to succeed with embedded stdlib + named runtime import, got {:?}",
+            report.error
+        );
+        assert!(
+            report.output.iter().any(|line| line == "hello wasm"),
+            "expected output to include trimmed string, got {:?}",
+            report.output
+        );
+        assert!(
+            report.stack.iter().any(|value| value == "hello wasm"),
+            "expected stack to include trimmed string, got {:?}",
+            report.stack
+        );
+    }
+
+    #[test]
     fn lint_accepts_json_and_regex_builtin_imports() {
         let source = r#"
             use re;
@@ -717,13 +745,6 @@ mod tests {
             catalog
                 .rustscript
                 .iter()
-                .any(|entry| entry.label == "add_one"),
-            "expected RustScript host completion entry"
-        );
-        assert!(
-            catalog
-                .rustscript
-                .iter()
                 .any(|entry| entry.label == "json::encode"),
             "expected RustScript json namespace completion entry"
         );
@@ -733,6 +754,35 @@ mod tests {
                 .iter()
                 .any(|entry| entry.label == "re::match"),
             "expected RustScript regex namespace completion entry"
+        );
+        assert!(
+            catalog
+                .rustscript
+                .iter()
+                .any(|entry| entry.label == "runtime::sleep"),
+            "expected RustScript runtime host namespace completion entry"
+        );
+    }
+
+    #[test]
+    fn run_source_supports_runtime_sleep_host_namespace() {
+        let source = r#"
+            use runtime;
+            runtime::sleep(0);
+            print("ok");
+        "#;
+        let report = run_source_with_flavor(source, SourceFlavor::RustScript);
+        assert!(report.error.is_none(), "expected runtime::sleep to succeed");
+        assert!(report.halted, "program should halt");
+        assert!(
+            report.output.iter().any(|line| line == "ok"),
+            "expected output to contain ok, got {:?}",
+            report.output
+        );
+        assert!(
+            report.stack.iter().any(|value| value == "ok"),
+            "expected stack to contain ok, got {:?}",
+            report.stack
         );
     }
 

@@ -478,6 +478,7 @@ index.
    - non-inlined runtime imports are remapped to dense import slots (`call_index_remap`)
    - emitted as `call <slot>, <argc>`
    - exposed as `Program.imports` and bound via `HostFunctionRegistry`
+   - `runtime::sleep(ms)` is available as a default host import; native runtimes block for the requested duration and wasm runtimes return `true` immediately
 3. Inlined RustScript function bodies
    - calls to targets with `FunctionImpl` are inlined (no emitted `call`)
 
@@ -499,7 +500,7 @@ Core compiler/IR:
 - in RustScript move-semantics mode, implicit captures follow expression semantics (`x` may move, `x.copy()` copies, `&x`/`&mut x` capture borrowed views)
 - `match` patterns are limited to int/string/null literals, `_`, and type constructors (`Some(TypeName)`)
 - `break` and `continue` are only valid inside loops
-- host import namespace support in parser is limited to `vm` (builtin namespaces are `io::`, `re::`, `json::`, and `jit::`)
+- direct host import namespace syntax in the parser is limited to `vm`, but source loading also supports virtual host namespaces such as `runtime` when the module is missing (builtin namespaces are `io::`, `re::`, `json::`, and `jit::`)
 
 Module/source loading:
 

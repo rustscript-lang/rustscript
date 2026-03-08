@@ -268,6 +268,11 @@ fn add_host_function_entries(
                     },
                 );
             }
+            other if other.contains("::") => {
+                add_namespaced_host_function_entries(
+                    rustscript, javascript, lua, scheme, other, &params, host.docs,
+                );
+            }
             other => {
                 push_unique(
                     rustscript,
@@ -357,6 +362,106 @@ fn add_host_function_entries(
             }
         }
     }
+}
+
+fn add_namespaced_host_function_entries(
+    rustscript: &mut Vec<CompletionEntry>,
+    javascript: &mut Vec<CompletionEntry>,
+    lua: &mut Vec<CompletionEntry>,
+    scheme: &mut Vec<CompletionEntry>,
+    name: &str,
+    params: &[String],
+    docs: &str,
+) {
+    let Some((root, _member)) = name.split_once("::") else {
+        return;
+    };
+    let dot_path = name.replace("::", ".");
+    let import_docs = format!("Imports virtual host namespace `{root}` for playground host calls.");
+
+    push_unique(
+        rustscript,
+        CompletionEntry {
+            label: name.to_string(),
+            insert_text: format!("{name}({})", comma_args(params)),
+            detail: format!("playground host {}", function_signature(name, params)),
+            documentation: docs.to_string(),
+            kind: "function".to_string(),
+        },
+    );
+    push_unique(
+        rustscript,
+        CompletionEntry {
+            label: format!("use {root};"),
+            insert_text: format!("use {root};"),
+            detail: format!("RustScript {root} host namespace import"),
+            documentation: import_docs.clone(),
+            kind: "module".to_string(),
+        },
+    );
+
+    push_unique(
+        javascript,
+        CompletionEntry {
+            label: dot_path.clone(),
+            insert_text: format!("{dot_path}({})", comma_args(params)),
+            detail: format!("playground host {}", function_signature(&dot_path, params)),
+            documentation: docs.to_string(),
+            kind: "function".to_string(),
+        },
+    );
+    push_unique(
+        javascript,
+        CompletionEntry {
+            label: format!("import * as {root} from \"{root}\";"),
+            insert_text: format!("import * as {root} from \"{root}\";"),
+            detail: format!("JavaScript {root} host namespace import"),
+            documentation: import_docs.clone(),
+            kind: "module".to_string(),
+        },
+    );
+
+    push_unique(
+        lua,
+        CompletionEntry {
+            label: dot_path.clone(),
+            insert_text: format!("{dot_path}({})", comma_args(params)),
+            detail: format!("playground host {}", function_signature(&dot_path, params)),
+            documentation: docs.to_string(),
+            kind: "function".to_string(),
+        },
+    );
+    push_unique(
+        lua,
+        CompletionEntry {
+            label: format!("local {root} = require(\"{root}\")"),
+            insert_text: format!("local {root} = require(\"{root}\")"),
+            detail: format!("Lua {root} host namespace import"),
+            documentation: import_docs.clone(),
+            kind: "module".to_string(),
+        },
+    );
+
+    push_unique(
+        scheme,
+        CompletionEntry {
+            label: dot_path.clone(),
+            insert_text: format!("({dot_path} {})", space_args(params)),
+            detail: format!("playground host {}", function_signature(&dot_path, params)),
+            documentation: docs.to_string(),
+            kind: "function".to_string(),
+        },
+    );
+    push_unique(
+        scheme,
+        CompletionEntry {
+            label: format!("(require (prefix-in {root}. \"{root}\"))"),
+            insert_text: format!("(require (prefix-in {root}. \"{root}\"))"),
+            detail: format!("Scheme {root} host namespace import"),
+            documentation: import_docs,
+            kind: "module".to_string(),
+        },
+    );
 }
 
 fn add_builtin_namespace_entries(
@@ -740,8 +845,8 @@ mod tests {
             catalog
                 .rustscript
                 .iter()
-                .any(|entry| entry.label == "add_one"),
-            "expected RustScript host completion for add_one",
+                .any(|entry| entry.label == "runtime::sleep"),
+            "expected RustScript host completion for runtime::sleep",
         );
         assert!(
             catalog
@@ -761,8 +866,8 @@ mod tests {
             catalog
                 .scheme
                 .iter()
-                .any(|entry| entry.label == "vm/add_one"),
-            "expected Scheme host completion for add_one",
+                .any(|entry| entry.label == "runtime.sleep"),
+            "expected Scheme host completion for runtime.sleep",
         );
         assert!(
             catalog

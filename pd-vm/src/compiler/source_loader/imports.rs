@@ -1033,5 +1033,8 @@ pub(super) fn should_treat_missing_module_as_host_namespace(
     options: &CompileSourceFileOptions,
     err: &std::io::Error,
 ) -> bool {
-    err.kind() == std::io::ErrorKind::NotFound && is_virtual_host_namespace_spec(spec, options)
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::Unsupported
+    ) && is_virtual_host_namespace_spec(spec, options)
 }

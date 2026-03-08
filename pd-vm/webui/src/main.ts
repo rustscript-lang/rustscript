@@ -60,9 +60,9 @@ const SAMPLE_SOURCES: Record<SourceFlavor, string> = {
   rustscript: `
 use stdlib::rss::strings as string;
 
-use vm::{add_one};
 use re;
 use json;
+use runtime;
 
 // Complex RustScript example with closure capture, stdlib module use, and host calls.
 let mut total = 0;
@@ -70,11 +70,13 @@ for (let mut i = 0; i < 4; i = i + 1) {
     total = total + i;
 }
 
+runtime::sleep(100);
+
 let total = if !string::non_empty("rustscript") => {
-    let mut zeroed = 0;
+    let zeroed = 0;
     zeroed
 } else => {
-    let mut bumped = add_one(total);
+    let bumped = total + 1;
     bumped
 };
 

@@ -234,6 +234,7 @@ pub struct AddOne;
 pub struct EchoString;
 pub struct PrintBuiltin;
 pub struct AlwaysAllow;
+pub struct RuntimeSleep;
 
 impl HostFunction for AddOne {
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
@@ -262,6 +263,12 @@ impl HostFunction for PrintBuiltin {
 }
 
 impl HostFunction for AlwaysAllow {
+    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+        Ok(CallOutcome::Return(vec![Value::Bool(true)]))
+    }
+}
+
+impl HostFunction for RuntimeSleep {
     fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
         Ok(CallOutcome::Return(vec![Value::Bool(true)]))
     }

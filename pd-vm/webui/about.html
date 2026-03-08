@@ -72,7 +72,8 @@
       <li><strong>Expressions:</strong> literals (<code>int</code>, <code>float</code>, <code>bool</code>, <code>string</code>, <code>null</code>), arithmetic, logical, comparison, function calls, closures (<code>|...| expr</code>), if-expression form (<code>if cond => { ... } else => { ... }</code>), match expressions.</li>
       <li><strong>Match patterns:</strong> int/string/null literals, wildcard <code>_</code>, and type constructors <code>Some(TypeName)</code> / <code>Option::Some(TypeName)</code>.</li>
       <li><strong>Collections:</strong> array literal <code>[]</code>, brace literals for arrays/maps, <code>obj.member</code>, <code>obj[key]</code>, optional chaining (<code>?.</code> and <code>?.[key]</code>), slice syntax (<code>[a:b]</code>, <code>[:b]</code>, <code>[a:]</code>), map key literals including <code>null</code>.</li>
-      <li><strong>Host/runtime calls:</strong> namespaces <code>io::...</code>, <code>re::...</code>, <code>json::...</code>, <code>jit::...</code>, imported via <code>use vm::{...};</code>.</li>
+      <li><strong>Builtins:</strong> namespaces <code>io::...</code>, <code>re::...</code>, <code>json::...</code>, and <code>jit::...</code>.</li>
+      <li><strong>Default runtime host namespace:</strong> <code>use runtime;</code> then <code>runtime::sleep(ms)</code>. In the browser playground this validates the argument and returns immediately because wasm cannot block the UI thread.</li>
     </ul>
 
     <h4>Ownership and Liveness Behavior</h4>
@@ -99,7 +100,7 @@
       <li>In move-semantics mode, implicit captures follow expression semantics.</li>
       <li><code>match</code> patterns are limited to int/string/null literals, <code>_</code>, and type constructors (<code>Some(TypeName)</code>).</li>
       <li><code>break</code> and <code>continue</code> are only valid inside loops.</li>
-      <li>Host import namespace support allows <code>vm</code>, <code>io::</code>, <code>re::</code>, <code>json::</code>, and <code>jit::</code>.</li>
+      <li>Host import namespace support allows <code>vm</code>, virtual host namespaces like <code>runtime::</code>, and builtin namespaces <code>io::</code>, <code>re::</code>, <code>json::</code>, and <code>jit::</code>.</li>
     </ul>
 
     <h3>Assembler API</h3>

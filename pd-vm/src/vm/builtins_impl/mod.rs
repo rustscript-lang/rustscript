@@ -15,6 +15,7 @@ mod jit;
 mod json;
 pub(crate) mod print;
 mod regex;
+mod runtime;
 
 #[cfg(target_arch = "wasm32")]
 use io_wasm as io;
@@ -24,6 +25,14 @@ pub(in crate::vm) use io::IoState;
 pub(super) enum BuiltinCallOutcome {
     Return(Vec<Value>),
     Pending(HostOpId),
+}
+
+pub(crate) fn register_default_host_functions(registry: &mut super::HostFunctionRegistry) {
+    runtime::register_default_host_functions(registry);
+}
+
+pub(crate) fn bind_default_host_function(vm: &mut Vm, name: &str) -> bool {
+    runtime::bind_default_host_function(vm, name)
 }
 
 pub(crate) fn register_builtin_namespaces(

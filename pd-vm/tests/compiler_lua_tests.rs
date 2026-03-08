@@ -271,6 +271,9 @@ fn lua_complex_fixture_runs() {
             "print" => {
                 vm.register_function(Box::new(PrintBuiltin));
             }
+            "runtime::sleep" => {
+                vm.register_function(Box::new(RuntimeSleep));
+            }
             other => panic!("unexpected function {other}"),
         }
     }

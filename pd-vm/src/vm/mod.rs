@@ -191,11 +191,13 @@ impl Default for HostFunctionRegistry {
 
 impl HostFunctionRegistry {
     pub fn new() -> Self {
-        Self {
+        let mut registry = Self {
             entries: Vec::new(),
             by_name: HashMap::new(),
             plan_cache: HashMap::new(),
-        }
+        };
+        builtins_impl::register_default_host_functions(&mut registry);
+        registry
     }
 
     pub fn register<F>(&mut self, name: impl Into<String>, arity: u8, factory: F)
@@ -1715,9 +1717,22 @@ impl Vm {
             return Ok(());
         }
 
+        if self.host_function_symbols.is_empty() && self.host_functions.is_empty() {
+            let import_names = self
+                .program
+                .imports
+                .iter()
+                .map(|import| import.name.clone())
+                .collect::<Vec<_>>();
+            for name in import_names {
+                let _ = builtins_impl::bind_default_host_function(self, &name);
+            }
+        }
+
         let use_legacy_order = self.host_function_symbols.is_empty();
         let mut resolved = Vec::with_capacity(self.program.imports.len());
-        for (index, import) in self.program.imports.iter().enumerate() {
+        let imports = self.program.imports.clone();
+        for (index, import) in imports.iter().enumerate() {
             if use_legacy_order {
                 if index >= self.host_functions.len() {
                     return Err(VmError::InvalidCall(index as u16));
@@ -1726,11 +1741,16 @@ impl Vm {
                 continue;
             }
 
-            let bound = self
-                .host_function_symbols
-                .get(&import.name)
-                .copied()
-                .ok_or_else(|| VmError::UnboundImport(import.name.clone()))?;
+            let bound = if let Some(bound) = self.host_function_symbols.get(&import.name).copied() {
+                bound
+            } else if builtins_impl::bind_default_host_function(self, &import.name) {
+                self.host_function_symbols
+                    .get(&import.name)
+                    .copied()
+                    .ok_or_else(|| VmError::UnboundImport(import.name.clone()))?
+            } else {
+                return Err(VmError::UnboundImport(import.name.clone()));
+            };
             resolved.push(bound);
         }
 

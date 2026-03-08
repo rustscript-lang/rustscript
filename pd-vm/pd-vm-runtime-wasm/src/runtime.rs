@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use vm::{
-    CallOutcome, FunctionDecl, HostFunction, LocalInfo, PrintHostFunction, PrintlnHostFunction,
-    SourceFlavor, SourcePathError, Value, Vm, VmError, VmStatus,
+    FunctionDecl, LocalInfo, PrintHostFunction, PrintlnHostFunction, SourceFlavor,
+    SourcePathError, Vm, VmError, VmStatus,
     compile_source_with_flavor_and_options, format_value, render_vm_error,
 };
 
@@ -52,14 +52,9 @@ const HOST_FUNCTION_SPECS: &[PlaygroundHostFunctionSpec] = &[
         docs: "Writes a value to playground print output.",
     },
     PlaygroundHostFunctionSpec {
-        name: "add_one",
+        name: "runtime::sleep",
         arity: 1,
-        docs: "Returns input integer + 1.",
-    },
-    PlaygroundHostFunctionSpec {
-        name: "echo",
-        arity: 1,
-        docs: "Returns the first argument unchanged.",
+        docs: "Sleeps for the requested milliseconds on native runtimes. In the wasm playground it validates the argument and returns immediately.",
     },
 ];
 
@@ -943,8 +938,7 @@ fn register_named_function(
                 })),
             );
         }
-        "add_one" => vm.bind_function("add_one", Box::new(AddOneFunction)),
-        "echo" => vm.bind_function("echo", Box::new(EchoFunction)),
+        "runtime::sleep" => {}
         other => {
             return Err(format!("no host binding for function '{other}'"));
         }
@@ -956,26 +950,5 @@ fn push_output_line(lines: &Arc<Mutex<Vec<String>>>, rendered: String) {
     let normalized = rendered.trim_end_matches('\n').to_string();
     if let Ok(mut guard) = lines.lock() {
         guard.push(normalized);
-    }
-}
-
-struct AddOneFunction;
-
-impl HostFunction for AddOneFunction {
-    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
-        let value = match args.first() {
-            Some(Value::Int(value)) => *value,
-            _ => return Err(VmError::TypeMismatch("int")),
-        };
-        Ok(CallOutcome::Return(vec![Value::Int(value + 1)]))
-    }
-}
-
-struct EchoFunction;
-
-impl HostFunction for EchoFunction {
-    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
-        let value = args.first().cloned().ok_or(VmError::StackUnderflow)?;
-        Ok(CallOutcome::Return(vec![value]))
     }
 }

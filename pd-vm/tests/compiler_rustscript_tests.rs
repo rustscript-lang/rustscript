@@ -434,8 +434,15 @@ fn compile_source_file_with_rustscript_complex_fixture() {
 
     for func in &compiled.functions {
         match func.name.as_str() {
-            "print" => vm.register_function(Box::new(PrintBuiltin)),
-            "add_one" => vm.register_function(Box::new(AddOne)),
+            "print" => {
+                vm.register_function(Box::new(PrintBuiltin));
+            }
+            "add_one" => {
+                vm.register_function(Box::new(AddOne));
+            }
+            "runtime::sleep" => {
+                vm.register_function(Box::new(RuntimeSleep));
+            }
             _ => panic!("unexpected function {}", func.name),
         };
     }

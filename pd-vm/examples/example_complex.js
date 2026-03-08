@@ -3,6 +3,7 @@ import { add_one } from "vm";
 import * as io from "io";
 import * as re from "re";
 import * as json from "json";
+import * as vm from "vm";
 
 // Complex JavaScript flavor example: loop + stdlib + host + closure.
 let total = 0;
@@ -35,12 +36,13 @@ const payload = {
 const payloadJson = json.encode(payload);
 const payloadDecoded = json.decode(payloadJson);
 const jsonScore = payloadDecoded.score;
+const sleepOk = vm.runtime.sleep(100);
 let ioOk = true;
 if (true) {
     ioOk = io.exists(".");
 }
 
-if (regexOk && ioOk && jsonScore == chainedScore) {
+if (regexOk && ioOk && sleepOk && jsonScore == chainedScore) {
     console.log(keep(chainedScore));
 } else {
     console.log(0);

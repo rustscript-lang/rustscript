@@ -1,5 +1,6 @@
 (import (prefix "../stdlib/rss/strings.rss" string:))
 (require (only-in "vm" add_one))
+(require (prefix-in vm. "vm"))
 (require (prefix-in io. "io"))
 (require (prefix-in re. "re"))
 (require (prefix-in json. "json"))
@@ -34,11 +35,12 @@
 (define payload-json (json.encode payload))
 (define payload-decoded (json.decode payload-json))
 (define json-score (hash-ref payload-decoded "score"))
+(define sleep-ok (vm.runtime.sleep 100))
 (define io-ok true)
 (if true
     (set! io-ok (io.exists "."))
     (set! io-ok io-ok))
 
-(if (and regex-ok io-ok (= json-score chained-score))
+(if (and regex-ok io-ok sleep-ok (= json-score chained-score))
     (print (keep chained-score))
     (print 0))

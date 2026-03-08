@@ -11,7 +11,7 @@ Features:
 
 - live wasm lint diagnostics (Monaco markers + diagnostics panel)
 - wasm runtime execution via **Run** button
-- autocomplete catalog sourced from wasm (embedded RSS stdlib + host functions + builtin namespaces like `json`/`re`)
+- autocomplete catalog sourced from wasm (embedded RSS stdlib + host functions + namespaces like `runtime`/`json`/`re`)
 - print output + final VM stack preview
 
 ## Contents

@@ -336,8 +336,15 @@ fn compile_source_file_with_javascript_complex_fixture() {
 
     for func in &compiled.functions {
         match func.name.as_str() {
-            "print" => vm.register_function(Box::new(PrintBuiltin)),
-            "add_one" => vm.register_function(Box::new(AddOne)),
+            "print" => {
+                vm.register_function(Box::new(PrintBuiltin));
+            }
+            "add_one" => {
+                vm.register_function(Box::new(AddOne));
+            }
+            "runtime::sleep" => {
+                vm.register_function(Box::new(RuntimeSleep));
+            }
             _ => panic!("unexpected function {}", func.name),
         };
     }
@@ -382,8 +389,15 @@ console.log(value);
     let mut vm = Vm::new(compiled.program);
     for func in &compiled.functions {
         match func.name.as_str() {
-            "add_one" => vm.register_function(Box::new(AddOne)),
-            "print" => vm.register_function(Box::new(PrintBuiltin)),
+            "add_one" => {
+                vm.register_function(Box::new(AddOne));
+            }
+            "print" => {
+                vm.register_function(Box::new(PrintBuiltin));
+            }
+            "runtime::sleep" => {
+                vm.register_function(Box::new(RuntimeSleep));
+            }
             _ => panic!("unexpected function {}", func.name),
         };
     }
@@ -434,8 +448,15 @@ fn compile_source_file_js_complex_replay_break_line_resolves_non_executable_line
     let mut vm = Vm::new(compiled.program);
     for func in &compiled.functions {
         match func.name.as_str() {
-            "add_one" => vm.register_function(Box::new(AddOne)),
-            "print" => vm.register_function(Box::new(PrintBuiltin)),
+            "add_one" => {
+                vm.register_function(Box::new(AddOne));
+            }
+            "print" => {
+                vm.register_function(Box::new(PrintBuiltin));
+            }
+            "runtime::sleep" => {
+                vm.register_function(Box::new(RuntimeSleep));
+            }
             _ => panic!("unexpected function {}", func.name),
         };
     }
