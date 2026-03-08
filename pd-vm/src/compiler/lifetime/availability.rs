@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::builtins::BuiltinFunction;
 
-use super::liveness::{LivenessRewriter, LocalSlotAllocator};
 use super::super::ParseError;
 use super::super::ir::{ClosureExpr, Expr, FrontendIr, FunctionImpl, LocalSlot, Stmt};
+use super::liveness::{LivenessRewriter, LocalSlotAllocator};
 
 #[derive(Clone, PartialEq, Eq)]
 struct FlowState {
@@ -190,7 +190,10 @@ fn stmt_uses_slot(stmt: &Stmt, slot: LocalSlot) -> bool {
             expr_uses_slot(expr, slot)
         }
         Stmt::ClosureLet { closure, .. } => {
-            closure.capture_copies.iter().any(|(source, _)| *source == slot)
+            closure
+                .capture_copies
+                .iter()
+                .any(|(source, _)| *source == slot)
                 || expr_uses_slot(&closure.body, slot)
         }
         Stmt::IfElse {
@@ -200,8 +203,12 @@ fn stmt_uses_slot(stmt: &Stmt, slot: LocalSlot) -> bool {
             ..
         } => {
             expr_uses_slot(condition, slot)
-                || then_branch.iter().any(|nested| stmt_uses_slot(nested, slot))
-                || else_branch.iter().any(|nested| stmt_uses_slot(nested, slot))
+                || then_branch
+                    .iter()
+                    .any(|nested| stmt_uses_slot(nested, slot))
+                || else_branch
+                    .iter()
+                    .any(|nested| stmt_uses_slot(nested, slot))
         }
         Stmt::For {
             init,
@@ -238,12 +245,18 @@ fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
             args.iter().any(|arg| expr_uses_slot(arg, slot))
         }
         Expr::Closure(closure) => {
-            closure.capture_copies.iter().any(|(source, _)| *source == slot)
+            closure
+                .capture_copies
+                .iter()
+                .any(|(source, _)| *source == slot)
                 || expr_uses_slot(&closure.body, slot)
         }
         Expr::ClosureCall(closure, args) => {
             args.iter().any(|arg| expr_uses_slot(arg, slot))
-                || closure.capture_copies.iter().any(|(source, _)| *source == slot)
+                || closure
+                    .capture_copies
+                    .iter()
+                    .any(|(source, _)| *source == slot)
                 || expr_uses_slot(&closure.body, slot)
         }
         Expr::Add(lhs, rhs)
@@ -295,10 +308,18 @@ fn collect_consumed_positions_from_stmt(
     out: &mut HashSet<usize>,
 ) {
     match stmt {
-        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. }
+        Stmt::Noop { .. }
+        | Stmt::FuncDecl { .. }
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. }
         | Stmt::Drop { .. } => {}
         Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
-            collect_consumed_positions_from_expr(expr, function_impl, known_consumed_positions, out);
+            collect_consumed_positions_from_expr(
+                expr,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
         }
         Stmt::ClosureLet { closure, .. } => {
             collect_consumed_positions_from_expr(
@@ -344,14 +365,24 @@ fn collect_consumed_positions_from_stmt(
             body,
             ..
         } => {
-            collect_consumed_positions_from_stmt(init, function_impl, known_consumed_positions, out);
+            collect_consumed_positions_from_stmt(
+                init,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
             collect_consumed_positions_from_expr(
                 condition,
                 function_impl,
                 known_consumed_positions,
                 out,
             );
-            collect_consumed_positions_from_stmt(post, function_impl, known_consumed_positions, out);
+            collect_consumed_positions_from_stmt(
+                post,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
             for nested in body {
                 collect_consumed_positions_from_stmt(
                     nested,
@@ -397,7 +428,10 @@ fn collect_consumed_positions_from_expr(
         | Expr::FunctionRef(_)
         | Expr::Var(_) => {}
         Expr::MoveVar(slot) => {
-            if let Some(position) = function_impl.param_slots.iter().position(|param| param == slot)
+            if let Some(position) = function_impl
+                .param_slots
+                .iter()
+                .position(|param| param == slot)
             {
                 out.insert(position);
             }
@@ -495,7 +529,12 @@ fn collect_consumed_positions_from_expr(
         | Expr::ToOwned(inner)
         | Expr::Borrow(inner)
         | Expr::BorrowMut(inner) => {
-            collect_consumed_positions_from_expr(inner, function_impl, known_consumed_positions, out);
+            collect_consumed_positions_from_expr(
+                inner,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
         }
         Expr::IfElse {
             condition,
@@ -557,7 +596,12 @@ fn collect_consumed_positions_from_expr(
                     out,
                 );
             }
-            collect_consumed_positions_from_expr(expr, function_impl, known_consumed_positions, out);
+            collect_consumed_positions_from_expr(
+                expr,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
         }
     }
 }
@@ -737,7 +781,9 @@ impl AvailabilityAnalyzer {
         loop_control: Option<&mut LoopControlFlow>,
     ) -> Result<(Stmt, FlowState), ParseError> {
         match stmt {
-            Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Drop { .. } => Ok((stmt.clone(), state)),
+            Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Drop { .. } => {
+                Ok((stmt.clone(), state))
+            }
             Stmt::Let { index, expr, line } => {
                 let mut out = self.analyze_expr(expr, &state, *line)?;
                 let mut rewritten_expr = expr.clone();
@@ -1094,13 +1140,12 @@ impl AvailabilityAnalyzer {
                     Ok(out)
                 } else if let Some(root_slot) = self.extract_collection_mutation_root(*index, args)
                 {
-                    let mut out = if BuiltinFunction::from_call_index(*index)
-                        == Some(BuiltinFunction::Set)
-                    {
-                        self.analyze_projection_args(args, state, line)?
-                    } else {
-                        self.analyze_args(args, state, line)?
-                    };
+                    let mut out =
+                        if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::Set) {
+                            self.analyze_projection_args(args, state, line)?
+                        } else {
+                            self.analyze_args(args, state, line)?
+                        };
                     self.apply_interprocedural_consumed_call_effects(*index, args, &mut out);
                     self.require_collection_mutation_permitted(root_slot, &out, line)?;
                     Ok(out)
@@ -1574,7 +1619,10 @@ impl AvailabilityAnalyzer {
         state: &'a FlowState,
         root: LocalSlot,
     ) -> impl Iterator<Item = &'a MovedFieldPath> {
-        state.moved_possible.iter().filter(move |entry| entry.root == root)
+        state
+            .moved_possible
+            .iter()
+            .filter(move |entry| entry.root == root)
     }
 
     fn moved_field_keys_conflict(lhs: &MovedFieldKey, rhs: &MovedFieldKey) -> bool {
@@ -2306,4 +2354,3 @@ fn stmt_line(stmt: &Stmt) -> u32 {
         | Stmt::Drop { line, .. } => *line,
     }
 }
-

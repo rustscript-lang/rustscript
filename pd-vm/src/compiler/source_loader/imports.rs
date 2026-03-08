@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use crate::builtins::is_builtin_namespace;
 
-use super::model::{ImportClause, ModuleImport, NamedImport, VM_HOST_NAMESPACE_SPEC};
-use super::super::{CompileSourceFileOptions, SourceFlavor, SourcePathError};
 use super::super::frontends::{is_ident_continue, is_ident_start};
+use super::super::{CompileSourceFileOptions, SourceFlavor, SourcePathError};
+use super::model::{ImportClause, ModuleImport, NamedImport, VM_HOST_NAMESPACE_SPEC};
 
 pub(super) fn parse_module_imports(
     source: &str,
@@ -1013,7 +1013,10 @@ pub(super) fn host_namespace_root_from_spec(spec: &str) -> Option<String> {
     Some(stem.to_string())
 }
 
-pub(super) fn is_virtual_host_namespace_spec(spec: &str, options: &CompileSourceFileOptions) -> bool {
+pub(super) fn is_virtual_host_namespace_spec(
+    spec: &str,
+    options: &CompileSourceFileOptions,
+) -> bool {
     options.module_override_path(spec).is_none()
         && options.module_override_source(spec).is_none()
         && host_namespace_root_from_spec(spec).is_some()
@@ -1032,4 +1035,3 @@ pub(super) fn should_treat_missing_module_as_host_namespace(
 ) -> bool {
     err.kind() == std::io::ErrorKind::NotFound && is_virtual_host_namespace_spec(spec, options)
 }
-

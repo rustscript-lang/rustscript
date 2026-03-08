@@ -173,7 +173,10 @@ fn trace_jit_native_path_honors_fuel_metering() {
 
     let mut yielded = 0_u64;
     loop {
-        match vm.run().expect("run should cooperatively yield under low fuel") {
+        match vm
+            .run()
+            .expect("run should cooperatively yield under low fuel")
+        {
             VmStatus::Yielded => {
                 yielded = yielded.saturating_add(1);
                 if !native_jit_supported() || vm.jit_native_exec_count() > 0 {

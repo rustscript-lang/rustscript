@@ -644,9 +644,9 @@ fn perf_cooperative_fuel_configuration_impacts_latency() {
 
     let source = format!(
         r#"
-        let outer = 0;
-        let i = 0;
-        let sum = 0;
+        let mut outer = 0;
+        let mut i = 0;
+        let mut sum = 0;
         while outer < {OUTER_LOOPS} {{
             i = 0;
             while i < {INNER_LOOP_ITERS} {{
@@ -873,7 +873,9 @@ fn run_sum_loop_with_cooperative_fuel(
     let started = Instant::now();
     let mut yield_count = 0_u64;
     let mut recharge_count = 0_u64;
-    let max_yields = 5_000_000_u64;
+    // Very low fuel settings (for example fuel=1, interval=1) can require
+    // several million cooperative yields while still making forward progress.
+    let max_yields = 20_000_000_u64;
 
     loop {
         let status = vm.run().expect("vm should run");

@@ -38,4 +38,3 @@ pub(super) struct ImportRewriteResult {
     pub(super) source: String,
     pub(super) requires_vm_namespace: bool,
 }
-

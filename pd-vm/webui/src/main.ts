@@ -236,8 +236,8 @@ if (!app) {
 app.innerHTML = `
   <main class="page">
     <section class="hero">
-      <h1>pd-vm playground</h1>
-      <p>Write RustScript, JavaScript, Lua, or Scheme. Live lint markers come from wasm compiler diagnostics; Run executes source in wasm runtime and streams print output + final stack.</p>
+      <h1>RustScript playground</h1>
+      <p>Live lint markers come from wasm compiler diagnostics; Run executes source in wasm runtime and streams print output + final stack.</p>
     </section>
     <section class="workspace">
       <div class="toolbar">

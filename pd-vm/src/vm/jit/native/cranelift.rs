@@ -26,9 +26,8 @@ mod layout;
 
 use bridge::pd_vm_cranelift_step;
 use codegen::{
-    emit_fuel_tick_inline, emit_fuel_tick_inline_guarded, emit_helper_step,
-    emit_inline_ldloc_copy, emit_inline_or_helper_step, entry_signature, helper_signature,
-    jump_with_status,
+    emit_fuel_tick_inline, emit_fuel_tick_inline_guarded, emit_helper_step, emit_inline_ldloc_copy,
+    emit_inline_or_helper_step, entry_signature, helper_signature, jump_with_status,
     resolve_offsets,
 };
 use layout::detect_native_stack_layout;

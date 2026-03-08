@@ -1838,7 +1838,11 @@ mod tests {
         assert!(matches!(outcome, ExecOutcome::Continue));
         assert_eq!(vm.ip, 5, "fusion should skip dup+stloc bytes");
         assert_eq!(vm.locals[0], map_value, "local value should remain in slot");
-        assert_eq!(vm.stack(), &[map_value], "stack should receive copied value");
+        assert_eq!(
+            vm.stack(),
+            &[map_value],
+            "stack should receive copied value"
+        );
         assert_eq!(
             vm.drop_contract_event_count(),
             0,
@@ -1870,7 +1874,11 @@ mod tests {
         let ldloc = step_once(&mut vm).expect("ldloc should execute");
         assert!(matches!(ldloc, ExecOutcome::Continue));
         assert_eq!(vm.ip, 2, "fuel metering path must not skip dup+stloc");
-        assert_eq!(vm.locals[0], Value::Null, "ldloc move should clear local slot");
+        assert_eq!(
+            vm.locals[0],
+            Value::Null,
+            "ldloc move should clear local slot"
+        );
         assert_eq!(vm.stack(), &[Value::Int(42)]);
 
         let dup = step_once(&mut vm).expect("dup should execute");

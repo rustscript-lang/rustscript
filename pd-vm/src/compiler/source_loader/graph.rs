@@ -3,16 +3,16 @@ use std::path::{Path, PathBuf};
 
 use crate::compiler::source_map::SourceMap;
 
+use super::super::{
+    CompileSourceFileOptions, SourceError, SourceFlavor, SourcePathError, frontends,
+    linker::{ParsedUnit, sanitize_scope_prefix},
+};
 use super::imports::{
     is_builtin_host_namespace_spec, is_module_specifier, is_virtual_host_namespace_spec,
     parse_module_imports, resolve_module_path, should_treat_missing_module_as_host_namespace,
     strip_import_directives,
 };
 use super::model::{ImportClause, ModuleCollectState, ModuleImport};
-use super::super::{
-    CompileSourceFileOptions, SourceError, SourceFlavor, SourcePathError, frontends,
-    linker::{ParsedUnit, sanitize_scope_prefix},
-};
 
 pub(super) fn collect_module_units(
     path: &Path,
@@ -203,4 +203,3 @@ fn collect_imported_module_functions(
     declared.sort_by(|(lhs_name, _), (rhs_name, _)| lhs_name.cmp(rhs_name));
     Ok(declared)
 }
-

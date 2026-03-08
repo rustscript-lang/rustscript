@@ -175,7 +175,10 @@ fn waiting_host_op_preserves_single_drop_state_for_moved_locals() {
     assert_eq!(first, VmStatus::Waiting(700));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(vm.locals()[a_index as usize], Value::Null);
-    assert_eq!(vm.locals()[b_index as usize], Value::String("payload".to_string()));
+    assert_eq!(
+        vm.locals()[b_index as usize],
+        Value::String("payload".to_string())
+    );
 
     let second = vm.run().expect("second run should still wait");
     assert_eq!(second, VmStatus::Waiting(700));

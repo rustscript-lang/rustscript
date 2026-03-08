@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use super::super::frontends::{is_ident_continue, is_ident_start};
+use super::super::{CompileSourceFileOptions, SourceFlavor, SourcePathError};
 use super::imports::{
     host_namespace_root_from_spec, is_builtin_host_namespace_spec, is_module_specifier,
     is_valid_ident, is_virtual_host_namespace_spec, resolve_module_path,
 };
 use super::model::{ImportClause, ImportRewriteResult, ModuleImport, VM_HOST_NAMESPACE_SPEC};
-use super::super::{CompileSourceFileOptions, SourceFlavor, SourcePathError};
-use super::super::frontends::{is_ident_continue, is_ident_start};
 
 pub(super) fn rewrite_imported_call_sites(
     source: &str,
@@ -673,4 +673,3 @@ fn rewrite_scheme_call_heads(
 
     out
 }
-

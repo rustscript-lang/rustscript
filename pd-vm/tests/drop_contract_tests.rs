@@ -560,7 +560,9 @@ fn nested_container_slot_is_null_after_drop() {
         .debug
         .as_ref()
         .expect("debug info should exist");
-    let deep_index = debug.local_index("deep").expect("deep binding should exist");
+    let deep_index = debug
+        .local_index("deep")
+        .expect("deep binding should exist");
 
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
@@ -762,7 +764,10 @@ fn cooperative_yield_drop_count_is_bounded_tightly() {
         drops <= 50,
         "drop count ({drops}) exceeds tight bound of 50 — possible double-drop across yield"
     );
-    assert!(drops >= 10, "expected at least 10 drop events (one per loop tmp), got {drops}");
+    assert!(
+        drops >= 10,
+        "expected at least 10 drop events (one per loop tmp), got {drops}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -836,7 +841,19 @@ fn all_locals_null_after_halt_for_simple_program() {
     assert_eq!(vm.stack(), &[Value::Int(42)]);
 
     // a, b, c are all dead after 'result' is computed — liveness should drop them.
-    assert_eq!(vm.locals()[a_index as usize], Value::Null, "a should be Null");
-    assert_eq!(vm.locals()[b_index as usize], Value::Null, "b should be Null");
-    assert_eq!(vm.locals()[c_index as usize], Value::Null, "c should be Null");
+    assert_eq!(
+        vm.locals()[a_index as usize],
+        Value::Null,
+        "a should be Null"
+    );
+    assert_eq!(
+        vm.locals()[b_index as usize],
+        Value::Null,
+        "b should be Null"
+    );
+    assert_eq!(
+        vm.locals()[c_index as usize],
+        Value::Null,
+        "c should be Null"
+    );
 }

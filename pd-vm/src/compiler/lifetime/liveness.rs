@@ -543,10 +543,11 @@ fn function_impl_uses_local_call(function_impl: &FunctionImpl) -> bool {
 
 fn stmt_contains_local_call(stmt: &Stmt) -> bool {
     match stmt {
-        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. }
-        | Stmt::Drop { .. } => {
-            false
-        }
+        Stmt::Noop { .. }
+        | Stmt::FuncDecl { .. }
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Drop { .. } => false,
         Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
             expr_contains_local_call(expr)
         }

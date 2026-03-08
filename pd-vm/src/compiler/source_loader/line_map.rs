@@ -152,4 +152,3 @@ fn remap_expr_line_numbers(expr: &mut Expr, offset: u32) {
 fn remap_closure_line_numbers(closure: &mut crate::compiler::ir::ClosureExpr, offset: u32) {
     remap_expr_line_numbers(&mut closure.body, offset);
 }
-

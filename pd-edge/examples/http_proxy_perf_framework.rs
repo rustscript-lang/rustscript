@@ -20,10 +20,10 @@ use vm::{compile_source, encode_program, validate_program};
 const LOAD_REQUEST_BODY: &str = "edge-perf-payload";
 
 const BASE_WORKLOAD_SOURCE: &str = r#"
-let outer = 0;
-let acc = 1;
+let mut outer = 0;
+let mut acc = 1;
 while outer < 12 {
-    let inner = 0;
+    let mut inner = 0;
     while inner < 24 {
         let mixed = (outer * 31 + inner * 17) % 97;
         if (mixed % 2) == 0 {

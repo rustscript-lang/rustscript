@@ -1296,8 +1296,7 @@ fn collect_closure_frame_slots(closure: &ClosureExpr) -> Vec<LocalSlot> {
 
 fn collect_stmt_slot_footprint(stmt: &Stmt, slots: &mut BTreeSet<LocalSlot>) {
     match stmt {
-        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {
-        }
+        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
         Stmt::Drop { index, .. } => {
             slots.insert(*index);
         }
