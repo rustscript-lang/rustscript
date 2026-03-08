@@ -35,18 +35,15 @@ const CURRENT_LINE_MARKER_CLASS = "pd-debug-current-line-marker";
 const THEME_STORAGE_KEY = "pd-vm-webui-theme";
 const FLAVOR_STORAGE_KEY = "pd-vm-webui-flavor";
 const SOURCE_STORAGE_KEY_PREFIX = "pd-vm-webui-source:";
-const INTERRUPT_MODE_STORAGE_KEY = "pd-vm-webui-interrupt-mode";
-const FUEL_AMOUNT_STORAGE_KEY = "pd-vm-webui-fuel-amount";
-const FUEL_INTERVAL_STORAGE_KEY = "pd-vm-webui-fuel-interval";
 const VIEWPORT_HEIGHT_CSS_VAR = "--pd-app-height";
 const RUN_POLL_INTERVAL_MS = 25;
 const EPOCH_TICK_INTERVAL_MS = 1;
 const EPOCH_UI_REFRESH_INTERVAL_MS = 250;
 const EPOCH_FLUSH_INTERVAL_MS = 250;
 const DEFAULT_FUEL_HINT =
-  "New runs and debug sessions start with the current interruption mode, amount, and interval. In browser epoch mode, one epoch tick is driven by a 1ms timer on the JS side, but compute-only wasm cannot be preempted mid-call while the main thread is busy.";
+  "New runs and debug sessions start with interruption disabled unless you explicitly arm fuel or epoch.";
 
-type InterruptModeChoice = "fuel" | "epoch";
+type InterruptModeChoice = "none" | "fuel" | "epoch";
 
 type ThemePreference = "light" | "dark" | "system";
 type ResolvedTheme = "light" | "dark";
@@ -162,7 +159,10 @@ const ICONS: Record<string, string> = {
   next: iconSvg('<polyline points="7 17 12 12 7 7"></polyline><polyline points="13 17 18 12 13 7"></polyline>'),
   out: iconSvg('<polyline points="9 14 4 9 9 4"></polyline><path d="M20 20v-7a4 4 0 0 0-4-4H4"></path>'),
   continue: iconSvg('<polygon points="7 4 20 12 7 20 7 4" fill="currentColor" stroke="none"></polygon>'),
-  stop: iconSvg('<rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor" stroke="none"></rect>')
+  stop: iconSvg('<rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor" stroke="none"></rect>'),
+  reset_sample: iconSvg(
+    '<path d="M3 12a9 9 0 0 1 15.5-6.36L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-15.5 6.36L3 16"></path><path d="M8 16H3v5"></path>'
+  )
 };
 
 declare global {
@@ -250,34 +250,6 @@ function loadSourceForFlavor(flavor: SourceFlavor): string {
     // Ignore storage failures and fall back to the bundled sample.
   }
   return SAMPLE_SOURCES[flavor];
-}
-
-function loadFuelAmountInput(): string {
-  try {
-    return window.localStorage.getItem(FUEL_AMOUNT_STORAGE_KEY) ?? "";
-  } catch {
-    return "";
-  }
-}
-
-function loadInterruptMode(): InterruptModeChoice {
-  try {
-    const stored = window.localStorage.getItem(INTERRUPT_MODE_STORAGE_KEY);
-    if (stored === "epoch") {
-      return "epoch";
-    }
-  } catch {
-    // Ignore storage failures and fall back to fuel mode.
-  }
-  return "fuel";
-}
-
-function loadFuelIntervalInput(): string {
-  try {
-    return window.localStorage.getItem(FUEL_INTERVAL_STORAGE_KEY) ?? "1";
-  } catch {
-    return "1";
-  }
 }
 
 function resolveTheme(preference: ThemePreference, query: MediaQueryList | null): ResolvedTheme {
@@ -474,9 +446,9 @@ const systemThemeQuery =
     ? window.matchMedia("(prefers-color-scheme: dark)")
     : null;
 const initialFlavor = loadCurrentFlavor();
-const initialInterruptMode = loadInterruptMode();
-const initialFuelAmount = loadFuelAmountInput();
-const initialFuelInterval = loadFuelIntervalInput();
+const initialInterruptMode: InterruptModeChoice = "none";
+const initialFuelAmount = "10";
+const initialFuelInterval = "1";
 const initialThemePreference = loadThemePreference();
 const initialResolvedTheme = resolveTheme(initialThemePreference, systemThemeQuery);
 updateViewportHeightCssVar();
@@ -491,8 +463,9 @@ app.innerHTML = `
   <main class="page">
     <section class="hero">
       <h1>RustScript playground</h1>
-      <p>Run or debug directly in wasm runtime with Monaco breakpoints, stepping controls, and hover variable inspect.</p>
-      <p><a href="./about.html" style="color: #58a6ff; text-decoration: underline;">Read more about the VM & RustScript here.</a></p>
+      <p>
+      <span>Run or debug directly in wasm runtime with Monaco breakpoints, stepping controls, and hover variable inspect.</span>
+      <span><a href="./about.html" style="color: #58a6ff; text-decoration: underline;">Read more about the VM & RustScript here.</a></span>
     </section>
     <section class="workspace">
       <div class="toolbar">
@@ -512,15 +485,29 @@ app.innerHTML = `
           <button id="debug-out-button" class="icon-button" type="button" title="Out" aria-label="Out"></button>
           <button id="debug-continue-button" class="icon-button" type="button" title="Continue" aria-label="Continue"></button>
           <span class="toolbar-sep" aria-hidden="true"></span>
-          <button id="debug-stop-button" class="icon-button icon-button--stop" type="button" title="Stop" aria-label="Stop"></button>
+          <button id="stop-button" class="icon-button icon-button--stop" type="button" title="Stop" aria-label="Stop"></button>
         </div>
-        <span id="lint-status" class="status neutral">lint: idle</span>
-        <span id="run-status" class="status neutral">run: idle</span>
-        <span id="debug-status" class="status neutral">debug: idle</span>
-        <div id="theme-control" class="theme-control" role="group" aria-label="theme mode" data-theme="system">
-          <button id="theme-system-button" class="theme-option" type="button" title="Follow system theme" aria-label="Follow system theme"></button>
-          <button id="theme-light-button" class="theme-option" type="button" title="Light mode" aria-label="Light mode"></button>
-          <button id="theme-dark-button" class="theme-option" type="button" title="Dark mode" aria-label="Dark mode"></button>
+        <div class="toolbar-status-strip" aria-live="polite">
+          <span id="lint-status" class="status neutral">lint: idle</span>
+          <span id="session-status" class="status neutral">idle</span>
+          <div id="run-fuel-state" class="fuel-state-line" hidden>Run fuel: idle</div>
+          <div id="run-epoch-state" class="fuel-state-line" hidden>Run epoch: idle</div>
+          <div id="debug-fuel-state" class="fuel-state-line" hidden>Debug fuel: idle</div>
+          <div id="debug-epoch-state" class="fuel-state-line" hidden>Debug epoch: idle</div>
+        </div>
+        <div class="toolbar-right">
+          <button
+            id="load-sample-button"
+            class="toolbar-action toolbar-utility-button toolbar-utility-button--icon"
+            type="button"
+            title="Reset to Sample"
+            aria-label="Reset to Sample"
+          ></button>
+          <div id="theme-control" class="theme-control" role="group" aria-label="theme mode" data-theme="system">
+            <button id="theme-system-button" class="theme-option" type="button" title="Follow system theme" aria-label="Follow system theme"></button>
+            <button id="theme-light-button" class="theme-option" type="button" title="Light mode" aria-label="Light mode"></button>
+            <button id="theme-dark-button" class="theme-option" type="button" title="Dark mode" aria-label="Dark mode"></button>
+          </div>
         </div>
       </div>
       <div class="workspace-body">
@@ -546,6 +533,7 @@ app.innerHTML = `
               <label class="fuel-field" for="interrupt-mode-select">
                 <span>Mode</span>
                 <select id="interrupt-mode-select" class="fuel-input" aria-label="interruption mode">
+                  <option value="none">Disabled</option>
                   <option value="fuel">Fuel</option>
                   <option value="epoch">Epoch</option>
                 </select>
@@ -577,14 +565,10 @@ app.innerHTML = `
                 <button id="debug-fuel-set-button" class="panel-button" type="button">Set Debug Fuel</button>
                 <button id="debug-fuel-add-button" class="panel-button panel-button--secondary" type="button">Add Debug Fuel</button>
                 <button id="debug-fuel-interval-button" class="panel-button panel-button--secondary" type="button">Apply Debug Interval</button>
-                <button id="debug-epoch-tick-button" class="panel-button panel-button--secondary" type="button">Tick Epoch</button>
+                <button id="debug-epoch-tick-button" class="panel-button panel-button--secondary" type="button">Pause Tick</button>
                 <button id="run-resume-button" class="panel-button" type="button">Resume Run</button>
               </div>
               <div id="fuel-hint" class="fuel-hint">${DEFAULT_FUEL_HINT}</div>
-              <div class="fuel-state-list">
-                <div id="run-fuel-state" class="fuel-state-line">Run session: idle</div>
-                <div id="debug-fuel-state" class="fuel-state-line">Debugger fuel: idle</div>
-              </div>
             </div>
           `)}
         </aside>
@@ -607,10 +591,10 @@ const debugStepButton = document.querySelector<HTMLButtonElement>("#debug-step-b
 const debugNextButton = document.querySelector<HTMLButtonElement>("#debug-next-button");
 const debugOutButton = document.querySelector<HTMLButtonElement>("#debug-out-button");
 const debugContinueButton = document.querySelector<HTMLButtonElement>("#debug-continue-button");
-const debugStopButton = document.querySelector<HTMLButtonElement>("#debug-stop-button");
+const stopButton = document.querySelector<HTMLButtonElement>("#stop-button");
 const lintStatus = document.querySelector<HTMLSpanElement>("#lint-status");
-const runStatus = document.querySelector<HTMLSpanElement>("#run-status");
-const debugStatus = document.querySelector<HTMLSpanElement>("#debug-status");
+const sessionStatus = document.querySelector<HTMLSpanElement>("#session-status");
+const loadSampleButton = document.querySelector<HTMLButtonElement>("#load-sample-button");
 const diagnosticsEl = document.querySelector<HTMLElement>("#diagnostics");
 const outputEl = document.querySelector<HTMLElement>("#run-output");
 const stackEl = document.querySelector<HTMLElement>("#run-stack");
@@ -628,7 +612,9 @@ const debugEpochTickButton = document.querySelector<HTMLButtonElement>("#debug-e
 const runResumeButton = document.querySelector<HTMLButtonElement>("#run-resume-button");
 const fuelHintEl = document.querySelector<HTMLElement>("#fuel-hint");
 const runFuelStateEl = document.querySelector<HTMLElement>("#run-fuel-state");
+const runEpochStateEl = document.querySelector<HTMLElement>("#run-epoch-state");
 const debugFuelStateEl = document.querySelector<HTMLElement>("#debug-fuel-state");
+const debugEpochStateEl = document.querySelector<HTMLElement>("#debug-epoch-state");
 const editorHost = document.querySelector<HTMLElement>("#editor");
 const sidebarPanels = Array.from(document.querySelectorAll<HTMLElement>(".panel[data-panel-key]"));
 
@@ -647,10 +633,10 @@ if (
   !debugNextButton ||
   !debugOutButton ||
   !debugContinueButton ||
-  !debugStopButton ||
+  !stopButton ||
   !lintStatus ||
-  !runStatus ||
-  !debugStatus ||
+  !sessionStatus ||
+  !loadSampleButton ||
   !diagnosticsEl ||
   !outputEl ||
   !stackEl ||
@@ -668,7 +654,9 @@ if (
   !runResumeButton ||
   !fuelHintEl ||
   !runFuelStateEl ||
+  !runEpochStateEl ||
   !debugFuelStateEl ||
+  !debugEpochStateEl ||
   !editorHost ||
   sidebarPanels.length === 0
 ) {
@@ -687,7 +675,8 @@ mountIconButton(debugStepButton, "step", "Step");
 mountIconButton(debugNextButton, "next", "Next");
 mountIconButton(debugOutButton, "out", "Out");
 mountIconButton(debugContinueButton, "continue", "Continue");
-mountIconButton(debugStopButton, "stop", "Stop");
+mountIconButton(stopButton, "stop", "Stop");
+mountIconButton(loadSampleButton, "reset_sample", "Reset to Sample");
 
 const flavorSelectEl: HTMLSelectElement = flavorSelect;
 const themeControlEl: HTMLElement = themeControl;
@@ -703,10 +692,10 @@ const debugStepButtonEl: HTMLButtonElement = debugStepButton;
 const debugNextButtonEl: HTMLButtonElement = debugNextButton;
 const debugOutButtonEl: HTMLButtonElement = debugOutButton;
 const debugContinueButtonEl: HTMLButtonElement = debugContinueButton;
-const debugStopButtonEl: HTMLButtonElement = debugStopButton;
+const stopButtonEl: HTMLButtonElement = stopButton;
 const lintStatusEl: HTMLSpanElement = lintStatus;
-const runStatusEl: HTMLSpanElement = runStatus;
-const debugStatusEl: HTMLSpanElement = debugStatus;
+const sessionStatusEl: HTMLSpanElement = sessionStatus;
+const loadSampleButtonEl: HTMLButtonElement = loadSampleButton;
 const diagnosticsPanelEl: HTMLElement = diagnosticsEl;
 const outputPanelEl: HTMLElement = outputEl;
 const stackPanelEl: HTMLElement = stackEl;
@@ -724,7 +713,9 @@ const debugEpochTickButtonEl: HTMLButtonElement = debugEpochTickButton;
 const runResumeButtonEl: HTMLButtonElement = runResumeButton;
 const fuelHintPanelEl: HTMLElement = fuelHintEl;
 const runFuelStatePanelEl: HTMLElement = runFuelStateEl;
+const runEpochStatePanelEl: HTMLElement = runEpochStateEl;
 const debugFuelStatePanelEl: HTMLElement = debugFuelStateEl;
+const debugEpochStatePanelEl: HTMLElement = debugEpochStateEl;
 const editorHostEl: HTMLElement = editorHost;
 const sidebarPanelEls = new Map<SidebarPanelKey, HTMLElement>();
 const sidebarPanelToggleEls = new Map<SidebarPanelKey, HTMLButtonElement>();
@@ -865,7 +856,6 @@ let runBusy = false;
 let runSessionActive = false;
 let runSessionYielded = false;
 let runFuelState: FuelState = defaultFuelState();
-let runSessionMessage = "Run session: idle";
 let runPollTimer: number | null = null;
 let runPollGeneration = 0;
 let pendingRunEpochTicks = 0;
@@ -880,19 +870,62 @@ let debugDecorationIds: string[] = [];
 const debugHoverCache = new Map<string, string | null>();
 const debugHoverInflight = new Map<string, Promise<string | null>>();
 let epochTickTimer: number | null = null;
+let epochTickerPaused = false;
 let epochFlushInFlight = false;
 let lastEpochUiRefreshAt = 0;
 let lastEpochFlushAt = 0;
+type StatusClass = "neutral" | "ok" | "error" | "busy";
+type SessionStatusSnapshot = {
+  text: string;
+  className: StatusClass;
+};
+let runStatusState: SessionStatusSnapshot = { text: "idle", className: "neutral" };
+let debugStatusState: SessionStatusSnapshot = { text: "idle", className: "neutral" };
 const themeButtons: Record<ThemePreference, HTMLButtonElement> = {
   system: themeSystemButtonEl,
   light: themeLightButtonEl,
   dark: themeDarkButtonEl
 };
 
-function setStatus(node: HTMLElement, text: string, className: "neutral" | "ok" | "error" | "busy"): void {
+function setStatus(node: HTMLElement, text: string, className: StatusClass): void {
   node.classList.remove("neutral", "ok", "error", "busy");
   node.classList.add(className);
   node.textContent = text;
+}
+
+function statusPriority(source: "run" | "debug", status: SessionStatusSnapshot): number {
+  if (status.className === "busy") {
+    return 50;
+  }
+  if (status.className === "ok" && status.text !== "completed") {
+    return 45;
+  }
+  if (status.className === "error") {
+    return 40;
+  }
+  if (status.className === "ok") {
+    return 10;
+  }
+  if (status.text !== "idle") {
+    return 5;
+  }
+  return source === "debug" ? 1 : 0;
+}
+
+function syncSessionStatus(): void {
+  const nextStatus =
+    statusPriority("debug", debugStatusState) >= statusPriority("run", runStatusState) ? debugStatusState : runStatusState;
+  setStatus(sessionStatusEl, nextStatus.text, nextStatus.className);
+}
+
+function setRunSessionStatus(text: string, className: StatusClass): void {
+  runStatusState = { text, className };
+  syncSessionStatus();
+}
+
+function setDebugSessionStatus(text: string, className: StatusClass): void {
+  debugStatusState = { text, className };
+  syncSessionStatus();
 }
 
 function persistThemePreference(preference: ThemePreference): void {
@@ -914,30 +947,6 @@ function persistCurrentFlavor(flavor: SourceFlavor): void {
 function persistSourceForFlavor(flavor: SourceFlavor, value: string): void {
   try {
     window.localStorage.setItem(sourceStorageKey(flavor), value);
-  } catch {
-    // Ignore storage failures; the current session still works.
-  }
-}
-
-function persistFuelAmount(value: string): void {
-  try {
-    window.localStorage.setItem(FUEL_AMOUNT_STORAGE_KEY, value);
-  } catch {
-    // Ignore storage failures; the current session still works.
-  }
-}
-
-function persistInterruptMode(value: InterruptModeChoice): void {
-  try {
-    window.localStorage.setItem(INTERRUPT_MODE_STORAGE_KEY, value);
-  } catch {
-    // Ignore storage failures; the current session still works.
-  }
-}
-
-function persistFuelInterval(value: string): void {
-  try {
-    window.localStorage.setItem(FUEL_INTERVAL_STORAGE_KEY, value);
   } catch {
     // Ignore storage failures; the current session still works.
   }
@@ -997,12 +1006,16 @@ function setFuelHint(message: string | null): void {
 
 function syncInterruptFormUi(): void {
   const epochMode = interruptMode === "epoch";
-  fuelAmountLabelEl.textContent = epochMode ? "Epoch Deadline" : "Fuel Amount";
+  const interruptDisabled = interruptMode === "none";
+  fuelAmountLabelEl.textContent = epochMode ? "Epoch Deadline (ms)" : "Fuel Amount";
   fuelIntervalLabelEl.textContent = "Check Interval";
   fuelAmountInputEl.placeholder = epochMode ? "disabled" : "disabled";
+  fuelAmountInputEl.disabled = interruptDisabled;
+  fuelIntervalInputEl.disabled = interruptDisabled;
   debugFuelSetButtonEl.textContent = epochMode ? "Arm Debug Epoch" : "Set Debug Fuel";
   debugFuelAddButtonEl.textContent = epochMode ? "Clear Debug Epoch" : "Add Debug Fuel";
   debugFuelIntervalButtonEl.textContent = epochMode ? "Apply Epoch Interval" : "Apply Debug Interval";
+  debugEpochTickButtonEl.textContent = epochTickerPaused ? "Resume Tick" : "Pause Tick";
   debugEpochTickButtonEl.hidden = !epochMode;
   debugEpochTickButtonEl.disabled = !epochMode || debugBusy || (!debugSessionActive && !runSessionActive);
 }
@@ -1097,7 +1110,7 @@ function stopEpochTicker(): void {
 }
 
 function scheduleEpochTicker(): void {
-  if (epochTickTimer !== null || !epochTimerShouldRun()) {
+  if (epochTickTimer !== null || epochTickerPaused || !epochTimerShouldRun()) {
     return;
   }
 
@@ -1133,6 +1146,11 @@ function syncEpochTicker(): void {
   syncEpochPendingState();
   if (!epochTimerShouldRun()) {
     stopEpochTicker();
+    epochTickerPaused = false;
+    return;
+  }
+  if (epochTickerPaused) {
+    stopEpochTicker();
     return;
   }
   scheduleEpochTicker();
@@ -1167,21 +1185,43 @@ function scheduleRunPollingIfActive(): void {
   }
 }
 
+function setInterruptStateLine(node: HTMLElement, visible: boolean, text: string): void {
+  node.hidden = !visible;
+  if (visible) {
+    node.textContent = text;
+  }
+}
+
 function syncFuelPanel(): void {
   syncEpochPendingState();
-  runFuelStatePanelEl.textContent = runSessionActive
-    ? `Run session: ${runSessionMessage} | ${formatFuelState(runFuelState, pendingRunEpochTicks)}`
-    : "Run session: idle";
-  debugFuelStatePanelEl.textContent = debugSessionActive
-    ? `Debugger: ${formatFuelState(debugFuelState, pendingDebugEpochTicks)}`
-    : "Debugger: idle";
+  const interruptDisabled = interruptMode === "none";
+  setInterruptStateLine(
+    runFuelStatePanelEl,
+    runSessionActive && runFuelState.mode === "fuel",
+    `Run fuel: ${formatFuelState(runFuelState, pendingRunEpochTicks)}`
+  );
+  setInterruptStateLine(
+    runEpochStatePanelEl,
+    runSessionActive && runFuelState.mode === "epoch",
+    `Run epoch: ${formatFuelState(runFuelState, pendingRunEpochTicks)}`
+  );
+  setInterruptStateLine(
+    debugFuelStatePanelEl,
+    debugSessionActive && debugFuelState.mode === "fuel",
+    `Debug fuel: ${formatFuelState(debugFuelState, pendingDebugEpochTicks)}`
+  );
+  setInterruptStateLine(
+    debugEpochStatePanelEl,
+    debugSessionActive && debugFuelState.mode === "epoch",
+    `Debug epoch: ${formatFuelState(debugFuelState, pendingDebugEpochTicks)}`
+  );
   runResumeButtonEl.disabled = !runSessionActive || runBusy;
-  debugFuelSetButtonEl.disabled = !debugSessionActive || debugBusy;
-  debugFuelAddButtonEl.disabled = !debugSessionActive || debugBusy;
-  debugFuelIntervalButtonEl.disabled = !debugSessionActive || debugBusy;
+  debugFuelSetButtonEl.disabled = interruptDisabled || !debugSessionActive || debugBusy;
+  debugFuelAddButtonEl.disabled = interruptDisabled || !debugSessionActive || debugBusy;
+  debugFuelIntervalButtonEl.disabled = interruptDisabled || !debugSessionActive || debugBusy;
   debugEpochTickButtonEl.disabled = interruptMode !== "epoch" || debugBusy || (!debugSessionActive && !runSessionActive);
-  syncInterruptFormUi();
   syncEpochTicker();
+  syncInterruptFormUi();
 }
 
 type ParsedFuelForm = {
@@ -1234,7 +1274,7 @@ function currentFuelConfig(): FuelConfig | null {
     return null;
   }
   return {
-    mode: parsed.mode,
+    mode: parsed.mode === "none" ? null : parsed.mode,
     fuel: parsed.mode === "fuel" ? parsed.amount : null,
     fuelCheckInterval: parsed.mode === "fuel" ? parsed.interval : null,
     epochDeadline: parsed.mode === "epoch" ? parsed.amount : null,
@@ -1276,10 +1316,39 @@ function activeBreakpoints(): Set<number> {
   return lineBreakpointsByFlavor[currentFlavor];
 }
 
+function resetEditorToSampleSource(): void {
+  if (runSessionActive) {
+    void runCommandWithWasm({ kind: "stop" }).catch(() => {
+      // best effort stop
+    });
+  }
+  if (debugSessionActive) {
+    void debugCommandWithWasm({ kind: "stop" }).catch(() => {
+      // best effort stop
+    });
+  }
+
+  activeModel().setValue(SAMPLE_SOURCES[currentFlavor]);
+  monaco.editor.setModelMarkers(activeModel(), MARKER_OWNER, []);
+  renderDiagnosticsList(diagnosticsPanelEl, []);
+  setRunPanel(outputPanelEl, stackPanelEl, [], []);
+  applyInactiveRunState();
+  applyInactiveDebugState("<no debugger output>");
+  setStatus(lintStatusEl, "lint: queued...", "busy");
+  scheduleLint();
+  editor.focus();
+}
+
 function clearHoverInspect(): void {
   debugHoveredVar = "";
   debugHoverActiveKey = "";
   debugHoverPanelEl.textContent = "hover inspect: (none)";
+}
+
+function syncStopButtonState(): void {
+  const canStopDebug = debugSessionActive && !debugBusy;
+  const canStopRun = runSessionActive && !runBusy;
+  stopButtonEl.disabled = !(canStopDebug || canStopRun);
 }
 
 function applyDebugControlState(): void {
@@ -1294,12 +1363,13 @@ function applyDebugControlState(): void {
   debugNextButtonEl.disabled = disableCommands;
   debugOutButtonEl.disabled = disableCommands;
   debugContinueButtonEl.disabled = disableCommands;
-  debugStopButtonEl.disabled = !hasSession || debugBusy;
+  syncStopButtonState();
   syncFuelPanel();
 }
 
 function applyRunControlState(): void {
   runButtonEl.disabled = runBusy;
+  syncStopButtonState();
   syncFuelPanel();
 }
 
@@ -1386,18 +1456,18 @@ function applyDebugReport(report: DebugReport, options: ApplyDebugReportOptions 
     return;
   }
   if (report.error) {
-    setStatus(debugStatusEl, `debug: error (${report.error})`, "error");
+    setDebugSessionStatus(`error (${report.error})`, "error");
     return;
   }
   if (report.currentLine) {
-    setStatus(debugStatusEl, `debug: paused @ ${report.currentLine}`, "ok");
+    setDebugSessionStatus(`paused @ ${report.currentLine}`, "ok");
     return;
   }
   if (report.halted) {
-    setStatus(debugStatusEl, "debug: halted", "ok");
+    setDebugSessionStatus("completed", "ok");
     return;
   }
-  setStatus(debugStatusEl, "debug: attached", "ok");
+  setDebugSessionStatus("running", "busy");
 }
 
 function applyInactiveDebugState(message: string): void {
@@ -1411,7 +1481,7 @@ function applyInactiveDebugState(message: string): void {
   if (message) {
     debugOutputPanelEl.textContent = message;
   }
-  setStatus(debugStatusEl, "debug: idle", "neutral");
+  setDebugSessionStatus("idle", "neutral");
 }
 
 function applyInactiveRunState(): void {
@@ -1420,9 +1490,9 @@ function applyInactiveRunState(): void {
   runSessionActive = false;
   runSessionYielded = false;
   runFuelState = defaultFuelState();
-  runSessionMessage = "Run session: idle";
   setFuelHint(null);
   applyRunControlState();
+  setRunSessionStatus("idle", "neutral");
 }
 
 function applyRunReport(report: RunReport): void {
@@ -1446,25 +1516,14 @@ function applyRunReport(report: RunReport): void {
     runSessionYielded = true;
   }
 
-  const commandOutput = report.commandOutput.trim();
-  if (commandOutput.length > 0) {
-    runSessionMessage = commandOutput;
-  } else if (runSessionActive) {
-    runSessionMessage = runSessionYielded ? "paused" : "active";
-  } else if (report.halted) {
-    runSessionMessage = "program halted";
-  } else {
-    runSessionMessage = "idle";
-  }
-
   if (report.error) {
     cancelRunPolling();
-    setStatus(runStatusEl, `run: error (${report.error})`, "error");
+    setRunSessionStatus(`error (${report.error})`, "error");
   } else if (report.halted) {
     cancelRunPolling();
-    setStatus(runStatusEl, "run: ok", "ok");
+    setRunSessionStatus("completed", "ok");
   } else {
-    setStatus(runStatusEl, "run: running", "busy");
+    setRunSessionStatus("running", "busy");
   }
 
   setFuelHint(
@@ -1496,7 +1555,7 @@ async function sendRunCommand(command: RunCommandRequest): Promise<RunReport | n
   runBusy = true;
   applyRunControlState();
   if (command.kind !== "stop") {
-    setStatus(runStatusEl, "run: running", "busy");
+    setRunSessionStatus("running", "busy");
   }
 
   try {
@@ -1504,9 +1563,7 @@ async function sendRunCommand(command: RunCommandRequest): Promise<RunReport | n
     if (command.kind === "stop" || report.error === "run session is not active") {
       applyInactiveRunState();
       if (report.error) {
-        setStatus(runStatusEl, `run: error (${report.error})`, "error");
-      } else {
-        setStatus(runStatusEl, "run: idle", "neutral");
+        setRunSessionStatus(`error (${report.error})`, "error");
       }
       return report;
     }
@@ -1515,7 +1572,7 @@ async function sendRunCommand(command: RunCommandRequest): Promise<RunReport | n
     return report;
   } catch (error) {
     const message = error instanceof Error ? error.message : "run command failed";
-    setStatus(runStatusEl, `run: wasm error (${message})`, "error");
+    setRunSessionStatus(`error (${message})`, "error");
     return null;
   } finally {
     runBusy = false;
@@ -1590,7 +1647,7 @@ async function sendDebugCommand(command: DebugCommandRequest): Promise<DebugRepo
 
   debugBusy = true;
   applyDebugControlState();
-  setStatus(debugStatusEl, `debug: ${command.kind}...`, "busy");
+  setDebugSessionStatus("running", "busy");
 
   try {
     const report = await debugCommandWithWasm(command);
@@ -1614,11 +1671,20 @@ async function sendDebugCommand(command: DebugCommandRequest): Promise<DebugRepo
     return report;
   } catch (error) {
     const message = error instanceof Error ? error.message : "debug command failed";
-    setStatus(debugStatusEl, `debug: wasm error (${message})`, "error");
+    setDebugSessionStatus(`error (${message})`, "error");
     return null;
   } finally {
     debugBusy = false;
     applyDebugControlState();
+  }
+}
+
+async function stopActiveSessions(): Promise<void> {
+  if (debugSessionActive && !debugBusy) {
+    await sendDebugCommand({ kind: "stop" });
+  }
+  if (runSessionActive && !runBusy) {
+    await sendRunCommand({ kind: "stop" });
   }
 }
 
@@ -1799,16 +1865,16 @@ flavorSelectEl.addEventListener("change", () => {
   applyInactiveRunState();
   applyInactiveDebugState("<no debugger output>");
   applyDebugDecorations();
-  setStatus(runStatusEl, "run: idle", "neutral");
   scheduleLint();
+});
+
+loadSampleButtonEl.addEventListener("click", () => {
+  resetEditorToSampleSource();
 });
 
 window.addEventListener("pagehide", () => {
   persistCurrentFlavor(currentFlavor);
   flushPersistedSources();
-  persistInterruptMode(interruptMode);
-  persistFuelAmount(fuelAmountInputEl.value);
-  persistFuelInterval(fuelIntervalInputEl.value);
 });
 
 for (const option of THEME_OPTIONS) {
@@ -1818,17 +1884,13 @@ for (const option of THEME_OPTIONS) {
 }
 
 interruptModeSelectEl.addEventListener("change", () => {
-  interruptMode = interruptModeSelectEl.value === "epoch" ? "epoch" : "fuel";
-  persistInterruptMode(interruptMode);
+  interruptMode =
+    interruptModeSelectEl.value === "epoch"
+      ? "epoch"
+      : interruptModeSelectEl.value === "fuel"
+        ? "fuel"
+        : "none";
   syncFuelPanel();
-});
-
-fuelAmountInputEl.addEventListener("input", () => {
-  persistFuelAmount(fuelAmountInputEl.value);
-});
-
-fuelIntervalInputEl.addEventListener("input", () => {
-  persistFuelInterval(fuelIntervalInputEl.value);
 });
 
 const handleSystemThemeChange = () => {
@@ -1849,14 +1911,14 @@ if (systemThemeQuery) {
 runButtonEl.addEventListener("click", async () => {
   const fuelConfig = currentFuelConfig();
   if (!fuelConfig) {
-    setStatus(runStatusEl, "run: invalid interruption settings", "error");
+    setRunSessionStatus("invalid interruption settings", "error");
     return;
   }
 
   cancelRunPolling();
   runBusy = true;
   applyRunControlState();
-  setStatus(runStatusEl, "run: running", "busy");
+  setRunSessionStatus("running", "busy");
 
   const source = activeModel().getValue();
   try {
@@ -1864,7 +1926,7 @@ runButtonEl.addEventListener("click", async () => {
     applyRunReport(report);
   } catch (error) {
     const message = error instanceof Error ? error.message : "run failed";
-    setStatus(runStatusEl, `run: wasm error (${message})`, "error");
+    setRunSessionStatus(`error (${message})`, "error");
   } finally {
     runBusy = false;
     applyRunControlState();
@@ -1879,13 +1941,13 @@ async function startDebugSession(): Promise<void> {
 
   const fuelConfig = currentFuelConfig();
   if (!fuelConfig) {
-    setStatus(debugStatusEl, "debug: invalid interruption settings", "error");
+    setDebugSessionStatus("invalid interruption settings", "error");
     return;
   }
 
   debugBusy = true;
   applyDebugControlState();
-  setStatus(debugStatusEl, "debug: starting...", "busy");
+  setDebugSessionStatus("running", "busy");
 
   const source = activeModel().getValue();
   const requestedBreakpoints = [...activeBreakpoints()].sort((lhs, rhs) => lhs - rhs);
@@ -1928,11 +1990,11 @@ async function startDebugSession(): Promise<void> {
     }
 
     if (debugSessionActive && requestedBreakpoints.length > 0) {
-      setStatus(debugStatusEl, "debug: attached", "ok");
+      setDebugSessionStatus("running", "busy");
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "debug start failed";
-    setStatus(debugStatusEl, `debug: wasm error (${message})`, "error");
+    setDebugSessionStatus(`error (${message})`, "error");
     debugSessionActive = false;
     debugCurrentLine = null;
     applyDebugDecorations();
@@ -1986,17 +2048,21 @@ debugContinueButtonEl.addEventListener("click", () => {
   void sendDebugCommand({ kind: "continue" });
 });
 
-debugStopButtonEl.addEventListener("click", () => {
+stopButtonEl.addEventListener("click", () => {
   debugHoverCache.clear();
   debugHoverInflight.clear();
   clearHoverInspect();
-  void sendDebugCommand({ kind: "stop" });
+  void stopActiveSessions();
 });
 
 debugFuelSetButtonEl.addEventListener("click", () => {
   const parsed = readFuelForm();
   if (!parsed) {
-    setStatus(debugStatusEl, "debug: invalid interruption settings", "error");
+    setDebugSessionStatus("invalid interruption settings", "error");
+    return;
+  }
+  if (parsed.mode === "none") {
+    setDebugSessionStatus("select fuel or epoch mode", "error");
     return;
   }
   if (parsed.mode === "epoch") {
@@ -2017,7 +2083,11 @@ debugFuelSetButtonEl.addEventListener("click", () => {
 debugFuelAddButtonEl.addEventListener("click", () => {
   const parsed = readFuelForm();
   if (!parsed) {
-    setStatus(debugStatusEl, "debug: invalid interruption settings", "error");
+    setDebugSessionStatus("invalid interruption settings", "error");
+    return;
+  }
+  if (parsed.mode === "none") {
+    setDebugSessionStatus("select fuel or epoch mode", "error");
     return;
   }
   if (parsed.mode === "epoch") {
@@ -2025,7 +2095,7 @@ debugFuelAddButtonEl.addEventListener("click", () => {
     return;
   }
   if (parsed.amount === null) {
-    setStatus(debugStatusEl, "debug: enter fuel to add", "error");
+    setDebugSessionStatus("enter fuel to add", "error");
     return;
   }
   void sendDebugCommand({ kind: "add_fuel", amount: parsed.amount });
@@ -2034,7 +2104,11 @@ debugFuelAddButtonEl.addEventListener("click", () => {
 debugFuelIntervalButtonEl.addEventListener("click", () => {
   const parsed = readFuelForm();
   if (!parsed) {
-    setStatus(debugStatusEl, "debug: invalid interruption settings", "error");
+    setDebugSessionStatus("invalid interruption settings", "error");
+    return;
+  }
+  if (parsed.mode === "none") {
+    setDebugSessionStatus("select fuel or epoch mode", "error");
     return;
   }
   void sendDebugCommand(
@@ -2048,25 +2122,21 @@ debugEpochTickButtonEl.addEventListener("click", () => {
   if (interruptMode !== "epoch") {
     return;
   }
-  const parsed = readFuelForm();
-  if (!parsed) {
-    setStatus(debugStatusEl, "debug: invalid interruption settings", "error");
+  if (!debugSessionActive && !runSessionActive) {
     return;
   }
-  const amount = parsed.amount ?? 1;
-  if (debugSessionActive) {
-    void sendDebugCommand({ kind: "tick_epoch", amount });
-    return;
-  }
-  if (runSessionActive) {
-    void sendRunCommand({ kind: "tick_epoch", amount });
-  }
+  epochTickerPaused = !epochTickerPaused;
+  syncFuelPanel();
 });
 
 runResumeButtonEl.addEventListener("click", () => {
   const parsed = readFuelForm();
   if (!parsed) {
-    setStatus(runStatusEl, "run: invalid interruption settings", "error");
+    setRunSessionStatus("invalid interruption settings", "error");
+    return;
+  }
+  if (parsed.mode === "none") {
+    setRunSessionStatus("select fuel or epoch mode", "error");
     return;
   }
   if (!runSessionActive) {
