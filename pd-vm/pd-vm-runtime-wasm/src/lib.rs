@@ -308,7 +308,10 @@ pub extern "C" fn debug_command_json(command_ptr: u32, command_len: u32) -> u64 
     let parsed = match serde_json::from_str::<DebugCommand>(command_json) {
         Ok(value) => value,
         Err(err) => {
-            return leak_bytes(invalid_debug_command_response(command_json, &err.to_string()));
+            return leak_bytes(invalid_debug_command_response(
+                command_json,
+                &err.to_string(),
+            ));
         }
     };
     let report = run_debug_command(parsed);
