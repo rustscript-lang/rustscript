@@ -26,6 +26,31 @@ export type RunReport = {
   error: string | null;
 };
 
+export type DebugCommandRequest =
+  | { kind: "state" }
+  | { kind: "continue" }
+  | { kind: "step" }
+  | { kind: "next" }
+  | { kind: "out" }
+  | { kind: "where" }
+  | { kind: "locals" }
+  | { kind: "stack" }
+  | { kind: "print_var"; name: string }
+  | { kind: "break_line"; line: number }
+  | { kind: "clear_line"; line: number }
+  | { kind: "stop" };
+
+export type DebugReport = {
+  diagnostics: LintDiagnostic[];
+  output: string[];
+  stack: string[];
+  error: string | null;
+  currentLine: number | null;
+  breakpoints: number[];
+  halted: boolean;
+  commandOutput: string;
+};
+
 export type CompletionEntryKind = "function" | "module" | "snippet";
 
 export type CompletionEntry = {
@@ -49,6 +74,9 @@ type WasmRuntimeExports = {
   wasm_dealloc(ptr: number, len: number): void;
   lint_source_json(sourcePtr: number, sourceLen: number, flavorPtr: number, flavorLen: number): bigint;
   run_source_json(sourcePtr: number, sourceLen: number, flavorPtr: number, flavorLen: number): bigint;
+  debug_start_json?: (sourcePtr: number, sourceLen: number, flavorPtr: number, flavorLen: number) => bigint;
+  debug_command_json?: (commandPtr: number, commandLen: number) => bigint;
+  debug_state_json?: () => bigint;
   completion_catalog_json?: () => bigint;
 };
 
@@ -166,6 +194,61 @@ function normalizeRunReport(raw: unknown): RunReport {
     output,
     stack,
     error
+  };
+}
+
+function normalizeDebugReport(raw: unknown): DebugReport {
+  if (!raw || typeof raw !== "object") {
+    return {
+      diagnostics: [],
+      output: [],
+      stack: [],
+      error: "invalid debug response",
+      currentLine: null,
+      breakpoints: [],
+      halted: true,
+      commandOutput: ""
+    };
+  }
+
+  const lint = normalizeLintReport(raw);
+  const rawOutput = (raw as { output?: unknown }).output;
+  const rawStack = (raw as { stack?: unknown }).stack;
+  const rawError = (raw as { error?: unknown }).error;
+  const rawCurrentLine = (raw as { current_line?: unknown }).current_line;
+  const rawBreakpoints = (raw as { breakpoints?: unknown }).breakpoints;
+  const rawHalted = (raw as { halted?: unknown }).halted;
+  const rawCommandOutput = (raw as { command_output?: unknown }).command_output;
+
+  const output = Array.isArray(rawOutput)
+    ? rawOutput.filter((entry): entry is string => typeof entry === "string")
+    : [];
+  const stack = Array.isArray(rawStack)
+    ? rawStack.filter((entry): entry is string => typeof entry === "string")
+    : [];
+  const error = typeof rawError === "string" ? rawError : null;
+  const currentLine =
+    typeof rawCurrentLine === "number" && Number.isFinite(rawCurrentLine)
+      ? Math.max(1, Math.trunc(rawCurrentLine))
+      : null;
+  const breakpoints = Array.isArray(rawBreakpoints)
+    ? rawBreakpoints
+        .map((entry) => Number(entry))
+        .filter((entry) => Number.isFinite(entry))
+        .map((entry) => Math.max(1, Math.trunc(entry)))
+    : [];
+  const halted = typeof rawHalted === "boolean" ? rawHalted : false;
+  const commandOutput = typeof rawCommandOutput === "string" ? rawCommandOutput : "";
+
+  return {
+    diagnostics: lint.diagnostics,
+    output,
+    stack,
+    error,
+    currentLine,
+    breakpoints,
+    halted,
+    commandOutput
   };
 }
 
@@ -294,6 +377,24 @@ async function invokePackedJsonNoArgs(
   return decodeJsonPayload(wasm, packed);
 }
 
+async function invokePackedJsonSingleArg(
+  invoke: (wasm: WasmRuntimeExports, payloadPtr: number, payloadLen: number) => bigint,
+  payload: string
+): Promise<unknown> {
+  const wasm = await loadWasm();
+  const payloadBytes = encoder.encode(payload);
+  let payloadPtr = 0;
+  try {
+    payloadPtr = writeBytes(wasm, payloadBytes);
+    const packed = invoke(wasm, payloadPtr, payloadBytes.length);
+    return decodeJsonPayload(wasm, packed);
+  } finally {
+    if (payloadPtr !== 0) {
+      wasm.wasm_dealloc(payloadPtr, payloadBytes.length);
+    }
+  }
+}
+
 export async function lintWithWasm(source: string, flavor: SourceFlavor): Promise<LintReport> {
   const raw = await invokePackedJson(
     (wasm, sourcePtr, sourceLen, flavorPtr, flavorLen) =>
@@ -312,6 +413,83 @@ export async function runWithWasm(source: string, flavor: SourceFlavor): Promise
     flavor
   );
   return normalizeRunReport(raw);
+}
+
+export async function startDebugWithWasm(source: string, flavor: SourceFlavor): Promise<DebugReport> {
+  const wasm = await loadWasm();
+  if (typeof wasm.debug_start_json !== "function") {
+    return {
+      diagnostics: [],
+      output: [],
+      stack: [],
+      error: "debugger wasm export is unavailable",
+      currentLine: null,
+      breakpoints: [],
+      halted: true,
+      commandOutput: ""
+    };
+  }
+  const raw = await invokePackedJson(
+    (instance, sourcePtr, sourceLen, flavorPtr, flavorLen) => {
+      const invoke = instance.debug_start_json;
+      if (!invoke) {
+        return 0n;
+      }
+      return invoke(sourcePtr, sourceLen, flavorPtr, flavorLen);
+    },
+    source,
+    flavor
+  );
+  return normalizeDebugReport(raw);
+}
+
+export async function debugCommandWithWasm(command: DebugCommandRequest): Promise<DebugReport> {
+  const wasm = await loadWasm();
+  if (typeof wasm.debug_command_json !== "function") {
+    return {
+      diagnostics: [],
+      output: [],
+      stack: [],
+      error: "debugger wasm export is unavailable",
+      currentLine: null,
+      breakpoints: [],
+      halted: true,
+      commandOutput: ""
+    };
+  }
+  const payload = JSON.stringify(command);
+  const raw = await invokePackedJsonSingleArg((instance, payloadPtr, payloadLen) => {
+    const invoke = instance.debug_command_json;
+    if (!invoke) {
+      return 0n;
+    }
+    return invoke(payloadPtr, payloadLen);
+  }, payload);
+  return normalizeDebugReport(raw);
+}
+
+export async function debugStateWithWasm(): Promise<DebugReport> {
+  const wasm = await loadWasm();
+  if (typeof wasm.debug_state_json !== "function") {
+    return {
+      diagnostics: [],
+      output: [],
+      stack: [],
+      error: "debugger wasm export is unavailable",
+      currentLine: null,
+      breakpoints: [],
+      halted: true,
+      commandOutput: ""
+    };
+  }
+  const raw = await invokePackedJsonNoArgs((instance) => {
+    const invoke = instance.debug_state_json;
+    if (!invoke) {
+      return 0n;
+    }
+    return invoke();
+  });
+  return normalizeDebugReport(raw);
 }
 
 export async function completionCatalogWithWasm(): Promise<CompletionCatalog> {

@@ -8,7 +8,10 @@ use vm::SourceFlavor;
 
 use crate::analyzer::{LintDiagnostic, LintReport, LintSpan, lint_source_with_flavor};
 use crate::completions::{CompletionCatalog, build_completion_catalog};
-use crate::runtime::{RunReport, run_source_with_flavor};
+use crate::runtime::{
+    DebugCommand, DebugReport, RunReport, debug_state, run_debug_command, run_source_with_flavor,
+    start_debug_source_with_flavor,
+};
 
 #[derive(Serialize)]
 struct LintResponse {
@@ -38,6 +41,18 @@ struct RunResponse {
     output: Vec<String>,
     stack: Vec<String>,
     error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DebugResponse {
+    diagnostics: Vec<LintDiagnosticJson>,
+    output: Vec<String>,
+    stack: Vec<String>,
+    error: Option<String>,
+    current_line: Option<u32>,
+    breakpoints: Vec<u32>,
+    halted: bool,
+    command_output: String,
 }
 
 fn parse_flavor(raw: &str) -> SourceFlavor {
@@ -114,6 +129,26 @@ fn run_response_to_json(report: RunReport) -> Vec<u8> {
     })
 }
 
+fn debug_response_to_json(report: DebugReport) -> Vec<u8> {
+    let response = DebugResponse {
+        diagnostics: report
+            .diagnostics
+            .into_iter()
+            .map(lint_diagnostic_to_json)
+            .collect(),
+        output: report.output,
+        stack: report.stack,
+        error: report.error,
+        current_line: report.current_line,
+        breakpoints: report.breakpoints,
+        halted: report.halted,
+        command_output: report.command_output,
+    };
+    serde_json::to_vec(&response).unwrap_or_else(|_| {
+        b"{\"diagnostics\":[],\"output\":[],\"stack\":[],\"breakpoints\":[],\"halted\":true,\"command_output\":\"\"}".to_vec()
+    })
+}
+
 fn completion_catalog_to_json(catalog: CompletionCatalog) -> Vec<u8> {
     serde_json::to_vec(&catalog).unwrap_or_else(|_| {
         b"{\"rustscript\":[],\"javascript\":[],\"lua\":[],\"scheme\":[]}".to_vec()
@@ -147,6 +182,45 @@ fn invalid_utf8_run_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8> 
     };
     serde_json::to_vec(&response).unwrap_or_else(|_| {
         b"{\"ok\":false,\"diagnostics\":[],\"output\":[],\"stack\":[]}".to_vec()
+    })
+}
+
+fn invalid_utf8_debug_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8> {
+    let response = DebugResponse {
+        diagnostics: vec![LintDiagnosticJson {
+            line: 1,
+            message: format!("invalid utf-8 {label}: {err}"),
+            span: None,
+            rendered: format!("invalid utf-8 {label}: {err}"),
+        }],
+        output: Vec::new(),
+        stack: Vec::new(),
+        error: Some(format!("invalid utf-8 {label}: {err}")),
+        current_line: None,
+        breakpoints: Vec::new(),
+        halted: true,
+        command_output: String::new(),
+    };
+    serde_json::to_vec(&response).unwrap_or_else(|_| {
+        b"{\"diagnostics\":[],\"output\":[],\"stack\":[],\"breakpoints\":[],\"halted\":true,\"command_output\":\"\"}".to_vec()
+    })
+}
+
+fn invalid_debug_command_response(command_json: &str, error: &str) -> Vec<u8> {
+    let response = DebugResponse {
+        diagnostics: Vec::new(),
+        output: Vec::new(),
+        stack: Vec::new(),
+        error: Some(format!(
+            "invalid debug command: {error}; payload={command_json}"
+        )),
+        current_line: None,
+        breakpoints: Vec::new(),
+        halted: true,
+        command_output: String::new(),
+    };
+    serde_json::to_vec(&response).unwrap_or_else(|_| {
+        b"{\"diagnostics\":[],\"output\":[],\"stack\":[],\"breakpoints\":[],\"halted\":true,\"command_output\":\"\"}".to_vec()
     })
 }
 
@@ -207,6 +281,46 @@ pub extern "C" fn run_source_json(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn debug_start_json(
+    source_ptr: u32,
+    source_len: u32,
+    flavor_ptr: u32,
+    flavor_len: u32,
+) -> u64 {
+    let source = match std::str::from_utf8(unpack_input(source_ptr, source_len)) {
+        Ok(value) => value,
+        Err(err) => return leak_bytes(invalid_utf8_debug_response("source", &err)),
+    };
+    let flavor_raw = match std::str::from_utf8(unpack_input(flavor_ptr, flavor_len)) {
+        Ok(value) => value,
+        Err(err) => return leak_bytes(invalid_utf8_debug_response("flavor", &err)),
+    };
+    let report = start_debug_source_with_flavor(source, parse_flavor(flavor_raw));
+    leak_bytes(debug_response_to_json(report))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_command_json(command_ptr: u32, command_len: u32) -> u64 {
+    let command_json = match std::str::from_utf8(unpack_input(command_ptr, command_len)) {
+        Ok(value) => value,
+        Err(err) => return leak_bytes(invalid_utf8_debug_response("command", &err)),
+    };
+    let parsed = match serde_json::from_str::<DebugCommand>(command_json) {
+        Ok(value) => value,
+        Err(err) => {
+            return leak_bytes(invalid_debug_command_response(command_json, &err.to_string()));
+        }
+    };
+    let report = run_debug_command(parsed);
+    leak_bytes(debug_response_to_json(report))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_state_json() -> u64 {
+    leak_bytes(debug_response_to_json(debug_state()))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn completion_catalog_json() -> u64 {
     leak_bytes(completion_catalog_to_json(build_completion_catalog()))
 }
@@ -216,7 +330,10 @@ mod tests {
     use super::parse_flavor;
     use crate::analyzer::lint_source_with_flavor;
     use crate::completions::build_completion_catalog;
-    use crate::runtime::run_source_with_flavor;
+    use crate::runtime::{
+        DebugCommand, debug_state, run_debug_command, run_source_with_flavor,
+        start_debug_source_with_flavor,
+    };
     use vm::SourceFlavor;
 
     #[test]
@@ -450,6 +567,58 @@ mod tests {
                 .iter()
                 .any(|entry| entry.label == "re::match"),
             "expected RustScript regex namespace completion entry"
+        );
+    }
+
+    #[test]
+    fn debug_session_supports_breakpoints_and_hover_print() {
+        let source = r#"
+            let mut value = 1;
+            value = value + 2;
+            print(value);
+            value;
+        "#;
+        let start = start_debug_source_with_flavor(source, SourceFlavor::RustScript);
+        assert!(
+            start.error.is_none(),
+            "debug start should succeed, got {:?}",
+            start.error
+        );
+        assert!(
+            start.current_line.is_some(),
+            "debug start should expose current line"
+        );
+
+        let set_break = run_debug_command(DebugCommand::BreakLine { line: 3 });
+        assert!(
+            !set_break.breakpoints.is_empty(),
+            "expected at least one breakpoint, got {:?}",
+            set_break.breakpoints
+        );
+
+        let cont = run_debug_command(DebugCommand::Continue);
+        assert!(
+            cont.current_line.is_some_and(|line| line >= 3),
+            "continue should pause at or after the breakpoint line, got {:?}",
+            cont.current_line
+        );
+
+        let hovered = run_debug_command(DebugCommand::PrintVar {
+            name: "value".to_string(),
+        });
+        assert!(
+            hovered.command_output.contains("value ="),
+            "expected print_var to return a value, got {:?}",
+            hovered.command_output
+        );
+
+        let stopped = run_debug_command(DebugCommand::Stop);
+        assert!(stopped.halted, "stop should return halted=true");
+
+        let state_after_stop = debug_state();
+        assert!(
+            state_after_stop.error.is_some(),
+            "state should report inactive session after stop"
         );
     }
 }
