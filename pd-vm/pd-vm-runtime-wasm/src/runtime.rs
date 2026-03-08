@@ -11,10 +11,9 @@ use std::time::Instant;
 
 use serde::Deserialize;
 use vm::{
-    CallOutcome, FunctionDecl, HostAsyncBridge, HostFunction, HostOpId, LocalInfo,
-    PrintHostFunction, PrintlnHostFunction, SourceFlavor, SourcePathError, Value, Vm, VmError,
-    VmResult, VmStatus, VmYieldReason, compile_source_with_flavor_and_options, format_value,
-    render_vm_error,
+    CallOutcome, FunctionDecl, HostAsyncBridge, HostFunction, HostOpId, LocalInfo, SourceFlavor,
+    SourcePathError, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
+    compile_source_with_flavor_and_options, format_value, render_vm_error,
 };
 
 use crate::analyzer::{LintDiagnostic, lint_source_with_flavor};
@@ -1342,6 +1341,10 @@ fn register_functions(
     functions: &[FunctionDecl],
     print_output: &Arc<Mutex<Vec<String>>>,
 ) -> Result<(), String> {
+    let lines = Arc::clone(print_output);
+    vm.set_runtime_print_sink(move |rendered| {
+        push_output_line(&lines, rendered);
+    });
     let async_state = functions
         .iter()
         .any(|decl| decl.name == "runtime::sleep")
@@ -1351,7 +1354,7 @@ fn register_functions(
             state
         });
     for decl in functions {
-        register_named_function(vm, &decl.name, print_output, async_state.as_ref())?;
+        register_named_function(vm, &decl.name, async_state.as_ref())?;
     }
     Ok(())
 }
@@ -1359,28 +1362,10 @@ fn register_functions(
 fn register_named_function(
     vm: &mut Vm,
     name: &str,
-    print_output: &Arc<Mutex<Vec<String>>>,
     async_state: Option<&Arc<Mutex<BrowserAsyncState>>>,
 ) -> Result<(), String> {
     match name {
-        "print" => {
-            let lines = Arc::clone(print_output);
-            vm.bind_function(
-                "print",
-                Box::new(PrintHostFunction::new(move |rendered| {
-                    push_output_line(&lines, rendered);
-                })),
-            );
-        }
-        "println" => {
-            let lines = Arc::clone(print_output);
-            vm.bind_function(
-                "println",
-                Box::new(PrintlnHostFunction::new(move |rendered| {
-                    push_output_line(&lines, rendered);
-                })),
-            );
-        }
+        "print" | "println" => {}
         "runtime::sleep" => {
             let Some(state) = async_state else {
                 return Err("runtime::sleep async bridge not initialized".to_string());

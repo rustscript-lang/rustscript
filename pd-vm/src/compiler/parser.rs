@@ -1890,8 +1890,25 @@ impl Parser {
                     let local = self.get_local(&name)?;
                     Expr::LocalCall(local, args)
                 } else if self.functions.contains_key(&name) {
-                    let decl = self.resolve_function_for_call(&name, args.len())?;
-                    Expr::Call(decl.index, args)
+                    let builtin_alias_call = if matches!(name.as_str(), "print" | "println") {
+                        self.functions
+                            .get(&name)
+                            .map(|decl| !self.function_impls.contains_key(&decl.index))
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    if builtin_alias_call {
+                        if let Some(expr) = self.try_build_language_builtin_call(&name, &args)? {
+                            expr
+                        } else {
+                            let decl = self.resolve_function_for_call(&name, args.len())?;
+                            Expr::Call(decl.index, args)
+                        }
+                    } else {
+                        let decl = self.resolve_function_for_call(&name, args.len())?;
+                        Expr::Call(decl.index, args)
+                    }
                 } else if let Some(expr) = self.try_build_language_builtin_call(&name, &args)? {
                     expr
                 } else if let Some(host_name) = self.resolve_direct_host_call_target(&name) {
@@ -2640,9 +2657,11 @@ impl Parser {
             "print" if self.dialect.allow_macro_calls() => {
                 Ok(Some(self.lower_print_call(args.to_vec())?))
             }
+            "print" => Ok(Some(self.lower_plain_print_call(args.to_vec())?)),
             "println" if self.dialect.allow_macro_calls() => {
                 Ok(Some(self.lower_println_call(args.to_vec())?))
             }
+            "println" => Ok(Some(self.lower_plain_println_call(args.to_vec())?)),
             "type" | "typeof" => {
                 if args.len() != 1 {
                     return Err(ParseError {
@@ -2694,6 +2713,11 @@ impl Parser {
         self.build_print_call_expr(rendered)
     }
 
+    fn lower_plain_print_call(&mut self, args: Vec<Expr>) -> Result<Expr, ParseError> {
+        let rendered = self.render_plain_print_args(args)?;
+        self.build_print_call_expr(rendered)
+    }
+
     fn lower_println_call(&mut self, args: Vec<Expr>) -> Result<Expr, ParseError> {
         let rendered = match args.as_slice() {
             [] => Expr::String("\n".to_string()),
@@ -2712,6 +2736,42 @@ impl Parser {
             }
         };
         self.build_print_call_expr(rendered)
+    }
+
+    fn lower_plain_println_call(&mut self, args: Vec<Expr>) -> Result<Expr, ParseError> {
+        let rendered = match args.is_empty() {
+            true => Expr::String("\n".to_string()),
+            false => {
+                let rendered = self.render_plain_print_args(args)?;
+                let value = self.build_to_string_expr(rendered)?;
+                self.append_newline_expr(value)
+            }
+        };
+        self.build_print_call_expr(rendered)
+    }
+
+    fn render_plain_print_args(&mut self, args: Vec<Expr>) -> Result<Expr, ParseError> {
+        match args.len() {
+            0 => Ok(Expr::String(String::new())),
+            1 => Ok(args
+                .into_iter()
+                .next()
+                .expect("single print arg should exist")),
+            _ => {
+                let mut args = args.into_iter();
+                let mut rendered =
+                    self.build_to_string_expr(args.next().expect("first print arg should exist"))?;
+                for arg in args {
+                    rendered =
+                        Expr::Add(Box::new(rendered), Box::new(Expr::String(" ".to_string())));
+                    rendered = Expr::Add(
+                        Box::new(rendered),
+                        Box::new(self.build_to_string_expr(arg)?),
+                    );
+                }
+                Ok(rendered)
+            }
+        }
     }
 
     fn expect_format_literal<'a>(
@@ -3126,8 +3186,9 @@ impl Parser {
         let mut args = self.parse_call_args()?;
 
         if base == "console" && segments.len() == 1 && segments[0] == "log" {
-            let decl = self.resolve_function_for_call(STDLIB_PRINT_NAME, args.len())?;
-            return Ok(Some(Expr::Call(decl.index, args)));
+            return Ok(Some(
+                self.lower_plain_print_call(std::mem::take(&mut args))?,
+            ));
         }
 
         if segments.is_empty() {

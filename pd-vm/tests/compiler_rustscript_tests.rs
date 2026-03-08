@@ -468,6 +468,25 @@ fn rustscript_println_function_supports_rust_style_formatting() {
 }
 
 #[test]
+fn rustscript_print_alias_handles_mixed_call_arities() {
+    let case = RuntimeCase {
+        name: "print alias handles mixed call arities",
+        source: r#"
+            print(1);
+            print("{}", 2);
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_stack: vec![Value::Int(1), Value::string("2")],
+        expected_locals: None,
+    };
+    let bindings = [HostBindingCase {
+        name: "print",
+        factory: make_print_builtin,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
+}
+
+#[test]
 fn rustscript_print_rejects_non_literal_format_string() {
     let case = ParseErrorCase {
         name: "print rejects non literal format string",

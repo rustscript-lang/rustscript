@@ -788,6 +788,50 @@ mod tests {
     }
 
     #[test]
+    fn run_supports_multi_arg_print_for_javascript() {
+        let source = r#"
+            print(1, 2);
+            1;
+        "#;
+        let report = run_source_with_flavor(source, SourceFlavor::JavaScript);
+        assert!(
+            report.error.is_none(),
+            "expected run to succeed with multi-arg print, got {:?}",
+            report.error
+        );
+        assert!(
+            report.output.iter().any(|line| line == "1 2"),
+            "expected output to include joined print line, got {:?}",
+            report.output
+        );
+    }
+
+    #[test]
+    fn run_supports_mixed_print_call_arities_for_rustscript() {
+        let source = r#"
+            print(1);
+            print("{}", 2);
+            1;
+        "#;
+        let report = run_source_with_flavor(source, SourceFlavor::RustScript);
+        assert!(
+            report.error.is_none(),
+            "expected run to succeed with mixed print arities, got {:?}",
+            report.error
+        );
+        assert!(
+            report.output.iter().any(|line| line == "1"),
+            "expected output to include first print line, got {:?}",
+            report.output
+        );
+        assert!(
+            report.output.iter().any(|line| line == "2"),
+            "expected output to include formatted print line, got {:?}",
+            report.output
+        );
+    }
+
+    #[test]
     fn completion_catalog_reports_stdlib_and_host_entries() {
         let catalog = build_completion_catalog();
         assert!(

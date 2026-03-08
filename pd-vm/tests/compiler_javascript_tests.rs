@@ -345,6 +345,43 @@ fn javascript_console_log_works_without_decl() {
 }
 
 #[test]
+fn javascript_print_supports_multiple_arguments_without_decl() {
+    let case = RuntimeCase {
+        name: "print supports multiple arguments without decl",
+        source: r#"
+            print(40, 2);
+        "#,
+        flavor: SourceFlavor::JavaScript,
+        expected_stack: vec![Value::string("40 2")],
+        expected_locals: None,
+    };
+    let bindings = [HostBindingCase {
+        name: "print",
+        factory: make_print_builtin,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
+}
+
+#[test]
+fn javascript_print_alias_handles_mixed_call_arities() {
+    let case = RuntimeCase {
+        name: "print alias handles mixed call arities",
+        source: r#"
+            print(1);
+            print(2, 3);
+        "#,
+        flavor: SourceFlavor::JavaScript,
+        expected_stack: vec![Value::Int(1), Value::string("2 3")],
+        expected_locals: None,
+    };
+    let bindings = [HostBindingCase {
+        name: "print",
+        factory: make_print_builtin,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
+}
+
+#[test]
 fn compile_source_file_with_javascript_complex_fixture() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.js");
     let compiled = compile_source_file(&path).expect("compile should succeed");
