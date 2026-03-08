@@ -421,7 +421,7 @@ impl Debugger {
                 "execution interrupted: out of fuel (needed {needed}, remaining {remaining}). use `fuel set <n>` or `fuel add <n>`, then `continue`"
             )),
             VmError::EpochDeadlineReached { current, deadline } => Some(format!(
-                "execution interrupted: epoch deadline reached (current {current}, deadline {deadline}). use `epoch deadline <ticks>` to re-arm interruption, optionally `epoch tick <n>` to advance the global epoch, then `continue`"
+                "execution interrupted: epoch deadline reached (current {current}, deadline {deadline}). `continue` will re-arm the same deadline automatically; use `epoch tick <n>` to advance the global epoch or `epoch deadline <ticks>` to change the slice size first"
             )),
             _ => None,
         };
@@ -1194,11 +1194,16 @@ fn print_epoch_state(vm: &Vm, out: &mut dyn Write) {
         .epoch_deadline()
         .map(|value| value.to_string())
         .unwrap_or_else(|| "disabled".to_string());
+    let slice = vm
+        .epoch_deadline_delta()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "disabled".to_string());
     let _ = writeln!(
         out,
-        "epoch: current={}, deadline={}, check_interval={}",
+        "epoch: current={}, deadline={}, slice={}, check_interval={}",
         vm.current_epoch(),
         deadline,
+        slice,
         vm.epoch_check_interval()
     );
 }
@@ -2958,7 +2963,7 @@ mod tests {
     }
 
     #[test]
-    fn debugger_bridge_can_recover_from_epoch_deadline_by_rearming() {
+    fn debugger_bridge_can_recover_from_epoch_deadline_with_auto_rearm() {
         let program = Program::new(
             vec![],
             vec![
@@ -2972,8 +2977,9 @@ mod tests {
 
         let join = std::thread::spawn(move || {
             let mut vm = Vm::new(program);
-            vm.set_epoch_deadline(0)
+            vm.set_epoch_deadline(1)
                 .expect("setting epoch deadline should succeed");
+            assert_eq!(vm.increment_epoch(), 1);
             vm.run_with_debugger(&mut debugger)
                 .expect("debugged vm run should recover and succeed")
         });
@@ -2984,18 +2990,9 @@ mod tests {
             .execute("epoch", Duration::from_millis(200))
             .expect("epoch command should succeed");
         assert!(
-            epoch_response.output.contains("deadline=0"),
+            epoch_response.output.contains("deadline=1"),
             "{}",
             epoch_response.output
-        );
-
-        let deadline_response = bridge
-            .execute("epoch deadline 1", Duration::from_millis(200))
-            .expect("epoch deadline command should succeed");
-        assert!(
-            deadline_response.output.contains("epoch deadline set 1 ticks beyond current epoch"),
-            "{}",
-            deadline_response.output
         );
 
         let continue_response = bridge

@@ -1737,9 +1737,6 @@ mod tests {
                 VmStatus::Yielded => {
                     assert_eq!(loaded.last_yield_reason(), Some(vm::VmYieldReason::Epoch));
                     yielded_ips.push(loaded.ip());
-                    loaded
-                        .set_epoch_deadline(1)
-                        .expect("re-arming epoch deadline should succeed");
                 }
                 VmStatus::Waiting(op_id) => {
                     panic!("unexpected waiting host op {op_id} in pure AOT epoch test");
@@ -1753,6 +1750,51 @@ mod tests {
             "expected at least one mid-trace epoch yield, got {yielded_ips:?}"
         );
         assert_eq!(loaded.stack(), &[Value::Int(5_000_000)]);
+    }
+
+    #[test]
+    fn native_aot_bundle_rejects_mismatched_interrupt_mode() {
+        let compiled = vm::compile_source("let mut i = 0; while i < 16 { i = i + 1; } i;")
+            .expect("compile should succeed");
+
+        let mut fuel_vm = Vm::new(compiled.program.clone().with_local_count(compiled.locals));
+        let fuel_encoded = fuel_vm
+            .emit_aot_bundle_with_fuel_check_interval(4)
+            .expect("fuel AOT emit should succeed");
+        let mut fuel_loaded = Vm::from_aot_bundle_bytes(&fuel_encoded).expect("AOT load should succeed");
+        fuel_loaded
+            .set_epoch_check_interval(4)
+            .expect("epoch interval update should succeed");
+        fuel_loaded
+            .set_epoch_deadline(1)
+            .expect("setting epoch deadline should succeed");
+        let fuel_err = fuel_loaded
+            .run()
+            .expect_err("fuel-specialized bundle should reject epoch interruption");
+        assert!(
+            fuel_err
+                .to_string()
+                .contains("emitted for fuel interruption and cannot run with epoch interruption enabled")
+        );
+
+        let mut epoch_vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+        let epoch_encoded = epoch_vm
+            .emit_aot_bundle_with_epoch_check_interval(4)
+            .expect("epoch AOT emit should succeed");
+        let mut epoch_loaded =
+            Vm::from_aot_bundle_bytes(&epoch_encoded).expect("AOT load should succeed");
+        epoch_loaded
+            .set_fuel_check_interval(4)
+            .expect("fuel interval update should succeed");
+        epoch_loaded.set_fuel(128);
+        let epoch_err = epoch_loaded
+            .run()
+            .expect_err("epoch-specialized bundle should reject fuel interruption");
+        assert!(
+            epoch_err
+                .to_string()
+                .contains("emitted for epoch interruption and cannot run with fuel interruption enabled")
+        );
     }
 
     #[test]

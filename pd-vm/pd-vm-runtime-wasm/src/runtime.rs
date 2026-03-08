@@ -4,8 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
+#[cfg(all(not(target_arch = "wasm32"), test))]
+use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::Deserialize;
 use vm::{
@@ -52,6 +54,7 @@ pub struct FuelState {
     pub check_interval: u32,
     pub epoch_current: u64,
     pub epoch_deadline: Option<u64>,
+    pub epoch_slice: Option<u64>,
 }
 
 impl FuelState {
@@ -63,6 +66,7 @@ impl FuelState {
             check_interval,
             epoch_current: 0,
             epoch_deadline: None,
+            epoch_slice: None,
         }
     }
 }
@@ -104,19 +108,6 @@ pub struct RunReport {
 }
 
 impl RunReport {
-    pub fn success(output: Vec<String>, stack: Vec<String>, fuel: FuelState) -> Self {
-        Self {
-            diagnostics: Vec::new(),
-            output,
-            stack,
-            error: None,
-            halted: true,
-            yielded: false,
-            fuel,
-            command_output: String::new(),
-        }
-    }
-
     pub fn source_error(source: &str, flavor: SourceFlavor, err: SourcePathError) -> Self {
         let diagnostics = lint_source_with_flavor(source, flavor).diagnostics;
         Self {
@@ -282,6 +273,7 @@ struct DebugSession {
     vm: Vm,
     output_lines: Arc<Mutex<Vec<String>>>,
     line_breakpoints: HashSet<u32>,
+    epoch_resume_rearm_pending: bool,
     halted: bool,
     error: Option<String>,
 }
@@ -496,6 +488,7 @@ impl DebugSession {
             vm,
             output_lines,
             line_breakpoints: HashSet::new(),
+            epoch_resume_rearm_pending: false,
             halted: false,
             error: None,
         }
@@ -648,6 +641,10 @@ impl DebugSession {
     }
 
     fn execute_single_instruction(&mut self) -> StepExecution {
+        if let Err(message) = self.rearm_epoch_deadline_after_yield_if_needed() {
+            return StepExecution::Error(message);
+        }
+
         if let Some(op_id) = self.vm.waiting_host_op_id() {
             return match poll_waiting_host_op_once(&mut self.vm) {
                 Poll::Ready(Ok(())) => StepExecution::Advanced,
@@ -697,6 +694,30 @@ impl DebugSession {
         outcome
     }
 
+    fn rearm_epoch_deadline_after_yield_if_needed(&mut self) -> Result<(), String> {
+        if !self.epoch_resume_rearm_pending {
+            return Ok(());
+        }
+
+        let Some(delta) = self.vm.epoch_deadline_delta() else {
+            self.epoch_resume_rearm_pending = false;
+            return Ok(());
+        };
+
+        match self.vm.set_epoch_deadline(delta) {
+            Ok(()) => {
+                self.epoch_resume_rearm_pending = false;
+                Ok(())
+            }
+            Err(err) => {
+                let message = render_vm_error(&self.vm, &err);
+                self.halted = true;
+                self.error = Some(message.clone());
+                Err(message)
+            }
+        }
+    }
+
     fn prepare_debug_step_interrupt(&mut self) -> Result<DebugStepCheckpoint, String> {
         if self.vm.epoch_deadline().is_some() {
             let checkpoint = self.vm.epoch_checkpoint();
@@ -708,8 +729,9 @@ impl DebugSession {
                 }
                 Err(VmError::EpochDeadlineReached { current, deadline }) => {
                     self.vm.restore_epoch(checkpoint);
+                    self.epoch_resume_rearm_pending = true;
                     Err(format!(
-                        "execution interrupted: epoch deadline reached (current {current}, deadline {deadline}). advance epoch or re-arm deadline, then continue"
+                        "execution interrupted: epoch deadline reached (current {current}, deadline {deadline}). continue will re-arm the same deadline automatically; advance epoch or change the deadline first if needed"
                     ))
                 }
                 Err(err) => {
@@ -833,17 +855,24 @@ impl DebugSession {
 
     fn command_set_epoch_deadline(&mut self, ticks: u64) -> String {
         match self.vm.set_epoch_deadline(ticks) {
-            Ok(()) => format!(
-                "epoch deadline set {ticks} ticks beyond current epoch\n{}",
-                format_fuel_state(&self.vm)
-            ),
+            Ok(()) => {
+                self.epoch_resume_rearm_pending = false;
+                format!(
+                    "epoch deadline set {ticks} ticks beyond current epoch\n{}",
+                    format_fuel_state(&self.vm)
+                )
+            }
             Err(err) => format!("epoch deadline update failed: {err}"),
         }
     }
 
     fn command_clear_epoch_deadline(&mut self) -> String {
+        self.epoch_resume_rearm_pending = false;
         self.vm.clear_epoch_deadline();
-        format!("epoch interruption disabled\n{}", format_fuel_state(&self.vm))
+        format!(
+            "epoch interruption disabled\n{}",
+            format_fuel_state(&self.vm)
+        )
     }
 
     fn command_tick_epoch(&mut self, amount: u64) -> String {
@@ -888,6 +917,7 @@ fn local_visible_at_line(local: &LocalInfo, line: Option<u32>) -> bool {
 fn capture_fuel_state(vm: &Vm) -> FuelState {
     let remaining = vm.get_fuel();
     let epoch_deadline = vm.epoch_deadline();
+    let epoch_slice = vm.epoch_deadline_delta();
     let mode = if remaining.is_some() {
         InterruptModeState::Fuel
     } else if epoch_deadline.is_some() {
@@ -906,6 +936,7 @@ fn capture_fuel_state(vm: &Vm) -> FuelState {
         },
         epoch_current: vm.current_epoch(),
         epoch_deadline,
+        epoch_slice,
     }
 }
 
@@ -924,13 +955,20 @@ fn format_fuel_state(vm: &Vm) -> String {
                 .epoch_deadline
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "disabled".to_string());
+            let slice = fuel
+                .epoch_slice
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "disabled".to_string());
             format!(
-                "epoch: current={}, deadline={}, check_interval={}",
-                fuel.epoch_current, deadline, fuel.check_interval
+                "epoch: current={}, deadline={}, slice={}, check_interval={}",
+                fuel.epoch_current, deadline, slice, fuel.check_interval
             )
         }
         InterruptModeState::None => {
-            format!("interruption: disabled, check_interval={}", fuel.check_interval)
+            format!(
+                "interruption: disabled, check_interval={}",
+                fuel.check_interval
+            )
         }
     }
 }
@@ -949,9 +987,7 @@ fn apply_fuel_config(vm: &mut Vm, config: FuelConfig) -> Result<(), String> {
     match mode {
         Some(InterruptConfigMode::Fuel) => {
             if config.epoch_deadline.is_some() || config.epoch_check_interval.is_some() {
-                return Err(
-                    "epoch settings cannot be combined with fuel interruption".to_string(),
-                );
+                return Err("epoch settings cannot be combined with fuel interruption".to_string());
             }
             if let Some(interval) = config.fuel_check_interval {
                 vm.set_fuel_check_interval(interval)
@@ -963,9 +999,7 @@ fn apply_fuel_config(vm: &mut Vm, config: FuelConfig) -> Result<(), String> {
         }
         Some(InterruptConfigMode::Epoch) => {
             if config.fuel.is_some() || config.fuel_check_interval.is_some() {
-                return Err(
-                    "fuel settings cannot be combined with epoch interruption".to_string(),
-                );
+                return Err("fuel settings cannot be combined with epoch interruption".to_string());
             }
             if let Some(interval) = config.epoch_check_interval {
                 vm.set_epoch_check_interval(interval)
@@ -987,13 +1021,14 @@ fn format_epoch_yield_message(vm: &Vm) -> String {
         .map(|value| value.to_string())
         .unwrap_or_else(|| "disabled".to_string());
     format!(
-        "execution interrupted: epoch deadline reached (current {}, deadline {}). adjust epoch state and resume",
+        "execution interrupted: epoch deadline reached (current {}, deadline {}). resume will re-arm the same deadline automatically; advance epoch or change the deadline first if needed",
         vm.current_epoch(),
         deadline
     )
 }
 
-pub fn run_source_with_flavor(source: &str, flavor: SourceFlavor) -> RunReport {
+#[cfg(test)]
+pub(crate) fn run_source_with_flavor(source: &str, flavor: SourceFlavor) -> RunReport {
     let compiled = match compile_source_with_flavor_and_options(
         source,
         flavor,
@@ -1061,7 +1096,16 @@ pub fn run_source_with_flavor(source: &str, flavor: SourceFlavor) -> RunReport {
             VmStatus::Halted => {
                 let output = drain_output(&output_lines);
                 let stack = vm.stack().iter().map(format_value).collect::<Vec<_>>();
-                return RunReport::success(output, stack, capture_fuel_state(&vm));
+                return RunReport {
+                    diagnostics: Vec::new(),
+                    output,
+                    stack,
+                    error: None,
+                    halted: true,
+                    yielded: false,
+                    fuel: capture_fuel_state(&vm),
+                    command_output: String::new(),
+                };
             }
             VmStatus::Yielded => {}
             VmStatus::Waiting(_) => {}
@@ -1174,7 +1218,10 @@ pub fn run_command(command: RunCommand) -> RunReport {
             },
             RunCommand::ClearEpochDeadline => {
                 session.vm.clear_epoch_deadline();
-                format!("epoch interruption disabled\n{}", format_fuel_state(&session.vm))
+                format!(
+                    "epoch interruption disabled\n{}",
+                    format_fuel_state(&session.vm)
+                )
             }
             RunCommand::TickEpoch { amount } => {
                 let current = session.vm.increment_epoch_by(amount);

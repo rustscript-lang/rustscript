@@ -158,6 +158,8 @@ impl FuelCheckpoint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EpochCheckpoint {
     deadline: Option<u64>,
+    deadline_delta: u64,
+    rearm_pending: bool,
     check_interval: u32,
     ops_until_check: u32,
 }
@@ -471,9 +473,12 @@ pub struct Vm {
     fuel_check_interval: u32,
     fuel_ops_until_check: u32,
     epoch_deadline: u64,
+    epoch_deadline_delta: u64,
+    epoch_rearm_pending: bool,
     last_yield_reason: Option<VmYieldReason>,
     native_only_aot: bool,
     native_aot_interrupt_check_interval: Option<u32>,
+    native_aot_interrupt_mode: Option<InterruptMode>,
     drop_contract_events: u64,
 }
 
@@ -660,9 +665,12 @@ impl Vm {
             fuel_check_interval: 1,
             fuel_ops_until_check: 1,
             epoch_deadline: 0,
+            epoch_deadline_delta: 0,
+            epoch_rearm_pending: false,
             last_yield_reason: None,
             native_only_aot: false,
             native_aot_interrupt_check_interval: None,
+            native_aot_interrupt_mode: None,
             drop_contract_events: 0,
         }
     }
@@ -713,6 +721,17 @@ impl Vm {
                     .to_string(),
             ));
         }
+        if self.native_only_aot
+            && self.interruption_enabled()
+            && let Some(expected_mode) = self.native_aot_interrupt_mode
+            && self.interrupt_mode != expected_mode
+        {
+            return Err(VmError::JitNative(format!(
+                "native-only AOT bundle was emitted for {} interruption and cannot run with {} interruption enabled",
+                expected_mode.label(),
+                self.interrupt_mode.label(),
+            )));
+        }
         Ok(())
     }
 
@@ -761,6 +780,7 @@ impl Vm {
         self.ip = 0;
         self.drop_contract_events = 0;
         self.last_yield_reason = None;
+        self.epoch_rearm_pending = false;
         self.clear_stack_with_drop_contract();
         self.clear_locals_with_drop_contract();
         self.call_depth = 0;
@@ -898,6 +918,8 @@ impl Vm {
             self.interrupt_mode = InterruptMode::None;
         }
         self.epoch_deadline = 0;
+        self.epoch_deadline_delta = 0;
+        self.epoch_rearm_pending = false;
         self.reset_interrupt_countdown();
     }
 
@@ -1053,6 +1075,8 @@ impl Vm {
         }
         self.interrupt_mode = InterruptMode::Epoch;
         self.epoch_deadline = self.current_epoch().saturating_add(ticks_beyond_current);
+        self.epoch_deadline_delta = ticks_beyond_current;
+        self.epoch_rearm_pending = false;
         self.reset_interrupt_countdown();
         Ok(())
     }
@@ -1063,6 +1087,11 @@ impl Vm {
 
     pub fn epoch_deadline(&self) -> Option<u64> {
         self.epoch_interruption_enabled().then_some(self.epoch_deadline)
+    }
+
+    pub fn epoch_deadline_delta(&self) -> Option<u64> {
+        self.epoch_interruption_enabled()
+            .then_some(self.epoch_deadline_delta)
     }
 
     pub fn set_epoch_check_interval(&mut self, interval: u32) -> VmResult<()> {
@@ -1089,6 +1118,8 @@ impl Vm {
     pub fn epoch_checkpoint(&self) -> EpochCheckpoint {
         EpochCheckpoint {
             deadline: self.epoch_interruption_enabled().then_some(self.epoch_deadline),
+            deadline_delta: self.epoch_deadline_delta,
+            rearm_pending: self.epoch_rearm_pending,
             check_interval: self.epoch_check_interval(),
             ops_until_check: self.fuel_ops_until_check,
         }
@@ -1102,6 +1133,8 @@ impl Vm {
             InterruptMode::None
         };
         self.epoch_deadline = checkpoint.deadline.unwrap_or(0);
+        self.epoch_deadline_delta = checkpoint.deadline_delta;
+        self.epoch_rearm_pending = checkpoint.rearm_pending;
         if self.native_aot_interrupt_check_interval == Some(0) {
             self.fuel_check_interval = 1;
             self.fuel_ops_until_check = 1;
@@ -1233,6 +1266,24 @@ impl Vm {
         }
     }
 
+    fn mark_interrupt_yield(&mut self, reason: VmYieldReason) {
+        self.last_yield_reason = Some(reason);
+        if matches!(reason, VmYieldReason::Epoch) {
+            self.epoch_rearm_pending = true;
+        }
+    }
+
+    fn rearm_epoch_after_yield_if_needed(&mut self) {
+        if !self.epoch_interruption_enabled() || !self.epoch_rearm_pending {
+            return;
+        }
+        self.epoch_deadline = self
+            .current_epoch()
+            .saturating_add(self.epoch_deadline_delta);
+        self.epoch_rearm_pending = false;
+        self.reset_interrupt_countdown();
+    }
+
     fn outcome_to_status(outcome: ExecOutcome) -> Option<VmStatus> {
         match outcome {
             ExecOutcome::Continue => None,
@@ -1276,8 +1327,10 @@ impl Vm {
             self.notify_debugger_status(&mut debugger, status);
             return Ok(status);
         }
+        self.last_yield_reason = None;
 
         loop {
+            self.rearm_epoch_after_yield_if_needed();
             if let Some(active_debugger) = debugger.as_deref_mut() {
                 active_debugger.on_instruction(self);
             }
@@ -1295,10 +1348,10 @@ impl Vm {
                                 // Cooperative interruption surfaces as a yield so callers can
                                 // adjust fuel/epoch state and resume without treating it as a
                                 // hard fault.
+                                self.mark_interrupt_yield(reason);
                                 if self.handle_debugger_error(&mut debugger, &err) {
                                     continue;
                                 }
-                                self.last_yield_reason = Some(reason);
                                 let status = VmStatus::Yielded;
                                 self.notify_debugger_status(&mut debugger, status);
                                 return Ok(status);
@@ -1333,10 +1386,10 @@ impl Vm {
                 if let Some(reason) = Self::yielded_interrupt_reason(&err) {
                     // Cooperative interruption surfaces as a yield so callers can
                     // adjust fuel/epoch state and resume without treating it as a hard fault.
+                    self.mark_interrupt_yield(reason);
                     if self.handle_debugger_error(&mut debugger, &err) {
                         continue;
                     }
-                    self.last_yield_reason = Some(reason);
                     let status = VmStatus::Yielded;
                     self.notify_debugger_status(&mut debugger, status);
                     return Ok(status);
@@ -1353,10 +1406,10 @@ impl Vm {
                     if let Some(reason) = Self::yielded_interrupt_reason(&err) {
                         // Cooperative interruption stays resumable even when raised during
                         // instruction execution (for example, fused call+ret tail tick).
+                        self.mark_interrupt_yield(reason);
                         if self.handle_debugger_error(&mut debugger, &err) {
                             continue;
                         }
-                        self.last_yield_reason = Some(reason);
                         let status = VmStatus::Yielded;
                         self.notify_debugger_status(&mut debugger, status);
                         return Ok(status);
@@ -2541,8 +2594,9 @@ mod tests {
         let mut vm = Vm::new(program);
         vm.set_epoch_check_interval(2)
             .expect("epoch interval update should succeed");
-        vm.set_epoch_deadline(0)
+        vm.set_epoch_deadline(1)
             .expect("setting epoch deadline should succeed");
+        assert_eq!(vm.increment_epoch(), 1);
         vm.stack.push(Value::String("tail".to_string()));
 
         let status = vm.run().expect("first run should yield");
@@ -2554,9 +2608,9 @@ mod tests {
         assert_eq!(vm.last_yield_reason(), Some(VmYieldReason::Epoch));
         assert_eq!(vm.stack(), &[Value::Int(4)]);
 
-        vm.set_epoch_deadline(1)
-            .expect("re-arming epoch deadline should succeed");
-        let resumed = vm.resume().expect("resume should execute trailing ret");
+        let resumed = vm
+            .resume()
+            .expect("resume should auto re-arm the epoch deadline and execute trailing ret");
         assert_eq!(resumed, VmStatus::Halted);
         assert_eq!(vm.ip, 5);
         assert_eq!(vm.stack(), &[Value::Int(4)]);

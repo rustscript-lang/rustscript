@@ -574,8 +574,8 @@ fn lower_lua_namespace_call(
     let imported_root = namespace_aliases.get(&path[0]).cloned();
     let root = imported_root.clone().unwrap_or_else(|| path[0].clone());
 
-    if let Some(imported_root) = imported_root {
-        if path.len() >= 2 && !is_builtin_namespace(&imported_root) {
+    if let Some(imported_root) = imported_root
+        && path.len() >= 2 && !is_builtin_namespace(&imported_root) {
             let mut segments = vec![imported_root];
             segments.extend(path.iter().skip(1).cloned());
             let call_name = segments.join("::");
@@ -583,7 +583,6 @@ fn lower_lua_namespace_call(
             builder.declare_function(&call_name, Some(arity)).ok()?;
             return builder.resolve_call_expr(&call_name, args);
         }
-    }
 
     if path.len() == 2 && is_builtin_namespace(&root) {
         return lower_lua_regex_or_builtin_namespace_call(&root, &path[1], args);

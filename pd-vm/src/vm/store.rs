@@ -107,6 +107,10 @@ impl<T> Store<T> {
         self.vm.epoch_deadline()
     }
 
+    pub fn epoch_deadline_delta(&self) -> Option<u64> {
+        self.vm.epoch_deadline_delta()
+    }
+
     pub fn set_epoch_check_interval(&mut self, interval: u32) -> VmResult<()> {
         self.vm.set_epoch_check_interval(interval)
     }

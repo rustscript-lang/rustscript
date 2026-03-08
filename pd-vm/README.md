@@ -168,8 +168,11 @@ Set a custom AOT fuel checkpoint interval while emitting:
 cargo run -p pd-vm --bin pd-vm-run -- --emit-aot out/example.pat --fuel-check-interval 64 examples/example.rss
 ```
 
-`--epoch-check-interval <n>` is also accepted in `--emit-aot` mode as an equivalent alias for the
-same native interruption checkpoint cadence.
+Set a custom AOT epoch checkpoint interval while emitting an epoch-specialized bundle:
+
+```powershell
+cargo run -p pd-vm --bin pd-vm-run -- --emit-aot out/example.pat --epoch-check-interval 64 examples/example.rss
+```
 
 Run an emitted AOT bundle:
 
@@ -184,6 +187,8 @@ cargo run -p pd-vm --bin pd-vm-run -- --run-aot out/example.pat --jit-dump
 - `--emit-aot` defaults to `--fuel-check-interval 64`.
 - `--fuel-check-interval 0` emits native code without inline fuel-check sequences. Such bundles
   cannot be run with `--fuel` because no native checkpoints exist.
+- `--fuel-check-interval <n>` emits fuel-specialized native checkpoints; `--epoch-check-interval <n>`
+  emits epoch-specialized checkpoints. Native-only AOT bundles reject the wrong interruption mode at runtime.
 - Bundles are validated against target arch/os/pointer width plus a VM-layout fingerprint before
   loading, so they are only portable across compatible builds on the same native support matrix.
 - Control-flow targets remain instruction offsets inside a synthetic code space (`ip` labels are
@@ -288,12 +293,15 @@ Fuel charging semantics:
 Semantics:
 
 - `EpochHandle` is shared engine-style state. Callers advance it externally.
+- The epoch unit is an abstract tick, not wall-clock time by itself.
 - `set_epoch_deadline(n)` arms the VM to yield once `current_epoch >= current_epoch_at_arm + n`.
 - Epoch interruption reuses `VmStatus::Yielded`; inspect `last_yield_reason()` if the caller needs
   to distinguish fuel vs epoch vs host yields.
-- Re-arm the deadline after a yield to continue execution.
+- After an epoch yield, the next `run()` / `resume()` automatically re-arms the same deadline delta.
+  Use `epoch deadline <n>` to change the slice size or `epoch clear` to disable interruption.
 - The interpreter, trace interpreter, native JIT, and native AOT all use the same inline
-  checkpoint cadence (`epoch_check_interval`).
+  checkpoint cadence (`epoch_check_interval`), but native fuel and epoch traces are emitted as
+  separate specialized machine-code variants.
 
 Debugger epoch commands:
 
@@ -339,6 +347,10 @@ bun run dev
 
 This runs `scripts/build-wasm-playground.mjs`, which builds `pd-vm-runtime-wasm`, copies wasm
 artifacts into `public/wasm`, and syncs RustScript Monaco grammar assets.
+
+In browser epoch mode, the playground drives one epoch tick from a 1ms JavaScript timer and shows
+the live epoch counter in the interruption panel. Timer delivery still depends on the main thread,
+so compute-only wasm cannot be preempted mid-call while the browser is busy running the VM.
 
 ### Test and Perf Commands
 

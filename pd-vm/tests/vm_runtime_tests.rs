@@ -580,7 +580,7 @@ fn fuel_checkpoint_restores_interval() {
 }
 
 #[test]
-fn epoch_deadline_exhausts_and_rearm_allows_resume() {
+fn epoch_deadline_exhausts_and_auto_rearm_allows_resume() {
     let constants = vec![Value::Int(9)];
     let mut bc = BytecodeBuilder::new();
     bc.ldc(0);
@@ -599,9 +599,7 @@ fn epoch_deadline_exhausts_and_rearm_allows_resume() {
     assert_eq!(status, VmStatus::Yielded);
     assert_eq!(vm.last_yield_reason(), Some(vm::VmYieldReason::Epoch));
 
-    vm.set_epoch_deadline(1)
-        .expect("re-arming epoch deadline should succeed");
-    let status = vm.run().expect("run should halt after re-arming");
+    let status = vm.run().expect("run should halt after auto re-arming");
     assert_eq!(status, VmStatus::Halted);
 }
 
@@ -643,10 +641,9 @@ fn store_api_exposes_epoch_checkpoint_and_deadline() {
     assert_eq!(status, VmStatus::Yielded);
     assert_eq!(store.vm().last_yield_reason(), Some(vm::VmYieldReason::Epoch));
 
-    store
-        .set_epoch_deadline(1)
-        .expect("re-arming epoch deadline should succeed");
-    let status = store.run().expect("store run should finish after re-arming");
+    let status = store
+        .run()
+        .expect("store run should finish after auto re-arming");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(store.data(), "ctx");
 
@@ -666,8 +663,9 @@ fn epoch_check_interval_can_be_configured() {
     let mut vm = Vm::new(program);
     vm.set_epoch_check_interval(3)
         .expect("interval update should succeed");
-    vm.set_epoch_deadline(0)
+    vm.set_epoch_deadline(1)
         .expect("setting epoch deadline should succeed");
+    assert_eq!(vm.increment_epoch(), 1);
 
     let status = vm
         .run()
@@ -675,10 +673,36 @@ fn epoch_check_interval_can_be_configured() {
     assert_eq!(status, VmStatus::Yielded);
     assert_eq!(vm.last_yield_reason(), Some(vm::VmYieldReason::Epoch));
 
-    vm.set_epoch_deadline(1)
-        .expect("re-arming epoch deadline should succeed");
-    let resumed = vm.run().expect("run should halt after re-arming");
+    let resumed = vm.run().expect("run should halt after auto re-arming");
     assert_eq!(resumed, VmStatus::Halted);
+}
+
+#[test]
+fn epoch_deadline_zero_auto_rearms_without_manual_reconfiguration() {
+    let constants = vec![Value::Int(7)];
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.pop();
+    bc.ret();
+
+    let program = Program::new(constants, bc.finish());
+    let mut vm = Vm::new(program);
+    vm.set_epoch_deadline(0)
+        .expect("setting epoch deadline should succeed");
+
+    let first = vm.run().expect("first run should yield at the expired epoch deadline");
+    assert_eq!(first, VmStatus::Yielded);
+    assert_eq!(vm.last_yield_reason(), Some(vm::VmYieldReason::Epoch));
+
+    let second = vm
+        .resume()
+        .expect("resume should auto re-arm the same zero-length deadline and yield again");
+    assert_eq!(second, VmStatus::Yielded);
+    assert_eq!(vm.last_yield_reason(), Some(vm::VmYieldReason::Epoch));
+
+    vm.clear_epoch_deadline();
+    let halted = vm.run().expect("run should halt once epoch interruption is cleared");
+    assert_eq!(halted, VmStatus::Halted);
 }
 
 #[test]

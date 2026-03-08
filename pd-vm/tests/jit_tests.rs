@@ -26,6 +26,17 @@ fn first_native_code_bytes(dump: &str) -> Option<usize> {
     None
 }
 
+fn first_native_code_hex(dump: &str) -> Option<String> {
+    for line in dump.lines() {
+        let marker = "    code:";
+        let Some(start) = line.find(marker) else {
+            continue;
+        };
+        return Some(line[start + marker.len()..].trim().to_string());
+    }
+    None
+}
+
 struct PrintNoReturn;
 
 impl HostFunction for PrintNoReturn {
@@ -337,12 +348,13 @@ fn trace_jit_native_path_honors_epoch_interruption() {
     });
     vm.set_epoch_check_interval(8)
         .expect("epoch interval update should succeed");
-    vm.set_epoch_deadline(0)
+    vm.set_epoch_deadline(1)
         .expect("setting epoch deadline should succeed");
+    assert_eq!(vm.increment_epoch(), 1);
 
     let status = vm
         .run()
-        .expect("run should cooperatively yield under an expired epoch deadline");
+        .expect("run should cooperatively yield once the epoch reaches the deadline");
     assert_eq!(status, VmStatus::Yielded);
     assert_eq!(vm.last_yield_reason(), Some(vm::VmYieldReason::Epoch));
     assert!(
@@ -351,10 +363,63 @@ fn trace_jit_native_path_honors_epoch_interruption() {
         vm.dump_jit_info()
     );
 
-    vm.set_epoch_deadline(1)
-        .expect("re-arming epoch deadline should succeed");
-    let status = vm.run().expect("second run should halt");
+    let status = vm.run().expect("second run should halt after auto re-arming");
     assert_eq!(status, VmStatus::Halted);
+}
+
+#[test]
+fn native_trace_epoch_zero_deadline_auto_rearms_without_manual_reconfiguration() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let mut i = 0;
+        while i < 10 {
+            i = i + 1;
+        }
+        i;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    let warmup = vm.run().expect("warmup run should halt and compile native traces");
+    assert_eq!(warmup, VmStatus::Halted);
+    assert!(
+        vm.jit_native_exec_count() > 0,
+        "expected warmup run to compile and execute native traces, dump:\n{}",
+        vm.dump_jit_info()
+    );
+
+    vm.reset_for_reuse();
+    vm.set_epoch_check_interval(1)
+        .expect("epoch interval update should succeed");
+    vm.set_epoch_deadline(0)
+        .expect("setting epoch deadline should succeed");
+
+    let first = vm.run().expect("first run should yield");
+    assert_eq!(first, VmStatus::Yielded);
+    assert_eq!(vm.last_yield_reason(), Some(vm::VmYieldReason::Epoch));
+
+    let second = vm
+        .resume()
+        .expect("resume should auto re-arm the zero-length epoch deadline");
+    assert_eq!(second, VmStatus::Yielded);
+    assert_eq!(vm.last_yield_reason(), Some(vm::VmYieldReason::Epoch));
+    assert!(
+        vm.jit_native_exec_count() > 0,
+        "expected native JIT execution under repeated epoch yields, dump:\n{}",
+        vm.dump_jit_info()
+    );
+
+    vm.clear_epoch_deadline();
+    let halted = vm.run().expect("run should halt after clearing epoch interruption");
+    assert_eq!(halted, VmStatus::Halted);
 }
 
 #[test]
@@ -470,6 +535,64 @@ fn changing_epoch_interval_recompiles_native_trace_variant() {
     assert!(
         bytes_second < bytes_first,
         "expected fewer injected epoch checks with interval 8; interval=1 bytes={bytes_first}, interval=8 bytes={bytes_second}\nfirst dump:\n{dump_first}\nsecond dump:\n{dump_second}"
+    );
+}
+
+#[test]
+fn fuel_and_epoch_compile_distinct_native_trace_variants() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let mut i = 0;
+        let mut acc = 0;
+        while i < 40 {
+            acc = acc + i;
+            i = i + 1;
+        }
+        acc;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+
+    let mut fuel_vm = Vm::new(compiled.program.clone().with_local_count(compiled.locals));
+    fuel_vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    fuel_vm
+        .set_fuel_check_interval(8)
+        .expect("fuel interval update should succeed");
+    fuel_vm.set_fuel(10_000);
+    let fuel_status = fuel_vm.run().expect("fuel-mode run should halt");
+    assert_eq!(fuel_status, VmStatus::Halted);
+    let fuel_dump = fuel_vm.dump_jit_info();
+    let fuel_code =
+        first_native_code_hex(&fuel_dump).expect("fuel-mode run should emit native code bytes");
+
+    let mut epoch_vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    epoch_vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    epoch_vm
+        .set_epoch_check_interval(8)
+        .expect("epoch interval update should succeed");
+    epoch_vm
+        .set_epoch_deadline(1)
+        .expect("setting epoch deadline should succeed");
+    let epoch_status = epoch_vm.run().expect("epoch-mode run should halt");
+    assert_eq!(epoch_status, VmStatus::Halted);
+    let epoch_dump = epoch_vm.dump_jit_info();
+    let epoch_code =
+        first_native_code_hex(&epoch_dump).expect("epoch-mode run should emit native code bytes");
+
+    assert_ne!(
+        fuel_code, epoch_code,
+        "fuel and epoch should compile distinct native inline interruption blocks\nfuel:\n{fuel_dump}\nepoch:\n{epoch_dump}"
     );
 }
 
