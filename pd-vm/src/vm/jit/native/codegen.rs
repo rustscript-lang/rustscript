@@ -329,7 +329,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
-                true,
+                ShiftKind::Left,
             )?;
             Ok(true)
         }
@@ -343,7 +343,21 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
-                false,
+                ShiftKind::ArithmeticRight,
+            )?;
+            Ok(true)
+        }
+        TraceStep::Lshr => {
+            emit_inline_shift(
+                b,
+                vm_ptr,
+                helper_ref,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                root_ip,
+                ShiftKind::LogicalRight,
             )?;
             Ok(true)
         }
@@ -373,6 +387,10 @@ pub(super) fn emit_inline_or_helper_step(
                 root_ip,
                 false,
             )?;
+            Ok(true)
+        }
+        TraceStep::Not => {
+            emit_inline_not(b, vm_ptr, helper_ref, exit_block, root_ip)?;
             Ok(true)
         }
         TraceStep::Neg => {
@@ -689,59 +707,13 @@ fn emit_inline_stloc(
     vm_ptr: cranelift_codegen::ir::Value,
     helper_ref: FuncRef,
     exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: NativeStackLayout,
-    offsets: ResolvedOffsets,
+    _pointer_type: cranelift_codegen::ir::Type,
+    _layout: NativeStackLayout,
+    _offsets: ResolvedOffsets,
     index: u8,
     root_ip: usize,
 ) -> VmResult<()> {
-    let slow = b.create_block();
-    let fast = b.create_block();
     let next = b.create_block();
-
-    let stack_len = b
-        .ins()
-        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_len);
-    let has_stack = b
-        .ins()
-        .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, stack_len, 1);
-    b.ins().brif(has_stack, fast, &[], slow, &[]);
-
-    b.switch_to_block(fast);
-    let locals_len = b
-        .ins()
-        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_len);
-    let idx = b.ins().iconst(pointer_type, i64::from(index));
-    let in_bounds = b.ins().icmp(IntCC::UnsignedLessThan, idx, locals_len);
-    let bounds_ok = b.create_block();
-    b.ins().brif(in_bounds, bounds_ok, &[], slow, &[]);
-
-    b.switch_to_block(bounds_ok);
-    let one = b.ins().iconst(pointer_type, 1);
-    let src_index = b.ins().isub(stack_len, one);
-    let stack_ptr = b
-        .ins()
-        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_ptr);
-    let src_addr = value_addr(b, pointer_type, stack_ptr, src_index, layout.value.size);
-
-    let locals_ptr = b
-        .ins()
-        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_ptr);
-    let dst_addr = value_addr(b, pointer_type, locals_ptr, idx, layout.value.size);
-    let dst_tag = load_tag_i32(b, layout.value, dst_addr);
-
-    let dst_scalar = is_scalar_tag(b, layout.value, dst_tag);
-    let scalar_ok = b.create_block();
-    b.ins().brif(dst_scalar, scalar_ok, &[], slow, &[]);
-
-    b.switch_to_block(scalar_ok);
-    copy_value_bytes(b, src_addr, dst_addr, layout.value.size);
-    let new_len = b.ins().isub(stack_len, one);
-    b.ins()
-        .store(MemFlags::new(), new_len, vm_ptr, offsets.stack_len);
-    b.ins().jump(next, &[]);
-
-    b.switch_to_block(slow);
     emit_helper_step_from_call_tuple(
         b,
         vm_ptr,
@@ -864,6 +836,13 @@ enum IntBinopKind {
     Add,
     Sub,
     Mul,
+}
+
+#[derive(Clone, Copy)]
+enum ShiftKind {
+    Left,
+    ArithmeticRight,
+    LogicalRight,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1084,7 +1063,7 @@ fn emit_inline_shift(
     layout: NativeStackLayout,
     offsets: ResolvedOffsets,
     root_ip: usize,
-    is_shl: bool,
+    kind: ShiftKind,
 ) -> VmResult<()> {
     let slow = b.create_block();
     let len_ok = b.create_block();
@@ -1138,10 +1117,10 @@ fn emit_inline_shift(
     b.ins().brif(shift_in_range, shift_ok, &[], slow, &[]);
 
     b.switch_to_block(shift_ok);
-    let out = if is_shl {
-        b.ins().ishl(lhs, rhs)
-    } else {
-        b.ins().sshr(lhs, rhs)
+    let out = match kind {
+        ShiftKind::Left => b.ins().ishl(lhs, rhs),
+        ShiftKind::ArithmeticRight => b.ins().sshr(lhs, rhs),
+        ShiftKind::LogicalRight => b.ins().ushr(lhs, rhs),
     };
     b.ins().store(
         MemFlags::new(),
@@ -1161,9 +1140,32 @@ fn emit_inline_shift(
         helper_ref,
         exit_block,
         next,
-        (if is_shl { OP_SHL } else { OP_SHR }, 0, 0, 0),
+        (
+            match kind {
+                ShiftKind::Left => OP_SHL,
+                ShiftKind::ArithmeticRight => OP_SHR,
+                ShiftKind::LogicalRight => OP_LSHR,
+            },
+            0,
+            0,
+            0,
+        ),
     );
 
+    b.switch_to_block(next);
+    let _ = root_ip;
+    Ok(())
+}
+
+fn emit_inline_not(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    helper_ref: FuncRef,
+    exit_block: Block,
+    root_ip: usize,
+) -> VmResult<()> {
+    let next = b.create_block();
+    emit_helper_step_from_call_tuple(b, vm_ptr, helper_ref, exit_block, next, (OP_NOT, 0, 0, 0));
     b.switch_to_block(next);
     let _ = root_ip;
     Ok(())
@@ -1839,8 +1841,10 @@ fn step_to_call(step: &TraceStep, root_ip: usize) -> VmResult<(i64, i64, i64, i6
         TraceStep::Mod => (OP_MOD, 0, 0, 0),
         TraceStep::Shl => (OP_SHL, 0, 0, 0),
         TraceStep::Shr => (OP_SHR, 0, 0, 0),
+        TraceStep::Lshr => (OP_LSHR, 0, 0, 0),
         TraceStep::And => (OP_AND, 0, 0, 0),
         TraceStep::Or => (OP_OR, 0, 0, 0),
+        TraceStep::Not => (OP_NOT, 0, 0, 0),
         TraceStep::Neg => (OP_NEG, 0, 0, 0),
         TraceStep::Ceq => (OP_CEQ, 0, 0, 0),
         TraceStep::Clt => (OP_CLT, 0, 0, 0),

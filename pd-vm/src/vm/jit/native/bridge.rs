@@ -30,8 +30,10 @@ fn bridge_name_for_op(op: i64) -> Option<&'static str> {
         OP_MOD => Some("mod"),
         OP_SHL => Some("shl"),
         OP_SHR => Some("shr"),
+        OP_LSHR => Some("lshr"),
         OP_AND => Some("and"),
         OP_OR => Some("or"),
+        OP_NOT => Some("not"),
         OP_NEG => Some("neg"),
         OP_CEQ => Some("ceq"),
         OP_CLT => Some("clt"),
@@ -100,12 +102,7 @@ pub(super) extern "C" fn pd_vm_cranelift_step(vm: *mut Vm, op: i64, a: i64, b: i
                         }
                         Ok(lhs.wrapping_div(rhs))
                     },
-                    |lhs, rhs| {
-                        if rhs == 0.0 {
-                            return Err(VmError::DivisionByZero);
-                        }
-                        Ok(lhs / rhs)
-                    },
+                    |lhs, rhs| Ok(lhs / rhs),
                 )?;
                 Ok(STATUS_CONTINUE)
             }
@@ -140,6 +137,15 @@ pub(super) extern "C" fn pd_vm_cranelift_step(vm: *mut Vm, op: i64, a: i64, b: i
                     .push(crate::bytecode::Value::Int(lhs.wrapping_shr(rhs)));
                 Ok(STATUS_CONTINUE)
             }
+            OP_LSHR => {
+                let rhs = vm.pop_shift_amount()?;
+                let lhs = vm.pop_int()?;
+                vm.stack
+                    .push(crate::bytecode::Value::Int(crate::vm::logical_shr_i64(
+                        lhs, rhs,
+                    )));
+                Ok(STATUS_CONTINUE)
+            }
             OP_AND => {
                 let rhs = vm.pop_bool()?;
                 let lhs = vm.pop_bool()?;
@@ -150,6 +156,10 @@ pub(super) extern "C" fn pd_vm_cranelift_step(vm: *mut Vm, op: i64, a: i64, b: i
                 let rhs = vm.pop_bool()?;
                 let lhs = vm.pop_bool()?;
                 vm.stack.push(crate::bytecode::Value::Bool(lhs || rhs));
+                Ok(STATUS_CONTINUE)
+            }
+            OP_NOT => {
+                vm.unary_not_op()?;
                 Ok(STATUS_CONTINUE)
             }
             OP_NEG => {
@@ -202,11 +212,7 @@ pub(super) extern "C" fn pd_vm_cranelift_step(vm: *mut Vm, op: i64, a: i64, b: i
                 let index = u8::try_from(a)
                     .map_err(|_| VmError::JitNative("stloc index out of range".to_string()))?;
                 let value = vm.pop_value()?;
-                let slot = vm
-                    .locals
-                    .get_mut(index as usize)
-                    .ok_or(VmError::InvalidLocal(index))?;
-                *slot = value;
+                vm.store_local_with_drop_contract(index, value)?;
                 Ok(STATUS_CONTINUE)
             }
             OP_CALL => {

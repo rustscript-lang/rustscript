@@ -260,7 +260,7 @@ fn waiting_host_op_preserves_interprocedural_closure_state_then_clears_on_resume
 }
 
 #[test]
-fn drop_contract_counts_overwrites_and_reset_cleanup() {
+fn drop_contract_counts_overwrites_and_reset_clears_counter() {
     let source = r#"
         let mut value = { payload: [1, 2, 3], name: "a" };
         value = { payload: [4], name: "b" };
@@ -279,9 +279,9 @@ fn drop_contract_counts_overwrites_and_reset_cleanup() {
 
     vm.reset_for_reuse();
     let after_reset = vm.drop_contract_event_count();
-    assert!(
-        after_reset > after_run,
-        "expected reset_for_reuse to route stack/local cleanup through drop contract (before={after_run}, after={after_reset})"
+    assert_eq!(
+        after_reset, 0,
+        "reset_for_reuse should clear drop accounting"
     );
 }
 

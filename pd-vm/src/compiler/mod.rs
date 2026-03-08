@@ -881,8 +881,7 @@ impl Compiler {
             }
             Expr::Not(inner) => {
                 self.compile_scalar_expr(inner)?;
-                self.assembler.push_const(Value::Bool(false));
-                self.assembler.ceq();
+                self.assembler.not();
             }
             Expr::ToOwned(inner) => {
                 self.compile_scalar_expr(inner)?;
@@ -891,14 +890,10 @@ impl Compiler {
                 self.compile_scalar_expr(inner)?;
             }
             Expr::And(lhs, rhs) => {
-                self.compile_scalar_expr(lhs)?;
-                self.compile_scalar_expr(rhs)?;
-                self.assembler.and();
+                self.compile_short_circuit_and(lhs, rhs)?;
             }
             Expr::Or(lhs, rhs) => {
-                self.compile_scalar_expr(lhs)?;
-                self.compile_scalar_expr(rhs)?;
-                self.assembler.or();
+                self.compile_short_circuit_or(lhs, rhs)?;
             }
             Expr::Eq(lhs, rhs) => {
                 self.compile_scalar_expr(lhs)?;
@@ -1339,6 +1334,40 @@ impl Compiler {
 
     fn compile_scalar_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
         self.compile_expr(expr)
+    }
+
+    fn compile_short_circuit_and(&mut self, lhs: &Expr, rhs: &Expr) -> Result<(), CompileError> {
+        let false_label = self.fresh_label("and_false");
+        let end_label = self.fresh_label("and_end");
+        self.compile_scalar_expr(lhs)?;
+        self.assembler.brfalse_label(&false_label);
+        self.compile_scalar_expr(rhs)?;
+        self.assembler.br_label(&end_label);
+        self.assembler
+            .label(&false_label)
+            .map_err(CompileError::Assembler)?;
+        self.assembler.push_const(Value::Bool(false));
+        self.assembler
+            .label(&end_label)
+            .map_err(CompileError::Assembler)?;
+        Ok(())
+    }
+
+    fn compile_short_circuit_or(&mut self, lhs: &Expr, rhs: &Expr) -> Result<(), CompileError> {
+        let rhs_label = self.fresh_label("or_rhs");
+        let end_label = self.fresh_label("or_end");
+        self.compile_scalar_expr(lhs)?;
+        self.assembler.brfalse_label(&rhs_label);
+        self.assembler.push_const(Value::Bool(true));
+        self.assembler.br_label(&end_label);
+        self.assembler
+            .label(&rhs_label)
+            .map_err(CompileError::Assembler)?;
+        self.compile_scalar_expr(rhs)?;
+        self.assembler
+            .label(&end_label)
+            .map_err(CompileError::Assembler)?;
+        Ok(())
     }
 
     fn compile_function_call(&mut self, index: u16, args: &[Expr]) -> Result<(), CompileError> {

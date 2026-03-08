@@ -318,12 +318,7 @@ impl Vm {
                             }
                             Ok(lhs.wrapping_div(rhs))
                         },
-                        |lhs, rhs| {
-                            if rhs == 0.0 {
-                                return Err(VmError::DivisionByZero);
-                            }
-                            Ok(lhs / rhs)
-                        },
+                        |lhs, rhs| Ok(lhs / rhs),
                     )?;
                 }
                 TraceStep::Mod => {
@@ -354,6 +349,14 @@ impl Vm {
                     self.stack
                         .push(crate::bytecode::Value::Int(lhs.wrapping_shr(rhs)));
                 }
+                TraceStep::Lshr => {
+                    let rhs = self.pop_shift_amount()?;
+                    let lhs = self.pop_int()?;
+                    self.stack
+                        .push(crate::bytecode::Value::Int(super::super::logical_shr_i64(
+                            lhs, rhs,
+                        )));
+                }
                 TraceStep::And => {
                     let rhs = self.pop_bool()?;
                     let lhs = self.pop_bool()?;
@@ -363,6 +366,9 @@ impl Vm {
                     let rhs = self.pop_bool()?;
                     let lhs = self.pop_bool()?;
                     self.stack.push(crate::bytecode::Value::Bool(lhs || rhs));
+                }
+                TraceStep::Not => {
+                    self.unary_not_op()?;
                 }
                 TraceStep::Neg => {
                     let value = self.pop_numeric()?;
@@ -403,11 +409,7 @@ impl Vm {
                 }
                 TraceStep::Stloc(index) => {
                     let value = self.pop_value()?;
-                    let slot = self
-                        .locals
-                        .get_mut(*index as usize)
-                        .ok_or(VmError::InvalidLocal(*index))?;
-                    *slot = value;
+                    self.store_local_with_drop_contract(*index, value)?;
                 }
                 TraceStep::BuiltinCall {
                     index,
@@ -737,10 +739,9 @@ impl Vm {
     ))]
     pub(super) fn build_loaded_native_aot_trace(
         trace: &JitTrace,
-        compiled: Box<native::CompiledTrace>,
+        compiled: native::CompiledTrace,
         fuel_check_interval: Option<u32>,
     ) -> NativeTrace {
-        let compiled = *compiled;
         let entry = unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(compiled.entry) };
         let code = Arc::<[u8]>::from(compiled.code.into_boxed_slice());
         let keepalive = Arc::new(Mutex::new(compiled.keepalive));

@@ -1,6 +1,7 @@
 #![cfg(feature = "runtime")]
 mod common;
 use common::*;
+use vm::OpCode;
 
 #[test]
 fn arithmetic_works() {
@@ -443,4 +444,267 @@ fn fuel_checkpoint_restores_interval() {
     vm.restore_checkpoint(checkpoint);
     assert_eq!(vm.fuel_check_interval(), 7);
     assert_eq!(vm.get_fuel(), Some(22));
+}
+
+#[test]
+fn float_division_by_zero_produces_signed_infinities() {
+    let constants = vec![Value::Float(1.0), Value::Float(0.0), Value::Float(-0.0)];
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.ldc(1);
+    bc.div();
+    bc.ldc(0);
+    bc.ldc(2);
+    bc.div();
+    bc.ret();
+
+    let program = Program::new(constants, bc.finish());
+    let mut vm = Vm::new(program);
+    let status = vm.run().expect("vm should run");
+
+    assert_eq!(status, VmStatus::Halted);
+    let [Value::Float(pos_inf), Value::Float(neg_inf)] = vm.stack() else {
+        panic!("expected infinities on the stack, got {:?}", vm.stack());
+    };
+    assert!(pos_inf.is_infinite() && pos_inf.is_sign_positive());
+    assert!(neg_inf.is_infinite() && neg_inf.is_sign_negative());
+}
+
+#[test]
+fn not_flips_booleans_and_rejects_non_booleans() {
+    let bool_program = assemble(
+        r#"
+        ldc true
+        not
+        ret
+    "#,
+    )
+    .expect("assemble should succeed");
+    let mut bool_vm = Vm::new(bool_program);
+    let bool_status = bool_vm.run().expect("boolean not should succeed");
+    assert_eq!(bool_status, VmStatus::Halted);
+    assert_eq!(bool_vm.stack(), &[Value::Bool(false)]);
+
+    let invalid_program = Program::new(
+        vec![Value::Int(0)],
+        vec![
+            OpCode::Ldc as u8,
+            0,
+            0,
+            0,
+            0,
+            OpCode::Not as u8,
+            OpCode::Ret as u8,
+        ],
+    );
+    let mut invalid_vm = Vm::new(invalid_program);
+    let err = invalid_vm.run().expect_err("non-boolean not should fail");
+    assert!(matches!(err, vm::VmError::TypeMismatch("bool")));
+}
+
+#[test]
+fn shift_right_variants_distinguish_arithmetic_and_logical_behavior() {
+    let constants = vec![Value::Int(-8), Value::Int(1)];
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.ldc(1);
+    bc.shr();
+    bc.ldc(0);
+    bc.ldc(1);
+    bc.lshr();
+    bc.ret();
+
+    let program = Program::new(constants, bc.finish());
+    let mut vm = Vm::new(program);
+    let status = vm.run().expect("vm should run");
+
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(-4), Value::Int(i64::MAX - 3)]);
+}
+
+#[test]
+fn shift_amount_must_be_between_zero_and_sixty_three() {
+    let negative_program = Program::new(
+        vec![Value::Int(1), Value::Int(-1)],
+        vec![
+            OpCode::Ldc as u8,
+            0,
+            0,
+            0,
+            0,
+            OpCode::Ldc as u8,
+            1,
+            0,
+            0,
+            0,
+            OpCode::Shl as u8,
+            OpCode::Ret as u8,
+        ],
+    );
+    let mut negative_vm = Vm::new(negative_program);
+    let negative_err = negative_vm.run().expect_err("negative shift should fail");
+    assert!(matches!(negative_err, vm::VmError::InvalidShift(-1)));
+
+    let large_program = Program::new(
+        vec![Value::Int(1), Value::Int(64)],
+        vec![
+            OpCode::Ldc as u8,
+            0,
+            0,
+            0,
+            0,
+            OpCode::Ldc as u8,
+            1,
+            0,
+            0,
+            0,
+            OpCode::Shr as u8,
+            OpCode::Ret as u8,
+        ],
+    );
+    let mut large_vm = Vm::new(large_program);
+    let large_err = large_vm.run().expect_err("large shift should fail");
+    assert!(matches!(large_err, vm::VmError::InvalidShift(64)));
+}
+
+#[test]
+fn brfalse_rejects_non_boolean_condition() {
+    let program = Program::new(
+        vec![Value::Int(1)],
+        vec![
+            OpCode::Ldc as u8,
+            0,
+            0,
+            0,
+            0,
+            OpCode::Brfalse as u8,
+            11,
+            0,
+            0,
+            0,
+            OpCode::Ret as u8,
+            OpCode::Ret as u8,
+        ],
+    );
+    let mut vm = Vm::new(program);
+    let err = vm.run().expect_err("brfalse should require a bool");
+    assert!(matches!(err, vm::VmError::TypeMismatch("bool")));
+}
+
+#[test]
+fn nan_is_not_equal_to_itself() {
+    let constants = vec![Value::Float(f64::NAN)];
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.dup();
+    bc.ceq();
+    bc.ret();
+
+    let program = Program::new(constants, bc.finish());
+    let mut vm = Vm::new(program);
+    let status = vm.run().expect("vm should run");
+
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Bool(false)]);
+}
+
+#[test]
+fn resume_on_halted_vm_returns_bytecode_bounds() {
+    let program = assemble(
+        r#"
+        ret
+    "#,
+    )
+    .expect("assemble should succeed");
+    let mut vm = Vm::new(program);
+    let status = vm.run().expect("initial run should halt");
+    assert_eq!(status, VmStatus::Halted);
+
+    let err = vm.resume().expect_err("resuming a halted vm should fail");
+    assert!(matches!(err, vm::VmError::BytecodeBounds));
+}
+
+#[test]
+fn map_equality_ignores_entry_order() {
+    let constants = vec![
+        Value::Map(vec![
+            (Value::String("a".to_string()), Value::Int(1)),
+            (Value::String("b".to_string()), Value::Int(2)),
+        ]),
+        Value::Map(vec![
+            (Value::String("b".to_string()), Value::Int(2)),
+            (Value::String("a".to_string()), Value::Int(1)),
+        ]),
+    ];
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.ldc(1);
+    bc.ceq();
+    bc.ret();
+
+    let program = Program::new(constants, bc.finish());
+    let mut vm = Vm::new(program);
+    let status = vm.run().expect("vm should run");
+
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Bool(true)]);
+}
+
+#[test]
+fn get_and_set_use_the_first_duplicate_map_entry() {
+    const BUILTIN_GET: u16 = 0xFFE6;
+    const BUILTIN_SET: u16 = 0xFFE7;
+
+    let map = Value::Map(vec![
+        (Value::String("k".to_string()), Value::Int(1)),
+        (Value::String("k".to_string()), Value::Int(2)),
+        (Value::String("z".to_string()), Value::Int(3)),
+    ]);
+    let constants = vec![map, Value::String("k".to_string()), Value::Int(9)];
+
+    let mut get_bc = BytecodeBuilder::new();
+    get_bc.ldc(0);
+    get_bc.ldc(1);
+    get_bc.call(BUILTIN_GET, 2);
+    get_bc.ret();
+    let mut get_vm = Vm::new(Program::new(constants.clone(), get_bc.finish()));
+    let get_status = get_vm.run().expect("get should succeed");
+    assert_eq!(get_status, VmStatus::Halted);
+    assert_eq!(get_vm.stack(), &[Value::Int(1)]);
+
+    let mut set_bc = BytecodeBuilder::new();
+    set_bc.ldc(0);
+    set_bc.ldc(1);
+    set_bc.ldc(2);
+    set_bc.call(BUILTIN_SET, 3);
+    set_bc.ret();
+    let mut set_vm = Vm::new(Program::new(constants, set_bc.finish()));
+    let set_status = set_vm.run().expect("set should succeed");
+    assert_eq!(set_status, VmStatus::Halted);
+    let [Value::Map(entries)] = set_vm.stack() else {
+        panic!("expected map result, got {:?}", set_vm.stack());
+    };
+    assert_eq!(
+        entries,
+        &vec![
+            (Value::String("k".to_string()), Value::Int(9)),
+            (Value::String("k".to_string()), Value::Int(2)),
+            (Value::String("z".to_string()), Value::Int(3)),
+        ]
+    );
+}
+
+#[test]
+fn program_new_infers_locals_through_new_zero_operand_opcodes() {
+    let program = Program::new(
+        vec![],
+        vec![
+            OpCode::Not as u8,
+            OpCode::Ldloc as u8,
+            5,
+            OpCode::Lshr as u8,
+            OpCode::Ret as u8,
+        ],
+    );
+    assert_eq!(program.local_count, 6);
 }

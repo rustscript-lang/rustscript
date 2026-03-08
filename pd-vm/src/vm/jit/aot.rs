@@ -185,7 +185,7 @@ impl Vm {
                 let trace_id = trace.id;
                 let native_trace = Vm::build_loaded_native_aot_trace(
                     &trace,
-                    compiled,
+                    *compiled,
                     aot_native_fuel_check_interval(fuel_check_interval),
                 );
                 vm.native_traces.insert(trace_id, native_trace);
@@ -504,8 +504,10 @@ fn encode_trace_step(step: &TraceStep, out: &mut Vec<u8>) -> VmResult<()> {
         TraceStep::Mod => out.push(6),
         TraceStep::Shl => out.push(7),
         TraceStep::Shr => out.push(8),
+        TraceStep::Lshr => out.push(25),
         TraceStep::And => out.push(9),
         TraceStep::Or => out.push(10),
+        TraceStep::Not => out.push(26),
         TraceStep::Neg => out.push(11),
         TraceStep::Ceq => out.push(12),
         TraceStep::Clt => out.push(13),
@@ -566,8 +568,10 @@ fn decode_trace_step(cursor: &mut AotCursor<'_>) -> VmResult<TraceStep> {
         6 => TraceStep::Mod,
         7 => TraceStep::Shl,
         8 => TraceStep::Shr,
+        25 => TraceStep::Lshr,
         9 => TraceStep::And,
         10 => TraceStep::Or,
+        26 => TraceStep::Not,
         11 => TraceStep::Neg,
         12 => TraceStep::Ceq,
         13 => TraceStep::Clt,
@@ -741,8 +745,10 @@ fn validate_aot_trace(trace: &JitTrace, code_len: usize) -> VmResult<()> {
             | TraceStep::Mod
             | TraceStep::Shl
             | TraceStep::Shr
+            | TraceStep::Lshr
             | TraceStep::And
             | TraceStep::Or
+            | TraceStep::Not
             | TraceStep::Neg
             | TraceStep::Ceq
             | TraceStep::Clt

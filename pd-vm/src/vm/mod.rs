@@ -407,8 +407,34 @@ fn noop_waker() -> Waker {
     Waker::from(Arc::new(NoopWake))
 }
 
+#[derive(Default)]
+struct StableHasher(u64);
+
+impl Hasher for StableHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+        const PRIME: u64 = 0x100000001b3;
+
+        if self.0 == 0 {
+            self.0 = OFFSET_BASIS;
+        }
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(PRIME);
+        }
+    }
+}
+
+fn logical_shr_i64(value: i64, amount: u32) -> i64 {
+    ((value as u64) >> amount) as i64
+}
+
 fn compute_program_cache_key(program: &Program) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = StableHasher::default();
     program.code.hash(&mut hasher);
     program.local_count.hash(&mut hasher);
     for constant in &program.constants {
@@ -449,9 +475,18 @@ fn hash_value(value: &Value, state: &mut impl Hasher) {
         Value::Map(entries) => {
             5u8.hash(state);
             entries.len().hash(state);
-            for (key, value) in entries {
-                hash_value(key, state);
-                hash_value(value, state);
+            let mut entry_hashes = entries
+                .iter()
+                .map(|(key, value)| {
+                    let mut entry_hasher = StableHasher::default();
+                    hash_value(key, &mut entry_hasher);
+                    hash_value(value, &mut entry_hasher);
+                    entry_hasher.finish()
+                })
+                .collect::<Vec<_>>();
+            entry_hashes.sort_unstable();
+            for entry_hash in entry_hashes {
+                entry_hash.hash(state);
             }
         }
     }
@@ -587,6 +622,7 @@ impl Vm {
         self.waiting_host_op = None;
         self.next_host_op_id = 1;
         self.io_state = builtins_impl::IoState::default();
+        self.drop_contract_events = 0;
     }
 
     pub fn drop_contract_event_count(&self) -> u64 {
@@ -1063,12 +1099,7 @@ impl Vm {
                         }
                         Ok(lhs.wrapping_div(rhs))
                     },
-                    |lhs, rhs| {
-                        if rhs == 0.0 {
-                            return Err(VmError::DivisionByZero);
-                        }
-                        Ok(lhs / rhs)
-                    },
+                    |lhs, rhs| Ok(lhs / rhs),
                 )?;
             }
             x if x == OpCode::Shl as u8 => {
@@ -1080,6 +1111,11 @@ impl Vm {
                 let rhs = self.pop_shift_amount()?;
                 let lhs = self.pop_int()?;
                 self.stack.push(Value::Int(lhs.wrapping_shr(rhs)));
+            }
+            x if x == OpCode::Lshr as u8 => {
+                let rhs = self.pop_shift_amount()?;
+                let lhs = self.pop_int()?;
+                self.stack.push(Value::Int(logical_shr_i64(lhs, rhs)));
             }
             x if x == OpCode::Mod as u8 => {
                 self.binary_numeric_op(
@@ -1106,6 +1142,9 @@ impl Vm {
                 let rhs = self.pop_bool()?;
                 let lhs = self.pop_bool()?;
                 self.stack.push(Value::Bool(lhs || rhs));
+            }
+            x if x == OpCode::Not as u8 => {
+                self.unary_not_op()?;
             }
             x if x == OpCode::Neg as u8 => {
                 let value = self.pop_numeric()?;
@@ -1165,12 +1204,7 @@ impl Vm {
             x if x == OpCode::Stloc as u8 => {
                 let index = self.read_u8()?;
                 let value = self.pop_value()?;
-                let slot = self
-                    .locals
-                    .get_mut(index as usize)
-                    .ok_or(VmError::InvalidLocal(index))?;
-                let previous = std::mem::replace(slot, value);
-                self.drop_value_with_contract(previous);
+                self.store_local_with_drop_contract(index, value)?;
             }
             x if x == OpCode::Call as u8 => {
                 let call_ip = self.ip - 1;
@@ -1352,6 +1386,12 @@ impl Vm {
         self.pop_value()?.as_bool()
     }
 
+    fn unary_not_op(&mut self) -> VmResult<()> {
+        let value = self.pop_bool()?;
+        self.stack.push(Value::Bool(!value));
+        Ok(())
+    }
+
     fn binary_add_op(&mut self) -> VmResult<()> {
         let rhs = self.pop_value()?;
         let lhs = self.pop_value()?;
@@ -1440,6 +1480,16 @@ impl Vm {
             return Err(VmError::InvalidShift(value));
         }
         Ok(value as u32)
+    }
+
+    fn store_local_with_drop_contract(&mut self, index: u8, value: Value) -> VmResult<()> {
+        let slot = self
+            .locals
+            .get_mut(index as usize)
+            .ok_or(VmError::InvalidLocal(index))?;
+        let previous = std::mem::replace(slot, value);
+        self.drop_value_with_contract(previous);
+        Ok(())
     }
 
     fn execute_host_call(

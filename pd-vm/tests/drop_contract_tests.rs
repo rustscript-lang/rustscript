@@ -60,21 +60,15 @@ impl HostFunction for PendingOnce {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn dead_local_is_dropped_exactly_once() {
-    // `a` is a non-trivial value (map) that goes dead after `b` is assigned.
-    // The lifetime pass should emit exactly one Stmt::Drop for `a` and the
-    // Stloc overwrite should fire the drop contract.  We verify that the
-    // drop-contract counter is non-zero.
+fn dead_scalar_local_is_dropped_exactly_once() {
+    // A single scalar local that goes dead should trigger exactly one drop
+    // contract event.
     let source = r#"
-        let a = { key: "hello" };
-        let b = 1;
-        b;
+        let a = "hello";
+        0;
     "#;
     let drops = compile_run_drop_count(source);
-    assert!(
-        drops > 0,
-        "expected at least one drop-contract event for dead local a, got {drops}"
-    );
+    assert_eq!(drops, 1, "expected exactly one drop event for dead local a");
 }
 
 #[test]
@@ -197,7 +191,7 @@ fn drop_events_fire_across_host_op_boundary() {
 
     let drops_after = vm.drop_contract_event_count();
     assert!(
-        drops_after >= drops_before,
+        drops_after > drops_before,
         "drop contract must not regress across host-op resume (before={drops_before}, after={drops_after})"
     );
     assert!(
@@ -208,8 +202,8 @@ fn drop_events_fire_across_host_op_boundary() {
 
 #[test]
 fn cooperative_yield_does_not_duplicate_drops() {
-    // Use fuel-limited execution so the VM yields cooperatively.  After
-    // resume the total drop count should be reasonable (no double-drop).
+    // Use fuel-limited execution so the VM yields cooperatively. The final
+    // drop count should match uninterrupted execution exactly.
     let source = r#"
         let mut i = 0;
         while i < 10 {
@@ -218,6 +212,12 @@ fn cooperative_yield_does_not_duplicate_drops() {
         }
         i;
     "#;
+
+    let baseline_compiled = compile_source(source).expect("compile baseline");
+    let mut baseline_vm = Vm::new(baseline_compiled.program);
+    let baseline_status = baseline_vm.run().expect("baseline run should halt");
+    assert_eq!(baseline_status, VmStatus::Halted);
+    let baseline_drops = baseline_vm.drop_contract_event_count();
 
     let compiled = compile_source(source).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
@@ -242,6 +242,10 @@ fn cooperative_yield_does_not_duplicate_drops() {
 
     assert!(total_yields > 0, "expected at least one cooperative yield");
     let drops = vm.drop_contract_event_count();
+    assert_eq!(
+        drops, baseline_drops,
+        "yield/resume should preserve exact drop parity with uninterrupted execution"
+    );
     // There should be approximately 10 drops (one per iteration for `tmp`)
     // plus a few more for local cleanup.  We just ensure it's bounded —
     // double-drops would inflate the count wildly.
@@ -366,12 +370,9 @@ fn native_jit_drop_parity_loop() {
         "interpreter and JIT should produce the same stack"
     );
 
-    // Drop counts should match when JIT is disabled; when JIT is active the
-    // trace-compiled path does not currently route through drop_value_with_contract,
-    // so we only require that the JIT drop count does not exceed the interpreter's
-    // (i.e. no double-drops) and that the stacks match.
+    // Drop counts should match exactly across interpreter and JIT execution.
     assert!(
-        drops_jit <= drops_interp,
+        drops_jit == drops_interp,
         "JIT drop count ({drops_jit}) should not exceed interpreter ({drops_interp}) — possible double-drop"
     );
 }
@@ -422,8 +423,8 @@ fn native_jit_drop_parity_branch() {
         "interpreter and JIT should produce the same stack for branch test"
     );
     assert!(
-        drops_jit <= drops_interp,
-        "JIT drop count (branch) ({drops_jit}) should not exceed interpreter ({drops_interp})"
+        drops_jit == drops_interp,
+        "JIT drop count (branch) ({drops_jit}) should match interpreter ({drops_interp})"
     );
 }
 // ---------------------------------------------------------------------------
@@ -649,6 +650,11 @@ fn reset_for_reuse_clears_all_locals_to_null() {
     assert_eq!(status, VmStatus::Halted);
 
     vm.reset_for_reuse();
+    assert_eq!(
+        vm.drop_contract_event_count(),
+        0,
+        "reset_for_reuse should reset drop accounting for the next run"
+    );
 
     // After reset, every local slot must be Null.
     for (i, local) in vm.locals().iter().enumerate() {

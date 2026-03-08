@@ -85,8 +85,10 @@ pub enum TraceStep {
     Mod,
     Shl,
     Shr,
+    Lshr,
     And,
     Or,
+    Not,
     Neg,
     Ceq,
     Clt,
@@ -602,6 +604,11 @@ impl TraceJitEngine {
                 steps.push(TraceStep::Shr);
                 continue;
             }
+            if opcode == OpCode::Lshr as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::Lshr);
+                continue;
+            }
             if opcode == OpCode::And as u8 {
                 step_ips.push(instr_ip);
                 steps.push(TraceStep::And);
@@ -610,6 +617,11 @@ impl TraceJitEngine {
             if opcode == OpCode::Or as u8 {
                 step_ips.push(instr_ip);
                 steps.push(TraceStep::Or);
+                continue;
+            }
+            if opcode == OpCode::Not as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::Not);
                 continue;
             }
             if opcode == OpCode::Neg as u8 {
@@ -804,6 +816,11 @@ impl TraceJitEngine {
                 steps.push(TraceStep::Shr);
                 continue;
             }
+            if opcode == OpCode::Lshr as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::Lshr);
+                continue;
+            }
             if opcode == OpCode::And as u8 {
                 step_ips.push(instr_ip);
                 steps.push(TraceStep::And);
@@ -812,6 +829,11 @@ impl TraceJitEngine {
             if opcode == OpCode::Or as u8 {
                 step_ips.push(instr_ip);
                 steps.push(TraceStep::Or);
+                continue;
+            }
+            if opcode == OpCode::Not as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::Not);
                 continue;
             }
             if opcode == OpCode::Neg as u8 {
@@ -1017,8 +1039,10 @@ fn trace_step_name(step: &TraceStep) -> &'static str {
         TraceStep::Mod => "mod",
         TraceStep::Shl => "shl",
         TraceStep::Shr => "shr",
+        TraceStep::Lshr => "lshr",
         TraceStep::And => "and",
         TraceStep::Or => "or",
+        TraceStep::Not => "not",
         TraceStep::Neg => "neg",
         TraceStep::Ceq => "ceq",
         TraceStep::Clt => "clt",

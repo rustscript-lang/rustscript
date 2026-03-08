@@ -1,4 +1,4 @@
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Value {
     Null,
     Int(i64),
@@ -7,6 +7,39 @@ pub enum Value {
     String(String),
     Array(Vec<Value>),
     Map(Vec<(Value, Value)>),
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Null, Self::Null) => true,
+            (Self::Int(lhs), Self::Int(rhs)) => lhs == rhs,
+            (Self::Float(lhs), Self::Float(rhs)) => lhs == rhs,
+            (Self::Bool(lhs), Self::Bool(rhs)) => lhs == rhs,
+            (Self::String(lhs), Self::String(rhs)) => lhs == rhs,
+            (Self::Array(lhs), Self::Array(rhs)) => lhs == rhs,
+            (Self::Map(lhs), Self::Map(rhs)) => map_entries_eq(lhs, rhs),
+            _ => false,
+        }
+    }
+}
+
+fn map_entries_eq(lhs: &[(Value, Value)], rhs: &[(Value, Value)]) -> bool {
+    if lhs.len() != rhs.len() {
+        return false;
+    }
+    let mut matched = vec![false; rhs.len()];
+    'outer: for lhs_entry in lhs {
+        for (index, rhs_entry) in rhs.iter().enumerate() {
+            if matched[index] || lhs_entry != rhs_entry {
+                continue;
+            }
+            matched[index] = true;
+            continue 'outer;
+        }
+        return false;
+    }
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -79,45 +112,21 @@ fn infer_local_count_from_code(code: &[u8]) -> usize {
 
     while let Some(&opcode) = code.get(ip) {
         ip += 1;
+        let Ok(opcode) = OpCode::try_from(opcode) else {
+            break;
+        };
+        let operand_len = opcode.operand_len();
+        if ip + operand_len > code.len() {
+            break;
+        }
         match opcode {
-            x if x == OpCode::Nop as u8
-                || x == OpCode::Ret as u8
-                || x == OpCode::Add as u8
-                || x == OpCode::Sub as u8
-                || x == OpCode::Mul as u8
-                || x == OpCode::Div as u8
-                || x == OpCode::Neg as u8
-                || x == OpCode::Ceq as u8
-                || x == OpCode::Clt as u8
-                || x == OpCode::Cgt as u8
-                || x == OpCode::Pop as u8
-                || x == OpCode::Dup as u8
-                || x == OpCode::Shl as u8
-                || x == OpCode::Shr as u8
-                || x == OpCode::Mod as u8
-                || x == OpCode::And as u8
-                || x == OpCode::Or as u8 => {}
-            x if x == OpCode::Ldc as u8 || x == OpCode::Br as u8 || x == OpCode::Brfalse as u8 => {
-                if ip + 4 > code.len() {
-                    break;
-                }
-                ip += 4;
-            }
-            x if x == OpCode::Ldloc as u8 || x == OpCode::Stloc as u8 => {
-                let Some(&index) = code.get(ip) else {
-                    break;
-                };
-                ip += 1;
+            OpCode::Ldloc | OpCode::Stloc => {
+                let index = code[ip];
                 max_local_index = Some(max_local_index.map_or(index, |prev| prev.max(index)));
             }
-            x if x == OpCode::Call as u8 => {
-                if ip + 3 > code.len() {
-                    break;
-                }
-                ip += 3;
-            }
-            _ => break,
+            _ => {}
         }
+        ip += operand_len;
     }
 
     max_local_index.map_or(0, |index| index as usize + 1)
@@ -149,9 +158,73 @@ pub enum OpCode {
     Mod = 0x14,
     And = 0x15,
     Or = 0x16,
+    Not = 0x17,
+    Lshr = 0x18,
+}
+
+impl TryFrom<u8> for OpCode {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            x if x == Self::Nop as u8 => Ok(Self::Nop),
+            x if x == Self::Ret as u8 => Ok(Self::Ret),
+            x if x == Self::Ldc as u8 => Ok(Self::Ldc),
+            x if x == Self::Add as u8 => Ok(Self::Add),
+            x if x == Self::Sub as u8 => Ok(Self::Sub),
+            x if x == Self::Mul as u8 => Ok(Self::Mul),
+            x if x == Self::Div as u8 => Ok(Self::Div),
+            x if x == Self::Neg as u8 => Ok(Self::Neg),
+            x if x == Self::Ceq as u8 => Ok(Self::Ceq),
+            x if x == Self::Clt as u8 => Ok(Self::Clt),
+            x if x == Self::Cgt as u8 => Ok(Self::Cgt),
+            x if x == Self::Br as u8 => Ok(Self::Br),
+            x if x == Self::Brfalse as u8 => Ok(Self::Brfalse),
+            x if x == Self::Pop as u8 => Ok(Self::Pop),
+            x if x == Self::Dup as u8 => Ok(Self::Dup),
+            x if x == Self::Ldloc as u8 => Ok(Self::Ldloc),
+            x if x == Self::Stloc as u8 => Ok(Self::Stloc),
+            x if x == Self::Call as u8 => Ok(Self::Call),
+            x if x == Self::Shl as u8 => Ok(Self::Shl),
+            x if x == Self::Shr as u8 => Ok(Self::Shr),
+            x if x == Self::Mod as u8 => Ok(Self::Mod),
+            x if x == Self::And as u8 => Ok(Self::And),
+            x if x == Self::Or as u8 => Ok(Self::Or),
+            x if x == Self::Not as u8 => Ok(Self::Not),
+            x if x == Self::Lshr as u8 => Ok(Self::Lshr),
+            _ => Err(()),
+        }
+    }
 }
 
 impl OpCode {
+    pub const fn operand_len(self) -> usize {
+        match self {
+            Self::Nop
+            | Self::Ret
+            | Self::Add
+            | Self::Sub
+            | Self::Mul
+            | Self::Div
+            | Self::Neg
+            | Self::Ceq
+            | Self::Clt
+            | Self::Cgt
+            | Self::Pop
+            | Self::Dup
+            | Self::Shl
+            | Self::Shr
+            | Self::Mod
+            | Self::And
+            | Self::Or
+            | Self::Not
+            | Self::Lshr => 0,
+            Self::Ldc | Self::Br | Self::Brfalse => 4,
+            Self::Ldloc | Self::Stloc => 1,
+            Self::Call => 3,
+        }
+    }
+
     pub fn mnemonic(self) -> &'static str {
         match self {
             OpCode::Nop => "nop",
@@ -177,6 +250,8 @@ impl OpCode {
             OpCode::Mod => "mod",
             OpCode::And => "and",
             OpCode::Or => "or",
+            OpCode::Not => "not",
+            OpCode::Lshr => "lshr",
         }
     }
 
@@ -205,6 +280,8 @@ impl OpCode {
             "mod" => Some(OpCode::Mod),
             "and" => Some(OpCode::And),
             "or" => Some(OpCode::Or),
+            "not" => Some(OpCode::Not),
+            "lshr" => Some(OpCode::Lshr),
             _ => None,
         }
     }

@@ -24,6 +24,17 @@ fn run_halted_vm_with_flavor(source: &str, flavor: SourceFlavor, jit_config: Jit
     vm
 }
 
+struct CountedTrueHost {
+    calls: Arc<AtomicUsize>,
+}
+
+impl HostFunction for CountedTrueHost {
+    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(CallOutcome::Return(vec![Value::Bool(true)]))
+    }
+}
+
 #[test]
 fn boolean_precedence_and_grouping_match_across_frontends() {
     let rustscript = r#"
@@ -69,6 +80,55 @@ fn boolean_precedence_and_grouping_match_across_frontends() {
             },
         );
         assert_eq!(vm.stack().last(), Some(&Value::Bool(true)));
+    }
+}
+
+#[test]
+fn logical_ops_short_circuit_host_calls_across_frontends() {
+    let rustscript = r#"
+        fn tick();
+        let a = false && tick();
+        let b = true || tick();
+        (!a) && b;
+    "#;
+    let javascript = r#"
+        import * as vm from "vm";
+        let a = false && vm.tick();
+        let b = true || vm.tick();
+        (!a) && b;
+    "#;
+    let lua = r#"
+        local vm = require("vm")
+        local a = false and vm.tick()
+        local b = true or vm.tick()
+        (not a) and b
+    "#;
+
+    let cases = [
+        (SourceFlavor::RustScript, rustscript),
+        (SourceFlavor::JavaScript, javascript),
+        (SourceFlavor::Lua, lua),
+    ];
+
+    for (flavor, source) in cases {
+        let compiled = compile_source_with_flavor(source, flavor).expect("compile should succeed");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut vm = Vm::new(compiled.program);
+        vm.bind_function(
+            "tick",
+            Box::new(CountedTrueHost {
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::Bool(true)]);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "logical short-circuit should suppress tick() for {flavor:?}"
+        );
     }
 }
 

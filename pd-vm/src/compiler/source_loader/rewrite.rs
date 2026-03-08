@@ -95,42 +95,70 @@ fn resolve_import_call_paths(
             }
             continue;
         }
-        if let Some(host_root) = host_namespace_root_from_spec(&import.spec)
-            && is_virtual_host_namespace_spec(&import.spec, options)
-        {
-            let vm_prefix = format!("vm::{host_root}");
-            match &import.clause {
-                ImportClause::AllPublic => {
-                    if let Some(namespace) = module_default_namespace(&import.spec) {
-                        namespace_prefix_calls.insert(namespace, vm_prefix.clone());
-                        requires_vm_namespace = true;
-                    }
-                }
-                ImportClause::Named(named) => {
-                    for binding in named {
-                        alias_calls.insert(
-                            binding.local.clone(),
-                            format!("{vm_prefix}::{}", binding.imported),
-                        );
-                    }
-                    if !named.is_empty() {
-                        requires_vm_namespace = true;
-                    }
-                }
-                ImportClause::Namespace(namespace) => {
-                    namespace_prefix_calls.insert(namespace.clone(), vm_prefix.clone());
-                    requires_vm_namespace = true;
-                }
-                ImportClause::Prefix(_) => {}
-            }
-            continue;
-        }
         if !is_module_specifier(&import.spec) {
+            if let Some(host_root) = host_namespace_root_from_spec(&import.spec)
+                && is_virtual_host_namespace_spec(&import.spec, options)
+            {
+                let vm_prefix = format!("vm::{host_root}");
+                match &import.clause {
+                    ImportClause::AllPublic => {
+                        if let Some(namespace) = module_default_namespace(&import.spec) {
+                            namespace_prefix_calls.insert(namespace, vm_prefix.clone());
+                            requires_vm_namespace = true;
+                        }
+                    }
+                    ImportClause::Named(named) => {
+                        for binding in named {
+                            alias_calls.insert(
+                                binding.local.clone(),
+                                format!("{vm_prefix}::{}", binding.imported),
+                            );
+                        }
+                        if !named.is_empty() {
+                            requires_vm_namespace = true;
+                        }
+                    }
+                    ImportClause::Namespace(namespace) => {
+                        namespace_prefix_calls.insert(namespace.clone(), vm_prefix.clone());
+                        requires_vm_namespace = true;
+                    }
+                    ImportClause::Prefix(_) => {}
+                }
+            }
             continue;
         }
 
         let resolved = resolve_module_path(path, &import.spec, options)?;
         let Some(exports) = module_exports.get(&resolved) else {
+            if let Some(host_root) = host_namespace_root_from_spec(&import.spec)
+                && is_virtual_host_namespace_spec(&import.spec, options)
+            {
+                let vm_prefix = format!("vm::{host_root}");
+                match &import.clause {
+                    ImportClause::AllPublic => {
+                        if let Some(namespace) = module_default_namespace(&import.spec) {
+                            namespace_prefix_calls.insert(namespace, vm_prefix.clone());
+                            requires_vm_namespace = true;
+                        }
+                    }
+                    ImportClause::Named(named) => {
+                        for binding in named {
+                            alias_calls.insert(
+                                binding.local.clone(),
+                                format!("{vm_prefix}::{}", binding.imported),
+                            );
+                        }
+                        if !named.is_empty() {
+                            requires_vm_namespace = true;
+                        }
+                    }
+                    ImportClause::Namespace(namespace) => {
+                        namespace_prefix_calls.insert(namespace.clone(), vm_prefix.clone());
+                        requires_vm_namespace = true;
+                    }
+                    ImportClause::Prefix(_) => {}
+                }
+            }
             continue;
         };
 
@@ -746,4 +774,90 @@ fn rewrite_scheme_call_heads(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use crate::compiler::CompileSourceFileOptions;
+    use crate::compiler::source_loader::model::{ImportClause, ModuleImport, NamedImport};
+
+    #[test]
+    fn rustscript_namespace_import_calls_rewrite_to_direct_calls() {
+        let source = r#"
+string::non_empty("rss");
+is_empty("");
+"#;
+        let path = Path::new("tests/main.rss");
+        let imports = vec![
+            ModuleImport {
+                spec: "strings.rss".to_string(),
+                clause: ImportClause::Namespace("string".to_string()),
+                line: 1,
+            },
+            ModuleImport {
+                spec: "strings.rss".to_string(),
+                clause: ImportClause::Named(vec![NamedImport {
+                    imported: "is_empty".to_string(),
+                    local: "is_empty".to_string(),
+                }]),
+                line: 2,
+            },
+        ];
+        let mut module_exports = HashMap::<PathBuf, HashMap<String, u8>>::new();
+        module_exports.insert(
+            PathBuf::from("tests").join("strings.rss"),
+            HashMap::from([("is_empty".to_string(), 1), ("non_empty".to_string(), 1)]),
+        );
+
+        let rewritten = rewrite_imported_call_sites(
+            source,
+            SourceFlavor::RustScript,
+            path,
+            &imports,
+            &module_exports,
+            &CompileSourceFileOptions::default(),
+        )
+        .expect("rewrite should succeed");
+
+        assert_eq!(
+            rewritten.source.trim(),
+            r#"
+non_empty("rss");
+is_empty("");
+"#
+            .trim()
+        );
+    }
+
+    #[test]
+    fn rustscript_all_public_import_namespace_calls_rewrite_to_direct_calls() {
+        let source = "runtime::sleep(3);\n";
+        let path = Path::new("tests/main.rss");
+        let imports = vec![ModuleImport {
+            spec: "runtime.rss".to_string(),
+            clause: ImportClause::AllPublic,
+            line: 1,
+        }];
+        let mut module_exports = HashMap::<PathBuf, HashMap<String, u8>>::new();
+        module_exports.insert(
+            PathBuf::from("tests").join("runtime.rss"),
+            HashMap::from([("sleep".to_string(), 1)]),
+        );
+
+        let rewritten = rewrite_imported_call_sites(
+            source,
+            SourceFlavor::RustScript,
+            path,
+            &imports,
+            &module_exports,
+            &CompileSourceFileOptions::default(),
+        )
+        .expect("rewrite should succeed");
+
+        assert_eq!(rewritten.source.trim(), "sleep(3);");
+    }
 }

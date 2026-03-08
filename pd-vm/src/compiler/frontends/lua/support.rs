@@ -2,7 +2,8 @@ use super::super::super::ParseError;
 use super::super::super::ir::{Expr, LocalIrBuilder, LocalSlot, Stmt};
 use super::super::{is_ident_continue, is_ident_start};
 use super::expr::{
-    LuaDirectExpr, build_lua_unpack_get_expr, lower_lua_direct_expr, parse_lua_direct_expr,
+    LuaDirectExpr, LuaDirectLowering, build_lua_unpack_get_expr, lower_lua_direct_expr,
+    parse_lua_direct_expr,
 };
 use super::{LuaLoweredExpr, fresh_lua_direct_temp};
 use crate::builtins::BuiltinFunction;
@@ -194,14 +195,17 @@ pub(super) fn lower_lua_return_body_exprs(
     let last_index = body.len().checked_sub(1)?;
     let mut lowered = Vec::with_capacity(body.len());
     for (index, expr) in body.into_iter().enumerate() {
-        lowered.push(lower_lua_direct_expr(
-            expr,
+        let mut lowering = LuaDirectLowering::new(
             builder,
             namespace_aliases,
             param_slots,
             capture_slots,
             true,
             callable_return_arities,
+        );
+        lowered.push(lower_lua_direct_expr(
+            expr,
+            &mut lowering,
             index == last_index,
         )?);
     }
@@ -314,16 +318,15 @@ pub(super) fn parse_lua_direct_return_exprs(
         .ok_or_else(|| ParseError::at_line(1, "lua return expression list cannot be empty"))?;
     let mut out = Vec::with_capacity(parts.len());
     for (index, part) in parts.into_iter().enumerate() {
-        let Some(expr) = parse_lua_direct_expr(
-            part.trim(),
+        let mut lowering = LuaDirectLowering::new(
             builder,
             namespace_aliases,
             param_slots,
             capture_slots,
             true,
             callable_return_arities,
-            index == last_index,
-        )?
+        );
+        let Some(expr) = parse_lua_direct_expr(part.trim(), &mut lowering, index == last_index)?
         else {
             return Ok(None);
         };
