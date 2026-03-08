@@ -122,7 +122,7 @@ Usage: pd-edge-http-proxy [options]
 --max-program-bytes <BYTES>           Max program/upload size in bytes (default: 1048576)
 --vm-fuel <UNITS>                     Enable cooperative VM fuel slices per request
 --vm-fuel-check-interval <OPS>        Fuel check interval when --vm-fuel is enabled (default: 1)
---vm-epoch-deadline <TICKS>           Enable cooperative VM epoch slices per request
+--vm-epoch-deadline <TICKS>           Enable cooperative VM epoch slices per request (1 tick = 1ms wall clock)
 --vm-epoch-check-interval <OPS>       Epoch check interval when --vm-epoch-deadline is enabled (default: 1)
 --vm-execution-mode <MODE>            VM execution mode: async|threading (default: async)
 --control-plane-url <URL>             Enable active control-plane RPC client
@@ -140,7 +140,7 @@ Notes:
 - `--vm-fuel` and `--vm-epoch-deadline` are mutually exclusive.
 - `--vm-fuel-check-interval` and `--vm-epoch-check-interval` are mutually exclusive.
 - `--vm-epoch-check-interval` requires `--vm-epoch-deadline`.
-- In epoch mode, the edge runtime advances the shared VM epoch between slices and resumes until the request completes or the debugger takes control.
+- In epoch mode, the edge runtime advances the shared VM epoch every `1ms` with a Tokio timer, so `1` epoch tick maps to `1ms` of wall-clock time in `pd-edge`.
 
 ### `pd-edge-console`
 
@@ -151,7 +151,7 @@ Usage: pd-edge-console [options]
 --max-program-bytes <BYTES>           Max program size in bytes (default: 1048576)
 --vm-fuel <UNITS>                     Enable cooperative VM fuel slices per run
 --vm-fuel-check-interval <OPS>        Fuel check interval when --vm-fuel is enabled (default: 1)
---vm-epoch-deadline <TICKS>           Enable cooperative VM epoch slices per run
+--vm-epoch-deadline <TICKS>           Enable cooperative VM epoch slices per run (1 tick = 1ms wall clock)
 --vm-epoch-check-interval <OPS>       Epoch check interval when --vm-epoch-deadline is enabled (default: 1)
 --control-plane-url <URL>             Enable active control-plane RPC client
 --edge-id <UUID>                      Explicit edge UUID for active control-plane mode

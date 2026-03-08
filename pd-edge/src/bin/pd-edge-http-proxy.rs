@@ -5,8 +5,9 @@ use std::{
 };
 
 use edge::{
-    ActiveControlPlaneConfig, SharedState, VmExecutionConfig, VmExecutionMode, VmInterruptConfig,
-    build_admin_app, build_http_proxy_app, init_logging, spawn_active_control_plane_client,
+    ActiveControlPlaneConfig, SharedState, VM_EPOCH_TICK_INTERVAL_MS, VmExecutionConfig,
+    VmExecutionMode, VmInterruptConfig, build_admin_app, build_http_proxy_app, init_logging,
+    spawn_active_control_plane_client,
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -86,8 +87,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             check_interval,
         } => {
             info!(
-                "vm cooperative scheduling enabled mode=epoch epoch_deadline={} check_interval={}",
-                ticks_per_slice, check_interval
+                "vm cooperative scheduling enabled mode=epoch epoch_deadline={} epoch_tick_ms={} check_interval={}",
+                ticks_per_slice, VM_EPOCH_TICK_INTERVAL_MS, check_interval
             );
         }
     }
@@ -326,7 +327,7 @@ fn print_cli_help() {
         "  --max-program-bytes <BYTES>               Max upload/program size in bytes (default: 1048576)\n",
         "  --vm-fuel <UNITS>                         Enable cooperative VM fuel slices per request\n",
         "  --vm-fuel-check-interval <OPS>            Fuel check interval when --vm-fuel is enabled (default: 1)\n",
-        "  --vm-epoch-deadline <TICKS>               Enable cooperative VM epoch slices per request\n",
+        "  --vm-epoch-deadline <TICKS>               Enable cooperative VM epoch slices per request (1 tick = 1ms wall clock)\n",
         "  --vm-epoch-check-interval <OPS>           Epoch check interval when --vm-epoch-deadline is enabled (default: 1)\n",
         "  --vm-execution-mode <MODE>                VM execution mode: async|threading (default: async)\n",
         "  --control-plane-url <URL>                 Enable active control-plane RPC client\n",

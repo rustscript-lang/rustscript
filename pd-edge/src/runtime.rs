@@ -24,6 +24,7 @@ mod http_plane;
 mod vm_runner;
 
 const MAX_LATENCY_SAMPLES: usize = 4096;
+pub const VM_EPOCH_TICK_INTERVAL_MS: u64 = 1;
 
 pub use http_plane::{build_admin_app, build_http_proxy_app};
 

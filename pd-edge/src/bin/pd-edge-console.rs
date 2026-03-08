@@ -2,23 +2,27 @@ use std::{
     env, fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::mpsc,
     sync::{Arc, Mutex},
-    thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use axum::http::HeaderMap;
 use edge::{
     ActiveControlPlaneConfig, ProxyVmContext, SharedProxyVmContext, SharedState, SharedVmAsyncOps,
-    VmAsyncOpBridge, VmExecutionConfig, VmExecutionMode, VmInterruptConfig,
-    apply_program_from_bytes, compile_edge_source_file, init_logging, new_shared_vm_async_ops,
-    register_host_module, spawn_active_control_plane_client,
+    VM_EPOCH_TICK_INTERVAL_MS, VmAsyncOpBridge, VmExecutionConfig, VmExecutionMode,
+    VmInterruptConfig, apply_program_from_bytes, compile_edge_source_file, init_logging,
+    new_shared_vm_async_ops, register_host_module, spawn_active_control_plane_client,
+};
+use tokio::{
+    runtime::Handle,
+    task::JoinHandle,
+    time::{Instant, MissedTickBehavior, interval_at},
 };
 use tracing::info;
 use uuid::Uuid;
 use vm::{
-    CallOutcome, EpochHandle, HostFunction, Store, Value, Vm, VmError, VmStatus,
-    VmYieldReason, encode_program,
+    CallOutcome, EpochHandle, HostFunction, Store, Value, Vm, VmError, VmStatus, VmYieldReason,
+    encode_program,
 };
 
 #[tokio::main]
@@ -65,8 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             check_interval,
         } => {
             info!(
-                "vm cooperative scheduling enabled mode=epoch epoch_deadline={} check_interval={}",
-                ticks_per_slice, check_interval
+                "vm cooperative scheduling enabled mode=epoch epoch_deadline={} epoch_tick_ms={} check_interval={}",
+                ticks_per_slice, VM_EPOCH_TICK_INTERVAL_MS, check_interval
             );
         }
     }
@@ -271,7 +275,7 @@ fn print_cli_help() {
         "  --max-program-bytes <BYTES>               Max upload/program size in bytes (default: 1048576)\n",
         "  --vm-fuel <UNITS>                         Enable cooperative VM fuel slices per run\n",
         "  --vm-fuel-check-interval <OPS>            Fuel check interval when --vm-fuel is enabled (default: 1)\n",
-        "  --vm-epoch-deadline <TICKS>               Enable cooperative VM epoch slices per run\n",
+        "  --vm-epoch-deadline <TICKS>               Enable cooperative VM epoch slices per run (1 tick = 1ms wall clock)\n",
         "  --vm-epoch-check-interval <OPS>           Epoch check interval when --vm-epoch-deadline is enabled (default: 1)\n",
         "  --control-plane-url <URL>                 Enable active control-plane RPC client\n",
         "  --edge-id <UUID>                          Explicit edge UUID used by active control-plane client\n",
@@ -449,37 +453,28 @@ impl ConsoleVmStoreData {
 }
 
 struct EpochInterruptionDriver {
-    arm_tx: Option<mpsc::Sender<()>>,
-    thread: Option<JoinHandle<()>>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl EpochInterruptionDriver {
-    fn new(epoch_handle: EpochHandle, ticks_per_slice: u64) -> Self {
-        let (arm_tx, arm_rx) = mpsc::channel::<()>();
-        let thread = thread::spawn(move || {
-            while arm_rx.recv().is_ok() {
-                thread::yield_now();
-                epoch_handle.increment_by(ticks_per_slice);
+    fn new(epoch_handle: EpochHandle) -> Self {
+        let task = Handle::current().spawn(async move {
+            let period = Duration::from_millis(VM_EPOCH_TICK_INTERVAL_MS);
+            let mut ticker = interval_at(Instant::now() + period, period);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
+            loop {
+                ticker.tick().await;
+                epoch_handle.increment();
             }
         });
-        Self {
-            arm_tx: Some(arm_tx),
-            thread: Some(thread),
-        }
-    }
-
-    fn arm(&self) {
-        if let Some(arm_tx) = &self.arm_tx {
-            let _ = arm_tx.send(());
-        }
+        Self { task: Some(task) }
     }
 }
 
 impl Drop for EpochInterruptionDriver {
     fn drop(&mut self) {
-        self.arm_tx.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(task) = self.task.take() {
+            task.abort();
         }
     }
 }
@@ -516,7 +511,10 @@ async fn run_loaded_program_once(state: &SharedState) -> Result<(), Box<dyn std:
             check_interval,
         } => {
             store.set_epoch_check_interval(check_interval)?;
-            Some((ticks_per_slice, EpochInterruptionDriver::new(store.vm().epoch_handle(), ticks_per_slice)))
+            Some((
+                ticks_per_slice,
+                EpochInterruptionDriver::new(store.vm().epoch_handle()),
+            ))
         }
     };
 
@@ -526,9 +524,8 @@ async fn run_loaded_program_once(state: &SharedState) -> Result<(), Box<dyn std:
     register_console_host_module(store.vm_mut(), async_ops)?;
 
     loop {
-        if let Some((ticks_per_slice, driver)) = &epoch_driver {
+        if let Some((ticks_per_slice, _driver)) = &epoch_driver {
             store.set_epoch_deadline(*ticks_per_slice)?;
-            driver.arm();
         }
         match store.run() {
             Ok(VmStatus::Halted) => {

@@ -1,15 +1,17 @@
-use std::{
-    future::Future,
-    pin::Pin,
-    sync::mpsc,
-    thread::{self, JoinHandle},
-};
+use std::{future::Future, pin::Pin, time::Duration};
 
 use axum::http::HeaderMap;
+use tokio::{
+    runtime::Handle,
+    task::JoinHandle,
+    time::{Instant, MissedTickBehavior, interval_at},
+};
 use tracing::warn;
 use vm::{EpochHandle, Store, Vm, VmStatus, VmYieldReason};
 
-use super::{LoadedProgram, VmExecutionConfig, VmExecutionMode, VmInterruptConfig};
+use super::{
+    LoadedProgram, VM_EPOCH_TICK_INTERVAL_MS, VmExecutionConfig, VmExecutionMode, VmInterruptConfig,
+};
 use crate::{
     abi_impl::{
         SharedProxyVmContext, SharedVmAsyncOps, VmAsyncOpBridge, VmExecutionOutcome,
@@ -56,7 +58,9 @@ struct ThreadingModeRunner;
 
 enum ActiveVmInterrupt {
     None,
-    Fuel { fuel_per_yield: u64 },
+    Fuel {
+        fuel_per_yield: u64,
+    },
     Epoch {
         ticks_per_slice: u64,
         driver: EpochInterruptionDriver,
@@ -64,37 +68,28 @@ enum ActiveVmInterrupt {
 }
 
 struct EpochInterruptionDriver {
-    arm_tx: Option<mpsc::Sender<()>>,
-    thread: Option<JoinHandle<()>>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl EpochInterruptionDriver {
-    fn new(epoch_handle: EpochHandle, ticks_per_slice: u64) -> Self {
-        let (arm_tx, arm_rx) = mpsc::channel::<()>();
-        let thread = thread::spawn(move || {
-            while arm_rx.recv().is_ok() {
-                thread::yield_now();
-                epoch_handle.increment_by(ticks_per_slice);
+    fn new(epoch_handle: EpochHandle) -> Self {
+        let task = Handle::current().spawn(async move {
+            let period = Duration::from_millis(VM_EPOCH_TICK_INTERVAL_MS);
+            let mut ticker = interval_at(Instant::now() + period, period);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
+            loop {
+                ticker.tick().await;
+                epoch_handle.increment();
             }
         });
-        Self {
-            arm_tx: Some(arm_tx),
-            thread: Some(thread),
-        }
-    }
-
-    fn arm(&self) {
-        if let Some(arm_tx) = &self.arm_tx {
-            let _ = arm_tx.send(());
-        }
+        Self { task: Some(task) }
     }
 }
 
 impl Drop for EpochInterruptionDriver {
     fn drop(&mut self) {
-        self.arm_tx.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(task) = self.task.take() {
+            task.abort();
         }
     }
 }
@@ -396,7 +391,7 @@ fn configure_vm_interrupt(
             vm_store
                 .set_epoch_check_interval(check_interval)
                 .map_err(VmExecutionError::Vm)?;
-            let driver = EpochInterruptionDriver::new(vm_store.vm().epoch_handle(), ticks_per_slice);
+            let driver = EpochInterruptionDriver::new(vm_store.vm().epoch_handle());
             Ok(ActiveVmInterrupt::Epoch {
                 ticks_per_slice,
                 driver,
@@ -412,7 +407,7 @@ fn arm_epoch_interrupt_if_enabled(
 ) -> Result<(), VmExecutionError> {
     let ActiveVmInterrupt::Epoch {
         ticks_per_slice,
-        driver,
+        driver: _driver,
     } = interrupt
     else {
         return Ok(());
@@ -423,7 +418,6 @@ fn arm_epoch_interrupt_if_enabled(
     vm_store
         .set_epoch_deadline(*ticks_per_slice)
         .map_err(VmExecutionError::Vm)?;
-    driver.arm();
     Ok(())
 }
 
@@ -433,10 +427,9 @@ fn handle_interrupt_yield(
     profile: &mut VmExecutionProfile,
 ) -> Result<(), VmExecutionError> {
     match (interrupt, vm_store.vm().last_yield_reason()) {
-        (
-            ActiveVmInterrupt::Fuel { fuel_per_yield },
-            Some(VmYieldReason::Fuel),
-        ) if vm_store.get_fuel() == Some(0) => {
+        (ActiveVmInterrupt::Fuel { fuel_per_yield }, Some(VmYieldReason::Fuel))
+            if vm_store.get_fuel() == Some(0) =>
+        {
             vm_store
                 .recharge(*fuel_per_yield)
                 .map_err(VmExecutionError::Vm)?;
@@ -510,16 +503,18 @@ fn tail_profile_threshold_us() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use axum::http::HeaderMap;
+    use tokio::time::sleep;
     use vm::compile_source;
 
     use super::*;
     use crate::{
-        ProxyVmContext,
-        abi_impl::RateLimiterStore,
-        debug_session::new_debug_session_store,
+        ProxyVmContext, abi_impl::RateLimiterStore, debug_session::new_debug_session_store,
     };
 
     fn no_host_modules(
@@ -530,8 +525,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn threading_epoch_interrupt_yields_and_completes() {
+    #[tokio::test]
+    async fn threading_epoch_interrupt_yields_and_completes() {
         let compiled = compile_source(
             r#"
                 let mut total = 0;
@@ -555,25 +550,38 @@ mod tests {
             request_path: "/".to_string(),
             request_id: "epoch-test".to_string(),
         };
-
-        let (_outcome, profile) = run_vm_threading(
-            store,
-            new_debug_session_store(),
-            debug,
-            no_host_modules,
-            VmExecutionConfig {
-                interrupt: VmInterruptConfig::Epoch {
-                    ticks_per_slice: 1,
-                    check_interval: 1,
-                },
-                execution_mode: VmExecutionMode::Threading,
+        let debug_session = new_debug_session_store();
+        let execution = VmExecutionConfig {
+            interrupt: VmInterruptConfig::Epoch {
+                ticks_per_slice: 1,
+                check_interval: 1,
             },
-        )
+            execution_mode: VmExecutionMode::Threading,
+        };
+
+        let (_outcome, profile) = tokio::task::spawn_blocking(move || {
+            run_vm_threading(store, debug_session, debug, no_host_modules, execution)
+        })
+        .await
+        .expect("threading task should complete")
         .expect("threading execution should succeed");
 
         assert!(
             profile.vm_yield_count > 0,
             "epoch scheduling should yield at least once"
+        );
+    }
+
+    #[tokio::test]
+    async fn epoch_interrupt_driver_advances_epoch_by_wall_clock() {
+        let epoch_handle = EpochHandle::default();
+        let _driver = EpochInterruptionDriver::new(epoch_handle.clone());
+
+        sleep(Duration::from_millis(10)).await;
+
+        assert!(
+            epoch_handle.current() > 0,
+            "epoch ticker should advance without explicit wake arming"
         );
     }
 }
