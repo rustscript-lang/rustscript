@@ -210,12 +210,12 @@ fn validate_rejects_truncated_operands_for_ldc_call_and_branches() {
 
 #[test]
 fn validate_rejects_builtin_call_arity_mismatch() {
-    // Builtin len() currently lives at 0xFFE0 and expects arity 1.
-    let program = Program::new(vec![], vec![OpCode::Call as u8, 0xE0, 0xFF, 0x02]);
+    // Builtin len() currently lives at 0xFFB0 and expects arity 1.
+    let program = Program::new(vec![], vec![OpCode::Call as u8, 0xB0, 0xFF, 0x02]);
     assert!(matches!(
         validate_program(&program, 0),
         Err(ValidationError::InvalidCallArity {
-            index: 0xFFE0,
+            index: 0xFFB0,
             expected: 1,
             got: 2,
             ..

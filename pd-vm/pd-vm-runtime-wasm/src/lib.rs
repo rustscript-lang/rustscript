@@ -822,6 +822,13 @@ mod tests {
             catalog
                 .rustscript
                 .iter()
+                .any(|entry| entry.label == "math::sqrt"),
+            "expected RustScript math namespace completion entry"
+        );
+        assert!(
+            catalog
+                .rustscript
+                .iter()
                 .any(|entry| entry.label == "re::match"),
             "expected RustScript regex namespace completion entry"
         );

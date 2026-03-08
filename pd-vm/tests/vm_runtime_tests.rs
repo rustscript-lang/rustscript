@@ -184,6 +184,32 @@ fn namespaced_builtin_json_encode_call_can_be_overridden_by_host_binding() {
 }
 
 #[test]
+fn namespaced_builtin_math_call_can_be_overridden_by_host_binding() {
+    struct MathSqrtOverride;
+
+    impl HostFunction for MathSqrtOverride {
+        fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            assert_eq!(args, &[Value::Int(81)]);
+            Ok(CallOutcome::Return(vec![Value::Float(7.0)]))
+        }
+    }
+
+    let compiled = compile_source(
+        r#"
+        use math;
+        math::sqrt(81);
+    "#,
+    )
+    .expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.bind_function("math::sqrt", Box::new(MathSqrtOverride));
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Float(7.0)]);
+}
+
+#[test]
 fn runtime_sleep_host_import_is_available_by_default() {
     let compiled = compile_source(
         r#"
@@ -270,7 +296,7 @@ fn json_encode_rejects_non_string_map_keys() {
 
 #[test]
 fn json_encode_rejects_duplicate_map_keys() {
-    const BUILTIN_JSON_ENCODE: u16 = 0xFFF7;
+    const BUILTIN_JSON_ENCODE: u16 = 0xFFC7;
 
     let duplicate_map = Value::map(vec![
         (Value::string("k"), Value::Int(1)),
@@ -966,8 +992,8 @@ fn map_equality_ignores_entry_order() {
 
 #[test]
 fn get_and_set_use_the_first_duplicate_map_entry() {
-    const BUILTIN_GET: u16 = 0xFFE6;
-    const BUILTIN_SET: u16 = 0xFFE7;
+    const BUILTIN_GET: u16 = 0xFFB6;
+    const BUILTIN_SET: u16 = 0xFFB7;
 
     let map = Value::map(vec![
         (Value::string("k"), Value::Int(1)),
@@ -1010,7 +1036,7 @@ fn get_and_set_use_the_first_duplicate_map_entry() {
 
 #[test]
 fn set_rejects_sparse_array_indexes() {
-    const BUILTIN_SET: u16 = 0xFFE7;
+    const BUILTIN_SET: u16 = 0xFFB7;
 
     let constants = vec![
         Value::array(vec![Value::Int(10), Value::Int(20)]),

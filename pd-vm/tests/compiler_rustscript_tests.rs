@@ -189,6 +189,24 @@ fn rustscript_builtin_and_namespace_runtime_cases_work() {
             expected_stack: vec![Value::Int(1)],
             expected_locals: None,
         },
+        RuntimeCase {
+            name: "math namespace builtins provide numeric helpers",
+            source: r#"
+                use math;
+                let root = math::sqrt(81);
+                let angle = math::to_radians(180);
+                let diff = math::abs(angle - math::pi());
+                let growth = math::powi(2, 5);
+                if math::is_finite(root) && diff < 0.0000001 && growth == 32.0 {
+                    1;
+                } else {
+                    0;
+                }
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(1)],
+            expected_locals: None,
+        },
     ];
     run_runtime_cases(&cases);
 }
@@ -247,6 +265,49 @@ fn compile_source_file_preserves_jit_builtin_namespace_use_directive() {
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(2)]);
+
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_dir(root);
+}
+
+#[test]
+fn compile_source_file_preserves_math_builtin_namespace_use_directive() {
+    let unique = format!(
+        "vm_rustscript_math_builtin_namespace_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).expect("temp module root should be created");
+
+    let main_path = root.join("main.rss");
+    std::fs::write(
+        &main_path,
+        r#"
+        use math;
+        let out = math::sqrt(81);
+        out;
+    "#,
+    )
+    .expect("main source should write");
+
+    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    assert!(
+        compiled
+            .program
+            .imports
+            .iter()
+            .all(|import| !import.name.starts_with("math::")),
+        "math namespace calls should lower as builtins, not host imports"
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Float(9.0)]);
 
     let _ = std::fs::remove_file(main_path);
     let _ = std::fs::remove_dir(root);

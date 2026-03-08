@@ -1,37 +1,53 @@
-// Numeric helpers implemented in pure RustScript.
+use math as native_math;
+
+// Numeric helpers built on the VM math namespace plus a few pure RustScript utilities.
+
+pub fn pi() {
+    native_math::pi();
+}
+
+pub fn tau() {
+    native_math::tau();
+}
+
+pub fn e() {
+    native_math::e();
+}
+
+pub fn epsilon() {
+    native_math::epsilon();
+}
+
+pub fn inf() {
+    native_math::inf();
+}
+
+pub fn neg_inf() {
+    native_math::neg_inf();
+}
+
+pub fn nan() {
+    native_math::nan();
+}
 
 pub fn abs(value) {
-    let mut out = value;
-    if value < 0 {
-        out = -value;
-    }
-    out;
+    native_math::abs(value);
 }
 
 pub fn min(lhs, rhs) {
-    let mut out = rhs;
-    if lhs < rhs || lhs == rhs {
-        out = lhs;
-    }
-    out;
+    native_math::min(lhs, rhs);
 }
 
 pub fn max(lhs, rhs) {
-    let mut out = rhs;
-    if lhs > rhs || lhs == rhs {
-        out = lhs;
-    }
-    out;
+    native_math::max(lhs, rhs);
 }
 
 pub fn clamp(value, lower, upper) {
-    let mut out = value;
-    if value < lower {
-        out = lower;
-    } else if value > upper {
-        out = upper;
-    }
-    out;
+    native_math::clamp(value, lower, upper);
+}
+
+pub fn signum(value) {
+    native_math::signum(value);
 }
 
 pub fn sign(value) {
@@ -69,33 +85,149 @@ pub fn sum(values) {
 }
 
 pub fn floor(value) {
-    let mut out = value;
-    let mut value_type = type(value);
-    if value_type == "float" {
-        let mut remainder = value % 1;
-        if remainder == 0 {
-            out = value;
-        } else if value > 0 {
-            out = value - remainder;
-        } else {
-            out = value - remainder - 1;
-        }
-    }
-    out;
+    native_math::floor(value);
 }
 
 pub fn ceil(value) {
-    let mut out = value;
-    let mut value_type = type(value);
-    if value_type == "float" {
-        let mut remainder = value % 1;
-        if remainder == 0 {
-            out = value;
-        } else if value > 0 {
-            out = value - remainder + 1;
-        } else {
-            out = value - remainder;
-        }
-    }
-    out;
+    native_math::ceil(value);
+}
+
+pub fn round(value) {
+    native_math::round(value);
+}
+
+pub fn trunc(value) {
+    native_math::trunc(value);
+}
+
+pub fn fract(value) {
+    native_math::fract(value);
+}
+
+pub fn sqrt(value) {
+    native_math::sqrt(value);
+}
+
+pub fn cbrt(value) {
+    native_math::cbrt(value);
+}
+
+pub fn powf(value, exponent) {
+    native_math::powf(value, exponent);
+}
+
+pub fn powi(value, exponent) {
+    native_math::powi(value, exponent);
+}
+
+pub fn exp(value) {
+    native_math::exp(value);
+}
+
+pub fn exp2(value) {
+    native_math::exp2(value);
+}
+
+pub fn ln(value) {
+    native_math::ln(value);
+}
+
+pub fn ln_1p(value) {
+    native_math::ln_1p(value);
+}
+
+pub fn log(value, base) {
+    native_math::log(value, base);
+}
+
+pub fn log2(value) {
+    native_math::log2(value);
+}
+
+pub fn log10(value) {
+    native_math::log10(value);
+}
+
+pub fn sin(value) {
+    native_math::sin(value);
+}
+
+pub fn cos(value) {
+    native_math::cos(value);
+}
+
+pub fn tan(value) {
+    native_math::tan(value);
+}
+
+pub fn asin(value) {
+    native_math::asin(value);
+}
+
+pub fn acos(value) {
+    native_math::acos(value);
+}
+
+pub fn atan(value) {
+    native_math::atan(value);
+}
+
+pub fn atan2(y, x) {
+    native_math::atan2(y, x);
+}
+
+pub fn sinh(value) {
+    native_math::sinh(value);
+}
+
+pub fn cosh(value) {
+    native_math::cosh(value);
+}
+
+pub fn tanh(value) {
+    native_math::tanh(value);
+}
+
+pub fn hypot(lhs, rhs) {
+    native_math::hypot(lhs, rhs);
+}
+
+pub fn copysign(value, sign_value) {
+    native_math::copysign(value, sign_value);
+}
+
+pub fn mul_add(a, b, c) {
+    native_math::mul_add(a, b, c);
+}
+
+pub fn to_degrees(value) {
+    native_math::to_degrees(value);
+}
+
+pub fn to_radians(value) {
+    native_math::to_radians(value);
+}
+
+pub fn deg(value) {
+    to_degrees(value);
+}
+
+pub fn rad(value) {
+    to_radians(value);
+}
+
+pub fn fmod(lhs, rhs) {
+    lhs % rhs;
+}
+
+pub fn is_nan(value) {
+    native_math::is_nan(value);
+}
+
+pub fn is_infinite(value) {
+    native_math::is_infinite(value);
+}
+
+pub fn is_finite(value) {
+    native_math::is_finite(value);
 }
