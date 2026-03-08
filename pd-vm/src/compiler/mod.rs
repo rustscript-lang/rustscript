@@ -305,7 +305,48 @@ impl CompileSourceFileOptions {
 }
 
 fn normalize_import_spec(spec: String) -> String {
-    spec.trim().replace('\\', "/")
+    normalize_import_key(spec.trim())
+}
+
+fn normalize_import_key(spec: &str) -> String {
+    let normalized = spec.replace('\\', "/");
+    let (prefix, remainder) = split_windows_prefix(&normalized);
+    let absolute = remainder.starts_with('/');
+    let mut segments = Vec::<&str>::new();
+
+    for segment in remainder.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            match segments.last().copied() {
+                Some(existing) if existing != ".." => {
+                    segments.pop();
+                }
+                _ if !absolute => segments.push(".."),
+                _ => {}
+            }
+            continue;
+        }
+        segments.push(segment);
+    }
+
+    let mut out = String::new();
+    out.push_str(prefix);
+    if absolute {
+        out.push('/');
+    }
+    out.push_str(&segments.join("/"));
+    out
+}
+
+fn split_windows_prefix(input: &str) -> (&str, &str) {
+    let bytes = input.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        (&input[..2], &input[2..])
+    } else {
+        ("", input)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -430,6 +471,19 @@ pub fn compile_source_with_flavor_and_options(
     })
 }
 
+pub fn compile_source_at_path_with_flavor_and_options(
+    path: impl AsRef<Path>,
+    source: &str,
+    flavor: SourceFlavor,
+    options: CompileSourceFileOptions,
+) -> Result<CompiledProgram, SourcePathError> {
+    let path = path.as_ref().to_path_buf();
+    let source_owned = source.to_string();
+    run_with_compiler_stack(move || {
+        compile_source_at_path_with_flavor_and_options_impl(&path, &source_owned, flavor, &options)
+    })
+}
+
 fn compile_source_with_flavor_and_behavior(
     source: &str,
     flavor: SourceFlavor,
@@ -477,6 +531,24 @@ fn compile_source_with_flavor_and_options_impl(
     let path = virtual_inmemory_entry_path(flavor);
     let (_root_parse_source, units) =
         source_loader::load_units_for_source_file(&path, flavor, source, options)?;
+    let merged = merge_units(units)?;
+    compile_parsed_output(
+        source.to_string(),
+        merged,
+        CompileBehavior::DEFAULT,
+        matches!(flavor, SourceFlavor::RustScript),
+    )
+    .map_err(SourcePathError::Source)
+}
+
+fn compile_source_at_path_with_flavor_and_options_impl(
+    path: &Path,
+    source: &str,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+) -> Result<CompiledProgram, SourcePathError> {
+    let (_root_parse_source, units) =
+        source_loader::load_units_for_source_file(path, flavor, source, options)?;
     let merged = merge_units(units)?;
     compile_parsed_output(
         source.to_string(),

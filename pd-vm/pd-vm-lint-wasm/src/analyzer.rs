@@ -1,5 +1,8 @@
+use std::path::Path;
+
 use vm::{
-    SourceError, SourceFlavor, SourceMap, SourcePathError, compile_source_with_flavor_and_options,
+    CompileSourceFileOptions, SourceError, SourceFlavor, SourceMap, SourcePathError,
+    compile_source_at_path_with_flavor_and_options, compile_source_with_flavor_and_options,
     render_source_error,
 };
 
@@ -35,8 +38,29 @@ impl LintReport {
 }
 
 pub fn lint_source_with_flavor(source: &str, flavor: SourceFlavor) -> LintReport {
-    match compile_source_with_flavor_and_options(source, flavor, embedded_stdlib_compile_options())
-    {
+    lint_compile_result(
+        source,
+        compile_source_with_flavor_and_options(source, flavor, embedded_stdlib_compile_options()),
+    )
+}
+
+pub fn lint_source_with_flavor_at_path(
+    source: &str,
+    path: &Path,
+    flavor: SourceFlavor,
+    options: CompileSourceFileOptions,
+) -> LintReport {
+    lint_compile_result(
+        source,
+        compile_source_at_path_with_flavor_and_options(path, source, flavor, options),
+    )
+}
+
+fn lint_compile_result(
+    source: &str,
+    result: Result<vm::CompiledProgram, SourcePathError>,
+) -> LintReport {
+    match result {
         Ok(_) => LintReport::ok(),
         Err(SourcePathError::Source(SourceError::Parse(err))) => {
             let mut source_map = SourceMap::new();

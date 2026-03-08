@@ -1,5 +1,6 @@
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const { fileURLToPath } = require("node:url");
 const { TextDecoder, TextEncoder } = require("node:util");
 const {
   CompletionItemKind,
@@ -229,8 +230,7 @@ async function validateDocument(document) {
 }
 
 async function computeDiagnostics(document) {
-  const source = document.getText();
-  const lintDiagnostics = await runWasmLint(source);
+  const lintDiagnostics = await runWasmLint(document);
   if (lintDiagnostics) {
     return lintDiagnostics
       .map((diagnostic) => toLspDiagnostic(document, diagnostic))
@@ -587,28 +587,51 @@ function mapCompletionKind(kind) {
   return CompletionItemKind.Snippet;
 }
 
-async function runWasmLint(source) {
+async function runWasmLint(document) {
   const wasm = await ensureWasmLoaded();
   if (!wasm) {
     return null;
   }
 
+  const source = document.getText();
+  const documentPath = documentPathFromUri(document.uri);
+  const moduleOverrides = documentPath
+    ? await collectRustScriptModuleOverrides(documentPath, source)
+    : [];
   const sourceBytes = encoder.encode(source);
   const flavorBytes = encoder.encode(FLAVOR);
+  const pathBytes = encoder.encode(documentPath || "");
+  const overridesBytes = encoder.encode(JSON.stringify(moduleOverrides));
   let sourcePtr = 0;
   let flavorPtr = 0;
+  let pathPtr = 0;
+  let overridesPtr = 0;
   let resultPtr = 0;
   let resultLen = 0;
 
   try {
     sourcePtr = writeBytes(wasm, sourceBytes);
     flavorPtr = writeBytes(wasm, flavorBytes);
-    const packed = wasm.lint_source_json(
-      sourcePtr,
-      sourceBytes.length,
-      flavorPtr,
-      flavorBytes.length
-    );
+    pathPtr = writeBytes(wasm, pathBytes);
+    overridesPtr = writeBytes(wasm, overridesBytes);
+    const packed =
+      typeof wasm.lint_source_json_with_context === "function"
+        ? wasm.lint_source_json_with_context(
+            sourcePtr,
+            sourceBytes.length,
+            flavorPtr,
+            flavorBytes.length,
+            pathPtr,
+            pathBytes.length,
+            overridesPtr,
+            overridesBytes.length
+          )
+        : wasm.lint_source_json(
+            sourcePtr,
+            sourceBytes.length,
+            flavorPtr,
+            flavorBytes.length
+          );
     const unpacked = unpackPtrLen(packed);
     resultPtr = unpacked.ptr;
     resultLen = unpacked.len;
@@ -629,8 +652,197 @@ async function runWasmLint(source) {
   } finally {
     freeBytes(wasm, sourcePtr, sourceBytes.length);
     freeBytes(wasm, flavorPtr, flavorBytes.length);
+    freeBytes(wasm, pathPtr, pathBytes.length);
+    freeBytes(wasm, overridesPtr, overridesBytes.length);
     freeBytes(wasm, resultPtr, resultLen);
   }
+}
+
+function documentPathFromUri(uri) {
+  if (!uri) {
+    return "";
+  }
+  try {
+    return fileURLToPath(uri);
+  } catch (error) {
+    connection.console.warn(`Unable to resolve document URI '${uri}' to a file path: ${errorMessage(error)}`);
+    return "";
+  }
+}
+
+async function collectRustScriptModuleOverrides(entryPath, source) {
+  const seen = new Set([normalizeModuleOverridePath(entryPath)]);
+  const pending = [{ filePath: entryPath, source }];
+  const overrides = [];
+
+  while (pending.length > 0) {
+    const current = pending.pop();
+    const specs = parseRustScriptImportSpecs(current.source);
+    for (const spec of specs) {
+      const resolved = resolveRustScriptImportPath(current.filePath, spec);
+      if (!resolved) {
+        continue;
+      }
+
+      const normalizedPath = normalizeModuleOverridePath(resolved);
+      if (seen.has(normalizedPath)) {
+        continue;
+      }
+
+      let moduleSource = "";
+      try {
+        moduleSource = await fs.readFile(resolved, "utf8");
+      } catch (error) {
+        if (shouldTreatMissingModuleAsHostNamespace(spec, error)) {
+          continue;
+        }
+        connection.console.warn(
+          `Falling back to placeholder source for '${spec}' (${normalizedPath}): ${errorMessage(error)}`
+        );
+      }
+
+      seen.add(normalizedPath);
+      overrides.push({
+        path: normalizedPath,
+        source: moduleSource
+      });
+
+      if (moduleSource.length > 0) {
+        pending.push({
+          filePath: resolved,
+          source: moduleSource
+        });
+      }
+    }
+  }
+
+  return overrides;
+}
+
+function parseRustScriptImportSpecs(source) {
+  const specs = [];
+  const lines = source.split(/\r?\n/);
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line.startsWith("use ")) {
+      continue;
+    }
+
+    const semicolonIndex = line.indexOf(";");
+    if (semicolonIndex < 0) {
+      continue;
+    }
+
+    const directiveBody = line.slice("use ".length, semicolonIndex).trim();
+    const spec = rustScriptUseDirectiveToSpec(directiveBody);
+    if (spec) {
+      specs.push(spec);
+    }
+  }
+  return specs;
+}
+
+function rustScriptUseDirectiveToSpec(directiveBody) {
+  if (!directiveBody) {
+    return null;
+  }
+  if (directiveBody.endsWith("::*")) {
+    return rustScriptModulePathToSpec(directiveBody.slice(0, -3).trim());
+  }
+
+  const listIndex = directiveBody.indexOf("::{");
+  if (listIndex >= 0 && directiveBody.endsWith("}")) {
+    return rustScriptModulePathToSpec(directiveBody.slice(0, listIndex).trim());
+  }
+
+  const aliasIndex = directiveBody.lastIndexOf(" as ");
+  if (aliasIndex >= 0) {
+    return rustScriptModulePathToSpec(directiveBody.slice(0, aliasIndex).trim());
+  }
+
+  return rustScriptModulePathToSpec(directiveBody);
+}
+
+function rustScriptModulePathToSpec(modulePath) {
+  if (!modulePath) {
+    return null;
+  }
+
+  const segments = modulePath.split("::").map((segment) => segment.trim());
+  if (segments.length === 0 || segments.some((segment) => segment.length === 0)) {
+    return null;
+  }
+
+  const pathSegments = [];
+  let cursor = 0;
+  while (cursor < segments.length) {
+    const segment = segments[cursor];
+    if (segment === "self") {
+      cursor += 1;
+      continue;
+    }
+    if (segment === "super") {
+      pathSegments.push("..");
+      cursor += 1;
+      continue;
+    }
+    if (segment === "crate") {
+      return null;
+    }
+    break;
+  }
+
+  if (cursor >= segments.length) {
+    return null;
+  }
+
+  for (; cursor < segments.length; cursor += 1) {
+    const segment = segments[cursor];
+    if (!isRustScriptIdent(segment)) {
+      return null;
+    }
+    pathSegments.push(segment);
+  }
+
+  let spec = pathSegments.join("/");
+  if (!spec.endsWith(".rss")) {
+    spec += ".rss";
+  }
+  return spec;
+}
+
+function resolveRustScriptImportPath(basePath, spec) {
+  if (!spec || !spec.endsWith(".rss")) {
+    return null;
+  }
+  if (path.isAbsolute(spec)) {
+    return path.resolve(spec);
+  }
+  return path.resolve(path.dirname(basePath), spec);
+}
+
+function normalizeModuleOverridePath(filePath) {
+  return path.resolve(filePath).replace(/\\/g, "/");
+}
+
+function shouldTreatMissingModuleAsHostNamespace(spec, error) {
+  return isVirtualHostNamespaceSpec(spec) && ["ENOENT", "ENOTDIR"].includes(error?.code || "");
+}
+
+function isVirtualHostNamespaceSpec(spec) {
+  return hostNamespaceRootFromSpec(spec) !== null;
+}
+
+function hostNamespaceRootFromSpec(spec) {
+  if (!spec || spec.includes("/")) {
+    return null;
+  }
+  const stem = spec.endsWith(".rss") ? spec.slice(0, -4) : spec;
+  return isRustScriptIdent(stem) ? stem : null;
+}
+
+function isRustScriptIdent(value) {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 }
 
 async function readCompletionCatalog(wasm) {

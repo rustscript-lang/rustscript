@@ -2,10 +2,12 @@ mod analyzer;
 mod completions;
 mod stdlib;
 
-use serde::Serialize;
-use vm::SourceFlavor;
+use std::path::Path;
 
-use crate::analyzer::{LintReport, lint_source_with_flavor};
+use serde::{Deserialize, Serialize};
+use vm::{CompileSourceFileOptions, SourceFlavor};
+
+use crate::analyzer::{LintReport, lint_source_with_flavor, lint_source_with_flavor_at_path};
 use crate::completions::{CompletionCatalog, build_completion_catalog};
 
 #[derive(Serialize)]
@@ -27,6 +29,12 @@ struct LintSpanJson {
     start_col: usize,
     end_line: usize,
     end_col: usize,
+}
+
+#[derive(Deserialize)]
+struct ModuleOverrideInput {
+    path: String,
+    source: String,
 }
 
 fn parse_flavor(raw: &str) -> SourceFlavor {
@@ -133,17 +141,75 @@ pub extern "C" fn lint_source_json(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn lint_source_json_with_context(
+    source_ptr: u32,
+    source_len: u32,
+    flavor_ptr: u32,
+    flavor_len: u32,
+    path_ptr: u32,
+    path_len: u32,
+    overrides_ptr: u32,
+    overrides_len: u32,
+) -> u64 {
+    let source_bytes = unpack_input(source_ptr, source_len);
+    let source = match std::str::from_utf8(source_bytes) {
+        Ok(value) => value,
+        Err(err) => return leak_bytes(invalid_utf8_lint_response(err)),
+    };
+
+    let flavor_raw = std::str::from_utf8(unpack_input(flavor_ptr, flavor_len)).unwrap_or("rss");
+    let flavor = parse_flavor(flavor_raw);
+    let path_raw = std::str::from_utf8(unpack_input(path_ptr, path_len)).unwrap_or("");
+    let overrides_raw =
+        std::str::from_utf8(unpack_input(overrides_ptr, overrides_len)).unwrap_or("[]");
+    let options = parse_module_overrides(overrides_raw);
+
+    let report = if path_raw.trim().is_empty() {
+        lint_source_with_flavor(source, flavor)
+    } else {
+        lint_source_with_flavor_at_path(source, Path::new(path_raw), flavor, options)
+    };
+    leak_bytes(report_to_json(report))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn completion_catalog_json() -> u64 {
     leak_bytes(completion_catalog_to_json(build_completion_catalog()))
 }
 
+fn invalid_utf8_lint_response(err: std::str::Utf8Error) -> Vec<u8> {
+    let report = LintResponse {
+        diagnostics: vec![LintDiagnostic {
+            line: 1,
+            message: format!("invalid utf-8 source: {err}"),
+            span: None,
+            rendered: format!("invalid utf-8 source: {err}"),
+        }],
+    };
+    serde_json::to_vec(&report).unwrap_or_else(|_| b"{\"diagnostics\":[]}".to_vec())
+}
+
+fn parse_module_overrides(raw: &str) -> CompileSourceFileOptions {
+    let mut options = stdlib::embedded_stdlib_compile_options();
+    let parsed = serde_json::from_str::<Vec<ModuleOverrideInput>>(raw).unwrap_or_default();
+    for entry in parsed {
+        if entry.path.trim().is_empty() {
+            continue;
+        }
+        options.set_module_override_source(entry.path, entry.source);
+    }
+    options
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use crate::completions::build_completion_catalog;
 
     use super::parse_flavor;
-    use crate::analyzer::lint_source_with_flavor;
-    use vm::SourceFlavor;
+    use crate::analyzer::{lint_source_with_flavor, lint_source_with_flavor_at_path};
+    use vm::{CompileSourceFileOptions, SourceFlavor};
 
     #[test]
     fn parse_flavor_accepts_aliases() {
@@ -250,5 +316,69 @@ mod tests {
             "expected move/borrow wording in diagnostics, got: {:?}",
             report.diagnostics
         );
+    }
+
+    #[test]
+    fn lint_with_context_resolves_relative_imports_from_real_document_path() {
+        let path = Path::new("workspace/examples/list_comp_test.rss");
+        let source = r#"
+            use super::stdlib::rss::iter::{range, map, filter};
+            let values = filter(map(range(4), |value| value + 1), |value| value > 2);
+            values;
+        "#;
+        let mut options = CompileSourceFileOptions::new();
+        options.set_module_override_source(
+            normalized_override_path(path, "../stdlib/rss/iter.rss"),
+            include_str!("../../stdlib/rss/iter.rss"),
+        );
+
+        let report =
+            lint_source_with_flavor_at_path(source, path, SourceFlavor::RustScript, options);
+        assert!(
+            report.diagnostics.is_empty(),
+            "expected relative import lint to pass with real path context, got {:?}",
+            report.diagnostics
+        );
+    }
+
+    fn normalized_override_path(base_path: &Path, relative_spec: &str) -> String {
+        let parent = base_path
+            .parent()
+            .expect("fixture path should have a parent");
+        normalize_path_string(parent.join(relative_spec))
+    }
+
+    fn normalize_path_string(path: PathBuf) -> String {
+        let raw = path.to_string_lossy().replace('\\', "/");
+        let (prefix, remainder) = if raw.len() >= 2 && raw.as_bytes()[1] == b':' {
+            (&raw[..2], &raw[2..])
+        } else {
+            ("", raw.as_str())
+        };
+        let absolute = remainder.starts_with('/');
+        let mut segments = Vec::<&str>::new();
+        for segment in remainder.split('/') {
+            if segment.is_empty() || segment == "." {
+                continue;
+            }
+            if segment == ".." {
+                match segments.last().copied() {
+                    Some(existing) if existing != ".." => {
+                        segments.pop();
+                    }
+                    _ if !absolute => segments.push(".."),
+                    _ => {}
+                }
+                continue;
+            }
+            segments.push(segment);
+        }
+        let mut out = String::new();
+        out.push_str(prefix);
+        if absolute {
+            out.push('/');
+        }
+        out.push_str(&segments.join("/"));
+        out
     }
 }
