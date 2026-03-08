@@ -128,6 +128,7 @@ pub enum RemoteDebugCommand {
     PrintVar { name: String },
     Locals,
     Stack,
+    Text { command: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

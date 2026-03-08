@@ -5,8 +5,8 @@ use std::{
 };
 
 use edge::{
-    ActiveControlPlaneConfig, SharedState, VmExecutionConfig, VmExecutionMode, build_admin_app,
-    build_http_proxy_app, init_logging, spawn_active_control_plane_client,
+    ActiveControlPlaneConfig, SharedState, VmExecutionConfig, VmExecutionMode, VmInterruptConfig,
+    build_admin_app, build_http_proxy_app, init_logging, spawn_active_control_plane_client,
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -64,18 +64,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let poll_interval_ms = cli.control_plane_poll_interval_ms.unwrap_or(1_000);
     let request_timeout_ms = cli.control_plane_rpc_timeout_ms.unwrap_or(5_000);
     let vm_execution = VmExecutionConfig {
-        fuel_per_yield: cli.vm_fuel,
-        fuel_check_interval: cli.vm_fuel_check_interval.unwrap_or(1),
+        interrupt: cli.vm_interrupt_config()?,
         execution_mode: cli.vm_execution_mode.unwrap_or_default(),
     };
 
     let state = SharedState::new(max_program_bytes).with_vm_execution_config(vm_execution);
     info!("vm execution mode={}", vm_execution.execution_mode.as_str());
-    if let Some(fuel_per_yield) = vm_execution.fuel_per_yield {
-        info!(
-            "vm cooperative scheduling enabled fuel_per_yield={} fuel_check_interval={}",
-            fuel_per_yield, vm_execution.fuel_check_interval
-        );
+    match vm_execution.interrupt {
+        VmInterruptConfig::None => {}
+        VmInterruptConfig::Fuel {
+            fuel_per_yield,
+            check_interval,
+        } => {
+            info!(
+                "vm cooperative scheduling enabled mode=fuel fuel_per_yield={} check_interval={}",
+                fuel_per_yield, check_interval
+            );
+        }
+        VmInterruptConfig::Epoch {
+            ticks_per_slice,
+            check_interval,
+        } => {
+            info!(
+                "vm cooperative scheduling enabled mode=epoch epoch_deadline={} check_interval={}",
+                ticks_per_slice, check_interval
+            );
+        }
     }
     if let Some(control_plane_url) = active_control_url {
         let edge_name = cli.edge_name.clone().unwrap_or_else(default_edge_name);
@@ -124,6 +138,8 @@ struct CliArgs {
     max_program_bytes: Option<usize>,
     vm_fuel: Option<u64>,
     vm_fuel_check_interval: Option<u32>,
+    vm_epoch_deadline: Option<u64>,
+    vm_epoch_check_interval: Option<u32>,
     vm_execution_mode: Option<VmExecutionMode>,
     control_plane_url: Option<String>,
     edge_id: Option<String>,
@@ -207,6 +223,26 @@ where
                 }
                 cli.vm_fuel_check_interval = Some(parsed);
             }
+            "--vm-epoch-deadline" => {
+                let value = next_arg_value("--vm-epoch-deadline", &mut args)?;
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --vm-epoch-deadline: {value}"))?;
+                if parsed == 0 {
+                    return Err("--vm-epoch-deadline must be > 0".to_string());
+                }
+                cli.vm_epoch_deadline = Some(parsed);
+            }
+            "--vm-epoch-check-interval" => {
+                let value = next_arg_value("--vm-epoch-check-interval", &mut args)?;
+                let parsed = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid --vm-epoch-check-interval: {value}"))?;
+                if parsed == 0 {
+                    return Err("--vm-epoch-check-interval must be > 0".to_string());
+                }
+                cli.vm_epoch_check_interval = Some(parsed);
+            }
             "--vm-execution-mode" => {
                 let value = next_arg_value("--vm-execution-mode", &mut args)?;
                 cli.vm_execution_mode = Some(parse_vm_execution_mode(&value)?);
@@ -240,6 +276,18 @@ where
                 return Err(format!("unknown argument: {arg}"));
             }
         }
+    }
+    if cli.vm_fuel.is_some() && cli.vm_epoch_deadline.is_some() {
+        return Err("--vm-fuel and --vm-epoch-deadline are mutually exclusive".to_string());
+    }
+    if cli.vm_fuel_check_interval.is_some() && cli.vm_epoch_check_interval.is_some() {
+        return Err(
+            "--vm-fuel-check-interval and --vm-epoch-check-interval are mutually exclusive"
+                .to_string(),
+        );
+    }
+    if cli.vm_epoch_check_interval.is_some() && cli.vm_epoch_deadline.is_none() {
+        return Err("--vm-epoch-check-interval requires --vm-epoch-deadline".to_string());
     }
     Ok(CliAction::Run(Box::new(cli)))
 }
@@ -278,6 +326,8 @@ fn print_cli_help() {
         "  --max-program-bytes <BYTES>               Max upload/program size in bytes (default: 1048576)\n",
         "  --vm-fuel <UNITS>                         Enable cooperative VM fuel slices per request\n",
         "  --vm-fuel-check-interval <OPS>            Fuel check interval when --vm-fuel is enabled (default: 1)\n",
+        "  --vm-epoch-deadline <TICKS>               Enable cooperative VM epoch slices per request\n",
+        "  --vm-epoch-check-interval <OPS>           Epoch check interval when --vm-epoch-deadline is enabled (default: 1)\n",
         "  --vm-execution-mode <MODE>                VM execution mode: async|threading (default: async)\n",
         "  --control-plane-url <URL>                 Enable active control-plane RPC client\n",
         "  --edge-id <UUID>                          Explicit edge UUID used by active control-plane client\n",
@@ -288,6 +338,24 @@ fn print_cli_help() {
         "  -V, --version                             Show version with git metadata\n",
         "  -h, --help                                Show this help\n"
     ));
+}
+
+impl CliArgs {
+    fn vm_interrupt_config(&self) -> Result<VmInterruptConfig, Box<dyn std::error::Error>> {
+        if let Some(fuel_per_yield) = self.vm_fuel {
+            return Ok(VmInterruptConfig::Fuel {
+                fuel_per_yield,
+                check_interval: self.vm_fuel_check_interval.unwrap_or(1),
+            });
+        }
+        if let Some(ticks_per_slice) = self.vm_epoch_deadline {
+            return Ok(VmInterruptConfig::Epoch {
+                ticks_per_slice,
+                check_interval: self.vm_epoch_check_interval.unwrap_or(1),
+            });
+        }
+        Ok(VmInterruptConfig::None)
+    }
 }
 
 fn binary_version_text() -> String {
@@ -427,6 +495,8 @@ mod tests {
                 max_program_bytes: Some(2048),
                 vm_fuel: None,
                 vm_fuel_check_interval: None,
+                vm_epoch_deadline: None,
+                vm_epoch_check_interval: None,
                 vm_execution_mode: None,
                 control_plane_url: Some("http://127.0.0.1:9100".to_string()),
                 edge_id: Some("123e4567-e89b-12d3-a456-426614174000".to_string()),
@@ -456,6 +526,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_cli_args_from_parses_vm_epoch_flags() {
+        let action = parse_cli_args_from([
+            "--vm-epoch-deadline".to_string(),
+            "3".to_string(),
+            "--vm-epoch-check-interval".to_string(),
+            "5".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        let CliAction::Run(cli) = action else {
+            panic!("expected run action");
+        };
+        assert_eq!(cli.vm_epoch_deadline, Some(3));
+        assert_eq!(cli.vm_epoch_check_interval, Some(5));
+    }
+
+    #[test]
     fn parse_cli_args_from_parses_vm_execution_mode() {
         let action =
             parse_cli_args_from(["--vm-execution-mode".to_string(), "threading".to_string()])
@@ -480,6 +567,18 @@ mod tests {
         let err = parse_cli_args_from(["--vm-fuel".to_string(), "0".to_string()])
             .expect_err("zero vm fuel should fail");
         assert!(err.contains("--vm-fuel must be > 0"));
+    }
+
+    #[test]
+    fn parse_cli_args_from_rejects_conflicting_vm_interrupt_flags() {
+        let err = parse_cli_args_from([
+            "--vm-fuel".to_string(),
+            "32".to_string(),
+            "--vm-epoch-deadline".to_string(),
+            "2".to_string(),
+        ])
+        .expect_err("conflicting vm interrupt flags should fail");
+        assert!(err.contains("mutually exclusive"));
     }
 
     #[test]
