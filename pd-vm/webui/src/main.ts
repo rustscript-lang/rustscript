@@ -35,12 +35,15 @@ const CURRENT_LINE_MARKER_CLASS = "pd-debug-current-line-marker";
 const THEME_STORAGE_KEY = "pd-vm-webui-theme";
 const FLAVOR_STORAGE_KEY = "pd-vm-webui-flavor";
 const SOURCE_STORAGE_KEY_PREFIX = "pd-vm-webui-source:";
+const INTERRUPT_MODE_STORAGE_KEY = "pd-vm-webui-interrupt-mode";
 const FUEL_AMOUNT_STORAGE_KEY = "pd-vm-webui-fuel-amount";
 const FUEL_INTERVAL_STORAGE_KEY = "pd-vm-webui-fuel-interval";
 const VIEWPORT_HEIGHT_CSS_VAR = "--pd-app-height";
 const RUN_POLL_INTERVAL_MS = 25;
 const DEFAULT_FUEL_HINT =
-  "New runs and debug sessions start with the current amount and interval. Resume run adds the current amount before continuing.";
+  "New runs and debug sessions start with the current interruption mode, amount, and interval. Browser epoch control is manual and cannot preempt a compute-only run mid-call on the main thread.";
+
+type InterruptModeChoice = "fuel" | "epoch";
 
 type ThemePreference = "light" | "dark" | "system";
 type ResolvedTheme = "light" | "dark";
@@ -254,6 +257,18 @@ function loadFuelAmountInput(): string {
   }
 }
 
+function loadInterruptMode(): InterruptModeChoice {
+  try {
+    const stored = window.localStorage.getItem(INTERRUPT_MODE_STORAGE_KEY);
+    if (stored === "epoch") {
+      return "epoch";
+    }
+  } catch {
+    // Ignore storage failures and fall back to fuel mode.
+  }
+  return "fuel";
+}
+
 function loadFuelIntervalInput(): string {
   try {
     return window.localStorage.getItem(FUEL_INTERVAL_STORAGE_KEY) ?? "1";
@@ -456,6 +471,7 @@ const systemThemeQuery =
     ? window.matchMedia("(prefers-color-scheme: dark)")
     : null;
 const initialFlavor = loadCurrentFlavor();
+const initialInterruptMode = loadInterruptMode();
 const initialFuelAmount = loadFuelAmountInput();
 const initialFuelInterval = loadFuelIntervalInput();
 const initialThemePreference = loadThemePreference();
@@ -522,10 +538,17 @@ app.innerHTML = `
             <pre id="debug-output" class="panel-content">&lt;no debugger output&gt;</pre>
             <div id="debug-hover" class="debug-hover">hover inspect: (none)</div>
           `)}
-          ${renderPanel("fuel", "fuel", "Fuel", `
+          ${renderPanel("fuel", "fuel", "Interruption", `
             <div class="fuel-panel">
+              <label class="fuel-field" for="interrupt-mode-select">
+                <span>Mode</span>
+                <select id="interrupt-mode-select" class="fuel-input" aria-label="interruption mode">
+                  <option value="fuel">Fuel</option>
+                  <option value="epoch">Epoch</option>
+                </select>
+              </label>
               <label class="fuel-field" for="fuel-amount-input">
-                <span>Fuel Amount</span>
+                <span id="fuel-amount-label">Fuel Amount</span>
                 <input
                   id="fuel-amount-input"
                   class="fuel-input"
@@ -537,7 +560,7 @@ app.innerHTML = `
                 />
               </label>
               <label class="fuel-field" for="fuel-interval-input">
-                <span>Check Interval</span>
+                <span id="fuel-interval-label">Check Interval</span>
                 <input
                   id="fuel-interval-input"
                   class="fuel-input"
@@ -551,6 +574,7 @@ app.innerHTML = `
                 <button id="debug-fuel-set-button" class="panel-button" type="button">Set Debug Fuel</button>
                 <button id="debug-fuel-add-button" class="panel-button panel-button--secondary" type="button">Add Debug Fuel</button>
                 <button id="debug-fuel-interval-button" class="panel-button panel-button--secondary" type="button">Apply Debug Interval</button>
+                <button id="debug-epoch-tick-button" class="panel-button panel-button--secondary" type="button">Tick Epoch</button>
                 <button id="run-resume-button" class="panel-button" type="button">Resume Run</button>
               </div>
               <div id="fuel-hint" class="fuel-hint">${DEFAULT_FUEL_HINT}</div>
@@ -589,11 +613,15 @@ const outputEl = document.querySelector<HTMLElement>("#run-output");
 const stackEl = document.querySelector<HTMLElement>("#run-stack");
 const debugOutputEl = document.querySelector<HTMLElement>("#debug-output");
 const debugHoverEl = document.querySelector<HTMLElement>("#debug-hover");
+const interruptModeSelect = document.querySelector<HTMLSelectElement>("#interrupt-mode-select");
+const fuelAmountLabel = document.querySelector<HTMLElement>("#fuel-amount-label");
+const fuelIntervalLabel = document.querySelector<HTMLElement>("#fuel-interval-label");
 const fuelAmountInput = document.querySelector<HTMLInputElement>("#fuel-amount-input");
 const fuelIntervalInput = document.querySelector<HTMLInputElement>("#fuel-interval-input");
 const debugFuelSetButton = document.querySelector<HTMLButtonElement>("#debug-fuel-set-button");
 const debugFuelAddButton = document.querySelector<HTMLButtonElement>("#debug-fuel-add-button");
 const debugFuelIntervalButton = document.querySelector<HTMLButtonElement>("#debug-fuel-interval-button");
+const debugEpochTickButton = document.querySelector<HTMLButtonElement>("#debug-epoch-tick-button");
 const runResumeButton = document.querySelector<HTMLButtonElement>("#run-resume-button");
 const fuelHintEl = document.querySelector<HTMLElement>("#fuel-hint");
 const runFuelStateEl = document.querySelector<HTMLElement>("#run-fuel-state");
@@ -625,11 +653,15 @@ if (
   !stackEl ||
   !debugOutputEl ||
   !debugHoverEl ||
+  !interruptModeSelect ||
+  !fuelAmountLabel ||
+  !fuelIntervalLabel ||
   !fuelAmountInput ||
   !fuelIntervalInput ||
   !debugFuelSetButton ||
   !debugFuelAddButton ||
   !debugFuelIntervalButton ||
+  !debugEpochTickButton ||
   !runResumeButton ||
   !fuelHintEl ||
   !runFuelStateEl ||
@@ -677,11 +709,15 @@ const outputPanelEl: HTMLElement = outputEl;
 const stackPanelEl: HTMLElement = stackEl;
 const debugOutputPanelEl: HTMLElement = debugOutputEl;
 const debugHoverPanelEl: HTMLElement = debugHoverEl;
+const interruptModeSelectEl: HTMLSelectElement = interruptModeSelect;
+const fuelAmountLabelEl: HTMLElement = fuelAmountLabel;
+const fuelIntervalLabelEl: HTMLElement = fuelIntervalLabel;
 const fuelAmountInputEl: HTMLInputElement = fuelAmountInput;
 const fuelIntervalInputEl: HTMLInputElement = fuelIntervalInput;
 const debugFuelSetButtonEl: HTMLButtonElement = debugFuelSetButton;
 const debugFuelAddButtonEl: HTMLButtonElement = debugFuelAddButton;
 const debugFuelIntervalButtonEl: HTMLButtonElement = debugFuelIntervalButton;
+const debugEpochTickButtonEl: HTMLButtonElement = debugEpochTickButton;
 const runResumeButtonEl: HTMLButtonElement = runResumeButton;
 const fuelHintPanelEl: HTMLElement = fuelHintEl;
 const runFuelStatePanelEl: HTMLElement = runFuelStateEl;
@@ -733,6 +769,7 @@ for (const [panelKey, toggleEl] of sidebarPanelToggleEls) {
   });
 }
 
+interruptModeSelectEl.value = initialInterruptMode;
 fuelAmountInputEl.value = initialFuelAmount;
 fuelIntervalInputEl.value = initialFuelInterval;
 
@@ -815,6 +852,7 @@ window.visualViewport?.addEventListener("resize", refreshViewportLayout);
 window.visualViewport?.addEventListener("scroll", refreshViewportLayout);
 
 let currentFlavor: SourceFlavor = initialFlavor;
+let interruptMode: InterruptModeChoice = initialInterruptMode;
 let themePreference: ThemePreference = initialThemePreference;
 let resolvedTheme: ResolvedTheme = initialResolvedTheme;
 let lintSequence = 0;
@@ -823,22 +861,14 @@ const sourcePersistTimers = new Map<SourceFlavor, number>();
 let runBusy = false;
 let runSessionActive = false;
 let runSessionYielded = false;
-let runFuelState: FuelState = {
-  enabled: false,
-  remaining: null,
-  checkInterval: 1
-};
+let runFuelState: FuelState = defaultFuelState();
 let runSessionMessage = "Run session: idle";
 let runPollTimer: number | null = null;
 let runPollGeneration = 0;
 let debugBusy = false;
 let debugSessionActive = false;
 let debugCurrentLine: number | null = null;
-let debugFuelState: FuelState = {
-  enabled: false,
-  remaining: null,
-  checkInterval: 1
-};
+let debugFuelState: FuelState = defaultFuelState();
 let debugHoveredVar = "";
 let debugHoverActiveKey = "";
 let debugDecorationIds: string[] = [];
@@ -888,6 +918,14 @@ function persistFuelAmount(value: string): void {
   }
 }
 
+function persistInterruptMode(value: InterruptModeChoice): void {
+  try {
+    window.localStorage.setItem(INTERRUPT_MODE_STORAGE_KEY, value);
+  } catch {
+    // Ignore storage failures; the current session still works.
+  }
+}
+
 function persistFuelInterval(value: string): void {
   try {
     window.localStorage.setItem(FUEL_INTERVAL_STORAGE_KEY, value);
@@ -923,20 +961,43 @@ function flushPersistedSources(): void {
 function defaultFuelState(): FuelState {
   return {
     enabled: false,
+    mode: "none",
     remaining: null,
-    checkInterval: 1
+    checkInterval: 1,
+    epochCurrent: 0,
+    epochDeadline: null
   };
 }
 
 function formatFuelState(fuel: FuelState): string {
-  if (!fuel.enabled) {
-    return `disabled (interval ${fuel.checkInterval})`;
+  if (fuel.mode === "epoch") {
+    const deadline = fuel.epochDeadline === null ? "disabled" : String(fuel.epochDeadline);
+    return `epoch current=${fuel.epochCurrent} deadline=${deadline} (interval ${fuel.checkInterval})`;
   }
-  return `${fuel.remaining ?? 0} left (interval ${fuel.checkInterval})`;
+  if (fuel.mode === "fuel") {
+    return `${fuel.remaining ?? 0} left (interval ${fuel.checkInterval})`;
+  }
+  return `disabled (interval ${fuel.checkInterval})`;
 }
 
 function setFuelHint(message: string | null): void {
   fuelHintPanelEl.textContent = message ?? DEFAULT_FUEL_HINT;
+}
+
+function syncInterruptFormUi(): void {
+  const epochMode = interruptMode === "epoch";
+  fuelAmountLabelEl.textContent = epochMode ? "Epoch Deadline" : "Fuel Amount";
+  fuelIntervalLabelEl.textContent = "Check Interval";
+  fuelAmountInputEl.placeholder = epochMode ? "disabled" : "disabled";
+  debugFuelSetButtonEl.textContent = epochMode ? "Arm Debug Epoch" : "Set Debug Fuel";
+  debugFuelAddButtonEl.textContent = epochMode ? "Clear Debug Epoch" : "Add Debug Fuel";
+  debugFuelIntervalButtonEl.textContent = epochMode ? "Apply Epoch Interval" : "Apply Debug Interval";
+  debugEpochTickButtonEl.hidden = !epochMode;
+  debugEpochTickButtonEl.disabled = !epochMode || debugBusy || (!debugSessionActive && !runSessionActive);
+}
+
+function epochResumeHint(): string {
+  return "Run paused at an epoch deadline. Re-arm a deadline before resuming. Browser wasm cannot advance epoch concurrently while the VM is running.";
 }
 
 function cancelRunPolling(): void {
@@ -973,15 +1034,18 @@ function syncFuelPanel(): void {
     ? `Run session: ${runSessionMessage} | ${formatFuelState(runFuelState)}`
     : "Run session: idle";
   debugFuelStatePanelEl.textContent = debugSessionActive
-    ? `Debugger fuel: ${formatFuelState(debugFuelState)}`
-    : "Debugger fuel: idle";
+    ? `Debugger: ${formatFuelState(debugFuelState)}`
+    : "Debugger: idle";
   runResumeButtonEl.disabled = !runSessionActive || runBusy;
   debugFuelSetButtonEl.disabled = !debugSessionActive || debugBusy;
   debugFuelAddButtonEl.disabled = !debugSessionActive || debugBusy;
   debugFuelIntervalButtonEl.disabled = !debugSessionActive || debugBusy;
+  debugEpochTickButtonEl.disabled = interruptMode !== "epoch" || debugBusy || (!debugSessionActive && !runSessionActive);
+  syncInterruptFormUi();
 }
 
 type ParsedFuelForm = {
+  mode: InterruptModeChoice;
   amount: number | null;
   interval: number;
 };
@@ -994,7 +1058,11 @@ function readFuelForm(): ParsedFuelForm | null {
   if (rawAmount.length > 0) {
     const parsedAmount = Number(rawAmount);
     if (!Number.isSafeInteger(parsedAmount) || parsedAmount < 0) {
-      setFuelHint("Fuel amount must be a non-negative integer.");
+      setFuelHint(
+        interruptMode === "epoch"
+          ? "Epoch deadline must be a non-negative integer."
+          : "Fuel amount must be a non-negative integer."
+      );
       return null;
     }
     amount = parsedAmount;
@@ -1006,8 +1074,15 @@ function readFuelForm(): ParsedFuelForm | null {
     return null;
   }
 
-  setFuelHint(runSessionYielded ? "Run paused. Enter more fuel and click Resume Run." : null);
+  setFuelHint(
+    runSessionYielded
+      ? runFuelState.mode === "epoch"
+        ? epochResumeHint()
+        : "Run paused. Enter more fuel and click Resume Run."
+      : null
+  );
   return {
+    mode: interruptMode,
     amount,
     interval: parsedInterval
   };
@@ -1019,8 +1094,11 @@ function currentFuelConfig(): FuelConfig | null {
     return null;
   }
   return {
-    fuel: parsed.amount,
-    fuelCheckInterval: parsed.interval
+    mode: parsed.mode,
+    fuel: parsed.mode === "fuel" ? parsed.amount : null,
+    fuelCheckInterval: parsed.mode === "fuel" ? parsed.interval : null,
+    epochDeadline: parsed.mode === "epoch" ? parsed.amount : null,
+    epochCheckInterval: parsed.mode === "epoch" ? parsed.interval : null
   };
 }
 
@@ -1249,7 +1327,13 @@ function applyRunReport(report: RunReport): void {
     setStatus(runStatusEl, "run: running", "busy");
   }
 
-  setFuelHint(runSessionYielded ? "Run paused. Enter more fuel and click Resume Run." : null);
+  setFuelHint(
+    runSessionYielded
+      ? runFuelState.mode === "epoch"
+        ? epochResumeHint()
+        : "Run paused. Enter more fuel and click Resume Run."
+      : null
+  );
   syncFuelPanel();
   if (runSessionActive && !runSessionYielded && !report.error) {
     scheduleRunPolling();
@@ -1568,6 +1652,7 @@ flavorSelectEl.addEventListener("change", () => {
 window.addEventListener("pagehide", () => {
   persistCurrentFlavor(currentFlavor);
   flushPersistedSources();
+  persistInterruptMode(interruptMode);
   persistFuelAmount(fuelAmountInputEl.value);
   persistFuelInterval(fuelIntervalInputEl.value);
 });
@@ -1577,6 +1662,12 @@ for (const option of THEME_OPTIONS) {
     applyThemePreference(option.value, true);
   });
 }
+
+interruptModeSelectEl.addEventListener("change", () => {
+  interruptMode = interruptModeSelectEl.value === "epoch" ? "epoch" : "fuel";
+  persistInterruptMode(interruptMode);
+  syncFuelPanel();
+});
 
 fuelAmountInputEl.addEventListener("input", () => {
   persistFuelAmount(fuelAmountInputEl.value);
@@ -1604,7 +1695,7 @@ if (systemThemeQuery) {
 runButtonEl.addEventListener("click", async () => {
   const fuelConfig = currentFuelConfig();
   if (!fuelConfig) {
-    setStatus(runStatusEl, "run: invalid fuel settings", "error");
+    setStatus(runStatusEl, "run: invalid interruption settings", "error");
     return;
   }
 
@@ -1634,7 +1725,7 @@ async function startDebugSession(): Promise<void> {
 
   const fuelConfig = currentFuelConfig();
   if (!fuelConfig) {
-    setStatus(debugStatusEl, "debug: invalid fuel settings", "error");
+    setStatus(debugStatusEl, "debug: invalid interruption settings", "error");
     return;
   }
 
@@ -1751,7 +1842,15 @@ debugStopButtonEl.addEventListener("click", () => {
 debugFuelSetButtonEl.addEventListener("click", () => {
   const parsed = readFuelForm();
   if (!parsed) {
-    setStatus(debugStatusEl, "debug: invalid fuel settings", "error");
+    setStatus(debugStatusEl, "debug: invalid interruption settings", "error");
+    return;
+  }
+  if (parsed.mode === "epoch") {
+    if (parsed.amount === null) {
+      void sendDebugCommand({ kind: "clear_epoch_deadline" });
+      return;
+    }
+    void sendDebugCommand({ kind: "set_epoch_deadline", ticks: parsed.amount });
     return;
   }
   if (parsed.amount === null) {
@@ -1763,7 +1862,15 @@ debugFuelSetButtonEl.addEventListener("click", () => {
 
 debugFuelAddButtonEl.addEventListener("click", () => {
   const parsed = readFuelForm();
-  if (!parsed || parsed.amount === null) {
+  if (!parsed) {
+    setStatus(debugStatusEl, "debug: invalid interruption settings", "error");
+    return;
+  }
+  if (parsed.mode === "epoch") {
+    void sendDebugCommand({ kind: "clear_epoch_deadline" });
+    return;
+  }
+  if (parsed.amount === null) {
     setStatus(debugStatusEl, "debug: enter fuel to add", "error");
     return;
   }
@@ -1773,16 +1880,39 @@ debugFuelAddButtonEl.addEventListener("click", () => {
 debugFuelIntervalButtonEl.addEventListener("click", () => {
   const parsed = readFuelForm();
   if (!parsed) {
-    setStatus(debugStatusEl, "debug: invalid fuel settings", "error");
+    setStatus(debugStatusEl, "debug: invalid interruption settings", "error");
     return;
   }
-  void sendDebugCommand({ kind: "set_fuel_check_interval", interval: parsed.interval });
+  void sendDebugCommand(
+    parsed.mode === "epoch"
+      ? { kind: "set_epoch_check_interval", interval: parsed.interval }
+      : { kind: "set_fuel_check_interval", interval: parsed.interval }
+  );
+});
+
+debugEpochTickButtonEl.addEventListener("click", () => {
+  if (interruptMode !== "epoch") {
+    return;
+  }
+  const parsed = readFuelForm();
+  if (!parsed) {
+    setStatus(debugStatusEl, "debug: invalid interruption settings", "error");
+    return;
+  }
+  const amount = parsed.amount ?? 1;
+  if (debugSessionActive) {
+    void sendDebugCommand({ kind: "tick_epoch", amount });
+    return;
+  }
+  if (runSessionActive) {
+    void sendRunCommand({ kind: "tick_epoch", amount });
+  }
 });
 
 runResumeButtonEl.addEventListener("click", () => {
   const parsed = readFuelForm();
   if (!parsed) {
-    setStatus(runStatusEl, "run: invalid fuel settings", "error");
+    setStatus(runStatusEl, "run: invalid interruption settings", "error");
     return;
   }
   if (!runSessionActive) {
@@ -1790,7 +1920,37 @@ runResumeButtonEl.addEventListener("click", () => {
   }
 
   void (async () => {
-    if (parsed.interval !== runFuelState.checkInterval) {
+    if (parsed.mode === "epoch") {
+      if (parsed.interval !== runFuelState.checkInterval || runFuelState.mode !== "epoch") {
+        const intervalReport = await sendRunCommand({
+          kind: "set_epoch_check_interval",
+          interval: parsed.interval
+        });
+        if (!intervalReport || intervalReport.error) {
+          return;
+        }
+      }
+
+      if (parsed.amount !== null) {
+        const deadlineReport = await sendRunCommand({
+          kind: "set_epoch_deadline",
+          ticks: parsed.amount
+        });
+        if (!deadlineReport || deadlineReport.error) {
+          return;
+        }
+      } else if (runFuelState.mode === "epoch" && runFuelState.epochDeadline !== null) {
+        const clearReport = await sendRunCommand({ kind: "clear_epoch_deadline" });
+        if (!clearReport || clearReport.error) {
+          return;
+        }
+      }
+
+      await sendRunCommand({ kind: "resume" });
+      return;
+    }
+
+    if (parsed.interval !== runFuelState.checkInterval || runFuelState.mode !== "fuel") {
       const intervalReport = await sendRunCommand({
         kind: "set_fuel_check_interval",
         interval: parsed.interval
