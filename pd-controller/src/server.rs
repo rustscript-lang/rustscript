@@ -1609,6 +1609,7 @@ enum DebugCommandRequest {
     Next,
     Continue,
     Out,
+    Text { command: String },
     SelectRecording { recording_id: String },
     BreakLine { line: u32 },
     ClearLine { line: u32 },

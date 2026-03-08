@@ -1005,6 +1005,14 @@ pub(super) async fn run_debug_command_handler(
             DebugCommandRequest::Next => RemoteDebugCommand::Next,
             DebugCommandRequest::Continue => RemoteDebugCommand::Continue,
             DebugCommandRequest::Out => RemoteDebugCommand::Out,
+            DebugCommandRequest::Text { command } => {
+                if command.trim().is_empty() {
+                    return Err(bad_request("debug command cannot be empty"));
+                }
+                RemoteDebugCommand::Text {
+                    command: command.trim().to_string(),
+                }
+            }
             DebugCommandRequest::SelectRecording { .. } => {
                 return Err(bad_request(
                     "recording selection is only available for recording sessions",
@@ -1123,6 +1131,12 @@ pub(super) async fn run_debug_command_handler(
         DebugCommandRequest::Next => "next".to_string(),
         DebugCommandRequest::Continue => "continue".to_string(),
         DebugCommandRequest::Out => "out".to_string(),
+        DebugCommandRequest::Text { command } => {
+            if command.trim().is_empty() {
+                return Err(bad_request("debug command cannot be empty"));
+            }
+            command.trim().to_string()
+        }
         DebugCommandRequest::BreakLine { line } => format!("break line {line}"),
         DebugCommandRequest::ClearLine { line } => format!("clear line {line}"),
         DebugCommandRequest::PrintVar { name } => {
