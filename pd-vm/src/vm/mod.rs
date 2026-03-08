@@ -1877,6 +1877,116 @@ mod tests {
         assert_eq!(vm.stack(), &[Value::Int(13)]);
     }
 
+    #[test]
+    fn rustscript_nested_function_implicitly_captures_outer_local() {
+        let source = r#"
+            fn outer(base) {
+                fn add(v) { v + base; }
+                add(2);
+            }
+            outer(5);
+        "#;
+        let compiled = crate::compile_source(source).expect("source should compile");
+        let mut vm = Vm::new(compiled.program);
+
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::Int(7)]);
+    }
+
+    #[test]
+    fn rustscript_top_level_function_implicitly_captures_snapshot() {
+        let source = r#"
+            let mut base = 5;
+            fn add(v) { v + base; }
+            base = 100;
+            add(1);
+        "#;
+        let compiled = crate::compile_source(source).expect("source should compile");
+        let mut vm = Vm::new(compiled.program);
+
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(
+            vm.stack(),
+            &[Value::Int(6)],
+            "function capture should snapshot at declaration time"
+        );
+    }
+
+    #[test]
+    fn rustscript_function_default_capture_moves_movable_local() {
+        let source = r#"
+            let a = "";
+            fn add(v) { v + a; }
+            let d = a;
+            d;
+        "#;
+        let err = match crate::compile_source(source) {
+            Ok(_) => panic!("capture should consume movable local"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, crate::compiler::SourceError::Parse(_)),
+            "expected parse/flow error for moved local, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rustscript_function_capture_copy_keeps_source_reusable() {
+        let source = r#"
+            let a = "x";
+            fn add(v) { v + a.copy(); }
+            let d = a;
+            add(d);
+        "#;
+        let compiled = crate::compile_source(source).expect("source should compile");
+        let mut vm = Vm::new(compiled.program);
+
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
+    }
+
+    #[test]
+    fn rustscript_nested_functions_capture_and_call_siblings() {
+        let source = r#"
+            fn outer(base) {
+                fn inc(v) { v + 1; }
+                fn add_base(v) { inc(v) + base; }
+                add_base(2);
+            }
+            outer(3);
+        "#;
+        let compiled = crate::compile_source(source).expect("source should compile");
+        let mut vm = Vm::new(compiled.program);
+
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::Int(6)]);
+    }
+
+    #[test]
+    fn rustscript_function_recursion_is_still_rejected() {
+        let source = r#"
+            fn recurse(x) { recurse(x); }
+            recurse(1);
+        "#;
+        let err = match crate::compile_source(source) {
+            Ok(_) => panic!("recursive function should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                err,
+                crate::compiler::SourceError::Compile(
+                    crate::compiler::CompileError::InlineFunctionRecursion(_)
+                )
+            ),
+            "expected inline recursion compile error, got: {err}"
+        );
+    }
+
     fn step_once(vm: &mut Vm) -> VmResult<ExecOutcome> {
         let opcode = vm.read_u8()?;
         vm.execute_interpreter_instruction(opcode)
@@ -2010,7 +2120,10 @@ mod tests {
             Err(err) => err,
         };
         assert!(matches!(err, VmError::OutOfFuel { .. }));
-        assert_eq!(vm.ip, 4, "ret must remain pending when tail tick cannot be charged");
+        assert_eq!(
+            vm.ip, 4,
+            "ret must remain pending when tail tick cannot be charged"
+        );
         assert_eq!(vm.stack(), &[Value::Int(4)]);
     }
 
@@ -2049,7 +2162,10 @@ mod tests {
 
         let status = vm.run().expect("first run should yield");
         assert_eq!(status, VmStatus::Yielded);
-        assert_eq!(vm.ip, 4, "fuel exhaustion should happen before trailing ret");
+        assert_eq!(
+            vm.ip, 4,
+            "fuel exhaustion should happen before trailing ret"
+        );
         assert_eq!(vm.stack(), &[Value::Int(4)]);
         assert_eq!(vm.get_fuel(), Some(0));
 

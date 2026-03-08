@@ -98,6 +98,17 @@ fn lua_runtime_cases_work() {
             expected_stack: vec![Value::Int(1), Value::Int(42)],
             expected_locals: None,
         },
+        RuntimeCase {
+            name: "empty param closure captures outer value",
+            source: r#"
+                local x = 41
+                local f = function() return x + 1 end
+                f()
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
+        },
     ];
 
     run_runtime_cases(&cases);

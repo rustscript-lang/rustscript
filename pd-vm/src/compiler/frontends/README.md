@@ -77,7 +77,10 @@ Supported syntax and features:
     mutating a collection while an alias exists is rejected unless one side is detached (for
     example via `.copy()`) or reassigned.
   - Locals must be definitely available on every control-flow path before use.
-  - Closures capture outer locals at definition time; `fn` declarations do not capture outer locals.
+  - Closures and `fn` declarations capture outer locals at definition/declaration time.
+  - In RustScript, capture mode follows expression semantics (`x` can move, `x.copy()` copies,
+    and `&x` / `&mut x` keep borrow-style capture behavior). Non-RustScript frontends keep
+    copy-style capture behavior.
   - Inline `fn` and closure calls clear per-call frame slots after producing the call result
     (deterministic descending-slot order). Closure capture slots are excluded from per-call clears.
   - Closure capture slots and other hidden locals now participate in liveness null-clears once
@@ -90,8 +93,7 @@ Supported syntax and features:
 Current subset limits:
 
 - Function declarations are inlined; recursive declarations are not supported.
-- Nested function declarations are not supported.
-- `fn` declarations cannot capture outer locals (closures can).
+- `fn` declarations can be nested and implicitly capture outer locals.
 - Callable values cannot currently be stored in arrays/maps or returned.
 - Calling callable-valued locals captured inside closure bodies is currently rejected.
 - Match patterns are limited to the forms listed above.

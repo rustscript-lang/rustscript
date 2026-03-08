@@ -74,6 +74,10 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
             for param_slot in &mut function_impl.param_slots {
                 *param_slot = remap_local_index(*param_slot, unit_local_base)?;
             }
+            for (source_slot, captured_slot) in &mut function_impl.capture_copies {
+                *source_slot = remap_local_index(*source_slot, unit_local_base)?;
+                *captured_slot = remap_local_index(*captured_slot, unit_local_base)?;
+            }
             for stmt in &mut function_impl.body_stmts {
                 remap_stmt_indices(stmt, unit_local_base, &function_map)?;
             }
@@ -208,7 +212,17 @@ fn remap_stmt_indices(
             }
             remap_expr_indices(&mut closure.body, local_base, function_map)?;
         }
-        Stmt::FuncDecl { .. } => {}
+        Stmt::FuncDecl { index, .. } => {
+            *index = function_map.get(index).copied().ok_or_else(|| {
+                SourcePathError::Source(SourceError::Parse(ParseError {
+                    span: None,
+                    code: None,
+                    line: 1,
+                    message: "function index remap failed while merging imported modules"
+                        .to_string(),
+                }))
+            })?;
+        }
         Stmt::Expr { expr, .. } => {
             remap_expr_indices(expr, local_base, function_map)?;
         }

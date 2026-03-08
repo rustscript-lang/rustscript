@@ -165,8 +165,15 @@ fn lower_scheme_direct_stmt(
                     message: format!("too many parameters in declaration '{name}'"),
                 })?;
                 builder.declare_function(&name, Some(arity))?;
+                let index = builder.function_index(&name).ok_or_else(|| ParseError {
+                    span: None,
+                    code: None,
+                    line: form.line,
+                    message: format!("internal function index missing for '{name}'"),
+                })?;
                 return Ok(Some(vec![Stmt::FuncDecl {
                     name,
+                    index,
                     arity,
                     args: params,
                     exported: false,

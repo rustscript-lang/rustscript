@@ -464,8 +464,8 @@ Core compiler/IR:
 - callable locals can be passed and called, but callables are not runtime `Value`s
 - callable values cannot currently be stored in arrays/maps or returned from functions
 - recursive RustScript function declarations are not supported by current inlining-based lowering
-- nested function declarations are not supported
-- RustScript function declarations cannot capture outer locals
+- function declarations can be nested and implicitly capture outer locals (closure-like snapshot at declaration time)
+- in RustScript move-semantics mode, implicit captures follow expression semantics (`x` may move, `x.copy()` copies, `&x`/`&mut x` capture borrowed views)
 - `match` patterns are limited to int/string/null literals, `_`, and type constructors (`Some(TypeName)`)
 - `break` and `continue` are only valid inside loops
 - host import namespace support in parser is limited to `vm` (builtin namespaces are `io::`, `re::`, `json::`, and `jit::`)
@@ -506,4 +506,3 @@ Current NYI in trace compiler:
 - backward `brfalse` targets (only forward guard exits are supported)
 - traces longer than configured max trace length
 - unsupported native targets (currently `x86_64` Windows/Unix-non-macOS and `aarch64` Linux/macOS)
-

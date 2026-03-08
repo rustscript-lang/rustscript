@@ -70,6 +70,17 @@ fn scheme_runtime_cases_work() {
             ],
             expected_locals: None,
         },
+        RuntimeCase {
+            name: "empty param lambda captures outer value",
+            source: r#"
+                (define x 41)
+                (define f (lambda () (+ x 1)))
+                (f)
+            "#,
+            flavor: SourceFlavor::Scheme,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
+        },
     ];
 
     run_runtime_cases(&cases);

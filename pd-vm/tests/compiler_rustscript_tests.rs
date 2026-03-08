@@ -492,6 +492,17 @@ fn rustscript_closure_value_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
+            name: "empty parameter closure literal captures and runs",
+            source: r#"
+                let x = 41;
+                let f = || x + 1;
+                f();
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
+        },
+        RuntimeCase {
             name: "named functions are first class and can be passed to functions",
             source: r#"
                 fn add_one(value) {
@@ -566,6 +577,56 @@ fn rustscript_closure_value_runtime_cases_work() {
             expected_stack: vec![Value::String("xx".to_string())],
             expected_locals: None,
         },
+        RuntimeCase {
+            name: "closure capture via copy keeps source reusable",
+            source: r#"
+                let a = "x";
+                let f = |d| d + a.copy();
+                let d = a;
+                f(d);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("xx".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "closure capture via borrow keeps source reusable",
+            source: r#"
+                let a = "x";
+                let f = |d| d + &a;
+                let d = a;
+                f(d);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("xx".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "closure capture via mut borrow keeps source reusable",
+            source: r#"
+                let mut a = "x";
+                let f = |d| d + &mut a;
+                let d = a;
+                f(d);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("xx".to_string())],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "moved closure capture value stays alive until closure use",
+            source: r#"
+                fn apply_once(func, value) {
+                    func(value);
+                }
+                let seed = "!";
+                let closure = |x| x + seed;
+                apply_once(closure, "a");
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::String("a!".to_string())],
+            expected_locals: None,
+        },
     ];
     run_runtime_cases(&cases);
 }
@@ -605,6 +666,17 @@ fn rustscript_closure_value_parse_rejection_cases_work() {
             "#,
             flavor: SourceFlavor::RustScript,
             expected_contains_all: &["inc", "unavailable"],
+        },
+        ParseErrorCase {
+            name: "closure default capture moves movable local",
+            source: r#"
+                let a = "";
+                let x = |d| { d + a };
+                let d = a;
+                d;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_contains_all: &["local 'a'", "moved"],
         },
         ParseErrorCase {
             name: "function value from partial control flow is rejected on call",

@@ -1165,6 +1165,7 @@ impl Parser {
 
         Ok(Stmt::FuncDecl {
             name,
+            index,
             arity,
             args: params,
             exported,
@@ -1209,18 +1210,6 @@ impl Parser {
                     message: "function body must end with an expression statement".to_string(),
                 });
             };
-
-            if body_stmts
-                .iter()
-                .any(|stmt| matches!(stmt, Stmt::FuncDecl { .. }))
-            {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: parser.current_line(),
-                    message: "nested function declarations are not supported".to_string(),
-                });
-            }
 
             Ok((body_stmts, body_expr))
         })
@@ -1267,16 +1256,9 @@ impl Parser {
                 message: "internal function capture state error".to_string(),
             })?;
         self.closure_scopes.pop();
-        if !capture_context.capture_copies.is_empty() {
-            return Err(ParseError {
-                span: None,
-                code: None,
-                line: self.current_line(),
-                message: "RustScript function definitions cannot capture outer locals".to_string(),
-            });
-        }
         Ok(FunctionImpl {
             param_slots,
+            capture_copies: capture_context.capture_copies,
             body_stmts,
             body_expr,
         })
@@ -1692,6 +1674,9 @@ impl Parser {
         }
         if self.match_kind(&TokenKind::Pipe) {
             return self.parse_closure_literal();
+        }
+        if self.match_kind(&TokenKind::PipePipe) {
+            return self.parse_closure_expr_with_params(Vec::new());
         }
         if self.dialect.allow_arrow_closure() && self.check_parenthesized_arrow_closure_start() {
             return self.parse_parenthesized_arrow_closure();
@@ -3229,37 +3214,58 @@ impl Parser {
     }
 
     fn get_local(&mut self, name: &str) -> Result<LocalSlot, ParseError> {
-        for scope in self.closure_scopes.iter().rev() {
-            if let Some(&index) = scope.get(name) {
-                return Ok(index);
-            }
+        if let Some(current_scope) = self.closure_scopes.last()
+            && let Some(&index) = current_scope.get(name)
+        {
+            return Ok(index);
         }
-        if let Some(source_index) = self.locals.get(name).copied() {
-            if let Some(capture_idx) = self.closure_capture_contexts.len().checked_sub(1) {
-                if let Some(&captured_slot) =
-                    self.closure_capture_contexts[capture_idx].by_name.get(name)
-                {
-                    return Ok(captured_slot);
+
+        if self.closure_scopes.len() > 1 {
+            for scope in self.closure_scopes[..self.closure_scopes.len() - 1]
+                .iter()
+                .rev()
+            {
+                if let Some(&source_index) = scope.get(name) {
+                    return self.capture_or_direct_local(name, source_index);
                 }
-                let captured_slot = self.allocate_hidden_local()?;
-                let source_mutable = self.is_local_slot_mutable(source_index);
-                self.set_local_slot_mutable(captured_slot, source_mutable);
-                self.closure_capture_contexts[capture_idx]
-                    .by_name
-                    .insert(name.to_string(), captured_slot);
-                self.closure_capture_contexts[capture_idx]
-                    .capture_copies
-                    .push((source_index, captured_slot));
-                return Ok(captured_slot);
             }
-            return Ok(source_index);
         }
+
+        if let Some(source_index) = self.locals.get(name).copied() {
+            return self.capture_or_direct_local(name, source_index);
+        }
+
         Err(ParseError {
             span: None,
             code: None,
             line: self.current_line(),
             message: format!("unknown local '{name}'"),
         })
+    }
+
+    fn capture_or_direct_local(
+        &mut self,
+        name: &str,
+        source_index: LocalSlot,
+    ) -> Result<LocalSlot, ParseError> {
+        if let Some(capture_idx) = self.closure_capture_contexts.len().checked_sub(1) {
+            if let Some(&captured_slot) =
+                self.closure_capture_contexts[capture_idx].by_name.get(name)
+            {
+                return Ok(captured_slot);
+            }
+            let captured_slot = self.allocate_hidden_local()?;
+            let source_mutable = self.is_local_slot_mutable(source_index);
+            self.set_local_slot_mutable(captured_slot, source_mutable);
+            self.closure_capture_contexts[capture_idx]
+                .by_name
+                .insert(name.to_string(), captured_slot);
+            self.closure_capture_contexts[capture_idx]
+                .capture_copies
+                .push((source_index, captured_slot));
+            return Ok(captured_slot);
+        }
+        Ok(source_index)
     }
 
     fn has_local_binding(&self, name: &str) -> bool {

@@ -7,8 +7,16 @@ while i < 3 {
     i = i + 1;
 }
 
+let base = add_one(0);
+fn bump_with_base(v) { v + base; }
+
+fn drive(seed) {
+    fn inner(v) { v + seed; }
+    inner(2);
+}
+
 if total != 3 {
     print(0);
 } else {
-    print(add_one(5));
+    print(bump_with_base(drive(3)));
 }

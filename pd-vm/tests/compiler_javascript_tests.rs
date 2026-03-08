@@ -131,6 +131,17 @@ fn javascript_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
+            name: "empty param arrow closure captures outer value",
+            source: r#"
+                let x = 41;
+                let make = () => x + 1;
+                make();
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
+        },
+        RuntimeCase {
             name: "function return statement is lowered",
             source: r#"
                 function inc(v) { return v + 1; }

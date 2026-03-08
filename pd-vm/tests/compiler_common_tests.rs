@@ -130,6 +130,34 @@ fn non_rustscript_frontends_keep_copy_semantics_for_local_rebinds() {
 }
 
 #[test]
+fn non_rustscript_frontends_keep_copy_capture_semantics_for_closures() {
+    let javascript = r#"
+        let a = "x";
+        let f = (d) => d + a;
+        let d = a;
+        f(d);
+    "#;
+    let scheme = r#"
+        (define a "x")
+        (define f (lambda (d) (+ d a)))
+        (define d a)
+        (f d)
+    "#;
+
+    let cases = [
+        (SourceFlavor::JavaScript, javascript),
+        (SourceFlavor::Scheme, scheme),
+    ];
+    for (flavor, source) in cases {
+        let compiled = compile_source_with_flavor(source, flavor).expect("compile should succeed");
+        let mut vm = Vm::new(compiled.program);
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::String("xx".to_string())]);
+    }
+}
+
+#[test]
 fn compiler_reuses_slots_when_declared_locals_exceed_bytecode_limit() {
     let mut source = String::from("let mut out = 0;\n");
     for idx in 0..600usize {

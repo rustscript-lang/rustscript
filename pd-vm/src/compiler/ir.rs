@@ -108,6 +108,7 @@ pub enum Stmt {
     },
     FuncDecl {
         name: String,
+        index: u16,
         arity: u8,
         args: Vec<String>,
         exported: bool,
@@ -161,6 +162,7 @@ pub struct FunctionDecl {
 #[derive(Clone, Debug)]
 pub struct FunctionImpl {
     pub param_slots: Vec<LocalSlot>,
+    pub capture_copies: Vec<(LocalSlot, LocalSlot)>,
     pub body_stmts: Vec<Stmt>,
     pub body_expr: Expr,
 }
@@ -224,6 +226,10 @@ impl LocalIrBuilder {
 
     pub(crate) fn has_declared_function(&self, name: &str) -> bool {
         self.function_meta.contains_key(name)
+    }
+
+    pub(crate) fn function_index(&self, name: &str) -> Option<u16> {
+        self.function_meta.get(name).map(|(index, _)| *index)
     }
 
     pub(crate) fn declare_function(
