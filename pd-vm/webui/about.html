@@ -32,41 +32,41 @@
     <h1>About pd-vm and RustScript</h1>
 
     <h2>Overview</h2>
-    <p><code>pd-vm</code> is a stack-based virtual machine plus compiler toolchain used as a backend for multiple source syntaxes, including our primary focus: RustScript (<code>.rss</code>).</p>
-    <p>Features include:</p>
+    <p>The playground is a browser UI for <code>RustScript</code> built on top of the <code>pd-vm</code> running in the WASM runtime in your browser and a Monaco editor.</p>
+
+    <h2>What The Playground Provides</h2>
     <ul>
-      <li>Executes compiled compact bytecode rather than interpreting source.</li>
-      <li>Offers consistent runtime semantics for both synchronous and asynchronous execution.</li>
-      <li>Includes rich debugging and profiling tools: interactive debugger, recording and replay, and JIT trace insights.</li>
+      <li>Live lint diagnostics surfaced as Monaco markers and a diagnostics panel.</li>
+      <li>Run and debug workflows directly in the browser.</li>
+      <li>Breakpoints, step/next/out/continue, stack and locals views, and hover inspection in the debugger.</li>
+      <li>Print output and final stack panels.</li>
+      <li>A reset-to-sample action that restores the bundled example for the active frontend.</li>
+      <li>Fuel and epoch interruption controls, plus live interruption state shown in the toolbar.</li>
     </ul>
 
-    <h2>How To Use</h2>
+    <h2>Interruption Controls</h2>
+    <p>The playground starts with interruption disabled by default. You can explicitly choose <code>Fuel</code> or <code>Epoch</code> in the Interruption panel before starting a run or debug session.</p>
 
-    <h3>Fuel Metering</h3>
-    <p><code>pd-vm</code> provides Wasmtime-style fuel controls on both <code>Vm</code> and <code>Store&lt;T&gt;</code>.</p>
-    <p>Fuel metering is disabled by default. If there is not enough fuel, execution returns <code>VmStatus::Yielded</code> before the next instruction runs.</p>
+    <h3>Fuel</h3>
+    <p>Fuel mode yields execution when the active session runs out of fuel. In the browser UI, fuel is configured per session together with a check interval.</p>
 
-    <h2>Internals</h2>
-    
-    <h3>VM Internals</h3>
-    <p><code>Program</code> consists of: constants, code, imports, and debug info. Bytecode format uses a 1 byte opcode, little-endian operands, and absolute jump targets.</p>
-    <table>
-      <tr><th>Opcode</th><th>Mnemonic</th><th>Stack effect</th></tr>
-      <tr><td>0x00</td><td><code>nop</code></td><td>no change</td></tr>
-      <tr><td>0x01</td><td><code>ret</code></td><td>stop execution</td></tr>
-      <tr><td>0x02</td><td><code>ldc</code></td><td>push constant</td></tr>
-      <tr><td>0x03-0x07</td><td><code>add</code>, <code>sub</code>, <code>mul</code>, <code>div</code>, <code>neg</code></td><td>math ops</td></tr>
-      <tr><td>0x08-0x0A</td><td><code>ceq</code>, <code>clt</code>, <code>cgt</code></td><td>comparison</td></tr>
-      <tr><td>0x0B-0x0C</td><td><code>br</code>, <code>brfalse</code></td><td>branching</td></tr>
-      <tr><td>0x0D-0x10</td><td><code>pop</code>, <code>dup</code>, <code>ldloc</code>, <code>stloc</code></td><td>stack & locals</td></tr>
-      <tr><td>0x11</td><td><code>call</code></td><td>pop args, call host, push returns</td></tr>
-      <tr><td>0x12-0x16</td><td><code>shl</code>, <code>shr</code>, <code>mod</code>, <code>and</code>, <code>or</code></td><td>bitwise & logical</td></tr>
-    </table>
+    <h3>Epoch</h3>
+    <p>Epoch mode uses a browser-side JavaScript timer. In the playground, one epoch tick is driven by a 1ms timer when ticking is enabled. The UI shows current epoch, deadline, slice, and check interval.</p>
+    <p>The epoch toggle button pauses or resumes that timer. This is a browser embedding detail, not a wall-clock guarantee from the VM itself.</p>
 
-    <h3>Compiler Internals for RustScript</h3>
-    <p>The compiler uses <code>compile_source()</code> for RustScript or <code>compile_source_file()</code> for flavor selection.</p>
-    
-    <h4>Supported Syntax and Features</h4>
+    <h2>Debugger</h2>
+    <p>The debugger supports:</p>
+    <ul>
+      <li>Line breakpoints in the Monaco gutter.</li>
+      <li><code>where</code>, <code>locals</code>, and <code>stack</code> inspection.</li>
+      <li><code>step</code>, <code>next</code>, <code>out</code>, <code>continue</code>, and stop controls.</li>
+      <li>Hover inspection for visible variables when a debug session is active.</li>
+    </ul>
+
+    <h2>RustScript In The Playground</h2>
+    <p>RustScript is the primary frontend documented here, but the same playground shell also hosts JavaScript, Lua, and Scheme frontends.</p>
+
+    <h3>Supported RustScript Syntax And Features</h3>
     <ul>
       <li><strong>Statements:</strong> <code>use</code>, <code>fn</code>, <code>pub fn</code>, <code>let</code>, assignment, indexed/member assignment, <code>if</code>/<code>else</code>, <code>while</code>, C-style <code>for</code>, <code>break</code>, <code>continue</code>.</li>
       <li><strong>Expressions:</strong> literals (<code>int</code>, <code>float</code>, <code>bool</code>, <code>string</code>, <code>null</code>), arithmetic, logical, comparison, function calls, closures (<code>|...| expr</code>), if-expression form (<code>if cond => { ... } else => { ... }</code>), match expressions.</li>
@@ -76,7 +76,7 @@
       <li><strong>Default runtime host namespace:</strong> <code>use runtime;</code> then <code>runtime::sleep(ms)</code>. In the browser playground this validates the argument and returns immediately because wasm cannot block the UI thread.</li>
     </ul>
 
-    <h4>Ownership and Liveness Behavior</h4>
+    <h3>Ownership And Liveness Behavior</h3>
     <ul>
       <li><code>let</code> bindings are immutable by default; use <code>let mut</code> for mutable bindings.</li>
       <li>Reassignment, indexed/member mutation, and <code>&mut</code> borrows require a mutable binding.</li>
@@ -91,7 +91,7 @@
       <li>Inline <code>fn</code> and closure calls clear per-call frame slots after producing the call result. Closure capture slots participate in liveness null-clears once the owning closure/value is dead.</li>
     </ul>
 
-    <h4>Current RustScript Compiler Limitations</h4>
+    <h3>Current RustScript Compiler Limitations</h3>
     <ul>
       <li><code>crate::...</code> module paths are not supported in source loading; use relative module paths.</li>
       <li>Callable locals can be passed and called, but are not runtime <code>Value</code>s and cannot be stored in arrays/maps or returned.</li>
@@ -103,31 +103,13 @@
       <li>Host import namespace support allows <code>vm</code>, virtual host namespaces like <code>runtime::</code>, and builtin namespaces <code>io::</code>, <code>re::</code>, <code>json::</code>, and <code>jit::</code>.</li>
     </ul>
 
-    <h3>Assembler API</h3>
-    <pre><code>.data
-const two 2
-string greeting "hello"
-.code
-.local counter
-.label loop
-ldc two
-...
-brfalse done
-br loop
-.label done
-ldc greeting
-ret</code></pre>
-    <p>Directives include <code>.data</code>, <code>.code</code>, <code>.label NAME</code>, and <code>.local NAME [INDEX]</code>.</p>
-
-    <h3>Builtins and Bridged `call` Opcode</h3>
+    <h2>Browser Runtime Limitations</h2>
     <ul>
-      <li><strong>Builtin calls:</strong> fixed reserved indices emitted by parser lowering (e.g. <code>len</code>, <code>assert</code>, <code>io::*</code>).</li>
-      <li><strong>Runtime host imports:</strong> per-program remapped indices emitted as <code>call &lt;slot&gt;, &lt;argc&gt;</code>.</li>
-      <li><strong>Inlined RustScript function bodies:</strong> calls to targets with <code>FunctionImpl</code> are inlined without emitted <code>call</code> opcodes.</li>
+      <li>The playground uses the wasm runtime. Native JIT is not available here.</li>
+      <li>Execution in the browser is effectively interpreter-only today.</li>
+      <li>Epoch mode depends on browser timer delivery. A long compute-only wasm call cannot be preempted mid-call while the main thread is busy.</li>
+      <li>Browser behavior can differ from native CLI or server embeddings where threads, timers, and native execution paths are available.</li>
     </ul>
-
-    <h3>JIT Internals</h3>
-    <p>The trace-based JIT path detects hot bytecode loops, records straight-line trace semantics, and emits native machine code via Cranelift, executing trace semantics without bytecode re-decoding.</p>
 
   </body>
 </html>
