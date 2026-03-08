@@ -524,14 +524,15 @@ async fn tiny_language_can_enforce_simple_rate_limit() {
     let client = reqwest::Client::new();
 
     let source = r#"
-        use vm;
+        use http;
+        use rate_limit;
 
-        if vm::rate_limit::allow(vm::http::request::get_header("x-client-id"), 2, 60) {
-            vm::http::response::set_header("x-vm", "allowed");
-            vm::http::response::set_body("ok");
+        if rate_limit::allow(http::request::get_header("x-client-id"), 2, 60) {
+            http::response::set_header("x-vm", "allowed");
+            http::response::set_body("ok");
         } else {
-            vm::http::response::set_header("x-vm", "rate-limited");
-            vm::http::response::set_body("blocked");
+            http::response::set_header("x-vm", "rate-limited");
+            http::response::set_body("blocked");
         }
     "#;
     let compiled = compile_source(source).expect("source should compile");
@@ -614,17 +615,18 @@ async fn http_prefixed_host_abi_can_rewrite_request_and_short_circuit() {
 
     let source = format!(
         r#"
-        use vm;
+        use http;
+        use rate_limit;
 
-        let client_id = vm::http::request::get_header("x-client-id");
-        if vm::rate_limit::allow(client_id, 1, 60) {{
-            vm::http::upstream::request::set_path("/rewritten");
-            vm::http::upstream::request::set_query("from=vm");
-            vm::http::upstream::request::set_header("x-added", "yes");
-            vm::http::upstream::request::set_target("{upstream_addr}");
+        let client_id = http::request::get_header("x-client-id");
+        if rate_limit::allow(client_id, 1, 60) {{
+            http::upstream::request::set_path("/rewritten");
+            http::upstream::request::set_query("from=vm");
+            http::upstream::request::set_header("x-added", "yes");
+            http::upstream::request::set_target("{upstream_addr}");
         }} else {{
-            vm::http::response::set_status(429);
-            vm::http::response::set_body("blocked");
+            http::response::set_status(429);
+            http::response::set_body("blocked");
         }}
     "#
     );
@@ -683,10 +685,10 @@ async fn http_request_body_can_be_rewritten_before_proxying() {
 
     let source = format!(
         r#"
-        use vm;
+        use http;
 
-        vm::http::upstream::request::set_body("rewritten-body");
-        vm::http::upstream::request::set_target("{upstream_addr}");
+        http::upstream::request::set_body("rewritten-body");
+        http::upstream::request::set_target("{upstream_addr}");
     "#
     );
     let compiled = compile_source(&source).expect("source should compile");
@@ -716,16 +718,16 @@ async fn http_request_body_chunk_api_reads_in_chunks() {
     let client = reqwest::Client::new();
 
     let source = r#"
-        use vm;
+        use http;
 
-        let first = vm::http::request::body::next_chunk(4);
-        let second = vm::http::request::body::next_chunk(4);
-        let rest = vm::http::request::body::next_chunk(64);
-        let done = vm::http::request::body::eof();
+        let first = http::request::body::next_chunk(4);
+        let second = http::request::body::next_chunk(4);
+        let rest = http::request::body::next_chunk(64);
+        let done = http::request::body::eof();
         if done {
-            vm::http::response::set_body(first + second + rest);
+            http::response::set_body(first + second + rest);
         } else {
-            vm::http::response::set_body("body-not-finished");
+            http::response::set_body("body-not-finished");
         }
     "#;
     let compiled = compile_source(source).expect("source should compile");
@@ -855,10 +857,10 @@ async fn uploaded_program_with_locals_executes_successfully() {
     let client = reqwest::Client::new();
 
     let source = r#"
-        use vm;
+        use http;
 
         let body = "from-local";
-        vm::http::response::set_body(body);
+        http::response::set_body(body);
     "#;
     let compiled = compile_source(source).expect("source should compile");
     assert!(

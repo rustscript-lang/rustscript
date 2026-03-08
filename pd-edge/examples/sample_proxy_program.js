@@ -1,11 +1,12 @@
-import * as vm from "vm";
+import * as http from "http";
+import * as rate_limit from "rate_limit";
 
-let header = vm.http.request.get_header("x-client-id");
+let header = http.request.get_header("x-client-id");
 
-if (vm.rate_limit.allow(header, 3, 60)) {
-    vm.http.response.set_header("x-vm", "allowed");
-    vm.http.response.set_body("request allowed");
+if (rate_limit.allow(header, 3, 60)) {
+    http.response.set_header("x-vm", "allowed");
+    http.response.set_body("request allowed");
 } else {
-    vm.http.response.set_header("x-vm", "rate-limited");
-    vm.http.response.set_body("rate limit exceeded");
+    http.response.set_header("x-vm", "rate-limited");
+    http.response.set_body("rate limit exceeded");
 }

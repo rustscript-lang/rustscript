@@ -4,7 +4,7 @@ use crate::builtins::is_builtin_namespace;
 
 use super::super::frontends::{is_ident_continue, is_ident_start};
 use super::super::{CompileSourceFileOptions, SourceFlavor, SourcePathError};
-use super::model::{ImportClause, ModuleImport, NamedImport, ROOT_HOST_NAMESPACE_SPEC};
+use super::model::{ImportClause, ModuleImport, NamedImport};
 
 pub(super) fn parse_module_imports(
     source: &str,
@@ -142,10 +142,6 @@ fn rustscript_use_module_to_spec(
             message: "expected module path after 'use'".to_string(),
         });
     }
-    if module_path == ROOT_HOST_NAMESPACE_SPEC {
-        return Ok(ROOT_HOST_NAMESPACE_SPEC.to_string());
-    }
-
     let segments = module_path
         .split("::")
         .map(|segment| segment.trim())
@@ -990,9 +986,6 @@ fn is_builtin_namespace_use_directive_line(line: &str) -> bool {
 }
 
 pub(super) fn host_namespace_root_from_spec(spec: &str) -> Option<String> {
-    if spec == ROOT_HOST_NAMESPACE_SPEC {
-        return None;
-    }
     if spec.contains('/') {
         return None;
     }

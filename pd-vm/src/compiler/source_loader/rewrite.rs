@@ -8,7 +8,7 @@ use super::imports::{
     host_namespace_root_from_spec, is_builtin_host_namespace_spec, is_module_specifier,
     is_valid_ident, is_virtual_host_namespace_spec, resolve_module_path,
 };
-use super::model::{ImportClause, ImportRewriteResult, ModuleImport, ROOT_HOST_NAMESPACE_SPEC};
+use super::model::{ImportClause, ImportRewriteResult, ModuleImport};
 
 struct ImportCallResolution {
     alias_calls: HashMap<String, String>,
@@ -40,20 +40,6 @@ pub(super) fn build_scheme_import_context(
             .or_insert(Some(arity));
     }
 
-    for import in imports {
-        if import.spec != ROOT_HOST_NAMESPACE_SPEC {
-            continue;
-        }
-        let ImportClause::Named(named) = &import.clause else {
-            continue;
-        };
-        for binding in named {
-            declared_functions
-                .entry(binding.imported.clone())
-                .or_insert(None);
-        }
-    }
-
     let mut declared_functions = declared_functions.into_iter().collect::<Vec<_>>();
     declared_functions.sort_by(|(lhs_name, _), (rhs_name, _)| lhs_name.cmp(rhs_name));
 
@@ -77,21 +63,6 @@ fn resolve_import_call_paths(
     let mut namespace_prefix_calls = HashMap::<String, String>::new();
     for import in imports {
         if is_builtin_host_namespace_spec(&import.spec) {
-            continue;
-        }
-        if import.spec == ROOT_HOST_NAMESPACE_SPEC {
-            match &import.clause {
-                ImportClause::AllPublic => {}
-                ImportClause::Named(named) => {
-                    for binding in named {
-                        if binding.local != binding.imported {
-                            alias_calls.insert(binding.local.clone(), binding.imported.clone());
-                        }
-                    }
-                }
-                ImportClause::Namespace(_) => {}
-                ImportClause::Prefix(_) => {}
-            }
             continue;
         }
         if !is_module_specifier(&import.spec) {

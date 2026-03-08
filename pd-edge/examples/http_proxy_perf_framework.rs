@@ -54,24 +54,24 @@ if parity == 0 {{
 fn host_calls_terminate_program_source() -> String {
     format!(
         r#"
-use vm;
-
 {BASE_WORKLOAD_SOURCE}
 
-let method = vm::http::request::get_method();
-let path = vm::http::request::get_path();
-let client_id = vm::http::request::get_header("x-client-id");
-let body = vm::http::request::get_body();
+use http;
+
+let method = http::request::get_method();
+let path = http::request::get_path();
+let client_id = http::request::get_header("x-client-id");
+let body = http::request::get_body();
 
 if (acc % 2) == 0 {{
-    vm::http::response::set_header("x-perf-acc", "even");
+    http::response::set_header("x-perf-acc", "even");
 }} else {{
-    vm::http::response::set_header("x-perf-acc", "odd");
+    http::response::set_header("x-perf-acc", "odd");
 }}
-    vm::http::response::set_header("x-perf-method", method);
-    vm::http::response::set_header("x-perf-path", path);
-    vm::http::response::set_header("x-perf-client-id", client_id);
-    vm::http::response::set_body("host-calls-terminate|" + body);
+    http::response::set_header("x-perf-method", method);
+    http::response::set_header("x-perf-path", path);
+    http::response::set_header("x-perf-client-id", client_id);
+    http::response::set_body("host-calls-terminate|" + body);
 "#
     )
 }

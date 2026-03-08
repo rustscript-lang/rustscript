@@ -86,21 +86,21 @@ fn boolean_precedence_and_grouping_match_across_frontends() {
 #[test]
 fn logical_ops_short_circuit_host_calls_across_frontends() {
     let rustscript = r#"
-        fn tick();
-        let a = false && tick();
-        let b = true || tick();
+        use runtime;
+        let a = false && runtime::tick();
+        let b = true || runtime::tick();
         (!a) && b;
     "#;
     let javascript = r#"
-        import * as vm from "vm";
-        let a = false && vm.tick();
-        let b = true || vm.tick();
+        import * as runtime from "runtime";
+        let a = false && runtime.tick();
+        let b = true || runtime.tick();
         (!a) && b;
     "#;
     let lua = r#"
-        local vm = require("vm")
-        local a = false and vm.tick()
-        local b = true or vm.tick()
+        local runtime = require("runtime")
+        local a = false and runtime.tick()
+        local b = true or runtime.tick()
         (not a) and b
     "#;
 
@@ -115,7 +115,7 @@ fn logical_ops_short_circuit_host_calls_across_frontends() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut vm = Vm::new(compiled.program);
         vm.bind_function(
-            "tick",
+            "runtime::tick",
             Box::new(CountedTrueHost {
                 calls: Arc::clone(&calls),
             }),
