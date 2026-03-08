@@ -207,6 +207,10 @@ impl Assembler {
         self.emit_opcode(OpCode::Neg);
     }
 
+    pub fn not(&mut self) {
+        self.emit_opcode(OpCode::Not);
+    }
+
     pub fn ceq(&mut self) {
         self.emit_opcode(OpCode::Ceq);
     }
@@ -279,6 +283,10 @@ impl Assembler {
 
     pub fn shr(&mut self) {
         self.emit_opcode(OpCode::Shr);
+    }
+
+    pub fn lshr(&mut self) {
+        self.emit_opcode(OpCode::Lshr);
     }
 
     fn emit_opcode(&mut self, opcode: OpCode) {
@@ -362,6 +370,10 @@ impl BytecodeBuilder {
         self.emit_opcode(OpCode::Neg);
     }
 
+    pub fn not(&mut self) {
+        self.emit_opcode(OpCode::Not);
+    }
+
     pub fn ceq(&mut self) {
         self.emit_opcode(OpCode::Ceq);
     }
@@ -414,6 +426,10 @@ impl BytecodeBuilder {
 
     pub fn shr(&mut self) {
         self.emit_opcode(OpCode::Shr);
+    }
+
+    pub fn lshr(&mut self) {
+        self.emit_opcode(OpCode::Lshr);
     }
 
     fn emit_opcode(&mut self, opcode: OpCode) {
@@ -641,6 +657,7 @@ pub fn assemble(source: &str) -> Result<Program, AsmParseError> {
             OpCode::Mul => assembler.mul(),
             OpCode::Div => assembler.div(),
             OpCode::Neg => assembler.neg(),
+            OpCode::Not => assembler.not(),
             OpCode::Ceq => assembler.ceq(),
             OpCode::Clt => assembler.clt(),
             OpCode::Cgt => assembler.cgt(),
@@ -697,6 +714,7 @@ pub fn assemble(source: &str) -> Result<Program, AsmParseError> {
             }
             OpCode::Shl => assembler.shl(),
             OpCode::Shr => assembler.shr(),
+            OpCode::Lshr => assembler.lshr(),
             OpCode::Mod => assembler.modulo(),
             OpCode::And => assembler.and(),
             OpCode::Or => assembler.or(),

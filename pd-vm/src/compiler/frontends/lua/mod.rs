@@ -3,7 +3,9 @@ mod support;
 
 use super::super::ParseError;
 use super::super::ir::{Expr, FrontendIr, LocalIrBuilder, LocalSlot, Stmt};
-use expr::{build_lua_unpack_get_expr, parse_lua_direct_expr, parse_lua_direct_expr_top};
+use expr::{
+    LuaDirectLowering, build_lua_unpack_get_expr, parse_lua_direct_expr, parse_lua_direct_expr_top,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use support::{
@@ -178,16 +180,16 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
                     if *in_else {
                         return Ok(None);
                     }
-                    let Some(condition) = parse_lua_direct_expr(
-                        condition_raw,
+                    let mut lowering = LuaDirectLowering::new(
                         &mut builder,
                         &namespace_aliases,
                         param_lookup,
                         captures,
                         true,
                         &callable_return_arities,
-                        true,
-                    )?
+                    );
+                    let Some(condition) =
+                        parse_lua_direct_expr(condition_raw, &mut lowering, true)?
                     else {
                         return Ok(None);
                     };
@@ -258,16 +260,15 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
                 if body_result.is_some() {
                     return Ok(None);
                 }
-                let Some(condition) = parse_lua_direct_expr(
-                    condition_raw,
+                let mut lowering = LuaDirectLowering::new(
                     &mut builder,
                     &namespace_aliases,
                     param_lookup,
                     captures,
                     true,
                     &callable_return_arities,
-                    true,
-                )?
+                );
+                let Some(condition) = parse_lua_direct_expr(condition_raw, &mut lowering, true)?
                 else {
                     return Ok(None);
                 };
@@ -679,16 +680,16 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
             }
             let params = HashMap::new();
             let mut captures = HashMap::new();
-            let Some(expr) = parse_lua_direct_expr(
-                rhs_parts[0].trim(),
+            let mut lowering = LuaDirectLowering::new(
                 &mut builder,
                 &namespace_aliases,
                 &params,
                 &mut captures,
                 false,
                 &callable_return_arities,
-                names.len() > 1,
-            )?
+            );
+            let Some(expr) =
+                parse_lua_direct_expr(rhs_parts[0].trim(), &mut lowering, names.len() > 1)?
             else {
                 return Ok(None);
             };
@@ -721,17 +722,16 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
             && !lhs.contains('>')
         {
             let mut captures = HashMap::new();
-            let Some(expr) = parse_lua_direct_expr(
-                rhs.trim(),
+            let empty_params = HashMap::new();
+            let mut lowering = LuaDirectLowering::new(
                 &mut builder,
                 &namespace_aliases,
-                &HashMap::new(),
+                &empty_params,
                 &mut captures,
                 false,
                 &callable_return_arities,
-                false,
-            )?
-            else {
+            );
+            let Some(expr) = parse_lua_direct_expr(rhs.trim(), &mut lowering, false)? else {
                 return Ok(None);
             };
             let stmt = builder.lower_assign(lhs.trim(), expr.expr, line_u32)?;

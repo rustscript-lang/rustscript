@@ -1,7 +1,7 @@
 #![cfg(feature = "runtime")]
 use vm::{
     CallOutcome, HostFunction, JitConfig, JitTraceTerminal, OpCode, Value, Vm, VmStatus,
-    compile_source,
+    compile_source, disassemble_program,
 };
 
 fn native_jit_supported() -> bool {
@@ -350,7 +350,7 @@ fn compiler_uses_shl_for_power_of_two_multiply_and_jit_accepts_it() {
 }
 
 #[test]
-fn compiler_emits_mod_and_or_and_jit_accepts_them() {
+fn compiler_emits_mod_and_short_circuit_logic_and_jit_accepts_them() {
     let source = r#"
         let mut i = 1;
         let mut sum = 0;
@@ -368,17 +368,22 @@ fn compiler_emits_mod_and_or_and_jit_accepts_them() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
+    let disassembly = disassemble_program(&compiled.program);
     assert!(
         compiled.program.code.contains(&(OpCode::Mod as u8)),
         "expected compiler to emit mod"
     );
     assert!(
-        compiled.program.code.contains(&(OpCode::And as u8)),
-        "expected compiler to emit and"
+        disassembly.contains("brfalse "),
+        "expected compiler to emit branch-based short-circuit logic"
     );
     assert!(
-        compiled.program.code.contains(&(OpCode::Or as u8)),
-        "expected compiler to emit or"
+        !disassembly.contains(" and\n"),
+        "short-circuit lowering should not emit eager and"
+    );
+    assert!(
+        !disassembly.contains(" or\n"),
+        "short-circuit lowering should not emit eager or"
     );
 
     let mut vm = Vm::new(compiled.program);
@@ -395,8 +400,6 @@ fn compiler_emits_mod_and_or_and_jit_accepts_them() {
     if native_jit_supported() {
         let dump = vm.dump_jit_info();
         assert!(dump.contains(" mod"), "expected trace dump to include mod");
-        assert!(dump.contains(" and"), "expected trace dump to include and");
-        assert!(dump.contains(" or"), "expected trace dump to include or");
     }
 }
 

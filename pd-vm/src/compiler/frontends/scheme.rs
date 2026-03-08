@@ -730,8 +730,10 @@ fn lower_scheme_direct_list_expr(
             capture_slots,
             capture_enabled,
             import_context,
-            Expr::Add,
-            fold_int_add,
+            SchemeFoldOps {
+                build: Expr::Add,
+                eval_int: fold_int_add,
+            },
         ),
         "*" => lower_scheme_direct_fold(
             args,
@@ -740,8 +742,10 @@ fn lower_scheme_direct_list_expr(
             capture_slots,
             capture_enabled,
             import_context,
-            Expr::Mul,
-            fold_int_mul,
+            SchemeFoldOps {
+                build: Expr::Mul,
+                eval_int: fold_int_mul,
+            },
         ),
         "-" => {
             if args.is_empty() {
@@ -768,8 +772,10 @@ fn lower_scheme_direct_list_expr(
                 capture_slots,
                 capture_enabled,
                 import_context,
-                Expr::Sub,
-                fold_int_sub,
+                SchemeFoldOps {
+                    build: Expr::Sub,
+                    eval_int: fold_int_sub,
+                },
             )
         }
         "/" => lower_scheme_direct_fold(
@@ -779,8 +785,10 @@ fn lower_scheme_direct_list_expr(
             capture_slots,
             capture_enabled,
             import_context,
-            Expr::Div,
-            fold_int_div,
+            SchemeFoldOps {
+                build: Expr::Div,
+                eval_int: fold_int_div,
+            },
         ),
         "modulo" | "remainder" => lower_scheme_direct_binary(
             args,
@@ -1479,6 +1487,11 @@ where
     Ok(Some(build(Box::new(lhs), Box::new(rhs))))
 }
 
+struct SchemeFoldOps<F> {
+    build: F,
+    eval_int: fn(i64, i64) -> Option<i64>,
+}
+
 fn lower_scheme_direct_fold<F>(
     args: &[SchemeForm],
     builder: &mut LocalIrBuilder,
@@ -1486,8 +1499,7 @@ fn lower_scheme_direct_fold<F>(
     capture_slots: &mut HashMap<u16, u16>,
     capture_enabled: bool,
     import_context: Option<&NormalizedSchemeImportContext>,
-    build: F,
-    eval_int: fn(i64, i64) -> Option<i64>,
+    ops: SchemeFoldOps<F>,
 ) -> Result<Option<Expr>, ParseError>
 where
     F: Fn(Box<Expr>, Box<Expr>) -> Expr + Copy,
@@ -1527,7 +1539,7 @@ where
         };
         let mut foldable = true;
         for rhs in iter {
-            let Some(next) = eval_int(acc, rhs) else {
+            let Some(next) = (ops.eval_int)(acc, rhs) else {
                 foldable = false;
                 break;
             };
@@ -1543,7 +1555,7 @@ where
         return Ok(None);
     };
     for rhs in iter {
-        expr = build(Box::new(expr), Box::new(rhs));
+        expr = (ops.build)(Box::new(expr), Box::new(rhs));
     }
     Ok(Some(expr))
 }

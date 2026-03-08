@@ -352,6 +352,7 @@ pub fn disassemble_program_with_options(program: &Program, options: DisassembleO
             x if x == OpCode::Mul as u8 => instruction.push_str("mul"),
             x if x == OpCode::Div as u8 => instruction.push_str("div"),
             x if x == OpCode::Neg as u8 => instruction.push_str("neg"),
+            x if x == OpCode::Not as u8 => instruction.push_str("not"),
             x if x == OpCode::Ceq as u8 => instruction.push_str("ceq"),
             x if x == OpCode::Clt as u8 => instruction.push_str("clt"),
             x if x == OpCode::Cgt as u8 => instruction.push_str("cgt"),
@@ -407,6 +408,7 @@ pub fn disassemble_program_with_options(program: &Program, options: DisassembleO
             }
             x if x == OpCode::Shl as u8 => instruction.push_str("shl"),
             x if x == OpCode::Shr as u8 => instruction.push_str("shr"),
+            x if x == OpCode::Lshr as u8 => instruction.push_str("lshr"),
             x if x == OpCode::Mod as u8 => instruction.push_str("mod"),
             x if x == OpCode::And as u8 => instruction.push_str("and"),
             x if x == OpCode::Or as u8 => instruction.push_str("or"),
@@ -499,10 +501,12 @@ fn analyze_program(
                 || x == OpCode::Div as u8
                 || x == OpCode::Shl as u8
                 || x == OpCode::Shr as u8
+                || x == OpCode::Lshr as u8
                 || x == OpCode::Mod as u8
                 || x == OpCode::And as u8
                 || x == OpCode::Or as u8
                 || x == OpCode::Neg as u8
+                || x == OpCode::Not as u8
                 || x == OpCode::Ceq as u8
                 || x == OpCode::Clt as u8
                 || x == OpCode::Cgt as u8
