@@ -291,6 +291,37 @@ mod tests {
                 .any(|entry| entry.label == "string::trim"),
             "expected RustScript stdlib completion"
         );
+        assert!(
+            catalog
+                .rustscript
+                .iter()
+                .any(|entry| entry.label == "parse::try_parse_int_base"),
+            "expected RustScript parse stdlib completion"
+        );
+        assert!(
+            catalog
+                .rustscript
+                .iter()
+                .any(|entry| entry.label == "set::union"),
+            "expected RustScript set stdlib completion"
+        );
+    }
+
+    #[test]
+    fn lint_accepts_embedded_parse_and_set_stdlib_imports() {
+        let source = r#"
+            use stdlib::rss::parse as parse;
+            use stdlib::rss::set as set;
+            let number = parse::try_parse_int_base("1011", 2);
+            let values = set::union([1, 2], [2, 3]);
+            number == 11 && values.length == 3;
+        "#;
+        let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
+        assert!(
+            report.diagnostics.is_empty(),
+            "expected embedded parse/set stdlib lint to pass, got {:?}",
+            report.diagnostics
+        );
     }
 
     #[test]

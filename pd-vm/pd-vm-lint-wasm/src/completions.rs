@@ -433,5 +433,19 @@ mod tests {
                 .any(|entry| entry.label == "string::trim"),
             "expected RustScript stdlib completion for string::trim",
         );
+        assert!(
+            catalog
+                .rustscript
+                .iter()
+                .any(|entry| entry.label == "parse::try_parse_int_base"),
+            "expected RustScript stdlib completion for parse::try_parse_int_base",
+        );
+        assert!(
+            catalog
+                .rustscript
+                .iter()
+                .any(|entry| entry.label == "set::union"),
+            "expected RustScript stdlib completion for set::union",
+        );
     }
 }
