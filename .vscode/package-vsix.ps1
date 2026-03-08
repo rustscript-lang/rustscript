@@ -35,6 +35,14 @@ $vsixPath = Join-Path $outputPath "$name-$version.vsix"
 
 Push-Location $extensionPath
 try {
+    if (Test-Path (Join-Path $extensionPath "package-lock.json")) {
+        npm ci
+    }
+    else {
+        npm install
+    }
+
+    npm run copy-wasm
     npx @vscode/vsce package --out $vsixPath
 }
 finally {

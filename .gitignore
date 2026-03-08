@@ -1,6 +1,5 @@
 /target
 /vm-compare-bench/
-.vsix
 .pd-controller
 .pd-edge
 *.wasm
@@ -9,5 +8,6 @@
 *.pat
 *.txt
 *.json
+*.vsix
 node_modules
 dist

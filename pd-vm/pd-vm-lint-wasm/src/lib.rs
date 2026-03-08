@@ -226,4 +226,29 @@ mod tests {
             "expected RustScript stdlib completion"
         );
     }
+
+    #[test]
+    fn lint_reports_rustscript_move_semantics_diagnostics() {
+        let source = r#"
+            let value = "hello";
+            let moved = value;
+            value;
+        "#;
+
+        let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
+        assert!(
+            !report.diagnostics.is_empty(),
+            "expected move/borrow style diagnostics for RustScript"
+        );
+        assert!(
+            report.diagnostics.iter().any(|diag| {
+                diag.message.contains("moved")
+                    || diag.rendered.contains("moved")
+                    || diag.message.contains("borrow")
+                    || diag.rendered.contains("borrow")
+            }),
+            "expected move/borrow wording in diagnostics, got: {:?}",
+            report.diagnostics
+        );
+    }
 }

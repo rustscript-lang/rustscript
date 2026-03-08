@@ -25,6 +25,11 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
@@ -74,6 +79,20 @@ jobs:
           tar -czf dist/pd-controller-${{ github.ref_name }}-linux-x86_64.tar.gz -C dist pd-controller
           tar -czf dist/pd-vm-run-${{ github.ref_name }}-linux-x86_64.tar.gz -C dist pd-vm-run
 
+      - name: Build RustScript VS Code extension
+        shell: bash
+        run: |
+          cd .vscode/rss-language-extension
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+          npm run package
+          EXT_VERSION=$(node -p "require('./package.json').version")
+          cd ../..
+          cp ".vscode/rss-language-extension/rustscript-syntax-${EXT_VERSION}.vsix" "dist/rustscript-syntax-${EXT_VERSION}.vsix"
+
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -83,6 +102,7 @@ jobs:
             dist/pd-edge-console-${{ github.ref_name }}-linux-x86_64.tar.gz
             dist/pd-controller-${{ github.ref_name }}-linux-x86_64.tar.gz
             dist/pd-vm-run-${{ github.ref_name }}-linux-x86_64.tar.gz
+            dist/rustscript-syntax-*.vsix
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -122,3 +142,4 @@ jobs:
             dist/pd-edge-console-${{ github.ref_name }}-linux-x86_64.tar.gz
             dist/pd-controller-${{ github.ref_name }}-linux-x86_64.tar.gz
             dist/pd-vm-run-${{ github.ref_name }}-linux-x86_64.tar.gz
+            dist/rustscript-syntax-*.vsix

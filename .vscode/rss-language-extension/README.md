@@ -1,6 +1,6 @@
-# RustScript Syntax Extension
+# RustScript Language Tools
 
-Local VS Code extension for syntax highlighting of RustScript `.rss` files.
+Local VS Code extension for RustScript `.rss` with syntax highlighting plus a language server.
 
 ## Covered syntax
 
@@ -12,6 +12,14 @@ Local VS Code extension for syntax highlighting of RustScript `.rss` files.
 - Expressions: operators (including `=>`, `!=`, `&&`, `||`, `%`), closure pipes (`|...|` and `| | ...`), wildcard `_`, member access (`obj.field`, `obj?.field`)
 - Delimiters: `()`, `{}`, `[]`, `,`, `:`, `;`
 
+## Language server features
+
+- Diagnostics from `pd_vm_lint_wasm.wasm` (same lint core used by the controller web UI)
+- Completion items sourced from the wasm completion catalog
+- Hover docs for known symbols
+- Basic document symbols for `fn` and `let` declarations
+- Fallback delimiter diagnostics if lint wasm is unavailable
+
 ## Install locally
 
 1. Open VS Code.
@@ -22,5 +30,11 @@ Local VS Code extension for syntax highlighting of RustScript `.rss` files.
 
 1. Open this folder in VS Code.
 2. Open `.vscode/rss-language-extension`.
-3. Press `F5` to launch an Extension Development Host.
-4. Open an `.rss` file in the development host.
+3. Run `npm install`.
+4. Run `npm run copy-wasm` (builds `pd-vm-lint-wasm` from source, then bundles it).
+5. Press `F5` to launch an Extension Development Host.
+6. Open an `.rss` file in the development host.
+
+## Config
+
+- `rustscript.languageServer.wasmPath`: optional absolute path override for `pd_vm_lint_wasm.wasm`.
