@@ -109,6 +109,26 @@ fn lua_runtime_cases_work() {
             expected_stack: vec![Value::Int(42)],
             expected_locals: None,
         },
+        RuntimeCase {
+            name: "inline_function_literal_empty_body_returns_null",
+            source: r#"
+                local f = function() end
+                f()
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_stack: vec![Value::Null],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "inline_function_literal_empty_return_returns_null",
+            source: r#"
+                local f = function() return end
+                f()
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_stack: vec![Value::Null],
+            expected_locals: None,
+        },
     ];
 
     run_runtime_cases(&cases);
