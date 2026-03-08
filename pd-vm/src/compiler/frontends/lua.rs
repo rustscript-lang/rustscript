@@ -1712,13 +1712,21 @@ impl LuaDirectExprParser {
                 return None;
             }
         }
-        if !self.match_token(|token| matches!(token, LuaDirectToken::Return)) {
+        let body = if self.match_token(|token| matches!(token, LuaDirectToken::End)) {
+            LuaDirectExpr::Null
+        } else if self.match_token(|token| matches!(token, LuaDirectToken::Return)) {
+            if self.match_token(|token| matches!(token, LuaDirectToken::End)) {
+                LuaDirectExpr::Null
+            } else {
+                let body = self.parse_or()?;
+                if !self.match_token(|token| matches!(token, LuaDirectToken::End)) {
+                    return None;
+                }
+                body
+            }
+        } else {
             return None;
-        }
-        let body = self.parse_or()?;
-        if !self.match_token(|token| matches!(token, LuaDirectToken::End)) {
-            return None;
-        }
+        };
         Some(LuaDirectExpr::Closure {
             params,
             body: Box::new(body),

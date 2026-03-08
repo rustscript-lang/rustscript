@@ -143,6 +143,8 @@ Library hooks:
 
 - `vm.set_jit_config(...)`
 - `vm.prepare_aot()`
+- `vm.emit_aot_bundle()`
+- `Vm::from_aot_bundle_bytes(...)`
 - `vm.jit_snapshot()`
 - `vm.dump_jit_info()`
 - `vm.jit_native_trace_count()`
@@ -173,10 +175,15 @@ cargo run -p pd-vm --bin pd-vm-run -- --run-aot out/example.pat --jit-dump
 
 - AOT uses the same native backend as JIT (Cranelift).
 - Opcode/native support coverage is shared with the JIT backend.
-- `.pat` stores VM program data (`local_count` + encoded VM bytecode), not process-specific native
-  pointers. Native traces are regenerated per process.
-- Control-flow targets are bytecode instruction offsets (effectively base+offset with bytecode base
-  at `0`), so emitted bundles are portable across runs on the same architecture/support matrix.
+- `.pat` stores native trace machine code, constants/import metadata, local count, and trace
+  metadata. Emitted bundles do not persist VM bytecode.
+- Bundles are validated against target arch/os/pointer width plus a VM-layout fingerprint before
+  loading, so they are only portable across compatible builds on the same native support matrix.
+- Control-flow targets remain instruction offsets inside a synthetic code space (`ip` labels are
+  preserved even though raw bytecode is not), so trace chaining and host-call resume addresses stay
+  stable at runtime.
+- Native-only AOT bundles support pending host calls, but synchronous host `CallOutcome::Yield`
+  requires bytecode replay and is therefore rejected at runtime.
 
 ### Fuel Metering
 
@@ -502,7 +509,7 @@ JavaScript frontend:
 Lua frontend:
 
 - Lua pattern API string methods (`:match`, `:gsub`, etc.) are not supported
-- function literals require a non-empty return expression (`function(...) return <expr> end`)
+- function literal bodies are limited to `function(...) end`, `function(...) return end`, or `function(...) return <expr> end`
 
 Scheme frontend:
 
