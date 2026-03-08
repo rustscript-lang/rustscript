@@ -14,6 +14,10 @@ Features:
 - autocomplete catalog sourced from wasm (embedded RSS stdlib + host functions + builtin namespaces like `json`/`re`)
 - print output + final VM stack preview
 
+## Contents
+
+- [Run](#run)
+
 ## Run
 
 ```powershell

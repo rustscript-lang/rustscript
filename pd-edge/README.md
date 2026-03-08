@@ -7,6 +7,27 @@ This crate now ships two binaries with different scopes:
 - `pd-edge-http-proxy`: full HTTP data plane runtime (proxy path + admin API + optional active control-plane client)
 - `pd-edge-console`: interactive local console runtime (stdin/stdout/stderr host APIs + optional active control-plane client)
 
+## Contents
+
+- [Binary Scope](#binary-scope)
+  - [pd-edge-http-proxy](#pd-edge-http-proxy)
+  - [pd-edge-console](#pd-edge-console)
+- [Quick Start](#quick-start)
+  - [HTTP Proxy Mode](#http-proxy-mode)
+  - [Console Mode](#console-mode)
+- [HTTP Proxy Admin API](#http-proxy-admin-api)
+- [CLI](#cli)
+  - [pd-edge-http-proxy](#pd-edge-http-proxy-1)
+  - [pd-edge-console](#pd-edge-console-1)
+- [Active Control-Plane RPC](#active-control-plane-rpc)
+  - [Example](#example)
+- [HTTP Proxy Performance Framework](#http-proxy-performance-framework)
+  - [Latest Snapshot (2026-03-07, Local Windows x86_64 Dev Machine)](#latest-snapshot-2026-03-07-local-windows-x8664-dev-machine)
+- [ABI Source of Truth](#abi-source-of-truth)
+- [Release Artifacts](#release-artifacts)
+- [Docker](#docker)
+- [Codebase Layout](#codebase-layout)
+
 ## Binary Scope
 
 ### `pd-edge-http-proxy`

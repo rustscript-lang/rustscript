@@ -10,6 +10,15 @@ frontends:
 
 All frontends lower to the same frontend IR and VM bytecode model.
 
+## Contents
+
+- [Quick Syntax Map](#quick-syntax-map)
+- [RustScript (.rss)](#rustscript-rss)
+- [JavaScript Subset (.js)](#javascript-subset-js)
+- [Lua Subset (.lua)](#lua-subset-lua)
+- [Scheme Subset (.scm)](#scheme-subset-scm)
+- [Frontend-wide Policy Notes](#frontend-wide-policy-notes)
+
 ## Quick Syntax Map
 
 | Feature | RustScript | JavaScript | Lua | Scheme |

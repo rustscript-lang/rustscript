@@ -2,6 +2,17 @@
 
 `project-d` is a Rust workspace for programmable edge data planes driven by a VM and a central controller.
 
+## Contents
+
+- [Workspace layout](#workspace-layout)
+- [Prerequisites](#prerequisites)
+- [Build and test](#build-and-test)
+- [Published Docker images](#published-docker-images)
+- [Run with Docker](#run-with-docker)
+- [Run from Release Binaries](#run-from-release-binaries)
+- [Key runtime behavior](#key-runtime-behavior)
+- [Useful docs](#useful-docs)
+
 ## Workspace layout
 
 - `pd-vm`: VM runtime, compiler (`.rss`, `.js`, `.lua`, `.scm`), debugger, and tools.
@@ -157,4 +168,3 @@ http://127.0.0.1:9100/ui
 - [pd-edge README](pd-edge/README.md)
 - [pd-vm README](pd-vm/README.md)
 - ABI manifest: `pd-edge-abi/abi.json`
-

@@ -3,12 +3,32 @@
 `pd-vm` is a stack-based virtual machine plus compiler toolchain used as a backend for multiple
 source syntaxes (`.rss`, `.js`, `.lua`, `.scm`).
 
-## Sections
+## Contents
 
 - [Overview](#overview)
 - [TODO](#todo)
 - [How To Use](#how-to-use)
+  - [Run Programs](#run-programs)
+  - [REPL](#repl)
+  - [Debugging](#debugging)
+  - [Recording and Replay](#recording-and-replay)
+  - [Bytecode and VMBC](#bytecode-and-vmbc)
+  - [JIT](#jit)
+  - [AOT](#aot)
+  - [Fuel Metering](#fuel-metering)
+  - [Wasm Lint](#wasm-lint)
+  - [Wasm Runtime Playground](#wasm-runtime-playground)
+  - [WebUI Playground](#webui-playground)
+  - [Test and Perf Commands](#test-and-perf-commands)
 - [Internals](#internals)
+  - [VM Internals](#vm-internals)
+  - [Compiler Internals](#compiler-internals)
+    - [Pipeline Layers](#pipeline-layers)
+    - [Compiler APIs](#compiler-apis)
+    - [Assembler API](#assembler-api)
+    - [Builtins and Bridged call Opcode](#builtins-and-bridged-call-opcode)
+    - [Current Compiler Subset Limitations](#current-compiler-subset-limitations)
+  - [JIT Internals](#jit-internals)
 - [Compiler frontend syntax and feature support](src/compiler/frontends/README.md)
 
 

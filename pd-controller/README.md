@@ -11,6 +11,17 @@ It implements:
 - `GET /healthz` and `GET /metrics`
 - embedded WebUI static serving on `/ui` and `/ui/*`
 
+## Contents
+
+- [Edge overview](#edge-overview)
+- [Program management](#program-management)
+- [Debugger](#debugger)
+- [Run](#run)
+- [Docker image](#docker-image)
+- [Example: enqueue bytecode for edge edge-1](#example-enqueue-bytecode-for-edge-edge-1)
+- [End-to-end integration test](#end-to-end-integration-test)
+- [WebUI](#webui)
+  - [Debug sessions in WebUI](#debug-sessions-in-webui)
 
 ### Edge overview
 
