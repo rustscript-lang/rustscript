@@ -689,7 +689,7 @@ impl Compiler {
                 self.assembler.mark_line(*line);
                 let else_label = self.fresh_label("else");
                 let end_label = self.fresh_label("endif");
-                self.compile_expr(condition)?;
+                self.compile_scalar_expr(condition)?;
                 self.assembler.brfalse_label(&else_label);
                 self.compile_stmts(then_branch)?;
                 self.assembler.br_label(&end_label);
@@ -719,7 +719,7 @@ impl Compiler {
                 self.assembler
                     .label(&start_label)
                     .map_err(CompileError::Assembler)?;
-                self.compile_expr(condition)?;
+                self.compile_scalar_expr(condition)?;
                 self.assembler.brfalse_label(&end_label);
                 self.loop_stack.push(LoopContext {
                     continue_label: continue_label.clone(),
@@ -749,7 +749,7 @@ impl Compiler {
                 self.assembler
                     .label(&start_label)
                     .map_err(CompileError::Assembler)?;
-                self.compile_expr(condition)?;
+                self.compile_scalar_expr(condition)?;
                 self.assembler.brfalse_label(&end_label);
                 self.loop_stack.push(LoopContext {
                     continue_label: start_label.clone(),
@@ -826,93 +826,93 @@ impl Compiler {
             }
             Expr::Add(lhs, rhs) => {
                 if is_definitely_string_expr(lhs) {
-                    self.compile_expr(lhs)?;
+                    self.compile_scalar_expr(lhs)?;
                     self.compile_string_concat_operand(rhs)?;
                     self.assembler.add();
                     return Ok(());
                 }
                 if is_definitely_string_expr(rhs) {
                     self.compile_string_concat_operand(lhs)?;
-                    self.compile_expr(rhs)?;
+                    self.compile_scalar_expr(rhs)?;
                     self.assembler.add();
                     return Ok(());
                 }
-                self.compile_expr(lhs)?;
-                self.compile_expr(rhs)?;
+                self.compile_scalar_expr(lhs)?;
+                self.compile_scalar_expr(rhs)?;
                 self.assembler.add();
             }
             Expr::Sub(lhs, rhs) => {
-                self.compile_expr(lhs)?;
-                self.compile_expr(rhs)?;
+                self.compile_scalar_expr(lhs)?;
+                self.compile_scalar_expr(rhs)?;
                 self.assembler.sub();
             }
             Expr::Mul(lhs, rhs) => {
                 if let Expr::Int(value) = rhs.as_ref()
                     && let Some(shift) = shift_amount_for_power_of_two(*value)
                 {
-                    self.compile_expr(lhs)?;
+                    self.compile_scalar_expr(lhs)?;
                     self.assembler.push_const(Value::Int(shift as i64));
                     self.assembler.shl();
                 } else if let Expr::Int(value) = lhs.as_ref()
                     && let Some(shift) = shift_amount_for_power_of_two(*value)
                 {
-                    self.compile_expr(rhs)?;
+                    self.compile_scalar_expr(rhs)?;
                     self.assembler.push_const(Value::Int(shift as i64));
                     self.assembler.shl();
                 } else {
-                    self.compile_expr(lhs)?;
-                    self.compile_expr(rhs)?;
+                    self.compile_scalar_expr(lhs)?;
+                    self.compile_scalar_expr(rhs)?;
                     self.assembler.mul();
                 }
             }
             Expr::Div(lhs, rhs) => {
-                self.compile_expr(lhs)?;
-                self.compile_expr(rhs)?;
+                self.compile_scalar_expr(lhs)?;
+                self.compile_scalar_expr(rhs)?;
                 self.assembler.div();
             }
             Expr::Mod(lhs, rhs) => {
-                self.compile_expr(lhs)?;
-                self.compile_expr(rhs)?;
+                self.compile_scalar_expr(lhs)?;
+                self.compile_scalar_expr(rhs)?;
                 self.assembler.modulo();
             }
             Expr::Neg(inner) => {
-                self.compile_expr(inner)?;
+                self.compile_scalar_expr(inner)?;
                 self.assembler.neg();
             }
             Expr::Not(inner) => {
-                self.compile_expr(inner)?;
+                self.compile_scalar_expr(inner)?;
                 self.assembler.push_const(Value::Bool(false));
                 self.assembler.ceq();
             }
             Expr::ToOwned(inner) => {
-                self.compile_expr(inner)?;
+                self.compile_scalar_expr(inner)?;
             }
             Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
-                self.compile_expr(inner)?;
+                self.compile_scalar_expr(inner)?;
             }
             Expr::And(lhs, rhs) => {
-                self.compile_expr(lhs)?;
-                self.compile_expr(rhs)?;
+                self.compile_scalar_expr(lhs)?;
+                self.compile_scalar_expr(rhs)?;
                 self.assembler.and();
             }
             Expr::Or(lhs, rhs) => {
-                self.compile_expr(lhs)?;
-                self.compile_expr(rhs)?;
+                self.compile_scalar_expr(lhs)?;
+                self.compile_scalar_expr(rhs)?;
                 self.assembler.or();
             }
             Expr::Eq(lhs, rhs) => {
-                self.compile_expr(lhs)?;
-                self.compile_expr(rhs)?;
+                self.compile_scalar_expr(lhs)?;
+                self.compile_scalar_expr(rhs)?;
                 self.assembler.ceq();
             }
             Expr::Lt(lhs, rhs) => {
-                self.compile_expr(lhs)?;
-                self.compile_expr(rhs)?;
+                self.compile_scalar_expr(lhs)?;
+                self.compile_scalar_expr(rhs)?;
                 self.assembler.clt();
             }
             Expr::Gt(lhs, rhs) => {
-                self.compile_expr(lhs)?;
-                self.compile_expr(rhs)?;
+                self.compile_scalar_expr(lhs)?;
+                self.compile_scalar_expr(rhs)?;
                 self.assembler.cgt();
             }
             Expr::Var(index) => {
@@ -954,7 +954,7 @@ impl Compiler {
                 then_expr,
                 else_expr,
             } => {
-                self.compile_expr(condition)?;
+                self.compile_scalar_expr(condition)?;
                 let else_label = self.fresh_label("if_else");
                 let end_label = self.fresh_label("if_end");
                 self.assembler.brfalse_label(&else_label);
@@ -975,21 +975,21 @@ impl Compiler {
                 arms,
                 default,
             } => {
-                self.compile_expr(value)?;
+                self.compile_scalar_expr(value)?;
                 self.emit_stloc(*value_slot)?;
                 let end_label = self.fresh_label("match_end");
                 for (pattern, arm_expr) in arms {
                     let next_label = self.fresh_label("match_next");
                     self.compile_match_pattern_condition(*value_slot, pattern)?;
                     self.assembler.brfalse_label(&next_label);
-                    self.compile_expr(arm_expr)?;
+                    self.compile_scalar_expr(arm_expr)?;
                     self.emit_stloc(*result_slot)?;
                     self.assembler.br_label(&end_label);
                     self.assembler
                         .label(&next_label)
                         .map_err(CompileError::Assembler)?;
                 }
-                self.compile_expr(default)?;
+                self.compile_scalar_expr(default)?;
                 self.emit_stloc(*result_slot)?;
                 self.assembler
                     .label(&end_label)
@@ -1332,9 +1332,13 @@ impl Compiler {
             return Ok(());
         }
         self.callable_bindings.remove(&slot);
-        self.compile_expr(expr)?;
+        self.compile_scalar_expr(expr)?;
         self.emit_stloc(slot)?;
         Ok(())
+    }
+
+    fn compile_scalar_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
+        self.compile_expr(expr)
     }
 
     fn compile_function_call(&mut self, index: u16, args: &[Expr]) -> Result<(), CompileError> {
@@ -1405,7 +1409,7 @@ impl Compiler {
 
     fn compile_direct_call(&mut self, index: u16, args: &[Expr]) -> Result<(), CompileError> {
         for arg in args {
-            self.compile_expr(arg)?;
+            self.compile_scalar_expr(arg)?;
         }
         let argc = u8::try_from(args.len()).map_err(|_| CompileError::CallArityOverflow)?;
         if let Some(builtin) = BuiltinFunction::from_call_index(index) {
@@ -1538,7 +1542,7 @@ impl Compiler {
             return Ok(());
         }
 
-        self.compile_expr(expr)?;
+        self.compile_scalar_expr(expr)?;
         self.lower_number_to_string_for_concat_top();
         Ok(())
     }

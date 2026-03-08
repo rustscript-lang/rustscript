@@ -110,6 +110,67 @@ fn lua_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
+            name: "multi_return_locals_unpack_in_order",
+            source: r#"
+                local function x()
+                    return 1, 2
+                end
+                local a, b = x()
+                a
+                b
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_stack: vec![Value::Int(1), Value::Int(2)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "multi_return_single_local_keeps_first_value",
+            source: r#"
+                local function x()
+                    return 1, 2
+                end
+                local a = x()
+                a
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_stack: vec![Value::Int(1)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "multi_return_missing_locals_are_null_padded",
+            source: r#"
+                local function x()
+                    return 1, 2
+                end
+                local a, b, c = x()
+                a
+                b
+                c
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_stack: vec![Value::Int(1), Value::Int(2), Value::Null],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "conditional_multi_return_pads_short_branch_with_null",
+            source: r#"
+                local function x()
+                    if true then
+                        return 1
+                    else
+                        return 1, 2
+                    end
+                end
+                local a, b, c = x()
+                a
+                b
+                c
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_stack: vec![Value::Int(1), Value::Null, Value::Null],
+            expected_locals: None,
+        },
+        RuntimeCase {
             name: "inline_function_literal_empty_body_returns_null",
             source: r#"
                 local f = function() end
@@ -136,7 +197,7 @@ fn lua_runtime_cases_work() {
 
 #[test]
 fn lua_rejection_cases_work() {
-    let cases = [ParseErrorCase {
+    let parse_cases = [ParseErrorCase {
         name: "assignment_to_undeclared_local",
         source: r#"
                 value = 1
@@ -145,7 +206,7 @@ fn lua_rejection_cases_work() {
         expected_contains_all: &["unknown local 'value'"],
     }];
 
-    for case in &cases {
+    for case in &parse_cases {
         expect_parse_error_case(case);
     }
 }

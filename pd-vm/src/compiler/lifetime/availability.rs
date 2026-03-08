@@ -194,9 +194,9 @@ fn stmt_uses_slot(stmt: &Stmt, slot: LocalSlot) -> bool {
             false
         }
         Stmt::Drop { index, .. } => *index == slot,
-        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
-            expr_uses_slot(expr, slot)
-        }
+        Stmt::Let { expr, .. }
+        | Stmt::Assign { expr, .. }
+        | Stmt::Expr { expr, .. } => expr_uses_slot(expr, slot),
         Stmt::ClosureLet { closure, .. } => {
             closure
                 .capture_copies
@@ -321,7 +321,9 @@ fn collect_consumed_positions_from_stmt(
         | Stmt::Break { .. }
         | Stmt::Continue { .. }
         | Stmt::Drop { .. } => {}
-        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+        Stmt::Let { expr, .. }
+        | Stmt::Assign { expr, .. }
+        | Stmt::Expr { expr, .. } => {
             collect_consumed_positions_from_expr(
                 expr,
                 function_impl,

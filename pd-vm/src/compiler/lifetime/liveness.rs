@@ -581,9 +581,9 @@ fn stmt_contains_local_call(stmt: &Stmt) -> bool {
         | Stmt::Break { .. }
         | Stmt::Continue { .. }
         | Stmt::Drop { .. } => false,
-        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
-            expr_contains_local_call(expr)
-        }
+        Stmt::Let { expr, .. }
+        | Stmt::Assign { expr, .. }
+        | Stmt::Expr { expr, .. } => expr_contains_local_call(expr),
         Stmt::ClosureLet { closure, .. } => expr_contains_local_call(&closure.body),
         Stmt::IfElse {
             condition,
@@ -761,7 +761,9 @@ impl LocalSlotAllocator {
                     }
                 }
             }
-            Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+            Stmt::Let { expr, .. }
+            | Stmt::Assign { expr, .. }
+            | Stmt::Expr { expr, .. } => {
                 self.collect_expr_constraints(expr, live_before)?;
             }
             Stmt::ClosureLet { closure, .. } => {

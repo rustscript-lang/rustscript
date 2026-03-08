@@ -25,6 +25,21 @@ local profile = { stats = { score = closure_value } }
 local chained_score = profile?.stats?.score
 local missing_score = profile?.missing?.value
 
+local function pair_scores()
+    return closure_value, total
+end
+local first_only = pair_scores()
+local first_score, second_score, third_score = pair_scores()
+
+local function branch_score()
+    if true then
+        return closure_value
+    else
+        return closure_value, total
+    end
+end
+local branch_a, branch_b, branch_c = branch_score()
+
 local function keep(value)
     return value
 end
@@ -38,8 +53,10 @@ if true then
     io_ok = io.exists(".")
 end
 
-if regex_ok and io_ok and json_score == chained_score then
-    print(keep(chained_score))
+local unpack_ok = first_only == closure_value and first_score == closure_value and second_score == total and third_score == nil and branch_a == closure_value and branch_b == nil and branch_c == nil
+
+if regex_ok and io_ok and json_score == chained_score and unpack_ok then
+    print(keep(branch_a))
 else
     print(0)
 end

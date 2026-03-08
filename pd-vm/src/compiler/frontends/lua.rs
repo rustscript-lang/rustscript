@@ -12,6 +12,42 @@ fn fresh_lua_direct_temp(prefix: &str) -> String {
     format!("__lua_direct_{prefix}_{id}")
 }
 
+#[derive(Clone, Debug)]
+struct LuaLoweredExpr {
+    expr: Expr,
+    unpack_arity: usize,
+    callable_return_arity: Option<usize>,
+}
+
+impl LuaLoweredExpr {
+    fn scalar(expr: Expr) -> Self {
+        Self {
+            expr,
+            unpack_arity: 1,
+            callable_return_arity: None,
+        }
+    }
+
+    fn callable(expr: Expr, return_arity: usize) -> Self {
+        Self {
+            expr,
+            unpack_arity: 1,
+            callable_return_arity: Some(return_arity.max(1)),
+        }
+    }
+
+    fn scalarized(self) -> Self {
+        if self.unpack_arity <= 1 {
+            return self;
+        }
+        Self {
+            expr: build_lua_unpack_get_expr(self.expr, 0),
+            unpack_arity: 1,
+            callable_return_arity: None,
+        }
+    }
+}
+
 pub(super) fn lower_to_ir(source: &str) -> Result<FrontendIr, ParseError> {
     if let Some(ir) = try_lower_direct_subset_to_ir(source)? {
         return Ok(ir);
@@ -28,6 +64,7 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
     let mut root_stmts = Vec::<Stmt>::new();
     let mut block_stack = Vec::<LuaDirectBlock>::new();
     let mut namespace_aliases = HashMap::<String, String>::new();
+    let mut callable_return_arities = HashMap::<LocalSlot, usize>::new();
 
     for (index, raw_line) in cleaned_source.lines().enumerate() {
         let line_no = index + 1;
@@ -75,30 +112,163 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
             continue;
         }
 
+        if block_stack.len() >= 2 {
+            let split = block_stack.len() - 1;
+            let (prefix, tail) = block_stack.split_at_mut(split);
+            if let (
+                Some(LuaDirectBlock::Function {
+                    param_lookup,
+                    captures,
+                    body_result,
+                    ..
+                }),
+                LuaDirectBlock::FunctionIfChain {
+                    branches,
+                    active_branch,
+                    else_branch,
+                    in_else,
+                },
+            ) = (prefix.last_mut(), &mut tail[0])
+            {
+                if trimmed == "return" {
+                    if *in_else {
+                        *else_branch = Some(vec![LuaLoweredExpr::scalar(Expr::Null)]);
+                    } else if let Some((_, branch_return)) = branches.get_mut(*active_branch) {
+                        *branch_return = Some(vec![LuaLoweredExpr::scalar(Expr::Null)]);
+                    } else {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                if let Some(rest) = trimmed.strip_prefix("return ") {
+                    let Some(exprs) = parse_lua_direct_return_exprs(
+                        rest.trim(),
+                        &mut builder,
+                        &namespace_aliases,
+                        param_lookup,
+                        captures,
+                        &callable_return_arities,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    if *in_else {
+                        *else_branch = Some(exprs);
+                    } else if let Some((_, branch_return)) = branches.get_mut(*active_branch) {
+                        *branch_return = Some(exprs);
+                    } else {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+
+                let elseif_condition = trimmed
+                    .strip_prefix("elseif ")
+                    .or_else(|| trimmed.strip_prefix("elif "))
+                    .and_then(|rest| rest.strip_suffix(" then"));
+                if let Some(condition_raw) = elseif_condition {
+                    if *in_else {
+                        return Ok(None);
+                    }
+                    let Some(condition) = parse_lua_direct_expr(
+                        condition_raw,
+                        &mut builder,
+                        &namespace_aliases,
+                        param_lookup,
+                        captures,
+                        true,
+                        &callable_return_arities,
+                        true,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    branches.push((condition.expr, None));
+                    *active_branch = branches.len().saturating_sub(1);
+                    continue;
+                }
+
+                if trimmed == "else" {
+                    if *in_else {
+                        return Ok(None);
+                    }
+                    *in_else = true;
+                    continue;
+                }
+
+                if trimmed == "end" {
+                    *body_result = Some(build_lua_if_chain_expr(
+                        branches.clone(),
+                        else_branch.clone(),
+                        &mut builder,
+                        line_u32,
+                    ));
+                    block_stack.pop();
+                    continue;
+                }
+
+                return Ok(None);
+            }
+        }
+
         if let Some(LuaDirectBlock::Function {
             param_lookup,
             captures,
-            return_expr,
+            body_result,
             ..
         }) = block_stack.last_mut()
         {
             if trimmed == "return" {
-                *return_expr = Some(Expr::Null);
+                *body_result = Some(LuaLoweredExpr::scalar(Expr::Null));
                 continue;
             }
             if let Some(rest) = trimmed.strip_prefix("return ") {
-                let Some(expr) = parse_lua_direct_expr(
+                let Some(exprs) = parse_lua_direct_return_exprs(
                     rest.trim(),
                     &mut builder,
                     &namespace_aliases,
                     param_lookup,
                     captures,
+                    &callable_return_arities,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let target_arity = lua_return_arity(Some(exprs.as_slice()));
+                *body_result = Some(build_lua_return_expr(
+                    Some(exprs),
+                    target_arity,
+                    &mut builder,
+                    line_u32,
+                ));
+                continue;
+            }
+            if let Some(condition_raw) = trimmed
+                .strip_prefix("if ")
+                .and_then(|rest| rest.strip_suffix(" then"))
+            {
+                if body_result.is_some() {
+                    return Ok(None);
+                }
+                let Some(condition) = parse_lua_direct_expr(
+                    condition_raw,
+                    &mut builder,
+                    &namespace_aliases,
+                    param_lookup,
+                    captures,
+                    true,
+                    &callable_return_arities,
                     true,
                 )?
                 else {
                     return Ok(None);
                 };
-                *return_expr = Some(expr);
+                block_stack.push(LuaDirectBlock::FunctionIfChain {
+                    branches: vec![(condition.expr, None)],
+                    active_branch: 0,
+                    else_branch: None,
+                    in_else: false,
+                });
                 continue;
             }
             if trimmed == "end" {
@@ -109,7 +279,7 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
                     name,
                     param_slots,
                     captures,
-                    return_expr,
+                    body_result,
                     is_local,
                     line,
                     ..
@@ -117,13 +287,13 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
                 else {
                     return Ok(None);
                 };
-                let body_expr = return_expr.unwrap_or(Expr::Null);
                 let mut capture_copies = captures.into_iter().collect::<Vec<_>>();
                 capture_copies.sort_by_key(|(source_slot, _)| *source_slot);
+                let body_result = body_result.unwrap_or_else(|| LuaLoweredExpr::scalar(Expr::Null));
                 let closure = Expr::Closure(super::super::ir::ClosureExpr {
                     param_slots,
                     capture_copies,
-                    body: Box::new(body_expr),
+                    body: Box::new(body_result.expr),
                 });
                 let stmt = if is_local {
                     builder.lower_local(&name, closure, line).ok()
@@ -133,6 +303,11 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
                     builder.lower_local(&name, closure, line).ok()
                 };
                 if let Some(stmt) = stmt {
+                    sync_callable_return_arity(
+                        &stmt,
+                        Some(body_result.unpack_arity),
+                        &mut callable_return_arities,
+                    );
                     emit_lua_direct_stmt(stmt, &mut root_stmts, &mut block_stack);
                     continue;
                 }
@@ -162,7 +337,7 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
                 param_lookup,
                 param_slots,
                 captures: HashMap::new(),
-                return_expr: None,
+                body_result: None,
                 is_local: true,
                 line: line_u32,
             });
@@ -189,7 +364,7 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
                 param_lookup,
                 param_slots,
                 captures: HashMap::new(),
-                return_expr: None,
+                body_result: None,
                 is_local: false,
                 line: line_u32,
             });
@@ -200,7 +375,12 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
             && let Some(condition_raw) = rest.strip_suffix(" then")
         {
             let condition =
-                parse_lua_direct_expr_top(condition_raw, &mut builder, &namespace_aliases)?;
+                parse_lua_direct_expr_top(
+                    condition_raw,
+                    &mut builder,
+                    &namespace_aliases,
+                    &callable_return_arities,
+                )?;
             let Some(condition) = condition else {
                 return Ok(None);
             };
@@ -232,7 +412,12 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
                 return Ok(None);
             }
             let Some(condition) =
-                parse_lua_direct_expr_top(condition_raw, &mut builder, &namespace_aliases)?
+                parse_lua_direct_expr_top(
+                    condition_raw,
+                    &mut builder,
+                    &namespace_aliases,
+                    &callable_return_arities,
+                )?
             else {
                 return Ok(None);
             };
@@ -253,7 +438,12 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
             && let Some(condition_raw) = rest.strip_suffix(" do")
         {
             let condition =
-                parse_lua_direct_expr_top(condition_raw, &mut builder, &namespace_aliases)?;
+                parse_lua_direct_expr_top(
+                    condition_raw,
+                    &mut builder,
+                    &namespace_aliases,
+                    &callable_return_arities,
+                )?;
             let Some(condition) = condition else {
                 return Ok(None);
             };
@@ -273,16 +463,31 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
                 return Ok(None);
             };
             let Some(start) =
-                parse_lua_direct_expr_top(&start_raw, &mut builder, &namespace_aliases)?
+                parse_lua_direct_expr_top(
+                    &start_raw,
+                    &mut builder,
+                    &namespace_aliases,
+                    &callable_return_arities,
+                )?
             else {
                 return Ok(None);
             };
-            let Some(end) = parse_lua_direct_expr_top(&end_raw, &mut builder, &namespace_aliases)?
+            let Some(end) = parse_lua_direct_expr_top(
+                &end_raw,
+                &mut builder,
+                &namespace_aliases,
+                &callable_return_arities,
+            )?
             else {
                 return Ok(None);
             };
             let Some(step) =
-                parse_lua_direct_expr_top(&step_raw, &mut builder, &namespace_aliases)?
+                parse_lua_direct_expr_top(
+                    &step_raw,
+                    &mut builder,
+                    &namespace_aliases,
+                    &callable_return_arities,
+                )?
             else {
                 return Ok(None);
             };
@@ -347,7 +552,12 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
                 return Ok(None);
             };
             let Some(condition) =
-                parse_lua_direct_expr_top(rest.trim(), &mut builder, &namespace_aliases)?
+                parse_lua_direct_expr_top(
+                    rest.trim(),
+                    &mut builder,
+                    &namespace_aliases,
+                    &callable_return_arities,
+                )?
             else {
                 return Ok(None);
             };
@@ -416,7 +626,9 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
                     body,
                     line,
                 },
-                LuaDirectBlock::Repeat { .. } | LuaDirectBlock::Function { .. } => return Ok(None),
+                LuaDirectBlock::Repeat { .. }
+                | LuaDirectBlock::Function { .. }
+                | LuaDirectBlock::FunctionIfChain { .. } => return Ok(None),
             };
             emit_lua_direct_stmt(stmt, &mut root_stmts, &mut block_stack);
             continue;
@@ -456,17 +668,47 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
             let Some((name_raw, expr_raw)) = rest.split_once('=') else {
                 return Ok(None);
             };
-            let name = name_raw.trim();
-            if !is_valid_lua_ident(name) {
-                return Ok(None);
-            }
-            let expr =
-                parse_lua_direct_expr_top(expr_raw.trim(), &mut builder, &namespace_aliases)?;
-            let Some(expr) = expr else {
+            let Some(names) = parse_lua_assignment_targets(name_raw.trim()) else {
                 return Ok(None);
             };
-            let stmt = builder.lower_local(name, expr, line_u32)?;
-            emit_lua_direct_stmt(stmt, &mut root_stmts, &mut block_stack);
+            let rhs_parts = split_top_level_csv(expr_raw.trim());
+            if rhs_parts.len() != 1 {
+                return Ok(None);
+            }
+            let params = HashMap::new();
+            let mut captures = HashMap::new();
+            let Some(expr) = parse_lua_direct_expr(
+                rhs_parts[0].trim(),
+                &mut builder,
+                &namespace_aliases,
+                &params,
+                &mut captures,
+                false,
+                &callable_return_arities,
+                names.len() > 1,
+            )?
+            else {
+                return Ok(None);
+            };
+            if names.len() == 1 {
+                let stmt = builder.lower_local(&names[0], expr.expr, line_u32)?;
+                sync_callable_return_arity(
+                    &stmt,
+                    expr.callable_return_arity,
+                    &mut callable_return_arities,
+                );
+                emit_lua_direct_stmt(stmt, &mut root_stmts, &mut block_stack);
+            } else {
+                for stmt in lower_lua_multi_local_binding(
+                    names,
+                    expr,
+                    &mut builder,
+                    line_u32,
+                    &mut callable_return_arities,
+                )? {
+                    emit_lua_direct_stmt(stmt, &mut root_stmts, &mut block_stack);
+                }
+            }
             continue;
         }
 
@@ -476,16 +718,36 @@ fn try_lower_direct_subset_to_ir(source: &str) -> Result<Option<FrontendIr>, Par
             && !lhs.contains('<')
             && !lhs.contains('>')
         {
-            let expr = parse_lua_direct_expr_top(rhs.trim(), &mut builder, &namespace_aliases)?;
-            let Some(expr) = expr else {
+            let mut captures = HashMap::new();
+            let Some(expr) = parse_lua_direct_expr(
+                rhs.trim(),
+                &mut builder,
+                &namespace_aliases,
+                &HashMap::new(),
+                &mut captures,
+                false,
+                &callable_return_arities,
+                false,
+            )?
+            else {
                 return Ok(None);
             };
-            let stmt = builder.lower_assign(lhs.trim(), expr, line_u32)?;
+            let stmt = builder.lower_assign(lhs.trim(), expr.expr, line_u32)?;
+            sync_callable_return_arity(
+                &stmt,
+                expr.callable_return_arity,
+                &mut callable_return_arities,
+            );
             emit_lua_direct_stmt(stmt, &mut root_stmts, &mut block_stack);
             continue;
         }
 
-        let expr = parse_lua_direct_expr_top(trimmed, &mut builder, &namespace_aliases)?;
+        let expr = parse_lua_direct_expr_top(
+            trimmed,
+            &mut builder,
+            &namespace_aliases,
+            &callable_return_arities,
+        )?;
         let Some(expr) = expr else {
             return Ok(None);
         };
@@ -539,9 +801,15 @@ enum LuaDirectBlock {
         param_lookup: HashMap<String, LocalSlot>,
         param_slots: Vec<LocalSlot>,
         captures: HashMap<LocalSlot, LocalSlot>,
-        return_expr: Option<Expr>,
+        body_result: Option<LuaLoweredExpr>,
         is_local: bool,
         line: u32,
+    },
+    FunctionIfChain {
+        branches: Vec<(Expr, Option<Vec<LuaLoweredExpr>>)>,
+        active_branch: usize,
+        else_branch: Option<Vec<LuaLoweredExpr>>,
+        in_else: bool,
     },
 }
 
@@ -568,7 +836,7 @@ fn emit_lua_direct_stmt(stmt: Stmt, root: &mut Vec<Stmt>, blocks: &mut [LuaDirec
         | LuaDirectBlock::Do { body, .. }
         | LuaDirectBlock::For { body, .. }
         | LuaDirectBlock::Repeat { body, .. } => body.push(stmt),
-        LuaDirectBlock::Function { .. } => {}
+        LuaDirectBlock::Function { .. } | LuaDirectBlock::FunctionIfChain { .. } => {}
     }
 }
 
@@ -603,6 +871,44 @@ fn build_lua_if_chain_stmt(
         };
     }
     stmt
+}
+
+fn build_lua_if_chain_expr(
+    branches: Vec<(Expr, Option<Vec<LuaLoweredExpr>>)>,
+    else_branch: Option<Vec<LuaLoweredExpr>>,
+    builder: &mut LocalIrBuilder,
+    line: u32,
+) -> LuaLoweredExpr {
+    let target_arity = branches
+        .iter()
+        .map(|(_, values)| lua_return_arity(values.as_deref()))
+        .chain(std::iter::once(lua_return_arity(else_branch.as_deref())))
+        .max()
+        .unwrap_or(1);
+    let mut iter = branches.into_iter().rev();
+    let Some((last_condition, last_then_branch)) = iter.next() else {
+        return build_lua_return_expr(else_branch, target_arity, builder, line);
+    };
+
+    let mut expr = Expr::IfElse {
+        condition: Box::new(last_condition),
+        then_expr: Box::new(build_lua_return_expr(last_then_branch, target_arity, builder, line).expr),
+        else_expr: Box::new(build_lua_return_expr(else_branch, target_arity, builder, line).expr),
+    };
+
+    for (condition, then_branch) in iter {
+        expr = Expr::IfElse {
+            condition: Box::new(condition),
+            then_expr: Box::new(build_lua_return_expr(then_branch, target_arity, builder, line).expr),
+            else_expr: Box::new(expr),
+        };
+    }
+
+    LuaLoweredExpr {
+        expr,
+        unpack_arity: target_arity,
+        callable_return_arity: None,
+    }
 }
 
 fn parse_lua_function_signature(signature: &str) -> Option<(String, Vec<String>)> {
@@ -669,7 +975,7 @@ enum LuaDirectExpr {
     TableMap(Vec<(String, LuaDirectExpr)>),
     Closure {
         params: Vec<String>,
-        body: Box<LuaDirectExpr>,
+        body: Vec<LuaDirectExpr>,
     },
     Add(Box<LuaDirectExpr>, Box<LuaDirectExpr>),
     Sub(Box<LuaDirectExpr>, Box<LuaDirectExpr>),
@@ -733,7 +1039,9 @@ fn parse_lua_direct_expr(
     param_slots: &HashMap<String, LocalSlot>,
     capture_slots: &mut HashMap<LocalSlot, LocalSlot>,
     capture_enabled: bool,
-) -> Result<Option<Expr>, ParseError> {
+    callable_return_arities: &HashMap<LocalSlot, usize>,
+    preserve_multi_return_root: bool,
+) -> Result<Option<LuaLoweredExpr>, ParseError> {
     let Some(tokens) = tokenize_lua_direct_expr(input) else {
         return Ok(None);
     };
@@ -751,6 +1059,8 @@ fn parse_lua_direct_expr(
         param_slots,
         capture_slots,
         capture_enabled,
+        callable_return_arities,
+        preserve_multi_return_root,
     );
     if lowered.is_none()
         && let Some(name) = unresolved_lua_direct_call_name(&expr, builder, param_slots)
@@ -785,17 +1095,56 @@ fn parse_lua_direct_expr_top(
     input: &str,
     builder: &mut LocalIrBuilder,
     namespace_aliases: &HashMap<String, String>,
+    callable_return_arities: &HashMap<LocalSlot, usize>,
 ) -> Result<Option<Expr>, ParseError> {
     let params = HashMap::new();
     let mut captures = HashMap::new();
-    parse_lua_direct_expr(
+    Ok(parse_lua_direct_expr(
         input,
         builder,
         namespace_aliases,
         &params,
         &mut captures,
         false,
+        callable_return_arities,
+        false,
+    )?
+    .map(|expr| expr.expr))
+}
+
+fn build_lua_unpack_get_expr(target: Expr, index: i64) -> Expr {
+    Expr::Call(
+        BuiltinFunction::Get.call_index(),
+        vec![target, Expr::Int(index)],
     )
+}
+
+fn finalize_lua_root_expr(
+    expr: Expr,
+    unpack_arity: usize,
+    preserve_multi_return_root: bool,
+) -> LuaLoweredExpr {
+    let lowered = LuaLoweredExpr {
+        expr,
+        unpack_arity: unpack_arity.max(1),
+        callable_return_arity: None,
+    };
+    if preserve_multi_return_root {
+        lowered
+    } else {
+        lowered.scalarized()
+    }
+}
+
+fn lookup_lua_callable_return_arity(
+    name: &str,
+    builder: &LocalIrBuilder,
+    callable_return_arities: &HashMap<LocalSlot, usize>,
+) -> Option<usize> {
+    let Expr::Var(slot) = builder.resolve_local_expr(name)? else {
+        return None;
+    };
+    callable_return_arities.get(&slot).copied()
 }
 
 fn lower_lua_direct_expr(
@@ -805,28 +1154,43 @@ fn lower_lua_direct_expr(
     param_slots: &HashMap<String, LocalSlot>,
     capture_slots: &mut HashMap<LocalSlot, LocalSlot>,
     capture_enabled: bool,
-) -> Option<Expr> {
+    callable_return_arities: &HashMap<LocalSlot, usize>,
+    preserve_multi_return_root: bool,
+) -> Option<LuaLoweredExpr> {
     match expr {
-        LuaDirectExpr::Null => Some(Expr::Null),
-        LuaDirectExpr::Bool(value) => Some(Expr::Bool(value)),
-        LuaDirectExpr::Int(value) => Some(Expr::Int(value)),
-        LuaDirectExpr::Float(value) => Some(Expr::Float(value)),
-        LuaDirectExpr::String(value) => Some(Expr::String(value)),
+        LuaDirectExpr::Null => Some(LuaLoweredExpr::scalar(Expr::Null)),
+        LuaDirectExpr::Bool(value) => Some(LuaLoweredExpr::scalar(Expr::Bool(value))),
+        LuaDirectExpr::Int(value) => Some(LuaLoweredExpr::scalar(Expr::Int(value))),
+        LuaDirectExpr::Float(value) => Some(LuaLoweredExpr::scalar(Expr::Float(value))),
+        LuaDirectExpr::String(value) => Some(LuaLoweredExpr::scalar(Expr::String(value))),
         LuaDirectExpr::Var(name) => {
             if let Some(slot) = param_slots.get(&name).copied() {
-                return Some(Expr::Var(slot));
+                return Some(LuaLoweredExpr::scalar(Expr::Var(slot)));
             }
             if let Some(Expr::Var(source_slot)) = builder.resolve_local_expr(&name) {
+                let callable_return_arity = callable_return_arities.get(&source_slot).copied();
                 if !capture_enabled {
-                    return Some(Expr::Var(source_slot));
+                    return Some(LuaLoweredExpr {
+                        expr: Expr::Var(source_slot),
+                        unpack_arity: 1,
+                        callable_return_arity,
+                    });
                 }
                 if let Some(captured_slot) = capture_slots.get(&source_slot).copied() {
-                    return Some(Expr::Var(captured_slot));
+                    return Some(LuaLoweredExpr {
+                        expr: Expr::Var(captured_slot),
+                        unpack_arity: 1,
+                        callable_return_arity,
+                    });
                 }
                 let capture_name = fresh_lua_direct_temp("capture_slot");
                 let captured_slot = builder.alloc_local_named(&capture_name).ok()?;
                 capture_slots.insert(source_slot, captured_slot);
-                return Some(Expr::Var(captured_slot));
+                return Some(LuaLoweredExpr {
+                    expr: Expr::Var(captured_slot),
+                    unpack_arity: 1,
+                    callable_return_arity,
+                });
             }
             None
         }
@@ -840,15 +1204,30 @@ fn lower_lua_direct_expr(
                     param_slots,
                     capture_slots,
                     capture_enabled,
+                    callable_return_arities,
+                    false,
                 )?);
             }
+            let lowered_args = lowered_args
+                .into_iter()
+                .map(|value| value.expr)
+                .collect::<Vec<_>>();
             if let LuaDirectExpr::Var(name) = *callee {
                 if let Some(expr) = builder.resolve_call_expr(&name, lowered_args.clone()) {
-                    return Some(expr);
+                    let unpack_arity =
+                        lookup_lua_callable_return_arity(&name, builder, callable_return_arities)
+                            .unwrap_or(1);
+                    return Some(finalize_lua_root_expr(
+                        expr,
+                        unpack_arity,
+                        preserve_multi_return_root,
+                    ));
                 }
                 if name == "print" && lowered_args.len() == 1 {
                     builder.declare_function("print", Some(1)).ok()?;
-                    return builder.resolve_call_expr("print", lowered_args);
+                    return builder
+                        .resolve_call_expr("print", lowered_args)
+                        .map(LuaLoweredExpr::scalar);
                 }
                 return None;
             }
@@ -856,7 +1235,7 @@ fn lower_lua_direct_expr(
                 && let Some(expr) =
                     lower_lua_namespace_call(&path, lowered_args, builder, namespace_aliases)
             {
-                return Some(expr);
+                return Some(LuaLoweredExpr::scalar(expr));
             }
             None
         }
@@ -868,11 +1247,13 @@ fn lower_lua_direct_expr(
                 param_slots,
                 capture_slots,
                 capture_enabled,
+                callable_return_arities,
+                false,
             )?;
-            Some(Expr::Call(
+            Some(LuaLoweredExpr::scalar(Expr::Call(
                 BuiltinFunction::Get.call_index(),
-                vec![target, Expr::String(member)],
-            ))
+                vec![target.expr, Expr::String(member)],
+            )))
         }
         LuaDirectExpr::OptionalMember(target, member) => {
             let target = lower_lua_direct_expr(
@@ -882,8 +1263,10 @@ fn lower_lua_direct_expr(
                 param_slots,
                 capture_slots,
                 capture_enabled,
+                callable_return_arities,
+                false,
             )?;
-            build_lua_optional_member_expr(target, member, builder)
+            build_lua_optional_member_expr(target.expr, member, builder).map(LuaLoweredExpr::scalar)
         }
         LuaDirectExpr::Index(target, key) => {
             let target = lower_lua_direct_expr(
@@ -893,6 +1276,8 @@ fn lower_lua_direct_expr(
                 param_slots,
                 capture_slots,
                 capture_enabled,
+                callable_return_arities,
+                false,
             )?;
             let key = lower_lua_direct_expr(
                 *key,
@@ -901,52 +1286,53 @@ fn lower_lua_direct_expr(
                 param_slots,
                 capture_slots,
                 capture_enabled,
+                callable_return_arities,
+                false,
             )?;
-            Some(Expr::Call(
+            Some(LuaLoweredExpr::scalar(Expr::Call(
                 BuiltinFunction::Get.call_index(),
-                vec![target, key],
-            ))
+                vec![target.expr, key.expr],
+            )))
         }
         LuaDirectExpr::TableArray(values) => {
             let mut out = Expr::Call(BuiltinFunction::ArrayNew.call_index(), Vec::new());
             for value in values {
+                let value = lower_lua_direct_expr(
+                    value,
+                    builder,
+                    namespace_aliases,
+                    param_slots,
+                    capture_slots,
+                    capture_enabled,
+                    callable_return_arities,
+                    false,
+                )?;
                 out = Expr::Call(
                     BuiltinFunction::ArrayPush.call_index(),
-                    vec![
-                        out,
-                        lower_lua_direct_expr(
-                            value,
-                            builder,
-                            namespace_aliases,
-                            param_slots,
-                            capture_slots,
-                            capture_enabled,
-                        )?,
-                    ],
+                    vec![out, value.expr],
                 );
             }
-            Some(out)
+            Some(LuaLoweredExpr::scalar(out))
         }
         LuaDirectExpr::TableMap(entries) => {
             let mut out = Expr::Call(BuiltinFunction::MapNew.call_index(), Vec::new());
             for (key, value) in entries {
+                let value = lower_lua_direct_expr(
+                    value,
+                    builder,
+                    namespace_aliases,
+                    param_slots,
+                    capture_slots,
+                    capture_enabled,
+                    callable_return_arities,
+                    false,
+                )?;
                 out = Expr::Call(
                     BuiltinFunction::Set.call_index(),
-                    vec![
-                        out,
-                        Expr::String(key),
-                        lower_lua_direct_expr(
-                            value,
-                            builder,
-                            namespace_aliases,
-                            param_slots,
-                            capture_slots,
-                            capture_enabled,
-                        )?,
-                    ],
+                    vec![out, Expr::String(key), value.expr],
                 );
             }
-            Some(out)
+            Some(LuaLoweredExpr::scalar(out))
         }
         LuaDirectExpr::Closure { params, body } => {
             let mut closure_params = HashMap::new();
@@ -958,273 +1344,261 @@ fn lower_lua_direct_expr(
                 param_slots_vec.push(slot);
             }
             let mut captures = HashMap::new();
-            let body = lower_lua_direct_expr(
-                *body,
+            let lowered_body = lower_lua_return_body_exprs(
+                body,
                 builder,
                 namespace_aliases,
                 &closure_params,
                 &mut captures,
-                true,
+                callable_return_arities,
             )?;
             let mut capture_copies = captures.into_iter().collect::<Vec<_>>();
             capture_copies.sort_by_key(|(source_slot, _)| *source_slot);
-            Some(Expr::Closure(super::super::ir::ClosureExpr {
-                param_slots: param_slots_vec,
-                capture_copies,
-                body: Box::new(body),
-            }))
+            let target_arity = lua_return_arity(Some(lowered_body.as_slice()));
+            Some(LuaLoweredExpr::callable(
+                Expr::Closure(super::super::ir::ClosureExpr {
+                    param_slots: param_slots_vec,
+                    capture_copies,
+                    body: Box::new(
+                        build_lua_return_expr(Some(lowered_body), target_arity, builder, 1).expr,
+                    ),
+                }),
+                target_arity,
+            ))
         }
-        LuaDirectExpr::Add(lhs, rhs) => Some(Expr::Add(
-            Box::new(lower_lua_direct_expr(
+        LuaDirectExpr::Add(lhs, rhs) => lower_lua_binary_expr(
+            *lhs,
+            *rhs,
+            builder,
+            namespace_aliases,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            callable_return_arities,
+            Expr::Add,
+        ),
+        LuaDirectExpr::Sub(lhs, rhs) => lower_lua_binary_expr(
+            *lhs,
+            *rhs,
+            builder,
+            namespace_aliases,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            callable_return_arities,
+            Expr::Sub,
+        ),
+        LuaDirectExpr::Mul(lhs, rhs) => lower_lua_binary_expr(
+            *lhs,
+            *rhs,
+            builder,
+            namespace_aliases,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            callable_return_arities,
+            Expr::Mul,
+        ),
+        LuaDirectExpr::Div(lhs, rhs) => lower_lua_binary_expr(
+            *lhs,
+            *rhs,
+            builder,
+            namespace_aliases,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            callable_return_arities,
+            Expr::Div,
+        ),
+        LuaDirectExpr::Mod(lhs, rhs) => lower_lua_binary_expr(
+            *lhs,
+            *rhs,
+            builder,
+            namespace_aliases,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            callable_return_arities,
+            Expr::Mod,
+        ),
+        LuaDirectExpr::Eq(lhs, rhs) => lower_lua_binary_expr(
+            *lhs,
+            *rhs,
+            builder,
+            namespace_aliases,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            callable_return_arities,
+            Expr::Eq,
+        ),
+        LuaDirectExpr::Ne(lhs, rhs) => {
+            let eq = lower_lua_binary_expr(
                 *lhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-            Box::new(lower_lua_direct_expr(
                 *rhs,
                 builder,
                 namespace_aliases,
                 param_slots,
                 capture_slots,
                 capture_enabled,
-            )?),
-        )),
-        LuaDirectExpr::Sub(lhs, rhs) => Some(Expr::Sub(
-            Box::new(lower_lua_direct_expr(
+                callable_return_arities,
+                Expr::Eq,
+            )?;
+            Some(LuaLoweredExpr::scalar(Expr::Not(Box::new(eq.expr))))
+        }
+        LuaDirectExpr::Lt(lhs, rhs) => lower_lua_binary_expr(
+            *lhs,
+            *rhs,
+            builder,
+            namespace_aliases,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            callable_return_arities,
+            Expr::Lt,
+        ),
+        LuaDirectExpr::Gt(lhs, rhs) => lower_lua_binary_expr(
+            *lhs,
+            *rhs,
+            builder,
+            namespace_aliases,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            callable_return_arities,
+            Expr::Gt,
+        ),
+        LuaDirectExpr::Le(lhs, rhs) => {
+            let gt = lower_lua_binary_expr(
                 *lhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-            Box::new(lower_lua_direct_expr(
                 *rhs,
                 builder,
                 namespace_aliases,
                 param_slots,
                 capture_slots,
                 capture_enabled,
-            )?),
-        )),
-        LuaDirectExpr::Mul(lhs, rhs) => Some(Expr::Mul(
-            Box::new(lower_lua_direct_expr(
+                callable_return_arities,
+                Expr::Gt,
+            )?;
+            Some(LuaLoweredExpr::scalar(Expr::Not(Box::new(gt.expr))))
+        }
+        LuaDirectExpr::Ge(lhs, rhs) => {
+            let lt = lower_lua_binary_expr(
                 *lhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-            Box::new(lower_lua_direct_expr(
                 *rhs,
                 builder,
                 namespace_aliases,
                 param_slots,
                 capture_slots,
                 capture_enabled,
-            )?),
-        )),
-        LuaDirectExpr::Div(lhs, rhs) => Some(Expr::Div(
-            Box::new(lower_lua_direct_expr(
-                *lhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-            Box::new(lower_lua_direct_expr(
-                *rhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-        )),
-        LuaDirectExpr::Mod(lhs, rhs) => Some(Expr::Mod(
-            Box::new(lower_lua_direct_expr(
-                *lhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-            Box::new(lower_lua_direct_expr(
-                *rhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-        )),
-        LuaDirectExpr::Eq(lhs, rhs) => Some(Expr::Eq(
-            Box::new(lower_lua_direct_expr(
-                *lhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-            Box::new(lower_lua_direct_expr(
-                *rhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-        )),
-        LuaDirectExpr::Ne(lhs, rhs) => Some(Expr::Not(Box::new(Expr::Eq(
-            Box::new(lower_lua_direct_expr(
-                *lhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-            Box::new(lower_lua_direct_expr(
-                *rhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-        )))),
-        LuaDirectExpr::Lt(lhs, rhs) => Some(Expr::Lt(
-            Box::new(lower_lua_direct_expr(
-                *lhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-            Box::new(lower_lua_direct_expr(
-                *rhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-        )),
-        LuaDirectExpr::Gt(lhs, rhs) => Some(Expr::Gt(
-            Box::new(lower_lua_direct_expr(
-                *lhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-            Box::new(lower_lua_direct_expr(
-                *rhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-        )),
-        LuaDirectExpr::Le(lhs, rhs) => Some(Expr::Not(Box::new(Expr::Gt(
-            Box::new(lower_lua_direct_expr(
-                *lhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-            Box::new(lower_lua_direct_expr(
-                *rhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-        )))),
-        LuaDirectExpr::Ge(lhs, rhs) => Some(Expr::Not(Box::new(Expr::Lt(
-            Box::new(lower_lua_direct_expr(
-                *lhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-            Box::new(lower_lua_direct_expr(
-                *rhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-        )))),
-        LuaDirectExpr::And(lhs, rhs) => Some(Expr::And(
-            Box::new(lower_lua_direct_expr(
-                *lhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-            Box::new(lower_lua_direct_expr(
-                *rhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-        )),
-        LuaDirectExpr::Or(lhs, rhs) => Some(Expr::Or(
-            Box::new(lower_lua_direct_expr(
-                *lhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-            Box::new(lower_lua_direct_expr(
-                *rhs,
-                builder,
-                namespace_aliases,
-                param_slots,
-                capture_slots,
-                capture_enabled,
-            )?),
-        )),
-        LuaDirectExpr::Neg(inner) => Some(Expr::Neg(Box::new(lower_lua_direct_expr(
+                callable_return_arities,
+                Expr::Lt,
+            )?;
+            Some(LuaLoweredExpr::scalar(Expr::Not(Box::new(lt.expr))))
+        }
+        LuaDirectExpr::And(lhs, rhs) => lower_lua_binary_expr(
+            *lhs,
+            *rhs,
+            builder,
+            namespace_aliases,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            callable_return_arities,
+            Expr::And,
+        ),
+        LuaDirectExpr::Or(lhs, rhs) => lower_lua_binary_expr(
+            *lhs,
+            *rhs,
+            builder,
+            namespace_aliases,
+            param_slots,
+            capture_slots,
+            capture_enabled,
+            callable_return_arities,
+            Expr::Or,
+        ),
+        LuaDirectExpr::Neg(inner) => lower_lua_unary_expr(
             *inner,
             builder,
             namespace_aliases,
             param_slots,
             capture_slots,
             capture_enabled,
-        )?))),
-        LuaDirectExpr::Not(inner) => Some(Expr::Not(Box::new(lower_lua_direct_expr(
+            callable_return_arities,
+            Expr::Neg,
+        ),
+        LuaDirectExpr::Not(inner) => lower_lua_unary_expr(
             *inner,
             builder,
             namespace_aliases,
             param_slots,
             capture_slots,
             capture_enabled,
-        )?))),
+            callable_return_arities,
+            Expr::Not,
+        ),
     }
+}
+
+fn lower_lua_binary_expr(
+    lhs: LuaDirectExpr,
+    rhs: LuaDirectExpr,
+    builder: &mut LocalIrBuilder,
+    namespace_aliases: &HashMap<String, String>,
+    param_slots: &HashMap<String, LocalSlot>,
+    capture_slots: &mut HashMap<LocalSlot, LocalSlot>,
+    capture_enabled: bool,
+    callable_return_arities: &HashMap<LocalSlot, usize>,
+    build: fn(Box<Expr>, Box<Expr>) -> Expr,
+) -> Option<LuaLoweredExpr> {
+    let lhs = lower_lua_direct_expr(
+        lhs,
+        builder,
+        namespace_aliases,
+        param_slots,
+        capture_slots,
+        capture_enabled,
+        callable_return_arities,
+        false,
+    )?;
+    let rhs = lower_lua_direct_expr(
+        rhs,
+        builder,
+        namespace_aliases,
+        param_slots,
+        capture_slots,
+        capture_enabled,
+        callable_return_arities,
+        false,
+    )?;
+    Some(LuaLoweredExpr::scalar(build(
+        Box::new(lhs.expr),
+        Box::new(rhs.expr),
+    )))
+}
+
+fn lower_lua_unary_expr(
+    inner: LuaDirectExpr,
+    builder: &mut LocalIrBuilder,
+    namespace_aliases: &HashMap<String, String>,
+    param_slots: &HashMap<String, LocalSlot>,
+    capture_slots: &mut HashMap<LocalSlot, LocalSlot>,
+    capture_enabled: bool,
+    callable_return_arities: &HashMap<LocalSlot, usize>,
+    build: fn(Box<Expr>) -> Expr,
+) -> Option<LuaLoweredExpr> {
+    let inner = lower_lua_direct_expr(
+        inner,
+        builder,
+        namespace_aliases,
+        param_slots,
+        capture_slots,
+        capture_enabled,
+        callable_return_arities,
+        false,
+    )?;
+    Some(LuaLoweredExpr::scalar(build(Box::new(inner.expr))))
 }
 
 fn flatten_lua_member_path(expr: &LuaDirectExpr) -> Option<Vec<String>> {
@@ -1713,12 +2087,15 @@ impl LuaDirectExprParser {
             }
         }
         let body = if self.match_token(|token| matches!(token, LuaDirectToken::End)) {
-            LuaDirectExpr::Null
+            vec![LuaDirectExpr::Null]
         } else if self.match_token(|token| matches!(token, LuaDirectToken::Return)) {
             if self.match_token(|token| matches!(token, LuaDirectToken::End)) {
-                LuaDirectExpr::Null
+                vec![LuaDirectExpr::Null]
             } else {
-                let body = self.parse_or()?;
+                let mut body = vec![self.parse_or()?];
+                while self.match_token(|token| matches!(token, LuaDirectToken::Comma)) {
+                    body.push(self.parse_or()?);
+                }
                 if !self.match_token(|token| matches!(token, LuaDirectToken::End)) {
                     return None;
                 }
@@ -1727,10 +2104,7 @@ impl LuaDirectExprParser {
         } else {
             return None;
         };
-        Some(LuaDirectExpr::Closure {
-            params,
-            body: Box::new(body),
-        })
+        Some(LuaDirectExpr::Closure { params, body })
     }
 
     fn peek(&self) -> Option<&LuaDirectToken> {
@@ -2002,6 +2376,226 @@ fn parse_lua_local_assignment(line: &str) -> Option<(&str, &str)> {
     } else {
         None
     }
+}
+
+fn parse_lua_assignment_targets(input: &str) -> Option<Vec<String>> {
+    let names = split_top_level_csv(input)
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .collect::<Vec<_>>();
+    if names.is_empty() || !names.iter().all(|name| is_valid_lua_ident(name)) {
+        return None;
+    }
+    Some(names)
+}
+
+fn sync_callable_return_arity(
+    stmt: &Stmt,
+    callable_return_arity: Option<usize>,
+    callable_return_arities: &mut HashMap<LocalSlot, usize>,
+) {
+    let slot = match stmt {
+        Stmt::Let { index, .. } | Stmt::Assign { index, .. } => *index,
+        _ => return,
+    };
+    if let Some(arity) = callable_return_arity {
+        callable_return_arities.insert(slot, arity.max(1));
+    } else {
+        callable_return_arities.remove(&slot);
+    }
+}
+
+fn lower_lua_multi_local_binding(
+    names: Vec<String>,
+    expr: LuaLoweredExpr,
+    builder: &mut LocalIrBuilder,
+    line: u32,
+    callable_return_arities: &mut HashMap<LocalSlot, usize>,
+) -> Result<Vec<Stmt>, ParseError> {
+    let mut stmts = Vec::new();
+    if names.is_empty() {
+        return Ok(stmts);
+    }
+
+    if expr.unpack_arity <= 1 {
+        let mut iter = names.into_iter();
+        if let Some(first) = iter.next() {
+            let stmt = builder.lower_local(&first, expr.expr, line)?;
+            sync_callable_return_arity(&stmt, expr.callable_return_arity, callable_return_arities);
+            stmts.push(stmt);
+        }
+        for name in iter {
+            let stmt = builder.lower_local(&name, Expr::Null, line)?;
+            sync_callable_return_arity(&stmt, None, callable_return_arities);
+            stmts.push(stmt);
+        }
+        return Ok(stmts);
+    }
+
+    let temp_slot = builder
+        .alloc_local_named(&fresh_lua_direct_temp("multi_ret"))
+        .map_err(|err| ParseError::at_line(line as usize, err.to_string()))?;
+    stmts.push(Stmt::Let {
+        index: temp_slot,
+        expr: expr.expr,
+        line,
+    });
+
+    for (value_index, name) in names.into_iter().enumerate() {
+        let value_expr = if value_index < expr.unpack_arity {
+            build_lua_unpack_get_expr(Expr::Var(temp_slot), value_index as i64)
+        } else {
+            Expr::Null
+        };
+        let stmt = builder.lower_local(&name, value_expr, line)?;
+        sync_callable_return_arity(&stmt, None, callable_return_arities);
+        stmts.push(stmt);
+    }
+
+    Ok(stmts)
+}
+
+fn lower_lua_return_body_exprs(
+    body: Vec<LuaDirectExpr>,
+    builder: &mut LocalIrBuilder,
+    namespace_aliases: &HashMap<String, String>,
+    param_slots: &HashMap<String, LocalSlot>,
+    capture_slots: &mut HashMap<LocalSlot, LocalSlot>,
+    callable_return_arities: &HashMap<LocalSlot, usize>,
+) -> Option<Vec<LuaLoweredExpr>> {
+    let last_index = body.len().checked_sub(1)?;
+    let mut lowered = Vec::with_capacity(body.len());
+    for (index, expr) in body.into_iter().enumerate() {
+        lowered.push(lower_lua_direct_expr(
+            expr,
+            builder,
+            namespace_aliases,
+            param_slots,
+            capture_slots,
+            true,
+            callable_return_arities,
+            index == last_index,
+        )?);
+    }
+    Some(lowered)
+}
+
+fn lua_return_arity(exprs: Option<&[LuaLoweredExpr]>) -> usize {
+    let Some(values) = exprs else {
+        return 1;
+    };
+    let Some((last, head)) = values.split_last() else {
+        return 1;
+    };
+    head.len() + last.unpack_arity.max(1)
+}
+
+fn build_lua_packed_array_expr(values: Vec<Expr>) -> Expr {
+    values.into_iter().fold(
+        Expr::Call(BuiltinFunction::ArrayNew.call_index(), Vec::new()),
+        |array, value| Expr::Call(BuiltinFunction::ArrayPush.call_index(), vec![array, value]),
+    )
+}
+
+fn build_lua_return_expr(
+    exprs: Option<Vec<LuaLoweredExpr>>,
+    target_arity: usize,
+    builder: &mut LocalIrBuilder,
+    line: u32,
+) -> LuaLoweredExpr {
+    let mut exprs = exprs.unwrap_or_default();
+    if target_arity <= 1 {
+        let expr = exprs
+            .drain(..)
+            .next()
+            .map(|expr| expr.scalarized().expr)
+            .unwrap_or(Expr::Null);
+        return LuaLoweredExpr::scalar(expr);
+    }
+
+    let Some(last) = exprs.pop() else {
+        return LuaLoweredExpr {
+            expr: build_lua_packed_array_expr(vec![Expr::Null; target_arity]),
+            unpack_arity: target_arity,
+            callable_return_arity: None,
+        };
+    };
+
+    let mut prefix_values = exprs
+        .into_iter()
+        .map(|expr| expr.scalarized().expr)
+        .collect::<Vec<_>>();
+
+    if last.unpack_arity <= 1 {
+        prefix_values.push(last.scalarized().expr);
+        while prefix_values.len() < target_arity {
+            prefix_values.push(Expr::Null);
+        }
+        return LuaLoweredExpr {
+            expr: build_lua_packed_array_expr(prefix_values.into_iter().take(target_arity).collect()),
+            unpack_arity: target_arity,
+            callable_return_arity: None,
+        };
+    }
+
+    let packed_slot = builder
+        .alloc_local_named(&fresh_lua_direct_temp("return_pack"))
+        .expect("lua direct lowering temp allocation should not fail");
+    let remaining_tail = target_arity.saturating_sub(prefix_values.len());
+    let mut values = prefix_values;
+    for index in 0..remaining_tail {
+        values.push(build_lua_unpack_get_expr(Expr::Var(packed_slot), index as i64));
+    }
+    while values.len() < target_arity {
+        values.push(Expr::Null);
+    }
+
+    LuaLoweredExpr {
+        expr: Expr::Block {
+            stmts: vec![Stmt::Let {
+                index: packed_slot,
+                expr: last.expr,
+                line,
+            }],
+            expr: Box::new(build_lua_packed_array_expr(
+                values.into_iter().take(target_arity).collect(),
+            )),
+        },
+        unpack_arity: target_arity,
+        callable_return_arity: None,
+    }
+}
+
+fn parse_lua_direct_return_exprs(
+    input: &str,
+    builder: &mut LocalIrBuilder,
+    namespace_aliases: &HashMap<String, String>,
+    param_slots: &HashMap<String, LocalSlot>,
+    capture_slots: &mut HashMap<LocalSlot, LocalSlot>,
+    callable_return_arities: &HashMap<LocalSlot, usize>,
+) -> Result<Option<Vec<LuaLoweredExpr>>, ParseError> {
+    let parts = split_top_level_csv(input);
+    let last_index = parts.len().checked_sub(1).ok_or_else(|| {
+        ParseError::at_line(1, "lua return expression list cannot be empty")
+    })?;
+    let mut out = Vec::with_capacity(parts.len());
+    for (index, part) in parts.into_iter().enumerate() {
+        let Some(expr) = parse_lua_direct_expr(
+            part.trim(),
+            builder,
+            namespace_aliases,
+            param_slots,
+            capture_slots,
+            true,
+            callable_return_arities,
+            index == last_index,
+        )?
+        else {
+            return Ok(None);
+        };
+        out.push(expr);
+    }
+    Ok(Some(out))
 }
 
 fn split_top_level_csv(input: &str) -> Vec<String> {

@@ -23,7 +23,7 @@ All frontends lower to the same frontend IR and VM bytecode model.
 
 | Feature | RustScript | JavaScript | Lua | Scheme |
 | --- | --- | --- | --- | --- |
-| Local binding | `let x = 1;` | `let x = 1;` / `const x = 1;` | `local x = 1` | `(define x 1)` |
+| Local binding | `let x = 1;` | `let x = 1;` / `const x = 1;` | `local x = 1` / `local a, b = f()` | `(define x 1)` |
 | Assignment | `x = 2;` | `x = 2;` | `x = 2` | `(set! x 2)` |
 | Function declaration | `fn add(x) { x + 1; }` | `function add(x) { x + 1; }` | `local function add(x) return x + 1 end` | `(define (add x) (+ x 1))` |
 | Closure literal | `|x| x + 1` | `(x) => x + 1` | `function(x) return x + 1 end` | `(lambda (x) (+ x 1))` |
@@ -146,7 +146,8 @@ Current subset limits:
 Supported syntax and features:
 
 - Statements:
-  - `local` bindings, assignment, indexed/member assignment
+  - `local` bindings, including compiler-known unpacking forms like `local a, b = f()`
+  - assignment, indexed/member assignment
   - `local function` and `function` declarations
   - `if`/`elseif`/`elif`/`else`/`end` (`elif` is accepted as an alias)
   - `while ... do ... end`
@@ -158,7 +159,7 @@ Supported syntax and features:
 - Expressions:
   - literals (`nil`, bool, int/float, single/double-quoted strings)
   - operators: `+ - * / %`, `not`, `and`, `or`, `~=` and `..` (lowered)
-  - function literals (`function(args) return <expr> end`)
+  - function literals (`function(args) return <expr[, expr...]> end`, plus fallthrough `function(args) end`)
   - table literals (array parts, map parts, and mixed forms)
   - member/index access, optional chaining, slice syntax
   - method-call lowering for `receiver:method(args)`
@@ -172,7 +173,9 @@ Supported syntax and features:
 
 Current subset limits:
 
-- Function literals must use `return <expr>` (single-expression body).
+- Function literals are limited to `function(args) end`, `function(args) return end`, or `function(args) return <expr[, expr...]> end`.
+- Direct `function`/`local function` bodies are still minimal: empty/fallthrough, `return`, `return <expr[, expr...]>`, or a single return-only `if`/`elseif`/`else` chain.
+- Multi-return unpacking is currently limited to compiler-known Lua function/closure return shapes; extra return values are dropped, missing locals are filled with `null`, but plain assignment destructuring and arbitrary host-call unpacking are not supported.
 - Lua pattern API string methods (`:find`, `:match`, `:gsub`) are currently rejected.
 - Direct VM helper builtin calls are not exposed as frontend functions.
 
