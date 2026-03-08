@@ -604,7 +604,7 @@ impl HostFunction for ConsoleStdinReadLineFunction {
             })
             .await
             .map_err(|err| VmError::HostError(format!("stdin read_line task failed: {err}")))??;
-            Ok(vec![Value::String(line)])
+            Ok(vec![Value::string(line)])
         })
     }
 }
@@ -632,7 +632,7 @@ impl HostFunction for ConsoleStdinReadAllFunction {
             })
             .await
             .map_err(|err| VmError::HostError(format!("stdin read_all task failed: {err}")))??;
-            Ok(vec![Value::String(text)])
+            Ok(vec![Value::string(text)])
         })
     }
 }
@@ -775,7 +775,7 @@ fn expect_arg_count(args: &[Value], expected: usize) -> Result<(), VmError> {
 
 fn expect_string(args: &[Value], index: usize) -> Result<String, VmError> {
     match args.get(index) {
-        Some(Value::String(value)) => Ok(value.clone()),
+        Some(Value::String(value)) => Ok(value.to_string()),
         _ => Err(VmError::TypeMismatch("string")),
     }
 }

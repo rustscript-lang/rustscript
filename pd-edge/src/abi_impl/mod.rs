@@ -909,7 +909,7 @@ fn expect_arg_count(args: &[Value], expected: usize) -> Result<(), VmError> {
 
 fn expect_string(args: &[Value], index: usize) -> Result<String, VmError> {
     match args.get(index) {
-        Some(Value::String(value)) => Ok(value.clone()),
+        Some(Value::String(value)) => Ok(value.to_string()),
         _ => Err(VmError::TypeMismatch("string")),
     }
 }
@@ -923,7 +923,7 @@ fn expect_int(args: &[Value], index: usize) -> Result<i64, VmError> {
 
 fn expect_map(args: &[Value], index: usize) -> Result<Vec<(Value, Value)>, VmError> {
     match args.get(index) {
-        Some(Value::Map(entries)) => Ok(entries.clone()),
+        Some(Value::Map(entries)) => Ok(entries.as_ref().clone()),
         _ => Err(VmError::TypeMismatch("map")),
     }
 }
@@ -952,7 +952,7 @@ fn parse_headers_map_arg(
     let mut parsed = Vec::with_capacity(entries.len());
     for (key, value) in entries {
         let name = match key {
-            Value::String(name) => name,
+            Value::String(name) => name.to_string(),
             _ => {
                 return Err(VmError::HostError(
                     "header map keys must be strings".to_string(),
@@ -963,12 +963,12 @@ fn parse_headers_map_arg(
             .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
 
         let values = match value {
-            Value::String(single) => vec![single],
+            Value::String(single) => vec![single.to_string()],
             Value::Array(values) => {
                 let mut collected = Vec::with_capacity(values.len());
-                for value in values {
+                for value in values.iter() {
                     match value {
-                        Value::String(item) => collected.push(item),
+                        Value::String(item) => collected.push(item.to_string()),
                         _ => {
                             return Err(VmError::HostError(
                                 "header map values must be strings or arrays of strings"
@@ -1012,16 +1012,16 @@ fn headers_to_value_map(headers: &HeaderMap) -> Value {
         let header_value = value.to_str().unwrap_or_default().to_string();
         values.entry(header_name).or_default().push(header_value);
     }
-    Value::Map(
+    Value::map(
         values
             .into_iter()
             .map(|(name, values)| {
                 let value = if values.len() == 1 {
-                    Value::String(values[0].clone())
+                    Value::string(values[0].clone())
                 } else {
-                    Value::Array(values.into_iter().map(Value::String).collect())
+                    Value::array(values.into_iter().map(Value::string).collect())
                 };
-                (Value::String(name), value)
+                (Value::string(name), value)
             })
             .collect(),
     )
@@ -1035,16 +1035,16 @@ fn query_to_value_map(query: &str) -> Value {
             .or_default()
             .push(value.into_owned());
     }
-    Value::Map(
+    Value::map(
         values
             .into_iter()
             .map(|(name, values)| {
                 let value = if values.len() == 1 {
-                    Value::String(values[0].clone())
+                    Value::string(values[0].clone())
                 } else {
-                    Value::Array(values.into_iter().map(Value::String).collect())
+                    Value::array(values.into_iter().map(Value::string).collect())
                 };
-                (Value::String(name), value)
+                (Value::string(name), value)
             })
             .collect(),
     )

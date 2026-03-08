@@ -48,16 +48,16 @@ fn build_short_circuit_program(body: &str, header: Option<(&str, &str)>) -> Prog
 
     if let Some((name, value)) = header {
         let name_index = constants.len() as u32;
-        constants.push(Value::String(name.to_string()));
+        constants.push(Value::string(name));
         let value_index = constants.len() as u32;
-        constants.push(Value::String(value.to_string()));
+        constants.push(Value::string(value));
         bc.ldc(name_index);
         bc.ldc(value_index);
         bc.call(FN_HTTP_RESPONSE_SET_HEADER, 2);
     }
 
     let body_index = constants.len() as u32;
-    constants.push(Value::String(body.to_string()));
+    constants.push(Value::string(body));
     bc.ldc(body_index);
     bc.call(FN_HTTP_RESPONSE_SET_BODY, 1);
     bc.ret();
@@ -70,15 +70,15 @@ fn build_upstream_program(upstream: &str, header: Option<(&str, &str)>) -> Progr
     let mut bc = BytecodeBuilder::new();
 
     let upstream_index = constants.len() as u32;
-    constants.push(Value::String(upstream.to_string()));
+    constants.push(Value::string(upstream));
     bc.ldc(upstream_index);
     bc.call(FN_HTTP_UPSTREAM_REQUEST_SET_TARGET, 1);
 
     if let Some((name, value)) = header {
         let name_index = constants.len() as u32;
-        constants.push(Value::String(name.to_string()));
+        constants.push(Value::string(name));
         let value_index = constants.len() as u32;
-        constants.push(Value::String(value.to_string()));
+        constants.push(Value::string(value));
         bc.ldc(name_index);
         bc.ldc(value_index);
         bc.call(FN_HTTP_RESPONSE_SET_HEADER, 2);

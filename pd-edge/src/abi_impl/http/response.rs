@@ -96,7 +96,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
             expect_arg_count(args, 0)?;
             context.touch_response_output();
             let value = context.response_content.clone().unwrap_or_default();
-            Ok(CallOutcome::Return(vec![Value::String(value)]))
+            Ok(CallOutcome::Return(vec![Value::string(value)]))
         }
     );
     bind_response_handler!(
@@ -115,7 +115,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
                 .get(&header_name)
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or("");
-            Ok(CallOutcome::Return(vec![Value::String(value.to_string())]))
+            Ok(CallOutcome::Return(vec![Value::string(value)]))
         }
     );
     bind_response_handler!(
