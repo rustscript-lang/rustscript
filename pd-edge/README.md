@@ -122,6 +122,8 @@ Usage: pd-edge-http-proxy [options]
 --max-program-bytes <BYTES>           Max program/upload size in bytes (default: 1048576)
 --vm-fuel <UNITS>                     Enable cooperative VM fuel slices per request
 --vm-fuel-check-interval <OPS>        Fuel check interval when --vm-fuel is enabled (default: 1)
+--vm-epoch-deadline <TICKS>           Enable cooperative VM epoch slices per request
+--vm-epoch-check-interval <OPS>       Epoch check interval when --vm-epoch-deadline is enabled (default: 1)
 --vm-execution-mode <MODE>            VM execution mode: async|threading (default: async)
 --control-plane-url <URL>             Enable active control-plane RPC client
 --edge-id <UUID>                      Explicit edge UUID for active control-plane mode
@@ -133,6 +135,13 @@ Usage: pd-edge-http-proxy [options]
 -h, --help
 ```
 
+Notes:
+
+- `--vm-fuel` and `--vm-epoch-deadline` are mutually exclusive.
+- `--vm-fuel-check-interval` and `--vm-epoch-check-interval` are mutually exclusive.
+- `--vm-epoch-check-interval` requires `--vm-epoch-deadline`.
+- In epoch mode, the edge runtime advances the shared VM epoch between slices and resumes until the request completes or the debugger takes control.
+
 ### `pd-edge-console`
 
 ```text
@@ -140,6 +149,10 @@ Usage: pd-edge-console [options]
 
 --program <PATH>                      Optional source/.vmbc to load at startup
 --max-program-bytes <BYTES>           Max program size in bytes (default: 1048576)
+--vm-fuel <UNITS>                     Enable cooperative VM fuel slices per run
+--vm-fuel-check-interval <OPS>        Fuel check interval when --vm-fuel is enabled (default: 1)
+--vm-epoch-deadline <TICKS>           Enable cooperative VM epoch slices per run
+--vm-epoch-check-interval <OPS>       Epoch check interval when --vm-epoch-deadline is enabled (default: 1)
 --control-plane-url <URL>             Enable active control-plane RPC client
 --edge-id <UUID>                      Explicit edge UUID for active control-plane mode
 --edge-name <NAME>                    Edge display name (default: hostname)
@@ -149,6 +162,8 @@ Usage: pd-edge-console [options]
 -V, --version
 -h, --help
 ```
+
+The same interruption exclusivity rules apply in console mode: fuel and epoch cannot both be enabled for the same VM run.
 
 ## Active Control-Plane RPC
 
@@ -169,6 +184,10 @@ Supported command types:
 - `get_metrics`
 - `get_telemetry`
 - `ping`
+
+`debug_command` supports both structured commands and raw debugger text. Raw text is passed through to the
+interactive VM debugger, so remote clients can issue commands such as `epoch`, `epoch tick 1`,
+`epoch deadline 3`, `epoch clear`, `fuel`, or `continue`.
 
 ### Example
 

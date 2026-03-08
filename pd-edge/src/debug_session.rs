@@ -577,6 +577,50 @@ fn debug_command_text(command: &RemoteDebugCommand) -> Result<(String, bool), De
         }
         RemoteDebugCommand::Locals => Ok(("locals".to_string(), false)),
         RemoteDebugCommand::Stack => Ok(("stack".to_string(), false)),
+        RemoteDebugCommand::Text { command } => {
+            let command = command.trim();
+            if command.is_empty() {
+                return Err(DebugSessionError::InvalidCommand(
+                    "debug command cannot be empty".to_string(),
+                ));
+            }
+            Ok((command.to_string(), remote_debug_command_is_resume(command)))
+        }
+    }
+}
+
+fn remote_debug_command_is_resume(command: &str) -> bool {
+    matches!(
+        command
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "step" | "next" | "continue" | "out"
+    )
+}
+
+#[cfg(test)]
+mod command_text_tests {
+    use super::debug_command_text;
+    use crate::RemoteDebugCommand;
+
+    #[test]
+    fn raw_remote_debug_command_preserves_text_and_resume_flag() {
+        let (command, resume) = debug_command_text(&RemoteDebugCommand::Text {
+            command: "epoch deadline 2".to_string(),
+        })
+        .expect("raw debugger command should parse");
+        assert_eq!(command, "epoch deadline 2");
+        assert!(!resume);
+
+        let (command, resume) = debug_command_text(&RemoteDebugCommand::Text {
+            command: "continue".to_string(),
+        })
+        .expect("continue command should parse");
+        assert_eq!(command, "continue");
+        assert!(resume);
     }
 }
 

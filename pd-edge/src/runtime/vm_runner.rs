@@ -1,10 +1,15 @@
-use std::{future::Future, pin::Pin};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::mpsc,
+    thread::{self, JoinHandle},
+};
 
 use axum::http::HeaderMap;
 use tracing::warn;
-use vm::{Store, Vm, VmStatus};
+use vm::{EpochHandle, Store, Vm, VmStatus, VmYieldReason};
 
-use super::{LoadedProgram, VmExecutionConfig, VmExecutionMode};
+use super::{LoadedProgram, VmExecutionConfig, VmExecutionMode, VmInterruptConfig};
 use crate::{
     abi_impl::{
         SharedProxyVmContext, SharedVmAsyncOps, VmAsyncOpBridge, VmExecutionOutcome,
@@ -48,6 +53,51 @@ trait VmModeRunner {
 
 struct AsyncModeRunner;
 struct ThreadingModeRunner;
+
+enum ActiveVmInterrupt {
+    None,
+    Fuel { fuel_per_yield: u64 },
+    Epoch {
+        ticks_per_slice: u64,
+        driver: EpochInterruptionDriver,
+    },
+}
+
+struct EpochInterruptionDriver {
+    arm_tx: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl EpochInterruptionDriver {
+    fn new(epoch_handle: EpochHandle, ticks_per_slice: u64) -> Self {
+        let (arm_tx, arm_rx) = mpsc::channel::<()>();
+        let thread = thread::spawn(move || {
+            while arm_rx.recv().is_ok() {
+                thread::yield_now();
+                epoch_handle.increment_by(ticks_per_slice);
+            }
+        });
+        Self {
+            arm_tx: Some(arm_tx),
+            thread: Some(thread),
+        }
+    }
+
+    fn arm(&self) {
+        if let Some(arm_tx) = &self.arm_tx {
+            let _ = arm_tx.send(());
+        }
+    }
+}
+
+impl Drop for EpochInterruptionDriver {
+    fn drop(&mut self) {
+        self.arm_tx.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum VmExecutionError {
@@ -205,16 +255,12 @@ async fn run_vm_async(
     register_host_modules: HostModuleRegistrar,
     vm_execution: VmExecutionConfig,
 ) -> Result<(VmExecutionOutcome, VmExecutionProfile), VmExecutionError> {
-    if let Some(fuel) = vm_execution.fuel_per_yield {
-        vm_store
-            .set_fuel_check_interval(vm_execution.fuel_check_interval)
-            .map_err(VmExecutionError::Vm)?;
-        vm_store.set_fuel(fuel);
-    }
+    let interrupt = configure_vm_interrupt(&mut vm_store, vm_execution)?;
     register_host_modules_from_store(&mut vm_store, register_host_modules)?;
     let mut profile = VmExecutionProfile::default();
 
     loop {
+        arm_epoch_interrupt_if_enabled(&mut vm_store, &interrupt, debug.attach_debugger)?;
         let status = if debug.attach_debugger {
             run_vm_with_optional_debugger(
                 &debug_session,
@@ -231,13 +277,7 @@ async fn run_vm_async(
             VmStatus::Halted => break,
             VmStatus::Yielded => {
                 profile.vm_yield_count = profile.vm_yield_count.saturating_add(1);
-                if let Some(fuel) = vm_execution.fuel_per_yield
-                    && vm_store.get_fuel() == Some(0)
-                {
-                    vm_store.recharge(fuel).map_err(VmExecutionError::Vm)?;
-                    profile.vm_fuel_recharge_count =
-                        profile.vm_fuel_recharge_count.saturating_add(1);
-                }
+                handle_interrupt_yield(&mut vm_store, &interrupt, &mut profile)?;
                 tokio::task::yield_now().await;
             }
             VmStatus::Waiting(_op_id) => {
@@ -268,16 +308,12 @@ fn run_vm_threading(
     register_host_modules: HostModuleRegistrar,
     vm_execution: VmExecutionConfig,
 ) -> Result<(VmExecutionOutcome, VmExecutionProfile), VmExecutionError> {
-    if let Some(fuel) = vm_execution.fuel_per_yield {
-        vm_store
-            .set_fuel_check_interval(vm_execution.fuel_check_interval)
-            .map_err(VmExecutionError::Vm)?;
-        vm_store.set_fuel(fuel);
-    }
+    let interrupt = configure_vm_interrupt(&mut vm_store, vm_execution)?;
     register_host_modules_from_store(&mut vm_store, register_host_modules)?;
     let mut profile = VmExecutionProfile::default();
 
     loop {
+        arm_epoch_interrupt_if_enabled(&mut vm_store, &interrupt, debug.attach_debugger)?;
         let status = if debug.attach_debugger {
             run_vm_with_optional_debugger(
                 &debug_session,
@@ -295,13 +331,7 @@ fn run_vm_threading(
             VmStatus::Halted => break,
             VmStatus::Yielded => {
                 profile.vm_yield_count = profile.vm_yield_count.saturating_add(1);
-                if let Some(fuel) = vm_execution.fuel_per_yield
-                    && vm_store.get_fuel() == Some(0)
-                {
-                    vm_store.recharge(fuel).map_err(VmExecutionError::Vm)?;
-                    profile.vm_fuel_recharge_count =
-                        profile.vm_fuel_recharge_count.saturating_add(1);
-                }
+                handle_interrupt_yield(&mut vm_store, &interrupt, &mut profile)?;
                 std::thread::yield_now();
             }
             VmStatus::Waiting(_op_id) => {
@@ -341,6 +371,83 @@ fn register_host_modules_from_store(
     let async_ops = vm_store.data().async_ops.clone();
     register_host_modules(vm_store.vm_mut(), vm_context, async_ops)
         .map_err(VmExecutionError::HostRegistration)
+}
+
+fn configure_vm_interrupt(
+    vm_store: &mut VmRunnerStore,
+    vm_execution: VmExecutionConfig,
+) -> Result<ActiveVmInterrupt, VmExecutionError> {
+    match vm_execution.interrupt {
+        VmInterruptConfig::None => Ok(ActiveVmInterrupt::None),
+        VmInterruptConfig::Fuel {
+            fuel_per_yield,
+            check_interval,
+        } => {
+            vm_store
+                .set_fuel_check_interval(check_interval)
+                .map_err(VmExecutionError::Vm)?;
+            vm_store.set_fuel(fuel_per_yield);
+            Ok(ActiveVmInterrupt::Fuel { fuel_per_yield })
+        }
+        VmInterruptConfig::Epoch {
+            ticks_per_slice,
+            check_interval,
+        } => {
+            vm_store
+                .set_epoch_check_interval(check_interval)
+                .map_err(VmExecutionError::Vm)?;
+            let driver = EpochInterruptionDriver::new(vm_store.vm().epoch_handle(), ticks_per_slice);
+            Ok(ActiveVmInterrupt::Epoch {
+                ticks_per_slice,
+                driver,
+            })
+        }
+    }
+}
+
+fn arm_epoch_interrupt_if_enabled(
+    vm_store: &mut VmRunnerStore,
+    interrupt: &ActiveVmInterrupt,
+    debugger_attached: bool,
+) -> Result<(), VmExecutionError> {
+    let ActiveVmInterrupt::Epoch {
+        ticks_per_slice,
+        driver,
+    } = interrupt
+    else {
+        return Ok(());
+    };
+    if debugger_attached {
+        return Ok(());
+    }
+    vm_store
+        .set_epoch_deadline(*ticks_per_slice)
+        .map_err(VmExecutionError::Vm)?;
+    driver.arm();
+    Ok(())
+}
+
+fn handle_interrupt_yield(
+    vm_store: &mut VmRunnerStore,
+    interrupt: &ActiveVmInterrupt,
+    profile: &mut VmExecutionProfile,
+) -> Result<(), VmExecutionError> {
+    match (interrupt, vm_store.vm().last_yield_reason()) {
+        (
+            ActiveVmInterrupt::Fuel { fuel_per_yield },
+            Some(VmYieldReason::Fuel),
+        ) if vm_store.get_fuel() == Some(0) => {
+            vm_store
+                .recharge(*fuel_per_yield)
+                .map_err(VmExecutionError::Vm)?;
+            profile.vm_fuel_recharge_count = profile.vm_fuel_recharge_count.saturating_add(1);
+        }
+        (ActiveVmInterrupt::Epoch { .. }, Some(VmYieldReason::Epoch))
+        | (ActiveVmInterrupt::None, _)
+        | (ActiveVmInterrupt::Fuel { .. }, _)
+        | (ActiveVmInterrupt::Epoch { .. }, _) => {}
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -399,4 +506,74 @@ fn tail_profile_threshold_us() -> u64 {
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(5_000)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::http::HeaderMap;
+    use vm::compile_source;
+
+    use super::*;
+    use crate::{
+        ProxyVmContext,
+        abi_impl::RateLimiterStore,
+        debug_session::new_debug_session_store,
+    };
+
+    fn no_host_modules(
+        _vm: &mut Vm,
+        _context: crate::SharedProxyVmContext,
+        _async_ops: crate::SharedVmAsyncOps,
+    ) -> Result<(), vm::VmError> {
+        Ok(())
+    }
+
+    #[test]
+    fn threading_epoch_interrupt_yields_and_completes() {
+        let compiled = compile_source(
+            r#"
+                let mut total = 0;
+                for (let mut i = 0; i < 200000; i = i + 1) {
+                    total = total + i;
+                }
+                total;
+            "#,
+        )
+        .expect("program should compile");
+        let program = Arc::new(compiled.program.with_local_count(compiled.locals));
+        let context = Arc::new(Mutex::new(ProxyVmContext::from_request_headers(
+            HeaderMap::new(),
+            Arc::new(Mutex::new(RateLimiterStore::new())),
+        )));
+        let async_ops = new_shared_vm_async_ops();
+        let store = new_vm_runner_store(program, context, async_ops);
+        let debug = VmDebugInvocation {
+            attach_debugger: false,
+            request_headers: HeaderMap::new(),
+            request_path: "/".to_string(),
+            request_id: "epoch-test".to_string(),
+        };
+
+        let (_outcome, profile) = run_vm_threading(
+            store,
+            new_debug_session_store(),
+            debug,
+            no_host_modules,
+            VmExecutionConfig {
+                interrupt: VmInterruptConfig::Epoch {
+                    ticks_per_slice: 1,
+                    check_interval: 1,
+                },
+                execution_mode: VmExecutionMode::Threading,
+            },
+        )
+        .expect("threading execution should succeed");
+
+        assert!(
+            profile.vm_yield_count > 0,
+            "epoch scheduling should yield at least once"
+        );
+    }
 }

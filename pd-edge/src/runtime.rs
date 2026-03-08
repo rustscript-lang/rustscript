@@ -43,18 +43,49 @@ impl VmExecutionMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VmInterruptConfig {
+    #[default]
+    None,
+    Fuel {
+        fuel_per_yield: u64,
+        check_interval: u32,
+    },
+    Epoch {
+        ticks_per_slice: u64,
+        check_interval: u32,
+    },
+}
+
+impl VmInterruptConfig {
+    pub fn kind_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Fuel { .. } => "fuel",
+            Self::Epoch { .. } => "epoch",
+        }
+    }
+
+    pub fn check_interval(self) -> u32 {
+        match self {
+            Self::None => 1,
+            Self::Fuel { check_interval, .. } | Self::Epoch { check_interval, .. } => {
+                check_interval
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VmExecutionConfig {
-    pub fuel_per_yield: Option<u64>,
-    pub fuel_check_interval: u32,
+    pub interrupt: VmInterruptConfig,
     pub execution_mode: VmExecutionMode,
 }
 
 impl Default for VmExecutionConfig {
     fn default() -> Self {
         Self {
-            fuel_per_yield: None,
-            fuel_check_interval: 1,
+            interrupt: VmInterruptConfig::None,
             execution_mode: VmExecutionMode::default(),
         }
     }
