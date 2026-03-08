@@ -33,6 +33,20 @@ pub fn enumerate(values) {
     out;
 }
 
+pub fn zip(lhs, rhs) {
+    let mut out = [];
+    let mut index = 0;
+    let mut limit = (lhs).length;
+    if (rhs).length < limit {
+        limit = (rhs).length;
+    }
+    while index < limit {
+        out[(out).length] = [lhs[index], rhs[index]];
+        index = index + 1;
+    }
+    out;
+}
+
 pub fn take(values, count) {
     let mut out = [];
     if count > 0 {
