@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>About pd-vm and RustScript</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, sans-serif;
+        line-height: 1.6;
+        color: #e5e5e5;
+        background: #1e1e1e;
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 2rem;
+      }
+      h1, h2, h3, h4 { color: #fff; }
+      pre { background: #2d2d2d; padding: 1rem; border-radius: 4px; overflow-x: auto; font-size: 0.9em; }
+      code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; background: #2d2d2d; padding: 0.2em 0.4em; border-radius: 3px; }
+      a { color: #58a6ff; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.9em; }
+      th, td { border: 1px solid #444; padding: 0.5rem; text-align: left; }
+      th { background: #2d2d2d; }
+    </style>
+  </head>
+  <body>
+    <div style="margin-bottom: 2rem;">
+      <a href="./index.html">&larr; Back to Playground</a>
+    </div>
+
+    <h1>About pd-vm and RustScript</h1>
+
+    <h2>Overview</h2>
+    <p><code>pd-vm</code> is a stack-based virtual machine plus compiler toolchain used as a backend for multiple source syntaxes, including our primary focus: RustScript (<code>.rss</code>).</p>
+    <p>Features include:</p>
+    <ul>
+      <li>Executes compiled compact bytecode rather than interpreting source.</li>
+      <li>Offers consistent runtime semantics for both synchronous and asynchronous execution.</li>
+      <li>Includes rich debugging and profiling tools: interactive debugger, recording and replay, and JIT trace insights.</li>
+    </ul>
+
+    <h2>How To Use</h2>
+
+    <h3>Fuel Metering</h3>
+    <p><code>pd-vm</code> provides Wasmtime-style fuel controls on both <code>Vm</code> and <code>Store&lt;T&gt;</code>.</p>
+    <p>Fuel metering is disabled by default. If there is not enough fuel, execution returns <code>VmStatus::Yielded</code> before the next instruction runs.</p>
+
+    <h2>Internals</h2>
+    
+    <h3>VM Internals</h3>
+    <p><code>Program</code> consists of: constants, code, imports, and debug info. Bytecode format uses a 1 byte opcode, little-endian operands, and absolute jump targets.</p>
+    <table>
+      <tr><th>Opcode</th><th>Mnemonic</th><th>Stack effect</th></tr>
+      <tr><td>0x00</td><td><code>nop</code></td><td>no change</td></tr>
+      <tr><td>0x01</td><td><code>ret</code></td><td>stop execution</td></tr>
+      <tr><td>0x02</td><td><code>ldc</code></td><td>push constant</td></tr>
+      <tr><td>0x03-0x07</td><td><code>add</code>, <code>sub</code>, <code>mul</code>, <code>div</code>, <code>neg</code></td><td>math ops</td></tr>
+      <tr><td>0x08-0x0A</td><td><code>ceq</code>, <code>clt</code>, <code>cgt</code></td><td>comparison</td></tr>
+      <tr><td>0x0B-0x0C</td><td><code>br</code>, <code>brfalse</code></td><td>branching</td></tr>
+      <tr><td>0x0D-0x10</td><td><code>pop</code>, <code>dup</code>, <code>ldloc</code>, <code>stloc</code></td><td>stack & locals</td></tr>
+      <tr><td>0x11</td><td><code>call</code></td><td>pop args, call host, push returns</td></tr>
+      <tr><td>0x12-0x16</td><td><code>shl</code>, <code>shr</code>, <code>mod</code>, <code>and</code>, <code>or</code></td><td>bitwise & logical</td></tr>
+    </table>
+
+    <h3>Compiler Internals for RustScript</h3>
+    <p>The compiler uses <code>compile_source()</code> for RustScript or <code>compile_source_file()</code> for flavor selection.</p>
+    
+    <h4>Supported Syntax and Features</h4>
+    <ul>
+      <li><strong>Statements:</strong> <code>use</code>, <code>fn</code>, <code>pub fn</code>, <code>let</code>, assignment, indexed/member assignment, <code>if</code>/<code>else</code>, <code>while</code>, C-style <code>for</code>, <code>break</code>, <code>continue</code>.</li>
+      <li><strong>Expressions:</strong> literals (<code>int</code>, <code>float</code>, <code>bool</code>, <code>string</code>, <code>null</code>), arithmetic, logical, comparison, function calls, closures (<code>|...| expr</code>), if-expression form (<code>if cond => { ... } else => { ... }</code>), match expressions.</li>
+      <li><strong>Match patterns:</strong> int/string/null literals, wildcard <code>_</code>, and type constructors <code>Some(TypeName)</code> / <code>Option::Some(TypeName)</code>.</li>
+      <li><strong>Collections:</strong> array literal <code>[]</code>, brace literals for arrays/maps, <code>obj.member</code>, <code>obj[key]</code>, optional chaining (<code>?.</code> and <code>?.[key]</code>), slice syntax (<code>[a:b]</code>, <code>[:b]</code>, <code>[a:]</code>), map key literals including <code>null</code>.</li>
+      <li><strong>Host/runtime calls:</strong> namespaces <code>io::...</code>, <code>re::...</code>, <code>json::...</code>, <code>jit::...</code>, imported via <code>use vm::{...};</code>.</li>
+    </ul>
+
+    <h4>Ownership and Liveness Behavior</h4>
+    <ul>
+      <li><code>let</code> bindings are immutable by default; use <code>let mut</code> for mutable bindings.</li>
+      <li>Reassignment, indexed/member mutation, and <code>&mut</code> borrows require a mutable binding.</li>
+      <li>Non-copyable field reads (e.g., <code>p.a</code>) and literal index element moves (e.g., <code>let x = arr[0]</code>) are move-by-default and clear the moved field/element on the owning container.</li>
+      <li>Non-copyable local-to-local rebinds (e.g., <code>let b = a</code>) move the source local by default.</li>
+      <li>RustScript function calls apply consumed-parameter inference; reusing a consumed caller local after the call is rejected.</li>
+      <li>Use <code>.copy()</code> to explicitly clone/detach a value.</li>
+      <li><code>&expr</code> and <code>&mut expr</code> are accepted borrow forms. In the current subset, they act as non-consuming access forms but participate in move/liveness checks.</li>
+      <li>Collection aliases are tracked through assignment, borrow binding, and passthrough calls; mutating a collection while an alias exists is rejected unless detached (e.g., via <code>.copy()</code>).</li>
+      <li>Locals must be definitely available on every control-flow path before use.</li>
+      <li>Closures and <code>fn</code> declarations capture outer locals at definition/declaration time. Capture mode follows expression semantics (<code>x</code> can move, <code>x.copy()</code> copies, and <code>&x</code> / <code>&mut x</code> keep borrow-style capture behavior).</li>
+      <li>Inline <code>fn</code> and closure calls clear per-call frame slots after producing the call result. Closure capture slots participate in liveness null-clears once the owning closure/value is dead.</li>
+    </ul>
+
+    <h4>Current RustScript Compiler Limitations</h4>
+    <ul>
+      <li><code>crate::...</code> module paths are not supported in source loading; use relative module paths.</li>
+      <li>Callable locals can be passed and called, but are not runtime <code>Value</code>s and cannot be stored in arrays/maps or returned.</li>
+      <li>Recursive RustScript function declarations are not supported by current inlining-based lowering.</li>
+      <li>Function declarations implicitly capture outer locals (snapshot at declaration time).</li>
+      <li>In move-semantics mode, implicit captures follow expression semantics.</li>
+      <li><code>match</code> patterns are limited to int/string/null literals, <code>_</code>, and type constructors (<code>Some(TypeName)</code>).</li>
+      <li><code>break</code> and <code>continue</code> are only valid inside loops.</li>
+      <li>Host import namespace support allows <code>vm</code>, <code>io::</code>, <code>re::</code>, <code>json::</code>, and <code>jit::</code>.</li>
+    </ul>
+
+    <h3>Assembler API</h3>
+    <pre><code>.data
+const two 2
+string greeting "hello"
+.code
+.local counter
+.label loop
+ldc two
+...
+brfalse done
+br loop
+.label done
+ldc greeting
+ret</code></pre>
+    <p>Directives include <code>.data</code>, <code>.code</code>, <code>.label NAME</code>, and <code>.local NAME [INDEX]</code>.</p>
+
+    <h3>Builtins and Bridged `call` Opcode</h3>
+    <ul>
+      <li><strong>Builtin calls:</strong> fixed reserved indices emitted by parser lowering (e.g. <code>len</code>, <code>assert</code>, <code>io::*</code>).</li>
+      <li><strong>Runtime host imports:</strong> per-program remapped indices emitted as <code>call &lt;slot&gt;, &lt;argc&gt;</code>.</li>
+      <li><strong>Inlined RustScript function bodies:</strong> calls to targets with <code>FunctionImpl</code> are inlined without emitted <code>call</code> opcodes.</li>
+    </ul>
+
+    <h3>JIT Internals</h3>
+    <p>The trace-based JIT path detects hot bytecode loops, records straight-line trace semantics, and emits native machine code via Cranelift, executing trace semantics without bytecode re-decoding.</p>
+
+  </body>
+</html>
