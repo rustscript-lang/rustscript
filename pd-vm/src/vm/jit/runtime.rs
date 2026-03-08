@@ -312,23 +312,13 @@ impl Vm {
                 }
                 TraceStep::Div => {
                     self.binary_numeric_op(
-                        |lhs, rhs| {
-                            if rhs == 0 {
-                                return Err(VmError::DivisionByZero);
-                            }
-                            Ok(lhs.wrapping_div(rhs))
-                        },
+                        crate::vm::checked_int_div,
                         |lhs, rhs| Ok(lhs / rhs),
                     )?;
                 }
                 TraceStep::Mod => {
                     self.binary_numeric_op(
-                        |lhs, rhs| {
-                            if rhs == 0 {
-                                return Err(VmError::DivisionByZero);
-                            }
-                            Ok(lhs.wrapping_rem(rhs))
-                        },
+                        crate::vm::checked_int_rem,
                         |lhs, rhs| {
                             if rhs == 0.0 {
                                 return Err(VmError::DivisionByZero);

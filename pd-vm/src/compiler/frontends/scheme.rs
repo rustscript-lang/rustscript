@@ -2149,10 +2149,10 @@ fn fold_int_mul(lhs: i64, rhs: i64) -> Option<i64> {
 
 #[inline]
 fn fold_int_div(lhs: i64, rhs: i64) -> Option<i64> {
-    if rhs == 0 {
+    if rhs == 0 || (lhs == i64::MIN && rhs == -1) {
         return None;
     }
-    Some(lhs.wrapping_div(rhs))
+    Some(lhs / rhs)
 }
 
 fn normalize_identifier(name: &str, line: usize, context: &str) -> Result<String, ParseError> {

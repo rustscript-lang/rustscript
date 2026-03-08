@@ -96,24 +96,14 @@ pub(super) extern "C" fn pd_vm_cranelift_step(vm: *mut Vm, op: i64, a: i64, b: i
             }
             OP_DIV => {
                 vm.binary_numeric_op(
-                    |lhs, rhs| {
-                        if rhs == 0 {
-                            return Err(VmError::DivisionByZero);
-                        }
-                        Ok(lhs.wrapping_div(rhs))
-                    },
+                    crate::vm::checked_int_div,
                     |lhs, rhs| Ok(lhs / rhs),
                 )?;
                 Ok(STATUS_CONTINUE)
             }
             OP_MOD => {
                 vm.binary_numeric_op(
-                    |lhs, rhs| {
-                        if rhs == 0 {
-                            return Err(VmError::DivisionByZero);
-                        }
-                        Ok(lhs.wrapping_rem(rhs))
-                    },
+                    crate::vm::checked_int_rem,
                     |lhs, rhs| {
                         if rhs == 0.0 {
                             return Err(VmError::DivisionByZero);

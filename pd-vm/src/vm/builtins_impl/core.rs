@@ -369,13 +369,9 @@ pub(super) fn builtin_set(args: Vec<Value>) -> VmResult<Vec<Value>> {
             } else if index == out.len() {
                 out.push(value);
             } else {
-                let mut entries = out
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, existing)| (Value::Int(idx as i64), existing))
-                    .collect::<Vec<_>>();
-                entries.push((Value::Int(index as i64), value));
-                return Ok(vec![Value::Map(entries)]);
+                return Err(VmError::HostError(format!(
+                    "array index {index} out of bounds"
+                )));
             }
             Ok(vec![Value::Array(out)])
         }

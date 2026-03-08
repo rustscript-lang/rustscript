@@ -264,7 +264,7 @@ fn drop_contract_counts_overwrites_and_reset_clears_counter() {
     let source = r#"
         let mut value = { payload: [1, 2, 3], name: "a" };
         value = { payload: [4], name: "b" };
-        0;
+        null;
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
@@ -282,6 +282,50 @@ fn drop_contract_counts_overwrites_and_reset_clears_counter() {
     assert_eq!(
         after_reset, 0,
         "reset_for_reuse should clear drop accounting"
+    );
+}
+
+#[test]
+fn reset_for_reuse_counts_cleanup_drops_from_live_state() {
+    let live_map = Value::Map(vec![(
+        Value::String("k".to_string()),
+        Value::Array(vec![Value::Int(1)]),
+    )]);
+    let live_stack_value = Value::String("live".to_string());
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.stloc(0);
+    bc.ldc(1);
+    bc.ret();
+
+    let program = Program::new(vec![live_map, live_stack_value], bc.finish());
+    let mut vm = Vm::new(program);
+    vm.set_fuel(3);
+
+    let status = vm.run().expect("run should yield before cleanup");
+    assert_eq!(status, VmStatus::Yielded);
+    assert_eq!(
+        vm.drop_contract_event_count(),
+        0,
+        "cleanup should not have run before reset"
+    );
+
+    vm.reset_for_reuse();
+    assert_eq!(
+        vm.drop_contract_event_count(),
+        5,
+        "reset should count drops fired while clearing live locals and stack"
+    );
+    assert!(
+        vm.stack().is_empty(),
+        "reset should clear live stack values, got {:?}",
+        vm.stack()
+    );
+    assert_eq!(
+        vm.locals(),
+        &[Value::Null],
+        "reset should clear live locals, got {:?}",
+        vm.locals()
     );
 }
 

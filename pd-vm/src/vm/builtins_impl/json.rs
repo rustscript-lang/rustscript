@@ -51,6 +51,11 @@ fn vm_to_json_value(value: &Value) -> VmResult<JsonValue> {
                         ));
                     }
                 };
+                if out.contains_key(key) {
+                    return Err(VmError::HostError(format!(
+                        "json_encode map keys must be unique strings; duplicate key '{key}'"
+                    )));
+                }
                 out.insert(key.clone(), vm_to_json_value(value)?);
             }
             Ok(JsonValue::Object(out))

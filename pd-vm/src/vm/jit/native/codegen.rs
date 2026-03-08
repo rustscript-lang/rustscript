@@ -999,27 +999,9 @@ fn emit_inline_int_divrem(
     let rhs_is_neg_one = b.ins().icmp(IntCC::Equal, rhs, neg_one);
     let overflow_case = b.ins().band(lhs_is_min, rhs_is_neg_one);
 
-    let overflow_block = b.create_block();
     let normal_block = b.create_block();
     b.ins()
-        .brif(overflow_case, overflow_block, &[], normal_block, &[]);
-
-    b.switch_to_block(overflow_block);
-    let overflow_out = if is_mod {
-        b.ins().iconst(types::I64, 0)
-    } else {
-        min_i64
-    };
-    b.ins().store(
-        MemFlags::new(),
-        overflow_out,
-        lhs_addr,
-        layout.value.int_payload_offset,
-    );
-    let new_len_overflow = b.ins().isub(len, one);
-    b.ins()
-        .store(MemFlags::new(), new_len_overflow, vm_ptr, offsets.stack_len);
-    b.ins().jump(next, &[]);
+        .brif(overflow_case, slow, &[], normal_block, &[]);
 
     b.switch_to_block(normal_block);
     let out = if is_mod {

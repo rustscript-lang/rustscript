@@ -672,6 +672,9 @@ impl TraceJitEngine {
                 let target_u32 =
                     read_u32(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("brfalse"))?;
                 let target = target_u32 as usize;
+                if target <= ip {
+                    return Err(JitNyiReason::BackwardGuard { target });
+                }
                 if target >= code.len() {
                     return Err(JitNyiReason::InvalidJumpTarget { target });
                 }

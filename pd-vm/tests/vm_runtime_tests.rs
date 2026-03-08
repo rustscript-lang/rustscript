@@ -209,6 +209,31 @@ fn json_encode_rejects_non_string_map_keys() {
 }
 
 #[test]
+fn json_encode_rejects_duplicate_map_keys() {
+    const BUILTIN_JSON_ENCODE: u16 = 0xFFF7;
+
+    let duplicate_map = Value::Map(vec![
+        (Value::String("k".to_string()), Value::Int(1)),
+        (Value::String("k".to_string()), Value::Int(2)),
+    ]);
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.call(BUILTIN_JSON_ENCODE, 1);
+    bc.ret();
+
+    let mut vm = Vm::new(Program::new(vec![duplicate_map], bc.finish()));
+    let err = vm
+        .run()
+        .expect_err("json::encode should reject duplicate map keys");
+    match err {
+        vm::VmError::HostError(message) => {
+            assert!(message.contains("duplicate key 'k'"), "{message}");
+        }
+        other => panic!("unexpected vm error: {other}"),
+    }
+}
+
+#[test]
 fn bind_builtin_override_rejects_unknown_namespaced_builtin() {
     struct Dummy;
 
@@ -692,6 +717,62 @@ fn get_and_set_use_the_first_duplicate_map_entry() {
             (Value::String("z".to_string()), Value::Int(3)),
         ]
     );
+}
+
+#[test]
+fn set_rejects_sparse_array_indexes() {
+    const BUILTIN_SET: u16 = 0xFFE7;
+
+    let constants = vec![
+        Value::Array(vec![Value::Int(10), Value::Int(20)]),
+        Value::Int(4),
+        Value::Int(99),
+    ];
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.ldc(1);
+    bc.ldc(2);
+    bc.call(BUILTIN_SET, 3);
+    bc.ret();
+
+    let mut vm = Vm::new(Program::new(constants, bc.finish()));
+    let err = vm.run().expect_err("sparse array set should fail");
+    match err {
+        vm::VmError::HostError(message) => {
+            assert!(message.contains("array index 4 out of bounds"), "{message}");
+        }
+        other => panic!("unexpected vm error: {other}"),
+    }
+}
+
+#[test]
+fn int_div_and_mod_overflow_report_integer_overflow() {
+    for (opcode, operation) in [
+        (OpCode::Div as u8, "division"),
+        (OpCode::Mod as u8, "remainder"),
+    ] {
+        let mut bc = BytecodeBuilder::new();
+        bc.ldc(0);
+        bc.ldc(1);
+        if opcode == OpCode::Div as u8 {
+            bc.div();
+        } else {
+            bc.modulo();
+        }
+        bc.ret();
+
+        let mut vm = Vm::new(Program::new(
+            vec![Value::Int(i64::MIN), Value::Int(-1)],
+            bc.finish(),
+        ));
+        let err = vm
+            .run()
+            .expect_err("i64::MIN with -1 should overflow");
+        assert!(
+            matches!(err, vm::VmError::IntegerOverflow(found) if found == operation),
+            "expected integer overflow in {operation}, got {err:?}"
+        );
+    }
 }
 
 #[test]

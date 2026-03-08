@@ -48,6 +48,7 @@ pub enum VmError {
     StackUnderflow,
     TypeMismatch(&'static str),
     DivisionByZero,
+    IntegerOverflow(&'static str),
     InvalidShift(i64),
     InvalidConstant(u32),
     InvalidLocal(u8),
@@ -76,6 +77,9 @@ impl std::fmt::Display for VmError {
             VmError::StackUnderflow => write!(f, "stack underflow"),
             VmError::TypeMismatch(expected) => write!(f, "type mismatch: expected {expected}"),
             VmError::DivisionByZero => write!(f, "division by zero"),
+            VmError::IntegerOverflow(operation) => {
+                write!(f, "integer overflow in {operation}")
+            }
             VmError::InvalidShift(value) => {
                 write!(f, "invalid shift amount {value}, expected 0..63")
             }
@@ -433,6 +437,26 @@ fn logical_shr_i64(value: i64, amount: u32) -> i64 {
     ((value as u64) >> amount) as i64
 }
 
+pub(crate) fn checked_int_div(lhs: i64, rhs: i64) -> VmResult<i64> {
+    if rhs == 0 {
+        return Err(VmError::DivisionByZero);
+    }
+    if lhs == i64::MIN && rhs == -1 {
+        return Err(VmError::IntegerOverflow("division"));
+    }
+    Ok(lhs / rhs)
+}
+
+pub(crate) fn checked_int_rem(lhs: i64, rhs: i64) -> VmResult<i64> {
+    if rhs == 0 {
+        return Err(VmError::DivisionByZero);
+    }
+    if lhs == i64::MIN && rhs == -1 {
+        return Err(VmError::IntegerOverflow("remainder"));
+    }
+    Ok(lhs % rhs)
+}
+
 fn compute_program_cache_key(program: &Program) -> u64 {
     let mut hasher = StableHasher::default();
     program.code.hash(&mut hasher);
@@ -616,13 +640,13 @@ impl Vm {
     /// rewound to the program entry.
     pub fn reset_for_reuse(&mut self) {
         self.ip = 0;
+        self.drop_contract_events = 0;
         self.clear_stack_with_drop_contract();
         self.clear_locals_with_drop_contract();
         self.call_depth = 0;
         self.waiting_host_op = None;
         self.next_host_op_id = 1;
         self.io_state = builtins_impl::IoState::default();
-        self.drop_contract_events = 0;
     }
 
     pub fn drop_contract_event_count(&self) -> u64 {
@@ -1093,12 +1117,7 @@ impl Vm {
             }
             x if x == OpCode::Div as u8 => {
                 self.binary_numeric_op(
-                    |lhs, rhs| {
-                        if rhs == 0 {
-                            return Err(VmError::DivisionByZero);
-                        }
-                        Ok(lhs.wrapping_div(rhs))
-                    },
+                    checked_int_div,
                     |lhs, rhs| Ok(lhs / rhs),
                 )?;
             }
@@ -1119,12 +1138,7 @@ impl Vm {
             }
             x if x == OpCode::Mod as u8 => {
                 self.binary_numeric_op(
-                    |lhs, rhs| {
-                        if rhs == 0 {
-                            return Err(VmError::DivisionByZero);
-                        }
-                        Ok(lhs.wrapping_rem(rhs))
-                    },
+                    checked_int_rem,
                     |lhs, rhs| {
                         if rhs == 0.0 {
                             return Err(VmError::DivisionByZero);

@@ -642,7 +642,7 @@ fn reset_for_reuse_clears_all_locals_to_null() {
         let a = { name: "first" };
         let b = [1, 2, 3];
         let c = "hello";
-        0;
+        null;
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
