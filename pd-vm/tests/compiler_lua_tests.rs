@@ -290,6 +290,25 @@ fn lua_complex_fixture_runs() {
 }
 
 #[test]
+fn lua_runtime_namespace_host_calls_are_supported() {
+    let case = RuntimeCase {
+        name: "runtime namespace host calls are supported",
+        source: r#"
+            local runtime = require("runtime")
+            runtime.sleep(1)
+        "#,
+        flavor: SourceFlavor::Lua,
+        expected_stack: vec![Value::Bool(true)],
+        expected_locals: None,
+    };
+    let bindings = [HostBindingCase {
+        name: "runtime::sleep",
+        factory: make_runtime_sleep,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
+}
+
+#[test]
 fn lua_non_strict_comparisons_treat_nan_as_false() {
     let case = RuntimeCase {
         name: "non strict comparisons treat nan as false",

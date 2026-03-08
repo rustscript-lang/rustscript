@@ -55,6 +55,25 @@ fn javascript_vm_http_subnamespace_host_calls_are_supported() {
 }
 
 #[test]
+fn javascript_runtime_namespace_host_calls_are_supported() {
+    let case = RuntimeCase {
+        name: "runtime namespace host calls are supported",
+        source: r#"
+            import * as runtime from "runtime";
+            runtime.sleep(1);
+        "#,
+        flavor: SourceFlavor::JavaScript,
+        expected_stack: vec![Value::Bool(true)],
+        expected_locals: None,
+    };
+    let bindings = [HostBindingCase {
+        name: "runtime::sleep",
+        factory: make_runtime_sleep,
+    }];
+    run_runtime_case_with_bindings(&case, &bindings);
+}
+
+#[test]
 fn javascript_runtime_cases_work() {
     let cases = vec![
         RuntimeCase {
@@ -480,9 +499,9 @@ fn compile_source_file_js_complex_replay_break_line_resolves_non_executable_line
         .expect("recording should be available");
     let mut replay = vm::VmRecordingReplayState::default();
 
-    let set_response = vm::run_recording_replay_command(&recording, &mut replay, "break line 11");
+    let set_response = vm::run_recording_replay_command(&recording, &mut replay, "break line 12");
     assert!(
-        set_response.output.contains("line 13 (requested line 11)"),
+        set_response.output.contains("line 13 (requested line 12)"),
         "non-executable line should resolve to next executable source line, got: {}",
         set_response.output
     );

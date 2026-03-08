@@ -3,31 +3,31 @@ mod common;
 use common::*;
 
 #[test]
-fn rustscript_vm_namespace_host_calls_are_supported() {
+fn rustscript_runtime_namespace_host_calls_are_supported() {
     let case = RuntimeCase {
-        name: "vm namespace host calls are supported",
+        name: "runtime namespace host calls are supported",
         source: r#"
-            use vm;
-            vm::add_one(41);
+            use runtime;
+            runtime::sleep(41);
         "#,
         flavor: SourceFlavor::RustScript,
         expected_stack: vec![Value::Int(42)],
         expected_locals: None,
     };
     let bindings = [HostBindingCase {
-        name: "add_one",
+        name: "runtime::sleep",
         factory: make_add_one,
     }];
     run_runtime_case_with_bindings(&case, &bindings);
 }
 
 #[test]
-fn rustscript_vm_http_subnamespace_host_calls_are_supported() {
+fn rustscript_http_subnamespace_host_calls_are_supported() {
     let case = RuntimeCase {
-        name: "vm http subnamespace host calls are supported",
+        name: "http subnamespace host calls are supported",
         source: r#"
-            use vm;
-            vm::http::request::get_header("x-client-id");
+            use http;
+            http::request::get_header("x-client-id");
         "#,
         flavor: SourceFlavor::RustScript,
         expected_stack: vec![Value::String("x-client-id".to_string())],
@@ -41,9 +41,9 @@ fn rustscript_vm_http_subnamespace_host_calls_are_supported() {
 }
 
 #[test]
-fn rustscript_host_namespace_import_without_vm_prefix_is_supported() {
+fn rustscript_host_namespace_import_is_supported() {
     let case = RuntimeCase {
-        name: "host namespace import without vm prefix is supported",
+        name: "host namespace import is supported",
         source: r#"
             use runtime;
             runtime::sleep(41);
@@ -79,19 +79,19 @@ fn rustscript_host_namespace_alias_import_is_supported() {
 }
 
 #[test]
-fn rustscript_vm_named_host_imports_are_supported() {
+fn rustscript_named_host_imports_are_supported() {
     let case = RuntimeCase {
-        name: "vm named host imports are supported",
+        name: "named host imports are supported",
         source: r#"
-            use vm::{add_one as inc};
-            inc(41);
+            use runtime as rt;
+            rt::sleep(41);
         "#,
         flavor: SourceFlavor::RustScript,
         expected_stack: vec![Value::Int(42)],
         expected_locals: None,
     };
     let bindings = [HostBindingCase {
-        name: "add_one",
+        name: "runtime::sleep",
         factory: make_add_one,
     }];
     run_runtime_case_with_bindings(&case, &bindings);
@@ -2251,9 +2251,9 @@ fn compile_source_file_rustscript_missing_runtime_module_falls_back_to_host_name
 }
 
 #[test]
-fn compile_source_file_rustscript_host_namespace_alias_maps_to_vm_host_import() {
+fn compile_source_file_rustscript_host_namespace_alias_maps_to_host_import() {
     let unique = format!(
-        "vm_rustscript_runtime_alias_host_fallback_test_{}_{}",
+        "rustscript_runtime_alias_host_fallback_test_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

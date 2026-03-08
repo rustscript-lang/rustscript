@@ -1,12 +1,17 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use vm::{
-    FunctionDecl, LocalInfo, PrintHostFunction, PrintlnHostFunction, SourceFlavor,
-    SourcePathError, Vm, VmError, VmStatus,
-    compile_source_with_flavor_and_options, format_value, render_vm_error,
+    CallOutcome, FunctionDecl, HostAsyncBridge, HostFunction, HostOpId, LocalInfo,
+    PrintHostFunction, PrintlnHostFunction, SourceFlavor, SourcePathError, Value, Vm, VmError,
+    VmResult, VmStatus, compile_source_with_flavor_and_options, format_value, render_vm_error,
 };
 
 use crate::analyzer::{LintDiagnostic, lint_source_with_flavor};
@@ -54,7 +59,7 @@ const HOST_FUNCTION_SPECS: &[PlaygroundHostFunctionSpec] = &[
     PlaygroundHostFunctionSpec {
         name: "runtime::sleep",
         arity: 1,
-        docs: "Sleeps for the requested milliseconds on native runtimes. In the wasm playground it validates the argument and returns immediately.",
+        docs: "Sleeps for the requested milliseconds. In the wasm playground it pauses the run session until the browser timer elapses.",
     },
 ];
 
@@ -223,6 +228,12 @@ enum StepExecution {
     Error(String),
 }
 
+enum RunProgress {
+    Halted,
+    Yielded,
+    Running,
+}
+
 struct RunSession {
     vm: Vm,
     output_lines: Arc<Mutex<Vec<String>>>,
@@ -241,6 +252,124 @@ struct DebugSession {
 thread_local! {
     static RUN_SESSION: RefCell<Option<RunSession>> = const { RefCell::new(None) };
     static DEBUG_SESSION: RefCell<Option<DebugSession>> = const { RefCell::new(None) };
+}
+
+#[derive(Default)]
+struct BrowserAsyncState {
+    deadlines_ms: HashMap<HostOpId, f64>,
+}
+
+struct BrowserAsyncBridge {
+    state: Arc<Mutex<BrowserAsyncState>>,
+}
+
+impl BrowserAsyncBridge {
+    fn new(state: Arc<Mutex<BrowserAsyncState>>) -> Self {
+        Self { state }
+    }
+}
+
+impl HostAsyncBridge for BrowserAsyncBridge {
+    fn poll_op(&mut self, op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<Vec<Value>>> {
+        let Ok(mut state) = self.state.lock() else {
+            return Poll::Ready(Err(VmError::HostError(
+                "browser async bridge state is unavailable".to_string(),
+            )));
+        };
+        let Some(deadline_ms) = state.deadlines_ms.get(&op_id).copied() else {
+            return Poll::Ready(Err(VmError::HostError(format!(
+                "unknown browser async op {op_id}"
+            ))));
+        };
+        if current_time_ms() >= deadline_ms {
+            state.deadlines_ms.remove(&op_id);
+            Poll::Ready(Ok(vec![Value::Bool(true)]))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+struct PlaygroundRuntimeSleepHostFunction {
+    async_state: Arc<Mutex<BrowserAsyncState>>,
+}
+
+impl PlaygroundRuntimeSleepHostFunction {
+    fn new(async_state: Arc<Mutex<BrowserAsyncState>>) -> Self {
+        Self { async_state }
+    }
+}
+
+impl HostFunction for PlaygroundRuntimeSleepHostFunction {
+    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+        let millis = sleep_millis(args)?;
+        let op_id = vm.allocate_host_op_id();
+        let deadline_ms = current_time_ms() + millis as f64;
+        let Ok(mut state) = self.async_state.lock() else {
+            return Err(VmError::HostError(
+                "browser async bridge state is unavailable".to_string(),
+            ));
+        };
+        state.deadlines_ms.insert(op_id, deadline_ms);
+        Ok(CallOutcome::Pending(op_id))
+    }
+}
+
+struct NoopWake;
+
+impl Wake for NoopWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+fn noop_waker() -> Waker {
+    Waker::from(Arc::new(NoopWake))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "env")]
+unsafe extern "C" {
+    #[link_name = "pd_playground_now_ms"]
+    fn imported_now_ms() -> f64;
+}
+
+fn current_time_ms() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        imported_now_ms()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1_000.0
+    }
+}
+
+fn sleep_millis(args: &[Value]) -> VmResult<u64> {
+    let millis = match args.first() {
+        Some(Value::Int(value)) => *value,
+        Some(_) => return Err(VmError::TypeMismatch("int")),
+        None => {
+            return Err(VmError::HostError(
+                "missing argument: runtime::sleep milliseconds".to_string(),
+            ));
+        }
+    };
+    if millis < 0 {
+        return Err(VmError::HostError(format!(
+            "runtime::sleep expects non-negative milliseconds, got {millis}",
+        )));
+    }
+    Ok(millis as u64)
+}
+
+fn wait_message(op_id: HostOpId) -> String {
+    format!("runtime::sleep pending in browser (host op {op_id})")
+}
+
+fn poll_waiting_host_op_once(vm: &mut Vm) -> Poll<VmResult<()>> {
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    vm.poll_waiting_host_op(&mut cx)
 }
 
 impl RunSession {
@@ -271,41 +400,51 @@ impl RunSession {
         }
     }
 
-    fn resume(&mut self) -> (String, bool) {
+    fn resume(&mut self) -> (String, RunProgress) {
         if self.halted {
-            return ("program halted".to_string(), false);
+            return ("program halted".to_string(), RunProgress::Halted);
         }
         if let Some(error) = self.error.as_ref() {
-            return (format!("run session is unavailable: {error}"), false);
+            return (
+                format!("run session is unavailable: {error}"),
+                RunProgress::Halted,
+            );
         }
 
-        match self.vm.run() {
-            Ok(VmStatus::Halted) => {
-                self.halted = true;
-                ("program halted".to_string(), false)
-            }
-            Ok(VmStatus::Yielded) => {
-                let message = match self.vm.get_fuel() {
-                    Some(0) => {
-                        "execution interrupted: out of fuel. add more fuel and resume".to_string()
+        loop {
+            if let Some(op_id) = self.vm.waiting_host_op_id() {
+                match poll_waiting_host_op_once(&mut self.vm) {
+                    Poll::Ready(Ok(())) => continue,
+                    Poll::Ready(Err(err)) => {
+                        self.halted = true;
+                        let message = render_vm_error(&self.vm, &err);
+                        self.error = Some(message.clone());
+                        return (message, RunProgress::Halted);
                     }
-                    _ => "execution yielded; resume to continue".to_string(),
-                };
-                (message, true)
+                    Poll::Pending => return (wait_message(op_id), RunProgress::Running),
+                }
             }
-            Ok(VmStatus::Waiting(op_id)) => {
-                self.halted = true;
-                let message = format!(
-                    "vm is waiting on host op {op_id}; asynchronous host ops are unavailable in the wasm playground runtime"
-                );
-                self.error = Some(message.clone());
-                (message, false)
-            }
-            Err(err) => {
-                self.halted = true;
-                let message = render_vm_error(&self.vm, &err);
-                self.error = Some(message.clone());
-                (message, false)
+
+            match self.vm.run() {
+                Ok(VmStatus::Halted) => {
+                    self.halted = true;
+                    return ("program halted".to_string(), RunProgress::Halted);
+                }
+                Ok(VmStatus::Yielded) => {
+                    let message = match self.vm.get_fuel() {
+                        Some(0) => "execution interrupted: out of fuel. add more fuel and resume"
+                            .to_string(),
+                        _ => "execution yielded; resume to continue".to_string(),
+                    };
+                    return (message, RunProgress::Yielded);
+                }
+                Ok(VmStatus::Waiting(_)) => continue,
+                Err(err) => {
+                    self.halted = true;
+                    let message = render_vm_error(&self.vm, &err);
+                    self.error = Some(message.clone());
+                    return (message, RunProgress::Halted);
+                }
             }
         }
     }
@@ -463,6 +602,19 @@ impl DebugSession {
     }
 
     fn execute_single_instruction(&mut self) -> StepExecution {
+        if let Some(op_id) = self.vm.waiting_host_op_id() {
+            return match poll_waiting_host_op_once(&mut self.vm) {
+                Poll::Ready(Ok(())) => StepExecution::Advanced,
+                Poll::Ready(Err(err)) => {
+                    self.halted = true;
+                    let message = render_vm_error(&self.vm, &err);
+                    self.error = Some(message.clone());
+                    StepExecution::Error(message)
+                }
+                Poll::Pending => StepExecution::Paused(wait_message(op_id)),
+            };
+        }
+
         let original_fuel = self.vm.fuel_checkpoint();
         let stepped_fuel = match self.prepare_debug_step_fuel() {
             Ok(checkpoint) => checkpoint,
@@ -480,14 +632,7 @@ impl DebugSession {
                 self.halted = true;
                 StepExecution::Halted
             }
-            Ok(VmStatus::Waiting(op_id)) => {
-                self.halted = true;
-                let message = format!(
-                    "vm is waiting on host op {op_id}; asynchronous host ops are unavailable in the wasm playground runtime"
-                );
-                self.error = Some(message.clone());
-                StepExecution::Error(message)
-            }
+            Ok(VmStatus::Waiting(op_id)) => StepExecution::Paused(wait_message(op_id)),
             Err(err) => {
                 self.halted = true;
                 let message = render_vm_error(&self.vm, &err);
@@ -677,6 +822,40 @@ pub fn run_source_with_flavor(source: &str, flavor: SourceFlavor) -> RunReport {
     }
 
     loop {
+        if let Some(_op_id) = vm.waiting_host_op_id() {
+            match poll_waiting_host_op_once(&mut vm) {
+                Poll::Ready(Ok(())) => continue,
+                Poll::Ready(Err(err)) => {
+                    let output = drain_output(&output_lines);
+                    let stack = vm.stack().iter().map(format_value).collect::<Vec<_>>();
+                    return RunReport::runtime_error(
+                        render_vm_error(&vm, &err),
+                        output,
+                        stack,
+                        capture_fuel_state(&vm),
+                    );
+                }
+                Poll::Pending => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let output = drain_output(&output_lines);
+                        let stack = vm.stack().iter().map(format_value).collect::<Vec<_>>();
+                        return RunReport::runtime_error(
+                            wait_message(_op_id),
+                            output,
+                            stack,
+                            capture_fuel_state(&vm),
+                        );
+                    }
+                }
+            }
+        }
+
         let status = match vm.run() {
             Ok(status) => status,
             Err(err) => {
@@ -697,18 +876,7 @@ pub fn run_source_with_flavor(source: &str, flavor: SourceFlavor) -> RunReport {
                 return RunReport::success(output, stack, capture_fuel_state(&vm));
             }
             VmStatus::Yielded => {}
-            VmStatus::Waiting(op_id) => {
-                let output = drain_output(&output_lines);
-                let stack = vm.stack().iter().map(format_value).collect::<Vec<_>>();
-                return RunReport::runtime_error(
-                    format!(
-                        "vm is waiting on host op {op_id}; asynchronous host ops are unavailable in the wasm playground runtime"
-                    ),
-                    output,
-                    stack,
-                    capture_fuel_state(&vm),
-                );
-            }
+            VmStatus::Waiting(_) => {}
         }
     }
 }
@@ -748,8 +916,12 @@ pub fn start_run_source_with_flavor(
     }
 
     let mut session = RunSession::new(vm, output_lines);
-    let (command_output, yielded) = session.resume();
-    let report = session.snapshot(Vec::new(), command_output, yielded);
+    let (command_output, progress) = session.resume();
+    let report = session.snapshot(
+        Vec::new(),
+        command_output,
+        matches!(progress, RunProgress::Yielded),
+    );
     RUN_SESSION.with(|state| {
         *state.borrow_mut() = if report.halted || report.error.is_some() {
             None
@@ -780,8 +952,8 @@ pub fn run_command(command: RunCommand) -> RunReport {
         let mut yielded = false;
         let command_output = match command {
             RunCommand::Resume => {
-                let (output, resumed_yielded) = session.resume();
-                yielded = resumed_yielded;
+                let (output, progress) = session.resume();
+                yielded = matches!(progress, RunProgress::Yielded);
                 output
             }
             RunCommand::SetFuel { amount } => {
@@ -908,8 +1080,16 @@ fn register_functions(
     functions: &[FunctionDecl],
     print_output: &Arc<Mutex<Vec<String>>>,
 ) -> Result<(), String> {
+    let async_state = functions
+        .iter()
+        .any(|decl| decl.name == "runtime::sleep")
+        .then(|| {
+            let state = Arc::new(Mutex::new(BrowserAsyncState::default()));
+            vm.set_async_bridge(Box::new(BrowserAsyncBridge::new(Arc::clone(&state))));
+            state
+        });
     for decl in functions {
-        register_named_function(vm, &decl.name, print_output)?;
+        register_named_function(vm, &decl.name, print_output, async_state.as_ref())?;
     }
     Ok(())
 }
@@ -918,6 +1098,7 @@ fn register_named_function(
     vm: &mut Vm,
     name: &str,
     print_output: &Arc<Mutex<Vec<String>>>,
+    async_state: Option<&Arc<Mutex<BrowserAsyncState>>>,
 ) -> Result<(), String> {
     match name {
         "print" => {
@@ -938,7 +1119,15 @@ fn register_named_function(
                 })),
             );
         }
-        "runtime::sleep" => {}
+        "runtime::sleep" => {
+            let Some(state) = async_state else {
+                return Err("runtime::sleep async bridge not initialized".to_string());
+            };
+            vm.bind_function(
+                "runtime::sleep",
+                Box::new(PlaygroundRuntimeSleepHostFunction::new(Arc::clone(state))),
+            );
+        }
         other => {
             return Err(format!("no host binding for function '{other}'"));
         }

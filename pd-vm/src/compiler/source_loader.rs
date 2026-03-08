@@ -14,7 +14,7 @@ mod model;
 mod rewrite;
 
 use graph::{build_rustscript_import_prelude, collect_module_units};
-use imports::{parse_module_imports, strip_import_directives, vm_namespace_direct_calls_supported};
+use imports::{parse_module_imports, strip_import_directives};
 use line_map::remap_frontend_ir_line_numbers;
 use model::ModuleCollectState;
 use rewrite::{build_scheme_import_context, rewrite_imported_call_sites};
@@ -58,12 +58,6 @@ pub(super) fn load_units_for_source_file(
                 &collect_state.module_exports,
                 options,
             )?;
-            if flavor == SourceFlavor::RustScript
-                && rewritten_root.requires_vm_namespace
-                && !vm_namespace_direct_calls_supported(&root_imports)
-            {
-                prelude.push_str("use vm;\n");
-            }
             let prelude_lines = prelude.lines().count();
             prelude.push_str(&rewritten_root.source);
             (prelude, prelude_lines)
@@ -127,9 +121,8 @@ mod tests {
     }
 
     #[test]
-    fn scheme_vm_rename_imports_resolve_during_lowering() {
-        let source =
-            "(require (rename-in \"vm\" (print say-print)))\n(define (entry x) (say-print x))\n";
+    fn scheme_runtime_rename_imports_resolve_during_lowering() {
+        let source = "(require (rename-in \"runtime\" (sleep nap)))\n(define (entry x) (nap x))\n";
         let path = Path::new("tests/main.scm");
 
         let (root_parse_source, units) = load_units_for_source_file(
@@ -138,7 +131,7 @@ mod tests {
             source,
             &CompileSourceFileOptions::default(),
         )
-        .expect("scheme vm rename import should load");
+        .expect("scheme runtime rename import should load");
 
         assert_eq!(root_parse_source, source);
         let root_unit = units.last().expect("root unit should be present");
@@ -147,8 +140,8 @@ mod tests {
                 .parsed
                 .functions
                 .iter()
-                .any(|func| func.name == "print"),
-            "renamed vm import should lower to the underlying host function name"
+                .any(|func| func.name == "runtime::sleep"),
+            "renamed runtime import should lower to the underlying host function name"
         );
     }
 

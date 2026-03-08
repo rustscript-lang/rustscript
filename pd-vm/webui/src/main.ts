@@ -37,6 +37,8 @@ const FLAVOR_STORAGE_KEY = "pd-vm-webui-flavor";
 const SOURCE_STORAGE_KEY_PREFIX = "pd-vm-webui-source:";
 const FUEL_AMOUNT_STORAGE_KEY = "pd-vm-webui-fuel-amount";
 const FUEL_INTERVAL_STORAGE_KEY = "pd-vm-webui-fuel-interval";
+const VIEWPORT_HEIGHT_CSS_VAR = "--pd-app-height";
+const RUN_POLL_INTERVAL_MS = 25;
 const DEFAULT_FUEL_HINT =
   "New runs and debug sessions start with the current amount and interval. Resume run adds the current amount before continuing.";
 
@@ -149,6 +151,7 @@ const ICONS: Record<string, string> = {
   stack: iconSvg(
     '<polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 12 12 17 22 12"></polyline><polyline points="2 17 12 22 22 17"></polyline>'
   ),
+  chevron_down: iconSvg('<polyline points="6 9 12 15 18 9"></polyline>'),
   step: iconSvg('<line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline>'),
   next: iconSvg('<polyline points="7 17 12 12 7 7"></polyline><polyline points="13 17 18 12 13 7"></polyline>'),
   out: iconSvg('<polyline points="9 14 4 9 9 4"></polyline><path d="M20 20v-7a4 4 0 0 0-4-4H4"></path>'),
@@ -269,6 +272,18 @@ function resolveTheme(preference: ThemePreference, query: MediaQueryList | null)
 function applyDocumentTheme(theme: ResolvedTheme): void {
   document.documentElement.dataset.theme = theme;
   document.documentElement.style.colorScheme = theme;
+}
+
+function updateViewportHeightCssVar(): void {
+  if (typeof document === "undefined") {
+    return;
+  }
+
+  const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
+  document.documentElement.style.setProperty(
+    VIEWPORT_HEIGHT_CSS_VAR,
+    `${Math.round(viewportHeight)}px`
+  );
 }
 
 function monacoThemeName(theme: ResolvedTheme): "vs" | "vs-dark" {
@@ -410,6 +425,32 @@ function panelTitle(icon: string, label: string): string {
   return `<span class="panel-title">${ICONS[icon] ?? ""}<span>${label}</span></span>`;
 }
 
+type SidebarPanelKey = "diagnostics" | "output" | "stack" | "debug" | "fuel";
+
+function renderPanel(panelKey: SidebarPanelKey, icon: string, label: string, body: string): string {
+  const bodyId = `panel-body-${panelKey}`;
+  const collapsed = panelKey === "stack" || panelKey === "debug" || panelKey === "fuel";
+  return `
+    <article class="panel panel--${panelKey}" data-panel-key="${panelKey}" data-collapsed="${collapsed ? "true" : "false"}">
+      <h2>
+        <button
+          id="panel-toggle-${panelKey}"
+          class="panel-toggle"
+          type="button"
+          aria-expanded="${collapsed ? "false" : "true"}"
+          aria-controls="${bodyId}"
+        >
+          ${panelTitle(icon, label)}
+          <span class="panel-toggle-chevron" aria-hidden="true">${ICONS.chevron_down}</span>
+        </button>
+      </h2>
+      <div id="${bodyId}" class="panel-body">
+        ${body}
+      </div>
+    </article>
+  `;
+}
+
 const systemThemeQuery =
   typeof window !== "undefined" && typeof window.matchMedia === "function"
     ? window.matchMedia("(prefers-color-scheme: dark)")
@@ -419,6 +460,7 @@ const initialFuelAmount = loadFuelAmountInput();
 const initialFuelInterval = loadFuelIntervalInput();
 const initialThemePreference = loadThemePreference();
 const initialResolvedTheme = resolveTheme(initialThemePreference, systemThemeQuery);
+updateViewportHeightCssVar();
 applyDocumentTheme(initialResolvedTheme);
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -467,25 +509,20 @@ app.innerHTML = `
           <div id="editor" class="editor"></div>
         </div>
         <aside class="panels" aria-label="runtime details">
-          <article class="panel">
-            <h2>${panelTitle("diagnostics", "Diagnostics")}</h2>
+          ${renderPanel("diagnostics", "diagnostics", "Diagnostics", `
             <pre id="diagnostics" class="panel-content">No lint diagnostics.</pre>
-          </article>
-          <article class="panel">
-            <h2>${panelTitle("output", "Print Output")}</h2>
+          `)}
+          ${renderPanel("output", "output", "Print Output", `
             <pre id="run-output" class="panel-content">&lt;no print output&gt;</pre>
-          </article>
-          <article class="panel">
-            <h2>${panelTitle("stack", "Final Stack")}</h2>
+          `)}
+          ${renderPanel("stack", "stack", "Final Stack", `
             <pre id="run-stack" class="panel-content">&lt;empty stack&gt;</pre>
-          </article>
-          <article class="panel">
-            <h2>${panelTitle("debug", "Debugger")}</h2>
+          `)}
+          ${renderPanel("debug", "debug", "Debugger", `
             <pre id="debug-output" class="panel-content">&lt;no debugger output&gt;</pre>
             <div id="debug-hover" class="debug-hover">hover inspect: (none)</div>
-          </article>
-          <article class="panel panel--fuel">
-            <h2>${panelTitle("fuel", "Fuel")}</h2>
+          `)}
+          ${renderPanel("fuel", "fuel", "Fuel", `
             <div class="fuel-panel">
               <label class="fuel-field" for="fuel-amount-input">
                 <span>Fuel Amount</span>
@@ -522,7 +559,7 @@ app.innerHTML = `
                 <div id="debug-fuel-state" class="fuel-state-line">Debugger fuel: idle</div>
               </div>
             </div>
-          </article>
+          `)}
         </aside>
       </div>
     </section>
@@ -562,6 +599,7 @@ const fuelHintEl = document.querySelector<HTMLElement>("#fuel-hint");
 const runFuelStateEl = document.querySelector<HTMLElement>("#run-fuel-state");
 const debugFuelStateEl = document.querySelector<HTMLElement>("#debug-fuel-state");
 const editorHost = document.querySelector<HTMLElement>("#editor");
+const sidebarPanels = Array.from(document.querySelectorAll<HTMLElement>(".panel[data-panel-key]"));
 
 if (
   !flavorSelect ||
@@ -596,7 +634,8 @@ if (
   !fuelHintEl ||
   !runFuelStateEl ||
   !debugFuelStateEl ||
-  !editorHost
+  !editorHost ||
+  sidebarPanels.length === 0
 ) {
   throw new Error("playground UI nodes are missing");
 }
@@ -648,6 +687,51 @@ const fuelHintPanelEl: HTMLElement = fuelHintEl;
 const runFuelStatePanelEl: HTMLElement = runFuelStateEl;
 const debugFuelStatePanelEl: HTMLElement = debugFuelStateEl;
 const editorHostEl: HTMLElement = editorHost;
+const sidebarPanelEls = new Map<SidebarPanelKey, HTMLElement>();
+const sidebarPanelToggleEls = new Map<SidebarPanelKey, HTMLButtonElement>();
+
+for (const panelEl of sidebarPanels) {
+  const key = panelEl.dataset.panelKey as SidebarPanelKey | undefined;
+  if (!key) {
+    continue;
+  }
+  const toggleEl = panelEl.querySelector<HTMLButtonElement>(".panel-toggle");
+  if (!toggleEl) {
+    continue;
+  }
+  sidebarPanelEls.set(key, panelEl);
+  sidebarPanelToggleEls.set(key, toggleEl);
+}
+
+function setPanelCollapsed(panelKey: SidebarPanelKey, collapsed: boolean): void {
+  const panelEl = sidebarPanelEls.get(panelKey);
+  const toggleEl = sidebarPanelToggleEls.get(panelKey);
+  if (!panelEl || !toggleEl) {
+    return;
+  }
+  panelEl.dataset.collapsed = collapsed ? "true" : "false";
+  toggleEl.setAttribute("aria-expanded", collapsed ? "false" : "true");
+}
+
+function togglePanelCollapsed(panelKey: SidebarPanelKey): void {
+  const panelEl = sidebarPanelEls.get(panelKey);
+  if (!panelEl) {
+    return;
+  }
+  setPanelCollapsed(panelKey, panelEl.dataset.collapsed !== "true");
+}
+
+function expandPanels(panelKeys: SidebarPanelKey[]): void {
+  for (const panelKey of panelKeys) {
+    setPanelCollapsed(panelKey, false);
+  }
+}
+
+for (const [panelKey, toggleEl] of sidebarPanelToggleEls) {
+  toggleEl.addEventListener("click", () => {
+    togglePanelCollapsed(panelKey);
+  });
+}
 
 fuelAmountInputEl.value = initialFuelAmount;
 fuelIntervalInputEl.value = initialFuelInterval;
@@ -711,6 +795,11 @@ function refreshEditorGeometry(): void {
   editor.layout();
 }
 
+function refreshViewportLayout(): void {
+  updateViewportHeightCssVar();
+  refreshEditorGeometry();
+}
+
 refreshEditorGeometry();
 if (typeof document !== "undefined" && "fonts" in document) {
   void document.fonts.ready.then(() => {
@@ -720,6 +809,10 @@ if (typeof document !== "undefined" && "fonts" in document) {
     refreshEditorGeometry();
   });
 }
+
+window.addEventListener("resize", refreshViewportLayout);
+window.visualViewport?.addEventListener("resize", refreshViewportLayout);
+window.visualViewport?.addEventListener("scroll", refreshViewportLayout);
 
 let currentFlavor: SourceFlavor = initialFlavor;
 let themePreference: ThemePreference = initialThemePreference;
@@ -736,6 +829,8 @@ let runFuelState: FuelState = {
   checkInterval: 1
 };
 let runSessionMessage = "Run session: idle";
+let runPollTimer: number | null = null;
+let runPollGeneration = 0;
 let debugBusy = false;
 let debugSessionActive = false;
 let debugCurrentLine: number | null = null;
@@ -842,6 +937,35 @@ function formatFuelState(fuel: FuelState): string {
 
 function setFuelHint(message: string | null): void {
   fuelHintPanelEl.textContent = message ?? DEFAULT_FUEL_HINT;
+}
+
+function cancelRunPolling(): void {
+  runPollGeneration += 1;
+  if (runPollTimer !== null) {
+    window.clearTimeout(runPollTimer);
+    runPollTimer = null;
+  }
+}
+
+function scheduleRunPolling(): void {
+  if (!runSessionActive || runSessionYielded || runBusy || runPollTimer !== null) {
+    return;
+  }
+
+  const token = runPollGeneration;
+  runPollTimer = window.setTimeout(() => {
+    runPollTimer = null;
+    if (token !== runPollGeneration || !runSessionActive || runSessionYielded || runBusy) {
+      return;
+    }
+    void sendRunCommand({ kind: "resume" });
+  }, RUN_POLL_INTERVAL_MS);
+}
+
+function scheduleRunPollingIfActive(): void {
+  if (runSessionActive && !runSessionYielded) {
+    scheduleRunPolling();
+  }
 }
 
 function syncFuelPanel(): void {
@@ -1073,6 +1197,7 @@ function applyInactiveDebugState(message: string): void {
 }
 
 function applyInactiveRunState(): void {
+  cancelRunPolling();
   runBusy = false;
   runSessionActive = false;
   runSessionYielded = false;
@@ -1115,17 +1240,20 @@ function applyRunReport(report: RunReport): void {
   }
 
   if (report.error) {
+    cancelRunPolling();
     setStatus(runStatusEl, `run: error (${report.error})`, "error");
   } else if (report.halted) {
+    cancelRunPolling();
     setStatus(runStatusEl, "run: ok", "ok");
-  } else if (runSessionYielded) {
-    setStatus(runStatusEl, "run: yielded", "busy");
   } else {
-    setStatus(runStatusEl, "run: paused", "busy");
+    setStatus(runStatusEl, "run: running", "busy");
   }
 
   setFuelHint(runSessionYielded ? "Run paused. Enter more fuel and click Resume Run." : null);
   syncFuelPanel();
+  if (runSessionActive && !runSessionYielded && !report.error) {
+    scheduleRunPolling();
+  }
 }
 
 async function sendRunCommand(command: RunCommandRequest): Promise<RunReport | null> {
@@ -1133,9 +1261,12 @@ async function sendRunCommand(command: RunCommandRequest): Promise<RunReport | n
     return null;
   }
 
+  cancelRunPolling();
   runBusy = true;
   applyRunControlState();
-  setStatus(runStatusEl, `run: ${command.kind}...`, "busy");
+  if (command.kind !== "stop") {
+    setStatus(runStatusEl, "run: running", "busy");
+  }
 
   try {
     const report = await runCommandWithWasm(command);
@@ -1158,6 +1289,7 @@ async function sendRunCommand(command: RunCommandRequest): Promise<RunReport | n
   } finally {
     runBusy = false;
     applyRunControlState();
+    scheduleRunPollingIfActive();
   }
 }
 
@@ -1476,9 +1608,10 @@ runButtonEl.addEventListener("click", async () => {
     return;
   }
 
+  cancelRunPolling();
   runBusy = true;
   applyRunControlState();
-  setStatus(runStatusEl, "run: running...", "busy");
+  setStatus(runStatusEl, "run: running", "busy");
 
   const source = activeModel().getValue();
   try {
@@ -1490,6 +1623,7 @@ runButtonEl.addEventListener("click", async () => {
   } finally {
     runBusy = false;
     applyRunControlState();
+    scheduleRunPollingIfActive();
   }
 });
 
@@ -1524,6 +1658,9 @@ async function startDebugSession(): Promise<void> {
     }
 
     debugSessionActive = !startReport.halted;
+    if (debugSessionActive) {
+      expandPanels(["debug", "fuel"]);
+    }
     applyDebugReport(startReport, { syncBreakpoints: false });
 
     let latestReport = startReport;
@@ -1539,6 +1676,10 @@ async function startDebugSession(): Promise<void> {
     if (latestReport.error === "debug session is not active") {
       applyInactiveDebugState("debug session is not active");
       return;
+    }
+
+    if (debugSessionActive) {
+      expandPanels(["debug", "fuel"]);
     }
 
     if (debugSessionActive && requestedBreakpoints.length > 0) {

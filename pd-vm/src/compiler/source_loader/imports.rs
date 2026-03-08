@@ -4,7 +4,7 @@ use crate::builtins::is_builtin_namespace;
 
 use super::super::frontends::{is_ident_continue, is_ident_start};
 use super::super::{CompileSourceFileOptions, SourceFlavor, SourcePathError};
-use super::model::{ImportClause, ModuleImport, NamedImport, VM_HOST_NAMESPACE_SPEC};
+use super::model::{ImportClause, ModuleImport, NamedImport, ROOT_HOST_NAMESPACE_SPEC};
 
 pub(super) fn parse_module_imports(
     source: &str,
@@ -142,8 +142,8 @@ fn rustscript_use_module_to_spec(
             message: "expected module path after 'use'".to_string(),
         });
     }
-    if module_path == VM_HOST_NAMESPACE_SPEC {
-        return Ok(VM_HOST_NAMESPACE_SPEC.to_string());
+    if module_path == ROOT_HOST_NAMESPACE_SPEC {
+        return Ok(ROOT_HOST_NAMESPACE_SPEC.to_string());
     }
 
     let segments = module_path
@@ -938,7 +938,7 @@ pub(super) fn strip_import_directives(source: &str, flavor: SourceFlavor) -> Str
             .lines()
             .map(|line| {
                 if line.trim_start().starts_with("use ")
-                    && !is_vm_use_directive_line(line.trim_start())
+                    && !is_direct_host_namespace_use_directive_line(line.trim_start())
                     && !is_builtin_namespace_use_directive_line(line.trim_start())
                 {
                     String::new()
@@ -953,7 +953,7 @@ pub(super) fn strip_import_directives(source: &str, flavor: SourceFlavor) -> Str
     }
 }
 
-fn is_vm_use_directive_line(line: &str) -> bool {
+fn is_direct_host_namespace_use_directive_line(line: &str) -> bool {
     let trimmed = line.trim();
     if !trimmed.starts_with("use ") {
         return false;
@@ -962,13 +962,16 @@ fn is_vm_use_directive_line(line: &str) -> bool {
         return false;
     };
     let directive_body = directive_body.trim();
-    if directive_body == VM_HOST_NAMESPACE_SPEC {
-        return true;
+    if directive_body.contains("::{") || directive_body.ends_with("::*") {
+        return false;
     }
-    if directive_body.starts_with("vm as ") {
-        return true;
+    if let Some((namespace, alias)) = directive_body.split_once(" as ") {
+        return is_virtual_host_namespace_spec(
+            namespace.trim(),
+            &CompileSourceFileOptions::default(),
+        ) && is_valid_ident(alias.trim());
     }
-    directive_body.starts_with("vm::")
+    is_virtual_host_namespace_spec(directive_body, &CompileSourceFileOptions::default())
 }
 
 fn is_builtin_namespace_use_directive_line(line: &str) -> bool {
@@ -986,21 +989,8 @@ fn is_builtin_namespace_use_directive_line(line: &str) -> bool {
     is_builtin_namespace(directive_body)
 }
 
-pub(super) fn vm_namespace_direct_calls_supported(imports: &[ModuleImport]) -> bool {
-    imports.iter().any(|import| {
-        if import.spec != VM_HOST_NAMESPACE_SPEC {
-            return false;
-        }
-        match &import.clause {
-            ImportClause::AllPublic => true,
-            ImportClause::Namespace(alias) => alias == VM_HOST_NAMESPACE_SPEC,
-            ImportClause::Named(_) | ImportClause::Prefix(_) => false,
-        }
-    })
-}
-
 pub(super) fn host_namespace_root_from_spec(spec: &str) -> Option<String> {
-    if spec == VM_HOST_NAMESPACE_SPEC {
+    if spec == ROOT_HOST_NAMESPACE_SPEC {
         return None;
     }
     if spec.contains('/') {

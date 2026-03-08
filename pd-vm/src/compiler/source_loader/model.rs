@@ -32,9 +32,8 @@ pub(super) struct ModuleCollectState {
     pub(super) module_exports: HashMap<PathBuf, HashMap<String, u8>>,
 }
 
-pub(super) const VM_HOST_NAMESPACE_SPEC: &str = "vm";
+pub(super) const ROOT_HOST_NAMESPACE_SPEC: &str = "vm";
 
 pub(super) struct ImportRewriteResult {
     pub(super) source: String,
-    pub(super) requires_vm_namespace: bool,
 }

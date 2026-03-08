@@ -493,6 +493,8 @@ pub extern "C" fn completion_catalog_json() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::parse_flavor;
     use crate::analyzer::lint_source_with_flavor;
     use crate::completions::build_completion_catalog;
@@ -886,6 +888,58 @@ mod tests {
     }
 
     #[test]
+    fn run_session_polls_runtime_sleep_until_ready() {
+        let source = r#"
+            use runtime;
+            runtime::sleep(25);
+            print("awake");
+            "awake";
+        "#;
+
+        let start =
+            start_run_source_with_flavor(source, SourceFlavor::RustScript, FuelConfig::default());
+        assert!(start.error.is_none(), "run start should not error");
+        assert!(!start.halted, "run should remain active while sleeping");
+        assert!(
+            !start.yielded,
+            "sleep wait should not look like a fuel yield"
+        );
+        assert!(
+            start.command_output.contains("runtime::sleep pending"),
+            "expected pending sleep message, got {:?}",
+            start.command_output
+        );
+
+        let pending = run_command(RunCommand::Resume);
+        assert!(pending.error.is_none(), "resume poll should not error");
+        assert!(
+            !pending.halted,
+            "sleep should still be active on immediate poll"
+        );
+        assert!(
+            pending.command_output.contains("runtime::sleep pending"),
+            "expected pending sleep message, got {:?}",
+            pending.command_output
+        );
+
+        std::thread::sleep(Duration::from_millis(35));
+
+        let resumed = run_command(RunCommand::Resume);
+        assert!(resumed.error.is_none(), "resumed run should not error");
+        assert!(resumed.halted, "run should halt after sleep completes");
+        assert!(
+            resumed.output.iter().any(|line| line == "awake"),
+            "expected resumed output to contain awake, got {:?}",
+            resumed.output
+        );
+        assert!(
+            resumed.stack.iter().any(|value| value == "awake"),
+            "expected resumed stack to contain awake, got {:?}",
+            resumed.stack
+        );
+    }
+
+    #[test]
     fn debug_session_reports_and_updates_fuel() {
         let source = r#"
             let mut value = 1;
@@ -940,6 +994,49 @@ mod tests {
         assert!(
             resumed.output.iter().any(|line| line == "3"),
             "expected debug output to contain 3, got {:?}",
+            resumed.output
+        );
+    }
+
+    #[test]
+    fn debug_session_pauses_for_runtime_sleep_without_error() {
+        let source = r#"
+            use runtime;
+            runtime::sleep(25);
+            print(7);
+            7;
+        "#;
+
+        let start =
+            start_debug_source_with_flavor(source, SourceFlavor::RustScript, FuelConfig::default());
+        assert!(start.error.is_none(), "debug start should succeed");
+
+        let waiting = run_debug_command(DebugCommand::Continue);
+        assert!(waiting.error.is_none(), "sleep wait should not error");
+        assert!(
+            !waiting.halted,
+            "debug session should stay active while sleeping"
+        );
+        assert!(
+            waiting.command_output.contains("runtime::sleep pending"),
+            "expected pending sleep message, got {:?}",
+            waiting.command_output
+        );
+
+        std::thread::sleep(Duration::from_millis(35));
+
+        let resumed = run_debug_command(DebugCommand::Continue);
+        assert!(
+            resumed.error.is_none(),
+            "resumed debug run should not error"
+        );
+        assert!(
+            resumed.halted,
+            "debug run should halt after sleep completes"
+        );
+        assert!(
+            resumed.output.iter().any(|line| line == "7"),
+            "expected debug output to contain 7, got {:?}",
             resumed.output
         );
     }

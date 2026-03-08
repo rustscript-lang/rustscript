@@ -2,6 +2,20 @@
 mod common;
 use common::*;
 
+fn unique_temp_root(label: &str) -> std::path::PathBuf {
+    let unique = format!(
+        "pd_vm_scheme_test_{label}_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).expect("temp module root should be created");
+    root
+}
+
 #[test]
 fn scheme_runtime_cases_work() {
     let cases = vec![
@@ -132,6 +146,31 @@ fn scheme_complex_fixture_runs() {
         }
     }
     assert_eq!(vm.stack(), &[Value::Int(12)]);
+}
+
+#[test]
+fn scheme_runtime_namespace_host_calls_are_supported() {
+    let root = unique_temp_root("runtime_namespace");
+    let main_path = root.join("main.scm");
+    std::fs::write(
+        &main_path,
+        r#"
+            (import "runtime")
+            (runtime.sleep 1)
+        "#,
+    )
+    .expect("scheme source should write");
+
+    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    vm.bind_function("runtime::sleep", make_runtime_sleep());
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Bool(true)]);
+
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_dir(root);
 }
 
 #[test]

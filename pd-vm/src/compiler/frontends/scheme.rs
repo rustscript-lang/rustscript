@@ -7,6 +7,7 @@ use super::{is_ident_continue, is_ident_start};
 use crate::builtins::{BuiltinFunction, is_builtin_namespace, resolve_builtin_namespace_call};
 
 static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
+const ROOT_HOST_NAMESPACE_SPEC: &str = "vm";
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SchemeImportContext {
@@ -179,7 +180,7 @@ fn lower_scheme_direct_stmt(
                             SchemeNode::String(value) => Some(value.as_str()),
                             _ => None,
                         })
-                        .is_some_and(|spec| spec == "vm")
+                        .is_some_and(|spec| spec == ROOT_HOST_NAMESPACE_SPEC)
                 {
                     for member in &clause[2..] {
                         if let Some(member_raw) = member.as_symbol() {
@@ -1208,17 +1209,40 @@ fn lower_scheme_direct_namespace_call(
     let root = segments[0].as_str();
     let member = segments[1].as_str();
 
-    if root == "vm" && segments.len() >= 3 {
+    if root == ROOT_HOST_NAMESPACE_SPEC && segments.len() >= 3 {
         let namespace = member;
-        let vm_member = segments[2].as_str();
+        let host_member = segments[2].as_str();
         if is_builtin_namespace(namespace)
-            && let Some(expr) =
-                lower_scheme_direct_regex_or_builtin_call(namespace, vm_member, args.clone(), line)?
+            && let Some(expr) = lower_scheme_direct_regex_or_builtin_call(
+                namespace,
+                host_member,
+                args.clone(),
+                line,
+            )?
         {
             return Ok(expr);
         }
 
         let call_name = segments[1..].join("::");
+        let arity = u8::try_from(args.len()).map_err(|_| ParseError {
+            span: None,
+            code: None,
+            line,
+            message: "too many call arguments".to_string(),
+        })?;
+        builder.declare_function(&call_name, Some(arity))?;
+        return builder
+            .resolve_call_expr(&call_name, args)
+            .ok_or_else(|| ParseError {
+                span: None,
+                code: None,
+                line,
+                message: format!("unknown function '{call_name}'"),
+            });
+    }
+
+    if !is_builtin_namespace(root) && segments.len() >= 2 {
+        let call_name = segments.join("::");
         let arity = u8::try_from(args.len()).map_err(|_| ParseError {
             span: None,
             code: None,

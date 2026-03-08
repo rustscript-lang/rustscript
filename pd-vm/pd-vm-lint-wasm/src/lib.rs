@@ -215,7 +215,7 @@ mod tests {
             catalog
                 .rustscript
                 .iter()
-                .any(|entry| entry.label == "vm::http::request::get_id"),
+                .any(|entry| entry.label == "http::request::get_id"),
             "expected RustScript pd-edge host completion"
         );
         assert!(

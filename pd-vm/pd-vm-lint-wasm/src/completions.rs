@@ -56,51 +56,8 @@ fn add_host_import_entries(
     lua: &mut Vec<CompletionEntry>,
     scheme: &mut Vec<CompletionEntry>,
 ) {
-    push_unique(
-        rustscript,
-        CompletionEntry {
-            label: "use vm;".to_string(),
-            insert_text: "use vm;".to_string(),
-            detail: "RustScript vm host import".to_string(),
-            documentation: "Imports `vm` namespace for pd-edge host calls.".to_string(),
-            kind: "module".to_string(),
-        },
-    );
-    push_unique(
-        javascript,
-        CompletionEntry {
-            label: "import * as vm from \"vm\";".to_string(),
-            insert_text: "import * as vm from \"vm\";".to_string(),
-            detail: "JavaScript vm host import".to_string(),
-            documentation: "Imports `vm` module for pd-edge host calls.".to_string(),
-            kind: "module".to_string(),
-        },
-    );
-    push_unique(
-        lua,
-        CompletionEntry {
-            label: "local vm = require(\"vm\")".to_string(),
-            insert_text: "local vm = require(\"vm\")".to_string(),
-            detail: "Lua vm host import".to_string(),
-            documentation: "Imports `vm` module for pd-edge host calls.".to_string(),
-            kind: "module".to_string(),
-        },
-    );
-    push_unique(
-        scheme,
-        CompletionEntry {
-            label: "(require (prefix-in vm. \"vm\"))".to_string(),
-            insert_text: "(require (prefix-in vm. \"vm\"))".to_string(),
-            detail: "Scheme vm host import".to_string(),
-            documentation: "Imports `vm` module for pd-edge host calls.".to_string(),
-            kind: "module".to_string(),
-        },
-    );
-
     for root in edge_host_namespace_roots() {
-        let docs = format!(
-            "Imports virtual host namespace `{root}` (rewritten to `vm::{root}::...` calls)."
-        );
+        let docs = format!("Imports host namespace `{root}` for pd-edge host calls.");
         push_unique(
             rustscript,
             CompletionEntry {
@@ -152,9 +109,7 @@ fn add_host_function_entries(
 ) {
     for function in EDGE_HOST_FUNCTIONS {
         let params = numbered_params(usize::from(function.arity));
-        let rust_path = format!("vm::{}", function.name);
         let dot_path = function.name.replace("::", ".");
-        let js_lua_path = format!("vm.{dot_path}");
         let root = function.name.split("::").next().unwrap_or(function.name);
         let docs = format!(
             "pd-edge host function from ABI index {} with arity {}.",
@@ -163,16 +118,6 @@ fn add_host_function_entries(
         let namespace_docs =
             format!("{docs} Namespace-export form (after importing `{root}`) is also available.");
 
-        push_unique(
-            rustscript,
-            CompletionEntry {
-                label: rust_path.clone(),
-                insert_text: format!("{rust_path}({})", comma_args(&params)),
-                detail: format!("pd-edge host {}", signature(&rust_path, &params)),
-                documentation: docs.clone(),
-                kind: "function".to_string(),
-            },
-        );
         push_unique(
             rustscript,
             CompletionEntry {
@@ -186,16 +131,6 @@ fn add_host_function_entries(
         push_unique(
             javascript,
             CompletionEntry {
-                label: js_lua_path.clone(),
-                insert_text: format!("{js_lua_path}({})", comma_args(&params)),
-                detail: format!("pd-edge host {}", signature(&js_lua_path, &params)),
-                documentation: docs.clone(),
-                kind: "function".to_string(),
-            },
-        );
-        push_unique(
-            javascript,
-            CompletionEntry {
                 label: dot_path.clone(),
                 insert_text: format!("{dot_path}({})", comma_args(&params)),
                 detail: format!("pd-edge host {}", signature(&dot_path, &params)),
@@ -206,30 +141,10 @@ fn add_host_function_entries(
         push_unique(
             lua,
             CompletionEntry {
-                label: js_lua_path.clone(),
-                insert_text: format!("{js_lua_path}({})", comma_args(&params)),
-                detail: format!("pd-edge host {}", signature(&js_lua_path, &params)),
-                documentation: docs.clone(),
-                kind: "function".to_string(),
-            },
-        );
-        push_unique(
-            lua,
-            CompletionEntry {
                 label: dot_path.clone(),
                 insert_text: format!("{dot_path}({})", comma_args(&params)),
                 detail: format!("pd-edge host {}", signature(&dot_path, &params)),
                 documentation: namespace_docs.clone(),
-                kind: "function".to_string(),
-            },
-        );
-        push_unique(
-            scheme,
-            CompletionEntry {
-                label: js_lua_path.clone(),
-                insert_text: format!("({js_lua_path} {})", space_args(&params)),
-                detail: format!("pd-edge host {}", signature(&js_lua_path, &params)),
-                documentation: docs,
                 kind: "function".to_string(),
             },
         );
@@ -475,15 +390,8 @@ mod tests {
             catalog
                 .rustscript
                 .iter()
-                .any(|entry| entry.label == "vm::http::request::get_id"),
-            "expected RustScript completion for vm::http::request::get_id",
-        );
-        assert!(
-            catalog
-                .javascript
-                .iter()
-                .any(|entry| entry.label == "vm.http.request.get_id"),
-            "expected JavaScript completion for vm.http.request.get_id",
+                .any(|entry| entry.label == "http::request::get_id"),
+            "expected RustScript completion for http::request::get_id",
         );
         assert!(
             catalog

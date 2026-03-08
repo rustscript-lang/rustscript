@@ -6,6 +6,8 @@ use super::{LuaLoweredExpr, fresh_lua_direct_temp};
 use crate::builtins::{BuiltinFunction, is_builtin_namespace, resolve_builtin_namespace_call};
 use std::collections::HashMap;
 
+const ROOT_HOST_NAMESPACE_SPEC: &str = "vm";
+
 pub(super) struct LuaDirectLowering<'a> {
     pub(super) builder: &'a mut LocalIrBuilder,
     pub(super) namespace_aliases: &'a HashMap<String, String>,
@@ -571,12 +573,10 @@ fn lower_lua_namespace_call(
     if path.is_empty() {
         return None;
     }
-    let root = namespace_aliases
-        .get(&path[0])
-        .cloned()
-        .unwrap_or_else(|| path[0].clone());
+    let imported_root = namespace_aliases.get(&path[0]).cloned();
+    let root = imported_root.clone().unwrap_or_else(|| path[0].clone());
 
-    if root == "vm" && path.len() >= 3 {
+    if root == ROOT_HOST_NAMESPACE_SPEC && path.len() >= 3 {
         if path.len() == 3
             && is_builtin_namespace(&path[1])
             && let Some(expr) =
@@ -588,6 +588,17 @@ fn lower_lua_namespace_call(
         let arity = u8::try_from(args.len()).ok()?;
         builder.declare_function(&call_name, Some(arity)).ok()?;
         return builder.resolve_call_expr(&call_name, args);
+    }
+
+    if let Some(imported_root) = imported_root {
+        if path.len() >= 2 && !is_builtin_namespace(&imported_root) {
+            let mut segments = vec![imported_root];
+            segments.extend(path.iter().skip(1).cloned());
+            let call_name = segments.join("::");
+            let arity = u8::try_from(args.len()).ok()?;
+            builder.declare_function(&call_name, Some(arity)).ok()?;
+            return builder.resolve_call_expr(&call_name, args);
+        }
     }
 
     if path.len() == 2 && is_builtin_namespace(&root) {

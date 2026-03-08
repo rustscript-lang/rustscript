@@ -1,5 +1,3 @@
-use vm::{add_one};
-
 let mut i = 0;
 let mut total = 0;
 while i < 3 {
@@ -7,7 +5,7 @@ while i < 3 {
     i = i + 1;
 }
 
-let base = add_one(0);
+let base = 1;
 fn bump_with_base(v) { v + base; }
 
 fn drive(seed) {

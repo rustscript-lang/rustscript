@@ -428,7 +428,11 @@ async function loadWasm(): Promise<WasmRuntimeExports> {
         throw new Error(`failed to fetch playground wasm (${response.status})`);
       }
       const bytes = await response.arrayBuffer();
-      const { instance } = await WebAssembly.instantiate(bytes, {});
+      const { instance } = await WebAssembly.instantiate(bytes, {
+        env: {
+          pd_playground_now_ms: () => globalThis.performance?.now?.() ?? Date.now()
+        }
+      });
       const exports = instance.exports as Partial<WasmRuntimeExports>;
       if (
         !exports.memory ||

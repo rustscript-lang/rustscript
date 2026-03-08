@@ -423,10 +423,10 @@ Built-in print aliases (no declaration needed):
 
 Host calls must be explicitly imported:
 
-- RustScript: `use vm::{...};` / `use vm;`
-- JavaScript: `import ... from "vm"` or `require("vm")`
-- Lua: `require("vm")`
-- Scheme: `(import ...)` / `(require ...)` forms for `"vm"`
+- RustScript: `use runtime;`, `use http;`, `use rate_limit;`
+- JavaScript: `import * as runtime from "runtime";`, `import * as http from "http";`
+- Lua: `require("runtime")`, `require("http")`
+- Scheme: `(import "runtime")`, `(require (prefix-in http. "http"))`
 
 #### Assembler API
 
@@ -500,7 +500,7 @@ Core compiler/IR:
 - in RustScript move-semantics mode, implicit captures follow expression semantics (`x` may move, `x.copy()` copies, `&x`/`&mut x` capture borrowed views)
 - `match` patterns are limited to int/string/null literals, `_`, and type constructors (`Some(TypeName)`)
 - `break` and `continue` are only valid inside loops
-- direct host import namespace syntax in the parser is limited to `vm`, but source loading also supports virtual host namespaces such as `runtime` when the module is missing (builtin namespaces are `io::`, `re::`, `json::`, and `jit::`)
+- direct host namespace syntax uses named namespaces such as `runtime`, `http`, and `rate_limit` when the corresponding module is not present (builtin namespaces are `io::`, `re::`, `json::`, and `jit::`)
 
 Module/source loading:
 

@@ -298,6 +298,10 @@ pub fn make_always_allow() -> Box<dyn HostFunction> {
     Box::new(AlwaysAllow)
 }
 
+pub fn make_runtime_sleep() -> Box<dyn HostFunction> {
+    Box::new(RuntimeSleep)
+}
+
 #[test]
 fn common_helpers_are_referenced() {
     let _runtime_case = RuntimeCase {
@@ -340,6 +344,7 @@ fn common_helpers_are_referenced() {
     let _ = make_echo_string as fn() -> Box<dyn HostFunction>;
     let _ = make_print_builtin as fn() -> Box<dyn HostFunction>;
     let _ = make_always_allow as fn() -> Box<dyn HostFunction>;
+    let _ = make_runtime_sleep as fn() -> Box<dyn HostFunction>;
 
     let _ = SourceErrorKind::CompileAny;
     let _ = SourceErrorKind::Compile(CompileErrorKind::Assembler);

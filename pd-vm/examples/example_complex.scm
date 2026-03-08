@@ -1,6 +1,5 @@
 (import (prefix "../stdlib/rss/strings.rss" string:))
-(require (only-in "vm" add_one))
-(require (prefix-in vm. "vm"))
+(import "runtime")
 (require (prefix-in io. "io"))
 (require (prefix-in re. "re"))
 (require (prefix-in json. "json"))
@@ -14,7 +13,7 @@
 
 (if (not (string:non_empty "scheme"))
     (set! total 0)
-    (set! total (add_one total)))
+    (set! total (+ total 1)))
 
 (define base 7)
 (define add (lambda (value) (+ value base)))
@@ -35,7 +34,7 @@
 (define payload-json (json.encode payload))
 (define payload-decoded (json.decode payload-json))
 (define json-score (hash-ref payload-decoded "score"))
-(define sleep-ok (vm.runtime.sleep 100))
+(define sleep-ok (runtime.sleep 100))
 (define io-ok true)
 (if true
     (set! io-ok (io.exists "."))

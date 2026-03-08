@@ -1,9 +1,8 @@
 import * as string from "../stdlib/rss/strings.rss";
-import { add_one } from "vm";
 import * as io from "io";
 import * as re from "re";
 import * as json from "json";
-import * as vm from "vm";
+import * as runtime from "runtime";
 
 // Complex JavaScript flavor example: loop + stdlib + host + closure.
 let total = 0;
@@ -14,7 +13,7 @@ for (let i = 0; i < 4; i = i + 1) {
 if (!string.non_empty("javascript")) {
     total = 0;
 } else {
-    total = add_one(total);
+    total = total + 1;
 }
 
 let base = 7;
@@ -36,7 +35,7 @@ const payload = {
 const payloadJson = json.encode(payload);
 const payloadDecoded = json.decode(payloadJson);
 const jsonScore = payloadDecoded.score;
-const sleepOk = vm.runtime.sleep(100);
+const sleepOk = runtime.sleep(100);
 let ioOk = true;
 if (true) {
     ioOk = io.exists(".");

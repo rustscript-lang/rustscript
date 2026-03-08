@@ -16,6 +16,20 @@ use super::{
     },
 };
 
+const ROOT_HOST_NAMESPACE_SPEC: &str = "vm";
+
+fn is_virtual_host_namespace_spec(spec: &str) -> bool {
+    if spec == ROOT_HOST_NAMESPACE_SPEC || spec.contains('/') || spec.ends_with(".rss") {
+        return false;
+    }
+
+    let mut chars = spec.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    is_ident_start(first) && chars.all(is_ident_continue)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum TokenKind {
     Ident(String),
@@ -709,10 +723,10 @@ pub(super) struct Parser {
     dialect: &'static dyn ParserDialect,
     loop_depth: usize,
     function_body_depth: usize,
-    vm_namespace_aliases: HashSet<String>,
+    root_host_namespace_aliases: HashSet<String>,
     host_namespace_aliases: HashMap<String, String>,
-    vm_named_imports: HashMap<String, String>,
-    vm_wildcard_import: bool,
+    root_host_named_imports: HashMap<String, String>,
+    root_host_wildcard_import: bool,
     mutable_locals: Vec<bool>,
 }
 
@@ -757,10 +771,10 @@ impl Parser {
             dialect,
             loop_depth: 0,
             function_body_depth: 0,
-            vm_namespace_aliases: HashSet::new(),
+            root_host_namespace_aliases: HashSet::new(),
             host_namespace_aliases: HashMap::new(),
-            vm_named_imports: HashMap::new(),
-            vm_wildcard_import: false,
+            root_host_named_imports: HashMap::new(),
+            root_host_wildcard_import: false,
             mutable_locals: Vec::new(),
         })
     }
@@ -861,7 +875,7 @@ impl Parser {
     fn parse_use_stmt(&mut self) -> Result<Stmt, ParseError> {
         let line = self.last_line();
         let namespace = self.expect_ident("expected namespace after 'use'")?;
-        if namespace != "vm" {
+        if namespace != ROOT_HOST_NAMESPACE_SPEC {
             if self.match_kind(&TokenKind::Semicolon) {
                 self.host_namespace_aliases
                     .insert(namespace.clone(), namespace);
@@ -886,14 +900,15 @@ impl Parser {
         }
 
         if self.match_kind(&TokenKind::Semicolon) {
-            self.vm_namespace_aliases.insert("vm".to_string());
+            self.root_host_namespace_aliases
+                .insert(ROOT_HOST_NAMESPACE_SPEC.to_string());
             return Ok(Stmt::Noop { line });
         }
 
         if self.match_kind(&TokenKind::As) {
             let alias = self.expect_ident("expected namespace alias after 'as'")?;
             self.expect(&TokenKind::Semicolon, "expected ';' after use alias")?;
-            self.vm_namespace_aliases.insert(alias);
+            self.root_host_namespace_aliases.insert(alias);
             return Ok(Stmt::Noop { line });
         }
 
@@ -902,19 +917,26 @@ impl Parser {
                 span: None,
                 code: None,
                 line: self.current_line(),
-                message: "expected ';', 'as <alias>', or '::{...}' after 'use vm'".to_string(),
+                message: "expected ';', 'as <alias>', or '::{...}' after root host import"
+                    .to_string(),
             });
         }
 
         if self.match_kind(&TokenKind::Star) {
-            self.vm_wildcard_import = true;
-            self.expect(&TokenKind::Semicolon, "expected ';' after 'use vm::*'")?;
+            self.root_host_wildcard_import = true;
+            self.expect(
+                &TokenKind::Semicolon,
+                "expected ';' after root host wildcard import",
+            )?;
             return Ok(Stmt::Noop { line });
         }
 
-        self.expect(&TokenKind::LBrace, "expected '{' after 'use vm::'")?;
+        self.expect(
+            &TokenKind::LBrace,
+            "expected '{' after root host import path",
+        )?;
         if self.match_kind(&TokenKind::Star) {
-            self.vm_wildcard_import = true;
+            self.root_host_wildcard_import = true;
             self.expect(&TokenKind::RBrace, "expected '}' after '*'")?;
             self.expect(&TokenKind::Semicolon, "expected ';' after use list")?;
             return Ok(Stmt::Noop { line });
@@ -927,7 +949,7 @@ impl Parser {
             } else {
                 imported.clone()
             };
-            if let Some(existing) = self.vm_named_imports.get(&local)
+            if let Some(existing) = self.root_host_named_imports.get(&local)
                 && existing != &imported
             {
                 return Err(ParseError {
@@ -939,7 +961,7 @@ impl Parser {
                     ),
                 });
             }
-            self.vm_named_imports.insert(local, imported);
+            self.root_host_named_imports.insert(local, imported);
 
             if self.match_kind(&TokenKind::Comma) {
                 if self.check(&TokenKind::RBrace) {
@@ -968,9 +990,9 @@ impl Parser {
             self.expect(&TokenKind::From, "expected 'from' in import statement")?;
             let spec = self.expect_string_literal("expected module string after 'from'")?;
             self.consume_stmt_terminator("expected ';' after import statement")?;
-            if spec == "vm" {
-                self.vm_namespace_aliases.insert(alias);
-            } else if is_builtin_namespace(&spec) {
+            if spec == ROOT_HOST_NAMESPACE_SPEC {
+                self.root_host_namespace_aliases.insert(alias);
+            } else if is_builtin_namespace(&spec) || is_virtual_host_namespace_spec(&spec) {
                 self.host_namespace_aliases.insert(alias, spec);
             }
             return Ok(Stmt::Noop { line });
@@ -982,9 +1004,9 @@ impl Parser {
             self.expect(&TokenKind::From, "expected 'from' in import statement")?;
             let spec = self.expect_string_literal("expected module string after 'from'")?;
             self.consume_stmt_terminator("expected ';' after import statement")?;
-            if spec == "vm" {
+            if spec == ROOT_HOST_NAMESPACE_SPEC {
                 for (imported, local) in named {
-                    self.vm_named_imports.insert(local, imported);
+                    self.root_host_named_imports.insert(local, imported);
                 }
             }
             return Ok(Stmt::Noop { line });
@@ -1010,9 +1032,9 @@ impl Parser {
         self.expect(&TokenKind::From, "expected 'from' in import statement")?;
         let spec = self.expect_string_literal("expected module string after 'from'")?;
         self.consume_stmt_terminator("expected ';' after import statement")?;
-        if spec == "vm" {
-            self.vm_namespace_aliases.insert(default_ident);
-        } else if is_builtin_namespace(&spec) {
+        if spec == ROOT_HOST_NAMESPACE_SPEC {
+            self.root_host_namespace_aliases.insert(default_ident);
+        } else if is_builtin_namespace(&spec) || is_virtual_host_namespace_spec(&spec) {
             self.host_namespace_aliases.insert(default_ident, spec);
         }
         Ok(Stmt::Noop { line })
@@ -1117,8 +1139,8 @@ impl Parser {
             )?;
             let spec = self.parse_js_require_call()?;
             self.consume_stmt_terminator("expected ';' after require declaration")?;
-            if spec == "vm" {
-                self.vm_wildcard_import = true;
+            if spec == ROOT_HOST_NAMESPACE_SPEC {
+                self.root_host_wildcard_import = true;
             }
             return Ok(Stmt::Noop { line });
         }
@@ -1130,9 +1152,9 @@ impl Parser {
         )?;
         let spec = self.parse_js_require_call()?;
         self.consume_stmt_terminator("expected ';' after require declaration")?;
-        if spec == "vm" {
-            self.vm_namespace_aliases.insert(alias);
-        } else if is_builtin_namespace(&spec) {
+        if spec == ROOT_HOST_NAMESPACE_SPEC {
+            self.root_host_namespace_aliases.insert(alias);
+        } else if is_builtin_namespace(&spec) || is_virtual_host_namespace_spec(&spec) {
             self.host_namespace_aliases.insert(alias, spec);
         }
         Ok(Stmt::Noop { line })
@@ -1869,19 +1891,19 @@ impl Parser {
                     });
                 }
                 let host_name = self
-                    .resolve_vm_namespace_call_target(&name, &member, &subpath)
+                    .resolve_host_namespace_call_target(&name, &member, &subpath)
                     .ok_or_else(|| ParseError {
                         span: None,
                         code: None,
                         line: self.current_line(),
                         message: format!(
-                            "unknown namespace call '{}::{}'; import builtin namespaces first ({}), and for host calls import 'vm' or a host namespace alias",
+                            "unknown namespace call '{}::{}'; import builtin namespaces first ({}), and for host calls import the matching host namespace or alias",
                             name,
                             path_segments.join("::"),
                             builtin_namespace_hint()
                         ),
                     })?;
-                let expr = self.build_vm_host_call_expr(&host_name, args)?;
+                let expr = self.build_host_call_expr(&host_name, args)?;
                 return Ok(expr);
             }
 
@@ -1898,9 +1920,9 @@ impl Parser {
                     Expr::Call(decl.index, args)
                 } else if let Some(expr) = self.try_build_language_builtin_call(&name, &args)? {
                     expr
-                } else if let Some(host_name) = self.resolve_vm_direct_call_target(&name) {
+                } else if let Some(host_name) = self.resolve_root_host_direct_call_target(&name) {
                     let host_name = host_name.to_string();
-                    self.build_vm_host_call_expr(&host_name, args)?
+                    self.build_host_call_expr(&host_name, args)?
                 } else {
                     let decl = self.resolve_function_for_call(&name, args.len())?;
                     Expr::Call(decl.index, args)
@@ -2789,7 +2811,7 @@ impl Parser {
         Expr::Add(Box::new(value), Box::new(Expr::String("\n".to_string())))
     }
 
-    fn build_vm_host_call_expr(
+    fn build_host_call_expr(
         &mut self,
         host_name: &str,
         args: Vec<Expr>,
@@ -2800,28 +2822,28 @@ impl Parser {
             line: self.current_line(),
             message: "function arity too large".to_string(),
         })?;
-        let decl = self.define_vm_host_function(host_name, arity)?;
+        let decl = self.define_host_function(host_name, arity)?;
         Ok(Expr::Call(decl.index, args))
     }
 
-    fn resolve_vm_direct_call_target<'a>(&'a self, name: &'a str) -> Option<&'a str> {
-        if let Some(mapped) = self.vm_named_imports.get(name) {
+    fn resolve_root_host_direct_call_target<'a>(&'a self, name: &'a str) -> Option<&'a str> {
+        if let Some(mapped) = self.root_host_named_imports.get(name) {
             return Some(mapped.as_str());
         }
-        if self.vm_wildcard_import {
+        if self.root_host_wildcard_import {
             return Some(name);
         }
         None
     }
 
-    fn resolve_vm_namespace_call_target(
+    fn resolve_host_namespace_call_target(
         &self,
         namespace: &str,
         member: &str,
         subpath: &[String],
     ) -> Option<String> {
-        let namespace_matches = self.vm_namespace_aliases.contains(namespace)
-            || (namespace == "vm" && self.vm_wildcard_import);
+        let namespace_matches = self.root_host_namespace_aliases.contains(namespace)
+            || (namespace == ROOT_HOST_NAMESPACE_SPEC && self.root_host_wildcard_import);
         let mut host_name = if namespace_matches {
             member.to_string()
         } else if let Some(host_root) = self.host_namespace_aliases.get(namespace) {
@@ -2862,9 +2884,9 @@ impl Parser {
             return Some((imported_root, member));
         }
 
-        let namespace_is_vm = self.vm_namespace_aliases.contains(namespace)
-            || (namespace == "vm" && self.vm_wildcard_import);
-        if namespace_is_vm && subpath.len() == 1 && is_builtin_namespace(member) {
+        let namespace_is_root_host = self.root_host_namespace_aliases.contains(namespace)
+            || (namespace == ROOT_HOST_NAMESPACE_SPEC && self.root_host_wildcard_import);
+        if namespace_is_root_host && subpath.len() == 1 && is_builtin_namespace(member) {
             return Some((member, subpath[0].as_str()));
         }
 
@@ -3178,9 +3200,10 @@ impl Parser {
             });
         }
 
-        let base_is_vm_namespace =
-            self.vm_namespace_aliases.contains(base) || (base == "vm" && self.vm_wildcard_import);
-        if base_is_vm_namespace && segments.len() == 2 && is_builtin_namespace(&segments[0]) {
+        let base_is_root_host_namespace = self.root_host_namespace_aliases.contains(base)
+            || (base == ROOT_HOST_NAMESPACE_SPEC && self.root_host_wildcard_import);
+        if base_is_root_host_namespace && segments.len() == 2 && is_builtin_namespace(&segments[0])
+        {
             let builtin_root = segments[0].as_str();
             let member = segments[1].as_str();
             if namespace_supports_regex_flags(builtin_root) {
@@ -3200,8 +3223,8 @@ impl Parser {
 
         let member = segments[0].clone();
         let subpath = segments.into_iter().skip(1).collect::<Vec<_>>();
-        if let Some(host_name) = self.resolve_vm_namespace_call_target(base, &member, &subpath) {
-            return Ok(Some(self.build_vm_host_call_expr(&host_name, args)?));
+        if let Some(host_name) = self.resolve_host_namespace_call_target(base, &member, &subpath) {
+            return Ok(Some(self.build_host_call_expr(&host_name, args)?));
         }
 
         self.pos = save_pos;
@@ -3527,11 +3550,7 @@ impl Parser {
         Ok(decl)
     }
 
-    fn define_vm_host_function(
-        &mut self,
-        name: &str,
-        arity: u8,
-    ) -> Result<FunctionDecl, ParseError> {
+    fn define_host_function(&mut self, name: &str, arity: u8) -> Result<FunctionDecl, ParseError> {
         if let Some(existing) = self.functions.get(name) {
             if existing.arity != arity {
                 return Err(ParseError {

@@ -34,7 +34,7 @@ All frontends lower to the same frontend IR and VM bytecode model.
 | Index/member access | `a[i]`, `m.key` | `a[i]`, `m.key` | `a[i]`, `m.key` | `(vector-ref a i)`, `(hash-ref m k)` |
 | Optional chain | `a?.b?.c` | `a?.b?.c` | `a?.b?.c` | `a?.b?.c` |
 | Slice | `v[start:end]` | `v[start:end]` | `v[start:end]` | `(slice-range v s e)` / `(slice-to v e)` / `(slice-from v s)` |
-| Host import | `use vm::{f};` | `import { f } from "vm";` | `local f = require("vm").f` | `(require (only-in "vm" f))` |
+| Host import | `use runtime;` | `import * as runtime from "runtime";` | `local runtime = require("runtime")` | `(require (prefix-in runtime. "runtime"))` |
 | Print | `print(x);` / `print("{}", x);` / `println(x);` / `println("{}", x);` | `console.log(x);` / `print(x);` | `print(x)` | `(print x)` / `(display x)` |
 
 ## RustScript (`.rss`)
@@ -52,9 +52,8 @@ Supported syntax and features:
   optional chaining (`?.` and `?.[key]`), slice syntax (`[a:b]`, `[:b]`, `[a:]`), map key
   literals including `null`.
 - Host/runtime calls:
-  - `use vm;`, `use vm as alias;`, `use vm::{name, name as local};`, `use vm::*;`
   - builtins via namespaces: `io::...`, `re::...`, `json::...`, `jit::...` (regex supports optional flags arg)
-  - additional host namespaces via `use <namespace>;` / `use <namespace> as <alias>;`
+  - host namespaces via `use <namespace>;` / `use <namespace> as <alias>;` / `use <namespace>::{name as local};`
 - RustScript frontend rewrites:
   - `Option::None` -> `null`
   - `Option::Some(expr)` -> `(expr)`
@@ -127,10 +126,9 @@ Supported syntax and features:
   - `function` -> `fn`
   - `return <expr>;` -> `<expr>;` (final-expression function body model)
 - Imports/host calls:
-  - `import * as vm from "vm";` for namespace calls (`vm.add_one(...)`,
-    `vm.http.request.get_header(...)`)
-  - named imports from `"vm"` (`import { add_one as inc } from "vm";`)
-  - `require("vm")` forms for vm namespace aliasing
+  - `import * as runtime from "runtime";` / `import * as http from "http";` for namespace calls
+  - named imports from host namespaces (`import { sleep as nap } from "runtime";`)
+  - `require("runtime")` / `require("http")` forms for host namespace aliasing
   - module imports from `.rss` are recognized from `import`/`require` forms
 - Semicolons may be omitted at line ends (frontend enables implicit statement terminators).
 
@@ -139,7 +137,7 @@ Current subset limits:
 - Arrow closures with block bodies are rejected (`(x) => { ... }`).
 - Direct calls to VM helper builtins like `len/get/set/count/...` are rejected; use language syntax
   (`.length`, indexing, assignment, `typeof`, namespace forms).
-- Undeclared host calls are rejected (import from `"vm"` first).
+- Undeclared host calls are rejected (import the relevant host namespace first).
 
 ## Lua Subset (`.lua`)
 
@@ -168,8 +166,9 @@ Supported syntax and features:
   - length operator `#value` with Lua-style helpers for arrays/maps/strings
   - `pcall(func, ...)` / `xpcall(func, handler, ...)` lowering with success-only semantics (`true, ...results`)
 - Imports/host calls:
-  - `local vm = require("vm")`
-  - `local alias = require("vm").name`
+  - `local runtime = require("runtime")`
+  - `local alias = require("runtime").sleep`
+  - `local http = require("http")`
   - direct `require("...")` module import forms (including `.rss` modules)
 
 Current subset limits:
@@ -220,8 +219,9 @@ Supported syntax and features:
     - `rename` / `rename-in`
     - `prefix` / `prefix-in`
     - `library` / `module`
-  - vm-prefixed host calls via forms like `(require (prefix-in vm. "vm"))` and then
-    `(vm.http.request.get_header "...")`
+  - host namespaces via forms like `(require (prefix-in runtime. "runtime"))` and then
+    `(runtime.sleep 100)`
+  - additional namespaces such as `(import "http")` and then `(http.request.get_header "...")`
 - Identifier normalization: Scheme `-` is normalized to `_` for lowered identifiers.
 
 Current subset limits:

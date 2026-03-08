@@ -284,79 +284,37 @@ fn add_host_function_entries(
                         kind: "function".to_string(),
                     },
                 );
-                push_unique(
-                    rustscript,
-                    CompletionEntry {
-                        label: format!("use vm::{{{other}}};"),
-                        insert_text: format!("use vm::{{{other}}};"),
-                        detail: "RustScript vm host import".to_string(),
-                        documentation: format!(
-                            "Imports host function `{other}` from vm namespace."
-                        ),
-                        kind: "module".to_string(),
-                    },
-                );
 
                 push_unique(
                     javascript,
                     CompletionEntry {
-                        label: format!("vm.{other}"),
+                        label: other.to_string(),
                         insert_text: format!("{other}({})", comma_args(&params)),
-                        detail: format!("vm host {signature}"),
+                        detail: format!("playground host {signature}"),
                         documentation: host.docs.to_string(),
                         kind: "function".to_string(),
-                    },
-                );
-                push_unique(
-                    javascript,
-                    CompletionEntry {
-                        label: format!("import {{ {other} }} from \"vm\";"),
-                        insert_text: format!("import {{ {other} }} from \"vm\";"),
-                        detail: "JavaScript vm host import".to_string(),
-                        documentation: format!("Imports host function `{other}` from vm module."),
-                        kind: "module".to_string(),
                     },
                 );
 
                 push_unique(
                     lua,
                     CompletionEntry {
-                        label: format!("vm.{other}"),
+                        label: other.to_string(),
                         insert_text: format!("{other}({})", comma_args(&params)),
-                        detail: format!("vm host {signature}"),
+                        detail: format!("playground host {signature}"),
                         documentation: host.docs.to_string(),
                         kind: "function".to_string(),
-                    },
-                );
-                push_unique(
-                    lua,
-                    CompletionEntry {
-                        label: format!("local {other} = require(\"vm\").{other}"),
-                        insert_text: format!("local {other} = require(\"vm\").{other}"),
-                        detail: "Lua vm host import".to_string(),
-                        documentation: format!("Imports host function `{other}` from vm module."),
-                        kind: "module".to_string(),
                     },
                 );
 
                 push_unique(
                     scheme,
                     CompletionEntry {
-                        label: format!("vm/{other}"),
+                        label: other.to_string(),
                         insert_text: format!("({other} {})", space_args(&params)),
-                        detail: format!("vm host {signature}"),
+                        detail: format!("playground host {signature}"),
                         documentation: host.docs.to_string(),
                         kind: "function".to_string(),
-                    },
-                );
-                push_unique(
-                    scheme,
-                    CompletionEntry {
-                        label: format!("(require (only-in \"vm\" {other}))"),
-                        insert_text: format!("(require (only-in \"vm\" {other}))"),
-                        detail: "Scheme vm host import".to_string(),
-                        documentation: format!("Imports host function `{other}` from vm module."),
-                        kind: "module".to_string(),
                     },
                 );
             }

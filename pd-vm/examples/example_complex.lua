@@ -1,9 +1,8 @@
 local string = require("../stdlib/rss/strings.rss")
-local add_one = require("vm").add_one
-local vm = require("vm")
 local io = require("io")
 local re = require("re")
 local json = require("json")
+local runtime = require("runtime")
 
 -- Complex Lua flavor example: loop + stdlib + host + closure.
 local total = 0
@@ -14,7 +13,7 @@ end
 if not string.non_empty("lua") then
     total = 0
 else
-    total = add_one(total)
+    total = total + 1
 end
 
 local base = 7
@@ -49,7 +48,7 @@ local payload = { lang = "lua", score = closure_value, chained = chained_score }
 local payload_json = json.encode(payload)
 local payload_decoded = json.decode(payload_json)
 local json_score = payload_decoded.score
-local sleep_ok = vm.runtime.sleep(100)
+local sleep_ok = runtime.sleep(100)
 local io_ok = true
 if true then
     io_ok = io.exists(".")
