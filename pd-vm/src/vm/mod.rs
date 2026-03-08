@@ -945,6 +945,16 @@ impl Vm {
             let outcome = match self.execute_interpreter_instruction(opcode) {
                 Ok(outcome) => outcome,
                 Err(err) => {
+                    if matches!(err, VmError::OutOfFuel { .. }) {
+                        // Fuel exhaustion stays cooperative even when raised during
+                        // instruction execution (for example, fused call+ret tail tick).
+                        if self.handle_debugger_error(&mut debugger, &err) {
+                            continue;
+                        }
+                        let status = VmStatus::Yielded;
+                        self.notify_debugger_status(&mut debugger, status);
+                        return Ok(status);
+                    }
                     if self.handle_debugger_error(&mut debugger, &err) {
                         continue;
                     }
@@ -1107,8 +1117,19 @@ impl Vm {
                 let call_ip = self.ip - 1;
                 let index = self.read_u16()?;
                 let argc_u8 = self.read_u8()?;
+                let can_fuse_tail_halt = self.can_fuse_call_ret_pattern();
                 match self.execute_host_call(index, argc_u8, call_ip)? {
-                    HostCallExecOutcome::Returned => {}
+                    HostCallExecOutcome::Returned => {
+                        if can_fuse_tail_halt {
+                            if self.fuel_enabled {
+                                // Preserve per-instruction fuel semantics when folding `call; ret`.
+                                self.charge_fuel_tick()?;
+                            }
+                            // Consume the trailing `ret` so a resumed run does not halt twice.
+                            self.ip = self.ip.saturating_add(1);
+                            return Ok(ExecOutcome::Halted);
+                        }
+                    }
                     HostCallExecOutcome::Yielded => return Ok(ExecOutcome::Yielded),
                     HostCallExecOutcome::Pending(op_id) => {
                         return Ok(ExecOutcome::Waiting(op_id));
@@ -1178,6 +1199,11 @@ impl Vm {
         code[self.ip] == OpCode::Dup as u8
             && code[self.ip + 1] == OpCode::Stloc as u8
             && code[self.ip + 2] == index
+    }
+
+    fn can_fuse_call_ret_pattern(&self) -> bool {
+        let code = &self.program.code;
+        self.ip < code.len() && code[self.ip] == OpCode::Ret as u8
     }
 
     fn clear_stack_with_drop_contract(&mut self) {
@@ -1891,6 +1917,132 @@ mod tests {
         assert_eq!(vm.ip, 5);
         assert_eq!(vm.locals[0], Value::Int(42));
         assert_eq!(vm.stack(), &[Value::Int(42)]);
+    }
+
+    #[test]
+    fn interpreter_fuses_call_ret_without_fuel() {
+        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
+        let program = Program::new(
+            vec![],
+            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
+        );
+        let mut vm = Vm::new(program);
+        vm.stack.push(Value::String("tail".to_string()));
+
+        let outcome = step_once(&mut vm).expect("call should execute");
+        assert!(matches!(outcome, ExecOutcome::Halted));
+        assert_eq!(vm.ip, 5, "tail-call fusion should consume trailing ret");
+        assert_eq!(vm.stack(), &[Value::Int(4)]);
+    }
+
+    #[test]
+    fn interpreter_fuses_call_ret_when_fuel_enabled_if_tail_tick_available() {
+        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
+        let program = Program::new(
+            vec![],
+            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
+        );
+        let mut vm = Vm::new(program);
+        vm.set_fuel(1);
+        vm.stack.push(Value::String("tail".to_string()));
+
+        // `step_once` bypasses the outer run-loop pre-tick, so this fuel only covers fused `ret`.
+        let call = step_once(&mut vm).expect("call should execute");
+        assert!(matches!(call, ExecOutcome::Halted));
+        assert_eq!(vm.ip, 5, "tail-call fusion should consume trailing ret");
+        assert_eq!(vm.stack(), &[Value::Int(4)]);
+        assert_eq!(vm.get_fuel(), Some(0));
+    }
+
+    #[test]
+    fn interpreter_call_ret_fusion_preserves_ip_when_tail_tick_exhausted() {
+        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
+        let program = Program::new(
+            vec![],
+            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
+        );
+        let mut vm = Vm::new(program);
+        vm.set_fuel(0);
+        vm.stack.push(Value::String("tail".to_string()));
+
+        let err = match step_once(&mut vm) {
+            Ok(_) => panic!("tail tick should fail with out-of-fuel"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, VmError::OutOfFuel { .. }));
+        assert_eq!(vm.ip, 4, "ret must remain pending when tail tick cannot be charged");
+        assert_eq!(vm.stack(), &[Value::Int(4)]);
+    }
+
+    #[test]
+    fn run_consumes_two_ticks_for_call_ret_when_fuel_enabled() {
+        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
+        let program = Program::new(
+            vec![],
+            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
+        );
+        let mut vm = Vm::new(program);
+        vm.set_fuel(2);
+        vm.stack.push(Value::String("tail".to_string()));
+
+        let status = vm.run().expect("run should complete");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(vm.ip, 5);
+        assert_eq!(vm.stack(), &[Value::Int(4)]);
+        assert_eq!(
+            vm.get_fuel(),
+            Some(0),
+            "call+ret should spend two ticks with fuel metering enabled"
+        );
+    }
+
+    #[test]
+    fn run_yields_before_ret_in_call_ret_sequence_when_out_of_fuel() {
+        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
+        let program = Program::new(
+            vec![],
+            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
+        );
+        let mut vm = Vm::new(program);
+        vm.set_fuel(1);
+        vm.stack.push(Value::String("tail".to_string()));
+
+        let status = vm.run().expect("first run should yield");
+        assert_eq!(status, VmStatus::Yielded);
+        assert_eq!(vm.ip, 4, "fuel exhaustion should happen before trailing ret");
+        assert_eq!(vm.stack(), &[Value::Int(4)]);
+        assert_eq!(vm.get_fuel(), Some(0));
+
+        vm.add_fuel(1).expect("recharging fuel should succeed");
+        let resumed = vm.resume().expect("resume should execute trailing ret");
+        assert_eq!(resumed, VmStatus::Halted);
+        assert_eq!(vm.ip, 5);
+        assert_eq!(vm.stack(), &[Value::Int(4)]);
+    }
+
+    #[test]
+    fn call_ret_fusion_pattern_requires_immediate_ret() {
+        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
+        let with_ret = Program::new(
+            vec![],
+            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
+        );
+        let mut vm_with_ret = Vm::new(with_ret);
+        vm_with_ret.ip = 4;
+        assert!(vm_with_ret.can_fuse_call_ret_pattern());
+
+        let wrong_next = Program::new(
+            vec![],
+            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Nop as u8],
+        );
+        let mut vm_wrong_next = Vm::new(wrong_next);
+        vm_wrong_next.ip = 4;
+        assert!(!vm_wrong_next.can_fuse_call_ret_pattern());
+
+        let no_next = Program::new(vec![], vec![OpCode::Call as u8, call_lo, call_hi, 1]);
+        let mut vm_no_next = Vm::new(no_next);
+        vm_no_next.ip = 4;
+        assert!(!vm_no_next.can_fuse_call_ret_pattern());
     }
 
     #[test]

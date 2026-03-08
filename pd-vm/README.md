@@ -19,6 +19,7 @@ Offers consistent runtime semantics for both synchronous and asynchronous execut
 Includes rich debugging and profiling tools: interactive debugger, recording and replay, and JIT trace insights.
 ## TODO
 
+- [ ] Optional type annotation (rustscript) for function boundaries / host APIs.
 - [ ] host call fuel budgeting.
 - [ ] Epoch-based interruption API.
 - [ ] Callable-as-value support.
