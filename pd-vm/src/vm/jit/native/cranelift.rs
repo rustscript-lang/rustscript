@@ -1,8 +1,8 @@
 use super::super::super::{HostCallExecOutcome, NumericValue, Value, Vm, VmError, VmResult};
 use super::super::{JitTrace, TraceStep};
 use super::{
-    NativeCompileProfile, STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_OUT_OF_FUEL,
-    STATUS_TRACE_EXIT, STATUS_WAITING, STATUS_YIELDED, store_bridge_error,
+    NativeCompileProfile, NativeInterruptSettings, STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED,
+    STATUS_OUT_OF_FUEL, STATUS_TRACE_EXIT, STATUS_WAITING, STATUS_YIELDED, store_bridge_error,
 };
 use crate::builtins::BuiltinFunction;
 use cranelift_codegen::ir::condcodes::IntCC;
@@ -27,9 +27,9 @@ mod layout;
 use super::exec::ExecutableBuffer;
 use bridge::pd_vm_cranelift_step;
 use codegen::{
-    emit_fuel_tick_inline, emit_fuel_tick_inline_guarded, emit_helper_step, emit_inline_ldloc_copy,
-    emit_inline_or_helper_step, entry_signature, helper_signature, jump_with_status,
-    resolve_offsets,
+    emit_helper_step, emit_inline_ldloc_copy, emit_inline_or_helper_step,
+    emit_interrupt_tick_inline, emit_interrupt_tick_inline_guarded, entry_signature,
+    helper_signature, jump_with_status, resolve_offsets,
 };
 use layout::{detect_native_stack_layout, native_layout_fingerprint};
 
@@ -79,11 +79,11 @@ fn fused_ldloc_copy_slot(steps: &[TraceStep], index: usize) -> Option<u8> {
 }
 
 fn fused_ldloc_copy_slot_if_allowed(
-    fuel_check_interval: Option<u32>,
+    interrupt_settings: Option<NativeInterruptSettings>,
     steps: &[TraceStep],
     index: usize,
 ) -> Option<u8> {
-    if fuel_check_interval.is_some() {
+    if interrupt_settings.is_some() {
         return None;
     }
     fused_ldloc_copy_slot(steps, index)
@@ -140,6 +140,7 @@ struct NativeStackLayout {
     vm_ip_offset: i32,
     vm_interrupt_mode_offset: i32,
     vm_fuel_remaining_offset: i32,
+    vm_fuel_check_interval_offset: i32,
     vm_fuel_ops_until_check_offset: i32,
     vm_epoch_deadline_offset: i32,
     vm_epoch_counter_ptr_offset: i32,
@@ -159,6 +160,7 @@ struct ResolvedOffsets {
     vm_ip: i32,
     interrupt_mode: i32,
     fuel_remaining: i32,
+    fuel_check_interval: i32,
     fuel_ops_until_check: i32,
     epoch_deadline: i32,
     epoch_counter_ptr: i32,
@@ -179,14 +181,14 @@ pub(super) fn native_helper_fn_offset() -> i32 {
 
 pub(crate) fn compile_trace(
     trace: &JitTrace,
-    fuel_check_interval: Option<u32>,
+    interrupt_settings: Option<NativeInterruptSettings>,
     profile: NativeCompileProfile,
 ) -> VmResult<CompiledTrace> {
-    if matches!(fuel_check_interval, Some(0)) {
+    if interrupt_settings.is_some_and(|settings| settings.check_interval == 0) {
         return Err(VmError::InvalidFuelCheckInterval(0));
     }
 
-    let check_runtime_fuel_enabled = trace
+    let check_runtime_interrupt_settings = trace
         .steps
         .iter()
         .any(|step| matches!(step, TraceStep::Call { .. } | TraceStep::BuiltinCall { .. }));
@@ -239,24 +241,24 @@ pub(crate) fn compile_trace(
             b.ins()
                 .store(MemFlags::new(), step_ip_val, vm_ptr, offsets.vm_ip);
 
-            if let Some(interval) = fuel_check_interval {
-                let stride = interval as usize;
+            if let Some(settings) = interrupt_settings {
+                let stride = settings.check_interval as usize;
                 if step_index.is_multiple_of(stride) {
                     let remaining = trace.steps.len().saturating_sub(step_index);
                     let chunk_len = remaining.min(stride) as u32;
-                    if check_runtime_fuel_enabled {
-                        emit_fuel_tick_inline_guarded(
-                            &mut b, vm_ptr, exit_block, offsets, chunk_len, interval,
+                    if check_runtime_interrupt_settings {
+                        emit_interrupt_tick_inline_guarded(
+                            &mut b, vm_ptr, exit_block, offsets, chunk_len, settings,
                         );
                     } else {
-                        emit_fuel_tick_inline(
-                            &mut b, vm_ptr, exit_block, offsets, chunk_len, interval,
+                        emit_interrupt_tick_inline(
+                            &mut b, vm_ptr, exit_block, offsets, chunk_len, settings,
                         );
                     }
                 }
             }
             if let Some(slot) =
-                fused_ldloc_copy_slot_if_allowed(fuel_check_interval, &trace.steps, step_index)
+                fused_ldloc_copy_slot_if_allowed(interrupt_settings, &trace.steps, step_index)
             {
                 emit_inline_ldloc_copy(
                     &mut b,
@@ -395,14 +397,22 @@ mod tests {
             "fusion should be available without fuel metering"
         );
         assert_eq!(
-            fused_ldloc_copy_slot_if_allowed(Some(1), &steps, 0),
+            fused_ldloc_copy_slot_if_allowed(
+                Some(NativeInterruptSettings::fuel(1)),
+                &steps,
+                0
+            ),
             None,
             "fuel metering must disable fused emission"
         );
         assert_eq!(
-            fused_ldloc_copy_slot_if_allowed(Some(8), &steps, 0),
+            fused_ldloc_copy_slot_if_allowed(
+                Some(NativeInterruptSettings::epoch(8)),
+                &steps,
+                0
+            ),
             None,
-            "all fuel metering variants must disable fused emission"
+            "all cooperative interruption variants must disable fused emission"
         );
     }
 }

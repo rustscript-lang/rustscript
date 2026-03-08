@@ -21,6 +21,7 @@ pub(super) fn native_layout_fingerprint() -> VmResult<u64> {
     layout.vm_ip_offset.hash(&mut hasher);
     layout.vm_interrupt_mode_offset.hash(&mut hasher);
     layout.vm_fuel_remaining_offset.hash(&mut hasher);
+    layout.vm_fuel_check_interval_offset.hash(&mut hasher);
     layout.vm_fuel_ops_until_check_offset.hash(&mut hasher);
     layout.vm_epoch_deadline_offset.hash(&mut hasher);
     layout.vm_epoch_counter_ptr_offset.hash(&mut hasher);
@@ -61,6 +62,10 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         std::mem::offset_of!(Vm, fuel_remaining),
         "Vm::fuel_remaining offset",
     )?;
+    let vm_fuel_check_interval_offset = usize_to_i32(
+        std::mem::offset_of!(Vm, fuel_check_interval),
+        "Vm::fuel_check_interval offset",
+    )?;
     let vm_fuel_ops_until_check_offset = usize_to_i32(
         std::mem::offset_of!(Vm, fuel_ops_until_check),
         "Vm::fuel_ops_until_check offset",
@@ -83,6 +88,7 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         vm_ip_offset,
         vm_interrupt_mode_offset,
         vm_fuel_remaining_offset,
+        vm_fuel_check_interval_offset,
         vm_fuel_ops_until_check_offset,
         vm_epoch_deadline_offset,
         vm_epoch_counter_ptr_offset,

@@ -1,44 +1,57 @@
 use super::layout::checked_add_i32;
 use super::*;
 
-pub(super) fn emit_fuel_tick_inline(
+pub(super) fn emit_interrupt_tick_inline(
     b: &mut FunctionBuilder,
     vm_ptr: cranelift_codegen::ir::Value,
     exit_block: Block,
     offsets: ResolvedOffsets,
     steps_to_advance: u32,
-    fuel_check_interval: u32,
+    interrupt_settings: super::super::NativeInterruptSettings,
 ) {
     if steps_to_advance == 0 {
         return;
     }
 
     let continue_block = b.create_block();
-    emit_fuel_tick_inline_core(
-        b,
-        vm_ptr,
-        exit_block,
-        offsets,
-        steps_to_advance,
-        fuel_check_interval,
-        continue_block,
-    );
+    match interrupt_settings.mode {
+        super::super::NativeInterruptMode::Fuel => emit_fuel_tick_inline_core(
+            b,
+            vm_ptr,
+            exit_block,
+            offsets,
+            steps_to_advance,
+            interrupt_settings.check_interval,
+            continue_block,
+        ),
+        super::super::NativeInterruptMode::Epoch => emit_epoch_tick_inline_core(
+            b,
+            vm_ptr,
+            exit_block,
+            offsets,
+            steps_to_advance,
+            interrupt_settings.check_interval,
+            continue_block,
+        ),
+    }
     b.switch_to_block(continue_block);
 }
 
-pub(super) fn emit_fuel_tick_inline_guarded(
+pub(super) fn emit_interrupt_tick_inline_guarded(
     b: &mut FunctionBuilder,
     vm_ptr: cranelift_codegen::ir::Value,
     exit_block: Block,
     offsets: ResolvedOffsets,
     steps_to_advance: u32,
-    fuel_check_interval: u32,
+    interrupt_settings: super::super::NativeInterruptSettings,
 ) {
     if steps_to_advance == 0 {
         return;
     }
 
-    let metering_enabled_block = b.create_block();
+    let settings_match_block = b.create_block();
+    let mode_match_block = b.create_block();
+    let mismatch_block = b.create_block();
     let continue_block = b.create_block();
     let interrupt_mode = b
         .ins()
@@ -46,21 +59,68 @@ pub(super) fn emit_fuel_tick_inline_guarded(
     let metering_enabled = b.ins().icmp_imm(IntCC::NotEqual, interrupt_mode, 0);
     b.ins().brif(
         metering_enabled,
-        metering_enabled_block,
+        mode_match_block,
         &[],
         continue_block,
         &[],
     );
-    b.switch_to_block(metering_enabled_block);
-    emit_fuel_tick_inline_core(
-        b,
+
+    b.switch_to_block(mode_match_block);
+    let expected_mode = match interrupt_settings.mode {
+        super::super::NativeInterruptMode::Fuel => {
+            crate::vm::InterruptMode::Fuel as u8
+        }
+        super::super::NativeInterruptMode::Epoch => {
+            crate::vm::InterruptMode::Epoch as u8
+        }
+    };
+    let mode_matches = b
+        .ins()
+        .icmp_imm(IntCC::Equal, interrupt_mode, i64::from(expected_mode));
+    b.ins()
+        .brif(mode_matches, settings_match_block, &[], mismatch_block, &[]);
+
+    b.switch_to_block(settings_match_block);
+    let live_interval = b.ins().load(
+        types::I32,
+        MemFlags::new(),
         vm_ptr,
-        exit_block,
-        offsets,
-        steps_to_advance,
-        fuel_check_interval,
-        continue_block,
+        offsets.fuel_check_interval,
     );
+    let expected_interval = b
+        .ins()
+        .iconst(types::I32, i64::from(interrupt_settings.check_interval));
+    let interval_matches = b.ins().icmp(IntCC::Equal, live_interval, expected_interval);
+    let specialized_block = b.create_block();
+    b.ins()
+        .brif(interval_matches, specialized_block, &[], mismatch_block, &[]);
+
+    b.switch_to_block(specialized_block);
+    match interrupt_settings.mode {
+        super::super::NativeInterruptMode::Fuel => emit_fuel_tick_inline_core(
+            b,
+            vm_ptr,
+            exit_block,
+            offsets,
+            steps_to_advance,
+            interrupt_settings.check_interval,
+            continue_block,
+        ),
+        super::super::NativeInterruptMode::Epoch => emit_epoch_tick_inline_core(
+            b,
+            vm_ptr,
+            exit_block,
+            offsets,
+            steps_to_advance,
+            interrupt_settings.check_interval,
+            continue_block,
+        ),
+    }
+
+    b.switch_to_block(mismatch_block);
+    let status = b.ins().iconst(types::I32, STATUS_TRACE_EXIT as i64);
+    jump_with_status(b, exit_block, status);
+
     b.switch_to_block(continue_block);
 }
 
@@ -101,21 +161,6 @@ fn emit_fuel_tick_inline_core(
 
     b.switch_to_block(check_block);
     let interval_i32 = b.ins().iconst(types::I32, i64::from(fuel_check_interval));
-    let interrupt_mode = b
-        .ins()
-        .load(types::I8, MemFlags::new(), vm_ptr, offsets.interrupt_mode);
-    let fuel_mode = b
-        .ins()
-        .icmp_imm(
-            IntCC::Equal,
-            interrupt_mode,
-            i64::from(crate::vm::InterruptMode::Fuel as u8),
-        );
-    let fuel_block = b.create_block();
-    let epoch_block = b.create_block();
-    b.ins().brif(fuel_mode, fuel_block, &[], epoch_block, &[]);
-
-    b.switch_to_block(fuel_block);
     let remaining = b
         .ins()
         .load(types::I64, MemFlags::new(), vm_ptr, offsets.fuel_remaining);
@@ -149,8 +194,45 @@ fn emit_fuel_tick_inline_core(
     b.switch_to_block(out_of_fuel);
     let status = b.ins().iconst(types::I32, STATUS_OUT_OF_FUEL as i64);
     jump_with_status(b, exit_block, status);
+}
 
-    b.switch_to_block(epoch_block);
+fn emit_epoch_tick_inline_core(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    exit_block: Block,
+    offsets: ResolvedOffsets,
+    steps_to_advance: u32,
+    fuel_check_interval: u32,
+    continue_block: Block,
+) {
+    let countdown_block = b.create_block();
+    let check_block = b.create_block();
+
+    let ops_until_check = b.ins().load(
+        types::I32,
+        MemFlags::new(),
+        vm_ptr,
+        offsets.fuel_ops_until_check,
+    );
+    let chunk_steps = b.ins().iconst(types::I32, i64::from(steps_to_advance));
+    let no_charge = b
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThan, ops_until_check, chunk_steps);
+    b.ins()
+        .brif(no_charge, countdown_block, &[], check_block, &[]);
+
+    b.switch_to_block(countdown_block);
+    let new_ops = b.ins().isub(ops_until_check, chunk_steps);
+    b.ins().store(
+        MemFlags::new(),
+        new_ops,
+        vm_ptr,
+        offsets.fuel_ops_until_check,
+    );
+    b.ins().jump(continue_block, &[]);
+
+    b.switch_to_block(check_block);
+    let interval_i32 = b.ins().iconst(types::I32, i64::from(fuel_check_interval));
     let epoch_counter_ptr = b.ins().load(
         types::I64,
         MemFlags::new(),
@@ -1834,6 +1916,7 @@ pub(super) fn resolve_offsets(layout: NativeStackLayout) -> VmResult<ResolvedOff
         vm_ip: layout.vm_ip_offset,
         interrupt_mode: layout.vm_interrupt_mode_offset,
         fuel_remaining: layout.vm_fuel_remaining_offset,
+        fuel_check_interval: layout.vm_fuel_check_interval_offset,
         fuel_ops_until_check: layout.vm_fuel_ops_until_check_offset,
         epoch_deadline: layout.vm_epoch_deadline_offset,
         epoch_counter_ptr: layout.vm_epoch_counter_ptr_offset,

@@ -4,7 +4,7 @@ use crate::{HostImport, Value};
 use std::collections::BTreeSet;
 
 const AOT_MAGIC: [u8; 4] = *b"VMAO";
-const AOT_VERSION: u16 = 2;
+const AOT_VERSION: u16 = 3;
 const AOT_FLAGS: u16 = 0;
 const AOT_NATIVE_ABI_VERSION: u16 = 1;
 const DEFAULT_AOT_BUNDLE_FUEL_CHECK_INTERVAL: u32 = 64;
@@ -18,6 +18,7 @@ struct EncodedAotTrace {
 struct DecodedAotBundle {
     local_count: usize,
     code_len: usize,
+    interrupt_mode: Option<native::NativeInterruptMode>,
     fuel_check_interval: u32,
     constants: Vec<Value>,
     imports: Vec<HostImport>,
@@ -33,11 +34,25 @@ impl Vm {
         &mut self,
         epoch_check_interval: u32,
     ) -> VmResult<Vec<u8>> {
-        self.emit_aot_bundle_with_fuel_check_interval(epoch_check_interval)
+        self.emit_aot_bundle_with_interrupt_settings(
+            (epoch_check_interval != 0).then_some(native::NativeInterruptMode::Epoch),
+            epoch_check_interval,
+        )
     }
 
     pub fn emit_aot_bundle_with_fuel_check_interval(
         &mut self,
+        fuel_check_interval: u32,
+    ) -> VmResult<Vec<u8>> {
+        self.emit_aot_bundle_with_interrupt_settings(
+            (fuel_check_interval != 0).then_some(native::NativeInterruptMode::Fuel),
+            fuel_check_interval,
+        )
+    }
+
+    fn emit_aot_bundle_with_interrupt_settings(
+        &mut self,
+        interrupt_mode: Option<native::NativeInterruptMode>,
         fuel_check_interval: u32,
     ) -> VmResult<Vec<u8>> {
         #[cfg(not(any(
@@ -106,13 +121,14 @@ impl Vm {
                 ));
             }
 
-            let native_fuel_check_interval = aot_native_fuel_check_interval(fuel_check_interval);
+            let native_interrupt_settings =
+                aot_native_interrupt_settings(interrupt_mode, fuel_check_interval);
             let mut traces = Vec::with_capacity(trace_ids.len());
             for trace_id in trace_ids {
                 self.ensure_native_trace_with_settings(
                     trace_id,
                     native::NativeCompileProfile::Aot,
-                    native_fuel_check_interval,
+                    native_interrupt_settings,
                 )?;
                 let trace = self.jit.trace_clone(trace_id).ok_or_else(|| {
                     VmError::JitNative(format!("AOT trace {} missing after compilation", trace_id))
@@ -132,6 +148,7 @@ impl Vm {
             encode_aot_bundle(&DecodedAotBundle {
                 local_count: self.locals.len(),
                 code_len: self.program.code.len(),
+                interrupt_mode,
                 fuel_check_interval,
                 constants: self.program.constants.clone(),
                 imports: self.program.imports.clone(),
@@ -174,6 +191,7 @@ impl Vm {
             });
             vm.native_only_aot = true;
             vm.native_aot_interrupt_check_interval = Some(fuel_check_interval);
+            vm.native_aot_interrupt_mode = bundle.interrupt_mode.map(aot_vm_interrupt_mode);
             vm.fuel_check_interval = runtime_fuel_check_interval(fuel_check_interval);
             vm.fuel_ops_until_check = runtime_fuel_check_interval(fuel_check_interval);
             vm.jit
@@ -193,7 +211,7 @@ impl Vm {
                 let native_trace = Vm::build_loaded_native_aot_trace(
                     &trace,
                     *compiled,
-                    aot_native_fuel_check_interval(fuel_check_interval),
+                    aot_native_interrupt_settings(bundle.interrupt_mode, fuel_check_interval),
                 );
                 vm.native_traces.insert(trace_id, native_trace);
             }
@@ -258,8 +276,26 @@ fn collect_resumable_aot_roots(
     roots.into_iter().collect()
 }
 
-fn aot_native_fuel_check_interval(fuel_check_interval: u32) -> Option<u32> {
-    (fuel_check_interval != 0).then_some(fuel_check_interval)
+fn aot_native_interrupt_settings(
+    interrupt_mode: Option<native::NativeInterruptMode>,
+    fuel_check_interval: u32,
+) -> Option<native::NativeInterruptSettings> {
+    match interrupt_mode {
+        Some(native::NativeInterruptMode::Fuel) if fuel_check_interval != 0 => {
+            Some(native::NativeInterruptSettings::fuel(fuel_check_interval))
+        }
+        Some(native::NativeInterruptMode::Epoch) if fuel_check_interval != 0 => {
+            Some(native::NativeInterruptSettings::epoch(fuel_check_interval))
+        }
+        _ => None,
+    }
+}
+
+fn aot_vm_interrupt_mode(mode: native::NativeInterruptMode) -> crate::vm::InterruptMode {
+    match mode {
+        native::NativeInterruptMode::Fuel => crate::vm::InterruptMode::Fuel,
+        native::NativeInterruptMode::Epoch => crate::vm::InterruptMode::Epoch,
+    }
 }
 
 fn runtime_fuel_check_interval(fuel_check_interval: u32) -> u32 {
@@ -283,6 +319,7 @@ fn encode_aot_bundle(bundle: &DecodedAotBundle) -> VmResult<Vec<u8>> {
     write_aot_string(std::env::consts::OS, &mut out)?;
     out.push((std::mem::size_of::<usize>() * 8) as u8);
     out.push(u8::from(cfg!(target_endian = "little")));
+    out.push(encode_aot_interrupt_mode(bundle.interrupt_mode));
     out.extend_from_slice(&bundle.fuel_check_interval.to_le_bytes());
     out.extend_from_slice(&local_count.to_le_bytes());
     out.extend_from_slice(&code_len.to_le_bytes());
@@ -369,6 +406,7 @@ fn decode_aot_bundle(bytes: &[u8]) -> VmResult<DecodedAotBundle> {
         ));
     }
 
+    let interrupt_mode = decode_aot_interrupt_mode(cursor.read_u8("interrupt mode")?)?;
     let fuel_check_interval = cursor.read_u32("fuel check interval")?;
 
     let local_count = cursor.read_u32("local_count")? as usize;
@@ -417,11 +455,31 @@ fn decode_aot_bundle(bytes: &[u8]) -> VmResult<DecodedAotBundle> {
     Ok(DecodedAotBundle {
         local_count,
         code_len,
+        interrupt_mode,
         fuel_check_interval,
         constants,
         imports,
         traces,
     })
+}
+
+fn encode_aot_interrupt_mode(mode: Option<native::NativeInterruptMode>) -> u8 {
+    match mode {
+        None => 0,
+        Some(native::NativeInterruptMode::Fuel) => 1,
+        Some(native::NativeInterruptMode::Epoch) => 2,
+    }
+}
+
+fn decode_aot_interrupt_mode(value: u8) -> VmResult<Option<native::NativeInterruptMode>> {
+    match value {
+        0 => Ok(None),
+        1 => Ok(Some(native::NativeInterruptMode::Fuel)),
+        2 => Ok(Some(native::NativeInterruptMode::Epoch)),
+        other => Err(VmError::JitNative(format!(
+            "invalid AOT interrupt mode tag {other}",
+        ))),
+    }
 }
 
 fn encode_aot_trace(encoded: &EncodedAotTrace, out: &mut Vec<u8>) -> VmResult<()> {

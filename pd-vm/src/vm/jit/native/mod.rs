@@ -19,6 +19,34 @@ pub(super) enum NativeCompileProfile {
     Aot,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum NativeInterruptMode {
+    Fuel,
+    Epoch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct NativeInterruptSettings {
+    pub(super) mode: NativeInterruptMode,
+    pub(super) check_interval: u32,
+}
+
+impl NativeInterruptSettings {
+    pub(super) const fn fuel(check_interval: u32) -> Self {
+        Self {
+            mode: NativeInterruptMode::Fuel,
+            check_interval,
+        }
+    }
+
+    pub(super) const fn epoch(check_interval: u32) -> Self {
+        Self {
+            mode: NativeInterruptMode::Epoch,
+            check_interval,
+        }
+    }
+}
+
 #[cfg(feature = "cranelift-jit")]
 pub(super) fn selected_codegen_backend() -> &'static str {
     "native"
@@ -50,12 +78,12 @@ pub(crate) struct CompiledTrace {
 #[cfg(feature = "cranelift-jit")]
 pub(super) fn compile_native_trace(
     trace: &super::JitTrace,
-    fuel_check_interval: Option<u32>,
+    interrupt_settings: Option<NativeInterruptSettings>,
     profile: NativeCompileProfile,
 ) -> VmResult<Box<CompiledTrace>> {
     Ok(Box::new(cranelift::compile_trace(
         trace,
-        fuel_check_interval,
+        interrupt_settings,
         profile,
     )?))
 }
@@ -63,7 +91,7 @@ pub(super) fn compile_native_trace(
 #[cfg(not(feature = "cranelift-jit"))]
 pub(super) fn compile_native_trace(
     _trace: &super::JitTrace,
-    _fuel_check_interval: Option<u32>,
+    _interrupt_settings: Option<NativeInterruptSettings>,
     _profile: NativeCompileProfile,
 ) -> VmResult<Box<CompiledTrace>> {
     Err(VmError::JitNative(

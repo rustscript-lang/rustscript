@@ -51,7 +51,7 @@ pub(crate) struct NativeTrace {
     root_ip: usize,
     terminal: JitTraceTerminal,
     has_yielding_call: bool,
-    fuel_check_interval: Option<u32>,
+    interrupt_settings: Option<native::NativeInterruptSettings>,
     compile_profile: native::NativeCompileProfile,
 }
 
@@ -64,7 +64,7 @@ pub(crate) struct NativeTrace {
 ))]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct NativeTraceCacheKey {
-    fuel_check_interval: Option<u32>,
+    interrupt_settings: Option<native::NativeInterruptSettings>,
     compile_profile: native::NativeCompileProfile,
     root_ip: usize,
     terminal: JitTraceTerminal,
@@ -137,11 +137,11 @@ fn with_native_trace_cache<R>(f: impl FnOnce(&mut NativeTraceCache) -> R) -> R {
 ))]
 fn native_trace_cache_key(
     trace: &JitTrace,
-    fuel_check_interval: Option<u32>,
+    interrupt_settings: Option<native::NativeInterruptSettings>,
     compile_profile: native::NativeCompileProfile,
 ) -> NativeTraceCacheKey {
     NativeTraceCacheKey {
-        fuel_check_interval,
+        interrupt_settings,
         compile_profile,
         root_ip: trace.root_ip,
         terminal: trace.terminal.clone(),
@@ -171,6 +171,18 @@ fn compile_profile_satisfies(
 }
 
 impl Vm {
+    fn active_native_interrupt_settings(&self) -> Option<native::NativeInterruptSettings> {
+        match self.interrupt_mode {
+            super::super::InterruptMode::None => None,
+            super::super::InterruptMode::Fuel => {
+                Some(native::NativeInterruptSettings::fuel(self.fuel_check_interval))
+            }
+            super::super::InterruptMode::Epoch => {
+                Some(native::NativeInterruptSettings::epoch(self.fuel_check_interval))
+            }
+        }
+    }
+
     pub fn set_jit_config(&mut self, config: super::JitConfig) {
         if config.enabled {
             self.ensure_program_cache_key();
@@ -633,8 +645,8 @@ impl Vm {
         trace_id: usize,
         compile_profile: native::NativeCompileProfile,
     ) -> VmResult<()> {
-        let fuel_check_interval = self.interruption_enabled().then_some(self.fuel_check_interval);
-        self.ensure_native_trace_with_settings(trace_id, compile_profile, fuel_check_interval)
+        let interrupt_settings = self.active_native_interrupt_settings();
+        self.ensure_native_trace_with_settings(trace_id, compile_profile, interrupt_settings)
     }
 
     #[cfg(any(
@@ -648,10 +660,10 @@ impl Vm {
         &mut self,
         trace_id: usize,
         compile_profile: native::NativeCompileProfile,
-        fuel_check_interval: Option<u32>,
+        interrupt_settings: Option<native::NativeInterruptSettings>,
     ) -> VmResult<()> {
         if let Some(native) = self.native_traces.get(&trace_id)
-            && native.fuel_check_interval == fuel_check_interval
+            && native.interrupt_settings == interrupt_settings
             && compile_profile_satisfies(native.compile_profile, compile_profile)
         {
             return Ok(());
@@ -662,11 +674,11 @@ impl Vm {
         let trace = self.jit.trace_clone(trace_id).ok_or_else(|| {
             VmError::JitNative(format!("trace {} missing for native compile", trace_id))
         })?;
-        let key = native_trace_cache_key(&trace, fuel_check_interval, compile_profile);
+        let key = native_trace_cache_key(&trace, interrupt_settings, compile_profile);
         let fallback_key = (compile_profile == native::NativeCompileProfile::Jit).then_some(
             native_trace_cache_key(
                 &trace,
-                fuel_check_interval,
+                interrupt_settings,
                 native::NativeCompileProfile::Aot,
             ),
         );
@@ -690,14 +702,15 @@ impl Vm {
                     root_ip: trace.root_ip,
                     terminal: trace.terminal,
                     has_yielding_call: trace.has_yielding_call,
-                    fuel_check_interval,
+                    interrupt_settings,
                     compile_profile: cached.compile_profile,
                 },
             );
             return Ok(());
         }
 
-        let compiled = native::compile_native_trace(&trace, fuel_check_interval, compile_profile)?;
+        let compiled =
+            native::compile_native_trace(&trace, interrupt_settings, compile_profile)?;
         let entry = unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(compiled.entry) };
         let code = Arc::<[u8]>::from(compiled.code.into_boxed_slice());
         let keepalive = Arc::new(Mutex::new(compiled.keepalive));
@@ -723,7 +736,7 @@ impl Vm {
                 root_ip: trace.root_ip,
                 terminal: trace.terminal,
                 has_yielding_call: trace.has_yielding_call,
-                fuel_check_interval,
+                interrupt_settings,
                 compile_profile,
             },
         );
@@ -740,7 +753,7 @@ impl Vm {
     pub(super) fn build_loaded_native_aot_trace(
         trace: &JitTrace,
         compiled: native::CompiledTrace,
-        fuel_check_interval: Option<u32>,
+        interrupt_settings: Option<native::NativeInterruptSettings>,
     ) -> NativeTrace {
         let entry = unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(compiled.entry) };
         let code = Arc::<[u8]>::from(compiled.code.into_boxed_slice());
@@ -752,7 +765,7 @@ impl Vm {
             root_ip: trace.root_ip,
             terminal: trace.terminal.clone(),
             has_yielding_call: trace.has_yielding_call,
-            fuel_check_interval,
+            interrupt_settings,
             compile_profile: native::NativeCompileProfile::Aot,
         }
     }
