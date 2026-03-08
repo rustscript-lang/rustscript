@@ -199,6 +199,17 @@ pub(crate) fn compile_trace(
 
         let mut step_index = 0usize;
         while step_index < trace.steps.len() {
+            let step_ip = trace
+                .step_ips
+                .get(step_index)
+                .copied()
+                .unwrap_or(trace.root_ip);
+            let step_ip_i64 = i64::try_from(step_ip)
+                .map_err(|_| VmError::JitNative("step ip out of range for i64".to_string()))?;
+            let step_ip_val = b.ins().iconst(pointer_type, step_ip_i64);
+            b.ins()
+                .store(MemFlags::new(), step_ip_val, vm_ptr, offsets.vm_ip);
+
             if let Some(interval) = fuel_check_interval {
                 let stride = interval as usize;
                 if step_index % stride == 0 {

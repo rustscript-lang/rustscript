@@ -275,7 +275,12 @@ impl Vm {
         let Some(trace) = self.jit.trace_clone(trace_id) else {
             return Ok(ExecOutcome::Continue);
         };
-        for step in &trace.steps {
+        for (step_index, step) in trace.steps.iter().enumerate() {
+            self.ip = trace
+                .step_ips
+                .get(step_index)
+                .copied()
+                .unwrap_or(trace.root_ip);
             self.charge_fuel_tick()?;
             match step {
                 TraceStep::Nop => {}

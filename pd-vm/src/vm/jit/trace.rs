@@ -123,6 +123,7 @@ pub struct JitTrace {
     pub has_call: bool,
     pub has_yielding_call: bool,
     pub steps: Vec<TraceStep>,
+    pub step_ips: Vec<usize>,
     pub terminal: JitTraceTerminal,
     pub executions: u64,
 }
@@ -448,95 +449,123 @@ impl TraceJitEngine {
         let code = &program.code;
         let mut ip = root_ip;
         let mut steps = Vec::new();
+        let mut step_ips = Vec::new();
 
         while steps.len() < self.config.max_trace_len {
+            let instr_ip = ip;
             let opcode = *code
                 .get(ip)
                 .ok_or(JitNyiReason::InvalidJumpTarget { target: ip })?;
             ip = ip.saturating_add(1);
 
             if opcode == OpCode::Nop as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Nop);
                 continue;
             }
             if opcode == OpCode::Ret as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Ret);
-                return Ok(self.finish_trace(program, root_ip, steps, JitTraceTerminal::Halt));
+                return Ok(self.finish_trace(
+                    program,
+                    root_ip,
+                    steps,
+                    step_ips,
+                    JitTraceTerminal::Halt,
+                ));
             }
             if opcode == OpCode::Ldc as u8 {
                 let value = read_u32(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("ldc"))?;
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Ldc(value));
                 continue;
             }
             if opcode == OpCode::Add as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Add);
                 continue;
             }
             if opcode == OpCode::Sub as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Sub);
                 continue;
             }
             if opcode == OpCode::Mul as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Mul);
                 continue;
             }
             if opcode == OpCode::Div as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Div);
                 continue;
             }
             if opcode == OpCode::Mod as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Mod);
                 continue;
             }
             if opcode == OpCode::Shl as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Shl);
                 continue;
             }
             if opcode == OpCode::Shr as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Shr);
                 continue;
             }
             if opcode == OpCode::And as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::And);
                 continue;
             }
             if opcode == OpCode::Or as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Or);
                 continue;
             }
             if opcode == OpCode::Neg as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Neg);
                 continue;
             }
             if opcode == OpCode::Ceq as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Ceq);
                 continue;
             }
             if opcode == OpCode::Clt as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Clt);
                 continue;
             }
             if opcode == OpCode::Cgt as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Cgt);
                 continue;
             }
             if opcode == OpCode::Pop as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Pop);
                 continue;
             }
             if opcode == OpCode::Dup as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Dup);
                 continue;
             }
             if opcode == OpCode::Ldloc as u8 {
                 let index =
                     read_u8(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("ldloc"))?;
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Ldloc(index));
                 continue;
             }
             if opcode == OpCode::Stloc as u8 {
                 let index =
                     read_u8(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("stloc"))?;
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Stloc(index));
                 continue;
             }
@@ -547,6 +576,7 @@ impl TraceJitEngine {
                 if target >= code.len() {
                     return Err(JitNyiReason::InvalidJumpTarget { target });
                 }
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::GuardFalse { exit_ip: target });
                 continue;
             }
@@ -558,20 +588,24 @@ impl TraceJitEngine {
                     return Err(JitNyiReason::InvalidJumpTarget { target });
                 }
                 if target == root_ip {
+                    step_ips.push(instr_ip);
                     steps.push(TraceStep::JumpToRoot);
                     return Ok(self.finish_trace(
                         program,
                         root_ip,
                         steps,
+                        step_ips,
                         JitTraceTerminal::LoopBack,
                     ));
                 }
                 if target < ip {
+                    step_ips.push(instr_ip);
                     steps.push(TraceStep::JumpToIp { target_ip: target });
                     return Ok(self.finish_trace(
                         program,
                         root_ip,
                         steps,
+                        step_ips,
                         JitTraceTerminal::BranchExit,
                     ));
                 }
@@ -588,12 +622,14 @@ impl TraceJitEngine {
                 if let Some(builtin) = BuiltinFunction::from_call_index(index)
                     && argc == builtin.arity()
                 {
+                    step_ips.push(instr_ip);
                     steps.push(TraceStep::BuiltinCall {
                         index,
                         argc,
                         call_ip,
                     });
                 } else {
+                    step_ips.push(instr_ip);
                     steps.push(TraceStep::Call {
                         index,
                         argc,
@@ -615,95 +651,123 @@ impl TraceJitEngine {
         let code = &program.code;
         let mut ip = root_ip;
         let mut steps = Vec::new();
+        let mut step_ips = Vec::new();
 
         while steps.len() < self.config.max_trace_len {
+            let instr_ip = ip;
             let opcode = *code
                 .get(ip)
                 .ok_or(JitNyiReason::InvalidJumpTarget { target: ip })?;
             ip = ip.saturating_add(1);
 
             if opcode == OpCode::Nop as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Nop);
                 continue;
             }
             if opcode == OpCode::Ret as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Ret);
-                return Ok(self.finish_trace(program, root_ip, steps, JitTraceTerminal::Halt));
+                return Ok(self.finish_trace(
+                    program,
+                    root_ip,
+                    steps,
+                    step_ips,
+                    JitTraceTerminal::Halt,
+                ));
             }
             if opcode == OpCode::Ldc as u8 {
                 let value = read_u32(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("ldc"))?;
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Ldc(value));
                 continue;
             }
             if opcode == OpCode::Add as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Add);
                 continue;
             }
             if opcode == OpCode::Sub as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Sub);
                 continue;
             }
             if opcode == OpCode::Mul as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Mul);
                 continue;
             }
             if opcode == OpCode::Div as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Div);
                 continue;
             }
             if opcode == OpCode::Mod as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Mod);
                 continue;
             }
             if opcode == OpCode::Shl as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Shl);
                 continue;
             }
             if opcode == OpCode::Shr as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Shr);
                 continue;
             }
             if opcode == OpCode::And as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::And);
                 continue;
             }
             if opcode == OpCode::Or as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Or);
                 continue;
             }
             if opcode == OpCode::Neg as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Neg);
                 continue;
             }
             if opcode == OpCode::Ceq as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Ceq);
                 continue;
             }
             if opcode == OpCode::Clt as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Clt);
                 continue;
             }
             if opcode == OpCode::Cgt as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Cgt);
                 continue;
             }
             if opcode == OpCode::Pop as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Pop);
                 continue;
             }
             if opcode == OpCode::Dup as u8 {
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Dup);
                 continue;
             }
             if opcode == OpCode::Ldloc as u8 {
                 let index =
                     read_u8(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("ldloc"))?;
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Ldloc(index));
                 continue;
             }
             if opcode == OpCode::Stloc as u8 {
                 let index =
                     read_u8(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("stloc"))?;
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::Stloc(index));
                 continue;
             }
@@ -717,6 +781,7 @@ impl TraceJitEngine {
                 if target >= code.len() {
                     return Err(JitNyiReason::InvalidJumpTarget { target });
                 }
+                step_ips.push(instr_ip);
                 steps.push(TraceStep::GuardFalse { exit_ip: target });
                 continue;
             }
@@ -728,20 +793,24 @@ impl TraceJitEngine {
                     return Err(JitNyiReason::InvalidJumpTarget { target });
                 }
                 if target == root_ip {
+                    step_ips.push(instr_ip);
                     steps.push(TraceStep::JumpToRoot);
                     return Ok(self.finish_trace(
                         program,
                         root_ip,
                         steps,
+                        step_ips,
                         JitTraceTerminal::LoopBack,
                     ));
                 }
                 if target < ip {
+                    step_ips.push(instr_ip);
                     steps.push(TraceStep::JumpToIp { target_ip: target });
                     return Ok(self.finish_trace(
                         program,
                         root_ip,
                         steps,
+                        step_ips,
                         JitTraceTerminal::BranchExit,
                     ));
                 }
@@ -758,12 +827,14 @@ impl TraceJitEngine {
                 if let Some(builtin) = BuiltinFunction::from_call_index(index)
                     && argc == builtin.arity()
                 {
+                    step_ips.push(instr_ip);
                     steps.push(TraceStep::BuiltinCall {
                         index,
                         argc,
                         call_ip,
                     });
                 } else {
+                    step_ips.push(instr_ip);
                     steps.push(TraceStep::Call {
                         index,
                         argc,
@@ -786,8 +857,14 @@ impl TraceJitEngine {
         program: &Program,
         root_ip: usize,
         steps: Vec<TraceStep>,
+        step_ips: Vec<usize>,
         terminal: JitTraceTerminal,
     ) -> usize {
+        debug_assert_eq!(
+            steps.len(),
+            step_ips.len(),
+            "trace steps and step_ips must stay aligned"
+        );
         let id = self.traces.len();
         let start_line = program
             .debug
@@ -810,6 +887,7 @@ impl TraceJitEngine {
             has_call,
             has_yielding_call,
             steps,
+            step_ips,
             terminal,
             executions: 0,
         });

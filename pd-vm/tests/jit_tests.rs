@@ -169,12 +169,29 @@ fn trace_jit_native_path_honors_fuel_metering() {
     });
     vm.set_fuel_check_interval(1)
         .expect("fuel interval update should succeed");
-    vm.set_fuel(12);
+    vm.set_fuel(10);
 
-    let status = vm
-        .run()
-        .expect("run should cooperatively yield when fuel is exhausted");
-    assert_eq!(status, VmStatus::Yielded);
+    let mut yielded = 0_u64;
+    loop {
+        match vm.run().expect("run should cooperatively yield under low fuel") {
+            VmStatus::Yielded => {
+                yielded = yielded.saturating_add(1);
+                if !native_jit_supported() || vm.jit_native_exec_count() > 0 {
+                    break;
+                }
+                assert!(
+                    yielded < 512,
+                    "low-fuel run did not reach native execution after {yielded} yields, dump:\n{}",
+                    vm.dump_jit_info()
+                );
+                vm.recharge_fuel(10).expect("recharge should succeed");
+            }
+            VmStatus::Halted => panic!("expected cooperative yield before halt"),
+            VmStatus::Waiting(op_id) => panic!("unexpected host wait on op {op_id}"),
+        }
+    }
+    assert!(yielded > 0, "expected at least one cooperative fuel yield");
+
     if native_jit_supported() {
         assert!(
             vm.jit_native_exec_count() > 0,
@@ -209,7 +226,7 @@ fn trace_jit_preserves_local_move_semantics_across_fuel_yields() {
     });
     vm.set_fuel_check_interval(1)
         .expect("fuel interval update should succeed");
-    vm.set_fuel(8);
+    vm.set_fuel(1);
 
     let mut yielded = 0_u64;
     loop {
@@ -218,11 +235,11 @@ fn trace_jit_preserves_local_move_semantics_across_fuel_yields() {
             VmStatus::Yielded => {
                 yielded = yielded.saturating_add(1);
                 assert!(
-                    yielded < 256,
+                    yielded < 2_048,
                     "move/yield loop made no progress after {yielded} yields, dump:\n{}",
                     vm.dump_jit_info()
                 );
-                vm.recharge_fuel(10_000).expect("recharge should succeed");
+                vm.recharge_fuel(10).expect("recharge should succeed");
             }
             VmStatus::Waiting(op_id) => panic!("unexpected host wait on op {op_id}"),
         }
