@@ -221,10 +221,7 @@ fn cooperative_yield_does_not_duplicate_drops() {
 
     let compiled = compile_source(source).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
-    // Use a generous fuel budget so the VM yields between loop iterations
-    // rather than mid-expression.  The loop body compiles to many opcodes,
-    // so 200 ops per slice keeps things cooperative.
-    vm.set_fuel(200);
+    vm.set_fuel(10);
 
     let mut total_yields = 0u64;
     loop {
@@ -233,7 +230,11 @@ fn cooperative_yield_does_not_duplicate_drops() {
             VmStatus::Halted => break,
             VmStatus::Yielded => {
                 total_yields += 1;
-                vm.recharge_fuel(200).expect("recharge should succeed");
+                assert!(
+                    total_yields < 4_096,
+                    "low-fuel drop test made no progress after {total_yields} yields"
+                );
+                vm.recharge_fuel(10).expect("recharge should succeed");
             }
             VmStatus::Waiting(_) => panic!("unexpected waiting"),
         }
@@ -734,14 +735,21 @@ fn cooperative_yield_drop_count_is_bounded_tightly() {
 
     let compiled = compile_source(source).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
-    vm.set_fuel(200);
+    vm.set_fuel(10);
+
+    let mut yields = 0u64;
 
     loop {
         let status = vm.run().expect("vm should run");
         match status {
             VmStatus::Halted => break,
             VmStatus::Yielded => {
-                vm.recharge_fuel(200).expect("recharge should succeed");
+                yields = yields.saturating_add(1);
+                assert!(
+                    yields < 4_096,
+                    "low-fuel drop bound test made no progress after {yields} yields"
+                );
+                vm.recharge_fuel(10).expect("recharge should succeed");
             }
             VmStatus::Waiting(_) => panic!("unexpected waiting"),
         }
