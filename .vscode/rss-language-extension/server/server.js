@@ -946,7 +946,7 @@ function resolveWasmPath() {
   if (configured.length > 0) {
     return path.resolve(configured);
   }
-  return path.resolve(__dirname, "..", "wasm", "pd_vm_lint_wasm.wasm");
+  return path.resolve(__dirname, "..", "wasm", "pd_vm_wasm.wasm");
 }
 
 function isValidWasmExports(exports) {

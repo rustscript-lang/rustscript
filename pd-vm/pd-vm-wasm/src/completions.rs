@@ -1,10 +1,13 @@
+use edge_abi::{
+    AbiParamType, AbiValueType, FUNCTIONS as EDGE_HOST_FUNCTIONS, host_namespace_specs,
+};
 use serde::Serialize;
 use vm::{
     CallableParam, CallableSignature, builtin_namespace_specs,
-    callable_signatures_for_builtin_namespace_member, language_builtin_specs,
+    callable_signatures_for_builtin_namespace_member, default_host_callables,
+    language_builtin_specs,
 };
 
-use crate::runtime::host_function_specs;
 use crate::stdlib::embedded_stdlib_modules;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -36,6 +39,8 @@ pub fn build_completion_catalog() -> CompletionCatalog {
     let mut lua = Vec::new();
     let mut scheme = Vec::new();
 
+    add_edge_host_import_entries(&mut rustscript, &mut javascript, &mut lua, &mut scheme);
+    add_edge_host_function_entries(&mut rustscript, &mut javascript, &mut lua, &mut scheme);
     add_host_function_entries(&mut rustscript, &mut javascript, &mut lua, &mut scheme);
     add_language_builtin_entries(&mut rustscript, &mut javascript, &mut lua, &mut scheme);
     add_builtin_namespace_entries(&mut rustscript, &mut javascript, &mut lua, &mut scheme);
@@ -116,9 +121,10 @@ fn add_host_function_entries(
     lua: &mut Vec<CompletionEntry>,
     scheme: &mut Vec<CompletionEntry>,
 ) {
-    for host in host_function_specs() {
+    for host in default_host_callables() {
         let params = named_params(host.signature.params);
-        let signature = typed_signature(host.name, host.signature.params, host.signature.return_type);
+        let signature =
+            typed_signature(host.name, host.signature.params, host.signature.return_type);
 
         match host.name {
             "print" => {
@@ -162,7 +168,11 @@ fn add_host_function_entries(
                         insert_text: format!("print({})", comma_args(&params)),
                         detail: format!(
                             "playground host {}",
-                            typed_signature("print", host.signature.params, host.signature.return_type)
+                            typed_signature(
+                                "print",
+                                host.signature.params,
+                                host.signature.return_type
+                            )
                         ),
                         documentation: host.docs.to_string(),
                         kind: "function".to_string(),
@@ -175,7 +185,11 @@ fn add_host_function_entries(
                         insert_text: format!("(print {})", space_args(&params)),
                         detail: format!(
                             "playground host {}",
-                            typed_signature("print", host.signature.params, host.signature.return_type)
+                            typed_signature(
+                                "print",
+                                host.signature.params,
+                                host.signature.return_type
+                            )
                         ),
                         documentation: host.docs.to_string(),
                         kind: "function".to_string(),
@@ -264,6 +278,157 @@ fn add_host_function_entries(
                 );
             }
         }
+    }
+}
+
+fn add_edge_host_import_entries(
+    rustscript: &mut Vec<CompletionEntry>,
+    javascript: &mut Vec<CompletionEntry>,
+    lua: &mut Vec<CompletionEntry>,
+    scheme: &mut Vec<CompletionEntry>,
+) {
+    for namespace in host_namespace_specs() {
+        let root = namespace.root;
+        let docs = format!(
+            "{} Imports host namespace `{root}` for pd-edge host calls.",
+            namespace.docs
+        );
+        push_unique(
+            rustscript,
+            CompletionEntry {
+                label: format!("use {root};"),
+                insert_text: format!("use {root};"),
+                detail: format!("RustScript {root} host namespace import"),
+                documentation: docs.clone(),
+                kind: "module".to_string(),
+            },
+        );
+        push_unique(
+            javascript,
+            CompletionEntry {
+                label: format!("import * as {root} from \"{root}\";"),
+                insert_text: format!("import * as {root} from \"{root}\";"),
+                detail: format!("JavaScript {root} host namespace import"),
+                documentation: docs.clone(),
+                kind: "module".to_string(),
+            },
+        );
+        push_unique(
+            lua,
+            CompletionEntry {
+                label: format!("local {root} = require(\"{root}\")"),
+                insert_text: format!("local {root} = require(\"{root}\")"),
+                detail: format!("Lua {root} host namespace import"),
+                documentation: docs.clone(),
+                kind: "module".to_string(),
+            },
+        );
+        push_unique(
+            scheme,
+            CompletionEntry {
+                label: format!("(require (prefix-in {root}. \"{root}\"))"),
+                insert_text: format!("(require (prefix-in {root}. \"{root}\"))"),
+                detail: format!("Scheme {root} host namespace import"),
+                documentation: docs,
+                kind: "module".to_string(),
+            },
+        );
+    }
+}
+
+fn add_edge_host_function_entries(
+    rustscript: &mut Vec<CompletionEntry>,
+    javascript: &mut Vec<CompletionEntry>,
+    lua: &mut Vec<CompletionEntry>,
+    scheme: &mut Vec<CompletionEntry>,
+) {
+    for function in EDGE_HOST_FUNCTIONS {
+        let params = abi_param_names(function.param_names);
+        let signature = abi_signature(
+            function.name,
+            function.param_names,
+            function.param_types,
+            function.return_type,
+        );
+        let dot_path = function.name.replace("::", ".");
+        let root = function.name.split("::").next().unwrap_or(function.name);
+        let namespace_doc_prefix = host_namespace_specs()
+            .iter()
+            .find(|namespace| namespace.root == root)
+            .map(|namespace| namespace.docs)
+            .unwrap_or("pd-edge host namespace.");
+        let docs = format!(
+            "pd-edge host function from ABI index {} with arity {}.",
+            function.index, function.arity
+        );
+        let namespace_docs = format!(
+            "{namespace_doc_prefix} {docs} Namespace-export form (after importing `{root}`) is also available."
+        );
+
+        push_unique(
+            rustscript,
+            CompletionEntry {
+                label: function.name.to_string(),
+                insert_text: format!("{}({})", function.name, comma_args(&params)),
+                detail: format!("pd-edge host {signature}"),
+                documentation: namespace_docs.clone(),
+                kind: "function".to_string(),
+            },
+        );
+        push_unique(
+            javascript,
+            CompletionEntry {
+                label: dot_path.clone(),
+                insert_text: format!("{dot_path}({})", comma_args(&params)),
+                detail: format!(
+                    "pd-edge host {}",
+                    abi_signature(
+                        &dot_path,
+                        function.param_names,
+                        function.param_types,
+                        function.return_type,
+                    )
+                ),
+                documentation: namespace_docs.clone(),
+                kind: "function".to_string(),
+            },
+        );
+        push_unique(
+            lua,
+            CompletionEntry {
+                label: dot_path.clone(),
+                insert_text: format!("{dot_path}({})", comma_args(&params)),
+                detail: format!(
+                    "pd-edge host {}",
+                    abi_signature(
+                        &dot_path,
+                        function.param_names,
+                        function.param_types,
+                        function.return_type,
+                    )
+                ),
+                documentation: namespace_docs.clone(),
+                kind: "function".to_string(),
+            },
+        );
+        push_unique(
+            scheme,
+            CompletionEntry {
+                label: dot_path.clone(),
+                insert_text: format!("({dot_path} {})", space_args(&params)),
+                detail: format!(
+                    "pd-edge host {}",
+                    abi_signature(
+                        &dot_path,
+                        function.param_names,
+                        function.param_types,
+                        function.return_type,
+                    )
+                ),
+                documentation: namespace_docs,
+                kind: "function".to_string(),
+            },
+        );
     }
 }
 
@@ -409,11 +574,11 @@ fn add_builtin_namespace_entries(
             CompletionEntry {
                 label: format!(
                     "import * as {} from \"{}\";",
-                    namespace.alias, namespace.namespace
+                    namespace.namespace, namespace.namespace
                 ),
                 insert_text: format!(
                     "import * as {} from \"{}\";",
-                    namespace.alias, namespace.namespace
+                    namespace.namespace, namespace.namespace
                 ),
                 detail: format!("JavaScript {} import", namespace.namespace),
                 documentation: format!("{} {}", namespace.docs, support_note),
@@ -425,11 +590,11 @@ fn add_builtin_namespace_entries(
             CompletionEntry {
                 label: format!(
                     "local {} = require(\"{}\")",
-                    namespace.alias, namespace.namespace
+                    namespace.namespace, namespace.namespace
                 ),
                 insert_text: format!(
                     "local {} = require(\"{}\")",
-                    namespace.alias, namespace.namespace
+                    namespace.namespace, namespace.namespace
                 ),
                 detail: format!("Lua {} import", namespace.namespace),
                 documentation: format!("{} {}", namespace.docs, support_note),
@@ -441,11 +606,11 @@ fn add_builtin_namespace_entries(
             CompletionEntry {
                 label: format!(
                     "(require (prefix-in {}. \"{}\"))",
-                    namespace.alias, namespace.namespace
+                    namespace.namespace, namespace.namespace
                 ),
                 insert_text: format!(
                     "(require (prefix-in {}. \"{}\"))",
-                    namespace.alias, namespace.namespace
+                    namespace.namespace, namespace.namespace
                 ),
                 detail: format!("Scheme {} import", namespace.namespace),
                 documentation: format!("{} {}", namespace.docs, support_note),
@@ -469,8 +634,8 @@ fn add_builtin_namespace_entries(
                 .map(signature_params)
                 .unwrap_or_else(|| numbered_params(member.arity));
 
-            let rust_label = format!("{}::{}", namespace.alias, member.name);
-            let dot_label = format!("{}.{}", namespace.alias, member.name);
+            let rust_label = format!("{}::{}", namespace.namespace, member.name);
+            let dot_label = format!("{}.{}", namespace.namespace, member.name);
             let rust_detail = signatures
                 .map(|items| format!("builtin {}", overload_signatures(&rust_label, items)))
                 .unwrap_or_else(|| format!("builtin {}", function_signature(&rust_label, &params)));
@@ -654,7 +819,11 @@ fn numbered_params(arity: usize) -> Vec<String> {
 }
 
 fn named_params(params: &[CallableParam]) -> Vec<String> {
-    params.iter().map(|param| param.name.to_string()).collect()
+    params
+        .iter()
+        .take_while(|param| !param.optional)
+        .map(|param| param.name.to_string())
+        .collect()
 }
 
 fn signature_params(signatures: &[CallableSignature]) -> Vec<String> {
@@ -662,6 +831,10 @@ fn signature_params(signatures: &[CallableSignature]) -> Vec<String> {
         .first()
         .map(|signature| named_params(signature.params))
         .unwrap_or_default()
+}
+
+fn abi_param_names(params: &[&str]) -> Vec<String> {
+    params.iter().map(|param| (*param).to_string()).collect()
 }
 
 fn overload_signatures(name: &str, signatures: &[CallableSignature]) -> String {
@@ -679,9 +852,57 @@ fn typed_signature(name: &str, params: &[CallableParam], return_type: &str) -> S
 fn typed_params(params: &[CallableParam]) -> String {
     params
         .iter()
-        .map(|param| format!("{}: {}", param.name, param.ty.label()))
+        .map(|param| {
+            if param.optional {
+                format!("{}?: {}", param.name, param.ty.label())
+            } else {
+                format!("{}: {}", param.name, param.ty.label())
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn abi_signature(
+    name: &str,
+    param_names: &[&str],
+    param_types: &[AbiParamType],
+    return_type: AbiValueType,
+) -> String {
+    let params = param_names
+        .iter()
+        .zip(param_types.iter().copied())
+        .map(|(name, param)| format!("{name}: {}", abi_param_type_label(param)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{name}({params}) -> {}", abi_value_type_label(return_type))
+}
+
+fn abi_param_type_label(value: AbiParamType) -> &'static str {
+    match value {
+        AbiParamType::Any => "any",
+        AbiParamType::Null => "null",
+        AbiParamType::Int => "int",
+        AbiParamType::Float => "float",
+        AbiParamType::Bool => "bool",
+        AbiParamType::String => "string",
+        AbiParamType::Array => "array",
+        AbiParamType::Map => "map",
+        AbiParamType::Number => "number",
+    }
+}
+
+fn abi_value_type_label(value: AbiValueType) -> &'static str {
+    match value {
+        AbiValueType::Unknown => "unknown",
+        AbiValueType::Null => "null",
+        AbiValueType::Int => "int",
+        AbiValueType::Float => "float",
+        AbiValueType::Bool => "bool",
+        AbiValueType::String => "string",
+        AbiValueType::Array => "array",
+        AbiValueType::Map => "map",
+    }
 }
 
 fn function_signature(name: &str, params: &[String]) -> String {
@@ -763,7 +984,8 @@ fn push_unique(entries: &mut Vec<CompletionEntry>, entry: CompletionEntry) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_completion_catalog, parse_pub_functions};
+    use super::{build_completion_catalog, parse_pub_functions, signature_params, typed_signature};
+    use vm::{CallableParam, CallableParamType, CallableSignature};
 
     #[test]
     fn parse_pub_functions_extracts_public_signatures() {
@@ -778,6 +1000,32 @@ mod tests {
         assert_eq!(functions[0].params, vec!["value", "needle", "replacement"]);
         assert_eq!(functions[1].name, "trim");
         assert_eq!(functions[1].params, vec!["value"]);
+    }
+
+    #[test]
+    fn optional_params_are_rendered_and_omitted_from_snippets() {
+        static PARAMS: [CallableParam; 2] = [
+            CallableParam {
+                name: "pattern",
+                ty: CallableParamType::String,
+                optional: false,
+            },
+            CallableParam {
+                name: "flags",
+                ty: CallableParamType::String,
+                optional: true,
+            },
+        ];
+        static SIGNATURES: [CallableSignature; 1] = [CallableSignature {
+            params: &PARAMS,
+            return_type: "bool",
+        }];
+
+        assert_eq!(signature_params(&SIGNATURES), vec!["pattern".to_string()]);
+        assert_eq!(
+            typed_signature("demo", &PARAMS, "bool"),
+            "demo(pattern: string, flags?: string) -> bool"
+        );
     }
 
     #[test]
@@ -837,6 +1085,20 @@ mod tests {
     #[test]
     fn completion_catalog_contains_host_functions() {
         let catalog = build_completion_catalog();
+        assert!(
+            catalog
+                .rustscript
+                .iter()
+                .any(|entry| entry.label == "http::request::get_id"),
+            "expected RustScript pd-edge host completion for http::request::get_id",
+        );
+        assert!(
+            catalog
+                .javascript
+                .iter()
+                .any(|entry| entry.label == "import * as http from \"http\";"),
+            "expected JavaScript pd-edge host namespace import completion for http",
+        );
         assert!(
             catalog
                 .rustscript

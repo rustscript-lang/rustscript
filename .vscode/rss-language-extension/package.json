@@ -53,7 +53,7 @@
         "rustscript.languageServer.wasmPath": {
           "type": "string",
           "default": "",
-          "description": "Optional absolute path to pd_vm_lint_wasm.wasm used by the RustScript language server."
+          "description": "Optional absolute path to pd_vm_wasm.wasm used by the RustScript language server."
         }
       }
     }

@@ -72,11 +72,11 @@ cd ../..
 cargo run -p pd-controller
 ```
 
-`bun run build` now also builds the browser wasm linter (`pd-vm-lint-wasm`) and copies:
+`bun run build` now also builds the browser wasm linter (`pd-vm-wasm`) and copies:
 
-- `pd-controller/webui/public/wasm/pd_vm_lint_wasm.wasm`
+- `pd-controller/webui/public/wasm/pd_vm_wasm.wasm`
 
-The controller serves this file under `/ui/wasm/pd_vm_lint_wasm.wasm` for Monaco live linting in
+The controller serves this file under `/ui/wasm/pd_vm_wasm.wasm` for Monaco live linting in
 both code edit mode and debug-session source views.
 
 Env vars:

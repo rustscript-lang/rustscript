@@ -1,13 +1,19 @@
 mod analyzer;
 mod completions;
+#[cfg(feature = "runtime")]
 mod runtime;
 mod stdlib;
 
-use serde::Serialize;
-use vm::SourceFlavor;
+use std::path::Path;
 
-use crate::analyzer::{LintDiagnostic, LintReport, LintSpan, lint_source_with_flavor};
+use serde::{Deserialize, Serialize};
+use vm::{CompileSourceFileOptions, SourceFlavor};
+
+use crate::analyzer::{
+    LintDiagnostic, LintReport, LintSpan, lint_source_with_flavor, lint_source_with_flavor_at_path,
+};
 use crate::completions::{CompletionCatalog, build_completion_catalog};
+#[cfg(feature = "runtime")]
 use crate::runtime::{
     DebugCommand, DebugReport, FuelConfig, FuelState, InterruptModeState, RunCommand, RunReport,
     debug_state, run_command, run_debug_command, start_debug_source_with_flavor,
@@ -35,6 +41,7 @@ struct LintSpanJson {
     end_col: usize,
 }
 
+#[cfg(feature = "runtime")]
 #[derive(Serialize)]
 struct RunResponse {
     ok: bool,
@@ -48,6 +55,7 @@ struct RunResponse {
     fuel: FuelStateJson,
 }
 
+#[cfg(feature = "runtime")]
 #[derive(Serialize)]
 struct DebugResponse {
     diagnostics: Vec<LintDiagnosticJson>,
@@ -61,6 +69,7 @@ struct DebugResponse {
     fuel: FuelStateJson,
 }
 
+#[cfg(feature = "runtime")]
 #[derive(Serialize)]
 struct FuelStateJson {
     enabled: bool,
@@ -70,6 +79,12 @@ struct FuelStateJson {
     epoch_current: u64,
     epoch_deadline: Option<u64>,
     epoch_slice: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ModuleOverrideInput {
+    path: String,
+    source: String,
 }
 
 fn parse_flavor(raw: &str) -> SourceFlavor {
@@ -128,6 +143,7 @@ fn lint_response_to_json(report: LintReport) -> Vec<u8> {
     serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"diagnostics\":[]}".to_vec())
 }
 
+#[cfg(feature = "runtime")]
 fn run_response_to_json(report: RunReport) -> Vec<u8> {
     let ok = report.error.is_none();
     let response = RunResponse {
@@ -150,6 +166,7 @@ fn run_response_to_json(report: RunReport) -> Vec<u8> {
     })
 }
 
+#[cfg(feature = "runtime")]
 fn debug_response_to_json(report: DebugReport) -> Vec<u8> {
     let response = DebugResponse {
         diagnostics: report
@@ -171,6 +188,7 @@ fn debug_response_to_json(report: DebugReport) -> Vec<u8> {
     })
 }
 
+#[cfg(feature = "runtime")]
 fn fuel_state_to_json(fuel: FuelState) -> FuelStateJson {
     FuelStateJson {
         enabled: fuel.enabled,
@@ -193,6 +211,18 @@ fn completion_catalog_to_json(catalog: CompletionCatalog) -> Vec<u8> {
     })
 }
 
+fn parse_module_overrides(raw: &str) -> CompileSourceFileOptions {
+    let mut options = stdlib::embedded_stdlib_compile_options();
+    let parsed = serde_json::from_str::<Vec<ModuleOverrideInput>>(raw).unwrap_or_default();
+    for entry in parsed {
+        if entry.path.trim().is_empty() {
+            continue;
+        }
+        options.set_module_override_source(entry.path, entry.source);
+    }
+    options
+}
+
 fn invalid_utf8_lint_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8> {
     let response = LintResponse {
         diagnostics: vec![LintDiagnosticJson {
@@ -205,6 +235,7 @@ fn invalid_utf8_lint_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8>
     serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"diagnostics\":[]}".to_vec())
 }
 
+#[cfg(feature = "runtime")]
 fn invalid_utf8_run_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8> {
     let response = RunResponse {
         ok: false,
@@ -235,6 +266,7 @@ fn invalid_utf8_run_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8> 
     })
 }
 
+#[cfg(feature = "runtime")]
 fn invalid_utf8_debug_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8> {
     let response = DebugResponse {
         diagnostics: vec![LintDiagnosticJson {
@@ -265,6 +297,7 @@ fn invalid_utf8_debug_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8
     })
 }
 
+#[cfg(feature = "runtime")]
 fn invalid_run_command_response(command_json: &str, error: &str) -> Vec<u8> {
     let response = RunResponse {
         ok: false,
@@ -292,6 +325,7 @@ fn invalid_run_command_response(command_json: &str, error: &str) -> Vec<u8> {
     })
 }
 
+#[cfg(feature = "runtime")]
 fn invalid_debug_command_response(command_json: &str, error: &str) -> Vec<u8> {
     let response = DebugResponse {
         diagnostics: Vec::new(),
@@ -319,6 +353,7 @@ fn invalid_debug_command_response(command_json: &str, error: &str) -> Vec<u8> {
     })
 }
 
+#[cfg(feature = "runtime")]
 fn invalid_run_options_response(options_json: &str, error: &str) -> Vec<u8> {
     let response = RunResponse {
         ok: false,
@@ -346,6 +381,7 @@ fn invalid_run_options_response(options_json: &str, error: &str) -> Vec<u8> {
     })
 }
 
+#[cfg(feature = "runtime")]
 fn invalid_debug_options_response(options_json: &str, error: &str) -> Vec<u8> {
     let response = DebugResponse {
         diagnostics: Vec::new(),
@@ -411,6 +447,41 @@ pub extern "C" fn lint_source_json(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn lint_source_json_with_context(
+    source_ptr: u32,
+    source_len: u32,
+    flavor_ptr: u32,
+    flavor_len: u32,
+    path_ptr: u32,
+    path_len: u32,
+    overrides_ptr: u32,
+    overrides_len: u32,
+) -> u64 {
+    let source = match std::str::from_utf8(unpack_input(source_ptr, source_len)) {
+        Ok(value) => value,
+        Err(err) => return leak_bytes(invalid_utf8_lint_response("source", &err)),
+    };
+    let flavor_raw = std::str::from_utf8(unpack_input(flavor_ptr, flavor_len)).unwrap_or("rss");
+    let path_raw = std::str::from_utf8(unpack_input(path_ptr, path_len)).unwrap_or("");
+    let overrides_raw =
+        std::str::from_utf8(unpack_input(overrides_ptr, overrides_len)).unwrap_or("[]");
+    let options = parse_module_overrides(overrides_raw);
+
+    let report = if path_raw.trim().is_empty() {
+        lint_source_with_flavor(source, parse_flavor(flavor_raw))
+    } else {
+        lint_source_with_flavor_at_path(
+            source,
+            Path::new(path_raw),
+            parse_flavor(flavor_raw),
+            options,
+        )
+    };
+    leak_bytes(lint_response_to_json(report))
+}
+
+#[cfg(feature = "runtime")]
+#[unsafe(no_mangle)]
 pub extern "C" fn run_source_json(
     source_ptr: u32,
     source_len: u32,
@@ -445,6 +516,7 @@ pub extern "C" fn run_source_json(
     leak_bytes(run_response_to_json(report))
 }
 
+#[cfg(feature = "runtime")]
 #[unsafe(no_mangle)]
 pub extern "C" fn debug_start_json(
     source_ptr: u32,
@@ -483,6 +555,7 @@ pub extern "C" fn debug_start_json(
     leak_bytes(debug_response_to_json(report))
 }
 
+#[cfg(feature = "runtime")]
 #[unsafe(no_mangle)]
 pub extern "C" fn run_command_json(command_ptr: u32, command_len: u32) -> u64 {
     let command_json = match std::str::from_utf8(unpack_input(command_ptr, command_len)) {
@@ -499,6 +572,7 @@ pub extern "C" fn run_command_json(command_ptr: u32, command_len: u32) -> u64 {
     leak_bytes(run_response_to_json(report))
 }
 
+#[cfg(feature = "runtime")]
 #[unsafe(no_mangle)]
 pub extern "C" fn debug_command_json(command_ptr: u32, command_len: u32) -> u64 {
     let command_json = match std::str::from_utf8(unpack_input(command_ptr, command_len)) {
@@ -518,6 +592,7 @@ pub extern "C" fn debug_command_json(command_ptr: u32, command_len: u32) -> u64 
     leak_bytes(debug_response_to_json(report))
 }
 
+#[cfg(feature = "runtime")]
 #[unsafe(no_mangle)]
 pub extern "C" fn debug_state_json() -> u64 {
     leak_bytes(debug_response_to_json(debug_state()))
@@ -529,7 +604,94 @@ pub extern "C" fn completion_catalog_json() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+mod lint_tests {
+    use std::path::Path;
+
+    use super::{parse_flavor, parse_module_overrides};
+    use crate::analyzer::{lint_source_with_flavor, lint_source_with_flavor_at_path};
+    use crate::completions::build_completion_catalog;
+    use vm::SourceFlavor;
+
+    #[test]
+    fn parse_flavor_accepts_aliases() {
+        assert_eq!(parse_flavor("js"), SourceFlavor::JavaScript);
+        assert_eq!(parse_flavor("scm"), SourceFlavor::Scheme);
+        assert_eq!(parse_flavor("lua"), SourceFlavor::Lua);
+        assert_eq!(parse_flavor("rss"), SourceFlavor::RustScript);
+    }
+
+    #[test]
+    fn lint_reports_no_errors_for_all_supported_frontends() {
+        let cases = [
+            (
+                SourceFlavor::RustScript,
+                include_str!("../../examples/example.rss"),
+            ),
+            (
+                SourceFlavor::JavaScript,
+                include_str!("../../examples/example.js"),
+            ),
+            (SourceFlavor::Lua, "local a = 1\na = a + 1\na"),
+            (SourceFlavor::Scheme, "(define a 1)\n(set! a (+ a 1))\na"),
+        ];
+
+        for (flavor, source) in cases {
+            let report = lint_source_with_flavor(source, flavor);
+            assert!(
+                report.diagnostics.is_empty(),
+                "lint should succeed for {flavor:?}, got diagnostics: {:?}",
+                report.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn completion_catalog_contains_edge_and_runtime_hosts() {
+        let catalog = build_completion_catalog();
+        assert!(
+            catalog
+                .rustscript
+                .iter()
+                .any(|entry| entry.label == "http::request::get_id"),
+            "expected pd-edge host completion"
+        );
+        assert!(
+            catalog
+                .rustscript
+                .iter()
+                .any(|entry| entry.label == "runtime::sleep"),
+            "expected playground runtime host completion"
+        );
+    }
+
+    #[test]
+    fn lint_with_context_resolves_relative_imports_from_real_document_path() {
+        let path = Path::new("workspace/examples/list_comp_test.rss");
+        let source = r#"
+            use super::stdlib::rss::iter::{range, map, filter};
+            let values = filter(map(range(4), |value| value + 1), |value| value > 2);
+            values;
+        "#;
+        let mut options = parse_module_overrides(
+            r#"[{"path":"workspace/stdlib/rss/iter.rss","source":"pub fn range(stop) {}\npub fn map(iterable, f) {}\npub fn filter(iterable, f) {}"}]"#,
+        );
+        options.set_module_override_source(
+            "workspace/stdlib/rss/iter.rss",
+            include_str!("../../stdlib/rss/iter.rss"),
+        );
+
+        let report =
+            lint_source_with_flavor_at_path(source, path, SourceFlavor::RustScript, options);
+        assert!(
+            report.diagnostics.is_empty(),
+            "expected relative import lint to pass with real path context, got {:?}",
+            report.diagnostics
+        );
+    }
+}
+
+#[cfg(all(test, feature = "runtime"))]
+mod runtime_tests {
     use std::time::Duration;
 
     use super::parse_flavor;
@@ -840,7 +1002,7 @@ mod tests {
         let source = r#"
             use re;
             use json;
-            let matched = re::match("^rss$", "RSS", "i");
+            let matched = re::match("(?i)^rss$", "RSS");
             let payload = json::encode({ ok: matched });
             payload;
         "#;
@@ -857,7 +1019,7 @@ mod tests {
         let source = r#"
             use re;
             use json;
-            let matched = re::match("^rss$", "RSS", "i");
+            let matched = re::match("(?i)^rss$", "RSS");
             let payload = json::encode({ ok: matched });
             let decoded = json::decode(payload);
             let ok = decoded.ok.copy();
@@ -1033,6 +1195,19 @@ mod tests {
             len.detail.contains("len(items: array) -> int"),
             "expected array overload in len detail, got {:?}",
             len.detail
+        );
+
+        let re_match = catalog
+            .rustscript
+            .iter()
+            .find(|entry| entry.label == "re::match")
+            .expect("re::match completion should exist");
+        assert!(
+            re_match
+                .detail
+                .contains("re::match(pattern: string, text: string) -> bool"),
+            "expected regex signature in completion detail, got {:?}",
+            re_match.detail
         );
     }
 

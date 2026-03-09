@@ -49,7 +49,7 @@ let wasmPromise: Promise<WasmLinterExports> | null = null;
 
 function wasmPath(): string {
   const base = import.meta.env.BASE_URL ?? "/";
-  return `${base.replace(/\/+$/, "/")}wasm/pd_vm_lint_wasm.wasm`;
+  return `${base.replace(/\/+$/, "/")}wasm/pd_vm_wasm.wasm`;
 }
 
 function writeBytes(wasm: WasmLinterExports, bytes: Uint8Array): number {

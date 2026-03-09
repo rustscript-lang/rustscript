@@ -14,7 +14,7 @@ Local VS Code extension for RustScript `.rss` with syntax highlighting plus a la
 
 ## Language server features
 
-- Diagnostics from `pd_vm_lint_wasm.wasm` (same lint core used by the controller web UI)
+- Diagnostics from `pd_vm_wasm.wasm` (same lint core used by the controller web UI)
 - Completion items sourced from the wasm completion catalog
 - Hover docs for known symbols
 - Basic document symbols for `fn` and `let` declarations
@@ -31,10 +31,10 @@ Local VS Code extension for RustScript `.rss` with syntax highlighting plus a la
 1. Open this folder in VS Code.
 2. Open `.vscode/rss-language-extension`.
 3. Run `npm install`.
-4. Run `npm run copy-wasm` (builds `pd-vm-lint-wasm` from source, then bundles it).
+4. Run `npm run copy-wasm` (builds `pd-vm-wasm` from source, then bundles it).
 5. Press `F5` to launch an Extension Development Host.
 6. Open an `.rss` file in the development host.
 
 ## Config
 
-- `rustscript.languageServer.wasmPath`: optional absolute path override for `pd_vm_lint_wasm.wasm`.
+- `rustscript.languageServer.wasmPath`: optional absolute path override for `pd_vm_wasm.wasm`.
