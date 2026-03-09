@@ -5,7 +5,7 @@ const { spawnSync } = require("node:child_process");
 const extensionRoot = path.resolve(__dirname, "..");
 const repoRoot = path.resolve(extensionRoot, "..", "..");
 const wasmTarget = "wasm32-unknown-unknown";
-const wasmName = "pd_vm_lint_wasm.wasm";
+const wasmName = "pd_vm_wasm.wasm";
 const compiledWasmPath = path.resolve(
   repoRoot,
   "target",
@@ -30,7 +30,7 @@ function run(command, args, cwd) {
 run("rustup", ["target", "add", wasmTarget], repoRoot);
 run(
   "cargo",
-  ["build", "-p", "pd-vm-lint-wasm", "--target", wasmTarget, "--release"],
+  ["build", "-p", "pd-vm-wasm", "--target", wasmTarget, "--release"],
   repoRoot
 );
 

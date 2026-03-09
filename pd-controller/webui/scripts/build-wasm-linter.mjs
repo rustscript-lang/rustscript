@@ -19,7 +19,7 @@ const scriptsDir = dirname(thisFile);
 const webuiDir = resolve(scriptsDir, "..");
 const repoRoot = resolve(webuiDir, "..", "..");
 const wasmTarget = "wasm32-unknown-unknown";
-const wasmName = "pd_vm_lint_wasm.wasm";
+const wasmName = "pd_vm_wasm.wasm";
 const wasmSrc = resolve(repoRoot, "target", wasmTarget, "release", wasmName);
 const wasmOutDir = resolve(webuiDir, "public", "wasm");
 const wasmOut = resolve(wasmOutDir, wasmName);
@@ -31,7 +31,7 @@ const rssGrammarOut = resolve(monacoConfigDir, "rss.tmLanguage.json");
 const rssConfigOut = resolve(monacoConfigDir, "rss.language-configuration.json");
 
 run("rustup", ["target", "add", wasmTarget], repoRoot);
-run("cargo", ["build", "-p", "pd-vm-lint-wasm", "--target", wasmTarget, "--release"], repoRoot);
+run("cargo", ["build", "-p", "pd-vm-wasm", "--target", wasmTarget, "--release"], repoRoot);
 
 if (!existsSync(wasmSrc)) {
   throw new Error(`expected wasm output not found: ${wasmSrc}`);
