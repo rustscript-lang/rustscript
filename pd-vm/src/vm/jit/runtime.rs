@@ -213,6 +213,25 @@ impl Vm {
             "  native trace executions: {}\n",
             self.native_trace_exec_count
         ));
+        if self.jit_runtime_diagnostics_enabled {
+            let mut runtime_entries: Vec<(&'static str, u64)> = self
+                .jit_runtime_counters
+                .iter()
+                .map(|(name, count)| (*name, *count))
+                .collect();
+            runtime_entries.sort_unstable_by_key(|(name, _)| *name);
+            let total_runtime_events = runtime_entries
+                .iter()
+                .fold(0u64, |acc, (_, count)| acc.saturating_add(*count));
+            out.push_str(&format!(
+                "  runtime diagnostics: {} (events={})\n",
+                total_runtime_events,
+                runtime_entries.len()
+            ));
+            for (name, count) in runtime_entries {
+                out.push_str(&format!("    event {}: {}\n", name, count));
+            }
+        }
         if self.jit_native_bridge_stats_enabled {
             let mut bridge_entries: Vec<(&'static str, u64)> = self
                 .jit_native_bridge_counts
@@ -514,6 +533,7 @@ impl Vm {
         ))]
         {
             if !self.builtin_overrides.is_empty() {
+                self.record_jit_runtime_event("interpreter_trace_fallback");
                 return self.execute_jit_trace(trace_id);
             }
             self.execute_jit_native(trace_id)
@@ -526,6 +546,7 @@ impl Vm {
             all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
         )))]
         {
+            self.record_jit_runtime_event("interpreter_trace_fallback");
             self.execute_jit_trace(trace_id)
         }
     }
@@ -554,6 +575,7 @@ impl Vm {
                         && let Some(next_trace_id) = self.jit.compiled_trace_for_ip(self.ip)
                         && next_trace_id != current_trace_id
                     {
+                        self.record_jit_runtime_event("native_trace_chain");
                         current_trace_id = next_trace_id;
                         self.ensure_native_trace(
                             current_trace_id,
@@ -572,6 +594,7 @@ impl Vm {
                         && terminal == JitTraceTerminal::LoopBack
                         && self.ip == root_ip
                     {
+                        self.record_jit_runtime_event("native_loop_back_iter");
                         continue;
                     }
                     if !has_yielding_call {
@@ -586,6 +609,7 @@ impl Vm {
                         if let Some(next_trace_id) = next_trace_id
                             && next_trace_id != current_trace_id
                         {
+                            self.record_jit_runtime_event("native_trace_chain");
                             current_trace_id = next_trace_id;
                             self.ensure_native_trace(
                                 current_trace_id,
@@ -596,6 +620,7 @@ impl Vm {
                             continue;
                         }
                     }
+                    self.record_jit_runtime_event("trace_exit_to_vm");
                     return Ok(ExecOutcome::Continue);
                 }
                 native::STATUS_HALTED => return Ok(ExecOutcome::Halted),

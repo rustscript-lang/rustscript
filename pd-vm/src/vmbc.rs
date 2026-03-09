@@ -389,6 +389,14 @@ pub fn disassemble_program_with_options(program: &Program, options: DisassembleO
                     truncated = true;
                 }
             }
+            x if x == OpCode::LdlocCopy as u8 => {
+                if let Some(index) = read_u8(code, &mut ip) {
+                    instruction.push_str(&format!("ldloc.copy {index}"));
+                } else {
+                    instruction.push_str("ldloc.copy <truncated>");
+                    truncated = true;
+                }
+            }
             x if x == OpCode::Stloc as u8 => {
                 if let Some(index) = read_u8(code, &mut ip) {
                     instruction.push_str(&format!("stloc {index}"));
@@ -416,6 +424,14 @@ pub fn disassemble_program_with_options(program: &Program, options: DisassembleO
             x if x == OpCode::Shl as u8 => instruction.push_str("shl"),
             x if x == OpCode::Shr as u8 => instruction.push_str("shr"),
             x if x == OpCode::Lshr as u8 => instruction.push_str("lshr"),
+            x if x == OpCode::IAdd as u8 => instruction.push_str("iadd"),
+            x if x == OpCode::ISub as u8 => instruction.push_str("isub"),
+            x if x == OpCode::IMul as u8 => instruction.push_str("imul"),
+            x if x == OpCode::IDiv as u8 => instruction.push_str("idiv"),
+            x if x == OpCode::IMod as u8 => instruction.push_str("imod"),
+            x if x == OpCode::INeg as u8 => instruction.push_str("ineg"),
+            x if x == OpCode::IClt as u8 => instruction.push_str("iclt"),
+            x if x == OpCode::ICgt as u8 => instruction.push_str("icgt"),
             x if x == OpCode::Mod as u8 => instruction.push_str("mod"),
             x if x == OpCode::And as u8 => instruction.push_str("and"),
             x if x == OpCode::Or as u8 => instruction.push_str("or"),
@@ -512,6 +528,14 @@ fn analyze_program(
                 || x == OpCode::Mod as u8
                 || x == OpCode::And as u8
                 || x == OpCode::Or as u8
+                || x == OpCode::IAdd as u8
+                || x == OpCode::ISub as u8
+                || x == OpCode::IMul as u8
+                || x == OpCode::IDiv as u8
+                || x == OpCode::IMod as u8
+                || x == OpCode::INeg as u8
+                || x == OpCode::IClt as u8
+                || x == OpCode::ICgt as u8
                 || x == OpCode::Neg as u8
                 || x == OpCode::Not as u8
                 || x == OpCode::Ceq as u8
@@ -527,7 +551,10 @@ fn analyze_program(
                 })?;
                 jump_targets.push((start, target));
             }
-            x if x == OpCode::Ldloc as u8 || x == OpCode::Stloc as u8 => {
+            x if x == OpCode::Ldloc as u8
+                || x == OpCode::LdlocCopy as u8
+                || x == OpCode::Stloc as u8 =>
+            {
                 let index = read_u8(code, &mut ip).ok_or(ValidationError::TruncatedOperand {
                     offset: start,
                     opcode,

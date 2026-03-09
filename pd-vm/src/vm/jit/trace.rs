@@ -590,9 +590,19 @@ impl TraceJitEngine {
                 steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
+            if opcode == OpCode::IAdd as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::IAdd);
+                continue;
+            }
             if opcode == OpCode::Sub as u8 {
                 step_ips.push(instr_ip);
                 steps.push(typed_trace_step(program, instr_ip, opcode));
+                continue;
+            }
+            if opcode == OpCode::ISub as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::ISub);
                 continue;
             }
             if opcode == OpCode::Mul as u8 {
@@ -600,14 +610,29 @@ impl TraceJitEngine {
                 steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
+            if opcode == OpCode::IMul as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::IMul);
+                continue;
+            }
             if opcode == OpCode::Div as u8 {
                 step_ips.push(instr_ip);
                 steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
+            if opcode == OpCode::IDiv as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::IDiv);
+                continue;
+            }
             if opcode == OpCode::Mod as u8 {
                 step_ips.push(instr_ip);
                 steps.push(typed_trace_step(program, instr_ip, opcode));
+                continue;
+            }
+            if opcode == OpCode::IMod as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::IMod);
                 continue;
             }
             if opcode == OpCode::Shl as u8 {
@@ -645,6 +670,11 @@ impl TraceJitEngine {
                 steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
+            if opcode == OpCode::INeg as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::INeg);
+                continue;
+            }
             if opcode == OpCode::Ceq as u8 {
                 step_ips.push(instr_ip);
                 steps.push(typed_trace_step(program, instr_ip, opcode));
@@ -655,9 +685,19 @@ impl TraceJitEngine {
                 steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
+            if opcode == OpCode::IClt as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::Clt);
+                continue;
+            }
             if opcode == OpCode::Cgt as u8 {
                 step_ips.push(instr_ip);
                 steps.push(typed_trace_step(program, instr_ip, opcode));
+                continue;
+            }
+            if opcode == OpCode::ICgt as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::Cgt);
                 continue;
             }
             if opcode == OpCode::Pop as u8 {
@@ -675,6 +715,17 @@ impl TraceJitEngine {
                     read_u8(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("ldloc"))?;
                 step_ips.push(instr_ip);
                 steps.push(TraceStep::Ldloc(index));
+                continue;
+            }
+            if opcode == OpCode::LdlocCopy as u8 {
+                let index = read_u8(code, &mut ip)
+                    .ok_or(JitNyiReason::InvalidImmediate("ldloc.copy"))?;
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::Ldloc(index));
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::Dup);
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::Stloc(index));
                 continue;
             }
             if opcode == OpCode::Stloc as u8 {
@@ -805,9 +856,19 @@ impl TraceJitEngine {
                 steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
+            if opcode == OpCode::IAdd as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::IAdd);
+                continue;
+            }
             if opcode == OpCode::Sub as u8 {
                 step_ips.push(instr_ip);
                 steps.push(typed_trace_step(program, instr_ip, opcode));
+                continue;
+            }
+            if opcode == OpCode::ISub as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::ISub);
                 continue;
             }
             if opcode == OpCode::Mul as u8 {
@@ -815,14 +876,29 @@ impl TraceJitEngine {
                 steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
+            if opcode == OpCode::IMul as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::IMul);
+                continue;
+            }
             if opcode == OpCode::Div as u8 {
                 step_ips.push(instr_ip);
                 steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
+            if opcode == OpCode::IDiv as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::IDiv);
+                continue;
+            }
             if opcode == OpCode::Mod as u8 {
                 step_ips.push(instr_ip);
                 steps.push(typed_trace_step(program, instr_ip, opcode));
+                continue;
+            }
+            if opcode == OpCode::IMod as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::IMod);
                 continue;
             }
             if opcode == OpCode::Shl as u8 {
@@ -860,6 +936,11 @@ impl TraceJitEngine {
                 steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
+            if opcode == OpCode::INeg as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::INeg);
+                continue;
+            }
             if opcode == OpCode::Ceq as u8 {
                 step_ips.push(instr_ip);
                 steps.push(typed_trace_step(program, instr_ip, opcode));
@@ -870,9 +951,19 @@ impl TraceJitEngine {
                 steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
+            if opcode == OpCode::IClt as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::Clt);
+                continue;
+            }
             if opcode == OpCode::Cgt as u8 {
                 step_ips.push(instr_ip);
                 steps.push(typed_trace_step(program, instr_ip, opcode));
+                continue;
+            }
+            if opcode == OpCode::ICgt as u8 {
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::Cgt);
                 continue;
             }
             if opcode == OpCode::Pop as u8 {
@@ -890,6 +981,17 @@ impl TraceJitEngine {
                     read_u8(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("ldloc"))?;
                 step_ips.push(instr_ip);
                 steps.push(TraceStep::Ldloc(index));
+                continue;
+            }
+            if opcode == OpCode::LdlocCopy as u8 {
+                let index = read_u8(code, &mut ip)
+                    .ok_or(JitNyiReason::InvalidImmediate("ldloc.copy"))?;
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::Ldloc(index));
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::Dup);
+                step_ips.push(instr_ip);
+                steps.push(TraceStep::Stloc(index));
                 continue;
             }
             if opcode == OpCode::Stloc as u8 {
@@ -1174,7 +1276,10 @@ fn scan_program_block_roots(program: &Program) -> HashSet<usize> {
                     roots.insert(ip);
                 }
             }
-            x if x == OpCode::Ldloc as u8 || x == OpCode::Stloc as u8 => {
+            x if x == OpCode::Ldloc as u8
+                || x == OpCode::LdlocCopy as u8
+                || x == OpCode::Stloc as u8 =>
+            {
                 if read_u8(code, &mut ip).is_none() {
                     break;
                 }
@@ -1221,7 +1326,10 @@ fn scan_loop_headers(program: &Program) -> HashSet<usize> {
                     headers.insert(target);
                 }
             }
-            x if x == OpCode::Ldloc as u8 || x == OpCode::Stloc as u8 => {
+            x if x == OpCode::Ldloc as u8
+                || x == OpCode::LdlocCopy as u8
+                || x == OpCode::Stloc as u8 =>
+            {
                 if read_u8(code, &mut ip).is_none() {
                     break;
                 }

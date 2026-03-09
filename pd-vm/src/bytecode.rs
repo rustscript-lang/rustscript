@@ -198,7 +198,7 @@ fn infer_local_count_from_code(code: &[u8]) -> usize {
             break;
         }
         match opcode {
-            OpCode::Ldloc | OpCode::Stloc => {
+            OpCode::Ldloc | OpCode::LdlocCopy | OpCode::Stloc => {
                 let index = code[ip];
                 max_local_index = Some(max_local_index.map_or(index, |prev| prev.max(index)));
             }
@@ -238,6 +238,15 @@ pub enum OpCode {
     Or = 0x16,
     Not = 0x17,
     Lshr = 0x18,
+    LdlocCopy = 0x19,
+    IAdd = 0x1A,
+    ISub = 0x1B,
+    IMul = 0x1C,
+    IDiv = 0x1D,
+    IMod = 0x1E,
+    INeg = 0x1F,
+    IClt = 0x20,
+    ICgt = 0x21,
 }
 
 impl TryFrom<u8> for OpCode {
@@ -270,6 +279,15 @@ impl TryFrom<u8> for OpCode {
             x if x == Self::Or as u8 => Ok(Self::Or),
             x if x == Self::Not as u8 => Ok(Self::Not),
             x if x == Self::Lshr as u8 => Ok(Self::Lshr),
+            x if x == Self::LdlocCopy as u8 => Ok(Self::LdlocCopy),
+            x if x == Self::IAdd as u8 => Ok(Self::IAdd),
+            x if x == Self::ISub as u8 => Ok(Self::ISub),
+            x if x == Self::IMul as u8 => Ok(Self::IMul),
+            x if x == Self::IDiv as u8 => Ok(Self::IDiv),
+            x if x == Self::IMod as u8 => Ok(Self::IMod),
+            x if x == Self::INeg as u8 => Ok(Self::INeg),
+            x if x == Self::IClt as u8 => Ok(Self::IClt),
+            x if x == Self::ICgt as u8 => Ok(Self::ICgt),
             _ => Err(()),
         }
     }
@@ -297,8 +315,16 @@ impl OpCode {
             | Self::Or
             | Self::Not
             | Self::Lshr => 0,
+            Self::IAdd
+            | Self::ISub
+            | Self::IMul
+            | Self::IDiv
+            | Self::IMod
+            | Self::INeg
+            | Self::IClt
+            | Self::ICgt => 0,
             Self::Ldc | Self::Br | Self::Brfalse => 4,
-            Self::Ldloc | Self::Stloc => 1,
+            Self::Ldloc | Self::LdlocCopy | Self::Stloc => 1,
             Self::Call => 3,
         }
     }
@@ -330,6 +356,15 @@ impl OpCode {
             OpCode::Or => "or",
             OpCode::Not => "not",
             OpCode::Lshr => "lshr",
+            OpCode::LdlocCopy => "ldloc.copy",
+            OpCode::IAdd => "iadd",
+            OpCode::ISub => "isub",
+            OpCode::IMul => "imul",
+            OpCode::IDiv => "idiv",
+            OpCode::IMod => "imod",
+            OpCode::INeg => "ineg",
+            OpCode::IClt => "iclt",
+            OpCode::ICgt => "icgt",
         }
     }
 
@@ -360,6 +395,15 @@ impl OpCode {
             "or" => Some(OpCode::Or),
             "not" => Some(OpCode::Not),
             "lshr" => Some(OpCode::Lshr),
+            "ldloc.copy" => Some(OpCode::LdlocCopy),
+            "iadd" => Some(OpCode::IAdd),
+            "isub" => Some(OpCode::ISub),
+            "imul" => Some(OpCode::IMul),
+            "idiv" => Some(OpCode::IDiv),
+            "imod" => Some(OpCode::IMod),
+            "ineg" => Some(OpCode::INeg),
+            "iclt" => Some(OpCode::IClt),
+            "icgt" => Some(OpCode::ICgt),
             _ => None,
         }
     }

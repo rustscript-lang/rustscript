@@ -482,6 +482,11 @@ pub struct Vm {
     native_trace_exec_count: u64,
     jit_native_bridge_stats_enabled: bool,
     jit_native_bridge_counts: HashMap<&'static str, u64>,
+    jit_runtime_diagnostics_enabled: bool,
+    jit_runtime_counters: HashMap<&'static str, u64>,
+    interpreter_opcode_profiling_enabled: bool,
+    interpreter_opcode_counts: HashMap<u8, u64>,
+    interpreter_superinstruction_counts: HashMap<&'static str, u64>,
     async_bridge: Option<Box<dyn HostAsyncBridge>>,
     runtime_print_sink: Option<Box<RuntimePrintSink>>,
     waiting_host_op: Option<WaitingHostOp>,
@@ -563,6 +568,12 @@ impl Hasher for StableHasher {
 #[inline(always)]
 fn logical_shr_i64(value: i64, amount: u32) -> i64 {
     ((value as u64) >> amount) as i64
+}
+
+fn opcode_label(opcode: u8) -> String {
+    OpCode::try_from(opcode)
+        .map(|op| op.mnemonic().to_string())
+        .unwrap_or_else(|_| format!("0x{opcode:02X}"))
 }
 
 #[inline(always)]
@@ -719,6 +730,11 @@ impl Vm {
             native_trace_exec_count: 0,
             jit_native_bridge_stats_enabled: false,
             jit_native_bridge_counts: HashMap::new(),
+            jit_runtime_diagnostics_enabled: false,
+            jit_runtime_counters: HashMap::new(),
+            interpreter_opcode_profiling_enabled: false,
+            interpreter_opcode_counts: HashMap::new(),
+            interpreter_superinstruction_counts: HashMap::new(),
             async_bridge: None,
             runtime_print_sink: None,
             waiting_host_op: None,
@@ -819,6 +835,67 @@ impl Vm {
         self.jit_native_bridge_counts.clear();
     }
 
+    pub fn set_jit_runtime_diagnostics_enabled(&mut self, enabled: bool) {
+        self.jit_runtime_diagnostics_enabled = enabled;
+        if !enabled {
+            self.clear_jit_runtime_diagnostics();
+        }
+    }
+
+    pub fn jit_runtime_diagnostics_enabled(&self) -> bool {
+        self.jit_runtime_diagnostics_enabled
+    }
+
+    pub fn clear_jit_runtime_diagnostics(&mut self) {
+        self.jit_runtime_counters.clear();
+    }
+
+    pub fn jit_runtime_diagnostics_snapshot(&self) -> Vec<(String, u64)> {
+        let mut entries = self
+            .jit_runtime_counters
+            .iter()
+            .map(|(name, count)| ((*name).to_string(), *count))
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
+        entries
+    }
+
+    pub fn set_interpreter_opcode_profiling_enabled(&mut self, enabled: bool) {
+        self.interpreter_opcode_profiling_enabled = enabled;
+        if !enabled {
+            self.clear_interpreter_opcode_profile();
+        }
+    }
+
+    pub fn interpreter_opcode_profiling_enabled(&self) -> bool {
+        self.interpreter_opcode_profiling_enabled
+    }
+
+    pub fn clear_interpreter_opcode_profile(&mut self) {
+        self.interpreter_opcode_counts.clear();
+        self.interpreter_superinstruction_counts.clear();
+    }
+
+    pub fn interpreter_opcode_profile_snapshot(&self) -> Vec<(String, u64)> {
+        let mut entries = self
+            .interpreter_opcode_counts
+            .iter()
+            .map(|(opcode, count)| (opcode_label(*opcode), *count))
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
+        entries
+    }
+
+    pub fn interpreter_superinstruction_profile_snapshot(&self) -> Vec<(String, u64)> {
+        let mut entries = self
+            .interpreter_superinstruction_counts
+            .iter()
+            .map(|(name, count)| ((*name).to_string(), *count))
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
+        entries
+    }
+
     pub fn jit_native_bridge_stats_snapshot(&self) -> Vec<(&'static str, u64)> {
         let mut entries: Vec<(&'static str, u64)> = self
             .jit_native_bridge_counts
@@ -837,6 +914,33 @@ impl Vm {
             .jit_native_bridge_counts
             .entry(bridge_name)
             .or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    fn record_interpreter_opcode_hit(&mut self, opcode: u8) {
+        if !self.interpreter_opcode_profiling_enabled {
+            return;
+        }
+        let entry = self.interpreter_opcode_counts.entry(opcode).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    fn record_interpreter_superinstruction_hit(&mut self, name: &'static str) {
+        if !self.interpreter_opcode_profiling_enabled {
+            return;
+        }
+        let entry = self
+            .interpreter_superinstruction_counts
+            .entry(name)
+            .or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    pub(in crate::vm) fn record_jit_runtime_event(&mut self, name: &'static str) {
+        if !self.jit_runtime_diagnostics_enabled {
+            return;
+        }
+        let entry = self.jit_runtime_counters.entry(name).or_insert(0);
         *entry = entry.saturating_add(1);
     }
 
@@ -1529,6 +1633,7 @@ impl Vm {
     }
 
     fn execute_interpreter_instruction(&mut self, opcode: u8) -> VmResult<ExecOutcome> {
+        self.record_interpreter_opcode_hit(opcode);
         match opcode {
             x if x == OpCode::Nop as u8 => {}
             x if x == OpCode::Ret as u8 => return Ok(ExecOutcome::Halted),
@@ -1551,6 +1656,9 @@ impl Vm {
                     _ => self.binary_add_op()?,
                 }
             }
+            x if x == OpCode::IAdd as u8 => {
+                self.int_add_op()?;
+            }
             x if x == OpCode::Sub as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
@@ -1567,6 +1675,9 @@ impl Vm {
                         )?;
                     }
                 }
+            }
+            x if x == OpCode::ISub as u8 => {
+                self.int_binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_sub(rhs)))?;
             }
             x if x == OpCode::Mul as u8 => {
                 let ip = self.ip - 1;
@@ -1585,6 +1696,9 @@ impl Vm {
                     }
                 }
             }
+            x if x == OpCode::IMul as u8 => {
+                self.int_binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_mul(rhs)))?;
+            }
             x if x == OpCode::Div as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
@@ -1596,6 +1710,9 @@ impl Vm {
                     }
                     _ => self.binary_numeric_op(checked_int_div, |lhs, rhs| Ok(lhs / rhs))?,
                 }
+            }
+            x if x == OpCode::IDiv as u8 => {
+                self.int_binary_numeric_op(checked_int_div)?;
             }
             x if x == OpCode::Shl as u8 => {
                 let rhs = self.pop_shift_amount()?;
@@ -1623,6 +1740,9 @@ impl Vm {
                     }
                     _ => self.binary_numeric_op(checked_int_rem, |lhs, rhs| Ok(lhs % rhs))?,
                 }
+            }
+            x if x == OpCode::IMod as u8 => {
+                self.int_binary_numeric_op(checked_int_rem)?;
             }
             x if x == OpCode::And as u8 => {
                 let rhs = self.pop_bool()?;
@@ -1653,6 +1773,9 @@ impl Vm {
                     }
                 }
             }
+            x if x == OpCode::INeg as u8 => {
+                self.int_neg_op()?;
+            }
             x if x == OpCode::Ceq as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
@@ -1680,6 +1803,9 @@ impl Vm {
                     _ => self.compare_numeric_op(|lhs, rhs| lhs < rhs, |lhs, rhs| lhs < rhs)?,
                 }
             }
+            x if x == OpCode::IClt as u8 => {
+                self.int_compare_op(|lhs, rhs| lhs < rhs)?;
+            }
             x if x == OpCode::Cgt as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
@@ -1691,6 +1817,9 @@ impl Vm {
                     }
                     _ => self.compare_numeric_op(|lhs, rhs| lhs > rhs, |lhs, rhs| lhs > rhs)?,
                 }
+            }
+            x if x == OpCode::ICgt as u8 => {
+                self.int_compare_op(|lhs, rhs| lhs > rhs)?;
             }
             x if x == OpCode::Br as u8 => {
                 let target = self.read_u32()? as usize;
@@ -1713,6 +1842,7 @@ impl Vm {
             x if x == OpCode::Ldloc as u8 => {
                 let index = self.read_u8()?;
                 if !self.interruption_enabled() && self.can_fuse_ldloc_copy_pattern(index) {
+                    self.record_interpreter_superinstruction_hit("ldloc_dup_stloc");
                     let value = self
                         .locals
                         .get(index as usize)
@@ -1728,6 +1858,16 @@ impl Vm {
                     let value = std::mem::replace(slot, Value::Null);
                     self.stack.push(value);
                 }
+            }
+            x if x == OpCode::LdlocCopy as u8 => {
+                self.record_interpreter_superinstruction_hit("ldloc_copy");
+                let index = self.read_u8()?;
+                let value = self
+                    .locals
+                    .get(index as usize)
+                    .cloned()
+                    .ok_or(VmError::InvalidLocal(index))?;
+                self.stack.push(value);
             }
             x if x == OpCode::Stloc as u8 => {
                 let index = self.read_u8()?;
@@ -1747,6 +1887,7 @@ impl Vm {
                 match self.execute_host_call(index, argc_u8, call_ip)? {
                     HostCallExecOutcome::Returned => {
                         if can_fuse_tail_halt {
+                            self.record_interpreter_superinstruction_hit("call_ret");
                             if self.interruption_enabled() {
                                 // Preserve per-instruction interruption semantics when folding
                                 // `call; ret`.
@@ -2881,6 +3022,63 @@ mod tests {
 
         let halted = step_once(&mut vm).expect("ret should execute");
         assert!(matches!(halted, ExecOutcome::Halted));
+    }
+
+    #[test]
+    fn interpreter_opcode_profile_tracks_opcodes_and_fused_patterns() {
+        let program = Program::new(
+            vec![],
+            vec![
+                OpCode::Ldloc as u8,
+                0,
+                OpCode::Dup as u8,
+                OpCode::Stloc as u8,
+                0,
+                OpCode::Ret as u8,
+            ],
+        )
+        .with_local_count(1);
+        let mut vm = Vm::new(program);
+        vm.set_interpreter_opcode_profiling_enabled(true);
+        vm.locals[0] = Value::Int(9);
+
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::Int(9)]);
+
+        let opcode_counts = vm.interpreter_opcode_profile_snapshot();
+        assert!(
+            opcode_counts
+                .iter()
+                .any(|(name, count)| name == "ldloc" && *count == 1),
+            "expected ldloc count, got {opcode_counts:?}"
+        );
+        assert!(
+            opcode_counts
+                .iter()
+                .any(|(name, count)| name == "ret" && *count == 1),
+            "expected ret count, got {opcode_counts:?}"
+        );
+        assert!(
+            !opcode_counts.iter().any(|(name, _)| name == "dup"),
+            "fused dup should not execute as a separate opcode: {opcode_counts:?}"
+        );
+        assert!(
+            !opcode_counts.iter().any(|(name, _)| name == "stloc"),
+            "fused stloc should not execute as a separate opcode: {opcode_counts:?}"
+        );
+
+        let superinstruction_counts = vm.interpreter_superinstruction_profile_snapshot();
+        assert!(
+            superinstruction_counts
+                .iter()
+                .any(|(name, count)| name == "ldloc_dup_stloc" && *count == 1),
+            "expected fused profile entry, got {superinstruction_counts:?}"
+        );
+
+        vm.clear_interpreter_opcode_profile();
+        assert!(vm.interpreter_opcode_profile_snapshot().is_empty());
+        assert!(vm.interpreter_superinstruction_profile_snapshot().is_empty());
     }
 
     #[test]

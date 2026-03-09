@@ -855,6 +855,51 @@ fn trace_jit_records_typed_int_add_steps() {
 }
 
 #[test]
+fn trace_jit_reports_native_loop_back_diagnostics_for_hot_loop() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        local i = 0
+        local sum = 0
+        while i < 64 do
+            sum = sum + i
+            i = i + 1
+        end
+        sum
+    "#;
+
+    let compiled = vm::compile_source_with_flavor(source, vm::SourceFlavor::Lua)
+        .expect("lua source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.set_jit_runtime_diagnostics_enabled(true);
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(2016)]);
+
+    let diagnostics = vm.jit_runtime_diagnostics_snapshot();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(name, count)| name == "native_loop_back_iter" && *count > 0),
+        "expected native loop-back diagnostics, got {diagnostics:?}\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        vm.jit_native_exec_count() > 0,
+        "expected native execution count > 0, dump:\n{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
 fn trace_jit_records_typed_float_and_string_add_steps() {
     if !native_jit_supported() {
         return;

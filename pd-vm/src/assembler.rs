@@ -277,6 +277,11 @@ impl Assembler {
         self.emit_u8(index);
     }
 
+    pub fn ldloc_copy(&mut self, index: u8) {
+        self.emit_opcode(OpCode::LdlocCopy);
+        self.emit_u8(index);
+    }
+
     pub fn stloc(&mut self, index: u8) {
         self.emit_opcode(OpCode::Stloc);
         self.emit_u8(index);
@@ -298,6 +303,38 @@ impl Assembler {
 
     pub fn lshr(&mut self) {
         self.emit_opcode(OpCode::Lshr);
+    }
+
+    pub fn iadd(&mut self) {
+        self.emit_opcode(OpCode::IAdd);
+    }
+
+    pub fn isub(&mut self) {
+        self.emit_opcode(OpCode::ISub);
+    }
+
+    pub fn imul(&mut self) {
+        self.emit_opcode(OpCode::IMul);
+    }
+
+    pub fn idiv(&mut self) {
+        self.emit_opcode(OpCode::IDiv);
+    }
+
+    pub fn imod(&mut self) {
+        self.emit_opcode(OpCode::IMod);
+    }
+
+    pub fn ineg(&mut self) {
+        self.emit_opcode(OpCode::INeg);
+    }
+
+    pub fn iclt(&mut self) {
+        self.emit_opcode(OpCode::IClt);
+    }
+
+    pub fn icgt(&mut self) {
+        self.emit_opcode(OpCode::ICgt);
     }
 
     fn emit_opcode(&mut self, opcode: OpCode) {
@@ -420,6 +457,11 @@ impl BytecodeBuilder {
         self.emit_u8(index);
     }
 
+    pub fn ldloc_copy(&mut self, index: u8) {
+        self.emit_opcode(OpCode::LdlocCopy);
+        self.emit_u8(index);
+    }
+
     pub fn stloc(&mut self, index: u8) {
         self.emit_opcode(OpCode::Stloc);
         self.emit_u8(index);
@@ -441,6 +483,38 @@ impl BytecodeBuilder {
 
     pub fn lshr(&mut self) {
         self.emit_opcode(OpCode::Lshr);
+    }
+
+    pub fn iadd(&mut self) {
+        self.emit_opcode(OpCode::IAdd);
+    }
+
+    pub fn isub(&mut self) {
+        self.emit_opcode(OpCode::ISub);
+    }
+
+    pub fn imul(&mut self) {
+        self.emit_opcode(OpCode::IMul);
+    }
+
+    pub fn idiv(&mut self) {
+        self.emit_opcode(OpCode::IDiv);
+    }
+
+    pub fn imod(&mut self) {
+        self.emit_opcode(OpCode::IMod);
+    }
+
+    pub fn ineg(&mut self) {
+        self.emit_opcode(OpCode::INeg);
+    }
+
+    pub fn iclt(&mut self) {
+        self.emit_opcode(OpCode::IClt);
+    }
+
+    pub fn icgt(&mut self) {
+        self.emit_opcode(OpCode::ICgt);
     }
 
     fn emit_opcode(&mut self, opcode: OpCode) {
@@ -706,6 +780,18 @@ pub fn assemble(source: &str) -> Result<Program, AsmParseError> {
                 };
                 assembler.ldloc(index);
             }
+            OpCode::LdlocCopy => {
+                let token = next_token(&mut parts, line_no, "local index")?;
+                let index = if let Ok(value) = token.parse::<u8>() {
+                    value
+                } else {
+                    *locals.get(token).ok_or(AsmParseError {
+                        line: line_no,
+                        message: format!("unknown local '{token}'"),
+                    })?
+                };
+                assembler.ldloc_copy(index);
+            }
             OpCode::Stloc => {
                 let token = next_token(&mut parts, line_no, "local index")?;
                 let index = if let Ok(value) = token.parse::<u8>() {
@@ -726,6 +812,14 @@ pub fn assemble(source: &str) -> Result<Program, AsmParseError> {
             OpCode::Shl => assembler.shl(),
             OpCode::Shr => assembler.shr(),
             OpCode::Lshr => assembler.lshr(),
+            OpCode::IAdd => assembler.iadd(),
+            OpCode::ISub => assembler.isub(),
+            OpCode::IMul => assembler.imul(),
+            OpCode::IDiv => assembler.idiv(),
+            OpCode::IMod => assembler.imod(),
+            OpCode::INeg => assembler.ineg(),
+            OpCode::IClt => assembler.iclt(),
+            OpCode::ICgt => assembler.icgt(),
             OpCode::Mod => assembler.modulo(),
             OpCode::And => assembler.and(),
             OpCode::Or => assembler.or(),

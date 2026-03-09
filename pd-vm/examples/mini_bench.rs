@@ -1,9 +1,12 @@
 use std::fmt::Write as _;
+use std::fs;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
+use serde_json::json;
 use vm::{
     CallOutcome, CompiledProgram, HostFunction, HostFunctionRegistry, JitConfig, Program,
     SourceFlavor, Value, Vm, VmError, VmStatus, compile_source, compile_source_file,
@@ -41,6 +44,7 @@ fn real_main() -> Result<(), String> {
     benchmark_aot_compile(&config)?;
     benchmark_load(&config)?;
     benchmark_runtime(&config)?;
+    benchmark_lua_hot_loop_compare(&config)?;
     benchmark_rss(&config)?;
     Ok(())
 }
@@ -636,6 +640,453 @@ fn ensure_jit_executed(vm: &Vm, mode: PerfExecMode) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LuaCompareMode {
+    PdVmInterpreter,
+    PdVmJit,
+    LuaJitOff,
+    LuaJitJit,
+}
+
+impl LuaCompareMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PdVmInterpreter => "pd-vm",
+            Self::PdVmJit => "pd-vm-jit",
+            Self::LuaJitOff => "luajit-joff",
+            Self::LuaJitJit => "luajit-jit",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LuaCompareSample {
+    mode: LuaCompareMode,
+    available: bool,
+    skip_reason: Option<String>,
+    compile_excluded: bool,
+    warmup_runs: usize,
+    timed_runs: usize,
+    total_elapsed: Option<Duration>,
+    normalized_ns_per_inner_iter: Option<f64>,
+    result: Option<i64>,
+    native_trace_count_before: Option<usize>,
+    native_trace_count_after: Option<usize>,
+    native_exec_delta: Option<u64>,
+    jit_runtime_diagnostics: Vec<(String, u64)>,
+    native_bridge_stats: Vec<(String, u64)>,
+    interpreter_opcode_counts: Vec<(String, u64)>,
+    interpreter_superinstruction_counts: Vec<(String, u64)>,
+}
+
+fn benchmark_lua_hot_loop_compare(config: &BenchConfig) -> Result<(), String> {
+    println!("[lua_compare]");
+
+    let shared_source = build_lua_hot_loop_shared_source();
+    let pd_vm_source = shared_source
+        .replace("__PDVM_HOT_LOOP_INNER__", &config.hot_loop_inner.to_string())
+        .replace("__PDVM_HOT_LOOP_OUTER__", &config.hot_loop_outer.to_string());
+    let compiled = compile_source_with_flavor(&pd_vm_source, SourceFlavor::Lua)
+        .map_err(|err| format!("failed to compile Lua hot loop workload: {err}"))?;
+    let expected = config.hot_loop_inner * (config.hot_loop_inner - 1) / 2;
+
+    let mut samples = Vec::new();
+    samples.push(measure_pd_vm_lua_compare_mode(
+        &compiled,
+        LuaCompareMode::PdVmInterpreter,
+        expected,
+        config.run_trials,
+        config.hot_loop_inner,
+        config.hot_loop_outer,
+    )?);
+
+    if native_jit_supported() {
+        samples.push(measure_pd_vm_lua_compare_mode(
+            &compiled,
+            LuaCompareMode::PdVmJit,
+            expected,
+            config.run_trials,
+            config.hot_loop_inner,
+            config.hot_loop_outer,
+        )?);
+    } else {
+        samples.push(skipped_lua_compare_sample(
+            LuaCompareMode::PdVmJit,
+            config.run_trials,
+            "native JIT unsupported on this target",
+        ));
+    }
+
+    samples.push(measure_luajit_compare_mode(
+        &shared_source,
+        LuaCompareMode::LuaJitOff,
+        expected,
+        config.run_trials,
+        config.hot_loop_inner,
+        config.hot_loop_outer,
+    ));
+    samples.push(measure_luajit_compare_mode(
+        &shared_source,
+        LuaCompareMode::LuaJitJit,
+        expected,
+        config.run_trials,
+        config.hot_loop_inner,
+        config.hot_loop_outer,
+    ));
+
+    for sample in &samples {
+        if let Some(reason) = sample.skip_reason.as_deref() {
+            println!("  {:<12} skipped {}", sample.mode.label(), reason);
+            continue;
+        }
+        println!(
+            "  {:<12} total_us={:<10} ns_per_inner_iter={:.2}",
+            sample.mode.label(),
+            sample.total_elapsed.unwrap_or_default().as_micros(),
+            sample.normalized_ns_per_inner_iter.unwrap_or_default(),
+        );
+    }
+
+    write_lua_compare_artifacts(config, &shared_source, expected, &samples)?;
+    println!();
+    Ok(())
+}
+
+fn measure_pd_vm_lua_compare_mode(
+    compiled: &CompiledProgram,
+    mode: LuaCompareMode,
+    expected: i64,
+    timed_runs: usize,
+    inner: i64,
+    outer: i64,
+) -> Result<LuaCompareSample, String> {
+    let mut vm = Vm::new(compiled.program.clone().with_local_count(compiled.locals));
+    let jit_enabled = mode == LuaCompareMode::PdVmJit;
+    vm.set_jit_config(JitConfig {
+        enabled: jit_enabled,
+        hot_loop_threshold: 1,
+        max_trace_len: 16_384,
+    });
+    vm.set_jit_runtime_diagnostics_enabled(jit_enabled);
+    vm.set_jit_native_bridge_stats_enabled(jit_enabled);
+    vm.set_interpreter_opcode_profiling_enabled(!jit_enabled);
+
+    let expected_stack = [Value::Int(expected)];
+    let warm_status = vm
+        .run()
+        .map_err(|err| format!("warmup {} run failed: {err}", mode.label()))?;
+    ensure_expected_completion(&vm, warm_status, &expected_stack, mode.label())?;
+    vm.reset_for_reuse();
+    vm.clear_jit_runtime_diagnostics();
+    vm.clear_jit_native_bridge_stats();
+    vm.clear_interpreter_opcode_profile();
+
+    let native_trace_count_before = vm.jit_native_trace_count();
+    let native_exec_before = vm.jit_native_exec_count();
+    let started = Instant::now();
+    let total_program_runs = timed_runs.saturating_mul(outer as usize);
+    for run_index in 0..total_program_runs {
+        let status = vm
+            .run()
+            .map_err(|err| format!("timed {} run failed: {err}", mode.label()))?;
+        ensure_expected_completion(&vm, status, &expected_stack, mode.label())?;
+        if jit_enabled {
+            ensure_jit_executed(&vm, PerfExecMode::Jit)?;
+        }
+        if run_index + 1 < total_program_runs {
+            vm.reset_for_reuse();
+        }
+    }
+    let total_elapsed = started.elapsed();
+
+    Ok(LuaCompareSample {
+        mode,
+        available: true,
+        skip_reason: None,
+        compile_excluded: true,
+        warmup_runs: 1,
+        timed_runs,
+        total_elapsed: Some(total_elapsed),
+        normalized_ns_per_inner_iter: Some(normalized_ns_per_inner_iter(
+            total_elapsed,
+            inner,
+            outer,
+            timed_runs,
+        )),
+        result: Some(expected),
+        native_trace_count_before: Some(native_trace_count_before),
+        native_trace_count_after: Some(vm.jit_native_trace_count()),
+        native_exec_delta: Some(vm.jit_native_exec_count().saturating_sub(native_exec_before)),
+        jit_runtime_diagnostics: vm.jit_runtime_diagnostics_snapshot(),
+        native_bridge_stats: vm
+            .jit_native_bridge_stats_snapshot()
+            .into_iter()
+            .map(|(name, count)| (name.to_string(), count))
+            .collect(),
+        interpreter_opcode_counts: vm.interpreter_opcode_profile_snapshot(),
+        interpreter_superinstruction_counts: vm.interpreter_superinstruction_profile_snapshot(),
+    })
+}
+
+fn measure_luajit_compare_mode(
+    shared_source: &str,
+    mode: LuaCompareMode,
+    expected: i64,
+    timed_runs: usize,
+    inner: i64,
+    outer: i64,
+) -> LuaCompareSample {
+    let mut command = Command::new("luajit");
+    if mode == LuaCompareMode::LuaJitOff {
+        command.arg("-joff");
+    }
+    let script = build_luajit_benchmark_script(shared_source, timed_runs, inner, outer);
+    let output = command.arg("-e").arg(script).output();
+    let Ok(output) = output else {
+        return skipped_lua_compare_sample(mode, timed_runs, "luajit not found in PATH");
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return skipped_lua_compare_sample(
+            mode,
+            timed_runs,
+            &format!("luajit failed: {}", stderr.trim()),
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed = parse_luajit_compare_output(&stdout);
+    match parsed {
+        Ok((result, elapsed_ns)) if result == expected => LuaCompareSample {
+            mode,
+            available: true,
+            skip_reason: None,
+            compile_excluded: true,
+            warmup_runs: 1,
+            timed_runs,
+            total_elapsed: Some(Duration::from_nanos(elapsed_ns)),
+            normalized_ns_per_inner_iter: Some(
+                elapsed_ns as f64 / (inner as f64 * outer as f64 * timed_runs as f64),
+            ),
+            result: Some(result),
+            native_trace_count_before: None,
+            native_trace_count_after: None,
+            native_exec_delta: None,
+            jit_runtime_diagnostics: Vec::new(),
+            native_bridge_stats: Vec::new(),
+            interpreter_opcode_counts: Vec::new(),
+            interpreter_superinstruction_counts: Vec::new(),
+        },
+        Ok((result, _)) => skipped_lua_compare_sample(
+            mode,
+            timed_runs,
+            &format!("unexpected LuaJIT result {result}, expected {expected}"),
+        ),
+        Err(err) => skipped_lua_compare_sample(mode, timed_runs, &err),
+    }
+}
+
+fn skipped_lua_compare_sample(
+    mode: LuaCompareMode,
+    timed_runs: usize,
+    reason: &str,
+) -> LuaCompareSample {
+    LuaCompareSample {
+        mode,
+        available: false,
+        skip_reason: Some(reason.to_string()),
+        compile_excluded: true,
+        warmup_runs: 1,
+        timed_runs,
+        total_elapsed: None,
+        normalized_ns_per_inner_iter: None,
+        result: None,
+        native_trace_count_before: None,
+        native_trace_count_after: None,
+        native_exec_delta: None,
+        jit_runtime_diagnostics: Vec::new(),
+        native_bridge_stats: Vec::new(),
+        interpreter_opcode_counts: Vec::new(),
+        interpreter_superinstruction_counts: Vec::new(),
+    }
+}
+
+fn build_lua_hot_loop_shared_source() -> String {
+    r#"
+local i = 0
+local sum = 0
+while i < __PDVM_HOT_LOOP_INNER__ do
+    sum = sum + i
+    i = i + 1
+end
+sum
+"#
+    .trim()
+    .to_string()
+}
+
+fn build_luajit_benchmark_script(
+    shared_source: &str,
+    timed_runs: usize,
+    inner: i64,
+    outer: i64,
+) -> String {
+    let function_body = shared_source
+        .replace("__PDVM_HOT_LOOP_INNER__", &inner.to_string())
+        .replace("__PDVM_HOT_LOOP_OUTER__", &outer.to_string());
+    format!(
+        r#"
+local function pd_vm_hot_loop()
+{function_body}
+end
+local warmup_runs = 1
+local last = 0
+for _ = 1, warmup_runs do
+    last = pd_vm_hot_loop()
+end
+local started = os.clock()
+for _ = 1, {timed_runs} * {outer} do
+    last = pd_vm_hot_loop()
+end
+local elapsed_ns = math.floor((os.clock() - started) * 1000000000)
+io.write(string.format("result=%d elapsed_ns=%d\n", last, elapsed_ns))
+"#
+    )
+}
+
+fn parse_luajit_compare_output(stdout: &str) -> Result<(i64, u64), String> {
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("result="))
+        .ok_or_else(|| format!("missing result line in LuaJIT output:\n{stdout}"))?;
+    let mut result = None;
+    let mut elapsed_ns = None;
+    for part in line.split_whitespace() {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        match key {
+            "result" => {
+                result = Some(
+                    value
+                        .parse::<i64>()
+                        .map_err(|err| format!("invalid LuaJIT result '{value}': {err}"))?,
+                );
+            }
+            "elapsed_ns" => {
+                elapsed_ns = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|err| format!("invalid LuaJIT elapsed_ns '{value}': {err}"))?,
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok((
+        result.ok_or_else(|| format!("missing result in LuaJIT output: {line}"))?,
+        elapsed_ns.ok_or_else(|| format!("missing elapsed_ns in LuaJIT output: {line}"))?,
+    ))
+}
+
+fn normalized_ns_per_inner_iter(
+    elapsed: Duration,
+    inner: i64,
+    outer: i64,
+    timed_runs: usize,
+) -> f64 {
+    elapsed.as_nanos() as f64 / (inner as f64 * outer as f64 * timed_runs as f64)
+}
+
+fn write_lua_compare_artifacts(
+    config: &BenchConfig,
+    shared_source: &str,
+    expected: i64,
+    samples: &[LuaCompareSample],
+) -> Result<(), String> {
+    let results_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("results");
+    fs::create_dir_all(&results_dir)
+        .map_err(|err| format!("failed to create results dir '{}': {err}", results_dir.display()))?;
+
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|err| format!("system clock error while preparing benchmark artifact: {err}"))?
+        .as_secs();
+
+    let artifact = json!({
+        "workload": {
+            "name": "lua_hot_loop_same_source",
+            "source_kind": "shared_lua_hot_loop_function",
+            "hot_loop_inner": config.hot_loop_inner,
+            "hot_loop_outer": config.hot_loop_outer,
+            "expected_result": expected,
+        },
+        "methodology": {
+            "compile_excluded_from_timing": true,
+            "warmup_excluded_from_timing": true,
+            "timed_runs_use_steady_state_execution_only": true,
+        },
+        "shared_source": shared_source,
+        "samples": samples.iter().map(|sample| {
+            json!({
+                "mode": sample.mode.label(),
+                "available": sample.available,
+                "skip_reason": sample.skip_reason,
+                "compile_excluded": sample.compile_excluded,
+                "warmup_runs": sample.warmup_runs,
+                "timed_runs": sample.timed_runs,
+                "total_elapsed_ns": sample.total_elapsed.map(|value| value.as_nanos() as u64),
+                "normalized_ns_per_inner_iter": sample.normalized_ns_per_inner_iter,
+                "result": sample.result,
+                "native_trace_count_before": sample.native_trace_count_before,
+                "native_trace_count_after": sample.native_trace_count_after,
+                "native_exec_delta": sample.native_exec_delta,
+                "jit_runtime_diagnostics": sample.jit_runtime_diagnostics,
+                "native_bridge_stats": sample.native_bridge_stats,
+                "interpreter_opcode_counts": sample.interpreter_opcode_counts,
+                "interpreter_superinstruction_counts": sample.interpreter_superinstruction_counts,
+            })
+        }).collect::<Vec<_>>(),
+    });
+
+    let run_json_path = results_dir.join(format!("pd_vm_lua_hot_loop_{timestamp}.json"));
+    let latest_json_path = results_dir.join("pd_vm_lua_hot_loop_latest.json");
+    let markdown_path = results_dir.join("pd_vm_lua_hot_loop_latest.md");
+    let artifact_text = serde_json::to_string_pretty(&artifact)
+        .map_err(|err| format!("failed to serialize Lua benchmark artifact: {err}"))?;
+    fs::write(&run_json_path, &artifact_text)
+        .map_err(|err| format!("failed to write '{}': {err}", run_json_path.display()))?;
+    fs::write(&latest_json_path, &artifact_text)
+        .map_err(|err| format!("failed to write '{}': {err}", latest_json_path.display()))?;
+
+    let mut markdown = String::new();
+    markdown.push_str("# pd-vm Lua Hot Loop Benchmark\n\n");
+    markdown.push_str("Methodology: compile outside timer, one warmup run outside timer, timed runs only over steady-state execution.\n\n");
+    markdown.push_str("| mode | status | total_us | ns_per_inner_iter |\n");
+    markdown.push_str("| --- | --- | ---: | ---: |\n");
+    for sample in samples {
+        let status = sample.skip_reason.as_deref().unwrap_or("ok");
+        let total_us = sample
+            .total_elapsed
+            .map(|value| value.as_micros().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let normalized = sample
+            .normalized_ns_per_inner_iter
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        let _ = writeln!(
+            &mut markdown,
+            "| {} | {} | {} | {} |",
+            sample.mode.label(),
+            status,
+            total_us,
+            normalized
+        );
+    }
+    fs::write(&markdown_path, markdown)
+        .map_err(|err| format!("failed to write '{}': {err}", markdown_path.display()))?;
+    Ok(())
+}
+
 struct HotLoopWorkload {
     program: Program,
     expected: i64,
@@ -1019,4 +1470,80 @@ fn current_rss_bytes() -> Option<u64> {
 #[cfg(not(any(unix, target_os = "windows")))]
 fn current_rss_bytes() -> Option<u64> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_luajit_compare_output_reads_result_and_elapsed_ns() {
+        let parsed = parse_luajit_compare_output("result=42 elapsed_ns=12345\n")
+            .expect("parse should succeed");
+        assert_eq!(parsed, (42, 12_345));
+    }
+
+    #[test]
+    fn pd_vm_lua_compare_interpreter_records_methodology_and_profiles() {
+        let source = build_lua_hot_loop_shared_source()
+            .replace("__PDVM_HOT_LOOP_INNER__", "8")
+            .replace("__PDVM_HOT_LOOP_OUTER__", "1");
+        let compiled = compile_source_with_flavor(&source, SourceFlavor::Lua)
+            .expect("lua source should compile");
+        let sample = measure_pd_vm_lua_compare_mode(
+            &compiled,
+            LuaCompareMode::PdVmInterpreter,
+            28,
+            2,
+            8,
+            3,
+        )
+        .expect("interpreter benchmark should succeed");
+
+        assert!(sample.available);
+        assert_eq!(sample.warmup_runs, 1);
+        assert_eq!(sample.timed_runs, 2);
+        assert_eq!(sample.result, Some(28));
+        assert!(sample.total_elapsed.is_some());
+        assert!(!sample.interpreter_opcode_counts.is_empty());
+    }
+
+    #[test]
+    fn pd_vm_lua_compare_jit_records_native_exec_delta() {
+        if !native_jit_supported() {
+            return;
+        }
+
+        let source = build_lua_hot_loop_shared_source()
+            .replace("__PDVM_HOT_LOOP_INNER__", "16")
+            .replace("__PDVM_HOT_LOOP_OUTER__", "1");
+        let compiled = compile_source_with_flavor(&source, SourceFlavor::Lua)
+            .expect("lua source should compile");
+        let sample = measure_pd_vm_lua_compare_mode(
+            &compiled,
+            LuaCompareMode::PdVmJit,
+            120,
+            2,
+            16,
+            2,
+        )
+        .expect("jit benchmark should succeed");
+
+        assert!(sample.available);
+        assert!(
+            sample.native_exec_delta.is_some_and(|value| value > 0),
+            "expected native execution during timed section, got {sample:?}"
+        );
+        assert!(
+            !sample.jit_runtime_diagnostics.is_empty(),
+            "expected jit runtime diagnostics, got {sample:?}"
+        );
+        assert!(
+            sample
+                .native_trace_count_after
+                .zip(sample.native_trace_count_before)
+                .is_some_and(|(after, before)| after >= before),
+            "expected trace count to stay stable or grow, got {sample:?}"
+        );
+    }
 }
