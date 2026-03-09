@@ -74,6 +74,19 @@ impl FlowState {
             copyable_fields: HashSet::new(),
         }
     }
+
+    fn reachable_with_definite(local_count: usize, definite_locals: &[LocalSlot]) -> Self {
+        let mut state = Self::reachable(local_count);
+        for slot in definite_locals {
+            let slot = *slot as usize;
+            if slot >= local_count {
+                continue;
+            }
+            state.definite[slot] = true;
+            state.possible[slot] = true;
+        }
+        state
+    }
 }
 
 fn extract_passthrough_return_slot(function_impl: &FunctionImpl) -> Option<LocalSlot> {
@@ -616,6 +629,7 @@ fn collect_consumed_positions_from_expr(
 
 pub(super) fn enforce_local_availability(
     mut ir: FrontendIr,
+    entry_definite_locals: &[LocalSlot],
     clear_dead_locals: bool,
     enable_local_move_semantics: bool,
 ) -> Result<FrontendIr, ParseError> {
@@ -639,8 +653,8 @@ pub(super) fn enforce_local_availability(
         &rewritten_impls,
         enable_local_move_semantics,
     );
-    let (rewritten_stmts, _) =
-        analyzer.analyze_block(&ir.stmts, FlowState::reachable(ir.locals), true)?;
+    let entry_state = FlowState::reachable_with_definite(ir.locals, entry_definite_locals);
+    let (rewritten_stmts, _) = analyzer.analyze_block(&ir.stmts, entry_state, true)?;
     ir.stmts = rewritten_stmts;
     ir.function_impls = rewritten_impls;
 

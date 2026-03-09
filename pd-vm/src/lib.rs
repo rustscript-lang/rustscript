@@ -24,11 +24,11 @@ pub use bytecode::{HostImport, OpCode, Program, TypeMap, Value, ValueType};
 pub use compiler::diagnostics::{render_compile_error, render_source_error};
 pub use compiler::source_map::{LineSpanMapping, LoweredSource, SourceId, SourceMap, Span};
 pub use compiler::{
-    CompileError, CompileSourceFileOptions, CompiledProgram, Compiler, Expr, FunctionDecl,
-    ParseError, SourceError, SourceFlavor, SourcePathError, Stmt, compile_source,
-    compile_source_at_path_with_flavor_and_options, compile_source_file,
-    compile_source_file_with_options, compile_source_for_repl, compile_source_with_flavor,
-    compile_source_with_flavor_and_options,
+    CompileError, CompileSourceFileOptions, CompiledProgram, CompiledReplProgram, Compiler, Expr,
+    FunctionDecl, ParseError, ReplLocalBinding, SourceError, SourceFlavor, SourcePathError, Stmt,
+    compile_source, compile_source_at_path_with_flavor_and_options, compile_source_file,
+    compile_source_file_with_options, compile_source_for_repl, compile_source_for_repl_with_locals,
+    compile_source_with_flavor, compile_source_with_flavor_and_options,
 };
 pub use debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 #[cfg(feature = "runtime")]

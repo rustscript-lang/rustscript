@@ -1783,6 +1783,10 @@ impl Vm {
         &self.locals
     }
 
+    pub fn set_local(&mut self, index: u8, value: Value) -> VmResult<()> {
+        self.store_local_with_drop_contract(index, value)
+    }
+
     pub fn program(&self) -> &Program {
         self.program.as_ref()
     }
