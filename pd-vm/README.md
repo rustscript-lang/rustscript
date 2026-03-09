@@ -373,6 +373,15 @@ Manual perf characterization (ignored by default):
 cargo test -p pd-vm --test perf_tests -- --ignored --nocapture
 ```
 
+Lua hot-loop comparison benchmark:
+
+```powershell
+cargo run -p pd-vm --example mini_bench --release -- --run-trials 7 --hot-loop-inner 40000 --hot-loop-outer 8
+```
+
+- Latest artifact summary: `results/pd_vm_lua_hot_loop_latest.md`
+- Latest machine-readable artifact: `results/pd_vm_lua_hot_loop_latest.json`
+
 Migration perf record (handwritten vs Cranelift baseline before handwritten backend removal):
 
 - `docs/JIT_BACKEND_MIGRATION_PERF_2026-03-06.md`
