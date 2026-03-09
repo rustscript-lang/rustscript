@@ -1142,16 +1142,24 @@ impl Compiler {
                 }
                 self.compile_scalar_expr(lhs)?;
                 self.compile_scalar_expr(rhs)?;
-                self.record_operand_types(lhs_ty, rhs_ty);
-                self.assembler.add();
+                if lhs_ty == ValueType::Int && rhs_ty == ValueType::Int {
+                    self.assembler.iadd();
+                } else {
+                    self.record_operand_types(lhs_ty, rhs_ty);
+                    self.assembler.add();
+                }
             }
             Expr::Sub(lhs, rhs) => {
                 let lhs_ty = self.value_type_of_expr(lhs);
                 let rhs_ty = self.value_type_of_expr(rhs);
                 self.compile_scalar_expr(lhs)?;
                 self.compile_scalar_expr(rhs)?;
-                self.record_operand_types(lhs_ty, rhs_ty);
-                self.assembler.sub();
+                if lhs_ty == ValueType::Int && rhs_ty == ValueType::Int {
+                    self.assembler.isub();
+                } else {
+                    self.record_operand_types(lhs_ty, rhs_ty);
+                    self.assembler.sub();
+                }
             }
             Expr::Mul(lhs, rhs) => {
                 if let Expr::Int(value) = rhs.as_ref()
@@ -1171,8 +1179,12 @@ impl Compiler {
                     let rhs_ty = self.value_type_of_expr(rhs);
                     self.compile_scalar_expr(lhs)?;
                     self.compile_scalar_expr(rhs)?;
-                    self.record_operand_types(lhs_ty, rhs_ty);
-                    self.assembler.mul();
+                    if lhs_ty == ValueType::Int && rhs_ty == ValueType::Int {
+                        self.assembler.imul();
+                    } else {
+                        self.record_operand_types(lhs_ty, rhs_ty);
+                        self.assembler.mul();
+                    }
                 }
             }
             Expr::Div(lhs, rhs) => {
@@ -1180,22 +1192,34 @@ impl Compiler {
                 let rhs_ty = self.value_type_of_expr(rhs);
                 self.compile_scalar_expr(lhs)?;
                 self.compile_scalar_expr(rhs)?;
-                self.record_operand_types(lhs_ty, rhs_ty);
-                self.assembler.div();
+                if lhs_ty == ValueType::Int && rhs_ty == ValueType::Int {
+                    self.assembler.idiv();
+                } else {
+                    self.record_operand_types(lhs_ty, rhs_ty);
+                    self.assembler.div();
+                }
             }
             Expr::Mod(lhs, rhs) => {
                 let lhs_ty = self.value_type_of_expr(lhs);
                 let rhs_ty = self.value_type_of_expr(rhs);
                 self.compile_scalar_expr(lhs)?;
                 self.compile_scalar_expr(rhs)?;
-                self.record_operand_types(lhs_ty, rhs_ty);
-                self.assembler.modulo();
+                if lhs_ty == ValueType::Int && rhs_ty == ValueType::Int {
+                    self.assembler.imod();
+                } else {
+                    self.record_operand_types(lhs_ty, rhs_ty);
+                    self.assembler.modulo();
+                }
             }
             Expr::Neg(inner) => {
                 let inner_ty = self.value_type_of_expr(inner);
                 self.compile_scalar_expr(inner)?;
-                self.record_unary_operand_type(inner_ty);
-                self.assembler.neg();
+                if inner_ty == ValueType::Int {
+                    self.assembler.ineg();
+                } else {
+                    self.record_unary_operand_type(inner_ty);
+                    self.assembler.neg();
+                }
             }
             Expr::Not(inner) => {
                 self.compile_scalar_expr(inner)?;
@@ -1226,16 +1250,24 @@ impl Compiler {
                 let rhs_ty = self.value_type_of_expr(rhs);
                 self.compile_scalar_expr(lhs)?;
                 self.compile_scalar_expr(rhs)?;
-                self.record_operand_types(lhs_ty, rhs_ty);
-                self.assembler.clt();
+                if lhs_ty == ValueType::Int && rhs_ty == ValueType::Int {
+                    self.assembler.iclt();
+                } else {
+                    self.record_operand_types(lhs_ty, rhs_ty);
+                    self.assembler.clt();
+                }
             }
             Expr::Gt(lhs, rhs) => {
                 let lhs_ty = self.value_type_of_expr(lhs);
                 let rhs_ty = self.value_type_of_expr(rhs);
                 self.compile_scalar_expr(lhs)?;
                 self.compile_scalar_expr(rhs)?;
-                self.record_operand_types(lhs_ty, rhs_ty);
-                self.assembler.cgt();
+                if lhs_ty == ValueType::Int && rhs_ty == ValueType::Int {
+                    self.assembler.icgt();
+                } else {
+                    self.record_operand_types(lhs_ty, rhs_ty);
+                    self.assembler.cgt();
+                }
             }
             Expr::Var(index) => {
                 if self.callable_bindings.contains_key(index) {
@@ -1933,9 +1965,8 @@ impl Compiler {
     }
 
     fn emit_copy_ldloc(&mut self, slot: LocalSlot) -> Result<(), CompileError> {
-        self.emit_move_ldloc(slot)?;
-        self.assembler.dup();
-        self.emit_stloc(slot)
+        self.assembler.ldloc_copy(local_slot_operand(slot)?);
+        Ok(())
     }
 
     fn emit_stloc(&mut self, slot: LocalSlot) -> Result<(), CompileError> {

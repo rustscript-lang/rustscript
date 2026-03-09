@@ -981,7 +981,10 @@ fn decode_instructions(code: &[u8]) -> Vec<DecodedInstr> {
             let mut bytes = [0u8; 4];
             bytes.copy_from_slice(&code[ip + 1..ip + 5]);
             (5usize, Some(u32::from_le_bytes(bytes)), None)
-        } else if op == vm::OpCode::Ldloc as u8 || op == vm::OpCode::Stloc as u8 {
+        } else if op == vm::OpCode::Ldloc as u8
+            || op == vm::OpCode::LdlocCopy as u8
+            || op == vm::OpCode::Stloc as u8
+        {
             assert!(
                 ip + 2 <= code.len(),
                 "truncated 1-byte operand at instruction {ip}"
@@ -1132,6 +1135,47 @@ fn liveness_avoids_in_loop_null_clears_but_clears_after_loop_exit() {
     assert_eq!(vm.stack(), &[Value::Int(3)]);
     assert_eq!(vm.locals()[a_index as usize], Value::Null);
     assert_eq!(vm.locals()[b_index as usize], Value::Null);
+}
+
+#[test]
+fn compile_int_while_loop_uses_specialized_integer_and_copy_opcodes() {
+    let source = r#"
+        let mut i = 0;
+        let mut sum = 0;
+        while i < 4 {
+            let next = i + 1;
+            sum = sum + next;
+            i = i + 1;
+        }
+        sum;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let instructions = decode_instructions(&compiled.program.code);
+
+    assert!(
+        instructions
+            .iter()
+            .any(|instr| instr.op == vm::OpCode::LdlocCopy as u8),
+        "expected fused local copy opcode"
+    );
+    assert!(
+        instructions
+            .iter()
+            .any(|instr| instr.op == vm::OpCode::IAdd as u8),
+        "expected integer add opcode"
+    );
+    assert!(
+        instructions
+            .iter()
+            .any(|instr| instr.op == vm::OpCode::IClt as u8),
+        "expected integer compare opcode"
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(10)]);
 }
 
 #[test]
