@@ -569,3 +569,43 @@ fn compiler_uses_generated_builtin_namespace_return_signatures() {
         ],
     );
 }
+
+#[test]
+fn compiler_infers_hidden_slice_bindings_inside_function_bodies() {
+    let source = r#"
+        fn tail_len(text) {
+            text[1:].length + 1;
+        }
+
+        tail_len("abcd");
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    assert_last_opcode_operand_types(&compiled, OpCode::Add, (ValueType::Int, ValueType::Int));
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(4)]);
+}
+
+#[test]
+fn compiler_infers_dynamic_slice_end_bindings_inside_function_bodies() {
+    let source = r#"
+        fn first_hex(text, i) {
+            let hex_lookup = {
+                "a": 10,
+                "b": 11
+            };
+            hex_lookup[text[i:(i + 1)]];
+        }
+
+        first_hex("ab", 0);
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(10)]);
+}

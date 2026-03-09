@@ -2597,6 +2597,100 @@ fn rss_function_definition_is_inlined_without_host_imports() {
 }
 
 #[test]
+fn compile_source_file_imported_module_slice_hidden_bindings_work() {
+    let unique = format!(
+        "vm_rustscript_imported_slice_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).expect("temp module root should be created");
+
+    let module_path = root.join("module.rss");
+    std::fs::write(
+        &module_path,
+        r#"
+        pub fn tail_len(text) {
+            text[1:].length + 1;
+        }
+    "#,
+    )
+    .expect("module source should write");
+
+    let main_path = root.join("main.rss");
+    std::fs::write(
+        &main_path,
+        r#"
+        use module;
+        tail_len("abcd");
+    "#,
+    )
+    .expect("main source should write");
+
+    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(4)]);
+
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_file(module_path);
+    let _ = std::fs::remove_dir(root);
+}
+
+#[test]
+fn compile_source_file_imported_module_dynamic_slice_end_bindings_work() {
+    let unique = format!(
+        "vm_rustscript_imported_dynamic_slice_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).expect("temp module root should be created");
+
+    let module_path = root.join("module.rss");
+    std::fs::write(
+        &module_path,
+        r#"
+        pub fn first_hex(text, i) {
+            let hex_lookup = {
+                "a": 10,
+                "b": 11
+            };
+            hex_lookup[text[i:(i + 1)]];
+        }
+    "#,
+    )
+    .expect("module source should write");
+
+    let main_path = root.join("main.rss");
+    std::fs::write(
+        &main_path,
+        r#"
+        use module;
+        first_hex("ab", 0);
+    "#,
+    )
+    .expect("main source should write");
+
+    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(10)]);
+
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_file(module_path);
+    let _ = std::fs::remove_dir(root);
+}
+
+#[test]
 fn rustscript_language_runtime_cases_work() {
     let cases = vec![
         RuntimeCase {
