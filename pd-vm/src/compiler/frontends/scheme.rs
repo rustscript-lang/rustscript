@@ -1227,7 +1227,7 @@ fn lower_scheme_direct_namespace_call(
 fn lower_scheme_direct_regex_or_builtin_call(
     namespace: &str,
     member: &str,
-    args: Vec<Expr>,
+    mut args: Vec<Expr>,
     line: usize,
 ) -> Result<Option<Expr>, ParseError> {
     if namespace == "re" {
@@ -1240,6 +1240,28 @@ fn lower_scheme_direct_regex_or_builtin_call(
             _ => return Ok(None),
         };
         if builtin.accepts_arity(u8::try_from(args.len()).unwrap_or(u8::MAX)) {
+            return Ok(Some(Expr::Call(builtin.call_index(), args)));
+        }
+        if args.len() == usize::from(builtin.arity()) + 1 {
+            let flags = args.pop().ok_or_else(|| ParseError {
+                span: None,
+                code: None,
+                line,
+                message: format!(
+                    "function 're::{member}' expects {} arguments",
+                    builtin.arity()
+                ),
+            })?;
+            let pattern = args.first().cloned().ok_or_else(|| ParseError {
+                span: None,
+                code: None,
+                line,
+                message: format!(
+                    "function 're::{member}' expects {} arguments",
+                    builtin.arity()
+                ),
+            })?;
+            args[0] = build_scheme_regex_flags_pattern_expr(pattern, flags);
             return Ok(Some(Expr::Call(builtin.call_index(), args)));
         }
         return Err(ParseError {
@@ -1268,6 +1290,18 @@ fn lower_scheme_direct_regex_or_builtin_call(
         return Ok(Some(Expr::Call(builtin.call_index(), args)));
     }
     Ok(None)
+}
+
+fn build_scheme_regex_flags_pattern_expr(pattern: Expr, flags: Expr) -> Expr {
+    let prefix = Expr::Call(
+        BuiltinFunction::Concat.call_index(),
+        vec![Expr::String("(?".to_string()), flags],
+    );
+    let prefix = Expr::Call(
+        BuiltinFunction::Concat.call_index(),
+        vec![prefix, Expr::String(")".to_string())],
+    );
+    Expr::Call(BuiltinFunction::Concat.call_index(), vec![prefix, pattern])
 }
 fn lower_scheme_direct_hash_expr(
     args: &[SchemeForm],

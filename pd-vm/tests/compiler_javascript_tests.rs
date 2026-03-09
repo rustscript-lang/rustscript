@@ -88,6 +88,16 @@ fn javascript_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
+            name: "regex namespace accepts inline flags argument",
+            source: r#"
+                import * as re from "re";
+                re.match("^javascript$", "JAVASCRIPT", "i");
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_stack: vec![Value::Bool(true)],
+            expected_locals: None,
+        },
+        RuntimeCase {
             name: "jit namespace builtins work with import",
             source: r#"
                 import * as jit from "jit";
