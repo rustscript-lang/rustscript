@@ -542,8 +542,8 @@ fn rustscript_named_function_capture_runtime_cases_work() {
         RuntimeCase {
             name: "named functions can compose other named functions",
             source: r#"
-                fn inc(x) { x + 1; }
-                fn twice(x) { x * 2; }
+                fn inc(x) { x + 1 }
+                fn twice(x) { x * 2 }
                 fn combine(a, b) {
                     let left = inc(a);
                     let right = twice(b);
@@ -558,8 +558,8 @@ fn rustscript_named_function_capture_runtime_cases_work() {
         RuntimeCase {
             name: "named function calls can nest without recursion",
             source: r#"
-                fn inc(x) { x + 1; }
-                fn double_inc(x) { inc(inc(x)); }
+                fn inc(x) { x + 1 }
+                fn double_inc(x) { inc(inc(x)) }
                 fn score(x) {
                     let a = double_inc(x);
                     let b = inc(x);
@@ -575,7 +575,7 @@ fn rustscript_named_function_capture_runtime_cases_work() {
             name: "nested named function implicitly captures outer local",
             source: r#"
                 fn outer(base) {
-                    fn add(v) { v + base; }
+                    fn add(v) { v + base }
                     add(2);
                 }
                 outer(5);
@@ -588,7 +588,7 @@ fn rustscript_named_function_capture_runtime_cases_work() {
             name: "top-level named function capture snapshots at declaration time",
             source: r#"
                 let mut base = 5;
-                fn add(v) { v + base; }
+                fn add(v) { v + base }
                 base = 100;
                 add(1);
             "#,
@@ -600,7 +600,7 @@ fn rustscript_named_function_capture_runtime_cases_work() {
             name: "named function capture via copy keeps source reusable",
             source: r#"
                 let a = "x";
-                fn add(v) { v + a.copy(); }
+                fn add(v) { v + a.copy() }
                 let d = a;
                 add(d);
             "#,
@@ -612,8 +612,8 @@ fn rustscript_named_function_capture_runtime_cases_work() {
             name: "nested named functions can capture outer locals and call siblings",
             source: r#"
                 fn outer(base) {
-                    fn inc(v) { v + 1; }
-                    fn add_base(v) { inc(v) + base; }
+                    fn inc(v) { v + 1 }
+                    fn add_base(v) { inc(v) + base }
                     add_base(2);
                 }
                 outer(3);
@@ -627,13 +627,32 @@ fn rustscript_named_function_capture_runtime_cases_work() {
 }
 
 #[test]
+fn rustscript_named_function_block_body_allows_trailing_expression_without_semicolon() {
+    let case = RuntimeCase {
+        name: "named function block body allows trailing expression without semicolon",
+        source: r#"
+            fn addme(x) {
+                let doubled = x + x;
+                doubled + 1
+            }
+
+            addme(20);
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_stack: vec![Value::Int(41)],
+        expected_locals: None,
+    };
+    run_runtime_case(&case);
+}
+
+#[test]
 fn rustscript_named_function_capture_error_cases_work() {
     let cases = [
         SourceErrorCase {
             name: "named function default capture moves movable local",
             source: r#"
                 let a = "";
-                fn add(v) { v + a; }
+                fn add(v) { v + a }
                 let d = a;
                 d;
             "#,
@@ -644,7 +663,7 @@ fn rustscript_named_function_capture_error_cases_work() {
         SourceErrorCase {
             name: "named function recursion is still rejected",
             source: r#"
-                fn recurse(x) { recurse(x); }
+                fn recurse(x) { recurse(x) }
                 recurse(1);
             "#,
             flavor: SourceFlavor::RustScript,

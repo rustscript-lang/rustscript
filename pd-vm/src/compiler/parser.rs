@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 use rt_format::{FormatArgument, NoNamedArguments, ParsedFormat, Specifier};
 
+use crate::ValueType;
 use crate::builtins::{
     BuiltinFunction, builtin_namespace_hint, is_builtin_namespace, namespace_supports_regex_flags,
     resolve_builtin_namespace_call,
 };
 use crate::compiler::source_map::{SourceId, Span};
-use crate::ValueType;
 
 use super::{
     ParseError, ReplLocalBinding, STDLIB_PRINT_ARITY, STDLIB_PRINT_NAME,
@@ -752,6 +752,177 @@ struct ClosureCaptureContext {
     capture_copies: Vec<(LocalSlot, LocalSlot)>,
 }
 
+pub(super) fn lint_trailing_function_return_semicolons(
+    source: &str,
+    source_id: SourceId,
+    dialect: &'static dyn ParserDialect,
+) -> Result<Vec<ParseError>, ParseError> {
+    let mut lexer = Lexer::new(source, source_id, dialect);
+    let mut tokens = Vec::new();
+    loop {
+        let token = lexer.next_token()?;
+        let is_eof = matches!(token.kind, TokenKind::Eof);
+        tokens.push(token);
+        if is_eof {
+            break;
+        }
+    }
+
+    Ok(find_function_return_semicolon_diagnostics(&tokens))
+}
+
+fn find_function_return_semicolon_diagnostics(tokens: &[Token]) -> Vec<ParseError> {
+    let mut diagnostics = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < tokens.len() {
+        if !matches!(tokens[cursor].kind, TokenKind::Fn) {
+            cursor += 1;
+            continue;
+        }
+
+        let Some(block_start) = find_function_block_start(tokens, cursor + 1) else {
+            cursor += 1;
+            continue;
+        };
+        let Some(block_end) = find_matching_block_end(tokens, block_start) else {
+            break;
+        };
+        if let Some(diagnostic) = lint_function_block_tail(tokens, block_start, block_end) {
+            diagnostics.push(diagnostic);
+        }
+        cursor = block_end.saturating_add(1);
+    }
+    diagnostics
+}
+
+fn find_function_block_start(tokens: &[Token], start: usize) -> Option<usize> {
+    let mut paren_depth = 0usize;
+    let mut cursor = start;
+    while let Some(token) = tokens.get(cursor) {
+        match token.kind {
+            TokenKind::LParen => paren_depth += 1,
+            TokenKind::RParen => paren_depth = paren_depth.saturating_sub(1),
+            TokenKind::LBrace if paren_depth == 0 => return Some(cursor),
+            TokenKind::Equal | TokenKind::Semicolon | TokenKind::Eof if paren_depth == 0 => {
+                return None;
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn find_matching_block_end(tokens: &[Token], block_start: usize) -> Option<usize> {
+    let mut brace_depth = 1usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    for (cursor, token) in tokens.iter().enumerate().skip(block_start + 1) {
+        match token.kind {
+            TokenKind::LParen => paren_depth += 1,
+            TokenKind::RParen => paren_depth = paren_depth.saturating_sub(1),
+            TokenKind::LBracket => bracket_depth += 1,
+            TokenKind::RBracket => bracket_depth = bracket_depth.saturating_sub(1),
+            TokenKind::LBrace if paren_depth == 0 && bracket_depth == 0 => brace_depth += 1,
+            TokenKind::RBrace if paren_depth == 0 && bracket_depth == 0 => {
+                brace_depth = brace_depth.saturating_sub(1);
+                if brace_depth == 0 {
+                    return Some(cursor);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn lint_function_block_tail(
+    tokens: &[Token],
+    block_start: usize,
+    block_end: usize,
+) -> Option<ParseError> {
+    let mut stmt_start = block_start + 1;
+    let mut last_terminated_stmt: Option<(usize, usize)> = None;
+    let mut saw_top_level_tokens_after_last_semicolon = false;
+    let mut brace_depth = 1usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+
+    for cursor in block_start + 1..=block_end {
+        let token = tokens.get(cursor)?;
+        match token.kind {
+            TokenKind::LParen => paren_depth += 1,
+            TokenKind::RParen => paren_depth = paren_depth.saturating_sub(1),
+            TokenKind::LBracket => bracket_depth += 1,
+            TokenKind::RBracket => bracket_depth = bracket_depth.saturating_sub(1),
+            TokenKind::LBrace if paren_depth == 0 && bracket_depth == 0 => brace_depth += 1,
+            TokenKind::Semicolon if brace_depth == 1 && paren_depth == 0 && bracket_depth == 0 => {
+                last_terminated_stmt = Some((stmt_start, cursor));
+                stmt_start = cursor + 1;
+                saw_top_level_tokens_after_last_semicolon = false;
+            }
+            TokenKind::RBrace if paren_depth == 0 && bracket_depth == 0 => {
+                brace_depth = brace_depth.saturating_sub(1);
+                if brace_depth == 0 {
+                    let Some((stmt_start, semi_index)) = last_terminated_stmt else {
+                        return None;
+                    };
+                    if saw_top_level_tokens_after_last_semicolon
+                        || !statement_looks_like_function_return(tokens, stmt_start, semi_index)
+                    {
+                        return None;
+                    }
+                    let semi = tokens.get(semi_index)?;
+                    return Some(ParseError {
+                        line: semi.line,
+                        message: "function return expression should not end with ';'".to_string(),
+                        span: Some(semi.span),
+                        code: None,
+                    });
+                }
+            }
+            _ => {
+                if brace_depth == 1
+                    && paren_depth == 0
+                    && bracket_depth == 0
+                    && !matches!(token.kind, TokenKind::Eof)
+                {
+                    saw_top_level_tokens_after_last_semicolon = true;
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn statement_looks_like_function_return(tokens: &[Token], start: usize, end: usize) -> bool {
+    let first = tokens
+        .iter()
+        .skip(start)
+        .take(end.saturating_sub(start) + 1)
+        .find(|token| !matches!(token.kind, TokenKind::Semicolon));
+
+    let Some(first) = first else {
+        return false;
+    };
+
+    match &first.kind {
+        TokenKind::Let
+        | TokenKind::Fn
+        | TokenKind::Pub
+        | TokenKind::Use
+        | TokenKind::Import
+        | TokenKind::For
+        | TokenKind::If
+        | TokenKind::While
+        | TokenKind::Break
+        | TokenKind::Continue => false,
+        TokenKind::Ident(name) if name == "return" => false,
+        _ => true,
+    }
+}
+
 impl Parser {
     pub(super) fn new(
         source: &str,
@@ -1323,6 +1494,7 @@ impl Parser {
     fn parse_function_impl_block(&mut self, params: &[String]) -> Result<FunctionImpl, ParseError> {
         self.parse_function_impl(params, |parser| {
             let mut body_stmts = Vec::new();
+            let mut trailing_expr: Option<Expr> = None;
             while !parser.check(&TokenKind::RBrace) {
                 if parser.check(&TokenKind::Eof) {
                     return Err(ParseError {
@@ -1332,26 +1504,43 @@ impl Parser {
                         message: "unexpected end of input in function body".to_string(),
                     });
                 }
-                body_stmts.push(parser.parse_stmt()?);
+
+                if parser.starts_trailing_expr_block_statement() {
+                    body_stmts.push(parser.parse_stmt()?);
+                    continue;
+                }
+
+                let line = parser.current_line_u32();
+                let expr = parser.parse_expr()?;
+                if parser.check(&TokenKind::RBrace) {
+                    trailing_expr = Some(expr);
+                    break;
+                }
+                parser.consume_stmt_terminator("expected ';' after expression")?;
+                body_stmts.push(Stmt::Expr { expr, line });
             }
 
-            let Some(last_stmt) = body_stmts.pop() else {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: parser.current_line(),
-                    message: "function body must end with an expression statement".to_string(),
-                });
-            };
-            let body_expr = if let Stmt::Expr { expr, .. } = last_stmt {
+            let body_expr = if let Some(expr) = trailing_expr {
                 expr
             } else {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: parser.current_line(),
-                    message: "function body must end with an expression statement".to_string(),
-                });
+                let Some(last_stmt) = body_stmts.pop() else {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: parser.current_line(),
+                        message: "function body must end with an expression statement".to_string(),
+                    });
+                };
+                if let Stmt::Expr { expr, .. } = last_stmt {
+                    expr
+                } else {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: parser.current_line(),
+                        message: "function body must end with an expression statement".to_string(),
+                    });
+                }
             };
 
             Ok((body_stmts, body_expr))
@@ -2078,7 +2267,7 @@ impl Parser {
                 });
             }
 
-            if self.starts_if_expr_branch_statement() {
+            if self.starts_trailing_expr_block_statement() {
                 stmts.push(self.parse_stmt()?);
                 continue;
             }
@@ -3722,8 +3911,7 @@ impl Parser {
     }
 
     fn match_return_type_arrow(&mut self) -> bool {
-        if self.check(&TokenKind::Minus) && self.check_kind_at(self.pos + 1, &TokenKind::Greater)
-        {
+        if self.check(&TokenKind::Minus) && self.check_kind_at(self.pos + 1, &TokenKind::Greater) {
             self.pos += 2;
             true
         } else {
@@ -3954,15 +4142,17 @@ impl Parser {
         })
     }
 
-    fn starts_if_expr_branch_statement(&self) -> bool {
+    fn starts_trailing_expr_block_statement(&self) -> bool {
         if self.check(&TokenKind::Pub)
             || self.check(&TokenKind::Use)
+            || (self.dialect.allow_import_stmt() && self.check(&TokenKind::Import))
             || self.check(&TokenKind::Fn)
             || self.check(&TokenKind::Let)
             || self.check(&TokenKind::For)
             || self.check(&TokenKind::While)
             || self.check(&TokenKind::Break)
             || self.check(&TokenKind::Continue)
+            || (self.dialect.allow_return_stmt() && self.check_ident_literal("return"))
             || self.check_assignment_start()
             || self.check_index_assignment_start()
         {
