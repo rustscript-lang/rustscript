@@ -4,7 +4,16 @@ use crate::builtins::BuiltinFunction;
 use crate::bytecode::ValueType;
 
 use super::CompileError;
-use super::ir::{ClosureExpr, Expr, FrontendIr, FunctionImpl, LocalSlot, Stmt};
+use super::ir::{ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SimpleType {
+    Null,
+    Int,
+    Float,
+    Bool,
+    String,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BoundType {
@@ -15,7 +24,9 @@ pub(crate) enum BoundType {
     Bool,
     String,
     Array,
+    ArrayOf(Option<SimpleType>),
     Map,
+    MapOf(Option<SimpleType>),
 }
 
 impl BoundType {
@@ -27,8 +38,29 @@ impl BoundType {
             BoundType::Float => Some("float"),
             BoundType::Bool => Some("bool"),
             BoundType::String => Some("string"),
-            BoundType::Array => Some("array"),
-            BoundType::Map => Some("map"),
+            BoundType::Array | BoundType::ArrayOf(_) => Some("array"),
+            BoundType::Map | BoundType::MapOf(_) => Some("map"),
+        }
+    }
+
+    fn simple_type(self) -> Option<SimpleType> {
+        match self {
+            BoundType::Null => Some(SimpleType::Null),
+            BoundType::Int => Some(SimpleType::Int),
+            BoundType::Float => Some(SimpleType::Float),
+            BoundType::Bool => Some(SimpleType::Bool),
+            BoundType::String => Some(SimpleType::String),
+            _ => None,
+        }
+    }
+
+    fn from_simple(value: SimpleType) -> Self {
+        match value {
+            SimpleType::Null => BoundType::Null,
+            SimpleType::Int => BoundType::Int,
+            SimpleType::Float => BoundType::Float,
+            SimpleType::Bool => BoundType::Bool,
+            SimpleType::String => BoundType::String,
         }
     }
 }
@@ -42,10 +74,65 @@ impl From<BoundType> for ValueType {
             BoundType::Float => ValueType::Float,
             BoundType::Bool => ValueType::Bool,
             BoundType::String => ValueType::String,
-            BoundType::Array => ValueType::Array,
-            BoundType::Map => ValueType::Map,
+            BoundType::Array | BoundType::ArrayOf(_) => ValueType::Array,
+            BoundType::Map | BoundType::MapOf(_) => ValueType::Map,
         }
     }
+}
+
+impl From<ValueType> for BoundType {
+    fn from(value: ValueType) -> Self {
+        match value {
+            ValueType::Unknown => BoundType::Unknown,
+            ValueType::Null => BoundType::Null,
+            ValueType::Int => BoundType::Int,
+            ValueType::Float => BoundType::Float,
+            ValueType::Bool => BoundType::Bool,
+            ValueType::String => BoundType::String,
+            ValueType::Array => BoundType::Array,
+            ValueType::Map => BoundType::Map,
+        }
+    }
+}
+
+fn merge_container_element_types(lhs: Option<SimpleType>, rhs: Option<SimpleType>) -> BoundType {
+    match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) if lhs == rhs => BoundType::ArrayOf(Some(lhs)),
+        (None, Some(rhs)) | (Some(rhs), None) => BoundType::ArrayOf(Some(rhs)),
+        (None, None) => BoundType::ArrayOf(None),
+        _ => BoundType::Array,
+    }
+}
+
+fn merge_map_element_types(lhs: Option<SimpleType>, rhs: Option<SimpleType>) -> BoundType {
+    match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) if lhs == rhs => BoundType::MapOf(Some(lhs)),
+        (None, Some(rhs)) | (Some(rhs), None) => BoundType::MapOf(Some(rhs)),
+        (None, None) => BoundType::MapOf(None),
+        _ => BoundType::Map,
+    }
+}
+
+fn merge_bound_types(lhs: BoundType, rhs: BoundType) -> BoundType {
+    if lhs == rhs {
+        return lhs;
+    }
+
+    match (lhs, rhs) {
+        (BoundType::ArrayOf(lhs), BoundType::ArrayOf(rhs)) => merge_container_element_types(lhs, rhs),
+        (BoundType::Array, BoundType::ArrayOf(_)) | (BoundType::ArrayOf(_), BoundType::Array) => {
+            BoundType::Array
+        }
+        (BoundType::MapOf(lhs), BoundType::MapOf(rhs)) => merge_map_element_types(lhs, rhs),
+        (BoundType::Map, BoundType::MapOf(_)) | (BoundType::MapOf(_), BoundType::Map) => {
+            BoundType::Map
+        }
+        _ => BoundType::Unknown,
+    }
+}
+
+fn are_compatible_bound_types(lhs: BoundType, rhs: BoundType) -> bool {
+    lhs == BoundType::Unknown || rhs == BoundType::Unknown || merge_bound_types(lhs, rhs) != BoundType::Unknown
 }
 
 #[derive(Clone, Debug)]
@@ -107,18 +194,13 @@ impl LocalTypeState {
         }
     }
 
-    pub(crate) fn clear(&mut self) {
-        self.by_slot.clear();
-        self.callables.clear();
-    }
-
     pub(crate) fn merge_from_branches(&mut self, lhs: &LocalTypeState, rhs: &LocalTypeState) {
         self.by_slot.clear();
         self.callables.clear();
         for slot in lhs.by_slot.keys().chain(rhs.by_slot.keys()) {
             let l = lhs.get(*slot);
             let r = rhs.get(*slot);
-            let merged = if l == r { l } else { BoundType::Unknown };
+            let merged = merge_bound_types(l, r);
             if merged != BoundType::Unknown {
                 self.by_slot.insert(*slot, merged);
             }
@@ -138,12 +220,35 @@ impl LocalTypeState {
     }
 }
 
-fn merge_loop_exit_state(
-    state: &mut LocalTypeState,
-    zero_iteration: &LocalTypeState,
-    iterated: &LocalTypeState,
-) {
-    state.merge_from_branches(zero_iteration, iterated);
+fn stabilize_loop_state<F>(state: &mut LocalTypeState, mut run_iteration: F)
+where
+    F: FnMut(&mut LocalTypeState),
+{
+    let zero_iteration = state.clone();
+    let mut first_iteration = state.clone();
+    run_iteration(&mut first_iteration);
+    let mut second_iteration = first_iteration.clone();
+    run_iteration(&mut second_iteration);
+
+    let mut stable_iteration = LocalTypeState::default();
+    stable_iteration.merge_from_branches(&first_iteration, &second_iteration);
+    state.merge_from_branches(&zero_iteration, &stable_iteration);
+}
+
+fn try_stabilize_loop_state<E, F>(state: &mut LocalTypeState, mut run_iteration: F) -> Result<(), E>
+where
+    F: FnMut(&mut LocalTypeState) -> Result<(), E>,
+{
+    let zero_iteration = state.clone();
+    let mut first_iteration = state.clone();
+    run_iteration(&mut first_iteration)?;
+    let mut second_iteration = first_iteration.clone();
+    run_iteration(&mut second_iteration)?;
+
+    let mut stable_iteration = LocalTypeState::default();
+    stable_iteration.merge_from_branches(&first_iteration, &second_iteration);
+    state.merge_from_branches(&zero_iteration, &stable_iteration);
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -153,13 +258,18 @@ pub(crate) struct TypeInferenceResult {
 
 struct TypeContext<'a> {
     function_impls: &'a HashMap<u16, FunctionImpl>,
+    host_import_return_types: &'a HashMap<u16, BoundType>,
     active_functions: Vec<u16>,
 }
 
 impl<'a> TypeContext<'a> {
-    fn new(function_impls: &'a HashMap<u16, FunctionImpl>) -> Self {
+    fn new(
+        function_impls: &'a HashMap<u16, FunctionImpl>,
+        host_import_return_types: &'a HashMap<u16, BoundType>,
+    ) -> Self {
         Self {
             function_impls,
+            host_import_return_types,
             active_functions: Vec::new(),
         }
     }
@@ -247,27 +357,30 @@ impl<'a> TypeContext<'a> {
         match expr {
             Expr::Call(index, args) => {
                 if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
-                    match builtin {
-                        BuiltinFunction::ArrayNew => BoundType::Array,
-                        BuiltinFunction::MapNew => BoundType::Map,
-                        BuiltinFunction::Len | BuiltinFunction::Count => BoundType::Int,
-                        BuiltinFunction::FormatTemplate
-                        | BuiltinFunction::ToString
-                        | BuiltinFunction::TypeOf => BoundType::String,
-                        BuiltinFunction::ArrayPush if args.len() == 2 => BoundType::Array,
-                        BuiltinFunction::Set if args.len() == 3 => {
-                            self.infer_expr_type(&args[0], state)
-                        }
-                        BuiltinFunction::Get => BoundType::Unknown,
-                        _ => BoundType::Unknown,
-                    }
+                    self.infer_builtin_call_like_expr_type(builtin, args, state)
                 } else {
-                    self.infer_function_return(*index, args, state)
+                    let inferred = self.infer_function_return(*index, args, state);
+                    if inferred != BoundType::Unknown {
+                        inferred
+                    } else {
+                        self.host_import_return_types
+                            .get(index)
+                            .copied()
+                            .unwrap_or(BoundType::Unknown)
+                    }
                 }
             }
             Expr::LocalCall(slot, args) => match state.callable(*slot).cloned() {
                 Some(InferredCallable::Function(index)) => {
-                    self.infer_function_return(index, args, state)
+                    let inferred = self.infer_function_return(index, args, state);
+                    if inferred != BoundType::Unknown {
+                        inferred
+                    } else {
+                        self.host_import_return_types
+                            .get(&index)
+                            .copied()
+                            .unwrap_or(BoundType::Unknown)
+                    }
                 }
                 Some(InferredCallable::Closure(closure)) => {
                     self.infer_closure_return(&closure, args, state)
@@ -277,6 +390,198 @@ impl<'a> TypeContext<'a> {
             Expr::ClosureCall(closure, args) => self.infer_closure_return(closure, args, state),
             Expr::Closure(_) | Expr::FunctionRef(_) => BoundType::Unknown,
             _ => BoundType::Unknown,
+        }
+    }
+
+    fn infer_builtin_call_like_expr_type(
+        &mut self,
+        builtin: BuiltinFunction,
+        args: &[Expr],
+        state: &LocalTypeState,
+    ) -> BoundType {
+        match builtin {
+            BuiltinFunction::ArrayNew => BoundType::ArrayOf(None),
+            BuiltinFunction::MapNew => BoundType::MapOf(None),
+            BuiltinFunction::Concat if args.len() == 2 => {
+                self.infer_concat_return_type(&args[0], &args[1], state)
+            }
+            BuiltinFunction::Slice if args.len() == 3 => {
+                self.infer_slice_return_type(&args[0], state)
+            }
+            BuiltinFunction::ArrayPush if args.len() == 2 => {
+                self.infer_array_push_return_type(&args[0], &args[1], state)
+            }
+            BuiltinFunction::Set if args.len() == 3 => {
+                self.infer_set_return_type(&args[0], &args[2], state)
+            }
+            BuiltinFunction::Get if args.len() == 2 => {
+                self.infer_get_return_type(&args[0], state)
+            }
+            BuiltinFunction::Keys if args.len() == 1 => {
+                self.infer_keys_return_type(&args[0], state)
+            }
+            BuiltinFunction::ReSplit => BoundType::ArrayOf(Some(SimpleType::String)),
+            BuiltinFunction::ReCaptures => BoundType::Array,
+            BuiltinFunction::MathAbs
+            | BuiltinFunction::MathFloor
+            | BuiltinFunction::MathCeil
+            | BuiltinFunction::MathRound
+            | BuiltinFunction::MathTrunc
+            | BuiltinFunction::MathSignum if args.len() == 1 => {
+                self.infer_same_numeric_return_type(&args[0], state)
+            }
+            BuiltinFunction::MathMin | BuiltinFunction::MathMax if args.len() == 2 => {
+                self.infer_numeric_pair_return_type(&args[0], &args[1], state)
+            }
+            BuiltinFunction::MathClamp if args.len() == 3 => {
+                self.infer_numeric_triplet_return_type(&args[0], &args[1], &args[2], state)
+            }
+            _ => BoundType::from(builtin.static_return_type()),
+        }
+    }
+
+    fn infer_concat_return_type(
+        &mut self,
+        lhs: &Expr,
+        rhs: &Expr,
+        state: &LocalTypeState,
+    ) -> BoundType {
+        let lhs_ty = self.infer_expr_type(lhs, state);
+        let rhs_ty = self.infer_expr_type(rhs, state);
+        match (lhs_ty, rhs_ty) {
+            (BoundType::String, BoundType::String) => BoundType::String,
+            (BoundType::ArrayOf(lhs), BoundType::ArrayOf(rhs)) => {
+                merge_container_element_types(lhs, rhs)
+            }
+            (BoundType::Array, BoundType::Array)
+            | (BoundType::Array, BoundType::ArrayOf(_))
+            | (BoundType::ArrayOf(_), BoundType::Array) => BoundType::Array,
+            _ => BoundType::Unknown,
+        }
+    }
+
+    fn infer_slice_return_type(&mut self, source: &Expr, state: &LocalTypeState) -> BoundType {
+        match self.infer_expr_type(source, state) {
+            BoundType::String => BoundType::String,
+            BoundType::Array => BoundType::Array,
+            BoundType::ArrayOf(element_type) => BoundType::ArrayOf(element_type),
+            _ => BoundType::Unknown,
+        }
+    }
+
+    fn infer_array_push_return_type(
+        &mut self,
+        array: &Expr,
+        value: &Expr,
+        state: &LocalTypeState,
+    ) -> BoundType {
+        let array_ty = self.infer_expr_type(array, state);
+        let value_simple = self.infer_expr_type(value, state).simple_type();
+        match (array_ty, value_simple) {
+            (BoundType::ArrayOf(None), Some(value_ty)) => BoundType::ArrayOf(Some(value_ty)),
+            (BoundType::ArrayOf(Some(existing)), Some(value_ty)) if existing == value_ty => {
+                BoundType::ArrayOf(Some(existing))
+            }
+            (BoundType::ArrayOf(_), _) => BoundType::Array,
+            (BoundType::Array, _) => BoundType::Array,
+            _ => BoundType::Unknown,
+        }
+    }
+
+    fn infer_set_return_type(
+        &mut self,
+        container: &Expr,
+        value: &Expr,
+        state: &LocalTypeState,
+    ) -> BoundType {
+        let container_ty = self.infer_expr_type(container, state);
+        let value_simple = self.infer_expr_type(value, state).simple_type();
+        match (container_ty, value_simple) {
+            (BoundType::ArrayOf(None), Some(value_ty)) => BoundType::ArrayOf(Some(value_ty)),
+            (BoundType::ArrayOf(Some(existing)), Some(value_ty)) if existing == value_ty => {
+                BoundType::ArrayOf(Some(existing))
+            }
+            (BoundType::ArrayOf(_), _) => BoundType::Array,
+            (BoundType::Array, _) => BoundType::Array,
+            (BoundType::MapOf(None), Some(value_ty)) => BoundType::MapOf(Some(value_ty)),
+            (BoundType::MapOf(Some(existing)), Some(value_ty)) if existing == value_ty => {
+                BoundType::MapOf(Some(existing))
+            }
+            (BoundType::MapOf(_), _) => BoundType::Map,
+            (BoundType::Map, _) => BoundType::Map,
+            _ => BoundType::Unknown,
+        }
+    }
+
+    fn infer_get_return_type(&mut self, container: &Expr, state: &LocalTypeState) -> BoundType {
+        match self.infer_expr_type(container, state) {
+            BoundType::String => BoundType::String,
+            BoundType::ArrayOf(Some(element_type)) | BoundType::MapOf(Some(element_type)) => {
+                BoundType::from_simple(element_type)
+            }
+            _ => BoundType::Unknown,
+        }
+    }
+
+    fn infer_keys_return_type(&mut self, container: &Expr, state: &LocalTypeState) -> BoundType {
+        match self.infer_expr_type(container, state) {
+            BoundType::Array | BoundType::ArrayOf(_) => BoundType::ArrayOf(Some(SimpleType::Int)),
+            BoundType::Map | BoundType::MapOf(_) => BoundType::Array,
+            _ => BoundType::Unknown,
+        }
+    }
+
+    fn infer_same_numeric_return_type(
+        &mut self,
+        expr: &Expr,
+        state: &LocalTypeState,
+    ) -> BoundType {
+        match self.infer_expr_type(expr, state) {
+            BoundType::Int => BoundType::Int,
+            BoundType::Float => BoundType::Float,
+            _ => BoundType::Unknown,
+        }
+    }
+
+    fn infer_numeric_pair_return_type(
+        &mut self,
+        lhs: &Expr,
+        rhs: &Expr,
+        state: &LocalTypeState,
+    ) -> BoundType {
+        let lhs_ty = self.infer_expr_type(lhs, state);
+        let rhs_ty = self.infer_expr_type(rhs, state);
+        if lhs_ty == BoundType::Int && rhs_ty == BoundType::Int {
+            BoundType::Int
+        } else if is_numeric_bound_type(lhs_ty) && is_numeric_bound_type(rhs_ty) {
+            BoundType::Float
+        } else {
+            BoundType::Unknown
+        }
+    }
+
+    fn infer_numeric_triplet_return_type(
+        &mut self,
+        first: &Expr,
+        second: &Expr,
+        third: &Expr,
+        state: &LocalTypeState,
+    ) -> BoundType {
+        let first_ty = self.infer_expr_type(first, state);
+        let second_ty = self.infer_expr_type(second, state);
+        let third_ty = self.infer_expr_type(third, state);
+        if first_ty == BoundType::Int
+            && second_ty == BoundType::Int
+            && third_ty == BoundType::Int
+        {
+            BoundType::Int
+        } else if is_numeric_bound_type(first_ty)
+            && is_numeric_bound_type(second_ty)
+            && is_numeric_bound_type(third_ty)
+        {
+            BoundType::Float
+        } else {
+            BoundType::Unknown
         }
     }
 
@@ -385,21 +690,19 @@ impl<'a> TypeContext<'a> {
                     ..
                 } => {
                     self.apply_stmts(std::slice::from_ref(init), state);
-                    let _ = self.infer_expr_type(condition, state);
-                    let zero_iteration = state.clone();
-                    let mut iterated = state.clone();
-                    self.apply_stmts(body, &mut iterated);
-                    self.apply_stmts(std::slice::from_ref(post), &mut iterated);
-                    merge_loop_exit_state(state, &zero_iteration, &iterated);
+                    stabilize_loop_state(state, |iterated| {
+                        let _ = self.infer_expr_type(condition, iterated);
+                        self.apply_stmts(body, iterated);
+                        self.apply_stmts(std::slice::from_ref(post), iterated);
+                    });
                 }
                 Stmt::While {
                     condition, body, ..
                 } => {
-                    let _ = self.infer_expr_type(condition, state);
-                    let zero_iteration = state.clone();
-                    let mut iterated = state.clone();
-                    self.apply_stmts(body, &mut iterated);
-                    merge_loop_exit_state(state, &zero_iteration, &iterated);
+                    stabilize_loop_state(state, |iterated| {
+                        let _ = self.infer_expr_type(condition, iterated);
+                        self.apply_stmts(body, iterated);
+                    });
                 }
             }
         }
@@ -437,63 +740,84 @@ impl<'a> TypeContext<'a> {
 }
 
 pub(super) fn legalize_builtins_and_bind_types(mut ir: FrontendIr) -> FrontendIr {
+    let host_import_return_types = build_host_import_return_types(&ir.functions, &ir.function_impls);
     let mut top_state = LocalTypeState::default();
-    let mut context = TypeContext::new(&ir.function_impls);
+    let mut context = TypeContext::new(&ir.function_impls, &host_import_return_types);
     legalize_stmts(&mut ir.stmts, &mut top_state, &mut context);
 
     let function_impls = ir.function_impls.clone();
     for function_impl in ir.function_impls.values_mut() {
-        legalize_function_impl(function_impl, &function_impls);
+        legalize_function_impl(function_impl, &function_impls, &host_import_return_types);
     }
 
     ir
 }
 
 pub(super) fn infer_types(ir: &FrontendIr) -> TypeInferenceResult {
+    let host_import_return_types = build_host_import_return_types(&ir.functions, &ir.function_impls);
     let mut local_types = vec![ValueType::Unknown; ir.locals];
     let mut top_state = LocalTypeState::default();
-    let mut context = TypeContext::new(&ir.function_impls);
+    let mut context = TypeContext::new(&ir.function_impls, &host_import_return_types);
     collect_stmt_types(&ir.stmts, &mut top_state, &mut local_types, &mut context);
 
     for function_impl in ir.function_impls.values() {
-        collect_function_types(function_impl, &mut local_types, &ir.function_impls);
+        collect_function_types(
+            function_impl,
+            &mut local_types,
+            &ir.function_impls,
+            &host_import_return_types,
+        );
     }
 
     TypeInferenceResult { local_types }
 }
 
 pub(super) fn validate_if_else_type_consistency(ir: &FrontendIr) -> Result<(), CompileError> {
+    let host_import_return_types = build_host_import_return_types(&ir.functions, &ir.function_impls);
     let mut top_state = LocalTypeState::default();
-    let mut context = TypeContext::new(&ir.function_impls);
+    let mut context = TypeContext::new(&ir.function_impls, &host_import_return_types);
     validate_stmts(&ir.stmts, &mut top_state, None, &mut context)?;
 
     for function_impl in ir.function_impls.values() {
-        validate_function_impl(function_impl, &ir.function_impls)?;
+        validate_function_impl(function_impl, &ir.function_impls, &host_import_return_types)?;
     }
 
     Ok(())
 }
 
 pub(crate) fn infer_expr_type(expr: &Expr, state: &LocalTypeState) -> BoundType {
-    let empty = HashMap::new();
-    infer_expr_type_with_function_impls(expr, state, &empty)
+    let empty_impls: HashMap<u16, FunctionImpl> = HashMap::new();
+    let empty_imports: HashMap<u16, BoundType> = HashMap::new();
+    infer_expr_type_with_function_impls_and_imports(expr, state, &empty_impls, &empty_imports)
 }
 
-pub(crate) fn infer_expr_type_with_function_impls(
+pub(crate) fn infer_expr_type_with_function_impls_and_imports(
     expr: &Expr,
     state: &LocalTypeState,
     function_impls: &HashMap<u16, FunctionImpl>,
+    host_import_return_types: &HashMap<u16, BoundType>,
 ) -> BoundType {
-    let mut context = TypeContext::new(function_impls);
+    let mut context = TypeContext::new(function_impls, host_import_return_types);
     context.infer_expr_type(expr, state)
+}
+
+pub(crate) fn apply_stmts_with_function_impls_and_imports(
+    stmts: &[Stmt],
+    state: &mut LocalTypeState,
+    function_impls: &HashMap<u16, FunctionImpl>,
+    host_import_return_types: &HashMap<u16, BoundType>,
+) {
+    let mut context = TypeContext::new(function_impls, host_import_return_types);
+    context.apply_stmts(stmts, state);
 }
 
 fn legalize_function_impl(
     function_impl: &mut FunctionImpl,
     function_impls: &HashMap<u16, FunctionImpl>,
+    host_import_return_types: &HashMap<u16, BoundType>,
 ) {
     let mut state = LocalTypeState::default();
-    let mut context = TypeContext::new(function_impls);
+    let mut context = TypeContext::new(function_impls, host_import_return_types);
     for slot in &function_impl.param_slots {
         state.set(*slot, BoundType::Unknown);
     }
@@ -508,9 +832,10 @@ fn legalize_function_impl(
 fn validate_function_impl(
     function_impl: &FunctionImpl,
     function_impls: &HashMap<u16, FunctionImpl>,
+    host_import_return_types: &HashMap<u16, BoundType>,
 ) -> Result<(), CompileError> {
     let mut state = LocalTypeState::default();
-    let mut context = TypeContext::new(function_impls);
+    let mut context = TypeContext::new(function_impls, host_import_return_types);
     for slot in &function_impl.param_slots {
         state.set(*slot, BoundType::Unknown);
     }
@@ -565,21 +890,19 @@ fn legalize_stmts(stmts: &mut [Stmt], state: &mut LocalTypeState, context: &mut 
                 ..
             } => {
                 legalize_stmts(std::slice::from_mut(init), state, context);
-                let _ = legalize_expr(condition, state, context);
-                let zero_iteration = state.clone();
-                let mut iterated = state.clone();
-                legalize_stmts(body, &mut iterated, context);
-                legalize_stmts(std::slice::from_mut(post), &mut iterated, context);
-                merge_loop_exit_state(state, &zero_iteration, &iterated);
+                stabilize_loop_state(state, |iterated| {
+                    let _ = legalize_expr(condition, iterated, context);
+                    legalize_stmts(body, iterated, context);
+                    legalize_stmts(std::slice::from_mut(post), iterated, context);
+                });
             }
             Stmt::While {
                 condition, body, ..
             } => {
-                let _ = legalize_expr(condition, state, context);
-                let zero_iteration = state.clone();
-                let mut iterated = state.clone();
-                legalize_stmts(body, &mut iterated, context);
-                merge_loop_exit_state(state, &zero_iteration, &iterated);
+                stabilize_loop_state(state, |iterated| {
+                    let _ = legalize_expr(condition, iterated, context);
+                    legalize_stmts(body, iterated, context);
+                });
             }
         }
     }
@@ -633,28 +956,21 @@ fn validate_stmts(
                 line,
             } => {
                 validate_stmts(std::slice::from_ref(init), state, Some(*line), context)?;
-                let _ = validate_expr(condition, state, Some(*line), context)?;
-                let zero_iteration = state.clone();
-                let mut iterated = state.clone();
-                validate_stmts(body, &mut iterated, Some(*line), context)?;
-                validate_stmts(
-                    std::slice::from_ref(post),
-                    &mut iterated,
-                    Some(*line),
-                    context,
-                )?;
-                merge_loop_exit_state(state, &zero_iteration, &iterated);
+                try_stabilize_loop_state(state, |iterated| {
+                    let _ = validate_expr(condition, iterated, Some(*line), context)?;
+                    validate_stmts(body, iterated, Some(*line), context)?;
+                    validate_stmts(std::slice::from_ref(post), iterated, Some(*line), context)
+                })?;
             }
             Stmt::While {
                 condition,
                 body,
                 line,
             } => {
-                let _ = validate_expr(condition, state, Some(*line), context)?;
-                let zero_iteration = state.clone();
-                let mut iterated = state.clone();
-                validate_stmts(body, &mut iterated, Some(*line), context)?;
-                merge_loop_exit_state(state, &zero_iteration, &iterated);
+                try_stabilize_loop_state(state, |iterated| {
+                    let _ = validate_expr(condition, iterated, Some(*line), context)?;
+                    validate_stmts(body, iterated, Some(*line), context)
+                })?;
             }
         }
     }
@@ -675,6 +991,21 @@ fn bind_expr_result_to_slot(
     } else {
         state.set(slot, ty);
     }
+}
+
+fn build_host_import_return_types(
+    functions: &[FunctionDecl],
+    function_impls: &HashMap<u16, FunctionImpl>,
+) -> HashMap<u16, BoundType> {
+    functions
+        .iter()
+        .filter(|decl| !function_impls.contains_key(&decl.index))
+        .map(|decl| (decl.index, BoundType::from(decl.return_type)))
+        .collect()
+}
+
+fn is_numeric_bound_type(value: BoundType) -> bool {
+    matches!(value, BoundType::Int | BoundType::Float)
 }
 
 fn legalize_expr(
@@ -1014,7 +1345,7 @@ fn ensure_compatible_if_else_types(
     lhs: BoundType,
     rhs: BoundType,
 ) -> Result<(), CompileError> {
-    if lhs == BoundType::Unknown || rhs == BoundType::Unknown || lhs == rhs {
+    if are_compatible_bound_types(lhs, rhs) {
         return Ok(());
     }
     Err(CompileError::IfElseBranchTypeMismatch {
@@ -1035,7 +1366,7 @@ fn validate_branch_state_merge(
     for slot in lhs.by_slot.keys().chain(rhs.by_slot.keys()) {
         let left = lhs.get(*slot);
         let right = rhs.get(*slot);
-        if left == BoundType::Unknown || right == BoundType::Unknown || left == right {
+        if are_compatible_bound_types(left, right) {
             continue;
         }
         return Err(CompileError::IfElseBranchTypeMismatch {
@@ -1059,8 +1390,8 @@ fn bound_type_label(ty: BoundType) -> &'static str {
         BoundType::Float => "float",
         BoundType::Bool => "bool",
         BoundType::String => "string",
-        BoundType::Array => "array",
-        BoundType::Map => "map",
+        BoundType::Array | BoundType::ArrayOf(_) => "array",
+        BoundType::Map | BoundType::MapOf(_) => "map",
     }
 }
 
@@ -1068,9 +1399,10 @@ fn collect_function_types(
     function_impl: &FunctionImpl,
     local_types: &mut [ValueType],
     function_impls: &HashMap<u16, FunctionImpl>,
+    host_import_return_types: &HashMap<u16, BoundType>,
 ) {
     let mut state = LocalTypeState::default();
-    let mut context = TypeContext::new(function_impls);
+    let mut context = TypeContext::new(function_impls, host_import_return_types);
     for slot in &function_impl.param_slots {
         record_local_type(local_types, *slot, BoundType::Unknown);
         state.set(*slot, BoundType::Unknown);
@@ -1147,26 +1479,19 @@ fn collect_stmt_types(
                 ..
             } => {
                 collect_stmt_types(std::slice::from_ref(init), state, local_types, context);
-                let _ = context.infer_expr_type(condition, state);
-                let zero_iteration = state.clone();
-                let mut iterated = state.clone();
-                collect_stmt_types(body, &mut iterated, local_types, context);
-                collect_stmt_types(
-                    std::slice::from_ref(post),
-                    &mut iterated,
-                    local_types,
-                    context,
-                );
-                merge_loop_exit_state(state, &zero_iteration, &iterated);
+                stabilize_loop_state(state, |iterated| {
+                    let _ = context.infer_expr_type(condition, iterated);
+                    collect_stmt_types(body, iterated, local_types, context);
+                    collect_stmt_types(std::slice::from_ref(post), iterated, local_types, context);
+                });
             }
             Stmt::While {
                 condition, body, ..
             } => {
-                let _ = context.infer_expr_type(condition, state);
-                let zero_iteration = state.clone();
-                let mut iterated = state.clone();
-                collect_stmt_types(body, &mut iterated, local_types, context);
-                merge_loop_exit_state(state, &zero_iteration, &iterated);
+                stabilize_loop_state(state, |iterated| {
+                    let _ = context.infer_expr_type(condition, iterated);
+                    collect_stmt_types(body, iterated, local_types, context);
+                });
             }
         }
     }

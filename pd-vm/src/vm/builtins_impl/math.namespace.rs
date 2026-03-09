@@ -8,12 +8,29 @@ macro_rules! declare_math_namespace {
             runtime_supported_on_wasm: true,
             supports_regex_flags: false,
             members: [
-                namespace_builtin!(MathPi, "pi", 0, builtin_math_pi, args_ref, "Return pi."),
-                namespace_builtin!(MathTau, "tau", 0, builtin_math_tau, args_ref, "Return tau."),
+                namespace_builtin!(
+                    MathPi,
+                    "pi",
+                    0,
+                    Float,
+                    builtin_math_pi,
+                    args_ref,
+                    "Return pi."
+                ),
+                namespace_builtin!(
+                    MathTau,
+                    "tau",
+                    0,
+                    Float,
+                    builtin_math_tau,
+                    args_ref,
+                    "Return tau."
+                ),
                 namespace_builtin!(
                     MathE,
                     "e",
                     0,
+                    Float,
                     builtin_math_e,
                     args_ref,
                     "Return Euler's number."
@@ -22,6 +39,7 @@ macro_rules! declare_math_namespace {
                     MathEpsilon,
                     "epsilon",
                     0,
+                    Float,
                     builtin_math_epsilon,
                     args_ref,
                     "Return f64 epsilon."
@@ -30,6 +48,7 @@ macro_rules! declare_math_namespace {
                     MathInf,
                     "inf",
                     0,
+                    Float,
                     builtin_math_inf,
                     args_ref,
                     "Return positive infinity."
@@ -38,15 +57,25 @@ macro_rules! declare_math_namespace {
                     MathNegInf,
                     "neg_inf",
                     0,
+                    Float,
                     builtin_math_neg_inf,
                     args_ref,
                     "Return negative infinity."
                 ),
-                namespace_builtin!(MathNaN, "nan", 0, builtin_math_nan, args_ref, "Return NaN."),
+                namespace_builtin!(
+                    MathNaN,
+                    "nan",
+                    0,
+                    Float,
+                    builtin_math_nan,
+                    args_ref,
+                    "Return NaN."
+                ),
                 namespace_builtin!(
                     MathAbs,
                     "abs",
                     1,
+                    Unknown,
                     builtin_math_abs,
                     args_ref,
                     "Absolute value."
@@ -55,6 +84,7 @@ macro_rules! declare_math_namespace {
                     MathSqrt,
                     "sqrt",
                     1,
+                    Float,
                     builtin_math_sqrt,
                     args_ref,
                     "Square root."
@@ -63,6 +93,7 @@ macro_rules! declare_math_namespace {
                     MathCbrt,
                     "cbrt",
                     1,
+                    Float,
                     builtin_math_cbrt,
                     args_ref,
                     "Cube root."
@@ -71,6 +102,7 @@ macro_rules! declare_math_namespace {
                     MathExp,
                     "exp",
                     1,
+                    Float,
                     builtin_math_exp,
                     args_ref,
                     "e raised to the value."
@@ -79,6 +111,7 @@ macro_rules! declare_math_namespace {
                     MathExp2,
                     "exp2",
                     1,
+                    Float,
                     builtin_math_exp2,
                     args_ref,
                     "2 raised to the value."
@@ -87,6 +120,7 @@ macro_rules! declare_math_namespace {
                     MathLn,
                     "ln",
                     1,
+                    Float,
                     builtin_math_ln,
                     args_ref,
                     "Natural logarithm."
@@ -95,6 +129,7 @@ macro_rules! declare_math_namespace {
                     MathLn1p,
                     "ln_1p",
                     1,
+                    Float,
                     builtin_math_ln_1p,
                     args_ref,
                     "Natural logarithm of 1 + value."
@@ -103,6 +138,7 @@ macro_rules! declare_math_namespace {
                     MathLog2,
                     "log2",
                     1,
+                    Float,
                     builtin_math_log2,
                     args_ref,
                     "Base-2 logarithm."
@@ -111,6 +147,7 @@ macro_rules! declare_math_namespace {
                     MathLog10,
                     "log10",
                     1,
+                    Float,
                     builtin_math_log10,
                     args_ref,
                     "Base-10 logarithm."
@@ -119,6 +156,7 @@ macro_rules! declare_math_namespace {
                     MathSin,
                     "sin",
                     1,
+                    Float,
                     builtin_math_sin,
                     args_ref,
                     "Sine."
@@ -127,6 +165,7 @@ macro_rules! declare_math_namespace {
                     MathCos,
                     "cos",
                     1,
+                    Float,
                     builtin_math_cos,
                     args_ref,
                     "Cosine."
@@ -135,6 +174,7 @@ macro_rules! declare_math_namespace {
                     MathTan,
                     "tan",
                     1,
+                    Float,
                     builtin_math_tan,
                     args_ref,
                     "Tangent."
@@ -143,6 +183,7 @@ macro_rules! declare_math_namespace {
                     MathAsin,
                     "asin",
                     1,
+                    Float,
                     builtin_math_asin,
                     args_ref,
                     "Arc sine."
@@ -151,6 +192,7 @@ macro_rules! declare_math_namespace {
                     MathAcos,
                     "acos",
                     1,
+                    Float,
                     builtin_math_acos,
                     args_ref,
                     "Arc cosine."
@@ -159,6 +201,7 @@ macro_rules! declare_math_namespace {
                     MathAtan,
                     "atan",
                     1,
+                    Float,
                     builtin_math_atan,
                     args_ref,
                     "Arc tangent."
@@ -167,6 +210,7 @@ macro_rules! declare_math_namespace {
                     MathSinh,
                     "sinh",
                     1,
+                    Float,
                     builtin_math_sinh,
                     args_ref,
                     "Hyperbolic sine."
@@ -175,6 +219,7 @@ macro_rules! declare_math_namespace {
                     MathCosh,
                     "cosh",
                     1,
+                    Float,
                     builtin_math_cosh,
                     args_ref,
                     "Hyperbolic cosine."
@@ -183,6 +228,7 @@ macro_rules! declare_math_namespace {
                     MathTanh,
                     "tanh",
                     1,
+                    Float,
                     builtin_math_tanh,
                     args_ref,
                     "Hyperbolic tangent."
@@ -191,6 +237,7 @@ macro_rules! declare_math_namespace {
                     MathFloor,
                     "floor",
                     1,
+                    Unknown,
                     builtin_math_floor,
                     args_ref,
                     "Round toward negative infinity."
@@ -199,6 +246,7 @@ macro_rules! declare_math_namespace {
                     MathCeil,
                     "ceil",
                     1,
+                    Unknown,
                     builtin_math_ceil,
                     args_ref,
                     "Round toward positive infinity."
@@ -207,6 +255,7 @@ macro_rules! declare_math_namespace {
                     MathRound,
                     "round",
                     1,
+                    Unknown,
                     builtin_math_round,
                     args_ref,
                     "Round to nearest integer."
@@ -215,6 +264,7 @@ macro_rules! declare_math_namespace {
                     MathTrunc,
                     "trunc",
                     1,
+                    Unknown,
                     builtin_math_trunc,
                     args_ref,
                     "Truncate fractional digits."
@@ -223,6 +273,7 @@ macro_rules! declare_math_namespace {
                     MathFract,
                     "fract",
                     1,
+                    Float,
                     builtin_math_fract,
                     args_ref,
                     "Fractional part."
@@ -231,6 +282,7 @@ macro_rules! declare_math_namespace {
                     MathSignum,
                     "signum",
                     1,
+                    Unknown,
                     builtin_math_signum,
                     args_ref,
                     "Sign of the number."
@@ -239,6 +291,7 @@ macro_rules! declare_math_namespace {
                     MathToDegrees,
                     "to_degrees",
                     1,
+                    Float,
                     builtin_math_to_degrees,
                     args_ref,
                     "Convert radians to degrees."
@@ -247,6 +300,7 @@ macro_rules! declare_math_namespace {
                     MathToRadians,
                     "to_radians",
                     1,
+                    Float,
                     builtin_math_to_radians,
                     args_ref,
                     "Convert degrees to radians."
@@ -255,6 +309,7 @@ macro_rules! declare_math_namespace {
                     MathIsNaN,
                     "is_nan",
                     1,
+                    Bool,
                     builtin_math_is_nan,
                     args_ref,
                     "Check for NaN."
@@ -263,6 +318,7 @@ macro_rules! declare_math_namespace {
                     MathIsInfinite,
                     "is_infinite",
                     1,
+                    Bool,
                     builtin_math_is_infinite,
                     args_ref,
                     "Check for infinity."
@@ -271,6 +327,7 @@ macro_rules! declare_math_namespace {
                     MathIsFinite,
                     "is_finite",
                     1,
+                    Bool,
                     builtin_math_is_finite,
                     args_ref,
                     "Check for finite numbers."
@@ -279,6 +336,7 @@ macro_rules! declare_math_namespace {
                     MathAtan2,
                     "atan2",
                     2,
+                    Float,
                     builtin_math_atan2,
                     args_ref,
                     "Arc tangent of y/x using both signs."
@@ -287,6 +345,7 @@ macro_rules! declare_math_namespace {
                     MathPowF,
                     "powf",
                     2,
+                    Float,
                     builtin_math_powf,
                     args_ref,
                     "Raise value to a floating-point exponent."
@@ -295,6 +354,7 @@ macro_rules! declare_math_namespace {
                     MathPowI,
                     "powi",
                     2,
+                    Float,
                     builtin_math_powi,
                     args_ref,
                     "Raise value to an integer exponent."
@@ -303,6 +363,7 @@ macro_rules! declare_math_namespace {
                     MathHypot,
                     "hypot",
                     2,
+                    Float,
                     builtin_math_hypot,
                     args_ref,
                     "Euclidean length of a right triangle."
@@ -311,6 +372,7 @@ macro_rules! declare_math_namespace {
                     MathLog,
                     "log",
                     2,
+                    Float,
                     builtin_math_log,
                     args_ref,
                     "Logarithm in the provided base."
@@ -319,6 +381,7 @@ macro_rules! declare_math_namespace {
                     MathMin,
                     "min",
                     2,
+                    Unknown,
                     builtin_math_min,
                     args_ref,
                     "Minimum numeric value."
@@ -327,6 +390,7 @@ macro_rules! declare_math_namespace {
                     MathMax,
                     "max",
                     2,
+                    Unknown,
                     builtin_math_max,
                     args_ref,
                     "Maximum numeric value."
@@ -335,6 +399,7 @@ macro_rules! declare_math_namespace {
                     MathCopySign,
                     "copysign",
                     2,
+                    Float,
                     builtin_math_copysign,
                     args_ref,
                     "Return value with the sign of another number."
@@ -343,6 +408,7 @@ macro_rules! declare_math_namespace {
                     MathClamp,
                     "clamp",
                     3,
+                    Unknown,
                     builtin_math_clamp,
                     args_ref,
                     "Clamp value between min and max."
@@ -351,6 +417,7 @@ macro_rules! declare_math_namespace {
                     MathMulAdd,
                     "mul_add",
                     3,
+                    Float,
                     builtin_math_mul_add,
                     args_ref,
                     "Fused multiply-add."

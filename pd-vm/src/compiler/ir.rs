@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::ValueType;
+
 use super::ParseError;
 
 pub type LocalSlot = u16;
@@ -157,6 +159,7 @@ pub struct FunctionDecl {
     pub index: u16,
     pub args: Vec<String>,
     pub exported: bool,
+    pub return_type: ValueType,
 }
 
 #[derive(Clone, Debug)]
@@ -277,6 +280,7 @@ impl LocalIrBuilder {
                 .map(|slot| format!("arg{slot}"))
                 .collect(),
             exported: false,
+            return_type: ValueType::Unknown,
         });
         self.function_meta.insert(name.to_string(), (index, arity));
         Ok(())

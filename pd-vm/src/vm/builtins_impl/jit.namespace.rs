@@ -12,6 +12,7 @@ macro_rules! declare_jit_namespace {
                     JitSetConfig,
                     "set_config",
                     3,
+                    Map,
                     builtin_jit_set_config,
                     vm_args_owned,
                     "Replace JIT configuration."
@@ -20,6 +21,7 @@ macro_rules! declare_jit_namespace {
                     JitGetConfig,
                     "get_config",
                     0,
+                    Map,
                     builtin_jit_get_config,
                     vm_noargs,
                     "Return current JIT configuration."
@@ -28,6 +30,7 @@ macro_rules! declare_jit_namespace {
                     JitSetEnabled,
                     "set_enabled",
                     1,
+                    Bool,
                     builtin_jit_set_enabled,
                     vm_args_owned,
                     "Enable or disable JIT compilation."
@@ -36,6 +39,7 @@ macro_rules! declare_jit_namespace {
                     JitGetEnabled,
                     "get_enabled",
                     0,
+                    Bool,
                     builtin_jit_get_enabled,
                     vm_noargs,
                     "Return whether JIT is enabled."
@@ -44,6 +48,7 @@ macro_rules! declare_jit_namespace {
                     JitSetHotLoopThreshold,
                     "set_hot_loop_threshold",
                     1,
+                    Int,
                     builtin_jit_set_hot_loop_threshold,
                     vm_args_owned,
                     "Set hot loop threshold."
@@ -52,6 +57,7 @@ macro_rules! declare_jit_namespace {
                     JitGetHotLoopThreshold,
                     "get_hot_loop_threshold",
                     0,
+                    Int,
                     builtin_jit_get_hot_loop_threshold,
                     vm_noargs,
                     "Return hot loop threshold."
@@ -60,6 +66,7 @@ macro_rules! declare_jit_namespace {
                     JitSetMaxTraceLen,
                     "set_max_trace_len",
                     1,
+                    Int,
                     builtin_jit_set_max_trace_len,
                     vm_args_owned,
                     "Set maximum trace length."
@@ -68,6 +75,7 @@ macro_rules! declare_jit_namespace {
                     JitGetMaxTraceLen,
                     "get_max_trace_len",
                     0,
+                    Int,
                     builtin_jit_get_max_trace_len,
                     vm_noargs,
                     "Return maximum trace length."

@@ -144,6 +144,25 @@ fn remap_functions(
                     ),
                 })));
             }
+            if existing.return_type != func.return_type {
+                match (existing.return_type, func.return_type) {
+                    (crate::ValueType::Unknown, known) => existing.return_type = known,
+                    (known, crate::ValueType::Unknown) => existing.return_type = known,
+                    (lhs, rhs) => {
+                        return Err(SourcePathError::Source(SourceError::Parse(ParseError {
+                            span: None,
+                            code: None,
+                            line: 1,
+                            message: format!(
+                                "function '{}' declared with conflicting return type {} vs {}",
+                                func.name,
+                                value_type_name(lhs),
+                                value_type_name(rhs)
+                            ),
+                        })));
+                    }
+                }
+            }
             existing.exported = existing.exported || func.exported;
             *existing_index
         } else {
@@ -161,6 +180,7 @@ fn remap_functions(
                 index: next_index,
                 args: func.args.clone(),
                 exported: func.exported,
+                return_type: func.return_type,
             });
             function_index_by_name.insert(func.name.clone(), next_index);
             next_index
@@ -169,6 +189,19 @@ fn remap_functions(
     }
 
     Ok(map)
+}
+
+fn value_type_name(ty: crate::ValueType) -> &'static str {
+    match ty {
+        crate::ValueType::Unknown => "unknown",
+        crate::ValueType::Null => "null",
+        crate::ValueType::Int => "int",
+        crate::ValueType::Float => "float",
+        crate::ValueType::Bool => "bool",
+        crate::ValueType::String => "string",
+        crate::ValueType::Array => "array",
+        crate::ValueType::Map => "map",
+    }
 }
 
 fn remap_local_index(index: LocalSlot, local_base: usize) -> Result<LocalSlot, SourcePathError> {

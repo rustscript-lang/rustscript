@@ -7,6 +7,7 @@ use crate::builtins::{
     resolve_builtin_namespace_call,
 };
 use crate::compiler::source_map::{SourceId, Span};
+use crate::ValueType;
 
 use super::{
     ParseError, ReplLocalBinding, STDLIB_PRINT_ARITY, STDLIB_PRINT_NAME,
@@ -26,6 +27,25 @@ fn is_virtual_host_namespace_spec(spec: &str) -> bool {
         return false;
     };
     is_ident_start(first) && chars.all(is_ident_continue)
+}
+
+fn abi_value_type_to_value_type(value: edge_abi::AbiValueType) -> ValueType {
+    match value {
+        edge_abi::AbiValueType::Unknown => ValueType::Unknown,
+        edge_abi::AbiValueType::Null => ValueType::Null,
+        edge_abi::AbiValueType::Int => ValueType::Int,
+        edge_abi::AbiValueType::Float => ValueType::Float,
+        edge_abi::AbiValueType::Bool => ValueType::Bool,
+        edge_abi::AbiValueType::String => ValueType::String,
+        edge_abi::AbiValueType::Array => ValueType::Array,
+        edge_abi::AbiValueType::Map => ValueType::Map,
+    }
+}
+
+fn known_host_return_type(name: &str) -> ValueType {
+    edge_abi::function_by_name(name)
+        .map(|function| abi_value_type_to_value_type(function.return_type))
+        .unwrap_or(ValueType::Unknown)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1191,6 +1211,7 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::RParen, "expected ')' after parameters")?;
+        let return_type = self.parse_optional_declared_return_type()?;
 
         let arity = u8::try_from(params.len()).map_err(|_| ParseError {
             span: None,
@@ -1227,6 +1248,7 @@ impl Parser {
             index,
             args: params.clone(),
             exported,
+            return_type,
         };
         self.functions.insert(name.clone(), decl.clone());
         self.function_list.push(decl.clone());
@@ -1263,6 +1285,39 @@ impl Parser {
 
     fn parse_function_impl_expr(&mut self, params: &[String]) -> Result<FunctionImpl, ParseError> {
         self.parse_function_impl(params, |parser| Ok((Vec::new(), parser.parse_expr()?)))
+    }
+
+    fn parse_optional_declared_return_type(&mut self) -> Result<ValueType, ParseError> {
+        if !self.match_return_type_arrow() {
+            return Ok(ValueType::Unknown);
+        }
+
+        let ty = if self.match_kind(&TokenKind::Null) {
+            ValueType::Null
+        } else {
+            let name = self.expect_ident("expected return type after '->'")?;
+            match name.as_str() {
+                "unknown" => ValueType::Unknown,
+                "int" => ValueType::Int,
+                "float" => ValueType::Float,
+                "bool" => ValueType::Bool,
+                "string" => ValueType::String,
+                "array" => ValueType::Array,
+                "map" => ValueType::Map,
+                other => {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: self.current_line(),
+                        message: format!(
+                            "unknown declared return type '{other}', expected unknown/null/int/float/bool/string/array/map"
+                        ),
+                    });
+                }
+            }
+        };
+
+        Ok(ty)
     }
 
     fn parse_function_impl_block(&mut self, params: &[String]) -> Result<FunctionImpl, ParseError> {
@@ -3528,6 +3583,7 @@ impl Parser {
             index,
             args: (0..arity).map(|idx| format!("arg{idx}")).collect(),
             exported: true,
+            return_type: ValueType::Unknown,
         };
         self.functions.insert(name.to_string(), decl.clone());
         self.function_list.push(decl.clone());
@@ -3572,6 +3628,7 @@ impl Parser {
             index,
             args,
             exported: true,
+            return_type: ValueType::Unknown,
         };
         self.functions.insert(name.to_string(), decl.clone());
         self.function_list.push(decl.clone());
@@ -3612,6 +3669,7 @@ impl Parser {
             index,
             args,
             exported: false,
+            return_type: known_host_return_type(name),
         };
         self.functions.insert(name.to_string(), decl.clone());
         self.function_list.push(decl.clone());
@@ -3657,6 +3715,16 @@ impl Parser {
     fn match_kind(&mut self, kind: &TokenKind) -> bool {
         if self.check(kind) {
             self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn match_return_type_arrow(&mut self) -> bool {
+        if self.check(&TokenKind::Minus) && self.check_kind_at(self.pos + 1, &TokenKind::Greater)
+        {
+            self.pos += 2;
             true
         } else {
             false

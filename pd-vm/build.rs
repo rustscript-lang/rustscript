@@ -20,6 +20,7 @@ enum NamespaceMemberDecl {
         variant: String,
         member_name: String,
         arity: usize,
+        return_type: String,
         handler: String,
         dispatch: String,
         docs: String,
@@ -28,6 +29,7 @@ enum NamespaceMemberDecl {
         variant: String,
         member_name: String,
         arity: usize,
+        return_type: String,
         docs: String,
     },
 }
@@ -232,6 +234,8 @@ fn parse_member(kind: &str, args: &str) -> NamespaceMemberDecl {
     let (member_name, next) = parse_string(rest);
     rest = expect_comma(next);
     let (arity, next) = parse_usize(rest);
+    rest = expect_comma(next);
+    let (return_type, next) = parse_ident(rest);
     rest = next;
     match kind {
         "namespace_builtin" => {
@@ -249,6 +253,7 @@ fn parse_member(kind: &str, args: &str) -> NamespaceMemberDecl {
                 variant,
                 member_name,
                 arity,
+                return_type,
                 handler,
                 dispatch,
                 docs,
@@ -265,6 +270,7 @@ fn parse_member(kind: &str, args: &str) -> NamespaceMemberDecl {
                 variant,
                 member_name,
                 arity,
+                return_type,
                 docs,
             }
         }
@@ -278,7 +284,7 @@ fn render_metadata_modules(declarations: &[NamespaceDecl]) -> String {
         writeln!(&mut out, "mod {} {{", decl.module).unwrap();
         writeln!(
             &mut out,
-            "    use super::{{BuiltinFunction, BuiltinNamespaceLookup, BuiltinNamespaceMemberLookup, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec}};"
+            "    use super::{{BuiltinFunction, BuiltinNamespaceLookup, BuiltinNamespaceMemberLookup, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec, ValueType}};"
         )
         .unwrap();
         writeln!(
@@ -291,18 +297,20 @@ fn render_metadata_modules(declarations: &[NamespaceDecl]) -> String {
                 NamespaceMemberDecl::Builtin {
                     member_name,
                     arity,
+                    return_type,
                     docs,
                     ..
                 }
                 | NamespaceMemberDecl::Alias {
                     member_name,
                     arity,
+                    return_type,
                     docs,
                     ..
                 } => {
                     writeln!(
                         &mut out,
-                        "        BuiltinNamespaceMemberSpec::new({member_name:?}, {arity}, {docs:?}),"
+                        "        BuiltinNamespaceMemberSpec::new({member_name:?}, {arity}, ValueType::{return_type}, {docs:?}),"
                     )
                     .unwrap();
                 }
@@ -659,6 +667,66 @@ fn render_builtin_catalog(declarations: &[NamespaceDecl]) -> String {
     writeln!(&mut out, "            BuiltinFunction::ToString => 1,").unwrap();
     writeln!(&mut out, "            BuiltinFunction::TypeOf => 1,").unwrap();
     writeln!(&mut out, "            BuiltinFunction::Assert => 1,").unwrap();
+    writeln!(&mut out, "        }}").unwrap();
+    writeln!(&mut out, "    }}").unwrap();
+    writeln!(&mut out).unwrap();
+
+    writeln!(
+        &mut out,
+        "    pub(crate) fn static_return_type(self) -> ValueType {{"
+    )
+    .unwrap();
+    writeln!(&mut out, "        match self {{").unwrap();
+    writeln!(&mut out, "            BuiltinFunction::Len => ValueType::Int,").unwrap();
+    writeln!(
+        &mut out,
+        "            BuiltinFunction::ArrayNew => ValueType::Array,"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "            BuiltinFunction::MapNew => ValueType::Map,"
+    )
+    .unwrap();
+    writeln!(&mut out, "            BuiltinFunction::Keys => ValueType::Array,").unwrap();
+    writeln!(&mut out, "            BuiltinFunction::Count => ValueType::Int,").unwrap();
+    writeln!(
+        &mut out,
+        "            BuiltinFunction::FormatTemplate => ValueType::String,"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "            BuiltinFunction::ToString => ValueType::String,"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "            BuiltinFunction::TypeOf => ValueType::String,"
+    )
+    .unwrap();
+    writeln!(&mut out, "            BuiltinFunction::Assert => ValueType::Null,").unwrap();
+    writeln!(
+        &mut out,
+        "            BuiltinFunction::Slice | BuiltinFunction::Concat | BuiltinFunction::ArrayPush | BuiltinFunction::Get | BuiltinFunction::Set => ValueType::Unknown,"
+    )
+    .unwrap();
+    for decl in declarations {
+        for member in &decl.members {
+            if let NamespaceMemberDecl::Builtin {
+                variant,
+                return_type,
+                ..
+            } = member
+            {
+                writeln!(
+                    &mut out,
+                    "            BuiltinFunction::{variant} => ValueType::{return_type},"
+                )
+                .unwrap();
+            }
+        }
+    }
     writeln!(&mut out, "        }}").unwrap();
     writeln!(&mut out, "    }}").unwrap();
     writeln!(&mut out, "}}").unwrap();
