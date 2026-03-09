@@ -725,13 +725,26 @@ impl<'a> TypeContext<'a> {
         expr: &Expr,
         state: &LocalTypeState,
         line_context: Option<u32>,
+        source_name: Option<&str>,
     ) -> Result<(), CompileError> {
         match expr {
             Expr::Call(index, args) => {
                 if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
-                    self.validate_builtin_argument_types(builtin, args, state, line_context)
+                    self.validate_builtin_argument_types(
+                        builtin,
+                        args,
+                        state,
+                        line_context,
+                        source_name,
+                    )
                 } else if let Some(signature) = self.host_import_signatures.get(index).cloned() {
-                    self.validate_host_argument_types(&signature, args, state, line_context)
+                    self.validate_host_argument_types(
+                        &signature,
+                        args,
+                        state,
+                        line_context,
+                        source_name,
+                    )
                 } else {
                     Ok(())
                 }
@@ -739,10 +752,22 @@ impl<'a> TypeContext<'a> {
             Expr::LocalCall(slot, args) => match state.callable(*slot).cloned() {
                 Some(InferredCallable::Function(index)) => {
                     if let Some(builtin) = BuiltinFunction::from_call_index(index) {
-                        self.validate_builtin_argument_types(builtin, args, state, line_context)
+                        self.validate_builtin_argument_types(
+                            builtin,
+                            args,
+                            state,
+                            line_context,
+                            source_name,
+                        )
                     } else if let Some(signature) = self.host_import_signatures.get(&index).cloned()
                     {
-                        self.validate_host_argument_types(&signature, args, state, line_context)
+                        self.validate_host_argument_types(
+                            &signature,
+                            args,
+                            state,
+                            line_context,
+                            source_name,
+                        )
                     } else {
                         Ok(())
                     }
@@ -759,6 +784,7 @@ impl<'a> TypeContext<'a> {
         args: &[Expr],
         state: &LocalTypeState,
         line_context: Option<u32>,
+        source_name: Option<&str>,
     ) -> Result<(), CompileError> {
         validate_signature_overloads(
             &display_name_for_builtin(builtin),
@@ -768,6 +794,7 @@ impl<'a> TypeContext<'a> {
             state,
             self,
             line_context,
+            source_name,
         )
     }
 
@@ -777,6 +804,7 @@ impl<'a> TypeContext<'a> {
         args: &[Expr],
         state: &LocalTypeState,
         line_context: Option<u32>,
+        source_name: Option<&str>,
     ) -> Result<(), CompileError> {
         validate_host_signature(
             &signature.name,
@@ -785,6 +813,7 @@ impl<'a> TypeContext<'a> {
             state,
             self,
             line_context,
+            source_name,
         )
     }
 
@@ -956,13 +985,27 @@ pub(super) fn validate_if_else_type_consistency(ir: &FrontendIr) -> Result<(), C
         &host_import_return_types,
         &host_import_signatures,
     );
-    validate_stmts(&ir.stmts, &mut top_state, None, &mut context, false)?;
+    for (index, stmt) in ir.stmts.iter().enumerate() {
+        validate_stmts(
+            std::slice::from_ref(stmt),
+            &mut top_state,
+            None,
+            ir.stmt_sources.get(index).and_then(|source| source.as_deref()),
+            &mut context,
+            false,
+        )?;
+    }
 
     for decl in &ir.functions {
         let Some(function_impl) = ir.function_impls.get(&decl.index) else {
             continue;
         };
-        validate_function_impl(decl.index, function_impl, &mut context)?;
+        validate_function_impl(
+            decl.index,
+            function_impl,
+            ir.function_sources.get(&decl.index).map(String::as_str),
+            &mut context,
+        )?;
     }
 
     Ok(())
@@ -1047,6 +1090,7 @@ fn legalize_function_impl(
 fn validate_function_impl(
     function_index: u16,
     function_impl: &FunctionImpl,
+    source_name: Option<&str>,
     context: &mut TypeContext<'_>,
 ) -> Result<(), CompileError> {
     if let Some(detail) = context
@@ -1054,7 +1098,11 @@ fn validate_function_impl(
         .get(&function_index)
         .cloned()
     {
-        return Err(CompileError::FunctionParameterTypeConflict { line: None, detail });
+        return Err(CompileError::FunctionParameterTypeConflict {
+            line: None,
+            source_name: owned_source_name(source_name),
+            detail,
+        });
     }
     let mut state = LocalTypeState::default();
     let strict_function_add_types = context
@@ -1074,6 +1122,7 @@ fn validate_function_impl(
         &function_impl.body_stmts,
         &mut state,
         None,
+        source_name,
         context,
         strict_function_add_types,
     )?;
@@ -1081,6 +1130,7 @@ fn validate_function_impl(
         &function_impl.body_expr,
         &state,
         None,
+        source_name,
         context,
         strict_function_add_types,
     )?;
@@ -1151,6 +1201,7 @@ fn validate_stmts(
     stmts: &[Stmt],
     state: &mut LocalTypeState,
     line_context: Option<u32>,
+    source_name: Option<&str>,
     context: &mut TypeContext<'_>,
     strict_function_add_types: bool,
 ) -> Result<(), CompileError> {
@@ -1164,7 +1215,14 @@ fn validate_stmts(
                 state.set(*index, BoundType::Null);
             }
             Stmt::ClosureLet { closure, .. } => {
-                let _ = validate_expr(&closure.body, state, line_context, context, false)?;
+                let _ = validate_expr(
+                    &closure.body,
+                    state,
+                    line_context,
+                    source_name,
+                    context,
+                    false,
+                )?;
             }
             Stmt::Let { index, expr, line } | Stmt::Assign { index, expr, line } => {
                 let expr_state = state.clone();
@@ -1172,14 +1230,21 @@ fn validate_stmts(
                     expr,
                     &expr_state,
                     Some(*line),
+                    source_name,
                     context,
                     strict_function_add_types,
                 )?;
                 bind_expr_result_to_slot(state, *index, expr, &expr_state, ty, context);
             }
             Stmt::Expr { expr, line } => {
-                let _ =
-                    validate_expr(expr, state, Some(*line), context, strict_function_add_types)?;
+                let _ = validate_expr(
+                    expr,
+                    state,
+                    Some(*line),
+                    source_name,
+                    context,
+                    strict_function_add_types,
+                )?;
             }
             Stmt::IfElse {
                 condition,
@@ -1191,6 +1256,7 @@ fn validate_stmts(
                     condition,
                     state,
                     Some(*line),
+                    source_name,
                     context,
                     strict_function_add_types,
                 )?;
@@ -1200,6 +1266,7 @@ fn validate_stmts(
                     then_branch,
                     &mut then_state,
                     Some(*line),
+                    source_name,
                     context,
                     strict_function_add_types,
                 )?;
@@ -1207,10 +1274,11 @@ fn validate_stmts(
                     else_branch,
                     &mut else_state,
                     Some(*line),
+                    source_name,
                     context,
                     strict_function_add_types,
                 )?;
-                validate_branch_state_merge(Some(*line), &then_state, &else_state)?;
+                validate_branch_state_merge(Some(*line), source_name, &then_state, &else_state)?;
                 state.merge_from_branches(&then_state, &else_state);
             }
             Stmt::For {
@@ -1224,6 +1292,7 @@ fn validate_stmts(
                     std::slice::from_ref(init),
                     state,
                     Some(*line),
+                    source_name,
                     context,
                     strict_function_add_types,
                 )?;
@@ -1232,6 +1301,7 @@ fn validate_stmts(
                         condition,
                         iterated,
                         Some(*line),
+                        source_name,
                         context,
                         strict_function_add_types,
                     )?;
@@ -1239,6 +1309,7 @@ fn validate_stmts(
                         body,
                         iterated,
                         Some(*line),
+                        source_name,
                         context,
                         strict_function_add_types,
                     )?;
@@ -1246,6 +1317,7 @@ fn validate_stmts(
                         std::slice::from_ref(post),
                         iterated,
                         Some(*line),
+                        source_name,
                         context,
                         strict_function_add_types,
                     )
@@ -1261,6 +1333,7 @@ fn validate_stmts(
                         condition,
                         iterated,
                         Some(*line),
+                        source_name,
                         context,
                         strict_function_add_types,
                     )?;
@@ -1268,6 +1341,7 @@ fn validate_stmts(
                         body,
                         iterated,
                         Some(*line),
+                        source_name,
                         context,
                         strict_function_add_types,
                     )
@@ -1292,6 +1366,10 @@ fn bind_expr_result_to_slot(
     } else {
         state.set(slot, ty);
     }
+}
+
+fn owned_source_name(source_name: Option<&str>) -> Option<String> {
+    source_name.map(str::to_string)
 }
 
 fn build_function_names(functions: &[FunctionDecl]) -> HashMap<u16, String> {
@@ -1647,6 +1725,7 @@ fn observe_direct_function_call_types(
     expr: &Expr,
     state: &LocalTypeState,
     line_context: Option<u32>,
+    source_name: Option<&str>,
     context: &mut TypeContext<'_>,
 ) -> Result<(), CompileError> {
     let function_index = match expr {
@@ -1678,6 +1757,7 @@ fn observe_direct_function_call_types(
     {
         return Err(CompileError::FunctionParameterTypeConflict {
             line: line_context,
+            source_name: owned_source_name(source_name),
             detail,
         });
     }
@@ -1692,6 +1772,7 @@ fn validate_signature_overloads(
     state: &LocalTypeState,
     context: &mut TypeContext<'_>,
     line_context: Option<u32>,
+    source_name: Option<&str>,
 ) -> Result<(), CompileError> {
     let actual = args
         .iter()
@@ -1706,6 +1787,7 @@ fn validate_signature_overloads(
 
     Err(CompileError::CallableArgumentTypeMismatch {
         line: line_context,
+        source_name: owned_source_name(source_name),
         detail: format!(
             "{callable_kind} '{callable_name}' does not accept argument types ({}); expected {}",
             format_actual_arg_types(&actual),
@@ -1721,6 +1803,7 @@ fn validate_host_signature(
     state: &LocalTypeState,
     context: &mut TypeContext<'_>,
     line_context: Option<u32>,
+    source_name: Option<&str>,
 ) -> Result<(), CompileError> {
     let actual = args
         .iter()
@@ -1732,6 +1815,7 @@ fn validate_host_signature(
 
     Err(CompileError::CallableArgumentTypeMismatch {
         line: line_context,
+        source_name: owned_source_name(source_name),
         detail: format!(
             "host function '{callable_name}' does not accept argument types ({}); expected {}({})",
             format_actual_arg_types(&actual),
@@ -1922,6 +2006,7 @@ fn validate_expr(
     expr: &Expr,
     state: &LocalTypeState,
     line_context: Option<u32>,
+    source_name: Option<&str>,
     context: &mut TypeContext<'_>,
     strict_function_add_types: bool,
 ) -> Result<BoundType, CompileError> {
@@ -1935,6 +2020,7 @@ fn validate_expr(
             inner,
             state,
             line_context,
+            source_name,
             context,
             strict_function_add_types,
         )?,
@@ -1945,11 +2031,12 @@ fn validate_expr(
                 expr,
                 state,
                 line_context,
+                source_name,
                 context,
                 strict_function_add_types,
             )?;
-            observe_direct_function_call_types(expr, state, line_context, context)?;
-            context.validate_call_argument_types(expr, state, line_context)?;
+            observe_direct_function_call_types(expr, state, line_context, source_name, context)?;
+            context.validate_call_argument_types(expr, state, line_context, source_name)?;
             context.infer_call_like_expr_type(expr, state)
         }
         Expr::ClosureCall(_, _) => {
@@ -1957,10 +2044,11 @@ fn validate_expr(
                 expr,
                 state,
                 line_context,
+                source_name,
                 context,
                 strict_function_add_types,
             )?;
-            context.validate_call_argument_types(expr, state, line_context)?;
+            context.validate_call_argument_types(expr, state, line_context, source_name)?;
             context.infer_call_like_expr_type(expr, state)
         }
         Expr::Add(lhs, rhs)
@@ -1973,10 +2061,22 @@ fn validate_expr(
         | Expr::Eq(lhs, rhs)
         | Expr::Lt(lhs, rhs)
         | Expr::Gt(lhs, rhs) => {
-            let lhs_ty =
-                validate_expr(lhs, state, line_context, context, strict_function_add_types)?;
-            let rhs_ty =
-                validate_expr(rhs, state, line_context, context, strict_function_add_types)?;
+            let lhs_ty = validate_expr(
+                lhs,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            let rhs_ty = validate_expr(
+                rhs,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
             let inferred = infer_binary_type(expr, lhs_ty, rhs_ty);
             if strict_function_add_types
                 && matches!(expr, Expr::Add(_, _))
@@ -1984,6 +2084,7 @@ fn validate_expr(
             {
                 return Err(CompileError::BinaryOperandTypeMismatch {
                     line: line_context,
+                    source_name: owned_source_name(source_name),
                     detail: format!(
                         "cannot infer '+' operand types in function body: {} vs {}",
                         bound_type_label(lhs_ty),
@@ -1998,6 +2099,7 @@ fn validate_expr(
                 inner,
                 state,
                 line_context,
+                source_name,
                 context,
                 strict_function_add_types,
             )?;
@@ -2012,6 +2114,7 @@ fn validate_expr(
                 condition,
                 state,
                 line_context,
+                source_name,
                 context,
                 strict_function_add_types,
             )?;
@@ -2019,6 +2122,7 @@ fn validate_expr(
                 then_expr,
                 state,
                 line_context,
+                source_name,
                 context,
                 strict_function_add_types,
             )?;
@@ -2026,10 +2130,17 @@ fn validate_expr(
                 else_expr,
                 state,
                 line_context,
+                source_name,
                 context,
                 strict_function_add_types,
             )?;
-            ensure_compatible_if_else_types(line_context, "expression result", then_ty, else_ty)?;
+            ensure_compatible_if_else_types(
+                line_context,
+                source_name,
+                "expression result",
+                then_ty,
+                else_ty,
+            )?;
             if then_ty == else_ty {
                 then_ty
             } else {
@@ -2046,6 +2157,7 @@ fn validate_expr(
                 value,
                 state,
                 line_context,
+                source_name,
                 context,
                 strict_function_add_types,
             )?;
@@ -2055,6 +2167,7 @@ fn validate_expr(
                     arm_expr,
                     state,
                     line_context,
+                    source_name,
                     context,
                     strict_function_add_types,
                 )?;
@@ -2070,6 +2183,7 @@ fn validate_expr(
                 default,
                 state,
                 line_context,
+                source_name,
                 context,
                 strict_function_add_types,
             )?;
@@ -2085,6 +2199,7 @@ fn validate_expr(
                 stmts,
                 &mut nested,
                 line_context,
+                source_name,
                 context,
                 strict_function_add_types,
             )?;
@@ -2092,6 +2207,7 @@ fn validate_expr(
                 expr,
                 &nested,
                 line_context,
+                source_name,
                 context,
                 strict_function_add_types,
             )?
@@ -2103,24 +2219,51 @@ fn validate_expr_children(
     expr: &Expr,
     state: &LocalTypeState,
     line_context: Option<u32>,
+    source_name: Option<&str>,
     context: &mut TypeContext<'_>,
     strict_function_add_types: bool,
 ) -> Result<(), CompileError> {
     match expr {
         Expr::Call(_, args) | Expr::LocalCall(_, args) => {
             for arg in args {
-                let _ =
-                    validate_expr(arg, state, line_context, context, strict_function_add_types)?;
+                let _ = validate_expr(
+                    arg,
+                    state,
+                    line_context,
+                    source_name,
+                    context,
+                    strict_function_add_types,
+                )?;
             }
         }
         Expr::Closure(closure) => {
-            let _ = validate_expr(&closure.body, state, line_context, context, false)?;
+            let _ = validate_expr(
+                &closure.body,
+                state,
+                line_context,
+                source_name,
+                context,
+                false,
+            )?;
         }
         Expr::ClosureCall(closure, args) => {
-            let _ = validate_expr(&closure.body, state, line_context, context, false)?;
+            let _ = validate_expr(
+                &closure.body,
+                state,
+                line_context,
+                source_name,
+                context,
+                false,
+            )?;
             for arg in args {
-                let _ =
-                    validate_expr(arg, state, line_context, context, strict_function_add_types)?;
+                let _ = validate_expr(
+                    arg,
+                    state,
+                    line_context,
+                    source_name,
+                    context,
+                    strict_function_add_types,
+                )?;
             }
         }
         _ => {}
@@ -2269,6 +2412,7 @@ fn infer_unary_type(expr: &Expr, inner: BoundType) -> BoundType {
 
 fn ensure_compatible_if_else_types(
     line: Option<u32>,
+    source_name: Option<&str>,
     context: &str,
     lhs: BoundType,
     rhs: BoundType,
@@ -2278,6 +2422,7 @@ fn ensure_compatible_if_else_types(
     }
     Err(CompileError::IfElseBranchTypeMismatch {
         line,
+        source_name: owned_source_name(source_name),
         detail: format!(
             "if/else branches produced incompatible {context}: {} vs {}",
             bound_type_label(lhs),
@@ -2288,6 +2433,7 @@ fn ensure_compatible_if_else_types(
 
 fn validate_branch_state_merge(
     line: Option<u32>,
+    source_name: Option<&str>,
     lhs: &LocalTypeState,
     rhs: &LocalTypeState,
 ) -> Result<(), CompileError> {
@@ -2299,6 +2445,7 @@ fn validate_branch_state_merge(
         }
         return Err(CompileError::IfElseBranchTypeMismatch {
             line,
+            source_name: owned_source_name(source_name),
             detail: format!(
                 "if/else branches assign incompatible types to local slot {}: {} vs {}",
                 slot,

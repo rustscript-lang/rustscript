@@ -193,6 +193,8 @@ pub struct FrontendIr {
     pub local_bindings: Vec<(String, LocalSlot)>,
     pub functions: Vec<FunctionDecl>,
     pub function_impls: HashMap<u16, FunctionImpl>,
+    pub stmt_sources: Vec<Option<String>>,
+    pub function_sources: HashMap<u16, String>,
 }
 
 pub(crate) struct LocalIrBuilder {
@@ -341,6 +343,8 @@ impl LocalIrBuilder {
             local_bindings,
             functions: self.functions,
             function_impls: HashMap::new(),
+            stmt_sources: Vec::new(),
+            function_sources: HashMap::new(),
         }
     }
 

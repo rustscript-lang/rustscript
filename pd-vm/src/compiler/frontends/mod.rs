@@ -3,6 +3,8 @@ mod lua;
 mod rustscript;
 mod scheme;
 
+use std::collections::HashMap;
+
 use crate::compiler::source_map::{LoweredSource, SourceMap};
 
 use super::{
@@ -129,6 +131,8 @@ fn parse_with_parser(
         local_bindings: parser.local_bindings(),
         functions: parser.function_decls(),
         function_impls: parser.function_impls(),
+        stmt_sources: Vec::new(),
+        function_sources: HashMap::new(),
     })
 }
 
@@ -171,6 +175,8 @@ fn parse_repl_with_parser(
             local_bindings: parser.local_bindings(),
             functions: parser.function_decls(),
             function_impls: parser.function_impls(),
+            stmt_sources: Vec::new(),
+            function_sources: HashMap::new(),
         },
         bindings,
         entry_definite_locals: predeclared,

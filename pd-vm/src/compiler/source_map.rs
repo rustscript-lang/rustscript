@@ -122,6 +122,10 @@ impl SourceMap {
         self.files.get(id as usize)
     }
 
+    pub fn source_id_by_name(&self, name: &str) -> Option<SourceId> {
+        self.files.iter().find(|file| file.name == name).map(|file| file.id)
+    }
+
     pub fn source(&self, id: SourceId) -> Option<&str> {
         self.file(id).map(|file| file.text.as_str())
     }
