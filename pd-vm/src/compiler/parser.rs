@@ -9,7 +9,7 @@ use crate::builtins::{
 use crate::compiler::source_map::{SourceId, Span};
 
 use super::{
-    ParseError, STDLIB_PRINT_ARITY, STDLIB_PRINT_NAME,
+    ParseError, ReplLocalBinding, STDLIB_PRINT_ARITY, STDLIB_PRINT_NAME,
     ir::{
         ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, MatchTypePattern,
         Stmt,
@@ -773,6 +773,29 @@ impl Parser {
             direct_host_wildcard_imports: HashSet::new(),
             mutable_locals: Vec::new(),
         })
+    }
+
+    pub(super) fn new_with_predeclared_locals(
+        source: &str,
+        source_id: SourceId,
+        allow_implicit_externs: bool,
+        allow_implicit_semicolons: bool,
+        enforce_mutable_bindings: bool,
+        dialect: &'static dyn ParserDialect,
+        predeclared_locals: &[ReplLocalBinding],
+    ) -> Result<Self, ParseError> {
+        let mut parser = Self::new(
+            source,
+            source_id,
+            allow_implicit_externs,
+            allow_implicit_semicolons,
+            enforce_mutable_bindings,
+            dialect,
+        )?;
+        for binding in predeclared_locals {
+            parser.predeclare_local(binding)?;
+        }
+        Ok(parser)
     }
 
     pub(super) fn parse_program(&mut self) -> Result<Vec<Stmt>, ParseError> {
@@ -3604,6 +3627,21 @@ impl Parser {
         Ok((index, true))
     }
 
+    fn predeclare_local(&mut self, binding: &ReplLocalBinding) -> Result<(), ParseError> {
+        if self.locals.contains_key(&binding.name) {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: 1,
+                message: format!("duplicate repl local '{}'", binding.name),
+            });
+        }
+        let index = self.allocate_hidden_local()?;
+        self.locals.insert(binding.name.clone(), index);
+        self.set_local_slot_mutable(index, binding.mutable);
+        Ok(())
+    }
+
     fn allocate_hidden_local(&mut self) -> Result<LocalSlot, ParseError> {
         let index = self.next_local;
         self.next_local = self.next_local.checked_add(1).ok_or(ParseError {
@@ -3970,6 +4008,19 @@ impl Parser {
             .map(|(name, index)| (name.clone(), *index))
             .collect();
         locals.sort_by_key(|(_, index)| *index);
+        locals
+    }
+
+    pub(super) fn local_bindings_with_mutability(&self) -> Vec<ReplLocalBinding> {
+        let mut locals = self
+            .locals
+            .iter()
+            .map(|(name, index)| ReplLocalBinding {
+                name: name.clone(),
+                mutable: self.is_local_slot_mutable(*index),
+            })
+            .collect::<Vec<_>>();
+        locals.sort_by_key(|binding| self.locals.get(&binding.name).copied().unwrap_or(0));
         locals
     }
 }

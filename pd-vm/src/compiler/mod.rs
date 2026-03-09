@@ -271,10 +271,21 @@ pub use ir::{
     MatchTypePattern, Stmt,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplLocalBinding {
+    pub name: String,
+    pub mutable: bool,
+}
+
 pub struct CompiledProgram {
     pub program: Program,
     pub locals: usize,
     pub functions: Vec<FunctionDecl>,
+}
+
+pub struct CompiledReplProgram {
+    pub compiled: CompiledProgram,
+    pub bindings: Vec<ReplLocalBinding>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -418,11 +429,30 @@ fn compile_parsed_output(
     behavior: CompileBehavior,
     enable_local_move_semantics: bool,
 ) -> Result<CompiledProgram, SourceError> {
+    compile_parsed_output_with_entry_locals(
+        source,
+        parsed,
+        &[],
+        behavior,
+        enable_local_move_semantics,
+    )
+}
+
+fn compile_parsed_output_with_entry_locals(
+    source: String,
+    parsed: FrontendIr,
+    entry_definite_locals: &[LocalSlot],
+    behavior: CompileBehavior,
+    enable_local_move_semantics: bool,
+) -> Result<CompiledProgram, SourceError> {
+    // Normal compilation passes no entry locals. The REPL uses this hook to treat
+    // carried-over locals from prior entries as already available at snippet start.
     let local_debug_ranges = collect_named_local_debug_ranges(&parsed);
     let parsed = opt::legalize_builtins_and_bind_types(parsed);
     opt::validate_if_else_type_consistency(&parsed).map_err(SourceError::Compile)?;
-    let parsed = lifetime::enforce_local_availability(
+    let parsed = lifetime::enforce_local_availability_with_entry_locals(
         parsed,
+        entry_definite_locals,
         behavior.clear_dead_locals,
         enable_local_move_semantics,
     )
@@ -502,7 +532,18 @@ pub fn compile_source(source: &str) -> Result<CompiledProgram, SourceError> {
 }
 
 pub fn compile_source_for_repl(source: &str) -> Result<CompiledProgram, SourceError> {
-    compile_source_with_flavor_and_behavior(source, SourceFlavor::RustScript, CompileBehavior::REPL)
+    compile_source_for_repl_with_locals(source, &[]).map(|compiled| compiled.compiled)
+}
+
+pub fn compile_source_for_repl_with_locals(
+    source: &str,
+    predefined_locals: &[ReplLocalBinding],
+) -> Result<CompiledReplProgram, SourceError> {
+    let source_owned = source.to_string();
+    let predefined_locals = predefined_locals.to_vec();
+    run_with_compiler_stack(move || {
+        compile_source_for_repl_with_locals_impl(&source_owned, &predefined_locals)
+    })
 }
 
 pub fn compile_source_with_flavor(
@@ -544,6 +585,36 @@ fn compile_source_with_flavor_and_behavior(
     let owned_source = source.to_string();
     run_with_compiler_stack(move || {
         compile_source_with_flavor_impl(&owned_source, flavor, behavior)
+    })
+}
+
+fn compile_source_for_repl_with_locals_impl(
+    source: &str,
+    predefined_locals: &[ReplLocalBinding],
+) -> Result<CompiledReplProgram, SourceError> {
+    let mut source_map = SourceMap::new();
+    let source_id = source_map.add_source("<source>", source.to_string());
+    // REPL parsing/compiler entry state is separate from normal program compilation so
+    // persisted locals do not leak into the generic frontend or IR surface.
+    let parsed =
+        frontends::parse_rustscript_repl_source(source, predefined_locals).map_err(|err| {
+            SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
+        })?;
+    let compiled = match compile_parsed_output_with_entry_locals(
+        source.to_string(),
+        parsed.ir,
+        &parsed.entry_definite_locals,
+        CompileBehavior::REPL,
+        true,
+    ) {
+        Err(SourceError::Parse(err)) => Err(SourceError::Parse(
+            err.with_line_span_from_source(&source_map, source_id),
+        )),
+        other => other,
+    }?;
+    Ok(CompiledReplProgram {
+        compiled,
+        bindings: parsed.bindings,
     })
 }
 

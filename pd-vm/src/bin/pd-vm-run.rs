@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use vm::{
-    CallOutcome, Debugger, DisassembleOptions, FunctionDecl, HostFunction, HostImport, SourceMap,
-    SourcePathError, Value, Vm, VmError, VmRecording, VmStatus, compile_source_file,
-    compile_source_for_repl, disassemble_vmbc_with_options, encode_program, render_source_error,
-    render_vm_error, replay_recording_stdio,
+    CallOutcome, Debugger, DisassembleOptions, FunctionDecl, HostFunction, HostImport,
+    ReplLocalBinding, SourceMap, SourcePathError, Value, Vm, VmError, VmRecording, VmStatus,
+    compile_source_file, compile_source_for_repl_with_locals, disassemble_vmbc_with_options,
+    encode_program, render_source_error, render_vm_error, replay_recording_stdio,
 };
 
 const DEFAULT_SOURCE: &str = "examples/example.rss";
@@ -790,15 +790,24 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                 };
-                let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
-                if let Err(err) = register_functions(&mut vm, &compiled.functions) {
+                let mut vm = Vm::new(
+                    compiled
+                        .compiled
+                        .program
+                        .with_local_count(compiled.compiled.locals),
+                );
+                if let Err(err) = register_functions(&mut vm, &compiled.compiled.functions) {
                     println!("{err}");
+                    continue;
+                }
+                if let Err(err) = seed_repl_vm_locals(&mut vm, &session.locals) {
+                    println!("{}", render_vm_error(&vm, &err));
                     continue;
                 }
                 loop {
                     match vm.run() {
                         Ok(VmStatus::Halted) => {
-                            sync_repl_session(&vm, &mut session);
+                            sync_repl_session(&vm, &compiled.bindings, &mut session);
                             if let Some(value) = vm.stack().last() {
                                 println!("=> {}", format_value(value));
                             } else {
@@ -809,14 +818,14 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(VmStatus::Yielded) => continue,
                         Ok(VmStatus::Waiting(_op_id)) => {
                             if let Err(err) = vm.wait_for_host_op_blocking() {
-                                sync_repl_session(&vm, &mut session);
+                                sync_repl_session(&vm, &compiled.bindings, &mut session);
                                 println!("{}", render_vm_error(&vm, &err));
                                 break;
                             }
                             continue;
                         }
                         Err(err) => {
-                            sync_repl_session(&vm, &mut session);
+                            sync_repl_session(&vm, &compiled.bindings, &mut session);
                             println!("{}", render_vm_error(&vm, &err));
                             break;
                         }
@@ -845,21 +854,39 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
 
 #[derive(Default)]
 struct ReplSession {
-    locals: BTreeMap<String, Value>,
+    locals: BTreeMap<String, ReplSessionLocal>,
 }
 
-fn sync_repl_session(vm: &Vm, session: &mut ReplSession) {
+#[derive(Clone, Debug, PartialEq)]
+struct ReplSessionLocal {
+    value: Value,
+    mutable: bool,
+}
+
+fn sync_repl_session(vm: &Vm, bindings: &[ReplLocalBinding], session: &mut ReplSession) {
+    if bindings.is_empty() {
+        session.locals.clear();
+        return;
+    }
     let Some(debug) = vm.debug_info() else {
+        session.locals.clear();
         return;
     };
     let mut next = BTreeMap::new();
-    for local in &debug.locals {
-        let Some(value) = vm.locals().get(local.index as usize) else {
+    for binding in bindings {
+        let Some(index) = debug.local_index(&binding.name) else {
             continue;
         };
-        if is_repl_serializable_value(value) {
-            next.insert(local.name.clone(), value.clone());
-        }
+        let Some(value) = vm.locals().get(index as usize) else {
+            continue;
+        };
+        next.insert(
+            binding.name.clone(),
+            ReplSessionLocal {
+                value: value.clone(),
+                mutable: binding.mutable,
+            },
+        );
     }
     session.locals = next;
 }
@@ -895,22 +922,49 @@ fn handle_repl_command(line: &str) -> Option<ReplAction> {
 
 fn compile_repl_snippet(
     input: &str,
-    locals: &BTreeMap<String, Value>,
-) -> Result<vm::CompiledProgram, vm::SourceError> {
+    locals: &BTreeMap<String, ReplSessionLocal>,
+) -> Result<vm::CompiledReplProgram, vm::SourceError> {
     let trimmed = input.trim_end();
-    let source = build_repl_source(trimmed, locals);
-    match compile_source_for_repl(&source) {
+    let bindings = locals
+        .iter()
+        .map(|(name, local)| ReplLocalBinding {
+            name: name.clone(),
+            mutable: local.mutable,
+        })
+        .collect::<Vec<_>>();
+    match compile_source_for_repl_with_locals(trimmed, &bindings) {
         Ok(compiled) => Ok(compiled),
         Err(first_err) => {
             if trimmed.ends_with(';') {
-                return Err(remap_repl_source_error(first_err, locals.len()));
+                return Err(first_err);
             }
             let fallback = format!("{trimmed};");
-            let fallback_source = build_repl_source(&fallback, locals);
-            compile_source_for_repl(&fallback_source)
-                .map_err(|_| remap_repl_source_error(first_err, locals.len()))
+            compile_source_for_repl_with_locals(&fallback, &bindings).map_err(|_| first_err)
         }
     }
+}
+
+fn seed_repl_vm_locals(
+    vm: &mut Vm,
+    locals: &BTreeMap<String, ReplSessionLocal>,
+) -> Result<(), VmError> {
+    if locals.is_empty() {
+        return Ok(());
+    }
+    for (name, local) in locals {
+        let index = {
+            let Some(debug) = vm.debug_info() else {
+                return Err(VmError::HostError(
+                    "repl debug info unavailable while restoring locals".to_string(),
+                ));
+            };
+            debug.local_index(name).ok_or_else(|| {
+                VmError::HostError(format!("repl local '{name}' missing from compiled snippet"))
+            })?
+        };
+        vm.set_local(index, local.value.clone())?;
+    }
+    Ok(())
 }
 
 fn is_repl_input_complete(input: &str) -> bool {
@@ -1035,38 +1089,6 @@ fn is_repl_input_complete(input: &str) -> bool {
         .any(|token| trimmed.ends_with(token))
 }
 
-fn build_repl_source(input: &str, locals: &BTreeMap<String, Value>) -> String {
-    if locals.is_empty() {
-        return input.to_string();
-    }
-
-    let mut source = String::new();
-    for (name, value) in locals {
-        if let Some(literal) = render_repl_value_literal(value) {
-            source.push_str("let ");
-            source.push_str(name);
-            source.push_str(" = ");
-            source.push_str(&literal);
-            source.push_str(";\n");
-        }
-    }
-    source.push_str(input);
-    source
-}
-
-fn remap_repl_source_error(error: vm::SourceError, prelude_lines: usize) -> vm::SourceError {
-    match error {
-        vm::SourceError::Parse(mut parse) => {
-            if prelude_lines > 0 {
-                parse.line = parse.line.saturating_sub(prelude_lines).max(1);
-                parse.span = None;
-            }
-            vm::SourceError::Parse(parse)
-        }
-        other => other,
-    }
-}
-
 fn render_repl_compile_error(snippet: &str, err: &vm::SourceError) -> String {
     match err {
         vm::SourceError::Parse(parse) => {
@@ -1079,74 +1101,6 @@ fn render_repl_compile_error(snippet: &str, err: &vm::SourceError) -> String {
         }
         _ => err.to_string(),
     }
-}
-
-fn render_repl_value_literal(value: &Value) -> Option<String> {
-    match value {
-        Value::Null => None,
-        Value::Int(number) => {
-            if *number == i64::MIN {
-                None
-            } else {
-                Some(number.to_string())
-            }
-        }
-        Value::Float(_) => None,
-        Value::Bool(flag) => Some(flag.to_string()),
-        Value::String(text) => Some(format!("\"{}\"", escape_repl_string_literal(text.as_str()))),
-        Value::Array(items) => {
-            let mut rendered = Vec::with_capacity(items.len());
-            for item in items.iter() {
-                rendered.push(render_repl_value_literal(item)?);
-            }
-            Some(format!("[{}]", rendered.join(", ")))
-        }
-        Value::Map(entries) => {
-            let mut rendered = Vec::with_capacity(entries.len());
-            for (key, item) in entries.iter() {
-                let rendered_key = render_repl_map_key_literal(key)?;
-                let rendered_value = render_repl_value_literal(item)?;
-                rendered.push(format!("{rendered_key}: {rendered_value}"));
-            }
-            Some(format!("{{{}}}", rendered.join(", ")))
-        }
-    }
-}
-
-fn render_repl_map_key_literal(value: &Value) -> Option<String> {
-    match value {
-        Value::Null => None,
-        Value::Int(number) => {
-            if *number == i64::MIN {
-                None
-            } else {
-                Some(number.to_string())
-            }
-        }
-        Value::Bool(flag) => Some(flag.to_string()),
-        Value::String(text) => Some(format!("\"{}\"", escape_repl_string_literal(text.as_str()))),
-        Value::Float(_) | Value::Array(_) | Value::Map(_) => None,
-    }
-}
-
-fn escape_repl_string_literal(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            '\0' => escaped.push_str("\\0"),
-            other => escaped.push(other),
-        }
-    }
-    escaped
-}
-
-fn is_repl_serializable_value(value: &Value) -> bool {
-    render_repl_value_literal(value).is_some()
 }
 
 struct PrintFunction;
@@ -1229,8 +1183,15 @@ mod tests {
     fn run_repl_snippet_and_sync(session: &mut super::ReplSession, snippet: &str) -> Vm {
         let compiled =
             super::compile_repl_snippet(snippet, &session.locals).expect("compile should succeed");
-        let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
-        super::register_functions(&mut vm, &compiled.functions).expect("register should succeed");
+        let mut vm = Vm::new(
+            compiled
+                .compiled
+                .program
+                .with_local_count(compiled.compiled.locals),
+        );
+        super::register_functions(&mut vm, &compiled.compiled.functions)
+            .expect("register should succeed");
+        super::seed_repl_vm_locals(&mut vm, &session.locals).expect("locals should restore");
         loop {
             match vm.run().expect("snippet should run") {
                 VmStatus::Halted => break,
@@ -1240,7 +1201,7 @@ mod tests {
                     .expect("snippet should not block"),
             }
         }
-        super::sync_repl_session(&vm, session);
+        super::sync_repl_session(&vm, &compiled.bindings, session);
         vm
     }
 
@@ -1853,32 +1814,87 @@ mod tests {
     fn repl_compile_falls_back_to_expression_semicolon() {
         let compiled =
             super::compile_repl_snippet("1 + 2", &BTreeMap::new()).expect("compile should succeed");
-        assert_eq!(compiled.locals, 0);
+        assert_eq!(compiled.compiled.locals, 0);
     }
 
     #[test]
     fn repl_compile_uses_persisted_locals() {
         let mut locals = BTreeMap::new();
-        locals.insert("x".to_string(), Value::Int(41));
+        locals.insert(
+            "x".to_string(),
+            super::ReplSessionLocal {
+                value: Value::Int(41),
+                mutable: false,
+            },
+        );
         let compiled =
             super::compile_repl_snippet("x + 1", &locals).expect("compile should succeed");
-        assert!(compiled.locals >= 1);
+        assert!(compiled.compiled.locals >= 1);
     }
 
     #[test]
     fn repl_session_persists_locals_between_entries() {
         let mut session = super::ReplSession::default();
         let _ = run_repl_snippet_and_sync(&mut session, "let x = 41;");
-        assert_eq!(session.locals.get("x"), Some(&Value::Int(41)));
+        assert_eq!(
+            session.locals.get("x").map(|local| &local.value),
+            Some(&Value::Int(41))
+        );
 
         let vm = run_repl_snippet_and_sync(&mut session, "x + 1");
         assert_eq!(vm.stack().last(), Some(&Value::Int(42)));
     }
 
     #[test]
+    fn repl_session_persists_mutable_locals_between_entries() {
+        let mut session = super::ReplSession::default();
+        let _ = run_repl_snippet_and_sync(&mut session, "let mut x = 1;");
+        assert_eq!(
+            session.locals.get("x").map(|local| local.mutable),
+            Some(true)
+        );
+
+        let _ = run_repl_snippet_and_sync(&mut session, "x = x + 1;");
+        let vm = run_repl_snippet_and_sync(&mut session, "x");
+        assert_eq!(vm.stack().last(), Some(&Value::Int(2)));
+    }
+
+    #[test]
+    fn repl_session_persists_null_between_entries() {
+        let mut session = super::ReplSession::default();
+        let _ = run_repl_snippet_and_sync(&mut session, "let x = null;");
+        assert_eq!(
+            session.locals.get("x").map(|local| &local.value),
+            Some(&Value::Null)
+        );
+
+        let vm = run_repl_snippet_and_sync(&mut session, "x");
+        assert_eq!(vm.stack().last(), Some(&Value::Null));
+    }
+
+    #[test]
+    fn repl_session_persists_float_between_entries() {
+        let mut session = super::ReplSession::default();
+        let _ = run_repl_snippet_and_sync(&mut session, "let x = 1.5;");
+        assert_eq!(
+            session.locals.get("x").map(|local| &local.value),
+            Some(&Value::Float(1.5))
+        );
+
+        let vm = run_repl_snippet_and_sync(&mut session, "x + 0.5");
+        assert_eq!(vm.stack().last(), Some(&Value::Float(2.0)));
+    }
+
+    #[test]
     fn repl_compile_remaps_parse_error_line_numbers() {
         let mut locals = BTreeMap::new();
-        locals.insert("x".to_string(), Value::Int(1));
+        locals.insert(
+            "x".to_string(),
+            super::ReplSessionLocal {
+                value: Value::Int(1),
+                mutable: false,
+            },
+        );
         match super::compile_repl_snippet("let y = ;", &locals) {
             Err(vm::SourceError::Parse(parse)) => assert_eq!(parse.line, 1),
             Err(other) => panic!("expected parse error, got {other}"),
