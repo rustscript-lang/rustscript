@@ -43,6 +43,7 @@ fn observe_direct_function_call_types(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn validate_signature_overloads(
     callable_name: &str,
     callable_kind: &str,
