@@ -1,6 +1,6 @@
 #![cfg(feature = "runtime")]
 
-use vm::{OpCode, Value, ValueType, Vm, VmStatus, compile_source};
+use vm::{CompiledProgram, OpCode, TypeMap, Value, ValueType, Vm, VmStatus, compile_source};
 
 fn opcode_offsets(code: &[u8], opcode: OpCode) -> Vec<usize> {
     let mut offsets = Vec::new();
@@ -19,6 +19,36 @@ fn opcode_offsets(code: &[u8], opcode: OpCode) -> Vec<usize> {
     offsets
 }
 
+fn compiled_type_map(compiled: &CompiledProgram) -> &TypeMap {
+    compiled
+        .program
+        .type_map
+        .as_ref()
+        .expect("compiled program should include type metadata")
+}
+
+fn assert_opcode_operand_types(
+    compiled: &CompiledProgram,
+    opcode: OpCode,
+    expected: &[(ValueType, ValueType)],
+) {
+    let type_map = compiled_type_map(compiled);
+    let offsets = opcode_offsets(&compiled.program.code, opcode);
+
+    assert_eq!(
+        offsets.len(),
+        expected.len(),
+        "unexpected {opcode:?} count in bytecode"
+    );
+    for (offset, expected_types) in offsets.into_iter().zip(expected.iter().copied()) {
+        assert_eq!(
+            type_map.operand_types.get(&offset),
+            Some(&expected_types),
+            "unexpected operand type metadata at bytecode offset {offset}"
+        );
+    }
+}
+
 #[test]
 fn compiler_attaches_known_operand_types_to_programs() {
     let source = r#"
@@ -31,32 +61,17 @@ fn compiler_attaches_known_operand_types_to_programs() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let type_map = compiled
-        .program
-        .type_map
-        .as_ref()
-        .expect("compiled program should include type metadata");
-    let add_offsets = opcode_offsets(&compiled.program.code, OpCode::Add);
-
-    assert_eq!(
-        add_offsets.len(),
-        3,
-        "expected exactly three add instructions"
-    );
-    assert_eq!(
-        type_map.operand_types.get(&add_offsets[0]),
-        Some(&(ValueType::Int, ValueType::Int))
-    );
-    assert_eq!(
-        type_map.operand_types.get(&add_offsets[1]),
-        Some(&(ValueType::Float, ValueType::Float))
-    );
-    assert_eq!(
-        type_map.operand_types.get(&add_offsets[2]),
-        Some(&(ValueType::String, ValueType::String))
+    assert_opcode_operand_types(
+        &compiled,
+        OpCode::Add,
+        &[
+            (ValueType::Int, ValueType::Int),
+            (ValueType::Float, ValueType::Float),
+            (ValueType::String, ValueType::String),
+        ],
     );
     assert!(
-        !type_map.local_types.is_empty(),
+        !compiled_type_map(&compiled).local_types.is_empty(),
         "type metadata should include local slot entries"
     );
 
@@ -93,5 +108,111 @@ fn compiler_rejects_mixed_if_else_branch_types() {
     assert!(
         rendered.contains("int") && rendered.contains("string"),
         "expected concrete type names in error: {rendered}"
+    );
+}
+
+#[test]
+fn compiler_propagates_callable_return_types_through_functions_and_closures() {
+    let source = r#"
+        fn add_one(value) {
+            value + 1;
+        }
+
+        fn apply_twice(func, value) {
+            let once = func(value);
+            func(once);
+        }
+
+        let named = add_one;
+        let inc = |x| x + 1;
+        let direct = add_one(40) + 1;
+        let via_named_local = named(40) + 1;
+        let via_closure_local = inc(40) + 1;
+        let via_named_param = apply_twice(named, 40) + 1;
+        let via_closure_param = apply_twice(inc, 40) + 1;
+        direct;
+        via_named_local;
+        via_closure_local;
+        via_named_param;
+        via_closure_param;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    assert_opcode_operand_types(
+        &compiled,
+        OpCode::Add,
+        &[
+            (ValueType::Int, ValueType::Int),
+            (ValueType::Int, ValueType::Int),
+            (ValueType::Int, ValueType::Int),
+            (ValueType::Int, ValueType::Int),
+            (ValueType::Int, ValueType::Int),
+            (ValueType::Int, ValueType::Int),
+            (ValueType::Int, ValueType::Int),
+            (ValueType::Int, ValueType::Int),
+            (ValueType::Int, ValueType::Int),
+            (ValueType::Int, ValueType::Int),
+            (ValueType::Int, ValueType::Int),
+            (ValueType::Int, ValueType::Int),
+        ],
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[
+            Value::Int(42),
+            Value::Int(42),
+            Value::Int(42),
+            Value::Int(43),
+            Value::Int(43),
+        ]
+    );
+}
+
+#[test]
+fn compiler_marks_string_plus_number_paths_as_string_concat() {
+    let source = r#"
+        fn label(value) {
+            "v=" + value;
+        }
+
+        let number = 123;
+        let formatter = |value| value + "!";
+        let a = "text" + 123;
+        let b = "text" + number;
+        let c = label(number);
+        let d = formatter(number);
+        let joined = c + d;
+        a;
+        b;
+        joined;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    assert_opcode_operand_types(
+        &compiled,
+        OpCode::Add,
+        &[
+            (ValueType::String, ValueType::String),
+            (ValueType::String, ValueType::String),
+            (ValueType::String, ValueType::String),
+            (ValueType::String, ValueType::String),
+            (ValueType::String, ValueType::String),
+        ],
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[
+            Value::string("text123"),
+            Value::string("text123"),
+            Value::string("v=123123!"),
+        ]
     );
 }
