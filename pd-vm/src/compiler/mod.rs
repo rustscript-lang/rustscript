@@ -21,10 +21,26 @@ pub enum CompileError {
     BreakOutsideLoop,
     ContinueOutsideLoop,
     InlineFunctionRecursion(String),
-    IfElseBranchTypeMismatch { line: Option<u32>, detail: String },
-    CallableArgumentTypeMismatch { line: Option<u32>, detail: String },
-    BinaryOperandTypeMismatch { line: Option<u32>, detail: String },
-    FunctionParameterTypeConflict { line: Option<u32>, detail: String },
+    IfElseBranchTypeMismatch {
+        line: Option<u32>,
+        source_name: Option<String>,
+        detail: String,
+    },
+    CallableArgumentTypeMismatch {
+        line: Option<u32>,
+        source_name: Option<String>,
+        detail: String,
+    },
+    BinaryOperandTypeMismatch {
+        line: Option<u32>,
+        source_name: Option<String>,
+        detail: String,
+    },
+    FunctionParameterTypeConflict {
+        line: Option<u32>,
+        source_name: Option<String>,
+        detail: String,
+    },
 }
 
 impl CompileError {
@@ -41,6 +57,18 @@ impl CompileError {
             }
             CompileError::FunctionParameterTypeConflict { line, .. } => {
                 line.and_then(|value| usize::try_from(value).ok())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn source_name(&self) -> Option<&str> {
+        match self {
+            CompileError::IfElseBranchTypeMismatch { source_name, .. }
+            | CompileError::CallableArgumentTypeMismatch { source_name, .. }
+            | CompileError::BinaryOperandTypeMismatch { source_name, .. }
+            | CompileError::FunctionParameterTypeConflict { source_name, .. } => {
+                source_name.as_deref()
             }
             _ => None,
         }
@@ -479,6 +507,7 @@ fn compile_parsed_output_with_entry_locals(
         local_bindings,
         functions,
         function_impls,
+        ..
     } = parsed;
 
     let mut runtime_import_functions: Vec<FunctionDecl> = functions

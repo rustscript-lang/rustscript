@@ -88,6 +88,7 @@ pub(super) fn collect_module_units(
         state.units.push(ParsedUnit {
             parsed,
             scope_prefix: Some(sanitize_scope_prefix(&resolved)),
+            source_name: resolved.display().to_string(),
         });
         state.module_exports.insert(key.clone(), exports);
         state.seen.insert(key);

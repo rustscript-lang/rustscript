@@ -11,6 +11,7 @@ use super::{
 pub(super) struct ParsedUnit {
     pub(super) parsed: FrontendIr,
     pub(super) scope_prefix: Option<String>,
+    pub(super) source_name: String,
 }
 
 pub(super) fn sanitize_scope_prefix(path: &Path) -> String {
@@ -30,13 +31,16 @@ pub(super) fn sanitize_scope_prefix(path: &Path) -> String {
 
 pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePathError> {
     let mut merged_stmts = Vec::new();
+    let mut merged_stmt_sources = Vec::new();
     let mut merged_local_bindings = Vec::new();
     let mut merged_functions = Vec::new();
     let mut merged_function_impls = HashMap::<u16, FunctionImpl>::new();
+    let mut merged_function_sources = HashMap::<u16, String>::new();
     let mut function_index_by_name = HashMap::<String, u16>::new();
     let mut local_base = 0usize;
 
     for unit in units {
+        let source_name = unit.source_name.clone();
         let function_map = remap_functions(
             &unit.parsed.functions,
             &mut merged_functions,
@@ -49,6 +53,9 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
         for stmt in &mut remapped_stmts {
             remap_stmt_indices(stmt, unit_local_base, &function_map)?;
         }
+        merged_stmt_sources.extend(
+            std::iter::repeat_n(Some(source_name.clone()), remapped_stmts.len()),
+        );
         merged_stmts.extend(remapped_stmts);
 
         for (name, index) in unit.parsed.local_bindings {
@@ -94,6 +101,7 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
                         .to_string(),
                 })));
             }
+            merged_function_sources.insert(merged_index, source_name.clone());
         }
 
         local_base = local_base.checked_add(unit_local_count).ok_or_else(|| {
@@ -120,6 +128,8 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
         local_bindings: merged_local_bindings,
         functions: merged_functions,
         function_impls: merged_function_impls,
+        stmt_sources: merged_stmt_sources,
+        function_sources: merged_function_sources,
     })
 }
 

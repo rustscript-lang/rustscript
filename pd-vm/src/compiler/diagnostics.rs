@@ -19,15 +19,22 @@ pub fn render_source_error(source_map: &SourceMap, err: &ParseError, _styled: bo
 
 pub fn render_compile_error(source_map: &SourceMap, err: &CompileError, _styled: bool) -> String {
     let message = err.diagnostic_message();
+    let source_id = err
+        .source_name()
+        .and_then(|name| source_map.source_id_by_name(name))
+        .unwrap_or(0);
 
     if let Some(line) = err.line()
-        && let Some(span) = source_map.line_span(0, line)
+        && let Some(span) = source_map.line_span(source_id, line)
         && let Some(rendered) = render_span_snippet(source_map, span, &message)
     {
         return format!("compile error: {}", rendered.trim_end());
     }
 
     if let Some(line) = err.line() {
+        if let Some(source_name) = err.source_name() {
+            return format!("compile error: {source_name}:{line}: {message}");
+        }
         return format!("compile error: line {line}: {message}");
     }
 

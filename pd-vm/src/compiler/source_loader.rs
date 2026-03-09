@@ -86,6 +86,7 @@ pub(super) fn load_units_for_source_file(
     collect_state.units.push(ParsedUnit {
         parsed: root_parsed,
         scope_prefix: None,
+        source_name: path.display().to_string(),
     });
 
     Ok((root_parse_source, collect_state.units))

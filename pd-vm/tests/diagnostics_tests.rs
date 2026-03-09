@@ -61,7 +61,7 @@ fn compile_source_file_parse_error_uses_original_line() {
 
 #[test]
 fn render_compile_error_highlights_if_else_mismatch_line() {
-    let source = "let value = if true => {\n    1\n} else => {\n    \"x\"\n};\n";
+    let source = "let cond = 1 == 1;\nlet value = if cond => {\n    1\n} else => {\n    \"x\"\n};\n";
 
     let err = match compile_source(source) {
         Ok(_) => panic!("compile should reject if/else mismatch"),
@@ -87,6 +87,58 @@ fn render_compile_error_highlights_if_else_mismatch_line() {
     assert!(rendered.contains("int vs string"));
     assert!(rendered.contains(&format!("inline.rss:{line}:1")));
     assert!(rendered.contains(line_text));
+}
+
+#[test]
+fn compile_error_from_imported_module_reports_module_path() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be monotonic")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("pd_vm_diag_import_{unique}"));
+    fs::create_dir_all(&root).expect("temp module root should be writable");
+
+    let module_path = root.join("module.rss");
+    let module_source = r#"let cond = 1 == 1;
+let broken = if cond => {
+    1
+} else => {
+    "x"
+};
+
+pub fn ok() {
+    0;
+}
+"#;
+    fs::write(&module_path, module_source).expect("module source should be writable");
+
+    let main_path = root.join("main.rss");
+    fs::write(
+        &main_path,
+        "use module;\nok();\n",
+    )
+    .expect("main source should be writable");
+
+    let result = compile_source_file(&main_path);
+
+    let _ = fs::remove_file(&main_path);
+    let _ = fs::remove_file(&module_path);
+    let _ = fs::remove_dir(&root);
+
+    match result {
+        Err(SourcePathError::Source(SourceError::Compile(compile))) => {
+            assert_eq!(compile.source_name(), Some(module_path.to_string_lossy().as_ref()));
+            assert_eq!(compile.line(), Some(2));
+
+            let mut source_map = SourceMap::new();
+            source_map.add_source(module_path.display().to_string(), module_source);
+            let rendered = render_compile_error(&source_map, &compile, false);
+            assert!(rendered.contains(&format!("{}:2:1", module_path.display())));
+            assert!(rendered.contains("let broken = if cond => {"));
+            assert!(rendered.contains("int vs string"));
+        }
+        _ => panic!("expected compile error"),
+    }
 }
 
 #[test]
