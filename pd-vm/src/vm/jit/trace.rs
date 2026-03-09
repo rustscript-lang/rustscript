@@ -112,6 +112,7 @@ pub enum TraceStep {
     Pop,
     Dup,
     Ldloc(u8),
+    LdlocCopy(u8),
     Stloc(u8),
     BuiltinCall {
         index: u16,
@@ -721,11 +722,7 @@ impl TraceJitEngine {
                 let index = read_u8(code, &mut ip)
                     .ok_or(JitNyiReason::InvalidImmediate("ldloc.copy"))?;
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Ldloc(index));
-                step_ips.push(instr_ip);
-                steps.push(TraceStep::Dup);
-                step_ips.push(instr_ip);
-                steps.push(TraceStep::Stloc(index));
+                steps.push(TraceStep::LdlocCopy(index));
                 continue;
             }
             if opcode == OpCode::Stloc as u8 {
@@ -987,11 +984,7 @@ impl TraceJitEngine {
                 let index = read_u8(code, &mut ip)
                     .ok_or(JitNyiReason::InvalidImmediate("ldloc.copy"))?;
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Ldloc(index));
-                step_ips.push(instr_ip);
-                steps.push(TraceStep::Dup);
-                step_ips.push(instr_ip);
-                steps.push(TraceStep::Stloc(index));
+                steps.push(TraceStep::LdlocCopy(index));
                 continue;
             }
             if opcode == OpCode::Stloc as u8 {
@@ -1224,6 +1217,7 @@ fn trace_step_name(step: &TraceStep) -> &'static str {
         TraceStep::Pop => "pop",
         TraceStep::Dup => "dup",
         TraceStep::Ldloc(_) => "ldloc",
+        TraceStep::LdlocCopy(_) => "ldloc_copy",
         TraceStep::Stloc(_) => "stloc",
         TraceStep::BuiltinCall { .. } => "call",
         TraceStep::Call { .. } => "call",

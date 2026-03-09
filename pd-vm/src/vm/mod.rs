@@ -460,6 +460,36 @@ const INT_UNARY_OPERAND_TYPE_HINT: PackedOperandTypes =
 const FLOAT_UNARY_OPERAND_TYPE_HINT: PackedOperandTypes =
     pack_operand_types(ValueType::Float, ValueType::Unknown);
 
+#[derive(Clone, Debug, Default)]
+struct InterpreterSuperinstructionCounters {
+    ldloc_dup_stloc: u64,
+    call_ret: u64,
+    ldloc_copy: u64,
+}
+
+#[derive(Clone, Debug)]
+struct InterpreterProfile {
+    opcode_counts: [u64; 256],
+    superinstructions: InterpreterSuperinstructionCounters,
+}
+
+impl Default for InterpreterProfile {
+    fn default() -> Self {
+        Self {
+            opcode_counts: [0; 256],
+            superinstructions: InterpreterSuperinstructionCounters::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct JitRuntimeDiagnostics {
+    native_loop_back_iter: u64,
+    native_trace_chain: u64,
+    trace_exit_to_vm: u64,
+    interpreter_trace_fallback: u64,
+}
+
 pub struct Vm {
     program: Arc<Program>,
     program_constants_ptr: usize,
@@ -483,10 +513,9 @@ pub struct Vm {
     jit_native_bridge_stats_enabled: bool,
     jit_native_bridge_counts: HashMap<&'static str, u64>,
     jit_runtime_diagnostics_enabled: bool,
-    jit_runtime_counters: HashMap<&'static str, u64>,
+    jit_runtime_diagnostics: JitRuntimeDiagnostics,
     interpreter_opcode_profiling_enabled: bool,
-    interpreter_opcode_counts: HashMap<u8, u64>,
-    interpreter_superinstruction_counts: HashMap<&'static str, u64>,
+    interpreter_profile: InterpreterProfile,
     async_bridge: Option<Box<dyn HostAsyncBridge>>,
     runtime_print_sink: Option<Box<RuntimePrintSink>>,
     waiting_host_op: Option<WaitingHostOp>,
@@ -731,10 +760,9 @@ impl Vm {
             jit_native_bridge_stats_enabled: false,
             jit_native_bridge_counts: HashMap::new(),
             jit_runtime_diagnostics_enabled: false,
-            jit_runtime_counters: HashMap::new(),
+            jit_runtime_diagnostics: JitRuntimeDiagnostics::default(),
             interpreter_opcode_profiling_enabled: false,
-            interpreter_opcode_counts: HashMap::new(),
-            interpreter_superinstruction_counts: HashMap::new(),
+            interpreter_profile: InterpreterProfile::default(),
             async_bridge: None,
             runtime_print_sink: None,
             waiting_host_op: None,
@@ -847,16 +875,22 @@ impl Vm {
     }
 
     pub fn clear_jit_runtime_diagnostics(&mut self) {
-        self.jit_runtime_counters.clear();
+        self.jit_runtime_diagnostics = JitRuntimeDiagnostics::default();
     }
 
     pub fn jit_runtime_diagnostics_snapshot(&self) -> Vec<(String, u64)> {
-        let mut entries = self
-            .jit_runtime_counters
-            .iter()
-            .map(|(name, count)| ((*name).to_string(), *count))
-            .collect::<Vec<_>>();
-        entries.sort_unstable_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
+        let mut entries = Vec::new();
+        let diagnostics = &self.jit_runtime_diagnostics;
+        for (name, count) in [
+            ("interpreter_trace_fallback", diagnostics.interpreter_trace_fallback),
+            ("native_loop_back_iter", diagnostics.native_loop_back_iter),
+            ("native_trace_chain", diagnostics.native_trace_chain),
+            ("trace_exit_to_vm", diagnostics.trace_exit_to_vm),
+        ] {
+            if count > 0 {
+                entries.push((name.to_string(), count));
+            }
+        }
         entries
     }
 
@@ -872,27 +906,31 @@ impl Vm {
     }
 
     pub fn clear_interpreter_opcode_profile(&mut self) {
-        self.interpreter_opcode_counts.clear();
-        self.interpreter_superinstruction_counts.clear();
+        self.interpreter_profile = InterpreterProfile::default();
     }
 
     pub fn interpreter_opcode_profile_snapshot(&self) -> Vec<(String, u64)> {
-        let mut entries = self
-            .interpreter_opcode_counts
-            .iter()
-            .map(|(opcode, count)| (opcode_label(*opcode), *count))
-            .collect::<Vec<_>>();
-        entries.sort_unstable_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
+        let mut entries = Vec::new();
+        for (opcode, count) in self.interpreter_profile.opcode_counts.iter().enumerate() {
+            if *count > 0 {
+                entries.push((opcode_label(opcode as u8), *count));
+            }
+        }
         entries
     }
 
     pub fn interpreter_superinstruction_profile_snapshot(&self) -> Vec<(String, u64)> {
-        let mut entries = self
-            .interpreter_superinstruction_counts
-            .iter()
-            .map(|(name, count)| ((*name).to_string(), *count))
-            .collect::<Vec<_>>();
-        entries.sort_unstable_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
+        let counters = &self.interpreter_profile.superinstructions;
+        let mut entries = Vec::new();
+        for (name, count) in [
+            ("call_ret", counters.call_ret),
+            ("ldloc_copy", counters.ldloc_copy),
+            ("ldloc_dup_stloc", counters.ldloc_dup_stloc),
+        ] {
+            if count > 0 {
+                entries.push((name.to_string(), count));
+            }
+        }
         entries
     }
 
@@ -921,7 +959,7 @@ impl Vm {
         if !self.interpreter_opcode_profiling_enabled {
             return;
         }
-        let entry = self.interpreter_opcode_counts.entry(opcode).or_insert(0);
+        let entry = &mut self.interpreter_profile.opcode_counts[opcode as usize];
         *entry = entry.saturating_add(1);
     }
 
@@ -929,19 +967,43 @@ impl Vm {
         if !self.interpreter_opcode_profiling_enabled {
             return;
         }
-        let entry = self
-            .interpreter_superinstruction_counts
-            .entry(name)
-            .or_insert(0);
-        *entry = entry.saturating_add(1);
+        let counters = &mut self.interpreter_profile.superinstructions;
+        match name {
+            "ldloc_dup_stloc" => {
+                counters.ldloc_dup_stloc = counters.ldloc_dup_stloc.saturating_add(1);
+            }
+            "call_ret" => {
+                counters.call_ret = counters.call_ret.saturating_add(1);
+            }
+            "ldloc_copy" => {
+                counters.ldloc_copy = counters.ldloc_copy.saturating_add(1);
+            }
+            _ => {}
+        }
     }
 
     pub(in crate::vm) fn record_jit_runtime_event(&mut self, name: &'static str) {
         if !self.jit_runtime_diagnostics_enabled {
             return;
         }
-        let entry = self.jit_runtime_counters.entry(name).or_insert(0);
-        *entry = entry.saturating_add(1);
+        let diagnostics = &mut self.jit_runtime_diagnostics;
+        match name {
+            "native_loop_back_iter" => {
+                diagnostics.native_loop_back_iter =
+                    diagnostics.native_loop_back_iter.saturating_add(1);
+            }
+            "native_trace_chain" => {
+                diagnostics.native_trace_chain = diagnostics.native_trace_chain.saturating_add(1);
+            }
+            "trace_exit_to_vm" => {
+                diagnostics.trace_exit_to_vm = diagnostics.trace_exit_to_vm.saturating_add(1);
+            }
+            "interpreter_trace_fallback" => {
+                diagnostics.interpreter_trace_fallback =
+                    diagnostics.interpreter_trace_fallback.saturating_add(1);
+            }
+            _ => {}
+        }
     }
 
     /// Reset VM execution state to allow rerunning the same program instance while

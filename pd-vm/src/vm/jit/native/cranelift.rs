@@ -66,6 +66,9 @@ const OP_JUMP: i64 = 23;
 const OP_BUILTIN_CALL: i64 = 24;
 
 fn fused_ldloc_copy_slot(steps: &[TraceStep], index: usize) -> Option<u8> {
+    if let Some(TraceStep::LdlocCopy(slot)) = steps.get(index) {
+        return Some(*slot);
+    }
     let Some(TraceStep::Ldloc(slot)) = steps.get(index) else {
         return None;
     };
@@ -274,7 +277,12 @@ pub(crate) fn compile_trace(
                     slot,
                     trace.root_ip,
                 )?;
-                step_index += 3;
+                step_index += if matches!(trace.steps.get(step_index), Some(TraceStep::LdlocCopy(_)))
+                {
+                    1
+                } else {
+                    3
+                };
                 continue;
             }
 

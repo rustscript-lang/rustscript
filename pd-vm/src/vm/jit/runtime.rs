@@ -214,12 +214,7 @@ impl Vm {
             self.native_trace_exec_count
         ));
         if self.jit_runtime_diagnostics_enabled {
-            let mut runtime_entries: Vec<(&'static str, u64)> = self
-                .jit_runtime_counters
-                .iter()
-                .map(|(name, count)| (*name, *count))
-                .collect();
-            runtime_entries.sort_unstable_by_key(|(name, _)| *name);
+            let runtime_entries = self.jit_runtime_diagnostics_snapshot();
             let total_runtime_events = runtime_entries
                 .iter()
                 .fold(0u64, |acc, (_, count)| acc.saturating_add(*count));
@@ -463,6 +458,14 @@ impl Vm {
                         .get_mut(*index as usize)
                         .ok_or(VmError::InvalidLocal(*index))?;
                     let value = std::mem::replace(slot, crate::bytecode::Value::Null);
+                    self.stack.push(value);
+                }
+                TraceStep::LdlocCopy(index) => {
+                    let value = self
+                        .locals
+                        .get(*index as usize)
+                        .cloned()
+                        .ok_or(VmError::InvalidLocal(*index))?;
                     self.stack.push(value);
                 }
                 TraceStep::Stloc(index) => {

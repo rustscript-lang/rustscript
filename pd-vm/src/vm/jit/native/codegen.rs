@@ -340,6 +340,20 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
+        TraceStep::LdlocCopy(index) => {
+            emit_inline_ldloc_copy(
+                b,
+                vm_ptr,
+                helper_ref,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *index,
+                root_ip,
+            )?;
+            Ok(true)
+        }
         TraceStep::Stloc(index) => {
             emit_inline_stloc(
                 b,
@@ -2482,6 +2496,7 @@ fn step_to_call(step: &TraceStep, root_ip: usize) -> VmResult<(i64, i64, i64, i6
         TraceStep::Pop => (OP_POP, 0, 0, 0),
         TraceStep::Dup => (OP_DUP, 0, 0, 0),
         TraceStep::Ldloc(index) => (OP_LDLOC, i64::from(*index), 0, 0),
+        TraceStep::LdlocCopy(index) => (OP_LDLOC, i64::from(*index), 0, 0),
         TraceStep::Stloc(index) => (OP_STLOC, i64::from(*index), 0, 0),
         TraceStep::Call {
             index,

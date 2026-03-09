@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use vm::{
-    CallOutcome, CompiledProgram, HostFunction, HostFunctionRegistry, JitConfig, Program,
-    SourceFlavor, Value, Vm, VmError, VmStatus, compile_source, compile_source_file,
-    compile_source_with_flavor,
+    CallOutcome, CompiledProgram, HostFunction, HostFunctionRegistry, JitConfig, JitSnapshot,
+    JitTraceTerminal, Program, SourceFlavor, Value, Vm, VmError, VmStatus, compile_source,
+    compile_source_file, compile_source_with_flavor,
 };
 
 const DEFAULT_COMPILE_ITERS: usize = 20;
@@ -767,7 +767,6 @@ fn measure_pd_vm_lua_compare_mode(
         hot_loop_threshold: 1,
         max_trace_len: 16_384,
     });
-    vm.set_jit_runtime_diagnostics_enabled(jit_enabled);
     vm.set_jit_native_bridge_stats_enabled(jit_enabled);
     vm.set_interpreter_opcode_profiling_enabled(!jit_enabled);
 
@@ -777,12 +776,12 @@ fn measure_pd_vm_lua_compare_mode(
         .map_err(|err| format!("warmup {} run failed: {err}", mode.label()))?;
     ensure_expected_completion(&vm, warm_status, &expected_stack, mode.label())?;
     vm.reset_for_reuse();
-    vm.clear_jit_runtime_diagnostics();
     vm.clear_jit_native_bridge_stats();
     vm.clear_interpreter_opcode_profile();
 
     let native_trace_count_before = vm.jit_native_trace_count();
     let native_exec_before = vm.jit_native_exec_count();
+    let jit_snapshot_before = vm.jit_snapshot();
     let started = Instant::now();
     let total_program_runs = timed_runs.saturating_mul(outer as usize);
     for run_index in 0..total_program_runs {
@@ -798,6 +797,7 @@ fn measure_pd_vm_lua_compare_mode(
         }
     }
     let total_elapsed = started.elapsed();
+    let jit_snapshot_after = vm.jit_snapshot();
 
     Ok(LuaCompareSample {
         mode,
@@ -817,7 +817,10 @@ fn measure_pd_vm_lua_compare_mode(
         native_trace_count_before: Some(native_trace_count_before),
         native_trace_count_after: Some(vm.jit_native_trace_count()),
         native_exec_delta: Some(vm.jit_native_exec_count().saturating_sub(native_exec_before)),
-        jit_runtime_diagnostics: vm.jit_runtime_diagnostics_snapshot(),
+        jit_runtime_diagnostics: trace_execution_diagnostics(
+            &jit_snapshot_before,
+            &jit_snapshot_after,
+        ),
         native_bridge_stats: vm
             .jit_native_bridge_stats_snapshot()
             .into_iter()
@@ -995,6 +998,40 @@ fn normalized_ns_per_inner_iter(
     timed_runs: usize,
 ) -> f64 {
     elapsed.as_nanos() as f64 / (inner as f64 * outer as f64 * timed_runs as f64)
+}
+
+fn trace_execution_diagnostics(
+    before: &JitSnapshot,
+    after: &JitSnapshot,
+) -> Vec<(String, u64)> {
+    let mut before_execs = before
+        .traces
+        .iter()
+        .map(|trace| (trace.id, trace.executions))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut loop_back = 0_u64;
+    let mut branch_exit = 0_u64;
+    let mut halt = 0_u64;
+    for trace in &after.traces {
+        let before_exec = before_execs.remove(&trace.id).unwrap_or(0);
+        let delta = trace.executions.saturating_sub(before_exec);
+        match trace.terminal {
+            JitTraceTerminal::LoopBack => loop_back = loop_back.saturating_add(delta),
+            JitTraceTerminal::BranchExit => branch_exit = branch_exit.saturating_add(delta),
+            JitTraceTerminal::Halt => halt = halt.saturating_add(delta),
+        }
+    }
+    let mut entries = Vec::new();
+    for (name, count) in [
+        ("loop_back_trace_exec_delta", loop_back),
+        ("branch_exit_trace_exec_delta", branch_exit),
+        ("halt_trace_exec_delta", halt),
+    ] {
+        if count > 0 {
+            entries.push((name.to_string(), count));
+        }
+    }
+    entries
 }
 
 fn write_lua_compare_artifacts(

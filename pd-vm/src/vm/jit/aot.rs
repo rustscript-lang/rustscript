@@ -602,6 +602,10 @@ fn encode_trace_step(step: &TraceStep, out: &mut Vec<u8>) -> VmResult<()> {
             out.push(17);
             out.push(*index);
         }
+        TraceStep::LdlocCopy(index) => {
+            out.push(43);
+            out.push(*index);
+        }
         TraceStep::Stloc(index) => {
             out.push(18);
             out.push(*index);
@@ -679,6 +683,7 @@ fn decode_trace_step(cursor: &mut AotCursor<'_>) -> VmResult<TraceStep> {
         15 => TraceStep::Pop,
         16 => TraceStep::Dup,
         17 => TraceStep::Ldloc(cursor.read_u8("ldloc index")?),
+        43 => TraceStep::LdlocCopy(cursor.read_u8("ldloc.copy index")?),
         18 => TraceStep::Stloc(cursor.read_u8("stloc index")?),
         19 => TraceStep::BuiltinCall {
             index: cursor.read_u16("builtin index")?,
@@ -888,6 +893,7 @@ fn validate_aot_trace(trace: &JitTrace, code_len: usize) -> VmResult<()> {
             | TraceStep::Pop
             | TraceStep::Dup
             | TraceStep::Ldloc(_)
+            | TraceStep::LdlocCopy(_)
             | TraceStep::Stloc(_)
             | TraceStep::JumpToRoot
             | TraceStep::Ret => {}

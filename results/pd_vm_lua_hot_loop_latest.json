@@ -10,42 +10,42 @@
       "compile_excluded": true,
       "interpreter_opcode_counts": [
         [
-          "br",
-          40
-        ],
-        [
-          "brfalse",
-          42
-        ],
-        [
-          "iadd",
-          80
-        ],
-        [
-          "iclt",
-          42
+          "ret",
+          56
         ],
         [
           "ldc",
-          90
+          4480280
         ],
         [
-          "ldloc.copy",
-          164
+          "br",
+          2240000
         ],
         [
-          "ret",
-          2
+          "brfalse",
+          2240056
         ],
         [
           "stloc",
-          88
+          4480224
+        ],
+        [
+          "ldloc.copy",
+          8960112
+        ],
+        [
+          "iadd",
+          4480000
+        ],
+        [
+          "iclt",
+          2240056
         ]
       ],
       "interpreter_superinstruction_counts": [
         [
           "ldloc_copy",
-          164
+          8960112
         ]
       ],
       "jit_runtime_diagnostics": [],
@@ -54,11 +54,11 @@
       "native_exec_delta": 0,
       "native_trace_count_after": 0,
       "native_trace_count_before": 0,
-      "normalized_ns_per_inner_iter": 3097.5,
-      "result": 190,
+      "normalized_ns_per_inner_iter": 85.67294642857142,
+      "result": 799980000,
       "skip_reason": null,
-      "timed_runs": 1,
-      "total_elapsed_ns": 123900,
+      "timed_runs": 7,
+      "total_elapsed_ns": 191907400,
       "warmup_runs": 1
     },
     {
@@ -68,24 +68,24 @@
       "interpreter_superinstruction_counts": [],
       "jit_runtime_diagnostics": [
         [
-          "native_loop_back_iter",
-          40
+          "loop_back_trace_exec_delta",
+          2240056
         ],
         [
-          "native_trace_chain",
-          2
+          "halt_trace_exec_delta",
+          56
         ]
       ],
       "mode": "pd-vm-jit",
       "native_bridge_stats": [],
-      "native_exec_delta": 44,
+      "native_exec_delta": 2240112,
       "native_trace_count_after": 2,
       "native_trace_count_before": 2,
-      "normalized_ns_per_inner_iter": 502.5,
-      "result": 190,
+      "normalized_ns_per_inner_iter": 19.314419642857143,
+      "result": 799980000,
       "skip_reason": null,
-      "timed_runs": 1,
-      "total_elapsed_ns": 20100,
+      "timed_runs": 7,
+      "total_elapsed_ns": 43264300,
       "warmup_runs": 1
     },
     {
@@ -102,7 +102,7 @@
       "normalized_ns_per_inner_iter": null,
       "result": null,
       "skip_reason": "luajit not found in PATH",
-      "timed_runs": 1,
+      "timed_runs": 7,
       "total_elapsed_ns": null,
       "warmup_runs": 1
     },
@@ -120,16 +120,16 @@
       "normalized_ns_per_inner_iter": null,
       "result": null,
       "skip_reason": "luajit not found in PATH",
-      "timed_runs": 1,
+      "timed_runs": 7,
       "total_elapsed_ns": null,
       "warmup_runs": 1
     }
   ],
   "shared_source": "local i = 0\nlocal sum = 0\nwhile i < __PDVM_HOT_LOOP_INNER__ do\n    sum = sum + i\n    i = i + 1\nend\nsum",
   "workload": {
-    "expected_result": 190,
-    "hot_loop_inner": 20,
-    "hot_loop_outer": 2,
+    "expected_result": 799980000,
+    "hot_loop_inner": 40000,
+    "hot_loop_outer": 8,
     "name": "lua_hot_loop_same_source",
     "source_kind": "shared_lua_hot_loop_function"
   }
