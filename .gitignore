@@ -8,6 +8,7 @@
 *.pat
 *.txt
 *.json
+!results/pd_vm_lua_hot_loop_latest.json
 *.vsix
 node_modules
 dist
