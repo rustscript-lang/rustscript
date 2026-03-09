@@ -310,11 +310,26 @@ impl Vm {
                 TraceStep::Add => {
                     self.binary_add_op()?;
                 }
+                TraceStep::IAdd => {
+                    self.int_add_op()?;
+                }
+                TraceStep::FAdd => {
+                    self.float_add_op()?;
+                }
+                TraceStep::SConcat => {
+                    self.string_concat_op()?;
+                }
                 TraceStep::Sub => {
                     self.binary_numeric_op(
                         |lhs, rhs| Ok(lhs.wrapping_sub(rhs)),
                         |lhs, rhs| Ok(lhs - rhs),
                     )?;
+                }
+                TraceStep::ISub => {
+                    self.int_binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_sub(rhs)))?;
+                }
+                TraceStep::FSub => {
+                    self.float_binary_numeric_op(|lhs, rhs| Ok(lhs - rhs))?;
                 }
                 TraceStep::Mul => {
                     self.binary_numeric_op(
@@ -322,11 +337,29 @@ impl Vm {
                         |lhs, rhs| Ok(lhs * rhs),
                     )?;
                 }
+                TraceStep::IMul => {
+                    self.int_binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_mul(rhs)))?;
+                }
+                TraceStep::FMul => {
+                    self.float_binary_numeric_op(|lhs, rhs| Ok(lhs * rhs))?;
+                }
                 TraceStep::Div => {
                     self.binary_numeric_op(crate::vm::checked_int_div, |lhs, rhs| Ok(lhs / rhs))?;
                 }
+                TraceStep::IDiv => {
+                    self.int_binary_numeric_op(crate::vm::checked_int_div)?;
+                }
+                TraceStep::FDiv => {
+                    self.float_binary_numeric_op(|lhs, rhs| Ok(lhs / rhs))?;
+                }
                 TraceStep::Mod => {
                     self.binary_numeric_op(crate::vm::checked_int_rem, |lhs, rhs| Ok(lhs % rhs))?;
+                }
+                TraceStep::IMod => {
+                    self.int_binary_numeric_op(crate::vm::checked_int_rem)?;
+                }
+                TraceStep::FMod => {
+                    self.float_binary_numeric_op(|lhs, rhs| Ok(lhs % rhs))?;
                 }
                 TraceStep::Shl => {
                     let rhs = self.pop_shift_amount()?;
@@ -371,6 +404,12 @@ impl Vm {
                             self.stack.push(crate::bytecode::Value::Float(-value))
                         }
                     }
+                }
+                TraceStep::INeg => {
+                    self.int_neg_op()?;
+                }
+                TraceStep::FNeg => {
+                    self.float_neg_op()?;
                 }
                 TraceStep::Ceq => {
                     let rhs = self.pop_value()?;

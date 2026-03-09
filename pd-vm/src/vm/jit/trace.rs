@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::builtins::BuiltinFunction;
 use crate::debug_info::DebugInfo;
-use crate::vm::{OpCode, Program};
+use crate::vm::{OpCode, Program, ValueType};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JitConfig {
@@ -79,10 +79,21 @@ pub enum TraceStep {
     Nop,
     Ldc(u32),
     Add,
+    IAdd,
+    FAdd,
+    SConcat,
     Sub,
+    ISub,
+    FSub,
     Mul,
+    IMul,
+    FMul,
     Div,
+    IDiv,
+    FDiv,
     Mod,
+    IMod,
+    FMod,
     Shl,
     Shr,
     Lshr,
@@ -90,6 +101,8 @@ pub enum TraceStep {
     Or,
     Not,
     Neg,
+    INeg,
+    FNeg,
     Ceq,
     Clt,
     Cgt,
@@ -571,27 +584,27 @@ impl TraceJitEngine {
             }
             if opcode == OpCode::Add as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Add);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Sub as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Sub);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Mul as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Mul);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Div as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Div);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Mod as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Mod);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Shl as u8 {
@@ -626,7 +639,7 @@ impl TraceJitEngine {
             }
             if opcode == OpCode::Neg as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Neg);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Ceq as u8 {
@@ -786,27 +799,27 @@ impl TraceJitEngine {
             }
             if opcode == OpCode::Add as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Add);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Sub as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Sub);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Mul as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Mul);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Div as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Div);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Mod as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Mod);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Shl as u8 {
@@ -841,7 +854,7 @@ impl TraceJitEngine {
             }
             if opcode == OpCode::Neg as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Neg);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Ceq as u8 {
@@ -1031,15 +1044,59 @@ fn read_u32(code: &[u8], ip: &mut usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes))
 }
 
+fn typed_trace_step(program: &Program, ip: usize, opcode: u8) -> TraceStep {
+    let operand_types = program
+        .type_map
+        .as_ref()
+        .and_then(|type_map| type_map.operand_types.get(&ip))
+        .copied()
+        .unwrap_or((ValueType::Unknown, ValueType::Unknown));
+    match (opcode, operand_types) {
+        (x, (ValueType::Int, ValueType::Int)) if x == OpCode::Add as u8 => TraceStep::IAdd,
+        (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Add as u8 => TraceStep::FAdd,
+        (x, (ValueType::String, ValueType::String)) if x == OpCode::Add as u8 => {
+            TraceStep::SConcat
+        }
+        (x, (ValueType::Int, ValueType::Int)) if x == OpCode::Sub as u8 => TraceStep::ISub,
+        (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Sub as u8 => TraceStep::FSub,
+        (x, (ValueType::Int, ValueType::Int)) if x == OpCode::Mul as u8 => TraceStep::IMul,
+        (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Mul as u8 => TraceStep::FMul,
+        (x, (ValueType::Int, ValueType::Int)) if x == OpCode::Div as u8 => TraceStep::IDiv,
+        (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Div as u8 => TraceStep::FDiv,
+        (x, (ValueType::Int, ValueType::Int)) if x == OpCode::Mod as u8 => TraceStep::IMod,
+        (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Mod as u8 => TraceStep::FMod,
+        (x, (ValueType::Int, _)) if x == OpCode::Neg as u8 => TraceStep::INeg,
+        (x, (ValueType::Float, _)) if x == OpCode::Neg as u8 => TraceStep::FNeg,
+        (x, _) if x == OpCode::Add as u8 => TraceStep::Add,
+        (x, _) if x == OpCode::Sub as u8 => TraceStep::Sub,
+        (x, _) if x == OpCode::Mul as u8 => TraceStep::Mul,
+        (x, _) if x == OpCode::Div as u8 => TraceStep::Div,
+        (x, _) if x == OpCode::Mod as u8 => TraceStep::Mod,
+        (x, _) if x == OpCode::Neg as u8 => TraceStep::Neg,
+        _ => unreachable!("typed_trace_step only supports arithmetic opcodes"),
+    }
+}
+
 fn trace_step_name(step: &TraceStep) -> &'static str {
     match step {
         TraceStep::Nop => "nop",
         TraceStep::Ldc(_) => "ldc",
         TraceStep::Add => "add",
+        TraceStep::IAdd => "add",
+        TraceStep::FAdd => "add",
+        TraceStep::SConcat => "add",
         TraceStep::Sub => "sub",
+        TraceStep::ISub => "sub",
+        TraceStep::FSub => "sub",
         TraceStep::Mul => "mul",
+        TraceStep::IMul => "mul",
+        TraceStep::FMul => "mul",
         TraceStep::Div => "div",
+        TraceStep::IDiv => "div",
+        TraceStep::FDiv => "div",
         TraceStep::Mod => "mod",
+        TraceStep::IMod => "mod",
+        TraceStep::FMod => "mod",
         TraceStep::Shl => "shl",
         TraceStep::Shr => "shr",
         TraceStep::Lshr => "lshr",
@@ -1047,6 +1104,8 @@ fn trace_step_name(step: &TraceStep) -> &'static str {
         TraceStep::Or => "or",
         TraceStep::Not => "not",
         TraceStep::Neg => "neg",
+        TraceStep::INeg => "neg",
+        TraceStep::FNeg => "neg",
         TraceStep::Ceq => "ceq",
         TraceStep::Clt => "clt",
         TraceStep::Cgt => "cgt",

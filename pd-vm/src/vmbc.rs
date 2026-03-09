@@ -3,6 +3,7 @@ use std::fmt::Write;
 
 use crate::builtins::BuiltinFunction;
 use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
+use crate::bytecode::{TypeMap, ValueType};
 use crate::vm::{HostImport, OpCode, Program, Value};
 
 const MAGIC: [u8; 4] = *b"VMBC";
@@ -11,7 +12,8 @@ const VERSION_V2: u16 = 2;
 const VERSION_V3: u16 = 3;
 const VERSION_V4: u16 = 4;
 const VERSION_V5: u16 = 5;
-const ENCODE_VERSION: u16 = VERSION_V5;
+const VERSION_V6: u16 = 6;
+const ENCODE_VERSION: u16 = VERSION_V6;
 const FLAGS: u16 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,7 +24,9 @@ pub enum WireError {
     UnsupportedFlags(u16),
     InvalidConstantTag(u8),
     InvalidBool(u8),
+    InvalidTypeMapFlag(u8),
     InvalidDebugFlag(u8),
+    InvalidValueType(u8),
     InvalidUtf8,
     StringTooLong(usize),
     CodeTooLong(usize),
@@ -42,7 +46,9 @@ impl std::fmt::Display for WireError {
             WireError::UnsupportedFlags(flags) => write!(f, "unsupported flags: {flags}"),
             WireError::InvalidConstantTag(tag) => write!(f, "invalid constant tag: {tag}"),
             WireError::InvalidBool(value) => write!(f, "invalid bool value: {value}"),
+            WireError::InvalidTypeMapFlag(value) => write!(f, "invalid type-map flag: {value}"),
             WireError::InvalidDebugFlag(value) => write!(f, "invalid debug flag: {value}"),
+            WireError::InvalidValueType(value) => write!(f, "invalid value type: {value}"),
             WireError::InvalidUtf8 => write!(f, "invalid utf-8 string"),
             WireError::StringTooLong(len) => write!(f, "string too long: {len}"),
             WireError::CodeTooLong(len) => write!(f, "code too long: {len}"),
@@ -179,6 +185,10 @@ pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
         }
     }
 
+    if ENCODE_VERSION >= VERSION_V6 {
+        write_type_map(&mut out, program.type_map.as_ref())?;
+    }
+
     if ENCODE_VERSION >= VERSION_V2 {
         write_debug_info(&mut out, program.debug.as_ref())?;
     }
@@ -200,6 +210,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         && version != VERSION_V3
         && version != VERSION_V4
         && version != VERSION_V5
+        && version != VERSION_V6
     {
         return Err(WireError::UnsupportedVersion(version));
     }
@@ -252,6 +263,11 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     } else {
         Vec::new()
     };
+    let type_map = if version >= VERSION_V6 {
+        read_type_map(&mut cursor)?
+    } else {
+        None
+    };
     let debug = if version >= VERSION_V2 {
         read_debug_info(&mut cursor, version)?
     } else {
@@ -262,9 +278,11 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         return Err(WireError::TrailingBytes);
     }
 
-    Ok(Program::with_imports_and_debug(
+    let mut program = Program::with_imports_and_debug(
         constants, code, imports, debug,
-    ))
+    );
+    program.type_map = type_map;
+    Ok(program)
 }
 
 pub fn validate_program(program: &Program, host_fn_count: u16) -> Result<(), ValidationError> {
@@ -712,6 +730,75 @@ fn read_debug_info(cursor: &mut Cursor<'_>, version: u16) -> Result<Option<Debug
             }))
         }
         other => Err(WireError::InvalidDebugFlag(other)),
+    }
+}
+
+fn write_type_map(out: &mut Vec<u8>, type_map: Option<&TypeMap>) -> Result<(), WireError> {
+    let Some(type_map) = type_map else {
+        out.push(0);
+        return Ok(());
+    };
+
+    out.push(1);
+    write_u32_count("type map locals", type_map.local_types.len(), out)?;
+    for ty in &type_map.local_types {
+        out.push(*ty as u8);
+    }
+
+    write_u32_count("type map operands", type_map.operand_types.len(), out)?;
+    let mut operand_entries = type_map
+        .operand_types
+        .iter()
+        .map(|(offset, pair)| (*offset, *pair))
+        .collect::<Vec<_>>();
+    operand_entries.sort_unstable_by_key(|(offset, _)| *offset);
+    for (offset, (lhs, rhs)) in operand_entries {
+        write_u32_count("type map operand offset", offset, out)?;
+        out.push(lhs as u8);
+        out.push(rhs as u8);
+    }
+    Ok(())
+}
+
+fn read_type_map(cursor: &mut Cursor<'_>) -> Result<Option<TypeMap>, WireError> {
+    match cursor.read_u8()? {
+        0 => Ok(None),
+        1 => {
+            let local_count = cursor.read_u32()? as usize;
+            let mut local_types = Vec::with_capacity(local_count);
+            for _ in 0..local_count {
+                local_types.push(read_value_type(cursor.read_u8()?)?);
+            }
+
+            let operand_count = cursor.read_u32()? as usize;
+            let mut operand_types = HashMap::with_capacity(operand_count);
+            for _ in 0..operand_count {
+                let offset = cursor.read_u32()? as usize;
+                let lhs = read_value_type(cursor.read_u8()?)?;
+                let rhs = read_value_type(cursor.read_u8()?)?;
+                operand_types.insert(offset, (lhs, rhs));
+            }
+
+            Ok(Some(TypeMap {
+                local_types,
+                operand_types,
+            }))
+        }
+        other => Err(WireError::InvalidTypeMapFlag(other)),
+    }
+}
+
+fn read_value_type(raw: u8) -> Result<ValueType, WireError> {
+    match raw {
+        0 => Ok(ValueType::Unknown),
+        1 => Ok(ValueType::Null),
+        2 => Ok(ValueType::Int),
+        3 => Ok(ValueType::Float),
+        4 => Ok(ValueType::Bool),
+        5 => Ok(ValueType::String),
+        6 => Ok(ValueType::Array),
+        7 => Ok(ValueType::Map),
+        other => Err(WireError::InvalidValueType(other)),
     }
 }
 

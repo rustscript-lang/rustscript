@@ -380,7 +380,7 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
-        TraceStep::Add => {
+        TraceStep::Add | TraceStep::IAdd => {
             emit_inline_int_binop(
                 b,
                 vm_ptr,
@@ -394,7 +394,8 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
-        TraceStep::Sub => {
+        TraceStep::FAdd | TraceStep::SConcat => Ok(false),
+        TraceStep::Sub | TraceStep::ISub => {
             emit_inline_int_binop(
                 b,
                 vm_ptr,
@@ -408,7 +409,8 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
-        TraceStep::Mul => {
+        TraceStep::FSub => Ok(false),
+        TraceStep::Mul | TraceStep::IMul => {
             emit_inline_int_binop(
                 b,
                 vm_ptr,
@@ -422,7 +424,8 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
-        TraceStep::Div => {
+        TraceStep::FMul => Ok(false),
+        TraceStep::Div | TraceStep::IDiv => {
             emit_inline_int_divrem(
                 b,
                 vm_ptr,
@@ -436,7 +439,8 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
-        TraceStep::Mod => {
+        TraceStep::FDiv => Ok(false),
+        TraceStep::Mod | TraceStep::IMod => {
             emit_inline_int_divrem(
                 b,
                 vm_ptr,
@@ -450,6 +454,7 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
+        TraceStep::FMod => Ok(false),
         TraceStep::Shl => {
             emit_inline_shift(
                 b,
@@ -524,7 +529,7 @@ pub(super) fn emit_inline_or_helper_step(
             emit_inline_not(b, vm_ptr, helper_ref, exit_block, root_ip)?;
             Ok(true)
         }
-        TraceStep::Neg => {
+        TraceStep::Neg | TraceStep::INeg => {
             emit_inline_neg(
                 b,
                 vm_ptr,
@@ -537,6 +542,7 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
+        TraceStep::FNeg => Ok(false),
         TraceStep::Clt => {
             emit_inline_int_compare(
                 b,
@@ -2021,18 +2027,20 @@ fn step_to_call(step: &TraceStep, root_ip: usize) -> VmResult<(i64, i64, i64, i6
     Ok(match step {
         TraceStep::Nop => (0, 0, 0, 0),
         TraceStep::Ldc(index) => (OP_LDC, i64::from(*index), 0, 0),
-        TraceStep::Add => (OP_ADD, 0, 0, 0),
-        TraceStep::Sub => (OP_SUB, 0, 0, 0),
-        TraceStep::Mul => (OP_MUL, 0, 0, 0),
-        TraceStep::Div => (OP_DIV, 0, 0, 0),
-        TraceStep::Mod => (OP_MOD, 0, 0, 0),
+        TraceStep::Add | TraceStep::IAdd | TraceStep::FAdd | TraceStep::SConcat => {
+            (OP_ADD, 0, 0, 0)
+        }
+        TraceStep::Sub | TraceStep::ISub | TraceStep::FSub => (OP_SUB, 0, 0, 0),
+        TraceStep::Mul | TraceStep::IMul | TraceStep::FMul => (OP_MUL, 0, 0, 0),
+        TraceStep::Div | TraceStep::IDiv | TraceStep::FDiv => (OP_DIV, 0, 0, 0),
+        TraceStep::Mod | TraceStep::IMod | TraceStep::FMod => (OP_MOD, 0, 0, 0),
         TraceStep::Shl => (OP_SHL, 0, 0, 0),
         TraceStep::Shr => (OP_SHR, 0, 0, 0),
         TraceStep::Lshr => (OP_LSHR, 0, 0, 0),
         TraceStep::And => (OP_AND, 0, 0, 0),
         TraceStep::Or => (OP_OR, 0, 0, 0),
         TraceStep::Not => (OP_NOT, 0, 0, 0),
-        TraceStep::Neg => (OP_NEG, 0, 0, 0),
+        TraceStep::Neg | TraceStep::INeg | TraceStep::FNeg => (OP_NEG, 0, 0, 0),
         TraceStep::Ceq => (OP_CEQ, 0, 0, 0),
         TraceStep::Clt => (OP_CLT, 0, 0, 0),
         TraceStep::Cgt => (OP_CGT, 0, 0, 0),

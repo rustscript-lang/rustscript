@@ -6,7 +6,7 @@ use crate::assembler::{Assembler, AssemblerError};
 use crate::builtins::BuiltinFunction;
 #[cfg(feature = "runtime")]
 use crate::vm::Vm;
-use crate::{HostImport, Program, Value};
+use crate::{HostImport, Program, TypeMap, Value, ValueType};
 
 #[derive(Debug)]
 pub enum CompileError {
@@ -20,6 +20,10 @@ pub enum CompileError {
     BreakOutsideLoop,
     ContinueOutsideLoop,
     InlineFunctionRecursion(String),
+    IfElseBranchTypeMismatch {
+        line: Option<u32>,
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,12 +375,14 @@ fn compile_parsed_output(
 ) -> Result<CompiledProgram, SourceError> {
     let local_debug_ranges = collect_named_local_debug_ranges(&parsed);
     let parsed = opt::legalize_builtins_and_bind_types(parsed);
+    opt::validate_if_else_type_consistency(&parsed).map_err(SourceError::Compile)?;
     let parsed = lifetime::enforce_local_availability(
         parsed,
         behavior.clear_dead_locals,
         enable_local_move_semantics,
     )
     .map_err(SourceError::Parse)?;
+    let type_info = opt::infer_types(&parsed);
     let FrontendIr {
         stmts,
         locals,
@@ -410,6 +416,7 @@ fn compile_parsed_output(
         .collect::<Vec<_>>();
 
     let mut compiler = Compiler::new();
+    compiler.set_type_inference(type_info);
     compiler.set_source(source);
     compiler.set_function_impls(function_impls);
     compiler.set_call_index_remap(call_index_remap);
@@ -633,6 +640,8 @@ pub struct Compiler {
     inline_call_stack: Vec<u16>,
     callable_bindings: HashMap<LocalSlot, CallableBinding>,
     enable_local_move_semantics: bool,
+    type_state: opt::LocalTypeState,
+    type_map: TypeMap,
 }
 
 struct LoopContext {
@@ -671,6 +680,8 @@ impl Compiler {
             inline_call_stack: Vec::new(),
             callable_bindings: HashMap::new(),
             enable_local_move_semantics: false,
+            type_state: opt::LocalTypeState::default(),
+            type_map: TypeMap::default(),
         }
     }
 
@@ -711,12 +722,19 @@ impl Compiler {
         self.enable_local_move_semantics = enable_local_move_semantics;
     }
 
+    pub(crate) fn set_type_inference(&mut self, type_info: opt::TypeInferenceResult) {
+        self.type_map.local_types = type_info.local_types;
+    }
+
     pub fn compile_program(mut self, stmts: &[Stmt]) -> Result<Program, CompileError> {
         self.compile_stmts(stmts)?;
         self.assembler.ret();
-        self.assembler
+        let mut program = self
+            .assembler
             .finish_program()
-            .map_err(CompileError::Assembler)
+            .map_err(CompileError::Assembler)?;
+        program.type_map = Some(self.type_map);
+        Ok(program)
     }
 
     fn compile_stmts(&mut self, stmts: &[Stmt]) -> Result<(), CompileError> {
@@ -758,22 +776,28 @@ impl Compiler {
                 line,
             } => {
                 let callable_snapshot = self.callable_bindings.clone();
+                let type_state_snapshot = self.type_state.clone();
                 self.assembler.mark_line(*line);
                 let else_label = self.fresh_label("else");
                 let end_label = self.fresh_label("endif");
                 self.compile_scalar_expr(condition)?;
                 self.assembler.brfalse_label(&else_label);
                 self.compile_stmts(then_branch)?;
+                let then_type_state = self.type_state.clone();
                 self.assembler.br_label(&end_label);
                 self.assembler
                     .label(&else_label)
                     .map_err(CompileError::Assembler)?;
                 self.callable_bindings = callable_snapshot.clone();
+                self.type_state = type_state_snapshot.clone();
                 self.compile_stmts(else_branch)?;
+                let else_type_state = self.type_state.clone();
                 self.assembler
                     .label(&end_label)
                     .map_err(CompileError::Assembler)?;
                 self.callable_bindings = callable_snapshot;
+                self.type_state
+                    .merge_from_branches(&then_type_state, &else_type_state);
             }
             Stmt::For {
                 init,
@@ -808,6 +832,7 @@ impl Compiler {
                     .label(&end_label)
                     .map_err(CompileError::Assembler)?;
                 self.callable_bindings = callable_snapshot;
+                self.type_state.clear();
             }
             Stmt::While {
                 condition,
@@ -834,6 +859,7 @@ impl Compiler {
                     .label(&end_label)
                     .map_err(CompileError::Assembler)?;
                 self.callable_bindings = callable_snapshot;
+                self.type_state.clear();
             }
             Stmt::Break { line } => {
                 self.assembler.mark_line(*line);
@@ -897,25 +923,33 @@ impl Compiler {
                 self.compile_callable_call(callable, args)?;
             }
             Expr::Add(lhs, rhs) => {
+                let lhs_ty = self.value_type_of_expr(lhs);
+                let rhs_ty = self.value_type_of_expr(rhs);
                 if is_definitely_string_expr(lhs) {
                     self.compile_scalar_expr(lhs)?;
                     self.compile_string_concat_operand(rhs)?;
+                    self.record_operand_types(ValueType::String, ValueType::String);
                     self.assembler.add();
                     return Ok(());
                 }
                 if is_definitely_string_expr(rhs) {
                     self.compile_string_concat_operand(lhs)?;
                     self.compile_scalar_expr(rhs)?;
+                    self.record_operand_types(ValueType::String, ValueType::String);
                     self.assembler.add();
                     return Ok(());
                 }
                 self.compile_scalar_expr(lhs)?;
                 self.compile_scalar_expr(rhs)?;
+                self.record_operand_types(lhs_ty, rhs_ty);
                 self.assembler.add();
             }
             Expr::Sub(lhs, rhs) => {
+                let lhs_ty = self.value_type_of_expr(lhs);
+                let rhs_ty = self.value_type_of_expr(rhs);
                 self.compile_scalar_expr(lhs)?;
                 self.compile_scalar_expr(rhs)?;
+                self.record_operand_types(lhs_ty, rhs_ty);
                 self.assembler.sub();
             }
             Expr::Mul(lhs, rhs) => {
@@ -932,23 +966,34 @@ impl Compiler {
                     self.assembler.push_const(Value::Int(shift as i64));
                     self.assembler.shl();
                 } else {
+                    let lhs_ty = self.value_type_of_expr(lhs);
+                    let rhs_ty = self.value_type_of_expr(rhs);
                     self.compile_scalar_expr(lhs)?;
                     self.compile_scalar_expr(rhs)?;
+                    self.record_operand_types(lhs_ty, rhs_ty);
                     self.assembler.mul();
                 }
             }
             Expr::Div(lhs, rhs) => {
+                let lhs_ty = self.value_type_of_expr(lhs);
+                let rhs_ty = self.value_type_of_expr(rhs);
                 self.compile_scalar_expr(lhs)?;
                 self.compile_scalar_expr(rhs)?;
+                self.record_operand_types(lhs_ty, rhs_ty);
                 self.assembler.div();
             }
             Expr::Mod(lhs, rhs) => {
+                let lhs_ty = self.value_type_of_expr(lhs);
+                let rhs_ty = self.value_type_of_expr(rhs);
                 self.compile_scalar_expr(lhs)?;
                 self.compile_scalar_expr(rhs)?;
+                self.record_operand_types(lhs_ty, rhs_ty);
                 self.assembler.modulo();
             }
             Expr::Neg(inner) => {
+                let inner_ty = self.value_type_of_expr(inner);
                 self.compile_scalar_expr(inner)?;
+                self.record_unary_operand_type(inner_ty);
                 self.assembler.neg();
             }
             Expr::Not(inner) => {
@@ -968,18 +1013,27 @@ impl Compiler {
                 self.compile_short_circuit_or(lhs, rhs)?;
             }
             Expr::Eq(lhs, rhs) => {
+                let lhs_ty = self.value_type_of_expr(lhs);
+                let rhs_ty = self.value_type_of_expr(rhs);
                 self.compile_scalar_expr(lhs)?;
                 self.compile_scalar_expr(rhs)?;
+                self.record_operand_types(lhs_ty, rhs_ty);
                 self.assembler.ceq();
             }
             Expr::Lt(lhs, rhs) => {
+                let lhs_ty = self.value_type_of_expr(lhs);
+                let rhs_ty = self.value_type_of_expr(rhs);
                 self.compile_scalar_expr(lhs)?;
                 self.compile_scalar_expr(rhs)?;
+                self.record_operand_types(lhs_ty, rhs_ty);
                 self.assembler.clt();
             }
             Expr::Gt(lhs, rhs) => {
+                let lhs_ty = self.value_type_of_expr(lhs);
+                let rhs_ty = self.value_type_of_expr(rhs);
                 self.compile_scalar_expr(lhs)?;
                 self.compile_scalar_expr(rhs)?;
+                self.record_operand_types(lhs_ty, rhs_ty);
                 self.assembler.cgt();
             }
             Expr::Var(index) => {
@@ -993,6 +1047,7 @@ impl Compiler {
                     return Err(CompileError::CallableUsedAsValue);
                 }
                 self.emit_move_ldloc(*index)?;
+                self.type_state.set(*index, opt::BoundType::Null);
             }
             Expr::MoveField { root, key } => {
                 self.emit_copy_ldloc(*root)?;
@@ -1096,12 +1151,15 @@ impl Compiler {
         captured_slot: LocalSlot,
         capture_mode: CaptureBindingMode,
     ) -> Result<(), CompileError> {
+        let captured_type = self.type_state.get(source_index);
         if self.enable_local_move_semantics && capture_mode == CaptureBindingMode::Move {
             self.emit_move_ldloc(source_index)?;
+            self.type_state.set(source_index, opt::BoundType::Null);
         } else {
             self.emit_copy_ldloc(source_index)?;
         }
         self.emit_stloc(captured_slot)?;
+        self.type_state.set(captured_slot, captured_type);
         Ok(())
     }
 
@@ -1396,11 +1454,14 @@ impl Compiler {
     fn assign_expr_to_slot(&mut self, slot: LocalSlot, expr: &Expr) -> Result<(), CompileError> {
         if let Some(callable) = self.callable_binding_from_expr(expr)? {
             self.callable_bindings.insert(slot, callable);
+            self.type_state.set(slot, opt::BoundType::Unknown);
             return Ok(());
         }
+        let ty = self.infer_bound_type(expr);
         self.callable_bindings.remove(&slot);
         self.compile_scalar_expr(expr)?;
         self.emit_stloc(slot)?;
+        self.type_state.set(slot, ty);
         Ok(())
     }
 
@@ -1607,6 +1668,32 @@ impl Compiler {
         Ok(())
     }
 
+    fn infer_bound_type(&self, expr: &Expr) -> opt::BoundType {
+        opt::infer_expr_type(expr, &self.type_state)
+    }
+
+    fn value_type_of_expr(&self, expr: &Expr) -> ValueType {
+        ValueType::from(self.infer_bound_type(expr))
+    }
+
+    fn record_operand_types(&mut self, lhs: ValueType, rhs: ValueType) {
+        if lhs == ValueType::Unknown || rhs == ValueType::Unknown {
+            return;
+        }
+        self.type_map
+            .operand_types
+            .insert(self.assembler.position() as usize, (lhs, rhs));
+    }
+
+    fn record_unary_operand_type(&mut self, operand: ValueType) {
+        if operand == ValueType::Unknown {
+            return;
+        }
+        self.type_map
+            .operand_types
+            .insert(self.assembler.position() as usize, (operand, ValueType::Unknown));
+    }
+
     fn fresh_label(&mut self, prefix: &str) -> String {
         let label = format!("{prefix}_{}", self.next_label_id);
         self.next_label_id += 1;
@@ -1633,6 +1720,7 @@ impl Compiler {
         for slot in slots {
             self.assembler.push_const(Value::Null);
             self.emit_stloc(*slot)?;
+            self.type_state.set(*slot, opt::BoundType::Null);
         }
         Ok(())
     }

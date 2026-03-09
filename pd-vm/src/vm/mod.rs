@@ -11,7 +11,7 @@ pub mod diagnostics;
 pub(crate) mod jit;
 mod store;
 
-pub use crate::bytecode::{HostImport, OpCode, Program, Value};
+pub use crate::bytecode::{HostImport, OpCode, Program, Value, ValueType};
 pub use store::Store;
 
 #[derive(Clone, Copy, Debug)]
@@ -576,7 +576,25 @@ fn compute_program_cache_key(program: &Program) -> u64 {
         hash_value(constant, &mut hasher);
     }
     program.imports.hash(&mut hasher);
+    hash_type_map(program.type_map.as_ref(), &mut hasher);
     hasher.finish()
+}
+
+fn hash_type_map(type_map: Option<&crate::bytecode::TypeMap>, state: &mut impl Hasher) {
+    let Some(type_map) = type_map else {
+        0u8.hash(state);
+        return;
+    };
+
+    1u8.hash(state);
+    type_map.local_types.hash(state);
+    let mut operand_entries = type_map
+        .operand_types
+        .iter()
+        .map(|(offset, pair)| (*offset, *pair))
+        .collect::<Vec<_>>();
+    operand_entries.sort_unstable_by_key(|(offset, _)| *offset);
+    operand_entries.hash(state);
 }
 
 fn hash_value(value: &Value, state: &mut impl Hasher) {
@@ -1483,22 +1501,59 @@ impl Vm {
                 self.stack.push(value);
             }
             x if x == OpCode::Add as u8 => {
-                self.binary_add_op()?;
+                let ip = self.ip - 1;
+                match self.type_map_operand(ip) {
+                    Some((ValueType::Int, ValueType::Int)) => self.int_add_op()?,
+                    Some((ValueType::Float, ValueType::Float)) => self.float_add_op()?,
+                    Some((ValueType::String, ValueType::String)) => self.string_concat_op()?,
+                    _ => self.binary_add_op()?,
+                }
             }
             x if x == OpCode::Sub as u8 => {
-                self.binary_numeric_op(
-                    |lhs, rhs| Ok(lhs.wrapping_sub(rhs)),
-                    |lhs, rhs| Ok(lhs - rhs),
-                )?;
+                let ip = self.ip - 1;
+                match self.type_map_operand(ip) {
+                    Some((ValueType::Int, ValueType::Int)) => {
+                        self.int_binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_sub(rhs)))?;
+                    }
+                    Some((ValueType::Float, ValueType::Float)) => {
+                        self.float_binary_numeric_op(|lhs, rhs| Ok(lhs - rhs))?;
+                    }
+                    _ => {
+                        self.binary_numeric_op(
+                            |lhs, rhs| Ok(lhs.wrapping_sub(rhs)),
+                            |lhs, rhs| Ok(lhs - rhs),
+                        )?;
+                    }
+                }
             }
             x if x == OpCode::Mul as u8 => {
-                self.binary_numeric_op(
-                    |lhs, rhs| Ok(lhs.wrapping_mul(rhs)),
-                    |lhs, rhs| Ok(lhs * rhs),
-                )?;
+                let ip = self.ip - 1;
+                match self.type_map_operand(ip) {
+                    Some((ValueType::Int, ValueType::Int)) => {
+                        self.int_binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_mul(rhs)))?;
+                    }
+                    Some((ValueType::Float, ValueType::Float)) => {
+                        self.float_binary_numeric_op(|lhs, rhs| Ok(lhs * rhs))?;
+                    }
+                    _ => {
+                        self.binary_numeric_op(
+                            |lhs, rhs| Ok(lhs.wrapping_mul(rhs)),
+                            |lhs, rhs| Ok(lhs * rhs),
+                        )?;
+                    }
+                }
             }
             x if x == OpCode::Div as u8 => {
-                self.binary_numeric_op(checked_int_div, |lhs, rhs| Ok(lhs / rhs))?;
+                let ip = self.ip - 1;
+                match self.type_map_operand(ip) {
+                    Some((ValueType::Int, ValueType::Int)) => {
+                        self.int_binary_numeric_op(checked_int_div)?;
+                    }
+                    Some((ValueType::Float, ValueType::Float)) => {
+                        self.float_binary_numeric_op(|lhs, rhs| Ok(lhs / rhs))?;
+                    }
+                    _ => self.binary_numeric_op(checked_int_div, |lhs, rhs| Ok(lhs / rhs))?,
+                }
             }
             x if x == OpCode::Shl as u8 => {
                 let rhs = self.pop_shift_amount()?;
@@ -1516,7 +1571,16 @@ impl Vm {
                 self.stack.push(Value::Int(logical_shr_i64(lhs, rhs)));
             }
             x if x == OpCode::Mod as u8 => {
-                self.binary_numeric_op(checked_int_rem, |lhs, rhs| Ok(lhs % rhs))?;
+                let ip = self.ip - 1;
+                match self.type_map_operand(ip) {
+                    Some((ValueType::Int, ValueType::Int)) => {
+                        self.int_binary_numeric_op(checked_int_rem)?;
+                    }
+                    Some((ValueType::Float, ValueType::Float)) => {
+                        self.float_binary_numeric_op(|lhs, rhs| Ok(lhs % rhs))?;
+                    }
+                    _ => self.binary_numeric_op(checked_int_rem, |lhs, rhs| Ok(lhs % rhs))?,
+                }
             }
             x if x == OpCode::And as u8 => {
                 let rhs = self.pop_bool()?;
@@ -1532,22 +1596,59 @@ impl Vm {
                 self.unary_not_op()?;
             }
             x if x == OpCode::Neg as u8 => {
-                let value = self.pop_numeric()?;
-                match value {
-                    NumericValue::Int(value) => self.stack.push(Value::Int(value.wrapping_neg())),
-                    NumericValue::Float(value) => self.stack.push(Value::Float(-value)),
+                let ip = self.ip - 1;
+                match self.type_map_operand(ip) {
+                    Some((ValueType::Int, _)) => self.int_neg_op()?,
+                    Some((ValueType::Float, _)) => self.float_neg_op()?,
+                    _ => {
+                        let value = self.pop_numeric()?;
+                        match value {
+                            NumericValue::Int(value) => {
+                                self.stack.push(Value::Int(value.wrapping_neg()))
+                            }
+                            NumericValue::Float(value) => self.stack.push(Value::Float(-value)),
+                        }
+                    }
                 }
             }
             x if x == OpCode::Ceq as u8 => {
-                let rhs = self.pop_value()?;
-                let lhs = self.pop_value()?;
-                self.stack.push(Value::Bool(lhs == rhs));
+                let ip = self.ip - 1;
+                match self.type_map_operand(ip) {
+                    Some((ValueType::Int, ValueType::Int)) => self.int_eq_op()?,
+                    Some((ValueType::Float, ValueType::Float)) => self.float_eq_op()?,
+                    Some((ValueType::Bool, ValueType::Bool)) => self.bool_eq_op()?,
+                    Some((ValueType::String, ValueType::String)) => self.string_eq_op()?,
+                    Some((ValueType::Null, ValueType::Null)) => self.null_eq_op()?,
+                    _ => {
+                        let rhs = self.pop_value()?;
+                        let lhs = self.pop_value()?;
+                        self.stack.push(Value::Bool(lhs == rhs));
+                    }
+                }
             }
             x if x == OpCode::Clt as u8 => {
-                self.compare_numeric_op(|lhs, rhs| lhs < rhs, |lhs, rhs| lhs < rhs)?;
+                let ip = self.ip - 1;
+                match self.type_map_operand(ip) {
+                    Some((ValueType::Int, ValueType::Int)) => {
+                        self.int_compare_op(|lhs, rhs| lhs < rhs)?;
+                    }
+                    Some((ValueType::Float, ValueType::Float)) => {
+                        self.float_compare_op(|lhs, rhs| lhs < rhs)?;
+                    }
+                    _ => self.compare_numeric_op(|lhs, rhs| lhs < rhs, |lhs, rhs| lhs < rhs)?,
+                }
             }
             x if x == OpCode::Cgt as u8 => {
-                self.compare_numeric_op(|lhs, rhs| lhs > rhs, |lhs, rhs| lhs > rhs)?;
+                let ip = self.ip - 1;
+                match self.type_map_operand(ip) {
+                    Some((ValueType::Int, ValueType::Int)) => {
+                        self.int_compare_op(|lhs, rhs| lhs > rhs)?;
+                    }
+                    Some((ValueType::Float, ValueType::Float)) => {
+                        self.float_compare_op(|lhs, rhs| lhs > rhs)?;
+                    }
+                    _ => self.compare_numeric_op(|lhs, rhs| lhs > rhs, |lhs, rhs| lhs > rhs)?,
+                }
             }
             x if x == OpCode::Br as u8 => {
                 let target = self.read_u32()? as usize;
@@ -1817,10 +1918,148 @@ impl Vm {
         self.pop_value()?.as_bool()
     }
 
+    fn pop_float_exact(&mut self) -> VmResult<f64> {
+        match self.pop_value()? {
+            Value::Float(value) => Ok(value),
+            _ => Err(VmError::TypeMismatch("float")),
+        }
+    }
+
+    fn type_map_operand(&self, ip: usize) -> Option<(ValueType, ValueType)> {
+        self.program
+            .type_map
+            .as_ref()?
+            .operand_types
+            .get(&ip)
+            .copied()
+    }
+
     #[inline(always)]
     fn unary_not_op(&mut self) -> VmResult<()> {
         let value = self.pop_bool()?;
         self.stack.push(Value::Bool(!value));
+        Ok(())
+    }
+
+    fn int_add_op(&mut self) -> VmResult<()> {
+        let rhs = self.pop_int()?;
+        let lhs = self.pop_int()?;
+        self.stack.push(Value::Int(lhs.wrapping_add(rhs)));
+        Ok(())
+    }
+
+    fn float_add_op(&mut self) -> VmResult<()> {
+        let rhs = self.pop_float_exact()?;
+        let lhs = self.pop_float_exact()?;
+        self.stack.push(Value::Float(lhs + rhs));
+        Ok(())
+    }
+
+    fn string_concat_op(&mut self) -> VmResult<()> {
+        let rhs = match self.pop_value()? {
+            Value::String(value) => value,
+            _ => return Err(VmError::TypeMismatch("string")),
+        };
+        let lhs = match self.pop_value()? {
+            Value::String(value) => value,
+            _ => return Err(VmError::TypeMismatch("string")),
+        };
+        let mut out = String::with_capacity(lhs.len() + rhs.len());
+        out.push_str(lhs.as_str());
+        out.push_str(rhs.as_str());
+        self.stack.push(Value::string(out));
+        Ok(())
+    }
+
+    fn int_binary_numeric_op(
+        &mut self,
+        op: impl FnOnce(i64, i64) -> VmResult<i64>,
+    ) -> VmResult<()> {
+        let rhs = self.pop_int()?;
+        let lhs = self.pop_int()?;
+        self.stack.push(Value::Int(op(lhs, rhs)?));
+        Ok(())
+    }
+
+    fn float_binary_numeric_op(
+        &mut self,
+        op: impl FnOnce(f64, f64) -> VmResult<f64>,
+    ) -> VmResult<()> {
+        let rhs = self.pop_float_exact()?;
+        let lhs = self.pop_float_exact()?;
+        self.stack.push(Value::Float(op(lhs, rhs)?));
+        Ok(())
+    }
+
+    fn int_neg_op(&mut self) -> VmResult<()> {
+        let value = self.pop_int()?;
+        self.stack.push(Value::Int(value.wrapping_neg()));
+        Ok(())
+    }
+
+    fn float_neg_op(&mut self) -> VmResult<()> {
+        let value = self.pop_float_exact()?;
+        self.stack.push(Value::Float(-value));
+        Ok(())
+    }
+
+    fn int_eq_op(&mut self) -> VmResult<()> {
+        let rhs = self.pop_int()?;
+        let lhs = self.pop_int()?;
+        self.stack.push(Value::Bool(lhs == rhs));
+        Ok(())
+    }
+
+    fn float_eq_op(&mut self) -> VmResult<()> {
+        let rhs = self.pop_float_exact()?;
+        let lhs = self.pop_float_exact()?;
+        self.stack.push(Value::Bool(lhs == rhs));
+        Ok(())
+    }
+
+    fn bool_eq_op(&mut self) -> VmResult<()> {
+        let rhs = self.pop_bool()?;
+        let lhs = self.pop_bool()?;
+        self.stack.push(Value::Bool(lhs == rhs));
+        Ok(())
+    }
+
+    fn string_eq_op(&mut self) -> VmResult<()> {
+        let rhs = match self.pop_value()? {
+            Value::String(value) => value,
+            _ => return Err(VmError::TypeMismatch("string")),
+        };
+        let lhs = match self.pop_value()? {
+            Value::String(value) => value,
+            _ => return Err(VmError::TypeMismatch("string")),
+        };
+        self.stack.push(Value::Bool(lhs == rhs));
+        Ok(())
+    }
+
+    fn null_eq_op(&mut self) -> VmResult<()> {
+        let rhs = self.pop_value()?;
+        let lhs = self.pop_value()?;
+        match (lhs, rhs) {
+            (Value::Null, Value::Null) => {
+                self.stack.push(Value::Bool(true));
+                Ok(())
+            }
+            _ => Err(VmError::TypeMismatch("null")),
+        }
+    }
+
+    fn int_compare_op(&mut self, op: impl FnOnce(i64, i64) -> bool) -> VmResult<()> {
+        let rhs = self.pop_int()?;
+        let lhs = self.pop_int()?;
+        self.stack.push(Value::Bool(op(lhs, rhs)));
+        Ok(())
+    }
+
+    fn float_compare_op(&mut self, op: impl FnOnce(f64, f64) -> bool) -> VmResult<()> {
+        let rhs = self.pop_float_exact()?;
+        let lhs = self.pop_float_exact()?;
+        self.stack.push(Value::Bool(op(lhs, rhs)));
         Ok(())
     }
 
