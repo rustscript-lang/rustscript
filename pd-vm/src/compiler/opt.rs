@@ -136,6 +136,8 @@ fn merge_bound_types(lhs: BoundType, rhs: BoundType) -> BoundType {
 fn are_compatible_bound_types(lhs: BoundType, rhs: BoundType) -> bool {
     lhs == BoundType::Unknown
         || rhs == BoundType::Unknown
+        || lhs == BoundType::Null
+        || rhs == BoundType::Null
         || merge_bound_types(lhs, rhs) != BoundType::Unknown
 }
 
@@ -399,14 +401,25 @@ impl<'a> TypeContext<'a> {
                 }
             }
             Expr::Match {
-                value: _,
+                value_slot,
+                value,
                 arms,
                 default,
                 ..
             } => {
+                let mut nested = state.clone();
+                let value_ty = self.infer_expr_type(value, state);
+                bind_expr_result_to_slot(
+                    &mut nested,
+                    *value_slot,
+                    value,
+                    state,
+                    value_ty,
+                    self,
+                );
                 let mut arm_type = BoundType::Unknown;
                 for (_pattern, arm_expr) in arms {
-                    let ty = self.infer_expr_type(arm_expr, state);
+                    let ty = self.infer_expr_type(arm_expr, &nested);
                     arm_type = if arm_type == BoundType::Unknown {
                         ty
                     } else if arm_type == ty {
@@ -415,8 +428,10 @@ impl<'a> TypeContext<'a> {
                         BoundType::Unknown
                     };
                 }
-                let default_ty = self.infer_expr_type(default, state);
-                if arm_type != BoundType::Unknown && arm_type == default_ty {
+                let default_ty = self.infer_expr_type(default, &nested);
+                if arms.is_empty() {
+                    default_ty
+                } else if arm_type != BoundType::Unknown && arm_type == default_ty {
                     arm_type
                 } else {
                     BoundType::Unknown
@@ -1970,15 +1985,18 @@ fn legalize_expr(
             }
         }
         Expr::Match {
+            value_slot,
             value,
             arms,
             default,
             ..
         } => {
-            let _ = legalize_expr(value, state, context);
+            let mut nested = state.clone();
+            let value_ty = legalize_expr(value, state, context);
+            bind_expr_result_to_slot(&mut nested, *value_slot, value, state, value_ty, context);
             let mut arm_type = BoundType::Unknown;
-            for (_pattern, arm_expr) in arms {
-                let ty = legalize_expr(arm_expr, state, context);
+            for (_pattern, arm_expr) in arms.iter_mut() {
+                let ty = legalize_expr(arm_expr, &nested, context);
                 arm_type = if arm_type == BoundType::Unknown {
                     ty
                 } else if arm_type == ty {
@@ -1987,8 +2005,10 @@ fn legalize_expr(
                     BoundType::Unknown
                 };
             }
-            let default_ty = legalize_expr(default, state, context);
-            if arm_type != BoundType::Unknown && arm_type == default_ty {
+            let default_ty = legalize_expr(default, &nested, context);
+            if arms.is_empty() {
+                default_ty
+            } else if arm_type != BoundType::Unknown && arm_type == default_ty {
                 arm_type
             } else {
                 BoundType::Unknown
@@ -2118,9 +2138,30 @@ fn validate_expr(
                 context,
                 strict_function_add_types,
             )?;
+            let then_state = refine_state_for_condition(state, condition, true);
+            let else_state = refine_state_for_condition(state, condition, false);
+            if let Some(true) = eval_static_bool(condition) {
+                validate_expr(
+                    then_expr,
+                    &then_state,
+                    line_context,
+                    source_name,
+                    context,
+                    strict_function_add_types,
+                )?
+            } else if let Some(false) = eval_static_bool(condition) {
+                validate_expr(
+                    else_expr,
+                    &else_state,
+                    line_context,
+                    source_name,
+                    context,
+                    strict_function_add_types,
+                )?
+            } else {
             let then_ty = validate_expr(
                 then_expr,
-                state,
+                &then_state,
                 line_context,
                 source_name,
                 context,
@@ -2128,7 +2169,7 @@ fn validate_expr(
             )?;
             let else_ty = validate_expr(
                 else_expr,
-                state,
+                &else_state,
                 line_context,
                 source_name,
                 context,
@@ -2146,14 +2187,16 @@ fn validate_expr(
             } else {
                 BoundType::Unknown
             }
+            }
         }
         Expr::Match {
+            value_slot,
             value,
             arms,
             default,
             ..
         } => {
-            let _ = validate_expr(
+            let value_ty = validate_expr(
                 value,
                 state,
                 line_context,
@@ -2161,11 +2204,13 @@ fn validate_expr(
                 context,
                 strict_function_add_types,
             )?;
+            let mut nested = state.clone();
+            bind_expr_result_to_slot(&mut nested, *value_slot, value, state, value_ty, context);
             let mut arm_type = BoundType::Unknown;
             for (_pattern, arm_expr) in arms {
                 let ty = validate_expr(
                     arm_expr,
-                    state,
+                    &nested,
                     line_context,
                     source_name,
                     context,
@@ -2181,13 +2226,15 @@ fn validate_expr(
             }
             let default_ty = validate_expr(
                 default,
-                state,
+                &nested,
                 line_context,
                 source_name,
                 context,
                 strict_function_add_types,
             )?;
-            if arm_type != BoundType::Unknown && arm_type == default_ty {
+            if arms.is_empty() {
+                default_ty
+            } else if arm_type != BoundType::Unknown && arm_type == default_ty {
                 arm_type
             } else {
                 BoundType::Unknown
@@ -2407,6 +2454,72 @@ fn infer_unary_type(expr: &Expr, inner: BoundType) -> BoundType {
         },
         Expr::Not(_) => BoundType::Bool,
         _ => BoundType::Unknown,
+    }
+}
+
+fn refine_state_for_condition(
+    state: &LocalTypeState,
+    condition: &Expr,
+    truthy: bool,
+) -> LocalTypeState {
+    let mut refined = state.clone();
+    if truthy
+        && let Some((slot, ty)) = extract_type_guard(condition)
+    {
+        refined.set(slot, ty);
+    }
+    refined
+}
+
+fn extract_type_guard(condition: &Expr) -> Option<(LocalSlot, BoundType)> {
+    let Expr::Eq(lhs, rhs) = condition else {
+        return None;
+    };
+    extract_type_guard_side(lhs, rhs).or_else(|| extract_type_guard_side(rhs, lhs))
+}
+
+fn extract_type_guard_side(lhs: &Expr, rhs: &Expr) -> Option<(LocalSlot, BoundType)> {
+    let Expr::Call(index, args) = lhs else {
+        return None;
+    };
+    if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::TypeOf) || args.len() != 1
+    {
+        return None;
+    }
+    let Expr::Var(slot) = args[0] else {
+        return None;
+    };
+    let Expr::String(type_name) = rhs else {
+        return None;
+    };
+    bound_type_from_type_name(type_name).map(|ty| (slot, ty))
+}
+
+fn bound_type_from_type_name(type_name: &str) -> Option<BoundType> {
+    match type_name {
+        "null" => Some(BoundType::Null),
+        "int" => Some(BoundType::Int),
+        "float" => Some(BoundType::Float),
+        "bool" => Some(BoundType::Bool),
+        "string" => Some(BoundType::String),
+        "array" => Some(BoundType::Array),
+        "map" => Some(BoundType::Map),
+        _ => None,
+    }
+}
+
+fn eval_static_bool(expr: &Expr) -> Option<bool> {
+    match expr {
+        Expr::Bool(value) => Some(*value),
+        Expr::Eq(lhs, rhs) => match (lhs.as_ref(), rhs.as_ref()) {
+            (Expr::Null, Expr::Null) => Some(true),
+            (Expr::Bool(lhs), Expr::Bool(rhs)) => Some(lhs == rhs),
+            (Expr::Int(lhs), Expr::Int(rhs)) => Some(lhs == rhs),
+            (Expr::Float(lhs), Expr::Float(rhs)) => Some(lhs == rhs),
+            (Expr::String(lhs), Expr::String(rhs)) => Some(lhs == rhs),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
