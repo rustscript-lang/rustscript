@@ -186,6 +186,7 @@ pub fn expect_source_error_case(case: &SourceErrorCase<'_>) {
     }
 }
 
+#[allow(dead_code)]
 pub fn run_source_error_cases(cases: &[SourceErrorCase<'_>]) {
     for case in cases {
         expect_source_error_case(case);

@@ -11,9 +11,9 @@ use std::time::Instant;
 
 use serde::Deserialize;
 use vm::{
-    CallOutcome, CallableDef, FunctionDecl, HostAsyncBridge, HostFunction, HostOpId, LocalInfo,
-    SourceFlavor, SourcePathError, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
-    compile_source_with_flavor_and_options, default_host_callables, format_value, render_vm_error,
+    CallOutcome, FunctionDecl, HostAsyncBridge, HostFunction, HostOpId, LocalInfo, SourceFlavor,
+    SourcePathError, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
+    compile_source_with_flavor_and_options, format_value, render_vm_error,
 };
 
 use crate::analyzer::{LintDiagnostic, lint_source_with_flavor};
@@ -68,10 +68,6 @@ impl FuelState {
             epoch_slice: None,
         }
     }
-}
-
-pub(crate) fn host_function_specs() -> &'static [CallableDef] {
-    default_host_callables()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

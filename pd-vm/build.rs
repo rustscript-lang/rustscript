@@ -292,7 +292,7 @@ fn render_builtin_catalog(
         .iter()
         .map(|group| group.key.clone())
         .collect::<Vec<_>>();
-    let host_group_input = host_callables.iter().cloned().collect::<Vec<_>>();
+    let host_group_input = host_callables.to_vec();
     let host_groups = stable_groups(&host_group_input, |callable| callable.name.clone());
     let (builtin_variant_order, actual_builtin_by_variant) =
         ordered_actual_builtin_variants(namespaces, builtin_callables, metadata_callables);
@@ -630,7 +630,12 @@ fn render_builtin_runtime_dispatch(
         writeln!(
             &mut out,
             "    {}",
-            render_wrapper_call(&callable.module, wrapper, SourceCategory::DefaultHost)
+            render_wrapper_call(
+                &callable.module,
+                wrapper,
+                SourceCategory::DefaultHost,
+                "args",
+            )
         )
         .unwrap();
         writeln!(&mut out, "}}").unwrap();
@@ -696,7 +701,12 @@ fn render_builtin_runtime_dispatch(
         writeln!(
             &mut out,
             "        BuiltinFunction::{variant} => {},",
-            render_wrapper_call(&callable.module, wrapper, SourceCategory::NamespacedBuiltin)
+            render_wrapper_call(
+                &callable.module,
+                wrapper,
+                SourceCategory::NamespacedBuiltin,
+                "&args",
+            )
         )
         .unwrap();
     }
@@ -1015,7 +1025,7 @@ fn render_builtin_accepts_arity_method(
     .unwrap();
     writeln!(out, "        match self {{").unwrap();
     for variant in builtin_variant_order {
-        let conditions = actual_builtin_by_variant
+        let mut conditions = actual_builtin_by_variant
             .get(variant)
             .unwrap_or_else(|| panic!("missing signatures for builtin variant '{variant}'"))
             .iter()
@@ -1028,8 +1038,9 @@ fn render_builtin_accepts_arity_method(
                     format!("({min}..={max}).contains(&(arity as usize))")
                 }
             })
-            .collect::<Vec<_>>()
-            .join(" || ");
+            .collect::<Vec<_>>();
+        conditions.dedup();
+        let conditions = conditions.join(" || ");
         writeln!(
             out,
             "            BuiltinFunction::{variant} => {conditions},"
@@ -1341,12 +1352,17 @@ fn namespace_member_signature_group_const_name(name: &str) -> String {
     format!("MEMBER_{}_SIGNATURES", to_shouty_snake(name))
 }
 
-fn render_wrapper_call(module: &str, wrapper: &WrapperDecl, category: SourceCategory) -> String {
+fn render_wrapper_call(
+    module: &str,
+    wrapper: &WrapperDecl,
+    category: SourceCategory,
+    slice_args_expr: &str,
+) -> String {
     let mut args = Vec::new();
     for param in &wrapper.params {
         match param {
             WrapperParamKind::Vm => args.push("vm".to_string()),
-            WrapperParamKind::SliceArgs => args.push("&args".to_string()),
+            WrapperParamKind::SliceArgs => args.push(slice_args_expr.to_string()),
         }
     }
     let call = format!("{module}::{}({})", wrapper.fn_name, args.join(", "));

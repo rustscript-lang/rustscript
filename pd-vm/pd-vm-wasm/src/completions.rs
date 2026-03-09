@@ -432,6 +432,7 @@ fn add_edge_host_function_entries(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_namespaced_host_function_entries(
     rustscript: &mut Vec<CompletionEntry>,
     javascript: &mut Vec<CompletionEntry>,

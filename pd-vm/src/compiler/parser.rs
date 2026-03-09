@@ -879,9 +879,7 @@ fn lint_function_block_tail(
             TokenKind::RBrace if paren_depth == 0 && bracket_depth == 0 => {
                 brace_depth = brace_depth.saturating_sub(1);
                 if brace_depth == 0 {
-                    let Some((stmt_start, semi_index)) = last_terminated_stmt else {
-                        return None;
-                    };
+                    let (stmt_start, semi_index) = last_terminated_stmt?;
                     if saw_top_level_tokens_after_last_semicolon
                         || !statement_looks_like_function_return(tokens, stmt_start, semi_index)
                     {
@@ -2117,7 +2115,6 @@ impl Parser {
                     .get(1..)
                     .map(|tail| tail.to_vec())
                     .unwrap_or_default();
-                let args = args;
                 if let Some((builtin_namespace, builtin_member)) =
                     self.resolve_builtins_call_path(&name, &member, &subpath)
                 {

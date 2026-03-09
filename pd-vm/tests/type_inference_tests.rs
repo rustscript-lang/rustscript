@@ -71,7 +71,7 @@ fn assert_last_opcode_has_no_operand_types(compiled: &CompiledProgram, opcode: O
         .last()
         .expect("expected opcode in bytecode");
     assert!(
-        type_map.operand_types.get(&offset).is_none(),
+        !type_map.operand_types.contains_key(&offset),
         "expected no operand type metadata at bytecode offset {offset}"
     );
 }

@@ -1622,10 +1622,10 @@ fn stmt_uses_param(stmt: &Stmt, param_slots: &[LocalSlot]) -> bool {
     }
 }
 
-fn observed_function_param_slice<'a>(
-    observed: &'a HashMap<u16, Vec<BoundType>>,
+fn observed_function_param_slice(
+    observed: &HashMap<u16, Vec<BoundType>>,
     function_index: u16,
-) -> Option<&'a [BoundType]> {
+) -> Option<&[BoundType]> {
     observed.get(&function_index).map(Vec::as_slice)
 }
 
@@ -2323,6 +2323,7 @@ fn bound_type_label(ty: BoundType) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_function_types(
     function_index: u16,
     function_impl: &FunctionImpl,
