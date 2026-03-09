@@ -1,9 +1,6 @@
 use std::f64::consts::{E, PI, TAU};
 
 use super::super::{Value, VmError, VmResult};
-use crate::builtins::{
-    BuiltinFunction, BuiltinNamespace, BuiltinNamespaceMember, BuiltinNamespaceRegistry,
-};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum NumericInput {
@@ -321,59 +318,6 @@ pub(super) fn builtin_math_mul_add(args: &[Value]) -> VmResult<Vec<Value>> {
     let b = arg_float(args, 1, "math::mul_add b")?;
     let c = arg_float(args, 2, "math::mul_add c")?;
     Ok(vec![Value::Float(a.mul_add(b, c))])
-}
-
-const NAMESPACE_MEMBERS: &[BuiltinNamespaceMember] = &[
-    BuiltinNamespaceMember::new("pi", BuiltinFunction::MathPi),
-    BuiltinNamespaceMember::new("tau", BuiltinFunction::MathTau),
-    BuiltinNamespaceMember::new("e", BuiltinFunction::MathE),
-    BuiltinNamespaceMember::new("epsilon", BuiltinFunction::MathEpsilon),
-    BuiltinNamespaceMember::new("inf", BuiltinFunction::MathInf),
-    BuiltinNamespaceMember::new("neg_inf", BuiltinFunction::MathNegInf),
-    BuiltinNamespaceMember::new("nan", BuiltinFunction::MathNaN),
-    BuiltinNamespaceMember::new("abs", BuiltinFunction::MathAbs),
-    BuiltinNamespaceMember::new("sqrt", BuiltinFunction::MathSqrt),
-    BuiltinNamespaceMember::new("cbrt", BuiltinFunction::MathCbrt),
-    BuiltinNamespaceMember::new("exp", BuiltinFunction::MathExp),
-    BuiltinNamespaceMember::new("exp2", BuiltinFunction::MathExp2),
-    BuiltinNamespaceMember::new("ln", BuiltinFunction::MathLn),
-    BuiltinNamespaceMember::new("ln_1p", BuiltinFunction::MathLn1p),
-    BuiltinNamespaceMember::new("log2", BuiltinFunction::MathLog2),
-    BuiltinNamespaceMember::new("log10", BuiltinFunction::MathLog10),
-    BuiltinNamespaceMember::new("sin", BuiltinFunction::MathSin),
-    BuiltinNamespaceMember::new("cos", BuiltinFunction::MathCos),
-    BuiltinNamespaceMember::new("tan", BuiltinFunction::MathTan),
-    BuiltinNamespaceMember::new("asin", BuiltinFunction::MathAsin),
-    BuiltinNamespaceMember::new("acos", BuiltinFunction::MathAcos),
-    BuiltinNamespaceMember::new("atan", BuiltinFunction::MathAtan),
-    BuiltinNamespaceMember::new("sinh", BuiltinFunction::MathSinh),
-    BuiltinNamespaceMember::new("cosh", BuiltinFunction::MathCosh),
-    BuiltinNamespaceMember::new("tanh", BuiltinFunction::MathTanh),
-    BuiltinNamespaceMember::new("floor", BuiltinFunction::MathFloor),
-    BuiltinNamespaceMember::new("ceil", BuiltinFunction::MathCeil),
-    BuiltinNamespaceMember::new("round", BuiltinFunction::MathRound),
-    BuiltinNamespaceMember::new("trunc", BuiltinFunction::MathTrunc),
-    BuiltinNamespaceMember::new("fract", BuiltinFunction::MathFract),
-    BuiltinNamespaceMember::new("signum", BuiltinFunction::MathSignum),
-    BuiltinNamespaceMember::new("to_degrees", BuiltinFunction::MathToDegrees),
-    BuiltinNamespaceMember::new("to_radians", BuiltinFunction::MathToRadians),
-    BuiltinNamespaceMember::new("is_nan", BuiltinFunction::MathIsNaN),
-    BuiltinNamespaceMember::new("is_infinite", BuiltinFunction::MathIsInfinite),
-    BuiltinNamespaceMember::new("is_finite", BuiltinFunction::MathIsFinite),
-    BuiltinNamespaceMember::new("atan2", BuiltinFunction::MathAtan2),
-    BuiltinNamespaceMember::new("powf", BuiltinFunction::MathPowF),
-    BuiltinNamespaceMember::new("powi", BuiltinFunction::MathPowI),
-    BuiltinNamespaceMember::new("hypot", BuiltinFunction::MathHypot),
-    BuiltinNamespaceMember::new("log", BuiltinFunction::MathLog),
-    BuiltinNamespaceMember::new("min", BuiltinFunction::MathMin),
-    BuiltinNamespaceMember::new("max", BuiltinFunction::MathMax),
-    BuiltinNamespaceMember::new("copysign", BuiltinFunction::MathCopySign),
-    BuiltinNamespaceMember::new("clamp", BuiltinFunction::MathClamp),
-    BuiltinNamespaceMember::new("mul_add", BuiltinFunction::MathMulAdd),
-];
-
-pub(crate) fn register_builtin_namespace(registry: &mut BuiltinNamespaceRegistry) {
-    registry.register(BuiltinNamespace::new("math", NAMESPACE_MEMBERS, false));
 }
 
 #[cfg(test)]

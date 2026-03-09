@@ -1,8 +1,5 @@
 use super::super::{Value, Vm, VmError, VmResult};
 use super::BuiltinCallOutcome;
-use crate::builtins::{
-    BuiltinFunction, BuiltinNamespace, BuiltinNamespaceMember, BuiltinNamespaceRegistry,
-};
 
 fn config_as_value(vm: &Vm) -> Value {
     let config = vm.jit_config();
@@ -122,25 +119,4 @@ pub(super) fn builtin_jit_get_max_trace_len(vm: &mut Vm) -> VmResult<BuiltinCall
     Ok(BuiltinCallOutcome::Return(vec![Value::Int(
         i64::try_from(vm.jit_config().max_trace_len).unwrap_or(i64::MAX),
     )]))
-}
-
-const NAMESPACE_MEMBERS: &[BuiltinNamespaceMember] = &[
-    BuiltinNamespaceMember::new("set_config", BuiltinFunction::JitSetConfig),
-    BuiltinNamespaceMember::new("get_config", BuiltinFunction::JitGetConfig),
-    BuiltinNamespaceMember::new("set_enabled", BuiltinFunction::JitSetEnabled),
-    BuiltinNamespaceMember::new("get_enabled", BuiltinFunction::JitGetEnabled),
-    BuiltinNamespaceMember::new(
-        "set_hot_loop_threshold",
-        BuiltinFunction::JitSetHotLoopThreshold,
-    ),
-    BuiltinNamespaceMember::new(
-        "get_hot_loop_threshold",
-        BuiltinFunction::JitGetHotLoopThreshold,
-    ),
-    BuiltinNamespaceMember::new("set_max_trace_len", BuiltinFunction::JitSetMaxTraceLen),
-    BuiltinNamespaceMember::new("get_max_trace_len", BuiltinFunction::JitGetMaxTraceLen),
-];
-
-pub(crate) fn register_builtin_namespace(registry: &mut BuiltinNamespaceRegistry) {
-    registry.register(BuiltinNamespace::new("jit", NAMESPACE_MEMBERS, false));
 }

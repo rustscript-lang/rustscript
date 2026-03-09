@@ -5,9 +5,6 @@ use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
 use super::super::{Value, VmError, VmResult};
 use super::arg_string;
-use crate::builtins::{
-    BuiltinFunction, BuiltinNamespace, BuiltinNamespaceMember, BuiltinNamespaceRegistry,
-};
 
 /// Encodes a `Value` into a JSON string.
 /// Note: When encoding a `Value::Map`, this function enforces a strict unique-keys contract.
@@ -169,13 +166,4 @@ impl<'de> Visitor<'de> for JsonValueVisitor {
         }
         Ok(DecodedJsonValue(Value::map(entries)))
     }
-}
-
-const NAMESPACE_MEMBERS: &[BuiltinNamespaceMember] = &[
-    BuiltinNamespaceMember::new("encode", BuiltinFunction::JsonEncode),
-    BuiltinNamespaceMember::new("decode", BuiltinFunction::JsonDecode),
-];
-
-pub(crate) fn register_builtin_namespace(registry: &mut BuiltinNamespaceRegistry) {
-    registry.register(BuiltinNamespace::new("json", NAMESPACE_MEMBERS, false));
 }

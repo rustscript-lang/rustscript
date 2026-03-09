@@ -19,6 +19,7 @@ pub mod vm;
 pub mod vmbc;
 
 pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, assemble};
+pub use builtins::{BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec, builtin_namespace_specs};
 pub use bytecode::{HostImport, OpCode, Program, Value};
 pub use compiler::diagnostics::render_source_error;
 pub use compiler::source_map::{LineSpanMapping, LoweredSource, SourceId, SourceMap, Span};

@@ -1,9 +1,5 @@
 use std::task::{Context, Poll};
 
-use crate::builtins::{
-    BuiltinFunction, BuiltinNamespace, BuiltinNamespaceMember, BuiltinNamespaceRegistry,
-};
-
 use super::super::{HostOpId, Value, Vm, VmError, VmResult};
 use super::BuiltinCallOutcome;
 
@@ -66,19 +62,4 @@ pub(super) fn builtin_io_close(_vm: &mut Vm, _args: Vec<Value>) -> VmResult<Buil
 
 pub(super) fn builtin_io_exists(_vm: &mut Vm, _args: Vec<Value>) -> VmResult<BuiltinCallOutcome> {
     unsupported_io("io::exists")
-}
-
-const NAMESPACE_MEMBERS: &[BuiltinNamespaceMember] = &[
-    BuiltinNamespaceMember::new("open", BuiltinFunction::IoOpen),
-    BuiltinNamespaceMember::new("popen", BuiltinFunction::IoPopen),
-    BuiltinNamespaceMember::new("read_all", BuiltinFunction::IoReadAll),
-    BuiltinNamespaceMember::new("read_line", BuiltinFunction::IoReadLine),
-    BuiltinNamespaceMember::new("write", BuiltinFunction::IoWrite),
-    BuiltinNamespaceMember::new("flush", BuiltinFunction::IoFlush),
-    BuiltinNamespaceMember::new("close", BuiltinFunction::IoClose),
-    BuiltinNamespaceMember::new("exists", BuiltinFunction::IoExists),
-];
-
-pub(crate) fn register_builtin_namespace(registry: &mut BuiltinNamespaceRegistry) {
-    registry.register(BuiltinNamespace::new("io", NAMESPACE_MEMBERS, false));
 }

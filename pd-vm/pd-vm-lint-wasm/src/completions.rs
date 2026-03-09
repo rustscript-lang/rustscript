@@ -1,6 +1,5 @@
-use edge_abi::FUNCTIONS as EDGE_HOST_FUNCTIONS;
+use edge_abi::{FUNCTIONS as EDGE_HOST_FUNCTIONS, host_namespace_specs};
 use serde::Serialize;
-use std::collections::BTreeSet;
 
 use crate::stdlib::embedded_stdlib_modules;
 
@@ -56,8 +55,12 @@ fn add_host_import_entries(
     lua: &mut Vec<CompletionEntry>,
     scheme: &mut Vec<CompletionEntry>,
 ) {
-    for root in edge_host_namespace_roots() {
-        let docs = format!("Imports host namespace `{root}` for pd-edge host calls.");
+    for namespace in host_namespace_specs() {
+        let root = namespace.root;
+        let docs = format!(
+            "{} Imports host namespace `{root}` for pd-edge host calls.",
+            namespace.docs
+        );
         push_unique(
             rustscript,
             CompletionEntry {
@@ -111,12 +114,18 @@ fn add_host_function_entries(
         let params = numbered_params(usize::from(function.arity));
         let dot_path = function.name.replace("::", ".");
         let root = function.name.split("::").next().unwrap_or(function.name);
+        let namespace_doc_prefix = host_namespace_specs()
+            .iter()
+            .find(|namespace| namespace.root == root)
+            .map(|namespace| namespace.docs)
+            .unwrap_or("pd-edge host namespace.");
         let docs = format!(
             "pd-edge host function from ABI index {} with arity {}.",
             function.index, function.arity
         );
-        let namespace_docs =
-            format!("{docs} Namespace-export form (after importing `{root}`) is also available.");
+        let namespace_docs = format!(
+            "{namespace_doc_prefix} {docs} Namespace-export form (after importing `{root}`) is also available."
+        );
 
         push_unique(
             rustscript,
@@ -159,16 +168,6 @@ fn add_host_function_entries(
             },
         );
     }
-}
-
-fn edge_host_namespace_roots() -> Vec<&'static str> {
-    let mut roots = BTreeSet::new();
-    for function in EDGE_HOST_FUNCTIONS {
-        if let Some((root, _)) = function.name.split_once("::") {
-            roots.insert(root);
-        }
-    }
-    roots.into_iter().collect()
 }
 
 fn add_stdlib_entries(

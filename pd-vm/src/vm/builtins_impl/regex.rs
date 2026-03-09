@@ -2,9 +2,6 @@ use regex::Regex;
 
 use super::super::{Value, VmError, VmResult};
 use super::arg_string;
-use crate::builtins::{
-    BuiltinFunction, BuiltinNamespace, BuiltinNamespaceMember, BuiltinNamespaceRegistry,
-};
 
 pub(super) fn builtin_re_is_match(args: &[Value]) -> VmResult<Vec<Value>> {
     let pattern = arg_string(args, 0, "re_is_match pattern")?;
@@ -66,17 +63,4 @@ pub(super) fn builtin_re_captures(args: &[Value]) -> VmResult<Vec<Value>> {
         groups.push(group_value);
     }
     Ok(vec![Value::array(groups)])
-}
-
-const NAMESPACE_MEMBERS: &[BuiltinNamespaceMember] = &[
-    BuiltinNamespaceMember::new("match", BuiltinFunction::ReIsMatch),
-    BuiltinNamespaceMember::new("is_match", BuiltinFunction::ReIsMatch),
-    BuiltinNamespaceMember::new("find", BuiltinFunction::ReFind),
-    BuiltinNamespaceMember::new("replace", BuiltinFunction::ReReplace),
-    BuiltinNamespaceMember::new("split", BuiltinFunction::ReSplit),
-    BuiltinNamespaceMember::new("captures", BuiltinFunction::ReCaptures),
-];
-
-pub(crate) fn register_builtin_namespace(registry: &mut BuiltinNamespaceRegistry) {
-    registry.register(BuiltinNamespace::new("re", NAMESPACE_MEMBERS, true));
 }
