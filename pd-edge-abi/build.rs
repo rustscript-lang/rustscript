@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 struct AbiFunctionDecl {
     name: String,
     arity: u8,
+    return_type: String,
 }
 
 #[derive(Clone, Debug)]
@@ -101,11 +102,17 @@ fn parse_function_decl(args: &str) -> AbiFunctionDecl {
     let (name, rest) = parse_string(args);
     let rest = expect_comma(rest);
     let (arity, rest) = parse_u8(rest);
+    let rest = expect_comma(rest);
+    let (return_type, rest) = parse_ident(rest);
     let rest = skip_ws(rest);
     if !rest.is_empty() {
         panic!("unexpected trailing tokens in function decl: {rest}");
     }
-    AbiFunctionDecl { name, arity }
+    AbiFunctionDecl {
+        name,
+        arity,
+        return_type,
+    }
 }
 
 fn parse_namespace_file(path: &Path) -> Vec<NamespaceDecl> {
@@ -171,11 +178,12 @@ fn render_abi_rust(functions: &[AbiFunctionDecl], namespaces: &[NamespaceDecl]) 
     for function in functions {
         writeln!(
             &mut out,
-            "pub const {}: AbiFunction = AbiFunction {{ index: {}, name: {:?}, arity: {} }};",
+            "pub const {}: AbiFunction = AbiFunction {{ index: {}, name: {:?}, arity: {}, return_type: AbiValueType::{} }};",
             abi_const_name(function),
             fn_const_name(function),
             function.name,
-            function.arity
+            function.arity,
+            function.return_type
         )
         .unwrap();
     }
@@ -238,8 +246,10 @@ fn render_abi_json(functions: &[AbiFunctionDecl]) -> String {
         };
         writeln!(
             &mut out,
-            "    {{ \"index\": {index}, \"name\": {:?}, \"arity\": {} }}{suffix}",
-            function.name, function.arity
+            "    {{ \"index\": {index}, \"name\": {:?}, \"arity\": {}, \"return_type\": {:?} }}{suffix}",
+            function.name,
+            function.arity,
+            function.return_type.to_ascii_lowercase()
         )
         .unwrap();
     }
@@ -356,6 +366,17 @@ fn parse_u8(source: &str) -> (u8, &str) {
             .unwrap_or_else(|err| panic!("invalid u8 '{}': {err}", &source[..end])),
         &source[end..],
     )
+}
+
+fn parse_ident(source: &str) -> (String, &str) {
+    let source = skip_ws(source);
+    let end = source
+        .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .unwrap_or(source.len());
+    if end == 0 {
+        panic!("expected identifier");
+    }
+    (source[..end].to_string(), &source[end..])
 }
 
 fn expect_comma(source: &str) -> &str {

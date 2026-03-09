@@ -1069,6 +1069,7 @@ dependencies = [
  "cranelift-native",
  "futures-channel",
  "libc",
+ "pd-edge-abi",
  "regex",
  "rt-format",
  "rustyline",
