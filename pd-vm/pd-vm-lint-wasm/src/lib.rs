@@ -323,6 +323,39 @@ mod tests {
     }
 
     #[test]
+    fn lint_reports_callable_argument_type_mismatch_diagnostics() {
+        let source = r#"
+            use runtime;
+            runtime::sleep("later");
+        "#;
+
+        let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
+        assert_eq!(
+            report.diagnostics.len(),
+            1,
+            "expected a single callable type diagnostic"
+        );
+        let diagnostic = &report.diagnostics[0];
+        assert!(
+            diagnostic
+                .message
+                .contains("host function 'runtime::sleep' does not accept argument types"),
+            "unexpected diagnostic message: {:?}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.message.contains("string"),
+            "expected actual argument type in diagnostic: {:?}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.message.contains("arg1: int"),
+            "expected host parameter type annotation in diagnostic: {:?}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
     fn completion_catalog_reports_host_and_stdlib_entries() {
         let catalog = build_completion_catalog();
         assert!(
@@ -352,6 +385,39 @@ mod tests {
                 .iter()
                 .any(|entry| entry.label == "set::union"),
             "expected RustScript set stdlib completion"
+        );
+    }
+
+    #[test]
+    fn completion_catalog_details_include_callable_signatures() {
+        let catalog = build_completion_catalog();
+        let set_status = catalog
+            .rustscript
+            .iter()
+            .find(|entry| entry.label == "http::response::set_status")
+            .expect("http::response::set_status completion should exist");
+        assert!(
+            set_status
+                .detail
+                .contains("http::response::set_status(arg1: int) -> null"),
+            "expected pd-edge host signature in completion detail, got {:?}",
+            set_status.detail
+        );
+
+        let len = catalog
+            .rustscript
+            .iter()
+            .find(|entry| entry.label == "len")
+            .expect("len completion should exist");
+        assert!(
+            len.detail.contains("len(arg1: string) -> int"),
+            "expected string overload in len detail, got {:?}",
+            len.detail
+        );
+        assert!(
+            len.detail.contains("len(arg1: map) -> int"),
+            "expected map overload in len detail, got {:?}",
+            len.detail
         );
     }
 

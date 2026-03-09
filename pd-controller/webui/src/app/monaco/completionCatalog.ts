@@ -2,6 +2,98 @@ import { completionCatalogWithWasm, type CompletionCatalog, type CompletionEntry
 
 let registrationPromise: Promise<void> | null = null;
 let registered = false;
+let cachedCatalog: CompletionCatalog | null = null;
+
+function entriesForLanguage(catalog: CompletionCatalog, languageId: string): CompletionEntry[] {
+  if (languageId === "rustscript") {
+    return catalog.rustscript;
+  }
+  if (languageId === "javascript") {
+    return catalog.javascript;
+  }
+  if (languageId === "lua") {
+    return catalog.lua;
+  }
+  if (languageId === "scheme") {
+    return catalog.scheme;
+  }
+  return [];
+}
+
+function isCallableTokenChar(value: string): boolean {
+  return /[A-Za-z0-9_:.]/.test(value);
+}
+
+function callableTokenAtPosition(
+  model: import("monaco-editor").editor.ITextModel,
+  position: import("monaco-editor").Position
+): { token: string; range: import("monaco-editor").IRange } | null {
+  const line = model.getLineContent(position.lineNumber);
+  const offset = Math.max(0, position.column - 1);
+  if (line.length === 0) {
+    return null;
+  }
+
+  let start = Math.min(offset, Math.max(0, line.length - 1));
+  let end = start;
+  if (!isCallableTokenChar(line[start] ?? "")) {
+    if (start > 0 && isCallableTokenChar(line[start - 1] ?? "")) {
+      start -= 1;
+      end = start;
+    } else {
+      return null;
+    }
+  }
+
+  while (start > 0 && isCallableTokenChar(line[start - 1] ?? "")) {
+    start -= 1;
+  }
+  while (end + 1 < line.length && isCallableTokenChar(line[end + 1] ?? "")) {
+    end += 1;
+  }
+
+  const token = line.slice(start, end + 1);
+  if (!token) {
+    return null;
+  }
+
+  if (model.getLanguageId() === "scheme") {
+    let prev = start - 1;
+    while (prev >= 0 && /\s/.test(line[prev] ?? "")) {
+      prev -= 1;
+    }
+    if (line[prev] !== "(") {
+      return null;
+    }
+  } else {
+    let next = end + 1;
+    while (next < line.length && /\s/.test(line[next] ?? "")) {
+      next += 1;
+    }
+    if (line[next] !== "(") {
+      return null;
+    }
+  }
+
+  return {
+    token,
+    range: {
+      startLineNumber: position.lineNumber,
+      startColumn: start + 1,
+      endLineNumber: position.lineNumber,
+      endColumn: end + 2
+    }
+  };
+}
+
+async function loadCompletionCatalog(): Promise<CompletionCatalog> {
+  if (cachedCatalog) {
+    return cachedCatalog;
+  }
+  const catalog = await completionCatalogWithWasm();
+  cachedCatalog = catalog;
+  return catalog;
+}
 
 function completionItemKind(
   monaco: typeof import("monaco-editor"),
@@ -61,6 +153,54 @@ function registerCatalogCompletions(
   registerCompletionProvider(monaco, "javascript", catalog.javascript, ["."]);
   registerCompletionProvider(monaco, "lua", catalog.lua, [".", ":"]);
   registerCompletionProvider(monaco, "scheme", catalog.scheme, ["(", "."]);
+
+  for (const languageId of ["rustscript", "javascript", "lua", "scheme"] as const) {
+    monaco.languages.registerHoverProvider(languageId, {
+      async provideHover(model, position) {
+        return lookupCallableHover(monaco, model, position);
+      }
+    });
+  }
+}
+
+export async function lookupCallableHover(
+  monaco: typeof import("monaco-editor"),
+  model: import("monaco-editor").editor.ITextModel,
+  position: import("monaco-editor").Position
+): Promise<import("monaco-editor").languages.Hover | null> {
+  const tokenInfo = callableTokenAtPosition(model, position);
+  if (!tokenInfo) {
+    return null;
+  }
+
+  const catalog = await loadCompletionCatalog();
+  const entry = entriesForLanguage(catalog, model.getLanguageId()).find(
+    (candidate) => candidate.kind === "function" && candidate.label === tokenInfo.token
+  );
+  if (!entry) {
+    return null;
+  }
+
+  const contents: import("monaco-editor").IMarkdownString[] = [];
+  if (entry.detail) {
+    contents.push({ value: `\`\`\`text\n${entry.detail}\n\`\`\`` });
+  }
+  if (entry.documentation) {
+    contents.push({ value: entry.documentation });
+  }
+  if (contents.length === 0) {
+    return null;
+  }
+
+  return {
+    range: new monaco.Range(
+      tokenInfo.range.startLineNumber,
+      tokenInfo.range.startColumn,
+      tokenInfo.range.endLineNumber,
+      tokenInfo.range.endColumn
+    ),
+    contents
+  };
 }
 
 export function ensureCompletionCatalogProviders(
@@ -73,7 +213,7 @@ export function ensureCompletionCatalogProviders(
     return registrationPromise;
   }
 
-  registrationPromise = completionCatalogWithWasm()
+  registrationPromise = loadCompletionCatalog()
     .then((catalog) => {
       registerCatalogCompletions(monaco, catalog);
       registered = true;

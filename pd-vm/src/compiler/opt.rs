@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::builtins::BuiltinFunction;
+use crate::builtins::{BuiltinFunction, CallableParamType, CallableSignature};
 use crate::bytecode::ValueType;
 
 use super::CompileError;
@@ -256,9 +256,16 @@ pub(crate) struct TypeInferenceResult {
     pub local_types: Vec<ValueType>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct HostCallableSignature {
+    pub(crate) name: String,
+    pub(crate) params: Vec<CallableParamType>,
+}
+
 struct TypeContext<'a> {
     function_impls: &'a HashMap<u16, FunctionImpl>,
     host_import_return_types: &'a HashMap<u16, BoundType>,
+    host_import_signatures: &'a HashMap<u16, HostCallableSignature>,
     active_functions: Vec<u16>,
 }
 
@@ -266,10 +273,12 @@ impl<'a> TypeContext<'a> {
     fn new(
         function_impls: &'a HashMap<u16, FunctionImpl>,
         host_import_return_types: &'a HashMap<u16, BoundType>,
+        host_import_signatures: &'a HashMap<u16, HostCallableSignature>,
     ) -> Self {
         Self {
             function_impls,
             host_import_return_types,
+            host_import_signatures,
             active_functions: Vec::new(),
         }
     }
@@ -649,6 +658,75 @@ impl<'a> TypeContext<'a> {
         self.infer_expr_type(body_expr, &nested)
     }
 
+    fn validate_call_argument_types(
+        &mut self,
+        expr: &Expr,
+        state: &LocalTypeState,
+        line_context: Option<u32>,
+    ) -> Result<(), CompileError> {
+        match expr {
+            Expr::Call(index, args) => {
+                if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
+                    self.validate_builtin_argument_types(builtin, args, state, line_context)
+                } else if let Some(signature) = self.host_import_signatures.get(index).cloned() {
+                    self.validate_host_argument_types(&signature, args, state, line_context)
+                } else {
+                    Ok(())
+                }
+            }
+            Expr::LocalCall(slot, args) => match state.callable(*slot).cloned() {
+                Some(InferredCallable::Function(index)) => {
+                    if let Some(builtin) = BuiltinFunction::from_call_index(index) {
+                        self.validate_builtin_argument_types(builtin, args, state, line_context)
+                    } else if let Some(signature) =
+                        self.host_import_signatures.get(&index).cloned()
+                    {
+                        self.validate_host_argument_types(&signature, args, state, line_context)
+                    } else {
+                        Ok(())
+                    }
+                }
+                _ => Ok(()),
+            },
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_builtin_argument_types(
+        &mut self,
+        builtin: BuiltinFunction,
+        args: &[Expr],
+        state: &LocalTypeState,
+        line_context: Option<u32>,
+    ) -> Result<(), CompileError> {
+        validate_signature_overloads(
+            &display_name_for_builtin(builtin),
+            "builtin",
+            builtin.callable_signatures(),
+            args,
+            state,
+            self,
+            line_context,
+        )
+    }
+
+    fn validate_host_argument_types(
+        &mut self,
+        signature: &HostCallableSignature,
+        args: &[Expr],
+        state: &LocalTypeState,
+        line_context: Option<u32>,
+    ) -> Result<(), CompileError> {
+        validate_host_signature(
+            &signature.name,
+            &signature.params,
+            args,
+            state,
+            self,
+            line_context,
+        )
+    }
+
     fn apply_stmts(&mut self, stmts: &[Stmt], state: &mut LocalTypeState) {
         for stmt in stmts {
             match stmt {
@@ -741,13 +819,23 @@ impl<'a> TypeContext<'a> {
 
 pub(super) fn legalize_builtins_and_bind_types(mut ir: FrontendIr) -> FrontendIr {
     let host_import_return_types = build_host_import_return_types(&ir.functions, &ir.function_impls);
+    let host_import_signatures = build_host_import_signatures(&ir.functions, &ir.function_impls);
     let mut top_state = LocalTypeState::default();
-    let mut context = TypeContext::new(&ir.function_impls, &host_import_return_types);
+    let mut context = TypeContext::new(
+        &ir.function_impls,
+        &host_import_return_types,
+        &host_import_signatures,
+    );
     legalize_stmts(&mut ir.stmts, &mut top_state, &mut context);
 
     let function_impls = ir.function_impls.clone();
     for function_impl in ir.function_impls.values_mut() {
-        legalize_function_impl(function_impl, &function_impls, &host_import_return_types);
+        legalize_function_impl(
+            function_impl,
+            &function_impls,
+            &host_import_return_types,
+            &host_import_signatures,
+        );
     }
 
     ir
@@ -755,9 +843,14 @@ pub(super) fn legalize_builtins_and_bind_types(mut ir: FrontendIr) -> FrontendIr
 
 pub(super) fn infer_types(ir: &FrontendIr) -> TypeInferenceResult {
     let host_import_return_types = build_host_import_return_types(&ir.functions, &ir.function_impls);
+    let host_import_signatures = build_host_import_signatures(&ir.functions, &ir.function_impls);
     let mut local_types = vec![ValueType::Unknown; ir.locals];
     let mut top_state = LocalTypeState::default();
-    let mut context = TypeContext::new(&ir.function_impls, &host_import_return_types);
+    let mut context = TypeContext::new(
+        &ir.function_impls,
+        &host_import_return_types,
+        &host_import_signatures,
+    );
     collect_stmt_types(&ir.stmts, &mut top_state, &mut local_types, &mut context);
 
     for function_impl in ir.function_impls.values() {
@@ -766,6 +859,7 @@ pub(super) fn infer_types(ir: &FrontendIr) -> TypeInferenceResult {
             &mut local_types,
             &ir.function_impls,
             &host_import_return_types,
+            &host_import_signatures,
         );
     }
 
@@ -774,12 +868,22 @@ pub(super) fn infer_types(ir: &FrontendIr) -> TypeInferenceResult {
 
 pub(super) fn validate_if_else_type_consistency(ir: &FrontendIr) -> Result<(), CompileError> {
     let host_import_return_types = build_host_import_return_types(&ir.functions, &ir.function_impls);
+    let host_import_signatures = build_host_import_signatures(&ir.functions, &ir.function_impls);
     let mut top_state = LocalTypeState::default();
-    let mut context = TypeContext::new(&ir.function_impls, &host_import_return_types);
+    let mut context = TypeContext::new(
+        &ir.function_impls,
+        &host_import_return_types,
+        &host_import_signatures,
+    );
     validate_stmts(&ir.stmts, &mut top_state, None, &mut context)?;
 
     for function_impl in ir.function_impls.values() {
-        validate_function_impl(function_impl, &ir.function_impls, &host_import_return_types)?;
+        validate_function_impl(
+            function_impl,
+            &ir.function_impls,
+            &host_import_return_types,
+            &host_import_signatures,
+        )?;
     }
 
     Ok(())
@@ -788,7 +892,14 @@ pub(super) fn validate_if_else_type_consistency(ir: &FrontendIr) -> Result<(), C
 pub(crate) fn infer_expr_type(expr: &Expr, state: &LocalTypeState) -> BoundType {
     let empty_impls: HashMap<u16, FunctionImpl> = HashMap::new();
     let empty_imports: HashMap<u16, BoundType> = HashMap::new();
-    infer_expr_type_with_function_impls_and_imports(expr, state, &empty_impls, &empty_imports)
+    let empty_signatures: HashMap<u16, HostCallableSignature> = HashMap::new();
+    infer_expr_type_with_function_impls_and_imports(
+        expr,
+        state,
+        &empty_impls,
+        &empty_imports,
+        &empty_signatures,
+    )
 }
 
 pub(crate) fn infer_expr_type_with_function_impls_and_imports(
@@ -796,8 +907,13 @@ pub(crate) fn infer_expr_type_with_function_impls_and_imports(
     state: &LocalTypeState,
     function_impls: &HashMap<u16, FunctionImpl>,
     host_import_return_types: &HashMap<u16, BoundType>,
+    host_import_signatures: &HashMap<u16, HostCallableSignature>,
 ) -> BoundType {
-    let mut context = TypeContext::new(function_impls, host_import_return_types);
+    let mut context = TypeContext::new(
+        function_impls,
+        host_import_return_types,
+        host_import_signatures,
+    );
     context.infer_expr_type(expr, state)
 }
 
@@ -806,8 +922,13 @@ pub(crate) fn apply_stmts_with_function_impls_and_imports(
     state: &mut LocalTypeState,
     function_impls: &HashMap<u16, FunctionImpl>,
     host_import_return_types: &HashMap<u16, BoundType>,
+    host_import_signatures: &HashMap<u16, HostCallableSignature>,
 ) {
-    let mut context = TypeContext::new(function_impls, host_import_return_types);
+    let mut context = TypeContext::new(
+        function_impls,
+        host_import_return_types,
+        host_import_signatures,
+    );
     context.apply_stmts(stmts, state);
 }
 
@@ -815,9 +936,14 @@ fn legalize_function_impl(
     function_impl: &mut FunctionImpl,
     function_impls: &HashMap<u16, FunctionImpl>,
     host_import_return_types: &HashMap<u16, BoundType>,
+    host_import_signatures: &HashMap<u16, HostCallableSignature>,
 ) {
     let mut state = LocalTypeState::default();
-    let mut context = TypeContext::new(function_impls, host_import_return_types);
+    let mut context = TypeContext::new(
+        function_impls,
+        host_import_return_types,
+        host_import_signatures,
+    );
     for slot in &function_impl.param_slots {
         state.set(*slot, BoundType::Unknown);
     }
@@ -833,9 +959,14 @@ fn validate_function_impl(
     function_impl: &FunctionImpl,
     function_impls: &HashMap<u16, FunctionImpl>,
     host_import_return_types: &HashMap<u16, BoundType>,
+    host_import_signatures: &HashMap<u16, HostCallableSignature>,
 ) -> Result<(), CompileError> {
     let mut state = LocalTypeState::default();
-    let mut context = TypeContext::new(function_impls, host_import_return_types);
+    let mut context = TypeContext::new(
+        function_impls,
+        host_import_return_types,
+        host_import_signatures,
+    );
     for slot in &function_impl.param_slots {
         state.set(*slot, BoundType::Unknown);
     }
@@ -1004,6 +1135,210 @@ fn build_host_import_return_types(
         .collect()
 }
 
+pub(crate) fn build_host_import_signatures(
+    functions: &[FunctionDecl],
+    function_impls: &HashMap<u16, FunctionImpl>,
+) -> HashMap<u16, HostCallableSignature> {
+    functions
+        .iter()
+        .filter(|decl| !function_impls.contains_key(&decl.index))
+        .filter_map(|decl| {
+            known_host_signature(&decl.name).map(|signature| (decl.index, signature))
+        })
+        .collect()
+}
+
+fn known_host_signature(name: &str) -> Option<HostCallableSignature> {
+    match name {
+        "print" | "println" => {
+            return Some(HostCallableSignature {
+                name: name.to_string(),
+                params: vec![CallableParamType::Any],
+            });
+        }
+        _ => {}
+    }
+
+    let function = edge_abi::function_by_name(name)?;
+    Some(HostCallableSignature {
+        name: name.to_string(),
+        params: function
+            .param_types
+            .iter()
+            .copied()
+            .map(callable_param_type_from_abi)
+            .collect(),
+    })
+}
+
+fn callable_param_type_from_abi(value: edge_abi::AbiParamType) -> CallableParamType {
+    match value {
+        edge_abi::AbiParamType::Any => CallableParamType::Any,
+        edge_abi::AbiParamType::Null => CallableParamType::Null,
+        edge_abi::AbiParamType::Int => CallableParamType::Int,
+        edge_abi::AbiParamType::Float => CallableParamType::Float,
+        edge_abi::AbiParamType::Bool => CallableParamType::Bool,
+        edge_abi::AbiParamType::String => CallableParamType::String,
+        edge_abi::AbiParamType::Array => CallableParamType::Array,
+        edge_abi::AbiParamType::Map => CallableParamType::Map,
+        edge_abi::AbiParamType::Number => CallableParamType::Number,
+    }
+}
+
+fn validate_signature_overloads(
+    callable_name: &str,
+    callable_kind: &str,
+    signatures: &[CallableSignature],
+    args: &[Expr],
+    state: &LocalTypeState,
+    context: &mut TypeContext<'_>,
+    line_context: Option<u32>,
+) -> Result<(), CompileError> {
+    let actual = args
+        .iter()
+        .map(|arg| context.infer_expr_type(arg, state))
+        .collect::<Vec<_>>();
+    if signatures
+        .iter()
+        .any(|signature| signature_matches_actual(signature, &actual))
+    {
+        return Ok(());
+    }
+
+    Err(CompileError::CallableArgumentTypeMismatch {
+        line: line_context,
+        detail: format!(
+            "{callable_kind} '{callable_name}' does not accept argument types ({}); expected {}",
+            format_actual_arg_types(&actual),
+            format_signature_overloads(callable_name, signatures),
+        ),
+    })
+}
+
+fn validate_host_signature(
+    callable_name: &str,
+    params: &[CallableParamType],
+    args: &[Expr],
+    state: &LocalTypeState,
+    context: &mut TypeContext<'_>,
+    line_context: Option<u32>,
+) -> Result<(), CompileError> {
+    let actual = args
+        .iter()
+        .map(|arg| context.infer_expr_type(arg, state))
+        .collect::<Vec<_>>();
+    if params_match_actual(params, &actual) {
+        return Ok(());
+    }
+
+    Err(CompileError::CallableArgumentTypeMismatch {
+        line: line_context,
+        detail: format!(
+            "host function '{callable_name}' does not accept argument types ({}); expected {}({})",
+            format_actual_arg_types(&actual),
+            callable_name,
+            format_param_types(params),
+        ),
+    })
+}
+
+fn signature_matches_actual(signature: &CallableSignature, actual: &[BoundType]) -> bool {
+    params_match_actual(signature.params, actual)
+}
+
+fn params_match_actual(params: &[CallableParamType], actual: &[BoundType]) -> bool {
+    params.len() == actual.len()
+        && params
+            .iter()
+            .zip(actual.iter().copied())
+            .all(|(expected, actual)| param_accepts_bound_type(*expected, actual))
+}
+
+fn param_accepts_bound_type(expected: CallableParamType, actual: BoundType) -> bool {
+    if actual == BoundType::Unknown {
+        return true;
+    }
+    match expected {
+        CallableParamType::Any => true,
+        CallableParamType::Null => actual == BoundType::Null,
+        CallableParamType::Int => actual == BoundType::Int,
+        CallableParamType::Float => actual == BoundType::Float,
+        CallableParamType::Bool => actual == BoundType::Bool,
+        CallableParamType::String => actual == BoundType::String,
+        CallableParamType::Array => {
+            matches!(actual, BoundType::Array | BoundType::ArrayOf(_))
+        }
+        CallableParamType::Map => matches!(actual, BoundType::Map | BoundType::MapOf(_)),
+        CallableParamType::Number => is_numeric_bound_type(actual),
+        CallableParamType::StringOrArray => {
+            matches!(
+                actual,
+                BoundType::String | BoundType::Array | BoundType::ArrayOf(_)
+            )
+        }
+        CallableParamType::ArrayOrMap => {
+            matches!(
+                actual,
+                BoundType::Array | BoundType::ArrayOf(_) | BoundType::Map | BoundType::MapOf(_)
+            )
+        }
+        CallableParamType::StringArrayOrMap => {
+            matches!(
+                actual,
+                BoundType::String
+                    | BoundType::Array
+                    | BoundType::ArrayOf(_)
+                    | BoundType::Map
+                    | BoundType::MapOf(_)
+            )
+        }
+    }
+}
+
+fn format_signature_overloads(name: &str, signatures: &[CallableSignature]) -> String {
+    signatures
+        .iter()
+        .map(|signature| format!("{name}({})", format_param_types(signature.params)))
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
+fn format_param_types(params: &[CallableParamType]) -> String {
+    params
+        .iter()
+        .enumerate()
+        .map(|(index, param)| format!("arg{}: {}", index + 1, param.label()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_actual_arg_types(actual: &[BoundType]) -> String {
+    actual
+        .iter()
+        .copied()
+        .map(bound_type_label)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn display_name_for_builtin(builtin: BuiltinFunction) -> String {
+    match builtin {
+        BuiltinFunction::Len => "len".to_string(),
+        BuiltinFunction::Slice => "slice".to_string(),
+        BuiltinFunction::Concat => "concat".to_string(),
+        BuiltinFunction::ArrayNew => "array_new".to_string(),
+        BuiltinFunction::ArrayPush => "array_push".to_string(),
+        BuiltinFunction::MapNew => "map_new".to_string(),
+        BuiltinFunction::Get => "get".to_string(),
+        BuiltinFunction::Set => "set".to_string(),
+        BuiltinFunction::Keys => "keys".to_string(),
+        BuiltinFunction::Count => "count".to_string(),
+        BuiltinFunction::TypeOf => "type".to_string(),
+        BuiltinFunction::Assert => "assert".to_string(),
+        _ => builtin.name().replacen('_', "::", 1),
+    }
+}
+
 fn is_numeric_bound_type(value: BoundType) -> bool {
     matches!(value, BoundType::Int | BoundType::Float)
 }
@@ -1116,10 +1451,12 @@ fn validate_expr(
         Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => state.get(*root),
         Expr::FunctionRef(_) | Expr::Call(_, _) | Expr::LocalCall(_, _) | Expr::Closure(_) => {
             validate_expr_children(expr, state, line_context, context)?;
+            context.validate_call_argument_types(expr, state, line_context)?;
             context.infer_call_like_expr_type(expr, state)
         }
         Expr::ClosureCall(_, _) => {
             validate_expr_children(expr, state, line_context, context)?;
+            context.validate_call_argument_types(expr, state, line_context)?;
             context.infer_call_like_expr_type(expr, state)
         }
         Expr::Add(lhs, rhs)
@@ -1400,9 +1737,14 @@ fn collect_function_types(
     local_types: &mut [ValueType],
     function_impls: &HashMap<u16, FunctionImpl>,
     host_import_return_types: &HashMap<u16, BoundType>,
+    host_import_signatures: &HashMap<u16, HostCallableSignature>,
 ) {
     let mut state = LocalTypeState::default();
-    let mut context = TypeContext::new(function_impls, host_import_return_types);
+    let mut context = TypeContext::new(
+        function_impls,
+        host_import_return_types,
+        host_import_signatures,
+    );
     for slot in &function_impl.param_slots {
         record_local_type(local_types, *slot, BoundType::Unknown);
         state.set(*slot, BoundType::Unknown);

@@ -81,6 +81,7 @@ pub enum CompileErrorKind {
     ContinueOutsideLoop,
     InlineFunctionRecursion,
     IfElseBranchTypeMismatch,
+    CallableArgumentTypeMismatch,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -112,6 +113,9 @@ fn compile_error_kind(err: &vm::CompileError) -> CompileErrorKind {
         vm::CompileError::InlineFunctionRecursion(_) => CompileErrorKind::InlineFunctionRecursion,
         vm::CompileError::IfElseBranchTypeMismatch { .. } => {
             CompileErrorKind::IfElseBranchTypeMismatch
+        }
+        vm::CompileError::CallableArgumentTypeMismatch { .. } => {
+            CompileErrorKind::CallableArgumentTypeMismatch
         }
     }
 }

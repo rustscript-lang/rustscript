@@ -1,5 +1,8 @@
 use serde::Serialize;
-use vm::builtin_namespace_specs;
+use vm::{
+    CallableParamType, CallableSignature, builtin_namespace_specs,
+    callable_signatures_for_builtin_namespace_member, language_builtin_specs,
+};
 
 use crate::runtime::host_function_specs;
 use crate::stdlib::embedded_stdlib_modules;
@@ -34,6 +37,7 @@ pub fn build_completion_catalog() -> CompletionCatalog {
     let mut scheme = Vec::new();
 
     add_host_function_entries(&mut rustscript, &mut javascript, &mut lua, &mut scheme);
+    add_language_builtin_entries(&mut rustscript, &mut javascript, &mut lua, &mut scheme);
     add_builtin_namespace_entries(&mut rustscript, &mut javascript, &mut lua, &mut scheme);
     add_stdlib_entries(&mut rustscript, &mut javascript, &mut lua, &mut scheme);
 
@@ -50,6 +54,64 @@ pub fn build_completion_catalog() -> CompletionCatalog {
     }
 }
 
+fn add_language_builtin_entries(
+    rustscript: &mut Vec<CompletionEntry>,
+    javascript: &mut Vec<CompletionEntry>,
+    lua: &mut Vec<CompletionEntry>,
+    scheme: &mut Vec<CompletionEntry>,
+) {
+    for builtin in language_builtin_specs() {
+        let arity = builtin
+            .signatures
+            .first()
+            .map(|signature| signature.params.len())
+            .unwrap_or(0);
+        let params = numbered_params(arity);
+        let detail = format!("builtin {}", overload_signatures(builtin.name, builtin.signatures));
+
+        push_unique(
+            rustscript,
+            CompletionEntry {
+                label: builtin.name.to_string(),
+                insert_text: format!("{}({})", builtin.name, comma_args(&params)),
+                detail: detail.clone(),
+                documentation: builtin.docs.to_string(),
+                kind: "function".to_string(),
+            },
+        );
+        push_unique(
+            javascript,
+            CompletionEntry {
+                label: builtin.name.to_string(),
+                insert_text: format!("{}({})", builtin.name, comma_args(&params)),
+                detail: detail.clone(),
+                documentation: builtin.docs.to_string(),
+                kind: "function".to_string(),
+            },
+        );
+        push_unique(
+            lua,
+            CompletionEntry {
+                label: builtin.name.to_string(),
+                insert_text: format!("{}({})", builtin.name, comma_args(&params)),
+                detail: detail.clone(),
+                documentation: builtin.docs.to_string(),
+                kind: "function".to_string(),
+            },
+        );
+        push_unique(
+            scheme,
+            CompletionEntry {
+                label: builtin.name.to_string(),
+                insert_text: format!("({} {})", builtin.name, space_args(&params)),
+                detail,
+                documentation: builtin.docs.to_string(),
+                kind: "function".to_string(),
+            },
+        );
+    }
+}
+
 fn add_host_function_entries(
     rustscript: &mut Vec<CompletionEntry>,
     javascript: &mut Vec<CompletionEntry>,
@@ -58,7 +120,7 @@ fn add_host_function_entries(
 ) {
     for host in host_function_specs() {
         let params = numbered_params(host.arity);
-        let signature = function_signature(host.name, &params);
+        let signature = typed_signature(host.name, host.param_types, host.return_type);
 
         match host.name {
             "print" => {
@@ -67,7 +129,7 @@ fn add_host_function_entries(
                     CompletionEntry {
                         label: "print".to_string(),
                         insert_text: format!("print({});", comma_args(&params)),
-                        detail: "RustScript output helper".to_string(),
+                        detail: format!("playground host {signature}"),
                         documentation:
                             "Writes a value to playground print output. Supports Rust-style formatting when called as print(\"...\", ...)."
                                 .to_string(),
@@ -79,7 +141,8 @@ fn add_host_function_entries(
                     CompletionEntry {
                         label: "print (format)".to_string(),
                         insert_text: "print(\"{}\", ${1:value});".to_string(),
-                        detail: "RustScript formatting call".to_string(),
+                        detail: "playground host print(format: string, arg1: any) -> any"
+                            .to_string(),
                         documentation:
                             "Formats with Rust std::fmt-style placeholders, then writes without a trailing newline."
                                 .to_string(),
@@ -91,7 +154,7 @@ fn add_host_function_entries(
                     CompletionEntry {
                         label: "println".to_string(),
                         insert_text: format!("println({});", comma_args(&params)),
-                        detail: "RustScript output helper with newline".to_string(),
+                        detail: "playground host println(arg1: any) -> any".to_string(),
                         documentation:
                             "Writes a value to playground print output and appends a newline. Supports Rust-style formatting when called as println(\"...\", ...)."
                                 .to_string(),
@@ -103,7 +166,7 @@ fn add_host_function_entries(
                     CompletionEntry {
                         label: "console.log".to_string(),
                         insert_text: format!("console.log({});", comma_args(&params)),
-                        detail: "JavaScript output helper".to_string(),
+                        detail: "playground host console.log(arg1: any) -> any".to_string(),
                         documentation: "Writes a value to playground print output.".to_string(),
                         kind: "function".to_string(),
                     },
@@ -113,7 +176,7 @@ fn add_host_function_entries(
                     CompletionEntry {
                         label: "print".to_string(),
                         insert_text: format!("print({})", comma_args(&params)),
-                        detail: "Lua output helper".to_string(),
+                        detail: format!("playground host {}", typed_signature("print", host.param_types, host.return_type)),
                         documentation: "Writes a value to playground print output.".to_string(),
                         kind: "function".to_string(),
                     },
@@ -123,7 +186,7 @@ fn add_host_function_entries(
                     CompletionEntry {
                         label: "print".to_string(),
                         insert_text: format!("(print {})", space_args(&params)),
-                        detail: "Scheme output helper".to_string(),
+                        detail: format!("playground host {}", typed_signature("print", host.param_types, host.return_type)),
                         documentation: "Writes a value to playground print output.".to_string(),
                         kind: "function".to_string(),
                     },
@@ -142,7 +205,15 @@ fn add_host_function_entries(
             }
             other if other.contains("::") => {
                 add_namespaced_host_function_entries(
-                    rustscript, javascript, lua, scheme, other, &params, host.docs,
+                    rustscript,
+                    javascript,
+                    lua,
+                    scheme,
+                    other,
+                    &params,
+                    host.param_types,
+                    host.return_type,
+                    host.docs,
                 );
             }
             other => {
@@ -201,6 +272,8 @@ fn add_namespaced_host_function_entries(
     scheme: &mut Vec<CompletionEntry>,
     name: &str,
     params: &[String],
+    param_types: &[CallableParamType],
+    return_type: &str,
     docs: &str,
 ) {
     let Some((root, _member)) = name.split_once("::") else {
@@ -214,7 +287,7 @@ fn add_namespaced_host_function_entries(
         CompletionEntry {
             label: name.to_string(),
             insert_text: format!("{name}({})", comma_args(params)),
-            detail: format!("playground host {}", function_signature(name, params)),
+            detail: format!("playground host {}", typed_signature(name, param_types, return_type)),
             documentation: docs.to_string(),
             kind: "function".to_string(),
         },
@@ -235,7 +308,7 @@ fn add_namespaced_host_function_entries(
         CompletionEntry {
             label: dot_path.clone(),
             insert_text: format!("{dot_path}({})", comma_args(params)),
-            detail: format!("playground host {}", function_signature(&dot_path, params)),
+            detail: format!("playground host {}", typed_signature(&dot_path, param_types, return_type)),
             documentation: docs.to_string(),
             kind: "function".to_string(),
         },
@@ -256,7 +329,7 @@ fn add_namespaced_host_function_entries(
         CompletionEntry {
             label: dot_path.clone(),
             insert_text: format!("{dot_path}({})", comma_args(params)),
-            detail: format!("playground host {}", function_signature(&dot_path, params)),
+            detail: format!("playground host {}", typed_signature(&dot_path, param_types, return_type)),
             documentation: docs.to_string(),
             kind: "function".to_string(),
         },
@@ -277,7 +350,7 @@ fn add_namespaced_host_function_entries(
         CompletionEntry {
             label: dot_path.clone(),
             insert_text: format!("({dot_path} {})", space_args(params)),
-            detail: format!("playground host {}", function_signature(&dot_path, params)),
+            detail: format!("playground host {}", typed_signature(&dot_path, param_types, return_type)),
             documentation: docs.to_string(),
             kind: "function".to_string(),
         },
@@ -374,16 +447,27 @@ fn add_builtin_namespace_entries(
                 "Unsupported at runtime on wasm playground."
             };
             let docs = format!("{} {}", member.docs, suffix);
+            let signatures = callable_signatures_for_builtin_namespace_member(
+                namespace.namespace,
+                member.name,
+                member.arity,
+            );
 
             let rust_label = format!("{}::{}", namespace.alias, member.name);
             let dot_label = format!("{}.{}", namespace.alias, member.name);
+            let rust_detail = signatures
+                .map(|items| format!("builtin {}", overload_signatures(&rust_label, items)))
+                .unwrap_or_else(|| format!("builtin {}", function_signature(&rust_label, &params)));
+            let dot_detail = signatures
+                .map(|items| format!("builtin {}", overload_signatures(&dot_label, items)))
+                .unwrap_or_else(|| format!("builtin {}", function_signature(&dot_label, &params)));
 
             push_unique(
                 rustscript,
                 CompletionEntry {
                     label: rust_label.clone(),
                     insert_text: format!("{rust_label}({})", comma_args(&params)),
-                    detail: format!("builtin {}", function_signature(&rust_label, &params)),
+                    detail: rust_detail.clone(),
                     documentation: docs.clone(),
                     kind: "function".to_string(),
                 },
@@ -393,7 +477,7 @@ fn add_builtin_namespace_entries(
                 CompletionEntry {
                     label: dot_label.clone(),
                     insert_text: format!("{dot_label}({})", comma_args(&params)),
-                    detail: format!("builtin {}", function_signature(&dot_label, &params)),
+                    detail: dot_detail.clone(),
                     documentation: docs.clone(),
                     kind: "function".to_string(),
                 },
@@ -403,7 +487,7 @@ fn add_builtin_namespace_entries(
                 CompletionEntry {
                     label: dot_label.clone(),
                     insert_text: format!("{dot_label}({})", comma_args(&params)),
-                    detail: format!("builtin {}", function_signature(&dot_label, &params)),
+                    detail: dot_detail.clone(),
                     documentation: docs.clone(),
                     kind: "function".to_string(),
                 },
@@ -413,7 +497,7 @@ fn add_builtin_namespace_entries(
                 CompletionEntry {
                     label: dot_label.clone(),
                     insert_text: format!("({dot_label} {})", space_args(&params)),
-                    detail: format!("builtin {}", function_signature(&dot_label, &params)),
+                    detail: dot_detail,
                     documentation: docs,
                     kind: "function".to_string(),
                 },
@@ -551,6 +635,27 @@ fn add_stdlib_entries(
 
 fn numbered_params(arity: usize) -> Vec<String> {
     (1..=arity).map(|index| format!("arg{index}")).collect()
+}
+
+fn overload_signatures(name: &str, signatures: &[CallableSignature]) -> String {
+    signatures
+        .iter()
+        .map(|signature| typed_signature(name, signature.params, signature.return_type))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn typed_signature(name: &str, params: &[CallableParamType], return_type: &str) -> String {
+    format!("{name}({}) -> {return_type}", typed_params(params))
+}
+
+fn typed_params(params: &[CallableParamType]) -> String {
+    params
+        .iter()
+        .enumerate()
+        .map(|(index, param)| format!("arg{}: {}", index + 1, param.label()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn function_signature(name: &str, params: &[String]) -> String {

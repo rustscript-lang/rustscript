@@ -384,6 +384,42 @@ fn compiler_rejects_if_else_type_mismatch_cases() {
 }
 
 #[test]
+fn compiler_rejects_callable_argument_type_mismatches() {
+    let cases = [
+        SourceErrorCase {
+            name: "language builtin rejects wrong argument type",
+            source: r#"
+                assert(1);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::CallableArgumentTypeMismatch),
+            expected_contains_all: &["builtin 'assert'", "int", "arg1: bool"],
+        },
+        SourceErrorCase {
+            name: "builtin namespace member rejects wrong argument type",
+            source: r#"
+                use math;
+                math::sqrt(true);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::CallableArgumentTypeMismatch),
+            expected_contains_all: &["builtin 'math::sqrt'", "bool", "arg1: number"],
+        },
+        SourceErrorCase {
+            name: "host function rejects wrong argument type",
+            source: r#"
+                use runtime;
+                runtime::sleep("later");
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::CallableArgumentTypeMismatch),
+            expected_contains_all: &["host function 'runtime::sleep'", "string", "arg1: int"],
+        },
+    ];
+    run_source_error_cases(&cases);
+}
+
+#[test]
 fn run_fails_when_import_is_unbound() {
     let source = r#"
         fn add_one(x);

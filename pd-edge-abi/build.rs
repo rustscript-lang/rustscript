@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 struct AbiFunctionDecl {
     name: String,
     arity: u8,
+    param_types: Vec<String>,
     return_type: String,
 }
 
@@ -103,6 +104,8 @@ fn parse_function_decl(args: &str) -> AbiFunctionDecl {
     let rest = expect_comma(rest);
     let (arity, rest) = parse_u8(rest);
     let rest = expect_comma(rest);
+    let (param_types, rest) = parse_param_types(rest);
+    let rest = expect_comma(rest);
     let (return_type, rest) = parse_ident(rest);
     let rest = skip_ws(rest);
     if !rest.is_empty() {
@@ -111,8 +114,33 @@ fn parse_function_decl(args: &str) -> AbiFunctionDecl {
     AbiFunctionDecl {
         name,
         arity,
+        param_types,
         return_type,
     }
+}
+
+fn parse_param_types(source: &str) -> (Vec<String>, &str) {
+    let source = skip_ws(source);
+    let Some(rest) = source.strip_prefix('[') else {
+        panic!("expected '[' to start param type list");
+    };
+    let end = rest
+        .find(']')
+        .unwrap_or_else(|| panic!("unterminated param type list"));
+    let inner = &rest[..end];
+    let remainder = &rest[end + 1..];
+    let mut out = Vec::new();
+    let mut cursor = inner;
+    loop {
+        cursor = skip_ws_and_commas(cursor);
+        if cursor.is_empty() {
+            break;
+        }
+        let (ident, next) = parse_ident(cursor);
+        out.push(ident);
+        cursor = next;
+    }
+    (out, remainder)
 }
 
 fn parse_namespace_file(path: &Path) -> Vec<NamespaceDecl> {
@@ -178,11 +206,25 @@ fn render_abi_rust(functions: &[AbiFunctionDecl], namespaces: &[NamespaceDecl]) 
     for function in functions {
         writeln!(
             &mut out,
-            "pub const {}: AbiFunction = AbiFunction {{ index: {}, name: {:?}, arity: {}, return_type: AbiValueType::{} }};",
+            "pub const {}_PARAM_TYPES: [AbiParamType; {}] = [{}];",
+            abi_const_name(function),
+            function.param_types.len(),
+            function
+                .param_types
+                .iter()
+                .map(|param| format!("AbiParamType::{param}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "pub const {}: AbiFunction = AbiFunction {{ index: {}, name: {:?}, arity: {}, param_types: &{}_PARAM_TYPES, return_type: AbiValueType::{} }};",
             abi_const_name(function),
             fn_const_name(function),
             function.name,
             function.arity,
+            abi_const_name(function),
             function.return_type
         )
         .unwrap();
@@ -246,9 +288,15 @@ fn render_abi_json(functions: &[AbiFunctionDecl]) -> String {
         };
         writeln!(
             &mut out,
-            "    {{ \"index\": {index}, \"name\": {:?}, \"arity\": {}, \"return_type\": {:?} }}{suffix}",
+            "    {{ \"index\": {index}, \"name\": {:?}, \"arity\": {}, \"param_types\": [{}], \"return_type\": {:?} }}{suffix}",
             function.name,
             function.arity,
+            function
+                .param_types
+                .iter()
+                .map(|param| format!("{:?}", param.to_ascii_lowercase()))
+                .collect::<Vec<_>>()
+                .join(", "),
             function.return_type.to_ascii_lowercase()
         )
         .unwrap();
@@ -387,6 +435,10 @@ fn expect_comma(source: &str) -> &str {
 
 fn skip_ws(source: &str) -> &str {
     source.trim_start_matches(char::is_whitespace)
+}
+
+fn skip_ws_and_commas(source: &str) -> &str {
+    source.trim_start_matches(|ch: char| ch.is_whitespace() || ch == ',')
 }
 
 fn find_matching_paren(source: &str) -> usize {

@@ -22,12 +22,16 @@ pub enum CompileError {
     ContinueOutsideLoop,
     InlineFunctionRecursion(String),
     IfElseBranchTypeMismatch { line: Option<u32>, detail: String },
+    CallableArgumentTypeMismatch { line: Option<u32>, detail: String },
 }
 
 impl CompileError {
     pub fn line(&self) -> Option<usize> {
         match self {
             CompileError::IfElseBranchTypeMismatch { line, .. } => {
+                line.and_then(|value| usize::try_from(value).ok())
+            }
+            CompileError::CallableArgumentTypeMismatch { line, .. } => {
                 line.and_then(|value| usize::try_from(value).ok())
             }
             _ => None,
@@ -59,6 +63,7 @@ impl CompileError {
                 format!("inline function recursion detected in '{name}'")
             }
             CompileError::IfElseBranchTypeMismatch { detail, .. } => detail.clone(),
+            CompileError::CallableArgumentTypeMismatch { detail, .. } => detail.clone(),
         }
     }
 }
@@ -494,12 +499,14 @@ fn compile_parsed_output_with_entry_locals(
         .filter(|func| !function_impls.contains_key(&func.index))
         .map(|func| (func.index, opt::BoundType::from(func.return_type)))
         .collect::<HashMap<_, _>>();
+    let host_import_signatures = opt::build_host_import_signatures(&functions, &function_impls);
 
     let mut compiler = Compiler::new();
     compiler.set_type_inference(type_info);
     compiler.set_source(source);
     compiler.set_function_impls(function_impls);
     compiler.set_host_import_return_types(host_import_return_types);
+    compiler.set_host_import_signatures(host_import_signatures);
     compiler.set_call_index_remap(call_index_remap);
     compiler.set_enable_local_move_semantics(enable_local_move_semantics);
     for func in &functions {
@@ -760,6 +767,7 @@ pub struct Compiler {
     loop_stack: Vec<LoopContext>,
     function_impls: HashMap<u16, FunctionImpl>,
     host_import_return_types: HashMap<u16, opt::BoundType>,
+    host_import_signatures: HashMap<u16, opt::HostCallableSignature>,
     call_index_remap: HashMap<u16, u16>,
     inline_call_stack: Vec<u16>,
     callable_bindings: HashMap<LocalSlot, CallableBinding>,
@@ -801,6 +809,7 @@ impl Compiler {
             loop_stack: Vec::new(),
             function_impls: HashMap::new(),
             host_import_return_types: HashMap::new(),
+            host_import_signatures: HashMap::new(),
             call_index_remap: HashMap::new(),
             inline_call_stack: Vec::new(),
             callable_bindings: HashMap::new(),
@@ -844,6 +853,13 @@ impl Compiler {
         host_import_return_types: HashMap<u16, opt::BoundType>,
     ) {
         self.host_import_return_types = host_import_return_types;
+    }
+
+    pub(crate) fn set_host_import_signatures(
+        &mut self,
+        host_import_signatures: HashMap<u16, opt::HostCallableSignature>,
+    ) {
+        self.host_import_signatures = host_import_signatures;
     }
 
     pub fn set_call_index_remap(&mut self, call_index_remap: HashMap<u16, u16>) {
@@ -1817,6 +1833,7 @@ impl Compiler {
             &self.type_state,
             &self.function_impls,
             &self.host_import_return_types,
+            &self.host_import_signatures,
         )
     }
 
@@ -1831,6 +1848,7 @@ impl Compiler {
             &mut state,
             &self.function_impls,
             &self.host_import_return_types,
+            &self.host_import_signatures,
         );
         state
     }

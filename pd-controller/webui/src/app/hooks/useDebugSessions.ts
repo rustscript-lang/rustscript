@@ -5,6 +5,7 @@ import type * as Monaco from "monaco-editor";
 import { looksLikeIdentifier, normalizeFlavor } from "@/app/helpers";
 import { lintWithWasm } from "@/app/lint/wasmLinter";
 import { LINT_MARKER_OWNER, lintFailureMarker, lintMarkersFromReport } from "@/app/monaco/lintMarkers";
+import { ensureCompletionCatalogProviders, lookupCallableHover } from "@/app/monaco/completionCatalog";
 import { ensureRustScriptLanguage } from "@/app/monaco/rustscriptLanguage";
 import type {
   DebugCommandRequest,
@@ -388,6 +389,7 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
 
   const onDebugEditorMount: OnMount = useCallback((editor, monaco) => {
     ensureRustScriptLanguage(monaco);
+    void ensureCompletionCatalogProviders(monaco);
     debugEditorRef.current = editor;
     debugMonacoRef.current = monaco;
     setDebugEditorReadyTick((value) => value + 1);
@@ -501,6 +503,10 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
         if (hoverModel.uri.toString() !== model.uri.toString()) {
           return null;
         }
+        const callableHover = await lookupCallableHover(monaco, hoverModel, position);
+        if (callableHover) {
+          return null;
+        }
         const word = hoverModel.getWordAtPosition(position);
         if (!word || !looksLikeIdentifier(word.word)) {
           return null;
@@ -513,7 +519,6 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
         }
         setDebugHoveredVar(word.word);
         setDebugHoverValue(value);
-
         return {
           range: new monaco.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn),
           contents: [{ value: `**${word.word}**` }, { value: `\`\`\`text\n${value}\n\`\`\`` }]

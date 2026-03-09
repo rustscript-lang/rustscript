@@ -42,9 +42,9 @@ Emits optional compile-time type metadata that the interpreter and trace JIT use
 paths and clearer compile diagnostics.
 ## TODO
 
-- [ ] Optional type annotation (rustscript) for function boundaries / host APIs.
+- [ ] Rust-like Option/Result support.
+- [ ] Epoch check should be only on loop start or function call, instead of per interval.
 - [ ] host call fuel budgeting.
-- [x] Epoch-based interruption API.
 - [ ] Callable-as-value support.
 
 ## How To Use

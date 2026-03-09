@@ -662,6 +662,40 @@ mod tests {
     }
 
     #[test]
+    fn run_reports_callable_argument_type_mismatch_diagnostics() {
+        let source = r#"
+            use runtime;
+            runtime::sleep("later");
+        "#;
+
+        let report = run_source_with_flavor(source, SourceFlavor::RustScript);
+        assert!(report.error.is_some(), "expected compile failure");
+        assert_eq!(
+            report.diagnostics.len(),
+            1,
+            "expected a single callable type diagnostic"
+        );
+        let diagnostic = &report.diagnostics[0];
+        assert!(
+            diagnostic
+                .message
+                .contains("host function 'runtime::sleep' does not accept argument types"),
+            "unexpected diagnostic message: {:?}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.message.contains("string"),
+            "expected actual argument type in diagnostic: {:?}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.message.contains("arg1: int"),
+            "expected host parameter type annotation in diagnostic: {:?}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
     fn run_reports_missing_host_bindings() {
         let source = r#"
             fn custom(x);
@@ -930,6 +964,39 @@ mod tests {
                 .iter()
                 .any(|entry| entry.label == "runtime::sleep"),
             "expected RustScript runtime host namespace completion entry"
+        );
+    }
+
+    #[test]
+    fn completion_catalog_details_include_callable_signatures() {
+        let catalog = build_completion_catalog();
+        let runtime_sleep = catalog
+            .rustscript
+            .iter()
+            .find(|entry| entry.label == "runtime::sleep")
+            .expect("runtime::sleep completion should exist");
+        assert!(
+            runtime_sleep
+                .detail
+                .contains("runtime::sleep(arg1: int) -> bool"),
+            "expected runtime host signature in completion detail, got {:?}",
+            runtime_sleep.detail
+        );
+
+        let len = catalog
+            .rustscript
+            .iter()
+            .find(|entry| entry.label == "len")
+            .expect("len completion should exist");
+        assert!(
+            len.detail.contains("len(arg1: string) -> int"),
+            "expected string overload in len detail, got {:?}",
+            len.detail
+        );
+        assert!(
+            len.detail.contains("len(arg1: array) -> int"),
+            "expected array overload in len detail, got {:?}",
+            len.detail
         );
     }
 
