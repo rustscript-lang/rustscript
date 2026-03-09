@@ -36,6 +36,7 @@ struct CliConfig {
     fuel: Option<u64>,
     epoch_deadline: Option<u64>,
     help: bool,
+    version: bool,
 }
 
 impl Default for CliConfig {
@@ -61,6 +62,7 @@ impl Default for CliConfig {
             fuel: None,
             epoch_deadline: None,
             help: false,
+            version: false,
         }
     }
 }
@@ -76,6 +78,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cli = parse_cli_args(&args).map_err(io::Error::other)?;
+    if cli.version {
+        println!("{}", binary_version_text());
+        return Ok(());
+    }
     if cli.help {
         print_usage();
         return Ok(());
@@ -310,6 +316,13 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
     let mut cfg = CliConfig::default();
     if args.is_empty() {
         cfg.repl = true;
+        return Ok(cfg);
+    }
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-V" | "--version"))
+    {
+        cfg.version = true;
         return Ok(cfg);
     }
     let mut index = 0usize;
@@ -712,6 +725,7 @@ fn register_named_function(vm: &mut Vm, name: &str) -> Result<(), io::Error> {
 fn print_usage() {
     println!("Usage:");
     println!("  pd-vm-run                  (defaults to REPL)");
+    println!("  pd-vm-run --version");
     println!("  pd-vm-run [source_path]");
     println!("  pd-vm-run --repl");
     println!("  pd-vm-run repl");
@@ -734,6 +748,24 @@ fn print_usage() {
         "  pd-vm-run [--fuel <n>|--epoch-deadline <n>] [--epoch-check-interval <n>] [source_path]"
     );
     println!("  pd-vm-run debug [--tcp <addr>] [source_path]");
+    println!();
+    println!("Options:");
+    println!("  -V, --version              Show version with git metadata");
+    println!("  -h, --help                 Show this help");
+}
+
+fn binary_version_text() -> String {
+    let binary = env!("CARGO_BIN_NAME");
+    let git_tag = option_env!("PD_BUILD_GIT_TAG").unwrap_or("untagged");
+    let git_commit = option_env!("PD_BUILD_GIT_COMMIT").unwrap_or("unknown");
+    let git_dirty = option_env!("PD_BUILD_GIT_DIRTY").unwrap_or("false");
+    let dirty = matches!(git_dirty, "true" | "1" | "yes" | "dirty");
+
+    if dirty {
+        format!("{binary} {git_tag} (dirty commit: {git_commit})")
+    } else {
+        format!("{binary} {git_tag}")
+    }
 }
 
 fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
@@ -1222,6 +1254,7 @@ mod tests {
         let cfg = parse_cli_args(&[]).expect("parse should succeed");
         assert!(cfg.repl);
         assert!(!cfg.debug);
+        assert!(!cfg.version);
         assert!(cfg.tcp_addr.is_none());
         assert!(cfg.stop_on_entry);
         assert!(!cfg.jit_dump);
@@ -1237,6 +1270,20 @@ mod tests {
         assert!(cfg.emit_vmbc_path.is_none());
         assert!(cfg.disasm_vmbc_path.is_none());
         assert!(!cfg.show_source);
+    }
+
+    #[test]
+    fn parse_cli_version_flag() {
+        let cfg = parse_cli_args(&[s("--version")]).expect("parse should succeed");
+        assert!(cfg.version);
+        assert!(!cfg.repl);
+    }
+
+    #[test]
+    fn parse_cli_version_short_flag() {
+        let cfg = parse_cli_args(&[s("-V")]).expect("parse should succeed");
+        assert!(cfg.version);
+        assert!(!cfg.repl);
     }
 
     #[test]
