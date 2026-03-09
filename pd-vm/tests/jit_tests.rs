@@ -3,6 +3,7 @@ use vm::{
     CallOutcome, HostFunction, JitConfig, JitTraceTerminal, OpCode, Value, Vm, VmStatus,
     compile_source, disassemble_program,
 };
+use vm::jit::TraceStep;
 
 fn native_jit_supported() -> bool {
     (cfg!(target_arch = "x86_64")
@@ -811,4 +812,112 @@ fn trace_jit_nested_loops_use_branch_exit_segments() {
             "expected at least one loop-back trace, dump:\n{dump}"
         );
     }
+}
+
+#[test]
+fn trace_jit_records_typed_int_add_steps() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let mut i = 0;
+        let mut sum = 0;
+        while i < 6 {
+            sum = sum + i;
+            i = i + 1;
+        }
+        sum;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(15)]);
+
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        snapshot
+            .traces
+            .iter()
+            .flat_map(|trace| trace.steps.iter())
+            .any(|step| matches!(step, TraceStep::IAdd)),
+        "expected a typed integer add trace step, dump:\n{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
+fn trace_jit_records_typed_float_and_string_add_steps() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let float_source = r#"
+        let mut i = 0;
+        let mut sum = 0.0;
+        while i < 4 {
+            sum = sum + 1.25;
+            i = i + 1;
+        }
+        sum;
+    "#;
+    let string_source = r#"
+        let mut i = 0;
+        let mut out = "";
+        while i < 3 {
+            out = out + "x";
+            i = i + 1;
+        }
+        out;
+    "#;
+
+    let compiled_float = compile_source(float_source).expect("float compile should succeed");
+    let mut float_vm = Vm::new(compiled_float.program);
+    float_vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    let float_status = float_vm.run().expect("float vm should run");
+    assert_eq!(float_status, VmStatus::Halted);
+    assert_eq!(float_vm.stack(), &[Value::Float(5.0)]);
+    let float_snapshot = float_vm.jit_snapshot();
+    assert!(
+        float_snapshot
+            .traces
+            .iter()
+            .flat_map(|trace| trace.steps.iter())
+            .any(|step| matches!(step, TraceStep::FAdd)),
+        "expected a typed float add trace step, dump:\n{}",
+        float_vm.dump_jit_info()
+    );
+
+    let compiled_string = compile_source(string_source).expect("string compile should succeed");
+    let mut string_vm = Vm::new(compiled_string.program);
+    string_vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    let string_status = string_vm.run().expect("string vm should run");
+    assert_eq!(string_status, VmStatus::Halted);
+    assert_eq!(string_vm.stack(), &[Value::string("xxx")]);
+    let string_snapshot = string_vm.jit_snapshot();
+    assert!(
+        string_snapshot
+            .traces
+            .iter()
+            .flat_map(|trace| trace.steps.iter())
+            .any(|step| matches!(step, TraceStep::SConcat)),
+        "expected a typed string concat trace step, dump:\n{}",
+        string_vm.dump_jit_info()
+    );
 }

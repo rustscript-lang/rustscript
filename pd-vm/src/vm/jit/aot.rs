@@ -4,7 +4,7 @@ use crate::{HostImport, Value};
 use std::collections::BTreeSet;
 
 const AOT_MAGIC: [u8; 4] = *b"VMAO";
-const AOT_VERSION: u16 = 3;
+const AOT_VERSION: u16 = 4;
 const AOT_FLAGS: u16 = 0;
 const AOT_NATIVE_ABI_VERSION: u16 = 1;
 const DEFAULT_AOT_BUNDLE_FUEL_CHECK_INTERVAL: u32 = 64;
@@ -188,6 +188,7 @@ impl Vm {
                 local_count: bundle.local_count,
                 imports: bundle.imports,
                 debug: None,
+                type_map: None,
             });
             vm.native_only_aot = true;
             vm.native_aot_interrupt_check_interval = Some(fuel_check_interval);
@@ -563,10 +564,21 @@ fn encode_trace_step(step: &TraceStep, out: &mut Vec<u8>) -> VmResult<()> {
             out.extend_from_slice(&index.to_le_bytes());
         }
         TraceStep::Add => out.push(2),
+        TraceStep::IAdd => out.push(27),
+        TraceStep::FAdd => out.push(28),
+        TraceStep::SConcat => out.push(29),
         TraceStep::Sub => out.push(3),
+        TraceStep::ISub => out.push(30),
+        TraceStep::FSub => out.push(31),
         TraceStep::Mul => out.push(4),
+        TraceStep::IMul => out.push(32),
+        TraceStep::FMul => out.push(33),
         TraceStep::Div => out.push(5),
+        TraceStep::IDiv => out.push(34),
+        TraceStep::FDiv => out.push(35),
         TraceStep::Mod => out.push(6),
+        TraceStep::IMod => out.push(36),
+        TraceStep::FMod => out.push(37),
         TraceStep::Shl => out.push(7),
         TraceStep::Shr => out.push(8),
         TraceStep::Lshr => out.push(25),
@@ -574,6 +586,8 @@ fn encode_trace_step(step: &TraceStep, out: &mut Vec<u8>) -> VmResult<()> {
         TraceStep::Or => out.push(10),
         TraceStep::Not => out.push(26),
         TraceStep::Neg => out.push(11),
+        TraceStep::INeg => out.push(38),
+        TraceStep::FNeg => out.push(39),
         TraceStep::Ceq => out.push(12),
         TraceStep::Clt => out.push(13),
         TraceStep::Cgt => out.push(14),
@@ -627,10 +641,21 @@ fn decode_trace_step(cursor: &mut AotCursor<'_>) -> VmResult<TraceStep> {
         0 => TraceStep::Nop,
         1 => TraceStep::Ldc(cursor.read_u32("ldc index")?),
         2 => TraceStep::Add,
+        27 => TraceStep::IAdd,
+        28 => TraceStep::FAdd,
+        29 => TraceStep::SConcat,
         3 => TraceStep::Sub,
+        30 => TraceStep::ISub,
+        31 => TraceStep::FSub,
         4 => TraceStep::Mul,
+        32 => TraceStep::IMul,
+        33 => TraceStep::FMul,
         5 => TraceStep::Div,
+        34 => TraceStep::IDiv,
+        35 => TraceStep::FDiv,
         6 => TraceStep::Mod,
+        36 => TraceStep::IMod,
+        37 => TraceStep::FMod,
         7 => TraceStep::Shl,
         8 => TraceStep::Shr,
         25 => TraceStep::Lshr,
@@ -638,6 +663,8 @@ fn decode_trace_step(cursor: &mut AotCursor<'_>) -> VmResult<TraceStep> {
         10 => TraceStep::Or,
         26 => TraceStep::Not,
         11 => TraceStep::Neg,
+        38 => TraceStep::INeg,
+        39 => TraceStep::FNeg,
         12 => TraceStep::Ceq,
         13 => TraceStep::Clt,
         14 => TraceStep::Cgt,
@@ -804,10 +831,21 @@ fn validate_aot_trace(trace: &JitTrace, code_len: usize) -> VmResult<()> {
             TraceStep::Nop
             | TraceStep::Ldc(_)
             | TraceStep::Add
+            | TraceStep::IAdd
+            | TraceStep::FAdd
+            | TraceStep::SConcat
             | TraceStep::Sub
+            | TraceStep::ISub
+            | TraceStep::FSub
             | TraceStep::Mul
+            | TraceStep::IMul
+            | TraceStep::FMul
             | TraceStep::Div
+            | TraceStep::IDiv
+            | TraceStep::FDiv
             | TraceStep::Mod
+            | TraceStep::IMod
+            | TraceStep::FMod
             | TraceStep::Shl
             | TraceStep::Shr
             | TraceStep::Lshr
@@ -815,6 +853,8 @@ fn validate_aot_trace(trace: &JitTrace, code_len: usize) -> VmResult<()> {
             | TraceStep::Or
             | TraceStep::Not
             | TraceStep::Neg
+            | TraceStep::INeg
+            | TraceStep::FNeg
             | TraceStep::Ceq
             | TraceStep::Clt
             | TraceStep::Cgt

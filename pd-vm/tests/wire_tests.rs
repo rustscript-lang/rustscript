@@ -1,13 +1,18 @@
 #![cfg(feature = "runtime")]
+use std::collections::HashMap;
+
 use vm::{
     ArgInfo, Assembler, BytecodeBuilder, DebugFunction, DebugInfo, DisassembleOptions, HostImport,
-    LineInfo, LocalInfo, Program, ValidationError, Value, WireError, decode_program,
+    LineInfo, LocalInfo, Program, TypeMap, ValidationError, Value, ValueType, WireError,
+    decode_program,
     disassemble_vmbc, disassemble_vmbc_with_options, encode_program, infer_local_count,
     validate_program,
 };
 
 #[test]
 fn wire_roundtrip_preserves_constants_and_code() {
+    let mut operand_types = HashMap::new();
+    operand_types.insert(0usize, (ValueType::Int, ValueType::Int));
     let program = Program::with_imports_and_debug(
         vec![
             Value::Int(42),
@@ -40,7 +45,11 @@ fn wire_roundtrip_preserves_constants_and_code() {
                 last_line: None,
             }],
         }),
-    );
+    )
+    .with_type_map(TypeMap {
+        local_types: vec![ValueType::Int, ValueType::Unknown],
+        operand_types,
+    });
 
     let encoded = encode_program(&program).expect("encode should succeed");
     let decoded = decode_program(&encoded).expect("decode should succeed");
@@ -49,6 +58,7 @@ fn wire_roundtrip_preserves_constants_and_code() {
     assert_eq!(decoded.code, program.code);
     assert_eq!(decoded.imports, program.imports);
     assert_eq!(decoded.debug, program.debug);
+    assert_eq!(decoded.type_map, program.type_map);
 }
 
 #[test]

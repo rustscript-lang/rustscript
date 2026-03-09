@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub type SharedString = Arc<String>;
@@ -13,6 +14,25 @@ pub enum Value {
     String(SharedString),
     Array(SharedArray),
     Map(SharedMap),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ValueType {
+    Unknown = 0,
+    Null = 1,
+    Int = 2,
+    Float = 3,
+    Bool = 4,
+    String = 5,
+    Array = 6,
+    Map = 7,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TypeMap {
+    pub local_types: Vec<ValueType>,
+    pub operand_types: HashMap<usize, (ValueType, ValueType)>,
 }
 
 impl Value {
@@ -103,6 +123,7 @@ pub struct Program {
     pub local_count: usize,
     pub imports: Vec<HostImport>,
     pub debug: Option<crate::debug_info::DebugInfo>,
+    pub type_map: Option<TypeMap>,
 }
 
 impl Program {
@@ -114,6 +135,7 @@ impl Program {
             local_count,
             imports: Vec::new(),
             debug: None,
+            type_map: None,
         }
     }
 
@@ -129,6 +151,7 @@ impl Program {
             local_count,
             imports: Vec::new(),
             debug,
+            type_map: None,
         }
     }
 
@@ -145,11 +168,17 @@ impl Program {
             local_count,
             imports,
             debug,
+            type_map: None,
         }
     }
 
     pub fn with_local_count(mut self, local_count: usize) -> Self {
         self.local_count = local_count;
+        self
+    }
+
+    pub fn with_type_map(mut self, type_map: TypeMap) -> Self {
+        self.type_map = Some(type_map);
         self
     }
 }
