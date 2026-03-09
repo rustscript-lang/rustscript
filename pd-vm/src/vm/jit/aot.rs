@@ -4,7 +4,7 @@ use crate::{HostImport, Value};
 use std::collections::BTreeSet;
 
 const AOT_MAGIC: [u8; 4] = *b"VMAO";
-const AOT_VERSION: u16 = 4;
+const AOT_VERSION: u16 = 5;
 const AOT_FLAGS: u16 = 0;
 const AOT_NATIVE_ABI_VERSION: u16 = 1;
 const DEFAULT_AOT_BUNDLE_FUEL_CHECK_INTERVAL: u32 = 64;
@@ -589,8 +589,11 @@ fn encode_trace_step(step: &TraceStep, out: &mut Vec<u8>) -> VmResult<()> {
         TraceStep::INeg => out.push(38),
         TraceStep::FNeg => out.push(39),
         TraceStep::Ceq => out.push(12),
+        TraceStep::FCeq => out.push(40),
         TraceStep::Clt => out.push(13),
+        TraceStep::FClt => out.push(41),
         TraceStep::Cgt => out.push(14),
+        TraceStep::FCgt => out.push(42),
         TraceStep::Pop => out.push(15),
         TraceStep::Dup => out.push(16),
         TraceStep::Ldloc(index) => {
@@ -666,8 +669,11 @@ fn decode_trace_step(cursor: &mut AotCursor<'_>) -> VmResult<TraceStep> {
         38 => TraceStep::INeg,
         39 => TraceStep::FNeg,
         12 => TraceStep::Ceq,
+        40 => TraceStep::FCeq,
         13 => TraceStep::Clt,
+        41 => TraceStep::FClt,
         14 => TraceStep::Cgt,
+        42 => TraceStep::FCgt,
         15 => TraceStep::Pop,
         16 => TraceStep::Dup,
         17 => TraceStep::Ldloc(cursor.read_u8("ldloc index")?),
@@ -856,8 +862,11 @@ fn validate_aot_trace(trace: &JitTrace, code_len: usize) -> VmResult<()> {
             | TraceStep::INeg
             | TraceStep::FNeg
             | TraceStep::Ceq
+            | TraceStep::FCeq
             | TraceStep::Clt
+            | TraceStep::FClt
             | TraceStep::Cgt
+            | TraceStep::FCgt
             | TraceStep::Pop
             | TraceStep::Dup
             | TraceStep::Ldloc(_)

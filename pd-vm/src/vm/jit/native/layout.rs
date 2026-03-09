@@ -37,6 +37,7 @@ pub(super) fn native_layout_fingerprint() -> VmResult<u64> {
     layout.value.float_tag.hash(&mut hasher);
     layout.value.bool_tag.hash(&mut hasher);
     layout.value.int_payload_offset.hash(&mut hasher);
+    layout.value.float_payload_offset.hash(&mut hasher);
     layout.value.bool_payload_offset.hash(&mut hasher);
     std::mem::offset_of!(Vm, native_helper_fn).hash(&mut hasher);
 
@@ -219,6 +220,27 @@ fn detect_value_layout() -> VmResult<ValueLayout> {
         )
     })?;
 
+    let float_payload_match_a = float_a.to_bits().to_le_bytes();
+    let float_payload_match_b = float_b.to_bits().to_le_bytes();
+    let mut float_payload_offset = None;
+    for offset in 0..=value_size.saturating_sub(8) {
+        if float_a_bytes[offset..offset + 8] == float_payload_match_a
+            && float_b_bytes[offset..offset + 8] == float_payload_match_b
+        {
+            if float_payload_offset.is_some() {
+                return Err(VmError::JitNative(
+                    "ambiguous Value::Float payload offset for native emission".to_string(),
+                ));
+            }
+            float_payload_offset = Some(offset);
+        }
+    }
+    let float_payload_offset = float_payload_offset.ok_or_else(|| {
+        VmError::JitNative(
+            "unable to find Value::Float payload offset for native emission".to_string(),
+        )
+    })?;
+
     let mut bool_payload_offset = None;
     for offset in 0..value_size {
         if bool_false_bytes[offset] == bool_true_bytes[offset] {
@@ -252,6 +274,7 @@ fn detect_value_layout() -> VmResult<ValueLayout> {
         float_tag,
         bool_tag,
         int_payload_offset: usize_to_i32(int_payload_offset, "Value::Int payload offset")?,
+        float_payload_offset: usize_to_i32(float_payload_offset, "Value::Float payload offset")?,
         bool_payload_offset: usize_to_i32(bool_payload_offset, "Value::Bool payload offset")?,
     })
 }

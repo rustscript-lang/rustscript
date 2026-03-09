@@ -416,11 +416,20 @@ impl Vm {
                     let lhs = self.pop_value()?;
                     self.stack.push(crate::bytecode::Value::Bool(lhs == rhs));
                 }
+                TraceStep::FCeq => {
+                    self.float_eq_op()?;
+                }
                 TraceStep::Clt => {
                     self.compare_numeric_op(|lhs, rhs| lhs < rhs, |lhs, rhs| lhs < rhs)?;
                 }
+                TraceStep::FClt => {
+                    self.float_compare_op(|lhs, rhs| lhs < rhs)?;
+                }
                 TraceStep::Cgt => {
                     self.compare_numeric_op(|lhs, rhs| lhs > rhs, |lhs, rhs| lhs > rhs)?;
+                }
+                TraceStep::FCgt => {
+                    self.float_compare_op(|lhs, rhs| lhs > rhs)?;
                 }
                 TraceStep::Pop => {
                     self.pop_value()?;

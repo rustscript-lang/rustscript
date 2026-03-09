@@ -921,3 +921,146 @@ fn trace_jit_records_typed_float_and_string_add_steps() {
         string_vm.dump_jit_info()
     );
 }
+
+#[test]
+fn trace_jit_executes_typed_float_math_without_helper_bridge() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let mut i = 0;
+        let mut acc = 6.0;
+        while i < 4 {
+            acc = acc + 2.0;
+            acc = acc - 0.5;
+            acc = acc * 2.0;
+            acc = acc / 4.0;
+            acc = acc % 3.0;
+            acc = -acc;
+            i = i + 1;
+        }
+        acc;
+    "#;
+
+    let compiled = compile_source(source).expect("float math compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.set_jit_native_bridge_stats_enabled(true);
+
+    let status = vm.run().expect("float math vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Float(-0.46875)]);
+    assert!(
+        vm.jit_native_exec_count() > 0,
+        "expected native execution, dump:\n{}",
+        vm.dump_jit_info()
+    );
+
+    let snapshot = vm.jit_snapshot();
+    let steps = snapshot
+        .traces
+        .iter()
+        .flat_map(|trace| trace.steps.iter())
+        .collect::<Vec<_>>();
+    for expected in [
+        TraceStep::FAdd,
+        TraceStep::FSub,
+        TraceStep::FMul,
+        TraceStep::FDiv,
+        TraceStep::FMod,
+        TraceStep::FNeg,
+    ] {
+        assert!(
+            steps.iter().any(|step| **step == expected),
+            "expected float trace step {expected:?}, dump:\n{}",
+            vm.dump_jit_info()
+        );
+    }
+
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    for bridge_name in ["add", "sub", "mul", "div", "mod", "neg"] {
+        assert!(
+            !bridge_hits
+                .iter()
+                .any(|(name, count)| *name == bridge_name && *count > 0),
+            "expected float op '{bridge_name}' to lower natively, bridge hits: {bridge_hits:?}\n{}",
+            vm.dump_jit_info()
+        );
+    }
+}
+
+#[test]
+fn trace_jit_executes_typed_float_comparisons_without_helper_bridge() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let mut i = 0;
+        let mut value = 1.5;
+        let mut less = false;
+        let mut greater = false;
+        let mut equal = false;
+        while i < 4 {
+            less = value < 3.0;
+            greater = value > 1.0;
+            equal = value == 2.0;
+            value = value + 0.5;
+            i = i + 1;
+        }
+        less;
+        greater;
+        equal;
+    "#;
+
+    let compiled = compile_source(source).expect("float compare compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.set_jit_native_bridge_stats_enabled(true);
+
+    let status = vm.run().expect("float compare vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::Bool(false), Value::Bool(true), Value::Bool(false)]
+    );
+    assert!(
+        vm.jit_native_exec_count() > 0,
+        "expected native execution, dump:\n{}",
+        vm.dump_jit_info()
+    );
+
+    let snapshot = vm.jit_snapshot();
+    let steps = snapshot
+        .traces
+        .iter()
+        .flat_map(|trace| trace.steps.iter())
+        .collect::<Vec<_>>();
+    for expected in [TraceStep::FClt, TraceStep::FCgt, TraceStep::FCeq] {
+        assert!(
+            steps.iter().any(|step| **step == expected),
+            "expected float trace step {expected:?}, dump:\n{}",
+            vm.dump_jit_info()
+        );
+    }
+
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    for bridge_name in ["clt", "cgt", "ceq"] {
+        assert!(
+            !bridge_hits
+                .iter()
+                .any(|(name, count)| *name == bridge_name && *count > 0),
+            "expected float compare '{bridge_name}' to lower natively, bridge hits: {bridge_hits:?}\n{}",
+            vm.dump_jit_info()
+        );
+    }
+}

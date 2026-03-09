@@ -5,7 +5,7 @@ use super::{
     STATUS_OUT_OF_FUEL, STATUS_TRACE_EXIT, STATUS_WAITING, STATUS_YIELDED, store_bridge_error,
 };
 use crate::builtins::BuiltinFunction;
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
     AbiParam, Block, BlockArg, InstBuilder, MemFlags, SigRef, Signature, types,
 };
@@ -128,6 +128,7 @@ struct ValueLayout {
     float_tag: u32,
     bool_tag: u32,
     int_payload_offset: i32,
+    float_payload_offset: i32,
     bool_payload_offset: i32,
 }
 

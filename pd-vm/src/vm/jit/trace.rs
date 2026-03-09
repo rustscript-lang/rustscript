@@ -104,8 +104,11 @@ pub enum TraceStep {
     INeg,
     FNeg,
     Ceq,
+    FCeq,
     Clt,
+    FClt,
     Cgt,
+    FCgt,
     Pop,
     Dup,
     Ldloc(u8),
@@ -644,17 +647,17 @@ impl TraceJitEngine {
             }
             if opcode == OpCode::Ceq as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Ceq);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Clt as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Clt);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Cgt as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Cgt);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Pop as u8 {
@@ -859,17 +862,17 @@ impl TraceJitEngine {
             }
             if opcode == OpCode::Ceq as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Ceq);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Clt as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Clt);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Cgt as u8 {
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::Cgt);
+                steps.push(typed_trace_step(program, instr_ip, opcode));
                 continue;
             }
             if opcode == OpCode::Pop as u8 {
@@ -1065,13 +1068,19 @@ fn typed_trace_step(program: &Program, ip: usize, opcode: u8) -> TraceStep {
         (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Mod as u8 => TraceStep::FMod,
         (x, (ValueType::Int, _)) if x == OpCode::Neg as u8 => TraceStep::INeg,
         (x, (ValueType::Float, _)) if x == OpCode::Neg as u8 => TraceStep::FNeg,
+        (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Ceq as u8 => TraceStep::FCeq,
+        (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Clt as u8 => TraceStep::FClt,
+        (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Cgt as u8 => TraceStep::FCgt,
         (x, _) if x == OpCode::Add as u8 => TraceStep::Add,
         (x, _) if x == OpCode::Sub as u8 => TraceStep::Sub,
         (x, _) if x == OpCode::Mul as u8 => TraceStep::Mul,
         (x, _) if x == OpCode::Div as u8 => TraceStep::Div,
         (x, _) if x == OpCode::Mod as u8 => TraceStep::Mod,
         (x, _) if x == OpCode::Neg as u8 => TraceStep::Neg,
-        _ => unreachable!("typed_trace_step only supports arithmetic opcodes"),
+        (x, _) if x == OpCode::Ceq as u8 => TraceStep::Ceq,
+        (x, _) if x == OpCode::Clt as u8 => TraceStep::Clt,
+        (x, _) if x == OpCode::Cgt as u8 => TraceStep::Cgt,
+        _ => unreachable!("typed_trace_step only supports arithmetic/comparison opcodes"),
     }
 }
 
@@ -1105,8 +1114,11 @@ fn trace_step_name(step: &TraceStep) -> &'static str {
         TraceStep::INeg => "neg",
         TraceStep::FNeg => "neg",
         TraceStep::Ceq => "ceq",
+        TraceStep::FCeq => "ceq",
         TraceStep::Clt => "clt",
+        TraceStep::FClt => "clt",
         TraceStep::Cgt => "cgt",
+        TraceStep::FCgt => "cgt",
         TraceStep::Pop => "pop",
         TraceStep::Dup => "dup",
         TraceStep::Ldloc(_) => "ldloc",

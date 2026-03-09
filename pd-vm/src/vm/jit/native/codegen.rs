@@ -394,7 +394,21 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
-        TraceStep::FAdd | TraceStep::SConcat => Ok(false),
+        TraceStep::FAdd => {
+            emit_inline_float_binop(
+                b,
+                vm_ptr,
+                helper_ref,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                root_ip,
+                FloatBinopKind::Add,
+            )?;
+            Ok(true)
+        }
+        TraceStep::SConcat => Ok(false),
         TraceStep::Sub | TraceStep::ISub => {
             emit_inline_int_binop(
                 b,
@@ -409,7 +423,20 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
-        TraceStep::FSub => Ok(false),
+        TraceStep::FSub => {
+            emit_inline_float_binop(
+                b,
+                vm_ptr,
+                helper_ref,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                root_ip,
+                FloatBinopKind::Sub,
+            )?;
+            Ok(true)
+        }
         TraceStep::Mul | TraceStep::IMul => {
             emit_inline_int_binop(
                 b,
@@ -424,7 +451,20 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
-        TraceStep::FMul => Ok(false),
+        TraceStep::FMul => {
+            emit_inline_float_binop(
+                b,
+                vm_ptr,
+                helper_ref,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                root_ip,
+                FloatBinopKind::Mul,
+            )?;
+            Ok(true)
+        }
         TraceStep::Div | TraceStep::IDiv => {
             emit_inline_int_divrem(
                 b,
@@ -439,7 +479,20 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
-        TraceStep::FDiv => Ok(false),
+        TraceStep::FDiv => {
+            emit_inline_float_binop(
+                b,
+                vm_ptr,
+                helper_ref,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                root_ip,
+                FloatBinopKind::Div,
+            )?;
+            Ok(true)
+        }
         TraceStep::Mod | TraceStep::IMod => {
             emit_inline_int_divrem(
                 b,
@@ -454,7 +507,20 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
-        TraceStep::FMod => Ok(false),
+        TraceStep::FMod => {
+            emit_inline_float_binop(
+                b,
+                vm_ptr,
+                helper_ref,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                root_ip,
+                FloatBinopKind::Mod,
+            )?;
+            Ok(true)
+        }
         TraceStep::Shl => {
             emit_inline_shift(
                 b,
@@ -542,9 +608,35 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
-        TraceStep::FNeg => Ok(false),
+        TraceStep::FNeg => {
+            emit_inline_float_neg(
+                b,
+                vm_ptr,
+                helper_ref,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                root_ip,
+            )?;
+            Ok(true)
+        }
         TraceStep::Clt => {
             emit_inline_int_compare(
+                b,
+                vm_ptr,
+                helper_ref,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                root_ip,
+                true,
+            )?;
+            Ok(true)
+        }
+        TraceStep::FClt => {
+            emit_inline_float_compare(
                 b,
                 vm_ptr,
                 helper_ref,
@@ -571,8 +663,35 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
+        TraceStep::FCgt => {
+            emit_inline_float_compare(
+                b,
+                vm_ptr,
+                helper_ref,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                root_ip,
+                false,
+            )?;
+            Ok(true)
+        }
         TraceStep::Ceq => {
             emit_inline_int_eq(
+                b,
+                vm_ptr,
+                helper_ref,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                root_ip,
+            )?;
+            Ok(true)
+        }
+        TraceStep::FCeq => {
+            emit_inline_float_eq(
                 b,
                 vm_ptr,
                 helper_ref,
@@ -1046,6 +1165,14 @@ enum IntBinopKind {
     Mul,
 }
 
+enum FloatBinopKind {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
 #[derive(Clone, Copy)]
 enum ShiftKind {
     Left,
@@ -1131,6 +1258,101 @@ fn emit_inline_int_binop(
         IntBinopKind::Add => OP_ADD,
         IntBinopKind::Sub => OP_SUB,
         IntBinopKind::Mul => OP_MUL,
+    };
+    emit_helper_step_from_call_tuple(b, vm_ptr, helper_ref, exit_block, next, (op, 0, 0, 0));
+
+    b.switch_to_block(next);
+    let _ = root_ip;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_float_binop(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    helper_ref: FuncRef,
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    layout: NativeStackLayout,
+    offsets: ResolvedOffsets,
+    root_ip: usize,
+    kind: FloatBinopKind,
+) -> VmResult<()> {
+    let slow = b.create_block();
+    let len_ok = b.create_block();
+    let fast = b.create_block();
+    let next = b.create_block();
+
+    let len = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_len);
+    let enough = b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, len, 2);
+    b.ins().brif(enough, len_ok, &[], slow, &[]);
+
+    b.switch_to_block(len_ok);
+    let one = b.ins().iconst(pointer_type, 1);
+    let two = b.ins().iconst(pointer_type, 2);
+    let rhs_index = b.ins().isub(len, one);
+    let lhs_index = b.ins().isub(len, two);
+    let stack_ptr = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_ptr);
+    let lhs_addr = value_addr(b, pointer_type, stack_ptr, lhs_index, layout.value.size);
+    let rhs_addr = value_addr(b, pointer_type, stack_ptr, rhs_index, layout.value.size);
+    let lhs_tag = load_tag_i32(b, layout.value, lhs_addr);
+    let rhs_tag = load_tag_i32(b, layout.value, rhs_addr);
+    let lhs_float = b
+        .ins()
+        .icmp_imm(IntCC::Equal, lhs_tag, i64::from(layout.value.float_tag));
+    let rhs_float = b
+        .ins()
+        .icmp_imm(IntCC::Equal, rhs_tag, i64::from(layout.value.float_tag));
+    let both_float = b.ins().band(lhs_float, rhs_float);
+    b.ins().brif(both_float, fast, &[], slow, &[]);
+
+    b.switch_to_block(fast);
+    let lhs = b.ins().load(
+        types::F64,
+        MemFlags::new(),
+        lhs_addr,
+        layout.value.float_payload_offset,
+    );
+    let rhs = b.ins().load(
+        types::F64,
+        MemFlags::new(),
+        rhs_addr,
+        layout.value.float_payload_offset,
+    );
+    let out = match kind {
+        FloatBinopKind::Add => b.ins().fadd(lhs, rhs),
+        FloatBinopKind::Sub => b.ins().fsub(lhs, rhs),
+        FloatBinopKind::Mul => b.ins().fmul(lhs, rhs),
+        FloatBinopKind::Div => b.ins().fdiv(lhs, rhs),
+        FloatBinopKind::Mod => {
+            let quotient = b.ins().fdiv(lhs, rhs);
+            let truncated = b.ins().trunc(quotient);
+            let product = b.ins().fmul(truncated, rhs);
+            b.ins().fsub(lhs, product)
+        }
+    };
+    b.ins().store(
+        MemFlags::new(),
+        out,
+        lhs_addr,
+        layout.value.float_payload_offset,
+    );
+    let new_len = b.ins().isub(len, one);
+    b.ins()
+        .store(MemFlags::new(), new_len, vm_ptr, offsets.stack_len);
+    b.ins().jump(next, &[]);
+
+    b.switch_to_block(slow);
+    let op = match kind {
+        FloatBinopKind::Add => OP_ADD,
+        FloatBinopKind::Sub => OP_SUB,
+        FloatBinopKind::Mul => OP_MUL,
+        FloatBinopKind::Div => OP_DIV,
+        FloatBinopKind::Mod => OP_MOD,
     };
     emit_helper_step_from_call_tuple(b, vm_ptr, helper_ref, exit_block, next, (op, 0, 0, 0));
 
@@ -1501,6 +1723,65 @@ fn emit_inline_neg(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn emit_inline_float_neg(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    helper_ref: FuncRef,
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    layout: NativeStackLayout,
+    offsets: ResolvedOffsets,
+    root_ip: usize,
+) -> VmResult<()> {
+    let slow = b.create_block();
+    let fast = b.create_block();
+    let next = b.create_block();
+
+    let len = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_len);
+    let has_stack = b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, len, 1);
+    b.ins().brif(has_stack, fast, &[], slow, &[]);
+
+    b.switch_to_block(fast);
+    let one = b.ins().iconst(pointer_type, 1);
+    let idx = b.ins().isub(len, one);
+    let stack_ptr = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_ptr);
+    let addr = value_addr(b, pointer_type, stack_ptr, idx, layout.value.size);
+    let tag = load_tag_i32(b, layout.value, addr);
+    let is_float = b
+        .ins()
+        .icmp_imm(IntCC::Equal, tag, i64::from(layout.value.float_tag));
+    let float_ok = b.create_block();
+    b.ins().brif(is_float, float_ok, &[], slow, &[]);
+
+    b.switch_to_block(float_ok);
+    let value = b.ins().load(
+        types::F64,
+        MemFlags::new(),
+        addr,
+        layout.value.float_payload_offset,
+    );
+    let neg = b.ins().fneg(value);
+    b.ins().store(
+        MemFlags::new(),
+        neg,
+        addr,
+        layout.value.float_payload_offset,
+    );
+    b.ins().jump(next, &[]);
+
+    b.switch_to_block(slow);
+    emit_helper_step_from_call_tuple(b, vm_ptr, helper_ref, exit_block, next, (OP_NEG, 0, 0, 0));
+
+    b.switch_to_block(next);
+    let _ = root_ip;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_inline_int_compare(
     b: &mut FunctionBuilder,
     vm_ptr: cranelift_codegen::ir::Value,
@@ -1561,6 +1842,89 @@ fn emit_inline_int_compare(
         b.ins().icmp(IntCC::SignedLessThan, lhs, rhs)
     } else {
         b.ins().icmp(IntCC::SignedGreaterThan, lhs, rhs)
+    };
+    store_bool_in_value(b, layout.value, lhs_addr, cmp);
+    let new_len = b.ins().isub(len, one);
+    b.ins()
+        .store(MemFlags::new(), new_len, vm_ptr, offsets.stack_len);
+    b.ins().jump(next, &[]);
+
+    b.switch_to_block(slow);
+    emit_helper_step_from_call_tuple(
+        b,
+        vm_ptr,
+        helper_ref,
+        exit_block,
+        next,
+        (if less_than { OP_CLT } else { OP_CGT }, 0, 0, 0),
+    );
+
+    b.switch_to_block(next);
+    let _ = root_ip;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_float_compare(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    helper_ref: FuncRef,
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    layout: NativeStackLayout,
+    offsets: ResolvedOffsets,
+    root_ip: usize,
+    less_than: bool,
+) -> VmResult<()> {
+    let slow = b.create_block();
+    let len_ok = b.create_block();
+    let fast = b.create_block();
+    let next = b.create_block();
+
+    let len = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_len);
+    let enough = b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, len, 2);
+    b.ins().brif(enough, len_ok, &[], slow, &[]);
+
+    b.switch_to_block(len_ok);
+    let one = b.ins().iconst(pointer_type, 1);
+    let two = b.ins().iconst(pointer_type, 2);
+    let rhs_index = b.ins().isub(len, one);
+    let lhs_index = b.ins().isub(len, two);
+    let stack_ptr = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_ptr);
+    let lhs_addr = value_addr(b, pointer_type, stack_ptr, lhs_index, layout.value.size);
+    let rhs_addr = value_addr(b, pointer_type, stack_ptr, rhs_index, layout.value.size);
+    let lhs_tag = load_tag_i32(b, layout.value, lhs_addr);
+    let rhs_tag = load_tag_i32(b, layout.value, rhs_addr);
+    let lhs_float = b
+        .ins()
+        .icmp_imm(IntCC::Equal, lhs_tag, i64::from(layout.value.float_tag));
+    let rhs_float = b
+        .ins()
+        .icmp_imm(IntCC::Equal, rhs_tag, i64::from(layout.value.float_tag));
+    let both_float = b.ins().band(lhs_float, rhs_float);
+    b.ins().brif(both_float, fast, &[], slow, &[]);
+
+    b.switch_to_block(fast);
+    let lhs = b.ins().load(
+        types::F64,
+        MemFlags::new(),
+        lhs_addr,
+        layout.value.float_payload_offset,
+    );
+    let rhs = b.ins().load(
+        types::F64,
+        MemFlags::new(),
+        rhs_addr,
+        layout.value.float_payload_offset,
+    );
+    let cmp = if less_than {
+        b.ins().fcmp(FloatCC::LessThan, lhs, rhs)
+    } else {
+        b.ins().fcmp(FloatCC::GreaterThan, lhs, rhs)
     };
     store_bool_in_value(b, layout.value, lhs_addr, cmp);
     let new_len = b.ins().isub(len, one);
@@ -1691,6 +2055,77 @@ fn emit_inline_int_eq(
     let new_len_null = b.ins().isub(len, one);
     b.ins()
         .store(MemFlags::new(), new_len_null, vm_ptr, offsets.stack_len);
+    b.ins().jump(next, &[]);
+
+    b.switch_to_block(slow);
+    emit_helper_step_from_call_tuple(b, vm_ptr, helper_ref, exit_block, next, (OP_CEQ, 0, 0, 0));
+
+    b.switch_to_block(next);
+    let _ = root_ip;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_float_eq(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    helper_ref: FuncRef,
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    layout: NativeStackLayout,
+    offsets: ResolvedOffsets,
+    root_ip: usize,
+) -> VmResult<()> {
+    let slow = b.create_block();
+    let len_ok = b.create_block();
+    let fast = b.create_block();
+    let next = b.create_block();
+
+    let len = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_len);
+    let enough = b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, len, 2);
+    b.ins().brif(enough, len_ok, &[], slow, &[]);
+
+    b.switch_to_block(len_ok);
+    let one = b.ins().iconst(pointer_type, 1);
+    let two = b.ins().iconst(pointer_type, 2);
+    let rhs_index = b.ins().isub(len, one);
+    let lhs_index = b.ins().isub(len, two);
+    let stack_ptr = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_ptr);
+    let lhs_addr = value_addr(b, pointer_type, stack_ptr, lhs_index, layout.value.size);
+    let rhs_addr = value_addr(b, pointer_type, stack_ptr, rhs_index, layout.value.size);
+    let lhs_tag = load_tag_i32(b, layout.value, lhs_addr);
+    let rhs_tag = load_tag_i32(b, layout.value, rhs_addr);
+    let lhs_float = b
+        .ins()
+        .icmp_imm(IntCC::Equal, lhs_tag, i64::from(layout.value.float_tag));
+    let rhs_float = b
+        .ins()
+        .icmp_imm(IntCC::Equal, rhs_tag, i64::from(layout.value.float_tag));
+    let both_float = b.ins().band(lhs_float, rhs_float);
+    b.ins().brif(both_float, fast, &[], slow, &[]);
+
+    b.switch_to_block(fast);
+    let lhs = b.ins().load(
+        types::F64,
+        MemFlags::new(),
+        lhs_addr,
+        layout.value.float_payload_offset,
+    );
+    let rhs = b.ins().load(
+        types::F64,
+        MemFlags::new(),
+        rhs_addr,
+        layout.value.float_payload_offset,
+    );
+    let cmp = b.ins().fcmp(FloatCC::Equal, lhs, rhs);
+    store_bool_in_value(b, layout.value, lhs_addr, cmp);
+    let new_len = b.ins().isub(len, one);
+    b.ins()
+        .store(MemFlags::new(), new_len, vm_ptr, offsets.stack_len);
     b.ins().jump(next, &[]);
 
     b.switch_to_block(slow);
@@ -2041,9 +2476,9 @@ fn step_to_call(step: &TraceStep, root_ip: usize) -> VmResult<(i64, i64, i64, i6
         TraceStep::Or => (OP_OR, 0, 0, 0),
         TraceStep::Not => (OP_NOT, 0, 0, 0),
         TraceStep::Neg | TraceStep::INeg | TraceStep::FNeg => (OP_NEG, 0, 0, 0),
-        TraceStep::Ceq => (OP_CEQ, 0, 0, 0),
-        TraceStep::Clt => (OP_CLT, 0, 0, 0),
-        TraceStep::Cgt => (OP_CGT, 0, 0, 0),
+        TraceStep::Ceq | TraceStep::FCeq => (OP_CEQ, 0, 0, 0),
+        TraceStep::Clt | TraceStep::FClt => (OP_CLT, 0, 0, 0),
+        TraceStep::Cgt | TraceStep::FCgt => (OP_CGT, 0, 0, 0),
         TraceStep::Pop => (OP_POP, 0, 0, 0),
         TraceStep::Dup => (OP_DUP, 0, 0, 0),
         TraceStep::Ldloc(index) => (OP_LDLOC, i64::from(*index), 0, 0),
