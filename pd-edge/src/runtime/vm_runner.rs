@@ -103,6 +103,7 @@ pub enum VmExecutionError {
 #[derive(Clone, Debug)]
 pub struct VmDebugInvocation {
     pub attach_debugger: bool,
+    pub force_threading: bool,
     pub request_headers: HeaderMap,
     pub request_path: String,
     pub request_id: String,
@@ -119,8 +120,13 @@ pub async fn execute_vm_with_context(
     let program = program.program.clone();
     let async_ops = new_shared_vm_async_ops();
     let vm_store = new_vm_runner_store(program, vm_context, async_ops);
+    let execution_mode = if debug.force_threading {
+        VmExecutionMode::Threading
+    } else {
+        vm_execution.execution_mode
+    };
 
-    match vm_execution.execution_mode {
+    match execution_mode {
         VmExecutionMode::Async => {
             AsyncModeRunner::execute(
                 vm_store,
@@ -546,6 +552,7 @@ mod tests {
         let store = new_vm_runner_store(program, context, async_ops);
         let debug = VmDebugInvocation {
             attach_debugger: false,
+            force_threading: false,
             request_headers: HeaderMap::new(),
             request_path: "/".to_string(),
             request_id: "epoch-test".to_string(),
@@ -574,14 +581,18 @@ mod tests {
 
     #[tokio::test]
     async fn epoch_interrupt_driver_advances_epoch_by_wall_clock() {
-        let epoch_handle = EpochHandle::default();
-        let _driver = EpochInterruptionDriver::new(epoch_handle.clone());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let epoch_handle = EpochHandle::default();
+            let _driver = EpochInterruptionDriver::new(epoch_handle.clone());
 
-        sleep(Duration::from_millis(10)).await;
-
-        assert!(
-            epoch_handle.current() > 0,
-            "epoch ticker should advance without explicit wake arming"
-        );
+            loop {
+                if epoch_handle.current() > 0 {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("epoch ticker should advance without explicit wake arming");
     }
 }

@@ -453,6 +453,24 @@ pub fn request_will_attach_debugger(
     request_matches_session(request_headers, request_path, &session)
 }
 
+pub fn request_uses_blocking_debugger(
+    store: &SharedDebugSession,
+    request_headers: &HeaderMap,
+    request_path: &str,
+) -> bool {
+    let session = {
+        let guard = store.session.read().expect("debug session lock poisoned");
+        guard.clone()
+    };
+    let Some(session) = session else {
+        return false;
+    };
+    if !request_matches_session(request_headers, request_path, &session) {
+        return false;
+    }
+    matches!(&session.state, DebugSessionState::Interactive { .. })
+}
+
 pub fn drain_recording_artifacts(store: &SharedDebugSession) -> Vec<DebugRecordingArtifact> {
     let session = {
         let guard = store.session.read().expect("debug session lock poisoned");

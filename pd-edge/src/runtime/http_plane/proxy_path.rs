@@ -23,7 +23,7 @@ use crate::{
         HttpRequestContext, ProxyVmContext, register_http_plane_host_module,
         resolve_outbound_request_body,
     },
-    debug_session::request_will_attach_debugger,
+    debug_session::{request_uses_blocking_debugger, request_will_attach_debugger},
     logging::category_program,
 };
 
@@ -88,6 +88,11 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
         };
         let debug = VmDebugInvocation {
             attach_debugger: request_will_attach_debugger(
+                &state.debug_session,
+                &vm_request.headers,
+                &request_path,
+            ),
+            force_threading: request_uses_blocking_debugger(
                 &state.debug_session,
                 &vm_request.headers,
                 &request_path,
