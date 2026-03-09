@@ -40,6 +40,16 @@ pub(super) fn parse_source(source: &str, flavor: SourceFlavor) -> Result<Fronten
     frontend.lower_to_ir(source)
 }
 
+pub(crate) fn parser_dialect_for_flavor(
+    flavor: SourceFlavor,
+) -> Option<&'static dyn ParserDialect> {
+    match flavor {
+        SourceFlavor::RustScript => Some(rustscript::parser_dialect()),
+        SourceFlavor::JavaScript => Some(javascript::parser_dialect()),
+        SourceFlavor::Lua | SourceFlavor::Scheme => None,
+    }
+}
+
 pub(super) fn parse_rustscript_repl_source(
     source: &str,
     predefined_locals: &[ReplLocalBinding],

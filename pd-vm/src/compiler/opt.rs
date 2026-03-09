@@ -119,7 +119,9 @@ fn merge_bound_types(lhs: BoundType, rhs: BoundType) -> BoundType {
     }
 
     match (lhs, rhs) {
-        (BoundType::ArrayOf(lhs), BoundType::ArrayOf(rhs)) => merge_container_element_types(lhs, rhs),
+        (BoundType::ArrayOf(lhs), BoundType::ArrayOf(rhs)) => {
+            merge_container_element_types(lhs, rhs)
+        }
         (BoundType::Array, BoundType::ArrayOf(_)) | (BoundType::ArrayOf(_), BoundType::Array) => {
             BoundType::Array
         }
@@ -132,7 +134,9 @@ fn merge_bound_types(lhs: BoundType, rhs: BoundType) -> BoundType {
 }
 
 fn are_compatible_bound_types(lhs: BoundType, rhs: BoundType) -> bool {
-    lhs == BoundType::Unknown || rhs == BoundType::Unknown || merge_bound_types(lhs, rhs) != BoundType::Unknown
+    lhs == BoundType::Unknown
+        || rhs == BoundType::Unknown
+        || merge_bound_types(lhs, rhs) != BoundType::Unknown
 }
 
 #[derive(Clone, Debug)]
@@ -264,23 +268,71 @@ pub(crate) struct HostCallableSignature {
 
 struct TypeContext<'a> {
     function_impls: &'a HashMap<u16, FunctionImpl>,
+    function_names: &'a HashMap<u16, String>,
     host_import_return_types: &'a HashMap<u16, BoundType>,
     host_import_signatures: &'a HashMap<u16, HostCallableSignature>,
     active_functions: Vec<u16>,
+    observed_function_param_types: HashMap<u16, Vec<BoundType>>,
+    function_param_conflicts: HashMap<u16, String>,
 }
 
 impl<'a> TypeContext<'a> {
     fn new(
         function_impls: &'a HashMap<u16, FunctionImpl>,
+        function_names: &'a HashMap<u16, String>,
         host_import_return_types: &'a HashMap<u16, BoundType>,
         host_import_signatures: &'a HashMap<u16, HostCallableSignature>,
     ) -> Self {
         Self {
             function_impls,
+            function_names,
             host_import_return_types,
             host_import_signatures,
             active_functions: Vec::new(),
+            observed_function_param_types: HashMap::new(),
+            function_param_conflicts: HashMap::new(),
         }
+    }
+
+    fn function_name(&self, index: u16) -> &str {
+        self.function_names
+            .get(&index)
+            .map(String::as_str)
+            .unwrap_or("<anonymous>")
+    }
+
+    fn observe_function_arg_types(&mut self, index: u16, args: &[Expr], state: &LocalTypeState) {
+        let function_name = self.function_name(index).to_string();
+        let actual = args
+            .iter()
+            .map(|arg| self.infer_expr_type(arg, state))
+            .collect::<Vec<_>>();
+        let mut merged_types = self
+            .observed_function_param_types
+            .remove(&index)
+            .unwrap_or_else(|| vec![BoundType::Unknown; actual.len()]);
+        if merged_types.len() < actual.len() {
+            merged_types.resize(actual.len(), BoundType::Unknown);
+        }
+        for (arg_index, actual_ty) in actual.into_iter().enumerate() {
+            let current = merged_types[arg_index];
+            match merge_observed_function_param_type(current, actual_ty) {
+                Ok(merged) => merged_types[arg_index] = merged,
+                Err((lhs, rhs)) => {
+                    self.function_param_conflicts.entry(index).or_insert_with(|| {
+                        format!(
+                            "function '{}' is called with conflicting inferred types for arg{}: {} vs {}",
+                            function_name,
+                            arg_index + 1,
+                            bound_type_label(lhs),
+                            bound_type_label(rhs)
+                        )
+                    });
+                }
+            }
+        }
+        self.observed_function_param_types
+            .insert(index, merged_types);
     }
 
     fn infer_expr_type(&mut self, expr: &Expr, state: &LocalTypeState) -> BoundType {
@@ -423,9 +475,7 @@ impl<'a> TypeContext<'a> {
             BuiltinFunction::Set if args.len() == 3 => {
                 self.infer_set_return_type(&args[0], &args[2], state)
             }
-            BuiltinFunction::Get if args.len() == 2 => {
-                self.infer_get_return_type(&args[0], state)
-            }
+            BuiltinFunction::Get if args.len() == 2 => self.infer_get_return_type(&args[0], state),
             BuiltinFunction::Keys if args.len() == 1 => {
                 self.infer_keys_return_type(&args[0], state)
             }
@@ -436,7 +486,9 @@ impl<'a> TypeContext<'a> {
             | BuiltinFunction::MathCeil
             | BuiltinFunction::MathRound
             | BuiltinFunction::MathTrunc
-            | BuiltinFunction::MathSignum if args.len() == 1 => {
+            | BuiltinFunction::MathSignum
+                if args.len() == 1 =>
+            {
                 self.infer_same_numeric_return_type(&args[0], state)
             }
             BuiltinFunction::MathMin | BuiltinFunction::MathMax if args.len() == 2 => {
@@ -540,11 +592,7 @@ impl<'a> TypeContext<'a> {
         }
     }
 
-    fn infer_same_numeric_return_type(
-        &mut self,
-        expr: &Expr,
-        state: &LocalTypeState,
-    ) -> BoundType {
+    fn infer_same_numeric_return_type(&mut self, expr: &Expr, state: &LocalTypeState) -> BoundType {
         match self.infer_expr_type(expr, state) {
             BoundType::Int => BoundType::Int,
             BoundType::Float => BoundType::Float,
@@ -579,10 +627,7 @@ impl<'a> TypeContext<'a> {
         let first_ty = self.infer_expr_type(first, state);
         let second_ty = self.infer_expr_type(second, state);
         let third_ty = self.infer_expr_type(third, state);
-        if first_ty == BoundType::Int
-            && second_ty == BoundType::Int
-            && third_ty == BoundType::Int
-        {
+        if first_ty == BoundType::Int && second_ty == BoundType::Int && third_ty == BoundType::Int {
             BoundType::Int
         } else if is_numeric_bound_type(first_ty)
             && is_numeric_bound_type(second_ty)
@@ -603,6 +648,7 @@ impl<'a> TypeContext<'a> {
         let Some(function_impl) = self.function_impls.get(&index).cloned() else {
             return BoundType::Unknown;
         };
+        self.observe_function_arg_types(index, args, caller_state);
         if self.active_functions.contains(&index) {
             return BoundType::Unknown;
         }
@@ -678,8 +724,7 @@ impl<'a> TypeContext<'a> {
                 Some(InferredCallable::Function(index)) => {
                     if let Some(builtin) = BuiltinFunction::from_call_index(index) {
                         self.validate_builtin_argument_types(builtin, args, state, line_context)
-                    } else if let Some(signature) =
-                        self.host_import_signatures.get(&index).cloned()
+                    } else if let Some(signature) = self.host_import_signatures.get(&index).cloned()
                     {
                         self.validate_host_argument_types(&signature, args, state, line_context)
                     } else {
@@ -818,23 +863,30 @@ impl<'a> TypeContext<'a> {
 }
 
 pub(super) fn legalize_builtins_and_bind_types(mut ir: FrontendIr) -> FrontendIr {
-    let host_import_return_types = build_host_import_return_types(&ir.functions, &ir.function_impls);
+    let function_names = build_function_names(&ir.functions);
+    let host_import_return_types =
+        build_host_import_return_types(&ir.functions, &ir.function_impls);
     let host_import_signatures = build_host_import_signatures(&ir.functions, &ir.function_impls);
     let mut top_state = LocalTypeState::default();
     let mut context = TypeContext::new(
         &ir.function_impls,
+        &function_names,
         &host_import_return_types,
         &host_import_signatures,
     );
     legalize_stmts(&mut ir.stmts, &mut top_state, &mut context);
+    let observed_function_param_types = context.observed_function_param_types.clone();
 
     let function_impls = ir.function_impls.clone();
-    for function_impl in ir.function_impls.values_mut() {
+    for (index, function_impl) in ir.function_impls.iter_mut() {
         legalize_function_impl(
+            *index,
             function_impl,
             &function_impls,
+            &function_names,
             &host_import_return_types,
             &host_import_signatures,
+            &observed_function_param_types,
         );
     }
 
@@ -842,24 +894,34 @@ pub(super) fn legalize_builtins_and_bind_types(mut ir: FrontendIr) -> FrontendIr
 }
 
 pub(super) fn infer_types(ir: &FrontendIr) -> TypeInferenceResult {
-    let host_import_return_types = build_host_import_return_types(&ir.functions, &ir.function_impls);
+    let function_names = build_function_names(&ir.functions);
+    let host_import_return_types =
+        build_host_import_return_types(&ir.functions, &ir.function_impls);
     let host_import_signatures = build_host_import_signatures(&ir.functions, &ir.function_impls);
     let mut local_types = vec![ValueType::Unknown; ir.locals];
     let mut top_state = LocalTypeState::default();
     let mut context = TypeContext::new(
         &ir.function_impls,
+        &function_names,
         &host_import_return_types,
         &host_import_signatures,
     );
     collect_stmt_types(&ir.stmts, &mut top_state, &mut local_types, &mut context);
+    let observed_function_param_types = context.observed_function_param_types.clone();
 
-    for function_impl in ir.function_impls.values() {
+    for decl in &ir.functions {
+        let Some(function_impl) = ir.function_impls.get(&decl.index) else {
+            continue;
+        };
         collect_function_types(
+            decl.index,
             function_impl,
             &mut local_types,
             &ir.function_impls,
+            &function_names,
             &host_import_return_types,
             &host_import_signatures,
+            &observed_function_param_types,
         );
     }
 
@@ -867,23 +929,24 @@ pub(super) fn infer_types(ir: &FrontendIr) -> TypeInferenceResult {
 }
 
 pub(super) fn validate_if_else_type_consistency(ir: &FrontendIr) -> Result<(), CompileError> {
-    let host_import_return_types = build_host_import_return_types(&ir.functions, &ir.function_impls);
+    let function_names = build_function_names(&ir.functions);
+    let host_import_return_types =
+        build_host_import_return_types(&ir.functions, &ir.function_impls);
     let host_import_signatures = build_host_import_signatures(&ir.functions, &ir.function_impls);
     let mut top_state = LocalTypeState::default();
     let mut context = TypeContext::new(
         &ir.function_impls,
+        &function_names,
         &host_import_return_types,
         &host_import_signatures,
     );
-    validate_stmts(&ir.stmts, &mut top_state, None, &mut context)?;
+    validate_stmts(&ir.stmts, &mut top_state, None, &mut context, false)?;
 
-    for function_impl in ir.function_impls.values() {
-        validate_function_impl(
-            function_impl,
-            &ir.function_impls,
-            &host_import_return_types,
-            &host_import_signatures,
-        )?;
+    for decl in &ir.functions {
+        let Some(function_impl) = ir.function_impls.get(&decl.index) else {
+            continue;
+        };
+        validate_function_impl(decl.index, function_impl, &mut context)?;
     }
 
     Ok(())
@@ -909,8 +972,10 @@ pub(crate) fn infer_expr_type_with_function_impls_and_imports(
     host_import_return_types: &HashMap<u16, BoundType>,
     host_import_signatures: &HashMap<u16, HostCallableSignature>,
 ) -> BoundType {
+    let empty_function_names: HashMap<u16, String> = HashMap::new();
     let mut context = TypeContext::new(
         function_impls,
+        &empty_function_names,
         host_import_return_types,
         host_import_signatures,
     );
@@ -924,8 +989,10 @@ pub(crate) fn apply_stmts_with_function_impls_and_imports(
     host_import_return_types: &HashMap<u16, BoundType>,
     host_import_signatures: &HashMap<u16, HostCallableSignature>,
 ) {
+    let empty_function_names: HashMap<u16, String> = HashMap::new();
     let mut context = TypeContext::new(
         function_impls,
+        &empty_function_names,
         host_import_return_types,
         host_import_signatures,
     );
@@ -933,20 +1000,26 @@ pub(crate) fn apply_stmts_with_function_impls_and_imports(
 }
 
 fn legalize_function_impl(
+    function_index: u16,
     function_impl: &mut FunctionImpl,
     function_impls: &HashMap<u16, FunctionImpl>,
+    function_names: &HashMap<u16, String>,
     host_import_return_types: &HashMap<u16, BoundType>,
     host_import_signatures: &HashMap<u16, HostCallableSignature>,
+    observed_function_param_types: &HashMap<u16, Vec<BoundType>>,
 ) {
     let mut state = LocalTypeState::default();
     let mut context = TypeContext::new(
         function_impls,
+        function_names,
         host_import_return_types,
         host_import_signatures,
     );
-    for slot in &function_impl.param_slots {
-        state.set(*slot, BoundType::Unknown);
-    }
+    seed_function_param_state(
+        &mut state,
+        &function_impl.param_slots,
+        observed_function_param_slice(observed_function_param_types, function_index),
+    );
     for (source_slot, captured_slot) in &function_impl.capture_copies {
         let source_state = state.clone();
         state.copy_binding_from(&source_state, *source_slot, *captured_slot);
@@ -956,26 +1029,29 @@ fn legalize_function_impl(
 }
 
 fn validate_function_impl(
+    function_index: u16,
     function_impl: &FunctionImpl,
-    function_impls: &HashMap<u16, FunctionImpl>,
-    host_import_return_types: &HashMap<u16, BoundType>,
-    host_import_signatures: &HashMap<u16, HostCallableSignature>,
+    context: &mut TypeContext<'_>,
 ) -> Result<(), CompileError> {
-    let mut state = LocalTypeState::default();
-    let mut context = TypeContext::new(
-        function_impls,
-        host_import_return_types,
-        host_import_signatures,
-    );
-    for slot in &function_impl.param_slots {
-        state.set(*slot, BoundType::Unknown);
+    if let Some(detail) = context
+        .function_param_conflicts
+        .get(&function_index)
+        .cloned()
+    {
+        return Err(CompileError::FunctionParameterTypeConflict { line: None, detail });
     }
+    let mut state = LocalTypeState::default();
+    seed_function_param_state(
+        &mut state,
+        &function_impl.param_slots,
+        observed_function_param_slice(&context.observed_function_param_types, function_index),
+    );
     for (source_slot, captured_slot) in &function_impl.capture_copies {
         let source_state = state.clone();
         state.copy_binding_from(&source_state, *source_slot, *captured_slot);
     }
-    validate_stmts(&function_impl.body_stmts, &mut state, None, &mut context)?;
-    let _ = validate_expr(&function_impl.body_expr, &state, None, &mut context)?;
+    validate_stmts(&function_impl.body_stmts, &mut state, None, context, true)?;
+    let _ = validate_expr(&function_impl.body_expr, &state, None, context, true)?;
     Ok(())
 }
 
@@ -1044,6 +1120,7 @@ fn validate_stmts(
     state: &mut LocalTypeState,
     line_context: Option<u32>,
     context: &mut TypeContext<'_>,
+    strict_function_add_types: bool,
 ) -> Result<(), CompileError> {
     for stmt in stmts {
         match stmt {
@@ -1055,15 +1132,22 @@ fn validate_stmts(
                 state.set(*index, BoundType::Null);
             }
             Stmt::ClosureLet { closure, .. } => {
-                let _ = validate_expr(&closure.body, state, line_context, context)?;
+                let _ = validate_expr(&closure.body, state, line_context, context, false)?;
             }
             Stmt::Let { index, expr, line } | Stmt::Assign { index, expr, line } => {
                 let expr_state = state.clone();
-                let ty = validate_expr(expr, &expr_state, Some(*line), context)?;
+                let ty = validate_expr(
+                    expr,
+                    &expr_state,
+                    Some(*line),
+                    context,
+                    strict_function_add_types,
+                )?;
                 bind_expr_result_to_slot(state, *index, expr, &expr_state, ty, context);
             }
             Stmt::Expr { expr, line } => {
-                let _ = validate_expr(expr, state, Some(*line), context)?;
+                let _ =
+                    validate_expr(expr, state, Some(*line), context, strict_function_add_types)?;
             }
             Stmt::IfElse {
                 condition,
@@ -1071,11 +1155,29 @@ fn validate_stmts(
                 else_branch,
                 line,
             } => {
-                let _ = validate_expr(condition, state, Some(*line), context)?;
+                let _ = validate_expr(
+                    condition,
+                    state,
+                    Some(*line),
+                    context,
+                    strict_function_add_types,
+                )?;
                 let mut then_state = state.clone();
                 let mut else_state = state.clone();
-                validate_stmts(then_branch, &mut then_state, Some(*line), context)?;
-                validate_stmts(else_branch, &mut else_state, Some(*line), context)?;
+                validate_stmts(
+                    then_branch,
+                    &mut then_state,
+                    Some(*line),
+                    context,
+                    strict_function_add_types,
+                )?;
+                validate_stmts(
+                    else_branch,
+                    &mut else_state,
+                    Some(*line),
+                    context,
+                    strict_function_add_types,
+                )?;
                 validate_branch_state_merge(Some(*line), &then_state, &else_state)?;
                 state.merge_from_branches(&then_state, &else_state);
             }
@@ -1086,11 +1188,35 @@ fn validate_stmts(
                 body,
                 line,
             } => {
-                validate_stmts(std::slice::from_ref(init), state, Some(*line), context)?;
+                validate_stmts(
+                    std::slice::from_ref(init),
+                    state,
+                    Some(*line),
+                    context,
+                    strict_function_add_types,
+                )?;
                 try_stabilize_loop_state(state, |iterated| {
-                    let _ = validate_expr(condition, iterated, Some(*line), context)?;
-                    validate_stmts(body, iterated, Some(*line), context)?;
-                    validate_stmts(std::slice::from_ref(post), iterated, Some(*line), context)
+                    let _ = validate_expr(
+                        condition,
+                        iterated,
+                        Some(*line),
+                        context,
+                        strict_function_add_types,
+                    )?;
+                    validate_stmts(
+                        body,
+                        iterated,
+                        Some(*line),
+                        context,
+                        strict_function_add_types,
+                    )?;
+                    validate_stmts(
+                        std::slice::from_ref(post),
+                        iterated,
+                        Some(*line),
+                        context,
+                        strict_function_add_types,
+                    )
                 })?;
             }
             Stmt::While {
@@ -1099,8 +1225,20 @@ fn validate_stmts(
                 line,
             } => {
                 try_stabilize_loop_state(state, |iterated| {
-                    let _ = validate_expr(condition, iterated, Some(*line), context)?;
-                    validate_stmts(body, iterated, Some(*line), context)
+                    let _ = validate_expr(
+                        condition,
+                        iterated,
+                        Some(*line),
+                        context,
+                        strict_function_add_types,
+                    )?;
+                    validate_stmts(
+                        body,
+                        iterated,
+                        Some(*line),
+                        context,
+                        strict_function_add_types,
+                    )
                 })?;
             }
         }
@@ -1122,6 +1260,13 @@ fn bind_expr_result_to_slot(
     } else {
         state.set(slot, ty);
     }
+}
+
+fn build_function_names(functions: &[FunctionDecl]) -> HashMap<u16, String> {
+    functions
+        .iter()
+        .map(|decl| (decl.index, decl.name.clone()))
+        .collect()
 }
 
 fn build_host_import_return_types(
@@ -1183,6 +1328,86 @@ fn callable_param_type_from_abi(value: edge_abi::AbiParamType) -> CallableParamT
         edge_abi::AbiParamType::Map => CallableParamType::Map,
         edge_abi::AbiParamType::Number => CallableParamType::Number,
     }
+}
+
+fn merge_observed_function_param_type(
+    current: BoundType,
+    next: BoundType,
+) -> Result<BoundType, (BoundType, BoundType)> {
+    if current == BoundType::Unknown {
+        return Ok(next);
+    }
+    if next == BoundType::Unknown || current == next {
+        return Ok(current);
+    }
+    let merged = merge_bound_types(current, next);
+    if merged != BoundType::Unknown {
+        Ok(merged)
+    } else {
+        Err((current, next))
+    }
+}
+
+fn observed_function_param_slice<'a>(
+    observed: &'a HashMap<u16, Vec<BoundType>>,
+    function_index: u16,
+) -> Option<&'a [BoundType]> {
+    observed.get(&function_index).map(Vec::as_slice)
+}
+
+fn seed_function_param_state(
+    state: &mut LocalTypeState,
+    param_slots: &[LocalSlot],
+    observed: Option<&[BoundType]>,
+) {
+    for (param_index, slot) in param_slots.iter().enumerate() {
+        let ty = observed
+            .and_then(|types| types.get(param_index))
+            .copied()
+            .unwrap_or(BoundType::Unknown);
+        state.set(*slot, ty);
+    }
+}
+
+fn observe_direct_function_call_types(
+    expr: &Expr,
+    state: &LocalTypeState,
+    line_context: Option<u32>,
+    context: &mut TypeContext<'_>,
+) -> Result<(), CompileError> {
+    let function_index = match expr {
+        Expr::Call(index, _) if context.function_impls.contains_key(index) => Some(*index),
+        Expr::LocalCall(slot, _) => match state.callable(*slot).cloned() {
+            Some(InferredCallable::Function(index))
+                if context.function_impls.contains_key(&index) =>
+            {
+                Some(index)
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+
+    let Some(function_index) = function_index else {
+        return Ok(());
+    };
+
+    let args = match expr {
+        Expr::Call(_, args) | Expr::LocalCall(_, args) => args,
+        _ => return Ok(()),
+    };
+    context.observe_function_arg_types(function_index, args, state);
+    if let Some(detail) = context
+        .function_param_conflicts
+        .get(&function_index)
+        .cloned()
+    {
+        return Err(CompileError::FunctionParameterTypeConflict {
+            line: line_context,
+            detail,
+        });
+    }
+    Ok(())
 }
 
 fn validate_signature_overloads(
@@ -1437,6 +1662,7 @@ fn validate_expr(
     state: &LocalTypeState,
     line_context: Option<u32>,
     context: &mut TypeContext<'_>,
+    strict_function_add_types: bool,
 ) -> Result<BoundType, CompileError> {
     Ok(match expr {
         Expr::Null => BoundType::Null,
@@ -1444,18 +1670,35 @@ fn validate_expr(
         Expr::Float(_) => BoundType::Float,
         Expr::Bool(_) => BoundType::Bool,
         Expr::String(_) => BoundType::String,
-        Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
-            validate_expr(inner, state, line_context, context)?
-        }
+        Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => validate_expr(
+            inner,
+            state,
+            line_context,
+            context,
+            strict_function_add_types,
+        )?,
         Expr::Var(slot) | Expr::MoveVar(slot) => state.get(*slot),
         Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => state.get(*root),
         Expr::FunctionRef(_) | Expr::Call(_, _) | Expr::LocalCall(_, _) | Expr::Closure(_) => {
-            validate_expr_children(expr, state, line_context, context)?;
+            validate_expr_children(
+                expr,
+                state,
+                line_context,
+                context,
+                strict_function_add_types,
+            )?;
+            observe_direct_function_call_types(expr, state, line_context, context)?;
             context.validate_call_argument_types(expr, state, line_context)?;
             context.infer_call_like_expr_type(expr, state)
         }
         Expr::ClosureCall(_, _) => {
-            validate_expr_children(expr, state, line_context, context)?;
+            validate_expr_children(
+                expr,
+                state,
+                line_context,
+                context,
+                strict_function_add_types,
+            )?;
             context.validate_call_argument_types(expr, state, line_context)?;
             context.infer_call_like_expr_type(expr, state)
         }
@@ -1469,12 +1712,34 @@ fn validate_expr(
         | Expr::Eq(lhs, rhs)
         | Expr::Lt(lhs, rhs)
         | Expr::Gt(lhs, rhs) => {
-            let lhs_ty = validate_expr(lhs, state, line_context, context)?;
-            let rhs_ty = validate_expr(rhs, state, line_context, context)?;
-            infer_binary_type(expr, lhs_ty, rhs_ty)
+            let lhs_ty =
+                validate_expr(lhs, state, line_context, context, strict_function_add_types)?;
+            let rhs_ty =
+                validate_expr(rhs, state, line_context, context, strict_function_add_types)?;
+            let inferred = infer_binary_type(expr, lhs_ty, rhs_ty);
+            if strict_function_add_types
+                && matches!(expr, Expr::Add(_, _))
+                && inferred == BoundType::Unknown
+            {
+                return Err(CompileError::BinaryOperandTypeMismatch {
+                    line: line_context,
+                    detail: format!(
+                        "cannot infer '+' operand types in function body: {} vs {}",
+                        bound_type_label(lhs_ty),
+                        bound_type_label(rhs_ty)
+                    ),
+                });
+            }
+            inferred
         }
         Expr::Neg(inner) | Expr::Not(inner) => {
-            let inner_ty = validate_expr(inner, state, line_context, context)?;
+            let inner_ty = validate_expr(
+                inner,
+                state,
+                line_context,
+                context,
+                strict_function_add_types,
+            )?;
             infer_unary_type(expr, inner_ty)
         }
         Expr::IfElse {
@@ -1482,9 +1747,27 @@ fn validate_expr(
             then_expr,
             else_expr,
         } => {
-            let _ = validate_expr(condition, state, line_context, context)?;
-            let then_ty = validate_expr(then_expr, state, line_context, context)?;
-            let else_ty = validate_expr(else_expr, state, line_context, context)?;
+            let _ = validate_expr(
+                condition,
+                state,
+                line_context,
+                context,
+                strict_function_add_types,
+            )?;
+            let then_ty = validate_expr(
+                then_expr,
+                state,
+                line_context,
+                context,
+                strict_function_add_types,
+            )?;
+            let else_ty = validate_expr(
+                else_expr,
+                state,
+                line_context,
+                context,
+                strict_function_add_types,
+            )?;
             ensure_compatible_if_else_types(line_context, "expression result", then_ty, else_ty)?;
             if then_ty == else_ty {
                 then_ty
@@ -1498,10 +1781,22 @@ fn validate_expr(
             default,
             ..
         } => {
-            let _ = validate_expr(value, state, line_context, context)?;
+            let _ = validate_expr(
+                value,
+                state,
+                line_context,
+                context,
+                strict_function_add_types,
+            )?;
             let mut arm_type = BoundType::Unknown;
             for (_pattern, arm_expr) in arms {
-                let ty = validate_expr(arm_expr, state, line_context, context)?;
+                let ty = validate_expr(
+                    arm_expr,
+                    state,
+                    line_context,
+                    context,
+                    strict_function_add_types,
+                )?;
                 arm_type = if arm_type == BoundType::Unknown {
                     ty
                 } else if arm_type == ty {
@@ -1510,7 +1805,13 @@ fn validate_expr(
                     BoundType::Unknown
                 };
             }
-            let default_ty = validate_expr(default, state, line_context, context)?;
+            let default_ty = validate_expr(
+                default,
+                state,
+                line_context,
+                context,
+                strict_function_add_types,
+            )?;
             if arm_type != BoundType::Unknown && arm_type == default_ty {
                 arm_type
             } else {
@@ -1519,8 +1820,20 @@ fn validate_expr(
         }
         Expr::Block { stmts, expr } => {
             let mut nested = state.clone();
-            validate_stmts(stmts, &mut nested, line_context, context)?;
-            validate_expr(expr, &nested, line_context, context)?
+            validate_stmts(
+                stmts,
+                &mut nested,
+                line_context,
+                context,
+                strict_function_add_types,
+            )?;
+            validate_expr(
+                expr,
+                &nested,
+                line_context,
+                context,
+                strict_function_add_types,
+            )?
         }
     })
 }
@@ -1530,20 +1843,23 @@ fn validate_expr_children(
     state: &LocalTypeState,
     line_context: Option<u32>,
     context: &mut TypeContext<'_>,
+    strict_function_add_types: bool,
 ) -> Result<(), CompileError> {
     match expr {
         Expr::Call(_, args) | Expr::LocalCall(_, args) => {
             for arg in args {
-                let _ = validate_expr(arg, state, line_context, context)?;
+                let _ =
+                    validate_expr(arg, state, line_context, context, strict_function_add_types)?;
             }
         }
         Expr::Closure(closure) => {
-            let _ = validate_expr(&closure.body, state, line_context, context)?;
+            let _ = validate_expr(&closure.body, state, line_context, context, false)?;
         }
         Expr::ClosureCall(closure, args) => {
-            let _ = validate_expr(&closure.body, state, line_context, context)?;
+            let _ = validate_expr(&closure.body, state, line_context, context, false)?;
             for arg in args {
-                let _ = validate_expr(arg, state, line_context, context)?;
+                let _ =
+                    validate_expr(arg, state, line_context, context, strict_function_add_types)?;
             }
         }
         _ => {}
@@ -1637,6 +1953,8 @@ fn infer_binary_type(expr: &Expr, lhs: BoundType, rhs: BoundType) -> BoundType {
         Expr::Add(_, _) => {
             if lhs == BoundType::String || rhs == BoundType::String {
                 BoundType::String
+            } else if let Some(array_ty) = infer_array_concat_type(lhs, rhs) {
+                array_ty
             } else if lhs == BoundType::Int && rhs == BoundType::Int {
                 BoundType::Int
             } else if (lhs == BoundType::Int || lhs == BoundType::Float)
@@ -1662,6 +1980,18 @@ fn infer_binary_type(expr: &Expr, lhs: BoundType, rhs: BoundType) -> BoundType {
             BoundType::Bool
         }
         _ => BoundType::Unknown,
+    }
+}
+
+fn infer_array_concat_type(lhs: BoundType, rhs: BoundType) -> Option<BoundType> {
+    match (lhs, rhs) {
+        (BoundType::ArrayOf(lhs), BoundType::ArrayOf(rhs)) => {
+            Some(merge_container_element_types(lhs, rhs))
+        }
+        (BoundType::Array, BoundType::Array)
+        | (BoundType::Array, BoundType::ArrayOf(_))
+        | (BoundType::ArrayOf(_), BoundType::Array) => Some(BoundType::Array),
+        _ => None,
     }
 }
 
@@ -1733,21 +2063,29 @@ fn bound_type_label(ty: BoundType) -> &'static str {
 }
 
 fn collect_function_types(
+    function_index: u16,
     function_impl: &FunctionImpl,
     local_types: &mut [ValueType],
     function_impls: &HashMap<u16, FunctionImpl>,
+    function_names: &HashMap<u16, String>,
     host_import_return_types: &HashMap<u16, BoundType>,
     host_import_signatures: &HashMap<u16, HostCallableSignature>,
+    observed_function_param_types: &HashMap<u16, Vec<BoundType>>,
 ) {
     let mut state = LocalTypeState::default();
     let mut context = TypeContext::new(
         function_impls,
+        function_names,
         host_import_return_types,
         host_import_signatures,
     );
-    for slot in &function_impl.param_slots {
-        record_local_type(local_types, *slot, BoundType::Unknown);
-        state.set(*slot, BoundType::Unknown);
+    for (param_index, slot) in function_impl.param_slots.iter().enumerate() {
+        let ty = observed_function_param_slice(observed_function_param_types, function_index)
+            .and_then(|types| types.get(param_index))
+            .copied()
+            .unwrap_or(BoundType::Unknown);
+        record_local_type(local_types, *slot, ty);
+        state.set(*slot, ty);
     }
     for (source_slot, captured_slot) in &function_impl.capture_copies {
         let ty = state.get(*source_slot);

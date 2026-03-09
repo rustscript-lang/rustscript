@@ -1,6 +1,6 @@
 use vm::{
     SourceError, SourceFlavor, SourceMap, SourcePathError, compile_source_with_flavor_and_options,
-    render_compile_error, render_source_error,
+    lint_trailing_function_return_semicolons, render_compile_error, render_source_error,
 };
 
 use crate::stdlib::embedded_stdlib_compile_options;
@@ -35,25 +35,19 @@ impl LintReport {
 }
 
 pub fn lint_source_with_flavor(source: &str, flavor: SourceFlavor) -> LintReport {
+    let mut diagnostics = lint_trailing_function_return_semicolon_diagnostics(source, flavor);
     match compile_source_with_flavor_and_options(source, flavor, embedded_stdlib_compile_options())
     {
-        Ok(_) => LintReport::ok(),
-        Err(SourcePathError::Source(SourceError::Parse(err))) => {
-            let mut source_map = SourceMap::new();
-            let source_id = source_map.add_source("<lint>", source.to_string());
-            let err = err.with_line_span_from_source(&source_map, source_id);
-            let span = err.span.and_then(|span| {
-                lint_span_from_source_span(&source_map, source_id, span.lo, span.hi)
-            });
-            let rendered = render_source_error(&source_map, &err, true);
-            LintReport {
-                diagnostics: vec![LintDiagnostic {
-                    line: err.line,
-                    message: err.message,
-                    span,
-                    rendered,
-                }],
+        Ok(_) => {
+            if diagnostics.is_empty() {
+                LintReport::ok()
+            } else {
+                LintReport { diagnostics }
             }
+        }
+        Err(SourcePathError::Source(SourceError::Parse(err))) => {
+            diagnostics.push(lint_diagnostic_from_parse_error(source, err));
+            LintReport { diagnostics }
         }
         Err(SourcePathError::Source(SourceError::Compile(err))) => {
             let mut source_map = SourceMap::new();
@@ -64,31 +58,61 @@ pub fn lint_source_with_flavor(source: &str, flavor: SourceFlavor) -> LintReport
                 lint_span_from_source_span(&source_map, source_id, span.lo, span.hi)
             });
             let rendered = render_compile_error(&source_map, &err, true);
-            LintReport {
-                diagnostics: vec![LintDiagnostic {
-                    line,
-                    message: err.diagnostic_message(),
-                    span,
-                    rendered,
-                }],
-            }
+            diagnostics.push(LintDiagnostic {
+                line,
+                message: err.diagnostic_message(),
+                span,
+                rendered,
+            });
+            LintReport { diagnostics }
         }
-        Err(SourcePathError::InvalidImportSyntax { line, message, .. }) => LintReport {
-            diagnostics: vec![LintDiagnostic {
+        Err(SourcePathError::InvalidImportSyntax { line, message, .. }) => {
+            diagnostics.push(LintDiagnostic {
                 line,
                 message: message.clone(),
                 span: None,
                 rendered: message,
-            }],
-        },
-        Err(err) => LintReport {
-            diagnostics: vec![LintDiagnostic {
+            });
+            LintReport { diagnostics }
+        }
+        Err(err) => {
+            diagnostics.push(LintDiagnostic {
                 line: 0,
                 message: err.to_string(),
                 span: None,
                 rendered: err.to_string(),
-            }],
-        },
+            });
+            LintReport { diagnostics }
+        }
+    }
+}
+
+fn lint_trailing_function_return_semicolon_diagnostics(
+    source: &str,
+    flavor: SourceFlavor,
+) -> Vec<LintDiagnostic> {
+    let Ok(errors) = lint_trailing_function_return_semicolons(source, flavor) else {
+        return Vec::new();
+    };
+    errors
+        .into_iter()
+        .map(|err| lint_diagnostic_from_parse_error(source, err))
+        .collect()
+}
+
+fn lint_diagnostic_from_parse_error(source: &str, err: vm::ParseError) -> LintDiagnostic {
+    let mut source_map = SourceMap::new();
+    let source_id = source_map.add_source("<lint>", source.to_string());
+    let err = err.with_line_span_from_source(&source_map, source_id);
+    let span = err
+        .span
+        .and_then(|span| lint_span_from_source_span(&source_map, source_id, span.lo, span.hi));
+    let rendered = render_source_error(&source_map, &err, true);
+    LintDiagnostic {
+        line: err.line,
+        message: err.message,
+        span,
+        rendered,
     }
 }
 

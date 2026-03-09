@@ -325,6 +325,51 @@ fn compiler_marks_string_plus_number_paths_as_string_concat() {
 }
 
 #[test]
+fn compiler_infers_named_function_plus_operands_from_consistent_calls() {
+    let source = r#"
+        fn addme(x) {
+            x + x
+        }
+
+        addme(21);
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    assert_opcode_operand_types(&compiled, OpCode::Add, &[(ValueType::Int, ValueType::Int)]);
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+}
+
+#[test]
+fn compiler_rejects_conflicting_named_function_plus_operand_flows() {
+    let source = r#"
+        fn addme(x) {
+            x + x
+        }
+
+        addme(1);
+        addme("as");
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("compile should reject conflicting function operand types"),
+        Err(err) => err,
+    };
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("FunctionParameterTypeConflict"),
+        "unexpected error: {rendered}"
+    );
+    assert!(
+        rendered.contains("addme") && rendered.contains("int") && rendered.contains("string"),
+        "expected function/type details in error: {rendered}"
+    );
+}
+
+#[test]
 fn compiler_preserves_stable_for_loop_counter_types_after_loop() {
     let source = r#"
         let mut total = 0;
@@ -358,11 +403,7 @@ fn compiler_preserves_stable_while_float_types_after_loop() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    assert_last_opcode_operand_types(
-        &compiled,
-        OpCode::Add,
-        (ValueType::Float, ValueType::Float),
-    );
+    assert_last_opcode_operand_types(&compiled, OpCode::Add, (ValueType::Float, ValueType::Float));
 
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
