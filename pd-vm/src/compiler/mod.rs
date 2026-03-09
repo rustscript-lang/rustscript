@@ -1450,8 +1450,11 @@ impl Compiler {
 
     fn assign_expr_to_slot(&mut self, slot: LocalSlot, expr: &Expr) -> Result<(), CompileError> {
         if let Some(callable) = self.callable_binding_from_expr(expr)? {
-            self.callable_bindings.insert(slot, callable);
-            self.type_state.set(slot, opt::BoundType::Unknown);
+            self.callable_bindings.insert(slot, callable.clone());
+            match callable {
+                CallableBinding::Closure(closure) => self.type_state.bind_closure(slot, &closure),
+                CallableBinding::Function(index) => self.type_state.bind_function(slot, index),
+            }
             return Ok(());
         }
         let ty = self.infer_bound_type(expr);
@@ -1666,7 +1669,7 @@ impl Compiler {
     }
 
     fn infer_bound_type(&self, expr: &Expr) -> opt::BoundType {
-        opt::infer_expr_type(expr, &self.type_state)
+        opt::infer_expr_type_with_function_impls(expr, &self.type_state, &self.function_impls)
     }
 
     fn value_type_of_expr(&self, expr: &Expr) -> ValueType {
