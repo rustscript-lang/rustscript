@@ -2897,7 +2897,7 @@ impl Parser {
     fn build_builtin_call_expr(
         &mut self,
         builtin: BuiltinFunction,
-        args: Vec<Expr>,
+        mut args: Vec<Expr>,
     ) -> Result<Expr, ParseError> {
         let arity = u8::try_from(args.len()).map_err(|_| ParseError {
             span: None,
@@ -2906,6 +2906,11 @@ impl Parser {
             message: "function arity too large".to_string(),
         })?;
         if !builtin.accepts_arity(arity) {
+            if args.len() == usize::from(builtin.arity()) + 1
+                && Self::rewrite_regex_flags_arg_into_pattern(builtin, &mut args)
+            {
+                return Ok(Expr::Call(builtin.call_index(), args));
+            }
             return Err(ParseError {
                 span: None,
                 code: None,
@@ -2918,6 +2923,41 @@ impl Parser {
             });
         }
         Ok(Expr::Call(builtin.call_index(), args))
+    }
+
+    fn rewrite_regex_flags_arg_into_pattern(
+        builtin: BuiltinFunction,
+        args: &mut Vec<Expr>,
+    ) -> bool {
+        match builtin {
+            BuiltinFunction::ReMatch
+            | BuiltinFunction::ReFind
+            | BuiltinFunction::ReReplace
+            | BuiltinFunction::ReSplit
+            | BuiltinFunction::ReCaptures => {
+                let Some(flags) = args.pop() else {
+                    return false;
+                };
+                let Some(pattern) = args.first().cloned() else {
+                    return false;
+                };
+                args[0] = Self::build_regex_flags_pattern_expr(pattern, flags);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn build_regex_flags_pattern_expr(pattern: Expr, flags: Expr) -> Expr {
+        let prefix = Expr::Call(
+            BuiltinFunction::Concat.call_index(),
+            vec![Expr::String("(?".to_string()), flags],
+        );
+        let prefix = Expr::Call(
+            BuiltinFunction::Concat.call_index(),
+            vec![prefix, Expr::String(")".to_string())],
+        );
+        Expr::Call(BuiltinFunction::Concat.call_index(), vec![prefix, pattern])
     }
 
     fn try_build_language_builtin_call(

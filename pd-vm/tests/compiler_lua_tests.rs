@@ -71,6 +71,16 @@ fn lua_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
+            name: "regex namespace accepts inline flags argument",
+            source: r#"
+                local re = require("re")
+                re.match("^lua$", "LUA", "i")
+            "#,
+            flavor: SourceFlavor::Lua,
+            expected_stack: vec![Value::Bool(true)],
+            expected_locals: None,
+        },
+        RuntimeCase {
             name: "elseif_and_elif_alias",
             source: r#"
                 local a = 2

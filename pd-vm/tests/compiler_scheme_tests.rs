@@ -81,6 +81,16 @@ fn scheme_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
+            name: "regex namespace accepts inline flags argument",
+            source: r#"
+                (define matched (re.match "^scheme$" "SCHEME" "i"))
+                matched
+            "#,
+            flavor: SourceFlavor::Scheme,
+            expected_stack: vec![Value::Bool(true)],
+            expected_locals: None,
+        },
+        RuntimeCase {
             name: "empty param lambda captures outer value",
             source: r#"
                 (define x 41)

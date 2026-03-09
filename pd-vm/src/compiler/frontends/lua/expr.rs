@@ -605,7 +605,7 @@ fn lower_lua_namespace_call(
 fn lower_lua_regex_or_builtin_namespace_call(
     namespace: &str,
     member: &str,
-    args: Vec<Expr>,
+    mut args: Vec<Expr>,
 ) -> Option<Expr> {
     if namespace == "re" {
         let builtin = match member {
@@ -619,6 +619,14 @@ fn lower_lua_regex_or_builtin_namespace_call(
         if builtin.accepts_arity(u8::try_from(args.len()).ok()?) {
             return Some(Expr::Call(builtin.call_index(), args));
         }
+        // Preserve the previous Lua frontend behavior where regex flags are
+        // accepted as a third argument and rewritten into an inline pattern.
+        if args.len() == usize::from(builtin.arity()) + 1 {
+            let flags = args.pop()?;
+            let pattern = args.first().cloned()?;
+            args[0] = apply_lua_regex_flags_to_pattern_expr(pattern, flags);
+            return Some(Expr::Call(builtin.call_index(), args));
+        }
         return None;
     }
 
@@ -627,6 +635,18 @@ fn lower_lua_regex_or_builtin_namespace_call(
         return None;
     }
     Some(Expr::Call(builtin.call_index(), args))
+}
+
+fn apply_lua_regex_flags_to_pattern_expr(pattern: Expr, flags: Expr) -> Expr {
+    let prefix = Expr::Call(
+        BuiltinFunction::Concat.call_index(),
+        vec![Expr::String("(?".to_string()), flags],
+    );
+    let prefix = Expr::Call(
+        BuiltinFunction::Concat.call_index(),
+        vec![prefix, Expr::String(")".to_string())],
+    );
+    Expr::Call(BuiltinFunction::Concat.call_index(), vec![prefix, pattern])
 }
 
 fn build_lua_optional_member_expr(
