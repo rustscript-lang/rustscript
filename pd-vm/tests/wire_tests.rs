@@ -23,6 +23,7 @@ fn wire_roundtrip_preserves_constants_and_code() {
         vec![HostImport {
             name: "print".to_string(),
             arity: 1,
+            return_type: ValueType::Unknown,
         }],
         Some(DebugInfo {
             source: Some("fn a(x);\na(1);".to_string()),
@@ -126,6 +127,7 @@ fn validate_accepts_known_good_program() {
         vec![HostImport {
             name: "print".to_string(),
             arity: 1,
+            return_type: ValueType::Unknown,
         }],
         None,
     );
@@ -144,6 +146,7 @@ fn validate_rejects_invalid_call_arity_for_import() {
         vec![HostImport {
             name: "print".to_string(),
             arity: 1,
+            return_type: ValueType::Unknown,
         }],
         None,
     );
@@ -182,6 +185,7 @@ fn disassemble_vmbc_outputs_readable_listing() {
         vec![HostImport {
             name: "print".to_string(),
             arity: 1,
+            return_type: ValueType::Unknown,
         }],
         None,
     );
@@ -258,6 +262,25 @@ fn disassemble_vmbc_hides_source_without_flag() {
 
     assert!(!listing.contains("source:"));
     assert!(!listing.contains("let x = 1;"));
+}
+
+#[test]
+fn wire_roundtrip_preserves_host_import_return_types() {
+    let program = Program::with_imports_and_debug(
+        vec![],
+        vec![0x01],
+        vec![HostImport {
+            name: "typed_host".to_string(),
+            arity: 1,
+            return_type: ValueType::Int,
+        }],
+        None,
+    );
+
+    let encoded = encode_program(&program).expect("encode should succeed");
+    let decoded = decode_program(&encoded).expect("decode should succeed");
+
+    assert_eq!(decoded.imports, program.imports);
 }
 
 #[test]

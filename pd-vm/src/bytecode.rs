@@ -114,6 +114,7 @@ fn map_entries_eq(lhs: &[(Value, Value)], rhs: &[(Value, Value)]) -> bool {
 pub struct HostImport {
     pub name: String,
     pub arity: u8,
+    pub return_type: ValueType,
 }
 
 #[derive(Clone, Debug)]

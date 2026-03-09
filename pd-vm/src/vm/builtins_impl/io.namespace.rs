@@ -12,6 +12,7 @@ macro_rules! declare_io_namespace {
                     IoOpen,
                     "open",
                     2,
+                    Int,
                     builtin_io_open,
                     vm_args_owned,
                     "Open file handle."
@@ -20,6 +21,7 @@ macro_rules! declare_io_namespace {
                     IoPopen,
                     "popen",
                     2,
+                    Int,
                     builtin_io_popen,
                     vm_args_owned,
                     "Open process handle."
@@ -28,6 +30,7 @@ macro_rules! declare_io_namespace {
                     IoReadAll,
                     "read_all",
                     1,
+                    String,
                     builtin_io_read_all,
                     vm_args_owned,
                     "Read full handle contents."
@@ -36,6 +39,7 @@ macro_rules! declare_io_namespace {
                     IoReadLine,
                     "read_line",
                     1,
+                    String,
                     builtin_io_read_line,
                     vm_args_owned,
                     "Read single line from handle."
@@ -44,6 +48,7 @@ macro_rules! declare_io_namespace {
                     IoWrite,
                     "write",
                     2,
+                    Int,
                     builtin_io_write,
                     vm_args_owned,
                     "Write text to handle."
@@ -52,6 +57,7 @@ macro_rules! declare_io_namespace {
                     IoFlush,
                     "flush",
                     1,
+                    Bool,
                     builtin_io_flush,
                     vm_args_owned,
                     "Flush handle buffers."
@@ -60,6 +66,7 @@ macro_rules! declare_io_namespace {
                     IoClose,
                     "close",
                     1,
+                    Bool,
                     builtin_io_close,
                     vm_args_owned,
                     "Close handle."
@@ -68,6 +75,7 @@ macro_rules! declare_io_namespace {
                     IoExists,
                     "exists",
                     1,
+                    Bool,
                     builtin_io_exists,
                     vm_args_owned,
                     "Check file existence."

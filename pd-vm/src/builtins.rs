@@ -1,16 +1,29 @@
 // Shared builtin catalog (ids, names, arity, call-index mapping).
 // VM execution logic lives under vm/builtins_impl/.
 
+use crate::ValueType;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BuiltinNamespaceMemberSpec {
     pub name: &'static str,
     pub arity: usize,
+    pub return_type: ValueType,
     pub docs: &'static str,
 }
 
 impl BuiltinNamespaceMemberSpec {
-    pub const fn new(name: &'static str, arity: usize, docs: &'static str) -> Self {
-        Self { name, arity, docs }
+    pub const fn new(
+        name: &'static str,
+        arity: usize,
+        return_type: ValueType,
+        docs: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            arity,
+            return_type,
+            docs,
+        }
     }
 }
 

@@ -7,13 +7,13 @@ use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 use crate::vm::{HostImport, OpCode, Program, Value};
 
 const MAGIC: [u8; 4] = *b"VMBC";
-const VERSION_V1: u16 = 1;
 const VERSION_V2: u16 = 2;
 const VERSION_V3: u16 = 3;
 const VERSION_V4: u16 = 4;
 const VERSION_V5: u16 = 5;
 const VERSION_V6: u16 = 6;
-const ENCODE_VERSION: u16 = VERSION_V6;
+const VERSION_V7: u16 = 7;
+const ENCODE_VERSION: u16 = VERSION_V7;
 const FLAGS: u16 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +182,7 @@ pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
         for import in &program.imports {
             write_string("import name", &import.name, &mut out)?;
             out.push(import.arity);
+            out.push(import.return_type as u8);
         }
     }
 
@@ -205,13 +206,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION_V1
-        && version != VERSION_V2
-        && version != VERSION_V3
-        && version != VERSION_V4
-        && version != VERSION_V5
-        && version != VERSION_V6
-    {
+    if version != VERSION_V7 {
         return Err(WireError::UnsupportedVersion(version));
     }
 
@@ -250,19 +245,15 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
 
     let code_len = cursor.read_u32()? as usize;
     let code = cursor.read_exact(code_len)?.to_vec();
-    let imports = if version >= VERSION_V4 {
-        let import_count = cursor.read_u32()? as usize;
-        let mut imports = Vec::with_capacity(import_count);
-        for _ in 0..import_count {
-            imports.push(HostImport {
-                name: cursor.read_string()?,
-                arity: cursor.read_u8()?,
-            });
-        }
-        imports
-    } else {
-        Vec::new()
-    };
+    let import_count = cursor.read_u32()? as usize;
+    let mut imports = Vec::with_capacity(import_count);
+    for _ in 0..import_count {
+        imports.push(HostImport {
+            name: cursor.read_string()?,
+            arity: cursor.read_u8()?,
+            return_type: read_value_type(cursor.read_u8()?)?,
+        });
+    }
     let type_map = if version >= VERSION_V6 {
         read_type_map(&mut cursor)?
     } else {

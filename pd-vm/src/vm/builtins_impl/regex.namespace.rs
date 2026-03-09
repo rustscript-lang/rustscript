@@ -12,12 +12,14 @@ macro_rules! declare_regex_namespace {
                     ReIsMatch,
                     "match",
                     3,
+                    Bool,
                     "Regex match with optional flags argument."
                 ),
                 namespace_builtin!(
                     ReIsMatch,
                     "is_match",
                     2,
+                    Bool,
                     builtin_re_is_match,
                     args_ref,
                     "Regex match without explicit flags."
@@ -26,6 +28,7 @@ macro_rules! declare_regex_namespace {
                     ReFind,
                     "find",
                     2,
+                    Unknown,
                     builtin_re_find,
                     args_ref,
                     "Find first regex match."
@@ -34,6 +37,7 @@ macro_rules! declare_regex_namespace {
                     ReReplace,
                     "replace",
                     3,
+                    String,
                     builtin_re_replace,
                     args_ref,
                     "Replace regex matches."
@@ -42,6 +46,7 @@ macro_rules! declare_regex_namespace {
                     ReSplit,
                     "split",
                     2,
+                    Array,
                     builtin_re_split,
                     args_ref,
                     "Split text by regex delimiter."
@@ -50,6 +55,7 @@ macro_rules! declare_regex_namespace {
                     ReCaptures,
                     "captures",
                     2,
+                    Array,
                     builtin_re_captures,
                     args_ref,
                     "Return capture groups."

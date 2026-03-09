@@ -15,7 +15,7 @@ use std::{
 use tokio::sync::oneshot;
 use vm::{
     BytecodeBuilder, CallOutcome, HostAsyncBridge, HostFunction, HostImport, HostOpId, Program,
-    Value, Vm, VmError, VmStatus,
+    Value, ValueType, Vm, VmError, VmStatus,
 };
 
 type AsyncHostResult = Result<Vec<Value>, VmError>;
@@ -133,6 +133,7 @@ fn build_async_import_program(input: i64) -> Program {
     let imports = vec![HostImport {
         name: "edge::async_add_one".to_string(),
         arity: 1,
+        return_type: ValueType::Int,
     }];
     let mut bc = BytecodeBuilder::new();
     bc.ldc(0);

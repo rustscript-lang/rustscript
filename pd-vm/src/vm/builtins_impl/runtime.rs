@@ -97,6 +97,7 @@ mod tests {
             vec![HostImport {
                 name: name.to_string(),
                 arity: 1,
+                return_type: crate::bytecode::ValueType::Bool,
             }],
             None,
         )

@@ -489,11 +489,17 @@ fn compile_parsed_output_with_entry_locals(
         .filter(|func| !is_compiler_primitive_import(&func.name))
         .cloned()
         .collect::<Vec<_>>();
+    let host_import_return_types = functions
+        .iter()
+        .filter(|func| !function_impls.contains_key(&func.index))
+        .map(|func| (func.index, opt::BoundType::from(func.return_type)))
+        .collect::<HashMap<_, _>>();
 
     let mut compiler = Compiler::new();
     compiler.set_type_inference(type_info);
     compiler.set_source(source);
     compiler.set_function_impls(function_impls);
+    compiler.set_host_import_return_types(host_import_return_types);
     compiler.set_call_index_remap(call_index_remap);
     compiler.set_enable_local_move_semantics(enable_local_move_semantics);
     for func in &functions {
@@ -514,6 +520,7 @@ fn compile_parsed_output_with_entry_locals(
         .map(|func| HostImport {
             name: func.name.clone(),
             arity: func.arity,
+            return_type: func.return_type,
         })
         .collect();
     Ok(CompiledProgram {
@@ -752,6 +759,7 @@ pub struct Compiler {
     next_label_id: u32,
     loop_stack: Vec<LoopContext>,
     function_impls: HashMap<u16, FunctionImpl>,
+    host_import_return_types: HashMap<u16, opt::BoundType>,
     call_index_remap: HashMap<u16, u16>,
     inline_call_stack: Vec<u16>,
     callable_bindings: HashMap<LocalSlot, CallableBinding>,
@@ -792,6 +800,7 @@ impl Compiler {
             next_label_id: 0,
             loop_stack: Vec::new(),
             function_impls: HashMap::new(),
+            host_import_return_types: HashMap::new(),
             call_index_remap: HashMap::new(),
             inline_call_stack: Vec::new(),
             callable_bindings: HashMap::new(),
@@ -828,6 +837,13 @@ impl Compiler {
 
     pub fn set_function_impls(&mut self, function_impls: HashMap<u16, FunctionImpl>) {
         self.function_impls = function_impls;
+    }
+
+    pub(crate) fn set_host_import_return_types(
+        &mut self,
+        host_import_return_types: HashMap<u16, opt::BoundType>,
+    ) {
+        self.host_import_return_types = host_import_return_types;
     }
 
     pub fn set_call_index_remap(&mut self, call_index_remap: HashMap<u16, u16>) {
@@ -923,6 +939,7 @@ impl Compiler {
                 line,
             } => {
                 let callable_snapshot = self.callable_bindings.clone();
+                let loop_entry_type_state = self.type_state.clone();
                 self.assembler.mark_line(*line);
                 self.compile_stmt(init)?;
                 let start_label = self.fresh_label("for_start");
@@ -948,7 +965,10 @@ impl Compiler {
                     .label(&end_label)
                     .map_err(CompileError::Assembler)?;
                 self.callable_bindings = callable_snapshot;
-                self.type_state.clear();
+                self.type_state = self.simulate_stmt_type_state(
+                    std::slice::from_ref(stmt),
+                    &loop_entry_type_state,
+                );
             }
             Stmt::While {
                 condition,
@@ -956,6 +976,7 @@ impl Compiler {
                 line,
             } => {
                 let callable_snapshot = self.callable_bindings.clone();
+                let loop_entry_type_state = self.type_state.clone();
                 self.assembler.mark_line(*line);
                 let start_label = self.fresh_label("while_start");
                 let end_label = self.fresh_label("while_end");
@@ -975,7 +996,10 @@ impl Compiler {
                     .label(&end_label)
                     .map_err(CompileError::Assembler)?;
                 self.callable_bindings = callable_snapshot;
-                self.type_state.clear();
+                self.type_state = self.simulate_stmt_type_state(
+                    std::slice::from_ref(stmt),
+                    &loop_entry_type_state,
+                );
             }
             Stmt::Break { line } => {
                 self.assembler.mark_line(*line);
@@ -1788,7 +1812,27 @@ impl Compiler {
     }
 
     fn infer_bound_type(&self, expr: &Expr) -> opt::BoundType {
-        opt::infer_expr_type_with_function_impls(expr, &self.type_state, &self.function_impls)
+        opt::infer_expr_type_with_function_impls_and_imports(
+            expr,
+            &self.type_state,
+            &self.function_impls,
+            &self.host_import_return_types,
+        )
+    }
+
+    fn simulate_stmt_type_state(
+        &self,
+        stmts: &[Stmt],
+        initial_state: &opt::LocalTypeState,
+    ) -> opt::LocalTypeState {
+        let mut state = initial_state.clone();
+        opt::apply_stmts_with_function_impls_and_imports(
+            stmts,
+            &mut state,
+            &self.function_impls,
+            &self.host_import_return_types,
+        );
+        state
     }
 
     fn value_type_of_expr(&self, expr: &Expr) -> ValueType {

@@ -1,10 +1,10 @@
 use super::super::{Vm, VmError, VmResult};
 use super::{JitTrace, JitTraceTerminal, TraceStep, native};
-use crate::{HostImport, Value};
+use crate::{HostImport, Value, ValueType};
 use std::collections::BTreeSet;
 
 const AOT_MAGIC: [u8; 4] = *b"VMAO";
-const AOT_VERSION: u16 = 5;
+const AOT_VERSION: u16 = 6;
 const AOT_FLAGS: u16 = 0;
 const AOT_NATIVE_ABI_VERSION: u16 = 1;
 const DEFAULT_AOT_BUNDLE_FUEL_CHECK_INTERVAL: u32 = 64;
@@ -332,6 +332,7 @@ fn encode_aot_bundle(bundle: &DecodedAotBundle) -> VmResult<Vec<u8>> {
     for import in &bundle.imports {
         write_aot_string(&import.name, &mut out)?;
         out.push(import.arity);
+        out.push(import.return_type as u8);
     }
     write_aot_len(bundle.traces.len(), "AOT traces", &mut out)?;
     for encoded in &bundle.traces {
@@ -430,6 +431,7 @@ fn decode_aot_bundle(bytes: &[u8]) -> VmResult<DecodedAotBundle> {
         imports.push(HostImport {
             name: cursor.read_string("import name")?,
             arity: cursor.read_u8("import arity")?,
+            return_type: decode_aot_value_type(cursor.read_u8("import return type")?)?,
         });
     }
 
@@ -779,6 +781,22 @@ fn decode_aot_value(cursor: &mut AotCursor<'_>) -> VmResult<Value> {
             ));
         }
     })
+}
+
+fn decode_aot_value_type(raw: u8) -> VmResult<ValueType> {
+    match raw {
+        0 => Ok(ValueType::Unknown),
+        1 => Ok(ValueType::Null),
+        2 => Ok(ValueType::Int),
+        3 => Ok(ValueType::Float),
+        4 => Ok(ValueType::Bool),
+        5 => Ok(ValueType::String),
+        6 => Ok(ValueType::Array),
+        7 => Ok(ValueType::Map),
+        other => Err(VmError::JitNative(format!(
+            "invalid AOT import return type tag {other}"
+        ))),
+    }
 }
 
 fn validate_aot_trace(trace: &JitTrace, code_len: usize) -> VmResult<()> {

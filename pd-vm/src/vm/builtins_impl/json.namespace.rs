@@ -12,6 +12,7 @@ macro_rules! declare_json_namespace {
                     JsonEncode,
                     "encode",
                     1,
+                    String,
                     builtin_json_encode,
                     args_ref,
                     "Serialize value to JSON string."
@@ -20,6 +21,7 @@ macro_rules! declare_json_namespace {
                     JsonDecode,
                     "decode",
                     1,
+                    Unknown,
                     builtin_json_decode,
                     args_ref,
                     "Parse JSON string into VM value."
