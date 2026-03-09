@@ -1,3 +1,4 @@
+use edge_abi::symbols::{rate_limit, runtime};
 use std::time::Duration;
 
 use vm::{CallOutcome, Value, Vm, VmError};
@@ -23,7 +24,7 @@ fn bind_runtime_sleep(vm: &mut Vm, async_ops: &SharedVmAsyncOps) {
     bind_async_host_handler(
         vm,
         &async_ops_for_bind,
-        "runtime::sleep",
+        runtime::SLEEP.name,
         move |vm, args| {
             expect_arg_count(args, 1)?;
             let millis = expect_int(args, 0)?;
@@ -42,7 +43,7 @@ fn bind_runtime_sleep(vm: &mut Vm, async_ops: &SharedVmAsyncOps) {
 }
 
 fn bind_rate_limit_allow(vm: &mut Vm, async_ops: &SharedVmAsyncOps, context: SharedProxyVmContext) {
-    bind_async_host_handler(vm, async_ops, "rate_limit::allow", move |_vm, args| {
+    bind_async_host_handler(vm, async_ops, rate_limit::ALLOW.name, move |_vm, args| {
         expect_arg_count(args, 3)?;
         let key = expect_string(args, 0)?;
         let limit = expect_int(args, 1)?;

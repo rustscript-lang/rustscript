@@ -1,4 +1,5 @@
 use axum::http::HeaderName;
+use edge_abi::symbols::http::upstream::response as abi;
 use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::super::super::{
@@ -7,12 +8,17 @@ use super::super::super::{
 };
 
 macro_rules! bind_upstream_response_handler {
-    ($vm:expr, $async_ops:expr, $symbol:literal, $context:expr, |$vm_arg:ident, $args_arg:ident, $context_arg:ident| $body:block) => {{
+    ($vm:expr, $async_ops:expr, $symbol:expr, $context:expr, |$vm_arg:ident, $args_arg:ident, $context_arg:ident| $body:block) => {{
         let context = $context.clone();
-        bind_async_host_handler($vm, $async_ops, $symbol, move |$vm_arg, $args_arg| {
-            let mut $context_arg = context.lock().expect("vm context lock poisoned");
-            $body
-        });
+        bind_async_host_handler(
+            $vm,
+            $async_ops,
+            ($symbol).name,
+            move |$vm_arg, $args_arg| {
+                let mut $context_arg = context.lock().expect("vm context lock poisoned");
+                $body
+            },
+        );
     }};
 }
 
@@ -20,7 +26,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_upstream_response_handler!(
         vm,
         &async_ops,
-        "http::upstream::response::get_status",
+        abi::GET_STATUS,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 0)?;
@@ -32,7 +38,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_upstream_response_handler!(
         vm,
         &async_ops,
-        "http::upstream::response::get_header",
+        abi::GET_HEADER,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 1)?;
@@ -51,7 +57,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_upstream_response_handler!(
         vm,
         &async_ops,
-        "http::upstream::response::get_headers",
+        abi::GET_HEADERS,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 0)?;
@@ -64,7 +70,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_upstream_response_handler!(
         vm,
         &async_ops,
-        "http::upstream::response::get_body",
+        abi::GET_BODY,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 0)?;

@@ -1,0 +1,18 @@
+edge_abi_functions![
+    edge_abi_function!("http::request::get_id", 0),
+    edge_abi_function!("http::request::get_method", 0),
+    edge_abi_function!("http::request::get_path", 0),
+    edge_abi_function!("http::request::get_query", 0),
+    edge_abi_function!("http::request::get_scheme", 0),
+    edge_abi_function!("http::request::get_host", 0),
+    edge_abi_function!("http::request::get_header", 1),
+    edge_abi_function!("http::request::get_client_ip", 0),
+    edge_abi_function!("http::request::get_headers", 0),
+    edge_abi_function!("http::request::get_query_arg", 1),
+    edge_abi_function!("http::request::get_query_args", 0),
+    edge_abi_function!("http::request::get_path_with_query", 0),
+    edge_abi_function!("http::request::get_raw_query", 0),
+    edge_abi_function!("http::request::get_body", 0),
+    edge_abi_function!("http::request::get_http_version", 0),
+    edge_abi_function!("http::request::get_port", 0),
+];
