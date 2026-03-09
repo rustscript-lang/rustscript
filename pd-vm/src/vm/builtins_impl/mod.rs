@@ -68,9 +68,10 @@ pub(super) fn execute_builtin_call(
         BuiltinFunction::TypeOf => {
             core::builtin_type_of(&args).map(IntoBuiltinCallOutcome::into_builtin_call_outcome)
         }
-        BuiltinFunction::Assert => {
-            core::builtin_assert(&args).map(IntoBuiltinCallOutcome::into_builtin_call_outcome)
-        }
+        BuiltinFunction::Assert => core::builtin_assert(&args).map(|()| {
+            // Successful asserts are control checks, not value-producing expressions.
+            BuiltinCallOutcome::Return(Vec::new())
+        }),
         _ => execute_namespaced_builtin_call(vm, builtin, args),
     }
 }
@@ -85,4 +86,28 @@ pub(super) fn poll_builtin_io_op(
 
 pub(super) fn close_all_handles(vm: &mut Vm) {
     io::close_all_handles(vm);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{OpCode, Program};
+
+    #[test]
+    fn builtin_assert_success_returns_no_stack_value() {
+        let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+
+        let outcome = execute_builtin_call(&mut vm, BuiltinFunction::Assert, vec![Value::Bool(true)])
+            .expect("assert should succeed");
+
+        match outcome {
+            BuiltinCallOutcome::Return(values) => assert!(
+                values.is_empty(),
+                "successful assert should not push a null sentinel"
+            ),
+            BuiltinCallOutcome::Pending(op_id) => {
+                panic!("assert should not yield pending host op {op_id}")
+            }
+        }
+    }
 }
