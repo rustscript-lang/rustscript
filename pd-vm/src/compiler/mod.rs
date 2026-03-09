@@ -20,10 +20,7 @@ pub enum CompileError {
     BreakOutsideLoop,
     ContinueOutsideLoop,
     InlineFunctionRecursion(String),
-    IfElseBranchTypeMismatch {
-        line: Option<u32>,
-        detail: String,
-    },
+    IfElseBranchTypeMismatch { line: Option<u32>, detail: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1689,9 +1686,10 @@ impl Compiler {
         if operand == ValueType::Unknown {
             return;
         }
-        self.type_map
-            .operand_types
-            .insert(self.assembler.position() as usize, (operand, ValueType::Unknown));
+        self.type_map.operand_types.insert(
+            self.assembler.position() as usize,
+            (operand, ValueType::Unknown),
+        );
     }
 
     fn fresh_label(&mut self, prefix: &str) -> String {

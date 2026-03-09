@@ -38,7 +38,11 @@ fn compiler_attaches_known_operand_types_to_programs() {
         .expect("compiled program should include type metadata");
     let add_offsets = opcode_offsets(&compiled.program.code, OpCode::Add);
 
-    assert_eq!(add_offsets.len(), 3, "expected exactly three add instructions");
+    assert_eq!(
+        add_offsets.len(),
+        3,
+        "expected exactly three add instructions"
+    );
     assert_eq!(
         type_map.operand_types.get(&add_offsets[0]),
         Some(&(ValueType::Int, ValueType::Int))

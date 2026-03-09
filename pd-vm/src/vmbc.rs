@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 
 use crate::builtins::BuiltinFunction;
-use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 use crate::bytecode::{TypeMap, ValueType};
+use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 use crate::vm::{HostImport, OpCode, Program, Value};
 
 const MAGIC: [u8; 4] = *b"VMBC";
@@ -278,9 +278,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         return Err(WireError::TrailingBytes);
     }
 
-    let mut program = Program::with_imports_and_debug(
-        constants, code, imports, debug,
-    );
+    let mut program = Program::with_imports_and_debug(constants, code, imports, debug);
     program.type_map = type_map;
     Ok(program)
 }

@@ -442,6 +442,24 @@ enum VmHostFunction {
     Static(StaticHostFunction),
 }
 
+type PackedOperandTypes = u8;
+
+const NO_OPERAND_TYPE_HINT: PackedOperandTypes = 0;
+const INT_INT_OPERAND_TYPE_HINT: PackedOperandTypes =
+    pack_operand_types(ValueType::Int, ValueType::Int);
+const FLOAT_FLOAT_OPERAND_TYPE_HINT: PackedOperandTypes =
+    pack_operand_types(ValueType::Float, ValueType::Float);
+const BOOL_BOOL_OPERAND_TYPE_HINT: PackedOperandTypes =
+    pack_operand_types(ValueType::Bool, ValueType::Bool);
+const STRING_STRING_OPERAND_TYPE_HINT: PackedOperandTypes =
+    pack_operand_types(ValueType::String, ValueType::String);
+const NULL_NULL_OPERAND_TYPE_HINT: PackedOperandTypes =
+    pack_operand_types(ValueType::Null, ValueType::Null);
+const INT_UNARY_OPERAND_TYPE_HINT: PackedOperandTypes =
+    pack_operand_types(ValueType::Int, ValueType::Unknown);
+const FLOAT_UNARY_OPERAND_TYPE_HINT: PackedOperandTypes =
+    pack_operand_types(ValueType::Float, ValueType::Unknown);
+
 pub struct Vm {
     program: Arc<Program>,
     program_constants_ptr: usize,
@@ -452,6 +470,7 @@ pub struct Vm {
     ip: usize,
     stack: Vec<Value>,
     locals: Vec<Value>,
+    operand_type_hints: Option<Box<[PackedOperandTypes]>>,
     host_functions: Vec<VmHostFunction>,
     host_function_symbols: HashMap<String, u16>,
     builtin_overrides: HashMap<u16, u16>,
@@ -544,6 +563,27 @@ impl Hasher for StableHasher {
 #[inline(always)]
 fn logical_shr_i64(value: i64, amount: u32) -> i64 {
     ((value as u64) >> amount) as i64
+}
+
+#[inline(always)]
+const fn pack_operand_types(lhs: ValueType, rhs: ValueType) -> PackedOperandTypes {
+    lhs as u8 | ((rhs as u8) << 4)
+}
+
+fn build_operand_type_hints(program: &Program) -> Option<Box<[PackedOperandTypes]>> {
+    let type_map = program.type_map.as_ref()?;
+    if type_map.operand_types.is_empty() {
+        return None;
+    }
+
+    let mut hints = vec![NO_OPERAND_TYPE_HINT; program.code.len()];
+    for (offset, (lhs, rhs)) in &type_map.operand_types {
+        let Some(entry) = hints.get_mut(*offset) else {
+            continue;
+        };
+        *entry = pack_operand_types(*lhs, *rhs);
+    }
+    Some(hints.into_boxed_slice())
 }
 
 #[inline(always)]
@@ -654,6 +694,7 @@ impl Vm {
         let program_constants_ptr = program.constants.as_ptr();
         let program_constants_len = program.constants.len();
         let local_count = program.local_count;
+        let operand_type_hints = build_operand_type_hints(program.as_ref());
         let epoch_handle = EpochHandle::default();
         let epoch_counter_ptr = epoch_handle.as_ptr() as usize;
         Self {
@@ -666,6 +707,7 @@ impl Vm {
             ip: 0,
             stack: Vec::new(),
             locals: vec![Value::Null; local_count],
+            operand_type_hints,
             host_functions: Vec::new(),
             host_function_symbols: HashMap::new(),
             builtin_overrides: HashMap::new(),
@@ -1502,20 +1544,20 @@ impl Vm {
             }
             x if x == OpCode::Add as u8 => {
                 let ip = self.ip - 1;
-                match self.type_map_operand(ip) {
-                    Some((ValueType::Int, ValueType::Int)) => self.int_add_op()?,
-                    Some((ValueType::Float, ValueType::Float)) => self.float_add_op()?,
-                    Some((ValueType::String, ValueType::String)) => self.string_concat_op()?,
+                match self.operand_type_hint(ip) {
+                    INT_INT_OPERAND_TYPE_HINT => self.int_add_op()?,
+                    FLOAT_FLOAT_OPERAND_TYPE_HINT => self.float_add_op()?,
+                    STRING_STRING_OPERAND_TYPE_HINT => self.string_concat_op()?,
                     _ => self.binary_add_op()?,
                 }
             }
             x if x == OpCode::Sub as u8 => {
                 let ip = self.ip - 1;
-                match self.type_map_operand(ip) {
-                    Some((ValueType::Int, ValueType::Int)) => {
+                match self.operand_type_hint(ip) {
+                    INT_INT_OPERAND_TYPE_HINT => {
                         self.int_binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_sub(rhs)))?;
                     }
-                    Some((ValueType::Float, ValueType::Float)) => {
+                    FLOAT_FLOAT_OPERAND_TYPE_HINT => {
                         self.float_binary_numeric_op(|lhs, rhs| Ok(lhs - rhs))?;
                     }
                     _ => {
@@ -1528,11 +1570,11 @@ impl Vm {
             }
             x if x == OpCode::Mul as u8 => {
                 let ip = self.ip - 1;
-                match self.type_map_operand(ip) {
-                    Some((ValueType::Int, ValueType::Int)) => {
+                match self.operand_type_hint(ip) {
+                    INT_INT_OPERAND_TYPE_HINT => {
                         self.int_binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_mul(rhs)))?;
                     }
-                    Some((ValueType::Float, ValueType::Float)) => {
+                    FLOAT_FLOAT_OPERAND_TYPE_HINT => {
                         self.float_binary_numeric_op(|lhs, rhs| Ok(lhs * rhs))?;
                     }
                     _ => {
@@ -1545,11 +1587,11 @@ impl Vm {
             }
             x if x == OpCode::Div as u8 => {
                 let ip = self.ip - 1;
-                match self.type_map_operand(ip) {
-                    Some((ValueType::Int, ValueType::Int)) => {
+                match self.operand_type_hint(ip) {
+                    INT_INT_OPERAND_TYPE_HINT => {
                         self.int_binary_numeric_op(checked_int_div)?;
                     }
-                    Some((ValueType::Float, ValueType::Float)) => {
+                    FLOAT_FLOAT_OPERAND_TYPE_HINT => {
                         self.float_binary_numeric_op(|lhs, rhs| Ok(lhs / rhs))?;
                     }
                     _ => self.binary_numeric_op(checked_int_div, |lhs, rhs| Ok(lhs / rhs))?,
@@ -1572,11 +1614,11 @@ impl Vm {
             }
             x if x == OpCode::Mod as u8 => {
                 let ip = self.ip - 1;
-                match self.type_map_operand(ip) {
-                    Some((ValueType::Int, ValueType::Int)) => {
+                match self.operand_type_hint(ip) {
+                    INT_INT_OPERAND_TYPE_HINT => {
                         self.int_binary_numeric_op(checked_int_rem)?;
                     }
-                    Some((ValueType::Float, ValueType::Float)) => {
+                    FLOAT_FLOAT_OPERAND_TYPE_HINT => {
                         self.float_binary_numeric_op(|lhs, rhs| Ok(lhs % rhs))?;
                     }
                     _ => self.binary_numeric_op(checked_int_rem, |lhs, rhs| Ok(lhs % rhs))?,
@@ -1597,9 +1639,9 @@ impl Vm {
             }
             x if x == OpCode::Neg as u8 => {
                 let ip = self.ip - 1;
-                match self.type_map_operand(ip) {
-                    Some((ValueType::Int, _)) => self.int_neg_op()?,
-                    Some((ValueType::Float, _)) => self.float_neg_op()?,
+                match self.operand_type_hint(ip) {
+                    INT_UNARY_OPERAND_TYPE_HINT => self.int_neg_op()?,
+                    FLOAT_UNARY_OPERAND_TYPE_HINT => self.float_neg_op()?,
                     _ => {
                         let value = self.pop_numeric()?;
                         match value {
@@ -1613,12 +1655,12 @@ impl Vm {
             }
             x if x == OpCode::Ceq as u8 => {
                 let ip = self.ip - 1;
-                match self.type_map_operand(ip) {
-                    Some((ValueType::Int, ValueType::Int)) => self.int_eq_op()?,
-                    Some((ValueType::Float, ValueType::Float)) => self.float_eq_op()?,
-                    Some((ValueType::Bool, ValueType::Bool)) => self.bool_eq_op()?,
-                    Some((ValueType::String, ValueType::String)) => self.string_eq_op()?,
-                    Some((ValueType::Null, ValueType::Null)) => self.null_eq_op()?,
+                match self.operand_type_hint(ip) {
+                    INT_INT_OPERAND_TYPE_HINT => self.int_eq_op()?,
+                    FLOAT_FLOAT_OPERAND_TYPE_HINT => self.float_eq_op()?,
+                    BOOL_BOOL_OPERAND_TYPE_HINT => self.bool_eq_op()?,
+                    STRING_STRING_OPERAND_TYPE_HINT => self.string_eq_op()?,
+                    NULL_NULL_OPERAND_TYPE_HINT => self.null_eq_op()?,
                     _ => {
                         let rhs = self.pop_value()?;
                         let lhs = self.pop_value()?;
@@ -1628,11 +1670,11 @@ impl Vm {
             }
             x if x == OpCode::Clt as u8 => {
                 let ip = self.ip - 1;
-                match self.type_map_operand(ip) {
-                    Some((ValueType::Int, ValueType::Int)) => {
+                match self.operand_type_hint(ip) {
+                    INT_INT_OPERAND_TYPE_HINT => {
                         self.int_compare_op(|lhs, rhs| lhs < rhs)?;
                     }
-                    Some((ValueType::Float, ValueType::Float)) => {
+                    FLOAT_FLOAT_OPERAND_TYPE_HINT => {
                         self.float_compare_op(|lhs, rhs| lhs < rhs)?;
                     }
                     _ => self.compare_numeric_op(|lhs, rhs| lhs < rhs, |lhs, rhs| lhs < rhs)?,
@@ -1640,11 +1682,11 @@ impl Vm {
             }
             x if x == OpCode::Cgt as u8 => {
                 let ip = self.ip - 1;
-                match self.type_map_operand(ip) {
-                    Some((ValueType::Int, ValueType::Int)) => {
+                match self.operand_type_hint(ip) {
+                    INT_INT_OPERAND_TYPE_HINT => {
                         self.int_compare_op(|lhs, rhs| lhs > rhs)?;
                     }
-                    Some((ValueType::Float, ValueType::Float)) => {
+                    FLOAT_FLOAT_OPERAND_TYPE_HINT => {
                         self.float_compare_op(|lhs, rhs| lhs > rhs)?;
                     }
                     _ => self.compare_numeric_op(|lhs, rhs| lhs > rhs, |lhs, rhs| lhs > rhs)?,
@@ -1925,13 +1967,11 @@ impl Vm {
         }
     }
 
-    fn type_map_operand(&self, ip: usize) -> Option<(ValueType, ValueType)> {
-        self.program
-            .type_map
-            .as_ref()?
-            .operand_types
-            .get(&ip)
-            .copied()
+    #[inline(always)]
+    fn operand_type_hint(&self, ip: usize) -> PackedOperandTypes {
+        self.operand_type_hints
+            .as_deref()
+            .map_or(NO_OPERAND_TYPE_HINT, |hints| hints[ip])
     }
 
     #[inline(always)]

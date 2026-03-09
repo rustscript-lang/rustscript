@@ -105,7 +105,12 @@ pub(super) fn legalize_builtins_and_bind_types(mut ir: FrontendIr) -> FrontendIr
 pub(super) fn infer_types(ir: &FrontendIr) -> TypeInferenceResult {
     let mut local_types = vec![ValueType::Unknown; ir.locals];
     let mut top_state = LocalTypeState::default();
-    collect_stmt_types(&ir.stmts, &mut top_state, &mut local_types, &ir.function_impls);
+    collect_stmt_types(
+        &ir.stmts,
+        &mut top_state,
+        &mut local_types,
+        &ir.function_impls,
+    );
 
     for function_impl in ir.function_impls.values() {
         collect_function_types(function_impl, &mut local_types);
@@ -652,9 +657,10 @@ fn infer_call_like_expr_type(expr: &Expr, state: &LocalTypeState) -> BoundType {
                 _ => BoundType::Unknown,
             }
         }
-        Expr::Closure(_) | Expr::ClosureCall(_, _) | Expr::FunctionRef(_) | Expr::LocalCall(_, _) => {
-            BoundType::Unknown
-        }
+        Expr::Closure(_)
+        | Expr::ClosureCall(_, _)
+        | Expr::FunctionRef(_)
+        | Expr::LocalCall(_, _) => BoundType::Unknown,
         _ => BoundType::Unknown,
     }
 }
@@ -833,10 +839,20 @@ fn collect_stmt_types(
                 body,
                 ..
             } => {
-                collect_stmt_types(std::slice::from_ref(init), state, local_types, function_impls);
+                collect_stmt_types(
+                    std::slice::from_ref(init),
+                    state,
+                    local_types,
+                    function_impls,
+                );
                 let _ = infer_expr_type(condition, state);
                 collect_stmt_types(body, state, local_types, function_impls);
-                collect_stmt_types(std::slice::from_ref(post), state, local_types, function_impls);
+                collect_stmt_types(
+                    std::slice::from_ref(post),
+                    state,
+                    local_types,
+                    function_impls,
+                );
                 state.clear();
             }
             Stmt::While {

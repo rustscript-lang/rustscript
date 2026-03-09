@@ -1,9 +1,9 @@
 #![cfg(feature = "runtime")]
+use vm::jit::TraceStep;
 use vm::{
     CallOutcome, HostFunction, JitConfig, JitTraceTerminal, OpCode, Value, Vm, VmStatus,
     compile_source, disassemble_program,
 };
-use vm::jit::TraceStep;
 
 fn native_jit_supported() -> bool {
     (cfg!(target_arch = "x86_64")

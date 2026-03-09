@@ -4,9 +4,8 @@ use std::collections::HashMap;
 use vm::{
     ArgInfo, Assembler, BytecodeBuilder, DebugFunction, DebugInfo, DisassembleOptions, HostImport,
     LineInfo, LocalInfo, Program, TypeMap, ValidationError, Value, ValueType, WireError,
-    decode_program,
-    disassemble_vmbc, disassemble_vmbc_with_options, encode_program, infer_local_count,
-    validate_program,
+    decode_program, disassemble_vmbc, disassemble_vmbc_with_options, encode_program,
+    infer_local_count, validate_program,
 };
 
 #[test]

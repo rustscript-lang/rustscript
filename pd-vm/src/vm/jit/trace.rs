@@ -1054,9 +1054,7 @@ fn typed_trace_step(program: &Program, ip: usize, opcode: u8) -> TraceStep {
     match (opcode, operand_types) {
         (x, (ValueType::Int, ValueType::Int)) if x == OpCode::Add as u8 => TraceStep::IAdd,
         (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Add as u8 => TraceStep::FAdd,
-        (x, (ValueType::String, ValueType::String)) if x == OpCode::Add as u8 => {
-            TraceStep::SConcat
-        }
+        (x, (ValueType::String, ValueType::String)) if x == OpCode::Add as u8 => TraceStep::SConcat,
         (x, (ValueType::Int, ValueType::Int)) if x == OpCode::Sub as u8 => TraceStep::ISub,
         (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Sub as u8 => TraceStep::FSub,
         (x, (ValueType::Int, ValueType::Int)) if x == OpCode::Mul as u8 => TraceStep::IMul,
