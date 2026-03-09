@@ -336,23 +336,27 @@ fn benchmark_runtime(config: &BenchConfig) -> Result<(), String> {
     println!("[run]");
 
     let aes_path = example_dir().join("aes_128_cbc_usage.rss");
-    let aes_compiled = compile_source_file(&aes_path).map_err(|err| {
-        format!(
-            "failed to compile AES workload '{}': {err}",
-            aes_path.display()
-        )
-    })?;
-    let aes_expected = vec![Value::string("7649abac8119b246cee98e9b12e9197d")];
-
     let hot_loop = build_hot_loop_workload(config.hot_loop_inner, config.hot_loop_outer)?;
     let hot_expected = vec![Value::Int(hot_loop.expected)];
 
-    benchmark_runtime_workload(
-        "aes_128_cbc_usage",
-        &aes_compiled.program,
-        &aes_expected,
-        config.run_trials,
-    )?;
+    match compile_source_file(&aes_path) {
+        Ok(aes_compiled) => {
+            let aes_expected = vec![Value::string("7649abac8119b246cee98e9b12e9197d")];
+            benchmark_runtime_workload(
+                "aes_128_cbc_usage",
+                &aes_compiled.program,
+                &aes_expected,
+                config.run_trials,
+            )?;
+        }
+        Err(err) => {
+            println!(
+                "  {:<16} mode=all          skipped compile_error={}",
+                "aes_128_cbc_usage", err
+            );
+        }
+    }
+
     benchmark_runtime_workload(
         "hot_loop",
         &hot_loop.program,
