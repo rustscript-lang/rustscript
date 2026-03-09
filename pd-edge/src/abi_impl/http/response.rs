@@ -1,4 +1,5 @@
 use axum::http::HeaderName;
+use edge_abi::symbols::http::response as abi;
 use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::super::{
@@ -8,12 +9,17 @@ use super::super::{
 };
 
 macro_rules! bind_response_handler {
-    ($vm:expr, $async_ops:expr, $symbol:literal, $context:expr, |$vm_arg:ident, $args_arg:ident, $context_arg:ident| $body:block) => {{
+    ($vm:expr, $async_ops:expr, $symbol:expr, $context:expr, |$vm_arg:ident, $args_arg:ident, $context_arg:ident| $body:block) => {{
         let context = $context.clone();
-        bind_async_host_handler($vm, $async_ops, $symbol, move |$vm_arg, $args_arg| {
-            let mut $context_arg = context.lock().expect("vm context lock poisoned");
-            $body
-        });
+        bind_async_host_handler(
+            $vm,
+            $async_ops,
+            ($symbol).name,
+            move |$vm_arg, $args_arg| {
+                let mut $context_arg = context.lock().expect("vm context lock poisoned");
+                $body
+            },
+        );
     }};
 }
 
@@ -21,7 +27,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_response_handler!(
         vm,
         &async_ops,
-        "http::response::set_header",
+        abi::SET_HEADER,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 2)?;
@@ -34,7 +40,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_response_handler!(
         vm,
         &async_ops,
-        "http::response::remove_header",
+        abi::REMOVE_HEADER,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 1)?;
@@ -47,7 +53,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_response_handler!(
         vm,
         &async_ops,
-        "http::response::set_body",
+        abi::SET_BODY,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 1)?;
@@ -60,7 +66,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_response_handler!(
         vm,
         &async_ops,
-        "http::response::set_status",
+        abi::SET_STATUS,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 1)?;
@@ -78,7 +84,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_response_handler!(
         vm,
         &async_ops,
-        "http::response::get_status",
+        abi::GET_STATUS,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 0)?;
@@ -90,7 +96,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_response_handler!(
         vm,
         &async_ops,
-        "http::response::get_body",
+        abi::GET_BODY,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 0)?;
@@ -102,7 +108,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_response_handler!(
         vm,
         &async_ops,
-        "http::response::get_header",
+        abi::GET_HEADER,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 1)?;
@@ -121,7 +127,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_response_handler!(
         vm,
         &async_ops,
-        "http::response::get_headers",
+        abi::GET_HEADERS,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 0)?;
@@ -134,7 +140,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_response_handler!(
         vm,
         &async_ops,
-        "http::response::add_header",
+        abi::ADD_HEADER,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 2)?;
@@ -147,7 +153,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_response_handler!(
         vm,
         &async_ops,
-        "http::response::clear_header",
+        abi::CLEAR_HEADER,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 1)?;
@@ -160,7 +166,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_response_handler!(
         vm,
         &async_ops,
-        "http::response::set_headers",
+        abi::SET_HEADERS,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 1)?;

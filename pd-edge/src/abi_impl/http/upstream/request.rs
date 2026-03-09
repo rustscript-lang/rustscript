@@ -1,4 +1,5 @@
 use axum::http::Method;
+use edge_abi::{AbiFunction, symbols::http::upstream::request as abi};
 use vm::{CallOutcome, Vm, VmError};
 
 use super::super::super::{
@@ -8,12 +9,17 @@ use super::super::super::{
 };
 
 macro_rules! bind_upstream_request_handler {
-    ($vm:expr, $async_ops:expr, $symbol:literal, $context:expr, |$vm_arg:ident, $args_arg:ident, $context_arg:ident| $body:block) => {{
+    ($vm:expr, $async_ops:expr, $symbol:expr, $context:expr, |$vm_arg:ident, $args_arg:ident, $context_arg:ident| $body:block) => {{
         let context = $context.clone();
-        bind_async_host_handler($vm, $async_ops, $symbol, move |$vm_arg, $args_arg| {
-            let mut $context_arg = context.lock().expect("vm context lock poisoned");
-            $body
-        });
+        bind_async_host_handler(
+            $vm,
+            $async_ops,
+            ($symbol).name,
+            move |$vm_arg, $args_arg| {
+                let mut $context_arg = context.lock().expect("vm context lock poisoned");
+                $body
+            },
+        );
     }};
 }
 
@@ -21,7 +27,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_upstream_request_handler!(
         vm,
         &async_ops,
-        "http::upstream::request::set_header",
+        abi::SET_HEADER,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 2)?;
@@ -36,7 +42,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_upstream_request_handler!(
         vm,
         &async_ops,
-        "http::upstream::request::remove_header",
+        abi::REMOVE_HEADER,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 1)?;
@@ -49,7 +55,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_upstream_request_handler!(
         vm,
         &async_ops,
-        "http::upstream::request::set_method",
+        abi::SET_METHOD,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 1)?;
@@ -64,7 +70,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_upstream_request_handler!(
         vm,
         &async_ops,
-        "http::upstream::request::set_path",
+        abi::SET_PATH,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 1)?;
@@ -79,16 +85,11 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
             Ok(CallOutcome::Return(vec![]))
         }
     );
-    bind_set_query_symbol(
-        vm,
-        &async_ops,
-        "http::upstream::request::set_query",
-        &context,
-    );
+    bind_set_query_symbol(vm, &async_ops, abi::SET_QUERY, &context);
     bind_upstream_request_handler!(
         vm,
         &async_ops,
-        "http::upstream::request::set_target",
+        abi::SET_TARGET,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 1)?;
@@ -106,7 +107,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_upstream_request_handler!(
         vm,
         &async_ops,
-        "http::upstream::request::set_body",
+        abi::SET_BODY,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 1)?;
@@ -120,7 +121,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_upstream_request_handler!(
         vm,
         &async_ops,
-        "http::upstream::request::add_header",
+        abi::ADD_HEADER,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 2)?;
@@ -135,7 +136,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_upstream_request_handler!(
         vm,
         &async_ops,
-        "http::upstream::request::clear_header",
+        abi::CLEAR_HEADER,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 1)?;
@@ -148,7 +149,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_upstream_request_handler!(
         vm,
         &async_ops,
-        "http::upstream::request::set_headers",
+        abi::SET_HEADERS,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 1)?;
@@ -163,16 +164,11 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
             Ok(CallOutcome::Return(vec![]))
         }
     );
-    bind_set_query_symbol(
-        vm,
-        &async_ops,
-        "http::upstream::request::set_raw_query",
-        &context,
-    );
+    bind_set_query_symbol(vm, &async_ops, abi::SET_RAW_QUERY, &context);
     bind_upstream_request_handler!(
         vm,
         &async_ops,
-        "http::upstream::request::set_query_arg",
+        abi::SET_QUERY_ARG,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 2)?;
@@ -193,11 +189,11 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
 fn bind_set_query_symbol(
     vm: &mut Vm,
     async_ops: &SharedVmAsyncOps,
-    symbol: &'static str,
+    symbol: AbiFunction,
     context: &SharedProxyVmContext,
 ) {
     let context = context.clone();
-    bind_async_host_handler(vm, async_ops, symbol, move |_vm, args| {
+    bind_async_host_handler(vm, async_ops, symbol.name, move |_vm, args| {
         expect_arg_count(args, 1)?;
         let raw_query = expect_string(args, 0)?;
         let query = raw_query.strip_prefix('?').unwrap_or(raw_query.as_str());

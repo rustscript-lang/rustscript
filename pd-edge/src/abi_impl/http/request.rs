@@ -1,4 +1,5 @@
 use axum::http::HeaderName;
+use edge_abi::{AbiFunction, symbols::http::request as abi};
 use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::super::{
@@ -8,30 +9,32 @@ use super::super::{
 };
 
 macro_rules! bind_request_handler {
-    ($vm:expr, $async_ops:expr, $symbol:literal, $context:expr, |$vm_arg:ident, $args_arg:ident, $context_arg:ident| $body:block) => {{
+    ($vm:expr, $async_ops:expr, $symbol:expr, $context:expr, |$vm_arg:ident, $args_arg:ident, $context_arg:ident| $body:block) => {{
         let context = $context.clone();
-        bind_async_host_handler($vm, $async_ops, $symbol, move |$vm_arg, $args_arg| {
-            let mut $context_arg = context.lock().expect("vm context lock poisoned");
-            $body
-        });
+        bind_async_host_handler(
+            $vm,
+            $async_ops,
+            ($symbol).name,
+            move |$vm_arg, $args_arg| {
+                let mut $context_arg = context.lock().expect("vm context lock poisoned");
+                $body
+            },
+        );
     }};
 }
 
 pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) {
     let field_symbols = [
-        ("http::request::get_id", RequestField::Id),
-        ("http::request::get_method", RequestField::Method),
-        ("http::request::get_path", RequestField::Path),
-        ("http::request::get_query", RequestField::Query),
-        ("http::request::get_scheme", RequestField::Scheme),
-        ("http::request::get_host", RequestField::Host),
-        ("http::request::get_client_ip", RequestField::ClientIp),
-        (
-            "http::request::get_path_with_query",
-            RequestField::PathWithQuery,
-        ),
-        ("http::request::get_raw_query", RequestField::RawQuery),
-        ("http::request::get_http_version", RequestField::HttpVersion),
+        (abi::GET_ID, RequestField::Id),
+        (abi::GET_METHOD, RequestField::Method),
+        (abi::GET_PATH, RequestField::Path),
+        (abi::GET_QUERY, RequestField::Query),
+        (abi::GET_SCHEME, RequestField::Scheme),
+        (abi::GET_HOST, RequestField::Host),
+        (abi::GET_CLIENT_IP, RequestField::ClientIp),
+        (abi::GET_PATH_WITH_QUERY, RequestField::PathWithQuery),
+        (abi::GET_RAW_QUERY, RequestField::RawQuery),
+        (abi::GET_HTTP_VERSION, RequestField::HttpVersion),
     ];
     for (symbol, field) in field_symbols {
         bind_request_field(vm, &async_ops, &context, symbol, field);
@@ -40,7 +43,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_request_handler!(
         vm,
         &async_ops,
-        "http::request::get_header",
+        abi::GET_HEADER,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 1)?;
@@ -59,7 +62,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_request_handler!(
         vm,
         &async_ops,
-        "http::request::get_headers",
+        abi::GET_HEADERS,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 0)?;
@@ -72,7 +75,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_request_handler!(
         vm,
         &async_ops,
-        "http::request::get_query_arg",
+        abi::GET_QUERY_ARG,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 1)?;
@@ -93,7 +96,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_request_handler!(
         vm,
         &async_ops,
-        "http::request::get_query_args",
+        abi::GET_QUERY_ARGS,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 0)?;
@@ -107,7 +110,7 @@ pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: Sh
     bind_request_handler!(
         vm,
         &async_ops,
-        "http::request::get_port",
+        abi::GET_PORT,
         context,
         |_vm, args, context| {
             expect_arg_count(args, 0)?;
@@ -146,11 +149,11 @@ fn bind_request_field(
     vm: &mut Vm,
     async_ops: &SharedVmAsyncOps,
     context: &SharedProxyVmContext,
-    symbol: &'static str,
+    symbol: AbiFunction,
     field: RequestField,
 ) {
     let context = context.clone();
-    bind_async_host_handler(vm, async_ops, symbol, move |_vm, args| {
+    bind_async_host_handler(vm, async_ops, symbol.name, move |_vm, args| {
         expect_arg_count(args, 0)?;
         let mut context = context.lock().expect("vm context lock poisoned");
         context.touch_request_line();
@@ -184,7 +187,7 @@ fn bind_get_request_body(
     bind_async_host_handler(
         vm,
         &async_ops_for_bind,
-        "http::request::get_body",
+        abi::GET_BODY.name,
         move |vm, args| {
             expect_arg_count(args, 0)?;
             let context = context.clone();
