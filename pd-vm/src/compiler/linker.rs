@@ -53,9 +53,10 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
         for stmt in &mut remapped_stmts {
             remap_stmt_indices(stmt, unit_local_base, &function_map)?;
         }
-        merged_stmt_sources.extend(
-            std::iter::repeat_n(Some(source_name.clone()), remapped_stmts.len()),
-        );
+        merged_stmt_sources.extend(std::iter::repeat_n(
+            Some(source_name.clone()),
+            remapped_stmts.len(),
+        ));
         merged_stmts.extend(remapped_stmts);
 
         for (name, index) in unit.parsed.local_bindings {

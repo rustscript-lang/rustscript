@@ -97,8 +97,9 @@ mod tests {
     fn builtin_assert_success_returns_no_stack_value() {
         let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
 
-        let outcome = execute_builtin_call(&mut vm, BuiltinFunction::Assert, vec![Value::Bool(true)])
-            .expect("assert should succeed");
+        let outcome =
+            execute_builtin_call(&mut vm, BuiltinFunction::Assert, vec![Value::Bool(true)])
+                .expect("assert should succeed");
 
         match outcome {
             BuiltinCallOutcome::Return(values) => assert!(

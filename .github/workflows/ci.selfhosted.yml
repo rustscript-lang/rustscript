@@ -1,11 +1,11 @@
-name: ci
+name: CI (self-hosted)
 
 on:
   push:
   pull_request:
 
 jobs:
-  lint-and-cargo:
+  rust-ci:
     runs-on: self-hosted
     steps:
       - name: Checkout
@@ -23,13 +23,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: cargo check
-        run: cargo check --workspace --locked
+        run: cargo check --workspace --all-features --locked
 
       - name: cargo test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --all-features --locked
 
       - name: cargo test (release)
-        run: cargo test --workspace --locked --release
+        run: cargo test --workspace --all-features --locked --release

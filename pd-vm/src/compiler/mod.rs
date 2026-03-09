@@ -17,7 +17,10 @@ pub enum CompileError {
     CallableUsedAsValue,
     NonCallableLocal(LocalSlot),
     LocalSlotOverflow(LocalSlot),
-    CallableArityMismatch { expected: usize, got: usize },
+    CallableArityMismatch {
+        expected: usize,
+        got: usize,
+    },
     BreakOutsideLoop,
     ContinueOutsideLoop,
     InlineFunctionRecursion(String),

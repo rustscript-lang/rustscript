@@ -61,7 +61,8 @@ fn compile_source_file_parse_error_uses_original_line() {
 
 #[test]
 fn render_compile_error_highlights_if_else_mismatch_line() {
-    let source = "let cond = 1 == 1;\nlet value = if cond => {\n    1\n} else => {\n    \"x\"\n};\n";
+    let source =
+        "let cond = 1 == 1;\nlet value = if cond => {\n    1\n} else => {\n    \"x\"\n};\n";
 
     let err = match compile_source(source) {
         Ok(_) => panic!("compile should reject if/else mismatch"),
@@ -113,11 +114,7 @@ pub fn ok() {
     fs::write(&module_path, module_source).expect("module source should be writable");
 
     let main_path = root.join("main.rss");
-    fs::write(
-        &main_path,
-        "use module;\nok();\n",
-    )
-    .expect("main source should be writable");
+    fs::write(&main_path, "use module;\nok();\n").expect("main source should be writable");
 
     let result = compile_source_file(&main_path);
 
@@ -127,7 +124,10 @@ pub fn ok() {
 
     match result {
         Err(SourcePathError::Source(SourceError::Compile(compile))) => {
-            assert_eq!(compile.source_name(), Some(module_path.to_string_lossy().as_ref()));
+            assert_eq!(
+                compile.source_name(),
+                Some(module_path.to_string_lossy().as_ref())
+            );
             assert_eq!(compile.line(), Some(2));
 
             let mut source_map = SourceMap::new();

@@ -477,9 +477,7 @@ fn refine_state_for_condition(
     truthy: bool,
 ) -> LocalTypeState {
     let mut refined = state.clone();
-    if truthy
-        && let Some((slot, ty)) = extract_type_guard(condition)
-    {
+    if truthy && let Some((slot, ty)) = extract_type_guard(condition) {
         refined.set(slot, ty);
     }
     refined

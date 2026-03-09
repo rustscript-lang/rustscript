@@ -12,6 +12,7 @@ use crate::builtins::{
 };
 use crate::compiler::source_map::{SourceId, Span};
 
+use self::lexer::{Lexer, ParserFormatArg, Token, TokenKind, is_ident_continue, is_ident_start};
 use super::{
     ParseError, ReplLocalBinding, STDLIB_PRINT_ARITY, STDLIB_PRINT_NAME,
     ir::{
@@ -19,7 +20,6 @@ use super::{
         Stmt,
     },
 };
-use self::lexer::{Lexer, ParserFormatArg, Token, TokenKind, is_ident_continue, is_ident_start};
 
 fn is_virtual_host_namespace_spec(spec: &str) -> bool {
     if spec.contains('/') || spec.ends_with(".rss") {

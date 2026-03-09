@@ -6,8 +6,6 @@ use std::collections::HashMap;
 use crate::builtins::{BuiltinFunction, CallableParam, CallableParamType, CallableSignature};
 use crate::bytecode::ValueType;
 
-use super::CompileError;
-use super::ir::{ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt};
 use self::collect::{
     collect_function_types, collect_stmt_types, observed_function_param_slice,
     seed_function_param_state,
@@ -16,6 +14,8 @@ use self::validate::{
     owned_source_name, validate_branch_state_merge, validate_expr, validate_host_signature,
     validate_signature_overloads,
 };
+use super::CompileError;
+use super::ir::{ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SimpleType {
@@ -420,14 +420,7 @@ impl<'a> TypeContext<'a> {
             } => {
                 let mut nested = state.clone();
                 let value_ty = self.infer_expr_type(value, state);
-                bind_expr_result_to_slot(
-                    &mut nested,
-                    *value_slot,
-                    value,
-                    state,
-                    value_ty,
-                    self,
-                );
+                bind_expr_result_to_slot(&mut nested, *value_slot, value, state, value_ty, self);
                 let mut arm_type = BoundType::Unknown;
                 for (_pattern, arm_expr) in arms {
                     let ty = self.infer_expr_type(arm_expr, &nested);
@@ -1016,7 +1009,9 @@ pub(super) fn validate_if_else_type_consistency(ir: &FrontendIr) -> Result<(), C
             std::slice::from_ref(stmt),
             &mut top_state,
             None,
-            ir.stmt_sources.get(index).and_then(|source| source.as_deref()),
+            ir.stmt_sources
+                .get(index)
+                .and_then(|source| source.as_deref()),
             &mut context,
             false,
         )?;

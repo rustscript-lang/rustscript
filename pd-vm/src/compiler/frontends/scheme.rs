@@ -3,15 +3,15 @@ mod reader;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::super::ParseError;
-use super::super::ir::{Expr, FrontendIr, LocalIrBuilder, Stmt};
-use super::{is_ident_continue, is_ident_start};
 use self::reader::{
     SchemeForm, SchemeNode, SchemeParser, canonicalize_call_path, canonicalize_identifier,
     fold_int_add, fold_int_div, fold_int_mul, fold_int_sub, is_forbidden_scheme_builtin_name,
     is_valid_member_ident, normalize_identifier, scheme_builtin_syntax_hint,
     split_namespace_segments,
 };
+use super::super::ParseError;
+use super::super::ir::{Expr, FrontendIr, LocalIrBuilder, Stmt};
+use super::{is_ident_continue, is_ident_start};
 use crate::builtins::{BuiltinFunction, is_builtin_namespace, resolve_builtin_namespace_call};
 
 static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);

@@ -194,7 +194,9 @@ fn collect_expr_slot_footprint(expr: &Expr, slots: &mut BTreeSet<LocalSlot>) {
     }
 }
 
-pub(super) fn collect_named_local_debug_ranges(parsed: &FrontendIr) -> HashMap<String, LocalDebugRange> {
+pub(super) fn collect_named_local_debug_ranges(
+    parsed: &FrontendIr,
+) -> HashMap<String, LocalDebugRange> {
     let slot_ranges = collect_local_debug_ranges(&parsed.stmts, &parsed.function_impls);
     let mut named_ranges = HashMap::<String, LocalDebugRange>::new();
     for (name, slot) in &parsed.local_bindings {
