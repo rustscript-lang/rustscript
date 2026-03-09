@@ -1,7 +1,9 @@
-use edge_abi::{AbiParamType, AbiValueType, FUNCTIONS as EDGE_HOST_FUNCTIONS, host_namespace_specs};
+use edge_abi::{
+    AbiParamType, AbiValueType, FUNCTIONS as EDGE_HOST_FUNCTIONS, host_namespace_specs,
+};
 use serde::Serialize;
 use vm::{
-    CallableParamType, CallableSignature, builtin_namespace_specs,
+    CallableParam, CallableSignature, builtin_namespace_specs,
     callable_signatures_for_builtin_namespace_member, language_builtin_specs,
 };
 
@@ -62,13 +64,11 @@ fn add_language_builtin_entries(
     scheme: &mut Vec<CompletionEntry>,
 ) {
     for builtin in language_builtin_specs() {
-        let arity = builtin
-            .signatures
-            .first()
-            .map(|signature| signature.params.len())
-            .unwrap_or(0);
-        let params = numbered_params(arity);
-        let detail = format!("builtin {}", overload_signatures(builtin.name, builtin.signatures));
+        let params = signature_params(builtin.signatures);
+        let detail = format!(
+            "builtin {}",
+            overload_signatures(builtin.name, builtin.signatures)
+        );
 
         push_unique(
             rustscript,
@@ -175,8 +175,13 @@ fn add_host_function_entries(
     scheme: &mut Vec<CompletionEntry>,
 ) {
     for function in EDGE_HOST_FUNCTIONS {
-        let params = numbered_params(usize::from(function.arity));
-        let signature = abi_signature(function.name, function.param_types, function.return_type);
+        let params = abi_param_names(function.param_names);
+        let signature = abi_signature(
+            function.name,
+            function.param_names,
+            function.param_types,
+            function.return_type,
+        );
         let dot_path = function.name.replace("::", ".");
         let root = function.name.split("::").next().unwrap_or(function.name);
         let namespace_doc_prefix = host_namespace_specs()
@@ -209,7 +214,12 @@ fn add_host_function_entries(
                 insert_text: format!("{dot_path}({})", comma_args(&params)),
                 detail: format!(
                     "pd-edge host {}",
-                    abi_signature(&dot_path, function.param_types, function.return_type)
+                    abi_signature(
+                        &dot_path,
+                        function.param_names,
+                        function.param_types,
+                        function.return_type,
+                    )
                 ),
                 documentation: namespace_docs.clone(),
                 kind: "function".to_string(),
@@ -222,7 +232,12 @@ fn add_host_function_entries(
                 insert_text: format!("{dot_path}({})", comma_args(&params)),
                 detail: format!(
                     "pd-edge host {}",
-                    abi_signature(&dot_path, function.param_types, function.return_type)
+                    abi_signature(
+                        &dot_path,
+                        function.param_names,
+                        function.param_types,
+                        function.return_type,
+                    )
                 ),
                 documentation: namespace_docs.clone(),
                 kind: "function".to_string(),
@@ -235,7 +250,12 @@ fn add_host_function_entries(
                 insert_text: format!("({dot_path} {})", space_args(&params)),
                 detail: format!(
                     "pd-edge host {}",
-                    abi_signature(&dot_path, function.param_types, function.return_type)
+                    abi_signature(
+                        &dot_path,
+                        function.param_names,
+                        function.param_types,
+                        function.return_type,
+                    )
                 ),
                 documentation: namespace_docs,
                 kind: "function".to_string(),
@@ -311,12 +331,14 @@ fn add_builtin_namespace_entries(
         );
 
         for member in namespace.members {
-            let params = numbered_params(member.arity);
             let signatures = callable_signatures_for_builtin_namespace_member(
                 namespace.namespace,
                 member.name,
                 member.arity,
             );
+            let params = signatures
+                .map(signature_params)
+                .unwrap_or_else(|| numbered_params(member.arity));
             let rust_label = format!("{}::{}", namespace.alias, member.name);
             let dot_label = format!("{}.{}", namespace.alias, member.name);
             let rust_detail = signatures
@@ -520,6 +542,21 @@ fn numbered_params(arity: usize) -> Vec<String> {
     (1..=arity).map(|index| format!("arg{index}")).collect()
 }
 
+fn named_params(params: &[CallableParam]) -> Vec<String> {
+    params.iter().map(|param| param.name.to_string()).collect()
+}
+
+fn signature_params(signatures: &[CallableSignature]) -> Vec<String> {
+    signatures
+        .first()
+        .map(|signature| named_params(signature.params))
+        .unwrap_or_default()
+}
+
+fn abi_param_names(params: &[&str]) -> Vec<String> {
+    params.iter().map(|param| (*param).to_string()).collect()
+}
+
 fn overload_signatures(name: &str, signatures: &[CallableSignature]) -> String {
     signatures
         .iter()
@@ -528,24 +565,28 @@ fn overload_signatures(name: &str, signatures: &[CallableSignature]) -> String {
         .join(" | ")
 }
 
-fn typed_signature(name: &str, params: &[CallableParamType], return_type: &str) -> String {
+fn typed_signature(name: &str, params: &[CallableParam], return_type: &str) -> String {
     format!("{name}({}) -> {return_type}", typed_params(params))
 }
 
-fn typed_params(params: &[CallableParamType]) -> String {
+fn typed_params(params: &[CallableParam]) -> String {
     params
         .iter()
-        .enumerate()
-        .map(|(index, param)| format!("arg{}: {}", index + 1, param.label()))
+        .map(|param| format!("{}: {}", param.name, param.ty.label()))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-fn abi_signature(name: &str, params: &[AbiParamType], return_type: AbiValueType) -> String {
-    let params = params
+fn abi_signature(
+    name: &str,
+    param_names: &[&str],
+    param_types: &[AbiParamType],
+    return_type: AbiValueType,
+) -> String {
+    let params = param_names
         .iter()
-        .enumerate()
-        .map(|(index, param)| format!("arg{}: {}", index + 1, abi_param_type_label(*param)))
+        .zip(param_types.iter().copied())
+        .map(|(name, param)| format!("{name}: {}", abi_param_type_label(param)))
         .collect::<Vec<_>>()
         .join(", ");
     format!("{name}({params}) -> {}", abi_value_type_label(return_type))

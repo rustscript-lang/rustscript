@@ -547,7 +547,7 @@ fn analyze_program(
                     expected_bytes: 3,
                 })?;
                 if let Some(builtin) = BuiltinFunction::from_call_index(index) {
-                    if argc != builtin.arity() {
+                    if !builtin.accepts_arity(argc) {
                         return Err(ValidationError::InvalidCallArity {
                             offset: start,
                             index,

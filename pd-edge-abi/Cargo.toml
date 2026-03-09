@@ -8,3 +8,7 @@ build = "build.rs"
 name = "edge_abi"
 
 [dependencies]
+pd-host-function = { path = "../pd-vm/pd-host-function" }
+
+[build-dependencies]
+syn = { version = "2", features = ["full"] }

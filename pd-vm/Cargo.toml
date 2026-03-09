@@ -30,8 +30,10 @@ cranelift-frontend = { version = "0.129.1", optional = true }
 cranelift-jit = { version = "0.129.1", optional = true }
 cranelift-module = { version = "0.129.1", optional = true }
 cranelift-native = { version = "0.129.1", optional = true }
+pd-host-function = { path = "./pd-host-function" }
 edge_abi = { package = "pd-edge-abi", path = "../pd-edge-abi" }
 futures-channel = "0.3"
+paste = "1"
 regex = "1"
 serde = "1"
 serde_json = "1"
@@ -46,3 +48,6 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }
+
+[build-dependencies]
+syn = { version = "2", features = ["full"] }

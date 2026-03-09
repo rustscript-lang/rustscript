@@ -4,10 +4,12 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use syn::{FnArg, Item, Meta, Pat, ReturnType, Type};
+
 #[derive(Clone, Debug)]
 struct AbiFunctionDecl {
     name: String,
-    arity: u8,
+    param_names: Vec<String>,
     param_types: Vec<String>,
     return_type: String,
 }
@@ -84,63 +86,123 @@ fn parse_include_order(path: &Path) -> Vec<String> {
 fn parse_function_file(path: &Path) -> Vec<AbiFunctionDecl> {
     let source = fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-    let mut decls = Vec::new();
-    let mut rest = source.as_str();
-    loop {
-        let Some(index) = rest.find("edge_abi_function!(") else {
-            break;
-        };
-        rest = &rest[index + "edge_abi_function!(".len()..];
-        let end = find_matching_paren(rest);
-        let args = &rest[..end];
-        decls.push(parse_function_decl(args));
-        rest = &rest[end + 1..];
-    }
-    decls
+    let parsed = syn::parse_file(&source)
+        .unwrap_or_else(|err| panic!("failed to parse {}: {err}", path.display()));
+    parsed
+        .items
+        .iter()
+        .filter_map(parse_function_decl)
+        .collect()
 }
 
-fn parse_function_decl(args: &str) -> AbiFunctionDecl {
-    let (name, rest) = parse_string(args);
-    let rest = expect_comma(rest);
-    let (arity, rest) = parse_u8(rest);
-    let rest = expect_comma(rest);
-    let (param_types, rest) = parse_param_types(rest);
-    let rest = expect_comma(rest);
-    let (return_type, rest) = parse_ident(rest);
-    let rest = skip_ws(rest);
-    if !rest.is_empty() {
-        panic!("unexpected trailing tokens in function decl: {rest}");
-    }
-    AbiFunctionDecl {
-        name,
-        arity,
-        param_types,
-        return_type,
-    }
-}
-
-fn parse_param_types(source: &str) -> (Vec<String>, &str) {
-    let source = skip_ws(source);
-    let Some(rest) = source.strip_prefix('[') else {
-        panic!("expected '[' to start param type list");
+fn parse_function_decl(item: &Item) -> Option<AbiFunctionDecl> {
+    let Item::Fn(function) = item else {
+        return None;
     };
-    let end = rest
-        .find(']')
-        .unwrap_or_else(|| panic!("unterminated param type list"));
-    let inner = &rest[..end];
-    let remainder = &rest[end + 1..];
-    let mut out = Vec::new();
-    let mut cursor = inner;
-    loop {
-        cursor = skip_ws_and_commas(cursor);
-        if cursor.is_empty() {
-            break;
-        }
-        let (ident, next) = parse_ident(cursor);
-        out.push(ident);
-        cursor = next;
+    let name = pd_host_function_name(&function.attrs).unwrap_or_else(|| {
+        panic!(
+            "abi spec function '{}' is missing #[pd_host_function(name = \"...\")]",
+            function.sig.ident
+        )
+    });
+    let mut param_names = Vec::new();
+    let mut param_types = Vec::new();
+    for input in &function.sig.inputs {
+        let FnArg::Typed(pat_type) = input else {
+            panic!("abi spec methods are not supported");
+        };
+        let Pat::Ident(ident) = pat_type.pat.as_ref() else {
+            panic!("abi spec parameters must use identifier patterns");
+        };
+        param_names.push(ident.ident.to_string());
+        param_types.push(type_label(&pat_type.ty));
     }
-    (out, remainder)
+
+    Some(AbiFunctionDecl {
+        name,
+        param_names,
+        param_types,
+        return_type: match &function.sig.output {
+            ReturnType::Default => "Null".to_string(),
+            ReturnType::Type(_, ty) => type_label(ty),
+        },
+    })
+}
+
+fn pd_host_function_name(attrs: &[syn::Attribute]) -> Option<String> {
+    let attr = attrs
+        .iter()
+        .find(|attr| attr.path().is_ident("pd_host_function"))?;
+    let meta = &attr.meta;
+    let Meta::List(list) = meta else {
+        panic!("#[pd_host_function] must use name = \"...\"");
+    };
+    let args = list
+        .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+        .unwrap_or_else(|err| panic!("failed to parse #[pd_host_function(...)] args: {err}"));
+    let Some(Meta::NameValue(name_value)) = args.first() else {
+        panic!("#[pd_host_function] requires name = \"...\"");
+    };
+    if !name_value.path.is_ident("name") {
+        panic!("#[pd_host_function] only supports name = \"...\"");
+    }
+    match &name_value.value {
+        syn::Expr::Lit(expr_lit) => {
+            if let syn::Lit::Str(value) = &expr_lit.lit {
+                Some(value.value())
+            } else {
+                panic!("callable name must be a string literal");
+            }
+        }
+        _ => panic!("callable name must be a string literal"),
+    }
+}
+
+fn type_label(ty: &Type) -> String {
+    match ty {
+        Type::Group(group) => type_label(&group.elem),
+        Type::Paren(paren) => type_label(&paren.elem),
+        Type::Reference(reference) => type_label(&reference.elem),
+        Type::Tuple(tuple) if tuple.elems.is_empty() => "Null".to_string(),
+        Type::Path(path) => {
+            let Some(segment) = path.path.segments.last() else {
+                panic!("unsupported callable type");
+            };
+            let ident = segment.ident.to_string();
+            match ident.as_str() {
+                "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64"
+                | "u128" | "usize" => "Int".to_string(),
+                "f32" | "f64" => "Float".to_string(),
+                "bool" => "Bool".to_string(),
+                "String" | "str" => "String".to_string(),
+                "Any" => "Any".to_string(),
+                "Array" => "Array".to_string(),
+                "Map" => "Map".to_string(),
+                "Number" => "Number".to_string(),
+                "Unknown" => "Unknown".to_string(),
+                "Option" => {
+                    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+                        panic!("Option<T> requires one generic argument");
+                    };
+                    let Some(syn::GenericArgument::Type(inner)) = args.args.first() else {
+                        panic!("Option<T> requires one type argument");
+                    };
+                    let inner_label = type_label(inner);
+                    if inner_label == "String" {
+                        "String".to_string()
+                    } else if inner_label == "Array" {
+                        "Array".to_string()
+                    } else if inner_label == "Map" {
+                        "Map".to_string()
+                    } else {
+                        panic!("unsupported Option return type '{inner_label}'");
+                    }
+                }
+                _ => panic!("unsupported callable type '{ident}'"),
+            }
+        }
+        _ => panic!("unsupported callable type"),
+    }
 }
 
 fn parse_namespace_file(path: &Path) -> Vec<NamespaceDecl> {
@@ -206,6 +268,19 @@ fn render_abi_rust(functions: &[AbiFunctionDecl], namespaces: &[NamespaceDecl]) 
     for function in functions {
         writeln!(
             &mut out,
+            "pub const {}_PARAM_NAMES: [&str; {}] = [{}];",
+            abi_const_name(function),
+            function.param_names.len(),
+            function
+                .param_names
+                .iter()
+                .map(|param| format!("{param:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
             "pub const {}_PARAM_TYPES: [AbiParamType; {}] = [{}];",
             abi_const_name(function),
             function.param_types.len(),
@@ -219,11 +294,12 @@ fn render_abi_rust(functions: &[AbiFunctionDecl], namespaces: &[NamespaceDecl]) 
         .unwrap();
         writeln!(
             &mut out,
-            "pub const {}: AbiFunction = AbiFunction {{ index: {}, name: {:?}, arity: {}, param_types: &{}_PARAM_TYPES, return_type: AbiValueType::{} }};",
+            "pub const {}: AbiFunction = AbiFunction {{ index: {}, name: {:?}, arity: {}, param_names: &{}_PARAM_NAMES, param_types: &{}_PARAM_TYPES, return_type: AbiValueType::{} }};",
             abi_const_name(function),
             fn_const_name(function),
             function.name,
-            function.arity,
+            function.param_names.len(),
+            abi_const_name(function),
             abi_const_name(function),
             function.return_type
         )
@@ -286,17 +362,24 @@ fn render_abi_json(functions: &[AbiFunctionDecl]) -> String {
         } else {
             ","
         };
+        let params = function
+            .param_names
+            .iter()
+            .zip(function.param_types.iter())
+            .map(|(name, ty)| {
+                format!(
+                    "{{\"name\": {name:?}, \"type\": {:?}}}",
+                    ty.to_ascii_lowercase()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         writeln!(
             &mut out,
-            "    {{ \"index\": {index}, \"name\": {:?}, \"arity\": {}, \"param_types\": [{}], \"return_type\": {:?} }}{suffix}",
+            "    {{ \"index\": {index}, \"name\": {:?}, \"arity\": {}, \"params\": [{}], \"return_type\": {:?} }}{suffix}",
             function.name,
-            function.arity,
-            function
-                .param_types
-                .iter()
-                .map(|param| format!("{:?}", param.to_ascii_lowercase()))
-                .collect::<Vec<_>>()
-                .join(", "),
+            function.param_names.len(),
+            params,
             function.return_type.to_ascii_lowercase()
         )
         .unwrap();
@@ -400,33 +483,6 @@ fn parse_string(source: &str) -> (String, &str) {
     panic!("unterminated string literal");
 }
 
-fn parse_u8(source: &str) -> (u8, &str) {
-    let source = skip_ws(source);
-    let end = source
-        .find(|ch: char| !ch.is_ascii_digit())
-        .unwrap_or(source.len());
-    if end == 0 {
-        panic!("expected integer");
-    }
-    (
-        source[..end]
-            .parse::<u8>()
-            .unwrap_or_else(|err| panic!("invalid u8 '{}': {err}", &source[..end])),
-        &source[end..],
-    )
-}
-
-fn parse_ident(source: &str) -> (String, &str) {
-    let source = skip_ws(source);
-    let end = source
-        .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-        .unwrap_or(source.len());
-    if end == 0 {
-        panic!("expected identifier");
-    }
-    (source[..end].to_string(), &source[end..])
-}
-
 fn expect_comma(source: &str) -> &str {
     skip_ws(source)
         .strip_prefix(',')
@@ -435,10 +491,6 @@ fn expect_comma(source: &str) -> &str {
 
 fn skip_ws(source: &str) -> &str {
     source.trim_start_matches(char::is_whitespace)
-}
-
-fn skip_ws_and_commas(source: &str) -> &str {
-    source.trim_start_matches(|ch: char| ch.is_whitespace() || ch == ',')
 }
 
 fn find_matching_paren(source: &str) -> usize {

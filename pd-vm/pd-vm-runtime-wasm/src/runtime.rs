@@ -11,10 +11,9 @@ use std::time::Instant;
 
 use serde::Deserialize;
 use vm::{
-    CallOutcome, FunctionDecl, HostAsyncBridge, HostFunction, HostOpId, LocalInfo, SourceFlavor,
-    SourcePathError, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
-    CallableParamType,
-    compile_source_with_flavor_and_options, format_value, render_vm_error,
+    CallOutcome, CallableDef, FunctionDecl, HostAsyncBridge, HostFunction, HostOpId, LocalInfo,
+    SourceFlavor, SourcePathError, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
+    compile_source_with_flavor_and_options, default_host_callables, format_value, render_vm_error,
 };
 
 use crate::analyzer::{LintDiagnostic, lint_source_with_flavor};
@@ -71,34 +70,8 @@ impl FuelState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PlaygroundHostFunctionSpec {
-    pub name: &'static str,
-    pub arity: usize,
-    pub param_types: &'static [CallableParamType],
-    pub return_type: &'static str,
-    pub docs: &'static str,
-}
-
-const HOST_FUNCTION_SPECS: &[PlaygroundHostFunctionSpec] = &[
-    PlaygroundHostFunctionSpec {
-        name: "print",
-        arity: 1,
-        param_types: &[CallableParamType::Any],
-        return_type: "any",
-        docs: "Writes a value to playground print output.",
-    },
-    PlaygroundHostFunctionSpec {
-        name: "runtime::sleep",
-        arity: 1,
-        param_types: &[CallableParamType::Int],
-        return_type: "bool",
-        docs: "Sleeps for the requested milliseconds. In the wasm playground it pauses the run session until the browser timer elapses.",
-    },
-];
-
-pub(crate) fn host_function_specs() -> &'static [PlaygroundHostFunctionSpec] {
-    HOST_FUNCTION_SPECS
+pub(crate) fn host_function_specs() -> &'static [CallableDef] {
+    default_host_callables()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

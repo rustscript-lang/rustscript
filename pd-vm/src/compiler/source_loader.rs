@@ -102,7 +102,7 @@ mod tests {
         let source = "(import (prefix-in mod: \"./math.rss\"))\n(define (entry x) (mod:inc x))\n";
         let path = Path::new("tests/main.scm");
         let options = CompileSourceFileOptions::default()
-            .with_module_override_source("./math.rss", "pub fn inc(arg0) { arg0 + 1; }\n");
+            .with_module_override_source("./math.rss", "pub fn inc(arg0) { arg0 + 1 }\n");
 
         let (root_parse_source, units) =
             load_units_for_source_file(path, SourceFlavor::Scheme, source, &options)

@@ -77,7 +77,7 @@ let matched = match chained_score {
     _ => 0,
 };
 
-let regex_ok = re::match("^rustscript$", "RUSTSCRIPT", "i");
+let regex_ok = re::match("(?i)^rustscript$", "RUSTSCRIPT");
 let payload = {
     lang: "rustscript",
     score: closure_value,

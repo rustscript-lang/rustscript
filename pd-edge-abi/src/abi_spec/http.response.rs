@@ -1,13 +1,54 @@
-edge_abi_functions![
-    edge_abi_function!("http::response::set_header", 2, [String, String], Null),
-    edge_abi_function!("http::response::remove_header", 1, [String], Null),
-    edge_abi_function!("http::response::set_body", 1, [String], Null),
-    edge_abi_function!("http::response::set_status", 1, [Int], Null),
-    edge_abi_function!("http::response::get_status", 0, [], Int),
-    edge_abi_function!("http::response::get_body", 0, [], String),
-    edge_abi_function!("http::response::get_header", 1, [String], String),
-    edge_abi_function!("http::response::get_headers", 0, [], Map),
-    edge_abi_function!("http::response::add_header", 2, [String, String], Null),
-    edge_abi_function!("http::response::clear_header", 1, [String], Null),
-    edge_abi_function!("http::response::set_headers", 1, [Map], Null),
-];
+#[pd_host_function(name = "http::response::set_header")]
+fn http_response_set_header(name: &str, value: &str) {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "http::response::remove_header")]
+fn http_response_remove_header(name: &str) {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "http::response::set_body")]
+fn http_response_set_body(body: &str) {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "http::response::set_status")]
+fn http_response_set_status(status: i64) {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "http::response::get_status")]
+fn http_response_get_status() -> i64 {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "http::response::get_body")]
+fn http_response_get_body() -> String {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "http::response::get_header")]
+fn http_response_get_header(name: &str) -> String {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "http::response::get_headers")]
+fn http_response_get_headers() -> Map {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "http::response::add_header")]
+fn http_response_add_header(name: &str, value: &str) {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "http::response::clear_header")]
+fn http_response_clear_header(name: &str) {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "http::response::set_headers")]
+fn http_response_set_headers(headers: Map) {
+    unreachable!("abi declaration only")
+}

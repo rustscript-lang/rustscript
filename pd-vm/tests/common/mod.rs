@@ -82,6 +82,8 @@ pub enum CompileErrorKind {
     InlineFunctionRecursion,
     IfElseBranchTypeMismatch,
     CallableArgumentTypeMismatch,
+    BinaryOperandTypeMismatch,
+    FunctionParameterTypeConflict,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -116,6 +118,12 @@ fn compile_error_kind(err: &vm::CompileError) -> CompileErrorKind {
         }
         vm::CompileError::CallableArgumentTypeMismatch { .. } => {
             CompileErrorKind::CallableArgumentTypeMismatch
+        }
+        vm::CompileError::BinaryOperandTypeMismatch { .. } => {
+            CompileErrorKind::BinaryOperandTypeMismatch
+        }
+        vm::CompileError::FunctionParameterTypeConflict { .. } => {
+            CompileErrorKind::FunctionParameterTypeConflict
         }
     }
 }

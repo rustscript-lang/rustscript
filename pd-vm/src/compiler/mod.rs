@@ -23,6 +23,8 @@ pub enum CompileError {
     InlineFunctionRecursion(String),
     IfElseBranchTypeMismatch { line: Option<u32>, detail: String },
     CallableArgumentTypeMismatch { line: Option<u32>, detail: String },
+    BinaryOperandTypeMismatch { line: Option<u32>, detail: String },
+    FunctionParameterTypeConflict { line: Option<u32>, detail: String },
 }
 
 impl CompileError {
@@ -32,6 +34,12 @@ impl CompileError {
                 line.and_then(|value| usize::try_from(value).ok())
             }
             CompileError::CallableArgumentTypeMismatch { line, .. } => {
+                line.and_then(|value| usize::try_from(value).ok())
+            }
+            CompileError::BinaryOperandTypeMismatch { line, .. } => {
+                line.and_then(|value| usize::try_from(value).ok())
+            }
+            CompileError::FunctionParameterTypeConflict { line, .. } => {
                 line.and_then(|value| usize::try_from(value).ok())
             }
             _ => None,
@@ -64,6 +72,8 @@ impl CompileError {
             }
             CompileError::IfElseBranchTypeMismatch { detail, .. } => detail.clone(),
             CompileError::CallableArgumentTypeMismatch { detail, .. } => detail.clone(),
+            CompileError::BinaryOperandTypeMismatch { detail, .. } => detail.clone(),
+            CompileError::FunctionParameterTypeConflict { detail, .. } => detail.clone(),
         }
     }
 }
@@ -545,6 +555,16 @@ pub fn compile_source(source: &str) -> Result<CompiledProgram, SourceError> {
     compile_source_with_flavor(source, SourceFlavor::RustScript)
 }
 
+pub fn lint_trailing_function_return_semicolons(
+    source: &str,
+    flavor: SourceFlavor,
+) -> Result<Vec<ParseError>, ParseError> {
+    let Some(dialect) = frontends::parser_dialect_for_flavor(flavor) else {
+        return Ok(Vec::new());
+    };
+    parser::lint_trailing_function_return_semicolons(source, 0, dialect)
+}
+
 pub fn compile_source_for_repl(source: &str) -> Result<CompiledProgram, SourceError> {
     compile_source_for_repl_with_locals(source, &[]).map(|compiled| compiled.compiled)
 }
@@ -981,10 +1001,8 @@ impl Compiler {
                     .label(&end_label)
                     .map_err(CompileError::Assembler)?;
                 self.callable_bindings = callable_snapshot;
-                self.type_state = self.simulate_stmt_type_state(
-                    std::slice::from_ref(stmt),
-                    &loop_entry_type_state,
-                );
+                self.type_state = self
+                    .simulate_stmt_type_state(std::slice::from_ref(stmt), &loop_entry_type_state);
             }
             Stmt::While {
                 condition,
@@ -1012,10 +1030,8 @@ impl Compiler {
                     .label(&end_label)
                     .map_err(CompileError::Assembler)?;
                 self.callable_bindings = callable_snapshot;
-                self.type_state = self.simulate_stmt_type_state(
-                    std::slice::from_ref(stmt),
-                    &loop_entry_type_state,
-                );
+                self.type_state = self
+                    .simulate_stmt_type_state(std::slice::from_ref(stmt), &loop_entry_type_state);
             }
             Stmt::Break { line } => {
                 self.assembler.mark_line(*line);
@@ -1734,7 +1750,7 @@ impl Compiler {
         }
         let argc = u8::try_from(args.len()).map_err(|_| CompileError::CallArityOverflow)?;
         if let Some(builtin) = BuiltinFunction::from_call_index(index) {
-            debug_assert_eq!(argc, builtin.arity());
+            debug_assert!(builtin.accepts_arity(argc));
             self.assembler.call(index, argc);
             return Ok(());
         }

@@ -1,4 +1,9 @@
-edge_abi_functions![
-    edge_abi_function!("rate_limit::allow", 3, [String, Int, Int], Bool),
-    edge_abi_function!("runtime::sleep", 1, [Int], Bool),
-];
+#[pd_host_function(name = "rate_limit::allow")]
+fn rate_limit_allow(key: &str, limit: i64, window_seconds: i64) -> bool {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "runtime::sleep")]
+fn runtime_sleep(ms: i64) -> bool {
+    unreachable!("abi declaration only")
+}

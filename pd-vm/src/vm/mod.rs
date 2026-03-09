@@ -2225,7 +2225,7 @@ impl Vm {
         args.reverse();
 
         if let Some(builtin) = BuiltinFunction::from_call_index(index) {
-            if argc_u8 != builtin.arity() {
+            if !builtin.accepts_arity(argc_u8) {
                 return Err(VmError::InvalidCallArity {
                     import: builtin.name().to_string(),
                     expected: builtin.arity(),

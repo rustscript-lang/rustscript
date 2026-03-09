@@ -123,14 +123,14 @@ fn rustscript_io_namespace_builtin_calls_are_supported() {
 fn rustscript_builtin_and_namespace_runtime_cases_work() {
     let cases = vec![
         RuntimeCase {
-            name: "re namespace supports optional inline flags across functions",
+            name: "re namespace supports inline regex flags across functions",
             source: r#"
                 use re;
-                let a = re::match("^foo$", "FoO", "i");
-                let b = re::find("^foo", "FoO bar", "i");
-                let c = re::replace("foo", "FoO bar", "x", "i");
-                let d = re::split("x", "aXb", "i");
-                let e = re::captures("^(foo)-([0-9]+)$", "FoO-42", "i");
+                let a = re::match("(?i)^foo$", "FoO");
+                let b = re::find("(?i)^foo", "FoO bar");
+                let c = re::replace("(?i)foo", "FoO bar", "x");
+                let d = re::split("(?i)x", "aXb");
+                let e = re::captures("(?i)^(foo)-([0-9]+)$", "FoO-42");
 
                 let mut score = 0;
                 if a {

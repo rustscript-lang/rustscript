@@ -321,7 +321,7 @@ Compiler-only wasm build (without runtime/JIT/debugger/CLI):
 cargo check -p pd-vm --target wasm32-unknown-unknown --no-default-features
 ```
 
-Browser/editor lint integration is provided by sibling crate `pd-vm-lint-wasm` via
+Browser/editor lint integration is provided by sibling crate `pd-vm-wasm` via
 `lint_source_json`.
 
 The wasm linter reports both parse errors and compile-time type errors with Monaco-friendly line
@@ -336,7 +336,8 @@ Runtime-enabled wasm build (without native JIT backend):
 cargo check -p pd-vm --target wasm32-unknown-unknown --no-default-features --features runtime
 ```
 
-Browser playground wasm runtime is provided by sibling crate `pd-vm-runtime-wasm` via:
+Browser playground wasm runtime is provided by sibling crate `pd-vm-wasm` built with the
+`runtime` feature via:
 
 - `lint_source_json`
 - `run_source_json`
@@ -351,7 +352,7 @@ bun install
 bun run dev
 ```
 
-This runs `scripts/build-wasm-playground.mjs`, which builds `pd-vm-runtime-wasm`, copies wasm
+This runs `scripts/build-wasm-playground.mjs`, which builds `pd-vm-wasm --features runtime`, copies wasm
 artifacts into `public/wasm`, and syncs RustScript Monaco grammar assets.
 
 In browser epoch mode, the playground drives one epoch tick from a 1ms JavaScript timer and shows

@@ -1,10 +1,26 @@
 use std::collections::HashMap;
 
 use crate::ValueType;
+use crate::builtins::default_host_callable;
 
 use super::ParseError;
 
 pub type LocalSlot = u16;
+
+fn known_host_accepts_arity(name: &str, arity: u8) -> bool {
+    if let Some(function) = edge_abi::function_by_name(name) {
+        return function.param_types.len() == usize::from(arity);
+    }
+    default_host_callable(name).is_some_and(|callable| {
+        let required = callable
+            .signature
+            .params
+            .iter()
+            .take_while(|param| !param.optional)
+            .count();
+        required <= usize::from(arity) && usize::from(arity) <= callable.signature.params.len()
+    })
+}
 
 /// Shared frontend-independent program representation that all source
 /// frontends lower into before bytecode emission.
@@ -242,7 +258,9 @@ impl LocalIrBuilder {
     ) -> Result<(), ParseError> {
         if let Some((index, existing_arity)) = self.function_meta.get(name).copied() {
             match (existing_arity, arity) {
-                (Some(expected), Some(actual)) if expected != actual => {
+                (Some(expected), Some(actual))
+                    if expected != actual && !known_host_accepts_arity(name, actual) =>
+                {
                     return Err(ParseError {
                         span: None,
                         code: None,
@@ -293,7 +311,11 @@ impl LocalIrBuilder {
         let (func_index, declared_arity) = self.function_meta.get(name).copied()?;
         let call_arity = u8::try_from(args.len()).ok()?;
         match declared_arity {
-            Some(expected) if expected != call_arity => return None,
+            Some(expected)
+                if expected != call_arity && !known_host_accepts_arity(name, call_arity) =>
+            {
+                return None;
+            }
             Some(_) => {}
             None => {
                 if let Some(function) = self.functions.get_mut(func_index as usize) {

@@ -7,9 +7,10 @@ use std::process::{Child, Command, Stdio};
 use std::task::{Context, Poll};
 
 use futures_channel::oneshot;
+use pd_host_function::pd_host_function;
 
 use super::super::{HostOpId, Value, Vm, VmError, VmResult};
-use super::{BuiltinCallOutcome, arg_string};
+use super::BuiltinResult;
 
 pub(in crate::vm) struct IoState {
     pub(super) next_handle: i64,
@@ -80,9 +81,8 @@ pub(super) fn close_all_handles(vm: &mut Vm) {
     }
 }
 
-pub(super) fn builtin_io_open(vm: &mut Vm, args: Vec<Value>) -> VmResult<BuiltinCallOutcome> {
-    let path = arg_string(&args, 0, "io_open path")?;
-    let mode = arg_string(&args, 1, "io_open mode")?;
+#[pd_host_function(name = "io::open")]
+pub(super) fn builtin_io_open(vm: &mut Vm, path: &str, mode: &str) -> VmResult<BuiltinResult<i64>> {
     let reserved_id = io_reserve_handle_id(vm);
     let path = path.to_string();
     let mode = mode.to_string();
@@ -128,12 +128,15 @@ pub(super) fn builtin_io_open(vm: &mut Vm, args: Vec<Value>) -> VmResult<Builtin
             },
         }
     })?;
-    Ok(BuiltinCallOutcome::Pending(op_id))
+    Ok(BuiltinResult::Pending(op_id))
 }
 
-pub(super) fn builtin_io_popen(vm: &mut Vm, args: Vec<Value>) -> VmResult<BuiltinCallOutcome> {
-    let command = arg_string(&args, 0, "io_popen command")?;
-    let mode = arg_string(&args, 1, "io_popen mode")?;
+#[pd_host_function(name = "io::popen")]
+pub(super) fn builtin_io_popen(
+    vm: &mut Vm,
+    command: &str,
+    mode: &str,
+) -> VmResult<BuiltinResult<i64>> {
     if mode != "r" && mode != "w" {
         return Err(VmError::HostError(format!(
             "unsupported io_popen mode '{mode}', expected r or w"
@@ -182,11 +185,11 @@ pub(super) fn builtin_io_popen(vm: &mut Vm, args: Vec<Value>) -> VmResult<Builti
             result: Ok(vec![Value::Int(reserved_id)]),
         }
     })?;
-    Ok(BuiltinCallOutcome::Pending(op_id))
+    Ok(BuiltinResult::Pending(op_id))
 }
 
-pub(super) fn builtin_io_read_all(vm: &mut Vm, args: Vec<Value>) -> VmResult<BuiltinCallOutcome> {
-    let handle_id = arg_handle_id(&args, 0, "io_read_all handle")?;
+#[pd_host_function(name = "io::read_all")]
+pub(super) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinResult<String>> {
     let handle = io_take_handle(vm, handle_id)?;
     let op_id = schedule_io_task(vm, move || {
         let mut handle = handle;
@@ -222,11 +225,11 @@ pub(super) fn builtin_io_read_all(vm: &mut Vm, args: Vec<Value>) -> VmResult<Bui
             result,
         }
     })?;
-    Ok(BuiltinCallOutcome::Pending(op_id))
+    Ok(BuiltinResult::Pending(op_id))
 }
 
-pub(super) fn builtin_io_read_line(vm: &mut Vm, args: Vec<Value>) -> VmResult<BuiltinCallOutcome> {
-    let handle_id = arg_handle_id(&args, 0, "io_read_line handle")?;
+#[pd_host_function(name = "io::read_line")]
+pub(super) fn builtin_io_read_line(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinResult<String>> {
     let handle = io_take_handle(vm, handle_id)?;
     let op_id = schedule_io_task(vm, move || {
         let mut handle = handle;
@@ -257,13 +260,16 @@ pub(super) fn builtin_io_read_line(vm: &mut Vm, args: Vec<Value>) -> VmResult<Bu
             result,
         }
     })?;
-    Ok(BuiltinCallOutcome::Pending(op_id))
+    Ok(BuiltinResult::Pending(op_id))
 }
 
-pub(super) fn builtin_io_write(vm: &mut Vm, args: Vec<Value>) -> VmResult<BuiltinCallOutcome> {
-    let handle_id = arg_handle_id(&args, 0, "io_write handle")?;
-    let data = arg_string(&args, 1, "io_write data")?;
-    let bytes = data.as_bytes().to_vec();
+#[pd_host_function(name = "io::write")]
+pub(super) fn builtin_io_write(
+    vm: &mut Vm,
+    handle_id: i64,
+    text: &str,
+) -> VmResult<BuiltinResult<i64>> {
+    let bytes = text.as_bytes().to_vec();
     let handle = io_take_handle(vm, handle_id)?;
     let op_id = schedule_io_task(vm, move || {
         let mut handle = handle;
@@ -298,11 +304,11 @@ pub(super) fn builtin_io_write(vm: &mut Vm, args: Vec<Value>) -> VmResult<Builti
             result,
         }
     })?;
-    Ok(BuiltinCallOutcome::Pending(op_id))
+    Ok(BuiltinResult::Pending(op_id))
 }
 
-pub(super) fn builtin_io_flush(vm: &mut Vm, args: Vec<Value>) -> VmResult<BuiltinCallOutcome> {
-    let handle_id = arg_handle_id(&args, 0, "io_flush handle")?;
+#[pd_host_function(name = "io::flush")]
+pub(super) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinResult<bool>> {
     let handle = io_take_handle(vm, handle_id)?;
     let op_id = schedule_io_task(vm, move || {
         let mut handle = handle;
@@ -335,28 +341,29 @@ pub(super) fn builtin_io_flush(vm: &mut Vm, args: Vec<Value>) -> VmResult<Builti
             result,
         }
     })?;
-    Ok(BuiltinCallOutcome::Pending(op_id))
+    Ok(BuiltinResult::Pending(op_id))
 }
 
-pub(super) fn builtin_io_close(vm: &mut Vm, args: Vec<Value>) -> VmResult<BuiltinCallOutcome> {
-    let handle_id = arg_handle_id(&args, 0, "io_close handle")?;
+#[pd_host_function(name = "io::close")]
+pub(super) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinResult<bool>> {
     let handle = io_take_handle(vm, handle_id)?;
     let op_id = schedule_io_task(vm, move || IoAsyncCompletion {
         restored_handle: None,
         result: close_io_handle(handle).map(|_| vec![Value::Bool(true)]),
     })?;
-    Ok(BuiltinCallOutcome::Pending(op_id))
+    Ok(BuiltinResult::Pending(op_id))
 }
 
-pub(super) fn builtin_io_exists(vm: &mut Vm, args: Vec<Value>) -> VmResult<BuiltinCallOutcome> {
-    let path = arg_string(&args, 0, "io_exists path")?.to_string();
+#[pd_host_function(name = "io::exists")]
+pub(super) fn builtin_io_exists(vm: &mut Vm, path: &str) -> VmResult<BuiltinResult<bool>> {
+    let path = path.to_string();
     let op_id = schedule_io_task(vm, move || IoAsyncCompletion {
         restored_handle: None,
         result: Ok(vec![Value::Bool(
             std::path::Path::new(path.as_str()).exists(),
         )]),
     })?;
-    Ok(BuiltinCallOutcome::Pending(op_id))
+    Ok(BuiltinResult::Pending(op_id))
 }
 
 fn spawn_shell_command(command: &str, mode: &str) -> VmResult<Child> {
@@ -413,19 +420,6 @@ fn schedule_io_task(
         .map_err(|err| VmError::HostError(format!("failed to spawn io task: {err}")))?;
     vm.io_state.pending_ops.insert(op_id, receiver);
     Ok(op_id)
-}
-
-fn arg_handle_id(args: &[Value], index: usize, label: &str) -> VmResult<i64> {
-    let id = args
-        .get(index)
-        .ok_or_else(|| VmError::HostError(format!("missing argument: {label}")))?
-        .as_int()?;
-    if id <= 0 {
-        return Err(VmError::HostError(format!(
-            "invalid io handle id {id}, expected positive id"
-        )));
-    }
-    Ok(id)
 }
 
 fn close_io_handle(mut handle: IoHandle) -> VmResult<()> {

@@ -1227,35 +1227,19 @@ fn lower_scheme_direct_namespace_call(
 fn lower_scheme_direct_regex_or_builtin_call(
     namespace: &str,
     member: &str,
-    mut args: Vec<Expr>,
+    args: Vec<Expr>,
     line: usize,
 ) -> Result<Option<Expr>, ParseError> {
     if namespace == "re" {
-        let (builtin, base_arity) = match member {
-            "match" | "is_match" => (BuiltinFunction::ReIsMatch, 2usize),
-            "find" => (BuiltinFunction::ReFind, 2usize),
-            "replace" => (BuiltinFunction::ReReplace, 3usize),
-            "split" => (BuiltinFunction::ReSplit, 2usize),
-            "captures" => (BuiltinFunction::ReCaptures, 2usize),
+        let builtin = match member {
+            "match" => BuiltinFunction::ReMatch,
+            "find" => BuiltinFunction::ReFind,
+            "replace" => BuiltinFunction::ReReplace,
+            "split" => BuiltinFunction::ReSplit,
+            "captures" => BuiltinFunction::ReCaptures,
             _ => return Ok(None),
         };
-        if args.len() == base_arity {
-            return Ok(Some(Expr::Call(builtin.call_index(), args)));
-        }
-        if args.len() == base_arity + 1 {
-            let flags = args.pop().ok_or_else(|| ParseError {
-                span: None,
-                code: None,
-                line,
-                message: "missing regex flags argument".to_string(),
-            })?;
-            let pattern = args.first().cloned().ok_or_else(|| ParseError {
-                span: None,
-                code: None,
-                line,
-                message: "missing regex pattern argument".to_string(),
-            })?;
-            args[0] = apply_regex_flags_to_pattern_expr_direct(pattern, flags);
+        if builtin.accepts_arity(u8::try_from(args.len()).unwrap_or(u8::MAX)) {
             return Ok(Some(Expr::Call(builtin.call_index(), args)));
         }
         return Err(ParseError {
@@ -1263,39 +1247,28 @@ fn lower_scheme_direct_regex_or_builtin_call(
             code: None,
             line,
             message: format!(
-                "function 're::{member}' expects {base_arity} or {} arguments",
-                base_arity + 1
+                "function 're::{member}' expects {} arguments",
+                builtin.arity()
             ),
         });
     }
 
     if let Some(builtin) = resolve_builtin_namespace_call(namespace, member) {
-        let expected = usize::from(builtin.arity());
-        if args.len() != expected {
+        if !builtin.accepts_arity(u8::try_from(args.len()).unwrap_or(u8::MAX)) {
             return Err(ParseError {
                 span: None,
                 code: None,
                 line,
-                message: format!("function '{namespace}::{member}' expects {expected} arguments"),
+                message: format!(
+                    "function '{namespace}::{member}' expects {} arguments",
+                    builtin.arity()
+                ),
             });
         }
         return Ok(Some(Expr::Call(builtin.call_index(), args)));
     }
     Ok(None)
 }
-
-fn apply_regex_flags_to_pattern_expr_direct(pattern: Expr, flags: Expr) -> Expr {
-    let prefix = Expr::Call(
-        BuiltinFunction::Concat.call_index(),
-        vec![Expr::String("(?".to_string()), flags],
-    );
-    let prefix = Expr::Call(
-        BuiltinFunction::Concat.call_index(),
-        vec![prefix, Expr::String(")".to_string())],
-    );
-    Expr::Call(BuiltinFunction::Concat.call_index(), vec![prefix, pattern])
-}
-
 fn lower_scheme_direct_hash_expr(
     args: &[SchemeForm],
     builder: &mut LocalIrBuilder,
@@ -2127,7 +2100,7 @@ fn is_forbidden_scheme_builtin_name(name: &str) -> bool {
             | "io_flush"
             | "io_close"
             | "io_exists"
-            | "re_is_match"
+            | "re_match"
             | "re_find"
             | "re_replace"
             | "re_split"
@@ -2145,8 +2118,8 @@ fn scheme_builtin_syntax_hint(name: &str) -> &'static str {
         "slice" => "use (slice-range ...), (slice-to ...), or (slice-from ...)",
         "io_open" | "io_popen" | "io_read_all" | "io_read_line" | "io_write" | "io_flush"
         | "io_close" | "io_exists" => "use io namespace syntax (for example io::open)",
-        "re_is_match" | "re_find" | "re_replace" | "re_split" | "re_captures" => {
-            "use re namespace syntax (for example re::match with optional flags arg)"
+        "re_match" | "re_find" | "re_replace" | "re_split" | "re_captures" => {
+            "use re namespace syntax (for example re::match)"
         }
         _ => "use Scheme frontend forms instead of VM builtin helpers",
     }

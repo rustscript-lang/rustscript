@@ -1,470 +1,329 @@
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug)]
-struct NamespaceDecl {
-    module: String,
-    namespace: String,
-    alias: String,
-    docs: String,
-    runtime_supported_on_wasm: bool,
-    supports_regex_flags: bool,
-    members: Vec<NamespaceMemberDecl>,
+use syn::{Attribute, FnArg, Item, ItemFn, Meta, Pat, ReturnType, Type};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceCategory {
+    DefaultHost,
+    NamespacedBuiltin,
+    MetadataOnlyBuiltin,
 }
 
 #[derive(Clone, Debug)]
-enum NamespaceMemberDecl {
-    Builtin {
-        variant: String,
-        member_name: String,
-        arity: usize,
-        return_type: String,
-        handler: String,
-        dispatch: String,
-        docs: String,
-    },
-    Alias {
-        variant: String,
-        member_name: String,
-        arity: usize,
-        return_type: String,
-        docs: String,
-    },
+struct SourceSpec {
+    path: String,
+    module: String,
+    category: SourceCategory,
+}
+
+#[derive(Clone, Debug)]
+struct CallableParamDecl {
+    name: String,
+    ty_label: String,
+    optional: bool,
+}
+
+#[derive(Clone, Debug)]
+struct WrapperDecl {
+    fn_name: String,
+    params: Vec<WrapperParamKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WrapperParamKind {
+    Vm,
+    SliceArgs,
+}
+
+#[derive(Clone, Debug)]
+struct CallableDecl {
+    rust_ident: String,
+    module: String,
+    name: String,
+    docs: String,
+    params: Vec<CallableParamDecl>,
+    return_label: String,
+    static_return_type: String,
+    wrapper: Option<WrapperDecl>,
+}
+
+#[derive(Clone, Debug)]
+struct NamespaceDecl {
+    namespace: String,
+    module: String,
+    docs: String,
+    runtime_supported_on_wasm: bool,
+}
+
+#[derive(Clone, Debug)]
+struct Group<'a> {
+    key: String,
+    items: Vec<&'a CallableDecl>,
 }
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing manifest dir"));
-    let builtins_impl_dir = manifest_dir.join("src").join("vm").join("builtins_impl");
-    let namespace_list = builtins_impl_dir.join("namespaces.rs");
-    let namespace_files = parse_namespace_include_order(&namespace_list);
-    let declarations = namespace_files
-        .iter()
-        .map(|relative| parse_namespace_file(&builtins_impl_dir.join(relative)))
-        .collect::<Vec<_>>();
-    let (pre_count, post_count) = declarations.split_at(1);
-
-    println!("cargo:rerun-if-changed={}", namespace_list.display());
-    for relative in &namespace_files {
-        println!(
-            "cargo:rerun-if-changed={}",
-            builtins_impl_dir.join(relative).display()
-        );
-    }
-
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("missing OUT_DIR"));
-    write_generated_file(
-        &out_dir.join("builtin_namespace_metadata.rs"),
-        &render_metadata_modules(&declarations),
-    );
-    write_generated_file(
-        &out_dir.join("builtin_namespace_pre_count_variants.rs"),
-        &render_variant_list(pre_count),
-    );
-    write_generated_file(
-        &out_dir.join("builtin_namespace_post_count_variants.rs"),
-        &render_variant_list(post_count),
-    );
-    write_generated_file(
-        &out_dir.join("builtin_namespace_pre_count_main_range.rs"),
-        &render_main_range_list(pre_count),
-    );
-    write_generated_file(
-        &out_dir.join("builtin_namespace_post_count_main_range.rs"),
-        &render_main_range_list(post_count),
-    );
-    write_generated_file(
-        &out_dir.join("builtin_namespace_pre_count_name_arms.rs"),
-        &render_name_arms(pre_count),
-    );
-    write_generated_file(
-        &out_dir.join("builtin_namespace_post_count_name_arms.rs"),
-        &render_name_arms(post_count),
-    );
-    write_generated_file(
-        &out_dir.join("builtin_namespace_pre_count_arity_arms.rs"),
-        &render_arity_arms(pre_count),
-    );
-    write_generated_file(
-        &out_dir.join("builtin_namespace_post_count_arity_arms.rs"),
-        &render_arity_arms(post_count),
-    );
-    write_generated_file(
-        &out_dir.join("builtin_namespace_pre_count_dispatch_arms.rs"),
-        &render_dispatch_arms(pre_count),
-    );
-    write_generated_file(
-        &out_dir.join("builtin_namespace_post_count_dispatch_arms.rs"),
-        &render_dispatch_arms(post_count),
-    );
+
+    let namespace_manifest = manifest_dir
+        .join("src")
+        .join("vm")
+        .join("builtins_impl")
+        .join("namespaces.rs");
+    println!("cargo:rerun-if-changed={}", namespace_manifest.display());
+    let namespaces = parse_namespace_manifest(&namespace_manifest);
+
+    let host_sources = [SourceSpec {
+        path: "src/vm/builtins_impl/runtime.rs".to_string(),
+        module: "runtime".to_string(),
+        category: SourceCategory::DefaultHost,
+    }];
+    let builtin_sources = builtin_source_specs(&namespaces);
+    let core_sources = [SourceSpec {
+        path: "src/vm/builtins_impl/core.rs".to_string(),
+        module: "core".to_string(),
+        category: SourceCategory::MetadataOnlyBuiltin,
+    }];
+
+    let mut next_order = 0usize;
+    let host_callables = parse_sources(&manifest_dir, &host_sources, &mut next_order);
+    let builtin_callables = parse_sources(&manifest_dir, &builtin_sources, &mut next_order);
+    let core_callables = parse_sources(&manifest_dir, &core_sources, &mut next_order);
+    let metadata_callables = core_callables.clone();
+
+    validate_namespace_roots(&builtin_callables, &namespaces);
+    validate_known_language_builtins(&core_callables);
+    validate_wrapper_shapes(&host_callables, SourceCategory::DefaultHost);
+    validate_wrapper_shapes(&builtin_callables, SourceCategory::NamespacedBuiltin);
+
     write_generated_file(
         &out_dir.join("builtin_catalog_generated.rs"),
-        &render_builtin_catalog(&declarations),
+        &render_builtin_catalog(
+            &namespaces,
+            &host_callables,
+            &builtin_callables,
+            &metadata_callables,
+        ),
     );
     write_generated_file(
-        &out_dir.join("builtin_namespaced_dispatch_generated.rs"),
-        &render_namespaced_dispatch(&declarations),
+        &out_dir.join("builtin_runtime_dispatch_generated.rs"),
+        &render_builtin_runtime_dispatch(&host_callables, &builtin_callables),
     );
 }
 
 fn write_generated_file(path: &Path, contents: &str) {
     fs::write(path, contents)
-        .unwrap_or_else(|err| panic!("failed to write generated file {}: {err}", path.display()));
+        .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
 }
 
-fn parse_namespace_include_order(path: &Path) -> Vec<String> {
-    let source = fs::read_to_string(path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-    let mut files = Vec::new();
-    let mut rest = source.as_str();
-    loop {
-        let Some(index) = rest.find("include!(\"") else {
-            break;
-        };
-        rest = &rest[index + "include!(\"".len()..];
-        let end = rest
-            .find('"')
-            .unwrap_or_else(|| panic!("unterminated include! path in {}", path.display()));
-        files.push(rest[..end].to_string());
-        rest = &rest[end + 1..];
+fn builtin_source_specs(namespaces: &[NamespaceDecl]) -> Vec<SourceSpec> {
+    namespaces
+        .iter()
+        .map(|namespace| SourceSpec {
+            path: format!("src/vm/builtins_impl/{}.rs", namespace.module),
+            module: namespace.module.clone(),
+            category: SourceCategory::NamespacedBuiltin,
+        })
+        .collect()
+}
+
+fn parse_sources(
+    manifest_dir: &Path,
+    specs: &[SourceSpec],
+    next_order: &mut usize,
+) -> Vec<CallableDecl> {
+    let mut out = Vec::new();
+    for spec in specs {
+        let path = manifest_dir.join(&spec.path);
+        println!("cargo:rerun-if-changed={}", path.display());
+        let mut file_callables = parse_source_file(&path, spec, *next_order);
+        *next_order += file_callables.len();
+        out.append(&mut file_callables);
     }
-    files
-}
-
-fn parse_namespace_file(path: &Path) -> NamespaceDecl {
-    let source = fs::read_to_string(path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-    let module = extract_ident_field(&source, "module:");
-    let namespace = extract_string_field(&source, "namespace:");
-    let alias = extract_string_field(&source, "alias:");
-    let docs = extract_string_field(&source, "docs:");
-    let runtime_supported_on_wasm = extract_bool_field(&source, "runtime_supported_on_wasm:");
-    let supports_regex_flags = extract_bool_field(&source, "supports_regex_flags:");
-    let members_block = extract_bracket_block(&source, "members:");
-    let members = parse_members(&members_block);
-    NamespaceDecl {
-        module,
-        namespace,
-        alias,
-        docs,
-        runtime_supported_on_wasm,
-        supports_regex_flags,
-        members,
-    }
-}
-
-fn extract_ident_field(source: &str, marker: &str) -> String {
-    let rest = source
-        .split_once(marker)
-        .unwrap_or_else(|| panic!("missing field {marker}"))
-        .1;
-    let (ident, _) = parse_ident(rest);
-    ident
-}
-
-fn extract_string_field(source: &str, marker: &str) -> String {
-    let rest = source
-        .split_once(marker)
-        .unwrap_or_else(|| panic!("missing field {marker}"))
-        .1;
-    let (value, _) = parse_string(rest);
-    value
-}
-
-fn extract_bool_field(source: &str, marker: &str) -> bool {
-    let rest = source
-        .split_once(marker)
-        .unwrap_or_else(|| panic!("missing field {marker}"))
-        .1;
-    let rest = skip_ws(rest);
-    if let Some(rest) = rest.strip_prefix("true") {
-        let _ = rest;
-        true
-    } else if let Some(rest) = rest.strip_prefix("false") {
-        let _ = rest;
-        false
-    } else {
-        panic!("invalid bool field {marker}");
-    }
-}
-
-fn extract_bracket_block(source: &str, marker: &str) -> String {
-    let rest = source
-        .split_once(marker)
-        .unwrap_or_else(|| panic!("missing block {marker}"))
-        .1;
-    let start = rest
-        .find('[')
-        .unwrap_or_else(|| panic!("missing '[' for {marker}"));
-    let after_start = &rest[start..];
-    let end = find_matching(after_start, '[', ']');
-    after_start[1..end].to_string()
-}
-
-fn parse_members(source: &str) -> Vec<NamespaceMemberDecl> {
-    let mut members = Vec::new();
-    let mut rest = source;
-    loop {
-        rest = skip_ws_and_commas(rest);
-        if rest.is_empty() {
-            break;
-        }
-        let (kind, after_kind) = parse_ident(rest);
-        let after_kind = skip_ws(after_kind);
-        let after_bang = after_kind
-            .strip_prefix('!')
-            .unwrap_or_else(|| panic!("missing ! after member kind {kind}"));
-        let after_paren = skip_ws(after_bang)
-            .strip_prefix('(')
-            .unwrap_or_else(|| panic!("missing ( after member kind {kind}"));
-        let paren_end = find_matching_with_offset(after_paren, '(', ')');
-        let args = &after_paren[..paren_end];
-        let remainder = &after_paren[paren_end + 1..];
-        members.push(parse_member(kind.as_str(), args));
-        rest = remainder;
-    }
-    members
-}
-
-fn parse_member(kind: &str, args: &str) -> NamespaceMemberDecl {
-    let mut rest = args;
-    let (variant, next) = parse_ident(rest);
-    rest = expect_comma(next);
-    let (member_name, next) = parse_string(rest);
-    rest = expect_comma(next);
-    let (arity, next) = parse_usize(rest);
-    rest = expect_comma(next);
-    let (return_type, next) = parse_ident(rest);
-    rest = next;
-    match kind {
-        "namespace_builtin" => {
-            rest = expect_comma(rest);
-            let (handler, next) = parse_ident(rest);
-            rest = expect_comma(next);
-            let (dispatch, next) = parse_ident(rest);
-            rest = expect_comma(next);
-            let (docs, next) = parse_string(rest);
-            let rest = skip_ws(next);
-            if !rest.is_empty() {
-                panic!("unexpected trailing tokens in builtin member: {rest}");
-            }
-            NamespaceMemberDecl::Builtin {
-                variant,
-                member_name,
-                arity,
-                return_type,
-                handler,
-                dispatch,
-                docs,
-            }
-        }
-        "namespace_alias" => {
-            rest = expect_comma(rest);
-            let (docs, next) = parse_string(rest);
-            let rest = skip_ws(next);
-            if !rest.is_empty() {
-                panic!("unexpected trailing tokens in alias member: {rest}");
-            }
-            NamespaceMemberDecl::Alias {
-                variant,
-                member_name,
-                arity,
-                return_type,
-                docs,
-            }
-        }
-        other => panic!("unknown member kind {other}"),
-    }
-}
-
-fn render_metadata_modules(declarations: &[NamespaceDecl]) -> String {
-    let mut out = String::new();
-    for decl in declarations {
-        writeln!(&mut out, "mod {} {{", decl.module).unwrap();
-        writeln!(
-            &mut out,
-            "    use super::{{BuiltinFunction, BuiltinNamespaceLookup, BuiltinNamespaceMemberLookup, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec, ValueType}};"
-        )
-        .unwrap();
-        writeln!(
-            &mut out,
-            "    pub(super) const MEMBERS: &[BuiltinNamespaceMemberSpec] = &["
-        )
-        .unwrap();
-        for member in &decl.members {
-            match member {
-                NamespaceMemberDecl::Builtin {
-                    member_name,
-                    arity,
-                    return_type,
-                    docs,
-                    ..
-                }
-                | NamespaceMemberDecl::Alias {
-                    member_name,
-                    arity,
-                    return_type,
-                    docs,
-                    ..
-                } => {
-                    writeln!(
-                        &mut out,
-                        "        BuiltinNamespaceMemberSpec::new({member_name:?}, {arity}, ValueType::{return_type}, {docs:?}),"
-                    )
-                    .unwrap();
-                }
-            }
-        }
-        writeln!(&mut out, "    ];").unwrap();
-        writeln!(
-            &mut out,
-            "    pub(super) const LOOKUP_MEMBERS: &[BuiltinNamespaceMemberLookup] = &["
-        )
-        .unwrap();
-        for member in &decl.members {
-            match member {
-                NamespaceMemberDecl::Builtin {
-                    variant,
-                    member_name,
-                    ..
-                }
-                | NamespaceMemberDecl::Alias {
-                    variant,
-                    member_name,
-                    ..
-                } => {
-                    writeln!(
-                        &mut out,
-                        "        BuiltinNamespaceMemberLookup::new({member_name:?}, BuiltinFunction::{variant}),"
-                    )
-                    .unwrap();
-                }
-            }
-        }
-        writeln!(&mut out, "    ];").unwrap();
-        writeln!(
-            &mut out,
-            "    pub(super) const LOOKUP: BuiltinNamespaceLookup = BuiltinNamespaceLookup::new({:?}, LOOKUP_MEMBERS);",
-            decl.namespace
-        )
-        .unwrap();
-        writeln!(
-            &mut out,
-            "    pub(super) const SPEC: BuiltinNamespaceSpec = BuiltinNamespaceSpec::new({:?}, {:?}, {:?}, {}, {}, MEMBERS);",
-            decl.namespace,
-            decl.alias,
-            decl.docs,
-            decl.runtime_supported_on_wasm,
-            decl.supports_regex_flags
-        )
-        .unwrap();
-        writeln!(&mut out, "}}").unwrap();
-        writeln!(&mut out).unwrap();
-    }
-    writeln!(
-        &mut out,
-        "const BUILTIN_NAMESPACE_LOOKUPS: &[BuiltinNamespaceLookup] = &["
-    )
-    .unwrap();
-    for decl in declarations {
-        writeln!(&mut out, "    {}::LOOKUP,", decl.module).unwrap();
-    }
-    writeln!(&mut out, "];").unwrap();
-    writeln!(&mut out).unwrap();
-    writeln!(
-        &mut out,
-        "const BUILTIN_NAMESPACE_SPECS: &[BuiltinNamespaceSpec] = &["
-    )
-    .unwrap();
-    for decl in declarations {
-        writeln!(&mut out, "    {}::SPEC,", decl.module).unwrap();
-    }
-    writeln!(&mut out, "];").unwrap();
     out
 }
 
-fn render_variant_list(declarations: &[NamespaceDecl]) -> String {
-    render_builtin_members(declarations, |decl, member| match member {
-        NamespaceMemberDecl::Builtin { variant, .. } => {
-            let _ = decl;
-            format!("{variant},")
+fn parse_source_file(path: &Path, spec: &SourceSpec, _order_offset: usize) -> Vec<CallableDecl> {
+    let source = fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    let parsed = syn::parse_file(&source)
+        .unwrap_or_else(|err| panic!("failed to parse {}: {err}", path.display()));
+
+    let mut out = Vec::new();
+    for item in parsed.items.iter() {
+        let Item::Fn(function) = item else {
+            continue;
+        };
+        let Some(name) = pd_host_function_name(&function.attrs) else {
+            continue;
+        };
+        let params = parse_callable_params(function);
+        let rust_ident = function.sig.ident.to_string();
+        let wrapper = match spec.category {
+            SourceCategory::MetadataOnlyBuiltin => None,
+            _ => Some(generated_wrapper_decl(function)),
+        };
+        out.push(CallableDecl {
+            rust_ident,
+            module: spec.module.clone(),
+            name,
+            docs: doc_string(&function.attrs),
+            params,
+            return_label: return_type_label(&function.sig.output),
+            static_return_type: static_return_type_label(&function.sig.output),
+            wrapper,
+        });
+    }
+    out
+}
+
+fn parse_namespace_manifest(path: &Path) -> Vec<NamespaceDecl> {
+    let source = fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    let mut decls = Vec::new();
+    let mut rest = source.as_str();
+    loop {
+        let Some(index) = rest.find("builtin_namespace!(") else {
+            break;
+        };
+        rest = &rest[index + "builtin_namespace!(".len()..];
+        let end = find_matching_paren(rest);
+        let args = &rest[..end];
+        let (namespace, rest_after_namespace) = parse_string(args);
+        let rest_after_namespace = expect_comma(rest_after_namespace);
+        let (module, rest_after_module) = parse_string(rest_after_namespace);
+        let rest_after_module = expect_comma(rest_after_module);
+        let (docs, rest_after_docs) = parse_string(rest_after_module);
+        let rest_after_docs = expect_comma(rest_after_docs);
+        let (runtime_supported_on_wasm, rest_after_wasm) = parse_bool(rest_after_docs);
+        if !skip_ws(rest_after_wasm).is_empty() {
+            panic!("unexpected trailing tokens in namespace declaration: {rest_after_wasm}");
         }
-        NamespaceMemberDecl::Alias { .. } => String::new(),
-    })
+        decls.push(NamespaceDecl {
+            namespace,
+            module,
+            docs,
+            runtime_supported_on_wasm,
+        });
+        rest = &rest[end + 1..];
+    }
+    decls
 }
 
-fn render_main_range_list(declarations: &[NamespaceDecl]) -> String {
-    render_builtin_members(declarations, |decl, member| match member {
-        NamespaceMemberDecl::Builtin { variant, .. } => {
-            let _ = decl;
-            format!("BuiltinFunction::{variant},")
+fn validate_namespace_roots(callables: &[CallableDecl], namespaces: &[NamespaceDecl]) {
+    let declared = namespaces
+        .iter()
+        .map(|namespace| namespace.namespace.as_str())
+        .collect::<HashSet<_>>();
+    let used = callables
+        .iter()
+        .filter_map(|callable| callable.name.split_once("::").map(|(root, _)| root))
+        .collect::<HashSet<_>>();
+    if declared != used {
+        panic!(
+            "builtin namespace declarations do not match annotated callables: declared={declared:?}, used={used:?}"
+        );
+    }
+}
+
+fn validate_known_language_builtins(callables: &[CallableDecl]) {
+    let known = callables
+        .iter()
+        .map(|callable| callable.name.as_str())
+        .collect::<HashSet<_>>();
+    for name in required_language_builtin_stubs() {
+        if !known.contains(name) {
+            panic!("missing lowering stub for language builtin '{name}'");
         }
-        NamespaceMemberDecl::Alias { .. } => String::new(),
-    })
-}
-
-fn render_name_arms(declarations: &[NamespaceDecl]) -> String {
-    render_builtin_members(declarations, |decl, member| match member {
-        NamespaceMemberDecl::Builtin {
-            variant,
-            member_name,
-            ..
-        } => format!(
-            "BuiltinFunction::{variant} => {:?},",
-            format!("{}_{}", decl.namespace, member_name)
-        ),
-        NamespaceMemberDecl::Alias { .. } => String::new(),
-    })
-}
-
-fn render_arity_arms(declarations: &[NamespaceDecl]) -> String {
-    render_builtin_members(declarations, |decl, member| match member {
-        NamespaceMemberDecl::Builtin { variant, arity, .. } => {
-            let _ = decl;
-            format!("BuiltinFunction::{variant} => {arity},")
+    }
+    for name in required_internal_builtin_stubs() {
+        if !known.contains(name) {
+            panic!("missing lowering stub for internal builtin '{name}'");
         }
-        NamespaceMemberDecl::Alias { .. } => String::new(),
-    })
+    }
 }
 
-fn render_dispatch_arms(declarations: &[NamespaceDecl]) -> String {
-    render_builtin_members(declarations, |decl, member| match member {
-        NamespaceMemberDecl::Builtin {
-            variant,
-            handler,
-            dispatch,
-            ..
-        } => match dispatch.as_str() {
-            "args_ref" => format!(
-                "BuiltinFunction::{variant} => {}::{handler}(&args).map(BuiltinCallOutcome::Return),",
-                decl.module
-            ),
-            "args_owned" => format!(
-                "BuiltinFunction::{variant} => {}::{handler}(args).map(BuiltinCallOutcome::Return),",
-                decl.module
-            ),
-            "vm_args_owned" => {
-                format!(
-                    "BuiltinFunction::{variant} => {}::{handler}(vm, args),",
-                    decl.module
-                )
-            }
-            "vm_noargs" => {
-                format!(
-                    "BuiltinFunction::{variant} => {}::{handler}(vm),",
-                    decl.module
-                )
-            }
-            other => panic!("unsupported dispatch kind {other}"),
-        },
-        NamespaceMemberDecl::Alias { .. } => String::new(),
-    })
+fn validate_wrapper_shapes(callables: &[CallableDecl], category: SourceCategory) {
+    for callable in callables {
+        let Some(_wrapper) = callable.wrapper.as_ref() else {
+            continue;
+        };
+        validate_optional_param_layout(callable);
+        match category {
+            SourceCategory::DefaultHost | SourceCategory::NamespacedBuiltin => {}
+            SourceCategory::MetadataOnlyBuiltin => {}
+        }
+    }
 }
 
-fn render_builtin_catalog(declarations: &[NamespaceDecl]) -> String {
-    let (pre_count, post_count) = declarations.split_at(1);
+fn validate_optional_param_layout(callable: &CallableDecl) {
+    let mut saw_optional = false;
+    for param in &callable.params {
+        if param.optional {
+            saw_optional = true;
+            continue;
+        }
+        if saw_optional {
+            panic!(
+                "callable '{}' has a required parameter after an optional parameter",
+                callable.name
+            );
+        }
+    }
+}
+
+fn render_builtin_catalog(
+    namespaces: &[NamespaceDecl],
+    host_callables: &[CallableDecl],
+    builtin_callables: &[CallableDecl],
+    metadata_callables: &[CallableDecl],
+) -> String {
+    let language_group_input = metadata_callables
+        .iter()
+        .filter(|callable| is_language_builtin_stub_name(&callable.name))
+        .cloned()
+        .collect::<Vec<_>>();
+    let language_groups = stable_groups(&language_group_input, |callable| callable.name.clone());
+    let language_builtin_order = language_groups
+        .iter()
+        .map(|group| group.key.clone())
+        .collect::<Vec<_>>();
+    let host_group_input = host_callables.iter().cloned().collect::<Vec<_>>();
+    let host_groups = stable_groups(&host_group_input, |callable| callable.name.clone());
+    let (builtin_variant_order, actual_builtin_by_variant) =
+        ordered_actual_builtin_variants(namespaces, builtin_callables, metadata_callables);
+
+    let namespace_member_group_input = builtin_callables
+        .iter()
+        .chain(
+            metadata_callables
+                .iter()
+                .filter(|callable| callable.name.contains("::")),
+        )
+        .cloned()
+        .collect::<Vec<_>>();
+    let namespace_member_groups = stable_groups(&namespace_member_group_input, |callable| {
+        callable.name.clone()
+    });
+    for variant in &builtin_variant_order {
+        if !actual_builtin_by_variant.contains_key(variant) {
+            panic!("missing callable signatures for builtin variant '{variant}'");
+        }
+    }
+
     let mut out = String::new();
+    out.push_str(&render_callable_consts(
+        &host_callables
+            .iter()
+            .chain(builtin_callables.iter())
+            .chain(metadata_callables.iter())
+            .collect::<Vec<_>>(),
+    ));
+
     writeln!(
         &mut out,
         "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]"
@@ -472,34 +331,13 @@ fn render_builtin_catalog(declarations: &[NamespaceDecl]) -> String {
     .unwrap();
     writeln!(&mut out, "#[repr(u16)]").unwrap();
     writeln!(&mut out, "pub(crate) enum BuiltinFunction {{").unwrap();
-    writeln!(&mut out, "    Len = 0,").unwrap();
-    writeln!(&mut out, "    Slice,").unwrap();
-    writeln!(&mut out, "    Concat,").unwrap();
-    writeln!(&mut out, "    ArrayNew,").unwrap();
-    writeln!(&mut out, "    ArrayPush,").unwrap();
-    writeln!(&mut out, "    MapNew,").unwrap();
-    writeln!(&mut out, "    Get,").unwrap();
-    writeln!(&mut out, "    Set,").unwrap();
-    writeln!(&mut out, "    Keys,").unwrap();
-    for decl in pre_count {
-        for member in &decl.members {
-            if let NamespaceMemberDecl::Builtin { variant, .. } = member {
-                writeln!(&mut out, "    {variant},").unwrap();
-            }
+    for (index, variant) in builtin_variant_order.iter().enumerate() {
+        if index == 0 {
+            writeln!(&mut out, "    {variant} = 0,").unwrap();
+        } else {
+            writeln!(&mut out, "    {variant},").unwrap();
         }
     }
-    writeln!(&mut out, "    Count,").unwrap();
-    for decl in post_count {
-        for member in &decl.members {
-            if let NamespaceMemberDecl::Builtin { variant, .. } = member {
-                writeln!(&mut out, "    {variant},").unwrap();
-            }
-        }
-    }
-    writeln!(&mut out, "    FormatTemplate,").unwrap();
-    writeln!(&mut out, "    ToString,").unwrap();
-    writeln!(&mut out, "    TypeOf,").unwrap();
-    writeln!(&mut out, "    Assert,").unwrap();
     writeln!(&mut out, "}}").unwrap();
     writeln!(&mut out).unwrap();
 
@@ -508,272 +346,359 @@ fn render_builtin_catalog(declarations: &[NamespaceDecl]) -> String {
         "const MAIN_RANGE_BUILTINS: &[BuiltinFunction] = &["
     )
     .unwrap();
-    writeln!(&mut out, "    BuiltinFunction::Len,").unwrap();
-    writeln!(&mut out, "    BuiltinFunction::Slice,").unwrap();
-    writeln!(&mut out, "    BuiltinFunction::Concat,").unwrap();
-    writeln!(&mut out, "    BuiltinFunction::ArrayNew,").unwrap();
-    writeln!(&mut out, "    BuiltinFunction::ArrayPush,").unwrap();
-    writeln!(&mut out, "    BuiltinFunction::MapNew,").unwrap();
-    writeln!(&mut out, "    BuiltinFunction::Get,").unwrap();
-    writeln!(&mut out, "    BuiltinFunction::Set,").unwrap();
-    writeln!(&mut out, "    BuiltinFunction::Keys,").unwrap();
-    for decl in pre_count {
-        for member in &decl.members {
-            if let NamespaceMemberDecl::Builtin { variant, .. } = member {
-                writeln!(&mut out, "    BuiltinFunction::{variant},").unwrap();
-            }
-        }
-    }
-    writeln!(&mut out, "    BuiltinFunction::Count,").unwrap();
-    for decl in post_count {
-        for member in &decl.members {
-            if let NamespaceMemberDecl::Builtin { variant, .. } = member {
-                writeln!(&mut out, "    BuiltinFunction::{variant},").unwrap();
-            }
-        }
+    for variant in main_range_builtin_variants(&builtin_variant_order) {
+        writeln!(&mut out, "    BuiltinFunction::{variant},").unwrap();
     }
     writeln!(&mut out, "];").unwrap();
     writeln!(&mut out).unwrap();
 
-    out.push_str(&render_metadata_modules(declarations));
+    for group in &language_groups {
+        render_signature_group_const(
+            &mut out,
+            group,
+            &language_signature_group_const_name(&group.key),
+        );
+    }
+    for variant in &builtin_variant_order {
+        let items = actual_builtin_by_variant
+            .get(variant)
+            .unwrap_or_else(|| panic!("missing builtin variant group '{variant}'"));
+        render_signature_group_const(
+            &mut out,
+            &Group {
+                key: variant.clone(),
+                items: items.clone(),
+            },
+            &variant_signature_group_const_name(variant),
+        );
+    }
+    for group in &namespace_member_groups {
+        render_signature_group_const(
+            &mut out,
+            group,
+            &namespace_member_signature_group_const_name(&group.key),
+        );
+    }
+
+    render_namespace_metadata(&mut out, namespaces, &namespace_member_groups);
+    render_default_host_array(&mut out, &host_groups);
+    render_language_builtin_specs(&mut out, &language_builtin_order, &language_groups);
+    render_namespace_member_signature_lookup(&mut out, &namespace_member_groups);
+
+    writeln!(
+        &mut out,
+        "pub(crate) const BUILTIN_CALL_BASE: u16 = 0xFFB0;"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "pub(crate) const BUILTIN_CALL_COUNT: u16 = MAIN_RANGE_BUILTINS.len() as u16;"
+    )
+    .unwrap();
+    writeln!(&mut out).unwrap();
+    writeln!(
+        &mut out,
+        "const SPECIAL_CALL_BUILTINS: &[(u16, BuiltinFunction)] = &["
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    (BUILTIN_CALL_BASE - 4, BuiltinFunction::FormatTemplate),"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    (BUILTIN_CALL_BASE - 3, BuiltinFunction::ToString),"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    (BUILTIN_CALL_BASE - 2, BuiltinFunction::TypeOf),"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    (BUILTIN_CALL_BASE - 1, BuiltinFunction::Assert),"
+    )
+    .unwrap();
+    writeln!(&mut out, "];").unwrap();
+    writeln!(&mut out).unwrap();
+
+    writeln!(
+        &mut out,
+        "pub fn language_builtin_specs() -> &'static [LanguageBuiltinSpec] {{"
+    )
+    .unwrap();
+    writeln!(&mut out, "    &LANGUAGE_BUILTIN_SPECS").unwrap();
+    writeln!(&mut out, "}}").unwrap();
+    writeln!(&mut out).unwrap();
+
+    writeln!(
+        &mut out,
+        "pub fn default_host_callables() -> &'static [CallableDef] {{"
+    )
+    .unwrap();
+    writeln!(&mut out, "    &DEFAULT_HOST_CALLABLES").unwrap();
+    writeln!(&mut out, "}}").unwrap();
+    writeln!(&mut out).unwrap();
+
+    writeln!(
+        &mut out,
+        "pub(crate) fn default_host_callable(name: &str) -> Option<&'static CallableDef> {{"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    DEFAULT_HOST_CALLABLES.iter().find(|callable| callable.name == name)"
+    )
+    .unwrap();
+    writeln!(&mut out, "}}").unwrap();
+    writeln!(&mut out).unwrap();
+
+    writeln!(
+        &mut out,
+        "pub fn builtin_namespace_specs() -> &'static [BuiltinNamespaceSpec] {{"
+    )
+    .unwrap();
+    writeln!(&mut out, "    BUILTIN_NAMESPACE_SPECS").unwrap();
+    writeln!(&mut out, "}}").unwrap();
+    writeln!(&mut out).unwrap();
+
+    writeln!(
+        &mut out,
+        "pub(crate) fn is_builtin_namespace(namespace: &str) -> bool {{"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    BUILTIN_NAMESPACE_SPECS.iter().any(|entry| entry.namespace == namespace)"
+    )
+    .unwrap();
+    writeln!(&mut out, "}}").unwrap();
+    writeln!(&mut out).unwrap();
+
+    writeln!(
+        &mut out,
+        "pub(crate) fn resolve_builtin_namespace_call(namespace: &str, member: &str) -> Option<BuiltinFunction> {{"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    let entry = BUILTIN_NAMESPACE_LOOKUPS.iter().find(|entry| entry.name == namespace)?;"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    entry.members.iter().find(|item| item.name == member).map(|item| item.builtin)"
+    )
+    .unwrap();
+    writeln!(&mut out, "}}").unwrap();
+    writeln!(&mut out).unwrap();
+
+    writeln!(
+        &mut out,
+        "pub(crate) fn builtin_namespace_hint() -> String {{"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    BUILTIN_NAMESPACE_SPECS.iter().map(|entry| entry.namespace).collect::<Vec<_>>().join(\"/\")"
+    )
+    .unwrap();
+    writeln!(&mut out, "}}").unwrap();
+    writeln!(&mut out).unwrap();
+
+    writeln!(
+        &mut out,
+        "#[cfg(feature = \"runtime\")]\npub(crate) fn resolve_namespaced_builtin(name: &str) -> Option<BuiltinFunction> {{"
+    )
+    .unwrap();
+    writeln!(&mut out, "    let mut parts = name.trim().split(\"::\");").unwrap();
+    writeln!(&mut out, "    let namespace = parts.next()?;").unwrap();
+    writeln!(&mut out, "    let member = parts.next()?;").unwrap();
+    writeln!(&mut out, "    if parts.next().is_some() {{ return None; }}").unwrap();
+    writeln!(
+        &mut out,
+        "    resolve_builtin_namespace_call(namespace, member)"
+    )
+    .unwrap();
+    writeln!(&mut out, "}}").unwrap();
     writeln!(&mut out).unwrap();
 
     writeln!(&mut out, "impl BuiltinFunction {{").unwrap();
-    writeln!(&mut out, "    pub(crate) fn name(self) -> &'static str {{").unwrap();
+    render_builtin_name_method(&mut out, &builtin_variant_order, &actual_builtin_by_variant);
+    render_builtin_arity_method(&mut out, &builtin_variant_order, &actual_builtin_by_variant);
+    render_builtin_accepts_arity_method(
+        &mut out,
+        &builtin_variant_order,
+        &actual_builtin_by_variant,
+    );
+    render_builtin_static_return_type_method(
+        &mut out,
+        &builtin_variant_order,
+        &actual_builtin_by_variant,
+    );
+    render_builtin_signature_method(&mut out, &builtin_variant_order);
+    writeln!(
+        &mut out,
+        "    #[cfg(feature = \"runtime\")]\n    pub(crate) fn from_namespaced_name(name: &str) -> Option<Self> {{"
+    )
+    .unwrap();
+    writeln!(&mut out, "        resolve_namespaced_builtin(name)").unwrap();
+    writeln!(&mut out, "    }}").unwrap();
+    writeln!(&mut out).unwrap();
+    writeln!(&mut out, "    pub(crate) fn call_index(self) -> u16 {{").unwrap();
     writeln!(&mut out, "        match self {{").unwrap();
-    writeln!(&mut out, "            BuiltinFunction::Len => \"len\",").unwrap();
-    writeln!(&mut out, "            BuiltinFunction::Slice => \"slice\",").unwrap();
     writeln!(
         &mut out,
-        "            BuiltinFunction::Concat => \"concat\","
+        "            BuiltinFunction::FormatTemplate => BUILTIN_CALL_BASE - 4,"
     )
     .unwrap();
     writeln!(
         &mut out,
-        "            BuiltinFunction::ArrayNew => \"array_new\","
+        "            BuiltinFunction::ToString => BUILTIN_CALL_BASE - 3,"
     )
     .unwrap();
     writeln!(
         &mut out,
-        "            BuiltinFunction::ArrayPush => \"array_push\","
+        "            BuiltinFunction::TypeOf => BUILTIN_CALL_BASE - 2,"
     )
     .unwrap();
     writeln!(
         &mut out,
-        "            BuiltinFunction::MapNew => \"map_new\","
-    )
-    .unwrap();
-    writeln!(&mut out, "            BuiltinFunction::Get => \"get\",").unwrap();
-    writeln!(&mut out, "            BuiltinFunction::Set => \"set\",").unwrap();
-    writeln!(&mut out, "            BuiltinFunction::Keys => \"keys\",").unwrap();
-    for decl in pre_count {
-        for member in &decl.members {
-            if let NamespaceMemberDecl::Builtin {
-                variant,
-                member_name,
-                ..
-            } = member
-            {
-                writeln!(
-                    &mut out,
-                    "            BuiltinFunction::{variant} => {:?},",
-                    format!("{}_{}", decl.namespace, member_name)
-                )
-                .unwrap();
-            }
-        }
-    }
-    writeln!(&mut out, "            BuiltinFunction::Count => \"count\",").unwrap();
-    for decl in post_count {
-        for member in &decl.members {
-            if let NamespaceMemberDecl::Builtin {
-                variant,
-                member_name,
-                ..
-            } = member
-            {
-                writeln!(
-                    &mut out,
-                    "            BuiltinFunction::{variant} => {:?},",
-                    format!("{}_{}", decl.namespace, member_name)
-                )
-                .unwrap();
-            }
-        }
-    }
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::FormatTemplate => \"__format_template\","
+        "            BuiltinFunction::Assert => BUILTIN_CALL_BASE - 1,"
     )
     .unwrap();
     writeln!(
         &mut out,
-        "            BuiltinFunction::ToString => \"__to_string\","
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::TypeOf => \"type_of\","
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::Assert => \"assert\","
+        "            _ => BUILTIN_CALL_BASE + self as u16,"
     )
     .unwrap();
     writeln!(&mut out, "        }}").unwrap();
     writeln!(&mut out, "    }}").unwrap();
     writeln!(&mut out).unwrap();
-
-    writeln!(&mut out, "    pub(crate) fn arity(self) -> u8 {{").unwrap();
-    writeln!(&mut out, "        match self {{").unwrap();
-    writeln!(&mut out, "            BuiltinFunction::Len => 1,").unwrap();
-    writeln!(&mut out, "            BuiltinFunction::Slice => 3,").unwrap();
-    writeln!(&mut out, "            BuiltinFunction::Concat => 2,").unwrap();
-    writeln!(&mut out, "            BuiltinFunction::ArrayNew => 0,").unwrap();
-    writeln!(&mut out, "            BuiltinFunction::ArrayPush => 2,").unwrap();
-    writeln!(&mut out, "            BuiltinFunction::MapNew => 0,").unwrap();
-    writeln!(&mut out, "            BuiltinFunction::Get => 2,").unwrap();
-    writeln!(&mut out, "            BuiltinFunction::Set => 3,").unwrap();
-    writeln!(&mut out, "            BuiltinFunction::Keys => 1,").unwrap();
-    for decl in pre_count {
-        for member in &decl.members {
-            if let NamespaceMemberDecl::Builtin { variant, arity, .. } = member {
-                writeln!(
-                    &mut out,
-                    "            BuiltinFunction::{variant} => {arity},"
-                )
-                .unwrap();
-            }
-        }
-    }
-    writeln!(&mut out, "            BuiltinFunction::Count => 1,").unwrap();
-    for decl in post_count {
-        for member in &decl.members {
-            if let NamespaceMemberDecl::Builtin { variant, arity, .. } = member {
-                writeln!(
-                    &mut out,
-                    "            BuiltinFunction::{variant} => {arity},"
-                )
-                .unwrap();
-            }
-        }
-    }
     writeln!(
         &mut out,
-        "            BuiltinFunction::FormatTemplate => 2,"
+        "    pub(crate) fn from_call_index(index: u16) -> Option<Self> {{"
     )
     .unwrap();
-    writeln!(&mut out, "            BuiltinFunction::ToString => 1,").unwrap();
-    writeln!(&mut out, "            BuiltinFunction::TypeOf => 1,").unwrap();
-    writeln!(&mut out, "            BuiltinFunction::Assert => 1,").unwrap();
+    writeln!(
+        &mut out,
+        "        if let Some((_, builtin)) = SPECIAL_CALL_BUILTINS.iter().find(|(call_index, _)| *call_index == index) {{"
+    )
+    .unwrap();
+    writeln!(&mut out, "            return Some(*builtin);").unwrap();
     writeln!(&mut out, "        }}").unwrap();
-    writeln!(&mut out, "    }}").unwrap();
-    writeln!(&mut out).unwrap();
-
     writeln!(
         &mut out,
-        "    pub(crate) fn static_return_type(self) -> ValueType {{"
-    )
-    .unwrap();
-    writeln!(&mut out, "        match self {{").unwrap();
-    writeln!(&mut out, "            BuiltinFunction::Len => ValueType::Int,").unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::ArrayNew => ValueType::Array,"
+        "        let offset = index.checked_sub(BUILTIN_CALL_BASE)?;"
     )
     .unwrap();
     writeln!(
         &mut out,
-        "            BuiltinFunction::MapNew => ValueType::Map,"
-    )
-    .unwrap();
-    writeln!(&mut out, "            BuiltinFunction::Keys => ValueType::Array,").unwrap();
-    writeln!(&mut out, "            BuiltinFunction::Count => ValueType::Int,").unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::FormatTemplate => ValueType::String,"
+        "        if offset >= BUILTIN_CALL_COUNT {{ return None; }}"
     )
     .unwrap();
     writeln!(
         &mut out,
-        "            BuiltinFunction::ToString => ValueType::String,"
+        "        MAIN_RANGE_BUILTINS.get(offset as usize).copied()"
     )
     .unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::TypeOf => ValueType::String,"
-    )
-    .unwrap();
-    writeln!(&mut out, "            BuiltinFunction::Assert => ValueType::Null,").unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::Slice | BuiltinFunction::Concat | BuiltinFunction::ArrayPush | BuiltinFunction::Get | BuiltinFunction::Set => ValueType::Unknown,"
-    )
-    .unwrap();
-    for decl in declarations {
-        for member in &decl.members {
-            if let NamespaceMemberDecl::Builtin {
-                variant,
-                return_type,
-                ..
-            } = member
-            {
-                writeln!(
-                    &mut out,
-                    "            BuiltinFunction::{variant} => ValueType::{return_type},"
-                )
-                .unwrap();
-            }
-        }
-    }
-    writeln!(&mut out, "        }}").unwrap();
     writeln!(&mut out, "    }}").unwrap();
     writeln!(&mut out, "}}").unwrap();
+
     out
 }
 
-fn render_namespaced_dispatch(declarations: &[NamespaceDecl]) -> String {
+fn render_builtin_runtime_dispatch(
+    host_callables: &[CallableDecl],
+    builtin_callables: &[CallableDecl],
+) -> String {
     let mut out = String::new();
+
+    for callable in host_callables {
+        let wrapper = callable
+            .wrapper
+            .as_ref()
+            .expect("host wrappers should exist");
+        let adapter_name = host_wrapper_adapter_name(callable);
+        writeln!(
+            &mut out,
+            "fn {adapter_name}(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {{"
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "    {}",
+            render_wrapper_call(&callable.module, wrapper, SourceCategory::DefaultHost)
+        )
+        .unwrap();
+        writeln!(&mut out, "}}").unwrap();
+        writeln!(&mut out).unwrap();
+    }
+
+    writeln!(
+        &mut out,
+        "pub(crate) fn register_default_host_functions(registry: &mut super::HostFunctionRegistry) {{"
+    )
+    .unwrap();
+    for callable in host_callables {
+        writeln!(
+            &mut out,
+            "    registry.register_static({:?}, {}, {});",
+            callable.name,
+            callable.params.len(),
+            host_wrapper_adapter_name(callable)
+        )
+        .unwrap();
+    }
+    writeln!(&mut out, "}}").unwrap();
+    writeln!(&mut out).unwrap();
+
+    writeln!(
+        &mut out,
+        "pub(crate) fn bind_default_host_function(vm: &mut Vm, name: &str) -> bool {{"
+    )
+    .unwrap();
+    writeln!(&mut out, "    match name {{").unwrap();
+    for callable in host_callables {
+        writeln!(&mut out, "        {:?} => {{", callable.name).unwrap();
+        writeln!(
+            &mut out,
+            "            vm.bind_static_function({:?}, {});",
+            callable.name,
+            host_wrapper_adapter_name(callable)
+        )
+        .unwrap();
+        writeln!(&mut out, "            true").unwrap();
+        writeln!(&mut out, "        }}").unwrap();
+    }
+    writeln!(&mut out, "        _ => false,").unwrap();
+    writeln!(&mut out, "    }}").unwrap();
+    writeln!(&mut out, "}}").unwrap();
+    writeln!(&mut out).unwrap();
+
     writeln!(
         &mut out,
         "fn execute_namespaced_builtin_call(vm: &mut Vm, builtin: BuiltinFunction, args: Vec<Value>) -> VmResult<BuiltinCallOutcome> {{"
     )
     .unwrap();
     writeln!(&mut out, "    match builtin {{").unwrap();
-    for decl in declarations {
-        for member in &decl.members {
-            if let NamespaceMemberDecl::Builtin {
-                variant,
-                handler,
-                dispatch,
-                ..
-            } = member
-            {
-                let arm = match dispatch.as_str() {
-                    "args_ref" => format!(
-                        "BuiltinFunction::{variant} => {}::{handler}(&args).map(BuiltinCallOutcome::Return),",
-                        decl.module
-                    ),
-                    "args_owned" => format!(
-                        "BuiltinFunction::{variant} => {}::{handler}(args).map(BuiltinCallOutcome::Return),",
-                        decl.module
-                    ),
-                    "vm_args_owned" => format!(
-                        "BuiltinFunction::{variant} => {}::{handler}(vm, args),",
-                        decl.module
-                    ),
-                    "vm_noargs" => {
-                        format!(
-                            "BuiltinFunction::{variant} => {}::{handler}(vm),",
-                            decl.module
-                        )
-                    }
-                    other => panic!("unsupported dispatch kind {other}"),
-                };
-                writeln!(&mut out, "        {arm}").unwrap();
-            }
-        }
+    for callable in builtin_callables
+        .iter()
+        .filter(|callable| callable.wrapper.is_some())
+    {
+        let variant = builtin_variant_name(&callable.name);
+        let wrapper = callable
+            .wrapper
+            .as_ref()
+            .expect("builtin wrappers should exist");
+        writeln!(
+            &mut out,
+            "        BuiltinFunction::{variant} => {},",
+            render_wrapper_call(&callable.module, wrapper, SourceCategory::NamespacedBuiltin)
+        )
+        .unwrap();
     }
     writeln!(
         &mut out,
@@ -782,50 +707,945 @@ fn render_namespaced_dispatch(declarations: &[NamespaceDecl]) -> String {
     .unwrap();
     writeln!(&mut out, "    }}").unwrap();
     writeln!(&mut out, "}}").unwrap();
+
     out
 }
 
-fn render_builtin_members(
-    declarations: &[NamespaceDecl],
-    render: impl Fn(&NamespaceDecl, &NamespaceMemberDecl) -> String,
-) -> String {
+fn render_callable_consts(callables: &[&CallableDecl]) -> String {
     let mut out = String::new();
-    for decl in declarations {
-        for member in &decl.members {
-            let rendered = render(decl, member);
-            if !rendered.is_empty() {
-                writeln!(&mut out, "{rendered}").unwrap();
-            }
+    for callable in callables {
+        let base = callable_const_base(callable);
+        writeln!(
+            &mut out,
+            "const {base}_PARAMS: [CallableParam; {}] = [",
+            callable.params.len()
+        )
+        .unwrap();
+        for param in &callable.params {
+            writeln!(
+                &mut out,
+                "    CallableParam {{ name: {:?}, ty: CallableParamType::{}, optional: {} }},",
+                param.name,
+                callable_param_variant(&param.ty_label),
+                param.optional
+            )
+            .unwrap();
+        }
+        writeln!(&mut out, "];").unwrap();
+        writeln!(
+            &mut out,
+            "const {base}_SIGNATURE: CallableSignature = CallableSignature {{ params: &{base}_PARAMS, return_type: {:?} }};",
+            callable.return_label
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "#[allow(dead_code)]\nconst {base}_DEF: CallableDef = CallableDef {{ name: {:?}, docs: {:?}, signature: {base}_SIGNATURE }};",
+            callable.name,
+            callable.docs
+        )
+        .unwrap();
+        writeln!(&mut out).unwrap();
+    }
+    out
+}
+
+fn render_signature_group_const(out: &mut String, group: &Group<'_>, const_name: &str) {
+    writeln!(
+        out,
+        "const {const_name}: [CallableSignature; {}] = [",
+        group.items.len()
+    )
+    .unwrap();
+    for callable in &group.items {
+        writeln!(out, "    {}_SIGNATURE,", callable_const_base(callable)).unwrap();
+    }
+    writeln!(out, "];").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn render_namespace_metadata(out: &mut String, namespaces: &[NamespaceDecl], groups: &[Group<'_>]) {
+    for namespace in namespaces {
+        let module_name = format!("namespace_{}", namespace.namespace);
+        writeln!(&mut *out, "mod {module_name} {{").unwrap();
+        writeln!(
+            &mut *out,
+            "    use super::{{BuiltinFunction, BuiltinNamespaceLookup, BuiltinNamespaceMemberLookup, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec, ValueType}};"
+        )
+        .unwrap();
+        let namespace_groups = groups
+            .iter()
+            .filter(|group| group.key.starts_with(&(namespace.namespace.clone() + "::")))
+            .collect::<Vec<_>>();
+        writeln!(
+            &mut *out,
+            "    pub(super) const MEMBERS: &[BuiltinNamespaceMemberSpec] = &["
+        )
+        .unwrap();
+        for group in &namespace_groups {
+            let member_name = group
+                .key
+                .split_once("::")
+                .map(|(_, member)| member)
+                .expect("namespaced callable group should include ::");
+            let docs = group
+                .items
+                .first()
+                .map(|callable| callable.docs.as_str())
+                .unwrap_or("");
+            let arity = group
+                .items
+                .iter()
+                .map(|callable| callable.params.len())
+                .max()
+                .unwrap_or(0);
+            let return_type = group
+                .items
+                .first()
+                .map(|callable| callable.static_return_type.as_str())
+                .unwrap_or("Unknown");
+            writeln!(
+                &mut *out,
+                "        BuiltinNamespaceMemberSpec::new({member_name:?}, {arity}, ValueType::{return_type}, {docs:?}),"
+            )
+            .unwrap();
+        }
+        writeln!(&mut *out, "    ];").unwrap();
+        writeln!(
+            &mut *out,
+            "    pub(super) const LOOKUP_MEMBERS: &[BuiltinNamespaceMemberLookup] = &["
+        )
+        .unwrap();
+        for group in &namespace_groups {
+            let member_name = group
+                .key
+                .split_once("::")
+                .map(|(_, member)| member)
+                .expect("namespaced callable group should include ::");
+            writeln!(
+                &mut *out,
+                "        BuiltinNamespaceMemberLookup::new({member_name:?}, BuiltinFunction::{}),",
+                namespace_member_target_variant(&group.key)
+            )
+            .unwrap();
+        }
+        writeln!(&mut *out, "    ];").unwrap();
+        writeln!(
+            &mut *out,
+            "    pub(super) const LOOKUP: BuiltinNamespaceLookup = BuiltinNamespaceLookup::new({:?}, LOOKUP_MEMBERS);",
+            namespace.namespace
+        )
+        .unwrap();
+        writeln!(
+            &mut *out,
+            "    pub(super) const SPEC: BuiltinNamespaceSpec = BuiltinNamespaceSpec::new({:?}, {:?}, {}, MEMBERS);",
+            namespace.namespace,
+            namespace.docs,
+            namespace.runtime_supported_on_wasm
+        )
+        .unwrap();
+        writeln!(&mut *out, "}}").unwrap();
+        writeln!(&mut *out).unwrap();
+    }
+
+    writeln!(
+        &mut *out,
+        "const BUILTIN_NAMESPACE_LOOKUPS: &[BuiltinNamespaceLookup] = &["
+    )
+    .unwrap();
+    for namespace in namespaces {
+        writeln!(&mut *out, "    namespace_{}::LOOKUP,", namespace.namespace).unwrap();
+    }
+    writeln!(&mut *out, "];").unwrap();
+    writeln!(&mut *out).unwrap();
+
+    writeln!(
+        &mut *out,
+        "const BUILTIN_NAMESPACE_SPECS: &[BuiltinNamespaceSpec] = &["
+    )
+    .unwrap();
+    for namespace in namespaces {
+        writeln!(&mut *out, "    namespace_{}::SPEC,", namespace.namespace).unwrap();
+    }
+    writeln!(&mut *out, "];").unwrap();
+    writeln!(&mut *out).unwrap();
+}
+
+fn render_default_host_array(out: &mut String, groups: &[Group<'_>]) {
+    writeln!(
+        out,
+        "const DEFAULT_HOST_CALLABLES: [CallableDef; {}] = [",
+        groups.len()
+    )
+    .unwrap();
+    for group in groups {
+        let callable = group.items.first().expect("host group should not be empty");
+        writeln!(out, "    {}_DEF,", callable_const_base(callable)).unwrap();
+    }
+    writeln!(out, "];").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn render_language_builtin_specs(
+    out: &mut String,
+    language_builtin_order: &[String],
+    groups: &[Group<'_>],
+) {
+    writeln!(
+        out,
+        "const LANGUAGE_BUILTIN_SPECS: [LanguageBuiltinSpec; {}] = [",
+        language_builtin_order.len()
+    )
+    .unwrap();
+    for name in language_builtin_order {
+        let group = groups
+            .iter()
+            .find(|group| group.key == *name)
+            .unwrap_or_else(|| panic!("missing language builtin group '{name}'"));
+        let docs = group
+            .items
+            .first()
+            .map(|callable| callable.docs.as_str())
+            .unwrap_or("");
+        writeln!(
+            out,
+            "    LanguageBuiltinSpec {{ name: {:?}, docs: {:?}, signatures: &{} }},",
+            name,
+            docs,
+            language_signature_group_const_name(name)
+        )
+        .unwrap();
+    }
+    writeln!(out, "];").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn render_namespace_member_signature_lookup(out: &mut String, groups: &[Group<'_>]) {
+    writeln!(
+        out,
+        "pub fn callable_signatures_for_builtin_namespace_member(namespace: &str, member: &str, arity: usize) -> Option<&'static [CallableSignature]> {{"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    let signatures: &'static [CallableSignature] = match (namespace, member) {{"
+    )
+    .unwrap();
+    for group in groups {
+        let (namespace, member) = group
+            .key
+            .split_once("::")
+            .expect("namespaced callable group should include ::");
+        writeln!(
+            out,
+            "        ({namespace:?}, {member:?}) => &{},",
+            namespace_member_signature_group_const_name(&group.key)
+        )
+        .unwrap();
+    }
+    writeln!(out, "        _ => return None,").unwrap();
+    writeln!(out, "    }};").unwrap();
+    writeln!(
+        out,
+        "    if signatures.iter().any(|signature| {{ let required = signature.params.iter().take_while(|param| !param.optional).count(); required <= arity && arity <= signature.params.len() }}) {{"
+    )
+    .unwrap();
+    writeln!(out, "        Some(signatures)").unwrap();
+    writeln!(out, "    }} else {{").unwrap();
+    writeln!(out, "        None").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn render_builtin_name_method(
+    out: &mut String,
+    builtin_variant_order: &[String],
+    actual_builtin_by_variant: &HashMap<String, Vec<&CallableDecl>>,
+) {
+    writeln!(out, "    pub(crate) fn name(self) -> &'static str {{").unwrap();
+    writeln!(out, "        match self {{").unwrap();
+    for variant in builtin_variant_order {
+        let internal_name = builtin_internal_name(variant, actual_builtin_by_variant);
+        writeln!(
+            out,
+            "            BuiltinFunction::{variant} => {internal_name:?},"
+        )
+        .unwrap();
+    }
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn render_builtin_arity_method(
+    out: &mut String,
+    builtin_variant_order: &[String],
+    actual_builtin_by_variant: &HashMap<String, Vec<&CallableDecl>>,
+) {
+    writeln!(out, "    pub(crate) fn arity(self) -> u8 {{").unwrap();
+    writeln!(out, "        match self {{").unwrap();
+    for variant in builtin_variant_order {
+        let arity = actual_builtin_by_variant
+            .get(variant)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|callable| required_param_count(&callable.params))
+                    .min()
+                    .unwrap_or(0)
+            })
+            .unwrap_or_else(|| panic!("missing arity for builtin variant '{variant}'"));
+        writeln!(out, "            BuiltinFunction::{variant} => {arity},").unwrap();
+    }
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn render_builtin_accepts_arity_method(
+    out: &mut String,
+    builtin_variant_order: &[String],
+    actual_builtin_by_variant: &HashMap<String, Vec<&CallableDecl>>,
+) {
+    writeln!(
+        out,
+        "    pub(crate) fn accepts_arity(self, arity: u8) -> bool {{"
+    )
+    .unwrap();
+    writeln!(out, "        match self {{").unwrap();
+    for variant in builtin_variant_order {
+        let conditions = actual_builtin_by_variant
+            .get(variant)
+            .unwrap_or_else(|| panic!("missing signatures for builtin variant '{variant}'"))
+            .iter()
+            .map(|callable| {
+                let min = required_param_count(&callable.params);
+                let max = callable.params.len();
+                if min == max {
+                    format!("arity as usize == {min}")
+                } else {
+                    format!("({min}..={max}).contains(&(arity as usize))")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" || ");
+        writeln!(
+            out,
+            "            BuiltinFunction::{variant} => {conditions},"
+        )
+        .unwrap();
+    }
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn render_builtin_static_return_type_method(
+    out: &mut String,
+    builtin_variant_order: &[String],
+    actual_builtin_by_variant: &HashMap<String, Vec<&CallableDecl>>,
+) {
+    writeln!(
+        out,
+        "    pub(crate) fn static_return_type(self) -> ValueType {{"
+    )
+    .unwrap();
+    writeln!(out, "        match self {{").unwrap();
+    for variant in builtin_variant_order {
+        let value_type = actual_builtin_by_variant
+            .get(variant)
+            .and_then(|items| items.first())
+            .map(|callable| callable.static_return_type.as_str())
+            .unwrap_or_else(|| panic!("missing return type for builtin variant '{variant}'"));
+        writeln!(
+            out,
+            "            BuiltinFunction::{variant} => ValueType::{value_type},"
+        )
+        .unwrap();
+    }
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn render_builtin_signature_method(out: &mut String, builtin_variant_order: &[String]) {
+    writeln!(
+        out,
+        "    pub(crate) fn callable_signatures(self) -> &'static [CallableSignature] {{"
+    )
+    .unwrap();
+    writeln!(out, "        match self {{").unwrap();
+    for variant in builtin_variant_order {
+        writeln!(
+            out,
+            "            BuiltinFunction::{variant} => &{},",
+            variant_signature_group_const_name(variant)
+        )
+        .unwrap();
+    }
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn required_param_count(params: &[CallableParamDecl]) -> usize {
+    params.iter().take_while(|param| !param.optional).count()
+}
+
+fn stable_groups<F>(callables: &[CallableDecl], mut key_fn: F) -> Vec<Group<'_>>
+where
+    F: FnMut(&CallableDecl) -> String,
+{
+    let mut groups = Vec::<Group<'_>>::new();
+    let mut positions = HashMap::<String, usize>::new();
+    for callable in callables {
+        let key = key_fn(callable);
+        if let Some(index) = positions.get(&key).copied() {
+            groups[index].items.push(callable);
+        } else {
+            positions.insert(key.clone(), groups.len());
+            groups.push(Group {
+                key,
+                items: vec![callable],
+            });
         }
     }
-    out
+    groups
 }
 
-fn parse_ident(source: &str) -> (String, &str) {
-    let source = skip_ws(source);
-    let end = source
-        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-        .unwrap_or(source.len());
-    if end == 0 {
-        panic!("expected identifier");
-    }
-    (source[..end].to_string(), &source[end..])
+fn callable_const_base(callable: &CallableDecl) -> String {
+    let prefix = callable.module.replace("::", "_");
+    to_shouty_snake(&format!("{prefix}_{}", callable.rust_ident))
 }
 
-fn parse_usize(source: &str) -> (usize, &str) {
-    let source = skip_ws(source);
-    let end = source
-        .find(|ch: char| !ch.is_ascii_digit())
-        .unwrap_or(source.len());
-    if end == 0 {
-        panic!("expected usize");
+fn callable_param_variant(label: &str) -> &'static str {
+    match label {
+        "any" => "Any",
+        "null" => "Null",
+        "int" => "Int",
+        "float" => "Float",
+        "bool" => "Bool",
+        "string" => "String",
+        "array" => "Array",
+        "map" => "Map",
+        "number" => "Number",
+        other => panic!("unsupported callable param type '{other}'"),
     }
-    (
-        source[..end]
-            .parse::<usize>()
-            .unwrap_or_else(|err| panic!("invalid usize '{}': {err}", &source[..end])),
-        &source[end..],
-    )
+}
+
+fn core_prefix_builtin_order() -> &'static [&'static str] {
+    &[
+        "len",
+        "slice",
+        "concat",
+        "array_new",
+        "array_push",
+        "map_new",
+        "get",
+        "set",
+        "keys",
+    ]
+}
+
+fn core_suffix_builtin_order() -> &'static [&'static str] {
+    &["count"]
+}
+
+fn special_builtin_order() -> &'static [&'static str] {
+    &["__format_template", "__to_string", "type", "assert"]
+}
+
+fn required_language_builtin_stubs() -> &'static [&'static str] {
+    &[
+        "len",
+        "slice",
+        "concat",
+        "array_new",
+        "array_push",
+        "map_new",
+        "get",
+        "set",
+        "keys",
+        "count",
+        "type",
+        "assert",
+    ]
+}
+
+fn required_internal_builtin_stubs() -> &'static [&'static str] {
+    &["__format_template", "__to_string"]
+}
+
+fn is_language_builtin_stub_name(name: &str) -> bool {
+    !name.contains("::") && !is_internal_builtin_name(name)
+}
+
+fn is_internal_builtin_name(name: &str) -> bool {
+    name.starts_with("__")
+}
+
+fn ordered_actual_builtin_variants<'a>(
+    namespaces: &[NamespaceDecl],
+    builtin_callables: &'a [CallableDecl],
+    metadata_callables: &'a [CallableDecl],
+) -> (Vec<String>, HashMap<String, Vec<&'a CallableDecl>>) {
+    let mut actual_builtin_by_variant = HashMap::<String, Vec<&CallableDecl>>::new();
+    for callable in builtin_callables {
+        let variant = builtin_variant_name(&callable.name);
+        actual_builtin_by_variant
+            .entry(variant)
+            .or_default()
+            .push(callable);
+    }
+    for callable in metadata_callables {
+        let variant = builtin_variant_name(&callable.name);
+        actual_builtin_by_variant
+            .entry(variant)
+            .or_default()
+            .push(callable);
+    }
+
+    let mut ordered = Vec::new();
+    let mut seen = HashSet::new();
+    for name in core_prefix_builtin_order() {
+        push_ordered_variant(&mut ordered, &mut seen, builtin_variant_name(name));
+    }
+    for namespace in namespaces {
+        for callable in builtin_callables
+            .iter()
+            .filter(|callable| namespace_root(&callable.name) == Some(namespace.namespace.as_str()))
+        {
+            push_ordered_variant(
+                &mut ordered,
+                &mut seen,
+                builtin_variant_name(&callable.name),
+            );
+        }
+    }
+    for name in core_suffix_builtin_order() {
+        push_ordered_variant(&mut ordered, &mut seen, builtin_variant_name(name));
+    }
+    for name in special_builtin_order() {
+        push_ordered_variant(&mut ordered, &mut seen, builtin_variant_name(name));
+    }
+
+    let extras = actual_builtin_by_variant
+        .keys()
+        .filter(|variant| !seen.contains(*variant))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !extras.is_empty() {
+        panic!("unordered builtin variants remain after generation: {extras:?}");
+    }
+
+    (ordered, actual_builtin_by_variant)
+}
+
+fn push_ordered_variant(out: &mut Vec<String>, seen: &mut HashSet<String>, variant: String) {
+    if seen.insert(variant.clone()) {
+        out.push(variant);
+    }
+}
+
+fn namespace_root(name: &str) -> Option<&str> {
+    name.split_once("::").map(|(root, _)| root)
+}
+
+fn builtin_variant_name(name: &str) -> String {
+    match name {
+        "type" => "TypeOf".to_string(),
+        "__to_string" => "ToString".to_string(),
+        "__format_template" => "FormatTemplate".to_string(),
+        other => {
+            let mut out = String::new();
+            for segment in other.split("::") {
+                for part in segment.split('_') {
+                    if part.is_empty() {
+                        continue;
+                    }
+                    out.push_str(&variant_segment(part));
+                }
+            }
+            if out.is_empty() {
+                panic!("unsupported builtin variant name for '{other}'");
+            }
+            out
+        }
+    }
+}
+
+fn variant_segment(segment: &str) -> String {
+    match segment {
+        "nan" => "NaN".to_string(),
+        "powf" => "PowF".to_string(),
+        "powi" => "PowI".to_string(),
+        "copysign" => "CopySign".to_string(),
+        other => {
+            let mut chars = other.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let mut out = String::new();
+            out.push(first.to_ascii_uppercase());
+            for ch in chars {
+                out.push(ch.to_ascii_lowercase());
+            }
+            out
+        }
+    }
+}
+
+fn main_range_builtin_variants(builtin_variant_order: &[String]) -> Vec<String> {
+    builtin_variant_order
+        .iter()
+        .filter(|variant| {
+            !matches!(
+                variant.as_str(),
+                "FormatTemplate" | "ToString" | "TypeOf" | "Assert"
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn namespace_member_target_variant(name: &str) -> String {
+    builtin_variant_name(name)
+}
+
+fn builtin_internal_name(
+    variant: &str,
+    actual_builtin_by_variant: &HashMap<String, Vec<&CallableDecl>>,
+) -> String {
+    match variant {
+        "TypeOf" => "type_of".to_string(),
+        "ToString" => "__to_string".to_string(),
+        "FormatTemplate" => "__format_template".to_string(),
+        _ => actual_builtin_by_variant
+            .get(variant)
+            .and_then(|items| items.first())
+            .map(|callable| callable.name.replace("::", "_"))
+            .unwrap_or_else(|| panic!("missing builtin name for variant '{variant}'")),
+    }
+}
+
+fn language_signature_group_const_name(name: &str) -> String {
+    format!("LANGUAGE_{}_SIGNATURES", to_shouty_snake(name))
+}
+
+fn variant_signature_group_const_name(variant: &str) -> String {
+    format!("BUILTIN_{}_SIGNATURES", to_shouty_snake(variant))
+}
+
+fn namespace_member_signature_group_const_name(name: &str) -> String {
+    format!("MEMBER_{}_SIGNATURES", to_shouty_snake(name))
+}
+
+fn render_wrapper_call(module: &str, wrapper: &WrapperDecl, category: SourceCategory) -> String {
+    let mut args = Vec::new();
+    for param in &wrapper.params {
+        match param {
+            WrapperParamKind::Vm => args.push("vm".to_string()),
+            WrapperParamKind::SliceArgs => args.push("&args".to_string()),
+        }
+    }
+    let call = format!("{module}::{}({})", wrapper.fn_name, args.join(", "));
+    match category {
+        SourceCategory::DefaultHost => {
+            format!("{call}.map(IntoHostCallOutcome::into_host_call_outcome)")
+        }
+        SourceCategory::NamespacedBuiltin => {
+            format!("{call}.map(IntoBuiltinCallOutcome::into_builtin_call_outcome)")
+        }
+        SourceCategory::MetadataOnlyBuiltin => call,
+    }
+}
+
+fn wrapper_name_for_callable(rust_ident: &str) -> String {
+    match rust_ident.strip_suffix("_impl") {
+        Some(prefix) => prefix.to_string(),
+        None => rust_ident.to_string(),
+    }
+}
+
+fn host_wrapper_adapter_name(callable: &CallableDecl) -> String {
+    format!("__pd_host_adapter_{}", callable.rust_ident)
+}
+
+fn generated_wrapper_decl(function: &ItemFn) -> WrapperDecl {
+    let mut params = Vec::new();
+    for input in &function.sig.inputs {
+        let FnArg::Typed(pat_type) = input else {
+            panic!("methods are not supported in #[pd_host_function] declarations");
+        };
+        if is_vm_context_type(&pat_type.ty) {
+            params.push(WrapperParamKind::Vm);
+        }
+    }
+    params.push(WrapperParamKind::SliceArgs);
+    WrapperDecl {
+        fn_name: wrapper_name_for_callable(&function.sig.ident.to_string()),
+        params,
+    }
+}
+
+fn parse_callable_params(function: &ItemFn) -> Vec<CallableParamDecl> {
+    function
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|input| {
+            let FnArg::Typed(pat_type) = input else {
+                panic!("methods are not supported in #[pd_host_function] declarations");
+            };
+            if is_vm_context_type(&pat_type.ty) {
+                return None;
+            }
+            let Pat::Ident(ident) = pat_type.pat.as_ref() else {
+                panic!("callable parameters must use identifier patterns");
+            };
+            let (ty_label, optional) = param_type_label(&pat_type.ty);
+            Some(CallableParamDecl {
+                name: ident.ident.to_string(),
+                ty_label,
+                optional,
+            })
+        })
+        .collect()
+}
+
+fn param_type_label(ty: &Type) -> (String, bool) {
+    match ty {
+        Type::Group(group) => param_type_label(&group.elem),
+        Type::Paren(paren) => param_type_label(&paren.elem),
+        Type::Reference(reference) => param_type_label(&reference.elem),
+        Type::Path(path) => {
+            let segment = path
+                .path
+                .segments
+                .last()
+                .unwrap_or_else(|| panic!("unsupported callable type"));
+            if segment.ident == "Option" {
+                let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+                    panic!("Option<T> requires one generic argument");
+                };
+                let Some(syn::GenericArgument::Type(inner)) = args.args.first() else {
+                    panic!("Option<T> requires one generic argument");
+                };
+                let (inner_label, inner_optional) = param_type_label(inner);
+                if inner_optional {
+                    panic!("nested Option<T> is not supported in callable parameters");
+                }
+                (inner_label, true)
+            } else {
+                (type_label(ty), false)
+            }
+        }
+        _ => (type_label(ty), false),
+    }
+}
+
+fn pd_host_function_name(attrs: &[Attribute]) -> Option<String> {
+    let attr = attrs
+        .iter()
+        .find(|attr| attr.path().is_ident("pd_host_function"))?;
+    let Meta::List(list) = &attr.meta else {
+        panic!("#[pd_host_function] must use name = \"...\"");
+    };
+    let args = list
+        .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+        .unwrap_or_else(|err| panic!("failed to parse #[pd_host_function(...)] args: {err}"));
+    let Some(Meta::NameValue(name_value)) = args.first() else {
+        panic!("#[pd_host_function] requires name = \"...\"");
+    };
+    if !name_value.path.is_ident("name") {
+        panic!("#[pd_host_function] only supports name = \"...\"");
+    }
+    match &name_value.value {
+        syn::Expr::Lit(expr_lit) => {
+            if let syn::Lit::Str(value) = &expr_lit.lit {
+                Some(value.value())
+            } else {
+                panic!("callable name must be a string literal");
+            }
+        }
+        _ => panic!("callable name must be a string literal"),
+    }
+}
+
+fn doc_string(attrs: &[Attribute]) -> String {
+    attrs
+        .iter()
+        .filter_map(|attr| {
+            if !attr.path().is_ident("doc") {
+                return None;
+            }
+            match &attr.meta {
+                Meta::NameValue(name_value) => match &name_value.value {
+                    syn::Expr::Lit(expr_lit) => match &expr_lit.lit {
+                        syn::Lit::Str(value) => Some(value.value().trim().to_string()),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            }
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn return_type_label(output: &ReturnType) -> String {
+    match output {
+        ReturnType::Default => "null".to_string(),
+        ReturnType::Type(_, ty) => type_label(ty),
+    }
+}
+
+fn static_return_type_label(output: &ReturnType) -> String {
+    value_type_from_label(&return_type_label(output)).to_string()
+}
+
+fn type_label(ty: &Type) -> String {
+    match ty {
+        Type::Group(group) => type_label(&group.elem),
+        Type::Paren(paren) => type_label(&paren.elem),
+        Type::Reference(reference) => type_label(&reference.elem),
+        Type::Tuple(tuple) if tuple.elems.is_empty() => "null".to_string(),
+        Type::Path(path) => {
+            let segment = path
+                .path
+                .segments
+                .last()
+                .unwrap_or_else(|| panic!("unsupported callable type"));
+            let ident = segment.ident.to_string();
+            match ident.as_str() {
+                "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64"
+                | "u128" | "usize" => "int".to_string(),
+                "f32" | "f64" => "float".to_string(),
+                "bool" => "bool".to_string(),
+                "String" | "str" => "string".to_string(),
+                "Any" | "AnyValue" | "Value" => "any".to_string(),
+                "Array" | "VmArray" => "array".to_string(),
+                "Map" | "VmMap" => "map".to_string(),
+                "Number" | "NumberValue" => "number".to_string(),
+                "Unknown" | "UnknownValue" => "unknown".to_string(),
+                "Option" => {
+                    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+                        panic!("Option<T> requires one generic argument");
+                    };
+                    let Some(syn::GenericArgument::Type(inner)) = args.args.first() else {
+                        panic!("Option<T> requires one generic argument");
+                    };
+                    format!("{} | null", type_label(inner))
+                }
+                "VmResult" | "BuiltinResult" | "HostResult" => {
+                    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+                        panic!("{ident}<T> requires one generic argument");
+                    };
+                    let Some(syn::GenericArgument::Type(inner)) = args.args.first() else {
+                        panic!("{ident}<T> requires one generic argument");
+                    };
+                    type_label(inner)
+                }
+                "Vec" => type_label_for_vec(segment),
+                _ => panic!("unsupported callable type '{ident}'"),
+            }
+        }
+        _ => panic!("unsupported callable type"),
+    }
+}
+
+fn type_label_for_vec(segment: &syn::PathSegment) -> String {
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        panic!("Vec<T> requires one generic argument");
+    };
+    let Some(syn::GenericArgument::Type(inner)) = args.args.first() else {
+        panic!("Vec<T> requires one generic argument");
+    };
+    if is_value_type(inner) {
+        return "array".to_string();
+    }
+    match inner {
+        Type::Tuple(tuple) if tuple.elems.len() == 2 => {
+            let lhs = tuple
+                .elems
+                .first()
+                .expect("tuple should contain first element");
+            let rhs = tuple
+                .elems
+                .last()
+                .expect("tuple should contain second element");
+            if is_value_type(lhs) && is_value_type(rhs) {
+                "map".to_string()
+            } else {
+                panic!("unsupported Vec tuple type in callable metadata")
+            }
+        }
+        _ => panic!("unsupported Vec return type in callable metadata"),
+    }
+}
+
+fn value_type_from_label(label: &str) -> &'static str {
+    match label {
+        "null" => "Null",
+        "int" => "Int",
+        "float" => "Float",
+        "bool" => "Bool",
+        "string" => "String",
+        "array" => "Array",
+        "map" => "Map",
+        _ => "Unknown",
+    }
+}
+
+fn is_vm_context_type(ty: &Type) -> bool {
+    match ty {
+        Type::Group(group) => is_vm_context_type(&group.elem),
+        Type::Paren(paren) => is_vm_context_type(&paren.elem),
+        Type::Reference(reference) => is_vm_context_type(&reference.elem),
+        Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "Vm"),
+        _ => false,
+    }
+}
+
+fn is_value_type(ty: &Type) -> bool {
+    match ty {
+        Type::Group(group) => is_value_type(&group.elem),
+        Type::Paren(paren) => is_value_type(&paren.elem),
+        Type::Reference(reference) => is_value_type(&reference.elem),
+        Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "Value"),
+        _ => false,
+    }
+}
+
+fn to_shouty_snake(value: &str) -> String {
+    let mut out = String::new();
+    let mut prev_is_lower_or_digit = false;
+    for ch in value.chars() {
+        if !ch.is_ascii_alphanumeric() {
+            if !out.ends_with('_') {
+                out.push('_');
+            }
+            prev_is_lower_or_digit = false;
+            continue;
+        }
+        if ch.is_ascii_uppercase() && prev_is_lower_or_digit && !out.ends_with('_') {
+            out.push('_');
+        }
+        out.push(ch.to_ascii_uppercase());
+        prev_is_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+    out.trim_matches('_').to_string()
 }
 
 fn parse_string(source: &str) -> (String, &str) {
@@ -851,39 +1671,35 @@ fn parse_string(source: &str) -> (String, &str) {
         }
         match ch {
             '\\' => escaped = true,
-            '"' => {
-                let end = 1 + index;
-                return (value, &source[end + 1..]);
-            }
+            '"' => return (value, &source[index + 2..]),
             other => value.push(other),
         }
     }
     panic!("unterminated string literal");
 }
 
+fn parse_bool(source: &str) -> (bool, &str) {
+    let source = skip_ws(source);
+    if let Some(rest) = source.strip_prefix("true") {
+        (true, rest)
+    } else if let Some(rest) = source.strip_prefix("false") {
+        (false, rest)
+    } else {
+        panic!("expected bool literal");
+    }
+}
+
 fn expect_comma(source: &str) -> &str {
     skip_ws(source)
         .strip_prefix(',')
-        .unwrap_or_else(|| panic!("expected comma in '{source}'"))
+        .unwrap_or_else(|| panic!("expected comma near '{source}'"))
 }
 
 fn skip_ws(source: &str) -> &str {
     source.trim_start_matches(char::is_whitespace)
 }
 
-fn skip_ws_and_commas(source: &str) -> &str {
-    source.trim_start_matches(|ch: char| ch.is_whitespace() || ch == ',')
-}
-
-fn find_matching(source: &str, open: char, close: char) -> usize {
-    let source = skip_ws(source);
-    let source = source
-        .strip_prefix(open)
-        .unwrap_or_else(|| panic!("expected '{open}'"));
-    find_matching_with_offset(source, open, close) + 1
-}
-
-fn find_matching_with_offset(source: &str, open: char, close: char) -> usize {
+fn find_matching_paren(source: &str) -> usize {
     let mut depth = 1usize;
     let mut in_string = false;
     let mut escaped = false;
@@ -902,8 +1718,8 @@ fn find_matching_with_offset(source: &str, open: char, close: char) -> usize {
         }
         match ch {
             '"' => in_string = true,
-            _ if ch == open => depth += 1,
-            _ if ch == close => {
+            '(' => depth += 1,
+            ')' => {
                 depth -= 1;
                 if depth == 0 {
                     return index;
@@ -912,5 +1728,5 @@ fn find_matching_with_offset(source: &str, open: char, close: char) -> usize {
             _ => {}
         }
     }
-    panic!("unterminated block starting with '{open}'");
+    panic!("unterminated macro invocation");
 }

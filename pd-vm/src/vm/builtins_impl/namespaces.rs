@@ -1,15 +1,7 @@
-include!("io.namespace.rs");
-include!("regex.namespace.rs");
-include!("json.namespace.rs");
-include!("jit.namespace.rs");
-include!("math.namespace.rs");
-
-macro_rules! declare_all_builtin_namespaces {
-    ($callback:ident) => {
-        declare_io_namespace!($callback)
-        declare_regex_namespace!($callback)
-        declare_json_namespace!($callback)
-        declare_jit_namespace!($callback)
-        declare_math_namespace!($callback)
-    };
-}
+builtin_namespaces![
+    builtin_namespace!("io", "io", "I/O builtin namespace.", false),
+    builtin_namespace!("re", "regex", "Regex builtin namespace.", true),
+    builtin_namespace!("json", "json", "JSON builtin namespace.", true),
+    builtin_namespace!("jit", "jit", "JIT control builtin namespace.", true),
+    builtin_namespace!("math", "math", "Numeric math builtin namespace.", true),
+];

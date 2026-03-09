@@ -1,8 +1,8 @@
 [workspace]
 members = [
+	"pd-vm/pd-host-function",
 	"pd-vm",
-	"pd-vm/pd-vm-lint-wasm",
-	"pd-vm/pd-vm-runtime-wasm",
+	"pd-vm/pd-vm-wasm",
 	"pd-edge-abi",
 	"pd-edge",
 	"pd-controller",

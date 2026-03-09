@@ -370,6 +370,23 @@ fn compiler_rejects_conflicting_named_function_plus_operand_flows() {
 }
 
 #[test]
+fn compiler_allows_unused_named_function_with_unobserved_plus_operands() {
+    let source = r#"
+        fn addme(x) {
+            x + x
+        }
+
+        42;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+}
+
+#[test]
 fn compiler_preserves_stable_for_loop_counter_types_after_loop() {
     let source = r#"
         let mut total = 0;
@@ -525,7 +542,7 @@ fn compiler_uses_generated_builtin_namespace_return_signatures() {
         use jit;
         use math;
         let encoded = json::encode({"a": 1});
-        let matched = re::is_match("a", "a");
+        let matched = re::match("a", "a");
         let enabled = jit::set_enabled(false);
         let pi = math::pi();
         encoded + "!";
