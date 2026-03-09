@@ -1,64 +1,40 @@
 use std::time::Duration;
 
-use super::super::{CallOutcome, HostFunctionRegistry, Value, Vm, VmError, VmResult};
+use super::super::{Value, Vm, VmError, VmResult};
+use super::AnyValue;
 use super::print::format_value;
+use pd_host_function::pd_host_function;
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const PRINT_NAME: &str = "print";
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const PRINTLN_NAME: &str = "println";
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const RUNTIME_SLEEP_NAME: &str = "runtime::sleep";
 
-pub(crate) fn register_default_host_functions(registry: &mut HostFunctionRegistry) {
-    registry.register_static(PRINT_NAME, 1, runtime_print);
-    registry.register_static(PRINTLN_NAME, 1, runtime_println);
-    registry.register_static(RUNTIME_SLEEP_NAME, 1, runtime_sleep);
-}
-
-pub(crate) fn bind_default_host_function(vm: &mut Vm, name: &str) -> bool {
-    match name {
-        PRINT_NAME => {
-            vm.bind_static_function(PRINT_NAME, runtime_print);
-            true
-        }
-        PRINTLN_NAME => {
-            vm.bind_static_function(PRINTLN_NAME, runtime_println);
-            true
-        }
-        RUNTIME_SLEEP_NAME => {
-            vm.bind_static_function(RUNTIME_SLEEP_NAME, runtime_sleep);
-            true
-        }
-        _ => false,
-    }
-}
-
-fn render_print_args(args: &[Value], newline: bool) -> String {
-    let mut rendered = args.iter().map(format_value).collect::<Vec<_>>().join(" ");
+fn render_print_value(value: &Value, newline: bool) -> String {
+    let mut rendered = format_value(value);
     if newline {
         rendered.push('\n');
     }
     rendered
 }
 
-fn runtime_print(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    vm.write_runtime_print(render_print_args(args, false))?;
-    Ok(CallOutcome::Return(args.to_vec()))
+/// Writes a value to the runtime print sink.
+#[pd_host_function(name = "print")]
+fn runtime_print_impl(vm: &mut Vm, value: &AnyValue) -> VmResult<AnyValue> {
+    vm.write_runtime_print(render_print_value(value, false))?;
+    Ok(value.clone())
 }
 
-fn runtime_println(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    vm.write_runtime_print(render_print_args(args, true))?;
-    Ok(CallOutcome::Return(args.to_vec()))
+/// Writes a value to the runtime print sink and appends a newline.
+#[pd_host_function(name = "println")]
+fn runtime_println_impl(vm: &mut Vm, value: &AnyValue) -> VmResult<AnyValue> {
+    vm.write_runtime_print(render_print_value(value, true))?;
+    Ok(value.clone())
 }
 
-fn sleep_duration(args: &[Value]) -> VmResult<Duration> {
-    let millis = match args.first() {
-        Some(Value::Int(value)) => *value,
-        Some(_) => return Err(VmError::TypeMismatch("int")),
-        None => {
-            return Err(VmError::HostError(
-                "missing argument: runtime::sleep milliseconds".to_string(),
-            ));
-        }
-    };
+fn sleep_duration(millis: i64) -> VmResult<Duration> {
     if millis < 0 {
         return Err(VmError::HostError(format!(
             "runtime::sleep expects non-negative milliseconds, got {millis}",
@@ -67,13 +43,15 @@ fn sleep_duration(args: &[Value]) -> VmResult<Duration> {
     Ok(Duration::from_millis(millis as u64))
 }
 
-fn runtime_sleep(_vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let duration = sleep_duration(args)?;
+/// Sleeps for the requested milliseconds.
+#[pd_host_function(name = "runtime::sleep")]
+fn runtime_sleep_impl(_vm: &mut Vm, ms: i64) -> VmResult<bool> {
+    let duration = sleep_duration(ms)?;
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::sleep(duration);
     #[cfg(target_arch = "wasm32")]
     let _ = duration;
-    Ok(CallOutcome::Return(vec![Value::Bool(true)]))
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -84,7 +62,7 @@ mod tests {
     use crate::bytecode::{HostImport, Program};
     use crate::vm::{HostFunctionRegistry, Value, Vm, VmStatus};
 
-    use super::{PRINT_NAME, PRINTLN_NAME, RUNTIME_SLEEP_NAME, runtime_sleep};
+    use super::{PRINT_NAME, PRINTLN_NAME, RUNTIME_SLEEP_NAME, runtime_sleep_impl};
 
     fn host_call_program(name: &str) -> Program {
         let mut bc = BytecodeBuilder::new();
@@ -109,8 +87,7 @@ mod tests {
             Vec::new(),
             vec![crate::bytecode::OpCode::Ret as u8],
         ));
-        let err =
-            runtime_sleep(&mut vm, &[Value::Int(-1)]).expect_err("negative sleep should fail");
+        let err = runtime_sleep_impl(&mut vm, -1).expect_err("negative sleep should fail");
         assert!(
             err.to_string()
                 .contains("runtime::sleep expects non-negative milliseconds"),

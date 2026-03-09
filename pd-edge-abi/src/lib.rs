@@ -59,6 +59,7 @@ pub struct AbiFunction {
     pub index: u16,
     pub name: &'static str,
     pub arity: u8,
+    pub param_names: &'static [&'static str],
     pub param_types: &'static [AbiParamType],
     pub return_type: AbiValueType,
 }
@@ -70,6 +71,19 @@ pub struct HostNamespaceSpec {
 }
 
 pub const ABI_VERSION: u16 = 10;
+
+#[allow(dead_code, unused_variables)]
+mod callable_specs {
+    mod marker {
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        pub struct Map;
+    }
+
+    use self::marker::Map;
+    use pd_host_function::pd_host_function;
+
+    include!("abi_spec/functions.rs");
+}
 
 include!(concat!(env!("OUT_DIR"), "/edge_abi_generated.rs"));
 
@@ -121,6 +135,9 @@ mod tests {
         for function in FUNCTIONS {
             assert!(manifest.contains(function.name));
             assert!(manifest.contains(function.return_type.as_str()));
+            for name in function.param_names {
+                assert!(manifest.contains(name));
+            }
             for param in function.param_types {
                 assert!(manifest.contains(param.as_str()));
             }

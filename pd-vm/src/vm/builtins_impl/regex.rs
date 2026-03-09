@@ -1,57 +1,46 @@
 use regex::Regex;
 
 use super::super::{Value, VmError, VmResult};
-use super::arg_string;
+use super::VmArray;
+use pd_host_function::pd_host_function;
 
-pub(super) fn builtin_re_is_match(args: &[Value]) -> VmResult<Vec<Value>> {
-    let pattern = arg_string(args, 0, "re_is_match pattern")?;
-    let text = arg_string(args, 1, "re_is_match text")?;
+#[pd_host_function(name = "re::match")]
+pub(super) fn builtin_re_match(pattern: &str, text: &str) -> VmResult<bool> {
     let regex = Regex::new(pattern)
-        .map_err(|err| VmError::HostError(format!("re_is_match invalid pattern: {err}")))?;
-    Ok(vec![Value::Bool(regex.is_match(text))])
+        .map_err(|err| VmError::HostError(format!("re_match invalid pattern: {err}")))?;
+    Ok(regex.is_match(text))
 }
 
-pub(super) fn builtin_re_find(args: &[Value]) -> VmResult<Vec<Value>> {
-    let pattern = arg_string(args, 0, "re_find pattern")?;
-    let text = arg_string(args, 1, "re_find text")?;
+#[pd_host_function(name = "re::find")]
+pub(super) fn builtin_re_find(pattern: &str, text: &str) -> VmResult<Option<String>> {
     let regex = Regex::new(pattern)
         .map_err(|err| VmError::HostError(format!("re_find invalid pattern: {err}")))?;
-    let value = match regex.find(text) {
-        Some(matched) => Value::string(matched.as_str().to_string()),
-        None => Value::Null,
-    };
-    Ok(vec![value])
+    Ok(regex.find(text).map(|matched| matched.as_str().to_string()))
 }
 
-pub(super) fn builtin_re_replace(args: &[Value]) -> VmResult<Vec<Value>> {
-    let pattern = arg_string(args, 0, "re_replace pattern")?;
-    let text = arg_string(args, 1, "re_replace text")?;
-    let replacement = arg_string(args, 2, "re_replace replacement")?;
+#[pd_host_function(name = "re::replace")]
+pub(super) fn builtin_re_replace(pattern: &str, text: &str, replacement: &str) -> VmResult<String> {
     let regex = Regex::new(pattern)
         .map_err(|err| VmError::HostError(format!("re_replace invalid pattern: {err}")))?;
-    let replaced = regex.replace_all(text, replacement).into_owned();
-    Ok(vec![Value::string(replaced)])
+    Ok(regex.replace_all(text, replacement).into_owned())
 }
 
-pub(super) fn builtin_re_split(args: &[Value]) -> VmResult<Vec<Value>> {
-    let pattern = arg_string(args, 0, "re_split pattern")?;
-    let text = arg_string(args, 1, "re_split text")?;
+#[pd_host_function(name = "re::split")]
+pub(super) fn builtin_re_split(pattern: &str, text: &str) -> VmResult<VmArray> {
     let regex = Regex::new(pattern)
         .map_err(|err| VmError::HostError(format!("re_split invalid pattern: {err}")))?;
-    let parts = regex
+    Ok(regex
         .split(text)
         .map(|part| Value::string(part.to_string()))
-        .collect::<Vec<_>>();
-    Ok(vec![Value::array(parts)])
+        .collect::<Vec<_>>())
 }
 
-pub(super) fn builtin_re_captures(args: &[Value]) -> VmResult<Vec<Value>> {
-    let pattern = arg_string(args, 0, "re_captures pattern")?;
-    let text = arg_string(args, 1, "re_captures text")?;
+#[pd_host_function(name = "re::captures")]
+pub(super) fn builtin_re_captures(pattern: &str, text: &str) -> VmResult<VmArray> {
     let regex = Regex::new(pattern)
         .map_err(|err| VmError::HostError(format!("re_captures invalid pattern: {err}")))?;
     let Some(captures) = regex.captures(text) else {
-        return Ok(vec![Value::array(Vec::new())]);
+        return Ok(Vec::new());
     };
 
     let mut groups = Vec::with_capacity(captures.len());
@@ -62,5 +51,5 @@ pub(super) fn builtin_re_captures(args: &[Value]) -> VmResult<Vec<Value>> {
         };
         groups.push(group_value);
     }
-    Ok(vec![Value::array(groups)])
+    Ok(groups)
 }

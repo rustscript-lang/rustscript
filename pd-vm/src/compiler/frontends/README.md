@@ -25,7 +25,7 @@ All frontends lower to the same frontend IR and VM bytecode model.
 | --- | --- | --- | --- | --- |
 | Local binding | `let x = 1;` | `let x = 1;` / `const x = 1;` | `local x = 1` / `local a, b = f()` | `(define x 1)` |
 | Assignment | `x = 2;` | `x = 2;` | `x = 2` | `(set! x 2)` |
-| Function declaration | `fn add(x) { x + 1; }` | `function add(x) { x + 1; }` | `local function add(x) return x + 1 end` | `(define (add x) (+ x 1))` |
+| Function declaration | `fn add(x) { x + 1 }` | `function add(x) { x + 1 }` | `local function add(x) return x + 1 end` | `(define (add x) (+ x 1))` |
 | Closure literal | `|x| x + 1` | `(x) => x + 1` | `function(x) return x + 1 end` | `(lambda (x) (+ x 1))` |
 | If statement | `if cond { ... } else { ... }` | `if (cond) { ... } else { ... }` | `if cond then ... elseif/elif ... else ... end` | `(if cond then else)` |
 | While loop | `while cond { ... }` | `while (cond) { ... }` | `while cond do ... end` | `(while cond ...)` |
@@ -53,7 +53,6 @@ Supported syntax and features:
   literals including `null`.
 - Host/runtime calls:
   - builtins via namespaces: `io::...`, `re::...`, `json::...`, `jit::...`, `math::...`
-    (regex supports optional flags arg)
   - host namespaces via `use <namespace>;` / `use <namespace> as <alias>;` / `use <namespace>::{name as local};`
 - RustScript frontend rewrites:
   - `Option::None` -> `null`

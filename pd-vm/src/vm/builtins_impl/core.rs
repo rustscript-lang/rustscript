@@ -1,18 +1,78 @@
 use super::super::{Value, VmError, VmResult};
+use super::{AnyValue, UnknownValue, VmArray, VmMap, arg, return_values};
 use crate::bytecode::unwrap_or_clone_shared;
+use pd_host_function::pd_host_function;
 use rt_format::{Format, FormatArgument, NoNamedArguments, ParsedFormat, Specifier};
 
+/// Return the length of a string, array, or map.
+#[pd_host_function(name = "len")]
+pub(super) fn builtin_len_string_impl(text: &str) -> i64 {
+    text.chars().count() as i64
+}
+
+/// Return the length of an array.
+#[pd_host_function(name = "len")]
+pub(super) fn builtin_len_array_impl(items: VmArray) -> i64 {
+    items.len() as i64
+}
+
+/// Return the number of entries in a map.
+#[pd_host_function(name = "len")]
+pub(super) fn builtin_len_map_impl(entries: VmMap) -> i64 {
+    entries.len() as i64
+}
+
 pub(super) fn builtin_len(args: &[Value]) -> VmResult<Vec<Value>> {
-    let value = args
-        .first()
-        .ok_or_else(|| VmError::HostError("missing argument to len".to_string()))?;
-    let len = match value {
-        Value::String(text) => text.chars().count() as i64,
-        Value::Array(values) => values.len() as i64,
-        Value::Map(entries) => entries.len() as i64,
-        _ => return Err(VmError::TypeMismatch("string/array/map")),
+    let value = arg::<&Value>(args, 0, "len value")?;
+    match value {
+        Value::String(text) => Ok(return_values(builtin_len_string_impl(text.as_str()))),
+        Value::Array(values) => Ok(return_values(builtin_len_array_impl(
+            unwrap_or_clone_shared(values.clone()),
+        ))),
+        Value::Map(entries) => Ok(return_values(builtin_len_map_impl(unwrap_or_clone_shared(
+            entries.clone(),
+        )))),
+        _ => Err(VmError::TypeMismatch("string/array/map")),
+    }
+}
+
+fn slice_bounds(start: i64, length: i64) -> VmResult<Option<(usize, usize)>> {
+    if start < 0 || length <= 0 {
+        return Ok(None);
+    }
+    let start = usize::try_from(start).map_err(|_| {
+        VmError::HostError("slice start overflow while converting to usize".to_string())
+    })?;
+    let length = usize::try_from(length).map_err(|_| {
+        VmError::HostError("slice length overflow while converting to usize".to_string())
+    })?;
+    Ok(Some((start, length)))
+}
+
+/// Slice a string from the given start and length.
+#[pd_host_function(name = "slice")]
+pub(super) fn builtin_slice_string_impl(text: &str, start: i64, length: i64) -> VmResult<String> {
+    let Some((start, length)) = slice_bounds(start, length)? else {
+        return Ok(String::new());
     };
-    Ok(vec![Value::Int(len)])
+    Ok(text.chars().skip(start).take(length).collect::<String>())
+}
+
+/// Slice an array from the given start and length.
+#[pd_host_function(name = "slice")]
+pub(super) fn builtin_slice_array_impl(
+    items: VmArray,
+    start: i64,
+    length: i64,
+) -> VmResult<VmArray> {
+    let Some((start, length)) = slice_bounds(start, length)? else {
+        return Ok(Vec::new());
+    };
+    Ok(items
+        .into_iter()
+        .skip(start)
+        .take(length)
+        .collect::<Vec<_>>())
 }
 
 pub(super) fn builtin_slice(args: Vec<Value>) -> VmResult<Vec<Value>> {
@@ -24,69 +84,74 @@ pub(super) fn builtin_slice(args: Vec<Value>) -> VmResult<Vec<Value>> {
         .next()
         .ok_or_else(|| VmError::HostError("missing slice start".to_string()))?
         .as_int()?;
-    let len = iter
+    let length = iter
         .next()
         .ok_or_else(|| VmError::HostError("missing slice length".to_string()))?
         .as_int()?;
-
-    if start < 0 || len <= 0 {
-        return match source {
-            Value::String(_) => Ok(vec![Value::string("")]),
-            Value::Array(_) => Ok(vec![Value::array(Vec::new())]),
-            _ => Err(VmError::TypeMismatch("string/array")),
-        };
-    }
-
-    let start = usize::try_from(start).map_err(|_| {
-        VmError::HostError("slice start overflow while converting to usize".to_string())
-    })?;
-    let len = usize::try_from(len).map_err(|_| {
-        VmError::HostError("slice length overflow while converting to usize".to_string())
-    })?;
     match source {
         Value::String(text) => {
-            let out = text.chars().skip(start).take(len).collect::<String>();
-            Ok(vec![Value::string(out)])
+            builtin_slice_string_impl(text.as_str(), start, length).map(return_values)
         }
         Value::Array(values) => {
-            let out = unwrap_or_clone_shared(values)
-                .into_iter()
-                .skip(start)
-                .take(len)
-                .collect::<Vec<_>>();
-            Ok(vec![Value::array(out)])
+            builtin_slice_array_impl(unwrap_or_clone_shared(values), start, length)
+                .map(return_values)
         }
         _ => Err(VmError::TypeMismatch("string/array")),
     }
 }
 
+/// Concatenate two strings.
+#[pd_host_function(name = "concat")]
+pub(super) fn builtin_concat_string_impl(left: &str, right: &str) -> String {
+    let mut out = String::with_capacity(left.len() + right.len());
+    out.push_str(left);
+    out.push_str(right);
+    out
+}
+
+/// Concatenate two arrays.
+#[pd_host_function(name = "concat")]
+pub(super) fn builtin_concat_array_impl(mut left: VmArray, right: VmArray) -> VmArray {
+    left.extend(right);
+    left
+}
+
 pub(super) fn builtin_concat(args: Vec<Value>) -> VmResult<Vec<Value>> {
     let mut iter = args.into_iter();
-    let lhs = iter
+    let left = iter
         .next()
         .ok_or_else(|| VmError::HostError("missing left argument to concat".to_string()))?;
-    let rhs = iter
+    let right = iter
         .next()
         .ok_or_else(|| VmError::HostError("missing right argument to concat".to_string()))?;
-    match (lhs, rhs) {
-        (Value::String(lhs), Value::String(rhs)) => {
-            let mut out = String::with_capacity(lhs.len() + rhs.len());
-            out.push_str(lhs.as_str());
-            out.push_str(rhs.as_str());
-            Ok(vec![Value::string(out)])
-        }
-        (Value::Array(lhs), Value::Array(rhs)) => {
-            let mut out = unwrap_or_clone_shared(lhs);
-            out.extend(unwrap_or_clone_shared(rhs));
-            Ok(vec![Value::array(out)])
-        }
+    match (left, right) {
+        (Value::String(left), Value::String(right)) => Ok(return_values(
+            builtin_concat_string_impl(left.as_str(), right.as_str()),
+        )),
+        (Value::Array(left), Value::Array(right)) => Ok(return_values(builtin_concat_array_impl(
+            unwrap_or_clone_shared(left),
+            unwrap_or_clone_shared(right),
+        ))),
         _ => Err(VmError::TypeMismatch("string/string or array/array")),
     }
 }
 
+/// Create an empty array.
+#[pd_host_function(name = "array_new")]
+pub(super) fn builtin_array_new_impl() -> VmArray {
+    Vec::new()
+}
+
+/// Append a value to an array and return the updated array.
+#[pd_host_function(name = "array_push")]
+pub(super) fn builtin_array_push_typed_impl(mut items: VmArray, value: AnyValue) -> VmArray {
+    items.push(value);
+    items
+}
+
 pub(super) fn builtin_array_push(args: Vec<Value>) -> VmResult<Vec<Value>> {
     let mut iter = args.into_iter();
-    let mut out = match iter
+    let items = match iter
         .next()
         .ok_or_else(|| VmError::HostError("missing array argument".to_string()))?
     {
@@ -96,8 +161,59 @@ pub(super) fn builtin_array_push(args: Vec<Value>) -> VmResult<Vec<Value>> {
     let value = iter
         .next()
         .ok_or_else(|| VmError::HostError("missing value argument".to_string()))?;
-    out.push(value);
-    Ok(vec![Value::array(out)])
+    Ok(return_values(builtin_array_push_typed_impl(items, value)))
+}
+
+/// Create an empty map.
+#[pd_host_function(name = "map_new")]
+pub(super) fn builtin_map_new_impl() -> VmMap {
+    Vec::new()
+}
+
+/// Read a string entry.
+#[pd_host_function(name = "get")]
+pub(super) fn builtin_get_string_impl(text: &str, index: i64) -> VmResult<String> {
+    if index < 0 {
+        return Err(VmError::HostError(
+            "string index must be non-negative".to_string(),
+        ));
+    }
+    let index = usize::try_from(index)
+        .map_err(|_| VmError::HostError("string index overflow".to_string()))?;
+    text.chars()
+        .nth(index)
+        .map(|ch| ch.to_string())
+        .ok_or_else(|| VmError::HostError(format!("string index {index} out of bounds")))
+}
+
+/// Read an array element by index.
+#[pd_host_function(name = "get")]
+pub(super) fn builtin_get_array_impl(items: VmArray, index: i64) -> VmResult<UnknownValue> {
+    if index < 0 {
+        return Err(VmError::HostError(
+            "array index must be non-negative".to_string(),
+        ));
+    }
+    let index = usize::try_from(index)
+        .map_err(|_| VmError::HostError("array index overflow".to_string()))?;
+    let mut items = items;
+    if index >= items.len() {
+        return Err(VmError::HostError(format!(
+            "array index {index} out of bounds"
+        )));
+    }
+    Ok(items.swap_remove(index))
+}
+
+/// Read a map value by key.
+#[pd_host_function(name = "get")]
+pub(super) fn builtin_get_map_impl(entries: VmMap, key: AnyValue) -> VmResult<UnknownValue> {
+    for (existing_key, value) in entries {
+        if existing_key == key {
+            return Ok(value);
+        }
+    }
+    Err(VmError::HostError("map key not found".to_string()))
 }
 
 pub(super) fn builtin_get(args: Vec<Value>) -> VmResult<Vec<Value>> {
@@ -108,59 +224,24 @@ pub(super) fn builtin_get(args: Vec<Value>) -> VmResult<Vec<Value>> {
     let key = iter
         .next()
         .ok_or_else(|| VmError::HostError("missing key argument".to_string()))?;
-
     match container {
         Value::Array(values) => {
-            let index = key.as_int()?;
-            if index < 0 {
-                return Err(VmError::HostError(
-                    "array index must be non-negative".to_string(),
-                ));
-            }
-            let index = usize::try_from(index)
-                .map_err(|_| VmError::HostError("array index overflow".to_string()))?;
-            let mut values = unwrap_or_clone_shared(values);
-            if index >= values.len() {
-                return Err(VmError::HostError(format!(
-                    "array index {index} out of bounds"
-                )));
-            }
-            let value = values.swap_remove(index);
-            Ok(vec![value])
+            builtin_get_array_impl(unwrap_or_clone_shared(values), key.as_int()?).map(return_values)
         }
         Value::Map(entries) => {
-            for (existing_key, value) in entries.iter() {
-                if *existing_key == key {
-                    return Ok(vec![value.clone()]);
-                }
-            }
-            Err(VmError::HostError("map key not found".to_string()))
+            builtin_get_map_impl(unwrap_or_clone_shared(entries), key).map(return_values)
         }
         Value::String(text) => {
-            let index = key.as_int()?;
-            if index < 0 {
-                return Err(VmError::HostError(
-                    "string index must be non-negative".to_string(),
-                ));
-            }
-            let index = usize::try_from(index)
-                .map_err(|_| VmError::HostError("string index overflow".to_string()))?;
-            let value = text
-                .chars()
-                .nth(index)
-                .map(|ch| Value::string(ch.to_string()))
-                .ok_or_else(|| VmError::HostError(format!("string index {index} out of bounds")))?;
-            Ok(vec![value])
+            builtin_get_string_impl(text.as_str(), key.as_int()?).map(return_values)
         }
         _ => Err(VmError::TypeMismatch("array/map/string")),
     }
 }
 
-pub(super) fn builtin_type_of(args: &[Value]) -> VmResult<Vec<Value>> {
-    let value = args
-        .first()
-        .ok_or_else(|| VmError::HostError("missing argument to type_of".to_string()))?;
-    let ty = match value {
+/// Return the runtime type name of a value.
+#[pd_host_function(name = "type")]
+pub(super) fn builtin_type_of_impl(value: &AnyValue) -> String {
+    match value {
         Value::Null => "null",
         Value::Int(_) => "int",
         Value::Float(_) => "float",
@@ -168,46 +249,26 @@ pub(super) fn builtin_type_of(args: &[Value]) -> VmResult<Vec<Value>> {
         Value::String(_) => "string",
         Value::Array(_) => "array",
         Value::Map(_) => "map",
-    };
-    Ok(vec![Value::string(ty)])
+    }
+    .to_string()
 }
 
-pub(super) fn builtin_to_string(args: &[Value]) -> VmResult<Vec<Value>> {
-    let value = args
-        .first()
-        .ok_or_else(|| VmError::HostError("missing argument to __to_string".to_string()))?;
-    let text = render_value_for_display(value);
-    Ok(vec![Value::string(text)])
+/// Convert a value into a display string.
+#[pd_host_function(name = "__to_string")]
+pub(super) fn builtin_to_string_impl(value: &AnyValue) -> String {
+    render_value_for_display(value)
 }
 
-pub(super) fn builtin_format_template(args: Vec<Value>) -> VmResult<Vec<Value>> {
-    let mut iter = args.into_iter();
-    let template = match iter.next() {
-        Some(Value::String(value)) => value,
-        Some(_) => return Err(VmError::TypeMismatch("string")),
-        None => {
-            return Err(VmError::HostError(
-                "missing template argument to __format_template".to_string(),
-            ));
-        }
-    };
-    let positional = match iter.next() {
-        Some(Value::Array(values)) => values,
-        Some(_) => return Err(VmError::TypeMismatch("array")),
-        None => {
-            return Err(VmError::HostError(
-                "missing positional arguments to __format_template".to_string(),
-            ));
-        }
-    };
-    let rendered = ParsedFormat::parse(template.as_str(), positional.as_slice(), &NoNamedArguments)
+/// Render a format template against an array of positional values.
+#[pd_host_function(name = "__format_template")]
+pub(super) fn builtin_format_template_impl(template: &str, values: VmArray) -> VmResult<String> {
+    ParsedFormat::parse(template, values.as_slice(), &NoNamedArguments)
         .map(|parsed| parsed.to_string())
         .map_err(|offset| {
             VmError::HostError(format!(
                 "format string and arguments are incompatible at byte {offset}: {template}"
             ))
-        })?;
-    Ok(vec![Value::string(rendered)])
+        })
 }
 
 fn render_value_for_display(value: &Value) -> String {
@@ -346,6 +407,46 @@ impl FormatArgument for Value {
     }
 }
 
+/// Update an array entry and return the updated array.
+#[pd_host_function(name = "set")]
+pub(super) fn builtin_set_array_impl(
+    mut items: VmArray,
+    index: i64,
+    value: AnyValue,
+) -> VmResult<VmArray> {
+    if index < 0 {
+        return Err(VmError::HostError(
+            "array index must be non-negative".to_string(),
+        ));
+    }
+    let index = usize::try_from(index)
+        .map_err(|_| VmError::HostError("array index overflow".to_string()))?;
+    if index < items.len() {
+        items[index] = value;
+    } else if index == items.len() {
+        items.push(value);
+    } else {
+        return Err(VmError::HostError(format!(
+            "array index {index} out of bounds"
+        )));
+    }
+    Ok(items)
+}
+
+/// Update a map entry and return the updated map.
+#[pd_host_function(name = "set")]
+pub(super) fn builtin_set_map_impl(mut entries: VmMap, key: AnyValue, value: AnyValue) -> VmMap {
+    if let Some((_, existing_value)) = entries
+        .iter_mut()
+        .find(|(existing_key, _)| *existing_key == key)
+    {
+        *existing_value = value;
+    } else {
+        entries.push((key, value));
+    }
+    entries
+}
+
 pub(super) fn builtin_set(args: Vec<Value>) -> VmResult<Vec<Value>> {
     let mut iter = args.into_iter();
     let container = iter
@@ -357,43 +458,32 @@ pub(super) fn builtin_set(args: Vec<Value>) -> VmResult<Vec<Value>> {
     let value = iter
         .next()
         .ok_or_else(|| VmError::HostError("missing value argument".to_string()))?;
-
     match container {
         Value::Array(values) => {
-            let index = key.as_int()?;
-            if index < 0 {
-                return Err(VmError::HostError(
-                    "array index must be non-negative".to_string(),
-                ));
-            }
-            let index = usize::try_from(index)
-                .map_err(|_| VmError::HostError("array index overflow".to_string()))?;
-            let mut out = unwrap_or_clone_shared(values);
-            if index < out.len() {
-                out[index] = value;
-            } else if index == out.len() {
-                out.push(value);
-            } else {
-                return Err(VmError::HostError(format!(
-                    "array index {index} out of bounds"
-                )));
-            }
-            Ok(vec![Value::array(out)])
+            builtin_set_array_impl(unwrap_or_clone_shared(values), key.as_int()?, value)
+                .map(return_values)
         }
-        Value::Map(entries) => {
-            let mut out = unwrap_or_clone_shared(entries);
-            if let Some((_, existing_value)) = out
-                .iter_mut()
-                .find(|(existing_key, _)| *existing_key == key)
-            {
-                *existing_value = value;
-            } else {
-                out.push((key, value));
-            }
-            Ok(vec![Value::map(out)])
-        }
+        Value::Map(entries) => Ok(return_values(builtin_set_map_impl(
+            unwrap_or_clone_shared(entries),
+            key,
+            value,
+        ))),
         _ => Err(VmError::TypeMismatch("array/map")),
     }
+}
+
+/// Return an array of container keys or indices.
+#[pd_host_function(name = "keys")]
+pub(super) fn builtin_keys_array_impl(items: VmArray) -> VmArray {
+    (0..items.len())
+        .map(|index| Value::Int(index as i64))
+        .collect::<Vec<_>>()
+}
+
+/// Return an array of map keys.
+#[pd_host_function(name = "keys")]
+pub(super) fn builtin_keys_map_impl(entries: VmMap) -> VmArray {
+    entries.into_iter().map(|(key, _)| key).collect::<Vec<_>>()
 }
 
 pub(super) fn builtin_keys(args: Vec<Value>) -> VmResult<Vec<Value>> {
@@ -401,39 +491,47 @@ pub(super) fn builtin_keys(args: Vec<Value>) -> VmResult<Vec<Value>> {
         .into_iter()
         .next()
         .ok_or_else(|| VmError::HostError("missing container argument".to_string()))?;
+    match container {
+        Value::Array(values) => Ok(return_values(builtin_keys_array_impl(
+            unwrap_or_clone_shared(values),
+        ))),
+        Value::Map(entries) => Ok(return_values(builtin_keys_map_impl(
+            unwrap_or_clone_shared(entries),
+        ))),
+        _ => Err(VmError::TypeMismatch("array/map")),
+    }
+}
 
-    let keys = match container {
-        Value::Array(values) => (0..values.len())
-            .map(|index| Value::Int(index as i64))
-            .collect::<Vec<_>>(),
-        Value::Map(entries) => unwrap_or_clone_shared(entries)
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect::<Vec<_>>(),
-        _ => return Err(VmError::TypeMismatch("array/map")),
-    };
-    Ok(vec![Value::array(keys)])
+/// Return the number of entries in an array or map.
+#[pd_host_function(name = "count")]
+pub(super) fn builtin_count_array_impl(items: VmArray) -> i64 {
+    items.len() as i64
+}
+
+/// Return the number of entries in a map.
+#[pd_host_function(name = "count")]
+pub(super) fn builtin_count_map_impl(entries: VmMap) -> i64 {
+    entries.len() as i64
 }
 
 pub(super) fn builtin_count(args: &[Value]) -> VmResult<Vec<Value>> {
-    let container = args
-        .first()
-        .ok_or_else(|| VmError::HostError("missing container argument".to_string()))?;
-    let count = match container {
-        Value::Array(values) => values.len() as i64,
-        Value::Map(entries) => entries.len() as i64,
-        _ => return Err(VmError::TypeMismatch("array/map")),
-    };
-    Ok(vec![Value::Int(count)])
+    let container = arg::<&Value>(args, 0, "count container")?;
+    match container {
+        Value::Array(values) => Ok(return_values(builtin_count_array_impl(
+            unwrap_or_clone_shared(values.clone()),
+        ))),
+        Value::Map(entries) => Ok(return_values(builtin_count_map_impl(
+            unwrap_or_clone_shared(entries.clone()),
+        ))),
+        _ => Err(VmError::TypeMismatch("array/map")),
+    }
 }
 
-pub(super) fn builtin_assert(args: &[Value]) -> VmResult<Vec<Value>> {
-    let condition = args
-        .first()
-        .ok_or_else(|| VmError::HostError("missing argument: assert condition".to_string()))?
-        .as_bool()?;
+/// Abort execution if the condition is false.
+#[pd_host_function(name = "assert")]
+pub(super) fn builtin_assert_impl(condition: bool) -> VmResult<()> {
     if condition {
-        Ok(Vec::new())
+        Ok(())
     } else {
         Err(VmError::HostError("assertion failed".to_string()))
     }

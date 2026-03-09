@@ -738,7 +738,7 @@ impl TraceJitEngine {
                 let argc =
                     read_u8(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("call argc"))?;
                 if let Some(builtin) = BuiltinFunction::from_call_index(index)
-                    && argc == builtin.arity()
+                    && builtin.accepts_arity(argc)
                 {
                     step_ips.push(instr_ip);
                     steps.push(TraceStep::BuiltinCall {
@@ -953,7 +953,7 @@ impl TraceJitEngine {
                 let argc =
                     read_u8(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("call argc"))?;
                 if let Some(builtin) = BuiltinFunction::from_call_index(index)
-                    && argc == builtin.arity()
+                    && builtin.accepts_arity(argc)
                 {
                     step_ips.push(instr_ip);
                     steps.push(TraceStep::BuiltinCall {

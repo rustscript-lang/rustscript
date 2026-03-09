@@ -4,7 +4,7 @@ use rt_format::{FormatArgument, NoNamedArguments, ParsedFormat, Specifier};
 
 use crate::ValueType;
 use crate::builtins::{
-    BuiltinFunction, builtin_namespace_hint, is_builtin_namespace, namespace_supports_regex_flags,
+    BuiltinFunction, builtin_namespace_hint, default_host_callable, is_builtin_namespace,
     resolve_builtin_namespace_call,
 };
 use crate::compiler::source_map::{SourceId, Span};
@@ -46,6 +46,21 @@ fn known_host_return_type(name: &str) -> ValueType {
     edge_abi::function_by_name(name)
         .map(|function| abi_value_type_to_value_type(function.return_type))
         .unwrap_or(ValueType::Unknown)
+}
+
+fn known_host_accepts_arity(name: &str, arity: u8) -> bool {
+    if let Some(function) = edge_abi::function_by_name(name) {
+        return function.param_types.len() == usize::from(arity);
+    }
+    default_host_callable(name).is_some_and(|callable| {
+        let required = callable
+            .signature
+            .params
+            .iter()
+            .take_while(|param| !param.optional)
+            .count();
+        required <= usize::from(arity) && usize::from(arity) <= callable.signature.params.len()
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2102,20 +2117,13 @@ impl Parser {
                     .get(1..)
                     .map(|tail| tail.to_vec())
                     .unwrap_or_default();
-                let mut args = args;
+                let args = args;
                 if let Some((builtin_namespace, builtin_member)) =
                     self.resolve_builtins_call_path(&name, &member, &subpath)
                 {
                     let builtin_namespace = builtin_namespace.to_string();
                     let builtin_member = builtin_member.to_string();
-                    if namespace_supports_regex_flags(&builtin_namespace) {
-                        if let Some(builtin) =
-                            self.try_re_namespace_builtin_call(&builtin_member, &mut args)?
-                        {
-                            let expr = self.build_builtin_call_expr(builtin, args)?;
-                            return Ok(expr);
-                        }
-                    } else if let Some(builtin) =
+                    if let Some(builtin) =
                         resolve_builtin_namespace_call(&builtin_namespace, &builtin_member)
                     {
                         let expr = self.build_builtin_call_expr(builtin, args)?;
@@ -2900,7 +2908,7 @@ impl Parser {
             line: self.current_line(),
             message: "function arity too large".to_string(),
         })?;
-        if arity != builtin.arity() {
+        if !builtin.accepts_arity(arity) {
             return Err(ParseError {
                 span: None,
                 code: None,
@@ -2929,7 +2937,7 @@ impl Parser {
                 Ok(Some(self.lower_println_call(args.to_vec())?))
             }
             "println" => Ok(Some(self.lower_plain_println_call(args.to_vec())?)),
-            "type" | "typeof" => {
+            "type" => {
                 if args.len() != 1 {
                     return Err(ParseError {
                         span: None,
@@ -3185,70 +3193,6 @@ impl Parser {
         None
     }
 
-    fn try_re_namespace_builtin_call(
-        &mut self,
-        member: &str,
-        args: &mut Vec<Expr>,
-    ) -> Result<Option<BuiltinFunction>, ParseError> {
-        let (builtin, base_arity, supports_optional_flags) = match member {
-            "match" | "is_match" => (BuiltinFunction::ReIsMatch, 2usize, true),
-            "find" => (BuiltinFunction::ReFind, 2usize, true),
-            "replace" => (BuiltinFunction::ReReplace, 3usize, true),
-            "split" => (BuiltinFunction::ReSplit, 2usize, true),
-            "captures" => (BuiltinFunction::ReCaptures, 2usize, true),
-            _ => return Ok(None),
-        };
-
-        if args.len() == base_arity {
-            return Ok(Some(builtin));
-        }
-
-        if supports_optional_flags && args.len() == base_arity + 1 {
-            let flags = args.pop().ok_or_else(|| ParseError {
-                span: None,
-                code: None,
-                line: self.current_line(),
-                message: "missing regex flags argument".to_string(),
-            })?;
-            let pattern = args.first().cloned().ok_or_else(|| ParseError {
-                span: None,
-                code: None,
-                line: self.current_line(),
-                message: "missing regex pattern argument".to_string(),
-            })?;
-            args[0] = self.apply_regex_flags_to_pattern_expr(pattern, flags)?;
-            return Ok(Some(builtin));
-        }
-
-        let expected = if supports_optional_flags {
-            format!("{base_arity} or {}", base_arity + 1)
-        } else {
-            base_arity.to_string()
-        };
-        Err(ParseError {
-            span: None,
-            code: None,
-            line: self.current_line(),
-            message: format!("function 're::{member}' expects {expected} arguments"),
-        })
-    }
-
-    fn apply_regex_flags_to_pattern_expr(
-        &mut self,
-        pattern: Expr,
-        flags: Expr,
-    ) -> Result<Expr, ParseError> {
-        let prefix = self.build_builtin_call_expr(
-            BuiltinFunction::Concat,
-            vec![Expr::String("(?".to_string()), flags],
-        )?;
-        let prefix = self.build_builtin_call_expr(
-            BuiltinFunction::Concat,
-            vec![prefix, Expr::String(")".to_string())],
-        )?;
-        self.build_builtin_call_expr(BuiltinFunction::Concat, vec![prefix, pattern])
-    }
-
     fn parse_index_assign_with_terminator(
         &mut self,
         expect_terminator: bool,
@@ -3478,11 +3422,7 @@ impl Parser {
                 });
             }
             let member = segments[0].as_str();
-            if namespace_supports_regex_flags(&imported_root) {
-                if let Some(builtin) = self.try_re_namespace_builtin_call(member, &mut args)? {
-                    return Ok(Some(self.build_builtin_call_expr(builtin, args)?));
-                }
-            } else if let Some(builtin) = resolve_builtin_namespace_call(&imported_root, member) {
+            if let Some(builtin) = resolve_builtin_namespace_call(&imported_root, member) {
                 return Ok(Some(self.build_builtin_call_expr(builtin, args)?));
             }
             return Err(ParseError {
@@ -3826,7 +3766,7 @@ impl Parser {
 
     fn define_host_function(&mut self, name: &str, arity: u8) -> Result<FunctionDecl, ParseError> {
         if let Some(existing) = self.functions.get(name) {
-            if existing.arity != arity {
+            if existing.arity != arity && !known_host_accepts_arity(name, arity) {
                 return Err(ParseError {
                     span: None,
                     code: None,

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::builtins::{BuiltinFunction, CallableParamType, CallableSignature};
+use crate::builtins::{BuiltinFunction, CallableParam, CallableParamType, CallableSignature};
 use crate::bytecode::ValueType;
 
 use super::CompileError;
@@ -263,7 +263,7 @@ pub(crate) struct TypeInferenceResult {
 #[derive(Clone, Debug)]
 pub(crate) struct HostCallableSignature {
     pub(crate) name: String,
-    pub(crate) params: Vec<CallableParamType>,
+    pub(crate) params: Vec<CallableParam>,
 }
 
 struct TypeContext<'a> {
@@ -301,6 +301,18 @@ impl<'a> TypeContext<'a> {
             .unwrap_or("<anonymous>")
     }
 
+    fn function_requires_strict_add_types(&self, index: u16) -> bool {
+        let Some(function_impl) = self.function_impls.get(&index) else {
+            return false;
+        };
+        function_impl.capture_copies.is_empty()
+            && function_body_contains_param_add(
+                &function_impl.param_slots,
+                &function_impl.body_stmts,
+                &function_impl.body_expr,
+            )
+    }
+
     fn observe_function_arg_types(&mut self, index: u16, args: &[Expr], state: &LocalTypeState) {
         let function_name = self.function_name(index).to_string();
         let actual = args
@@ -319,15 +331,19 @@ impl<'a> TypeContext<'a> {
             match merge_observed_function_param_type(current, actual_ty) {
                 Ok(merged) => merged_types[arg_index] = merged,
                 Err((lhs, rhs)) => {
-                    self.function_param_conflicts.entry(index).or_insert_with(|| {
-                        format!(
-                            "function '{}' is called with conflicting inferred types for arg{}: {} vs {}",
-                            function_name,
-                            arg_index + 1,
-                            bound_type_label(lhs),
-                            bound_type_label(rhs)
-                        )
-                    });
+                    if self.function_requires_strict_add_types(index) {
+                        self.function_param_conflicts.entry(index).or_insert_with(|| {
+                            format!(
+                                "function '{}' is called with conflicting inferred types for arg{}: {} vs {}",
+                                function_name,
+                                arg_index + 1,
+                                bound_type_label(lhs),
+                                bound_type_label(rhs)
+                            )
+                        });
+                    } else {
+                        merged_types[arg_index] = BoundType::Unknown;
+                    }
                 }
             }
         }
@@ -1041,6 +1057,10 @@ fn validate_function_impl(
         return Err(CompileError::FunctionParameterTypeConflict { line: None, detail });
     }
     let mut state = LocalTypeState::default();
+    let strict_function_add_types = context
+        .observed_function_param_types
+        .contains_key(&function_index)
+        && context.function_requires_strict_add_types(function_index);
     seed_function_param_state(
         &mut state,
         &function_impl.param_slots,
@@ -1050,8 +1070,20 @@ fn validate_function_impl(
         let source_state = state.clone();
         state.copy_binding_from(&source_state, *source_slot, *captured_slot);
     }
-    validate_stmts(&function_impl.body_stmts, &mut state, None, context, true)?;
-    let _ = validate_expr(&function_impl.body_expr, &state, None, context, true)?;
+    validate_stmts(
+        &function_impl.body_stmts,
+        &mut state,
+        None,
+        context,
+        strict_function_add_types,
+    )?;
+    let _ = validate_expr(
+        &function_impl.body_expr,
+        &state,
+        None,
+        context,
+        strict_function_add_types,
+    )?;
     Ok(())
 }
 
@@ -1294,24 +1326,26 @@ pub(crate) fn build_host_import_signatures(
 }
 
 fn known_host_signature(name: &str) -> Option<HostCallableSignature> {
-    match name {
-        "print" | "println" => {
-            return Some(HostCallableSignature {
-                name: name.to_string(),
-                params: vec![CallableParamType::Any],
-            });
-        }
-        _ => {}
+    if let Some(callable) = crate::builtins::default_host_callable(name) {
+        return Some(HostCallableSignature {
+            name: callable.name.to_string(),
+            params: callable.signature.params.to_vec(),
+        });
     }
 
     let function = edge_abi::function_by_name(name)?;
     Some(HostCallableSignature {
         name: name.to_string(),
         params: function
-            .param_types
+            .param_names
             .iter()
             .copied()
-            .map(callable_param_type_from_abi)
+            .zip(function.param_types.iter().copied())
+            .map(|(param_name, param_type)| CallableParam {
+                name: param_name,
+                ty: callable_param_type_from_abi(param_type),
+                optional: false,
+            })
             .collect(),
     })
 }
@@ -1345,6 +1379,246 @@ fn merge_observed_function_param_type(
         Ok(merged)
     } else {
         Err((current, next))
+    }
+}
+
+fn function_body_contains_param_add(
+    param_slots: &[LocalSlot],
+    stmts: &[Stmt],
+    expr: &Expr,
+) -> bool {
+    stmts
+        .iter()
+        .any(|stmt| stmt_contains_param_add(stmt, param_slots))
+        || expr_contains_param_add(expr, param_slots)
+}
+
+fn stmt_contains_param_add(stmt: &Stmt, param_slots: &[LocalSlot]) -> bool {
+    match stmt {
+        Stmt::Noop { .. }
+        | Stmt::FuncDecl { .. }
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Drop { .. } => false,
+        Stmt::ClosureLet { closure, .. } => expr_contains_param_add(&closure.body, param_slots),
+        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+            expr_contains_param_add(expr, param_slots)
+        }
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_contains_param_add(condition, param_slots)
+                || then_branch
+                    .iter()
+                    .any(|stmt| stmt_contains_param_add(stmt, param_slots))
+                || else_branch
+                    .iter()
+                    .any(|stmt| stmt_contains_param_add(stmt, param_slots))
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            ..
+        } => {
+            stmt_contains_param_add(init, param_slots)
+                || expr_contains_param_add(condition, param_slots)
+                || stmt_contains_param_add(post, param_slots)
+                || body
+                    .iter()
+                    .any(|stmt| stmt_contains_param_add(stmt, param_slots))
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            expr_contains_param_add(condition, param_slots)
+                || body
+                    .iter()
+                    .any(|stmt| stmt_contains_param_add(stmt, param_slots))
+        }
+    }
+}
+
+fn expr_contains_param_add(expr: &Expr, param_slots: &[LocalSlot]) -> bool {
+    match expr {
+        Expr::Add(lhs, rhs) => {
+            expr_uses_param(lhs, param_slots)
+                || expr_uses_param(rhs, param_slots)
+                || expr_contains_param_add(lhs, param_slots)
+                || expr_contains_param_add(rhs, param_slots)
+        }
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::FunctionRef(_)
+        | Expr::Var(_)
+        | Expr::MoveVar(_)
+        | Expr::MoveField { .. }
+        | Expr::MoveIndex { .. } => false,
+        Expr::Call(_, args) | Expr::LocalCall(_, args) => args
+            .iter()
+            .any(|arg| expr_contains_param_add(arg, param_slots)),
+        Expr::ClosureCall(closure, args) => {
+            expr_contains_param_add(&closure.body, param_slots)
+                || args
+                    .iter()
+                    .any(|arg| expr_contains_param_add(arg, param_slots))
+        }
+        Expr::Closure(closure) => expr_contains_param_add(&closure.body, param_slots),
+        Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            expr_contains_param_add(lhs, param_slots) || expr_contains_param_add(rhs, param_slots)
+        }
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => expr_contains_param_add(inner, param_slots),
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            expr_contains_param_add(condition, param_slots)
+                || expr_contains_param_add(then_expr, param_slots)
+                || expr_contains_param_add(else_expr, param_slots)
+        }
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            expr_contains_param_add(value, param_slots)
+                || arms
+                    .iter()
+                    .any(|(_, arm_expr)| expr_contains_param_add(arm_expr, param_slots))
+                || expr_contains_param_add(default, param_slots)
+        }
+        Expr::Block { stmts, expr } => function_body_contains_param_add(param_slots, stmts, expr),
+    }
+}
+
+fn expr_uses_param(expr: &Expr, param_slots: &[LocalSlot]) -> bool {
+    match expr {
+        Expr::Var(slot) | Expr::MoveVar(slot) => param_slots.contains(slot),
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::FunctionRef(_)
+        | Expr::MoveField { .. }
+        | Expr::MoveIndex { .. } => false,
+        Expr::Call(_, args) | Expr::LocalCall(_, args) => {
+            args.iter().any(|arg| expr_uses_param(arg, param_slots))
+        }
+        Expr::ClosureCall(closure, args) => {
+            expr_uses_param(&closure.body, param_slots)
+                || args.iter().any(|arg| expr_uses_param(arg, param_slots))
+        }
+        Expr::Closure(closure) => expr_uses_param(&closure.body, param_slots),
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            expr_uses_param(lhs, param_slots) || expr_uses_param(rhs, param_slots)
+        }
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => expr_uses_param(inner, param_slots),
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            expr_uses_param(condition, param_slots)
+                || expr_uses_param(then_expr, param_slots)
+                || expr_uses_param(else_expr, param_slots)
+        }
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            expr_uses_param(value, param_slots)
+                || arms
+                    .iter()
+                    .any(|(_, arm_expr)| expr_uses_param(arm_expr, param_slots))
+                || expr_uses_param(default, param_slots)
+        }
+        Expr::Block { stmts, expr } => {
+            stmts.iter().any(|stmt| stmt_uses_param(stmt, param_slots))
+                || expr_uses_param(expr, param_slots)
+        }
+    }
+}
+
+fn stmt_uses_param(stmt: &Stmt, param_slots: &[LocalSlot]) -> bool {
+    match stmt {
+        Stmt::Noop { .. }
+        | Stmt::FuncDecl { .. }
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Drop { .. } => false,
+        Stmt::ClosureLet { closure, .. } => expr_uses_param(&closure.body, param_slots),
+        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+            expr_uses_param(expr, param_slots)
+        }
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_uses_param(condition, param_slots)
+                || then_branch
+                    .iter()
+                    .any(|stmt| stmt_uses_param(stmt, param_slots))
+                || else_branch
+                    .iter()
+                    .any(|stmt| stmt_uses_param(stmt, param_slots))
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            ..
+        } => {
+            stmt_uses_param(init, param_slots)
+                || expr_uses_param(condition, param_slots)
+                || stmt_uses_param(post, param_slots)
+                || body.iter().any(|stmt| stmt_uses_param(stmt, param_slots))
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            expr_uses_param(condition, param_slots)
+                || body.iter().any(|stmt| stmt_uses_param(stmt, param_slots))
+        }
     }
 }
 
@@ -1442,7 +1716,7 @@ fn validate_signature_overloads(
 
 fn validate_host_signature(
     callable_name: &str,
-    params: &[CallableParamType],
+    params: &[CallableParam],
     args: &[Expr],
     state: &LocalTypeState,
     context: &mut TypeContext<'_>,
@@ -1471,12 +1745,16 @@ fn signature_matches_actual(signature: &CallableSignature, actual: &[BoundType])
     params_match_actual(signature.params, actual)
 }
 
-fn params_match_actual(params: &[CallableParamType], actual: &[BoundType]) -> bool {
-    params.len() == actual.len()
-        && params
-            .iter()
-            .zip(actual.iter().copied())
-            .all(|(expected, actual)| param_accepts_bound_type(*expected, actual))
+fn params_match_actual(params: &[CallableParam], actual: &[BoundType]) -> bool {
+    let required = params.iter().take_while(|param| !param.optional).count();
+    if actual.len() < required || actual.len() > params.len() {
+        return false;
+    }
+    params
+        .iter()
+        .take(actual.len())
+        .zip(actual.iter().copied())
+        .all(|(expected, actual)| param_accepts_bound_type(expected.ty, actual))
 }
 
 fn param_accepts_bound_type(expected: CallableParamType, actual: BoundType) -> bool {
@@ -1495,28 +1773,6 @@ fn param_accepts_bound_type(expected: CallableParamType, actual: BoundType) -> b
         }
         CallableParamType::Map => matches!(actual, BoundType::Map | BoundType::MapOf(_)),
         CallableParamType::Number => is_numeric_bound_type(actual),
-        CallableParamType::StringOrArray => {
-            matches!(
-                actual,
-                BoundType::String | BoundType::Array | BoundType::ArrayOf(_)
-            )
-        }
-        CallableParamType::ArrayOrMap => {
-            matches!(
-                actual,
-                BoundType::Array | BoundType::ArrayOf(_) | BoundType::Map | BoundType::MapOf(_)
-            )
-        }
-        CallableParamType::StringArrayOrMap => {
-            matches!(
-                actual,
-                BoundType::String
-                    | BoundType::Array
-                    | BoundType::ArrayOf(_)
-                    | BoundType::Map
-                    | BoundType::MapOf(_)
-            )
-        }
     }
 }
 
@@ -1528,11 +1784,16 @@ fn format_signature_overloads(name: &str, signatures: &[CallableSignature]) -> S
         .join(" or ")
 }
 
-fn format_param_types(params: &[CallableParamType]) -> String {
+fn format_param_types(params: &[CallableParam]) -> String {
     params
         .iter()
-        .enumerate()
-        .map(|(index, param)| format!("arg{}: {}", index + 1, param.label()))
+        .map(|param| {
+            if param.optional {
+                format!("{}?: {}", param.name, param.ty.label())
+            } else {
+                format!("{}: {}", param.name, param.ty.label())
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }

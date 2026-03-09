@@ -248,7 +248,7 @@ fn compiler_rejects_programs_with_more_than_256_simultaneously_live_locals() {
 
 #[test]
 fn compiler_reuses_slots_with_large_programs_that_inline_functions() {
-    let mut source = String::from("fn id(x) { x; }\nlet mut out = 0;\n");
+    let mut source = String::from("fn id(x) { x }\nlet mut out = 0;\n");
     for idx in 0..400usize {
         source.push_str(&format!("let v{idx} = {idx};\n"));
         source.push_str(&format!("out = id(v{idx});\n"));
@@ -393,7 +393,7 @@ fn compiler_rejects_callable_argument_type_mismatches() {
             "#,
             flavor: SourceFlavor::RustScript,
             expected_kind: SourceErrorKind::Compile(CompileErrorKind::CallableArgumentTypeMismatch),
-            expected_contains_all: &["builtin 'assert'", "int", "arg1: bool"],
+            expected_contains_all: &["builtin 'assert'", "int", "condition: bool"],
         },
         SourceErrorCase {
             name: "builtin namespace member rejects wrong argument type",
@@ -403,7 +403,7 @@ fn compiler_rejects_callable_argument_type_mismatches() {
             "#,
             flavor: SourceFlavor::RustScript,
             expected_kind: SourceErrorKind::Compile(CompileErrorKind::CallableArgumentTypeMismatch),
-            expected_contains_all: &["builtin 'math::sqrt'", "bool", "arg1: number"],
+            expected_contains_all: &["builtin 'math::sqrt'", "bool", "value: number"],
         },
         SourceErrorCase {
             name: "host function rejects wrong argument type",
@@ -413,7 +413,7 @@ fn compiler_rejects_callable_argument_type_mismatches() {
             "#,
             flavor: SourceFlavor::RustScript,
             expected_kind: SourceErrorKind::Compile(CompileErrorKind::CallableArgumentTypeMismatch),
-            expected_contains_all: &["host function 'runtime::sleep'", "string", "arg1: int"],
+            expected_contains_all: &["host function 'runtime::sleep'", "string", "ms: int"],
         },
     ];
     run_source_error_cases(&cases);

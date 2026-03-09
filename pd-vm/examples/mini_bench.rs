@@ -869,7 +869,7 @@ fn build_compiler_stress_source(line_count: usize) -> String {
 
 fn build_complex_rss_source() -> String {
     r#"
-    fn keep(value) { value; }
+    fn keep(value) { value }
 
     let mut total = 0;
     for (let mut i = 0; i < 8; i = i + 1) {

@@ -605,46 +605,28 @@ fn lower_lua_namespace_call(
 fn lower_lua_regex_or_builtin_namespace_call(
     namespace: &str,
     member: &str,
-    mut args: Vec<Expr>,
+    args: Vec<Expr>,
 ) -> Option<Expr> {
     if namespace == "re" {
-        let (builtin, base_arity) = match member {
-            "match" | "is_match" => (BuiltinFunction::ReIsMatch, 2usize),
-            "find" => (BuiltinFunction::ReFind, 2usize),
-            "replace" => (BuiltinFunction::ReReplace, 3usize),
-            "split" => (BuiltinFunction::ReSplit, 2usize),
-            "captures" => (BuiltinFunction::ReCaptures, 2usize),
+        let builtin = match member {
+            "match" => BuiltinFunction::ReMatch,
+            "find" => BuiltinFunction::ReFind,
+            "replace" => BuiltinFunction::ReReplace,
+            "split" => BuiltinFunction::ReSplit,
+            "captures" => BuiltinFunction::ReCaptures,
             _ => return None,
         };
-        if args.len() == base_arity {
-            return Some(Expr::Call(builtin.call_index(), args));
-        }
-        if args.len() == base_arity + 1 {
-            let flags = args.pop()?;
-            let pattern = args.first().cloned()?;
-            args[0] = apply_lua_regex_flags_to_pattern_expr(pattern, flags);
+        if builtin.accepts_arity(u8::try_from(args.len()).ok()?) {
             return Some(Expr::Call(builtin.call_index(), args));
         }
         return None;
     }
 
     let builtin = resolve_builtin_namespace_call(namespace, member)?;
-    if usize::from(builtin.arity()) != args.len() {
+    if !builtin.accepts_arity(u8::try_from(args.len()).ok()?) {
         return None;
     }
     Some(Expr::Call(builtin.call_index(), args))
-}
-
-fn apply_lua_regex_flags_to_pattern_expr(pattern: Expr, flags: Expr) -> Expr {
-    let prefix = Expr::Call(
-        BuiltinFunction::Concat.call_index(),
-        vec![Expr::String("(?".to_string()), flags],
-    );
-    let prefix = Expr::Call(
-        BuiltinFunction::Concat.call_index(),
-        vec![prefix, Expr::String(")".to_string())],
-    );
-    Expr::Call(BuiltinFunction::Concat.call_index(), vec![prefix, pattern])
 }
 
 fn build_lua_optional_member_expr(

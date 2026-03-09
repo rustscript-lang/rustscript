@@ -1,6 +1,6 @@
 # pd-vm Playground
 
-Browser playground for `pd-vm`, backed by the `pd-vm-runtime-wasm` runtime and a Monaco-based editor.
+Browser playground for `pd-vm`, backed by the `pd-vm-wasm` crate with the `runtime` feature and a Monaco-based editor.
 
 Supported source frontends:
 
@@ -47,7 +47,7 @@ Useful commands:
 - `bun run preview`
   Serves the built bundle locally.
 
-The wasm build step compiles `pd-vm-runtime-wasm` for `wasm32-unknown-unknown`, copies the generated `pd_vm_runtime_wasm.wasm` into `public/wasm/`, and syncs the RustScript Monaco grammar assets used by the editor.
+The wasm build step compiles `pd-vm-wasm --features runtime` for `wasm32-unknown-unknown`, copies the generated `pd_vm_wasm.wasm` into `public/wasm/`, and syncs the RustScript Monaco grammar assets used by the editor.
 
 ## Related docs
 

@@ -5,7 +5,7 @@ WORKDIR /src
 
 COPY . .
 RUN rustup target add wasm32-unknown-unknown \
-    && cargo build -p pd-vm-lint-wasm --target wasm32-unknown-unknown --release --locked
+    && cargo build -p pd-vm-wasm --target wasm32-unknown-unknown --release --locked
 
 FROM oven/bun:1 AS webui-builder
 WORKDIR /src/pd-controller/webui
@@ -15,7 +15,7 @@ RUN bun install --frozen-lockfile
 
 COPY pd-controller/webui/ ./
 RUN mkdir -p ./public/wasm
-COPY --from=wasm-builder /src/target/wasm32-unknown-unknown/release/pd_vm_lint_wasm.wasm ./public/wasm/pd_vm_lint_wasm.wasm
+COPY --from=wasm-builder /src/target/wasm32-unknown-unknown/release/pd_vm_wasm.wasm ./public/wasm/pd_vm_wasm.wasm
 RUN bun run tsc --noEmit && bun run vite build
 
 FROM rust:1-bookworm AS builder

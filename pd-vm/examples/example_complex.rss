@@ -33,7 +33,7 @@ let mut matched = match chained_score {
     _ => 0,
 };
 
-let mut regex_ok = re::match("^rustscript$", "RUSTSCRIPT", "i");
+let mut regex_ok = re::match("(?i)^rustscript$", "RUSTSCRIPT");
 let mut payload = {
     lang: "rustscript",
     score: closure_value,

@@ -4,29 +4,27 @@ use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
 use super::super::{Value, VmError, VmResult};
-use super::arg_string;
+use super::{AnyValue, UnknownValue};
+use pd_host_function::pd_host_function;
 
 /// Encodes a `Value` into a JSON string.
 /// Note: When encoding a `Value::Map`, this function enforces a strict unique-keys contract.
 /// If the map contains duplicate keys, it will return an error rather than silently omitting data.
-pub(super) fn builtin_json_encode(args: &[Value]) -> VmResult<Vec<Value>> {
-    let value = args
-        .first()
-        .ok_or_else(|| VmError::HostError("missing argument to json_encode".to_string()))?;
+#[pd_host_function(name = "json::encode")]
+pub(super) fn builtin_json_encode(value: &AnyValue) -> VmResult<String> {
     let json_value = vm_to_json_value(value)?;
-    let text = serde_json::to_string(&json_value)
-        .map_err(|err| VmError::HostError(format!("json_encode failed: {err}")))?;
-    Ok(vec![Value::string(text)])
+    serde_json::to_string(&json_value)
+        .map_err(|err| VmError::HostError(format!("json_encode failed: {err}")))
 }
 
 /// Decodes a JSON string into a `Value`.
 /// Note: This function enforces a strict unique-keys contract for JSON objects.
 /// If the JSON string contains duplicate keys, it will return an error instead of letting the last key win.
-pub(super) fn builtin_json_decode(args: &[Value]) -> VmResult<Vec<Value>> {
-    let text = arg_string(args, 0, "json_decode input")?;
+#[pd_host_function(name = "json::decode")]
+pub(super) fn builtin_json_decode(text: &str) -> VmResult<UnknownValue> {
     let json_value = serde_json::from_str::<DecodedJsonValue>(text)
         .map_err(|err| VmError::HostError(format!("json_decode failed: {err}")))?;
-    Ok(vec![json_value.0])
+    Ok(json_value.0)
 }
 
 fn vm_to_json_value(value: &Value) -> VmResult<JsonValue> {

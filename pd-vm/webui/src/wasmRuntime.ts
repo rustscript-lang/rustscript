@@ -144,7 +144,7 @@ let wasmPromise: Promise<WasmRuntimeExports> | null = null;
 
 function wasmPath(): string {
   const base = import.meta.env.BASE_URL ?? "/";
-  return `${base.replace(/\/+$/, "/")}wasm/pd_vm_runtime_wasm.wasm`;
+  return `${base.replace(/\/+$/, "/")}wasm/pd_vm_wasm.wasm`;
 }
 
 function writeBytes(wasm: WasmRuntimeExports, bytes: Uint8Array): number {

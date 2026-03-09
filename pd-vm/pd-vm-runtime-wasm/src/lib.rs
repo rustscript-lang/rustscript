@@ -689,9 +689,45 @@ mod tests {
             diagnostic.message
         );
         assert!(
-            diagnostic.message.contains("arg1: int"),
+            diagnostic.message.contains("ms: int"),
             "expected host parameter type annotation in diagnostic: {:?}",
             diagnostic.message
+        );
+    }
+
+    #[test]
+    fn lint_reports_trailing_function_return_semicolon_diagnostic() {
+        let source = r#"
+            fn addme(x) {
+                x + x;
+            }
+
+            addme(1);
+        "#;
+
+        let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
+        assert_eq!(
+            report.diagnostics.len(),
+            1,
+            "expected a single trailing-semicolon diagnostic"
+        );
+        let diagnostic = &report.diagnostics[0];
+        assert!(diagnostic.line > 0, "expected a concrete diagnostic line");
+        assert!(
+            diagnostic
+                .message
+                .contains("function return expression should not end with ';'"),
+            "unexpected diagnostic message: {:?}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.span.is_some(),
+            "expected a source span for the semicolon diagnostic"
+        );
+        assert!(
+            diagnostic.rendered.contains("x + x;"),
+            "expected rendered diagnostic snippet, got {:?}",
+            diagnostic.rendered
         );
     }
 
@@ -978,7 +1014,7 @@ mod tests {
         assert!(
             runtime_sleep
                 .detail
-                .contains("runtime::sleep(arg1: int) -> bool"),
+                .contains("runtime::sleep(ms: int) -> bool"),
             "expected runtime host signature in completion detail, got {:?}",
             runtime_sleep.detail
         );
@@ -989,12 +1025,12 @@ mod tests {
             .find(|entry| entry.label == "len")
             .expect("len completion should exist");
         assert!(
-            len.detail.contains("len(arg1: string) -> int"),
+            len.detail.contains("len(text: string) -> int"),
             "expected string overload in len detail, got {:?}",
             len.detail
         );
         assert!(
-            len.detail.contains("len(arg1: array) -> int"),
+            len.detail.contains("len(items: array) -> int"),
             "expected array overload in len detail, got {:?}",
             len.detail
         );
