@@ -2,7 +2,9 @@ import { type OnMount } from "@monaco-editor/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type * as Monaco from "monaco-editor";
 
-import { looksLikeIdentifier } from "@/app/helpers";
+import { looksLikeIdentifier, normalizeFlavor } from "@/app/helpers";
+import { lintWithWasm } from "@/app/lint/wasmLinter";
+import { LINT_MARKER_OWNER, lintFailureMarker, lintMarkersFromReport } from "@/app/monaco/lintMarkers";
 import { ensureRustScriptLanguage } from "@/app/monaco/rustscriptLanguage";
 import type {
   DebugCommandRequest,
@@ -53,6 +55,7 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
   const selectedDebugSessionIdRef = useRef<string | null>(null);
   const debugSessionsSocketRef = useRef<WebSocket | null>(null);
   const debugSessionsReconnectTimerRef = useRef<number | null>(null);
+  const debugLintSeqRef = useRef(0);
 
   const loadDebugSessions = useCallback(async () => {
     const response = await fetch("/v1/debug-sessions");
@@ -559,6 +562,60 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
   }, [debugEditorReadyTick, selectedDebugSession?.source_code, selectedDebugSession?.current_line, selectedDebugSession?.breakpoints]);
 
   useEffect(() => {
+    const editor = debugEditorRef.current;
+    const monaco = debugMonacoRef.current;
+    const model = editor?.getModel();
+    const source = selectedDebugSession?.source_code;
+    if (!editor || !monaco || !model || !source) {
+      if (model) {
+        monaco?.editor.setModelMarkers(model, LINT_MARKER_OWNER, []);
+      }
+      return;
+    }
+
+    debugLintSeqRef.current += 1;
+    const currentSeq = debugLintSeqRef.current;
+    const flavor = normalizeFlavor(selectedDebugSession?.source_flavor ?? "");
+
+    void lintWithWasm(source, flavor)
+      .then((report) => {
+        if (currentSeq !== debugLintSeqRef.current) {
+          return;
+        }
+        const currentModel = debugEditorRef.current?.getModel();
+        const currentMonaco = debugMonacoRef.current;
+        if (!currentModel || !currentMonaco) {
+          return;
+        }
+        const markers = lintMarkersFromReport(report, currentModel, currentMonaco);
+        currentMonaco.editor.setModelMarkers(currentModel, LINT_MARKER_OWNER, markers);
+      })
+      .catch((error) => {
+        if (currentSeq !== debugLintSeqRef.current) {
+          return;
+        }
+        const currentModel = debugEditorRef.current?.getModel();
+        const currentMonaco = debugMonacoRef.current;
+        if (!currentModel || !currentMonaco) {
+          return;
+        }
+        const message = error instanceof Error ? error.message : "wasm linter failed";
+        const markers = lintFailureMarker(message, currentModel, currentMonaco);
+        currentMonaco.editor.setModelMarkers(currentModel, LINT_MARKER_OWNER, markers);
+      });
+
+    return () => {
+      debugLintSeqRef.current += 1;
+      const currentModel = debugEditorRef.current?.getModel();
+      const currentMonaco = debugMonacoRef.current;
+      if (!currentModel || !currentMonaco) {
+        return;
+      }
+      currentMonaco.editor.setModelMarkers(currentModel, LINT_MARKER_OWNER, []);
+    };
+  }, [debugEditorReadyTick, selectedDebugSession?.source_code, selectedDebugSession?.source_flavor]);
+
+  useEffect(() => {
     debugHoverCacheRef.current.clear();
     debugHoverInflightRef.current.clear();
     debugHoverActiveKeyRef.current = "";
@@ -577,6 +634,11 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
       debugMouseMoveDisposableRef.current = null;
       debugMouseLeaveDisposableRef.current?.dispose();
       debugMouseLeaveDisposableRef.current = null;
+      const model = debugEditorRef.current?.getModel();
+      const monaco = debugMonacoRef.current;
+      if (model && monaco) {
+        monaco.editor.setModelMarkers(model, LINT_MARKER_OWNER, []);
+      }
     };
   }, []);
 

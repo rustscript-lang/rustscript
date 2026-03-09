@@ -4,11 +4,10 @@ import type * as Monaco from "monaco-editor";
 
 import { monacoLanguageForFlavor } from "@/app/helpers";
 import { lintWithWasm } from "@/app/lint/wasmLinter";
+import { LINT_MARKER_OWNER, lintFailureMarker, lintMarkersFromReport } from "@/app/monaco/lintMarkers";
 import { ensureCompletionCatalogProviders } from "@/app/monaco/completionCatalog";
 import { ensureRustScriptLanguage } from "@/app/monaco/rustscriptLanguage";
 import type { SourceFlavor, UiSourceBundle } from "@/app/types";
-
-const LINT_OWNER = "pd-vm-wasm-lint";
 
 export function HighlightedCode({
   flavor,
@@ -39,7 +38,7 @@ export function HighlightedCode({
     if (!editor || !monaco || !model) {
       return;
     }
-    monaco.editor.setModelMarkers(model, LINT_OWNER, []);
+    monaco.editor.setModelMarkers(model, LINT_MARKER_OWNER, []);
   }, []);
 
   const onEditorMount: OnMount = useCallback((editor, monaco) => {
@@ -50,7 +49,7 @@ export function HighlightedCode({
     if (!(enableLint && !readOnly)) {
       const model = editor.getModel();
       if (model) {
-        monaco.editor.setModelMarkers(model, LINT_OWNER, []);
+        monaco.editor.setModelMarkers(model, LINT_MARKER_OWNER, []);
       }
     }
   }, [enableLint, readOnly]);
@@ -97,33 +96,8 @@ export function HighlightedCode({
         if (!currentModel || !monacoRef.current) {
           return;
         }
-        const markers: Monaco.editor.IMarkerData[] = report.diagnostics.map((item) => {
-          const maxLine = Math.max(1, currentModel.getLineCount());
-          const fallbackLine = Math.min(Math.max(item.line || 1, 1), maxLine);
-          const rawRange = item.span
-            ? {
-                startLineNumber: item.span.startLine,
-                startColumn: item.span.startColumn,
-                endLineNumber: item.span.endLine,
-                endColumn: item.span.endColumn
-              }
-            : {
-                startLineNumber: fallbackLine,
-                startColumn: 1,
-                endLineNumber: fallbackLine,
-                endColumn: Math.max(2, currentModel.getLineMaxColumn(fallbackLine))
-              };
-          const range = currentModel.validateRange(rawRange);
-          return {
-            severity: monacoRef.current!.MarkerSeverity.Error,
-            message: item.message,
-            startLineNumber: range.startLineNumber,
-            startColumn: range.startColumn,
-            endLineNumber: range.endLineNumber,
-            endColumn: range.endColumn
-          };
-        });
-        monacoRef.current.editor.setModelMarkers(currentModel, LINT_OWNER, markers);
+        const markers = lintMarkersFromReport(report, currentModel, monacoRef.current);
+        monacoRef.current.editor.setModelMarkers(currentModel, LINT_MARKER_OWNER, markers);
       } catch (error) {
         if (currentSeq !== lintSeqRef.current) {
           return;
@@ -133,16 +107,8 @@ export function HighlightedCode({
           return;
         }
         const message = error instanceof Error ? error.message : "wasm linter failed";
-        monacoRef.current.editor.setModelMarkers(currentModel, LINT_OWNER, [
-          {
-            severity: monacoRef.current.MarkerSeverity.Warning,
-            message,
-            startLineNumber: 1,
-            startColumn: 1,
-            endLineNumber: 1,
-            endColumn: Math.max(2, currentModel.getLineMaxColumn(1))
-          }
-        ]);
+        const markers = lintFailureMarker(message, currentModel, monacoRef.current);
+        monacoRef.current.editor.setModelMarkers(currentModel, LINT_MARKER_OWNER, markers);
       }
     }, 120);
 

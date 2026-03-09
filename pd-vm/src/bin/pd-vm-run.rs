@@ -284,6 +284,12 @@ fn render_source_path_error(source_path: &Path, err: &SourcePathError) -> String
                 .with_line_span_from_source(&source_map, source_id);
             render_source_error(&source_map, &parse, true)
         }
+        SourcePathError::Source(vm::SourceError::Compile(compile)) => {
+            let source = std::fs::read_to_string(source_path).unwrap_or_default();
+            let mut source_map = SourceMap::new();
+            source_map.add_source(source_path.display().to_string(), source);
+            vm::render_compile_error(&source_map, compile, true)
+        }
         SourcePathError::InvalidImportSyntax {
             path,
             line,

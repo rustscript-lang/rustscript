@@ -59,6 +59,12 @@ Supported syntax and features:
   - `Option::None` -> `null`
   - `Option::Some(expr)` -> `(expr)`
   - `print("...", ...)` and `println("...", ...)` support Rust-style `std::fmt` formatting
+- RustScript compile-time type rules:
+  - `+` is inferred as string concatenation when either side is known `string`, so expressions such
+    as `"text" + 123` are valid and lower as string concat.
+  - Known mixed numeric arithmetic widens to `float`.
+  - `if`-expression branches and `if`/`else` local merges with conflicting known concrete types are
+    rejected during compilation.
 - RustScript ownership and liveness behavior (current):
   - `let` bindings are immutable by default; use `let mut` for mutable bindings.
   - Reassignment (`x = ...`), indexed/member mutation (`x[i] = ...`, `x.k = ...`), and `&mut`
@@ -236,3 +242,8 @@ Current subset limits:
 
 - VM helper builtin names such as `count` are not exposed as direct frontend functions.
 - Host calls must be imported/declared in frontend-appropriate syntax.
+- The shared compiler performs lightweight inference after frontend lowering and emits operand type
+  metadata into bytecode programs for interpreter/JIT fast paths and compile diagnostics.
+- Source-level type inference is best observed through emitted operand metadata and compile
+  diagnostics, not through raw local-slot summaries, because hidden slots and compiler-inserted
+  `null` clears can widen local slot metadata to `Unknown`/`Null`.

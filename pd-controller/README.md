@@ -76,7 +76,8 @@ cargo run -p pd-controller
 
 - `pd-controller/webui/public/wasm/pd_vm_lint_wasm.wasm`
 
-The controller serves this file under `/ui/wasm/pd_vm_lint_wasm.wasm` for Monaco live linting in code edit mode.
+The controller serves this file under `/ui/wasm/pd_vm_lint_wasm.wasm` for Monaco live linting in
+both code edit mode and debug-session source views.
 
 Env vars:
 
@@ -156,3 +157,5 @@ For recording mode in UI:
 3. Start session and send matching requests to the edge.
 4. Open captured recordings from the recordings sub-list in session detail.
 5. Use the same Monaco view + toolbar commands (`where/step/next/continue/out/locals/stack/print`) during replay, including hover variable inspection.
+6. Compile-time diagnostics from the wasm linter, including inferred type mismatches such as
+   incompatible `if/else` branches, are shown directly on the debug-session source view.

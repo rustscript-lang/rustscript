@@ -12,6 +12,8 @@ Supported source frontends:
 ## Features
 
 - Live lint diagnostics from the wasm runtime, surfaced as Monaco markers plus a diagnostics panel
+- Compile-time type mismatches such as incompatible `if/else` branches are reported as line-aware
+  Monaco markers from the wasm runtime
 - Run and debug workflows directly in the browser
 - Breakpoints, step/next/out/continue controls, stack/locals views, and hover inspection in the debugger
 - Print output and final stack panels

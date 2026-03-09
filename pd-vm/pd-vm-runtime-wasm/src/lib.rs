@@ -614,6 +614,54 @@ mod tests {
     }
 
     #[test]
+    fn lint_reports_structured_if_else_type_mismatch_diagnostics() {
+        let source = r#"
+            let value = if true => {
+                1
+            } else => {
+                "x"
+            };
+            value;
+        "#;
+
+        let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
+        assert_eq!(
+            report.diagnostics.len(),
+            1,
+            "expected a single compile diagnostic"
+        );
+        let diagnostic = &report.diagnostics[0];
+        assert!(diagnostic.line > 0, "expected a concrete diagnostic line");
+        assert!(
+            diagnostic.span.is_some(),
+            "expected a full-line span for compile diagnostics"
+        );
+        assert!(
+            diagnostic
+                .message
+                .contains("if/else branches produced incompatible expression result"),
+            "unexpected diagnostic message: {:?}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.message.contains("int vs string"),
+            "expected concrete type names in diagnostic: {:?}",
+            diagnostic.message
+        );
+        assert!(
+            !diagnostic.message.contains("IfElseBranchTypeMismatch"),
+            "diagnostic should not expose raw debug formatting: {:?}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.rendered.contains("<lint>:")
+                && diagnostic.rendered.contains("let value = if true => {"),
+            "expected rendered diagnostic snippet, got {:?}",
+            diagnostic.rendered
+        );
+    }
+
+    #[test]
     fn run_reports_missing_host_bindings() {
         let source = r#"
             fn custom(x);
