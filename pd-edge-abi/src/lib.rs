@@ -1,8 +1,36 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbiValueType {
+    Unknown,
+    Null,
+    Int,
+    Float,
+    Bool,
+    String,
+    Array,
+    Map,
+}
+
+impl AbiValueType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Null => "null",
+            Self::Int => "int",
+            Self::Float => "float",
+            Self::Bool => "bool",
+            Self::String => "string",
+            Self::Array => "array",
+            Self::Map => "map",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AbiFunction {
     pub index: u16,
     pub name: &'static str,
     pub arity: u8,
+    pub return_type: AbiValueType,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +90,7 @@ mod tests {
         assert!(manifest.contains("\"abi_version\": 10"));
         for function in FUNCTIONS {
             assert!(manifest.contains(function.name));
+            assert!(manifest.contains(function.return_type.as_str()));
         }
     }
 }
