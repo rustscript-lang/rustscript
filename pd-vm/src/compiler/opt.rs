@@ -138,6 +138,14 @@ impl LocalTypeState {
     }
 }
 
+fn merge_loop_exit_state(
+    state: &mut LocalTypeState,
+    zero_iteration: &LocalTypeState,
+    iterated: &LocalTypeState,
+) {
+    state.merge_from_branches(zero_iteration, iterated);
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TypeInferenceResult {
     pub local_types: Vec<ValueType>,
@@ -378,16 +386,20 @@ impl<'a> TypeContext<'a> {
                 } => {
                     self.apply_stmts(std::slice::from_ref(init), state);
                     let _ = self.infer_expr_type(condition, state);
-                    self.apply_stmts(body, state);
-                    self.apply_stmts(std::slice::from_ref(post), state);
-                    state.clear();
+                    let zero_iteration = state.clone();
+                    let mut iterated = state.clone();
+                    self.apply_stmts(body, &mut iterated);
+                    self.apply_stmts(std::slice::from_ref(post), &mut iterated);
+                    merge_loop_exit_state(state, &zero_iteration, &iterated);
                 }
                 Stmt::While {
                     condition, body, ..
                 } => {
                     let _ = self.infer_expr_type(condition, state);
-                    self.apply_stmts(body, state);
-                    state.clear();
+                    let zero_iteration = state.clone();
+                    let mut iterated = state.clone();
+                    self.apply_stmts(body, &mut iterated);
+                    merge_loop_exit_state(state, &zero_iteration, &iterated);
                 }
             }
         }
@@ -554,16 +566,20 @@ fn legalize_stmts(stmts: &mut [Stmt], state: &mut LocalTypeState, context: &mut 
             } => {
                 legalize_stmts(std::slice::from_mut(init), state, context);
                 let _ = legalize_expr(condition, state, context);
-                legalize_stmts(body, state, context);
-                legalize_stmts(std::slice::from_mut(post), state, context);
-                state.clear();
+                let zero_iteration = state.clone();
+                let mut iterated = state.clone();
+                legalize_stmts(body, &mut iterated, context);
+                legalize_stmts(std::slice::from_mut(post), &mut iterated, context);
+                merge_loop_exit_state(state, &zero_iteration, &iterated);
             }
             Stmt::While {
                 condition, body, ..
             } => {
                 let _ = legalize_expr(condition, state, context);
-                legalize_stmts(body, state, context);
-                state.clear();
+                let zero_iteration = state.clone();
+                let mut iterated = state.clone();
+                legalize_stmts(body, &mut iterated, context);
+                merge_loop_exit_state(state, &zero_iteration, &iterated);
             }
         }
     }
@@ -618,9 +634,16 @@ fn validate_stmts(
             } => {
                 validate_stmts(std::slice::from_ref(init), state, Some(*line), context)?;
                 let _ = validate_expr(condition, state, Some(*line), context)?;
-                validate_stmts(body, state, Some(*line), context)?;
-                validate_stmts(std::slice::from_ref(post), state, Some(*line), context)?;
-                state.clear();
+                let zero_iteration = state.clone();
+                let mut iterated = state.clone();
+                validate_stmts(body, &mut iterated, Some(*line), context)?;
+                validate_stmts(
+                    std::slice::from_ref(post),
+                    &mut iterated,
+                    Some(*line),
+                    context,
+                )?;
+                merge_loop_exit_state(state, &zero_iteration, &iterated);
             }
             Stmt::While {
                 condition,
@@ -628,8 +651,10 @@ fn validate_stmts(
                 line,
             } => {
                 let _ = validate_expr(condition, state, Some(*line), context)?;
-                validate_stmts(body, state, Some(*line), context)?;
-                state.clear();
+                let zero_iteration = state.clone();
+                let mut iterated = state.clone();
+                validate_stmts(body, &mut iterated, Some(*line), context)?;
+                merge_loop_exit_state(state, &zero_iteration, &iterated);
             }
         }
     }
@@ -1123,16 +1148,25 @@ fn collect_stmt_types(
             } => {
                 collect_stmt_types(std::slice::from_ref(init), state, local_types, context);
                 let _ = context.infer_expr_type(condition, state);
-                collect_stmt_types(body, state, local_types, context);
-                collect_stmt_types(std::slice::from_ref(post), state, local_types, context);
-                state.clear();
+                let zero_iteration = state.clone();
+                let mut iterated = state.clone();
+                collect_stmt_types(body, &mut iterated, local_types, context);
+                collect_stmt_types(
+                    std::slice::from_ref(post),
+                    &mut iterated,
+                    local_types,
+                    context,
+                );
+                merge_loop_exit_state(state, &zero_iteration, &iterated);
             }
             Stmt::While {
                 condition, body, ..
             } => {
                 let _ = context.infer_expr_type(condition, state);
-                collect_stmt_types(body, state, local_types, context);
-                state.clear();
+                let zero_iteration = state.clone();
+                let mut iterated = state.clone();
+                collect_stmt_types(body, &mut iterated, local_types, context);
+                merge_loop_exit_state(state, &zero_iteration, &iterated);
             }
         }
     }

@@ -140,6 +140,38 @@ fn compiler_rejects_shadowed_if_else_branch_mismatch() {
 }
 
 #[test]
+fn compiler_rejects_shadowed_if_else_branch_mismatch_after_loop() {
+    let source = r#"
+        let mut total = 0;
+        for (let mut i = 0; i < 4; i = i + 1) {
+            total = total + i;
+        }
+
+        let total = if true => {
+            "222"
+        } else => {
+            let bumped = total + 1;
+            bumped
+        };
+        total;
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("compile should reject loop-carried shadowed mixed branch types"),
+        Err(err) => err,
+    };
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("IfElseBranchTypeMismatch"),
+        "unexpected error: {rendered}"
+    );
+    assert!(
+        rendered.contains("string") && rendered.contains("int"),
+        "expected concrete type names in error: {rendered}"
+    );
+}
+
+#[test]
 fn compiler_propagates_callable_return_types_through_functions_and_closures() {
     let source = r#"
         fn add_one(value) {
