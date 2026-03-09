@@ -302,38 +302,65 @@ fn compile_source_resolves_imports_by_name_not_registration_order() {
 }
 
 #[test]
-fn compiler_rejects_if_else_expression_branch_type_mismatch() {
-    let case = SourceErrorCase {
-        name: "if else expression branch type mismatch",
-        source: r#"
-            let value = if true => { 1 } else => { "x" };
-            value;
-        "#,
-        flavor: SourceFlavor::RustScript,
-        expected_kind: SourceErrorKind::Compile(CompileErrorKind::IfElseBranchTypeMismatch),
-        expected_contains_all: &["expression result", "int", "string"],
-    };
-    expect_source_error_case(&case);
-}
-
-#[test]
-fn compiler_rejects_if_else_local_type_merge_mismatch() {
-    let case = SourceErrorCase {
-        name: "if else local merge mismatch",
-        source: r#"
-            let mut value = 0;
-            if true {
-                value = 1;
-            } else {
-                value = "x";
-            }
-            value;
-        "#,
-        flavor: SourceFlavor::RustScript,
-        expected_kind: SourceErrorKind::Compile(CompileErrorKind::IfElseBranchTypeMismatch),
-        expected_contains_all: &["local slot", "int", "string"],
-    };
-    expect_source_error_case(&case);
+fn compiler_rejects_if_else_type_mismatch_cases() {
+    let cases = [
+        SourceErrorCase {
+            name: "if else expression branch type mismatch",
+            source: r#"
+                let value = if true => { 1 } else => { "x" };
+                value;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::IfElseBranchTypeMismatch),
+            expected_contains_all: &["expression result", "int", "string"],
+        },
+        SourceErrorCase {
+            name: "if else local merge mismatch",
+            source: r#"
+                let mut value = 0;
+                if true {
+                    value = 1;
+                } else {
+                    value = "x";
+                }
+                value;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::IfElseBranchTypeMismatch),
+            expected_contains_all: &["local slot", "int", "string"],
+        },
+        SourceErrorCase {
+            name: "if else initializer self reference is unknown local",
+            source: r#"
+                let total = if true => {
+                    "222"
+                } else => {
+                    let bumped = total + 1;
+                    bumped
+                };
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Parse,
+            expected_contains_all: &["unknown local 'total'"],
+        },
+        SourceErrorCase {
+            name: "if else branch type mismatch through shadowed outer local",
+            source: r#"
+                let total = 1;
+                let total = if true => {
+                    "222"
+                } else => {
+                    let bumped = total + 1;
+                    bumped
+                };
+                total;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::IfElseBranchTypeMismatch),
+            expected_contains_all: &["expression result", "string", "int"],
+        },
+    ];
+    run_source_error_cases(&cases);
 }
 
 #[test]

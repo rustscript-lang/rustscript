@@ -112,6 +112,34 @@ fn compiler_rejects_mixed_if_else_branch_types() {
 }
 
 #[test]
+fn compiler_rejects_shadowed_if_else_branch_mismatch() {
+    let source = r#"
+        let total = 1;
+        let total = if true => {
+            "222"
+        } else => {
+            let bumped = total + 1;
+            bumped
+        };
+        total;
+    "#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("compile should reject shadowed mixed branch types"),
+        Err(err) => err,
+    };
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("IfElseBranchTypeMismatch"),
+        "unexpected error: {rendered}"
+    );
+    assert!(
+        rendered.contains("string") && rendered.contains("int"),
+        "expected concrete type names in error: {rendered}"
+    );
+}
+
+#[test]
 fn compiler_propagates_callable_return_types_through_functions_and_closures() {
     let source = r#"
         fn add_one(value) {

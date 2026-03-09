@@ -174,6 +174,12 @@ pub fn expect_source_error_case(case: &SourceErrorCase<'_>) {
     }
 }
 
+pub fn run_source_error_cases(cases: &[SourceErrorCase<'_>]) {
+    for case in cases {
+        expect_source_error_case(case);
+    }
+}
+
 pub fn expect_parse_error_case(case: &ParseErrorCase<'_>) {
     let source_case = SourceErrorCase {
         name: case.name,
