@@ -1,5 +1,5 @@
-use super::ParseError;
 use super::source_map::{SourceMap, Span};
+use super::{CompileError, ParseError};
 
 pub fn render_source_error(source_map: &SourceMap, err: &ParseError, _styled: bool) -> String {
     let code_prefix = err
@@ -15,6 +15,23 @@ pub fn render_source_error(source_map: &SourceMap, err: &ParseError, _styled: bo
     }
 
     format!("{code_prefix}: line {}: {}", err.line, err.message)
+}
+
+pub fn render_compile_error(source_map: &SourceMap, err: &CompileError, _styled: bool) -> String {
+    let message = err.diagnostic_message();
+
+    if let Some(line) = err.line()
+        && let Some(span) = source_map.line_span(0, line)
+        && let Some(rendered) = render_span_snippet(source_map, span, &message)
+    {
+        return format!("compile error: {}", rendered.trim_end());
+    }
+
+    if let Some(line) = err.line() {
+        return format!("compile error: line {line}: {message}");
+    }
+
+    format!("compile error: {message}")
 }
 
 fn render_span_snippet(source_map: &SourceMap, span: Span, message: &str) -> Option<String> {

@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use self::source_map::{SourceMap, Span};
@@ -22,6 +23,53 @@ pub enum CompileError {
     InlineFunctionRecursion(String),
     IfElseBranchTypeMismatch { line: Option<u32>, detail: String },
 }
+
+impl CompileError {
+    pub fn line(&self) -> Option<usize> {
+        match self {
+            CompileError::IfElseBranchTypeMismatch { line, .. } => {
+                line.and_then(|value| usize::try_from(value).ok())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn diagnostic_message(&self) -> String {
+        match self {
+            CompileError::Assembler(err) => err.to_string(),
+            CompileError::CallArityOverflow => {
+                "call arity exceeds the supported bytecode encoding".to_string()
+            }
+            CompileError::ClosureUsedAsValue => {
+                "closures cannot be used as plain values".to_string()
+            }
+            CompileError::CallableUsedAsValue => {
+                "callables cannot be used as plain values".to_string()
+            }
+            CompileError::NonCallableLocal(slot) => format!("local slot {slot} is not callable"),
+            CompileError::LocalSlotOverflow(slot) => {
+                format!("local slot {slot} exceeds the supported bytecode encoding")
+            }
+            CompileError::CallableArityMismatch { expected, got } => {
+                format!("callable arity mismatch: expected {expected}, got {got}")
+            }
+            CompileError::BreakOutsideLoop => "break used outside of a loop".to_string(),
+            CompileError::ContinueOutsideLoop => "continue used outside of a loop".to_string(),
+            CompileError::InlineFunctionRecursion(name) => {
+                format!("inline function recursion detected in '{name}'")
+            }
+            CompileError::IfElseBranchTypeMismatch { detail, .. } => detail.clone(),
+        }
+    }
+}
+
+impl fmt::Display for CompileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.diagnostic_message())
+    }
+}
+
+impl std::error::Error for CompileError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
@@ -101,7 +149,7 @@ impl std::fmt::Display for SourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SourceError::Parse(err) => write!(f, "{err}"),
-            SourceError::Compile(err) => write!(f, "compile error: {err:?}"),
+            SourceError::Compile(err) => write!(f, "compile error: {err}"),
         }
     }
 }

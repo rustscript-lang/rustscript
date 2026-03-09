@@ -13,6 +13,17 @@ pub enum AssemblerError {
     UnknownLabel(String),
 }
 
+impl std::fmt::Display for AssemblerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AssemblerError::DuplicateLabel(label) => write!(f, "duplicate label '{label}'"),
+            AssemblerError::UnknownLabel(label) => write!(f, "unknown label '{label}'"),
+        }
+    }
+}
+
+impl std::error::Error for AssemblerError {}
+
 struct Fixup {
     at: usize,
     label: String,

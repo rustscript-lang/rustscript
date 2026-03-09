@@ -38,6 +38,8 @@ source syntaxes (`.rss`, `.js`, `.lua`, `.scm`).
 Executes compiled compact bytecode rather than interpreting source.
 Offers consistent runtime semantics for both synchronous and asynchronous execution.
 Includes rich debugging and profiling tools: interactive debugger, recording and replay, and JIT trace insights.
+Emits optional compile-time type metadata that the interpreter and trace JIT use for typed fast
+paths and clearer compile diagnostics.
 ## TODO
 
 - [ ] Optional type annotation (rustscript) for function boundaries / host APIs.
@@ -322,6 +324,10 @@ cargo check -p pd-vm --target wasm32-unknown-unknown --no-default-features
 Browser/editor lint integration is provided by sibling crate `pd-vm-lint-wasm` via
 `lint_source_json`.
 
+The wasm linter reports both parse errors and compile-time type errors with Monaco-friendly line
+and span metadata. That includes inferred-type failures such as incompatible `if`/`else` branch
+merges.
+
 ### Wasm Runtime Playground
 
 Runtime-enabled wasm build (without native JIT backend):
@@ -378,8 +384,21 @@ Migration perf record (handwritten vs Cranelift baseline before handwritten back
 
 - `constants: Vec<Value>`
 - `code: Vec<u8>`
+- `local_count: usize`
 - `imports: Vec<HostImport>`
 - `debug: Option<DebugInfo>`
+- `type_map: Option<TypeMap>`
+
+`TypeMap` currently contains:
+
+- `operand_types: HashMap<usize, (ValueType, ValueType)>`
+- `local_types: Vec<ValueType>`
+
+`operand_types` is keyed by bytecode offset and records inferred operand pairs for emitted binary
+ops/comparisons. The interpreter and trace recorder use it for typed int/float/string fast paths.
+`local_types` is a post-lowering local-slot summary and is intentionally lossy: compiler-inserted
+`null` clears and hidden frame slots can widen entries to `Unknown`/`Null`, so it should not be
+treated as a source-level binding type table.
 
 Bytecode format:
 
@@ -487,9 +506,31 @@ The end-to-end stack is split into layers. Not every entrypoint uses every layer
 1. Unit linking (`linker::merge_units`)
 1. Frontend lowering (`rustscript`, `javascript`, `lua`, `scheme`)
 1. Frontend-independent IR
+1. Type-consistency validation on legalized IR (for example rejecting known `if`/`else` branch mismatches)
+1. Lifetime/liveness lowering plus type metadata collection
 1. Bytecode backend (`Compiler` + `Assembler` -> `Program`) executed by VM
 1. Trace-JIT IR recording (`JitTrace` + `TraceStep`) using TraceStep IR
 1. Native machine code emission and execution
+
+#### Type Metadata and Inference
+
+The compiler runs lightweight value-type inference before bytecode emission and records the result
+into `Program.type_map` when metadata is available.
+
+Current important behaviors:
+
+- Known arithmetic on `int`/`int` stays `int`.
+- Known mixed numeric arithmetic widens to `float`.
+- `+` becomes string concatenation when either side is known `string`, so cases such as
+  `"text" + 123` are recorded as string-concat operand metadata.
+- Callable return types propagate through direct named calls, function-valued locals,
+  closure-valued locals, and callable parameters when the callee can still be identified.
+- `if`/`else` expression results and branch-local merges are rejected when both sides have
+  different known concrete types. The compiler no longer keeps backward-compatible dynamic fallback
+  behavior for those mismatches.
+
+This inference is intentionally local and pragmatic. It exists to drive compile diagnostics and
+monomorphic runtime fast paths, not to provide a full source-language static type system.
 
 
 #### Compiler APIs
@@ -603,6 +644,10 @@ Core compiler/IR:
 
 - callable locals can be passed and called, but callables are not runtime `Value`s
 - callable values cannot currently be stored in arrays/maps or returned from functions
+- callable return-type inference propagates through direct named calls, callable locals, closures,
+  and callable parameters when the compiler can still identify the callee
+- known `if`/`else` expression results and branch-local merges with incompatible concrete types are
+  compile errors
 - recursive RustScript function declarations are not supported by current inlining-based lowering
 - function declarations can be nested and implicitly capture outer locals (closure-like snapshot at declaration time)
 - in RustScript move-semantics mode, implicit captures follow expression semantics (`x` may move, `x.copy()` copies, `&x`/`&mut x` capture borrowed views)

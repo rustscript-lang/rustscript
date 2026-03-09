@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use vm::{
     ParseError, SourceError, SourceMap, SourcePathError, Span, Vm, compile_source,
-    compile_source_file, render_source_error, render_vm_error,
+    compile_source_file, render_compile_error, render_source_error, render_vm_error,
 };
 
 #[test]
@@ -57,6 +57,36 @@ fn compile_source_file_parse_error_uses_original_line() {
         }
         _ => panic!("expected parse error"),
     }
+}
+
+#[test]
+fn render_compile_error_highlights_if_else_mismatch_line() {
+    let source = "let value = if true => {\n    1\n} else => {\n    \"x\"\n};\n";
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("compile should reject if/else mismatch"),
+        Err(err) => err,
+    };
+    let compile = match err {
+        SourceError::Compile(compile) => compile,
+        other => panic!("expected compile error, got {other:?}"),
+    };
+
+    let line = compile
+        .line()
+        .expect("if/else mismatch should report a line");
+    let mut source_map = SourceMap::new();
+    let source_id = source_map.add_source("inline.rss", source);
+    let line_text = source_map
+        .file(source_id)
+        .and_then(|file| file.line_text(line))
+        .expect("line text should exist");
+    let rendered = render_compile_error(&source_map, &compile, false);
+
+    assert!(rendered.contains("if/else branches produced incompatible expression result"));
+    assert!(rendered.contains("int vs string"));
+    assert!(rendered.contains(&format!("inline.rss:{line}:1")));
+    assert!(rendered.contains(line_text));
 }
 
 #[test]

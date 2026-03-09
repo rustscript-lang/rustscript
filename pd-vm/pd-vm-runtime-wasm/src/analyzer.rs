@@ -1,6 +1,6 @@
 use vm::{
     SourceError, SourceFlavor, SourceMap, SourcePathError, compile_source_with_flavor_and_options,
-    render_source_error,
+    render_compile_error, render_source_error,
 };
 
 use crate::stdlib::embedded_stdlib_compile_options;
@@ -43,15 +43,7 @@ pub fn lint_source_with_flavor(source: &str, flavor: SourceFlavor) -> LintReport
             let source_id = source_map.add_source("<lint>", source.to_string());
             let err = err.with_line_span_from_source(&source_map, source_id);
             let span = err.span.and_then(|span| {
-                let (start_line, start_col) = source_map.line_col_for_offset(source_id, span.lo)?;
-                let end_offset = if span.hi > span.lo { span.hi } else { span.lo };
-                let (end_line, end_col) = source_map.line_col_for_offset(source_id, end_offset)?;
-                Some(LintSpan {
-                    start_line,
-                    start_col,
-                    end_line,
-                    end_col,
-                })
+                lint_span_from_source_span(&source_map, source_id, span.lo, span.hi)
             });
             let rendered = render_source_error(&source_map, &err, true);
             LintReport {
@@ -63,14 +55,24 @@ pub fn lint_source_with_flavor(source: &str, flavor: SourceFlavor) -> LintReport
                 }],
             }
         }
-        Err(SourcePathError::Source(SourceError::Compile(err))) => LintReport {
-            diagnostics: vec![LintDiagnostic {
-                line: 0,
-                message: format!("compile error: {err:?}"),
-                span: None,
-                rendered: format!("compile error: {err:?}"),
-            }],
-        },
+        Err(SourcePathError::Source(SourceError::Compile(err))) => {
+            let mut source_map = SourceMap::new();
+            let source_id = source_map.add_source("<lint>", source.to_string());
+            let line = err.line().unwrap_or(0);
+            let span = err.line().and_then(|value| {
+                let span = source_map.line_span(source_id, value)?;
+                lint_span_from_source_span(&source_map, source_id, span.lo, span.hi)
+            });
+            let rendered = render_compile_error(&source_map, &err, true);
+            LintReport {
+                diagnostics: vec![LintDiagnostic {
+                    line,
+                    message: err.diagnostic_message(),
+                    span,
+                    rendered,
+                }],
+            }
+        }
         Err(SourcePathError::InvalidImportSyntax { line, message, .. }) => LintReport {
             diagnostics: vec![LintDiagnostic {
                 line,
@@ -88,4 +90,21 @@ pub fn lint_source_with_flavor(source: &str, flavor: SourceFlavor) -> LintReport
             }],
         },
     }
+}
+
+fn lint_span_from_source_span(
+    source_map: &SourceMap,
+    source_id: u32,
+    lo: usize,
+    hi: usize,
+) -> Option<LintSpan> {
+    let (start_line, start_col) = source_map.line_col_for_offset(source_id, lo)?;
+    let end_offset = if hi > lo { hi } else { lo };
+    let (end_line, end_col) = source_map.line_col_for_offset(source_id, end_offset)?;
+    Some(LintSpan {
+        start_line,
+        start_col,
+        end_line,
+        end_col,
+    })
 }
