@@ -359,6 +359,26 @@ fn compiler_rejects_if_else_type_mismatch_cases() {
             expected_kind: SourceErrorKind::Compile(CompileErrorKind::IfElseBranchTypeMismatch),
             expected_contains_all: &["expression result", "string", "int"],
         },
+        SourceErrorCase {
+            name: "if else branch type mismatch through shadowed outer local after loop",
+            source: r#"
+                let mut total = 0;
+                for (let mut i = 0; i < 4; i = i + 1) {
+                    total = total + i;
+                }
+
+                let total = if true => {
+                    "222"
+                } else => {
+                    let bumped = total + 1;
+                    bumped
+                };
+                total;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::IfElseBranchTypeMismatch),
+            expected_contains_all: &["expression result", "string", "int"],
+        },
     ];
     run_source_error_cases(&cases);
 }
