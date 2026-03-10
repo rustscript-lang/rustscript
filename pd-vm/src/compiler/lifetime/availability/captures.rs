@@ -131,7 +131,10 @@ impl AvailabilityAnalyzer {
         self.copy_local_field_moves(state, source_slot, captured_slot);
         self.copy_local_collection_aliases(state, source_slot, captured_slot);
         if capture_mode == CaptureBindingMode::Move
-            && self.should_move_local_on_rebind_source(source_slot, state)
+            && self.enable_local_move_semantics
+            && source_idx < self.local_count
+            && (state.movable_locals[source_idx]
+                || !state.collection_aliases[source_idx].is_empty())
         {
             self.mark_local_moved(state, source_slot);
         }

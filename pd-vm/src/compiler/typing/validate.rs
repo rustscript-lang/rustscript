@@ -534,7 +534,14 @@ fn validate_callable_body(
     else {
         return Ok(());
     };
-    validate_stmts(body_stmts, &mut nested, line_context, source_name, context, false)?;
+    validate_stmts(
+        body_stmts,
+        &mut nested,
+        line_context,
+        source_name,
+        context,
+        false,
+    )?;
     let _ = validate_expr(
         body_expr,
         &nested,

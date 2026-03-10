@@ -272,7 +272,11 @@ impl Parser {
         self.expect(&TokenKind::LBrace, "expected '{' after struct name")?;
         let fields = self.parse_object_type_schema_fields()?;
         self.expect(&TokenKind::RBrace, "expected '}' after struct body")?;
-        if self.struct_schemas.insert(name.clone(), TypeSchema::Object(fields)).is_some() {
+        if self
+            .struct_schemas
+            .insert(name.clone(), TypeSchema::Object(fields))
+            .is_some()
+        {
             return Err(ParseError {
                 span: None,
                 code: None,
@@ -450,25 +454,28 @@ impl Parser {
         self.functions.insert(name.clone(), decl.clone());
         self.function_list.push(decl.clone());
 
-        if self.match_kind(&TokenKind::Equal) {
+        let has_impl = if self.match_kind(&TokenKind::Equal) {
             let function_impl = self.parse_function_impl_expr(&params)?;
             self.expect(
                 &TokenKind::Semicolon,
                 "expected ';' after function definition",
             )?;
             self.function_impls.insert(index, function_impl);
+            true
         } else if self.match_kind(&TokenKind::LBrace) {
             let function_impl = self.parse_function_impl_block(&params)?;
             self.expect(&TokenKind::RBrace, "expected '}' after function body")?;
             self.function_impls.insert(index, function_impl);
             // Optional trailing semicolon for compatibility.
             self.match_kind(&TokenKind::Semicolon);
+            true
         } else {
             self.expect(
                 &TokenKind::Semicolon,
                 "expected ';' after function declaration",
             )?;
-        }
+            false
+        };
 
         Ok(Stmt::FuncDecl {
             name,
@@ -476,6 +483,7 @@ impl Parser {
             arity,
             args: params,
             exported,
+            has_impl,
             line,
         })
     }
@@ -484,7 +492,10 @@ impl Parser {
         &mut self,
         params: &[String],
     ) -> Result<FunctionImpl, ParseError> {
-        self.parse_function_impl(params, |parser| Ok((Vec::new(), parser.parse_expr()?)))
+        self.parse_function_impl(params, |parser| {
+            let body_expr_line = parser.current_line_u32();
+            Ok((Vec::new(), parser.parse_expr()?, body_expr_line))
+        })
     }
 
     pub(super) fn parse_optional_declared_return_type(&mut self) -> Result<ValueType, ParseError> {
@@ -524,7 +535,9 @@ impl Parser {
         Ok(ty)
     }
 
-    fn parse_object_type_schema_fields(&mut self) -> Result<HashMap<String, TypeSchema>, ParseError> {
+    fn parse_object_type_schema_fields(
+        &mut self,
+    ) -> Result<HashMap<String, TypeSchema>, ParseError> {
         let mut fields = HashMap::new();
         if !self.check(&TokenKind::RBrace) {
             loop {
@@ -597,6 +610,7 @@ impl Parser {
         self.parse_function_impl(params, |parser| {
             let mut body_stmts = Vec::new();
             let mut trailing_expr: Option<Expr> = None;
+            let mut trailing_expr_line: Option<u32> = None;
             while !parser.check(&TokenKind::RBrace) {
                 if parser.check(&TokenKind::Eof) {
                     return Err(ParseError {
@@ -616,14 +630,15 @@ impl Parser {
                 let expr = parser.parse_expr()?;
                 if parser.check(&TokenKind::RBrace) {
                     trailing_expr = Some(expr);
+                    trailing_expr_line = Some(line);
                     break;
                 }
                 parser.consume_stmt_terminator("expected ';' after expression")?;
                 body_stmts.push(Stmt::Expr { expr, line });
             }
 
-            let body_expr = if let Some(expr) = trailing_expr {
-                expr
+            let (body_expr, body_expr_line) = if let Some(expr) = trailing_expr {
+                (expr, trailing_expr_line.expect("trailing expr should record a line"))
             } else {
                 let Some(last_stmt) = body_stmts.pop() else {
                     return Err(ParseError {
@@ -633,8 +648,8 @@ impl Parser {
                         message: "function body must end with an expression statement".to_string(),
                     });
                 };
-                if let Stmt::Expr { expr, .. } = last_stmt {
-                    expr
+                if let Stmt::Expr { expr, line } = last_stmt {
+                    (expr, line)
                 } else {
                     return Err(ParseError {
                         span: None,
@@ -645,7 +660,7 @@ impl Parser {
                 }
             };
 
-            Ok((body_stmts, body_expr))
+            Ok((body_stmts, body_expr, body_expr_line))
         })
     }
 
@@ -655,7 +670,7 @@ impl Parser {
         parse_body: F,
     ) -> Result<FunctionImpl, ParseError>
     where
-        F: FnOnce(&mut Self) -> Result<(Vec<Stmt>, Expr), ParseError>,
+        F: FnOnce(&mut Self) -> Result<(Vec<Stmt>, Expr, u32), ParseError>,
     {
         let mut param_scope = HashMap::new();
         let mut param_slots = Vec::new();
@@ -678,7 +693,7 @@ impl Parser {
             capture_copies: Vec::new(),
         });
         self.function_body_depth += 1;
-        let (body_stmts, body_expr) = parse_body(self)?;
+        let (body_stmts, body_expr, body_expr_line) = parse_body(self)?;
         self.function_body_depth = self.function_body_depth.saturating_sub(1);
         let capture_context = self
             .closure_capture_contexts
@@ -690,11 +705,15 @@ impl Parser {
                 message: "internal function capture state error".to_string(),
             })?;
         self.closure_scopes.pop();
+        let mut capture_copies = capture_context.capture_copies;
+        capture_copies.sort_unstable();
+        capture_copies.dedup();
         Ok(FunctionImpl {
             param_slots,
-            capture_copies: capture_context.capture_copies,
+            capture_copies,
             body_stmts,
             body_expr,
+            body_expr_line,
         })
     }
 
@@ -738,8 +757,9 @@ impl Parser {
             }
             let index = self.allocate_hidden_local()?;
             if let Some(scope) = self.closure_scopes.last_mut() {
-                scope.insert(name, index);
+                scope.insert(name.clone(), index);
             }
+            self.named_local_bindings.push((name, index));
             self.apply_let_binding_mutability(index, declared_mutable, true);
             return Ok(Stmt::Let {
                 index,

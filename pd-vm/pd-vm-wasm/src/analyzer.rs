@@ -1,11 +1,11 @@
 use std::path::Path;
 
 use vm::{
-    CompileSourceFileOptions, CompiledProgram, SourceError, SourceFlavor, SourceMap, SourcePathError,
+    CompileSourceFileOptions, CompiledProgram, SourceError, SourceFlavor, SourceMap,
+    SourcePathError, compile_source_at_path_with_flavor_and_options,
+    compile_source_with_flavor_and_options, lint_trailing_function_return_semicolons,
     lint_unknown_inferred_local_types_at_path_with_options,
-    lint_unknown_inferred_local_types_with_options,
-    compile_source_at_path_with_flavor_and_options, compile_source_with_flavor_and_options,
-    lint_trailing_function_return_semicolons, render_compile_error, render_source_error,
+    lint_unknown_inferred_local_types_with_options, render_compile_error, render_source_error,
 };
 
 use crate::stdlib::embedded_stdlib_compile_options;
@@ -99,7 +99,8 @@ fn lint_compile_result(
             }
         }
         Err(SourcePathError::Source(SourceError::Parse(err))) => {
-            let mut diagnostics = lint_trailing_function_return_semicolon_diagnostics(source, flavor);
+            let mut diagnostics =
+                lint_trailing_function_return_semicolon_diagnostics(source, flavor);
             diagnostics.push(lint_diagnostic_from_parse_error(
                 source,
                 err,
@@ -108,7 +109,8 @@ fn lint_compile_result(
             LintReport { diagnostics }
         }
         Err(SourcePathError::Source(SourceError::Compile(err))) => {
-            let mut diagnostics = lint_trailing_function_return_semicolon_diagnostics(source, flavor);
+            let mut diagnostics =
+                lint_trailing_function_return_semicolon_diagnostics(source, flavor);
             diagnostics.extend(lint_unknown_inferred_local_diagnostics(
                 source, flavor, path, options,
             ));
@@ -130,7 +132,8 @@ fn lint_compile_result(
             LintReport { diagnostics }
         }
         Err(SourcePathError::InvalidImportSyntax { line, message, .. }) => {
-            let mut diagnostics = lint_trailing_function_return_semicolon_diagnostics(source, flavor);
+            let mut diagnostics =
+                lint_trailing_function_return_semicolon_diagnostics(source, flavor);
             diagnostics.push(LintDiagnostic {
                 line,
                 severity: LintSeverity::Error,
@@ -141,7 +144,8 @@ fn lint_compile_result(
             LintReport { diagnostics }
         }
         Err(err) => {
-            let mut diagnostics = lint_trailing_function_return_semicolon_diagnostics(source, flavor);
+            let mut diagnostics =
+                lint_trailing_function_return_semicolon_diagnostics(source, flavor);
             diagnostics.push(LintDiagnostic {
                 line: 0,
                 severity: LintSeverity::Error,

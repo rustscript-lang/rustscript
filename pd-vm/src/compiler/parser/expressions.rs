@@ -940,10 +940,8 @@ impl Parser {
         let container_len =
             self.build_builtin_call_expr(BuiltinFunction::Len, vec![Expr::Var(container_slot)])?;
         let key_present = Expr::Eq(Box::new(set_probe_len), Box::new(container_len));
-        let value = self.build_builtin_call_expr(
-            BuiltinFunction::Get,
-            vec![Expr::Var(container_slot), key],
-        )?;
+        let value = self
+            .build_builtin_call_expr(BuiltinFunction::Get, vec![Expr::Var(container_slot), key])?;
         Ok(Expr::IfElse {
             condition: Box::new(key_present),
             then_expr: Box::new(value),

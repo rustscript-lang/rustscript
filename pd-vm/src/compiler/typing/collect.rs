@@ -44,6 +44,30 @@ pub(super) fn seed_function_param_state(
     }
 }
 
+pub(super) fn seed_function_capture_state(
+    state: &mut LocalTypeState,
+    function_index: u16,
+    capture_copies: &[(LocalSlot, LocalSlot)],
+    observed_capture_states: &HashMap<u16, LocalTypeState>,
+) {
+    let Some(observed) = observed_capture_states.get(&function_index) else {
+        return;
+    };
+
+    for (_, captured_slot) in capture_copies {
+        if let Some(callable) = observed.callable(*captured_slot).cloned() {
+            state.bind_callable(*captured_slot, callable);
+        } else {
+            state.set_with_schema_origin(
+                *captured_slot,
+                observed.get(*captured_slot),
+                observed.schema(*captured_slot).cloned(),
+                observed.has_declared_schema(*captured_slot),
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn collect_function_types(
     function_index: u16,
@@ -57,6 +81,7 @@ pub(super) fn collect_function_types(
     host_import_signatures: &HashMap<u16, HostCallableSignature>,
     observed_function_param_types: &HashMap<u16, Vec<BoundType>>,
     observed_function_param_schemas: &HashMap<u16, Vec<Option<TypeSchema>>>,
+    observed_function_capture_states: &HashMap<u16, LocalTypeState>,
 ) {
     let mut state = LocalTypeState::default();
     let mut context = TypeContext::new(
@@ -72,14 +97,18 @@ pub(super) fn collect_function_types(
         observed_function_param_slice(observed_function_param_types, function_index),
         observed_function_param_schema_slice(observed_function_param_schemas, function_index),
     );
+    seed_function_capture_state(
+        &mut state,
+        function_index,
+        &function_impl.capture_copies,
+        observed_function_capture_states,
+    );
     for slot in &function_impl.param_slots {
         record_local_type(local_types, *slot, state.get(*slot));
     }
-    for (source_slot, captured_slot) in &function_impl.capture_copies {
-        let ty = state.get(*source_slot);
+    for (_source_slot, captured_slot) in &function_impl.capture_copies {
+        let ty = state.get(*captured_slot);
         record_local_type(local_types, *captured_slot, ty);
-        let source_state = state.clone();
-        state.copy_binding_from(&source_state, *source_slot, *captured_slot, None, false);
         if state.callable(*captured_slot).is_some() {
             record_callable_slot(callable_slots, *captured_slot);
         }
@@ -112,8 +141,13 @@ pub(super) fn collect_stmt_types(
                 collect_closure_capture_types(closure, state, local_types);
                 collect_expr_types(&closure.body, state, local_types, callable_slots, context);
             }
-            Stmt::FuncDecl { index, .. } => {
-                if let Some(function_impl) = context.function_impls.get(index) {
+            Stmt::FuncDecl {
+                index, has_impl, ..
+            } => {
+                if *has_impl
+                    && let Some(function_impl) = context.function_impls.get(index)
+                {
+                    context.observe_function_capture_state(*index, &function_impl.capture_copies, state);
                     for (source_slot, captured_slot) in &function_impl.capture_copies {
                         let ty = state.get(*source_slot);
                         record_local_type(local_types, *captured_slot, ty);
@@ -261,16 +295,13 @@ fn collect_expr_types(
             let _ = context.infer_expr_type(expr, state);
         }
         Expr::Closure(closure) => {
-            if let Some(nested) =
-                context.build_callable_state(&closure.param_slots, &closure.capture_copies, None, state)
-            {
-                collect_callable_body_types(
-                    closure,
-                    &nested,
-                    local_types,
-                    callable_slots,
-                    context,
-                );
+            if let Some(nested) = context.build_callable_state(
+                &closure.param_slots,
+                &closure.capture_copies,
+                None,
+                state,
+            ) {
+                collect_callable_body_types(closure, &nested, local_types, callable_slots, context);
             } else {
                 let _ = context.infer_expr_type(expr, state);
             }
@@ -285,13 +316,7 @@ fn collect_expr_types(
                 Some(args),
                 state,
             ) {
-                collect_callable_body_types(
-                    closure,
-                    &nested,
-                    local_types,
-                    callable_slots,
-                    context,
-                );
+                collect_callable_body_types(closure, &nested, local_types, callable_slots, context);
             } else {
                 let _ = context.infer_expr_type(expr, state);
             }

@@ -1,12 +1,12 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::assembler::Assembler;
 use crate::builtins::BuiltinFunction;
 use crate::{Program, TypeMap, Value, ValueType};
 
 use super::ir::{
-    ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, MatchTypePattern,
-    Stmt, TypeSchema,
+    ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, MatchTypePattern, Stmt,
+    TypeSchema,
 };
 use super::{CompileError, typing};
 
@@ -173,9 +173,16 @@ impl Compiler {
                 self.assembler.mark_line(*line);
                 self.bind_closure_captures(closure)?;
             }
-            Stmt::FuncDecl { index, line, .. } => {
+            Stmt::FuncDecl {
+                index,
+                has_impl,
+                line,
+                ..
+            } => {
                 self.assembler.mark_line(*line);
-                self.bind_function_decl_captures(*index)?;
+                if *has_impl {
+                    self.bind_function_decl_captures(*index)?;
+                }
             }
             Stmt::Expr { expr, line } => {
                 self.assembler.mark_line(*line);
@@ -219,9 +226,39 @@ impl Compiler {
                 line,
             } => {
                 let callable_snapshot = self.callable_bindings.clone();
-                let loop_entry_type_state = self.type_state.clone();
                 self.assembler.mark_line(*line);
                 self.compile_stmt(init)?;
+                let loop_entry_type_state = self.type_state.clone();
+                let stabilized_loop_type_state = self.stabilize_loop_type_state(
+                    &loop_entry_type_state,
+                    |iterated| {
+                        let _ = typing::infer_expr_type_with_function_impls_and_imports(
+                            condition,
+                            iterated,
+                            &self.function_impls,
+                            &self.struct_schemas,
+                            &self.host_import_return_types,
+                            &self.host_import_signatures,
+                        );
+                        typing::apply_stmts_with_function_impls_and_imports(
+                            body,
+                            iterated,
+                            &self.function_impls,
+                            &self.struct_schemas,
+                            &self.host_import_return_types,
+                            &self.host_import_signatures,
+                        );
+                        typing::apply_stmts_with_function_impls_and_imports(
+                            std::slice::from_ref(post),
+                            iterated,
+                            &self.function_impls,
+                            &self.struct_schemas,
+                            &self.host_import_return_types,
+                            &self.host_import_signatures,
+                        );
+                    },
+                );
+                self.type_state = stabilized_loop_type_state;
                 let start_label = self.fresh_label("for_start");
                 let continue_label = self.fresh_label("for_continue");
                 let end_label = self.fresh_label("for_end");
@@ -255,7 +292,27 @@ impl Compiler {
             } => {
                 let callable_snapshot = self.callable_bindings.clone();
                 let loop_entry_type_state = self.type_state.clone();
+                let stabilized_loop_type_state =
+                    self.stabilize_loop_type_state(&loop_entry_type_state, |iterated| {
+                        let _ = typing::infer_expr_type_with_function_impls_and_imports(
+                            condition,
+                            iterated,
+                            &self.function_impls,
+                            &self.struct_schemas,
+                            &self.host_import_return_types,
+                            &self.host_import_signatures,
+                        );
+                        typing::apply_stmts_with_function_impls_and_imports(
+                            body,
+                            iterated,
+                            &self.function_impls,
+                            &self.struct_schemas,
+                            &self.host_import_return_types,
+                            &self.host_import_signatures,
+                        );
+                    });
                 self.assembler.mark_line(*line);
+                self.type_state = stabilized_loop_type_state;
                 let start_label = self.fresh_label("while_start");
                 let end_label = self.fresh_label("while_end");
                 self.assembler
@@ -543,7 +600,11 @@ impl Compiler {
     }
 
     fn bind_closure_captures(&mut self, closure: &ClosureExpr) -> Result<(), CompileError> {
+        let mut seen = HashSet::new();
         for (source_index, captured_slot) in &closure.capture_copies {
+            if !seen.insert((*source_index, *captured_slot)) {
+                continue;
+            }
             let capture_mode = self.closure_capture_mode_for_slot(closure, *captured_slot);
             self.bind_capture_copy(*source_index, *captured_slot, capture_mode)?;
         }
@@ -554,7 +615,11 @@ impl Compiler {
         let Some(function_impl) = self.function_impls.get(&index).cloned() else {
             return Ok(());
         };
+        let mut seen = HashSet::new();
         for (source_index, captured_slot) in &function_impl.capture_copies {
+            if !seen.insert((*source_index, *captured_slot)) {
+                continue;
+            }
             let capture_mode = self.function_capture_mode_for_slot(&function_impl, *captured_slot);
             self.bind_capture_copy(*source_index, *captured_slot, capture_mode)?;
         }
@@ -885,19 +950,22 @@ impl Compiler {
         self.callable_bindings.remove(&slot);
         self.compile_scalar_expr(expr)?;
         self.emit_stloc(slot)?;
-        let slot_declared_schema = declared_schema
-            .cloned()
-            .or_else(|| self.type_state.has_declared_schema(slot).then(|| self.type_state.schema(slot).cloned()).flatten());
-        let schema = slot_declared_schema
-            .clone()
-            .or_else(|| typing::infer_expr_schema_with_function_impls_and_imports(
+        let slot_declared_schema = declared_schema.cloned().or_else(|| {
+            self.type_state
+                .has_declared_schema(slot)
+                .then(|| self.type_state.schema(slot).cloned())
+                .flatten()
+        });
+        let schema = slot_declared_schema.clone().or_else(|| {
+            typing::infer_expr_schema_with_function_impls_and_imports(
                 expr,
                 &self.type_state,
                 &self.function_impls,
                 &self.struct_schemas,
                 &self.host_import_return_types,
                 &self.host_import_signatures,
-            ));
+            )
+        });
         let from_declared_schema =
             slot_declared_schema.is_some() || self.type_state.has_declared_schema(slot);
         let ty = slot_declared_schema
@@ -1138,6 +1206,28 @@ impl Compiler {
             &self.host_import_signatures,
         );
         state
+    }
+
+    fn stabilize_loop_type_state<F>(
+        &self,
+        initial_state: &typing::LocalTypeState,
+        mut run_iteration: F,
+    ) -> typing::LocalTypeState
+    where
+        F: FnMut(&mut typing::LocalTypeState),
+    {
+        let zero_iteration = initial_state.clone();
+        let mut first_iteration = initial_state.clone();
+        run_iteration(&mut first_iteration);
+        let mut second_iteration = first_iteration.clone();
+        run_iteration(&mut second_iteration);
+
+        let mut stable_iteration = typing::LocalTypeState::default();
+        stable_iteration.merge_from_branches(&first_iteration, &second_iteration);
+
+        let mut stabilized = zero_iteration.clone();
+        stabilized.merge_from_branches(&zero_iteration, &stable_iteration);
+        stabilized
     }
 
     fn value_type_of_expr(&self, expr: &Expr) -> ValueType {

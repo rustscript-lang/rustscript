@@ -676,3 +676,36 @@ fn compiler_attaches_operand_types_for_named_struct_fields_and_arrays() {
     let compiled = compile_source(source).expect("compile should succeed");
     assert_last_opcode_operand_types(&compiled, OpCode::Add, (ValueType::Int, ValueType::Int));
 }
+
+#[test]
+fn compiler_stabilizes_loop_typeof_after_container_element_type_widens() {
+    let source = r#"
+        let mut pending = [{a: 1}];
+        let mut first = "";
+        let mut second = "";
+        let mut steps = 0;
+
+        while (&pending).length > 0 {
+            let next_index = (&pending).length - 1;
+            let item = (&pending)[next_index].copy();
+            pending = pending[0:next_index];
+
+            if steps == 0 {
+                first = type(item);
+                pending[pending.length] = 1;
+            } else {
+                second = type(item);
+            }
+
+            steps = steps + 1;
+        }
+
+        first + second;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("mapint")]);
+}

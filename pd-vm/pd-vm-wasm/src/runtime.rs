@@ -379,7 +379,11 @@ fn poll_waiting_host_op_once(vm: &mut Vm) -> Poll<VmResult<()>> {
 }
 
 impl RunSession {
-    fn new(vm: Vm, output_lines: Arc<Mutex<Vec<String>>>, diagnostics: Vec<LintDiagnostic>) -> Self {
+    fn new(
+        vm: Vm,
+        output_lines: Arc<Mutex<Vec<String>>>,
+        diagnostics: Vec<LintDiagnostic>,
+    ) -> Self {
         Self {
             vm,
             output_lines,
@@ -456,7 +460,11 @@ impl RunSession {
 }
 
 impl DebugSession {
-    fn new(vm: Vm, output_lines: Arc<Mutex<Vec<String>>>, diagnostics: Vec<LintDiagnostic>) -> Self {
+    fn new(
+        vm: Vm,
+        output_lines: Arc<Mutex<Vec<String>>>,
+        diagnostics: Vec<LintDiagnostic>,
+    ) -> Self {
         Self {
             vm,
             output_lines,

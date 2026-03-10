@@ -24,6 +24,7 @@ pub(super) struct TypeContext<'a> {
     pub(super) active_functions: Vec<u16>,
     pub(super) observed_function_param_types: HashMap<u16, Vec<BoundType>>,
     pub(super) observed_function_param_schemas: HashMap<u16, Vec<Option<TypeSchema>>>,
+    pub(super) observed_function_capture_states: HashMap<u16, LocalTypeState>,
     pub(super) function_param_conflicts: HashMap<u16, String>,
 }
 
@@ -44,6 +45,7 @@ impl<'a> TypeContext<'a> {
             active_functions: Vec::new(),
             observed_function_param_types: HashMap::new(),
             observed_function_param_schemas: HashMap::new(),
+            observed_function_capture_states: HashMap::new(),
             function_param_conflicts: HashMap::new(),
         }
     }
@@ -80,15 +82,9 @@ impl<'a> TypeContext<'a> {
             .unwrap_or(schema)
     }
 
-    pub(super) fn expr_has_declared_schema(
-        &mut self,
-        expr: &Expr,
-        state: &LocalTypeState,
-    ) -> bool {
+    pub(super) fn expr_has_declared_schema(&mut self, expr: &Expr, state: &LocalTypeState) -> bool {
         match expr {
-            Expr::Var(slot) | Expr::MoveVar(slot) => {
-                state.has_declared_schema(*slot)
-            }
+            Expr::Var(slot) | Expr::MoveVar(slot) => state.has_declared_schema(*slot),
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.expr_has_declared_schema(inner, state)
             }
@@ -165,7 +161,12 @@ impl<'a> TypeContext<'a> {
         let function_name = self.function_name(index).to_string();
         let actual = args
             .iter()
-            .map(|arg| (self.infer_expr_type(arg, state), self.infer_expr_schema(arg, state)))
+            .map(|arg| {
+                (
+                    self.infer_expr_type(arg, state),
+                    self.infer_expr_schema(arg, state),
+                )
+            })
             .collect::<Vec<_>>();
         let mut merged_types = self
             .observed_function_param_types
@@ -201,13 +202,35 @@ impl<'a> TypeContext<'a> {
                     }
                 }
             }
-            merged_schemas[arg_index] =
-                merge_observed_function_param_schema(merged_schemas[arg_index].clone(), actual_schema);
+            merged_schemas[arg_index] = merge_observed_function_param_schema(
+                merged_schemas[arg_index].clone(),
+                actual_schema,
+            );
         }
         self.observed_function_param_types
             .insert(index, merged_types);
         self.observed_function_param_schemas
             .insert(index, merged_schemas);
+    }
+
+    pub(super) fn observe_function_capture_state(
+        &mut self,
+        index: u16,
+        capture_copies: &[(LocalSlot, LocalSlot)],
+        state: &LocalTypeState,
+    ) {
+        let mut observed = LocalTypeState::default();
+        for (source_slot, captured_slot) in capture_copies {
+            observed.copy_binding_from(state, *source_slot, *captured_slot, None, false);
+        }
+
+        if let Some(existing) = self.observed_function_capture_states.remove(&index) {
+            let mut merged = LocalTypeState::default();
+            merged.merge_from_branches(&existing, &observed);
+            self.observed_function_capture_states.insert(index, merged);
+        } else {
+            self.observed_function_capture_states.insert(index, observed);
+        }
     }
 
     pub(super) fn infer_expr_schema(
@@ -224,9 +247,7 @@ impl<'a> TypeContext<'a> {
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.infer_expr_schema(inner, state)
             }
-            Expr::Var(slot) | Expr::MoveVar(slot) => state
-                .schema(*slot)
-                .cloned(),
+            Expr::Var(slot) | Expr::MoveVar(slot) => state.schema(*slot).cloned(),
             Expr::Call(index, args) => {
                 let builtin = BuiltinFunction::from_call_index(*index)?;
                 self.infer_builtin_call_schema(builtin, args, state)
@@ -504,12 +525,13 @@ impl<'a> TypeContext<'a> {
             BuiltinFunction::Get if args.len() == 2 => self
                 .infer_expr_schema(&args[0], state)
                 .and_then(|schema| infer_access_schema(&schema, &args[1], self, state).ok()),
-            BuiltinFunction::Slice if args.len() == 3 => match self.infer_expr_schema(&args[0], state)
-            {
-                Some(TypeSchema::Array(element)) => Some(TypeSchema::Array(element)),
-                Some(TypeSchema::String) => Some(TypeSchema::String),
-                _ => None,
-            },
+            BuiltinFunction::Slice if args.len() == 3 => {
+                match self.infer_expr_schema(&args[0], state) {
+                    Some(TypeSchema::Array(element)) => Some(TypeSchema::Array(element)),
+                    Some(TypeSchema::String) => Some(TypeSchema::String),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -878,7 +900,13 @@ impl<'a> TypeContext<'a> {
                         .as_deref()
                         .and_then(|name| self.resolve_struct_schema(name))
                         .cloned();
-                    self.bind_expr_to_slot(state, *index, declared_schema.as_ref(), expr, &expr_state);
+                    self.bind_expr_to_slot(
+                        state,
+                        *index,
+                        declared_schema.as_ref(),
+                        expr,
+                        &expr_state,
+                    );
                 }
                 Stmt::Assign { index, expr, .. } => {
                     let expr_state = state.clone();
@@ -952,9 +980,12 @@ impl<'a> TypeContext<'a> {
             BoundType::Unknown
         } else {
             let ty = self.infer_expr_type(expr, expr_state);
-            let slot_declared_schema = declared_schema
-                .cloned()
-                .or_else(|| expr_state.has_declared_schema(slot).then(|| expr_state.schema(slot).cloned()).flatten());
+            let slot_declared_schema = declared_schema.cloned().or_else(|| {
+                expr_state
+                    .has_declared_schema(slot)
+                    .then(|| expr_state.schema(slot).cloned())
+                    .flatten()
+            });
             let schema = slot_declared_schema
                 .clone()
                 .or_else(|| self.infer_expr_schema(expr, expr_state));
@@ -994,7 +1025,9 @@ fn schema_from_bound_type(ty: BoundType) -> Option<TypeSchema> {
         BoundType::Array | BoundType::ArrayOf(_) => {
             Some(TypeSchema::Array(Box::new(TypeSchema::Unknown)))
         }
-        BoundType::Map | BoundType::MapOf(_) => Some(TypeSchema::Map(Box::new(TypeSchema::Unknown))),
+        BoundType::Map | BoundType::MapOf(_) => {
+            Some(TypeSchema::Map(Box::new(TypeSchema::Unknown)))
+        }
     }
 }
 

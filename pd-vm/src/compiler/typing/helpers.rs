@@ -5,7 +5,8 @@ use crate::builtins::{BuiltinFunction, CallableParam, CallableParamType};
 use super::super::CompileError;
 use super::super::ir::{Expr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, TypeSchema};
 use super::collect::{
-    observed_function_param_schema_slice, observed_function_param_slice, seed_function_param_state,
+    observed_function_param_schema_slice, observed_function_param_slice, seed_function_capture_state,
+    seed_function_param_state,
 };
 use super::context::{TypeContext, bound_type_from_schema};
 use super::infer_expr_type;
@@ -25,6 +26,7 @@ pub(super) fn legalize_function_impl(
     host_import_signatures: &HashMap<u16, HostCallableSignature>,
     observed_function_param_types: &HashMap<u16, Vec<BoundType>>,
     observed_function_param_schemas: &HashMap<u16, Vec<Option<TypeSchema>>>,
+    observed_function_capture_states: &HashMap<u16, LocalTypeState>,
 ) {
     let mut state = LocalTypeState::default();
     let mut context = TypeContext::new(
@@ -40,10 +42,12 @@ pub(super) fn legalize_function_impl(
         observed_function_param_slice(observed_function_param_types, function_index),
         observed_function_param_schema_slice(observed_function_param_schemas, function_index),
     );
-    for (source_slot, captured_slot) in &function_impl.capture_copies {
-        let source_state = state.clone();
-        state.copy_binding_from(&source_state, *source_slot, *captured_slot, None, false);
-    }
+    seed_function_capture_state(
+        &mut state,
+        function_index,
+        &function_impl.capture_copies,
+        observed_function_capture_states,
+    );
     legalize_stmts(&mut function_impl.body_stmts, &mut state, &mut context);
     let _ = legalize_expr(&mut function_impl.body_expr, &state, &mut context);
 }
@@ -79,10 +83,12 @@ pub(super) fn validate_function_impl(
             function_index,
         ),
     );
-    for (source_slot, captured_slot) in &function_impl.capture_copies {
-        let source_state = state.clone();
-        state.copy_binding_from(&source_state, *source_slot, *captured_slot, None, false);
-    }
+    seed_function_capture_state(
+        &mut state,
+        function_index,
+        &function_impl.capture_copies,
+        &context.observed_function_capture_states,
+    );
     validate_stmts(
         &function_impl.body_stmts,
         &mut state,
@@ -94,7 +100,7 @@ pub(super) fn validate_function_impl(
     let _ = validate_expr(
         &function_impl.body_expr,
         &state,
-        None,
+        Some(function_impl.body_expr_line),
         source_name,
         context,
         strict_function_add_types,
@@ -110,9 +116,17 @@ pub(super) fn legalize_stmts(
     for stmt in stmts {
         match stmt {
             Stmt::Noop { .. }
-            | Stmt::FuncDecl { .. }
             | Stmt::Break { .. }
             | Stmt::Continue { .. } => {}
+            Stmt::FuncDecl {
+                index, has_impl, ..
+            } => {
+                if *has_impl
+                    && let Some(function_impl) = context.function_impls.get(index)
+                {
+                    context.observe_function_capture_state(*index, &function_impl.capture_copies, state);
+                }
+            }
             Stmt::Drop { index, .. } => {
                 state.set(*index, BoundType::Null);
             }
@@ -170,19 +184,35 @@ pub(super) fn legalize_stmts(
                 ..
             } => {
                 legalize_stmts(std::slice::from_mut(init), state, context);
-                stabilize_loop_state(state, |iterated| {
-                    let _ = legalize_expr(condition, iterated, context);
-                    legalize_stmts(body, iterated, context);
-                    legalize_stmts(std::slice::from_mut(post), iterated, context);
+                let mut stabilized_state = state.clone();
+                stabilize_loop_state(&mut stabilized_state, |iterated| {
+                    let mut condition_probe = condition.clone();
+                    let mut body_probe = body.clone();
+                    let mut post_probe = post.as_ref().clone();
+                    let _ = legalize_expr(&mut condition_probe, iterated, context);
+                    legalize_stmts(&mut body_probe, iterated, context);
+                    legalize_stmts(std::slice::from_mut(&mut post_probe), iterated, context);
                 });
+                let mut loop_state = stabilized_state.clone();
+                let _ = legalize_expr(condition, &loop_state, context);
+                legalize_stmts(body, &mut loop_state, context);
+                legalize_stmts(std::slice::from_mut(post), &mut loop_state, context);
+                *state = stabilized_state;
             }
             Stmt::While {
                 condition, body, ..
             } => {
-                stabilize_loop_state(state, |iterated| {
-                    let _ = legalize_expr(condition, iterated, context);
-                    legalize_stmts(body, iterated, context);
+                let mut stabilized_state = state.clone();
+                stabilize_loop_state(&mut stabilized_state, |iterated| {
+                    let mut condition_probe = condition.clone();
+                    let mut body_probe = body.clone();
+                    let _ = legalize_expr(&mut condition_probe, iterated, context);
+                    legalize_stmts(&mut body_probe, iterated, context);
                 });
+                let mut loop_state = stabilized_state.clone();
+                let _ = legalize_expr(condition, &loop_state, context);
+                legalize_stmts(body, &mut loop_state, context);
+                *state = stabilized_state;
             }
         }
     }
@@ -199,9 +229,17 @@ pub(super) fn validate_stmts(
     for stmt in stmts {
         match stmt {
             Stmt::Noop { .. }
-            | Stmt::FuncDecl { .. }
             | Stmt::Break { .. }
             | Stmt::Continue { .. } => {}
+            Stmt::FuncDecl {
+                index, has_impl, ..
+            } => {
+                if *has_impl
+                    && let Some(function_impl) = context.function_impls.get(index)
+                {
+                    context.observe_function_capture_state(*index, &function_impl.capture_copies, state);
+                }
+            }
             Stmt::Drop { index, .. } => {
                 state.set(*index, BoundType::Null);
             }
@@ -434,9 +472,12 @@ pub(super) fn bind_expr_result_to_slot(
     if let Some(callable) = context.callable_binding_from_expr(expr, expr_state) {
         state.bind_callable(slot, callable);
     } else {
-        let slot_declared_schema = declared_schema
-            .cloned()
-            .or_else(|| expr_state.has_declared_schema(slot).then(|| expr_state.schema(slot).cloned()).flatten());
+        let slot_declared_schema = declared_schema.cloned().or_else(|| {
+            expr_state
+                .has_declared_schema(slot)
+                .then(|| expr_state.schema(slot).cloned())
+                .flatten()
+        });
         let schema = slot_declared_schema
             .clone()
             .or_else(|| context.infer_expr_schema(expr, expr_state));

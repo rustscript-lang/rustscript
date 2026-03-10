@@ -21,8 +21,8 @@ use self::symbols::is_virtual_host_namespace_spec;
 use super::{
     ParseError, ReplLocalBinding, STDLIB_PRINT_ARITY, STDLIB_PRINT_NAME,
     ir::{
-        ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern,
-        MatchTypePattern, Stmt, TypeSchema,
+        ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, MatchTypePattern,
+        Stmt, TypeSchema,
     },
 };
 
@@ -92,6 +92,7 @@ pub(super) struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     locals: HashMap<String, LocalSlot>,
+    named_local_bindings: Vec<(String, LocalSlot)>,
     next_local: LocalSlot,
     functions: HashMap<String, FunctionDecl>,
     function_list: Vec<FunctionDecl>,
@@ -142,6 +143,7 @@ impl Parser {
             tokens,
             pos: 0,
             locals: HashMap::new(),
+            named_local_bindings: Vec::new(),
             next_local: 0,
             functions: HashMap::new(),
             function_list: Vec::new(),
@@ -210,11 +212,7 @@ impl Parser {
     }
 
     pub(super) fn local_bindings(&self) -> Vec<(String, LocalSlot)> {
-        let mut locals: Vec<(String, LocalSlot)> = self
-            .locals
-            .iter()
-            .map(|(name, index)| (name.clone(), *index))
-            .collect();
+        let mut locals = self.named_local_bindings.clone();
         locals.sort_by_key(|(_, index)| *index);
         locals
     }

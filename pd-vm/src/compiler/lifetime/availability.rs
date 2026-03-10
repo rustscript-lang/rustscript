@@ -5,7 +5,7 @@ use crate::builtins::BuiltinFunction;
 
 use super::super::ParseError;
 use super::super::ir::{ClosureExpr, Expr, FrontendIr, FunctionImpl, LocalSlot, Stmt};
-use super::liveness::{LivenessRewriter, LocalSlotAllocator};
+use super::liveness::{LivenessRewriter, LocalSlotAllocator, persistent_capture_slots};
 mod captures;
 mod consumption;
 mod field_moves;
@@ -129,9 +129,11 @@ pub(super) fn enforce_local_availability(
 
     if clear_dead_locals {
         let liveness = LivenessRewriter::new(ir.locals, &ir.local_bindings, &ir.function_impls);
+        let persistent_slots = persistent_capture_slots(&ir.stmts, &ir.function_impls);
         ir.stmts = liveness.rewrite_program_block(&ir.stmts);
         for function_impl in ir.function_impls.values_mut() {
-            *function_impl = liveness.rewrite_function_impl(function_impl.clone());
+            *function_impl =
+                liveness.rewrite_function_impl(function_impl.clone(), &persistent_slots);
         }
     }
 
@@ -199,6 +201,7 @@ impl AvailabilityAnalyzer {
             capture_copies,
             body_stmts,
             body_expr,
+            body_expr_line,
         } = function_impl;
         let mut state = FlowState::reachable(self.local_count);
         for slot in &param_slots {
@@ -214,6 +217,7 @@ impl AvailabilityAnalyzer {
             capture_copies,
             body_stmts: rewritten_body,
             body_expr,
+            body_expr_line,
         })
     }
 
@@ -280,9 +284,15 @@ impl AvailabilityAnalyzer {
     ) -> Result<(Stmt, FlowState), ParseError> {
         match stmt {
             Stmt::Noop { .. } | Stmt::Drop { .. } => Ok((stmt.clone(), state)),
-            Stmt::FuncDecl { index, line, .. } => {
+            Stmt::FuncDecl {
+                index,
+                has_impl,
+                line,
+                ..
+            } => {
                 let mut out = state.clone();
-                if out.reachable
+                if *has_impl
+                    && out.reachable
                     && let Some(function_impl) = self.function_impls.get(index)
                 {
                     for (source_slot, captured_slot) in &function_impl.capture_copies {

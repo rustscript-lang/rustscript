@@ -546,6 +546,30 @@ fn rustscript_named_function_capture_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
+            name: "top-level named function keeps transitive captures alive across inline calls",
+            source: r#"
+                let lut = {"a": 1};
+                fn parse_key(text) { lut[text[0:1]] }
+                fn wrapper(text) { parse_key(text) }
+                wrapper("ab");
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(1)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "top-level named function capture survives repeated calls",
+            source: r#"
+                let lut = {"a": 1};
+                fn parse_key(text) { lut[text[0:1]] }
+                parse_key("ab");
+                parse_key("ab");
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(1), Value::Int(1)],
+            expected_locals: None,
+        },
+        RuntimeCase {
             name: "named function capture via copy keeps source reusable",
             source: r#"
                 let a = "x";
@@ -608,6 +632,18 @@ fn rustscript_named_function_capture_error_cases_work() {
             flavor: SourceFlavor::RustScript,
             expected_kind: SourceErrorKind::Parse,
             expected_contains_all: &[],
+        },
+        SourceErrorCase {
+            name: "named function repeated default move capture is rejected",
+            source: r#"
+                let lut = {"a": 1};
+                fn parse_a(text) { lut[text[0:1]] }
+                fn parse_b(text) { lut[text[0:1]] }
+                parse_a("ab");
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Parse,
+            expected_contains_all: &["lut", "moved"],
         },
         SourceErrorCase {
             name: "named function recursion is still rejected",
@@ -2120,6 +2156,156 @@ fn compile_source_file_rustscript_imports_merge_with_scoped_locals() {
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(2)]);
+
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_file(module_path);
+    let _ = std::fs::remove_dir(root);
+}
+
+#[test]
+fn compile_source_file_rustscript_imported_function_capture_binds_once() {
+    let unique = format!(
+        "vm_rss_import_capture_bind_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).expect("temp module root should be created");
+
+    let module_path = root.join("module.rss");
+    let main_path = root.join("main.rss");
+    std::fs::write(
+        &module_path,
+        r#"
+        let t = [7];
+        fn inner_arg(x) { x[0] }
+        pub fn run() { inner_arg(t) }
+    "#,
+    )
+    .expect("module source should write");
+    std::fs::write(
+        &main_path,
+        r#"
+        use self::module as m;
+        m::run();
+    "#,
+    )
+    .expect("main source should write");
+
+    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(7)]);
+
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_file(module_path);
+    let _ = std::fs::remove_dir(root);
+}
+
+#[test]
+fn compile_source_file_rustscript_imported_borrow_capture_survives_nested_calls() {
+    let unique = format!(
+        "vm_rss_import_direct_capture_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).expect("temp module root should be created");
+
+    let module_path = root.join("module.rss");
+    let main_path = root.join("main.rss");
+    std::fs::write(
+        &module_path,
+        r#"
+        let lut = {"a": 1};
+        let digits = [0, 2];
+        fn parse_key(text) { (&lut)[text[0:1]] }
+        fn read_digit() { (&digits)[1] }
+        pub fn run() {
+            let a = parse_key("ab");
+            let b = read_digit();
+            let c = parse_key("ab");
+            a + b + c;
+        }
+    "#,
+    )
+    .expect("module source should write");
+    std::fs::write(
+        &main_path,
+        r#"
+        use self::module as m;
+        m::run();
+    "#,
+    )
+    .expect("main source should write");
+
+    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(4)]);
+
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_file(module_path);
+    let _ = std::fs::remove_dir(root);
+}
+
+#[test]
+fn compile_source_file_rustscript_imported_direct_capture_multiple_move_is_rejected() {
+    let unique = format!(
+        "vm_rss_import_direct_capture_error_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).expect("temp module root should be created");
+
+    let module_path = root.join("module.rss");
+    let main_path = root.join("main.rss");
+    std::fs::write(
+        &module_path,
+        r#"
+        let lut = {"a": 1};
+        fn parse_key(text) { lut[text[0:1]] }
+        fn parse_again(text) { lut[text[0:1]] }
+        pub fn run() {
+            parse_key("ab");
+        }
+    "#,
+    )
+    .expect("module source should write");
+    std::fs::write(
+        &main_path,
+        r#"
+        use self::module as m;
+        m::run();
+    "#,
+    )
+    .expect("main source should write");
+
+    let err = match compile_source_file(&main_path) {
+        Ok(_) => panic!("compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
+            assert!(
+                parse.message.contains("lut") && parse.message.contains("moved"),
+                "unexpected parse error: {parse:?}"
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
 
     let _ = std::fs::remove_file(main_path);
     let _ = std::fs::remove_file(module_path);

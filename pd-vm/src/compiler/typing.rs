@@ -10,6 +10,7 @@ use crate::bytecode::ValueType;
 
 use self::collect::{collect_function_types, collect_stmt_types};
 use self::context::TypeContext;
+pub(crate) use self::context::bound_type_from_schema;
 use self::helpers::{
     build_function_names, build_host_import_return_types, legalize_function_impl, legalize_stmts,
     validate_function_impl, validate_stmts,
@@ -17,7 +18,6 @@ use self::helpers::{
 pub(crate) use self::state::{
     BoundType, HostCallableSignature, LocalTypeState, TypeInferenceResult,
 };
-pub(crate) use self::context::bound_type_from_schema;
 use super::CompileError;
 use super::ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, Stmt, TypeSchema};
 pub(super) fn legalize_builtins_and_bind_types(mut ir: FrontendIr) -> FrontendIr {
@@ -36,6 +36,7 @@ pub(super) fn legalize_builtins_and_bind_types(mut ir: FrontendIr) -> FrontendIr
     legalize_stmts(&mut ir.stmts, &mut top_state, &mut context);
     let observed_function_param_types = context.observed_function_param_types.clone();
     let observed_function_param_schemas = context.observed_function_param_schemas.clone();
+    let observed_function_capture_states = context.observed_function_capture_states.clone();
 
     let function_impls = ir.function_impls.clone();
     for (index, function_impl) in ir.function_impls.iter_mut() {
@@ -49,6 +50,7 @@ pub(super) fn legalize_builtins_and_bind_types(mut ir: FrontendIr) -> FrontendIr
             &host_import_signatures,
             &observed_function_param_types,
             &observed_function_param_schemas,
+            &observed_function_capture_states,
         );
     }
 
@@ -79,6 +81,7 @@ pub(super) fn infer_types(ir: &FrontendIr) -> TypeInferenceResult {
     );
     let observed_function_param_types = context.observed_function_param_types.clone();
     let observed_function_param_schemas = context.observed_function_param_schemas.clone();
+    let observed_function_capture_states = context.observed_function_capture_states.clone();
 
     for decl in &ir.functions {
         let Some(function_impl) = ir.function_impls.get(&decl.index) else {
@@ -96,6 +99,7 @@ pub(super) fn infer_types(ir: &FrontendIr) -> TypeInferenceResult {
             &host_import_signatures,
             &observed_function_param_types,
             &observed_function_param_schemas,
+            &observed_function_capture_states,
         );
     }
 

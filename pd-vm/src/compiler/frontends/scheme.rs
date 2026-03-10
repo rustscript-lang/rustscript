@@ -281,6 +281,7 @@ fn lower_scheme_direct_stmt(
                     arity,
                     args: params,
                     exported: false,
+                    has_impl: false,
                     line,
                 }]));
             }
