@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::bytecode::ValueType;
 
-use super::super::ir::{ClosureExpr, FunctionImpl, LocalSlot, Stmt, TypeSchema};
+use super::super::ir::{ClosureExpr, Expr, FunctionImpl, LocalSlot, Stmt, TypeSchema};
 use super::context::TypeContext;
 use super::helpers::bind_expr_result_to_slot;
 use super::state::{BoundType, HostCallableSignature, LocalTypeState, stabilize_loop_state};
@@ -110,7 +110,7 @@ pub(super) fn collect_stmt_types(
             }
             Stmt::ClosureLet { closure, .. } => {
                 collect_closure_capture_types(closure, state, local_types);
-                let _ = context.infer_expr_type(&closure.body, state);
+                collect_expr_types(&closure.body, state, local_types, callable_slots, context);
             }
             Stmt::FuncDecl { index, .. } => {
                 if let Some(function_impl) = context.function_impls.get(index) {
@@ -138,6 +138,7 @@ pub(super) fn collect_stmt_types(
                 ..
             } => {
                 let expr_state = state.clone();
+                collect_expr_types(expr, &expr_state, local_types, callable_slots, context);
                 let ty = context.infer_expr_type(expr, &expr_state);
                 record_local_type(local_types, *index, ty);
                 let declared_schema = declared_struct
@@ -159,6 +160,7 @@ pub(super) fn collect_stmt_types(
             }
             Stmt::Assign { index, expr, .. } => {
                 let expr_state = state.clone();
+                collect_expr_types(expr, &expr_state, local_types, callable_slots, context);
                 let ty = context.infer_expr_type(expr, &expr_state);
                 record_local_type(local_types, *index, ty);
                 bind_expr_result_to_slot(state, *index, None, expr, &expr_state, ty, context);
@@ -167,7 +169,7 @@ pub(super) fn collect_stmt_types(
                 }
             }
             Stmt::Expr { expr, .. } => {
-                let _ = context.infer_expr_type(expr, state);
+                collect_expr_types(expr, state, local_types, callable_slots, context);
             }
             Stmt::IfElse {
                 condition,
@@ -175,7 +177,7 @@ pub(super) fn collect_stmt_types(
                 else_branch,
                 ..
             } => {
-                let _ = context.infer_expr_type(condition, state);
+                collect_expr_types(condition, state, local_types, callable_slots, context);
                 let mut then_state = state.clone();
                 let mut else_state = state.clone();
                 collect_stmt_types(
@@ -209,7 +211,7 @@ pub(super) fn collect_stmt_types(
                     context,
                 );
                 stabilize_loop_state(state, |iterated| {
-                    let _ = context.infer_expr_type(condition, iterated);
+                    collect_expr_types(condition, iterated, local_types, callable_slots, context);
                     collect_stmt_types(body, iterated, local_types, callable_slots, context);
                     collect_stmt_types(
                         std::slice::from_ref(post),
@@ -224,12 +226,157 @@ pub(super) fn collect_stmt_types(
                 condition, body, ..
             } => {
                 stabilize_loop_state(state, |iterated| {
-                    let _ = context.infer_expr_type(condition, iterated);
+                    collect_expr_types(condition, iterated, local_types, callable_slots, context);
                     collect_stmt_types(body, iterated, local_types, callable_slots, context);
                 });
             }
         }
     }
+}
+
+fn collect_expr_types(
+    expr: &Expr,
+    state: &LocalTypeState,
+    local_types: &mut [ValueType],
+    callable_slots: &mut [bool],
+    context: &mut TypeContext<'_>,
+) {
+    match expr {
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::Var(_)
+        | Expr::MoveVar(_)
+        | Expr::MoveField { .. }
+        | Expr::MoveIndex { .. }
+        | Expr::FunctionRef(_) => {
+            let _ = context.infer_expr_type(expr, state);
+        }
+        Expr::Call(_, args) | Expr::LocalCall(_, args) => {
+            for arg in args {
+                collect_expr_types(arg, state, local_types, callable_slots, context);
+            }
+            let _ = context.infer_expr_type(expr, state);
+        }
+        Expr::Closure(closure) => {
+            if let Some(nested) =
+                context.build_callable_state(&closure.param_slots, &closure.capture_copies, None, state)
+            {
+                collect_callable_body_types(
+                    closure,
+                    &nested,
+                    local_types,
+                    callable_slots,
+                    context,
+                );
+            } else {
+                let _ = context.infer_expr_type(expr, state);
+            }
+        }
+        Expr::ClosureCall(closure, args) => {
+            for arg in args {
+                collect_expr_types(arg, state, local_types, callable_slots, context);
+            }
+            if let Some(nested) = context.build_callable_state(
+                &closure.param_slots,
+                &closure.capture_copies,
+                Some(args),
+                state,
+            ) {
+                collect_callable_body_types(
+                    closure,
+                    &nested,
+                    local_types,
+                    callable_slots,
+                    context,
+                );
+            } else {
+                let _ = context.infer_expr_type(expr, state);
+            }
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            collect_expr_types(lhs, state, local_types, callable_slots, context);
+            collect_expr_types(rhs, state, local_types, callable_slots, context);
+            let _ = context.infer_expr_type(expr, state);
+        }
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => {
+            collect_expr_types(inner, state, local_types, callable_slots, context);
+            let _ = context.infer_expr_type(expr, state);
+        }
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            collect_expr_types(condition, state, local_types, callable_slots, context);
+            collect_expr_types(then_expr, state, local_types, callable_slots, context);
+            collect_expr_types(else_expr, state, local_types, callable_slots, context);
+            let _ = context.infer_expr_type(expr, state);
+        }
+        Expr::Match {
+            value_slot,
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            collect_expr_types(value, state, local_types, callable_slots, context);
+            let value_ty = context.infer_expr_type(value, state);
+            let mut nested = state.clone();
+            bind_expr_result_to_slot(
+                &mut nested,
+                *value_slot,
+                None,
+                value,
+                state,
+                value_ty,
+                context,
+            );
+            record_local_type(local_types, *value_slot, nested.get(*value_slot));
+            for (_, arm_expr) in arms {
+                collect_expr_types(arm_expr, &nested, local_types, callable_slots, context);
+            }
+            collect_expr_types(default, &nested, local_types, callable_slots, context);
+            let _ = context.infer_expr_type(expr, state);
+        }
+        Expr::Block { stmts, expr } => {
+            let mut nested = state.clone();
+            collect_stmt_types(stmts, &mut nested, local_types, callable_slots, context);
+            collect_expr_types(expr, &nested, local_types, callable_slots, context);
+        }
+    }
+}
+
+fn collect_callable_body_types(
+    closure: &ClosureExpr,
+    nested: &LocalTypeState,
+    local_types: &mut [ValueType],
+    callable_slots: &mut [bool],
+    context: &mut TypeContext<'_>,
+) {
+    for slot in &closure.param_slots {
+        record_local_type(local_types, *slot, nested.get(*slot));
+        if nested.callable(*slot).is_some() {
+            record_callable_slot(callable_slots, *slot);
+        }
+    }
+    collect_closure_capture_types(closure, nested, local_types);
+    collect_expr_types(&closure.body, nested, local_types, callable_slots, context);
 }
 
 fn collect_closure_capture_types(
