@@ -185,7 +185,7 @@ fn native_trace_cache_reuses_entries_for_same_program() {
 
 fn step_once(vm: &mut Vm) -> VmResult<ExecOutcome> {
     let opcode = vm.read_u8()?;
-    vm.execute_interpreter_instruction(opcode)
+    vm.execute_interpreter_instruction(opcode, true)
 }
 
 fn assert_shared_heap_backing(lhs: &Value, rhs: &Value) {
@@ -261,7 +261,8 @@ fn shared_string_survives_local_overwrite_after_copy_like_read() {
     )
     .with_local_count(1);
     let mut vm = Vm::new(program);
-    vm.locals[0] = Value::string("alive");
+    vm.set_local(0, Value::string("alive"))
+        .expect("setting local should succeed");
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -296,7 +297,8 @@ fn shared_array_survives_local_overwrite_after_copy_like_read() {
     )
     .with_local_count(1);
     let mut vm = Vm::new(program);
-    vm.locals[0] = Value::array(vec![Value::Int(1), Value::Int(2)]);
+    vm.set_local(0, Value::array(vec![Value::Int(1), Value::Int(2)]))
+        .expect("setting local should succeed");
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -331,7 +333,8 @@ fn shared_map_survives_local_overwrite_after_copy_like_read() {
     )
     .with_local_count(1);
     let mut vm = Vm::new(program);
-    vm.locals[0] = Value::map(vec![(Value::string("k"), Value::Int(9))]);
+    vm.set_local(0, Value::map(vec![(Value::string("k"), Value::Int(9))]))
+        .expect("setting local should succeed");
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -345,7 +348,8 @@ fn interpreter_ldloc_preserves_local_slot() {
         .with_local_count(1);
     let mut vm = Vm::new(program);
     let map_value = Value::map(vec![(Value::string("k"), Value::Int(9))]);
-    vm.locals[0] = map_value.clone();
+    vm.set_local(0, map_value.clone())
+        .expect("setting local should succeed");
 
     let outcome = step_once(&mut vm).expect("ldloc should execute");
     assert!(matches!(outcome, ExecOutcome::Continue));
@@ -376,7 +380,8 @@ fn interpreter_explicit_move_sequence_clears_local_slot() {
     .with_local_count(1);
     let mut vm = Vm::new(program);
     let map_value = Value::map(vec![(Value::string("k"), Value::Int(9))]);
-    vm.locals[0] = map_value.clone();
+    vm.set_local(0, map_value.clone())
+        .expect("setting local should succeed");
 
     let ldloc = step_once(&mut vm).expect("ldloc should execute");
     assert!(matches!(ldloc, ExecOutcome::Continue));
@@ -396,6 +401,198 @@ fn interpreter_explicit_move_sequence_clears_local_slot() {
 }
 
 #[test]
+fn interpreter_fuses_ldloc_ldc_add_stloc_without_touching_stack() {
+    let program = Program::new(
+        vec![Value::Int(1)],
+        vec![
+            OpCode::Ldloc as u8,
+            0,
+            OpCode::Ldc as u8,
+            0,
+            0,
+            0,
+            0,
+            OpCode::Add as u8,
+            OpCode::Stloc as u8,
+            1,
+            OpCode::Ret as u8,
+        ],
+    )
+    .with_local_count(2);
+    let mut vm = Vm::new(program);
+    vm.set_local(0, Value::Int(41))
+        .expect("setting local should succeed");
+
+    let outcome = step_once(&mut vm).expect("fused sequence should execute");
+    assert!(matches!(outcome, ExecOutcome::Continue));
+    assert_eq!(vm.ip, 10, "fusion should consume ldc/add/stloc");
+    assert_eq!(vm.locals[0], Value::Int(41));
+    assert_eq!(vm.locals[1], Value::Int(42));
+    assert!(vm.stack().is_empty(), "fusion should avoid transient stack traffic");
+}
+
+#[test]
+fn interpreter_fuses_ldloc_ldc_compare_brfalse() {
+    let program = Program::new(
+        vec![Value::Int(10), Value::Int(1)],
+        vec![
+            OpCode::Ldloc as u8,
+            0,
+            OpCode::Ldc as u8,
+            0,
+            0,
+            0,
+            0,
+            OpCode::Clt as u8,
+            OpCode::Brfalse as u8,
+            15,
+            0,
+            0,
+            0,
+            OpCode::Ldc as u8,
+            1,
+            0,
+            0,
+            0,
+            OpCode::Ret as u8,
+        ],
+    )
+    .with_local_count(1);
+    let mut vm = Vm::new(program);
+    vm.set_local(0, Value::Int(42))
+        .expect("setting local should succeed");
+
+    let outcome = step_once(&mut vm).expect("fused compare should execute");
+    assert!(matches!(outcome, ExecOutcome::Continue));
+    assert_eq!(vm.ip, 15, "fusion should jump directly to branch target");
+    assert!(vm.stack().is_empty(), "fusion should avoid bool stack traffic");
+}
+
+#[test]
+fn interpreter_fuses_generic_scalar_update_chain() {
+    let program = Program::new(
+        vec![Value::Int(3), Value::Int(7)],
+        vec![
+            OpCode::Ldloc as u8,
+            0,
+            OpCode::Ldloc as u8,
+            1,
+            OpCode::Ldc as u8,
+            0,
+            0,
+            0,
+            0,
+            OpCode::Mul as u8,
+            OpCode::Add as u8,
+            OpCode::Ldc as u8,
+            1,
+            0,
+            0,
+            0,
+            OpCode::Add as u8,
+            OpCode::Stloc as u8,
+            0,
+            OpCode::Ret as u8,
+        ],
+    )
+    .with_local_count(2);
+    let mut vm = Vm::new(program);
+    vm.set_local(0, Value::Int(10))
+        .expect("setting local should succeed");
+    vm.set_local(1, Value::Int(4))
+        .expect("setting local should succeed");
+
+    let outcome = step_once(&mut vm).expect("generic chain should fuse");
+    assert!(matches!(outcome, ExecOutcome::Continue));
+    assert_eq!(vm.ip, 19);
+    assert_eq!(vm.locals[0], Value::Int(29));
+    assert_eq!(vm.locals[1], Value::Int(4));
+    assert!(vm.stack().is_empty());
+}
+
+#[test]
+fn interpreter_fuses_float_scalar_sequences() {
+    let program = Program::new(
+        vec![Value::Float(1.5), Value::Float(2.0)],
+        vec![
+            OpCode::Ldloc as u8,
+            0,
+            OpCode::Ldc as u8,
+            0,
+            0,
+            0,
+            0,
+            OpCode::Add as u8,
+            OpCode::Stloc as u8,
+            0,
+            OpCode::Ldloc as u8,
+            0,
+            OpCode::Ldc as u8,
+            1,
+            0,
+            0,
+            0,
+            OpCode::Cgt as u8,
+            OpCode::Brfalse as u8,
+            24,
+            0,
+            0,
+            0,
+            OpCode::Ret as u8,
+        ],
+    )
+    .with_local_count(1);
+    let mut vm = Vm::new(program);
+    vm.set_local(0, Value::Float(1.0))
+        .expect("setting local should succeed");
+
+    let first = step_once(&mut vm).expect("float update should fuse");
+    assert!(matches!(first, ExecOutcome::Continue));
+    assert_eq!(vm.ip, 10);
+    assert_eq!(vm.locals[0], Value::Float(2.5));
+    assert!(vm.stack().is_empty());
+
+    let second = step_once(&mut vm).expect("float compare should fuse");
+    assert!(matches!(second, ExecOutcome::Continue));
+    assert_eq!(vm.ip, 23);
+    assert!(vm.stack().is_empty());
+}
+
+#[test]
+fn interpreter_does_not_fuse_ldloc_sequences_when_fuel_is_enabled() {
+    let program = Program::new(
+        vec![Value::Int(1)],
+        vec![
+            OpCode::Ldloc as u8,
+            0,
+            OpCode::Ldc as u8,
+            0,
+            0,
+            0,
+            0,
+            OpCode::Add as u8,
+            OpCode::Stloc as u8,
+            0,
+            OpCode::Ret as u8,
+        ],
+    )
+    .with_local_count(1);
+    let mut vm = Vm::new(program);
+    vm.set_local(0, Value::Int(41))
+        .expect("setting local should succeed");
+    vm.set_fuel(32);
+
+    let opcode = vm.read_u8().expect("ldloc opcode should decode");
+    let outcome = vm
+        .execute_interpreter_instruction(opcode, false)
+        .expect("ldloc should execute without fusion");
+    assert!(matches!(outcome, ExecOutcome::Continue));
+    assert_eq!(vm.ip, 2, "ldloc should advance only past its operand");
+    assert_eq!(vm.stack(), &[Value::Int(41)]);
+    assert_eq!(vm.locals[0], Value::Int(41));
+}
+
+#[test]
 fn interpreter_copy_like_ldloc_dup_stloc_shares_map_backing_with_fuel() {
     let program = Program::new(
         vec![],
@@ -410,7 +607,8 @@ fn interpreter_copy_like_ldloc_dup_stloc_shares_map_backing_with_fuel() {
     )
     .with_local_count(1);
     let mut vm = Vm::new(program);
-    vm.locals[0] = Value::map(vec![(Value::string("k"), Value::Int(9))]);
+    vm.set_local(0, Value::map(vec![(Value::string("k"), Value::Int(9))]))
+        .expect("setting local should succeed");
     vm.set_fuel(32);
 
     let _ = step_once(&mut vm).expect("ldloc should execute");
