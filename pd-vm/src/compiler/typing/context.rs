@@ -7,12 +7,13 @@ use super::super::ir::{ClosureExpr, Expr, FunctionImpl, LocalSlot, Stmt, TypeSch
 use super::helpers::{
     bind_expr_result_to_slot, bound_type_label, display_name_for_builtin,
     function_body_contains_param_add, infer_binary_type, infer_unary_type, is_numeric_bound_type,
-    merge_observed_function_param_type,
+    merge_observed_function_param_type, refine_state_for_match_pattern,
 };
 use super::state::{
     BoundType, HostCallableSignature, InferredCallable, LocalTypeState, SimpleType,
-    merge_container_element_types, stabilize_loop_state,
+    merge_bound_types, merge_container_element_types, stabilize_loop_state,
 };
+use super::validate::refine_state_for_condition;
 use super::validate::{validate_host_signature, validate_signature_overloads};
 
 pub(super) struct TypeContext<'a> {
@@ -21,6 +22,7 @@ pub(super) struct TypeContext<'a> {
     pub(super) function_names: &'a HashMap<u16, String>,
     pub(super) host_import_return_types: &'a HashMap<u16, BoundType>,
     pub(super) host_import_signatures: &'a HashMap<u16, HostCallableSignature>,
+    pub(super) require_declared_schema_for_optional_access: bool,
     pub(super) active_functions: Vec<u16>,
     pub(super) observed_function_param_types: HashMap<u16, Vec<BoundType>>,
     pub(super) observed_function_param_schemas: HashMap<u16, Vec<Option<TypeSchema>>>,
@@ -35,6 +37,7 @@ impl<'a> TypeContext<'a> {
         function_names: &'a HashMap<u16, String>,
         host_import_return_types: &'a HashMap<u16, BoundType>,
         host_import_signatures: &'a HashMap<u16, HostCallableSignature>,
+        require_declared_schema_for_optional_access: bool,
     ) -> Self {
         Self {
             function_impls,
@@ -42,6 +45,7 @@ impl<'a> TypeContext<'a> {
             function_names,
             host_import_return_types,
             host_import_signatures,
+            require_declared_schema_for_optional_access,
             active_functions: Vec::new(),
             observed_function_param_types: HashMap::new(),
             observed_function_param_schemas: HashMap::new(),
@@ -85,6 +89,8 @@ impl<'a> TypeContext<'a> {
     pub(super) fn expr_has_declared_schema(&mut self, expr: &Expr, state: &LocalTypeState) -> bool {
         match expr {
             Expr::Var(slot) | Expr::MoveVar(slot) => state.has_declared_schema(*slot),
+            Expr::OptionalGet { container, .. } => self.expr_has_declared_schema(container, state),
+            Expr::OptionUnwrapOr { value, .. } => self.expr_has_declared_schema(value, state),
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.expr_has_declared_schema(inner, state)
             }
@@ -127,9 +133,10 @@ impl<'a> TypeContext<'a> {
                     value_ty,
                     self,
                 );
-                arms.iter()
-                    .any(|(_, arm_expr)| self.expr_has_declared_schema(arm_expr, &nested))
-                    || self.expr_has_declared_schema(default, &nested)
+                arms.iter().any(|(pattern, arm_expr)| {
+                    let arm_state = refine_state_for_match_pattern(&nested, pattern, *value_slot);
+                    self.expr_has_declared_schema(arm_expr, &arm_state)
+                }) || self.expr_has_declared_schema(default, &nested)
             }
             Expr::Block { stmts, expr } => {
                 let mut nested = state.clone();
@@ -137,6 +144,143 @@ impl<'a> TypeContext<'a> {
                 self.expr_has_declared_schema(expr, &nested)
             }
             _ => false,
+        }
+    }
+
+    pub(super) fn expr_is_optional(&mut self, expr: &Expr, state: &LocalTypeState) -> bool {
+        match expr {
+            Expr::Var(slot) | Expr::MoveVar(slot) => state.is_optional(*slot),
+            Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => state.is_optional(*root),
+            Expr::OptionalGet { .. } => true,
+            Expr::OptionUnwrapOr { .. } => false,
+            Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+                self.expr_is_optional(inner, state)
+            }
+            Expr::IfElse {
+                then_expr,
+                else_expr,
+                ..
+            } => self.expr_is_optional(then_expr, state) || self.expr_is_optional(else_expr, state),
+            Expr::Match {
+                value_slot,
+                value,
+                arms,
+                default,
+                ..
+            } => {
+                let value_ty = self.infer_expr_type(value, state);
+                let mut nested = state.clone();
+                bind_expr_result_to_slot(
+                    &mut nested,
+                    *value_slot,
+                    None,
+                    value,
+                    state,
+                    value_ty,
+                    self,
+                );
+                arms.iter().any(|(pattern, arm_expr)| {
+                    let arm_state = refine_state_for_match_pattern(&nested, pattern, *value_slot);
+                    self.expr_is_optional(arm_expr, &arm_state)
+                }) || self.expr_is_optional(default, &nested)
+            }
+            Expr::Block { stmts, expr } => {
+                let mut nested = state.clone();
+                self.apply_stmts(stmts, &mut nested);
+                self.expr_is_optional(expr, &nested)
+            }
+            _ => false,
+        }
+    }
+
+    pub(super) fn infer_optional_expr_inner_type(
+        &mut self,
+        expr: &Expr,
+        state: &LocalTypeState,
+    ) -> BoundType {
+        match expr {
+            Expr::Var(slot) | Expr::MoveVar(slot) => state.get(*slot),
+            Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => state.get(*root),
+            Expr::OptionalGet { container, key, .. } => {
+                self.infer_get_return_type_from_container(container, key, state)
+            }
+            Expr::OptionUnwrapOr {
+                value, fallback, ..
+            } => {
+                let value_ty = self.infer_optional_expr_inner_type(value, state);
+                let fallback_ty = self.infer_expr_type(fallback, state);
+                if value_ty == BoundType::Unknown {
+                    fallback_ty
+                } else if fallback_ty == BoundType::Unknown || fallback_ty == value_ty {
+                    value_ty
+                } else {
+                    merge_bound_types(value_ty, fallback_ty)
+                }
+            }
+            Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+                self.infer_optional_expr_inner_type(inner, state)
+            }
+            _ => self.infer_expr_type(expr, state),
+        }
+    }
+
+    pub(super) fn infer_optional_expr_inner_schema(
+        &mut self,
+        expr: &Expr,
+        state: &LocalTypeState,
+    ) -> Option<TypeSchema> {
+        match expr {
+            Expr::Var(slot) | Expr::MoveVar(slot) => state.schema(*slot).cloned(),
+            Expr::OptionalGet { container, key, .. } => self
+                .infer_expr_schema(container, state)
+                .and_then(|schema| infer_access_schema(&schema, key, self, state).ok()),
+            Expr::OptionUnwrapOr {
+                value, fallback, ..
+            } => {
+                let value_schema = self.infer_optional_expr_inner_schema(value, state);
+                let fallback_schema = self.infer_expr_schema(fallback, state);
+                match (value_schema, fallback_schema) {
+                    (None, rhs) => rhs,
+                    (lhs, None) => lhs,
+                    (Some(lhs), Some(rhs)) if lhs == rhs => Some(lhs),
+                    _ => None,
+                }
+            }
+            Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+                self.infer_optional_expr_inner_schema(inner, state)
+            }
+            _ => self.infer_expr_schema(expr, state),
+        }
+    }
+
+    fn infer_get_return_type_from_container(
+        &mut self,
+        container: &Expr,
+        key: &Expr,
+        state: &LocalTypeState,
+    ) -> BoundType {
+        let container_schema = if self.expr_is_optional(container, state) {
+            self.infer_optional_expr_inner_schema(container, state)
+        } else {
+            self.infer_expr_schema(container, state)
+        };
+        if let Some(schema) =
+            container_schema.and_then(|schema| infer_access_schema(&schema, key, self, state).ok())
+        {
+            return bound_type_from_schema(&schema);
+        }
+
+        let container_ty = if self.expr_is_optional(container, state) {
+            self.infer_optional_expr_inner_type(container, state)
+        } else {
+            self.infer_expr_type(container, state)
+        };
+        match container_ty {
+            BoundType::String => BoundType::String,
+            BoundType::ArrayOf(Some(element_type)) | BoundType::MapOf(Some(element_type)) => {
+                BoundType::from_simple(element_type)
+            }
+            _ => BoundType::Unknown,
         }
     }
 
@@ -229,7 +373,8 @@ impl<'a> TypeContext<'a> {
             merged.merge_from_branches(&existing, &observed);
             self.observed_function_capture_states.insert(index, merged);
         } else {
-            self.observed_function_capture_states.insert(index, observed);
+            self.observed_function_capture_states
+                .insert(index, observed);
         }
     }
 
@@ -244,6 +389,21 @@ impl<'a> TypeContext<'a> {
             Expr::Float(_) => Some(TypeSchema::Float),
             Expr::Bool(_) => Some(TypeSchema::Bool),
             Expr::String(_) => Some(TypeSchema::String),
+            Expr::OptionalGet { container, key, .. } => self
+                .infer_expr_schema(container, state)
+                .and_then(|schema| infer_access_schema(&schema, key, self, state).ok()),
+            Expr::OptionUnwrapOr {
+                value, fallback, ..
+            } => {
+                let value_schema = self.infer_optional_expr_inner_schema(value, state);
+                let fallback_schema = self.infer_expr_schema(fallback, state);
+                match (value_schema, fallback_schema) {
+                    (None, rhs) => rhs,
+                    (lhs, None) => lhs,
+                    (Some(lhs), Some(rhs)) if lhs == rhs => Some(lhs),
+                    _ => None,
+                }
+            }
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.infer_expr_schema(inner, state)
             }
@@ -286,8 +446,9 @@ impl<'a> TypeContext<'a> {
                 );
                 let default_schema = self.infer_expr_schema(default, &nested);
                 let mut arm_schema = None;
-                for (_, arm_expr) in arms {
-                    let current = self.infer_expr_schema(arm_expr, &nested);
+                for (pattern, arm_expr) in arms {
+                    let arm_state = refine_state_for_match_pattern(&nested, pattern, *value_slot);
+                    let current = self.infer_expr_schema(arm_expr, &arm_state);
                     match (&arm_schema, &current) {
                         (None, _) => arm_schema = current,
                         (Some(lhs), Some(rhs)) if lhs == rhs => {}
@@ -318,11 +479,41 @@ impl<'a> TypeContext<'a> {
             Expr::Float(_) => BoundType::Float,
             Expr::Bool(_) => BoundType::Bool,
             Expr::String(_) => BoundType::String,
-            Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
-                self.infer_expr_type(inner, state)
+            Expr::OptionalGet { .. } => BoundType::Unknown,
+            Expr::OptionUnwrapOr {
+                value, fallback, ..
+            } => {
+                let value_ty = self.infer_optional_expr_inner_type(value, state);
+                let fallback_ty = self.infer_expr_type(fallback, state);
+                if value_ty == BoundType::Unknown {
+                    fallback_ty
+                } else if fallback_ty == BoundType::Unknown || value_ty == fallback_ty {
+                    value_ty
+                } else {
+                    merge_bound_types(value_ty, fallback_ty)
+                }
             }
-            Expr::Var(slot) | Expr::MoveVar(slot) => state.get(*slot),
-            Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => state.get(*root),
+            Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+                if self.expr_is_optional(inner, state) {
+                    BoundType::Unknown
+                } else {
+                    self.infer_expr_type(inner, state)
+                }
+            }
+            Expr::Var(slot) | Expr::MoveVar(slot) => {
+                if state.is_optional(*slot) {
+                    BoundType::Unknown
+                } else {
+                    state.get(*slot)
+                }
+            }
+            Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
+                if state.is_optional(*root) {
+                    BoundType::Unknown
+                } else {
+                    state.get(*root)
+                }
+            }
             Expr::FunctionRef(_) | Expr::Call(_, _) | Expr::LocalCall(_, _) | Expr::Closure(_) => {
                 self.infer_call_like_expr_type(expr, state)
             }
@@ -377,8 +568,9 @@ impl<'a> TypeContext<'a> {
                     self,
                 );
                 let mut arm_type = BoundType::Unknown;
-                for (_pattern, arm_expr) in arms {
-                    let ty = self.infer_expr_type(arm_expr, &nested);
+                for (pattern, arm_expr) in arms {
+                    let arm_state = refine_state_for_match_pattern(&nested, pattern, *value_slot);
+                    let ty = self.infer_expr_type(arm_expr, &arm_state);
                     arm_type = if arm_type == BoundType::Unknown {
                         ty
                     } else if arm_type == ty {
@@ -619,19 +811,7 @@ impl<'a> TypeContext<'a> {
         key: &Expr,
         state: &LocalTypeState,
     ) -> BoundType {
-        if let Some(schema) = self
-            .infer_expr_schema(container, state)
-            .and_then(|schema| infer_access_schema(&schema, key, self, state).ok())
-        {
-            return bound_type_from_schema(&schema);
-        }
-        match self.infer_expr_type(container, state) {
-            BoundType::String => BoundType::String,
-            BoundType::ArrayOf(Some(element_type)) | BoundType::MapOf(Some(element_type)) => {
-                BoundType::from_simple(element_type)
-            }
-            _ => BoundType::Unknown,
-        }
+        self.infer_get_return_type_from_container(container, key, state)
     }
 
     pub(super) fn infer_keys_return_type(
@@ -922,8 +1102,8 @@ impl<'a> TypeContext<'a> {
                     ..
                 } => {
                     let _ = self.infer_expr_type(condition, state);
-                    let mut then_state = state.clone();
-                    let mut else_state = state.clone();
+                    let mut then_state = refine_state_for_condition(state, condition, true);
+                    let mut else_state = refine_state_for_condition(state, condition, false);
                     self.apply_stmts(then_branch, &mut then_state);
                     self.apply_stmts(else_branch, &mut else_state);
                     state.merge_from_branches(&then_state, &else_state);
@@ -986,17 +1166,27 @@ impl<'a> TypeContext<'a> {
                     .then(|| expr_state.schema(slot).cloned())
                     .flatten()
             });
-            let schema = slot_declared_schema
-                .clone()
-                .or_else(|| self.infer_expr_schema(expr, expr_state));
+            let optional = self.expr_is_optional(expr, expr_state);
+            let schema = slot_declared_schema.clone().or_else(|| {
+                if optional {
+                    self.infer_optional_expr_inner_schema(expr, expr_state)
+                } else {
+                    self.infer_expr_schema(expr, expr_state)
+                }
+            });
             let from_declared_schema = slot_declared_schema.is_some()
                 || expr_state.has_declared_schema(slot)
                 || self.expr_has_declared_schema(expr, expr_state);
+            let inferred_ty = if optional {
+                self.infer_optional_expr_inner_type(expr, expr_state)
+            } else {
+                ty
+            };
             let ty = slot_declared_schema
                 .as_ref()
                 .map(bound_type_from_schema)
-                .unwrap_or(ty);
-            state.set_with_schema_origin(slot, ty, schema, from_declared_schema);
+                .unwrap_or(inferred_ty);
+            state.set_with_optional_schema_origin(slot, ty, schema, from_declared_schema, optional);
             ty
         }
     }
@@ -1138,6 +1328,17 @@ pub(super) fn infer_access_schema(
             } else {
                 Err(format!(
                     "schema-typed array access requires an int index, got {}",
+                    bound_type_label(key_ty)
+                ))
+            }
+        }
+        TypeSchema::String => {
+            let key_ty = context.infer_expr_type(key, state);
+            if matches!(key_ty, BoundType::Unknown | BoundType::Int) {
+                Ok(TypeSchema::String)
+            } else {
+                Err(format!(
+                    "schema-typed string access requires an int index, got {}",
                     bound_type_label(key_ty)
                 ))
             }

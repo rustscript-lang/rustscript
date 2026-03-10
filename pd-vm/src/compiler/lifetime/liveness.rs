@@ -123,9 +123,7 @@ impl LivenessRewriter {
                 index, has_impl, ..
             } => {
                 let mut live_before = live_after.clone();
-                if *has_impl
-                    && let Some(function_impl) = self.function_impls.get(index)
-                {
+                if *has_impl && let Some(function_impl) = self.function_impls.get(index) {
                     for (source_slot, captured_slot) in &function_impl.capture_copies {
                         self.kill_slot(&mut live_before, *captured_slot);
                         self.mark_live(&mut live_before, *source_slot);
@@ -330,9 +328,7 @@ impl LivenessRewriter {
                 index, has_impl, ..
             } => {
                 let mut live_before = live_after.clone();
-                if *has_impl
-                    && let Some(function_impl) = self.function_impls.get(index)
-                {
+                if *has_impl && let Some(function_impl) = self.function_impls.get(index) {
                     for (source_slot, captured_slot) in &function_impl.capture_copies {
                         self.kill_slot(&mut live_before, *captured_slot);
                         self.mark_live(&mut live_before, *source_slot);
@@ -438,6 +434,26 @@ impl LivenessRewriter {
             Expr::Var(index) | Expr::MoveVar(index) => self.mark_live(live, *index),
             Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
                 self.mark_live(live, *root)
+            }
+            Expr::OptionalGet {
+                container,
+                key,
+                container_slot,
+                key_slot,
+            } => {
+                self.mark_live(live, *container_slot);
+                self.mark_live(live, *key_slot);
+                self.add_expr_uses(container, live);
+                self.add_expr_uses(key, live);
+            }
+            Expr::OptionUnwrapOr {
+                value,
+                value_slot,
+                fallback,
+            } => {
+                self.mark_live(live, *value_slot);
+                self.add_expr_uses(value, live);
+                self.add_expr_uses(fallback, live);
             }
             Expr::Call(index, args) => {
                 for arg in args {
@@ -647,9 +663,7 @@ impl LivenessRewriter {
             Stmt::FuncDecl {
                 index, has_impl, ..
             } => {
-                if *has_impl
-                    && let Some(function_impl) = self.function_impls.get(index)
-                {
+                if *has_impl && let Some(function_impl) = self.function_impls.get(index) {
                     for (source_slot, captured_slot) in &function_impl.capture_copies {
                         self.mark_live(footprint, *source_slot);
                         self.mark_live(footprint, *captured_slot);
@@ -721,6 +735,26 @@ impl LivenessRewriter {
             Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
                 self.mark_live(footprint, *root);
             }
+            Expr::OptionalGet {
+                container,
+                key,
+                container_slot,
+                key_slot,
+            } => {
+                self.mark_live(footprint, *container_slot);
+                self.mark_live(footprint, *key_slot);
+                self.collect_expr_footprint(container, footprint, stack);
+                self.collect_expr_footprint(key, footprint, stack);
+            }
+            Expr::OptionUnwrapOr {
+                value,
+                value_slot,
+                fallback,
+            } => {
+                self.mark_live(footprint, *value_slot);
+                self.collect_expr_footprint(value, footprint, stack);
+                self.collect_expr_footprint(fallback, footprint, stack);
+            }
             Expr::Call(index, args) => {
                 let called = self.function_footprint(*index, stack);
                 self.union_inplace(footprint, &called);
@@ -781,7 +815,10 @@ impl LivenessRewriter {
                 self.mark_live(footprint, *value_slot);
                 self.mark_live(footprint, *result_slot);
                 self.collect_expr_footprint(value, footprint, stack);
-                for (_, arm_expr) in arms {
+                for (pattern, arm_expr) in arms {
+                    if let Some(binding_slot) = pattern.binding_slot() {
+                        self.mark_live(footprint, binding_slot);
+                    }
                     self.collect_expr_footprint(arm_expr, footprint, stack);
                 }
                 self.collect_expr_footprint(default, footprint, stack);
@@ -856,6 +893,12 @@ fn expr_contains_local_call(expr: &Expr) -> bool {
         | Expr::MoveVar(_)
         | Expr::MoveField { .. }
         | Expr::MoveIndex { .. } => false,
+        Expr::OptionalGet { container, key, .. } => {
+            expr_contains_local_call(container) || expr_contains_local_call(key)
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => expr_contains_local_call(value) || expr_contains_local_call(fallback),
         Expr::Call(_, args) => args.iter().any(expr_contains_local_call),
         Expr::Closure(closure) => expr_contains_local_call(&closure.body),
         Expr::ClosureCall(closure, args) => {
@@ -990,9 +1033,7 @@ impl LocalSlotAllocator {
             Stmt::FuncDecl {
                 index, has_impl, ..
             } => {
-                if *has_impl
-                    && let Some(function_impl) = self.function_impls.get(index)
-                {
+                if *has_impl && let Some(function_impl) = self.function_impls.get(index) {
                     let capture_copies = function_impl.capture_copies.clone();
                     for (source_slot, captured_slot) in capture_copies {
                         self.add_slot_live_edges(source_slot, live_before);
@@ -1086,6 +1127,26 @@ impl LocalSlotAllocator {
             Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
                 self.add_slot_live_edges(*root, &live_during);
             }
+            Expr::OptionalGet {
+                container,
+                key,
+                container_slot,
+                key_slot,
+            } => {
+                self.add_slot_live_edges(*container_slot, &live_during);
+                self.add_slot_live_edges(*key_slot, &live_during);
+                self.collect_expr_constraints(container, &live_during)?;
+                self.collect_expr_constraints(key, &live_during)?;
+            }
+            Expr::OptionUnwrapOr {
+                value,
+                value_slot,
+                fallback,
+            } => {
+                self.add_slot_live_edges(*value_slot, &live_during);
+                self.collect_expr_constraints(value, &live_during)?;
+                self.collect_expr_constraints(fallback, &live_during)?;
+            }
             Expr::Call(index, args) => {
                 for arg in args {
                     self.collect_expr_constraints(arg, &live_during)?;
@@ -1152,7 +1213,10 @@ impl LocalSlotAllocator {
                 self.add_slot_live_edges(*value_slot, &live_during);
                 self.add_slot_live_edges(*result_slot, &live_during);
                 self.collect_expr_constraints(value, &live_during)?;
-                for (_, arm_expr) in arms {
+                for (pattern, arm_expr) in arms {
+                    if let Some(binding_slot) = pattern.binding_slot() {
+                        self.add_slot_live_edges(binding_slot, &live_during);
+                    }
                     self.collect_expr_constraints(arm_expr, &live_during)?;
                 }
                 self.collect_expr_constraints(default, &live_during)?;
@@ -1212,9 +1276,7 @@ impl LocalSlotAllocator {
             Stmt::FuncDecl {
                 index, has_impl, ..
             } => {
-                if *has_impl
-                    && let Some(function_impl) = self.function_impls.get(index)
-                {
+                if *has_impl && let Some(function_impl) = self.function_impls.get(index) {
                     for (source_slot, captured_slot) in &function_impl.capture_copies {
                         self.mark_set_slot(set, *source_slot);
                         self.mark_set_slot(set, *captured_slot);
@@ -1288,6 +1350,26 @@ impl LocalSlotAllocator {
             Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
                 self.mark_set_slot(set, *root);
             }
+            Expr::OptionalGet {
+                container,
+                key,
+                container_slot,
+                key_slot,
+            } => {
+                self.mark_set_slot(set, *container_slot);
+                self.mark_set_slot(set, *key_slot);
+                self.collect_expr_footprint(container, set, stack);
+                self.collect_expr_footprint(key, set, stack);
+            }
+            Expr::OptionUnwrapOr {
+                value,
+                value_slot,
+                fallback,
+            } => {
+                self.mark_set_slot(set, *value_slot);
+                self.collect_expr_footprint(value, set, stack);
+                self.collect_expr_footprint(fallback, set, stack);
+            }
             Expr::Call(index, args) => {
                 if self.function_impls.contains_key(index) {
                     let footprint = self.function_footprint(*index, stack);
@@ -1358,7 +1440,10 @@ impl LocalSlotAllocator {
                 self.mark_set_slot(set, *value_slot);
                 self.mark_set_slot(set, *result_slot);
                 self.collect_expr_footprint(value, set, stack);
-                for (_, arm_expr) in arms {
+                for (pattern, arm_expr) in arms {
+                    if let Some(binding_slot) = pattern.binding_slot() {
+                        self.mark_set_slot(set, binding_slot);
+                    }
                     self.collect_expr_footprint(arm_expr, set, stack);
                 }
                 self.collect_expr_footprint(default, set, stack);
@@ -1673,6 +1758,26 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
         Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
             *root = remap_slot(*root, mapping)?;
         }
+        Expr::OptionalGet {
+            container,
+            key,
+            container_slot,
+            key_slot,
+        } => {
+            *container_slot = remap_slot(*container_slot, mapping)?;
+            *key_slot = remap_slot(*key_slot, mapping)?;
+            remap_expr_slots(container, mapping)?;
+            remap_expr_slots(key, mapping)?;
+        }
+        Expr::OptionUnwrapOr {
+            value,
+            value_slot,
+            fallback,
+        } => {
+            *value_slot = remap_slot(*value_slot, mapping)?;
+            remap_expr_slots(value, mapping)?;
+            remap_expr_slots(fallback, mapping)?;
+        }
         Expr::IfElse {
             condition,
             then_expr,
@@ -1692,7 +1797,10 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
             *value_slot = remap_slot(*value_slot, mapping)?;
             *result_slot = remap_slot(*result_slot, mapping)?;
             remap_expr_slots(value, mapping)?;
-            for (_, arm_expr) in arms {
+            for (pattern, arm_expr) in arms {
+                if let crate::compiler::ir::MatchPattern::SomeBinding(binding_slot) = pattern {
+                    *binding_slot = remap_slot(*binding_slot, mapping)?;
+                }
                 remap_expr_slots(arm_expr, mapping)?;
             }
             remap_expr_slots(default, mapping)?;

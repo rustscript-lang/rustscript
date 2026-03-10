@@ -649,10 +649,15 @@ Core compiler/IR:
   and callable parameters when the compiler can still identify the callee
 - known `if`/`else` expression results and branch-local merges with incompatible concrete types are
   compile errors
+- in RustScript, optional chaining requires a user-declared schema on the container; the result
+  stays optional until handled with `.unwrap_or(...)`, a `!= null` refinement, or a `match` arm
+  that binds `Some(name)`
+- after optional handling, the compiler and wasm lint keep the concrete inner type instead of
+  degrading back to `unknown`
 - recursive RustScript function declarations are not supported by current inlining-based lowering
 - function declarations can be nested and implicitly capture outer locals (closure-like snapshot at declaration time)
 - in RustScript move-semantics mode, implicit captures follow expression semantics (`x` may move, `x.copy()` copies, `&x`/`&mut x` capture borrowed views)
-- `match` patterns are limited to int/string/null literals, `_`, and type constructors (`Some(TypeName)`)
+- `match` patterns are limited to int/string/null literals, `None`, `Some(name)`, `_`, and type constructors (`Some(TypeName)`)
 - `break` and `continue` are only valid inside loops
 - direct host namespace syntax uses named namespaces such as `runtime`, `http`, and `rate_limit` when the corresponding module is not present (builtin namespaces are `io::`, `re::`, `json::`, and `jit::`)
 

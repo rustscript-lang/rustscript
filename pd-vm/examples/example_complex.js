@@ -22,7 +22,7 @@ base = 8;
 let closureValue = add(5);
 
 const profile = { stats: { score: closureValue } };
-const chainedScore = profile?.stats?.score;
+const chainedScoreOpt = profile?.stats?.score;
 const missingScore = profile?.missing?.value;
 
 function keep(value) { return value; }
@@ -30,7 +30,7 @@ const regexOk = re.match("^javascript$", "JAVASCRIPT", "i");
 const payload = {
     lang: "javascript",
     score: closureValue,
-    chained: chainedScore,
+    chained: closureValue,
 };
 const payloadJson = json.encode(payload);
 const payloadDecoded = json.decode(payloadJson);
@@ -41,8 +41,12 @@ if (true) {
     ioOk = io.exists(".");
 }
 
-if (regexOk && ioOk && sleepOk && jsonScore == chainedScore) {
-    console.log(keep(chainedScore));
+if (chainedScoreOpt != null) {
+    if (regexOk && ioOk && sleepOk && jsonScore == closureValue && missingScore == null) {
+        console.log(keep(chainedScoreOpt));
+    } else {
+        console.log(0);
+    }
 } else {
     console.log(0);
 }

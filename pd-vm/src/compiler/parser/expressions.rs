@@ -1,5 +1,9 @@
 use super::*;
 
+type MatchBinding = Option<(String, LocalSlot)>;
+type ParsedMatchPattern = (Option<MatchPattern>, MatchBinding);
+type ParsedMatchConstructor = Option<(MatchPattern, MatchBinding)>;
+
 impl Parser {
     pub(super) fn parse_expr(&mut self) -> Result<Expr, ParseError> {
         self.parse_or()
@@ -591,9 +595,22 @@ impl Parser {
             }
 
             let pattern_token_line = self.current_line();
-            let pattern = self.parse_match_pattern()?;
+            let (pattern, arm_binding) = self.parse_match_pattern()?;
             self.expect(&TokenKind::FatArrow, "expected '=>' in match arm")?;
-            let arm_expr = self.parse_expr()?;
+            if let Some((name, slot)) = arm_binding {
+                let mut scope = HashMap::new();
+                scope.insert(name, slot);
+                self.closure_scopes.push(scope);
+            }
+            let arm_expr = self.parse_expr();
+            if pattern
+                .as_ref()
+                .and_then(MatchPattern::binding_slot)
+                .is_some()
+            {
+                self.closure_scopes.pop();
+            }
+            let arm_expr = arm_expr?;
 
             match pattern {
                 Some(pattern) => {
@@ -654,7 +671,7 @@ impl Parser {
         })
     }
 
-    pub(super) fn parse_match_pattern(&mut self) -> Result<Option<MatchPattern>, ParseError> {
+    pub(super) fn parse_match_pattern(&mut self) -> Result<ParsedMatchPattern, ParseError> {
         if self.match_kind(&TokenKind::LParen) {
             let pattern = self.parse_match_pattern()?;
             self.expect(
@@ -664,27 +681,30 @@ impl Parser {
             return Ok(pattern);
         }
         if let Some(value) = self.match_int() {
-            return Ok(Some(MatchPattern::Int(value)));
+            return Ok((Some(MatchPattern::Int(value)), None));
         }
         self.reject_out_of_range_int_literal()?;
         if let Some(value) = self.match_string() {
-            return Ok(Some(MatchPattern::String(value)));
+            return Ok((Some(MatchPattern::String(value)), None));
         }
         if self.match_kind(&TokenKind::Null) {
-            return Ok(Some(MatchPattern::Null));
+            return Ok((Some(MatchPattern::Null), None));
         }
         if let Some(name) = self.match_ident() {
             if name == "_" {
-                return Ok(None);
+                return Ok((None, None));
             }
-            if let Some(type_pattern) = self.parse_match_type_constructor_pattern(&name)? {
-                return Ok(Some(MatchPattern::Type(type_pattern)));
+            if name == "None" {
+                return Ok((Some(MatchPattern::None), None));
+            }
+            if let Some((pattern, binding)) = self.parse_match_type_constructor_pattern(&name)? {
+                return Ok((Some(pattern), binding));
             }
         }
         Err(ParseError { span: None, code: None,
             line: self.current_line(),
             message:
-                "match patterns currently support int/string/null literals, type patterns via Some(TypeName), and '_'"
+                "match patterns currently support int/string/null literals, None, Some(name), type patterns via Some(TypeName), and '_'"
                     .to_string(),
         })
     }
@@ -692,34 +712,51 @@ impl Parser {
     pub(super) fn parse_match_type_constructor_pattern(
         &mut self,
         head: &str,
-    ) -> Result<Option<MatchTypePattern>, ParseError> {
+    ) -> Result<ParsedMatchConstructor, ParseError> {
         if head == "Some" {
             return self.parse_some_type_pattern();
+        }
+        if head == "Option" && self.match_path_separator() {
+            let variant =
+                self.expect_namespace_segment("expected 'Some' or 'None' after 'Option::'")?;
+            if variant == "Some" {
+                return self.parse_some_type_pattern();
+            }
+            if variant == "None" {
+                return Ok(Some((MatchPattern::None, None)));
+            }
         }
         Ok(None)
     }
 
-    pub(super) fn parse_some_type_pattern(
-        &mut self,
-    ) -> Result<Option<MatchTypePattern>, ParseError> {
+    pub(super) fn parse_some_type_pattern(&mut self) -> Result<ParsedMatchConstructor, ParseError> {
         self.expect(
             &TokenKind::LParen,
             "expected '(' after Some in match type pattern",
         )?;
-        let type_name = self.expect_ident("expected type name inside Some(...)")?;
-        let type_pattern = match_type_pattern_from_ident(&type_name).ok_or_else(|| ParseError {
-            span: None,
-            code: None,
-            line: self.current_line(),
-            message:
-                "unknown match type pattern; expected one of Int/Float/Number/Bool/String/Array/Map"
-                    .to_string(),
-        })?;
+        let binding_name =
+            self.expect_ident("expected type name or binding name inside Some(...)")?;
         self.expect(
             &TokenKind::RParen,
-            "expected ')' after Some(TypeName) match pattern",
+            "expected ')' after Some(...) match pattern",
         )?;
-        Ok(Some(type_pattern))
+        if let Some(type_pattern) = match_type_pattern_from_ident(&binding_name) {
+            return Ok(Some((MatchPattern::Type(type_pattern), None)));
+        }
+        if binding_name == "_" {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: "Some(_) is not supported; bind a name with Some(name)".to_string(),
+            });
+        }
+        let binding_slot = self.allocate_hidden_local()?;
+        self.set_local_slot_mutable(binding_slot, false);
+        Ok(Some((
+            MatchPattern::SomeBinding(binding_slot),
+            Some((binding_name, binding_slot)),
+        )))
     }
 
     pub(super) fn parse_postfix_access(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
@@ -764,6 +801,23 @@ impl Parser {
                         "copy does not take arguments; use '.copy()'",
                     )?;
                     expr = Expr::ToOwned(Box::new(expr));
+                } else if member == "unwrap" {
+                    return Err(ParseError {
+                        line: self.current_line(),
+                        message:
+                            "'.unwrap()' is not supported; use '.unwrap_or(...)' or a null check"
+                                .to_string(),
+                        span: None,
+                        code: None,
+                    });
+                } else if member == "unwrap_or" {
+                    self.expect(&TokenKind::LParen, "expected '(' after '.unwrap_or'")?;
+                    let fallback = self.parse_expr()?;
+                    self.expect(
+                        &TokenKind::RParen,
+                        "expected ')' after unwrap_or fallback expression",
+                    )?;
+                    expr = self.build_option_unwrap_or_expr(expr, fallback)?;
                 } else if member == "length" {
                     expr = self.build_builtin_call_expr(BuiltinFunction::Len, vec![expr])?;
                 } else if member == "keys" {
@@ -849,37 +903,12 @@ impl Parser {
         container: Expr,
         key: Expr,
     ) -> Result<Expr, ParseError> {
-        let container_slot = self.allocate_hidden_local()?;
-        let key_slot = self.allocate_hidden_local()?;
-
-        let is_null = self.build_type_check_expr(Expr::Var(container_slot), "null")?;
-        let is_map = self.build_type_check_expr(Expr::Var(container_slot), "map")?;
-        let is_array = self.build_type_check_expr(Expr::Var(container_slot), "array")?;
-        let is_string = self.build_type_check_expr(Expr::Var(container_slot), "string")?;
-        let map_lookup = self.build_optional_map_lookup_expr(container_slot, key_slot)?;
-        let array_lookup = self.build_optional_index_lookup_expr(container_slot, key_slot)?;
-        let string_lookup = self.build_optional_index_lookup_expr(container_slot, key_slot)?;
-        let typed_lookup = Expr::IfElse {
-            condition: Box::new(is_map),
-            then_expr: Box::new(map_lookup),
-            else_expr: Box::new(Expr::IfElse {
-                condition: Box::new(is_array),
-                then_expr: Box::new(array_lookup),
-                else_expr: Box::new(Expr::IfElse {
-                    condition: Box::new(is_string),
-                    then_expr: Box::new(string_lookup),
-                    else_expr: Box::new(Expr::Null),
-                }),
-            }),
-        };
-        let guarded = Expr::IfElse {
-            condition: Box::new(is_null),
-            then_expr: Box::new(Expr::Null),
-            else_expr: Box::new(typed_lookup),
-        };
-
-        let key_bound = self.bind_hidden_local_expr(key_slot, key, guarded)?;
-        self.bind_hidden_local_expr(container_slot, container, key_bound)
+        Ok(Expr::OptionalGet {
+            container: Box::new(container),
+            key: Box::new(key),
+            container_slot: self.allocate_hidden_local()?,
+            key_slot: self.allocate_hidden_local()?,
+        })
     }
 
     pub(super) fn build_optional_member_get_expr(
@@ -887,96 +916,18 @@ impl Parser {
         container: Expr,
         member: String,
     ) -> Result<Expr, ParseError> {
-        let container_slot = self.allocate_hidden_local()?;
-        let key_expr = Expr::String(member);
-
-        let is_null = self.build_type_check_expr(Expr::Var(container_slot), "null")?;
-        let is_map = self.build_type_check_expr(Expr::Var(container_slot), "map")?;
-        let map_lookup =
-            self.build_optional_map_lookup_expr_with_key(container_slot, key_expr.clone())?;
-        let guarded = Expr::IfElse {
-            condition: Box::new(is_null),
-            then_expr: Box::new(Expr::Null),
-            else_expr: Box::new(Expr::IfElse {
-                condition: Box::new(is_map),
-                then_expr: Box::new(map_lookup),
-                else_expr: Box::new(Expr::Null),
-            }),
-        };
-
-        self.bind_hidden_local_expr(container_slot, container, guarded)
+        self.build_optional_get_expr(container, Expr::String(member))
     }
 
-    pub(super) fn build_type_check_expr(
+    pub(super) fn build_option_unwrap_or_expr(
         &mut self,
         value: Expr,
-        expected: &str,
+        fallback: Expr,
     ) -> Result<Expr, ParseError> {
-        let value_type = self.build_builtin_call_expr(BuiltinFunction::TypeOf, vec![value])?;
-        Ok(Expr::Eq(
-            Box::new(value_type),
-            Box::new(Expr::String(expected.to_string())),
-        ))
-    }
-
-    pub(super) fn build_optional_map_lookup_expr(
-        &mut self,
-        container_slot: LocalSlot,
-        key_slot: LocalSlot,
-    ) -> Result<Expr, ParseError> {
-        self.build_optional_map_lookup_expr_with_key(container_slot, Expr::Var(key_slot))
-    }
-
-    pub(super) fn build_optional_map_lookup_expr_with_key(
-        &mut self,
-        container_slot: LocalSlot,
-        key: Expr,
-    ) -> Result<Expr, ParseError> {
-        let set_probe = self.build_builtin_call_expr(
-            BuiltinFunction::Set,
-            vec![Expr::Var(container_slot), key.clone(), Expr::Null],
-        )?;
-        let set_probe_len = self.build_builtin_call_expr(BuiltinFunction::Len, vec![set_probe])?;
-        let container_len =
-            self.build_builtin_call_expr(BuiltinFunction::Len, vec![Expr::Var(container_slot)])?;
-        let key_present = Expr::Eq(Box::new(set_probe_len), Box::new(container_len));
-        let value = self
-            .build_builtin_call_expr(BuiltinFunction::Get, vec![Expr::Var(container_slot), key])?;
-        Ok(Expr::IfElse {
-            condition: Box::new(key_present),
-            then_expr: Box::new(value),
-            else_expr: Box::new(Expr::Null),
-        })
-    }
-
-    pub(super) fn build_optional_index_lookup_expr(
-        &mut self,
-        container_slot: LocalSlot,
-        key_slot: LocalSlot,
-    ) -> Result<Expr, ParseError> {
-        let key_is_int = self.build_type_check_expr(Expr::Var(key_slot), "int")?;
-        let key_is_negative = Expr::Lt(Box::new(Expr::Var(key_slot)), Box::new(Expr::Int(0)));
-        let container_len =
-            self.build_builtin_call_expr(BuiltinFunction::Len, vec![Expr::Var(container_slot)])?;
-        let key_in_bounds = Expr::Lt(Box::new(Expr::Var(key_slot)), Box::new(container_len));
-        let value = self.build_builtin_call_expr(
-            BuiltinFunction::Get,
-            vec![Expr::Var(container_slot), Expr::Var(key_slot)],
-        )?;
-        let in_range_value = Expr::IfElse {
-            condition: Box::new(key_in_bounds),
-            then_expr: Box::new(value),
-            else_expr: Box::new(Expr::Null),
-        };
-        let non_negative_value = Expr::IfElse {
-            condition: Box::new(key_is_negative),
-            then_expr: Box::new(Expr::Null),
-            else_expr: Box::new(in_range_value),
-        };
-        Ok(Expr::IfElse {
-            condition: Box::new(key_is_int),
-            then_expr: Box::new(non_negative_value),
-            else_expr: Box::new(Expr::Null),
+        Ok(Expr::OptionUnwrapOr {
+            value: Box::new(value),
+            value_slot: self.allocate_hidden_local()?,
+            fallback: Box::new(fallback),
         })
     }
 

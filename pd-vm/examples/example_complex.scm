@@ -30,7 +30,7 @@
   (hash
     (lang "scheme")
     (score closure-value)
-    (chained chained-score)))
+    (chained closure-value)))
 (define payload-json (json.encode payload))
 (define payload-decoded (json.decode payload-json))
 (define json-score (hash-ref payload-decoded "score"))
@@ -40,6 +40,8 @@
     (set! io-ok (io.exists "."))
     (set! io-ok io-ok))
 
-(if (and regex-ok io-ok sleep-ok (= json-score chained-score))
-    (print (keep chained-score))
+(if (not (= chained-score null))
+    (if (and regex-ok io-ok sleep-ok (= json-score closure-value) (= missing-score null))
+        (print (keep chained-score))
+        (print 0))
     (print 0))

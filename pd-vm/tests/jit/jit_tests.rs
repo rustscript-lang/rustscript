@@ -691,9 +691,7 @@ fn compiler_emits_mod_and_short_circuit_logic_and_jit_accepts_them() {
     if native_jit_supported() {
         let dump = vm.dump_jit_info();
         assert!(
-            dump.contains(" mod")
-                || dump.contains(" mod_imm")
-                || dump.contains(" ldloc_mod_imm"),
+            dump.contains(" mod") || dump.contains(" mod_imm") || dump.contains(" ldloc_mod_imm"),
             "expected trace dump to include mod or fused mod-imm, dump:\n{dump}"
         );
     }
@@ -1214,22 +1212,16 @@ fn trace_jit_executes_typed_float_comparisons_without_helper_bridge() {
         .flat_map(|trace| trace.steps.iter())
         .collect::<Vec<_>>();
     assert!(
-        steps.iter().any(|step| {
-            matches!(
-                step,
-                TraceStep::FClt | TraceStep::FLocalCltImm { .. }
-            )
-        }),
+        steps
+            .iter()
+            .any(|step| { matches!(step, TraceStep::FClt | TraceStep::FLocalCltImm { .. }) }),
         "expected float less-than trace step, dump:\n{}",
         vm.dump_jit_info()
     );
     assert!(
-        steps.iter().any(|step| {
-            matches!(
-                step,
-                TraceStep::FCgt | TraceStep::FLocalCgtImm { .. }
-            )
-        }),
+        steps
+            .iter()
+            .any(|step| { matches!(step, TraceStep::FCgt | TraceStep::FLocalCgtImm { .. }) }),
         "expected float greater-than trace step, dump:\n{}",
         vm.dump_jit_info()
     );

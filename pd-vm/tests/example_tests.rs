@@ -136,18 +136,25 @@ fn ifft_math_example_runs() {
 }
 
 #[test]
-fn nullable_chain_maps_in_all_frontends() {
+fn rustscript_optional_chain_uses_declared_schema_and_handling_runs() {
     let rss_source = r#"
-let a = { b: { c: 7 } };
-a?.b?.c;
-let m = { b: {} };
-m?.b?.c;
+struct Inner { c: int }
+struct Outer { b: Inner }
+
+let present: Outer = { b: { c: 7 } };
+let missing: Outer = null;
+
+present?.b?.c.unwrap_or(0);
+missing?.b?.c.unwrap_or(0);
 "#;
     assert_eq!(
         run_compiled_source(SourceFlavor::RustScript, rss_source),
-        vec![Value::Int(7), Value::Null]
+        vec![Value::Int(7), Value::Int(0)]
     );
+}
 
+#[test]
+fn javascript_nullable_chain_maps_work() {
     let js_source = r#"
 const a = { b: { c: 7 } };
 a?.b?.c;
@@ -161,27 +168,32 @@ m?.b?.c;
 }
 
 #[test]
-fn nullable_chain_handles_array_and_string_indexes() {
+fn rustscript_optional_chain_handles_declared_array_and_string_indexes() {
     let rss_source = r#"
-let arr = [10, 20];
-arr?.[1];
-arr?.[2];
-arr?.["x"];
-let text = "abc";
-text?.[1];
-text?.[5];
+struct Data {
+    arr: [int],
+    text: string,
+}
+
+let data: Data = { arr: [10, 20], text: "abc" };
+data?.arr?.[1].unwrap_or(0);
+data?.arr?.[2].unwrap_or(0);
+data?.text?.[1].unwrap_or("");
+data?.text?.[5].unwrap_or("");
 "#;
     assert_eq!(
         run_compiled_source(SourceFlavor::RustScript, rss_source),
         vec![
             Value::Int(20),
-            Value::Null,
-            Value::Null,
+            Value::Int(0),
             Value::string("b"),
-            Value::Null,
+            Value::string(""),
         ]
     );
+}
 
+#[test]
+fn javascript_nullable_chain_handles_array_and_string_indexes() {
     let js_source = r#"
 const arr = [10, 20];
 arr?.[1];
@@ -204,15 +216,15 @@ text?.[5];
 }
 
 #[test]
-fn nullable_map_lookup_does_not_mutate_source_map() {
+fn javascript_nullable_map_lookup_does_not_mutate_source_map() {
     let source = r#"
-let m = { present: 1 };
+const m = { present: 1 };
 m?.missing;
 m.length;
 m.present;
 "#;
     assert_eq!(
-        run_compiled_source(SourceFlavor::RustScript, source),
+        run_compiled_source(SourceFlavor::JavaScript, source),
         vec![Value::Null, Value::Int(1), Value::Int(1)]
     );
 }

@@ -81,39 +81,69 @@ pub enum TraceStep {
     Add,
     IAdd,
     IAddImm(i64),
-    ILocalAddImm { local: u8, imm: i64 },
+    ILocalAddImm {
+        local: u8,
+        imm: i64,
+    },
     FAdd,
     FAddImm(u64),
-    FLocalAddImm { local: u8, imm_bits: u64 },
+    FLocalAddImm {
+        local: u8,
+        imm_bits: u64,
+    },
     SConcat,
     Sub,
     ISub,
     ISubImm(i64),
-    ILocalSubImm { local: u8, imm: i64 },
+    ILocalSubImm {
+        local: u8,
+        imm: i64,
+    },
     FSub,
     FSubImm(u64),
-    FLocalSubImm { local: u8, imm_bits: u64 },
+    FLocalSubImm {
+        local: u8,
+        imm_bits: u64,
+    },
     Mul,
     IMul,
     IMulImm(i64),
-    ILocalMulImm { local: u8, imm: i64 },
+    ILocalMulImm {
+        local: u8,
+        imm: i64,
+    },
     FMul,
     FMulImm(u64),
-    FLocalMulImm { local: u8, imm_bits: u64 },
+    FLocalMulImm {
+        local: u8,
+        imm_bits: u64,
+    },
     Div,
     IDiv,
     IDivImm(i64),
-    ILocalDivImm { local: u8, imm: i64 },
+    ILocalDivImm {
+        local: u8,
+        imm: i64,
+    },
     FDiv,
     FDivImm(u64),
-    FLocalDivImm { local: u8, imm_bits: u64 },
+    FLocalDivImm {
+        local: u8,
+        imm_bits: u64,
+    },
     Mod,
     IMod,
     IModImm(i64),
-    ILocalModImm { local: u8, imm: i64 },
+    ILocalModImm {
+        local: u8,
+        imm: i64,
+    },
     FMod,
     FModImm(u64),
-    FLocalModImm { local: u8, imm_bits: u64 },
+    FLocalModImm {
+        local: u8,
+        imm_bits: u64,
+    },
     Shl,
     Shr,
     Lshr,
@@ -126,17 +156,32 @@ pub enum TraceStep {
     Ceq,
     FCeq,
     Clt,
-    ILocalCltImm { local: u8, imm: i64 },
+    ILocalCltImm {
+        local: u8,
+        imm: i64,
+    },
     FClt,
-    FLocalCltImm { local: u8, imm_bits: u64 },
+    FLocalCltImm {
+        local: u8,
+        imm_bits: u64,
+    },
     Cgt,
-    ILocalCgtImm { local: u8, imm: i64 },
+    ILocalCgtImm {
+        local: u8,
+        imm: i64,
+    },
     FCgt,
-    FLocalCgtImm { local: u8, imm_bits: u64 },
+    FLocalCgtImm {
+        local: u8,
+        imm_bits: u64,
+    },
     Pop,
     Dup,
     Ldloc(u8),
-    ILocalShlImm { local: u8, amount: u32 },
+    ILocalShlImm {
+        local: u8,
+        amount: u32,
+    },
     Stloc(u8),
     BuiltinCall {
         index: u16,
@@ -1094,7 +1139,11 @@ fn read_u32(code: &[u8], ip: &mut usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes))
 }
 
-fn straight_line_if_join_side_entry(code: &[u8], side_start: usize, join_ip: usize) -> Option<usize> {
+fn straight_line_if_join_side_entry(
+    code: &[u8],
+    side_start: usize,
+    join_ip: usize,
+) -> Option<usize> {
     let mut cursor = side_start;
     while cursor < join_ip {
         let opcode = OpCode::try_from(*code.get(cursor)?).ok()?;
@@ -1142,8 +1191,7 @@ fn optimize_trace_steps(
             cursor += consumed;
             continue;
         }
-        if let Some((step, consumed)) = fuse_local_float_immediate_step(program, &steps[cursor..])
-        {
+        if let Some((step, consumed)) = fuse_local_float_immediate_step(program, &steps[cursor..]) {
             optimized_steps.push(step);
             optimized_ips.push(step_ips[cursor]);
             cursor += consumed;
@@ -1155,8 +1203,7 @@ fn optimize_trace_steps(
             cursor += consumed;
             continue;
         }
-        if let Some((step, consumed)) = fuse_stack_float_immediate_step(program, &steps[cursor..])
-        {
+        if let Some((step, consumed)) = fuse_stack_float_immediate_step(program, &steps[cursor..]) {
             optimized_steps.push(step);
             optimized_ips.push(step_ips[cursor]);
             cursor += consumed;

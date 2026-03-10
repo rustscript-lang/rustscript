@@ -1,12 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::builtins::{BuiltinFunction, CallableParam, CallableParamType};
 
 use super::super::CompileError;
-use super::super::ir::{Expr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, TypeSchema};
+use super::super::ir::{
+    Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, Stmt, TypeSchema,
+};
 use super::collect::{
-    observed_function_param_schema_slice, observed_function_param_slice, seed_function_capture_state,
-    seed_function_param_state,
+    observed_function_param_schema_slice, observed_function_param_slice,
+    seed_function_capture_state, seed_function_param_state,
 };
 use super::context::{TypeContext, bound_type_from_schema};
 use super::infer_expr_type;
@@ -14,39 +16,46 @@ use super::state::{
     BoundType, HostCallableSignature, LocalTypeState, merge_bound_types,
     merge_container_element_types, stabilize_loop_state, try_stabilize_loop_state,
 };
-use super::validate::{owned_source_name, validate_branch_state_merge, validate_expr};
+use super::validate::{
+    owned_source_name, refine_state_for_condition, validate_branch_state_merge, validate_expr,
+};
+
+pub(super) struct FunctionLegalizeEnv<'a> {
+    pub(super) function_impls: &'a HashMap<u16, FunctionImpl>,
+    pub(super) function_names: &'a HashMap<u16, String>,
+    pub(super) struct_schemas: &'a HashMap<String, TypeSchema>,
+    pub(super) host_import_return_types: &'a HashMap<u16, BoundType>,
+    pub(super) host_import_signatures: &'a HashMap<u16, HostCallableSignature>,
+    pub(super) observed_function_param_types: &'a HashMap<u16, Vec<BoundType>>,
+    pub(super) observed_function_param_schemas: &'a HashMap<u16, Vec<Option<TypeSchema>>>,
+    pub(super) observed_function_capture_states: &'a HashMap<u16, LocalTypeState>,
+}
 
 pub(super) fn legalize_function_impl(
     function_index: u16,
     function_impl: &mut FunctionImpl,
-    function_impls: &HashMap<u16, FunctionImpl>,
-    function_names: &HashMap<u16, String>,
-    struct_schemas: &HashMap<String, TypeSchema>,
-    host_import_return_types: &HashMap<u16, BoundType>,
-    host_import_signatures: &HashMap<u16, HostCallableSignature>,
-    observed_function_param_types: &HashMap<u16, Vec<BoundType>>,
-    observed_function_param_schemas: &HashMap<u16, Vec<Option<TypeSchema>>>,
-    observed_function_capture_states: &HashMap<u16, LocalTypeState>,
+    env: &FunctionLegalizeEnv<'_>,
 ) {
     let mut state = LocalTypeState::default();
     let mut context = TypeContext::new(
-        function_impls,
-        struct_schemas,
-        function_names,
-        host_import_return_types,
-        host_import_signatures,
+        env.function_impls,
+        env.struct_schemas,
+        env.function_names,
+        env.host_import_return_types,
+        env.host_import_signatures,
+        false,
     );
     seed_function_param_state(
         &mut state,
         &function_impl.param_slots,
-        observed_function_param_slice(observed_function_param_types, function_index),
-        observed_function_param_schema_slice(observed_function_param_schemas, function_index),
+        observed_function_param_slice(env.observed_function_param_types, function_index),
+        observed_function_param_schema_slice(env.observed_function_param_schemas, function_index),
     );
     seed_function_capture_state(
         &mut state,
         function_index,
         &function_impl.capture_copies,
-        observed_function_capture_states,
+        env.observed_function_capture_states,
     );
     legalize_stmts(&mut function_impl.body_stmts, &mut state, &mut context);
     let _ = legalize_expr(&mut function_impl.body_expr, &state, &mut context);
@@ -115,16 +124,16 @@ pub(super) fn legalize_stmts(
 ) {
     for stmt in stmts {
         match stmt {
-            Stmt::Noop { .. }
-            | Stmt::Break { .. }
-            | Stmt::Continue { .. } => {}
+            Stmt::Noop { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
             Stmt::FuncDecl {
                 index, has_impl, ..
             } => {
-                if *has_impl
-                    && let Some(function_impl) = context.function_impls.get(index)
-                {
-                    context.observe_function_capture_state(*index, &function_impl.capture_copies, state);
+                if *has_impl && let Some(function_impl) = context.function_impls.get(index) {
+                    context.observe_function_capture_state(
+                        *index,
+                        &function_impl.capture_copies,
+                        state,
+                    );
                 }
             }
             Stmt::Drop { index, .. } => {
@@ -228,16 +237,16 @@ pub(super) fn validate_stmts(
 ) -> Result<(), CompileError> {
     for stmt in stmts {
         match stmt {
-            Stmt::Noop { .. }
-            | Stmt::Break { .. }
-            | Stmt::Continue { .. } => {}
+            Stmt::Noop { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
             Stmt::FuncDecl {
                 index, has_impl, ..
             } => {
-                if *has_impl
-                    && let Some(function_impl) = context.function_impls.get(index)
-                {
-                    context.observe_function_capture_state(*index, &function_impl.capture_copies, state);
+                if *has_impl && let Some(function_impl) = context.function_impls.get(index) {
+                    context.observe_function_capture_state(
+                        *index,
+                        &function_impl.capture_copies,
+                        state,
+                    );
                 }
             }
             Stmt::Drop { index, .. } => {
@@ -272,9 +281,12 @@ pub(super) fn validate_stmts(
                     .as_deref()
                     .and_then(|name| context.resolve_struct_schema(name))
                     .cloned();
+                let actual_schema = inferred_expr_assignment_schema(expr, &expr_state, context);
                 validate_declared_local_schema(
                     declared_schema.as_ref(),
                     ty,
+                    actual_schema.as_ref(),
+                    context,
                     Some(*line),
                     source_name,
                 )?;
@@ -297,6 +309,19 @@ pub(super) fn validate_stmts(
                     source_name,
                     context,
                     strict_function_add_types,
+                )?;
+                let declared_schema = state
+                    .has_declared_schema(*index)
+                    .then(|| state.schema(*index).cloned())
+                    .flatten();
+                let actual_schema = inferred_expr_assignment_schema(expr, &expr_state, context);
+                validate_declared_local_schema(
+                    declared_schema.as_ref(),
+                    ty,
+                    actual_schema.as_ref(),
+                    context,
+                    Some(*line),
+                    source_name,
                 )?;
                 bind_expr_result_to_slot(state, *index, None, expr, &expr_state, ty, context);
             }
@@ -324,8 +349,8 @@ pub(super) fn validate_stmts(
                     context,
                     strict_function_add_types,
                 )?;
-                let mut then_state = state.clone();
-                let mut else_state = state.clone();
+                let mut then_state = refine_state_for_condition(state, condition, true);
+                let mut else_state = refine_state_for_condition(state, condition, false);
                 validate_stmts(
                     then_branch,
                     &mut then_state,
@@ -420,6 +445,8 @@ pub(super) fn validate_stmts(
 fn validate_declared_local_schema(
     schema: Option<&TypeSchema>,
     actual: BoundType,
+    actual_schema: Option<&TypeSchema>,
+    context: &TypeContext<'_>,
     line: Option<u32>,
     source_name: Option<&str>,
 ) -> Result<(), CompileError> {
@@ -433,6 +460,16 @@ fn validate_declared_local_schema(
         || (expected == BoundType::Array && matches!(actual, BoundType::ArrayOf(_)))
         || (expected == BoundType::Map && matches!(actual, BoundType::MapOf(_)))
     {
+        if let Some(actual_schema) = actual_schema
+            && let Some(detail) =
+                find_declared_schema_mismatch(schema, actual_schema, context, String::new())
+        {
+            return Err(CompileError::InvalidFieldAccess {
+                line,
+                source_name: owned_source_name(source_name),
+                detail,
+            });
+        }
         return Ok(());
     }
     Err(CompileError::InvalidFieldAccess {
@@ -444,6 +481,173 @@ fn validate_declared_local_schema(
             bound_type_label(actual)
         ),
     })
+}
+
+fn inferred_expr_assignment_schema(
+    expr: &Expr,
+    expr_state: &LocalTypeState,
+    context: &mut TypeContext<'_>,
+) -> Option<TypeSchema> {
+    if context.expr_is_optional(expr, expr_state) {
+        context.infer_optional_expr_inner_schema(expr, expr_state)
+    } else {
+        context.infer_expr_schema(expr, expr_state)
+    }
+}
+
+fn find_declared_schema_mismatch(
+    expected: &TypeSchema,
+    actual: &TypeSchema,
+    context: &TypeContext<'_>,
+    path: String,
+) -> Option<String> {
+    let mut recursive_named = HashSet::new();
+    find_declared_schema_mismatch_with_recursion(
+        expected,
+        actual,
+        context,
+        path,
+        &mut recursive_named,
+        false,
+    )
+}
+
+fn find_declared_schema_mismatch_with_recursion(
+    expected: &TypeSchema,
+    actual: &TypeSchema,
+    context: &TypeContext<'_>,
+    path: String,
+    recursive_named: &mut HashSet<String>,
+    allow_partial_object: bool,
+) -> Option<String> {
+    let expected = match expected {
+        TypeSchema::Named(name) => {
+            let is_recursive = !recursive_named.insert(name.clone());
+            let resolved = context.resolve_struct_schema(name).unwrap_or(expected);
+            let mismatch = find_declared_schema_mismatch_with_recursion(
+                resolved,
+                actual,
+                context,
+                path,
+                recursive_named,
+                is_recursive,
+            );
+            if !is_recursive {
+                recursive_named.remove(name);
+            }
+            return mismatch;
+        }
+        _ => context.resolve_schema(expected),
+    };
+    let actual = context.resolve_schema(actual);
+
+    match (expected, actual) {
+        (_, TypeSchema::Unknown | TypeSchema::Null) | (TypeSchema::Unknown, _) => None,
+        (TypeSchema::Int, TypeSchema::Int)
+        | (TypeSchema::Float, TypeSchema::Float)
+        | (TypeSchema::Bool, TypeSchema::Bool)
+        | (TypeSchema::String, TypeSchema::String) => None,
+        (TypeSchema::Array(expected), TypeSchema::Array(actual)) => {
+            find_declared_schema_mismatch_with_recursion(
+                expected,
+                actual,
+                context,
+                path,
+                recursive_named,
+                allow_partial_object,
+            )
+        }
+        (TypeSchema::Map(expected), TypeSchema::Map(actual)) => {
+            find_declared_schema_mismatch_with_recursion(
+                expected,
+                actual,
+                context,
+                path,
+                recursive_named,
+                allow_partial_object,
+            )
+        }
+        (TypeSchema::Map(expected), TypeSchema::Object(fields)) => {
+            for (name, field_schema) in fields {
+                let field_path = extend_schema_path(&path, name);
+                if let Some(detail) = find_declared_schema_mismatch_with_recursion(
+                    expected,
+                    field_schema,
+                    context,
+                    field_path,
+                    recursive_named,
+                    allow_partial_object,
+                ) {
+                    return Some(detail);
+                }
+            }
+            None
+        }
+        (TypeSchema::Object(expected_fields), TypeSchema::Object(actual_fields)) => {
+            if !allow_partial_object {
+                for (name, expected_field) in expected_fields {
+                    let field_path = extend_schema_path(&path, name);
+                    let Some(actual_field) = actual_fields.get(name) else {
+                        return Some(format!(
+                            "field '{}' is required by the declared schema but is missing",
+                            field_path
+                        ));
+                    };
+                    if let Some(detail) = find_declared_schema_mismatch_with_recursion(
+                        expected_field,
+                        actual_field,
+                        context,
+                        field_path,
+                        recursive_named,
+                        false,
+                    ) {
+                        return Some(detail);
+                    }
+                }
+                return None;
+            }
+
+            for (name, actual_field) in actual_fields {
+                let Some(expected_field) = expected_fields.get(name) else {
+                    continue;
+                };
+                let field_path = extend_schema_path(&path, name);
+                if let Some(detail) = find_declared_schema_mismatch_with_recursion(
+                    expected_field,
+                    actual_field,
+                    context,
+                    field_path,
+                    recursive_named,
+                    true,
+                ) {
+                    return Some(detail);
+                }
+            }
+            None
+        }
+        _ => Some(format!(
+            "{} is declared as schema type '{}' but was assigned {}",
+            schema_path_label(&path),
+            schema_type_label(expected),
+            schema_type_label(actual)
+        )),
+    }
+}
+
+fn extend_schema_path(path: &str, segment: &str) -> String {
+    if path.is_empty() {
+        segment.to_string()
+    } else {
+        format!("{path}.{segment}")
+    }
+}
+
+fn schema_path_label(path: &str) -> String {
+    if path.is_empty() {
+        "value".to_string()
+    } else {
+        format!("field '{path}'")
+    }
 }
 
 fn schema_type_label(schema: &TypeSchema) -> &'static str {
@@ -478,18 +682,46 @@ pub(super) fn bind_expr_result_to_slot(
                 .then(|| expr_state.schema(slot).cloned())
                 .flatten()
         });
-        let schema = slot_declared_schema
-            .clone()
-            .or_else(|| context.infer_expr_schema(expr, expr_state));
+        let optional = context.expr_is_optional(expr, expr_state);
+        let schema = slot_declared_schema.clone().or_else(|| {
+            if optional {
+                context.infer_optional_expr_inner_schema(expr, expr_state)
+            } else {
+                context.infer_expr_schema(expr, expr_state)
+            }
+        });
         let from_declared_schema = slot_declared_schema.is_some()
             || expr_state.has_declared_schema(slot)
             || context.expr_has_declared_schema(expr, expr_state);
+        let inferred_ty = if optional {
+            context.infer_optional_expr_inner_type(expr, expr_state)
+        } else {
+            ty
+        };
         let ty = slot_declared_schema
             .as_ref()
             .map(bound_type_from_schema)
-            .unwrap_or(ty);
-        state.set_with_schema_origin(slot, ty, schema, from_declared_schema);
+            .unwrap_or(inferred_ty);
+        state.set_with_optional_schema_origin(slot, ty, schema, from_declared_schema, optional);
     }
+}
+
+pub(super) fn refine_state_for_match_pattern(
+    state: &LocalTypeState,
+    pattern: &MatchPattern,
+    value_slot: LocalSlot,
+) -> LocalTypeState {
+    let mut refined = state.clone();
+    if let Some(binding_slot) = pattern.binding_slot() {
+        refined.set_with_optional_schema_origin(
+            binding_slot,
+            state.get(value_slot),
+            state.schema(value_slot).cloned(),
+            state.has_declared_schema(value_slot),
+            false,
+        );
+    }
+    refined
 }
 
 pub(super) fn build_function_names(functions: &[FunctionDecl]) -> HashMap<u16, String> {
@@ -659,6 +891,16 @@ pub(super) fn expr_contains_param_add(expr: &Expr, param_slots: &[LocalSlot]) ->
         | Expr::MoveVar(_)
         | Expr::MoveField { .. }
         | Expr::MoveIndex { .. } => false,
+        Expr::OptionalGet { container, key, .. } => {
+            expr_contains_param_add(container, param_slots)
+                || expr_contains_param_add(key, param_slots)
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            expr_contains_param_add(value, param_slots)
+                || expr_contains_param_add(fallback, param_slots)
+        }
         Expr::Call(_, args) | Expr::LocalCall(_, args) => args
             .iter()
             .any(|arg| expr_contains_param_add(arg, param_slots)),
@@ -721,6 +963,12 @@ pub(super) fn expr_uses_param(expr: &Expr, param_slots: &[LocalSlot]) -> bool {
         | Expr::FunctionRef(_)
         | Expr::MoveField { .. }
         | Expr::MoveIndex { .. } => false,
+        Expr::OptionalGet { container, key, .. } => {
+            expr_uses_param(container, param_slots) || expr_uses_param(key, param_slots)
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => expr_uses_param(value, param_slots) || expr_uses_param(fallback, param_slots),
         Expr::Call(_, args) | Expr::LocalCall(_, args) => {
             args.iter().any(|arg| expr_uses_param(arg, param_slots))
         }
@@ -853,6 +1101,18 @@ pub(super) fn legalize_expr(
         Expr::Float(_) => BoundType::Float,
         Expr::Bool(_) => BoundType::Bool,
         Expr::String(_) => BoundType::String,
+        Expr::OptionalGet { container, key, .. } => {
+            let _ = legalize_expr(container, state, context);
+            let _ = legalize_expr(key, state, context);
+            context.infer_expr_type(expr, state)
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            let _ = legalize_expr(value, state, context);
+            let _ = legalize_expr(fallback, state, context);
+            context.infer_expr_type(expr, state)
+        }
         Expr::FunctionRef(_) | Expr::Call(_, _) | Expr::LocalCall(_, _) | Expr::Closure(_) => {
             legalize_expr_children(expr, state, context);
             context.infer_call_like_expr_type(expr, state)
@@ -917,8 +1177,9 @@ pub(super) fn legalize_expr(
                 context,
             );
             let mut arm_type = BoundType::Unknown;
-            for (_pattern, arm_expr) in arms.iter_mut() {
-                let ty = legalize_expr(arm_expr, &nested, context);
+            for (pattern, arm_expr) in arms.iter_mut() {
+                let arm_state = refine_state_for_match_pattern(&nested, pattern, *value_slot);
+                let ty = legalize_expr(arm_expr, &arm_state, context);
                 arm_type = if arm_type == BoundType::Unknown {
                     ty
                 } else if arm_type == ty {

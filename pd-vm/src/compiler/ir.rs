@@ -50,7 +50,22 @@ pub enum MatchPattern {
     Int(i64),
     String(String),
     Null,
+    None,
+    SomeBinding(LocalSlot),
     Type(MatchTypePattern),
+}
+
+impl MatchPattern {
+    pub(crate) fn binding_slot(&self) -> Option<LocalSlot> {
+        match self {
+            MatchPattern::SomeBinding(slot) => Some(*slot),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn requires_optional_value(&self) -> bool {
+        matches!(self, MatchPattern::None | MatchPattern::SomeBinding(_))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +87,17 @@ pub enum Expr {
     Bool(bool),
     String(String),
     FunctionRef(u16),
+    OptionalGet {
+        container: Box<Expr>,
+        key: Box<Expr>,
+        container_slot: LocalSlot,
+        key_slot: LocalSlot,
+    },
+    OptionUnwrapOr {
+        value: Box<Expr>,
+        value_slot: LocalSlot,
+        fallback: Box<Expr>,
+    },
     Call(u16, Vec<Expr>),
     LocalCall(LocalSlot, Vec<Expr>),
     Closure(ClosureExpr),

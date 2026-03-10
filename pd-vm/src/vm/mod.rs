@@ -18,7 +18,7 @@ pub use self::host::{
     StaticHostFunction,
 };
 use self::host::{HostCallExecOutcome, VmHostFunction, WaitingHostOp};
-use self::superinstructions::{build_decoded_instruction_data, DecodedInstructionData};
+use self::superinstructions::{DecodedInstructionData, build_decoded_instruction_data};
 pub use crate::bytecode::{HostImport, OpCode, Program, Value, ValueType};
 pub use store::Store;
 
@@ -197,8 +197,11 @@ const FLOAT_UNARY_OPERAND_TYPE_HINT: PackedOperandTypes =
 
 pub struct Vm {
     program: Arc<Program>,
+    #[allow(dead_code)]
     program_constants_ptr: usize,
+    #[allow(dead_code)]
     program_constants_len: usize,
+    #[allow(dead_code)]
     native_helper_fn: usize,
     program_cache_key: u64,
     program_cache_key_ready: bool,
@@ -224,6 +227,7 @@ pub struct Vm {
     next_host_op_id: HostOpId,
     pub(crate) io_state: crate::builtins::runtime::IoState,
     epoch_handle: EpochHandle,
+    #[allow(dead_code)]
     epoch_counter_ptr: usize,
     interrupt_mode: InterruptMode,
     fuel_remaining: u64,
@@ -539,6 +543,7 @@ impl Vm {
         entries
     }
 
+    #[allow(dead_code)]
     pub(in crate::vm) fn record_jit_native_bridge_hit(&mut self, bridge_name: &'static str) {
         if !self.jit_native_bridge_stats_enabled {
             return;
@@ -1117,24 +1122,25 @@ impl Vm {
 
             let opcode = self.read_u8()?;
             let allow_superinstructions = debugger.is_none() && !self.interruption_enabled();
-            let outcome = match self.execute_interpreter_instruction(opcode, allow_superinstructions) {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    if let Some(reason) = Self::yielded_interrupt_reason(&err) {
-                        self.mark_interrupt_yield(reason);
+            let outcome =
+                match self.execute_interpreter_instruction(opcode, allow_superinstructions) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        if let Some(reason) = Self::yielded_interrupt_reason(&err) {
+                            self.mark_interrupt_yield(reason);
+                            if self.handle_debugger_error(&mut debugger, &err) {
+                                continue;
+                            }
+                            let status = VmStatus::Yielded;
+                            self.notify_debugger_status(&mut debugger, status);
+                            return Ok(status);
+                        }
                         if self.handle_debugger_error(&mut debugger, &err) {
                             continue;
                         }
-                        let status = VmStatus::Yielded;
-                        self.notify_debugger_status(&mut debugger, status);
-                        return Ok(status);
+                        return Err(err);
                     }
-                    if self.handle_debugger_error(&mut debugger, &err) {
-                        continue;
-                    }
-                    return Err(err);
-                }
-            };
+                };
             if let Some(status) = self.finish_outcome(&mut debugger, outcome) {
                 return Ok(status);
             }

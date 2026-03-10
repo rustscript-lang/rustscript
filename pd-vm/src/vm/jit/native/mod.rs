@@ -134,6 +134,7 @@ fn generic_bridge_error_cell() -> &'static Mutex<Option<VmError>> {
     GENERIC_BRIDGE_ERROR.get_or_init(|| Mutex::new(None))
 }
 
+#[allow(dead_code)]
 pub(super) fn store_bridge_error(error: VmError) {
     if let Ok(mut guard) = generic_bridge_error_cell().lock() {
         *guard = Some(error);

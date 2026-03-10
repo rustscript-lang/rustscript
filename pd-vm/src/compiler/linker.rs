@@ -373,6 +373,26 @@ fn remap_expr_indices(
                 remap_expr_indices(arg, local_base, function_map)?;
             }
         }
+        Expr::OptionalGet {
+            container,
+            key,
+            container_slot,
+            key_slot,
+        } => {
+            *container_slot = remap_local_index(*container_slot, local_base)?;
+            *key_slot = remap_local_index(*key_slot, local_base)?;
+            remap_expr_indices(container, local_base, function_map)?;
+            remap_expr_indices(key, local_base, function_map)?;
+        }
+        Expr::OptionUnwrapOr {
+            value,
+            value_slot,
+            fallback,
+        } => {
+            *value_slot = remap_local_index(*value_slot, local_base)?;
+            remap_expr_indices(value, local_base, function_map)?;
+            remap_expr_indices(fallback, local_base, function_map)?;
+        }
         Expr::LocalCall(index, args) => {
             *index = remap_local_index(*index, local_base)?;
             for arg in args {
@@ -447,7 +467,10 @@ fn remap_expr_indices(
             *value_slot = remap_local_index(*value_slot, local_base)?;
             *result_slot = remap_local_index(*result_slot, local_base)?;
             remap_expr_indices(value, local_base, function_map)?;
-            for (_, arm_expr) in arms {
+            for (pattern, arm_expr) in arms {
+                if let crate::compiler::ir::MatchPattern::SomeBinding(binding_slot) = pattern {
+                    *binding_slot = remap_local_index(*binding_slot, local_base)?;
+                }
                 remap_expr_indices(arm_expr, local_base, function_map)?;
             }
             remap_expr_indices(default, local_base, function_map)?;

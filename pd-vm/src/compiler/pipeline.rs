@@ -162,6 +162,26 @@ fn record_expr_local_debug_ranges(
         Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
             note_local_use(ranges, *root, line);
         }
+        Expr::OptionalGet {
+            container,
+            key,
+            container_slot,
+            key_slot,
+        } => {
+            note_local_use(ranges, *container_slot, line);
+            note_local_use(ranges, *key_slot, line);
+            record_expr_local_debug_ranges(container, line, ranges);
+            record_expr_local_debug_ranges(key, line, ranges);
+        }
+        Expr::OptionUnwrapOr {
+            value,
+            value_slot,
+            fallback,
+        } => {
+            note_local_use(ranges, *value_slot, line);
+            record_expr_local_debug_ranges(value, line, ranges);
+            record_expr_local_debug_ranges(fallback, line, ranges);
+        }
         Expr::Call(_, args) => {
             for arg in args {
                 record_expr_local_debug_ranges(arg, line, ranges);
@@ -229,7 +249,10 @@ fn record_expr_local_debug_ranges(
             note_local_use(ranges, *value_slot, line);
             note_local_use(ranges, *result_slot, line);
             record_expr_local_debug_ranges(value, line, ranges);
-            for (_, arm_expr) in arms {
+            for (pattern, arm_expr) in arms {
+                if let Some(binding_slot) = pattern.binding_slot() {
+                    note_local_use(ranges, binding_slot, line);
+                }
                 record_expr_local_debug_ranges(arm_expr, line, ranges);
             }
             record_expr_local_debug_ranges(default, line, ranges);
@@ -323,7 +346,8 @@ fn compile_parsed_output_with_entry_locals(
     // carried-over locals from prior entries as already available at snippet start.
     let local_debug_ranges = collect_named_local_debug_ranges(&parsed);
     let parsed = typing::legalize_builtins_and_bind_types(parsed);
-    typing::validate_if_else_type_consistency(&parsed).map_err(SourceError::Compile)?;
+    typing::validate_if_else_type_consistency(&parsed, enable_local_move_semantics)
+        .map_err(SourceError::Compile)?;
     let parsed = lifetime::enforce_local_availability_with_entry_locals(
         parsed,
         entry_definite_locals,
@@ -555,7 +579,7 @@ fn collect_unknown_inferred_local_types(
         warnings.push(UnknownInferredLocal {
             name: name.clone(),
             line,
-            span: find_local_name_span(&source_map, source_id, line, name)
+            span: find_local_name_span(source_map, source_id, line, name)
                 .or_else(|| source_map.line_span(source_id, line)),
         });
     }

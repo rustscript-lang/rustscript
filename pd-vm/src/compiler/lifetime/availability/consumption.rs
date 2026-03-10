@@ -173,6 +173,22 @@ pub(super) fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
         | Expr::FunctionRef(_) => false,
         Expr::Var(index) | Expr::MoveVar(index) => *index == slot,
         Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => *root == slot,
+        Expr::OptionalGet {
+            container,
+            key,
+            container_slot,
+            key_slot,
+        } => {
+            *container_slot == slot
+                || *key_slot == slot
+                || expr_uses_slot(container, slot)
+                || expr_uses_slot(key, slot)
+        }
+        Expr::OptionUnwrapOr {
+            value,
+            value_slot,
+            fallback,
+        } => *value_slot == slot || expr_uses_slot(value, slot) || expr_uses_slot(fallback, slot),
         Expr::Call(_, args) | Expr::LocalCall(_, args) => {
             args.iter().any(|arg| expr_uses_slot(arg, slot))
         }
@@ -376,6 +392,31 @@ pub(super) fn collect_consumed_positions_from_expr(
             {
                 out.insert(position);
             }
+        }
+        Expr::OptionalGet { container, key, .. } => {
+            collect_consumed_positions_from_expr(
+                container,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
+            collect_consumed_positions_from_expr(key, function_impl, known_consumed_positions, out);
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            collect_consumed_positions_from_expr(
+                value,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
+            collect_consumed_positions_from_expr(
+                fallback,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
         }
         Expr::Call(index, args) => {
             for arg in args {

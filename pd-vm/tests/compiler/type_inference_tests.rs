@@ -588,6 +588,66 @@ fn compiler_infers_hidden_slice_bindings_inside_function_bodies() {
 }
 
 #[test]
+fn compiler_uses_concrete_types_after_optional_handling_refinement_and_match_binding() {
+    let unwrap_or_source = r#"
+        struct Stats { score: int }
+        struct Profile { stats: Stats }
+
+        let profile: Profile = { stats: { score: 41 } };
+        let score = profile?.stats?.score.unwrap_or(0);
+        score + 1;
+    "#;
+
+    let compiled = compile_source(unwrap_or_source).expect("compile should succeed");
+    assert_last_opcode_operand_types(&compiled, OpCode::Add, (ValueType::Int, ValueType::Int));
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+
+    let refined_source = r#"
+        struct Stats { score: int }
+        struct Profile { stats: Stats }
+
+        let profile: Profile = { stats: { score: 41 } };
+        let score = profile?.stats?.score;
+        if score != null {
+            score + 1;
+        } else {
+            0;
+        }
+    "#;
+
+    let compiled = compile_source(refined_source).expect("compile should succeed");
+    assert_last_opcode_operand_types(&compiled, OpCode::Add, (ValueType::Int, ValueType::Int));
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+
+    let matched_source = r#"
+        struct Data { values: [int] }
+        let data: Data = { values: [41] };
+        let result = match data?.values?.[0] {
+            None => 0,
+            Some(value) => value + 1,
+            _ => 0,
+        };
+        result;
+    "#;
+
+    let compiled = compile_source(matched_source).expect("compile should succeed");
+    assert_last_opcode_operand_types(&compiled, OpCode::Add, (ValueType::Int, ValueType::Int));
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+}
+
+#[test]
 fn compiler_infers_dynamic_slice_end_bindings_inside_function_bodies() {
     let source = r#"
         fn first_hex(text, i) {
