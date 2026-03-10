@@ -255,3 +255,11 @@ pub(super) extern "C" fn pd_vm_cranelift_step(vm: *mut Vm, op: i64, a: i64, b: i
         }
     })
 }
+
+pub(super) extern "C" fn pd_vm_cranelift_sconcat(vm: *mut Vm) -> i32 {
+    run_step(vm, "sconcat", |vm| {
+        vm.record_jit_native_bridge_hit("sconcat");
+        vm.string_concat_op()?;
+        Ok(STATUS_CONTINUE)
+    })
+}

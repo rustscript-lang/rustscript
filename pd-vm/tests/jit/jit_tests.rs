@@ -1047,6 +1047,68 @@ fn trace_jit_executes_typed_float_math_without_helper_bridge() {
 }
 
 #[test]
+fn trace_jit_executes_typed_string_concat_without_generic_add_bridge() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let mut i = 0;
+        let mut text = "";
+        while i < 6 {
+            text = text + "x";
+            i = i + 1;
+        }
+        text;
+    "#;
+
+    let compiled = compile_source(source).expect("string concat compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.set_jit_native_bridge_stats_enabled(true);
+
+    let status = vm.run().expect("string concat vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("xxxxxx")]);
+    assert!(
+        vm.jit_native_exec_count() > 0,
+        "expected native execution, dump:\n{}",
+        vm.dump_jit_info()
+    );
+
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        snapshot
+            .traces
+            .iter()
+            .flat_map(|trace| trace.steps.iter())
+            .any(|step| matches!(step, TraceStep::SConcat)),
+        "expected typed string concat trace step, dump:\n{}",
+        vm.dump_jit_info()
+    );
+
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert!(
+        !bridge_hits
+            .iter()
+            .any(|(name, count)| *name == "add" && *count > 0),
+        "expected string concat to avoid generic add bridge, bridge hits: {bridge_hits:?}\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        bridge_hits
+            .iter()
+            .any(|(name, count)| *name == "sconcat" && *count > 0),
+        "expected dedicated sconcat helper to run, bridge hits: {bridge_hits:?}\n{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
 fn trace_jit_executes_typed_float_comparisons_without_helper_bridge() {
     if !native_jit_supported() {
         return;

@@ -25,7 +25,7 @@ mod codegen;
 mod layout;
 
 use super::exec::ExecutableBuffer;
-use bridge::pd_vm_cranelift_step;
+use bridge::{pd_vm_cranelift_sconcat, pd_vm_cranelift_step};
 use codegen::{
     emit_helper_step, emit_inline_or_helper_step, emit_interrupt_tick_inline,
     emit_interrupt_tick_inline_guarded, entry_signature, helper_signature, jump_with_status,
@@ -150,6 +150,10 @@ pub(crate) fn helper_entry_address() -> usize {
     pd_vm_cranelift_step as *const () as usize
 }
 
+pub(crate) fn sconcat_helper_entry_address() -> usize {
+    pd_vm_cranelift_sconcat as *const () as usize
+}
+
 pub(crate) fn layout_fingerprint() -> VmResult<u64> {
     native_layout_fingerprint()
 }
@@ -207,6 +211,8 @@ pub(crate) fn compile_trace(
         let vm_ptr = b.block_params(entry_block)[0];
 
         let helper_ref = b.import_signature(helper_sig.clone());
+        let vm_status_helper_ref = b.import_signature(entry_signature(pointer_type, call_conv));
+        let sconcat_helper_addr = sconcat_helper_entry_address();
 
         let mut step_index = 0usize;
         while step_index < trace.steps.len() {
@@ -243,10 +249,12 @@ pub(crate) fn compile_trace(
                 &mut b,
                 vm_ptr,
                 helper_ref,
+                vm_status_helper_ref,
                 exit_block,
                 pointer_type,
                 layout,
                 offsets,
+                sconcat_helper_addr,
                 trace.root_ip,
                 step_ip,
                 step,

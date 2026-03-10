@@ -272,10 +272,12 @@ pub(super) fn emit_inline_or_helper_step(
     b: &mut FunctionBuilder,
     vm_ptr: cranelift_codegen::ir::Value,
     helper_ref: FuncRef,
+    vm_status_helper_ref: FuncRef,
     exit_block: Block,
     pointer_type: cranelift_codegen::ir::Type,
     layout: NativeStackLayout,
     offsets: ResolvedOffsets,
+    sconcat_helper_addr: usize,
     root_ip: usize,
     step_ip: usize,
     step: &TraceStep,
@@ -416,7 +418,20 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
-        TraceStep::SConcat => Ok(false),
+        TraceStep::SConcat => {
+            emit_inline_sconcat(
+                b,
+                vm_ptr,
+                vm_status_helper_ref,
+                exit_block,
+                pointer_type,
+                offsets,
+                sconcat_helper_addr,
+                root_ip,
+                step_ip,
+            )?;
+            Ok(true)
+        }
         TraceStep::Sub | TraceStep::ISub => {
             emit_inline_int_binop(
                 b,
@@ -1355,6 +1370,43 @@ fn emit_inline_float_binop(
         step_ip,
         (op, 0, 0, 0),
     );
+
+    b.switch_to_block(next);
+    let _ = root_ip;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_sconcat(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    helper_ref: FuncRef,
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    offsets: ResolvedOffsets,
+    helper_addr: usize,
+    root_ip: usize,
+    step_ip: usize,
+) -> VmResult<()> {
+    let next = b.create_block();
+    let step_ip = i64::try_from(step_ip)
+        .map_err(|_| VmError::JitNative("step ip out of range for i64".to_string()))?;
+    let step_ip_val = b.ins().iconst(pointer_type, step_ip);
+    b.ins()
+        .store(MemFlags::new(), step_ip_val, vm_ptr, offsets.vm_ip);
+
+    let helper_addr = i64::try_from(helper_addr)
+        .map_err(|_| VmError::JitNative("sconcat helper address out of range".to_string()))?;
+    let helper_ptr = b.ins().iconst(pointer_type, helper_addr);
+    let call = b.ins().call_indirect(helper_ref, helper_ptr, &[vm_ptr]);
+    let status = b.inst_results(call)[0];
+
+    let is_continue = b
+        .ins()
+        .icmp_imm(IntCC::Equal, status, STATUS_CONTINUE as i64);
+    let else_args = [BlockArg::Value(status)];
+    b.ins()
+        .brif(is_continue, next, &[], exit_block, &else_args);
 
     b.switch_to_block(next);
     let _ = root_ip;
