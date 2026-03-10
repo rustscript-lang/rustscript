@@ -277,6 +277,7 @@ pub(super) fn emit_inline_or_helper_step(
     layout: NativeStackLayout,
     offsets: ResolvedOffsets,
     root_ip: usize,
+    step_ip: usize,
     step: &TraceStep,
 ) -> VmResult<bool> {
     match step {
@@ -323,6 +324,7 @@ pub(super) fn emit_inline_or_helper_step(
                 offsets,
                 *index,
                 root_ip,
+                step_ip,
             )?;
             Ok(true)
         }
@@ -337,6 +339,7 @@ pub(super) fn emit_inline_or_helper_step(
                 offsets,
                 *index,
                 root_ip,
+                step_ip,
             )?;
             Ok(true)
         }
@@ -351,6 +354,7 @@ pub(super) fn emit_inline_or_helper_step(
                 offsets,
                 *index,
                 root_ip,
+                step_ip,
             )?;
             Ok(true)
         }
@@ -364,6 +368,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
             )?;
             Ok(true)
         }
@@ -377,6 +382,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
             )?;
             Ok(true)
         }
@@ -390,6 +396,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 IntBinopKind::Add,
             )?;
             Ok(true)
@@ -404,6 +411,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 FloatBinopKind::Add,
             )?;
             Ok(true)
@@ -419,6 +427,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 IntBinopKind::Sub,
             )?;
             Ok(true)
@@ -433,6 +442,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 FloatBinopKind::Sub,
             )?;
             Ok(true)
@@ -447,6 +457,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 IntBinopKind::Mul,
             )?;
             Ok(true)
@@ -461,6 +472,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 FloatBinopKind::Mul,
             )?;
             Ok(true)
@@ -475,6 +487,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 false,
             )?;
             Ok(true)
@@ -489,6 +502,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 FloatBinopKind::Div,
             )?;
             Ok(true)
@@ -503,6 +517,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 true,
             )?;
             Ok(true)
@@ -517,6 +532,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 FloatBinopKind::Mod,
             )?;
             Ok(true)
@@ -531,6 +547,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 ShiftKind::Left,
             )?;
             Ok(true)
@@ -545,6 +562,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 ShiftKind::ArithmeticRight,
             )?;
             Ok(true)
@@ -559,6 +577,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 ShiftKind::LogicalRight,
             )?;
             Ok(true)
@@ -573,6 +592,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 true,
             )?;
             Ok(true)
@@ -587,12 +607,13 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 false,
             )?;
             Ok(true)
         }
         TraceStep::Not => {
-            emit_inline_not(b, vm_ptr, helper_ref, exit_block, root_ip)?;
+            emit_inline_not(b, vm_ptr, helper_ref, exit_block, offsets, root_ip, step_ip)?;
             Ok(true)
         }
         TraceStep::Neg | TraceStep::INeg => {
@@ -605,6 +626,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
             )?;
             Ok(true)
         }
@@ -618,6 +640,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
             )?;
             Ok(true)
         }
@@ -631,6 +654,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 true,
             )?;
             Ok(true)
@@ -645,6 +669,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 true,
             )?;
             Ok(true)
@@ -659,6 +684,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 false,
             )?;
             Ok(true)
@@ -673,6 +699,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
                 false,
             )?;
             Ok(true)
@@ -687,6 +714,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
             )?;
             Ok(true)
         }
@@ -700,6 +728,7 @@ pub(super) fn emit_inline_or_helper_step(
                 layout,
                 offsets,
                 root_ip,
+                step_ip,
             )?;
             Ok(true)
         }
@@ -714,6 +743,7 @@ pub(super) fn emit_inline_or_helper_step(
                 offsets,
                 root_ip,
                 *exit_ip,
+                step_ip,
             )?;
             Ok(true)
         }
@@ -728,6 +758,7 @@ pub(super) fn emit_inline_or_helper_step(
                 offsets,
                 root_ip,
                 *exit_ip,
+                step_ip,
             )?;
             Ok(true)
         }
@@ -746,6 +777,7 @@ fn emit_inline_ldc(
     offsets: ResolvedOffsets,
     index: u32,
     root_ip: usize,
+    step_ip: usize,
 ) -> VmResult<()> {
     let slow = b.create_block();
     let fast = b.create_block();
@@ -798,6 +830,8 @@ fn emit_inline_ldc(
         helper_ref,
         exit_block,
         next,
+        offsets,
+        step_ip,
         (OP_LDC, i64::from(index), 0, 0),
     );
 
@@ -817,6 +851,7 @@ fn emit_inline_ldloc(
     offsets: ResolvedOffsets,
     index: u8,
     root_ip: usize,
+    step_ip: usize,
 ) -> VmResult<()> {
     let slow = b.create_block();
     let fast = b.create_block();
@@ -869,6 +904,8 @@ fn emit_inline_ldloc(
         helper_ref,
         exit_block,
         next,
+        offsets,
+        step_ip,
         (OP_LDLOC, i64::from(index), 0, 0),
     );
 
@@ -888,6 +925,7 @@ fn emit_inline_stloc(
     offsets: ResolvedOffsets,
     index: u8,
     root_ip: usize,
+    step_ip: usize,
 ) -> VmResult<()> {
     let slow = b.create_block();
     let fast = b.create_block();
@@ -967,6 +1005,8 @@ fn emit_inline_stloc(
         helper_ref,
         exit_block,
         next,
+        offsets,
+        step_ip,
         (OP_STLOC, i64::from(index), 0, 0),
     );
 
@@ -985,6 +1025,7 @@ fn emit_inline_pop(
     layout: NativeStackLayout,
     offsets: ResolvedOffsets,
     root_ip: usize,
+    step_ip: usize,
 ) -> VmResult<()> {
     let slow = b.create_block();
     let fast = b.create_block();
@@ -1015,7 +1056,16 @@ fn emit_inline_pop(
     b.ins().jump(next, &[]);
 
     b.switch_to_block(slow);
-    emit_helper_step_from_call_tuple(b, vm_ptr, helper_ref, exit_block, next, (OP_POP, 0, 0, 0));
+    emit_helper_step_from_call_tuple(
+        b,
+        vm_ptr,
+        helper_ref,
+        exit_block,
+        next,
+        offsets,
+        step_ip,
+        (OP_POP, 0, 0, 0),
+    );
 
     b.switch_to_block(next);
     let _ = root_ip;
@@ -1032,6 +1082,7 @@ fn emit_inline_dup(
     layout: NativeStackLayout,
     offsets: ResolvedOffsets,
     root_ip: usize,
+    step_ip: usize,
 ) -> VmResult<()> {
     let slow = b.create_block();
     let fast = b.create_block();
@@ -1072,7 +1123,16 @@ fn emit_inline_dup(
     b.ins().jump(next, &[]);
 
     b.switch_to_block(slow);
-    emit_helper_step_from_call_tuple(b, vm_ptr, helper_ref, exit_block, next, (OP_DUP, 0, 0, 0));
+    emit_helper_step_from_call_tuple(
+        b,
+        vm_ptr,
+        helper_ref,
+        exit_block,
+        next,
+        offsets,
+        step_ip,
+        (OP_DUP, 0, 0, 0),
+    );
 
     b.switch_to_block(next);
     let _ = root_ip;
@@ -1110,6 +1170,7 @@ fn emit_inline_int_binop(
     layout: NativeStackLayout,
     offsets: ResolvedOffsets,
     root_ip: usize,
+    step_ip: usize,
     kind: IntBinopKind,
 ) -> VmResult<()> {
     let slow = b.create_block();
@@ -1179,7 +1240,16 @@ fn emit_inline_int_binop(
         IntBinopKind::Sub => OP_SUB,
         IntBinopKind::Mul => OP_MUL,
     };
-    emit_helper_step_from_call_tuple(b, vm_ptr, helper_ref, exit_block, next, (op, 0, 0, 0));
+    emit_helper_step_from_call_tuple(
+        b,
+        vm_ptr,
+        helper_ref,
+        exit_block,
+        next,
+        offsets,
+        step_ip,
+        (op, 0, 0, 0),
+    );
 
     b.switch_to_block(next);
     let _ = root_ip;
@@ -1196,6 +1266,7 @@ fn emit_inline_float_binop(
     layout: NativeStackLayout,
     offsets: ResolvedOffsets,
     root_ip: usize,
+    step_ip: usize,
     kind: FloatBinopKind,
 ) -> VmResult<()> {
     let slow = b.create_block();
@@ -1274,7 +1345,16 @@ fn emit_inline_float_binop(
         FloatBinopKind::Div => OP_DIV,
         FloatBinopKind::Mod => OP_MOD,
     };
-    emit_helper_step_from_call_tuple(b, vm_ptr, helper_ref, exit_block, next, (op, 0, 0, 0));
+    emit_helper_step_from_call_tuple(
+        b,
+        vm_ptr,
+        helper_ref,
+        exit_block,
+        next,
+        offsets,
+        step_ip,
+        (op, 0, 0, 0),
+    );
 
     b.switch_to_block(next);
     let _ = root_ip;
@@ -1291,6 +1371,7 @@ fn emit_inline_int_divrem(
     layout: NativeStackLayout,
     offsets: ResolvedOffsets,
     root_ip: usize,
+    step_ip: usize,
     is_mod: bool,
 ) -> VmResult<()> {
     let slow = b.create_block();
@@ -1376,6 +1457,8 @@ fn emit_inline_int_divrem(
         helper_ref,
         exit_block,
         next,
+        offsets,
+        step_ip,
         (if is_mod { OP_MOD } else { OP_DIV }, 0, 0, 0),
     );
 
@@ -1394,6 +1477,7 @@ fn emit_inline_shift(
     layout: NativeStackLayout,
     offsets: ResolvedOffsets,
     root_ip: usize,
+    step_ip: usize,
     kind: ShiftKind,
 ) -> VmResult<()> {
     let slow = b.create_block();
@@ -1471,6 +1555,8 @@ fn emit_inline_shift(
         helper_ref,
         exit_block,
         next,
+        offsets,
+        step_ip,
         (
             match kind {
                 ShiftKind::Left => OP_SHL,
@@ -1493,10 +1579,21 @@ fn emit_inline_not(
     vm_ptr: cranelift_codegen::ir::Value,
     helper_ref: FuncRef,
     exit_block: Block,
+    offsets: ResolvedOffsets,
     root_ip: usize,
+    step_ip: usize,
 ) -> VmResult<()> {
     let next = b.create_block();
-    emit_helper_step_from_call_tuple(b, vm_ptr, helper_ref, exit_block, next, (OP_NOT, 0, 0, 0));
+    emit_helper_step_from_call_tuple(
+        b,
+        vm_ptr,
+        helper_ref,
+        exit_block,
+        next,
+        offsets,
+        step_ip,
+        (OP_NOT, 0, 0, 0),
+    );
     b.switch_to_block(next);
     let _ = root_ip;
     Ok(())
@@ -1512,6 +1609,7 @@ fn emit_inline_bool_logic(
     layout: NativeStackLayout,
     offsets: ResolvedOffsets,
     root_ip: usize,
+    step_ip: usize,
     is_and: bool,
 ) -> VmResult<()> {
     let slow = b.create_block();
@@ -1579,6 +1677,8 @@ fn emit_inline_bool_logic(
         helper_ref,
         exit_block,
         next,
+        offsets,
+        step_ip,
         (if is_and { OP_AND } else { OP_OR }, 0, 0, 0),
     );
 
@@ -1597,6 +1697,7 @@ fn emit_inline_neg(
     layout: NativeStackLayout,
     offsets: ResolvedOffsets,
     root_ip: usize,
+    step_ip: usize,
 ) -> VmResult<()> {
     let slow = b.create_block();
     let fast = b.create_block();
@@ -1635,7 +1736,16 @@ fn emit_inline_neg(
     b.ins().jump(next, &[]);
 
     b.switch_to_block(slow);
-    emit_helper_step_from_call_tuple(b, vm_ptr, helper_ref, exit_block, next, (OP_NEG, 0, 0, 0));
+    emit_helper_step_from_call_tuple(
+        b,
+        vm_ptr,
+        helper_ref,
+        exit_block,
+        next,
+        offsets,
+        step_ip,
+        (OP_NEG, 0, 0, 0),
+    );
 
     b.switch_to_block(next);
     let _ = root_ip;
@@ -1652,6 +1762,7 @@ fn emit_inline_float_neg(
     layout: NativeStackLayout,
     offsets: ResolvedOffsets,
     root_ip: usize,
+    step_ip: usize,
 ) -> VmResult<()> {
     let slow = b.create_block();
     let fast = b.create_block();
@@ -1694,7 +1805,16 @@ fn emit_inline_float_neg(
     b.ins().jump(next, &[]);
 
     b.switch_to_block(slow);
-    emit_helper_step_from_call_tuple(b, vm_ptr, helper_ref, exit_block, next, (OP_NEG, 0, 0, 0));
+    emit_helper_step_from_call_tuple(
+        b,
+        vm_ptr,
+        helper_ref,
+        exit_block,
+        next,
+        offsets,
+        step_ip,
+        (OP_NEG, 0, 0, 0),
+    );
 
     b.switch_to_block(next);
     let _ = root_ip;
@@ -1711,6 +1831,7 @@ fn emit_inline_int_compare(
     layout: NativeStackLayout,
     offsets: ResolvedOffsets,
     root_ip: usize,
+    step_ip: usize,
     less_than: bool,
 ) -> VmResult<()> {
     let slow = b.create_block();
@@ -1776,6 +1897,8 @@ fn emit_inline_int_compare(
         helper_ref,
         exit_block,
         next,
+        offsets,
+        step_ip,
         (if less_than { OP_CLT } else { OP_CGT }, 0, 0, 0),
     );
 
@@ -1794,6 +1917,7 @@ fn emit_inline_float_compare(
     layout: NativeStackLayout,
     offsets: ResolvedOffsets,
     root_ip: usize,
+    step_ip: usize,
     less_than: bool,
 ) -> VmResult<()> {
     let slow = b.create_block();
@@ -1859,6 +1983,8 @@ fn emit_inline_float_compare(
         helper_ref,
         exit_block,
         next,
+        offsets,
+        step_ip,
         (if less_than { OP_CLT } else { OP_CGT }, 0, 0, 0),
     );
 
@@ -1877,6 +2003,7 @@ fn emit_inline_int_eq(
     layout: NativeStackLayout,
     offsets: ResolvedOffsets,
     root_ip: usize,
+    step_ip: usize,
 ) -> VmResult<()> {
     let slow = b.create_block();
     let len_ok = b.create_block();
@@ -1978,7 +2105,16 @@ fn emit_inline_int_eq(
     b.ins().jump(next, &[]);
 
     b.switch_to_block(slow);
-    emit_helper_step_from_call_tuple(b, vm_ptr, helper_ref, exit_block, next, (OP_CEQ, 0, 0, 0));
+    emit_helper_step_from_call_tuple(
+        b,
+        vm_ptr,
+        helper_ref,
+        exit_block,
+        next,
+        offsets,
+        step_ip,
+        (OP_CEQ, 0, 0, 0),
+    );
 
     b.switch_to_block(next);
     let _ = root_ip;
@@ -1995,6 +2131,7 @@ fn emit_inline_float_eq(
     layout: NativeStackLayout,
     offsets: ResolvedOffsets,
     root_ip: usize,
+    step_ip: usize,
 ) -> VmResult<()> {
     let slow = b.create_block();
     let len_ok = b.create_block();
@@ -2049,7 +2186,16 @@ fn emit_inline_float_eq(
     b.ins().jump(next, &[]);
 
     b.switch_to_block(slow);
-    emit_helper_step_from_call_tuple(b, vm_ptr, helper_ref, exit_block, next, (OP_CEQ, 0, 0, 0));
+    emit_helper_step_from_call_tuple(
+        b,
+        vm_ptr,
+        helper_ref,
+        exit_block,
+        next,
+        offsets,
+        step_ip,
+        (OP_CEQ, 0, 0, 0),
+    );
 
     b.switch_to_block(next);
     let _ = root_ip;
@@ -2067,6 +2213,7 @@ fn emit_inline_guard_false(
     offsets: ResolvedOffsets,
     root_ip: usize,
     exit_ip: usize,
+    step_ip: usize,
 ) -> VmResult<()> {
     let slow = b.create_block();
     let len_ok = b.create_block();
@@ -2122,6 +2269,8 @@ fn emit_inline_guard_false(
         helper_ref,
         exit_block,
         next,
+        offsets,
+        step_ip,
         (OP_GUARD_FALSE, exit_ip, 0, 0),
     );
 
@@ -2141,6 +2290,7 @@ fn emit_inline_guard_true(
     offsets: ResolvedOffsets,
     root_ip: usize,
     exit_ip: usize,
+    step_ip: usize,
 ) -> VmResult<()> {
     let slow = b.create_block();
     let len_ok = b.create_block();
@@ -2196,6 +2346,8 @@ fn emit_inline_guard_true(
         helper_ref,
         exit_block,
         next,
+        offsets,
+        step_ip,
         (OP_GUARD_TRUE, exit_ip, 0, 0),
     );
 
@@ -2209,12 +2361,16 @@ pub(super) fn emit_helper_step(
     vm_ptr: cranelift_codegen::ir::Value,
     helper_ref: FuncRef,
     exit_block: Block,
+    offsets: ResolvedOffsets,
+    step_ip: usize,
     root_ip: usize,
     step: &TraceStep,
 ) -> VmResult<()> {
     let tuple = step_to_call(step, root_ip)?;
     let next = b.create_block();
-    emit_helper_step_from_call_tuple(b, vm_ptr, helper_ref, exit_block, next, tuple);
+    emit_helper_step_from_call_tuple(
+        b, vm_ptr, helper_ref, exit_block, next, offsets, step_ip, tuple,
+    );
     b.switch_to_block(next);
     Ok(())
 }
@@ -2225,6 +2381,8 @@ fn emit_helper_step_from_call_tuple(
     helper_ref: FuncRef,
     exit_block: Block,
     next_block: Block,
+    offsets: ResolvedOffsets,
+    step_ip: usize,
     tuple: (i64, i64, i64, i64),
 ) {
     let (op, a, b_arg, c) = tuple;
@@ -2233,6 +2391,10 @@ fn emit_helper_step_from_call_tuple(
     let b_val = b.ins().iconst(types::I64, b_arg);
     let c_val = b.ins().iconst(types::I64, c);
     let pointer_type = b.func.signature.params[0].value_type;
+    let step_ip = i64::try_from(step_ip).expect("step ip must fit i64");
+    let step_ip_val = b.ins().iconst(pointer_type, step_ip);
+    b.ins()
+        .store(MemFlags::new(), step_ip_val, vm_ptr, offsets.vm_ip);
     let helper_ptr = b.ins().load(
         pointer_type,
         MemFlags::new(),

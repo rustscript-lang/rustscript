@@ -215,15 +215,16 @@ pub(crate) fn compile_trace(
                 .get(step_index)
                 .copied()
                 .unwrap_or(trace.root_ip);
-            let step_ip_i64 = i64::try_from(step_ip)
-                .map_err(|_| VmError::JitNative("step ip out of range for i64".to_string()))?;
-            let step_ip_val = b.ins().iconst(pointer_type, step_ip_i64);
-            b.ins()
-                .store(MemFlags::new(), step_ip_val, vm_ptr, offsets.vm_ip);
 
             if let Some(settings) = interrupt_settings {
                 let stride = settings.check_interval as usize;
                 if step_index.is_multiple_of(stride) {
+                    let step_ip_i64 = i64::try_from(step_ip).map_err(|_| {
+                        VmError::JitNative("step ip out of range for i64".to_string())
+                    })?;
+                    let step_ip_val = b.ins().iconst(pointer_type, step_ip_i64);
+                    b.ins()
+                        .store(MemFlags::new(), step_ip_val, vm_ptr, offsets.vm_ip);
                     let remaining = trace.steps.len().saturating_sub(step_index);
                     let chunk_len = remaining.min(stride) as u32;
                     if check_runtime_interrupt_settings {
@@ -247,12 +248,22 @@ pub(crate) fn compile_trace(
                 layout,
                 offsets,
                 trace.root_ip,
+                step_ip,
                 step,
             )? {
                 step_index += 1;
                 continue;
             }
-            emit_helper_step(&mut b, vm_ptr, helper_ref, exit_block, trace.root_ip, step)?;
+            emit_helper_step(
+                &mut b,
+                vm_ptr,
+                helper_ref,
+                exit_block,
+                offsets,
+                step_ip,
+                trace.root_ip,
+                step,
+            )?;
             step_index += 1;
         }
 
