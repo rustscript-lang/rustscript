@@ -2,9 +2,10 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vm::{
-    ParseError, SourceError, SourceFlavor, SourceMap, SourcePathError, Span, Vm, compile_source,
-    compile_source_file, lint_unknown_inferred_local_types, render_compile_error,
-    render_source_error, render_vm_error,
+    ParseError, SourceError, SourceFlavor, SourceMap, SourcePathError, Span, Vm,
+    collect_inferred_local_type_hints, compile_source, compile_source_file,
+    lint_unknown_inferred_local_types, render_compile_error, render_source_error,
+    render_vm_error,
 };
 
 #[test]
@@ -240,4 +241,67 @@ fn nothing() {
             .any(|warning| warning.name == "b" && warning.line == 4),
         "expected function-local unknown inferred warning for 'b', got {warnings:?}"
     );
+}
+
+#[test]
+fn collect_inferred_local_type_hints_reports_visible_local_types() {
+    let source = r#"
+let total = 1;
+print(total);
+"#;
+
+    let hints =
+        collect_inferred_local_type_hints(source, SourceFlavor::RustScript).expect("type hints should succeed");
+    let total = hints
+        .iter()
+        .find(|hint| hint.name == "total")
+        .expect("expected a type hint for total");
+
+    assert_eq!(total.inferred_type, "int");
+    assert_eq!(total.declared_line, Some(2));
+    assert_eq!(total.last_line, Some(3));
+}
+
+#[test]
+fn collect_inferred_local_type_hints_include_named_function_parameters() {
+    let source = r#"
+fn plus_one(amount) {
+    amount + 1
+}
+
+plus_one(2);
+"#;
+
+    let hints =
+        collect_inferred_local_type_hints(source, SourceFlavor::RustScript).expect("type hints should succeed");
+    let amount = hints
+        .iter()
+        .find(|hint| hint.name == "amount")
+        .expect("expected a type hint for amount");
+
+    assert_eq!(amount.inferred_type, "int");
+    assert_eq!(amount.declared_line, Some(2));
+}
+
+#[test]
+fn collect_inferred_local_type_hints_keep_function_body_expr_visibility() {
+    let source = r#"
+fn plus_one(amount) {
+    let total = amount + 1;
+    total
+}
+
+plus_one(2);
+"#;
+
+    let hints =
+        collect_inferred_local_type_hints(source, SourceFlavor::RustScript).expect("type hints should succeed");
+    let total = hints
+        .iter()
+        .find(|hint| hint.name == "total")
+        .expect("expected a type hint for total");
+
+    assert_eq!(total.inferred_type, "int");
+    assert_eq!(total.declared_line, Some(3));
+    assert_eq!(total.last_line, Some(4));
 }

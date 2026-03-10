@@ -7,7 +7,10 @@ mod stdlib;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use vm::{CompileSourceFileOptions, SourceFlavor};
+use vm::{
+    CompileSourceFileOptions, InferredLocalTypeHint, SourceFlavor,
+    collect_inferred_local_type_hints_at_path_with_options, collect_inferred_local_type_hints_with_options,
+};
 
 use crate::analyzer::{
     LintDiagnostic, LintReport, LintSpan, lint_source_with_flavor, lint_source_with_flavor_at_path,
@@ -26,6 +29,11 @@ struct LintResponse {
 }
 
 #[derive(Serialize)]
+struct LocalTypeHintsResponse {
+    hints: Vec<LocalTypeHintJson>,
+}
+
+#[derive(Serialize)]
 struct LintDiagnosticJson {
     line: usize,
     severity: &'static str,
@@ -40,6 +48,14 @@ struct LintSpanJson {
     start_col: usize,
     end_line: usize,
     end_col: usize,
+}
+
+#[derive(Serialize)]
+struct LocalTypeHintJson {
+    name: String,
+    inferred_type: String,
+    declared_line: Option<u32>,
+    last_line: Option<u32>,
 }
 
 #[cfg(feature = "runtime")]
@@ -145,6 +161,32 @@ fn lint_response_to_json(report: LintReport) -> Vec<u8> {
     serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"diagnostics\":[]}".to_vec())
 }
 
+fn local_type_hints_to_json(hints: Vec<InferredLocalTypeHint>) -> Vec<u8> {
+    let response = LocalTypeHintsResponse {
+        hints: hints.into_iter().map(local_type_hint_to_json).collect(),
+    };
+    serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"hints\":[]}".to_vec())
+}
+
+fn local_type_hints_with_flavor(source: &str, flavor: SourceFlavor) -> Vec<InferredLocalTypeHint> {
+    collect_inferred_local_type_hints_with_options(
+        source,
+        flavor,
+        stdlib::embedded_stdlib_compile_options(),
+    )
+    .unwrap_or_default()
+}
+
+fn local_type_hints_with_flavor_at_path(
+    source: &str,
+    path: &Path,
+    flavor: SourceFlavor,
+    options: CompileSourceFileOptions,
+) -> Vec<InferredLocalTypeHint> {
+    collect_inferred_local_type_hints_at_path_with_options(path, source, flavor, options)
+        .unwrap_or_default()
+}
+
 #[cfg(feature = "runtime")]
 fn run_response_to_json(report: RunReport) -> Vec<u8> {
     let ok = report.error.is_none();
@@ -213,6 +255,15 @@ fn completion_catalog_to_json(catalog: CompletionCatalog) -> Vec<u8> {
     })
 }
 
+fn local_type_hint_to_json(hint: InferredLocalTypeHint) -> LocalTypeHintJson {
+    LocalTypeHintJson {
+        name: hint.name,
+        inferred_type: hint.inferred_type,
+        declared_line: hint.declared_line,
+        last_line: hint.last_line,
+    }
+}
+
 fn parse_module_overrides(raw: &str) -> CompileSourceFileOptions {
     let mut options = stdlib::embedded_stdlib_compile_options();
     let parsed = serde_json::from_str::<Vec<ModuleOverrideInput>>(raw).unwrap_or_default();
@@ -236,6 +287,12 @@ fn invalid_utf8_lint_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8>
         }],
     };
     serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"diagnostics\":[]}".to_vec())
+}
+
+fn invalid_utf8_local_type_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8> {
+    let response = LocalTypeHintsResponse { hints: Vec::new() };
+    let _ = (label, err);
+    serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"hints\":[]}".to_vec())
 }
 
 #[cfg(feature = "runtime")]
@@ -485,6 +542,61 @@ pub extern "C" fn lint_source_json_with_context(
     leak_bytes(lint_response_to_json(report))
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn local_type_hints_json(
+    source_ptr: u32,
+    source_len: u32,
+    flavor_ptr: u32,
+    flavor_len: u32,
+) -> u64 {
+    let source = match std::str::from_utf8(unpack_input(source_ptr, source_len)) {
+        Ok(value) => value,
+        Err(err) => return leak_bytes(invalid_utf8_local_type_response("source", &err)),
+    };
+    let flavor_raw = match std::str::from_utf8(unpack_input(flavor_ptr, flavor_len)) {
+        Ok(value) => value,
+        Err(err) => return leak_bytes(invalid_utf8_local_type_response("flavor", &err)),
+    };
+    let hints = local_type_hints_with_flavor(source, parse_flavor(flavor_raw));
+    leak_bytes(local_type_hints_to_json(hints))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn local_type_hints_json_with_context(
+    source_ptr: u32,
+    source_len: u32,
+    flavor_ptr: u32,
+    flavor_len: u32,
+    path_ptr: u32,
+    path_len: u32,
+    overrides_ptr: u32,
+    overrides_len: u32,
+) -> u64 {
+    let source = match std::str::from_utf8(unpack_input(source_ptr, source_len)) {
+        Ok(value) => value,
+        Err(err) => return leak_bytes(invalid_utf8_local_type_response("source", &err)),
+    };
+    let flavor_raw = std::str::from_utf8(unpack_input(flavor_ptr, flavor_len)).unwrap_or("rss");
+    let path_raw = std::str::from_utf8(unpack_input(path_ptr, path_len)).unwrap_or("");
+    let overrides_raw =
+        std::str::from_utf8(unpack_input(overrides_ptr, overrides_len)).unwrap_or("[]");
+    let options = parse_module_overrides(overrides_raw);
+
+    let hints = if path_raw.trim().is_empty() {
+        collect_inferred_local_type_hints_with_options(source, parse_flavor(flavor_raw), options)
+            .unwrap_or_default()
+    } else {
+        local_type_hints_with_flavor_at_path(
+            source,
+            Path::new(path_raw),
+            parse_flavor(flavor_raw),
+            options,
+        )
+    };
+
+    leak_bytes(local_type_hints_to_json(hints))
+}
+
 #[cfg(feature = "runtime")]
 #[unsafe(no_mangle)]
 pub extern "C" fn run_source_json(
@@ -612,10 +724,11 @@ pub extern "C" fn completion_catalog_json() -> u64 {
 mod lint_tests {
     use std::path::Path;
 
+    use serde_json::Value;
     use super::{parse_flavor, parse_module_overrides};
     use crate::analyzer::{lint_source_with_flavor, lint_source_with_flavor_at_path};
     use crate::completions::build_completion_catalog;
-    use vm::SourceFlavor;
+    use vm::{SourceFlavor, collect_inferred_local_type_hints};
 
     #[test]
     fn parse_flavor_accepts_aliases() {
@@ -667,6 +780,68 @@ mod lint_tests {
                 .any(|entry| entry.label == "runtime::sleep"),
             "expected playground runtime host completion"
         );
+    }
+
+    #[test]
+    fn local_type_hint_json_payload_uses_hover_contract_fields() {
+        let source = r#"
+            fn plus_one(amount) {
+                let total = amount + 1;
+                total
+            }
+
+            plus_one(2);
+        "#;
+
+        let hints =
+            collect_inferred_local_type_hints(source, SourceFlavor::RustScript).expect("type hints should succeed");
+        let payload: Value = serde_json::from_slice(&super::local_type_hints_to_json(hints))
+            .expect("type hints should serialize as json");
+        let items = payload["hints"]
+            .as_array()
+            .expect("hints should serialize as an array");
+
+        let amount = items
+            .iter()
+            .find(|item| item["name"] == "amount")
+            .expect("expected amount parameter hint");
+        assert_eq!(amount["inferred_type"], "int");
+        assert_eq!(amount["declared_line"], 2);
+        assert_eq!(amount["last_line"], 3);
+
+        let total = items
+            .iter()
+            .find(|item| item["name"] == "total")
+            .expect("expected total local hint");
+        assert_eq!(total["inferred_type"], "int");
+        assert_eq!(total["declared_line"], 3);
+        assert_eq!(total["last_line"], 4);
+    }
+
+    #[test]
+    fn local_type_hints_support_embedded_stdlib_imports() {
+        let source = r#"
+            use stdlib::rss::strings as string;
+            let label = 1;
+            let value = string::trim("  hello  ");
+            label;
+        "#;
+
+        let hints = super::local_type_hints_with_flavor(source, SourceFlavor::RustScript);
+        let label = hints
+            .iter()
+            .find(|hint| hint.name == "label")
+            .expect("expected a concrete hint alongside embedded stdlib imports");
+        assert_eq!(label.inferred_type, "int");
+        assert_eq!(label.declared_line, Some(3));
+        assert_eq!(label.last_line, Some(5));
+
+        let value = hints
+            .iter()
+            .find(|hint| hint.name == "value")
+            .expect("expected a value hint with embedded stdlib imports");
+        assert_eq!(value.declared_line, Some(4));
+        assert_eq!(value.last_line, Some(4));
     }
 
     #[test]

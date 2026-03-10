@@ -32,6 +32,7 @@ let completionEntries = fallbackCompletionEntries();
 let completionLookup = buildCompletionLookup(completionEntries);
 
 const latestDocumentVersion = new Map();
+const localTypeHintsByDocument = new Map();
 
 connection.onInitialize(() => {
   return {
@@ -61,6 +62,7 @@ documents.onDidSave((event) => {
 
 documents.onDidClose((event) => {
   latestDocumentVersion.delete(event.document.uri);
+  localTypeHintsByDocument.delete(event.document.uri);
   connection.sendDiagnostics({
     uri: event.document.uri,
     diagnostics: []
@@ -138,21 +140,31 @@ connection.onHover(async (params) => {
   }
 
   const token = tokenAt(document, params.position);
-  if (!token) {
-    return null;
-  }
+  const entry = token ? lookupCompletionEntry(token.text) : null;
+  const identifier = identifierAt(document, params.position);
+  const localTypeHint = identifier
+    ? lookupVisibleLocalTypeHint(
+        await loadLocalTypeHints(document),
+        identifier.text,
+        identifier.line
+      )
+    : null;
 
-  const entry = lookupCompletionEntry(token.text);
-  if (!entry) {
+  const sections = [];
+  if (entry) {
+    sections.push(`\`${entry.label}\``);
+    if (entry.detail) {
+      sections.push(entry.detail);
+    }
+    if (entry.documentation) {
+      sections.push(entry.documentation);
+    }
+  }
+  if (localTypeHint) {
+    sections.push(`Inferred type: \`${localTypeHint.inferred_type}\``);
+  }
+  if (sections.length === 0) {
     return null;
-  }
-
-  const sections = [`\`${entry.label}\``];
-  if (entry.detail) {
-    sections.push(entry.detail);
-  }
-  if (entry.documentation) {
-    sections.push(entry.documentation);
   }
 
   return {
@@ -160,7 +172,7 @@ connection.onHover(async (params) => {
       kind: MarkupKind.Markdown,
       value: sections.join("\n\n")
     },
-    range: token.range
+    range: (token || identifier).range
   };
 });
 
@@ -212,6 +224,20 @@ async function ensureCompletionCatalogLoaded() {
   await completionCatalogPromise;
 }
 
+async function loadLocalTypeHints(document) {
+  const cached = localTypeHintsByDocument.get(document.uri);
+  if (cached && cached.version === document.version) {
+    return cached.hints;
+  }
+
+  const hints = await runWasmLocalTypeHints(document);
+  localTypeHintsByDocument.set(document.uri, {
+    version: document.version,
+    hints
+  });
+  return hints;
+}
+
 function queueValidation(document) {
   latestDocumentVersion.set(document.uri, document.version);
   void validateDocument(document);
@@ -237,6 +263,34 @@ async function computeDiagnostics(document) {
       .filter((diagnostic) => diagnostic !== null);
   }
   return scanDelimiters(document);
+}
+
+function normalizeLocalTypeHints(raw) {
+  if (!raw || !Array.isArray(raw.hints)) {
+    return [];
+  }
+
+  const hints = [];
+  for (const item of raw.hints) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const name = typeof item.name === "string" ? item.name : "";
+    const inferredType =
+      typeof item.inferred_type === "string" && item.inferred_type.length > 0
+        ? item.inferred_type
+        : "";
+    if (!name || !inferredType) {
+      continue;
+    }
+    hints.push({
+      name,
+      inferred_type: inferredType,
+      declared_line: toNullablePositiveInteger(item.declared_line),
+      last_line: toNullablePositiveInteger(item.last_line)
+    });
+  }
+  return hints;
 }
 
 function toLspDiagnostic(document, diagnostic) {
@@ -548,6 +602,40 @@ function tokenAt(document, position) {
   };
 }
 
+function identifierAt(document, position) {
+  const line = lineText(document, position.line);
+  if (!line) {
+    return null;
+  }
+
+  let start = clamp(position.character, 0, line.length);
+  let end = start;
+
+  while (start > 0 && isIdentifierChar(line[start - 1])) {
+    start -= 1;
+  }
+  while (end < line.length && isIdentifierChar(line[end])) {
+    end += 1;
+  }
+  if (start === end) {
+    return null;
+  }
+
+  const text = line.slice(start, end);
+  if (!isRustScriptIdent(text)) {
+    return null;
+  }
+
+  return {
+    text,
+    line: position.line + 1,
+    range: {
+      start: { line: position.line, character: start },
+      end: { line: position.line, character: end }
+    }
+  };
+}
+
 function lookupCompletionEntry(token) {
   if (!token) {
     return null;
@@ -568,6 +656,41 @@ function lookupCompletionEntry(token) {
   }
 
   return null;
+}
+
+function lookupVisibleLocalTypeHint(hints, name, line) {
+  let best = null;
+  for (const hint of hints) {
+    if (hint.name !== name) {
+      continue;
+    }
+    if (hint.declared_line !== null && line < hint.declared_line) {
+      continue;
+    }
+    if (hint.last_line !== null && line > hint.last_line) {
+      continue;
+    }
+    if (!best) {
+      best = hint;
+      continue;
+    }
+
+    const bestDeclared = best.declared_line ?? 0;
+    const hintDeclared = hint.declared_line ?? 0;
+    if (hintDeclared > bestDeclared) {
+      best = hint;
+      continue;
+    }
+
+    if (hintDeclared === bestDeclared) {
+      const bestLast = best.last_line ?? Number.MAX_SAFE_INTEGER;
+      const hintLast = hint.last_line ?? Number.MAX_SAFE_INTEGER;
+      if (hintLast < bestLast) {
+        best = hint;
+      }
+    }
+  }
+  return best;
 }
 
 function buildCompletionLookup(entries) {
@@ -651,6 +774,79 @@ async function runWasmLint(document) {
   } catch (error) {
     connection.console.error(`RustScript lint failed: ${errorMessage(error)}`);
     return null;
+  } finally {
+    freeBytes(wasm, sourcePtr, sourceBytes.length);
+    freeBytes(wasm, flavorPtr, flavorBytes.length);
+    freeBytes(wasm, pathPtr, pathBytes.length);
+    freeBytes(wasm, overridesPtr, overridesBytes.length);
+    freeBytes(wasm, resultPtr, resultLen);
+  }
+}
+
+async function runWasmLocalTypeHints(document) {
+  const wasm = await ensureWasmLoaded();
+  if (!wasm) {
+    return [];
+  }
+
+  const source = document.getText();
+  const documentPath = documentPathFromUri(document.uri);
+  const moduleOverrides = await collectCombinedModuleOverrides(documentPath, source);
+  const sourceBytes = encoder.encode(source);
+  const flavorBytes = encoder.encode(FLAVOR);
+  const pathBytes = encoder.encode(documentPath || "");
+  const overridesBytes = encoder.encode(JSON.stringify(moduleOverrides));
+  let sourcePtr = 0;
+  let flavorPtr = 0;
+  let pathPtr = 0;
+  let overridesPtr = 0;
+  let resultPtr = 0;
+  let resultLen = 0;
+
+  try {
+    sourcePtr = writeBytes(wasm, sourceBytes);
+    flavorPtr = writeBytes(wasm, flavorBytes);
+    pathPtr = writeBytes(wasm, pathBytes);
+    overridesPtr = writeBytes(wasm, overridesBytes);
+
+    const packed =
+      typeof wasm.local_type_hints_json_with_context === "function"
+        ? wasm.local_type_hints_json_with_context(
+            sourcePtr,
+            sourceBytes.length,
+            flavorPtr,
+            flavorBytes.length,
+            pathPtr,
+            pathBytes.length,
+            overridesPtr,
+            overridesBytes.length
+          )
+        : typeof wasm.local_type_hints_json === "function"
+          ? wasm.local_type_hints_json(
+              sourcePtr,
+              sourceBytes.length,
+              flavorPtr,
+              flavorBytes.length
+            )
+          : 0;
+
+    if (!packed) {
+      return [];
+    }
+
+    const unpacked = unpackPtrLen(packed);
+    resultPtr = unpacked.ptr;
+    resultLen = unpacked.len;
+
+    if (resultPtr === 0 || resultLen === 0) {
+      return [];
+    }
+
+    const resultBytes = readBytes(wasm, resultPtr, resultLen);
+    return normalizeLocalTypeHints(JSON.parse(decoder.decode(resultBytes)));
+  } catch (error) {
+    connection.console.error(`RustScript local type hints failed: ${errorMessage(error)}`);
+    return [];
   } finally {
     freeBytes(wasm, sourcePtr, sourceBytes.length);
     freeBytes(wasm, flavorPtr, flavorBytes.length);
@@ -1129,6 +1325,10 @@ function isTokenChar(value) {
   return /[A-Za-z0-9_:.]/.test(value);
 }
 
+function isIdentifierChar(value) {
+  return /[A-Za-z0-9_]/.test(value);
+}
+
 function clamp(value, min, max) {
   if (value < min) {
     return min;
@@ -1148,6 +1348,14 @@ function toPositiveInteger(value, fallback) {
     return fallback;
   }
   return parsed;
+}
+
+function toNullablePositiveInteger(value) {
+  if (!Number.isFinite(value)) {
+    return null;
+  }
+  const parsed = Math.trunc(value);
+  return parsed > 0 ? parsed : null;
 }
 
 function errorMessage(error) {

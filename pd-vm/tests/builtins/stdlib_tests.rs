@@ -114,3 +114,11 @@ fn stdlib_set_spec_passes() {
     let stack = run_rustscript_spec(&path);
     assert_eq!(stack, Vec::<Value>::new());
 }
+
+#[test]
+fn stdlib_lrucache_spec_passes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("stdlib/tests/lrucache.rss");
+    let stack = run_rustscript_spec(&path);
+    assert_eq!(stack, Vec::<Value>::new());
+}

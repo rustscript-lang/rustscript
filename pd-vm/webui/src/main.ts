@@ -55,6 +55,7 @@ import {
   type RunCommandRequest,
   type SourceFlavor
 } from "./wasmRuntime";
+import { lookupLocalTypeHover } from "./localTypeHover";
 
 declare global {
   interface Window {
@@ -1365,18 +1366,16 @@ async function stopActiveSessions(): Promise<void> {
   }
 }
 
-function updateHoverPanel(variable: string, value: string | null): void {
+function updateHoverPanel(variable: string, value: string | null, inferredType: string | null): void {
   if (!variable) {
     clearHoverInspect();
     return;
   }
 
   debugHoveredVar = variable;
-  if (value === null) {
-    debugHoverPanelEl.textContent = `hover inspect: ${variable} = (unavailable)`;
-  } else {
-    debugHoverPanelEl.textContent = `hover inspect: ${variable} = ${value}`;
-  }
+  const runtimeValue = value === null ? "(unavailable)" : value;
+  const typeSuffix = inferredType ? ` | type: ${inferredType}` : "";
+  debugHoverPanelEl.textContent = `hover inspect: ${variable} = ${runtimeValue}${typeSuffix}`;
 }
 
 function hoverKey(variable: string): string {
@@ -1424,44 +1423,72 @@ function installHoverProvider(languageId: string): void {
         return null;
       }
       const callableHover = await lookupCallableHover(hoverModel, position);
-      if (callableHover) {
-        return callableHover;
-      }
+      const compileTypeHover = await lookupLocalTypeHover(
+        hoverModel,
+        position,
+        hoverModel.getValue(),
+        currentFlavor,
+        `${hoverModel.uri.toString()}:${hoverModel.getVersionId()}`
+      );
+      const compileHover = compileTypeHover?.hover ?? null;
       if (!debugSessionActive) {
-        return null;
+        if (callableHover && compileHover) {
+          return {
+            range: callableHover.range ?? compileHover.range,
+            contents: [...callableHover.contents, ...compileHover.contents]
+          };
+        }
+        return callableHover ?? compileHover;
       }
 
       const word = hoverModel.getWordAtPosition(position);
       if (!word || !looksLikeIdentifier(word.word)) {
-        return null;
+        return callableHover ?? compileHover;
       }
 
       const key = `${hoverKey(word.word)}:${position.lineNumber}:${word.startColumn}`;
       if (debugHoverActiveKey === key && debugHoveredVar === word.word) {
         const cached = debugHoverCache.get(hoverKey(word.word)) ?? null;
-        if (cached === null) {
-          return null;
+        const contents: monaco.IMarkdownString[] = [{ value: `**${word.word}**` }];
+        if (compileTypeHover) {
+          contents.push(...compileTypeHover.hover.contents);
+        }
+        if (cached !== null) {
+          contents.push({ value: `\`\`\`text\n${cached}\n\`\`\`` });
+        }
+        if (contents.length === 1) {
+          return callableHover ?? compileHover;
         }
         return {
           range: new monaco.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn),
-          contents: [{ value: `**${word.word}**` }, { value: `\`\`\`text\n${cached}\n\`\`\`` }]
+          contents
         };
       }
 
       debugHoverActiveKey = key;
-      debugHoverPanelEl.textContent = `hover inspect: ${word.word} = (loading)`;
+      const inferredType = compileTypeHover?.hint.inferredType ?? null;
+      debugHoverPanelEl.textContent = inferredType
+        ? `hover inspect: ${word.word} = (loading) | type: ${inferredType}`
+        : `hover inspect: ${word.word} = (loading)`;
       const value = await resolveHoverValue(word.word);
       if (debugHoverActiveKey !== key) {
         return null;
       }
-      updateHoverPanel(word.word, value);
-      if (value === null) {
-        return null;
+      updateHoverPanel(word.word, value, inferredType);
+      if (value === null && !compileTypeHover) {
+        return callableHover ?? null;
       }
 
+      const contents: monaco.IMarkdownString[] = [{ value: `**${word.word}**` }];
+      if (compileTypeHover) {
+        contents.push(...compileTypeHover.hover.contents);
+      }
+      if (value !== null) {
+        contents.push({ value: `\`\`\`text\n${value}\n\`\`\`` });
+      }
       return {
         range: new monaco.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn),
-        contents: [{ value: `**${word.word}**` }, { value: `\`\`\`text\n${value}\n\`\`\`` }]
+        contents
       };
     }
   });

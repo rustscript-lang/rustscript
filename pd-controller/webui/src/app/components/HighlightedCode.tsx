@@ -5,7 +5,8 @@ import type * as Monaco from "monaco-editor";
 import { monacoLanguageForFlavor } from "@/app/helpers";
 import { lintWithWasm } from "@/app/lint/wasmLinter";
 import { LINT_MARKER_OWNER, lintFailureMarker, lintMarkersFromReport } from "@/app/monaco/lintMarkers";
-import { ensureCompletionCatalogProviders } from "@/app/monaco/completionCatalog";
+import { ensureCompletionCatalogProviders, lookupCallableHover } from "@/app/monaco/completionCatalog";
+import { lookupLocalTypeHover } from "@/app/monaco/localTypeHover";
 import { ensureRustScriptLanguage } from "@/app/monaco/rustscriptLanguage";
 import type { SourceFlavor, UiSourceBundle } from "@/app/types";
 
@@ -28,8 +29,14 @@ export function HighlightedCode({
   const code = source[flavor] ?? "";
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<typeof import("monaco-editor") | null>(null);
+  const hoverProviderDisposableRef = useRef<Monaco.IDisposable | null>(null);
   const lintSeqRef = useRef(0);
   const lintTimeoutRef = useRef<number | null>(null);
+  const currentCodeRef = useRef(code);
+  const currentFlavorRef = useRef(flavor);
+
+  currentCodeRef.current = code;
+  currentFlavorRef.current = flavor;
 
   const clearLintMarkers = useCallback(() => {
     const editor = editorRef.current;
@@ -60,11 +67,54 @@ export function HighlightedCode({
   }, []);
 
   useEffect(() => {
+    const editor = editorRef.current;
+    const monaco = monacoRef.current;
+    const model = editor?.getModel();
+    if (!editor || !monaco || !model) {
+      return;
+    }
+
+    hoverProviderDisposableRef.current?.dispose();
+    hoverProviderDisposableRef.current = monaco.languages.registerHoverProvider(model.getLanguageId(), {
+      provideHover: async (hoverModel, position) => {
+        const activeModel = editorRef.current?.getModel();
+        if (!activeModel || hoverModel.uri.toString() !== activeModel.uri.toString()) {
+          return null;
+        }
+
+        const callableHover = await lookupCallableHover(monaco, hoverModel, position);
+        const compileTypeHover = await lookupLocalTypeHover(
+          hoverModel,
+          position,
+          currentCodeRef.current,
+          currentFlavorRef.current,
+          `${hoverModel.uri.toString()}:${hoverModel.getVersionId()}`,
+          monaco
+        );
+        if (callableHover && compileTypeHover) {
+          return {
+            range: callableHover.range ?? compileTypeHover.hover.range,
+            contents: [...callableHover.contents, ...compileTypeHover.hover.contents]
+          };
+        }
+        return callableHover ?? compileTypeHover?.hover ?? null;
+      }
+    });
+
+    return () => {
+      hoverProviderDisposableRef.current?.dispose();
+      hoverProviderDisposableRef.current = null;
+    };
+  }, [flavor]);
+
+  useEffect(() => {
     return () => {
       if (lintTimeoutRef.current !== null) {
         window.clearTimeout(lintTimeoutRef.current);
         lintTimeoutRef.current = null;
       }
+      hoverProviderDisposableRef.current?.dispose();
+      hoverProviderDisposableRef.current = null;
       clearLintMarkers();
     };
   }, [clearLintMarkers]);

@@ -153,14 +153,6 @@ function registerCatalogCompletions(
   registerCompletionProvider(monaco, "javascript", catalog.javascript, ["."]);
   registerCompletionProvider(monaco, "lua", catalog.lua, [".", ":"]);
   registerCompletionProvider(monaco, "scheme", catalog.scheme, ["(", "."]);
-
-  for (const languageId of ["rustscript", "javascript", "lua", "scheme"] as const) {
-    monaco.languages.registerHoverProvider(languageId, {
-      async provideHover(model, position) {
-        return lookupCallableHover(monaco, model, position);
-      }
-    });
-  }
 }
 
 export async function lookupCallableHover(

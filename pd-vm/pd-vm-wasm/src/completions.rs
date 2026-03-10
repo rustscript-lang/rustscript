@@ -1062,6 +1062,13 @@ mod tests {
         );
         assert!(
             catalog
+                .rustscript
+                .iter()
+                .any(|entry| entry.label == "lrucache::put"),
+            "expected RustScript stdlib completion for lrucache::put",
+        );
+        assert!(
+            catalog
                 .javascript
                 .iter()
                 .any(|entry| entry.label == "parse.try_parse_int_base"),
