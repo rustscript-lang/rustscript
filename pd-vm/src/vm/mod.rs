@@ -603,16 +603,6 @@ impl Vm {
         self.stack.pop().ok_or(VmError::StackUnderflow)
     }
 
-    pub(super) fn can_fuse_ldloc_copy_pattern(&self, index: u8) -> bool {
-        let code = &self.program.code;
-        if self.ip + 2 >= code.len() {
-            return false;
-        }
-        code[self.ip] == OpCode::Dup as u8
-            && code[self.ip + 1] == OpCode::Stloc as u8
-            && code[self.ip + 2] == index
-    }
-
     pub(super) fn can_fuse_call_ret_pattern(&self) -> bool {
         let code = &self.program.code;
         self.ip < code.len() && code[self.ip] == OpCode::Ret as u8
@@ -1299,22 +1289,12 @@ impl Vm {
             }
             x if x == OpCode::Ldloc as u8 => {
                 let index = self.read_u8()?;
-                if !self.interruption_enabled() && self.can_fuse_ldloc_copy_pattern(index) {
-                    let value = self
-                        .locals
-                        .get(index as usize)
-                        .cloned()
-                        .ok_or(VmError::InvalidLocal(index))?;
-                    self.stack.push(value);
-                    self.ip = self.ip.saturating_add(3);
-                } else {
-                    let slot = self
-                        .locals
-                        .get_mut(index as usize)
-                        .ok_or(VmError::InvalidLocal(index))?;
-                    let value = std::mem::replace(slot, Value::Null);
-                    self.stack.push(value);
-                }
+                let value = self
+                    .locals
+                    .get(index as usize)
+                    .cloned()
+                    .ok_or(VmError::InvalidLocal(index))?;
+                self.stack.push(value);
             }
             x if x == OpCode::Stloc as u8 => {
                 let index = self.read_u8()?;

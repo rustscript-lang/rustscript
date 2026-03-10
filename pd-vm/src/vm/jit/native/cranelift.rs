@@ -27,9 +27,9 @@ mod layout;
 use super::exec::ExecutableBuffer;
 use bridge::pd_vm_cranelift_step;
 use codegen::{
-    emit_helper_step, emit_inline_ldloc_copy, emit_inline_or_helper_step,
-    emit_interrupt_tick_inline, emit_interrupt_tick_inline_guarded, entry_signature,
-    helper_signature, jump_with_status, resolve_offsets,
+    emit_helper_step, emit_inline_or_helper_step, emit_interrupt_tick_inline,
+    emit_interrupt_tick_inline_guarded, entry_signature, helper_signature, jump_with_status,
+    resolve_offsets,
 };
 use layout::{detect_native_stack_layout, native_layout_fingerprint};
 
@@ -64,30 +64,6 @@ const OP_CALL: i64 = 21;
 const OP_GUARD_FALSE: i64 = 22;
 const OP_JUMP: i64 = 23;
 const OP_BUILTIN_CALL: i64 = 24;
-
-fn fused_ldloc_copy_slot(steps: &[TraceStep], index: usize) -> Option<u8> {
-    let Some(TraceStep::Ldloc(slot)) = steps.get(index) else {
-        return None;
-    };
-    if !matches!(steps.get(index + 1), Some(TraceStep::Dup)) {
-        return None;
-    }
-    let Some(TraceStep::Stloc(stored_slot)) = steps.get(index + 2) else {
-        return None;
-    };
-    (stored_slot == slot).then_some(*slot)
-}
-
-fn fused_ldloc_copy_slot_if_allowed(
-    interrupt_settings: Option<NativeInterruptSettings>,
-    steps: &[TraceStep],
-    index: usize,
-) -> Option<u8> {
-    if interrupt_settings.is_some() {
-        return None;
-    }
-    fused_ldloc_copy_slot(steps, index)
-}
 
 pub(crate) struct CompiledTrace {
     pub(crate) entry: *const u8,
@@ -260,24 +236,6 @@ pub(crate) fn compile_trace(
                     }
                 }
             }
-            if let Some(slot) =
-                fused_ldloc_copy_slot_if_allowed(interrupt_settings, &trace.steps, step_index)
-            {
-                emit_inline_ldloc_copy(
-                    &mut b,
-                    vm_ptr,
-                    helper_ref,
-                    exit_block,
-                    pointer_type,
-                    layout,
-                    offsets,
-                    slot,
-                    trace.root_ip,
-                )?;
-                step_index += 3;
-                continue;
-            }
-
             let step = &trace.steps[step_index];
             if emit_inline_or_helper_step(
                 &mut b,
@@ -373,41 +331,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fused_ldloc_copy_slot_matches_only_dup_stloc_same_slot() {
-        let steps = vec![
-            TraceStep::Ldloc(3),
-            TraceStep::Dup,
-            TraceStep::Stloc(3),
-            TraceStep::Add,
-        ];
-        assert_eq!(fused_ldloc_copy_slot(&steps, 0), Some(3));
-        assert_eq!(fused_ldloc_copy_slot(&steps, 1), None);
-
-        let mismatch = vec![TraceStep::Ldloc(3), TraceStep::Dup, TraceStep::Stloc(2)];
-        assert_eq!(fused_ldloc_copy_slot(&mismatch, 0), None);
-
-        let wrong_middle = vec![TraceStep::Ldloc(3), TraceStep::Pop, TraceStep::Stloc(3)];
-        assert_eq!(fused_ldloc_copy_slot(&wrong_middle, 0), None);
-    }
-
-    #[test]
-    fn fused_ldloc_copy_slot_is_disabled_when_fuel_metering_is_active() {
-        let steps = vec![TraceStep::Ldloc(1), TraceStep::Dup, TraceStep::Stloc(1)];
-
-        assert_eq!(
-            fused_ldloc_copy_slot_if_allowed(None, &steps, 0),
-            Some(1),
-            "fusion should be available without fuel metering"
-        );
-        assert_eq!(
-            fused_ldloc_copy_slot_if_allowed(Some(NativeInterruptSettings::fuel(1)), &steps, 0),
-            None,
-            "fuel metering must disable fused emission"
-        );
-        assert_eq!(
-            fused_ldloc_copy_slot_if_allowed(Some(NativeInterruptSettings::epoch(8)), &steps, 0),
-            None,
-            "all cooperative interruption variants must disable fused emission"
-        );
+    fn native_opcodes_remain_stable() {
+        assert_eq!(OP_LDLOC, 19);
+        assert_eq!(OP_STLOC, 20);
     }
 }

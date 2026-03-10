@@ -340,13 +340,34 @@ fn shared_map_survives_local_overwrite_after_copy_like_read() {
 }
 
 #[test]
-fn interpreter_fuses_ldloc_dup_stloc_same_slot_without_fuel() {
+fn interpreter_ldloc_preserves_local_slot() {
+    let program = Program::new(vec![], vec![OpCode::Ldloc as u8, 0, OpCode::Ret as u8])
+        .with_local_count(1);
+    let mut vm = Vm::new(program);
+    let map_value = Value::map(vec![(Value::string("k"), Value::Int(9))]);
+    vm.locals[0] = map_value.clone();
+
+    let outcome = step_once(&mut vm).expect("ldloc should execute");
+    assert!(matches!(outcome, ExecOutcome::Continue));
+    assert_eq!(vm.ip, 2);
+    assert_eq!(vm.locals[0], map_value, "ldloc should leave local intact");
+    assert_eq!(vm.stack(), &[map_value], "stack should receive copied value");
+    assert_shared_heap_backing(&vm.locals[0], &vm.stack()[0]);
+    assert_eq!(vm.drop_contract_event_count(), 0);
+}
+
+#[test]
+fn interpreter_explicit_move_sequence_clears_local_slot() {
     let program = Program::new(
-        vec![],
+        vec![Value::Null],
         vec![
             OpCode::Ldloc as u8,
             0,
-            OpCode::Dup as u8,
+            OpCode::Ldc as u8,
+            0,
+            0,
+            0,
+            0,
             OpCode::Stloc as u8,
             0,
             OpCode::Ret as u8,
@@ -357,64 +378,21 @@ fn interpreter_fuses_ldloc_dup_stloc_same_slot_without_fuel() {
     let map_value = Value::map(vec![(Value::string("k"), Value::Int(9))]);
     vm.locals[0] = map_value.clone();
 
-    let outcome = step_once(&mut vm).expect("ldloc should execute");
-    assert!(matches!(outcome, ExecOutcome::Continue));
-    assert_eq!(vm.ip, 5, "fusion should skip dup+stloc bytes");
-    assert_eq!(vm.locals[0], map_value, "local value should remain in slot");
-    assert_eq!(
-        vm.stack(),
-        &[map_value],
-        "stack should receive copied value"
-    );
-    assert_shared_heap_backing(&vm.locals[0], &vm.stack()[0]);
-    assert_eq!(
-        vm.drop_contract_event_count(),
-        0,
-        "copy fusion should not synthesize drop events"
-    );
-
-    let halted = step_once(&mut vm).expect("ret should execute");
-    assert!(matches!(halted, ExecOutcome::Halted));
-}
-
-#[test]
-fn interpreter_does_not_fuse_ldloc_dup_stloc_when_fuel_enabled() {
-    let program = Program::new(
-        vec![],
-        vec![
-            OpCode::Ldloc as u8,
-            0,
-            OpCode::Dup as u8,
-            OpCode::Stloc as u8,
-            0,
-            OpCode::Ret as u8,
-        ],
-    )
-    .with_local_count(1);
-    let mut vm = Vm::new(program);
-    vm.locals[0] = Value::Int(42);
-    vm.set_fuel(32);
-
     let ldloc = step_once(&mut vm).expect("ldloc should execute");
     assert!(matches!(ldloc, ExecOutcome::Continue));
-    assert_eq!(vm.ip, 2, "fuel metering path must not skip dup+stloc");
-    assert_eq!(
-        vm.locals[0],
-        Value::Null,
-        "ldloc move should clear local slot"
-    );
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
+    assert_eq!(vm.locals[0], map_value);
+    assert_eq!(vm.stack(), &[map_value.clone()]);
+    assert_shared_heap_backing(&vm.locals[0], &vm.stack()[0]);
 
-    let dup = step_once(&mut vm).expect("dup should execute");
-    assert!(matches!(dup, ExecOutcome::Continue));
-    assert_eq!(vm.ip, 3);
-    assert_eq!(vm.stack(), &[Value::Int(42), Value::Int(42)]);
+    let ldc = step_once(&mut vm).expect("ldc should execute");
+    assert!(matches!(ldc, ExecOutcome::Continue));
+    assert_eq!(vm.stack(), &[map_value.clone(), Value::Null]);
 
     let stloc = step_once(&mut vm).expect("stloc should execute");
     assert!(matches!(stloc, ExecOutcome::Continue));
-    assert_eq!(vm.ip, 5);
-    assert_eq!(vm.locals[0], Value::Int(42));
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
+    assert_eq!(vm.ip, 9);
+    assert_eq!(vm.locals[0], Value::Null);
+    assert_eq!(vm.stack(), &[map_value]);
 }
 
 #[test]
@@ -441,32 +419,6 @@ fn interpreter_copy_like_ldloc_dup_stloc_shares_map_backing_with_fuel() {
 
     assert_eq!(vm.stack().len(), 1);
     assert_shared_heap_backing(&vm.locals[0], &vm.stack()[0]);
-}
-
-#[test]
-fn interpreter_does_not_fuse_ldloc_dup_stloc_when_epoch_enabled() {
-    let program = Program::new(
-        vec![],
-        vec![
-            OpCode::Ldloc as u8,
-            0,
-            OpCode::Dup as u8,
-            OpCode::Stloc as u8,
-            0,
-            OpCode::Ret as u8,
-        ],
-    )
-    .with_local_count(1);
-    let mut vm = Vm::new(program);
-    vm.locals[0] = Value::Int(42);
-    vm.set_epoch_deadline(1)
-        .expect("setting epoch deadline should succeed");
-
-    let ldloc = step_once(&mut vm).expect("ldloc should execute");
-    assert!(matches!(ldloc, ExecOutcome::Continue));
-    assert_eq!(vm.ip, 2, "epoch interruption must not skip dup+stloc");
-    assert_eq!(vm.locals[0], Value::Null);
-    assert_eq!(vm.stack(), &[Value::Int(42)]);
 }
 
 #[test]
@@ -655,55 +607,4 @@ fn call_ret_fusion_pattern_requires_immediate_ret() {
     let mut vm_no_next = Vm::new(no_next);
     vm_no_next.ip = 4;
     assert!(!vm_no_next.can_fuse_call_ret_pattern());
-}
-
-#[test]
-fn ldloc_copy_pattern_match_is_strict_to_dup_stloc_same_slot() {
-    let base = Program::new(
-        vec![],
-        vec![
-            OpCode::Ldloc as u8,
-            0,
-            OpCode::Dup as u8,
-            OpCode::Stloc as u8,
-            0,
-            OpCode::Ret as u8,
-        ],
-    )
-    .with_local_count(1);
-    let mut vm = Vm::new(base);
-    vm.ip = 2;
-    assert!(vm.can_fuse_ldloc_copy_pattern(0));
-
-    let mismatch_slot = Program::new(
-        vec![],
-        vec![
-            OpCode::Ldloc as u8,
-            0,
-            OpCode::Dup as u8,
-            OpCode::Stloc as u8,
-            1,
-            OpCode::Ret as u8,
-        ],
-    )
-    .with_local_count(2);
-    let mut vm_slot_mismatch = Vm::new(mismatch_slot);
-    vm_slot_mismatch.ip = 2;
-    assert!(!vm_slot_mismatch.can_fuse_ldloc_copy_pattern(0));
-
-    let wrong_middle = Program::new(
-        vec![],
-        vec![
-            OpCode::Ldloc as u8,
-            0,
-            OpCode::Pop as u8,
-            OpCode::Stloc as u8,
-            0,
-            OpCode::Ret as u8,
-        ],
-    )
-    .with_local_count(1);
-    let mut vm_wrong_middle = Vm::new(wrong_middle);
-    vm_wrong_middle.ip = 2;
-    assert!(!vm_wrong_middle.can_fuse_ldloc_copy_pattern(0));
 }

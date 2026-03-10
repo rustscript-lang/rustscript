@@ -1,6 +1,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 use common::*;
+use vm::OpCode;
 
 #[test]
 fn compiler_emits_expression() {
@@ -1132,6 +1133,44 @@ fn liveness_avoids_in_loop_null_clears_but_clears_after_loop_exit() {
     assert_eq!(vm.stack(), &[Value::Int(3)]);
     assert_eq!(vm.locals()[a_index as usize], Value::Null);
     assert_eq!(vm.locals()[b_index as usize], Value::Null);
+}
+
+#[test]
+fn ordinary_local_reads_compile_to_bare_ldloc() {
+    let source = r#"
+        let x = 1;
+        let y = x + 1;
+        let z = x;
+        z;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let instructions = decode_instructions(&compiled.program.code);
+    let ldloc_ips = instructions
+        .iter()
+        .filter(|instr| instr.op == OpCode::Ldloc as u8)
+        .map(|instr| instr.ip)
+        .collect::<Vec<_>>();
+    assert!(
+        !ldloc_ips.is_empty(),
+        "expected at least one ldloc in compiled bytecode"
+    );
+
+    for window in instructions.windows(3) {
+        let [first, second, third] = window else {
+            continue;
+        };
+        let is_copy_pattern = first.op == OpCode::Ldloc as u8
+            && second.op == OpCode::Dup as u8
+            && third.op == OpCode::Stloc as u8
+            && first.ip + first.width == second.ip
+            && second.ip + second.width == third.ip;
+        assert!(
+            !is_copy_pattern,
+            "ordinary reads should not lower to ldloc/dup/stloc: {:?}",
+            window
+        );
+    }
 }
 
 #[test]
