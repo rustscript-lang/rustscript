@@ -8,6 +8,7 @@ mod fuel;
 mod host;
 pub(crate) mod jit;
 mod store;
+mod superinstructions;
 #[cfg(test)]
 mod tests;
 pub use self::epoch::{EpochCheckpoint, EpochHandle};
@@ -17,6 +18,7 @@ pub use self::host::{
     StaticHostFunction,
 };
 use self::host::{HostCallExecOutcome, VmHostFunction, WaitingHostOp};
+use self::superinstructions::{build_decoded_instruction_data, DecodedInstructionData};
 pub use crate::bytecode::{HostImport, OpCode, Program, Value, ValueType};
 pub use store::Store;
 
@@ -204,6 +206,7 @@ pub struct Vm {
     stack: Vec<Value>,
     locals: Vec<Value>,
     operand_type_hints: Option<Box<[PackedOperandTypes]>>,
+    decoded_instruction_data: DecodedInstructionData,
     host_functions: Vec<VmHostFunction>,
     host_function_symbols: HashMap<String, u16>,
     builtin_overrides: HashMap<u16, u16>,
@@ -400,6 +403,7 @@ impl Vm {
         let program_constants_len = program.constants.len();
         let local_count = program.local_count;
         let operand_type_hints = build_operand_type_hints(program.as_ref());
+        let decoded_instruction_data = build_decoded_instruction_data(program.as_ref());
         let epoch_handle = EpochHandle::default();
         let epoch_counter_ptr = epoch_handle.as_ptr() as usize;
         Self {
@@ -413,6 +417,7 @@ impl Vm {
             stack: Vec::new(),
             locals: vec![Value::Null; local_count],
             operand_type_hints,
+            decoded_instruction_data,
             host_functions: Vec::new(),
             host_function_symbols: HashMap::new(),
             builtin_overrides: HashMap::new(),
@@ -561,6 +566,15 @@ impl Vm {
         self.waiting_host_op = None;
         self.next_host_op_id = 1;
         self.io_state = crate::builtins::runtime::IoState::default();
+    }
+
+    #[inline(always)]
+    pub(super) fn local_numeric_value(&self, index: u8) -> Option<NumericValue> {
+        match self.locals.get(index as usize)? {
+            Value::Int(value) => Some(NumericValue::Int(*value)),
+            Value::Float(value) => Some(NumericValue::Float(*value)),
+            _ => None,
+        }
     }
 
     pub fn drop_contract_event_count(&self) -> u64 {
@@ -1102,7 +1116,8 @@ impl Vm {
             }
 
             let opcode = self.read_u8()?;
-            let outcome = match self.execute_interpreter_instruction(opcode) {
+            let allow_superinstructions = debugger.is_none() && !self.interruption_enabled();
+            let outcome = match self.execute_interpreter_instruction(opcode, allow_superinstructions) {
                 Ok(outcome) => outcome,
                 Err(err) => {
                     if let Some(reason) = Self::yielded_interrupt_reason(&err) {
@@ -1126,18 +1141,27 @@ impl Vm {
         }
     }
 
-    pub(super) fn execute_interpreter_instruction(&mut self, opcode: u8) -> VmResult<ExecOutcome> {
+    pub(super) fn execute_interpreter_instruction(
+        &mut self,
+        opcode: u8,
+        allow_superinstructions: bool,
+    ) -> VmResult<ExecOutcome> {
         match opcode {
             x if x == OpCode::Nop as u8 => {}
             x if x == OpCode::Ret as u8 => return Ok(ExecOutcome::Halted),
             x if x == OpCode::Ldc as u8 => {
-                let index = self.read_u32()?;
-                let value = self
-                    .program
-                    .constants
-                    .get(index as usize)
-                    .cloned()
-                    .ok_or(VmError::InvalidConstant(index))?;
+                let opcode_ip = self.ip - 1;
+                let value = if let Some(value) = self.decoded_ldc_value_at(opcode_ip).cloned() {
+                    self.ip += 4;
+                    value
+                } else {
+                    let index = self.read_u32()?;
+                    self.program
+                        .constants
+                        .get(index as usize)
+                        .cloned()
+                        .ok_or(VmError::InvalidConstant(index))?
+                };
                 self.stack.push(value);
             }
             x if x == OpCode::Add as u8 => {
@@ -1270,11 +1294,23 @@ impl Vm {
                 }
             }
             x if x == OpCode::Br as u8 => {
-                let target = self.read_u32()? as usize;
+                let opcode_ip = self.ip - 1;
+                let target = if let Some(target) = self.decoded_jump_target_at(opcode_ip) {
+                    self.ip += 4;
+                    target
+                } else {
+                    self.read_u32()? as usize
+                };
                 self.jump_to(target)?;
             }
             x if x == OpCode::Brfalse as u8 => {
-                let target = self.read_u32()? as usize;
+                let opcode_ip = self.ip - 1;
+                let target = if let Some(target) = self.decoded_jump_target_at(opcode_ip) {
+                    self.ip += 4;
+                    target
+                } else {
+                    self.read_u32()? as usize
+                };
                 let condition = self.pop_bool()?;
                 if !condition {
                     self.jump_to(target)?;
@@ -1288,7 +1324,16 @@ impl Vm {
                 self.stack.push(value);
             }
             x if x == OpCode::Ldloc as u8 => {
-                let index = self.read_u8()?;
+                let opcode_ip = self.ip - 1;
+                let index = if let Some(index) = self.decoded_local_index_at(opcode_ip) {
+                    self.ip += 1;
+                    index
+                } else {
+                    self.read_u8()?
+                };
+                if self.try_fuse_scalar_sequence(index, allow_superinstructions)? {
+                    return Ok(ExecOutcome::Continue);
+                }
                 let value = self
                     .locals
                     .get(index as usize)
@@ -1297,14 +1342,15 @@ impl Vm {
                 self.stack.push(value);
             }
             x if x == OpCode::Stloc as u8 => {
-                let index = self.read_u8()?;
+                let opcode_ip = self.ip - 1;
+                let index = if let Some(index) = self.decoded_local_index_at(opcode_ip) {
+                    self.ip += 1;
+                    index
+                } else {
+                    self.read_u8()?
+                };
                 let value = self.pop_value()?;
-                let slot = self
-                    .locals
-                    .get_mut(index as usize)
-                    .ok_or(VmError::InvalidLocal(index))?;
-                let previous = std::mem::replace(slot, value);
-                self.drop_value_with_contract(previous);
+                self.store_local_with_drop_contract(index, value)?;
             }
             x if x == OpCode::Call as u8 => {
                 let call_ip = self.ip - 1;
