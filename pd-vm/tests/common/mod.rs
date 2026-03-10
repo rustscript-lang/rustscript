@@ -68,6 +68,51 @@ pub fn run_runtime_cases(cases: &[RuntimeCase<'_>]) {
     }
 }
 
+#[allow(dead_code)]
+pub fn rustscript_runtime_case<'a>(
+    name: &'a str,
+    source: &'a str,
+    expected_stack: Vec<Value>,
+) -> RuntimeCase<'a> {
+    RuntimeCase {
+        name,
+        source,
+        flavor: SourceFlavor::RustScript,
+        expected_stack,
+        expected_locals: None,
+    }
+}
+
+#[allow(dead_code)]
+pub fn rustscript_runtime_case_with_locals<'a>(
+    name: &'a str,
+    source: &'a str,
+    expected_stack: Vec<Value>,
+    expected_locals: usize,
+) -> RuntimeCase<'a> {
+    RuntimeCase {
+        name,
+        source,
+        flavor: SourceFlavor::RustScript,
+        expected_stack,
+        expected_locals: Some(expected_locals),
+    }
+}
+
+#[allow(dead_code)]
+pub fn rustscript_parse_error_case<'a>(
+    name: &'a str,
+    source: &'a str,
+    expected_contains_all: &'a [&'a str],
+) -> ParseErrorCase<'a> {
+    ParseErrorCase {
+        name,
+        source,
+        flavor: SourceFlavor::RustScript,
+        expected_contains_all,
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CompileErrorKind {
     Assembler,
