@@ -271,15 +271,7 @@ pub(super) async fn create_program_version_handler(
     Path(program_id): Path<String>,
     Json(request): Json<CreateProgramVersionRequest>,
 ) -> Result<(StatusCode, Json<ProgramVersionResponse>), (StatusCode, Json<ErrorResponse>)> {
-    // Backward/compat guard: if client sends source-only payload with no graph,
-    // accept it as code-only save even when flow_synced is absent/stale.
-    let inferred_code_only =
-        request.source.is_some() && request.nodes.is_empty() && request.blocks.is_empty();
-    let flow_synced = if inferred_code_only {
-        false
-    } else {
-        request.flow_synced
-    };
+    let flow_synced = request.flow_synced;
     let (nodes, edges, source) = if flow_synced {
         let nodes = if !request.nodes.is_empty() {
             request.nodes.clone()

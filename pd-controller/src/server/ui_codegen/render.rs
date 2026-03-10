@@ -555,54 +555,22 @@ pub(super) fn render_single_block(
             let value = block_value(block, "value", "hello");
             let start = render_slice_bound_expr(block.values.get("start"));
             let end = render_slice_bound_expr(block.values.get("end"));
-            // Compatibility for previously saved graphs that still use `length`.
-            let legacy_length = if end.is_none() {
-                render_slice_bound_expr(block.values.get("length"))
-            } else {
-                None
-            };
-
-            let rss_expr = if let Some(length) = &legacy_length {
-                let legacy_start = start.clone().unwrap_or_else(|| "0".to_string());
-                let legacy_end = format!("({legacy_start}) + ({length})");
-                render_slice_expr(render_expr_rss(value), Some(legacy_start), Some(legacy_end))
-            } else {
-                render_slice_expr(render_expr_rss(value), start.clone(), end.clone())
-            };
-            let js_expr = if let Some(length) = &legacy_length {
-                let legacy_start = start.clone().unwrap_or_else(|| "0".to_string());
-                let legacy_end = format!("({legacy_start}) + ({length})");
-                render_slice_expr(render_expr_js(value), Some(legacy_start), Some(legacy_end))
-            } else {
-                render_slice_expr(render_expr_js(value), start.clone(), end.clone())
-            };
-            let lua_expr = if let Some(length) = &legacy_length {
-                let legacy_start = start.clone().unwrap_or_else(|| "0".to_string());
-                let legacy_end = format!("({legacy_start}) + ({length})");
-                render_slice_expr(render_expr_lua(value), Some(legacy_start), Some(legacy_end))
-            } else {
-                render_slice_expr(render_expr_lua(value), start.clone(), end.clone())
-            };
+            let rss_expr = render_slice_expr(render_expr_rss(value), start.clone(), end.clone());
+            let js_expr = render_slice_expr(render_expr_js(value), start.clone(), end.clone());
+            let lua_expr = render_slice_expr(render_expr_lua(value), start.clone(), end.clone());
 
             rss.push(format!("let {var} = {rss_expr};"));
             js.push(format!("let {var} = {js_expr};"));
             lua.push(format!("local {var} = {lua_expr}"));
 
             let scheme_value = render_expr_scheme(value);
-            let scheme_expr = if let Some(length) = legacy_length {
-                let legacy_start = start
-                    .clone()
-                    .unwrap_or_else(|| render_slice_index_expr(None, "0"));
-                format!("(slice {scheme_value} {legacy_start} {length})")
-            } else {
-                match (start, end) {
-                    (Some(start), Some(end)) => {
-                        format!("(slice-range {scheme_value} {start} {end})")
-                    }
-                    (None, Some(end)) => format!("(slice-to {scheme_value} {end})"),
-                    (Some(start), None) => format!("(slice-from {scheme_value} {start})"),
-                    (None, None) => format!("(slice-from {scheme_value} 0)"),
+            let scheme_expr = match (start, end) {
+                (Some(start), Some(end)) => {
+                    format!("(slice-range {scheme_value} {start} {end})")
                 }
+                (None, Some(end)) => format!("(slice-to {scheme_value} {end})"),
+                (Some(start), None) => format!("(slice-from {scheme_value} {start})"),
+                (None, None) => format!("(slice-from {scheme_value} 0)"),
             };
             scm.push(format!("(define {var} {scheme_expr})"));
         }
@@ -1177,10 +1145,6 @@ fn render_slice_bound_expr(raw: Option<&String>) -> Option<String> {
         return Some(raw.to_string());
     }
     None
-}
-
-pub(super) fn render_slice_index_expr(raw: Option<&String>, fallback: &str) -> String {
-    render_slice_bound_expr(raw).unwrap_or_else(|| fallback.to_string())
 }
 
 pub(super) fn render_slice_expr(
