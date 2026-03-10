@@ -114,11 +114,24 @@ export type CompletionCatalog = {
   scheme: CompletionEntry[];
 };
 
+export type LocalTypeHint = {
+  name: string;
+  inferredType: string;
+  declaredLine: number | null;
+  lastLine: number | null;
+};
+
 type WasmRuntimeExports = {
   memory: WebAssembly.Memory;
   wasm_alloc(len: number): number;
   wasm_dealloc(ptr: number, len: number): void;
   lint_source_json(sourcePtr: number, sourceLen: number, flavorPtr: number, flavorLen: number): bigint;
+  local_type_hints_json?: (
+    sourcePtr: number,
+    sourceLen: number,
+    flavorPtr: number,
+    flavorLen: number
+  ) => bigint;
   run_source_json(
     sourcePtr: number,
     sourceLen: number,
@@ -461,6 +474,39 @@ function normalizeCompletionCatalog(raw: unknown): CompletionCatalog {
   };
 }
 
+function normalizeLocalTypeHints(raw: unknown): LocalTypeHint[] {
+  if (!raw || typeof raw !== "object" || !("hints" in raw)) {
+    return [];
+  }
+  const rawHints = (raw as { hints?: unknown }).hints;
+  if (!Array.isArray(rawHints)) {
+    return [];
+  }
+
+  const hints: LocalTypeHint[] = [];
+  for (const item of rawHints) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const name = (item as { name?: unknown }).name;
+    const inferredType = (item as { inferred_type?: unknown }).inferred_type;
+    const declaredLineRaw = Number((item as { declared_line?: unknown }).declared_line);
+    const lastLineRaw = Number((item as { last_line?: unknown }).last_line);
+    if (typeof name !== "string" || !name || typeof inferredType !== "string" || !inferredType) {
+      continue;
+    }
+
+    hints.push({
+      name,
+      inferredType,
+      declaredLine: Number.isFinite(declaredLineRaw) ? Math.max(1, Math.trunc(declaredLineRaw)) : null,
+      lastLine: Number.isFinite(lastLineRaw) ? Math.max(1, Math.trunc(lastLineRaw)) : null
+    });
+  }
+
+  return hints;
+}
+
 async function loadWasm(): Promise<WasmRuntimeExports> {
   if (!wasmPromise) {
     wasmPromise = (async () => {
@@ -702,4 +748,26 @@ export async function completionCatalogWithWasm(): Promise<CompletionCatalog> {
     return invoke();
   });
   return normalizeCompletionCatalog(raw);
+}
+
+export async function localTypeHintsWithWasm(
+  source: string,
+  flavor: SourceFlavor
+): Promise<LocalTypeHint[]> {
+  const wasm = await loadWasm();
+  if (typeof wasm.local_type_hints_json !== "function") {
+    return [];
+  }
+  const raw = await invokePackedJson(
+    (instance, sourcePtr, sourceLen, flavorPtr, flavorLen) => {
+      const invoke = instance.local_type_hints_json;
+      if (!invoke) {
+        return 0n;
+      }
+      return invoke(sourcePtr, sourceLen, flavorPtr, flavorLen);
+    },
+    source,
+    flavor
+  );
+  return normalizeLocalTypeHints(raw);
 }

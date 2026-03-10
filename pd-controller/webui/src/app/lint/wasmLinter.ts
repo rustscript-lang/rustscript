@@ -38,11 +38,24 @@ export type CompletionCatalog = {
   scheme: CompletionEntry[];
 };
 
+export type LocalTypeHint = {
+  name: string;
+  inferredType: string;
+  declaredLine: number | null;
+  lastLine: number | null;
+};
+
 type WasmLinterExports = {
   memory: WebAssembly.Memory;
   wasm_alloc(len: number): number;
   wasm_dealloc(ptr: number, len: number): void;
   lint_source_json(sourcePtr: number, sourceLen: number, flavorPtr: number, flavorLen: number): bigint;
+  local_type_hints_json?: (
+    sourcePtr: number,
+    sourceLen: number,
+    flavorPtr: number,
+    flavorLen: number
+  ) => bigint;
   completion_catalog_json?: () => bigint;
 };
 
@@ -193,6 +206,38 @@ function normalizeCompletionCatalog(raw: unknown): CompletionCatalog {
   };
 }
 
+function normalizeLocalTypeHints(raw: unknown): LocalTypeHint[] {
+  if (!raw || typeof raw !== "object" || !("hints" in raw)) {
+    return [];
+  }
+  const rawHints = (raw as { hints?: unknown }).hints;
+  if (!Array.isArray(rawHints)) {
+    return [];
+  }
+
+  const hints: LocalTypeHint[] = [];
+  for (const item of rawHints) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const name = (item as { name?: unknown }).name;
+    const inferredType = (item as { inferred_type?: unknown }).inferred_type;
+    const declaredLineRaw = Number((item as { declared_line?: unknown }).declared_line);
+    const lastLineRaw = Number((item as { last_line?: unknown }).last_line);
+    if (typeof name !== "string" || !name || typeof inferredType !== "string" || !inferredType) {
+      continue;
+    }
+    hints.push({
+      name,
+      inferredType,
+      declaredLine: Number.isFinite(declaredLineRaw) ? Math.max(1, Math.trunc(declaredLineRaw)) : null,
+      lastLine: Number.isFinite(lastLineRaw) ? Math.max(1, Math.trunc(lastLineRaw)) : null
+    });
+  }
+
+  return hints;
+}
+
 async function loadWasm(): Promise<WasmLinterExports> {
   if (!wasmPromise) {
     wasmPromise = (async () => {
@@ -268,5 +313,51 @@ export async function completionCatalogWithWasm(): Promise<CompletionCatalog> {
     return normalizeCompletionCatalog(JSON.parse(json));
   } finally {
     wasm.wasm_dealloc(ptr, len);
+  }
+}
+
+export async function localTypeHintsWithWasm(
+  source: string,
+  flavor: SourceFlavor
+): Promise<LocalTypeHint[]> {
+  const wasm = await loadWasm();
+  if (typeof wasm.local_type_hints_json !== "function") {
+    return [];
+  }
+
+  const sourceBytes = encoder.encode(source);
+  const flavorBytes = encoder.encode(flavor);
+  let sourcePtr = 0;
+  let flavorPtr = 0;
+  let resultPtr = 0;
+  let resultLen = 0;
+
+  try {
+    sourcePtr = writeBytes(wasm, sourceBytes);
+    flavorPtr = writeBytes(wasm, flavorBytes);
+    const packed = wasm.local_type_hints_json(
+      sourcePtr,
+      sourceBytes.length,
+      flavorPtr,
+      flavorBytes.length
+    );
+    const unpacked = unpackPtrLen(packed);
+    resultPtr = unpacked.ptr;
+    resultLen = unpacked.len;
+    if (resultPtr === 0 || resultLen === 0) {
+      return [];
+    }
+    const json = decoder.decode(readBytes(wasm, resultPtr, resultLen));
+    return normalizeLocalTypeHints(JSON.parse(json));
+  } finally {
+    if (sourcePtr !== 0) {
+      wasm.wasm_dealloc(sourcePtr, sourceBytes.length);
+    }
+    if (flavorPtr !== 0) {
+      wasm.wasm_dealloc(flavorPtr, flavorBytes.length);
+    }
+    if (resultPtr !== 0 && resultLen > 0) {
+      wasm.wasm_dealloc(resultPtr, resultLen);
+    }
   }
 }

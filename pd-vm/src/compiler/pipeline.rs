@@ -27,6 +27,14 @@ pub struct UnknownInferredLocal {
     pub span: Option<crate::compiler::source_map::Span>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InferredLocalTypeHint {
+    pub name: String,
+    pub inferred_type: String,
+    pub declared_line: Option<u32>,
+    pub last_line: Option<u32>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct CompileBehavior {
     clear_dead_locals: bool,
@@ -72,7 +80,12 @@ fn collect_local_debug_ranges(
             .last()
             .map(stmt_source_line)
             .unwrap_or(1);
-        record_expr_local_debug_ranges(&function_impl.body_expr, fallback_line, &mut ranges);
+        let body_expr_line = if function_impl.body_expr_line > 0 {
+            function_impl.body_expr_line
+        } else {
+            fallback_line
+        };
+        record_expr_local_debug_ranges(&function_impl.body_expr, body_expr_line, &mut ranges);
     }
     ranges
 }
@@ -466,6 +479,42 @@ pub fn lint_unknown_inferred_local_types(
     lint_unknown_inferred_local_types_impl(source, flavor)
 }
 
+pub fn collect_inferred_local_type_hints(
+    source: &str,
+    flavor: SourceFlavor,
+) -> Result<Vec<InferredLocalTypeHint>, SourceError> {
+    collect_inferred_local_type_hints_impl(source, flavor)
+}
+
+pub fn collect_inferred_local_type_hints_with_options(
+    source: &str,
+    flavor: SourceFlavor,
+    options: CompileSourceFileOptions,
+) -> Result<Vec<InferredLocalTypeHint>, SourcePathError> {
+    let source_owned = source.to_string();
+    run_with_compiler_stack(move || {
+        collect_inferred_local_type_hints_with_options_impl(&source_owned, flavor, &options)
+    })
+}
+
+pub fn collect_inferred_local_type_hints_at_path_with_options(
+    path: impl AsRef<Path>,
+    source: &str,
+    flavor: SourceFlavor,
+    options: CompileSourceFileOptions,
+) -> Result<Vec<InferredLocalTypeHint>, SourcePathError> {
+    let path = path.as_ref().to_path_buf();
+    let source_owned = source.to_string();
+    run_with_compiler_stack(move || {
+        collect_inferred_local_type_hints_at_path_with_options_impl(
+            &path,
+            &source_owned,
+            flavor,
+            &options,
+        )
+    })
+}
+
 pub fn lint_unknown_inferred_local_types_with_options(
     source: &str,
     flavor: SourceFlavor,
@@ -511,6 +560,18 @@ fn lint_unknown_inferred_local_types_impl(
     ))
 }
 
+fn collect_inferred_local_type_hints_impl(
+    source: &str,
+    flavor: SourceFlavor,
+) -> Result<Vec<InferredLocalTypeHint>, SourceError> {
+    let mut source_map = SourceMap::new();
+    let source_id = source_map.add_source("<source>", source.to_string());
+    let parsed = frontends::parse_source(source, flavor).map_err(|err| {
+        SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
+    })?;
+    Ok(collect_named_local_type_hints(parsed))
+}
+
 fn lint_unknown_inferred_local_types_with_options_impl(
     source: &str,
     flavor: SourceFlavor,
@@ -523,6 +584,20 @@ fn lint_unknown_inferred_local_types_with_options_impl(
 
     let path = virtual_inmemory_entry_path(flavor);
     lint_unknown_inferred_local_types_at_path_with_options_impl(&path, source, flavor, options)
+}
+
+fn collect_inferred_local_type_hints_with_options_impl(
+    source: &str,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+) -> Result<Vec<InferredLocalTypeHint>, SourcePathError> {
+    if !options.has_module_overrides() {
+        return collect_inferred_local_type_hints_impl(source, flavor)
+            .map_err(SourcePathError::Source);
+    }
+
+    let path = virtual_inmemory_entry_path(flavor);
+    collect_inferred_local_type_hints_at_path_with_options_impl(&path, source, flavor, options)
 }
 
 fn lint_unknown_inferred_local_types_at_path_with_options_impl(
@@ -544,6 +619,21 @@ fn lint_unknown_inferred_local_types_at_path_with_options_impl(
         source_id,
         parsed,
     ))
+}
+
+fn collect_inferred_local_type_hints_at_path_with_options_impl(
+    path: &Path,
+    source: &str,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+) -> Result<Vec<InferredLocalTypeHint>, SourcePathError> {
+    let (_root_parse_source, units) = load_units_for_source_file(path, flavor, source, options)?;
+    let parsed = units
+        .into_iter()
+        .last()
+        .map(|unit| unit.parsed)
+        .expect("root parsed unit should always be present");
+    Ok(collect_named_local_type_hints(parsed))
 }
 
 fn collect_unknown_inferred_local_types(
@@ -584,6 +674,131 @@ fn collect_unknown_inferred_local_types(
         });
     }
     warnings
+}
+
+fn collect_named_local_type_hints(parsed: FrontendIr) -> Vec<InferredLocalTypeHint> {
+    let slot_ranges = collect_local_debug_ranges(&parsed.stmts, &parsed.function_impls);
+    let function_decl_lines = collect_function_decl_lines(&parsed.stmts);
+    let parsed = typing::legalize_builtins_and_bind_types(parsed);
+    let type_info = typing::infer_types(&parsed);
+
+    let mut hints = Vec::new();
+    for (name, slot) in &parsed.local_bindings {
+        hints.push(InferredLocalTypeHint {
+            name: name.clone(),
+            inferred_type: inferred_slot_type_name(&type_info, *slot),
+            declared_line: slot_ranges.get(slot).and_then(|range| range.declared_line),
+            last_line: slot_ranges.get(slot).and_then(|range| range.last_line),
+        });
+    }
+
+    for decl in &parsed.functions {
+        let Some(function_impl) = parsed.function_impls.get(&decl.index) else {
+            continue;
+        };
+        let declared_line = function_decl_lines.get(&decl.index).copied();
+        let last_line = function_scope_last_line(function_impl).or(declared_line);
+        for (name, slot) in decl.args.iter().zip(function_impl.param_slots.iter()) {
+            hints.push(InferredLocalTypeHint {
+                name: name.clone(),
+                inferred_type: inferred_slot_type_name(&type_info, *slot),
+                declared_line: slot_ranges
+                    .get(slot)
+                    .and_then(|range| range.declared_line)
+                    .or(declared_line),
+                last_line: slot_ranges
+                    .get(slot)
+                    .and_then(|range| range.last_line)
+                    .or(last_line),
+            });
+        }
+    }
+
+    hints
+}
+
+fn inferred_slot_type_name(type_info: &typing::TypeInferenceResult, slot: LocalSlot) -> String {
+    let slot_index = usize::from(slot);
+    if type_info
+        .callable_slots
+        .get(slot_index)
+        .copied()
+        .unwrap_or(false)
+    {
+        return "function".to_string();
+    }
+    value_type_name(
+        type_info
+            .local_types
+            .get(slot_index)
+            .copied()
+            .unwrap_or(crate::ValueType::Unknown),
+    )
+    .to_string()
+}
+
+fn value_type_name(value: crate::ValueType) -> &'static str {
+    match value {
+        crate::ValueType::Unknown => "unknown",
+        crate::ValueType::Null => "null",
+        crate::ValueType::Int => "int",
+        crate::ValueType::Float => "float",
+        crate::ValueType::Bool => "bool",
+        crate::ValueType::String => "string",
+        crate::ValueType::Array => "array",
+        crate::ValueType::Map => "map",
+    }
+}
+
+fn collect_function_decl_lines(stmts: &[Stmt]) -> HashMap<u16, u32> {
+    let mut lines = HashMap::new();
+    record_function_decl_lines(stmts, &mut lines);
+    lines
+}
+
+fn record_function_decl_lines(stmts: &[Stmt], lines: &mut HashMap<u16, u32>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::FuncDecl { index, line, .. } => {
+                lines.insert(*index, *line);
+            }
+            Stmt::IfElse {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                record_function_decl_lines(then_branch, lines);
+                record_function_decl_lines(else_branch, lines);
+            }
+            Stmt::For {
+                init, post, body, ..
+            } => {
+                record_function_decl_lines(std::slice::from_ref(init.as_ref()), lines);
+                record_function_decl_lines(std::slice::from_ref(post.as_ref()), lines);
+                record_function_decl_lines(body, lines);
+            }
+            Stmt::While { body, .. } => {
+                record_function_decl_lines(body, lines);
+            }
+            Stmt::Noop { .. }
+            | Stmt::Let { .. }
+            | Stmt::Assign { .. }
+            | Stmt::ClosureLet { .. }
+            | Stmt::Expr { .. }
+            | Stmt::Break { .. }
+            | Stmt::Continue { .. }
+            | Stmt::Drop { .. } => {}
+        }
+    }
+}
+
+fn function_scope_last_line(function_impl: &FunctionImpl) -> Option<u32> {
+    let stmt_last_line = function_impl.body_stmts.last().map(stmt_source_line);
+    match stmt_last_line {
+        Some(line) => Some(line.max(function_impl.body_expr_line)),
+        None if function_impl.body_expr_line > 0 => Some(function_impl.body_expr_line),
+        None => None,
+    }
 }
 
 fn find_local_name_span(

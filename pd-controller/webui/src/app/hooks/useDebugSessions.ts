@@ -6,6 +6,7 @@ import { looksLikeIdentifier, normalizeFlavor } from "@/app/helpers";
 import { lintWithWasm } from "@/app/lint/wasmLinter";
 import { LINT_MARKER_OWNER, lintFailureMarker, lintMarkersFromReport } from "@/app/monaco/lintMarkers";
 import { ensureCompletionCatalogProviders, lookupCallableHover } from "@/app/monaco/completionCatalog";
+import { getLocalTypeHints, lookupLocalTypeHover, lookupVisibleLocalTypeHint } from "@/app/monaco/localTypeHover";
 import { ensureRustScriptLanguage } from "@/app/monaco/rustscriptLanguage";
 import type {
   DebugCommandRequest,
@@ -387,6 +388,26 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
     return inflight;
   }, []);
 
+  const formatDebugHoverValue = useCallback((value: string | null, inferredType: string | null) => {
+    const runtimeValue = value ?? "(unavailable)";
+    return inferredType ? `${runtimeValue} | type: ${inferredType}` : runtimeValue;
+  }, []);
+
+  const resolveCompileTimeHoverType = useCallback(
+    async (session: DebugSessionDetail, variable: string, line: number, model: Monaco.editor.ITextModel) => {
+      if (!session.source_code) {
+        return null;
+      }
+      const hints = await getLocalTypeHints(
+        `${model.uri.toString()}:${model.getVersionId()}`,
+        session.source_code,
+        normalizeFlavor(session.source_flavor ?? "")
+      );
+      return lookupVisibleLocalTypeHint(hints, variable, line)?.inferredType ?? null;
+    },
+    []
+  );
+
   const onDebugEditorMount: OnMount = useCallback((editor, monaco) => {
     ensureRustScriptLanguage(monaco);
     void ensureCompletionCatalogProviders(monaco);
@@ -453,17 +474,33 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
       debugHoverActiveKeyRef.current = cacheKey;
       setDebugHoveredVar(word.word);
       const cached = debugHoverCacheRef.current.get(cacheKey);
+      const lineNumber = position.lineNumber;
       if (cached) {
-        setDebugHoverValue(cached);
+        resolveCompileTimeHoverType(session, word.word, lineNumber, model)
+          .then((inferredType) => {
+            if (debugHoverActiveKeyRef.current !== cacheKey) {
+              return;
+            }
+            setDebugHoverValue(formatDebugHoverValue(cached, inferredType));
+          })
+          .catch(() => {
+            if (debugHoverActiveKeyRef.current !== cacheKey) {
+              return;
+            }
+            setDebugHoverValue(cached);
+          });
         return;
       }
       setDebugHoverValue("(loading)");
-      resolveDebugHoverValue(session, word.word)
-        .then((value) => {
+      Promise.all([
+        resolveDebugHoverValue(session, word.word),
+        resolveCompileTimeHoverType(session, word.word, lineNumber, model).catch(() => null)
+      ])
+        .then(([value, inferredType]) => {
           if (debugHoverActiveKeyRef.current !== cacheKey) {
             return;
           }
-          setDebugHoverValue(value ?? "(unavailable)");
+          setDebugHoverValue(formatDebugHoverValue(value, inferredType));
         })
         .catch(() => {
           if (debugHoverActiveKeyRef.current !== cacheKey) {
@@ -479,7 +516,7 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
       setDebugHoveredVar("");
       setDebugHoverValue("");
     });
-  }, [resolveDebugHoverValue]);
+  }, [formatDebugHoverValue, resolveCompileTimeHoverType, resolveDebugHoverValue]);
 
   useEffect(() => {
     const editor = debugEditorRef.current;
@@ -504,24 +541,44 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
           return null;
         }
         const callableHover = await lookupCallableHover(monaco, hoverModel, position);
-        if (callableHover) {
-          return null;
-        }
+        const compileTypeHover = session.source_code
+          ? await lookupLocalTypeHover(
+              hoverModel,
+              position,
+              session.source_code,
+              normalizeFlavor(session.source_flavor ?? ""),
+              `${hoverModel.uri.toString()}:${hoverModel.getVersionId()}`,
+              monaco
+            )
+          : null;
         const word = hoverModel.getWordAtPosition(position);
         if (!word || !looksLikeIdentifier(word.word)) {
-          return null;
+          if (callableHover && compileTypeHover) {
+            return {
+              range: callableHover.range ?? compileTypeHover.hover.range,
+              contents: [...callableHover.contents, ...compileTypeHover.hover.contents]
+            };
+          }
+          return callableHover ?? compileTypeHover?.hover ?? null;
         }
 
-        const cacheKey = `${session.session_id}:${word.word}:${session.current_line ?? 0}`;
         const value = await resolveDebugHoverValue(session, word.word);
-        if (!value) {
-          return null;
-        }
+        const inferredType = compileTypeHover?.hint.inferredType ?? null;
         setDebugHoveredVar(word.word);
-        setDebugHoverValue(value);
+        setDebugHoverValue(formatDebugHoverValue(value, inferredType));
+        if (!value && !compileTypeHover) {
+          return callableHover ?? null;
+        }
+        const contents = [{ value: `**${word.word}**` }];
+        if (compileTypeHover) {
+          contents.push(...compileTypeHover.hover.contents);
+        }
+        if (value) {
+          contents.push({ value: `\`\`\`text\n${value}\n\`\`\`` });
+        }
         return {
           range: new monaco.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn),
-          contents: [{ value: `**${word.word}**` }, { value: `\`\`\`text\n${value}\n\`\`\`` }]
+          contents
         };
       }
     });
@@ -529,7 +586,14 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
       debugHoverProviderDisposableRef.current?.dispose();
       debugHoverProviderDisposableRef.current = null;
     };
-  }, [debugEditorReadyTick, resolveDebugHoverValue, selectedDebugSessionId, selectedDebugSession?.source_code, selectedDebugSession?.source_flavor]);
+  }, [
+    debugEditorReadyTick,
+    formatDebugHoverValue,
+    resolveDebugHoverValue,
+    selectedDebugSessionId,
+    selectedDebugSession?.source_code,
+    selectedDebugSession?.source_flavor
+  ]);
 
   useEffect(() => {
     const editor = debugEditorRef.current;
