@@ -630,6 +630,10 @@ fn encode_trace_step(step: &TraceStep, out: &mut Vec<u8>) -> VmResult<()> {
             out.push(21);
             write_aot_u32(*exit_ip, "guard exit_ip", out)?;
         }
+        TraceStep::GuardTrue { exit_ip } => {
+            out.push(43);
+            write_aot_u32(*exit_ip, "guard exit_ip", out)?;
+        }
         TraceStep::JumpToIp { target_ip } => {
             out.push(22);
             write_aot_u32(*target_ip, "jump target_ip", out)?;
@@ -691,6 +695,9 @@ fn decode_trace_step(cursor: &mut AotCursor<'_>) -> VmResult<TraceStep> {
             call_ip: cursor.read_u32("call_ip")? as usize,
         },
         21 => TraceStep::GuardFalse {
+            exit_ip: cursor.read_u32("guard exit_ip")? as usize,
+        },
+        43 => TraceStep::GuardTrue {
             exit_ip: cursor.read_u32("guard exit_ip")? as usize,
         },
         22 => TraceStep::JumpToIp {
@@ -836,7 +843,7 @@ fn validate_aot_trace(trace: &JitTrace, code_len: usize) -> VmResult<()> {
                     )));
                 }
             }
-            TraceStep::GuardFalse { exit_ip } => {
+            TraceStep::GuardFalse { exit_ip } | TraceStep::GuardTrue { exit_ip } => {
                 if *exit_ip >= code_len {
                     return Err(VmError::JitNative(format!(
                         "trace {} guard exit_ip {} is out of range for code_len {}",

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::builtins::BuiltinFunction;
 use crate::debug_info::DebugInfo;
-use crate::vm::{OpCode, Program, ValueType};
+use crate::vm::{OpCode, Program, Value, ValueType};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JitConfig {
@@ -124,6 +124,9 @@ pub enum TraceStep {
         call_ip: usize,
     },
     GuardFalse {
+        exit_ip: usize,
+    },
+    GuardTrue {
         exit_ip: usize,
     },
     JumpToIp {
@@ -695,7 +698,16 @@ impl TraceJitEngine {
                     return Err(JitNyiReason::InvalidJumpTarget { target });
                 }
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::GuardFalse { exit_ip: target });
+                if can_prefer_join_path(program, &steps)
+                    && let Some(side_entry_ip) = straight_line_if_join_side_entry(code, ip, target)
+                {
+                    steps.push(TraceStep::GuardTrue {
+                        exit_ip: side_entry_ip,
+                    });
+                    ip = target;
+                } else {
+                    steps.push(TraceStep::GuardFalse { exit_ip: target });
+                }
                 continue;
             }
             if opcode == OpCode::Br as u8 {
@@ -910,7 +922,16 @@ impl TraceJitEngine {
                     return Err(JitNyiReason::InvalidJumpTarget { target });
                 }
                 step_ips.push(instr_ip);
-                steps.push(TraceStep::GuardFalse { exit_ip: target });
+                if can_prefer_join_path(program, &steps)
+                    && let Some(side_entry_ip) = straight_line_if_join_side_entry(code, ip, target)
+                {
+                    steps.push(TraceStep::GuardTrue {
+                        exit_ip: side_entry_ip,
+                    });
+                    ip = target;
+                } else {
+                    steps.push(TraceStep::GuardFalse { exit_ip: target });
+                }
                 continue;
             }
             if opcode == OpCode::Br as u8 {
@@ -1047,6 +1068,37 @@ fn read_u32(code: &[u8], ip: &mut usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes))
 }
 
+fn straight_line_if_join_side_entry(code: &[u8], side_start: usize, join_ip: usize) -> Option<usize> {
+    let mut cursor = side_start;
+    while cursor < join_ip {
+        let opcode = OpCode::try_from(*code.get(cursor)?).ok()?;
+        cursor = cursor.saturating_add(1);
+        match opcode {
+            OpCode::Br => {
+                let target = read_u32(code, &mut cursor)? as usize;
+                return (target == join_ip && cursor == join_ip).then_some(side_start);
+            }
+            OpCode::Brfalse | OpCode::Ret => return None,
+            _ => {
+                let operand_len = opcode.operand_len();
+                if cursor.saturating_add(operand_len) > join_ip {
+                    return None;
+                }
+                cursor = cursor.saturating_add(operand_len);
+            }
+        }
+    }
+    None
+}
+
+fn can_prefer_join_path(program: &Program, steps: &[TraceStep]) -> bool {
+    !matches!(
+        steps.last(),
+        Some(TraceStep::Ldc(index))
+            if matches!(program.constants.get(*index as usize), Some(Value::Bool(_)))
+    )
+}
+
 fn typed_trace_step(program: &Program, ip: usize, opcode: u8) -> TraceStep {
     let operand_types = program
         .type_map
@@ -1126,6 +1178,7 @@ fn trace_step_name(step: &TraceStep) -> &'static str {
         TraceStep::BuiltinCall { .. } => "call",
         TraceStep::Call { .. } => "call",
         TraceStep::GuardFalse { .. } => "guard_false",
+        TraceStep::GuardTrue { .. } => "guard_true",
         TraceStep::JumpToIp { .. } => "jump_ip",
         TraceStep::JumpToRoot => "jump_root",
         TraceStep::Ret => "ret",

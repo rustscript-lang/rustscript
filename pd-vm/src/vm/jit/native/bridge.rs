@@ -45,6 +45,7 @@ fn bridge_name_for_op(op: i64) -> Option<&'static str> {
         OP_CALL => Some("call"),
         OP_BUILTIN_CALL => Some("builtin_call"),
         OP_GUARD_FALSE => Some("guard_false"),
+        OP_GUARD_TRUE => Some("guard_true"),
         OP_JUMP => Some("jump_ip"),
         _ => None,
     }
@@ -227,6 +228,16 @@ pub(super) extern "C" fn pd_vm_cranelift_step(vm: *mut Vm, op: i64, a: i64, b: i
                     .map_err(|_| VmError::JitNative("guard exit ip out of range".to_string()))?;
                 let condition = vm.pop_bool()?;
                 if !condition {
+                    vm.jump_to(exit_ip)?;
+                    return Ok(STATUS_TRACE_EXIT);
+                }
+                Ok(STATUS_CONTINUE)
+            }
+            OP_GUARD_TRUE => {
+                let exit_ip = usize::try_from(a)
+                    .map_err(|_| VmError::JitNative("guard exit ip out of range".to_string()))?;
+                let condition = vm.pop_bool()?;
+                if condition {
                     vm.jump_to(exit_ip)?;
                     return Ok(STATUS_TRACE_EXIT);
                 }

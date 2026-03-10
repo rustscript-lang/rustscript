@@ -484,6 +484,14 @@ impl Vm {
                         return Ok(ExecOutcome::Continue);
                     }
                 }
+                TraceStep::GuardTrue { exit_ip } => {
+                    let condition = self.pop_bool()?;
+                    if condition {
+                        self.jump_to(*exit_ip)?;
+                        self.jit.mark_trace_executed(trace_id);
+                        return Ok(ExecOutcome::Continue);
+                    }
+                }
                 TraceStep::JumpToIp { target_ip } => {
                     self.jump_to(*target_ip)?;
                     self.jit.mark_trace_executed(trace_id);

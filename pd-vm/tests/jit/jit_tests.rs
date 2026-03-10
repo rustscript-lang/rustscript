@@ -922,6 +922,59 @@ fn trace_jit_records_typed_float_and_string_add_steps() {
 }
 
 #[test]
+fn trace_jit_keeps_join_path_inline_for_straight_line_if_diamond() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let mut i = 0;
+        let mut acc = 0;
+        while i < 64 {
+            acc = acc + 250;
+            if acc > 1000 {
+                acc = acc - 1000;
+            }
+            i = i + 1;
+        }
+        acc;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1000)]);
+
+    let snapshot = vm.jit_snapshot();
+    let loop_trace = snapshot
+        .traces
+        .iter()
+        .find(|trace| {
+            trace.terminal == JitTraceTerminal::LoopBack
+                && trace
+                    .steps
+                    .iter()
+                    .any(|step| matches!(step, TraceStep::GuardTrue { .. }))
+        })
+        .expect("expected loop trace with join-path guard");
+    assert!(
+        loop_trace
+            .steps
+            .iter()
+            .any(|step| matches!(step, TraceStep::JumpToRoot)),
+        "expected loop trace to continue through the join path, dump:\n{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
 fn trace_jit_executes_typed_float_math_without_helper_bridge() {
     if !native_jit_supported() {
         return;

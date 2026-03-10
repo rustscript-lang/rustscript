@@ -64,6 +64,7 @@ const OP_CALL: i64 = 21;
 const OP_GUARD_FALSE: i64 = 22;
 const OP_JUMP: i64 = 23;
 const OP_BUILTIN_CALL: i64 = 24;
+const OP_GUARD_TRUE: i64 = 25;
 
 pub(crate) struct CompiledTrace {
     pub(crate) entry: *const u8,
