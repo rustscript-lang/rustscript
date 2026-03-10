@@ -1260,14 +1260,16 @@ impl Compiler {
     }
 
     fn emit_move_ldloc(&mut self, slot: LocalSlot) -> Result<(), CompileError> {
-        self.assembler.ldloc(local_slot_operand(slot)?);
+        let operand = local_slot_operand(slot)?;
+        self.assembler.ldloc(operand);
+        self.assembler.push_const(Value::Null);
+        self.assembler.stloc(operand);
         Ok(())
     }
 
     fn emit_copy_ldloc(&mut self, slot: LocalSlot) -> Result<(), CompileError> {
-        self.emit_move_ldloc(slot)?;
-        self.assembler.dup();
-        self.emit_stloc(slot)
+        self.assembler.ldloc(local_slot_operand(slot)?);
+        Ok(())
     }
 
     fn emit_stloc(&mut self, slot: LocalSlot) -> Result<(), CompileError> {
