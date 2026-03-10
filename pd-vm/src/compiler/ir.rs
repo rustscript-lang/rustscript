@@ -145,6 +145,7 @@ pub enum Stmt {
         arity: u8,
         args: Vec<String>,
         exported: bool,
+        has_impl: bool,
         line: u32,
     },
     Expr {
@@ -199,6 +200,7 @@ pub struct FunctionImpl {
     pub capture_copies: Vec<(LocalSlot, LocalSlot)>,
     pub body_stmts: Vec<Stmt>,
     pub body_expr: Expr,
+    pub body_expr_line: u32,
 }
 
 #[derive(Clone, Debug)]

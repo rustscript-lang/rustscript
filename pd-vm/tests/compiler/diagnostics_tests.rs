@@ -2,8 +2,9 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vm::{
-    ParseError, SourceError, SourceMap, SourcePathError, Span, Vm, compile_source,
-    compile_source_file, render_compile_error, render_source_error, render_vm_error,
+    ParseError, SourceError, SourceFlavor, SourceMap, SourcePathError, Span, Vm, compile_source,
+    compile_source_file, lint_unknown_inferred_local_types, render_compile_error,
+    render_source_error, render_vm_error,
 };
 
 #[test]
@@ -170,7 +171,9 @@ fn render_compile_error_highlights_invalid_schema_field_access_line() {
         other => panic!("expected compile error, got {other:?}"),
     };
 
-    let line = compile.line().expect("schema field access should report a line");
+    let line = compile
+        .line()
+        .expect("schema field access should report a line");
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("inline.rss", source);
     let line_text = source_map
@@ -182,4 +185,59 @@ fn render_compile_error_highlights_invalid_schema_field_access_line() {
     assert!(rendered.contains("field 'age' is not declared"));
     assert!(rendered.contains(&format!("inline.rss:{line}:1")));
     assert!(rendered.contains(line_text));
+}
+
+#[test]
+fn render_compile_error_highlights_captured_schema_field_access_inside_named_function() {
+    let source = r#"struct User { name: string }
+let user: User = { name: "Ada" };
+fn show_age() {
+    user.age;
+}
+show_age();
+"#;
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("compile should reject invalid captured schema field access"),
+        Err(err) => err,
+    };
+    let compile = match err {
+        SourceError::Compile(compile) => compile,
+        other => panic!("expected compile error, got {other:?}"),
+    };
+
+    let line = compile
+        .line()
+        .expect("captured schema field access should report a line");
+    let mut source_map = SourceMap::new();
+    let source_id = source_map.add_source("inline.rss", source);
+    let line_text = source_map
+        .file(source_id)
+        .and_then(|file| file.line_text(line))
+        .expect("line text should exist");
+    let rendered = render_compile_error(&source_map, &compile, false);
+
+    assert!(rendered.contains("field 'age' is not declared"));
+    assert!(rendered.contains(&format!("inline.rss:{line}:1")));
+    assert!(rendered.contains(line_text));
+}
+
+#[test]
+fn lint_unknown_inferred_local_types_includes_function_scope_locals() {
+    let source = r#"
+fn nothing() {
+    let a = [1, "2"];
+    let b = a[0];
+    0
+}
+"#;
+
+    let warnings = lint_unknown_inferred_local_types(source, SourceFlavor::RustScript)
+        .expect("lint should succeed");
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.name == "b" && warning.line == 4),
+        "expected function-local unknown inferred warning for 'b', got {warnings:?}"
+    );
 }

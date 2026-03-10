@@ -302,6 +302,7 @@ impl Parser {
         }
         let index = self.allocate_hidden_local()?;
         self.locals.insert(name.to_string(), index);
+        self.named_local_bindings.push((name.to_string(), index));
         Ok((index, true))
     }
 
@@ -319,6 +320,7 @@ impl Parser {
         }
         let index = self.allocate_hidden_local()?;
         self.locals.insert(binding.name.clone(), index);
+        self.named_local_bindings.push((binding.name.clone(), index));
         self.set_local_slot_mutable(index, binding.mutable);
         Ok(())
     }

@@ -992,7 +992,10 @@ mod runtime_tests {
             .span
             .as_ref()
             .expect("unknown inferred local warning should expose a span");
-        assert_eq!(span.start_line, 3, "warning should point at the declaration line");
+        assert_eq!(
+            span.start_line, 3,
+            "warning should point at the declaration line"
+        );
         assert!(
             span.end_col > span.start_col,
             "warning span should underline the declaration line"
@@ -1065,9 +1068,7 @@ mod runtime_tests {
         assert!(
             report.diagnostics.iter().any(|diagnostic| {
                 diagnostic.severity == LintSeverity::Error
-                    && diagnostic
-                        .message
-                        .contains("runtime::sleep")
+                    && diagnostic.message.contains("runtime::sleep")
             }),
             "expected the compile error to be preserved: {:?}",
             report.diagnostics
@@ -1098,7 +1099,10 @@ mod runtime_tests {
             "unexpected warning: {:?}",
             diagnostic
         );
-        let span = diagnostic.span.as_ref().expect("warning should expose a span");
+        let span = diagnostic
+            .span
+            .as_ref()
+            .expect("warning should expose a span");
         assert_eq!(span.start_line, 4);
         assert_eq!(span.start_col, 17);
         assert_eq!(span.end_col, 22);
@@ -1152,10 +1156,40 @@ mod runtime_tests {
             "unexpected warning: {:?}",
             diagnostic
         );
-        let span = diagnostic.span.as_ref().expect("warning should expose a span");
+        let span = diagnostic
+            .span
+            .as_ref()
+            .expect("warning should expose a span");
         assert_eq!(span.start_line, 4);
         assert_eq!(span.start_col, 17);
         assert_eq!(span.end_col, 22);
+    }
+
+    #[test]
+    fn lint_supports_super_stdlib_use_alias_without_a_real_file_path() {
+        let source = r#"
+            use super::stdlib::rss::strings as string;
+            let arr = [1, "two"];
+            let value = arr[0];
+            value;
+        "#;
+
+        let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
+        assert_eq!(
+            report.diagnostics.len(),
+            1,
+            "expected pathless lint to resolve super::stdlib aliases without an io error: {:?}",
+            report.diagnostics
+        );
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.severity, LintSeverity::Warning);
+        assert!(
+            diagnostic
+                .message
+                .contains("compiler could not determine the type of local 'value'"),
+            "unexpected warning: {:?}",
+            diagnostic
+        );
     }
 
     #[test]

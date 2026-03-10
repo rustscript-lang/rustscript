@@ -481,7 +481,9 @@ fn lint_unknown_inferred_local_types_impl(
         SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
     })?;
     Ok(collect_unknown_inferred_local_types(
-        &source_map, source_id, parsed,
+        &source_map,
+        source_id,
+        parsed,
     ))
 }
 
@@ -491,7 +493,8 @@ fn lint_unknown_inferred_local_types_with_options_impl(
     options: &CompileSourceFileOptions,
 ) -> Result<Vec<UnknownInferredLocal>, SourcePathError> {
     if !options.has_module_overrides() {
-        return lint_unknown_inferred_local_types_impl(source, flavor).map_err(SourcePathError::Source);
+        return lint_unknown_inferred_local_types_impl(source, flavor)
+            .map_err(SourcePathError::Source);
     }
 
     let path = virtual_inmemory_entry_path(flavor);
@@ -513,7 +516,9 @@ fn lint_unknown_inferred_local_types_at_path_with_options_impl(
         .map(|unit| unit.parsed)
         .expect("root parsed unit should always be present");
     Ok(collect_unknown_inferred_local_types(
-        &source_map, source_id, parsed,
+        &source_map,
+        source_id,
+        parsed,
     ))
 }
 
@@ -575,8 +580,8 @@ fn find_local_name_span(
                 .chars()
                 .next_back()
                 .is_some_and(is_ident_char);
-        let next_ok = end == line_text.len()
-            || !line_text[end..].chars().next().is_some_and(is_ident_char);
+        let next_ok =
+            end == line_text.len() || !line_text[end..].chars().next().is_some_and(is_ident_char);
         if prev_ok && next_ok {
             return Some(crate::compiler::source_map::Span::new(
                 source_id,
