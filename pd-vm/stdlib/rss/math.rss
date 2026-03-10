@@ -75,7 +75,7 @@ pub fn is_odd(value) {
 
 pub fn sum(values) {
     let mut out = 0;
-    for (let mut index = 0; index < (values).length; index = index + 1) {
+    for (let mut index = 0; index < values.length; index = index + 1) {
         out = out + values[index];
     }
     out;

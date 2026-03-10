@@ -1,10 +1,10 @@
 // Collection helpers implemented in pure RustScript.
 
 fn map_has_key(map, key) {
-    let mut keys = (map).keys;
+    let keys = (&map).keys;
     let mut found = false;
-    for (let mut key_index = 0; key_index < (keys).length; key_index = key_index + 1) {
-        if keys[key_index] == key {
+    for (let mut key_index = 0; key_index < (&keys).length; key_index = key_index + 1) {
+        if (&keys)[key_index] == key {
             found = true;
             break;
         }
@@ -18,7 +18,7 @@ pub fn append(lhs, rhs) {
 
 pub fn index_of(values, needle) {
     let mut found = -1;
-    for (let mut find_index = 0; find_index < (values).length; find_index = find_index + 1) {
+    for (let mut find_index = 0; find_index < values.length; find_index = find_index + 1) {
         if values[find_index] == needle {
             found = find_index;
             break;
@@ -34,21 +34,21 @@ pub fn contains(values, needle) {
 pub fn reverse(values) {
     let mut out = [];
     for (
-        let mut reverse_index = (values).length - 1;
+        let mut reverse_index = values.length - 1;
         reverse_index > -1;
         reverse_index = reverse_index - 1
     ) {
-        out[(out).length] = values[reverse_index];
+        out[out.length] = values[reverse_index];
     }
     out;
 }
 
 pub fn dedup(values) {
     let mut out = [];
-    for (let mut dedup_index = 0; dedup_index < (values).length; dedup_index = dedup_index + 1) {
-        let mut value = values[dedup_index];
+    for (let mut dedup_index = 0; dedup_index < values.length; dedup_index = dedup_index + 1) {
+        let value = values[dedup_index];
         if contains(out, value) == false {
-            out[(out).length] = value;
+            out[out.length] = value;
         }
     }
     out;
@@ -68,21 +68,21 @@ pub fn get_or(map, key, fallback) {
 }
 
 pub fn values(map) {
-    let mut keys = (map).keys;
+    let keys = (&map).keys;
     let mut out = [];
-    for (let mut value_index = 0; value_index < (keys).length; value_index = value_index + 1) {
-        let mut key = keys[value_index];
-        out[(out).length] = map[key];
+    for (let mut value_index = 0; value_index < (&keys).length; value_index = value_index + 1) {
+        let key = (&keys)[value_index];
+        out[out.length] = map[key];
     }
     out;
 }
 
 pub fn entries(map) {
-    let mut keys = (map).keys;
+    let keys = (&map).keys;
     let mut out = [];
-    for (let mut entry_index = 0; entry_index < (keys).length; entry_index = entry_index + 1) {
-        let mut key = keys[entry_index];
-        out[(out).length] = [key, map[key]];
+    for (let mut entry_index = 0; entry_index < (&keys).length; entry_index = entry_index + 1) {
+        let key = (&keys)[entry_index];
+        out[out.length] = [key, map[key]];
     }
     out;
 }
@@ -90,33 +90,33 @@ pub fn entries(map) {
 pub fn merge(lhs, rhs) {
     let mut out = {};
 
-    let mut lhs_keys = (lhs).keys;
-    for (let mut left_index = 0; left_index < (lhs_keys).length; left_index = left_index + 1) {
-        let mut key = lhs_keys[left_index];
+    let lhs_keys = (&lhs).keys;
+    for (let mut left_index = 0; left_index < (&lhs_keys).length; left_index = left_index + 1) {
+        let key = (&lhs_keys)[left_index];
         out[key] = lhs[key];
     }
 
-    let mut rhs_keys = (rhs).keys;
-    for (let mut right_index = 0; right_index < (rhs_keys).length; right_index = right_index + 1) {
-        let mut key = rhs_keys[right_index];
+    let rhs_keys = (&rhs).keys;
+    for (let mut right_index = 0; right_index < (&rhs_keys).length; right_index = right_index + 1) {
+        let key = (&rhs_keys)[right_index];
         out[key] = rhs[key];
     }
     out;
 }
 
 pub fn deep_compare(lhs, rhs) {
-    let mut pending = [[lhs, rhs]];
+    let mut left_pending = [lhs];
+    let mut right_pending = [rhs];
     let mut out = true;
 
-    while (pending).length > 0 {
-        let mut next_index = (pending).length - 1;
-        let mut next = pending[next_index].copy();
-        pending = pending[0:next_index];
-
-        let mut left = next[0];
-        let mut right = next[1];
-        let mut lhs_type = type(left);
-        let mut rhs_type = type(right);
+    while (&left_pending).length > 0 {
+        let next_index = (&left_pending).length - 1;
+        let left = (&left_pending)[next_index].copy();
+        let right = (&right_pending)[next_index].copy();
+        left_pending = left_pending[0:next_index];
+        right_pending = right_pending[0:next_index];
+        let lhs_type = type(left);
+        let rhs_type = type(right);
 
         if lhs_type != rhs_type {
             out = false;
@@ -124,30 +124,41 @@ pub fn deep_compare(lhs, rhs) {
         }
 
         if lhs_type == "array" {
-            if (left).length != (right).length {
+            if (&left).length != (&right).length {
                 out = false;
                 break;
             }
-            let mut index = (left).length - 1;
+            let mut index = (&left).length - 1;
             while index > -1 {
-                pending[(pending).length] = [left[index], right[index]];
+                left_pending[left_pending.length] = (&left)[index].copy();
+                right_pending[right_pending.length] = (&right)[index].copy();
                 index = index - 1;
             }
         } else if lhs_type == "map" {
-            let mut lhs_keys = (left).keys;
-            let mut rhs_keys = (right).keys;
-            if (lhs_keys).length != (rhs_keys).length {
+            let lhs_keys = (&left).keys;
+            let rhs_keys = (&right).keys;
+            if (&lhs_keys).length != (&rhs_keys).length {
                 out = false;
                 break;
             }
-            let mut index = (lhs_keys).length - 1;
+            let mut index = (&lhs_keys).length - 1;
             while index > -1 {
-                let mut key = lhs_keys[index];
-                if map_has_key(right, key) == false {
+                let key = (&lhs_keys)[index];
+                let mut key_found = false;
+                let mut rhs_index = (&rhs_keys).length - 1;
+                while rhs_index > -1 {
+                    if (&rhs_keys)[rhs_index] == key {
+                        key_found = true;
+                        break;
+                    }
+                    rhs_index = rhs_index - 1;
+                }
+                if key_found == false {
                     out = false;
                     break;
                 }
-                pending[(pending).length] = [left[key], right[key]];
+                left_pending[left_pending.length] = (&left)[key].copy();
+                right_pending[right_pending.length] = (&right)[key].copy();
                 index = index - 1;
             }
             if out == false {

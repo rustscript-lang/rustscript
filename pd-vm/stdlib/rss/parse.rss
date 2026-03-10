@@ -11,10 +11,10 @@ fn is_whitespace(ch) {
 }
 
 fn trim(value) {
-    let mut value_len = (value).length;
+    let value_len = (&value).length;
     let mut start = 0;
     while start < value_len {
-        if is_whitespace((value)[start:(start + 1)]) {
+        if is_whitespace((&value)[start:(start + 1)]) {
             start = start + 1;
         } else {
             break;
@@ -23,13 +23,13 @@ fn trim(value) {
 
     let mut end = value_len;
     while end > start {
-        if is_whitespace((value)[(end - 1):end]) {
+        if is_whitespace((&value)[(end - 1):end]) {
             end = end - 1;
         } else {
             break;
         }
     }
-    (value)[start:end];
+    (&value)[start:end];
 }
 
 fn digit_value(ch) {
@@ -105,14 +105,14 @@ fn is_valid_base(base) {
 }
 
 pub fn is_int_literal_base(value, base) {
-    let mut text = trim(value);
-    let mut text_len = (text).length;
+    let text = trim(value);
+    let text_len = (&text).length;
     let mut out = true;
     let mut index = 0;
     if is_valid_base(base) == false || text_len == 0 {
         out = false;
     } else {
-        let mut first = (text)[0:1];
+        let first = (&text)[0:1];
         if first == "+" || first == "-" {
             index = 1;
         }
@@ -120,7 +120,7 @@ pub fn is_int_literal_base(value, base) {
             out = false;
         } else {
             while index < text_len {
-                let mut digit = digit_value((text)[index:(index + 1)]);
+                let digit = digit_value((&text)[index:(index + 1)]);
                 if digit < 0 || digit >= base {
                     out = false;
                     break;
@@ -137,21 +137,21 @@ pub fn is_int_literal(value) {
 }
 
 pub fn try_parse_int_base(value, base) {
-    let mut text = trim(value);
+    let text = trim(value);
     let mut out = null;
     if is_int_literal_base(text, base) {
         let mut sign = 1;
         let mut index = 0;
         let mut parsed = 0;
-        let mut first = (text)[0:1];
+        let first = (&text)[0:1];
         if first == "-" {
             sign = -1;
             index = 1;
         } else if first == "+" {
             index = 1;
         }
-        while index < (text).length {
-            parsed = parsed * base + digit_value((text)[index:(index + 1)]);
+        while index < (&text).length {
+            parsed = parsed * base + digit_value((&text)[index:(index + 1)]);
             index = index + 1;
         }
         out = parsed * sign;

@@ -1,11 +1,11 @@
 use super::stdlib::rss::math as math_std;
 
 fn nearly_equal(lhs, rhs) {
-    math_std::abs(lhs - rhs) < 0.000001;
+    math_std::abs(lhs - rhs) < 0.000001
 }
 
 fn nearly_zero(value) {
-    nearly_equal(value, 0.0);
+    nearly_equal(value, 0.0)
 }
 
 fn clean(value) {
@@ -13,7 +13,7 @@ fn clean(value) {
     if nearly_zero(value) {
         out = 0.0;
     }
-    out;
+    out
 }
 
 fn exact_log2(value) {
@@ -33,7 +33,7 @@ fn exact_log2(value) {
     if valid {
         out = bits;
     }
-    out;
+    out
 }
 
 fn reverse_bits(index, bit_count) {
@@ -45,21 +45,21 @@ fn reverse_bits(index, bit_count) {
         value = value / 2;
         i = i + 1;
     }
-    out;
+    out
 }
 
 fn ifft(freq_re, freq_im) {
-    let mut n = (freq_re).length;
-    assert(n == (freq_im).length);
+    let n = freq_re.length;
+    assert(n == freq_im.length);
 
-    let mut bit_count = exact_log2(n);
+    let bit_count = exact_log2(n);
     assert(bit_count >= 0);
 
     let mut out_re = [];
     let mut out_im = [];
     let mut i = 0;
     while i < n {
-        let mut j = reverse_bits(i, bit_count);
+        let j = reverse_bits(i, bit_count);
         out_re[i] = freq_re[j];
         out_im[i] = freq_im[j];
         i = i + 1;
@@ -70,18 +70,18 @@ fn ifft(freq_re, freq_im) {
         let mut half = size / 2;
         let mut j = 0;
         while j < half {
-            let mut angle = 2.0 * math_std::pi() * j / size;
-            let mut wr = math_std::cos(angle);
-            let mut wi = math_std::sin(angle);
+            let angle = 2.0 * math_std::pi() * j / size;
+            let wr = math_std::cos(angle);
+            let wi = math_std::sin(angle);
             let mut k = j;
             while k < n {
-                let mut pair = k + half;
-                let mut even_re = out_re[k];
-                let mut even_im = out_im[k];
-                let mut odd_re = out_re[pair];
-                let mut odd_im = out_im[pair];
-                let mut t_re = odd_re * wr - odd_im * wi;
-                let mut t_im = odd_re * wi + odd_im * wr;
+                let pair = k + half;
+                let even_re = (&out_re)[k];
+                let even_im = (&out_im)[k];
+                let odd_re = (&out_re)[pair];
+                let odd_im = (&out_im)[pair];
+                let t_re = odd_re * wr - odd_im * wi;
+                let t_im = odd_re * wi + odd_im * wr;
 
                 out_re[k] = even_re + t_re;
                 out_im[k] = even_im + t_im;
@@ -95,7 +95,7 @@ fn ifft(freq_re, freq_im) {
         size = size * 2;
     }
 
-    let mut scale = 1.0 / n;
+    let scale = 1.0 / n;
     i = 0;
     while i < n {
         out_re[i] = clean(out_re[i] * scale);
@@ -103,16 +103,16 @@ fn ifft(freq_re, freq_im) {
         i = i + 1;
     }
 
-    { re: out_re, im: out_im };
+    { re: out_re, im: out_im }
 }
 
 // These bins are the forward DFT of [1, 2, 3, 4].
-let mut spectrum_re = [10.0, -2.0, -2.0, -2.0];
-let mut spectrum_im = [0.0, 2.0, 0.0, -2.0];
+let spectrum_re = [10.0, -2.0, -2.0, -2.0];
+let spectrum_im = [0.0, 2.0, 0.0, -2.0];
 
-let mut signal = ifft(spectrum_re, spectrum_im);
-let mut signal_re = signal.re;
-let mut signal_im = signal.im;
+let signal = ifft(spectrum_re, spectrum_im);
+let signal_re = signal.re;
+let signal_im = signal.im;
 
 let sample0 = signal_re[0];
 let sample1 = signal_re[1];

@@ -1,11 +1,11 @@
 use self::crypto::aes_128_cbc as aes;
 
-let mut key = "2b7e151628aed2a6abf7158809cf4f3c";
-let mut iv = "000102030405060708090a0b0c0d0e0f";
-let mut plaintext = "6bc1bee22e409f96e93d7e117393172a";
+let key = "2b7e151628aed2a6abf7158809cf4f3c";
+let iv = "000102030405060708090a0b0c0d0e0f";
+let plaintext = "6bc1bee22e409f96e93d7e117393172a";
 
-let mut ciphertext = aes::encrypt_cbc_hex(plaintext, key, iv);
-let mut decrypted = aes::decrypt_cbc_hex(ciphertext, key, iv);
+let ciphertext = aes::encrypt_cbc_hex(plaintext, key, iv);
+let decrypted = aes::decrypt_cbc_hex(ciphertext, key, iv);
 
 assert(decrypted == plaintext);
 

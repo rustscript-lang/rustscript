@@ -15,7 +15,7 @@ pub fn equals(lhs, rhs) {
 }
 
 pub fn is_empty(value) {
-    (value).length == 0;
+    value.length == 0;
 }
 
 pub fn non_empty(value) {
@@ -23,15 +23,15 @@ pub fn non_empty(value) {
 }
 
 pub fn contains(haystack, needle) {
-    let haystack_len = (haystack).length;
-    let needle_len = (needle).length;
+    let haystack_len = haystack.length;
+    let needle_len = needle.length;
     let out = if needle_len == 0 => {
         true
     } else => {
         let mut found = false;
         let limit = haystack_len - needle_len + 1;
         for (let mut index = 0; index < limit; index = index + 1) {
-            if equals((haystack)[index:(index + needle_len)], needle) {
+            if equals(haystack[index:(index + needle_len)], needle) {
                 found = true;
                 break;
             }
@@ -42,12 +42,12 @@ pub fn contains(haystack, needle) {
 }
 
 pub fn split(value, separator) {
-    let value_len = (value).length;
-    let separator_len = (separator).length;
+    let value_len = value.length;
+    let separator_len = separator.length;
     let out = if separator_len == 0 => {
         let mut out = [];
         for (let mut char_index = 0; char_index < value_len; char_index = char_index + 1) {
-            out[(out).length] = (value)[char_index:(char_index + 1)];
+            out[out.length] = value[char_index:(char_index + 1)];
         }
         out
     } else => {
@@ -56,25 +56,25 @@ pub fn split(value, separator) {
         let mut part_start = 0;
         let limit = value_len - separator_len + 1;
         while cursor < limit {
-            if equals((value)[cursor:(cursor + separator_len)], separator) {
-                out[(out).length] = (value)[part_start:cursor];
+            if equals(value[cursor:(cursor + separator_len)], separator) {
+                out[out.length] = value[part_start:cursor];
                 part_start = cursor + separator_len;
                 cursor = part_start;
             } else {
                 cursor = cursor + 1;
             }
         }
-        out[(out).length] = (value)[part_start:value_len];
+        out[out.length] = value[part_start:value_len];
         out
     };
     out;
 }
 
 pub fn trim(value) {
-    let trim_len = (value).length;
+    let trim_len = value.length;
     let mut trim_start = 0;
     while trim_start < trim_len {
-        if is_whitespace((value)[trim_start:(trim_start + 1)]) {
+        if is_whitespace(value[trim_start:(trim_start + 1)]) {
             trim_start = trim_start + 1;
         } else {
             break;
@@ -83,18 +83,18 @@ pub fn trim(value) {
 
     let mut trim_end = trim_len;
     while trim_end > trim_start {
-        if is_whitespace((value)[(trim_end - 1):trim_end]) {
+        if is_whitespace(value[(trim_end - 1):trim_end]) {
             trim_end = trim_end - 1;
         } else {
             break;
         }
     }
-    (value)[trim_start:trim_end];
+    value[trim_start:trim_end];
 }
 
 pub fn replace(value, needle, replacement) {
-    let value_len = (value).length;
-    let needle_len = (needle).length;
+    let value_len = value.length;
+    let needle_len = needle.length;
     let out = if needle_len == 0 => {
         value
     } else => {
@@ -102,13 +102,13 @@ pub fn replace(value, needle, replacement) {
         let mut output = "";
         while index < value_len {
             if index + needle_len > value_len {
-                output = output + (value)[index:(index + 1)];
+                output = output + value[index:(index + 1)];
                 index = index + 1;
-            } else if equals((value)[index:(index + needle_len)], needle) {
+            } else if equals(value[index:(index + needle_len)], needle) {
                 output = output + replacement;
                 index = index + needle_len;
             } else {
-                output = output + (value)[index:(index + 1)];
+                output = output + value[index:(index + 1)];
                 index = index + 1;
             }
         }

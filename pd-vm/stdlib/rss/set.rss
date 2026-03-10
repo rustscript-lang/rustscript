@@ -2,7 +2,7 @@
 
 fn index_of(values, needle) {
     let mut out = -1;
-    for (let mut index = 0; index < (values).length; index = index + 1) {
+    for (let mut index = 0; index < values.length; index = index + 1) {
         if values[index] == needle {
             out = index;
             break;
@@ -17,10 +17,10 @@ pub fn has(values, needle) {
 
 pub fn from(values) {
     let mut out = [];
-    for (let mut index = 0; index < (values).length; index = index + 1) {
-        let mut value = values[index];
+    for (let mut index = 0; index < values.length; index = index + 1) {
+        let value = values[index];
         if has(out, value) == false {
-            out[(out).length] = value;
+            out[out.length] = value;
         }
     }
     out;
@@ -29,17 +29,17 @@ pub fn from(values) {
 pub fn add(values, needle) {
     let mut out = from(values);
     if has(out, needle) == false {
-        out[(out).length] = needle;
+        out[out.length] = needle;
     }
     out;
 }
 
 pub fn remove(values, needle) {
     let mut out = [];
-    for (let mut index = 0; index < (values).length; index = index + 1) {
-        let mut value = values[index];
+    for (let mut index = 0; index < values.length; index = index + 1) {
+        let value = values[index];
         if value != needle && has(out, value) == false {
-            out[(out).length] = value;
+            out[out.length] = value;
         }
     }
     out;
@@ -47,47 +47,47 @@ pub fn remove(values, needle) {
 
 pub fn union(lhs, rhs) {
     let mut out = from(lhs);
-    for (let mut index = 0; index < (rhs).length; index = index + 1) {
-        let mut value = rhs[index];
+    for (let mut index = 0; index < rhs.length; index = index + 1) {
+        let value = rhs[index];
         if has(out, value) == false {
-            out[(out).length] = value;
+            out[out.length] = value;
         }
     }
     out;
 }
 
 pub fn intersect(lhs, rhs) {
-    let mut left = from(lhs);
-    let mut right = from(rhs);
+    let left = from(lhs);
+    let right = from(rhs);
     let mut out = [];
-    for (let mut index = 0; index < (left).length; index = index + 1) {
-        let mut value = left[index];
+    for (let mut index = 0; index < (&left).length; index = index + 1) {
+        let value = (&left)[index];
         if has(right, value) {
-            out[(out).length] = value;
+            out[out.length] = value;
         }
     }
     out;
 }
 
 pub fn difference(lhs, rhs) {
-    let mut left = from(lhs);
-    let mut right = from(rhs);
+    let left = from(lhs);
+    let right = from(rhs);
     let mut out = [];
-    for (let mut index = 0; index < (left).length; index = index + 1) {
-        let mut value = left[index];
+    for (let mut index = 0; index < (&left).length; index = index + 1) {
+        let value = (&left)[index];
         if has(right, value) == false {
-            out[(out).length] = value;
+            out[out.length] = value;
         }
     }
     out;
 }
 
 pub fn is_subset(lhs, rhs) {
-    let mut left = from(lhs);
-    let mut right = from(rhs);
+    let left = from(lhs);
+    let right = from(rhs);
     let mut out = true;
-    for (let mut index = 0; index < (left).length; index = index + 1) {
-        if has(right, left[index]) == false {
+    for (let mut index = 0; index < (&left).length; index = index + 1) {
+        if has(right, (&left)[index]) == false {
             out = false;
             break;
         }
