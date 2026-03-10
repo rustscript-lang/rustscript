@@ -567,20 +567,110 @@ fn encode_trace_step(step: &TraceStep, out: &mut Vec<u8>) -> VmResult<()> {
         }
         TraceStep::Add => out.push(2),
         TraceStep::IAdd => out.push(27),
+        TraceStep::IAddImm(imm) => {
+            out.push(44);
+            out.extend_from_slice(&imm.to_le_bytes());
+        }
+        TraceStep::ILocalAddImm { local, imm } => {
+            out.push(45);
+            out.push(*local);
+            out.extend_from_slice(&imm.to_le_bytes());
+        }
         TraceStep::FAdd => out.push(28),
+        TraceStep::FAddImm(imm_bits) => {
+            out.push(57);
+            out.extend_from_slice(&imm_bits.to_le_bytes());
+        }
+        TraceStep::FLocalAddImm { local, imm_bits } => {
+            out.push(58);
+            out.push(*local);
+            out.extend_from_slice(&imm_bits.to_le_bytes());
+        }
         TraceStep::SConcat => out.push(29),
         TraceStep::Sub => out.push(3),
         TraceStep::ISub => out.push(30),
+        TraceStep::ISubImm(imm) => {
+            out.push(46);
+            out.extend_from_slice(&imm.to_le_bytes());
+        }
+        TraceStep::ILocalSubImm { local, imm } => {
+            out.push(47);
+            out.push(*local);
+            out.extend_from_slice(&imm.to_le_bytes());
+        }
         TraceStep::FSub => out.push(31),
+        TraceStep::FSubImm(imm_bits) => {
+            out.push(59);
+            out.extend_from_slice(&imm_bits.to_le_bytes());
+        }
+        TraceStep::FLocalSubImm { local, imm_bits } => {
+            out.push(60);
+            out.push(*local);
+            out.extend_from_slice(&imm_bits.to_le_bytes());
+        }
         TraceStep::Mul => out.push(4),
         TraceStep::IMul => out.push(32),
+        TraceStep::IMulImm(imm) => {
+            out.push(52);
+            out.extend_from_slice(&imm.to_le_bytes());
+        }
+        TraceStep::ILocalMulImm { local, imm } => {
+            out.push(48);
+            out.push(*local);
+            out.extend_from_slice(&imm.to_le_bytes());
+        }
         TraceStep::FMul => out.push(33),
+        TraceStep::FMulImm(imm_bits) => {
+            out.push(61);
+            out.extend_from_slice(&imm_bits.to_le_bytes());
+        }
+        TraceStep::FLocalMulImm { local, imm_bits } => {
+            out.push(62);
+            out.push(*local);
+            out.extend_from_slice(&imm_bits.to_le_bytes());
+        }
         TraceStep::Div => out.push(5),
         TraceStep::IDiv => out.push(34),
+        TraceStep::IDivImm(imm) => {
+            out.push(53);
+            out.extend_from_slice(&imm.to_le_bytes());
+        }
+        TraceStep::ILocalDivImm { local, imm } => {
+            out.push(54);
+            out.push(*local);
+            out.extend_from_slice(&imm.to_le_bytes());
+        }
         TraceStep::FDiv => out.push(35),
+        TraceStep::FDivImm(imm_bits) => {
+            out.push(63);
+            out.extend_from_slice(&imm_bits.to_le_bytes());
+        }
+        TraceStep::FLocalDivImm { local, imm_bits } => {
+            out.push(64);
+            out.push(*local);
+            out.extend_from_slice(&imm_bits.to_le_bytes());
+        }
         TraceStep::Mod => out.push(6),
         TraceStep::IMod => out.push(36),
+        TraceStep::IModImm(imm) => {
+            out.push(55);
+            out.extend_from_slice(&imm.to_le_bytes());
+        }
+        TraceStep::ILocalModImm { local, imm } => {
+            out.push(56);
+            out.push(*local);
+            out.extend_from_slice(&imm.to_le_bytes());
+        }
         TraceStep::FMod => out.push(37),
+        TraceStep::FModImm(imm_bits) => {
+            out.push(65);
+            out.extend_from_slice(&imm_bits.to_le_bytes());
+        }
+        TraceStep::FLocalModImm { local, imm_bits } => {
+            out.push(66);
+            out.push(*local);
+            out.extend_from_slice(&imm_bits.to_le_bytes());
+        }
         TraceStep::Shl => out.push(7),
         TraceStep::Shr => out.push(8),
         TraceStep::Lshr => out.push(25),
@@ -593,14 +683,39 @@ fn encode_trace_step(step: &TraceStep, out: &mut Vec<u8>) -> VmResult<()> {
         TraceStep::Ceq => out.push(12),
         TraceStep::FCeq => out.push(40),
         TraceStep::Clt => out.push(13),
+        TraceStep::ILocalCltImm { local, imm } => {
+            out.push(49);
+            out.push(*local);
+            out.extend_from_slice(&imm.to_le_bytes());
+        }
         TraceStep::FClt => out.push(41),
+        TraceStep::FLocalCltImm { local, imm_bits } => {
+            out.push(67);
+            out.push(*local);
+            out.extend_from_slice(&imm_bits.to_le_bytes());
+        }
         TraceStep::Cgt => out.push(14),
+        TraceStep::ILocalCgtImm { local, imm } => {
+            out.push(50);
+            out.push(*local);
+            out.extend_from_slice(&imm.to_le_bytes());
+        }
         TraceStep::FCgt => out.push(42),
+        TraceStep::FLocalCgtImm { local, imm_bits } => {
+            out.push(68);
+            out.push(*local);
+            out.extend_from_slice(&imm_bits.to_le_bytes());
+        }
         TraceStep::Pop => out.push(15),
         TraceStep::Dup => out.push(16),
         TraceStep::Ldloc(index) => {
             out.push(17);
             out.push(*index);
+        }
+        TraceStep::ILocalShlImm { local, amount } => {
+            out.push(51);
+            out.push(*local);
+            out.extend_from_slice(&amount.to_le_bytes());
         }
         TraceStep::Stloc(index) => {
             out.push(18);
@@ -651,20 +766,70 @@ fn decode_trace_step(cursor: &mut AotCursor<'_>) -> VmResult<TraceStep> {
         1 => TraceStep::Ldc(cursor.read_u32("ldc index")?),
         2 => TraceStep::Add,
         27 => TraceStep::IAdd,
+        44 => TraceStep::IAddImm(cursor.read_i64("iadd imm")?),
+        45 => TraceStep::ILocalAddImm {
+            local: cursor.read_u8("ilocal add local")?,
+            imm: cursor.read_i64("ilocal add imm")?,
+        },
         28 => TraceStep::FAdd,
+        57 => TraceStep::FAddImm(cursor.read_u64("fadd imm bits")?),
+        58 => TraceStep::FLocalAddImm {
+            local: cursor.read_u8("flocal add local")?,
+            imm_bits: cursor.read_u64("flocal add imm bits")?,
+        },
         29 => TraceStep::SConcat,
         3 => TraceStep::Sub,
         30 => TraceStep::ISub,
+        46 => TraceStep::ISubImm(cursor.read_i64("isub imm")?),
+        47 => TraceStep::ILocalSubImm {
+            local: cursor.read_u8("ilocal sub local")?,
+            imm: cursor.read_i64("ilocal sub imm")?,
+        },
         31 => TraceStep::FSub,
+        59 => TraceStep::FSubImm(cursor.read_u64("fsub imm bits")?),
+        60 => TraceStep::FLocalSubImm {
+            local: cursor.read_u8("flocal sub local")?,
+            imm_bits: cursor.read_u64("flocal sub imm bits")?,
+        },
         4 => TraceStep::Mul,
         32 => TraceStep::IMul,
+        52 => TraceStep::IMulImm(cursor.read_i64("imul imm")?),
+        48 => TraceStep::ILocalMulImm {
+            local: cursor.read_u8("ilocal mul local")?,
+            imm: cursor.read_i64("ilocal mul imm")?,
+        },
         33 => TraceStep::FMul,
+        61 => TraceStep::FMulImm(cursor.read_u64("fmul imm bits")?),
+        62 => TraceStep::FLocalMulImm {
+            local: cursor.read_u8("flocal mul local")?,
+            imm_bits: cursor.read_u64("flocal mul imm bits")?,
+        },
         5 => TraceStep::Div,
         34 => TraceStep::IDiv,
+        53 => TraceStep::IDivImm(cursor.read_i64("idiv imm")?),
+        54 => TraceStep::ILocalDivImm {
+            local: cursor.read_u8("ilocal div local")?,
+            imm: cursor.read_i64("ilocal div imm")?,
+        },
         35 => TraceStep::FDiv,
+        63 => TraceStep::FDivImm(cursor.read_u64("fdiv imm bits")?),
+        64 => TraceStep::FLocalDivImm {
+            local: cursor.read_u8("flocal div local")?,
+            imm_bits: cursor.read_u64("flocal div imm bits")?,
+        },
         6 => TraceStep::Mod,
         36 => TraceStep::IMod,
+        55 => TraceStep::IModImm(cursor.read_i64("imod imm")?),
+        56 => TraceStep::ILocalModImm {
+            local: cursor.read_u8("ilocal mod local")?,
+            imm: cursor.read_i64("ilocal mod imm")?,
+        },
         37 => TraceStep::FMod,
+        65 => TraceStep::FModImm(cursor.read_u64("fmod imm bits")?),
+        66 => TraceStep::FLocalModImm {
+            local: cursor.read_u8("flocal mod local")?,
+            imm_bits: cursor.read_u64("flocal mod imm bits")?,
+        },
         7 => TraceStep::Shl,
         8 => TraceStep::Shr,
         25 => TraceStep::Lshr,
@@ -677,12 +842,32 @@ fn decode_trace_step(cursor: &mut AotCursor<'_>) -> VmResult<TraceStep> {
         12 => TraceStep::Ceq,
         40 => TraceStep::FCeq,
         13 => TraceStep::Clt,
+        49 => TraceStep::ILocalCltImm {
+            local: cursor.read_u8("ilocal clt local")?,
+            imm: cursor.read_i64("ilocal clt imm")?,
+        },
         41 => TraceStep::FClt,
+        67 => TraceStep::FLocalCltImm {
+            local: cursor.read_u8("flocal clt local")?,
+            imm_bits: cursor.read_u64("flocal clt imm bits")?,
+        },
         14 => TraceStep::Cgt,
+        50 => TraceStep::ILocalCgtImm {
+            local: cursor.read_u8("ilocal cgt local")?,
+            imm: cursor.read_i64("ilocal cgt imm")?,
+        },
         42 => TraceStep::FCgt,
+        68 => TraceStep::FLocalCgtImm {
+            local: cursor.read_u8("flocal cgt local")?,
+            imm_bits: cursor.read_u64("flocal cgt imm bits")?,
+        },
         15 => TraceStep::Pop,
         16 => TraceStep::Dup,
         17 => TraceStep::Ldloc(cursor.read_u8("ldloc index")?),
+        51 => TraceStep::ILocalShlImm {
+            local: cursor.read_u8("ilocal shl local")?,
+            amount: cursor.read_u32("ilocal shl amount")?,
+        },
         18 => TraceStep::Stloc(cursor.read_u8("stloc index")?),
         19 => TraceStep::BuiltinCall {
             index: cursor.read_u16("builtin index")?,
@@ -863,20 +1048,40 @@ fn validate_aot_trace(trace: &JitTrace, code_len: usize) -> VmResult<()> {
             | TraceStep::Ldc(_)
             | TraceStep::Add
             | TraceStep::IAdd
+            | TraceStep::IAddImm(_)
+            | TraceStep::ILocalAddImm { .. }
             | TraceStep::FAdd
+            | TraceStep::FAddImm(_)
+            | TraceStep::FLocalAddImm { .. }
             | TraceStep::SConcat
             | TraceStep::Sub
             | TraceStep::ISub
+            | TraceStep::ISubImm(_)
+            | TraceStep::ILocalSubImm { .. }
             | TraceStep::FSub
+            | TraceStep::FSubImm(_)
+            | TraceStep::FLocalSubImm { .. }
             | TraceStep::Mul
             | TraceStep::IMul
+            | TraceStep::IMulImm(_)
+            | TraceStep::ILocalMulImm { .. }
             | TraceStep::FMul
+            | TraceStep::FMulImm(_)
+            | TraceStep::FLocalMulImm { .. }
             | TraceStep::Div
             | TraceStep::IDiv
+            | TraceStep::IDivImm(_)
+            | TraceStep::ILocalDivImm { .. }
             | TraceStep::FDiv
+            | TraceStep::FDivImm(_)
+            | TraceStep::FLocalDivImm { .. }
             | TraceStep::Mod
             | TraceStep::IMod
+            | TraceStep::IModImm(_)
+            | TraceStep::ILocalModImm { .. }
             | TraceStep::FMod
+            | TraceStep::FModImm(_)
+            | TraceStep::FLocalModImm { .. }
             | TraceStep::Shl
             | TraceStep::Shr
             | TraceStep::Lshr
@@ -889,12 +1094,17 @@ fn validate_aot_trace(trace: &JitTrace, code_len: usize) -> VmResult<()> {
             | TraceStep::Ceq
             | TraceStep::FCeq
             | TraceStep::Clt
+            | TraceStep::ILocalCltImm { .. }
             | TraceStep::FClt
+            | TraceStep::FLocalCltImm { .. }
             | TraceStep::Cgt
+            | TraceStep::ILocalCgtImm { .. }
             | TraceStep::FCgt
+            | TraceStep::FLocalCgtImm { .. }
             | TraceStep::Pop
             | TraceStep::Dup
             | TraceStep::Ldloc(_)
+            | TraceStep::ILocalShlImm { .. }
             | TraceStep::Stloc(_)
             | TraceStep::JumpToRoot
             | TraceStep::Ret => {}

@@ -80,20 +80,40 @@ pub enum TraceStep {
     Ldc(u32),
     Add,
     IAdd,
+    IAddImm(i64),
+    ILocalAddImm { local: u8, imm: i64 },
     FAdd,
+    FAddImm(u64),
+    FLocalAddImm { local: u8, imm_bits: u64 },
     SConcat,
     Sub,
     ISub,
+    ISubImm(i64),
+    ILocalSubImm { local: u8, imm: i64 },
     FSub,
+    FSubImm(u64),
+    FLocalSubImm { local: u8, imm_bits: u64 },
     Mul,
     IMul,
+    IMulImm(i64),
+    ILocalMulImm { local: u8, imm: i64 },
     FMul,
+    FMulImm(u64),
+    FLocalMulImm { local: u8, imm_bits: u64 },
     Div,
     IDiv,
+    IDivImm(i64),
+    ILocalDivImm { local: u8, imm: i64 },
     FDiv,
+    FDivImm(u64),
+    FLocalDivImm { local: u8, imm_bits: u64 },
     Mod,
     IMod,
+    IModImm(i64),
+    ILocalModImm { local: u8, imm: i64 },
     FMod,
+    FModImm(u64),
+    FLocalModImm { local: u8, imm_bits: u64 },
     Shl,
     Shr,
     Lshr,
@@ -106,12 +126,17 @@ pub enum TraceStep {
     Ceq,
     FCeq,
     Clt,
+    ILocalCltImm { local: u8, imm: i64 },
     FClt,
+    FLocalCltImm { local: u8, imm_bits: u64 },
     Cgt,
+    ILocalCgtImm { local: u8, imm: i64 },
     FCgt,
+    FLocalCgtImm { local: u8, imm_bits: u64 },
     Pop,
     Dup,
     Ldloc(u8),
+    ILocalShlImm { local: u8, amount: u32 },
     Stloc(u8),
     BuiltinCall {
         index: u16,
@@ -1009,6 +1034,7 @@ impl TraceJitEngine {
         step_ips: Vec<usize>,
         terminal: JitTraceTerminal,
     ) -> usize {
+        let (steps, step_ips) = optimize_trace_steps(program, steps, step_ips);
         debug_assert_eq!(
             steps.len(),
             step_ips.len(),
@@ -1099,6 +1125,177 @@ fn can_prefer_join_path(program: &Program, steps: &[TraceStep]) -> bool {
     )
 }
 
+fn optimize_trace_steps(
+    program: &Program,
+    steps: Vec<TraceStep>,
+    step_ips: Vec<usize>,
+) -> (Vec<TraceStep>, Vec<usize>) {
+    debug_assert_eq!(steps.len(), step_ips.len());
+    let mut optimized_steps = Vec::with_capacity(steps.len());
+    let mut optimized_ips = Vec::with_capacity(step_ips.len());
+    let mut cursor = 0usize;
+
+    while cursor < steps.len() {
+        if let Some((step, consumed)) = fuse_local_int_immediate_step(program, &steps[cursor..]) {
+            optimized_steps.push(step);
+            optimized_ips.push(step_ips[cursor]);
+            cursor += consumed;
+            continue;
+        }
+        if let Some((step, consumed)) = fuse_local_float_immediate_step(program, &steps[cursor..])
+        {
+            optimized_steps.push(step);
+            optimized_ips.push(step_ips[cursor]);
+            cursor += consumed;
+            continue;
+        }
+        if let Some((step, consumed)) = fuse_stack_int_immediate_step(program, &steps[cursor..]) {
+            optimized_steps.push(step);
+            optimized_ips.push(step_ips[cursor]);
+            cursor += consumed;
+            continue;
+        }
+        if let Some((step, consumed)) = fuse_stack_float_immediate_step(program, &steps[cursor..])
+        {
+            optimized_steps.push(step);
+            optimized_ips.push(step_ips[cursor]);
+            cursor += consumed;
+            continue;
+        }
+
+        optimized_steps.push(steps[cursor].clone());
+        optimized_ips.push(step_ips[cursor]);
+        cursor += 1;
+    }
+
+    (optimized_steps, optimized_ips)
+}
+
+fn fuse_local_int_immediate_step(
+    program: &Program,
+    steps: &[TraceStep],
+) -> Option<(TraceStep, usize)> {
+    let [TraceStep::Ldloc(local), TraceStep::Ldc(index), op, ..] = steps else {
+        return None;
+    };
+    let imm = int_constant(program, *index)?;
+    let step = match op {
+        TraceStep::IAdd => TraceStep::ILocalAddImm { local: *local, imm },
+        TraceStep::ISub => TraceStep::ILocalSubImm { local: *local, imm },
+        TraceStep::IMul => TraceStep::ILocalMulImm { local: *local, imm },
+        TraceStep::IDiv => TraceStep::ILocalDivImm { local: *local, imm },
+        TraceStep::IMod => TraceStep::ILocalModImm { local: *local, imm },
+        TraceStep::Clt => TraceStep::ILocalCltImm { local: *local, imm },
+        TraceStep::Cgt => TraceStep::ILocalCgtImm { local: *local, imm },
+        TraceStep::Shl => {
+            let amount = u32::try_from(imm).ok()?;
+            if amount > 63 {
+                return None;
+            }
+            TraceStep::ILocalShlImm {
+                local: *local,
+                amount,
+            }
+        }
+        _ => return None,
+    };
+    Some((step, 3))
+}
+
+fn fuse_local_float_immediate_step(
+    program: &Program,
+    steps: &[TraceStep],
+) -> Option<(TraceStep, usize)> {
+    let [TraceStep::Ldloc(local), TraceStep::Ldc(index), op, ..] = steps else {
+        return None;
+    };
+    let imm_bits = float_constant_bits(program, *index)?;
+    let step = match op {
+        TraceStep::FAdd => TraceStep::FLocalAddImm {
+            local: *local,
+            imm_bits,
+        },
+        TraceStep::FSub => TraceStep::FLocalSubImm {
+            local: *local,
+            imm_bits,
+        },
+        TraceStep::FMul => TraceStep::FLocalMulImm {
+            local: *local,
+            imm_bits,
+        },
+        TraceStep::FDiv => TraceStep::FLocalDivImm {
+            local: *local,
+            imm_bits,
+        },
+        TraceStep::FMod => TraceStep::FLocalModImm {
+            local: *local,
+            imm_bits,
+        },
+        TraceStep::FClt => TraceStep::FLocalCltImm {
+            local: *local,
+            imm_bits,
+        },
+        TraceStep::FCgt => TraceStep::FLocalCgtImm {
+            local: *local,
+            imm_bits,
+        },
+        _ => return None,
+    };
+    Some((step, 3))
+}
+
+fn fuse_stack_int_immediate_step(
+    program: &Program,
+    steps: &[TraceStep],
+) -> Option<(TraceStep, usize)> {
+    let [TraceStep::Ldc(index), op, ..] = steps else {
+        return None;
+    };
+    let imm = int_constant(program, *index)?;
+    let step = match op {
+        TraceStep::IAdd => TraceStep::IAddImm(imm),
+        TraceStep::ISub => TraceStep::ISubImm(imm),
+        TraceStep::IMul => TraceStep::IMulImm(imm),
+        TraceStep::IDiv => TraceStep::IDivImm(imm),
+        TraceStep::IMod => TraceStep::IModImm(imm),
+        _ => return None,
+    };
+    Some((step, 2))
+}
+
+fn fuse_stack_float_immediate_step(
+    program: &Program,
+    steps: &[TraceStep],
+) -> Option<(TraceStep, usize)> {
+    let [TraceStep::Ldc(index), op, ..] = steps else {
+        return None;
+    };
+    let imm_bits = float_constant_bits(program, *index)?;
+    let step = match op {
+        TraceStep::FAdd => TraceStep::FAddImm(imm_bits),
+        TraceStep::FSub => TraceStep::FSubImm(imm_bits),
+        TraceStep::FMul => TraceStep::FMulImm(imm_bits),
+        TraceStep::FDiv => TraceStep::FDivImm(imm_bits),
+        TraceStep::FMod => TraceStep::FModImm(imm_bits),
+        _ => return None,
+    };
+    Some((step, 2))
+}
+
+fn int_constant(program: &Program, index: u32) -> Option<i64> {
+    match program.constants.get(index as usize) {
+        Some(Value::Int(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn float_constant_bits(program: &Program, index: u32) -> Option<u64> {
+    match program.constants.get(index as usize) {
+        Some(Value::Float(value)) => Some(value.to_bits()),
+        _ => None,
+    }
+}
+
 fn typed_trace_step(program: &Program, ip: usize, opcode: u8) -> TraceStep {
     let operand_types = program
         .type_map
@@ -1142,20 +1339,40 @@ fn trace_step_name(step: &TraceStep) -> &'static str {
         TraceStep::Ldc(_) => "ldc",
         TraceStep::Add => "add",
         TraceStep::IAdd => "add",
+        TraceStep::IAddImm(_) => "add_imm",
+        TraceStep::ILocalAddImm { .. } => "ldloc_add_imm",
         TraceStep::FAdd => "add",
+        TraceStep::FAddImm(_) => "fadd_imm",
+        TraceStep::FLocalAddImm { .. } => "ldloc_fadd_imm",
         TraceStep::SConcat => "add",
         TraceStep::Sub => "sub",
         TraceStep::ISub => "sub",
+        TraceStep::ISubImm(_) => "sub_imm",
+        TraceStep::ILocalSubImm { .. } => "ldloc_sub_imm",
         TraceStep::FSub => "sub",
+        TraceStep::FSubImm(_) => "fsub_imm",
+        TraceStep::FLocalSubImm { .. } => "ldloc_fsub_imm",
         TraceStep::Mul => "mul",
         TraceStep::IMul => "mul",
+        TraceStep::IMulImm(_) => "mul_imm",
+        TraceStep::ILocalMulImm { .. } => "ldloc_mul_imm",
         TraceStep::FMul => "mul",
+        TraceStep::FMulImm(_) => "fmul_imm",
+        TraceStep::FLocalMulImm { .. } => "ldloc_fmul_imm",
         TraceStep::Div => "div",
         TraceStep::IDiv => "div",
+        TraceStep::IDivImm(_) => "div_imm",
+        TraceStep::ILocalDivImm { .. } => "ldloc_div_imm",
         TraceStep::FDiv => "div",
+        TraceStep::FDivImm(_) => "fdiv_imm",
+        TraceStep::FLocalDivImm { .. } => "ldloc_fdiv_imm",
         TraceStep::Mod => "mod",
         TraceStep::IMod => "mod",
+        TraceStep::IModImm(_) => "mod_imm",
+        TraceStep::ILocalModImm { .. } => "ldloc_mod_imm",
         TraceStep::FMod => "mod",
+        TraceStep::FModImm(_) => "fmod_imm",
+        TraceStep::FLocalModImm { .. } => "ldloc_fmod_imm",
         TraceStep::Shl => "shl",
         TraceStep::Shr => "shr",
         TraceStep::Lshr => "lshr",
@@ -1168,12 +1385,17 @@ fn trace_step_name(step: &TraceStep) -> &'static str {
         TraceStep::Ceq => "ceq",
         TraceStep::FCeq => "ceq",
         TraceStep::Clt => "clt",
+        TraceStep::ILocalCltImm { .. } => "ldloc_clt_imm",
         TraceStep::FClt => "clt",
+        TraceStep::FLocalCltImm { .. } => "ldloc_fclt_imm",
         TraceStep::Cgt => "cgt",
+        TraceStep::ILocalCgtImm { .. } => "ldloc_cgt_imm",
         TraceStep::FCgt => "cgt",
+        TraceStep::FLocalCgtImm { .. } => "ldloc_fcgt_imm",
         TraceStep::Pop => "pop",
         TraceStep::Dup => "dup",
         TraceStep::Ldloc(_) => "ldloc",
+        TraceStep::ILocalShlImm { .. } => "ldloc_shl_imm",
         TraceStep::Stloc(_) => "stloc",
         TraceStep::BuiltinCall { .. } => "call",
         TraceStep::Call { .. } => "call",

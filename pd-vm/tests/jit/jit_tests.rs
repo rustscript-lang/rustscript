@@ -633,7 +633,10 @@ fn compiler_uses_shl_for_power_of_two_multiply_and_jit_accepts_it() {
 
     if native_jit_supported() {
         let dump = vm.dump_jit_info();
-        assert!(dump.contains(" shl"), "expected trace dump to include shl");
+        assert!(
+            dump.contains(" shl") || dump.contains(" ldloc_shl_imm"),
+            "expected trace dump to include shl or fused shl-imm, dump:\n{dump}"
+        );
     }
 }
 
@@ -687,7 +690,12 @@ fn compiler_emits_mod_and_short_circuit_logic_and_jit_accepts_them() {
 
     if native_jit_supported() {
         let dump = vm.dump_jit_info();
-        assert!(dump.contains(" mod"), "expected trace dump to include mod");
+        assert!(
+            dump.contains(" mod")
+                || dump.contains(" mod_imm")
+                || dump.contains(" ldloc_mod_imm"),
+            "expected trace dump to include mod or fused mod-imm, dump:\n{dump}"
+        );
     }
 }
 
@@ -894,8 +902,13 @@ fn trace_jit_records_typed_float_and_string_add_steps() {
             .traces
             .iter()
             .flat_map(|trace| trace.steps.iter())
-            .any(|step| matches!(step, TraceStep::FAdd)),
-        "expected a typed float add trace step, dump:\n{}",
+            .any(|step| {
+                matches!(
+                    step,
+                    TraceStep::FAdd | TraceStep::FAddImm(_) | TraceStep::FLocalAddImm { .. }
+                )
+            }),
+        "expected a typed float add or fused float-add-imm trace step, dump:\n{}",
         float_vm.dump_jit_info()
     );
 
@@ -1019,20 +1032,61 @@ fn trace_jit_executes_typed_float_math_without_helper_bridge() {
         .iter()
         .flat_map(|trace| trace.steps.iter())
         .collect::<Vec<_>>();
-    for expected in [
-        TraceStep::FAdd,
-        TraceStep::FSub,
-        TraceStep::FMul,
-        TraceStep::FDiv,
-        TraceStep::FMod,
-        TraceStep::FNeg,
-    ] {
-        assert!(
-            steps.iter().any(|step| **step == expected),
-            "expected float trace step {expected:?}, dump:\n{}",
-            vm.dump_jit_info()
-        );
-    }
+    assert!(
+        steps.iter().any(|step| {
+            matches!(
+                step,
+                TraceStep::FAdd | TraceStep::FAddImm(_) | TraceStep::FLocalAddImm { .. }
+            )
+        }),
+        "expected float add trace step, dump:\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        steps.iter().any(|step| {
+            matches!(
+                step,
+                TraceStep::FSub | TraceStep::FSubImm(_) | TraceStep::FLocalSubImm { .. }
+            )
+        }),
+        "expected float sub trace step, dump:\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        steps.iter().any(|step| {
+            matches!(
+                step,
+                TraceStep::FMul | TraceStep::FMulImm(_) | TraceStep::FLocalMulImm { .. }
+            )
+        }),
+        "expected float mul trace step, dump:\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        steps.iter().any(|step| {
+            matches!(
+                step,
+                TraceStep::FDiv | TraceStep::FDivImm(_) | TraceStep::FLocalDivImm { .. }
+            )
+        }),
+        "expected float div trace step, dump:\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        steps.iter().any(|step| {
+            matches!(
+                step,
+                TraceStep::FMod | TraceStep::FModImm(_) | TraceStep::FLocalModImm { .. }
+            )
+        }),
+        "expected float mod trace step, dump:\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        steps.iter().any(|step| **step == TraceStep::FNeg),
+        "expected float neg trace step, dump:\n{}",
+        vm.dump_jit_info()
+    );
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     for bridge_name in ["add", "sub", "mul", "div", "mod", "neg"] {
@@ -1159,13 +1213,33 @@ fn trace_jit_executes_typed_float_comparisons_without_helper_bridge() {
         .iter()
         .flat_map(|trace| trace.steps.iter())
         .collect::<Vec<_>>();
-    for expected in [TraceStep::FClt, TraceStep::FCgt, TraceStep::FCeq] {
-        assert!(
-            steps.iter().any(|step| **step == expected),
-            "expected float trace step {expected:?}, dump:\n{}",
-            vm.dump_jit_info()
-        );
-    }
+    assert!(
+        steps.iter().any(|step| {
+            matches!(
+                step,
+                TraceStep::FClt | TraceStep::FLocalCltImm { .. }
+            )
+        }),
+        "expected float less-than trace step, dump:\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        steps.iter().any(|step| {
+            matches!(
+                step,
+                TraceStep::FCgt | TraceStep::FLocalCgtImm { .. }
+            )
+        }),
+        "expected float greater-than trace step, dump:\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|step| matches!(step, TraceStep::FCeq | TraceStep::Ceq)),
+        "expected float equality trace step, dump:\n{}",
+        vm.dump_jit_info()
+    );
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     for bridge_name in ["clt", "cgt", "ceq"] {

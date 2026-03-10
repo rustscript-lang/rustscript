@@ -403,6 +403,35 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
+        TraceStep::IAddImm(imm) => {
+            emit_inline_stack_int_imm_binop(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *imm,
+                step_ip,
+                IntImmBinopKind::Add,
+            )?;
+            Ok(true)
+        }
+        TraceStep::ILocalAddImm { local, imm } => {
+            emit_inline_local_numeric_imm_op(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *local,
+                NumberImmediate::Int(*imm),
+                step_ip,
+                LocalNumericImmOpKind::Add,
+            )?;
+            Ok(true)
+        }
         TraceStep::FAdd => {
             emit_inline_float_binop(
                 b,
@@ -415,6 +444,35 @@ pub(super) fn emit_inline_or_helper_step(
                 root_ip,
                 step_ip,
                 FloatBinopKind::Add,
+            )?;
+            Ok(true)
+        }
+        TraceStep::FAddImm(imm_bits) => {
+            emit_inline_stack_float_imm_binop(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *imm_bits,
+                step_ip,
+                FloatImmBinopKind::Add,
+            )?;
+            Ok(true)
+        }
+        TraceStep::FLocalAddImm { local, imm_bits } => {
+            emit_inline_local_numeric_imm_op(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *local,
+                NumberImmediate::Float(*imm_bits),
+                step_ip,
+                LocalNumericImmOpKind::Add,
             )?;
             Ok(true)
         }
@@ -447,6 +505,35 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
+        TraceStep::ISubImm(imm) => {
+            emit_inline_stack_int_imm_binop(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *imm,
+                step_ip,
+                IntImmBinopKind::Sub,
+            )?;
+            Ok(true)
+        }
+        TraceStep::ILocalSubImm { local, imm } => {
+            emit_inline_local_numeric_imm_op(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *local,
+                NumberImmediate::Int(*imm),
+                step_ip,
+                LocalNumericImmOpKind::Sub,
+            )?;
+            Ok(true)
+        }
         TraceStep::FSub => {
             emit_inline_float_binop(
                 b,
@@ -459,6 +546,35 @@ pub(super) fn emit_inline_or_helper_step(
                 root_ip,
                 step_ip,
                 FloatBinopKind::Sub,
+            )?;
+            Ok(true)
+        }
+        TraceStep::FSubImm(imm_bits) => {
+            emit_inline_stack_float_imm_binop(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *imm_bits,
+                step_ip,
+                FloatImmBinopKind::Sub,
+            )?;
+            Ok(true)
+        }
+        TraceStep::FLocalSubImm { local, imm_bits } => {
+            emit_inline_local_numeric_imm_op(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *local,
+                NumberImmediate::Float(*imm_bits),
+                step_ip,
+                LocalNumericImmOpKind::Sub,
             )?;
             Ok(true)
         }
@@ -477,6 +593,35 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
+        TraceStep::IMulImm(imm) => {
+            emit_inline_stack_int_imm_binop(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *imm,
+                step_ip,
+                IntImmBinopKind::Mul,
+            )?;
+            Ok(true)
+        }
+        TraceStep::ILocalMulImm { local, imm } => {
+            emit_inline_local_numeric_imm_op(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *local,
+                NumberImmediate::Int(*imm),
+                step_ip,
+                LocalNumericImmOpKind::Mul,
+            )?;
+            Ok(true)
+        }
         TraceStep::FMul => {
             emit_inline_float_binop(
                 b,
@@ -489,6 +634,35 @@ pub(super) fn emit_inline_or_helper_step(
                 root_ip,
                 step_ip,
                 FloatBinopKind::Mul,
+            )?;
+            Ok(true)
+        }
+        TraceStep::FMulImm(imm_bits) => {
+            emit_inline_stack_float_imm_binop(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *imm_bits,
+                step_ip,
+                FloatImmBinopKind::Mul,
+            )?;
+            Ok(true)
+        }
+        TraceStep::FLocalMulImm { local, imm_bits } => {
+            emit_inline_local_numeric_imm_op(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *local,
+                NumberImmediate::Float(*imm_bits),
+                step_ip,
+                LocalNumericImmOpKind::Mul,
             )?;
             Ok(true)
         }
@@ -507,6 +681,35 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
+        TraceStep::IDivImm(imm) => {
+            emit_inline_stack_int_imm_binop(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *imm,
+                step_ip,
+                IntImmBinopKind::Div,
+            )?;
+            Ok(true)
+        }
+        TraceStep::ILocalDivImm { local, imm } => {
+            emit_inline_local_numeric_imm_op(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *local,
+                NumberImmediate::Int(*imm),
+                step_ip,
+                LocalNumericImmOpKind::Div,
+            )?;
+            Ok(true)
+        }
         TraceStep::FDiv => {
             emit_inline_float_binop(
                 b,
@@ -519,6 +722,35 @@ pub(super) fn emit_inline_or_helper_step(
                 root_ip,
                 step_ip,
                 FloatBinopKind::Div,
+            )?;
+            Ok(true)
+        }
+        TraceStep::FDivImm(imm_bits) => {
+            emit_inline_stack_float_imm_binop(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *imm_bits,
+                step_ip,
+                FloatImmBinopKind::Div,
+            )?;
+            Ok(true)
+        }
+        TraceStep::FLocalDivImm { local, imm_bits } => {
+            emit_inline_local_numeric_imm_op(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *local,
+                NumberImmediate::Float(*imm_bits),
+                step_ip,
+                LocalNumericImmOpKind::Div,
             )?;
             Ok(true)
         }
@@ -537,6 +769,35 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
+        TraceStep::IModImm(imm) => {
+            emit_inline_stack_int_imm_binop(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *imm,
+                step_ip,
+                IntImmBinopKind::Mod,
+            )?;
+            Ok(true)
+        }
+        TraceStep::ILocalModImm { local, imm } => {
+            emit_inline_local_numeric_imm_op(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *local,
+                NumberImmediate::Int(*imm),
+                step_ip,
+                LocalNumericImmOpKind::Mod,
+            )?;
+            Ok(true)
+        }
         TraceStep::FMod => {
             emit_inline_float_binop(
                 b,
@@ -552,6 +813,35 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
+        TraceStep::FModImm(imm_bits) => {
+            emit_inline_stack_float_imm_binop(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *imm_bits,
+                step_ip,
+                FloatImmBinopKind::Mod,
+            )?;
+            Ok(true)
+        }
+        TraceStep::FLocalModImm { local, imm_bits } => {
+            emit_inline_local_numeric_imm_op(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *local,
+                NumberImmediate::Float(*imm_bits),
+                step_ip,
+                LocalNumericImmOpKind::Mod,
+            )?;
+            Ok(true)
+        }
         TraceStep::Shl => {
             emit_inline_shift(
                 b,
@@ -564,6 +854,21 @@ pub(super) fn emit_inline_or_helper_step(
                 root_ip,
                 step_ip,
                 ShiftKind::Left,
+            )?;
+            Ok(true)
+        }
+        TraceStep::ILocalShlImm { local, amount } => {
+            emit_inline_local_numeric_imm_op(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *local,
+                NumberImmediate::Int(i64::from(*amount)),
+                step_ip,
+                LocalNumericImmOpKind::Shl,
             )?;
             Ok(true)
         }
@@ -674,6 +979,21 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
+        TraceStep::ILocalCltImm { local, imm } => {
+            emit_inline_local_numeric_imm_op(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *local,
+                NumberImmediate::Int(*imm),
+                step_ip,
+                LocalNumericImmOpKind::Clt,
+            )?;
+            Ok(true)
+        }
         TraceStep::FClt => {
             emit_inline_float_compare(
                 b,
@@ -686,6 +1006,21 @@ pub(super) fn emit_inline_or_helper_step(
                 root_ip,
                 step_ip,
                 true,
+            )?;
+            Ok(true)
+        }
+        TraceStep::FLocalCltImm { local, imm_bits } => {
+            emit_inline_local_numeric_imm_op(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *local,
+                NumberImmediate::Float(*imm_bits),
+                step_ip,
+                LocalNumericImmOpKind::Clt,
             )?;
             Ok(true)
         }
@@ -704,6 +1039,21 @@ pub(super) fn emit_inline_or_helper_step(
             )?;
             Ok(true)
         }
+        TraceStep::ILocalCgtImm { local, imm } => {
+            emit_inline_local_numeric_imm_op(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *local,
+                NumberImmediate::Int(*imm),
+                step_ip,
+                LocalNumericImmOpKind::Cgt,
+            )?;
+            Ok(true)
+        }
         TraceStep::FCgt => {
             emit_inline_float_compare(
                 b,
@@ -716,6 +1066,21 @@ pub(super) fn emit_inline_or_helper_step(
                 root_ip,
                 step_ip,
                 false,
+            )?;
+            Ok(true)
+        }
+        TraceStep::FLocalCgtImm { local, imm_bits } => {
+            emit_inline_local_numeric_imm_op(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *local,
+                NumberImmediate::Float(*imm_bits),
+                step_ip,
+                LocalNumericImmOpKind::Cgt,
             )?;
             Ok(true)
         }
@@ -1160,6 +1525,14 @@ enum IntBinopKind {
     Mul,
 }
 
+enum IntImmBinopKind {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
 enum FloatBinopKind {
     Add,
     Sub,
@@ -1168,11 +1541,85 @@ enum FloatBinopKind {
     Mod,
 }
 
+enum FloatImmBinopKind {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+enum LocalNumericImmOpKind {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Clt,
+    Cgt,
+    Shl,
+}
+
+enum NumberImmediate {
+    Int(i64),
+    Float(u64),
+}
+
 #[derive(Clone, Copy)]
 enum ShiftKind {
     Left,
     ArithmeticRight,
     LogicalRight,
+}
+
+fn emit_trace_exit_to_step_ip(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    offsets: ResolvedOffsets,
+    step_ip: usize,
+) -> VmResult<()> {
+    let step_ip = i64::try_from(step_ip)
+        .map_err(|_| VmError::JitNative("step ip out of range for i64".to_string()))?;
+    let step_ip_val = b.ins().iconst(pointer_type, step_ip);
+    b.ins()
+        .store(MemFlags::new(), step_ip_val, vm_ptr, offsets.vm_ip);
+    let status = b.ins().iconst(types::I32, STATUS_TRACE_EXIT as i64);
+    jump_with_status(b, exit_block, status);
+    let dead = b.create_block();
+    b.switch_to_block(dead);
+    Ok(())
+}
+
+fn store_int_in_value(
+    b: &mut FunctionBuilder,
+    layout: ValueLayout,
+    value_addr: cranelift_codegen::ir::Value,
+    int_value: cranelift_codegen::ir::Value,
+) {
+    store_tag(b, layout, value_addr, layout.int_tag);
+    b.ins().store(
+        MemFlags::new(),
+        int_value,
+        value_addr,
+        layout.int_payload_offset,
+    );
+}
+
+fn store_float_in_value(
+    b: &mut FunctionBuilder,
+    layout: ValueLayout,
+    value_addr: cranelift_codegen::ir::Value,
+    float_value: cranelift_codegen::ir::Value,
+) {
+    store_tag(b, layout, value_addr, layout.float_tag);
+    b.ins().store(
+        MemFlags::new(),
+        float_value,
+        value_addr,
+        layout.float_payload_offset,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1373,6 +1820,341 @@ fn emit_inline_float_binop(
 
     b.switch_to_block(next);
     let _ = root_ip;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_stack_int_imm_binop(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    layout: NativeStackLayout,
+    offsets: ResolvedOffsets,
+    imm: i64,
+    step_ip: usize,
+    kind: IntImmBinopKind,
+) -> VmResult<()> {
+    let exit = b.create_block();
+    let len_ok = b.create_block();
+    let type_ok = b.create_block();
+    let next = b.create_block();
+
+    let len = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_len);
+    let enough = b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, len, 1);
+    b.ins().brif(enough, len_ok, &[], exit, &[]);
+
+    b.switch_to_block(len_ok);
+    let one = b.ins().iconst(pointer_type, 1);
+    let index = b.ins().isub(len, one);
+    let stack_ptr = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_ptr);
+    let top_addr = value_addr(b, pointer_type, stack_ptr, index, layout.value.size);
+    let top_tag = load_tag_i32(b, layout.value, top_addr);
+    let is_int = b
+        .ins()
+        .icmp_imm(IntCC::Equal, top_tag, i64::from(layout.value.int_tag));
+    b.ins().brif(is_int, type_ok, &[], exit, &[]);
+
+    b.switch_to_block(type_ok);
+    let lhs = b.ins().load(
+        types::I64,
+        MemFlags::new(),
+        top_addr,
+        layout.value.int_payload_offset,
+    );
+    let imm_val = b.ins().iconst(types::I64, imm);
+    let out = match kind {
+        IntImmBinopKind::Add => b.ins().iadd(lhs, imm_val),
+        IntImmBinopKind::Sub => b.ins().isub(lhs, imm_val),
+        IntImmBinopKind::Mul => b.ins().imul(lhs, imm_val),
+        IntImmBinopKind::Div | IntImmBinopKind::Mod => {
+            if imm == 0 {
+                b.ins().jump(exit, &[]);
+                b.switch_to_block(exit);
+                emit_trace_exit_to_step_ip(b, vm_ptr, exit_block, pointer_type, offsets, step_ip)?;
+                b.switch_to_block(next);
+                return Ok(());
+            }
+            let overflow_ok = b.create_block();
+            if imm == -1 {
+                let min_i64 = b.ins().iconst(types::I64, i64::MIN);
+                let lhs_is_min = b.ins().icmp(IntCC::Equal, lhs, min_i64);
+                b.ins().brif(lhs_is_min, exit, &[], overflow_ok, &[]);
+                b.switch_to_block(overflow_ok);
+            }
+            if matches!(kind, IntImmBinopKind::Div) {
+                b.ins().sdiv(lhs, imm_val)
+            } else {
+                b.ins().srem(lhs, imm_val)
+            }
+        }
+    };
+    store_int_in_value(b, layout.value, top_addr, out);
+    b.ins().jump(next, &[]);
+
+    b.switch_to_block(exit);
+    emit_trace_exit_to_step_ip(b, vm_ptr, exit_block, pointer_type, offsets, step_ip)?;
+
+    b.switch_to_block(next);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_stack_float_imm_binop(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    layout: NativeStackLayout,
+    offsets: ResolvedOffsets,
+    imm_bits: u64,
+    step_ip: usize,
+    kind: FloatImmBinopKind,
+) -> VmResult<()> {
+    let exit = b.create_block();
+    let len_ok = b.create_block();
+    let type_ok = b.create_block();
+    let next = b.create_block();
+
+    let len = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_len);
+    let enough = b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, len, 1);
+    b.ins().brif(enough, len_ok, &[], exit, &[]);
+
+    b.switch_to_block(len_ok);
+    let one = b.ins().iconst(pointer_type, 1);
+    let index = b.ins().isub(len, one);
+    let stack_ptr = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_ptr);
+    let top_addr = value_addr(b, pointer_type, stack_ptr, index, layout.value.size);
+    let top_tag = load_tag_i32(b, layout.value, top_addr);
+    let is_float = b
+        .ins()
+        .icmp_imm(IntCC::Equal, top_tag, i64::from(layout.value.float_tag));
+    b.ins().brif(is_float, type_ok, &[], exit, &[]);
+
+    b.switch_to_block(type_ok);
+    let lhs = b.ins().load(
+        types::F64,
+        MemFlags::new(),
+        top_addr,
+        layout.value.float_payload_offset,
+    );
+    let imm_val = b.ins().f64const(cranelift_codegen::ir::immediates::Ieee64::with_bits(
+        imm_bits,
+    ));
+    let out = match kind {
+        FloatImmBinopKind::Add => b.ins().fadd(lhs, imm_val),
+        FloatImmBinopKind::Sub => b.ins().fsub(lhs, imm_val),
+        FloatImmBinopKind::Mul => b.ins().fmul(lhs, imm_val),
+        FloatImmBinopKind::Div => b.ins().fdiv(lhs, imm_val),
+        FloatImmBinopKind::Mod => {
+            let quotient = b.ins().fdiv(lhs, imm_val);
+            let truncated = b.ins().trunc(quotient);
+            let product = b.ins().fmul(truncated, imm_val);
+            b.ins().fsub(lhs, product)
+        }
+    };
+    store_float_in_value(b, layout.value, top_addr, out);
+    b.ins().jump(next, &[]);
+
+    b.switch_to_block(exit);
+    emit_trace_exit_to_step_ip(b, vm_ptr, exit_block, pointer_type, offsets, step_ip)?;
+
+    b.switch_to_block(next);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_local_numeric_imm_op(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    layout: NativeStackLayout,
+    offsets: ResolvedOffsets,
+    local: u8,
+    imm: NumberImmediate,
+    step_ip: usize,
+    kind: LocalNumericImmOpKind,
+) -> VmResult<()> {
+    let exit = b.create_block();
+    let local_ok = b.create_block();
+    let stack_ok = b.create_block();
+    let type_ok = b.create_block();
+    let next = b.create_block();
+
+    let locals_len = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_len);
+    let local_index = b.ins().iconst(pointer_type, i64::from(local));
+    let local_in_bounds = b
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, local_index, locals_len);
+    b.ins().brif(local_in_bounds, local_ok, &[], exit, &[]);
+
+    b.switch_to_block(local_ok);
+    let stack_len = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_len);
+    let stack_cap = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_cap);
+    let has_capacity = b.ins().icmp(IntCC::UnsignedLessThan, stack_len, stack_cap);
+    b.ins().brif(has_capacity, stack_ok, &[], exit, &[]);
+
+    b.switch_to_block(stack_ok);
+    let locals_ptr = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_ptr);
+    let local_addr = value_addr(b, pointer_type, locals_ptr, local_index, layout.value.size);
+    let local_tag = load_tag_i32(b, layout.value, local_addr);
+    let type_matches = match imm {
+        NumberImmediate::Int(_) => b
+            .ins()
+            .icmp_imm(IntCC::Equal, local_tag, i64::from(layout.value.int_tag)),
+        NumberImmediate::Float(_) => b
+            .ins()
+            .icmp_imm(IntCC::Equal, local_tag, i64::from(layout.value.float_tag)),
+    };
+    b.ins().brif(type_matches, type_ok, &[], exit, &[]);
+
+    b.switch_to_block(type_ok);
+    let stack_ptr = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_ptr);
+    let dst_addr = value_addr(b, pointer_type, stack_ptr, stack_len, layout.value.size);
+    match imm {
+        NumberImmediate::Int(imm) => {
+            let lhs = b.ins().load(
+                types::I64,
+                MemFlags::new(),
+                local_addr,
+                layout.value.int_payload_offset,
+            );
+            match kind {
+                LocalNumericImmOpKind::Add => {
+                    let out = b.ins().iadd_imm(lhs, imm);
+                    store_int_in_value(b, layout.value, dst_addr, out);
+                }
+                LocalNumericImmOpKind::Sub => {
+                    let rhs = b.ins().iconst(types::I64, imm);
+                    let out = b.ins().isub(lhs, rhs);
+                    store_int_in_value(b, layout.value, dst_addr, out);
+                }
+                LocalNumericImmOpKind::Mul => {
+                    let rhs = b.ins().iconst(types::I64, imm);
+                    let out = b.ins().imul(lhs, rhs);
+                    store_int_in_value(b, layout.value, dst_addr, out);
+                }
+                LocalNumericImmOpKind::Div | LocalNumericImmOpKind::Mod => {
+                    if imm == 0 {
+                        b.ins().jump(exit, &[]);
+                        b.switch_to_block(exit);
+                        emit_trace_exit_to_step_ip(
+                            b, vm_ptr, exit_block, pointer_type, offsets, step_ip,
+                        )?;
+                        b.switch_to_block(next);
+                        return Ok(());
+                    }
+                    if imm == -1 {
+                        let min_i64 = b.ins().iconst(types::I64, i64::MIN);
+                        let lhs_is_min = b.ins().icmp(IntCC::Equal, lhs, min_i64);
+                        let op_ok = b.create_block();
+                        b.ins().brif(lhs_is_min, exit, &[], op_ok, &[]);
+                        b.switch_to_block(op_ok);
+                    }
+                    let rhs = b.ins().iconst(types::I64, imm);
+                    let out = if matches!(kind, LocalNumericImmOpKind::Div) {
+                        b.ins().sdiv(lhs, rhs)
+                    } else {
+                        b.ins().srem(lhs, rhs)
+                    };
+                    store_int_in_value(b, layout.value, dst_addr, out);
+                }
+                LocalNumericImmOpKind::Clt => {
+                    let cmp = b.ins().icmp_imm(IntCC::SignedLessThan, lhs, imm);
+                    store_bool_in_value(b, layout.value, dst_addr, cmp);
+                }
+                LocalNumericImmOpKind::Cgt => {
+                    let cmp = b.ins().icmp_imm(IntCC::SignedGreaterThan, lhs, imm);
+                    store_bool_in_value(b, layout.value, dst_addr, cmp);
+                }
+                LocalNumericImmOpKind::Shl => {
+                    let amount = u32::try_from(imm)
+                        .map_err(|_| VmError::JitNative("shift immediate out of range".to_string()))?;
+                    let rhs = b.ins().iconst(types::I64, i64::from(amount));
+                    let out = b.ins().ishl(lhs, rhs);
+                    store_int_in_value(b, layout.value, dst_addr, out);
+                }
+            }
+        }
+        NumberImmediate::Float(imm_bits) => {
+            let lhs = b.ins().load(
+                types::F64,
+                MemFlags::new(),
+                local_addr,
+                layout.value.float_payload_offset,
+            );
+            let rhs = b.ins().f64const(cranelift_codegen::ir::immediates::Ieee64::with_bits(
+                imm_bits,
+            ));
+            match kind {
+                LocalNumericImmOpKind::Add => {
+                    let out = b.ins().fadd(lhs, rhs);
+                    store_float_in_value(b, layout.value, dst_addr, out);
+                }
+                LocalNumericImmOpKind::Sub => {
+                    let out = b.ins().fsub(lhs, rhs);
+                    store_float_in_value(b, layout.value, dst_addr, out);
+                }
+                LocalNumericImmOpKind::Mul => {
+                    let out = b.ins().fmul(lhs, rhs);
+                    store_float_in_value(b, layout.value, dst_addr, out);
+                }
+                LocalNumericImmOpKind::Div => {
+                    let out = b.ins().fdiv(lhs, rhs);
+                    store_float_in_value(b, layout.value, dst_addr, out);
+                }
+                LocalNumericImmOpKind::Mod => {
+                    let quotient = b.ins().fdiv(lhs, rhs);
+                    let truncated = b.ins().trunc(quotient);
+                    let product = b.ins().fmul(truncated, rhs);
+                    let out = b.ins().fsub(lhs, product);
+                    store_float_in_value(b, layout.value, dst_addr, out);
+                }
+                LocalNumericImmOpKind::Clt => {
+                    let cmp = b.ins().fcmp(FloatCC::LessThan, lhs, rhs);
+                    store_bool_in_value(b, layout.value, dst_addr, cmp);
+                }
+                LocalNumericImmOpKind::Cgt => {
+                    let cmp = b.ins().fcmp(FloatCC::GreaterThan, lhs, rhs);
+                    store_bool_in_value(b, layout.value, dst_addr, cmp);
+                }
+                LocalNumericImmOpKind::Shl => {
+                    return Err(VmError::JitNative(
+                        "float local immediate shift is invalid".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    let new_len = b.ins().iadd_imm(stack_len, 1);
+    b.ins()
+        .store(MemFlags::new(), new_len, vm_ptr, offsets.stack_len);
+    b.ins().jump(next, &[]);
+
+    b.switch_to_block(exit);
+    emit_trace_exit_to_step_ip(b, vm_ptr, exit_block, pointer_type, offsets, step_ip)?;
+
+    b.switch_to_block(next);
     Ok(())
 }
 
@@ -2670,6 +3452,35 @@ fn step_to_call(step: &TraceStep, root_ip: usize) -> VmResult<(i64, i64, i64, i6
     Ok(match step {
         TraceStep::Nop => (0, 0, 0, 0),
         TraceStep::Ldc(index) => (OP_LDC, i64::from(*index), 0, 0),
+        TraceStep::IAddImm(_)
+        | TraceStep::ILocalAddImm { .. }
+        | TraceStep::FAddImm(_)
+        | TraceStep::FLocalAddImm { .. }
+        | TraceStep::ISubImm(_)
+        | TraceStep::ILocalSubImm { .. }
+        | TraceStep::FSubImm(_)
+        | TraceStep::FLocalSubImm { .. }
+        | TraceStep::IMulImm(_)
+        | TraceStep::ILocalMulImm { .. }
+        | TraceStep::FMulImm(_)
+        | TraceStep::FLocalMulImm { .. }
+        | TraceStep::IDivImm(_)
+        | TraceStep::ILocalDivImm { .. }
+        | TraceStep::FDivImm(_)
+        | TraceStep::FLocalDivImm { .. }
+        | TraceStep::IModImm(_)
+        | TraceStep::ILocalModImm { .. }
+        | TraceStep::FModImm(_)
+        | TraceStep::FLocalModImm { .. }
+        | TraceStep::ILocalCltImm { .. }
+        | TraceStep::FLocalCltImm { .. }
+        | TraceStep::ILocalCgtImm { .. }
+        | TraceStep::FLocalCgtImm { .. }
+        | TraceStep::ILocalShlImm { .. } => {
+            return Err(VmError::JitNative(
+                "fused immediate trace step must inline natively".to_string(),
+            ));
+        }
         TraceStep::Add | TraceStep::IAdd | TraceStep::FAdd | TraceStep::SConcat => {
             (OP_ADD, 0, 0, 0)
         }
