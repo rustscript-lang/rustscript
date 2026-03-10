@@ -2,7 +2,7 @@ use crate::builtins::{BuiltinFunction, CallableParam, CallableParamType, Callabl
 
 use super::super::CompileError;
 use super::super::ir::{Expr, LocalSlot};
-use super::context::TypeContext;
+use super::context::{TypeContext, infer_access_schema};
 use super::helpers::{
     bind_expr_result_to_slot, bound_type_label, infer_binary_type, infer_unary_type,
     is_numeric_bound_type, validate_stmts,
@@ -214,6 +214,7 @@ pub(super) fn validate_expr(
                 strict_function_add_types,
             )?;
             observe_direct_function_call_types(expr, state, line_context, source_name, context)?;
+            validate_schema_access(expr, state, line_context, source_name, context)?;
             context.validate_call_argument_types(expr, state, line_context, source_name)?;
             context.infer_call_like_expr_type(expr, state)
         }
@@ -226,6 +227,7 @@ pub(super) fn validate_expr(
                 context,
                 strict_function_add_types,
             )?;
+            validate_schema_access(expr, state, line_context, source_name, context)?;
             context.validate_call_argument_types(expr, state, line_context, source_name)?;
             context.infer_call_like_expr_type(expr, state)
         }
@@ -485,6 +487,34 @@ fn validate_expr_children(
         _ => {}
     }
     Ok(())
+}
+
+fn validate_schema_access(
+    expr: &Expr,
+    state: &LocalTypeState,
+    line_context: Option<u32>,
+    source_name: Option<&str>,
+    context: &mut TypeContext<'_>,
+) -> Result<(), CompileError> {
+    let Expr::Call(index, args) = expr else {
+        return Ok(());
+    };
+    if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get) || args.len() != 2 {
+        return Ok(());
+    }
+    if !context.expr_has_declared_schema(&args[0], state) {
+        return Ok(());
+    }
+    let Some(container_schema) = context.infer_expr_schema(&args[0], state) else {
+        return Ok(());
+    };
+    infer_access_schema(&container_schema, &args[1], context, state)
+        .map(|_| ())
+        .map_err(|detail| CompileError::InvalidFieldAccess {
+            line: line_context,
+            source_name: owned_source_name(source_name),
+            detail,
+        })
 }
 
 pub(super) fn owned_source_name(source_name: Option<&str>) -> Option<String> {

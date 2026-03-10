@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::builtins::CallableParam;
 use crate::bytecode::ValueType;
 
-use super::super::ir::{ClosureExpr, LocalSlot};
+use super::super::ir::{ClosureExpr, LocalSlot, TypeSchema};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SimpleType {
@@ -155,6 +155,8 @@ pub(super) enum InferredCallable {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LocalTypeState {
     by_slot: HashMap<LocalSlot, BoundType>,
+    schemas: HashMap<LocalSlot, TypeSchema>,
+    declared_schema_slots: HashSet<LocalSlot>,
     callables: HashMap<LocalSlot, InferredCallable>,
 }
 
@@ -170,21 +172,51 @@ impl LocalTypeState {
         self.callables.get(&slot)
     }
 
+    pub(crate) fn schema(&self, slot: LocalSlot) -> Option<&TypeSchema> {
+        self.schemas.get(&slot)
+    }
+
+    pub(crate) fn has_declared_schema(&self, slot: LocalSlot) -> bool {
+        self.declared_schema_slots.contains(&slot)
+    }
+
     pub(super) fn iter_slots(&self) -> impl Iterator<Item = LocalSlot> + '_ {
         self.by_slot.keys().copied()
     }
 
     pub(crate) fn set(&mut self, slot: LocalSlot, ty: BoundType) {
+        self.set_with_schema_origin(slot, ty, None, false);
+    }
+
+    pub(crate) fn set_with_schema_origin(
+        &mut self,
+        slot: LocalSlot,
+        ty: BoundType,
+        schema: Option<TypeSchema>,
+        from_declared_schema: bool,
+    ) {
         if ty == BoundType::Unknown {
             self.by_slot.remove(&slot);
         } else {
             self.by_slot.insert(slot, ty);
+        }
+        if let Some(schema) = schema {
+            self.schemas.insert(slot, schema);
+        } else {
+            self.schemas.remove(&slot);
+        }
+        if from_declared_schema {
+            self.declared_schema_slots.insert(slot);
+        } else {
+            self.declared_schema_slots.remove(&slot);
         }
         self.callables.remove(&slot);
     }
 
     pub(super) fn bind_callable(&mut self, slot: LocalSlot, callable: InferredCallable) {
         self.by_slot.remove(&slot);
+        self.schemas.remove(&slot);
+        self.declared_schema_slots.remove(&slot);
         self.callables.insert(slot, callable);
     }
 
@@ -201,16 +233,25 @@ impl LocalTypeState {
         source: &LocalTypeState,
         source_slot: LocalSlot,
         slot: LocalSlot,
+        fallback_schema: Option<TypeSchema>,
+        fallback_from_declared_schema: bool,
     ) {
         if let Some(callable) = source.callable(source_slot).cloned() {
             self.bind_callable(slot, callable);
         } else {
-            self.set(slot, source.get(source_slot));
+            self.set_with_schema_origin(
+                slot,
+                source.get(source_slot),
+                source.schema(source_slot).cloned().or(fallback_schema),
+                source.has_declared_schema(source_slot) || fallback_from_declared_schema,
+            );
         }
     }
 
     pub(crate) fn merge_from_branches(&mut self, lhs: &LocalTypeState, rhs: &LocalTypeState) {
         self.by_slot.clear();
+        self.schemas.clear();
+        self.declared_schema_slots.clear();
         self.callables.clear();
         for slot in lhs.iter_slots().chain(rhs.iter_slots()) {
             let l = lhs.get(slot);
@@ -218,6 +259,14 @@ impl LocalTypeState {
             let merged = merge_bound_types(l, r);
             if merged != BoundType::Unknown {
                 self.by_slot.insert(slot, merged);
+            }
+            if lhs.schema(slot) == rhs.schema(slot)
+                && let Some(schema) = lhs.schema(slot).cloned()
+            {
+                self.schemas.insert(slot, schema);
+            }
+            if lhs.has_declared_schema(slot) && rhs.has_declared_schema(slot) {
+                self.declared_schema_slots.insert(slot);
             }
         }
         for slot in lhs.callables.keys().chain(rhs.callables.keys()) {

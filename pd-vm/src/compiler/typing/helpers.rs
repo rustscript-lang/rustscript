@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use crate::builtins::{BuiltinFunction, CallableParam, CallableParamType};
 
 use super::super::CompileError;
-use super::super::ir::{Expr, FunctionDecl, FunctionImpl, LocalSlot, Stmt};
+use super::super::ir::{Expr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, TypeSchema};
 use super::collect::{observed_function_param_slice, seed_function_param_state};
-use super::context::TypeContext;
+use super::context::{TypeContext, bound_type_from_schema};
 use super::infer_expr_type;
 use super::state::{
     BoundType, HostCallableSignature, LocalTypeState, merge_bound_types,
@@ -21,10 +21,12 @@ pub(super) fn legalize_function_impl(
     host_import_return_types: &HashMap<u16, BoundType>,
     host_import_signatures: &HashMap<u16, HostCallableSignature>,
     observed_function_param_types: &HashMap<u16, Vec<BoundType>>,
+    declared_local_schemas: &HashMap<LocalSlot, TypeSchema>,
 ) {
     let mut state = LocalTypeState::default();
     let mut context = TypeContext::new(
         function_impls,
+        declared_local_schemas,
         function_names,
         host_import_return_types,
         host_import_signatures,
@@ -36,7 +38,13 @@ pub(super) fn legalize_function_impl(
     );
     for (source_slot, captured_slot) in &function_impl.capture_copies {
         let source_state = state.clone();
-        state.copy_binding_from(&source_state, *source_slot, *captured_slot);
+        state.copy_binding_from(
+            &source_state,
+            *source_slot,
+            *captured_slot,
+            context.declared_local_schema(*source_slot).cloned(),
+            context.declared_local_schema(*source_slot).is_some(),
+        );
     }
     legalize_stmts(&mut function_impl.body_stmts, &mut state, &mut context);
     let _ = legalize_expr(&mut function_impl.body_expr, &state, &mut context);
@@ -46,6 +54,7 @@ pub(super) fn validate_function_impl(
     function_index: u16,
     function_impl: &FunctionImpl,
     source_name: Option<&str>,
+    declared_local_schemas: &HashMap<LocalSlot, TypeSchema>,
     context: &mut TypeContext<'_>,
 ) -> Result<(), CompileError> {
     if let Some(detail) = context
@@ -71,7 +80,13 @@ pub(super) fn validate_function_impl(
     );
     for (source_slot, captured_slot) in &function_impl.capture_copies {
         let source_state = state.clone();
-        state.copy_binding_from(&source_state, *source_slot, *captured_slot);
+        state.copy_binding_from(
+            &source_state,
+            *source_slot,
+            *captured_slot,
+            declared_local_schemas.get(source_slot).cloned(),
+            declared_local_schemas.contains_key(source_slot),
+        );
     }
     validate_stmts(
         &function_impl.body_stmts,
@@ -193,6 +208,13 @@ pub(super) fn validate_stmts(
                     context,
                     strict_function_add_types,
                 )?;
+                validate_declared_local_schema(
+                    *index,
+                    ty,
+                    Some(*line),
+                    source_name,
+                    context,
+                )?;
                 bind_expr_result_to_slot(state, *index, expr, &expr_state, ty, context);
             }
             Stmt::Expr { expr, line } => {
@@ -312,6 +334,50 @@ pub(super) fn validate_stmts(
     Ok(())
 }
 
+fn validate_declared_local_schema(
+    slot: LocalSlot,
+    actual: BoundType,
+    line: Option<u32>,
+    source_name: Option<&str>,
+    context: &TypeContext<'_>,
+) -> Result<(), CompileError> {
+    let Some(schema) = context.declared_local_schema(slot) else {
+        return Ok(());
+    };
+    let expected = bound_type_from_schema(schema);
+    if actual == BoundType::Unknown
+        || actual == BoundType::Null
+        || actual == expected
+        || (expected == BoundType::Array && matches!(actual, BoundType::ArrayOf(_)))
+        || (expected == BoundType::Map && matches!(actual, BoundType::MapOf(_)))
+    {
+        return Ok(());
+    }
+    Err(CompileError::InvalidFieldAccess {
+        line,
+        source_name: owned_source_name(source_name),
+        detail: format!(
+            "local slot {} is declared as schema type '{}' but was assigned {}",
+            slot,
+            schema_type_label(schema),
+            bound_type_label(actual)
+        ),
+    })
+}
+
+fn schema_type_label(schema: &TypeSchema) -> &'static str {
+    match schema {
+        TypeSchema::Unknown => "unknown",
+        TypeSchema::Null => "null",
+        TypeSchema::Int => "int",
+        TypeSchema::Float => "float",
+        TypeSchema::Bool => "bool",
+        TypeSchema::String => "string",
+        TypeSchema::Array(_) => "array",
+        TypeSchema::Map(_) | TypeSchema::Object(_) => "map",
+    }
+}
+
 pub(super) fn bind_expr_result_to_slot(
     state: &mut LocalTypeState,
     slot: LocalSlot,
@@ -323,7 +389,17 @@ pub(super) fn bind_expr_result_to_slot(
     if let Some(callable) = context.callable_binding_from_expr(expr, expr_state) {
         state.bind_callable(slot, callable);
     } else {
-        state.set(slot, ty);
+        let schema = context
+            .declared_local_schema(slot)
+            .cloned()
+            .or_else(|| context.infer_expr_schema(expr, expr_state));
+        let from_declared_schema = context.declared_local_schema(slot).is_some()
+            || context.expr_has_declared_schema(expr, expr_state);
+        let ty = context
+            .declared_local_schema(slot)
+            .map(bound_type_from_schema)
+            .unwrap_or(ty);
+        state.set_with_schema_origin(slot, ty, schema, from_declared_schema);
     }
 }
 

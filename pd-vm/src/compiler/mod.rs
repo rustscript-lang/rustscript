@@ -24,7 +24,7 @@ use self::source_map::{SourceMap, Span};
 pub use self::codegen::Compiler;
 pub use self::ir::{
     ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern,
-    MatchTypePattern, Stmt,
+    MatchTypePattern, Stmt, TypeSchema,
 };
 pub use self::pipeline::{
     compile_source, compile_source_at_path_with_flavor_and_options, compile_source_file,
@@ -63,6 +63,11 @@ pub enum CompileError {
         source_name: Option<String>,
         detail: String,
     },
+    InvalidFieldAccess {
+        line: Option<u32>,
+        source_name: Option<String>,
+        detail: String,
+    },
     FunctionParameterTypeConflict {
         line: Option<u32>,
         source_name: Option<String>,
@@ -82,6 +87,9 @@ impl CompileError {
             CompileError::BinaryOperandTypeMismatch { line, .. } => {
                 line.and_then(|value| usize::try_from(value).ok())
             }
+            CompileError::InvalidFieldAccess { line, .. } => {
+                line.and_then(|value| usize::try_from(value).ok())
+            }
             CompileError::FunctionParameterTypeConflict { line, .. } => {
                 line.and_then(|value| usize::try_from(value).ok())
             }
@@ -94,6 +102,7 @@ impl CompileError {
             CompileError::IfElseBranchTypeMismatch { source_name, .. }
             | CompileError::CallableArgumentTypeMismatch { source_name, .. }
             | CompileError::BinaryOperandTypeMismatch { source_name, .. }
+            | CompileError::InvalidFieldAccess { source_name, .. }
             | CompileError::FunctionParameterTypeConflict { source_name, .. } => {
                 source_name.as_deref()
             }
@@ -128,6 +137,7 @@ impl CompileError {
             CompileError::IfElseBranchTypeMismatch { detail, .. } => detail.clone(),
             CompileError::CallableArgumentTypeMismatch { detail, .. } => detail.clone(),
             CompileError::BinaryOperandTypeMismatch { detail, .. } => detail.clone(),
+            CompileError::InvalidFieldAccess { detail, .. } => detail.clone(),
             CompileError::FunctionParameterTypeConflict { detail, .. } => detail.clone(),
         }
     }

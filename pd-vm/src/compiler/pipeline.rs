@@ -327,6 +327,7 @@ fn compile_parsed_output_with_entry_locals(
         stmts,
         locals,
         local_bindings,
+        local_schemas,
         functions,
         function_impls,
         ..
@@ -366,6 +367,7 @@ fn compile_parsed_output_with_entry_locals(
     compiler.set_type_inference(type_info);
     compiler.set_source(source);
     compiler.set_function_impls(function_impls);
+    compiler.set_local_schemas(local_schemas);
     compiler.set_host_import_return_types(host_import_return_types);
     compiler.set_host_import_signatures(host_import_signatures);
     compiler.set_call_index_remap(call_index_remap);

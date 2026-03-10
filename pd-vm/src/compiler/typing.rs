@@ -18,7 +18,7 @@ pub(crate) use self::state::{
     BoundType, HostCallableSignature, LocalTypeState, TypeInferenceResult,
 };
 use super::CompileError;
-use super::ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, Stmt};
+use super::ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, Stmt, TypeSchema};
 pub(super) fn legalize_builtins_and_bind_types(mut ir: FrontendIr) -> FrontendIr {
     let function_names = build_function_names(&ir.functions);
     let host_import_return_types =
@@ -27,6 +27,7 @@ pub(super) fn legalize_builtins_and_bind_types(mut ir: FrontendIr) -> FrontendIr
     let mut top_state = LocalTypeState::default();
     let mut context = TypeContext::new(
         &ir.function_impls,
+        &ir.local_schemas,
         &function_names,
         &host_import_return_types,
         &host_import_signatures,
@@ -44,6 +45,7 @@ pub(super) fn legalize_builtins_and_bind_types(mut ir: FrontendIr) -> FrontendIr
             &host_import_return_types,
             &host_import_signatures,
             &observed_function_param_types,
+            &ir.local_schemas,
         );
     }
 
@@ -59,6 +61,7 @@ pub(super) fn infer_types(ir: &FrontendIr) -> TypeInferenceResult {
     let mut top_state = LocalTypeState::default();
     let mut context = TypeContext::new(
         &ir.function_impls,
+        &ir.local_schemas,
         &function_names,
         &host_import_return_types,
         &host_import_signatures,
@@ -79,6 +82,7 @@ pub(super) fn infer_types(ir: &FrontendIr) -> TypeInferenceResult {
             &host_import_return_types,
             &host_import_signatures,
             &observed_function_param_types,
+            &ir.local_schemas,
         );
     }
 
@@ -93,6 +97,7 @@ pub(super) fn validate_if_else_type_consistency(ir: &FrontendIr) -> Result<(), C
     let mut top_state = LocalTypeState::default();
     let mut context = TypeContext::new(
         &ir.function_impls,
+        &ir.local_schemas,
         &function_names,
         &host_import_return_types,
         &host_import_signatures,
@@ -118,6 +123,7 @@ pub(super) fn validate_if_else_type_consistency(ir: &FrontendIr) -> Result<(), C
             decl.index,
             function_impl,
             ir.function_sources.get(&decl.index).map(String::as_str),
+            &ir.local_schemas,
             &mut context,
         )?;
     }
@@ -133,6 +139,7 @@ pub(crate) fn infer_expr_type(expr: &Expr, state: &LocalTypeState) -> BoundType 
         expr,
         state,
         &empty_impls,
+        &HashMap::new(),
         &empty_imports,
         &empty_signatures,
     )
@@ -142,12 +149,14 @@ pub(crate) fn infer_expr_type_with_function_impls_and_imports(
     expr: &Expr,
     state: &LocalTypeState,
     function_impls: &HashMap<u16, FunctionImpl>,
+    local_schemas: &HashMap<u16, TypeSchema>,
     host_import_return_types: &HashMap<u16, BoundType>,
     host_import_signatures: &HashMap<u16, HostCallableSignature>,
 ) -> BoundType {
     let empty_function_names: HashMap<u16, String> = HashMap::new();
     let mut context = TypeContext::new(
         function_impls,
+        local_schemas,
         &empty_function_names,
         host_import_return_types,
         host_import_signatures,
@@ -159,12 +168,14 @@ pub(crate) fn apply_stmts_with_function_impls_and_imports(
     stmts: &[Stmt],
     state: &mut LocalTypeState,
     function_impls: &HashMap<u16, FunctionImpl>,
+    local_schemas: &HashMap<u16, TypeSchema>,
     host_import_return_types: &HashMap<u16, BoundType>,
     host_import_signatures: &HashMap<u16, HostCallableSignature>,
 ) {
     let empty_function_names: HashMap<u16, String> = HashMap::new();
     let mut context = TypeContext::new(
         function_impls,
+        local_schemas,
         &empty_function_names,
         host_import_return_types,
         host_import_signatures,

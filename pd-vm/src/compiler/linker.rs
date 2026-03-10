@@ -33,6 +33,7 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
     let mut merged_stmts = Vec::new();
     let mut merged_stmt_sources = Vec::new();
     let mut merged_local_bindings = Vec::new();
+    let mut merged_local_schemas = HashMap::new();
     let mut merged_functions = Vec::new();
     let mut merged_function_impls = HashMap::<u16, FunctionImpl>::new();
     let mut merged_function_sources = HashMap::<u16, String>::new();
@@ -67,6 +68,11 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
                 name
             };
             merged_local_bindings.push((scoped_name, remapped_index));
+        }
+
+        for (index, schema) in unit.parsed.local_schemas {
+            let remapped_index = remap_local_index(index, unit_local_base)?;
+            merged_local_schemas.insert(remapped_index, schema);
         }
 
         for (unit_index, mut function_impl) in unit.parsed.function_impls {
@@ -127,6 +133,7 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
         stmts: merged_stmts,
         locals: local_base,
         local_bindings: merged_local_bindings,
+        local_schemas: merged_local_schemas,
         functions: merged_functions,
         function_impls: merged_function_impls,
         stmt_sources: merged_stmt_sources,

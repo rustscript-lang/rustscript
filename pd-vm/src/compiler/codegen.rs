@@ -5,7 +5,8 @@ use crate::builtins::BuiltinFunction;
 use crate::{Program, TypeMap, Value, ValueType};
 
 use super::ir::{
-    ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, MatchTypePattern, Stmt,
+    ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, MatchTypePattern,
+    Stmt, TypeSchema,
 };
 use super::{CompileError, typing};
 
@@ -14,6 +15,7 @@ pub struct Compiler {
     next_label_id: u32,
     loop_stack: Vec<LoopContext>,
     function_impls: HashMap<u16, FunctionImpl>,
+    local_schemas: HashMap<LocalSlot, TypeSchema>,
     host_import_return_types: HashMap<u16, typing::BoundType>,
     host_import_signatures: HashMap<u16, typing::HostCallableSignature>,
     call_index_remap: HashMap<u16, u16>,
@@ -56,6 +58,7 @@ impl Compiler {
             next_label_id: 0,
             loop_stack: Vec::new(),
             function_impls: HashMap::new(),
+            local_schemas: HashMap::new(),
             host_import_return_types: HashMap::new(),
             host_import_signatures: HashMap::new(),
             call_index_remap: HashMap::new(),
@@ -94,6 +97,10 @@ impl Compiler {
 
     pub fn set_function_impls(&mut self, function_impls: HashMap<u16, FunctionImpl>) {
         self.function_impls = function_impls;
+    }
+
+    pub fn set_local_schemas(&mut self, local_schemas: HashMap<LocalSlot, TypeSchema>) {
+        self.local_schemas = local_schemas;
     }
 
     pub(crate) fn set_host_import_return_types(
@@ -1076,6 +1083,7 @@ impl Compiler {
             expr,
             &self.type_state,
             &self.function_impls,
+            &self.local_schemas,
             &self.host_import_return_types,
             &self.host_import_signatures,
         )
@@ -1091,6 +1099,7 @@ impl Compiler {
             stmts,
             &mut state,
             &self.function_impls,
+            &self.local_schemas,
             &self.host_import_return_types,
             &self.host_import_signatures,
         );

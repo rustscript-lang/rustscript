@@ -786,7 +786,7 @@ impl Parser {
                     continue;
                 }
                 let member = self.expect_namespace_segment("expected member name after '?.'")?;
-                expr = self.build_optional_get_expr(expr, Expr::String(member))?;
+                expr = self.build_optional_member_get_expr(expr, member)?;
                 continue;
             }
             break;
@@ -880,6 +880,31 @@ impl Parser {
         self.bind_hidden_local_expr(container_slot, container, key_bound)
     }
 
+    pub(super) fn build_optional_member_get_expr(
+        &mut self,
+        container: Expr,
+        member: String,
+    ) -> Result<Expr, ParseError> {
+        let container_slot = self.allocate_hidden_local()?;
+        let key_expr = Expr::String(member);
+
+        let is_null = self.build_type_check_expr(Expr::Var(container_slot), "null")?;
+        let is_map = self.build_type_check_expr(Expr::Var(container_slot), "map")?;
+        let map_lookup =
+            self.build_optional_map_lookup_expr_with_key(container_slot, key_expr.clone())?;
+        let guarded = Expr::IfElse {
+            condition: Box::new(is_null),
+            then_expr: Box::new(Expr::Null),
+            else_expr: Box::new(Expr::IfElse {
+                condition: Box::new(is_map),
+                then_expr: Box::new(map_lookup),
+                else_expr: Box::new(Expr::Null),
+            }),
+        };
+
+        self.bind_hidden_local_expr(container_slot, container, guarded)
+    }
+
     pub(super) fn build_type_check_expr(
         &mut self,
         value: Expr,
@@ -897,9 +922,17 @@ impl Parser {
         container_slot: LocalSlot,
         key_slot: LocalSlot,
     ) -> Result<Expr, ParseError> {
+        self.build_optional_map_lookup_expr_with_key(container_slot, Expr::Var(key_slot))
+    }
+
+    pub(super) fn build_optional_map_lookup_expr_with_key(
+        &mut self,
+        container_slot: LocalSlot,
+        key: Expr,
+    ) -> Result<Expr, ParseError> {
         let set_probe = self.build_builtin_call_expr(
             BuiltinFunction::Set,
-            vec![Expr::Var(container_slot), Expr::Var(key_slot), Expr::Null],
+            vec![Expr::Var(container_slot), key.clone(), Expr::Null],
         )?;
         let set_probe_len = self.build_builtin_call_expr(BuiltinFunction::Len, vec![set_probe])?;
         let container_len =
@@ -907,7 +940,7 @@ impl Parser {
         let key_present = Expr::Eq(Box::new(set_probe_len), Box::new(container_len));
         let value = self.build_builtin_call_expr(
             BuiltinFunction::Get,
-            vec![Expr::Var(container_slot), Expr::Var(key_slot)],
+            vec![Expr::Var(container_slot), key],
         )?;
         Ok(Expr::IfElse {
             condition: Box::new(key_present),
