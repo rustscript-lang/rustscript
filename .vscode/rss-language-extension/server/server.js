@@ -257,7 +257,11 @@ function toLspDiagnostic(document, diagnostic) {
     : 0;
 
   return {
-    severity: DiagnosticSeverity.Error,
+    severity:
+      typeof diagnostic.severity === "string" &&
+      diagnostic.severity.toLowerCase() === "warning"
+        ? DiagnosticSeverity.Warning
+        : DiagnosticSeverity.Error,
     source: "rustscript-lsp",
     message,
     range: span || fullLineRange(document, line > 0 ? line - 1 : 0)
@@ -595,9 +599,7 @@ async function runWasmLint(document) {
 
   const source = document.getText();
   const documentPath = documentPathFromUri(document.uri);
-  const moduleOverrides = documentPath
-    ? await collectRustScriptModuleOverrides(documentPath, source)
-    : [];
+  const moduleOverrides = await collectCombinedModuleOverrides(documentPath, source);
   const sourceBytes = encoder.encode(source);
   const flavorBytes = encoder.encode(FLAVOR);
   const pathBytes = encoder.encode(documentPath || "");
@@ -658,6 +660,36 @@ async function runWasmLint(document) {
   }
 }
 
+async function collectCombinedModuleOverrides(documentPath, source) {
+  if (!documentPath) {
+    return [];
+  }
+  const diskStdlibOverrides = await loadDiskStdlibOverrides(documentPath);
+  const documentOverrides = await collectRustScriptModuleOverrides(documentPath, source);
+  return mergeModuleOverrides(diskStdlibOverrides, documentOverrides);
+}
+
+function mergeModuleOverrides(base, extra) {
+  const merged = [...base];
+  const seen = new Set(
+    base.map((entry) =>
+      typeof entry.path === "string" ? normalizeModuleOverridePath(entry.path) : ""
+    )
+  );
+  for (const entry of extra) {
+    if (!entry || typeof entry.path !== "string") {
+      continue;
+    }
+    const normalized = normalizeModuleOverridePath(entry.path);
+    if (seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    merged.push(entry);
+  }
+  return merged;
+}
+
 function documentPathFromUri(uri) {
   if (!uri) {
     return "";
@@ -679,6 +711,9 @@ async function collectRustScriptModuleOverrides(entryPath, source) {
     const current = pending.pop();
     const specs = parseRustScriptImportSpecs(current.source);
     for (const spec of specs) {
+      if (isEmbeddedStdlibSpec(spec)) {
+        continue;
+      }
       const resolved = resolveRustScriptImportPath(current.filePath, spec);
       if (!resolved) {
         continue;
@@ -717,6 +752,85 @@ async function collectRustScriptModuleOverrides(entryPath, source) {
   }
 
   return overrides;
+}
+
+const diskStdlibOverrideCache = new Map();
+let missingDiskStdlibWarningLogged = false;
+
+async function loadDiskStdlibOverrides(entryPath) {
+  const stdlibDir = await resolveDiskStdlibDir(entryPath);
+  if (!stdlibDir) {
+    if (!missingDiskStdlibWarningLogged) {
+      missingDiskStdlibWarningLogged = true;
+      connection.console.warn(
+        `RustScript stdlib sources were not found on disk for '${entryPath}'.`
+      );
+    }
+    return [];
+  }
+
+  if (diskStdlibOverrideCache.has(stdlibDir)) {
+    return diskStdlibOverrideCache.get(stdlibDir);
+  }
+
+  const overridesPromise = (async () => {
+    const overrides = [];
+    const entries = await fs.readdir(stdlibDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".rss")) {
+        continue;
+      }
+      const modulePath = path.join(stdlibDir, entry.name);
+      const source = await fs.readFile(modulePath, "utf8");
+      overrides.push({
+        path: `stdlib/rss/${entry.name}`,
+        source
+      });
+    }
+    return overrides;
+  })();
+
+  diskStdlibOverrideCache.set(stdlibDir, overridesPromise);
+  return overridesPromise;
+}
+
+async function resolveDiskStdlibDir(entryPath) {
+  const roots = ancestorDirs(path.dirname(entryPath));
+  for (const root of roots) {
+    const directCandidate = path.join(root, "stdlib", "rss");
+    if (await isDirectory(directCandidate)) {
+      return directCandidate;
+    }
+
+    const repoCandidate = path.join(root, "pd-vm", "stdlib", "rss");
+    if (await isDirectory(repoCandidate)) {
+      return repoCandidate;
+    }
+  }
+  return "";
+}
+
+function ancestorDirs(startDir) {
+  const dirs = [];
+  let current = path.resolve(startDir);
+  while (true) {
+    dirs.push(current);
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+  return dirs;
+}
+
+async function isDirectory(candidate) {
+  try {
+    const stats = await fs.stat(candidate);
+    return stats.isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function parseRustScriptImportSpecs(source) {
@@ -809,6 +923,10 @@ function rustScriptModulePathToSpec(modulePath) {
     spec += ".rss";
   }
   return spec;
+}
+
+function isEmbeddedStdlibSpec(spec) {
+  return typeof spec === "string" && /^stdlib\/rss\/[A-Za-z_][A-Za-z0-9_]*\.rss$/.test(spec);
 }
 
 function resolveRustScriptImportPath(basePath, spec) {
