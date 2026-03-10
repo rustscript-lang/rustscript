@@ -4,6 +4,8 @@ mod liveness;
 use super::ParseError;
 use super::ir::{FrontendIr, LocalSlot};
 
+// This module is the entry point for the lifetime pass. `availability` owns the
+// top-level transformation and depends on the lower-level liveness machinery.
 pub(super) fn enforce_local_availability_with_entry_locals(
     ir: FrontendIr,
     entry_definite_locals: &[LocalSlot],

@@ -1,21 +1,28 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
-
-use crate::builtins::BuiltinFunction;
 
 pub(crate) mod builtins_impl;
 pub mod diagnostics;
+mod epoch;
+mod fuel;
+mod host;
 pub(crate) mod jit;
 mod store;
-
+#[cfg(test)]
+mod tests;
+pub use self::epoch::{EpochCheckpoint, EpochHandle};
+pub use self::fuel::FuelCheckpoint;
+pub use self::host::{
+    CallOutcome, HostAsyncBridge, HostBindingPlan, HostFunction, HostFunctionRegistry, HostOpId,
+    StaticHostFunction,
+};
+use self::host::{HostCallExecOutcome, VmHostFunction, WaitingHostOp};
 pub use crate::bytecode::{HostImport, OpCode, Program, Value, ValueType};
 pub use store::Store;
 
 #[derive(Clone, Copy, Debug)]
-enum NumericValue {
+pub(crate) enum NumericValue {
     Int(i64),
     Float(f64),
 }
@@ -136,76 +143,6 @@ impl std::error::Error for VmError {}
 
 pub type VmResult<T> = Result<T, VmError>;
 
-pub type HostOpId = u64;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FuelCheckpoint {
-    remaining: Option<u64>,
-    check_interval: u32,
-    ops_until_check: u32,
-}
-
-impl FuelCheckpoint {
-    pub fn fuel(&self) -> Option<u64> {
-        self.remaining
-    }
-
-    pub fn check_interval(&self) -> u32 {
-        self.check_interval
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EpochCheckpoint {
-    deadline: Option<u64>,
-    deadline_delta: u64,
-    rearm_pending: bool,
-    check_interval: u32,
-    ops_until_check: u32,
-}
-
-impl EpochCheckpoint {
-    pub fn deadline(&self) -> Option<u64> {
-        self.deadline
-    }
-
-    pub fn check_interval(&self) -> u32 {
-        self.check_interval
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct EpochHandle {
-    current: Arc<AtomicU64>,
-}
-
-impl EpochHandle {
-    pub fn current(&self) -> u64 {
-        self.current.load(Ordering::Acquire)
-    }
-
-    pub fn increment(&self) -> u64 {
-        self.increment_by(1)
-    }
-
-    pub fn increment_by(&self, delta: u64) -> u64 {
-        if delta == 0 {
-            return self.current();
-        }
-        let previous = self
-            .current
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_add(delta))
-            })
-            .unwrap_or_else(|current| current);
-        previous.saturating_add(delta)
-    }
-
-    fn as_ptr(&self) -> *const AtomicU64 {
-        Arc::as_ptr(&self.current)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmStatus {
     Halted,
@@ -237,210 +174,7 @@ impl InterruptMode {
         }
     }
 }
-
-#[derive(Debug, PartialEq)]
-pub enum CallOutcome {
-    Return(Vec<Value>),
-    Yield,
-    Pending(HostOpId),
-}
-
-pub trait HostFunction: Send {
-    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome>;
-}
-
-pub trait HostAsyncBridge: Send {
-    fn poll_op(&mut self, op_id: HostOpId, cx: &mut Context<'_>) -> Poll<VmResult<Vec<Value>>>;
-}
-
-pub type StaticHostFunction = fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>;
-
-type HostFactory = dyn Fn() -> Box<dyn HostFunction> + Send + Sync;
 type RuntimePrintSink = dyn FnMut(String) + Send;
-
-enum RegistryEntryKind {
-    Factory(Box<HostFactory>),
-    Static(StaticHostFunction),
-}
-
-struct RegistryEntry {
-    arity: u8,
-    kind: RegistryEntryKind,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HostBindingPlan {
-    import_signature: Vec<HostImport>,
-    registry_slots: Vec<u16>,
-    resolved_calls: Vec<u16>,
-}
-
-pub struct HostFunctionRegistry {
-    entries: Vec<RegistryEntry>,
-    by_name: HashMap<String, u16>,
-    plan_cache: HashMap<Vec<HostImport>, HostBindingPlan>,
-}
-
-impl Default for HostFunctionRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl HostFunctionRegistry {
-    pub fn new() -> Self {
-        let mut registry = Self {
-            entries: Vec::new(),
-            by_name: HashMap::new(),
-            plan_cache: HashMap::new(),
-        };
-        builtins_impl::register_default_host_functions(&mut registry);
-        registry
-    }
-
-    pub fn register<F>(&mut self, name: impl Into<String>, arity: u8, factory: F)
-    where
-        F: Fn() -> Box<dyn HostFunction> + Send + Sync + 'static,
-    {
-        let name = name.into();
-        if let Some(&slot) = self.by_name.get(&name)
-            && let Some(entry) = self.entries.get_mut(slot as usize)
-        {
-            entry.arity = arity;
-            entry.kind = RegistryEntryKind::Factory(Box::new(factory));
-            self.plan_cache.clear();
-            return;
-        }
-
-        let slot = self.entries.len() as u16;
-        self.entries.push(RegistryEntry {
-            arity,
-            kind: RegistryEntryKind::Factory(Box::new(factory)),
-        });
-        self.by_name.insert(name, slot);
-        self.plan_cache.clear();
-    }
-
-    pub fn register_static(
-        &mut self,
-        name: impl Into<String>,
-        arity: u8,
-        function: StaticHostFunction,
-    ) {
-        let name = name.into();
-        if let Some(&slot) = self.by_name.get(&name)
-            && let Some(entry) = self.entries.get_mut(slot as usize)
-        {
-            entry.arity = arity;
-            entry.kind = RegistryEntryKind::Static(function);
-            self.plan_cache.clear();
-            return;
-        }
-
-        let slot = self.entries.len() as u16;
-        self.entries.push(RegistryEntry {
-            arity,
-            kind: RegistryEntryKind::Static(function),
-        });
-        self.by_name.insert(name, slot);
-        self.plan_cache.clear();
-    }
-
-    pub fn bind_vm_cached(&mut self, vm: &mut Vm) -> VmResult<()> {
-        let plan = self.prepare_plan(&vm.program.imports)?;
-        self.bind_vm_with_plan(vm, &plan)
-    }
-
-    pub fn prepare_plan(&mut self, imports: &[HostImport]) -> VmResult<HostBindingPlan> {
-        self.plan_for_imports(imports).cloned()
-    }
-
-    fn plan_for_imports(&mut self, imports: &[HostImport]) -> VmResult<&HostBindingPlan> {
-        if !self.plan_cache.contains_key(imports) {
-            let mut registry_slot_to_vm_slot: HashMap<u16, u16> = HashMap::new();
-            let mut registry_slots = Vec::new();
-            let mut resolved_calls = Vec::with_capacity(imports.len());
-
-            for import in imports {
-                let registry_slot = self
-                    .by_name
-                    .get(&import.name)
-                    .copied()
-                    .ok_or_else(|| VmError::UnboundImport(import.name.clone()))?;
-                let entry = self
-                    .entries
-                    .get(registry_slot as usize)
-                    .ok_or(VmError::InvalidCall(registry_slot))?;
-                if entry.arity != import.arity {
-                    return Err(VmError::InvalidCallArity {
-                        import: import.name.clone(),
-                        expected: entry.arity,
-                        got: import.arity,
-                    });
-                }
-
-                let vm_slot = if let Some(&existing) = registry_slot_to_vm_slot.get(&registry_slot)
-                {
-                    existing
-                } else {
-                    let slot = registry_slots.len() as u16;
-                    registry_slots.push(registry_slot);
-                    registry_slot_to_vm_slot.insert(registry_slot, slot);
-                    slot
-                };
-                resolved_calls.push(vm_slot);
-            }
-
-            self.plan_cache.insert(
-                imports.to_vec(),
-                HostBindingPlan {
-                    import_signature: imports.to_vec(),
-                    registry_slots,
-                    resolved_calls,
-                },
-            );
-        }
-
-        self.plan_cache
-            .get(imports)
-            .ok_or_else(|| VmError::HostError("host binding plan cache lookup failed".to_string()))
-    }
-
-    pub fn bind_vm_with_plan(&self, vm: &mut Vm, plan: &HostBindingPlan) -> VmResult<()> {
-        if vm.program.imports != plan.import_signature {
-            return Err(VmError::HostError(
-                "host binding plan does not match vm import signature".to_string(),
-            ));
-        }
-        if !vm.host_functions.is_empty() || !vm.host_function_symbols.is_empty() {
-            return Err(VmError::HostError(
-                "host binding cache requires an unbound vm".to_string(),
-            ));
-        }
-
-        for &registry_slot in &plan.registry_slots {
-            let entry = self
-                .entries
-                .get(registry_slot as usize)
-                .ok_or(VmError::InvalidCall(registry_slot))?;
-            match &entry.kind {
-                RegistryEntryKind::Factory(factory) => {
-                    vm.register_function(factory());
-                }
-                RegistryEntryKind::Static(function) => {
-                    vm.register_static_function(*function);
-                }
-            }
-        }
-        vm.install_resolved_calls(plan.resolved_calls.clone())?;
-        Ok(())
-    }
-}
-
-enum VmHostFunction {
-    Dynamic(Box<dyn HostFunction>),
-    Static(StaticHostFunction),
-}
 
 type PackedOperandTypes = u8;
 
@@ -503,39 +237,11 @@ pub struct Vm {
     drop_contract_events: u64,
 }
 
-enum ExecOutcome {
+pub(crate) enum ExecOutcome {
     Continue,
     Halted,
     Yielded,
     Waiting(HostOpId),
-}
-
-enum HostCallExecOutcome {
-    Returned,
-    Yielded,
-    Pending(HostOpId),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct WaitingHostOp {
-    op_id: HostOpId,
-    source: WaitingHostOpSource,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WaitingHostOpSource {
-    HostBridge,
-    BuiltinIo,
-}
-
-struct NoopWake;
-
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-}
-
-fn noop_waker() -> Waker {
-    Waker::from(Arc::new(NoopWake))
 }
 
 #[derive(Default)]
@@ -862,136 +568,6 @@ impl Vm {
         self.drop_contract_events
     }
 
-    pub fn register_function(&mut self, function: Box<dyn HostFunction>) -> u16 {
-        let index = self.host_functions.len() as u16;
-        self.host_functions.push(VmHostFunction::Dynamic(function));
-        self.resolved_calls_dirty = true;
-        index
-    }
-
-    pub fn register_static_function(&mut self, function: StaticHostFunction) -> u16 {
-        let index = self.host_functions.len() as u16;
-        self.host_functions.push(VmHostFunction::Static(function));
-        self.resolved_calls_dirty = true;
-        index
-    }
-
-    pub fn bind_function(&mut self, name: impl Into<String>, function: Box<dyn HostFunction>) {
-        let name = name.into();
-        if let Some(builtin) = BuiltinFunction::from_namespaced_name(&name) {
-            self.bind_builtin_overrideslot(builtin.call_index(), VmHostFunction::Dynamic(function));
-            return;
-        }
-        if let Some(&index) = self.host_function_symbols.get(&name)
-            && let Some(slot) = self.host_functions.get_mut(index as usize)
-        {
-            *slot = VmHostFunction::Dynamic(function);
-            self.resolved_calls_dirty = true;
-            return;
-        }
-
-        let index = self.register_function(function);
-        self.host_function_symbols.insert(name, index);
-        self.resolved_calls_dirty = true;
-    }
-
-    pub fn bind_static_function(&mut self, name: impl Into<String>, function: StaticHostFunction) {
-        let name = name.into();
-        if let Some(builtin) = BuiltinFunction::from_namespaced_name(&name) {
-            self.bind_builtin_overrideslot(builtin.call_index(), VmHostFunction::Static(function));
-            return;
-        }
-        if let Some(&index) = self.host_function_symbols.get(&name)
-            && let Some(slot) = self.host_functions.get_mut(index as usize)
-        {
-            *slot = VmHostFunction::Static(function);
-            self.resolved_calls_dirty = true;
-            return;
-        }
-
-        let index = self.register_static_function(function);
-        self.host_function_symbols.insert(name, index);
-        self.resolved_calls_dirty = true;
-    }
-
-    pub fn bind_builtin_override(
-        &mut self,
-        name: impl Into<String>,
-        function: Box<dyn HostFunction>,
-    ) -> VmResult<()> {
-        let name = name.into();
-        let builtin = BuiltinFunction::from_namespaced_name(&name).ok_or_else(|| {
-            VmError::HostError(format!("unknown namespaced builtin override '{name}'"))
-        })?;
-        self.bind_builtin_overrideslot(builtin.call_index(), VmHostFunction::Dynamic(function));
-        Ok(())
-    }
-
-    pub fn bind_builtin_static_override(
-        &mut self,
-        name: impl Into<String>,
-        function: StaticHostFunction,
-    ) -> VmResult<()> {
-        let name = name.into();
-        let builtin = BuiltinFunction::from_namespaced_name(&name).ok_or_else(|| {
-            VmError::HostError(format!("unknown namespaced builtin override '{name}'"))
-        })?;
-        self.bind_builtin_overrideslot(builtin.call_index(), VmHostFunction::Static(function));
-        Ok(())
-    }
-
-    fn bind_builtin_overrideslot(&mut self, builtin_call_index: u16, function: VmHostFunction) {
-        if let Some(&host_slot) = self.builtin_overrides.get(&builtin_call_index)
-            && let Some(slot) = self.host_functions.get_mut(host_slot as usize)
-        {
-            *slot = function;
-            return;
-        }
-
-        let host_slot = self.host_functions.len() as u16;
-        self.host_functions.push(function);
-        self.builtin_overrides.insert(builtin_call_index, host_slot);
-    }
-
-    pub fn set_async_bridge(&mut self, bridge: Box<dyn HostAsyncBridge>) {
-        self.async_bridge = Some(bridge);
-    }
-
-    pub fn clear_async_bridge(&mut self) {
-        self.async_bridge = None;
-    }
-
-    pub fn set_runtime_print_sink<F>(&mut self, sink: F)
-    where
-        F: FnMut(String) + Send + 'static,
-    {
-        self.runtime_print_sink = Some(Box::new(sink));
-    }
-
-    pub fn clear_runtime_print_sink(&mut self) {
-        self.runtime_print_sink = None;
-    }
-
-    pub(crate) fn write_runtime_print(&mut self, rendered: String) -> VmResult<()> {
-        let Some(sink) = self.runtime_print_sink.as_mut() else {
-            return Err(VmError::HostError(
-                "runtime print sink is not configured".to_string(),
-            ));
-        };
-        sink(rendered);
-        Ok(())
-    }
-
-    pub fn allocate_host_op_id(&mut self) -> HostOpId {
-        let op_id = self.next_host_op_id;
-        self.next_host_op_id = self.next_host_op_id.wrapping_add(1).max(1);
-        op_id
-    }
-
-    pub fn waiting_host_op_id(&self) -> Option<HostOpId> {
-        self.waiting_host_op.map(|op| op.op_id)
-    }
-
     fn interruption_mode_conflict(&self, requested: InterruptMode) -> VmError {
         VmError::InterruptionModeConflict {
             active: self.interrupt_mode.label(),
@@ -1001,317 +577,6 @@ impl Vm {
 
     fn reset_interrupt_countdown(&mut self) {
         self.fuel_ops_until_check = self.fuel_check_interval.max(1);
-    }
-
-    fn clear_epoch_deadline_internal(&mut self) {
-        if self.epoch_interruption_enabled() {
-            self.interrupt_mode = InterruptMode::None;
-        }
-        self.epoch_deadline = 0;
-        self.epoch_deadline_delta = 0;
-        self.epoch_rearm_pending = false;
-        self.reset_interrupt_countdown();
-    }
-
-    fn clear_fuel_internal(&mut self) {
-        if self.fuel_metering_enabled() {
-            self.interrupt_mode = InterruptMode::None;
-        }
-        self.fuel_remaining = 0;
-        self.reset_interrupt_countdown();
-    }
-
-    pub fn set_fuel(&mut self, fuel: u64) {
-        self.clear_epoch_deadline_internal();
-        self.interrupt_mode = InterruptMode::Fuel;
-        self.fuel_remaining = fuel;
-        self.reset_interrupt_countdown();
-    }
-
-    pub fn clear_fuel(&mut self) {
-        self.clear_fuel_internal();
-    }
-
-    pub fn set_fuel_check_interval(&mut self, interval: u32) -> VmResult<()> {
-        if interval == 0 {
-            return Err(VmError::InvalidFuelCheckInterval(interval));
-        }
-        if self.epoch_interruption_enabled() {
-            return Err(self.interruption_mode_conflict(InterruptMode::Fuel));
-        }
-        self.validate_native_aot_interrupt_interval(interval)?;
-        self.fuel_check_interval = interval;
-        self.reset_interrupt_countdown();
-        Ok(())
-    }
-
-    pub fn fuel_check_interval(&self) -> u32 {
-        if self.native_aot_interrupt_check_interval == Some(0) {
-            0
-        } else {
-            self.fuel_check_interval
-        }
-    }
-
-    pub fn aot_fuel_check_interval(&self) -> Option<u32> {
-        self.native_aot_interrupt_check_interval
-    }
-
-    pub fn get_fuel(&self) -> Option<u64> {
-        self.fuel_metering_enabled()
-            .then_some(self.fuel_remaining.saturating_sub(self.pending_fuel_debt()))
-    }
-
-    pub fn add_fuel(&mut self, fuel: u64) -> VmResult<()> {
-        if fuel == 0 {
-            return Ok(());
-        }
-        if self.epoch_interruption_enabled() {
-            return Err(self.interruption_mode_conflict(InterruptMode::Fuel));
-        }
-        self.fuel_remaining = if self.fuel_metering_enabled() {
-            self.fuel_remaining
-                .checked_add(fuel)
-                .ok_or(VmError::FuelOverflow)?
-        } else {
-            self.interrupt_mode = InterruptMode::Fuel;
-            self.reset_interrupt_countdown();
-            fuel
-        };
-        Ok(())
-    }
-
-    pub fn recharge_fuel(&mut self, fuel: u64) -> VmResult<()> {
-        self.add_fuel(fuel)
-    }
-
-    pub fn consume_fuel(&mut self, fuel: u64) -> VmResult<()> {
-        if self.epoch_interruption_enabled() {
-            return Err(self.interruption_mode_conflict(InterruptMode::Fuel));
-        }
-        self.charge_fuel(fuel)
-    }
-
-    pub fn consume_fuel_tick(&mut self) -> VmResult<()> {
-        if self.epoch_interruption_enabled() {
-            return Err(self.interruption_mode_conflict(InterruptMode::Fuel));
-        }
-        self.charge_fuel_tick()
-    }
-
-    pub fn consume_epoch_tick(&mut self) -> VmResult<()> {
-        if self.fuel_metering_enabled() {
-            return Err(self.interruption_mode_conflict(InterruptMode::Epoch));
-        }
-        self.charge_epoch_tick()
-    }
-
-    pub fn fuel_checkpoint(&self) -> FuelCheckpoint {
-        FuelCheckpoint {
-            remaining: self.fuel_metering_enabled().then_some(self.fuel_remaining),
-            check_interval: self.fuel_check_interval(),
-            ops_until_check: self.fuel_ops_until_check,
-        }
-    }
-
-    pub fn checkpoint(&self) -> FuelCheckpoint {
-        self.fuel_checkpoint()
-    }
-
-    pub fn restore_fuel(&mut self, checkpoint: FuelCheckpoint) {
-        self.clear_epoch_deadline_internal();
-        self.interrupt_mode = if checkpoint.remaining.is_some() {
-            InterruptMode::Fuel
-        } else {
-            InterruptMode::None
-        };
-        self.fuel_remaining = checkpoint.remaining.unwrap_or(0);
-        if self.native_aot_interrupt_check_interval == Some(0) {
-            self.fuel_check_interval = 1;
-            self.fuel_ops_until_check = 1;
-            return;
-        }
-        self.fuel_check_interval = self
-            .native_aot_interrupt_check_interval
-            .unwrap_or(checkpoint.check_interval.max(1));
-        self.fuel_ops_until_check = checkpoint
-            .ops_until_check
-            .clamp(1, self.fuel_check_interval);
-    }
-
-    pub fn restore_checkpoint(&mut self, checkpoint: FuelCheckpoint) {
-        self.restore_fuel(checkpoint);
-    }
-
-    pub fn epoch_handle(&self) -> EpochHandle {
-        self.epoch_handle.clone()
-    }
-
-    pub fn current_epoch(&self) -> u64 {
-        self.epoch_handle.current()
-    }
-
-    pub fn increment_epoch(&self) -> u64 {
-        self.epoch_handle.increment()
-    }
-
-    pub fn increment_epoch_by(&self, delta: u64) -> u64 {
-        self.epoch_handle.increment_by(delta)
-    }
-
-    pub fn set_epoch_deadline(&mut self, ticks_beyond_current: u64) -> VmResult<()> {
-        if self.fuel_metering_enabled() {
-            return Err(self.interruption_mode_conflict(InterruptMode::Epoch));
-        }
-        self.interrupt_mode = InterruptMode::Epoch;
-        self.epoch_deadline = self.current_epoch().saturating_add(ticks_beyond_current);
-        self.epoch_deadline_delta = ticks_beyond_current;
-        self.epoch_rearm_pending = false;
-        self.reset_interrupt_countdown();
-        Ok(())
-    }
-
-    pub fn clear_epoch_deadline(&mut self) {
-        self.clear_epoch_deadline_internal();
-    }
-
-    pub fn epoch_deadline(&self) -> Option<u64> {
-        self.epoch_interruption_enabled()
-            .then_some(self.epoch_deadline)
-    }
-
-    pub fn epoch_deadline_delta(&self) -> Option<u64> {
-        self.epoch_interruption_enabled()
-            .then_some(self.epoch_deadline_delta)
-    }
-
-    pub fn set_epoch_check_interval(&mut self, interval: u32) -> VmResult<()> {
-        if interval == 0 {
-            return Err(VmError::InvalidEpochCheckInterval(interval));
-        }
-        if self.fuel_metering_enabled() {
-            return Err(self.interruption_mode_conflict(InterruptMode::Epoch));
-        }
-        self.validate_native_aot_interrupt_interval(interval)?;
-        self.fuel_check_interval = interval;
-        self.reset_interrupt_countdown();
-        Ok(())
-    }
-
-    pub fn epoch_check_interval(&self) -> u32 {
-        self.fuel_check_interval()
-    }
-
-    pub fn aot_epoch_check_interval(&self) -> Option<u32> {
-        self.native_aot_interrupt_check_interval
-    }
-
-    pub fn epoch_checkpoint(&self) -> EpochCheckpoint {
-        EpochCheckpoint {
-            deadline: self
-                .epoch_interruption_enabled()
-                .then_some(self.epoch_deadline),
-            deadline_delta: self.epoch_deadline_delta,
-            rearm_pending: self.epoch_rearm_pending,
-            check_interval: self.epoch_check_interval(),
-            ops_until_check: self.fuel_ops_until_check,
-        }
-    }
-
-    pub fn restore_epoch(&mut self, checkpoint: EpochCheckpoint) {
-        self.clear_fuel_internal();
-        self.interrupt_mode = if checkpoint.deadline.is_some() {
-            InterruptMode::Epoch
-        } else {
-            InterruptMode::None
-        };
-        self.epoch_deadline = checkpoint.deadline.unwrap_or(0);
-        self.epoch_deadline_delta = checkpoint.deadline_delta;
-        self.epoch_rearm_pending = checkpoint.rearm_pending;
-        if self.native_aot_interrupt_check_interval == Some(0) {
-            self.fuel_check_interval = 1;
-            self.fuel_ops_until_check = 1;
-            return;
-        }
-        self.fuel_check_interval = self
-            .native_aot_interrupt_check_interval
-            .unwrap_or(checkpoint.check_interval.max(1));
-        self.fuel_ops_until_check = checkpoint
-            .ops_until_check
-            .clamp(1, self.fuel_check_interval);
-    }
-
-    pub fn last_yield_reason(&self) -> Option<VmYieldReason> {
-        self.last_yield_reason
-    }
-
-    pub fn complete_host_op(&mut self, op_id: HostOpId, values: Vec<Value>) -> VmResult<()> {
-        self.complete_waiting_host_op(op_id, values)
-    }
-
-    pub fn poll_waiting_host_op(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<()>> {
-        let Some(waiting) = self.waiting_host_op else {
-            return Poll::Ready(Ok(()));
-        };
-
-        let poll_result = match waiting.source {
-            WaitingHostOpSource::HostBridge => {
-                let bridge_ptr = match self.async_bridge.as_mut() {
-                    Some(bridge) => bridge.as_mut() as *mut dyn HostAsyncBridge,
-                    None => {
-                        return Poll::Ready(Err(VmError::HostError(format!(
-                            "vm waiting on host op {} without an async bridge",
-                            waiting.op_id
-                        ))));
-                    }
-                };
-
-                // SAFETY: `bridge_ptr` points to `self.async_bridge`, and this scope does not
-                // mutably access `self.async_bridge` again before `poll_op` returns.
-                unsafe { (&mut *bridge_ptr).poll_op(waiting.op_id, cx) }
-            }
-            WaitingHostOpSource::BuiltinIo => {
-                builtins_impl::poll_builtin_io_op(self, waiting.op_id, cx)
-            }
-        };
-
-        match poll_result {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(values)) => {
-                self.complete_waiting_host_op(waiting.op_id, values)?;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(err)) => {
-                self.waiting_host_op = None;
-                Poll::Ready(Err(err))
-            }
-        }
-    }
-
-    pub async fn await_waiting_host_op(&mut self) -> VmResult<()> {
-        std::future::poll_fn(|cx| self.poll_waiting_host_op(cx)).await
-    }
-
-    pub fn wait_for_host_op_blocking(&mut self) -> VmResult<()> {
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        loop {
-            match self.poll_waiting_host_op(&mut cx) {
-                Poll::Ready(result) => return result,
-                Poll::Pending => {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        return Err(VmError::HostError(
-                            "blocking host-op wait is unsupported on wasm32 runtime".to_string(),
-                        ));
-                    }
-                }
-            }
-        }
     }
 
     pub fn run(&mut self) -> VmResult<VmStatus> {
@@ -1324,8 +589,384 @@ impl Vm {
     ) -> VmResult<VmStatus> {
         self.run_internal(Some(debugger), false)
     }
+}
 
-    fn notify_debugger_status(
+impl Drop for Vm {
+    fn drop(&mut self) {
+        self.clear_stack_with_drop_contract();
+        self.clear_locals_with_drop_contract();
+        builtins_impl::close_all_handles(self);
+    }
+}
+
+impl Vm {
+    pub(super) fn pop_value(&mut self) -> VmResult<Value> {
+        self.stack.pop().ok_or(VmError::StackUnderflow)
+    }
+
+    pub(super) fn can_fuse_ldloc_copy_pattern(&self, index: u8) -> bool {
+        let code = &self.program.code;
+        if self.ip + 2 >= code.len() {
+            return false;
+        }
+        code[self.ip] == OpCode::Dup as u8
+            && code[self.ip + 1] == OpCode::Stloc as u8
+            && code[self.ip + 2] == index
+    }
+
+    pub(super) fn can_fuse_call_ret_pattern(&self) -> bool {
+        let code = &self.program.code;
+        self.ip < code.len() && code[self.ip] == OpCode::Ret as u8
+    }
+
+    pub(super) fn clear_stack_with_drop_contract(&mut self) {
+        let drained = self.stack.drain(..).collect::<Vec<_>>();
+        for value in drained {
+            self.drop_value_with_contract(value);
+        }
+    }
+
+    pub(super) fn clear_locals_with_drop_contract(&mut self) {
+        for slot in 0..self.locals.len() {
+            let previous = std::mem::replace(&mut self.locals[slot], Value::Null);
+            self.drop_value_with_contract(previous);
+        }
+    }
+
+    pub(super) fn drop_value_with_contract(&mut self, value: Value) {
+        self.count_value_drop_contract(&value);
+    }
+
+    pub(super) fn count_value_drop_contract(&mut self, value: &Value) {
+        match value {
+            Value::Null => {}
+            Value::Array(values) => {
+                self.drop_contract_events = self.drop_contract_events.saturating_add(1);
+                for item in values.iter() {
+                    self.count_value_drop_contract(item);
+                }
+            }
+            Value::Map(entries) => {
+                self.drop_contract_events = self.drop_contract_events.saturating_add(1);
+                for (key, value) in entries.iter() {
+                    self.count_value_drop_contract(key);
+                    self.count_value_drop_contract(value);
+                }
+            }
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::String(_) => {
+                self.drop_contract_events = self.drop_contract_events.saturating_add(1);
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(in crate::vm) fn charge_interrupt_tick(&mut self) -> VmResult<()> {
+        match self.interrupt_mode {
+            InterruptMode::None => Ok(()),
+            InterruptMode::Fuel => self.charge_fuel_tick(),
+            InterruptMode::Epoch => self.charge_epoch_tick(),
+        }
+    }
+
+    pub(super) fn peek_value(&self) -> VmResult<&Value> {
+        self.stack.last().ok_or(VmError::StackUnderflow)
+    }
+
+    pub(super) fn pop_int(&mut self) -> VmResult<i64> {
+        self.pop_value()?.as_int()
+    }
+
+    pub(super) fn pop_numeric(&mut self) -> VmResult<NumericValue> {
+        self.pop_value()?.as_numeric()
+    }
+
+    pub(super) fn pop_bool(&mut self) -> VmResult<bool> {
+        self.pop_value()?.as_bool()
+    }
+
+    pub(super) fn pop_float_exact(&mut self) -> VmResult<f64> {
+        match self.pop_value()? {
+            Value::Float(value) => Ok(value),
+            _ => Err(VmError::TypeMismatch("float")),
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn operand_type_hint(&self, ip: usize) -> PackedOperandTypes {
+        self.operand_type_hints
+            .as_deref()
+            .map_or(NO_OPERAND_TYPE_HINT, |hints| hints[ip])
+    }
+
+    #[inline(always)]
+    pub(super) fn unary_not_op(&mut self) -> VmResult<()> {
+        let value = self.pop_bool()?;
+        self.stack.push(Value::Bool(!value));
+        Ok(())
+    }
+
+    pub(super) fn int_add_op(&mut self) -> VmResult<()> {
+        let rhs = self.pop_int()?;
+        let lhs = self.pop_int()?;
+        self.stack.push(Value::Int(lhs.wrapping_add(rhs)));
+        Ok(())
+    }
+
+    pub(super) fn float_add_op(&mut self) -> VmResult<()> {
+        let rhs = self.pop_float_exact()?;
+        let lhs = self.pop_float_exact()?;
+        self.stack.push(Value::Float(lhs + rhs));
+        Ok(())
+    }
+
+    pub(super) fn string_concat_op(&mut self) -> VmResult<()> {
+        let rhs = match self.pop_value()? {
+            Value::String(value) => value,
+            _ => return Err(VmError::TypeMismatch("string")),
+        };
+        let lhs = match self.pop_value()? {
+            Value::String(value) => value,
+            _ => return Err(VmError::TypeMismatch("string")),
+        };
+        let mut out = String::with_capacity(lhs.len() + rhs.len());
+        out.push_str(lhs.as_str());
+        out.push_str(rhs.as_str());
+        self.stack.push(Value::string(out));
+        Ok(())
+    }
+
+    pub(super) fn int_binary_numeric_op(
+        &mut self,
+        op: impl FnOnce(i64, i64) -> VmResult<i64>,
+    ) -> VmResult<()> {
+        let rhs = self.pop_int()?;
+        let lhs = self.pop_int()?;
+        self.stack.push(Value::Int(op(lhs, rhs)?));
+        Ok(())
+    }
+
+    pub(super) fn float_binary_numeric_op(
+        &mut self,
+        op: impl FnOnce(f64, f64) -> VmResult<f64>,
+    ) -> VmResult<()> {
+        let rhs = self.pop_float_exact()?;
+        let lhs = self.pop_float_exact()?;
+        self.stack.push(Value::Float(op(lhs, rhs)?));
+        Ok(())
+    }
+
+    pub(super) fn int_neg_op(&mut self) -> VmResult<()> {
+        let value = self.pop_int()?;
+        self.stack.push(Value::Int(value.wrapping_neg()));
+        Ok(())
+    }
+
+    pub(super) fn float_neg_op(&mut self) -> VmResult<()> {
+        let value = self.pop_float_exact()?;
+        self.stack.push(Value::Float(-value));
+        Ok(())
+    }
+
+    pub(super) fn int_eq_op(&mut self) -> VmResult<()> {
+        let rhs = self.pop_int()?;
+        let lhs = self.pop_int()?;
+        self.stack.push(Value::Bool(lhs == rhs));
+        Ok(())
+    }
+
+    pub(super) fn float_eq_op(&mut self) -> VmResult<()> {
+        let rhs = self.pop_float_exact()?;
+        let lhs = self.pop_float_exact()?;
+        self.stack.push(Value::Bool(lhs == rhs));
+        Ok(())
+    }
+
+    pub(super) fn bool_eq_op(&mut self) -> VmResult<()> {
+        let rhs = self.pop_bool()?;
+        let lhs = self.pop_bool()?;
+        self.stack.push(Value::Bool(lhs == rhs));
+        Ok(())
+    }
+
+    pub(super) fn string_eq_op(&mut self) -> VmResult<()> {
+        let rhs = match self.pop_value()? {
+            Value::String(value) => value,
+            _ => return Err(VmError::TypeMismatch("string")),
+        };
+        let lhs = match self.pop_value()? {
+            Value::String(value) => value,
+            _ => return Err(VmError::TypeMismatch("string")),
+        };
+        self.stack.push(Value::Bool(lhs == rhs));
+        Ok(())
+    }
+
+    pub(super) fn null_eq_op(&mut self) -> VmResult<()> {
+        let rhs = self.pop_value()?;
+        let lhs = self.pop_value()?;
+        match (lhs, rhs) {
+            (Value::Null, Value::Null) => {
+                self.stack.push(Value::Bool(true));
+                Ok(())
+            }
+            _ => Err(VmError::TypeMismatch("null")),
+        }
+    }
+
+    pub(super) fn int_compare_op(&mut self, op: impl FnOnce(i64, i64) -> bool) -> VmResult<()> {
+        let rhs = self.pop_int()?;
+        let lhs = self.pop_int()?;
+        self.stack.push(Value::Bool(op(lhs, rhs)));
+        Ok(())
+    }
+
+    pub(super) fn float_compare_op(&mut self, op: impl FnOnce(f64, f64) -> bool) -> VmResult<()> {
+        let rhs = self.pop_float_exact()?;
+        let lhs = self.pop_float_exact()?;
+        self.stack.push(Value::Bool(op(lhs, rhs)));
+        Ok(())
+    }
+
+    pub(super) fn binary_add_op(&mut self) -> VmResult<()> {
+        let rhs = self.pop_value()?;
+        let lhs = self.pop_value()?;
+        match (lhs, rhs) {
+            (Value::Int(lhs), Value::Int(rhs)) => {
+                self.stack.push(Value::Int(lhs.wrapping_add(rhs)))
+            }
+            (Value::Int(lhs), Value::Float(rhs)) => self.stack.push(Value::Float(lhs as f64 + rhs)),
+            (Value::Float(lhs), Value::Int(rhs)) => self.stack.push(Value::Float(lhs + rhs as f64)),
+            (Value::Float(lhs), Value::Float(rhs)) => self.stack.push(Value::Float(lhs + rhs)),
+            (Value::String(lhs), Value::String(rhs)) => {
+                let mut out = String::with_capacity(lhs.len() + rhs.len());
+                out.push_str(lhs.as_str());
+                out.push_str(rhs.as_str());
+                self.stack.push(Value::string(out));
+            }
+            (Value::Array(lhs), Value::Array(rhs)) => {
+                let mut out = crate::bytecode::unwrap_or_clone_shared(lhs);
+                out.extend(crate::bytecode::unwrap_or_clone_shared(rhs));
+                self.stack.push(Value::array(out));
+            }
+            _ => return Err(VmError::TypeMismatch("number/string or array/array")),
+        }
+        Ok(())
+    }
+
+    pub(super) fn binary_numeric_op(
+        &mut self,
+        int_op: impl FnOnce(i64, i64) -> VmResult<i64>,
+        float_op: impl FnOnce(f64, f64) -> VmResult<f64>,
+    ) -> VmResult<()> {
+        let rhs = self.pop_numeric()?;
+        let lhs = self.pop_numeric()?;
+        match (lhs, rhs) {
+            (NumericValue::Int(lhs), NumericValue::Int(rhs)) => {
+                self.stack.push(Value::Int(int_op(lhs, rhs)?));
+            }
+            (lhs, rhs) => {
+                let lhs = match lhs {
+                    NumericValue::Int(v) => v as f64,
+                    NumericValue::Float(v) => v,
+                };
+                let rhs = match rhs {
+                    NumericValue::Int(v) => v as f64,
+                    NumericValue::Float(v) => v,
+                };
+                self.stack.push(Value::Float(float_op(lhs, rhs)?));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn compare_numeric_op(
+        &mut self,
+        int_op: impl FnOnce(i64, i64) -> bool,
+        float_op: impl FnOnce(f64, f64) -> bool,
+    ) -> VmResult<()> {
+        let rhs = self.pop_numeric()?;
+        let lhs = self.pop_numeric()?;
+        let result = match (lhs, rhs) {
+            (NumericValue::Int(lhs), NumericValue::Int(rhs)) => int_op(lhs, rhs),
+            (lhs, rhs) => {
+                let lhs = match lhs {
+                    NumericValue::Int(v) => v as f64,
+                    NumericValue::Float(v) => v,
+                };
+                let rhs = match rhs {
+                    NumericValue::Int(v) => v as f64,
+                    NumericValue::Float(v) => v,
+                };
+                float_op(lhs, rhs)
+            }
+        };
+        self.stack.push(Value::Bool(result));
+        Ok(())
+    }
+
+    pub(super) fn pop_shift_amount(&mut self) -> VmResult<u32> {
+        let value = self.pop_int()?;
+        if !(0..=63).contains(&value) {
+            return Err(VmError::InvalidShift(value));
+        }
+        Ok(value as u32)
+    }
+
+    #[inline(always)]
+    pub(super) fn store_local_with_drop_contract(
+        &mut self,
+        index: u8,
+        value: Value,
+    ) -> VmResult<()> {
+        let slot = self
+            .locals
+            .get_mut(index as usize)
+            .ok_or(VmError::InvalidLocal(index))?;
+        let previous = std::mem::replace(slot, value);
+        self.drop_value_with_contract(previous);
+        Ok(())
+    }
+
+    pub(super) fn read_u8(&mut self) -> VmResult<u8> {
+        if self.ip >= self.program.code.len() {
+            return Err(VmError::BytecodeBounds);
+        }
+        let value = self.program.code[self.ip];
+        self.ip += 1;
+        Ok(value)
+    }
+
+    pub(super) fn read_u16(&mut self) -> VmResult<u16> {
+        let bytes = self.read_bytes(2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    pub(super) fn read_u32(&mut self) -> VmResult<u32> {
+        let bytes = self.read_bytes(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    pub(super) fn read_bytes(&mut self, count: usize) -> VmResult<[u8; 4]> {
+        if self.ip + count > self.program.code.len() {
+            return Err(VmError::BytecodeBounds);
+        }
+        let mut buf = [0u8; 4];
+        buf[..count].copy_from_slice(&self.program.code[self.ip..self.ip + count]);
+        self.ip += count;
+        Ok(buf)
+    }
+
+    pub(super) fn jump_to(&mut self, target: usize) -> VmResult<()> {
+        if target >= self.program.code.len() {
+            return Err(VmError::BytecodeBounds);
+        }
+        self.ip = target;
+        Ok(())
+    }
+}
+
+impl Vm {
+    pub(super) fn notify_debugger_status(
         &mut self,
         debugger: &mut Option<&mut crate::debugger::Debugger>,
         status: VmStatus,
@@ -1335,7 +976,7 @@ impl Vm {
         }
     }
 
-    fn handle_debugger_error(
+    pub(super) fn handle_debugger_error(
         &mut self,
         debugger: &mut Option<&mut crate::debugger::Debugger>,
         err: &VmError,
@@ -1352,7 +993,7 @@ impl Vm {
     }
 
     #[inline(always)]
-    fn yielded_interrupt_reason(err: &VmError) -> Option<VmYieldReason> {
+    pub(super) fn yielded_interrupt_reason(err: &VmError) -> Option<VmYieldReason> {
         match err {
             VmError::OutOfFuel { .. } => Some(VmYieldReason::Fuel),
             VmError::EpochDeadlineReached { .. } => Some(VmYieldReason::Epoch),
@@ -1360,31 +1001,7 @@ impl Vm {
         }
     }
 
-    #[inline(always)]
-    fn mark_interrupt_yield(&mut self, reason: VmYieldReason) {
-        self.last_yield_reason = Some(reason);
-        if matches!(reason, VmYieldReason::Epoch) {
-            self.epoch_rearm_pending = true;
-        }
-    }
-
-    #[inline(always)]
-    fn rearm_epoch_after_yield_if_needed(&mut self) {
-        if !self.epoch_rearm_pending {
-            return;
-        }
-        if !self.epoch_interruption_enabled() {
-            self.epoch_rearm_pending = false;
-            return;
-        }
-        self.epoch_deadline = self
-            .current_epoch()
-            .saturating_add(self.epoch_deadline_delta);
-        self.epoch_rearm_pending = false;
-        self.reset_interrupt_countdown();
-    }
-
-    fn outcome_to_status(outcome: ExecOutcome) -> Option<VmStatus> {
+    pub(super) fn outcome_to_status(outcome: ExecOutcome) -> Option<VmStatus> {
         match outcome {
             ExecOutcome::Continue => None,
             ExecOutcome::Halted => Some(VmStatus::Halted),
@@ -1393,16 +1010,14 @@ impl Vm {
         }
     }
 
-    fn finish_outcome(
+    pub(super) fn finish_outcome(
         &mut self,
         debugger: &mut Option<&mut crate::debugger::Debugger>,
         outcome: ExecOutcome,
     ) -> Option<VmStatus> {
         match outcome {
             ExecOutcome::Continue => {}
-            ExecOutcome::Halted | ExecOutcome::Waiting(_) => {
-                self.last_yield_reason = None;
-            }
+            ExecOutcome::Halted | ExecOutcome::Waiting(_) => self.last_yield_reason = None,
             ExecOutcome::Yielded => {
                 if self.last_yield_reason.is_none() {
                     self.last_yield_reason = Some(VmYieldReason::Host);
@@ -1414,7 +1029,7 @@ impl Vm {
         Some(status)
     }
 
-    fn run_internal(
+    pub(super) fn run_internal(
         &mut self,
         mut debugger: Option<&mut crate::debugger::Debugger>,
         allow_jit: bool,
@@ -1447,9 +1062,6 @@ impl Vm {
                         Ok(outcome) => outcome,
                         Err(err) => {
                             if let Some(reason) = Self::yielded_interrupt_reason(&err) {
-                                // Cooperative interruption surfaces as a yield so callers can
-                                // adjust fuel/epoch state and resume without treating it as a
-                                // hard fault.
                                 self.mark_interrupt_yield(reason);
                                 if self.handle_debugger_error(&mut debugger, &err) {
                                     continue;
@@ -1486,8 +1098,6 @@ impl Vm {
                 && let Err(err) = self.charge_interrupt_tick()
             {
                 if let Some(reason) = Self::yielded_interrupt_reason(&err) {
-                    // Cooperative interruption surfaces as a yield so callers can
-                    // adjust fuel/epoch state and resume without treating it as a hard fault.
                     self.mark_interrupt_yield(reason);
                     if self.handle_debugger_error(&mut debugger, &err) {
                         continue;
@@ -1501,13 +1111,12 @@ impl Vm {
                 }
                 return Err(err);
             }
+
             let opcode = self.read_u8()?;
             let outcome = match self.execute_interpreter_instruction(opcode) {
                 Ok(outcome) => outcome,
                 Err(err) => {
                     if let Some(reason) = Self::yielded_interrupt_reason(&err) {
-                        // Cooperative interruption stays resumable even when raised during
-                        // instruction execution (for example, fused call+ret tail tick).
                         self.mark_interrupt_yield(reason);
                         if self.handle_debugger_error(&mut debugger, &err) {
                             continue;
@@ -1528,7 +1137,7 @@ impl Vm {
         }
     }
 
-    fn execute_interpreter_instruction(&mut self, opcode: u8) -> VmResult<ExecOutcome> {
+    pub(super) fn execute_interpreter_instruction(&mut self, opcode: u8) -> VmResult<ExecOutcome> {
         match opcode {
             x if x == OpCode::Nop as u8 => {}
             x if x == OpCode::Ret as u8 => return Ok(ExecOutcome::Halted),
@@ -1555,44 +1164,38 @@ impl Vm {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
                     INT_INT_OPERAND_TYPE_HINT => {
-                        self.int_binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_sub(rhs)))?;
+                        self.int_binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_sub(rhs)))?
                     }
                     FLOAT_FLOAT_OPERAND_TYPE_HINT => {
-                        self.float_binary_numeric_op(|lhs, rhs| Ok(lhs - rhs))?;
+                        self.float_binary_numeric_op(|lhs, rhs| Ok(lhs - rhs))?
                     }
-                    _ => {
-                        self.binary_numeric_op(
-                            |lhs, rhs| Ok(lhs.wrapping_sub(rhs)),
-                            |lhs, rhs| Ok(lhs - rhs),
-                        )?;
-                    }
+                    _ => self.binary_numeric_op(
+                        |lhs, rhs| Ok(lhs.wrapping_sub(rhs)),
+                        |lhs, rhs| Ok(lhs - rhs),
+                    )?,
                 }
             }
             x if x == OpCode::Mul as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
                     INT_INT_OPERAND_TYPE_HINT => {
-                        self.int_binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_mul(rhs)))?;
+                        self.int_binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_mul(rhs)))?
                     }
                     FLOAT_FLOAT_OPERAND_TYPE_HINT => {
-                        self.float_binary_numeric_op(|lhs, rhs| Ok(lhs * rhs))?;
+                        self.float_binary_numeric_op(|lhs, rhs| Ok(lhs * rhs))?
                     }
-                    _ => {
-                        self.binary_numeric_op(
-                            |lhs, rhs| Ok(lhs.wrapping_mul(rhs)),
-                            |lhs, rhs| Ok(lhs * rhs),
-                        )?;
-                    }
+                    _ => self.binary_numeric_op(
+                        |lhs, rhs| Ok(lhs.wrapping_mul(rhs)),
+                        |lhs, rhs| Ok(lhs * rhs),
+                    )?,
                 }
             }
             x if x == OpCode::Div as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
-                    INT_INT_OPERAND_TYPE_HINT => {
-                        self.int_binary_numeric_op(checked_int_div)?;
-                    }
+                    INT_INT_OPERAND_TYPE_HINT => self.int_binary_numeric_op(checked_int_div)?,
                     FLOAT_FLOAT_OPERAND_TYPE_HINT => {
-                        self.float_binary_numeric_op(|lhs, rhs| Ok(lhs / rhs))?;
+                        self.float_binary_numeric_op(|lhs, rhs| Ok(lhs / rhs))?
                     }
                     _ => self.binary_numeric_op(checked_int_div, |lhs, rhs| Ok(lhs / rhs))?,
                 }
@@ -1615,11 +1218,9 @@ impl Vm {
             x if x == OpCode::Mod as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
-                    INT_INT_OPERAND_TYPE_HINT => {
-                        self.int_binary_numeric_op(checked_int_rem)?;
-                    }
+                    INT_INT_OPERAND_TYPE_HINT => self.int_binary_numeric_op(checked_int_rem)?,
                     FLOAT_FLOAT_OPERAND_TYPE_HINT => {
-                        self.float_binary_numeric_op(|lhs, rhs| Ok(lhs % rhs))?;
+                        self.float_binary_numeric_op(|lhs, rhs| Ok(lhs % rhs))?
                     }
                     _ => self.binary_numeric_op(checked_int_rem, |lhs, rhs| Ok(lhs % rhs))?,
                 }
@@ -1634,23 +1235,18 @@ impl Vm {
                 let lhs = self.pop_bool()?;
                 self.stack.push(Value::Bool(lhs || rhs));
             }
-            x if x == OpCode::Not as u8 => {
-                self.unary_not_op()?;
-            }
+            x if x == OpCode::Not as u8 => self.unary_not_op()?,
             x if x == OpCode::Neg as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
                     INT_UNARY_OPERAND_TYPE_HINT => self.int_neg_op()?,
                     FLOAT_UNARY_OPERAND_TYPE_HINT => self.float_neg_op()?,
-                    _ => {
-                        let value = self.pop_numeric()?;
-                        match value {
-                            NumericValue::Int(value) => {
-                                self.stack.push(Value::Int(value.wrapping_neg()))
-                            }
-                            NumericValue::Float(value) => self.stack.push(Value::Float(-value)),
+                    _ => match self.pop_numeric()? {
+                        NumericValue::Int(value) => {
+                            self.stack.push(Value::Int(value.wrapping_neg()))
                         }
-                    }
+                        NumericValue::Float(value) => self.stack.push(Value::Float(-value)),
+                    },
                 }
             }
             x if x == OpCode::Ceq as u8 => {
@@ -1671,24 +1267,16 @@ impl Vm {
             x if x == OpCode::Clt as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
-                    INT_INT_OPERAND_TYPE_HINT => {
-                        self.int_compare_op(|lhs, rhs| lhs < rhs)?;
-                    }
-                    FLOAT_FLOAT_OPERAND_TYPE_HINT => {
-                        self.float_compare_op(|lhs, rhs| lhs < rhs)?;
-                    }
+                    INT_INT_OPERAND_TYPE_HINT => self.int_compare_op(|lhs, rhs| lhs < rhs)?,
+                    FLOAT_FLOAT_OPERAND_TYPE_HINT => self.float_compare_op(|lhs, rhs| lhs < rhs)?,
                     _ => self.compare_numeric_op(|lhs, rhs| lhs < rhs, |lhs, rhs| lhs < rhs)?,
                 }
             }
             x if x == OpCode::Cgt as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
-                    INT_INT_OPERAND_TYPE_HINT => {
-                        self.int_compare_op(|lhs, rhs| lhs > rhs)?;
-                    }
-                    FLOAT_FLOAT_OPERAND_TYPE_HINT => {
-                        self.float_compare_op(|lhs, rhs| lhs > rhs)?;
-                    }
+                    INT_INT_OPERAND_TYPE_HINT => self.int_compare_op(|lhs, rhs| lhs > rhs)?,
+                    FLOAT_FLOAT_OPERAND_TYPE_HINT => self.float_compare_op(|lhs, rhs| lhs > rhs)?,
                     _ => self.compare_numeric_op(|lhs, rhs| lhs > rhs, |lhs, rhs| lhs > rhs)?,
                 }
             }
@@ -1748,11 +1336,8 @@ impl Vm {
                     HostCallExecOutcome::Returned => {
                         if can_fuse_tail_halt {
                             if self.interruption_enabled() {
-                                // Preserve per-instruction interruption semantics when folding
-                                // `call; ret`.
                                 self.charge_interrupt_tick()?;
                             }
-                            // Consume the trailing `ret` so a resumed run does not halt twice.
                             self.ip = self.ip.saturating_add(1);
                             return Ok(ExecOutcome::Halted);
                         }
@@ -1761,9 +1346,7 @@ impl Vm {
                         self.last_yield_reason = Some(VmYieldReason::Host);
                         return Ok(ExecOutcome::Yielded);
                     }
-                    HostCallExecOutcome::Pending(op_id) => {
-                        return Ok(ExecOutcome::Waiting(op_id));
-                    }
+                    HostCallExecOutcome::Pending(op_id) => return Ok(ExecOutcome::Waiting(op_id)),
                 }
             }
             other => return Err(VmError::InvalidOpcode(other)),
@@ -1809,1408 +1392,5 @@ impl Vm {
 
     pub fn call_depth(&self) -> usize {
         self.call_depth
-    }
-
-    #[inline(always)]
-    fn pending_fuel_debt(&self) -> u64 {
-        if !self.fuel_metering_enabled() {
-            return 0;
-        }
-        let executed_since_last_check = self
-            .fuel_check_interval
-            .saturating_sub(self.fuel_ops_until_check);
-        u64::from(executed_since_last_check)
-    }
-
-    fn pop_value(&mut self) -> VmResult<Value> {
-        self.stack.pop().ok_or(VmError::StackUnderflow)
-    }
-
-    fn can_fuse_ldloc_copy_pattern(&self, index: u8) -> bool {
-        let code = &self.program.code;
-        if self.ip + 2 >= code.len() {
-            return false;
-        }
-        code[self.ip] == OpCode::Dup as u8
-            && code[self.ip + 1] == OpCode::Stloc as u8
-            && code[self.ip + 2] == index
-    }
-
-    fn can_fuse_call_ret_pattern(&self) -> bool {
-        let code = &self.program.code;
-        self.ip < code.len() && code[self.ip] == OpCode::Ret as u8
-    }
-
-    fn clear_stack_with_drop_contract(&mut self) {
-        let drained = self.stack.drain(..).collect::<Vec<_>>();
-        for value in drained {
-            self.drop_value_with_contract(value);
-        }
-    }
-
-    fn clear_locals_with_drop_contract(&mut self) {
-        for slot in 0..self.locals.len() {
-            let previous = std::mem::replace(&mut self.locals[slot], Value::Null);
-            self.drop_value_with_contract(previous);
-        }
-    }
-
-    fn drop_value_with_contract(&mut self, value: Value) {
-        self.count_value_drop_contract(&value);
-    }
-
-    fn count_value_drop_contract(&mut self, value: &Value) {
-        match value {
-            Value::Null => {}
-            Value::Array(values) => {
-                self.drop_contract_events = self.drop_contract_events.saturating_add(1);
-                for item in values.iter() {
-                    self.count_value_drop_contract(item);
-                }
-            }
-            Value::Map(entries) => {
-                self.drop_contract_events = self.drop_contract_events.saturating_add(1);
-                for (key, value) in entries.iter() {
-                    self.count_value_drop_contract(key);
-                    self.count_value_drop_contract(value);
-                }
-            }
-            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::String(_) => {
-                self.drop_contract_events = self.drop_contract_events.saturating_add(1);
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub(in crate::vm) fn charge_fuel(&mut self, amount: u64) -> VmResult<()> {
-        if amount == 0 {
-            return Ok(());
-        }
-
-        if !self.fuel_metering_enabled() {
-            return Ok(());
-        }
-        let remaining = self.fuel_remaining;
-
-        if remaining < amount {
-            return Err(VmError::OutOfFuel {
-                needed: amount,
-                remaining,
-            });
-        }
-        self.fuel_remaining = remaining - amount;
-        Ok(())
-    }
-
-    #[inline(always)]
-    pub(in crate::vm) fn charge_fuel_tick(&mut self) -> VmResult<()> {
-        if !self.fuel_metering_enabled() {
-            return Ok(());
-        }
-        if self.fuel_ops_until_check > 1 {
-            self.fuel_ops_until_check -= 1;
-            return Ok(());
-        }
-
-        let amount = u64::from(self.fuel_check_interval);
-        self.charge_fuel(amount)?;
-        self.fuel_ops_until_check = self.fuel_check_interval;
-        Ok(())
-    }
-
-    #[inline(always)]
-    pub(in crate::vm) fn charge_epoch_tick(&mut self) -> VmResult<()> {
-        if !self.epoch_interruption_enabled() {
-            return Ok(());
-        }
-        if self.fuel_ops_until_check > 1 {
-            self.fuel_ops_until_check -= 1;
-            return Ok(());
-        }
-
-        let current = self.current_epoch();
-        if current >= self.epoch_deadline {
-            return Err(VmError::EpochDeadlineReached {
-                current,
-                deadline: self.epoch_deadline,
-            });
-        }
-        self.fuel_ops_until_check = self.fuel_check_interval;
-        Ok(())
-    }
-
-    #[inline(always)]
-    pub(in crate::vm) fn charge_interrupt_tick(&mut self) -> VmResult<()> {
-        match self.interrupt_mode {
-            InterruptMode::None => Ok(()),
-            InterruptMode::Fuel => self.charge_fuel_tick(),
-            InterruptMode::Epoch => self.charge_epoch_tick(),
-        }
-    }
-
-    fn peek_value(&self) -> VmResult<&Value> {
-        self.stack.last().ok_or(VmError::StackUnderflow)
-    }
-
-    fn pop_int(&mut self) -> VmResult<i64> {
-        self.pop_value()?.as_int()
-    }
-
-    fn pop_numeric(&mut self) -> VmResult<NumericValue> {
-        self.pop_value()?.as_numeric()
-    }
-
-    fn pop_bool(&mut self) -> VmResult<bool> {
-        self.pop_value()?.as_bool()
-    }
-
-    fn pop_float_exact(&mut self) -> VmResult<f64> {
-        match self.pop_value()? {
-            Value::Float(value) => Ok(value),
-            _ => Err(VmError::TypeMismatch("float")),
-        }
-    }
-
-    #[inline(always)]
-    fn operand_type_hint(&self, ip: usize) -> PackedOperandTypes {
-        self.operand_type_hints
-            .as_deref()
-            .map_or(NO_OPERAND_TYPE_HINT, |hints| hints[ip])
-    }
-
-    #[inline(always)]
-    fn unary_not_op(&mut self) -> VmResult<()> {
-        let value = self.pop_bool()?;
-        self.stack.push(Value::Bool(!value));
-        Ok(())
-    }
-
-    fn int_add_op(&mut self) -> VmResult<()> {
-        let rhs = self.pop_int()?;
-        let lhs = self.pop_int()?;
-        self.stack.push(Value::Int(lhs.wrapping_add(rhs)));
-        Ok(())
-    }
-
-    fn float_add_op(&mut self) -> VmResult<()> {
-        let rhs = self.pop_float_exact()?;
-        let lhs = self.pop_float_exact()?;
-        self.stack.push(Value::Float(lhs + rhs));
-        Ok(())
-    }
-
-    fn string_concat_op(&mut self) -> VmResult<()> {
-        let rhs = match self.pop_value()? {
-            Value::String(value) => value,
-            _ => return Err(VmError::TypeMismatch("string")),
-        };
-        let lhs = match self.pop_value()? {
-            Value::String(value) => value,
-            _ => return Err(VmError::TypeMismatch("string")),
-        };
-        let mut out = String::with_capacity(lhs.len() + rhs.len());
-        out.push_str(lhs.as_str());
-        out.push_str(rhs.as_str());
-        self.stack.push(Value::string(out));
-        Ok(())
-    }
-
-    fn int_binary_numeric_op(
-        &mut self,
-        op: impl FnOnce(i64, i64) -> VmResult<i64>,
-    ) -> VmResult<()> {
-        let rhs = self.pop_int()?;
-        let lhs = self.pop_int()?;
-        self.stack.push(Value::Int(op(lhs, rhs)?));
-        Ok(())
-    }
-
-    fn float_binary_numeric_op(
-        &mut self,
-        op: impl FnOnce(f64, f64) -> VmResult<f64>,
-    ) -> VmResult<()> {
-        let rhs = self.pop_float_exact()?;
-        let lhs = self.pop_float_exact()?;
-        self.stack.push(Value::Float(op(lhs, rhs)?));
-        Ok(())
-    }
-
-    fn int_neg_op(&mut self) -> VmResult<()> {
-        let value = self.pop_int()?;
-        self.stack.push(Value::Int(value.wrapping_neg()));
-        Ok(())
-    }
-
-    fn float_neg_op(&mut self) -> VmResult<()> {
-        let value = self.pop_float_exact()?;
-        self.stack.push(Value::Float(-value));
-        Ok(())
-    }
-
-    fn int_eq_op(&mut self) -> VmResult<()> {
-        let rhs = self.pop_int()?;
-        let lhs = self.pop_int()?;
-        self.stack.push(Value::Bool(lhs == rhs));
-        Ok(())
-    }
-
-    fn float_eq_op(&mut self) -> VmResult<()> {
-        let rhs = self.pop_float_exact()?;
-        let lhs = self.pop_float_exact()?;
-        self.stack.push(Value::Bool(lhs == rhs));
-        Ok(())
-    }
-
-    fn bool_eq_op(&mut self) -> VmResult<()> {
-        let rhs = self.pop_bool()?;
-        let lhs = self.pop_bool()?;
-        self.stack.push(Value::Bool(lhs == rhs));
-        Ok(())
-    }
-
-    fn string_eq_op(&mut self) -> VmResult<()> {
-        let rhs = match self.pop_value()? {
-            Value::String(value) => value,
-            _ => return Err(VmError::TypeMismatch("string")),
-        };
-        let lhs = match self.pop_value()? {
-            Value::String(value) => value,
-            _ => return Err(VmError::TypeMismatch("string")),
-        };
-        self.stack.push(Value::Bool(lhs == rhs));
-        Ok(())
-    }
-
-    fn null_eq_op(&mut self) -> VmResult<()> {
-        let rhs = self.pop_value()?;
-        let lhs = self.pop_value()?;
-        match (lhs, rhs) {
-            (Value::Null, Value::Null) => {
-                self.stack.push(Value::Bool(true));
-                Ok(())
-            }
-            _ => Err(VmError::TypeMismatch("null")),
-        }
-    }
-
-    fn int_compare_op(&mut self, op: impl FnOnce(i64, i64) -> bool) -> VmResult<()> {
-        let rhs = self.pop_int()?;
-        let lhs = self.pop_int()?;
-        self.stack.push(Value::Bool(op(lhs, rhs)));
-        Ok(())
-    }
-
-    fn float_compare_op(&mut self, op: impl FnOnce(f64, f64) -> bool) -> VmResult<()> {
-        let rhs = self.pop_float_exact()?;
-        let lhs = self.pop_float_exact()?;
-        self.stack.push(Value::Bool(op(lhs, rhs)));
-        Ok(())
-    }
-
-    fn binary_add_op(&mut self) -> VmResult<()> {
-        let rhs = self.pop_value()?;
-        let lhs = self.pop_value()?;
-        match (lhs, rhs) {
-            (Value::Int(lhs), Value::Int(rhs)) => {
-                self.stack.push(Value::Int(lhs.wrapping_add(rhs)));
-            }
-            (Value::Int(lhs), Value::Float(rhs)) => {
-                self.stack.push(Value::Float(lhs as f64 + rhs));
-            }
-            (Value::Float(lhs), Value::Int(rhs)) => {
-                self.stack.push(Value::Float(lhs + rhs as f64));
-            }
-            (Value::Float(lhs), Value::Float(rhs)) => {
-                self.stack.push(Value::Float(lhs + rhs));
-            }
-            (Value::String(lhs), Value::String(rhs)) => {
-                let mut out = String::with_capacity(lhs.len() + rhs.len());
-                out.push_str(lhs.as_str());
-                out.push_str(rhs.as_str());
-                self.stack.push(Value::string(out));
-            }
-            (Value::Array(lhs), Value::Array(rhs)) => {
-                let mut out = crate::bytecode::unwrap_or_clone_shared(lhs);
-                out.extend(crate::bytecode::unwrap_or_clone_shared(rhs));
-                self.stack.push(Value::array(out));
-            }
-            _ => {
-                return Err(VmError::TypeMismatch("number/string or array/array"));
-            }
-        }
-        Ok(())
-    }
-
-    fn binary_numeric_op(
-        &mut self,
-        int_op: impl FnOnce(i64, i64) -> VmResult<i64>,
-        float_op: impl FnOnce(f64, f64) -> VmResult<f64>,
-    ) -> VmResult<()> {
-        let rhs = self.pop_numeric()?;
-        let lhs = self.pop_numeric()?;
-        match (lhs, rhs) {
-            (NumericValue::Int(lhs), NumericValue::Int(rhs)) => {
-                self.stack.push(Value::Int(int_op(lhs, rhs)?));
-            }
-            (lhs, rhs) => {
-                let lhs = match lhs {
-                    NumericValue::Int(v) => v as f64,
-                    NumericValue::Float(v) => v,
-                };
-                let rhs = match rhs {
-                    NumericValue::Int(v) => v as f64,
-                    NumericValue::Float(v) => v,
-                };
-                self.stack.push(Value::Float(float_op(lhs, rhs)?));
-            }
-        }
-        Ok(())
-    }
-
-    fn compare_numeric_op(
-        &mut self,
-        int_op: impl FnOnce(i64, i64) -> bool,
-        float_op: impl FnOnce(f64, f64) -> bool,
-    ) -> VmResult<()> {
-        let rhs = self.pop_numeric()?;
-        let lhs = self.pop_numeric()?;
-        let result = match (lhs, rhs) {
-            (NumericValue::Int(lhs), NumericValue::Int(rhs)) => int_op(lhs, rhs),
-            (lhs, rhs) => {
-                let lhs = match lhs {
-                    NumericValue::Int(v) => v as f64,
-                    NumericValue::Float(v) => v,
-                };
-                let rhs = match rhs {
-                    NumericValue::Int(v) => v as f64,
-                    NumericValue::Float(v) => v,
-                };
-                float_op(lhs, rhs)
-            }
-        };
-        self.stack.push(Value::Bool(result));
-        Ok(())
-    }
-
-    fn pop_shift_amount(&mut self) -> VmResult<u32> {
-        let value = self.pop_int()?;
-        if !(0..=63).contains(&value) {
-            return Err(VmError::InvalidShift(value));
-        }
-        Ok(value as u32)
-    }
-
-    #[inline(always)]
-    fn store_local_with_drop_contract(&mut self, index: u8, value: Value) -> VmResult<()> {
-        let slot = self
-            .locals
-            .get_mut(index as usize)
-            .ok_or(VmError::InvalidLocal(index))?;
-        let previous = std::mem::replace(slot, value);
-        self.drop_value_with_contract(previous);
-        Ok(())
-    }
-
-    fn execute_host_call(
-        &mut self,
-        index: u16,
-        argc_u8: u8,
-        call_ip: usize,
-    ) -> VmResult<HostCallExecOutcome> {
-        let argc = argc_u8 as usize;
-        let mut args = Vec::with_capacity(argc);
-        for _ in 0..argc {
-            args.push(self.pop_value()?);
-        }
-        args.reverse();
-
-        if let Some(builtin) = BuiltinFunction::from_call_index(index) {
-            if !builtin.accepts_arity(argc_u8) {
-                return Err(VmError::InvalidCallArity {
-                    import: builtin.name().to_string(),
-                    expected: builtin.arity(),
-                    got: argc_u8,
-                });
-            }
-            if self.builtin_overrides.contains_key(&index) {
-                return self.execute_builtin_override_call(index, args, call_ip);
-            }
-            match builtins_impl::execute_builtin_call(self, builtin, args)? {
-                builtins_impl::BuiltinCallOutcome::Return(values) => {
-                    for value in values {
-                        self.stack.push(value);
-                    }
-                    return Ok(HostCallExecOutcome::Returned);
-                }
-                builtins_impl::BuiltinCallOutcome::Pending(op_id) => {
-                    let resume_ip = self.call_resume_ip(call_ip)?;
-                    self.set_waiting_host_op(op_id, WaitingHostOpSource::BuiltinIo)?;
-                    self.ip = resume_ip;
-                    return Ok(HostCallExecOutcome::Pending(op_id));
-                }
-            }
-        }
-
-        let resolved_index = self.resolve_call_target(index, argc_u8)?;
-        self.execute_bound_host_function(resolved_index, args, call_ip)
-    }
-
-    fn execute_builtin_override_call(
-        &mut self,
-        builtin_call_index: u16,
-        args: Vec<Value>,
-        call_ip: usize,
-    ) -> VmResult<HostCallExecOutcome> {
-        let resolved_index = self
-            .builtin_overrides
-            .get(&builtin_call_index)
-            .copied()
-            .ok_or_else(|| {
-                VmError::HostError(format!(
-                    "missing builtin override slot for call index {builtin_call_index}"
-                ))
-            })?;
-        self.execute_bound_host_function(resolved_index, args, call_ip)
-    }
-
-    fn execute_bound_host_function(
-        &mut self,
-        resolved_index: u16,
-        args: Vec<Value>,
-        call_ip: usize,
-    ) -> VmResult<HostCallExecOutcome> {
-        self.call_depth += 1;
-        let function_ptr =
-            self.host_functions
-                .get_mut(resolved_index as usize)
-                .ok_or(VmError::InvalidCall(resolved_index))? as *mut VmHostFunction;
-        let outcome = unsafe {
-            match &mut *function_ptr {
-                VmHostFunction::Dynamic(function) => function.call(self, &args),
-                VmHostFunction::Static(function) => function(self, &args),
-            }
-        };
-        self.call_depth = self.call_depth.saturating_sub(1);
-        let outcome = outcome?;
-
-        match outcome {
-            CallOutcome::Return(values) => {
-                for value in values {
-                    self.stack.push(value);
-                }
-                Ok(HostCallExecOutcome::Returned)
-            }
-            CallOutcome::Yield => {
-                for value in args {
-                    self.stack.push(value);
-                }
-                if self.native_only_aot {
-                    return Err(VmError::JitNative(
-                        "native-only AOT bundles do not support host CallOutcome::Yield"
-                            .to_string(),
-                    ));
-                }
-                self.ip = call_ip;
-                Ok(HostCallExecOutcome::Yielded)
-            }
-            CallOutcome::Pending(op_id) => {
-                let resume_ip = self.call_resume_ip(call_ip)?;
-                self.set_waiting_host_op(op_id, WaitingHostOpSource::HostBridge)?;
-                self.ip = resume_ip;
-                Ok(HostCallExecOutcome::Pending(op_id))
-            }
-        }
-    }
-
-    fn call_resume_ip(&self, call_ip: usize) -> VmResult<usize> {
-        let resume_ip = call_ip.checked_add(4).ok_or(VmError::BytecodeBounds)?;
-        if resume_ip > self.program.code.len() {
-            return Err(VmError::BytecodeBounds);
-        }
-        Ok(resume_ip)
-    }
-
-    fn set_waiting_host_op(
-        &mut self,
-        op_id: HostOpId,
-        source: WaitingHostOpSource,
-    ) -> VmResult<()> {
-        if let Some(active) = self.waiting_host_op
-            && active.op_id != op_id
-        {
-            return Err(VmError::HostError(format!(
-                "vm already waiting on host op {}, cannot wait on {}",
-                active.op_id, op_id
-            )));
-        }
-        self.waiting_host_op = Some(WaitingHostOp { op_id, source });
-        Ok(())
-    }
-
-    fn complete_waiting_host_op(&mut self, op_id: HostOpId, values: Vec<Value>) -> VmResult<()> {
-        let waiting = self.waiting_host_op.ok_or_else(|| {
-            VmError::HostError(format!(
-                "host op {} completed but vm is not waiting on any op",
-                op_id
-            ))
-        })?;
-        if waiting.op_id != op_id {
-            return Err(VmError::HostError(format!(
-                "host op {} completed while vm waits on {}",
-                op_id, waiting.op_id
-            )));
-        }
-        self.waiting_host_op = None;
-        for value in values {
-            self.stack.push(value);
-        }
-        Ok(())
-    }
-
-    fn read_u8(&mut self) -> VmResult<u8> {
-        if self.ip >= self.program.code.len() {
-            return Err(VmError::BytecodeBounds);
-        }
-        let value = self.program.code[self.ip];
-        self.ip += 1;
-        Ok(value)
-    }
-
-    fn read_u16(&mut self) -> VmResult<u16> {
-        let bytes = self.read_bytes(2)?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
-    }
-
-    fn read_u32(&mut self) -> VmResult<u32> {
-        let bytes = self.read_bytes(4)?;
-        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    }
-
-    fn read_bytes(&mut self, count: usize) -> VmResult<[u8; 4]> {
-        if self.ip + count > self.program.code.len() {
-            return Err(VmError::BytecodeBounds);
-        }
-        let mut buf = [0u8; 4];
-        buf[..count].copy_from_slice(&self.program.code[self.ip..self.ip + count]);
-        self.ip += count;
-        Ok(buf)
-    }
-
-    fn jump_to(&mut self, target: usize) -> VmResult<()> {
-        if target >= self.program.code.len() {
-            return Err(VmError::BytecodeBounds);
-        }
-        self.ip = target;
-        Ok(())
-    }
-
-    fn install_resolved_calls(&mut self, resolved_calls: Vec<u16>) -> VmResult<()> {
-        if self.program.imports.len() != resolved_calls.len() {
-            return Err(VmError::HostError(format!(
-                "resolved call cache size mismatch: expected {}, got {}",
-                self.program.imports.len(),
-                resolved_calls.len()
-            )));
-        }
-        for &index in &resolved_calls {
-            if index as usize >= self.host_functions.len() {
-                return Err(VmError::InvalidCall(index));
-            }
-        }
-        self.resolved_calls = resolved_calls;
-        self.resolved_calls_dirty = false;
-        Ok(())
-    }
-
-    fn ensure_call_bindings(&mut self) -> VmResult<()> {
-        if self.program.imports.is_empty() || !self.resolved_calls_dirty {
-            return Ok(());
-        }
-
-        if self.host_function_symbols.is_empty() && self.host_functions.is_empty() {
-            let import_names = self
-                .program
-                .imports
-                .iter()
-                .map(|import| import.name.clone())
-                .collect::<Vec<_>>();
-            for name in import_names {
-                let _ = builtins_impl::bind_default_host_function(self, &name);
-            }
-        }
-
-        let use_legacy_order = self.host_function_symbols.is_empty();
-        let mut resolved = Vec::with_capacity(self.program.imports.len());
-        let imports = self.program.imports.clone();
-        for (index, import) in imports.iter().enumerate() {
-            if use_legacy_order {
-                if index >= self.host_functions.len() {
-                    return Err(VmError::InvalidCall(index as u16));
-                }
-                resolved.push(index as u16);
-                continue;
-            }
-
-            let bound = if let Some(bound) = self.host_function_symbols.get(&import.name).copied() {
-                bound
-            } else if builtins_impl::bind_default_host_function(self, &import.name) {
-                self.host_function_symbols
-                    .get(&import.name)
-                    .copied()
-                    .ok_or_else(|| VmError::UnboundImport(import.name.clone()))?
-            } else {
-                return Err(VmError::UnboundImport(import.name.clone()));
-            };
-            resolved.push(bound);
-        }
-
-        self.resolved_calls = resolved;
-        self.resolved_calls_dirty = false;
-        Ok(())
-    }
-
-    fn resolve_call_target(&mut self, index: u16, argc: u8) -> VmResult<u16> {
-        if self.program.imports.is_empty() {
-            return Ok(index);
-        }
-
-        self.ensure_call_bindings()?;
-        let import = self
-            .program
-            .imports
-            .get(index as usize)
-            .ok_or(VmError::InvalidCall(index))?;
-        if import.arity != argc {
-            return Err(VmError::InvalidCallArity {
-                import: import.name.clone(),
-                expected: import.arity,
-                got: argc,
-            });
-        }
-
-        self.resolved_calls
-            .get(index as usize)
-            .copied()
-            .ok_or(VmError::InvalidCall(index))
-    }
-}
-
-impl Drop for Vm {
-    fn drop(&mut self) {
-        self.clear_stack_with_drop_contract();
-        self.clear_locals_with_drop_contract();
-        builtins_impl::close_all_handles(self);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{Arc, Mutex, OnceLock};
-
-    fn native_cache_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    #[test]
-    #[cfg(any(
-        all(
-            target_arch = "x86_64",
-            any(target_os = "windows", all(unix, not(target_os = "macos")))
-        ),
-        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-    ))]
-    fn native_trace_cache_resets_when_program_changes() {
-        let _guard = native_cache_test_lock()
-            .lock()
-            .expect("native cache test lock should succeed");
-        jit::runtime::clear_native_trace_cache_for_tests();
-
-        let source_one = r#"
-            let mut i = 0;
-            while i < 8 {
-                i = i + 1;
-            }
-            let mut j = 0;
-            while j < 8 {
-                j = j + 1;
-            }
-            i + j;
-        "#;
-        let source_two = r#"
-            let mut k = 0;
-            while k < 8 {
-                k = k + 1;
-            }
-            k;
-        "#;
-
-        let compiled_one = crate::compile_source(source_one).expect("source one should compile");
-        let compiled_two = crate::compile_source(source_two).expect("source two should compile");
-
-        let mut vm_one = Vm::new(compiled_one.program);
-        vm_one.set_jit_config(jit::JitConfig {
-            enabled: true,
-            hot_loop_threshold: 1,
-            max_trace_len: 512,
-        });
-        let status_one = vm_one.run().expect("first vm should run");
-        assert_eq!(status_one, VmStatus::Halted);
-        let vm_one_trace_count = vm_one.jit_native_trace_count();
-        assert!(
-            vm_one_trace_count > 0,
-            "first vm should produce native traces"
-        );
-
-        let (cache_program_after_one, cache_entries_after_one) =
-            jit::runtime::native_trace_cache_snapshot_for_tests();
-        assert_eq!(
-            cache_program_after_one,
-            Some(vm_one.program_cache_key),
-            "cache should be keyed to first program after first run"
-        );
-        assert_eq!(
-            cache_entries_after_one, vm_one_trace_count,
-            "cache entry count should match first program traces"
-        );
-
-        let mut vm_two = Vm::new(compiled_two.program);
-        vm_two.set_jit_config(jit::JitConfig {
-            enabled: true,
-            hot_loop_threshold: 1,
-            max_trace_len: 512,
-        });
-        assert_ne!(
-            vm_one.program_cache_key, vm_two.program_cache_key,
-            "test programs should have different cache keys"
-        );
-        let status_two = vm_two.run().expect("second vm should run");
-        assert_eq!(status_two, VmStatus::Halted);
-        let vm_two_trace_count = vm_two.jit_native_trace_count();
-        assert!(
-            vm_two_trace_count > 0,
-            "second vm should produce native traces"
-        );
-
-        let (cache_program_after_two, cache_entries_after_two) =
-            jit::runtime::native_trace_cache_snapshot_for_tests();
-        assert_eq!(
-            cache_program_after_two,
-            Some(vm_two.program_cache_key),
-            "cache should switch to second program key"
-        );
-        assert_eq!(
-            cache_entries_after_two, vm_two_trace_count,
-            "cache should only contain traces from the active program"
-        );
-    }
-
-    #[test]
-    #[cfg(any(
-        all(
-            target_arch = "x86_64",
-            any(target_os = "windows", all(unix, not(target_os = "macos")))
-        ),
-        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-    ))]
-    fn native_trace_cache_reuses_entries_for_same_program() {
-        let _guard = native_cache_test_lock()
-            .lock()
-            .expect("native cache test lock should succeed");
-        jit::runtime::clear_native_trace_cache_for_tests();
-
-        let source = r#"
-            let mut i = 0;
-            let mut sum = 0;
-            while i < 10 {
-                sum = sum + i;
-                i = i + 1;
-            }
-            sum;
-        "#;
-        let compiled = crate::compile_source(source).expect("source should compile");
-
-        let mut vm_one = Vm::new(compiled.program.clone());
-        vm_one.set_jit_config(jit::JitConfig {
-            enabled: true,
-            hot_loop_threshold: 1,
-            max_trace_len: 512,
-        });
-        let status_one = vm_one.run().expect("first vm should run");
-        assert_eq!(status_one, VmStatus::Halted);
-        let vm_one_trace_count = vm_one.jit_native_trace_count();
-        assert!(
-            vm_one_trace_count > 0,
-            "first vm should produce native traces"
-        );
-
-        let (cache_program_after_one, cache_entries_after_one) =
-            jit::runtime::native_trace_cache_snapshot_for_tests();
-        assert_eq!(
-            cache_program_after_one,
-            Some(vm_one.program_cache_key),
-            "cache should be keyed to the first program"
-        );
-        assert_eq!(
-            cache_entries_after_one, vm_one_trace_count,
-            "cache entry count should match first vm traces"
-        );
-
-        let mut vm_two = Vm::new(compiled.program);
-        vm_two.set_jit_config(jit::JitConfig {
-            enabled: true,
-            hot_loop_threshold: 1,
-            max_trace_len: 512,
-        });
-        assert_eq!(
-            vm_two.program_cache_key, vm_one.program_cache_key,
-            "same program should use identical cache key"
-        );
-
-        let status_two = vm_two.run().expect("second vm should run");
-        assert_eq!(status_two, VmStatus::Halted);
-        let vm_two_trace_count = vm_two.jit_native_trace_count();
-        assert_eq!(
-            vm_two_trace_count, vm_one_trace_count,
-            "same program should compile same native trace count"
-        );
-
-        let (cache_program_after_two, cache_entries_after_two) =
-            jit::runtime::native_trace_cache_snapshot_for_tests();
-        assert_eq!(
-            cache_program_after_two,
-            Some(vm_two.program_cache_key),
-            "cache key should remain the same for identical program"
-        );
-        assert_eq!(
-            cache_entries_after_two, cache_entries_after_one,
-            "cache entries should be reused instead of duplicated"
-        );
-    }
-
-    fn step_once(vm: &mut Vm) -> VmResult<ExecOutcome> {
-        let opcode = vm.read_u8()?;
-        vm.execute_interpreter_instruction(opcode)
-    }
-
-    fn assert_shared_heap_backing(lhs: &Value, rhs: &Value) {
-        match (lhs, rhs) {
-            (Value::String(lhs), Value::String(rhs)) => {
-                assert!(Arc::ptr_eq(lhs, rhs), "expected shared string backing");
-            }
-            (Value::Array(lhs), Value::Array(rhs)) => {
-                assert!(Arc::ptr_eq(lhs, rhs), "expected shared array backing");
-            }
-            (Value::Map(lhs), Value::Map(rhs)) => {
-                assert!(Arc::ptr_eq(lhs, rhs), "expected shared map backing");
-            }
-            _ => panic!("expected matching heap values, got lhs={lhs:?} rhs={rhs:?}"),
-        }
-    }
-
-    #[test]
-    fn interpreter_ldc_shares_string_constant_backing() {
-        let program = Program::new(
-            vec![Value::string("shared")],
-            vec![OpCode::Ldc as u8, 0, 0, 0, 0, OpCode::Ret as u8],
-        );
-        let mut vm = Vm::new(program);
-
-        let outcome = step_once(&mut vm).expect("ldc should execute");
-        assert!(matches!(outcome, ExecOutcome::Continue));
-        let constant = vm
-            .program
-            .constants
-            .first()
-            .expect("program should keep a constant");
-        assert_shared_heap_backing(constant, &vm.stack()[0]);
-    }
-
-    #[test]
-    fn interpreter_dup_shares_array_backing() {
-        let program = Program::new(vec![], vec![OpCode::Dup as u8, OpCode::Ret as u8]);
-        let mut vm = Vm::new(program);
-        vm.stack
-            .push(Value::array(vec![Value::Int(1), Value::Int(2)]));
-
-        let outcome = step_once(&mut vm).expect("dup should execute");
-        assert!(matches!(outcome, ExecOutcome::Continue));
-        assert_eq!(vm.stack().len(), 2);
-        assert_shared_heap_backing(&vm.stack()[0], &vm.stack()[1]);
-    }
-
-    #[test]
-    fn shared_string_survives_local_overwrite_after_copy_like_read() {
-        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
-        let program = Program::new(
-            vec![Value::Null],
-            vec![
-                OpCode::Ldloc as u8,
-                0,
-                OpCode::Dup as u8,
-                OpCode::Stloc as u8,
-                0,
-                OpCode::Ldc as u8,
-                0,
-                0,
-                0,
-                0,
-                OpCode::Stloc as u8,
-                0,
-                OpCode::Call as u8,
-                call_lo,
-                call_hi,
-                1,
-                OpCode::Ret as u8,
-            ],
-        )
-        .with_local_count(1);
-        let mut vm = Vm::new(program);
-        vm.locals[0] = Value::string("alive");
-
-        let status = vm.run().expect("vm should run");
-        assert_eq!(status, VmStatus::Halted);
-        assert_eq!(vm.locals()[0], Value::Null);
-        assert_eq!(vm.stack(), &[Value::Int(5)]);
-    }
-
-    #[test]
-    fn shared_array_survives_local_overwrite_after_copy_like_read() {
-        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
-        let program = Program::new(
-            vec![Value::Null],
-            vec![
-                OpCode::Ldloc as u8,
-                0,
-                OpCode::Dup as u8,
-                OpCode::Stloc as u8,
-                0,
-                OpCode::Ldc as u8,
-                0,
-                0,
-                0,
-                0,
-                OpCode::Stloc as u8,
-                0,
-                OpCode::Call as u8,
-                call_lo,
-                call_hi,
-                1,
-                OpCode::Ret as u8,
-            ],
-        )
-        .with_local_count(1);
-        let mut vm = Vm::new(program);
-        vm.locals[0] = Value::array(vec![Value::Int(1), Value::Int(2)]);
-
-        let status = vm.run().expect("vm should run");
-        assert_eq!(status, VmStatus::Halted);
-        assert_eq!(vm.locals()[0], Value::Null);
-        assert_eq!(vm.stack(), &[Value::Int(2)]);
-    }
-
-    #[test]
-    fn shared_map_survives_local_overwrite_after_copy_like_read() {
-        let [call_lo, call_hi] = BuiltinFunction::Count.call_index().to_le_bytes();
-        let program = Program::new(
-            vec![Value::Null],
-            vec![
-                OpCode::Ldloc as u8,
-                0,
-                OpCode::Dup as u8,
-                OpCode::Stloc as u8,
-                0,
-                OpCode::Ldc as u8,
-                0,
-                0,
-                0,
-                0,
-                OpCode::Stloc as u8,
-                0,
-                OpCode::Call as u8,
-                call_lo,
-                call_hi,
-                1,
-                OpCode::Ret as u8,
-            ],
-        )
-        .with_local_count(1);
-        let mut vm = Vm::new(program);
-        vm.locals[0] = Value::map(vec![(Value::string("k"), Value::Int(9))]);
-
-        let status = vm.run().expect("vm should run");
-        assert_eq!(status, VmStatus::Halted);
-        assert_eq!(vm.locals()[0], Value::Null);
-        assert_eq!(vm.stack(), &[Value::Int(1)]);
-    }
-
-    #[test]
-    fn interpreter_fuses_ldloc_dup_stloc_same_slot_without_fuel() {
-        let program = Program::new(
-            vec![],
-            vec![
-                OpCode::Ldloc as u8,
-                0,
-                OpCode::Dup as u8,
-                OpCode::Stloc as u8,
-                0,
-                OpCode::Ret as u8,
-            ],
-        )
-        .with_local_count(1);
-        let mut vm = Vm::new(program);
-        let map_value = Value::map(vec![(Value::string("k"), Value::Int(9))]);
-        vm.locals[0] = map_value.clone();
-
-        let outcome = step_once(&mut vm).expect("ldloc should execute");
-        assert!(matches!(outcome, ExecOutcome::Continue));
-        assert_eq!(vm.ip, 5, "fusion should skip dup+stloc bytes");
-        assert_eq!(vm.locals[0], map_value, "local value should remain in slot");
-        assert_eq!(
-            vm.stack(),
-            &[map_value],
-            "stack should receive copied value"
-        );
-        assert_shared_heap_backing(&vm.locals[0], &vm.stack()[0]);
-        assert_eq!(
-            vm.drop_contract_event_count(),
-            0,
-            "copy fusion should not synthesize drop events"
-        );
-
-        let halted = step_once(&mut vm).expect("ret should execute");
-        assert!(matches!(halted, ExecOutcome::Halted));
-    }
-
-    #[test]
-    fn interpreter_does_not_fuse_ldloc_dup_stloc_when_fuel_enabled() {
-        let program = Program::new(
-            vec![],
-            vec![
-                OpCode::Ldloc as u8,
-                0,
-                OpCode::Dup as u8,
-                OpCode::Stloc as u8,
-                0,
-                OpCode::Ret as u8,
-            ],
-        )
-        .with_local_count(1);
-        let mut vm = Vm::new(program);
-        vm.locals[0] = Value::Int(42);
-        vm.set_fuel(32);
-
-        let ldloc = step_once(&mut vm).expect("ldloc should execute");
-        assert!(matches!(ldloc, ExecOutcome::Continue));
-        assert_eq!(vm.ip, 2, "fuel metering path must not skip dup+stloc");
-        assert_eq!(
-            vm.locals[0],
-            Value::Null,
-            "ldloc move should clear local slot"
-        );
-        assert_eq!(vm.stack(), &[Value::Int(42)]);
-
-        let dup = step_once(&mut vm).expect("dup should execute");
-        assert!(matches!(dup, ExecOutcome::Continue));
-        assert_eq!(vm.ip, 3);
-        assert_eq!(vm.stack(), &[Value::Int(42), Value::Int(42)]);
-
-        let stloc = step_once(&mut vm).expect("stloc should execute");
-        assert!(matches!(stloc, ExecOutcome::Continue));
-        assert_eq!(vm.ip, 5);
-        assert_eq!(vm.locals[0], Value::Int(42));
-        assert_eq!(vm.stack(), &[Value::Int(42)]);
-    }
-
-    #[test]
-    fn interpreter_copy_like_ldloc_dup_stloc_shares_map_backing_with_fuel() {
-        let program = Program::new(
-            vec![],
-            vec![
-                OpCode::Ldloc as u8,
-                0,
-                OpCode::Dup as u8,
-                OpCode::Stloc as u8,
-                0,
-                OpCode::Ret as u8,
-            ],
-        )
-        .with_local_count(1);
-        let mut vm = Vm::new(program);
-        vm.locals[0] = Value::map(vec![(Value::string("k"), Value::Int(9))]);
-        vm.set_fuel(32);
-
-        let _ = step_once(&mut vm).expect("ldloc should execute");
-        let _ = step_once(&mut vm).expect("dup should execute");
-        let _ = step_once(&mut vm).expect("stloc should execute");
-
-        assert_eq!(vm.stack().len(), 1);
-        assert_shared_heap_backing(&vm.locals[0], &vm.stack()[0]);
-    }
-
-    #[test]
-    fn interpreter_does_not_fuse_ldloc_dup_stloc_when_epoch_enabled() {
-        let program = Program::new(
-            vec![],
-            vec![
-                OpCode::Ldloc as u8,
-                0,
-                OpCode::Dup as u8,
-                OpCode::Stloc as u8,
-                0,
-                OpCode::Ret as u8,
-            ],
-        )
-        .with_local_count(1);
-        let mut vm = Vm::new(program);
-        vm.locals[0] = Value::Int(42);
-        vm.set_epoch_deadline(1)
-            .expect("setting epoch deadline should succeed");
-
-        let ldloc = step_once(&mut vm).expect("ldloc should execute");
-        assert!(matches!(ldloc, ExecOutcome::Continue));
-        assert_eq!(vm.ip, 2, "epoch interruption must not skip dup+stloc");
-        assert_eq!(vm.locals[0], Value::Null);
-        assert_eq!(vm.stack(), &[Value::Int(42)]);
-    }
-
-    #[test]
-    fn interpreter_fuses_call_ret_without_fuel() {
-        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
-        let program = Program::new(
-            vec![],
-            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
-        );
-        let mut vm = Vm::new(program);
-        vm.stack.push(Value::string("tail"));
-
-        let outcome = step_once(&mut vm).expect("call should execute");
-        assert!(matches!(outcome, ExecOutcome::Halted));
-        assert_eq!(vm.ip, 5, "tail-call fusion should consume trailing ret");
-        assert_eq!(vm.stack(), &[Value::Int(4)]);
-    }
-
-    #[test]
-    fn interpreter_fuses_call_ret_when_fuel_enabled_if_tail_tick_available() {
-        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
-        let program = Program::new(
-            vec![],
-            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
-        );
-        let mut vm = Vm::new(program);
-        vm.set_fuel(1);
-        vm.stack.push(Value::string("tail"));
-
-        // `step_once` bypasses the outer run-loop pre-tick, so this fuel only covers fused `ret`.
-        let call = step_once(&mut vm).expect("call should execute");
-        assert!(matches!(call, ExecOutcome::Halted));
-        assert_eq!(vm.ip, 5, "tail-call fusion should consume trailing ret");
-        assert_eq!(vm.stack(), &[Value::Int(4)]);
-        assert_eq!(vm.get_fuel(), Some(0));
-    }
-
-    #[test]
-    fn interpreter_call_ret_fusion_preserves_ip_when_tail_tick_exhausted() {
-        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
-        let program = Program::new(
-            vec![],
-            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
-        );
-        let mut vm = Vm::new(program);
-        vm.set_fuel(0);
-        vm.stack.push(Value::string("tail"));
-
-        let err = match step_once(&mut vm) {
-            Ok(_) => panic!("tail tick should fail with out-of-fuel"),
-            Err(err) => err,
-        };
-        assert!(matches!(err, VmError::OutOfFuel { .. }));
-        assert_eq!(
-            vm.ip, 4,
-            "ret must remain pending when tail tick cannot be charged"
-        );
-        assert_eq!(vm.stack(), &[Value::Int(4)]);
-    }
-
-    #[test]
-    fn interpreter_call_ret_fusion_preserves_ip_when_epoch_deadline_is_reached() {
-        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
-        let program = Program::new(
-            vec![],
-            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
-        );
-        let mut vm = Vm::new(program);
-        vm.set_epoch_deadline(0)
-            .expect("setting epoch deadline should succeed");
-        vm.stack.push(Value::string("tail"));
-
-        let err = match step_once(&mut vm) {
-            Ok(_) => panic!("tail tick should fail with epoch deadline reached"),
-            Err(err) => err,
-        };
-        assert!(matches!(err, VmError::EpochDeadlineReached { .. }));
-        assert_eq!(
-            vm.ip, 4,
-            "ret must remain pending when the epoch check trips during fused tail execution"
-        );
-        assert_eq!(vm.stack(), &[Value::Int(4)]);
-    }
-
-    #[test]
-    fn run_consumes_two_ticks_for_call_ret_when_fuel_enabled() {
-        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
-        let program = Program::new(
-            vec![],
-            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
-        );
-        let mut vm = Vm::new(program);
-        vm.set_fuel(2);
-        vm.stack.push(Value::string("tail"));
-
-        let status = vm.run().expect("run should complete");
-        assert_eq!(status, VmStatus::Halted);
-        assert_eq!(vm.ip, 5);
-        assert_eq!(vm.stack(), &[Value::Int(4)]);
-        assert_eq!(
-            vm.get_fuel(),
-            Some(0),
-            "call+ret should spend two ticks with fuel metering enabled"
-        );
-    }
-
-    #[test]
-    fn run_yields_before_ret_in_call_ret_sequence_when_out_of_fuel() {
-        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
-        let program = Program::new(
-            vec![],
-            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
-        );
-        let mut vm = Vm::new(program);
-        vm.set_fuel(1);
-        vm.stack.push(Value::string("tail"));
-
-        let status = vm.run().expect("first run should yield");
-        assert_eq!(status, VmStatus::Yielded);
-        assert_eq!(
-            vm.ip, 4,
-            "fuel exhaustion should happen before trailing ret"
-        );
-        assert_eq!(vm.stack(), &[Value::Int(4)]);
-        assert_eq!(vm.get_fuel(), Some(0));
-
-        vm.add_fuel(1).expect("recharging fuel should succeed");
-        let resumed = vm.resume().expect("resume should execute trailing ret");
-        assert_eq!(resumed, VmStatus::Halted);
-        assert_eq!(vm.ip, 5);
-        assert_eq!(vm.stack(), &[Value::Int(4)]);
-    }
-
-    #[test]
-    fn run_yields_before_ret_in_call_ret_sequence_when_epoch_deadline_is_reached() {
-        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
-        let program = Program::new(
-            vec![],
-            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
-        );
-        let mut vm = Vm::new(program);
-        vm.set_epoch_check_interval(2)
-            .expect("epoch interval update should succeed");
-        vm.set_epoch_deadline(1)
-            .expect("setting epoch deadline should succeed");
-        assert_eq!(vm.increment_epoch(), 1);
-        vm.stack.push(Value::string("tail"));
-
-        let status = vm.run().expect("first run should yield");
-        assert_eq!(status, VmStatus::Yielded);
-        assert_eq!(
-            vm.ip, 4,
-            "epoch interruption should happen before trailing ret"
-        );
-        assert_eq!(vm.last_yield_reason(), Some(VmYieldReason::Epoch));
-        assert_eq!(vm.stack(), &[Value::Int(4)]);
-
-        let resumed = vm
-            .resume()
-            .expect("resume should auto re-arm the epoch deadline and execute trailing ret");
-        assert_eq!(resumed, VmStatus::Halted);
-        assert_eq!(vm.ip, 5);
-        assert_eq!(vm.stack(), &[Value::Int(4)]);
-    }
-
-    #[test]
-    fn call_ret_fusion_pattern_requires_immediate_ret() {
-        let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
-        let with_ret = Program::new(
-            vec![],
-            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
-        );
-        let mut vm_with_ret = Vm::new(with_ret);
-        vm_with_ret.ip = 4;
-        assert!(vm_with_ret.can_fuse_call_ret_pattern());
-
-        let wrong_next = Program::new(
-            vec![],
-            vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Nop as u8],
-        );
-        let mut vm_wrong_next = Vm::new(wrong_next);
-        vm_wrong_next.ip = 4;
-        assert!(!vm_wrong_next.can_fuse_call_ret_pattern());
-
-        let no_next = Program::new(vec![], vec![OpCode::Call as u8, call_lo, call_hi, 1]);
-        let mut vm_no_next = Vm::new(no_next);
-        vm_no_next.ip = 4;
-        assert!(!vm_no_next.can_fuse_call_ret_pattern());
-    }
-
-    #[test]
-    fn ldloc_copy_pattern_match_is_strict_to_dup_stloc_same_slot() {
-        let base = Program::new(
-            vec![],
-            vec![
-                OpCode::Ldloc as u8,
-                0,
-                OpCode::Dup as u8,
-                OpCode::Stloc as u8,
-                0,
-                OpCode::Ret as u8,
-            ],
-        )
-        .with_local_count(1);
-        let mut vm = Vm::new(base);
-        vm.ip = 2;
-        assert!(vm.can_fuse_ldloc_copy_pattern(0));
-
-        let mismatch_slot = Program::new(
-            vec![],
-            vec![
-                OpCode::Ldloc as u8,
-                0,
-                OpCode::Dup as u8,
-                OpCode::Stloc as u8,
-                1,
-                OpCode::Ret as u8,
-            ],
-        )
-        .with_local_count(2);
-        let mut vm_slot_mismatch = Vm::new(mismatch_slot);
-        vm_slot_mismatch.ip = 2;
-        assert!(!vm_slot_mismatch.can_fuse_ldloc_copy_pattern(0));
-
-        let wrong_middle = Program::new(
-            vec![],
-            vec![
-                OpCode::Ldloc as u8,
-                0,
-                OpCode::Pop as u8,
-                OpCode::Stloc as u8,
-                0,
-                OpCode::Ret as u8,
-            ],
-        )
-        .with_local_count(1);
-        let mut vm_wrong_middle = Vm::new(wrong_middle);
-        vm_wrong_middle.ip = 2;
-        assert!(!vm_wrong_middle.can_fuse_ldloc_copy_pattern(0));
     }
 }

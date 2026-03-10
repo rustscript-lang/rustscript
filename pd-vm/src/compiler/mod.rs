@@ -5,8 +5,6 @@ use std::path::{Path, PathBuf};
 use self::source_map::{SourceMap, Span};
 use crate::assembler::{Assembler, AssemblerError};
 use crate::builtins::BuiltinFunction;
-#[cfg(feature = "runtime")]
-use crate::vm::Vm;
 use crate::{HostImport, Program, TypeMap, Value, ValueType};
 
 #[derive(Debug)]
@@ -301,18 +299,20 @@ const STDLIB_PRINT_NAME: &str = "print";
 const STDLIB_PRINT_ARITY: u8 = 1;
 
 pub mod diagnostics;
+mod driver;
 mod frontends;
-mod helpers;
 pub mod ir;
 mod lifetime;
 mod linker;
 mod opt;
 mod parser;
 mod source_loader;
-use self::helpers::{
-    collect_closure_frame_slots, collect_function_frame_slots, collect_named_local_debug_ranges,
-    eval_const_int_expr, is_compiler_primitive_import, is_definitely_string_expr,
-    local_slot_operand, shift_amount_for_power_of_two,
+use self::driver::normalize_import_spec;
+pub use self::driver::{
+    compile_source, compile_source_at_path_with_flavor_and_options, compile_source_file,
+    compile_source_file_with_options, compile_source_for_repl, compile_source_for_repl_with_locals,
+    compile_source_with_flavor, compile_source_with_flavor_and_options,
+    lint_trailing_function_return_semicolons,
 };
 pub mod source_map;
 
@@ -338,19 +338,6 @@ pub struct CompiledProgram {
 pub struct CompiledReplProgram {
     pub compiled: CompiledProgram,
     pub bindings: Vec<ReplLocalBinding>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct LocalDebugRange {
-    declared_line: Option<u32>,
-    last_line: Option<u32>,
-}
-
-impl CompiledProgram {
-    #[cfg(feature = "runtime")]
-    pub fn into_vm(self) -> Vm {
-        Vm::new(self.program)
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -413,405 +400,6 @@ impl CompileSourceFileOptions {
 
     fn has_module_overrides(&self) -> bool {
         !self.module_path_overrides.is_empty() || !self.module_source_overrides.is_empty()
-    }
-}
-
-fn normalize_import_spec(spec: String) -> String {
-    normalize_import_key(spec.trim())
-}
-
-fn normalize_import_key(spec: &str) -> String {
-    let normalized = spec.replace('\\', "/");
-    let (prefix, remainder) = split_windows_prefix(&normalized);
-    let absolute = remainder.starts_with('/');
-    let mut segments = Vec::<&str>::new();
-
-    for segment in remainder.split('/') {
-        if segment.is_empty() || segment == "." {
-            continue;
-        }
-        if segment == ".." {
-            match segments.last().copied() {
-                Some(existing) if existing != ".." => {
-                    segments.pop();
-                }
-                _ if !absolute => segments.push(".."),
-                _ => {}
-            }
-            continue;
-        }
-        segments.push(segment);
-    }
-
-    let mut out = String::new();
-    out.push_str(prefix);
-    if absolute {
-        out.push('/');
-    }
-    out.push_str(&segments.join("/"));
-    out
-}
-
-fn split_windows_prefix(input: &str) -> (&str, &str) {
-    let bytes = input.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        (&input[..2], &input[2..])
-    } else {
-        ("", input)
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CompileBehavior {
-    clear_dead_locals: bool,
-}
-
-impl CompileBehavior {
-    const DEFAULT: Self = Self {
-        clear_dead_locals: true,
-    };
-    const REPL: Self = Self {
-        clear_dead_locals: false,
-    };
-}
-
-fn compile_parsed_output(
-    source: String,
-    parsed: FrontendIr,
-    behavior: CompileBehavior,
-    enable_local_move_semantics: bool,
-) -> Result<CompiledProgram, SourceError> {
-    compile_parsed_output_with_entry_locals(
-        source,
-        parsed,
-        &[],
-        behavior,
-        enable_local_move_semantics,
-    )
-}
-
-fn compile_parsed_output_with_entry_locals(
-    source: String,
-    parsed: FrontendIr,
-    entry_definite_locals: &[LocalSlot],
-    behavior: CompileBehavior,
-    enable_local_move_semantics: bool,
-) -> Result<CompiledProgram, SourceError> {
-    // Normal compilation passes no entry locals. The REPL uses this hook to treat
-    // carried-over locals from prior entries as already available at snippet start.
-    let local_debug_ranges = collect_named_local_debug_ranges(&parsed);
-    let parsed = opt::legalize_builtins_and_bind_types(parsed);
-    opt::validate_if_else_type_consistency(&parsed).map_err(SourceError::Compile)?;
-    let parsed = lifetime::enforce_local_availability_with_entry_locals(
-        parsed,
-        entry_definite_locals,
-        behavior.clear_dead_locals,
-        enable_local_move_semantics,
-    )
-    .map_err(SourceError::Parse)?;
-    let type_info = opt::infer_types(&parsed);
-    let FrontendIr {
-        stmts,
-        locals,
-        local_bindings,
-        functions,
-        function_impls,
-        ..
-    } = parsed;
-
-    let mut runtime_import_functions: Vec<FunctionDecl> = functions
-        .iter()
-        .filter(|func| !function_impls.contains_key(&func.index))
-        .cloned()
-        .collect();
-    let mut call_index_remap = HashMap::<u16, u16>::new();
-    for (next_index, func) in runtime_import_functions.iter_mut().enumerate() {
-        let next_index = u16::try_from(next_index).map_err(|_| {
-            SourceError::Parse(ParseError {
-                span: None,
-                code: None,
-                line: 1,
-                message: "too many host imports after RSS function inlining".to_string(),
-            })
-        })?;
-        call_index_remap.insert(func.index, next_index);
-        func.index = next_index;
-    }
-    let visible_runtime_import_functions = runtime_import_functions
-        .iter()
-        .filter(|func| !is_compiler_primitive_import(&func.name))
-        .cloned()
-        .collect::<Vec<_>>();
-    let host_import_return_types = functions
-        .iter()
-        .filter(|func| !function_impls.contains_key(&func.index))
-        .map(|func| (func.index, opt::BoundType::from(func.return_type)))
-        .collect::<HashMap<_, _>>();
-    let host_import_signatures = opt::build_host_import_signatures(&functions, &function_impls);
-
-    let mut compiler = Compiler::new();
-    compiler.set_type_inference(type_info);
-    compiler.set_source(source);
-    compiler.set_function_impls(function_impls);
-    compiler.set_host_import_return_types(host_import_return_types);
-    compiler.set_host_import_signatures(host_import_signatures);
-    compiler.set_call_index_remap(call_index_remap);
-    compiler.set_enable_local_move_semantics(enable_local_move_semantics);
-    for func in &functions {
-        compiler.add_function_debug(func);
-    }
-    for (name, index) in local_bindings {
-        let range = local_debug_ranges.get(&name).copied().unwrap_or_default();
-        compiler
-            .add_local_debug(name, index, range.declared_line, range.last_line)
-            .map_err(SourceError::Compile)?;
-    }
-    let mut program = compiler
-        .compile_program(&stmts)
-        .map_err(SourceError::Compile)?;
-    program.local_count = locals;
-    program.imports = runtime_import_functions
-        .iter()
-        .map(|func| HostImport {
-            name: func.name.clone(),
-            arity: func.arity,
-            return_type: func.return_type,
-        })
-        .collect();
-    Ok(CompiledProgram {
-        program,
-        locals,
-        functions: visible_runtime_import_functions,
-    })
-}
-
-pub fn compile_source(source: &str) -> Result<CompiledProgram, SourceError> {
-    compile_source_with_flavor(source, SourceFlavor::RustScript)
-}
-
-pub fn lint_trailing_function_return_semicolons(
-    source: &str,
-    flavor: SourceFlavor,
-) -> Result<Vec<ParseError>, ParseError> {
-    let Some(dialect) = frontends::parser_dialect_for_flavor(flavor) else {
-        return Ok(Vec::new());
-    };
-    parser::lint_trailing_function_return_semicolons(source, 0, dialect)
-}
-
-pub fn compile_source_for_repl(source: &str) -> Result<CompiledProgram, SourceError> {
-    compile_source_for_repl_with_locals(source, &[]).map(|compiled| compiled.compiled)
-}
-
-pub fn compile_source_for_repl_with_locals(
-    source: &str,
-    predefined_locals: &[ReplLocalBinding],
-) -> Result<CompiledReplProgram, SourceError> {
-    let source_owned = source.to_string();
-    let predefined_locals = predefined_locals.to_vec();
-    run_with_compiler_stack(move || {
-        compile_source_for_repl_with_locals_impl(&source_owned, &predefined_locals)
-    })
-}
-
-pub fn compile_source_with_flavor(
-    source: &str,
-    flavor: SourceFlavor,
-) -> Result<CompiledProgram, SourceError> {
-    compile_source_with_flavor_and_behavior(source, flavor, CompileBehavior::DEFAULT)
-}
-
-pub fn compile_source_with_flavor_and_options(
-    source: &str,
-    flavor: SourceFlavor,
-    options: CompileSourceFileOptions,
-) -> Result<CompiledProgram, SourcePathError> {
-    let source_owned = source.to_string();
-    run_with_compiler_stack(move || {
-        compile_source_with_flavor_and_options_impl(&source_owned, flavor, &options)
-    })
-}
-
-pub fn compile_source_at_path_with_flavor_and_options(
-    path: impl AsRef<Path>,
-    source: &str,
-    flavor: SourceFlavor,
-    options: CompileSourceFileOptions,
-) -> Result<CompiledProgram, SourcePathError> {
-    let path = path.as_ref().to_path_buf();
-    let source_owned = source.to_string();
-    run_with_compiler_stack(move || {
-        compile_source_at_path_with_flavor_and_options_impl(&path, &source_owned, flavor, &options)
-    })
-}
-
-fn compile_source_with_flavor_and_behavior(
-    source: &str,
-    flavor: SourceFlavor,
-    behavior: CompileBehavior,
-) -> Result<CompiledProgram, SourceError> {
-    let owned_source = source.to_string();
-    run_with_compiler_stack(move || {
-        compile_source_with_flavor_impl(&owned_source, flavor, behavior)
-    })
-}
-
-fn compile_source_for_repl_with_locals_impl(
-    source: &str,
-    predefined_locals: &[ReplLocalBinding],
-) -> Result<CompiledReplProgram, SourceError> {
-    let mut source_map = SourceMap::new();
-    let source_id = source_map.add_source("<source>", source.to_string());
-    // REPL parsing/compiler entry state is separate from normal program compilation so
-    // persisted locals do not leak into the generic frontend or IR surface.
-    let parsed =
-        frontends::parse_rustscript_repl_source(source, predefined_locals).map_err(|err| {
-            SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
-        })?;
-    let compiled = match compile_parsed_output_with_entry_locals(
-        source.to_string(),
-        parsed.ir,
-        &parsed.entry_definite_locals,
-        CompileBehavior::REPL,
-        true,
-    ) {
-        Err(SourceError::Parse(err)) => Err(SourceError::Parse(
-            err.with_line_span_from_source(&source_map, source_id),
-        )),
-        other => other,
-    }?;
-    Ok(CompiledReplProgram {
-        compiled,
-        bindings: parsed.bindings,
-    })
-}
-
-fn compile_source_with_flavor_impl(
-    source: &str,
-    flavor: SourceFlavor,
-    behavior: CompileBehavior,
-) -> Result<CompiledProgram, SourceError> {
-    let mut source_map = SourceMap::new();
-    let source_id = source_map.add_source("<source>", source.to_string());
-    let parsed = frontends::parse_source(source, flavor).map_err(|err| {
-        SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
-    })?;
-    match compile_parsed_output(
-        source.to_string(),
-        parsed,
-        behavior,
-        matches!(flavor, SourceFlavor::RustScript),
-    ) {
-        Err(SourceError::Parse(err)) => Err(SourceError::Parse(
-            err.with_line_span_from_source(&source_map, source_id),
-        )),
-        other => other,
-    }
-}
-
-fn compile_source_with_flavor_and_options_impl(
-    source: &str,
-    flavor: SourceFlavor,
-    options: &CompileSourceFileOptions,
-) -> Result<CompiledProgram, SourcePathError> {
-    if !options.has_module_overrides() {
-        return compile_source_with_flavor_impl(source, flavor, CompileBehavior::DEFAULT)
-            .map_err(SourcePathError::Source);
-    }
-
-    let path = virtual_inmemory_entry_path(flavor);
-    let (_root_parse_source, units) =
-        source_loader::load_units_for_source_file(&path, flavor, source, options)?;
-    let merged = merge_units(units)?;
-    compile_parsed_output(
-        source.to_string(),
-        merged,
-        CompileBehavior::DEFAULT,
-        matches!(flavor, SourceFlavor::RustScript),
-    )
-    .map_err(SourcePathError::Source)
-}
-
-fn compile_source_at_path_with_flavor_and_options_impl(
-    path: &Path,
-    source: &str,
-    flavor: SourceFlavor,
-    options: &CompileSourceFileOptions,
-) -> Result<CompiledProgram, SourcePathError> {
-    let (_root_parse_source, units) =
-        source_loader::load_units_for_source_file(path, flavor, source, options)?;
-    let merged = merge_units(units)?;
-    compile_parsed_output(
-        source.to_string(),
-        merged,
-        CompileBehavior::DEFAULT,
-        matches!(flavor, SourceFlavor::RustScript),
-    )
-    .map_err(SourcePathError::Source)
-}
-
-fn virtual_inmemory_entry_path(flavor: SourceFlavor) -> PathBuf {
-    let ext = match flavor {
-        SourceFlavor::RustScript => "rss",
-        SourceFlavor::JavaScript => "js",
-        SourceFlavor::Lua => "lua",
-        SourceFlavor::Scheme => "scm",
-    };
-    PathBuf::from("__pd_vm_inmemory__").join(format!("main.{ext}"))
-}
-
-pub fn compile_source_file(path: impl AsRef<Path>) -> Result<CompiledProgram, SourcePathError> {
-    compile_source_file_with_options(path, CompileSourceFileOptions::default())
-}
-
-pub fn compile_source_file_with_options(
-    path: impl AsRef<Path>,
-    options: CompileSourceFileOptions,
-) -> Result<CompiledProgram, SourcePathError> {
-    let path = path.as_ref().to_path_buf();
-    run_with_compiler_stack(move || compile_source_file_impl(&path, &options))
-}
-
-fn compile_source_file_impl(
-    path: &Path,
-    options: &CompileSourceFileOptions,
-) -> Result<CompiledProgram, SourcePathError> {
-    let flavor = SourceFlavor::from_path(path)?;
-    let source_raw = std::fs::read_to_string(path)?;
-    let (_root_parse_source, units) =
-        source_loader::load_units_for_source_file(path, flavor, &source_raw, options)?;
-    let merged = merge_units(units)?;
-    compile_parsed_output(
-        source_raw,
-        merged,
-        CompileBehavior::DEFAULT,
-        matches!(flavor, SourceFlavor::RustScript),
-    )
-    .map_err(SourcePathError::Source)
-}
-
-fn run_with_compiler_stack<T, F>(f: F) -> T
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    #[cfg(target_arch = "wasm32")]
-    {
-        f()
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        const COMPILER_STACK_SIZE: usize = 32 * 1024 * 1024;
-        let handle = std::thread::Builder::new()
-            .name("pd-vm-compile".to_string())
-            .stack_size(COMPILER_STACK_SIZE)
-            .spawn(f)
-            .expect("failed to spawn compiler thread");
-        match handle.join() {
-            Ok(value) => value,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
     }
 }
 
@@ -2000,5 +1588,246 @@ impl Compiler {
         self.assembler
             .label(&done_label)
             .expect("compiler-generated label should be valid");
+    }
+}
+
+fn local_slot_operand(index: LocalSlot) -> Result<u8, CompileError> {
+    u8::try_from(index).map_err(|_| CompileError::LocalSlotOverflow(index))
+}
+
+fn collect_function_frame_slots(function_impl: &FunctionImpl) -> Vec<LocalSlot> {
+    let mut slots = BTreeSet::new();
+    for slot in &function_impl.param_slots {
+        slots.insert(*slot);
+    }
+    for stmt in &function_impl.body_stmts {
+        collect_stmt_slot_footprint(stmt, &mut slots);
+    }
+    collect_expr_slot_footprint(&function_impl.body_expr, &mut slots);
+    for (_, captured_slot) in &function_impl.capture_copies {
+        slots.remove(captured_slot);
+    }
+    let mut out = slots.into_iter().collect::<Vec<_>>();
+    out.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+    out
+}
+
+fn collect_closure_frame_slots(closure: &ClosureExpr) -> Vec<LocalSlot> {
+    let mut slots = BTreeSet::new();
+    for slot in &closure.param_slots {
+        slots.insert(*slot);
+    }
+    collect_expr_slot_footprint(&closure.body, &mut slots);
+    for (_, captured_slot) in &closure.capture_copies {
+        slots.remove(captured_slot);
+    }
+    let mut out = slots.into_iter().collect::<Vec<_>>();
+    out.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+    out
+}
+
+fn collect_stmt_slot_footprint(stmt: &Stmt, slots: &mut BTreeSet<LocalSlot>) {
+    match stmt {
+        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        Stmt::Drop { index, .. } => {
+            slots.insert(*index);
+        }
+        Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
+            slots.insert(*index);
+            collect_expr_slot_footprint(expr, slots);
+        }
+        Stmt::ClosureLet { closure, .. } => {
+            for slot in &closure.param_slots {
+                slots.insert(*slot);
+            }
+            for (source_slot, captured_slot) in &closure.capture_copies {
+                slots.insert(*source_slot);
+                slots.insert(*captured_slot);
+            }
+            collect_expr_slot_footprint(&closure.body, slots);
+        }
+        Stmt::Expr { expr, .. } => collect_expr_slot_footprint(expr, slots),
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_expr_slot_footprint(condition, slots);
+            for stmt in then_branch {
+                collect_stmt_slot_footprint(stmt, slots);
+            }
+            for stmt in else_branch {
+                collect_stmt_slot_footprint(stmt, slots);
+            }
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            ..
+        } => {
+            collect_stmt_slot_footprint(init, slots);
+            collect_expr_slot_footprint(condition, slots);
+            collect_stmt_slot_footprint(post, slots);
+            for stmt in body {
+                collect_stmt_slot_footprint(stmt, slots);
+            }
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            collect_expr_slot_footprint(condition, slots);
+            for stmt in body {
+                collect_stmt_slot_footprint(stmt, slots);
+            }
+        }
+    }
+}
+
+fn collect_expr_slot_footprint(expr: &Expr, slots: &mut BTreeSet<LocalSlot>) {
+    match expr {
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::FunctionRef(_) => {}
+        Expr::Var(index) | Expr::MoveVar(index) => {
+            slots.insert(*index);
+        }
+        Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
+            slots.insert(*root);
+        }
+        Expr::Call(_, args) => {
+            for arg in args {
+                collect_expr_slot_footprint(arg, slots);
+            }
+        }
+        Expr::LocalCall(index, args) => {
+            slots.insert(*index);
+            for arg in args {
+                collect_expr_slot_footprint(arg, slots);
+            }
+        }
+        Expr::Closure(closure) => {
+            for slot in &closure.param_slots {
+                slots.insert(*slot);
+            }
+            for (source_slot, captured_slot) in &closure.capture_copies {
+                slots.insert(*source_slot);
+                slots.insert(*captured_slot);
+            }
+            collect_expr_slot_footprint(&closure.body, slots);
+        }
+        Expr::ClosureCall(closure, args) => {
+            for slot in &closure.param_slots {
+                slots.insert(*slot);
+            }
+            for (source_slot, captured_slot) in &closure.capture_copies {
+                slots.insert(*source_slot);
+                slots.insert(*captured_slot);
+            }
+            for arg in args {
+                collect_expr_slot_footprint(arg, slots);
+            }
+            collect_expr_slot_footprint(&closure.body, slots);
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            collect_expr_slot_footprint(lhs, slots);
+            collect_expr_slot_footprint(rhs, slots);
+        }
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => collect_expr_slot_footprint(inner, slots),
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            collect_expr_slot_footprint(condition, slots);
+            collect_expr_slot_footprint(then_expr, slots);
+            collect_expr_slot_footprint(else_expr, slots);
+        }
+        Expr::Match {
+            value_slot,
+            result_slot,
+            value,
+            arms,
+            default,
+        } => {
+            slots.insert(*value_slot);
+            slots.insert(*result_slot);
+            collect_expr_slot_footprint(value, slots);
+            for (_, arm_expr) in arms {
+                collect_expr_slot_footprint(arm_expr, slots);
+            }
+            collect_expr_slot_footprint(default, slots);
+        }
+        Expr::Block { stmts, expr } => {
+            for stmt in stmts {
+                collect_stmt_slot_footprint(stmt, slots);
+            }
+            collect_expr_slot_footprint(expr, slots);
+        }
+    }
+}
+
+fn shift_amount_for_power_of_two(value: i64) -> Option<u32> {
+    if value <= 0 {
+        return None;
+    }
+    let as_u64 = value as u64;
+    if !as_u64.is_power_of_two() {
+        return None;
+    }
+    Some(as_u64.trailing_zeros())
+}
+
+fn is_definitely_string_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::String(_) => true,
+        Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+            is_definitely_string_expr(inner)
+        }
+        Expr::Add(lhs, rhs) => {
+            (is_definitely_string_expr(lhs) && is_definitely_string_expr(rhs))
+                || (is_definitely_string_expr(lhs) && eval_const_int_expr(rhs).is_some())
+                || (eval_const_int_expr(lhs).is_some() && is_definitely_string_expr(rhs))
+        }
+        _ => false,
+    }
+}
+
+fn eval_const_int_expr(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Int(value) => Some(*value),
+        Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+            eval_const_int_expr(inner)
+        }
+        Expr::Neg(inner) => eval_const_int_expr(inner)?.checked_neg(),
+        Expr::Add(lhs, rhs) => eval_const_int_expr(lhs)?.checked_add(eval_const_int_expr(rhs)?),
+        Expr::Sub(lhs, rhs) => eval_const_int_expr(lhs)?.checked_sub(eval_const_int_expr(rhs)?),
+        Expr::Mul(lhs, rhs) => eval_const_int_expr(lhs)?.checked_mul(eval_const_int_expr(rhs)?),
+        Expr::Div(lhs, rhs) => {
+            let rhs = eval_const_int_expr(rhs)?;
+            if rhs == 0 {
+                return None;
+            }
+            eval_const_int_expr(lhs)?.checked_div(rhs)
+        }
+        _ => None,
     }
 }

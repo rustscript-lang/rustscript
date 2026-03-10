@@ -1,4 +1,13 @@
-use super::*;
+use crate::builtins::{BuiltinFunction, CallableParam, CallableParamType, CallableSignature};
+
+use super::super::CompileError;
+use super::super::ir::{Expr, LocalSlot};
+use super::context::TypeContext;
+use super::helpers::{
+    bind_expr_result_to_slot, bound_type_label, infer_binary_type, infer_unary_type,
+    is_numeric_bound_type, validate_stmts,
+};
+use super::state::{BoundType, InferredCallable, LocalTypeState, are_compatible_bound_types};
 
 fn observe_direct_function_call_types(
     expr: &Expr,
@@ -391,7 +400,7 @@ pub(super) fn validate_expr(
         }
         Expr::Block { stmts, expr } => {
             let mut nested = state.clone();
-            super::validate_stmts(
+            validate_stmts(
                 stmts,
                 &mut nested,
                 line_context,
@@ -562,9 +571,9 @@ pub(super) fn validate_branch_state_merge(
     lhs: &LocalTypeState,
     rhs: &LocalTypeState,
 ) -> Result<(), CompileError> {
-    for slot in lhs.by_slot.keys().chain(rhs.by_slot.keys()) {
-        let left = lhs.get(*slot);
-        let right = rhs.get(*slot);
+    for slot in lhs.iter_slots().chain(rhs.iter_slots()) {
+        let left = lhs.get(slot);
+        let right = rhs.get(slot);
         if are_compatible_bound_types(left, right) {
             continue;
         }

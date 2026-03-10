@@ -1,4 +1,11 @@
-use super::*;
+use std::collections::HashMap;
+
+use crate::bytecode::ValueType;
+
+use super::super::ir::{ClosureExpr, FunctionImpl, LocalSlot, Stmt};
+use super::context::TypeContext;
+use super::helpers::bind_expr_result_to_slot;
+use super::state::{BoundType, HostCallableSignature, LocalTypeState, stabilize_loop_state};
 
 pub(super) fn observed_function_param_slice(
     observed: &HashMap<u16, Vec<BoundType>>,
