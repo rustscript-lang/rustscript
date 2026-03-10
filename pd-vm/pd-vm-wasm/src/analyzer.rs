@@ -1,12 +1,28 @@
 use std::path::Path;
 
 use vm::{
-    CompileSourceFileOptions, SourceError, SourceFlavor, SourceMap, SourcePathError,
+    CompileSourceFileOptions, CompiledProgram, SourceError, SourceFlavor, SourceMap, SourcePathError,
+    lint_unknown_type_annotations,
     compile_source_at_path_with_flavor_and_options, compile_source_with_flavor_and_options,
     lint_trailing_function_return_semicolons, render_compile_error, render_source_error,
 };
 
 use crate::stdlib::embedded_stdlib_compile_options;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LintSeverity {
+    Error,
+    Warning,
+}
+
+impl LintSeverity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LintSpan {
@@ -19,6 +35,7 @@ pub struct LintSpan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LintDiagnostic {
     pub line: usize,
+    pub severity: LintSeverity,
     pub message: String,
     pub span: Option<LintSpan>,
     pub rendered: String,
@@ -63,9 +80,9 @@ fn lint_compile_result(
     flavor: SourceFlavor,
     result: Result<vm::CompiledProgram, SourcePathError>,
 ) -> LintReport {
-    let mut diagnostics = lint_trailing_function_return_semicolon_diagnostics(source, flavor);
     match result {
-        Ok(_) => {
+        Ok(compiled) => {
+            let diagnostics = lint_success_diagnostics(source, flavor, &compiled);
             if diagnostics.is_empty() {
                 LintReport::ok()
             } else {
@@ -73,10 +90,16 @@ fn lint_compile_result(
             }
         }
         Err(SourcePathError::Source(SourceError::Parse(err))) => {
-            diagnostics.push(lint_diagnostic_from_parse_error(source, err));
+            let mut diagnostics = lint_trailing_function_return_semicolon_diagnostics(source, flavor);
+            diagnostics.push(lint_diagnostic_from_parse_error(
+                source,
+                err,
+                LintSeverity::Error,
+            ));
             LintReport { diagnostics }
         }
         Err(SourcePathError::Source(SourceError::Compile(err))) => {
+            let mut diagnostics = lint_trailing_function_return_semicolon_diagnostics(source, flavor);
             let mut source_map = SourceMap::new();
             let source_id = source_map.add_source("<lint>", source.to_string());
             let line = err.line().unwrap_or(0);
@@ -87,6 +110,7 @@ fn lint_compile_result(
             let rendered = render_compile_error(&source_map, &err, true);
             diagnostics.push(LintDiagnostic {
                 line,
+                severity: LintSeverity::Error,
                 message: err.diagnostic_message(),
                 span,
                 rendered,
@@ -94,8 +118,10 @@ fn lint_compile_result(
             LintReport { diagnostics }
         }
         Err(SourcePathError::InvalidImportSyntax { line, message, .. }) => {
+            let mut diagnostics = lint_trailing_function_return_semicolon_diagnostics(source, flavor);
             diagnostics.push(LintDiagnostic {
                 line,
+                severity: LintSeverity::Error,
                 message: message.clone(),
                 span: None,
                 rendered: message,
@@ -103,8 +129,10 @@ fn lint_compile_result(
             LintReport { diagnostics }
         }
         Err(err) => {
+            let mut diagnostics = lint_trailing_function_return_semicolon_diagnostics(source, flavor);
             diagnostics.push(LintDiagnostic {
                 line: 0,
+                severity: LintSeverity::Error,
                 message: err.to_string(),
                 span: None,
                 rendered: err.to_string(),
@@ -123,11 +151,25 @@ fn lint_trailing_function_return_semicolon_diagnostics(
     };
     errors
         .into_iter()
-        .map(|err| lint_diagnostic_from_parse_error(source, err))
+        .map(|err| lint_diagnostic_from_parse_error(source, err, LintSeverity::Warning))
         .collect()
 }
 
-fn lint_diagnostic_from_parse_error(source: &str, err: vm::ParseError) -> LintDiagnostic {
+pub(crate) fn lint_success_diagnostics(
+    source: &str,
+    flavor: SourceFlavor,
+    compiled: &CompiledProgram,
+) -> Vec<LintDiagnostic> {
+    let mut diagnostics = lint_trailing_function_return_semicolon_diagnostics(source, flavor);
+    diagnostics.extend(lint_unknown_local_type_diagnostics(source, flavor, compiled));
+    diagnostics
+}
+
+fn lint_diagnostic_from_parse_error(
+    source: &str,
+    err: vm::ParseError,
+    severity: LintSeverity,
+) -> LintDiagnostic {
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<lint>", source.to_string());
     let err = err.with_line_span_from_source(&source_map, source_id);
@@ -137,10 +179,68 @@ fn lint_diagnostic_from_parse_error(source: &str, err: vm::ParseError) -> LintDi
     let rendered = render_source_error(&source_map, &err, true);
     LintDiagnostic {
         line: err.line,
+        severity,
         message: err.message,
         span,
         rendered,
     }
+}
+
+fn lint_unknown_local_type_diagnostics(
+    source: &str,
+    flavor: SourceFlavor,
+    _compiled: &CompiledProgram,
+) -> Vec<LintDiagnostic> {
+    let mut source_map = SourceMap::new();
+    let source_id = source_map.add_source("<lint>", source.to_string());
+    let Ok(spans) = lint_unknown_type_annotations(source, flavor) else {
+        return Vec::new();
+    };
+
+    spans
+        .into_iter()
+        .filter_map(|span| {
+            let (line, _) = source_map.line_col_for_offset(source_id, span.lo)?;
+            let lint_span = lint_span_from_source_span(&source_map, source_id, span.lo, span.hi);
+            let message = "declared type 'unknown' should be avoided".to_string();
+            let rendered = render_lint_warning(&source_map, source_id, span.lo, span.hi, &message);
+            Some(LintDiagnostic {
+                line,
+                severity: LintSeverity::Warning,
+                message,
+                span: lint_span,
+                rendered,
+            })
+        })
+        .collect()
+}
+
+fn render_lint_warning(
+    source_map: &SourceMap,
+    source_id: u32,
+    lo: usize,
+    hi: usize,
+    message: &str,
+) -> String {
+    let Some(file) = source_map.file(source_id) else {
+        return format!("warning: {message}");
+    };
+    let Some((line, col)) = file.line_col_for_offset(lo) else {
+        return format!("warning: {message}");
+    };
+    let Some(line_text) = file.line_text(line) else {
+        return format!("warning: {}:{line}:{col}: {message}", file.name);
+    };
+    let pointer_width = hi.saturating_sub(lo).max(1);
+    let pointer = format!(
+        "{}{}",
+        " ".repeat(col.saturating_sub(1)),
+        "^".repeat(pointer_width)
+    );
+    format!(
+        "warning: {message}\n --> {}:{line}:{col}\n  |\n{line:>3} | {line_text}\n  | {pointer}",
+        file.name
+    )
 }
 
 fn lint_span_from_source_span(

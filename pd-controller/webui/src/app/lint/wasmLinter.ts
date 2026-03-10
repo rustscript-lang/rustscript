@@ -7,8 +7,11 @@ export type LintSpan = {
   endColumn: number;
 };
 
+export type LintSeverity = "error" | "warning";
+
 export type LintDiagnostic = {
   line: number;
+  severity: LintSeverity;
   message: string;
   span: LintSpan | null;
   rendered: string;
@@ -83,6 +86,7 @@ function normalizeReport(parsed: unknown): LintReport {
       continue;
     }
     const lineRaw = Number((item as { line?: unknown }).line);
+    const severityRaw = (item as { severity?: unknown }).severity;
     const messageRaw = (item as { message?: unknown }).message;
     const renderedRaw = (item as { rendered?: unknown }).rendered;
     let span: LintSpan | null = null;
@@ -107,6 +111,7 @@ function normalizeReport(parsed: unknown): LintReport {
       }
     }
     const line = Number.isFinite(lineRaw) ? Math.max(0, Math.trunc(lineRaw)) : 0;
+    const severity: LintSeverity = severityRaw === "warning" ? "warning" : "error";
     const message = typeof messageRaw === "string" ? messageRaw : "";
     const rendered = typeof renderedRaw === "string" ? renderedRaw : message;
     if (!message) {
@@ -114,6 +119,7 @@ function normalizeReport(parsed: unknown): LintReport {
     }
     diagnostics.push({
       line,
+      severity,
       message,
       span,
       rendered

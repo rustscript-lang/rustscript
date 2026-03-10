@@ -27,7 +27,8 @@ export function lintMarkersFromReport(
         };
     const range = model.validateRange(rawRange);
     return {
-      severity: monaco.MarkerSeverity.Error,
+      severity:
+        item.severity === "warning" ? monaco.MarkerSeverity.Warning : monaco.MarkerSeverity.Error,
       message: item.message,
       startLineNumber: range.startLineNumber,
       startColumn: range.startColumn,

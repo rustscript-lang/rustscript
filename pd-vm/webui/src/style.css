@@ -32,6 +32,8 @@
   --status-neutral-bg: rgba(255, 255, 255, 0.72);
   --status-ok-fg: #125f3a;
   --status-ok-bg: rgba(22, 163, 74, 0.14);
+  --status-warn-fg: var(--warn);
+  --status-warn-bg: rgba(245, 158, 11, 0.16);
   --status-error-fg: var(--danger);
   --status-error-bg: rgba(239, 68, 68, 0.12);
   --status-busy-fg: var(--warn);
@@ -67,6 +69,8 @@
   --status-neutral-bg: rgba(119, 142, 155, 0.18);
   --status-ok-fg: #8fe0ae;
   --status-ok-bg: rgba(34, 197, 94, 0.16);
+  --status-warn-fg: #f6cd84;
+  --status-warn-bg: rgba(245, 158, 11, 0.18);
   --status-error-fg: #fca5a5;
   --status-error-bg: rgba(239, 68, 68, 0.16);
   --status-busy-fg: #f6cd84;
@@ -551,6 +555,10 @@ body {
 
 .status.ok {
   color: var(--status-ok-fg);
+}
+
+.status.warn {
+  color: var(--status-warn-fg);
 }
 
 .status.error {

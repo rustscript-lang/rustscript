@@ -28,6 +28,7 @@ struct LintResponse {
 #[derive(Serialize)]
 struct LintDiagnosticJson {
     line: usize,
+    severity: &'static str,
     message: String,
     span: Option<LintSpanJson>,
     rendered: String,
@@ -117,6 +118,7 @@ fn leak_bytes(bytes: Vec<u8>) -> u64 {
 fn lint_diagnostic_to_json(item: LintDiagnostic) -> LintDiagnosticJson {
     LintDiagnosticJson {
         line: item.line,
+        severity: item.severity.as_str(),
         message: item.message,
         span: item.span.map(lint_span_to_json),
         rendered: item.rendered,
@@ -227,6 +229,7 @@ fn invalid_utf8_lint_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8>
     let response = LintResponse {
         diagnostics: vec![LintDiagnosticJson {
             line: 1,
+            severity: "error",
             message: format!("invalid utf-8 {label}: {err}"),
             span: None,
             rendered: format!("invalid utf-8 {label}: {err}"),
@@ -241,6 +244,7 @@ fn invalid_utf8_run_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8> 
         ok: false,
         diagnostics: vec![LintDiagnosticJson {
             line: 1,
+            severity: "error",
             message: format!("invalid utf-8 {label}: {err}"),
             span: None,
             rendered: format!("invalid utf-8 {label}: {err}"),
@@ -271,6 +275,7 @@ fn invalid_utf8_debug_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8
     let response = DebugResponse {
         diagnostics: vec![LintDiagnosticJson {
             line: 1,
+            severity: "error",
             message: format!("invalid utf-8 {label}: {err}"),
             span: None,
             rendered: format!("invalid utf-8 {label}: {err}"),
@@ -695,7 +700,7 @@ mod runtime_tests {
     use std::time::Duration;
 
     use super::parse_flavor;
-    use crate::analyzer::lint_source_with_flavor;
+    use crate::analyzer::{LintSeverity, lint_source_with_flavor};
     use crate::completions::build_completion_catalog;
     use crate::runtime::{
         DebugCommand, FuelConfig, RunCommand, debug_state, run_command, run_debug_command,
@@ -798,6 +803,11 @@ mod runtime_tests {
             diagnostic.span.is_some(),
             "expected a full-line span for compile diagnostics"
         );
+        assert_eq!(
+            diagnostic.severity,
+            LintSeverity::Error,
+            "compile mismatches should surface as errors"
+        );
         assert!(
             diagnostic
                 .message
@@ -875,6 +885,11 @@ mod runtime_tests {
         );
         let diagnostic = &report.diagnostics[0];
         assert!(diagnostic.line > 0, "expected a concrete diagnostic line");
+        assert_eq!(
+            diagnostic.severity,
+            LintSeverity::Warning,
+            "trailing semicolon lint should surface as a warning"
+        );
         assert!(
             diagnostic
                 .message
@@ -890,6 +905,73 @@ mod runtime_tests {
             diagnostic.rendered.contains("x + x;"),
             "expected rendered diagnostic snippet, got {:?}",
             diagnostic.rendered
+        );
+    }
+
+    #[test]
+    fn lint_reports_explicit_unknown_type_annotations_as_warnings() {
+        let source = r#"
+            fn id() -> unknown { 1 }
+            let result = id();
+            result;
+        "#;
+
+        let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
+        assert_eq!(
+            report.diagnostics.len(),
+            1,
+            "expected a single unknown-type warning"
+        );
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(
+            diagnostic.severity,
+            LintSeverity::Warning,
+            "explicit unknown types should surface as warnings"
+        );
+        assert!(
+            diagnostic
+                .message
+                .contains("declared type 'unknown' should be avoided"),
+            "unexpected diagnostic message: {:?}",
+            diagnostic.message
+        );
+        let span = diagnostic
+            .span
+            .as_ref()
+            .expect("unknown local type warning should expose a span");
+        assert_eq!(span.start_line, 2, "warning should point at the declaration line");
+        assert!(
+            span.end_col > span.start_col,
+            "warning span should underline the unknown type token"
+        );
+        assert!(
+            diagnostic.rendered.contains("warning:")
+                && diagnostic.rendered.contains("fn id() -> unknown { 1 }"),
+            "expected rendered warning snippet, got {:?}",
+            diagnostic.rendered
+        );
+    }
+
+    #[test]
+    fn run_reports_unknown_type_warnings_after_successful_compile() {
+        let source = r#"
+            fn id() -> unknown { "ok" }
+            let result = id();
+            print("ok");
+            result;
+        "#;
+
+        let report = run_source_with_flavor(source, SourceFlavor::RustScript);
+        assert!(report.error.is_none(), "expected run to succeed");
+        assert_eq!(
+            report.diagnostics.len(),
+            1,
+            "expected successful run to keep lint warnings"
+        );
+        assert_eq!(
+            report.diagnostics[0].severity,
+            LintSeverity::Warning,
+            "run report should preserve warning severity"
         );
     }
 

@@ -306,7 +306,8 @@ function markerFromDiagnostic(
       };
   const range = model.validateRange(rawRange);
   return {
-    severity: monaco.MarkerSeverity.Error,
+    severity:
+      diagnostic.severity === "warning" ? monaco.MarkerSeverity.Warning : monaco.MarkerSeverity.Error,
     message: diagnostic.message,
     startLineNumber: range.startLineNumber,
     startColumn: range.startColumn,
@@ -326,9 +327,38 @@ function renderDiagnosticsList(container: HTMLElement, diagnostics: LintDiagnost
       diagnostic.span !== null
         ? `${diagnostic.span.startLine}:${diagnostic.span.startColumn}`
         : `${Math.max(1, diagnostic.line)}:1`;
-    return `[${location}] ${diagnostic.message}`;
+    return `[${diagnostic.severity} ${location}] ${diagnostic.message}`;
   });
   container.textContent = lines.join("\n");
+}
+
+function summarizeLintDiagnostics(
+  diagnostics: LintDiagnostic[]
+): { text: string; className: StatusClass } {
+  const errors = diagnostics.filter((diagnostic) => diagnostic.severity === "error").length;
+  const warnings = diagnostics.length - errors;
+  if (errors > 0 && warnings > 0) {
+    return {
+      text: `lint: ${errors} error(s), ${warnings} warning(s)`,
+      className: "error"
+    };
+  }
+  if (errors > 0) {
+    return {
+      text: `lint: ${errors} error(s)`,
+      className: "error"
+    };
+  }
+  if (warnings > 0) {
+    return {
+      text: `lint: ${warnings} warning(s)`,
+      className: "warn"
+    };
+  }
+  return {
+    text: "lint: ok",
+    className: "ok"
+  };
 }
 
 function setRunPanel(outputEl: HTMLElement, stackEl: HTMLElement, output: string[], stack: string[]): void {
@@ -527,7 +557,7 @@ let epochTickerPaused = false;
 let epochFlushInFlight = false;
 let lastEpochUiRefreshAt = 0;
 let lastEpochFlushAt = 0;
-type StatusClass = "neutral" | "ok" | "error" | "busy";
+type StatusClass = "neutral" | "ok" | "warn" | "error" | "busy";
 type SessionStatusSnapshot = {
   text: string;
   className: StatusClass;
@@ -541,7 +571,7 @@ const themeButtons: Record<ThemePreference, HTMLButtonElement> = {
 };
 
 function setStatus(node: HTMLElement, text: string, className: StatusClass): void {
-  node.classList.remove("neutral", "ok", "error", "busy");
+  node.classList.remove("neutral", "ok", "warn", "error", "busy");
   node.classList.add(className);
   node.textContent = text;
 }
@@ -555,6 +585,9 @@ function statusPriority(source: "run" | "debug", status: SessionStatusSnapshot):
   }
   if (status.className === "error") {
     return 40;
+  }
+  if (status.className === "warn") {
+    return 30;
   }
   if (status.className === "ok") {
     return 10;
@@ -1085,11 +1118,8 @@ function applyDebugReport(report: DebugReport, options: ApplyDebugReportOptions 
   monaco.editor.setModelMarkers(model, MARKER_OWNER, markers);
   renderDiagnosticsList(diagnosticsPanelEl, report.diagnostics);
 
-  if (report.diagnostics.length > 0) {
-    setStatus(lintStatusEl, `lint: ${report.diagnostics.length} error(s)`, "error");
-  } else {
-    setStatus(lintStatusEl, "lint: ok", "ok");
-  }
+  const lintSummary = summarizeLintDiagnostics(report.diagnostics);
+  setStatus(lintStatusEl, lintSummary.text, lintSummary.className);
 
   setRunPanel(outputPanelEl, stackPanelEl, report.output, report.stack);
 
@@ -1155,11 +1185,8 @@ function applyRunReport(report: RunReport): void {
   renderDiagnosticsList(diagnosticsPanelEl, report.diagnostics);
   setRunPanel(outputPanelEl, stackPanelEl, report.output, report.stack);
 
-  if (report.diagnostics.length > 0) {
-    setStatus(lintStatusEl, `lint: ${report.diagnostics.length} error(s)`, "error");
-  } else {
-    setStatus(lintStatusEl, "lint: ok", "ok");
-  }
+  const lintSummary = summarizeLintDiagnostics(report.diagnostics);
+  setStatus(lintStatusEl, lintSummary.text, lintSummary.className);
 
   runFuelState = report.fuel;
   runSessionActive = !report.halted && report.error === null;
@@ -1251,11 +1278,8 @@ async function runLintNow(): Promise<void> {
     const markers = report.diagnostics.map((item) => markerFromDiagnostic(item, model));
     monaco.editor.setModelMarkers(model, MARKER_OWNER, markers);
     renderDiagnosticsList(diagnosticsPanelEl, report.diagnostics);
-    if (report.diagnostics.length > 0) {
-      setStatus(lintStatusEl, `lint: ${report.diagnostics.length} error(s)`, "error");
-    } else {
-      setStatus(lintStatusEl, "lint: ok", "ok");
-    }
+    const lintSummary = summarizeLintDiagnostics(report.diagnostics);
+    setStatus(lintStatusEl, lintSummary.text, lintSummary.className);
   } catch (error) {
     if (seq !== lintSequence) {
       return;

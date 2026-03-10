@@ -16,7 +16,7 @@ use vm::{
     compile_source_with_flavor_and_options, format_value, render_vm_error,
 };
 
-use crate::analyzer::{LintDiagnostic, lint_source_with_flavor};
+use crate::analyzer::{LintDiagnostic, lint_source_with_flavor, lint_success_diagnostics};
 use crate::stdlib::embedded_stdlib_compile_options;
 
 const MAX_DEBUG_STEPS_PER_COMMAND: usize = 200_000;
@@ -240,6 +240,7 @@ enum RunProgress {
 struct RunSession {
     vm: Vm,
     output_lines: Arc<Mutex<Vec<String>>>,
+    diagnostics: Vec<LintDiagnostic>,
     halted: bool,
     error: Option<String>,
 }
@@ -247,6 +248,7 @@ struct RunSession {
 struct DebugSession {
     vm: Vm,
     output_lines: Arc<Mutex<Vec<String>>>,
+    diagnostics: Vec<LintDiagnostic>,
     line_breakpoints: HashSet<u32>,
     epoch_resume_rearm_pending: bool,
     halted: bool,
@@ -377,23 +379,19 @@ fn poll_waiting_host_op_once(vm: &mut Vm) -> Poll<VmResult<()>> {
 }
 
 impl RunSession {
-    fn new(vm: Vm, output_lines: Arc<Mutex<Vec<String>>>) -> Self {
+    fn new(vm: Vm, output_lines: Arc<Mutex<Vec<String>>>, diagnostics: Vec<LintDiagnostic>) -> Self {
         Self {
             vm,
             output_lines,
+            diagnostics,
             halted: false,
             error: None,
         }
     }
 
-    fn snapshot(
-        &self,
-        diagnostics: Vec<LintDiagnostic>,
-        command_output: String,
-        yielded: bool,
-    ) -> RunReport {
+    fn snapshot(&self, command_output: String, yielded: bool) -> RunReport {
         RunReport {
-            diagnostics,
+            diagnostics: self.diagnostics.clone(),
             output: drain_output(&self.output_lines),
             stack: self.vm.stack().iter().map(format_value).collect(),
             error: self.error.clone(),
@@ -458,10 +456,11 @@ impl RunSession {
 }
 
 impl DebugSession {
-    fn new(vm: Vm, output_lines: Arc<Mutex<Vec<String>>>) -> Self {
+    fn new(vm: Vm, output_lines: Arc<Mutex<Vec<String>>>, diagnostics: Vec<LintDiagnostic>) -> Self {
         Self {
             vm,
             output_lines,
+            diagnostics,
             line_breakpoints: HashSet::new(),
             epoch_resume_rearm_pending: false,
             halted: false,
@@ -503,11 +502,11 @@ impl DebugSession {
         }
     }
 
-    fn snapshot(&self, diagnostics: Vec<LintDiagnostic>, command_output: String) -> DebugReport {
+    fn snapshot(&self, command_output: String) -> DebugReport {
         let mut breakpoints = self.line_breakpoints.iter().copied().collect::<Vec<_>>();
         breakpoints.sort_unstable();
         DebugReport {
-            diagnostics,
+            diagnostics: self.diagnostics.clone(),
             output: drain_output(&self.output_lines),
             stack: self.vm.stack().iter().map(format_value).collect(),
             error: self.error.clone(),
@@ -1012,6 +1011,7 @@ pub(crate) fn run_source_with_flavor(source: &str, flavor: SourceFlavor) -> RunR
         Ok(compiled) => compiled,
         Err(err) => return RunReport::source_error(source, flavor, err),
     };
+    let diagnostics = lint_success_diagnostics(source, flavor, &compiled);
 
     let output_lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
@@ -1072,7 +1072,7 @@ pub(crate) fn run_source_with_flavor(source: &str, flavor: SourceFlavor) -> RunR
                 let output = drain_output(&output_lines);
                 let stack = vm.stack().iter().map(format_value).collect::<Vec<_>>();
                 return RunReport {
-                    diagnostics: Vec::new(),
+                    diagnostics: diagnostics.clone(),
                     output,
                     stack,
                     error: None,
@@ -1106,6 +1106,7 @@ pub fn start_run_source_with_flavor(
             return RunReport::source_error(source, flavor, err);
         }
     };
+    let diagnostics = lint_success_diagnostics(source, flavor, &compiled);
 
     let output_lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
@@ -1122,13 +1123,9 @@ pub fn start_run_source_with_flavor(
         return RunReport::runtime_error(err, Vec::new(), Vec::new(), capture_fuel_state(&vm));
     }
 
-    let mut session = RunSession::new(vm, output_lines);
+    let mut session = RunSession::new(vm, output_lines, diagnostics);
     let (command_output, progress) = session.resume();
-    let report = session.snapshot(
-        Vec::new(),
-        command_output,
-        matches!(progress, RunProgress::Yielded),
-    );
+    let report = session.snapshot(command_output, matches!(progress, RunProgress::Yielded));
     RUN_SESSION.with(|state| {
         *state.borrow_mut() = if report.halted || report.error.is_some() {
             None
@@ -1217,7 +1214,7 @@ pub fn run_command(command: RunCommand) -> RunReport {
             RunCommand::Stop => unreachable!("handled above"),
         };
 
-        let report = session.snapshot(Vec::new(), command_output, yielded);
+        let report = session.snapshot(command_output, yielded);
         if report.halted || report.error.is_some() {
             *slot = None;
         }
@@ -1243,6 +1240,7 @@ pub fn start_debug_source_with_flavor(
             return DebugReport::source_error(source, flavor, err);
         }
     };
+    let diagnostics = lint_success_diagnostics(source, flavor, &compiled);
 
     let output_lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
@@ -1259,8 +1257,8 @@ pub fn start_debug_source_with_flavor(
         return DebugReport::inactive(Some(err), "debugger initialization failed");
     }
 
-    let session = DebugSession::new(vm, output_lines);
-    let report = session.snapshot(Vec::new(), "debugger attached".to_string());
+    let session = DebugSession::new(vm, output_lines, diagnostics);
+    let report = session.snapshot("debugger attached".to_string());
     DEBUG_SESSION.with(|state| {
         *state.borrow_mut() = Some(session);
     });
@@ -1284,7 +1282,7 @@ pub fn run_debug_command(command: DebugCommand) -> DebugReport {
             );
         };
         let command_output = session.run_command(command);
-        let report = session.snapshot(Vec::new(), command_output);
+        let report = session.snapshot(command_output);
         if report.halted || report.error.is_some() {
             *slot = None;
         }
@@ -1301,7 +1299,7 @@ pub fn debug_state() -> DebugReport {
                 String::new(),
             );
         };
-        session.snapshot(Vec::new(), String::new())
+        session.snapshot(String::new())
     })
 }
 
