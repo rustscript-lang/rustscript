@@ -156,3 +156,30 @@ fn render_vm_error_includes_ip_and_source_line() {
     assert!(rendered.contains("line 1"));
     assert!(rendered.contains("let value = 1 / 0;"));
 }
+
+#[test]
+fn render_compile_error_highlights_invalid_schema_field_access_line() {
+    let source = "let user: {name: string} = { name: \"Ada\" };\nuser.age;\n";
+
+    let err = match compile_source(source) {
+        Ok(_) => panic!("compile should reject invalid schema field access"),
+        Err(err) => err,
+    };
+    let compile = match err {
+        SourceError::Compile(compile) => compile,
+        other => panic!("expected compile error, got {other:?}"),
+    };
+
+    let line = compile.line().expect("schema field access should report a line");
+    let mut source_map = SourceMap::new();
+    let source_id = source_map.add_source("inline.rss", source);
+    let line_text = source_map
+        .file(source_id)
+        .and_then(|file| file.line_text(line))
+        .expect("line text should exist");
+    let rendered = render_compile_error(&source_map, &compile, false);
+
+    assert!(rendered.contains("field 'age' is not declared"));
+    assert!(rendered.contains(&format!("inline.rss:{line}:1")));
+    assert!(rendered.contains(line_text));
+}

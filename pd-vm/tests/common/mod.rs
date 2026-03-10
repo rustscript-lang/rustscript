@@ -128,6 +128,7 @@ pub enum CompileErrorKind {
     IfElseBranchTypeMismatch,
     CallableArgumentTypeMismatch,
     BinaryOperandTypeMismatch,
+    InvalidFieldAccess,
     FunctionParameterTypeConflict,
 }
 
@@ -167,6 +168,7 @@ fn compile_error_kind(err: &vm::CompileError) -> CompileErrorKind {
         vm::CompileError::BinaryOperandTypeMismatch { .. } => {
             CompileErrorKind::BinaryOperandTypeMismatch
         }
+        vm::CompileError::InvalidFieldAccess { .. } => CompileErrorKind::InvalidFieldAccess,
         vm::CompileError::FunctionParameterTypeConflict { .. } => {
             CompileErrorKind::FunctionParameterTypeConflict
         }
