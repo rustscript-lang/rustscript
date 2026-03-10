@@ -1105,6 +1105,30 @@ mod runtime_tests {
     }
 
     #[test]
+    fn lint_does_not_warn_for_if_else_block_locals_with_concrete_types() {
+        let source = r#"
+            use stdlib::rss::strings as string;
+
+            let mut total = 0;
+
+            let total = if !string::non_empty("rustscript") => {
+                let zeroed = 0;
+                zeroed
+            } else => {
+                let bumped = total + 1;
+                bumped
+            };
+        "#;
+
+        let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
+        assert!(
+            report.diagnostics.is_empty(),
+            "block-local literals inside if/else expressions should not be flagged: {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
     fn lint_keeps_unknown_local_warnings_with_stdlib_use_alias() {
         let source = r#"
             use stdlib::rss::strings as string;
