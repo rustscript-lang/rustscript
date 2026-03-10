@@ -44,8 +44,6 @@ const MAX_TRAFFIC_POINTS: usize = 720;
 const PERSISTENCE_SCHEMA_VERSION: u32 = 1;
 const RECORDINGS_SCHEMA_VERSION: u32 = 1;
 const DEBUG_SESSIONS_SCHEMA_VERSION: u32 = 1;
-const TIMESERIES_SCHEMA_VERSION_V1: u32 = 1;
-const TIMESERIES_SCHEMA_VERSION_V2: u32 = 2;
 const TIMESERIES_SCHEMA_VERSION: u32 = 3;
 const TIMESERIES_BINARY_MAGIC: [u8; 4] = *b"PDTS";
 const DEBUG_RESUME_GRACE_MS: u64 = 1_500;
@@ -505,21 +503,9 @@ struct ControllerTimeseriesSnapshot {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct PersistedControllerStore {
-    #[serde(default)]
-    edges: HashMap<String, PersistedEdgeMergedRecord>,
-    #[serde(default)]
-    edge_lookup: HashMap<String, String>,
-    #[serde(default)]
-    programs: HashMap<String, StoredProgram>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct PersistedEdgeCoreRecord {
-    #[serde(default)]
-    edge_id: Option<String>,
-    #[serde(default)]
-    edge_name: Option<String>,
+    edge_id: String,
+    edge_name: String,
     #[serde(default)]
     applied_program: Option<AppliedProgramRef>,
     #[serde(default)]
@@ -540,42 +526,6 @@ struct PersistedEdgeTimeseriesRecord {
     traffic_points: VecDeque<EdgeTrafficPoint>,
     #[serde(default)]
     last_traffic_cumulative: Option<EdgeTrafficSample>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct PersistedEdgeMergedRecord {
-    #[serde(default)]
-    edge_id: Option<String>,
-    #[serde(default)]
-    edge_name: Option<String>,
-    #[serde(default)]
-    applied_program: Option<AppliedProgramRef>,
-    #[serde(default)]
-    traffic_points: VecDeque<EdgeTrafficPoint>,
-    #[serde(default)]
-    last_traffic_cumulative: Option<EdgeTrafficSample>,
-    #[serde(default)]
-    last_poll_unix_ms: Option<u64>,
-    #[serde(default)]
-    last_result_unix_ms: Option<u64>,
-    #[serde(default)]
-    last_telemetry: Option<TelemetrySnapshot>,
-    #[serde(default)]
-    total_polls: u64,
-    #[serde(default)]
-    total_results: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ControllerSnapshotLegacy {
-    #[serde(default = "snapshot_schema_version")]
-    schema_version: u32,
-    #[serde(default)]
-    command_sequence: u64,
-    #[serde(default)]
-    program_sequence: u64,
-    #[serde(default)]
-    store: PersistedControllerStore,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -736,27 +686,12 @@ impl ControllerState {
             let guard = self.inner.read().await;
             let debug_sessions = self.debug_sessions.read().await;
             let recordings = self.debug_recordings.read().await;
-            let persisted = guard.to_persisted();
-            let core_edges = persisted
+            let core_edges = guard
                 .edges
                 .iter()
-                .map(|(edge_id, record)| {
-                    (
-                        edge_id.clone(),
-                        PersistedEdgeCoreRecord {
-                            edge_id: record.edge_id.clone(),
-                            edge_name: record.edge_name.clone(),
-                            applied_program: record.applied_program.clone(),
-                            last_poll_unix_ms: record.last_poll_unix_ms,
-                            last_result_unix_ms: record.last_result_unix_ms,
-                            last_telemetry: record.last_telemetry.clone(),
-                            total_polls: record.total_polls,
-                            total_results: record.total_results,
-                        },
-                    )
-                })
+                .map(|(edge_id, record)| (edge_id.clone(), record.to_persisted(edge_id.clone())))
                 .collect::<HashMap<_, _>>();
-            let timeseries_edges = persisted
+            let timeseries_edges = guard
                 .edges
                 .iter()
                 .map(|(edge_id, record)| {
@@ -775,11 +710,11 @@ impl ControllerState {
                     command_sequence: self.command_sequence.load(Ordering::Relaxed),
                     program_sequence: self.program_sequence.load(Ordering::Relaxed),
                     edges: core_edges,
-                    edge_lookup: persisted.edge_lookup.clone(),
+                    edge_lookup: guard.edge_lookup.clone(),
                 },
                 ControllerProgramsSnapshot {
                     schema_version: PERSISTENCE_SCHEMA_VERSION,
-                    programs: persisted.programs.clone(),
+                    programs: guard.programs.clone(),
                 },
                 ControllerTimeseriesSnapshot {
                     schema_version: TIMESERIES_SCHEMA_VERSION,
@@ -832,70 +767,38 @@ impl ControllerStore {
         edge_id
     }
 
-    fn to_persisted(&self) -> PersistedControllerStore {
-        PersistedControllerStore {
-            edges: self
-                .edges
-                .iter()
-                .map(|(edge_id, record)| {
-                    (edge_id.clone(), record.to_persisted(Some(edge_id.clone())))
-                })
-                .collect(),
-            edge_lookup: self.edge_lookup.clone(),
-            programs: self.programs.clone(),
-        }
-    }
-
     fn from_persisted(
-        store: PersistedControllerStore,
+        snapshot: ControllerCoreSnapshot,
+        programs: HashMap<String, StoredProgram>,
+        timeseries: HashMap<String, PersistedEdgeTimeseriesRecord>,
         max_result_history: usize,
     ) -> ControllerStore {
-        let mut edge_lookup = store.edge_lookup;
+        let mut edge_lookup = snapshot.edge_lookup;
         let mut edges = HashMap::new();
 
-        for (stored_key, record) in store.edges {
-            let edge_id = record.edge_id.clone().unwrap_or_else(|| {
-                if Uuid::parse_str(&stored_key).is_ok() {
-                    stored_key.clone()
-                } else {
-                    Uuid::new_v4().to_string()
-                }
-            });
-
-            let edge_name = record.edge_name.clone().unwrap_or_else(|| {
-                if Uuid::parse_str(&stored_key).is_ok() {
-                    edge_lookup
-                        .iter()
-                        .find_map(|(name, id)| (id == &edge_id).then(|| name.clone()))
-                        .unwrap_or_else(|| stored_key.clone())
-                } else {
-                    stored_key.clone()
-                }
-            });
-
-            edge_lookup.insert(edge_name.clone(), edge_id.clone());
+        for (stored_key, record) in snapshot.edges {
+            let edge_id = record.edge_id.clone();
+            edge_lookup.insert(record.edge_name.clone(), edge_id.clone());
             edges.insert(
                 edge_id,
-                EdgeRecord::from_persisted(record, max_result_history, edge_name),
+                EdgeRecord::from_persisted(record, timeseries.get(&stored_key), max_result_history),
             );
         }
 
         ControllerStore {
             edges,
             edge_lookup,
-            programs: store.programs,
+            programs,
         }
     }
 }
 
 impl EdgeRecord {
-    fn to_persisted(&self, edge_id: Option<String>) -> PersistedEdgeMergedRecord {
-        PersistedEdgeMergedRecord {
+    fn to_persisted(&self, edge_id: String) -> PersistedEdgeCoreRecord {
+        PersistedEdgeCoreRecord {
             edge_id,
-            edge_name: Some(self.edge_name.clone()),
+            edge_name: self.edge_name.clone(),
             applied_program: self.applied_program.clone(),
-            traffic_points: self.traffic_points.clone(),
-            last_traffic_cumulative: self.last_traffic_cumulative.clone(),
             last_poll_unix_ms: self.last_poll_unix_ms,
             last_result_unix_ms: self.last_result_unix_ms,
             last_telemetry: self.last_telemetry.clone(),
@@ -905,15 +808,18 @@ impl EdgeRecord {
     }
 
     fn from_persisted(
-        store: PersistedEdgeMergedRecord,
+        store: PersistedEdgeCoreRecord,
+        timeseries: Option<&PersistedEdgeTimeseriesRecord>,
         max_result_history: usize,
-        edge_name: String,
     ) -> EdgeRecord {
         let mut record = EdgeRecord {
-            edge_name,
+            edge_name: store.edge_name,
             applied_program: store.applied_program,
-            traffic_points: store.traffic_points,
-            last_traffic_cumulative: store.last_traffic_cumulative,
+            traffic_points: timeseries
+                .map(|item| item.traffic_points.clone())
+                .unwrap_or_default(),
+            last_traffic_cumulative: timeseries
+                .and_then(|item| item.last_traffic_cumulative.clone()),
             last_poll_unix_ms: store.last_poll_unix_ms,
             last_result_unix_ms: store.last_result_unix_ms,
             last_telemetry: store.last_telemetry,
@@ -947,9 +853,7 @@ fn default_true() -> bool {
 }
 
 fn is_supported_timeseries_schema_version(value: u32) -> bool {
-    value == TIMESERIES_SCHEMA_VERSION_V1
-        || value == TIMESERIES_SCHEMA_VERSION_V2
-        || value == TIMESERIES_SCHEMA_VERSION
+    value == TIMESERIES_SCHEMA_VERSION
 }
 
 fn load_snapshot_from_disk(
@@ -995,42 +899,15 @@ fn load_snapshot_from_disk(
     };
     let snapshot = match serde_json::from_slice::<ControllerCoreSnapshot>(&data) {
         Ok(snapshot) => snapshot,
-        Err(_) => {
-            // Backward compatibility with previous monolithic state file format.
-            let legacy = match serde_json::from_slice::<ControllerSnapshotLegacy>(&data) {
-                Ok(snapshot) => snapshot,
-                Err(err) => {
-                    warn!(
-                        "failed to parse controller snapshot path={} err={err}",
-                        path.display()
-                    );
-                    return (
-                        ControllerStore::default(),
-                        0,
-                        0,
-                        HashMap::new(),
-                        HashMap::new(),
-                    );
-                }
-            };
-            if legacy.schema_version != PERSISTENCE_SCHEMA_VERSION {
-                warn!(
-                    "ignoring controller snapshot path={} unsupported schema_version={}",
-                    path.display(),
-                    legacy.schema_version
-                );
-                return (
-                    ControllerStore::default(),
-                    0,
-                    0,
-                    HashMap::new(),
-                    HashMap::new(),
-                );
-            }
+        Err(err) => {
+            warn!(
+                "failed to parse controller snapshot path={} err={err}",
+                path.display()
+            );
             return (
-                ControllerStore::from_persisted(legacy.store, max_result_history),
-                legacy.command_sequence,
-                legacy.program_sequence,
+                ControllerStore::default(),
+                0,
+                0,
                 HashMap::new(),
                 HashMap::new(),
             );
@@ -1071,35 +948,8 @@ fn load_snapshot_from_disk(
     };
 
     let timeseries = load_timeseries_snapshot(timeseries_path.as_path());
-
-    let mut merged_edges = HashMap::new();
-    for (edge_id, core) in snapshot.edges {
-        let traffic = timeseries.get(&edge_id);
-        merged_edges.insert(
-            edge_id.clone(),
-            PersistedEdgeMergedRecord {
-                edge_id: core.edge_id,
-                edge_name: core.edge_name,
-                applied_program: core.applied_program,
-                traffic_points: traffic
-                    .map(|item| item.traffic_points.clone())
-                    .unwrap_or_default(),
-                last_traffic_cumulative: traffic
-                    .and_then(|item| item.last_traffic_cumulative.clone()),
-                last_poll_unix_ms: core.last_poll_unix_ms,
-                last_result_unix_ms: core.last_result_unix_ms,
-                last_telemetry: core.last_telemetry,
-                total_polls: core.total_polls,
-                total_results: core.total_results,
-            },
-        );
-    }
-
-    let store = PersistedControllerStore {
-        edges: merged_edges,
-        edge_lookup: snapshot.edge_lookup,
-        programs,
-    };
+    let command_sequence = snapshot.command_sequence;
+    let program_sequence = snapshot.program_sequence;
 
     let recordings = if recordings_path.exists() {
         match fs::read(recordings_path.as_path())
@@ -1145,9 +995,9 @@ fn load_snapshot_from_disk(
     };
 
     (
-        ControllerStore::from_persisted(store, max_result_history),
-        snapshot.command_sequence,
-        snapshot.program_sequence,
+        ControllerStore::from_persisted(snapshot, programs, timeseries, max_result_history),
+        command_sequence,
+        program_sequence,
         debug_sessions,
         recordings,
     )
@@ -1328,71 +1178,45 @@ fn decode_timeseries_snapshot(bytes: &[u8]) -> Result<ControllerTimeseriesSnapsh
         let point_count = cursor.read_u32()?;
         let mut traffic_points = VecDeque::with_capacity(point_count as usize);
         for _ in 0..point_count {
-            let mut point = EdgeTrafficPoint {
+            let point = EdgeTrafficPoint {
                 unix_ms: cursor.read_u64()?,
                 requests: cursor.read_u64()?,
                 status_2xx: cursor.read_u64()?,
                 status_3xx: cursor.read_u64()?,
                 status_4xx: cursor.read_u64()?,
                 status_5xx: cursor.read_u64()?,
-                latency_p50_ms: 0,
-                latency_p90_ms: 0,
-                latency_p99_ms: 0,
-                upstream_latency_p50_ms: 0,
-                upstream_latency_p90_ms: 0,
-                upstream_latency_p99_ms: 0,
-                edge_latency_p50_ms: 0,
-                edge_latency_p90_ms: 0,
-                edge_latency_p99_ms: 0,
+                latency_p50_ms: cursor.read_u64()?,
+                latency_p90_ms: cursor.read_u64()?,
+                latency_p99_ms: cursor.read_u64()?,
+                upstream_latency_p50_ms: cursor.read_u64()?,
+                upstream_latency_p90_ms: cursor.read_u64()?,
+                upstream_latency_p99_ms: cursor.read_u64()?,
+                edge_latency_p50_ms: cursor.read_u64()?,
+                edge_latency_p90_ms: cursor.read_u64()?,
+                edge_latency_p99_ms: cursor.read_u64()?,
             };
-            if schema_version >= TIMESERIES_SCHEMA_VERSION_V2 {
-                point.latency_p50_ms = cursor.read_u64()?;
-                point.latency_p90_ms = cursor.read_u64()?;
-                point.latency_p99_ms = cursor.read_u64()?;
-            }
-            if schema_version >= TIMESERIES_SCHEMA_VERSION {
-                point.upstream_latency_p50_ms = cursor.read_u64()?;
-                point.upstream_latency_p90_ms = cursor.read_u64()?;
-                point.upstream_latency_p99_ms = cursor.read_u64()?;
-                point.edge_latency_p50_ms = cursor.read_u64()?;
-                point.edge_latency_p90_ms = cursor.read_u64()?;
-                point.edge_latency_p99_ms = cursor.read_u64()?;
-            }
             traffic_points.push_back(point);
         }
 
         let last_traffic_cumulative = match cursor.read_u8()? {
             0 => None,
             1 => {
-                let mut sample = EdgeTrafficSample {
+                let sample = EdgeTrafficSample {
                     requests_total: cursor.read_u64()?,
                     status_2xx_total: cursor.read_u64()?,
                     status_3xx_total: cursor.read_u64()?,
                     status_4xx_total: cursor.read_u64()?,
                     status_5xx_total: cursor.read_u64()?,
-                    latency_p50_ms: 0,
-                    latency_p90_ms: 0,
-                    latency_p99_ms: 0,
-                    upstream_latency_p50_ms: 0,
-                    upstream_latency_p90_ms: 0,
-                    upstream_latency_p99_ms: 0,
-                    edge_latency_p50_ms: 0,
-                    edge_latency_p90_ms: 0,
-                    edge_latency_p99_ms: 0,
+                    latency_p50_ms: cursor.read_u64()?,
+                    latency_p90_ms: cursor.read_u64()?,
+                    latency_p99_ms: cursor.read_u64()?,
+                    upstream_latency_p50_ms: cursor.read_u64()?,
+                    upstream_latency_p90_ms: cursor.read_u64()?,
+                    upstream_latency_p99_ms: cursor.read_u64()?,
+                    edge_latency_p50_ms: cursor.read_u64()?,
+                    edge_latency_p90_ms: cursor.read_u64()?,
+                    edge_latency_p99_ms: cursor.read_u64()?,
                 };
-                if schema_version >= TIMESERIES_SCHEMA_VERSION_V2 {
-                    sample.latency_p50_ms = cursor.read_u64()?;
-                    sample.latency_p90_ms = cursor.read_u64()?;
-                    sample.latency_p99_ms = cursor.read_u64()?;
-                }
-                if schema_version >= TIMESERIES_SCHEMA_VERSION {
-                    sample.upstream_latency_p50_ms = cursor.read_u64()?;
-                    sample.upstream_latency_p90_ms = cursor.read_u64()?;
-                    sample.upstream_latency_p99_ms = cursor.read_u64()?;
-                    sample.edge_latency_p50_ms = cursor.read_u64()?;
-                    sample.edge_latency_p90_ms = cursor.read_u64()?;
-                    sample.edge_latency_p99_ms = cursor.read_u64()?;
-                }
                 Some(sample)
             }
             value => {
