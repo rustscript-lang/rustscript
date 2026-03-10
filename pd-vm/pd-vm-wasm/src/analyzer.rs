@@ -2,7 +2,8 @@ use std::path::Path;
 
 use vm::{
     CompileSourceFileOptions, CompiledProgram, SourceError, SourceFlavor, SourceMap, SourcePathError,
-    lint_unknown_type_annotations,
+    lint_unknown_inferred_local_types_at_path_with_options,
+    lint_unknown_inferred_local_types_with_options,
     compile_source_at_path_with_flavor_and_options, compile_source_with_flavor_and_options,
     lint_trailing_function_return_semicolons, render_compile_error, render_source_error,
 };
@@ -55,10 +56,13 @@ impl LintReport {
 }
 
 pub fn lint_source_with_flavor(source: &str, flavor: SourceFlavor) -> LintReport {
+    let options = embedded_stdlib_compile_options();
     lint_compile_result(
         source,
         flavor,
-        compile_source_with_flavor_and_options(source, flavor, embedded_stdlib_compile_options()),
+        None,
+        &options,
+        compile_source_with_flavor_and_options(source, flavor, options.clone()),
     )
 }
 
@@ -68,21 +72,26 @@ pub fn lint_source_with_flavor_at_path(
     flavor: SourceFlavor,
     options: CompileSourceFileOptions,
 ) -> LintReport {
+    let path = path.to_path_buf();
     lint_compile_result(
         source,
         flavor,
-        compile_source_at_path_with_flavor_and_options(path, source, flavor, options),
+        Some(path.as_path()),
+        &options,
+        compile_source_at_path_with_flavor_and_options(&path, source, flavor, options.clone()),
     )
 }
 
 fn lint_compile_result(
     source: &str,
     flavor: SourceFlavor,
+    path: Option<&Path>,
+    options: &CompileSourceFileOptions,
     result: Result<vm::CompiledProgram, SourcePathError>,
 ) -> LintReport {
     match result {
         Ok(compiled) => {
-            let diagnostics = lint_success_diagnostics(source, flavor, &compiled);
+            let diagnostics = lint_success_diagnostics(source, flavor, &compiled, path, options);
             if diagnostics.is_empty() {
                 LintReport::ok()
             } else {
@@ -100,6 +109,9 @@ fn lint_compile_result(
         }
         Err(SourcePathError::Source(SourceError::Compile(err))) => {
             let mut diagnostics = lint_trailing_function_return_semicolon_diagnostics(source, flavor);
+            diagnostics.extend(lint_unknown_inferred_local_diagnostics(
+                source, flavor, path, options,
+            ));
             let mut source_map = SourceMap::new();
             let source_id = source_map.add_source("<lint>", source.to_string());
             let line = err.line().unwrap_or(0);
@@ -159,9 +171,14 @@ pub(crate) fn lint_success_diagnostics(
     source: &str,
     flavor: SourceFlavor,
     compiled: &CompiledProgram,
+    path: Option<&Path>,
+    options: &CompileSourceFileOptions,
 ) -> Vec<LintDiagnostic> {
     let mut diagnostics = lint_trailing_function_return_semicolon_diagnostics(source, flavor);
-    diagnostics.extend(lint_unknown_local_type_diagnostics(source, flavor, compiled));
+    let _ = compiled;
+    diagnostics.extend(lint_unknown_inferred_local_diagnostics(
+        source, flavor, path, options,
+    ));
     diagnostics
 }
 
@@ -186,26 +203,42 @@ fn lint_diagnostic_from_parse_error(
     }
 }
 
-fn lint_unknown_local_type_diagnostics(
+fn lint_unknown_inferred_local_diagnostics(
     source: &str,
     flavor: SourceFlavor,
-    _compiled: &CompiledProgram,
+    path: Option<&Path>,
+    options: &CompileSourceFileOptions,
 ) -> Vec<LintDiagnostic> {
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<lint>", source.to_string());
-    let Ok(spans) = lint_unknown_type_annotations(source, flavor) else {
+    let warnings = if let Some(path) = path {
+        lint_unknown_inferred_local_types_at_path_with_options(
+            path,
+            source,
+            flavor,
+            options.clone(),
+        )
+    } else {
+        lint_unknown_inferred_local_types_with_options(source, flavor, options.clone())
+    };
+    let Ok(warnings) = warnings else {
         return Vec::new();
     };
 
-    spans
+    warnings
         .into_iter()
-        .filter_map(|span| {
-            let (line, _) = source_map.line_col_for_offset(source_id, span.lo)?;
+        .filter_map(|warning| {
+            let span = warning
+                .span
+                .or_else(|| source_map.line_span(source_id, warning.line))?;
             let lint_span = lint_span_from_source_span(&source_map, source_id, span.lo, span.hi);
-            let message = "declared type 'unknown' should be avoided".to_string();
+            let message = format!(
+                "compiler could not determine the type of local '{}'",
+                warning.name
+            );
             let rendered = render_lint_warning(&source_map, source_id, span.lo, span.hi, &message);
             Some(LintDiagnostic {
-                line,
+                line: warning.line,
                 severity: LintSeverity::Warning,
                 message,
                 span: lint_span,

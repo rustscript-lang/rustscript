@@ -688,8 +688,52 @@ mod lint_tests {
         let report =
             lint_source_with_flavor_at_path(source, path, SourceFlavor::RustScript, options);
         assert!(
-            report.diagnostics.is_empty(),
-            "expected relative import lint to pass with real path context, got {:?}",
+            report
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity.as_str() == "warning"),
+            "expected relative import lint to avoid hard errors, got {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("compiler could not determine the type of local 'values'")
+            }),
+            "expected relative import lint to surface the unknown local warning, got {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn lint_with_context_keeps_unknown_local_warnings_with_relative_imports() {
+        let path = Path::new("workspace/examples/list_comp_test.rss");
+        let source = r#"
+            use super::stdlib::rss::iter::{range, map, filter};
+            let values = filter(map(range(4), |item| item + 1), |item| item > 2);
+            let arr = [1, "two"];
+            let value = arr[0];
+            value;
+        "#;
+        let mut options = parse_module_overrides(
+            r#"[{"path":"workspace/stdlib/rss/iter.rss","source":"pub fn range(stop) {}\npub fn map(iterable, f) {}\npub fn filter(iterable, f) {}"}]"#,
+        );
+        options.set_module_override_source(
+            "workspace/stdlib/rss/iter.rss",
+            include_str!("../../stdlib/rss/iter.rss"),
+        );
+
+        let report =
+            lint_source_with_flavor_at_path(source, path, SourceFlavor::RustScript, options);
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.severity.as_str() == "warning"
+                    && diagnostic
+                        .message
+                        .contains("compiler could not determine the type of local 'value'")
+            }),
+            "expected path-aware lint to keep the unknown-local warning, got {:?}",
             report.diagnostics
         );
     }
@@ -792,12 +836,11 @@ mod runtime_tests {
         "#;
 
         let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
-        assert_eq!(
-            report.diagnostics.len(),
-            1,
-            "expected a single compile diagnostic"
-        );
-        let diagnostic = &report.diagnostics[0];
+        let diagnostic = report
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.severity == LintSeverity::Error)
+            .expect("expected a compile error diagnostic");
         assert!(diagnostic.line > 0, "expected a concrete diagnostic line");
         assert!(
             diagnostic.span.is_some(),
@@ -830,6 +873,16 @@ mod runtime_tests {
                 && diagnostic.rendered.contains("let value = if true => {"),
             "expected rendered diagnostic snippet, got {:?}",
             diagnostic.rendered
+        );
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.severity == LintSeverity::Warning
+                    && diagnostic
+                        .message
+                        .contains("compiler could not determine the type of local 'value'")
+            }),
+            "expected the unresolved local warning to be preserved, got {:?}",
+            report.diagnostics
         );
     }
 
@@ -909,56 +962,58 @@ mod runtime_tests {
     }
 
     #[test]
-    fn lint_reports_explicit_unknown_type_annotations_as_warnings() {
+    fn lint_reports_inferred_unknown_local_types_as_warnings() {
         let source = r#"
-            fn id() -> unknown { 1 }
-            let result = id();
-            result;
+            let arr = [1, "two"];
+            let value = arr[0];
+            value;
         "#;
 
         let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
         assert_eq!(
             report.diagnostics.len(),
             1,
-            "expected a single unknown-type warning"
+            "expected a single unknown local type warning"
         );
         let diagnostic = &report.diagnostics[0];
         assert_eq!(
             diagnostic.severity,
             LintSeverity::Warning,
-            "explicit unknown types should surface as warnings"
+            "unknown inferred local types should surface as warnings"
         );
         assert!(
             diagnostic
                 .message
-                .contains("declared type 'unknown' should be avoided"),
+                .contains("compiler could not determine the type of local 'value'"),
             "unexpected diagnostic message: {:?}",
             diagnostic.message
         );
         let span = diagnostic
             .span
             .as_ref()
-            .expect("unknown local type warning should expose a span");
-        assert_eq!(span.start_line, 2, "warning should point at the declaration line");
+            .expect("unknown inferred local warning should expose a span");
+        assert_eq!(span.start_line, 3, "warning should point at the declaration line");
         assert!(
             span.end_col > span.start_col,
-            "warning span should underline the unknown type token"
+            "warning span should underline the declaration line"
         );
+        assert_eq!(span.start_col, 17, "warning should point at the local name");
+        assert_eq!(span.end_col, 22, "warning should span the local name");
         assert!(
             diagnostic.rendered.contains("warning:")
-                && diagnostic.rendered.contains("fn id() -> unknown { 1 }"),
+                && diagnostic.rendered.contains("let value = arr[0];"),
             "expected rendered warning snippet, got {:?}",
             diagnostic.rendered
         );
     }
 
     #[test]
-    fn run_reports_unknown_type_warnings_after_successful_compile() {
+    fn run_reports_unknown_local_warnings_after_successful_compile() {
         let source = r#"
-            fn id() -> unknown { "ok" }
-            let result = id();
+            let arr = [1, "two"];
+            let value = arr[0];
             print("ok");
-            result;
+            value;
         "#;
 
         let report = run_source_with_flavor(source, SourceFlavor::RustScript);
@@ -966,12 +1021,158 @@ mod runtime_tests {
         assert_eq!(
             report.diagnostics.len(),
             1,
-            "expected successful run to keep lint warnings"
+            "expected successful run to keep unknown-local warnings"
         );
         assert_eq!(
             report.diagnostics[0].severity,
             LintSeverity::Warning,
             "run report should preserve warning severity"
+        );
+        assert!(
+            report.diagnostics[0]
+                .message
+                .contains("compiler could not determine the type of local 'value'"),
+            "unexpected warning: {:?}",
+            report.diagnostics[0]
+        );
+    }
+
+    #[test]
+    fn lint_keeps_unknown_local_warnings_when_compile_errors_exist() {
+        let source = r#"
+            use runtime;
+            let arr = [1, "two"];
+            let value = arr[0];
+            runtime::sleep("later");
+        "#;
+
+        let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
+        assert_eq!(
+            report.diagnostics.len(),
+            2,
+            "expected one warning and one compile error"
+        );
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.severity == LintSeverity::Warning
+                    && diagnostic
+                        .message
+                        .contains("compiler could not determine the type of local 'value'")
+            }),
+            "expected the unknown-local warning to be preserved: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.severity == LintSeverity::Error
+                    && diagnostic
+                        .message
+                        .contains("runtime::sleep")
+            }),
+            "expected the compile error to be preserved: {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn lint_keeps_unknown_local_warnings_with_leading_use_statements() {
+        let source = r#"
+            use runtime;
+            let arr = [1, "two"];
+            let value = arr[0];
+            value;
+        "#;
+
+        let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
+        assert_eq!(
+            report.diagnostics.len(),
+            1,
+            "expected the unknown-local warning to survive leading use statements"
+        );
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.severity, LintSeverity::Warning);
+        assert!(
+            diagnostic
+                .message
+                .contains("compiler could not determine the type of local 'value'"),
+            "unexpected warning: {:?}",
+            diagnostic
+        );
+        let span = diagnostic.span.as_ref().expect("warning should expose a span");
+        assert_eq!(span.start_line, 4);
+        assert_eq!(span.start_col, 17);
+        assert_eq!(span.end_col, 22);
+    }
+
+    #[test]
+    fn lint_keeps_unknown_local_warnings_with_stdlib_use_alias() {
+        let source = r#"
+            use stdlib::rss::strings as string;
+            let arr = [1, "two"];
+            let value = arr[0];
+            value;
+        "#;
+
+        let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
+        assert_eq!(
+            report.diagnostics.len(),
+            1,
+            "expected the unknown-local warning to survive stdlib use aliases"
+        );
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.severity, LintSeverity::Warning);
+        assert!(
+            diagnostic
+                .message
+                .contains("compiler could not determine the type of local 'value'"),
+            "unexpected warning: {:?}",
+            diagnostic
+        );
+        let span = diagnostic.span.as_ref().expect("warning should expose a span");
+        assert_eq!(span.start_line, 4);
+        assert_eq!(span.start_col, 17);
+        assert_eq!(span.end_col, 22);
+    }
+
+    #[test]
+    fn run_keeps_unknown_local_warnings_with_stdlib_use_alias() {
+        let source = r#"
+            use stdlib::rss::strings as string;
+            let arr = [1, "two"];
+            let value = arr[0];
+            value;
+        "#;
+
+        let report = run_source_with_flavor(source, SourceFlavor::RustScript);
+        assert!(report.error.is_none(), "expected run to succeed");
+        assert_eq!(
+            report.diagnostics.len(),
+            1,
+            "expected successful run to keep the stdlib-alias unknown-local warning"
+        );
+        assert_eq!(report.diagnostics[0].severity, LintSeverity::Warning);
+        assert!(
+            report.diagnostics[0]
+                .message
+                .contains("compiler could not determine the type of local 'value'"),
+            "unexpected warning: {:?}",
+            report.diagnostics[0]
+        );
+    }
+
+    #[test]
+    fn lint_does_not_warn_for_callable_local_bindings() {
+        let source = r#"
+            let id = |x| x;
+            let value = 1;
+            value;
+        "#;
+
+        let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
+        assert!(
+            report.diagnostics.is_empty(),
+            "callable locals should not be flagged as unknown types: {:?}",
+            report.diagnostics
         );
     }
 
@@ -1002,8 +1203,20 @@ mod runtime_tests {
         "#;
         let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
         assert!(
-            report.diagnostics.is_empty(),
-            "expected embedded stdlib import lint to pass, got {:?}",
+            report
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity == LintSeverity::Warning),
+            "expected embedded stdlib import lint to emit warnings only, got {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("compiler could not determine the type of local 'value'")
+            }),
+            "expected embedded stdlib import lint to surface the unknown local warning, got {:?}",
             report.diagnostics
         );
     }
@@ -1073,8 +1286,29 @@ mod runtime_tests {
         "#;
         let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
         assert!(
-            report.diagnostics.is_empty(),
-            "expected embedded parse/set stdlib lint to pass, got {:?}",
+            report
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity == LintSeverity::Warning),
+            "expected embedded parse/set stdlib lint to emit warnings only, got {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("compiler could not determine the type of local 'value'")
+            }),
+            "expected an unknown warning for 'value', got {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("compiler could not determine the type of local 'joined'")
+            }),
+            "expected an unknown warning for 'joined', got {:?}",
             report.diagnostics
         );
     }

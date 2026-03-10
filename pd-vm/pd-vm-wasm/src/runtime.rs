@@ -1003,15 +1003,12 @@ fn format_epoch_yield_message(vm: &Vm) -> String {
 
 #[cfg(test)]
 pub(crate) fn run_source_with_flavor(source: &str, flavor: SourceFlavor) -> RunReport {
-    let compiled = match compile_source_with_flavor_and_options(
-        source,
-        flavor,
-        embedded_stdlib_compile_options(),
-    ) {
+    let options = embedded_stdlib_compile_options();
+    let compiled = match compile_source_with_flavor_and_options(source, flavor, options.clone()) {
         Ok(compiled) => compiled,
         Err(err) => return RunReport::source_error(source, flavor, err),
     };
-    let diagnostics = lint_success_diagnostics(source, flavor, &compiled);
+    let diagnostics = lint_success_diagnostics(source, flavor, &compiled, None, &options);
 
     let output_lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
@@ -1093,11 +1090,8 @@ pub fn start_run_source_with_flavor(
     flavor: SourceFlavor,
     fuel_config: FuelConfig,
 ) -> RunReport {
-    let compiled = match compile_source_with_flavor_and_options(
-        source,
-        flavor,
-        embedded_stdlib_compile_options(),
-    ) {
+    let options = embedded_stdlib_compile_options();
+    let compiled = match compile_source_with_flavor_and_options(source, flavor, options.clone()) {
         Ok(compiled) => compiled,
         Err(err) => {
             RUN_SESSION.with(|state| {
@@ -1106,7 +1100,7 @@ pub fn start_run_source_with_flavor(
             return RunReport::source_error(source, flavor, err);
         }
     };
-    let diagnostics = lint_success_diagnostics(source, flavor, &compiled);
+    let diagnostics = lint_success_diagnostics(source, flavor, &compiled, None, &options);
 
     let output_lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
@@ -1227,11 +1221,8 @@ pub fn start_debug_source_with_flavor(
     flavor: SourceFlavor,
     fuel_config: FuelConfig,
 ) -> DebugReport {
-    let compiled = match compile_source_with_flavor_and_options(
-        source,
-        flavor,
-        embedded_stdlib_compile_options(),
-    ) {
+    let options = embedded_stdlib_compile_options();
+    let compiled = match compile_source_with_flavor_and_options(source, flavor, options.clone()) {
         Ok(compiled) => compiled,
         Err(err) => {
             DEBUG_SESSION.with(|state| {
@@ -1240,7 +1231,7 @@ pub fn start_debug_source_with_flavor(
             return DebugReport::source_error(source, flavor, err);
         }
     };
-    let diagnostics = lint_success_diagnostics(source, flavor, &compiled);
+    let diagnostics = lint_success_diagnostics(source, flavor, &compiled, None, &options);
 
     let output_lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
