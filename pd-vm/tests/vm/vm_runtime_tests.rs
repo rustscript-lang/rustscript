@@ -296,18 +296,20 @@ fn json_encode_rejects_non_string_map_keys() {
 
 #[test]
 fn json_encode_rejects_duplicate_map_keys() {
-    const BUILTIN_JSON_ENCODE: u16 = 0xFFC7;
-
     let duplicate_map = Value::map(vec![
         (Value::string("k"), Value::Int(1)),
         (Value::string("k"), Value::Int(2)),
     ]);
-    let mut bc = BytecodeBuilder::new();
-    bc.ldc(0);
-    bc.call(BUILTIN_JSON_ENCODE, 1);
-    bc.ret();
+    let mut compiled = compile_source(
+        r#"
+        use json;
+        json::encode("placeholder");
+    "#,
+    )
+    .expect("source should compile");
+    compiled.program.constants = vec![duplicate_map];
 
-    let mut vm = Vm::new(Program::new(vec![duplicate_map], bc.finish()));
+    let mut vm = Vm::new(compiled.program);
     let err = vm
         .run()
         .expect_err("json::encode should reject duplicate map keys");

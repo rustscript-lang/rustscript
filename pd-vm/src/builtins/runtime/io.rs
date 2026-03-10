@@ -399,6 +399,11 @@ fn io_reserve_handle_id(vm: &mut Vm) -> i64 {
 }
 
 fn io_take_handle(vm: &mut Vm, handle_id: i64) -> VmResult<IoHandle> {
+    if handle_id <= 0 {
+        return Err(VmError::HostError(format!(
+            "invalid io handle id {handle_id}; expected positive handle id"
+        )));
+    }
     vm.io_state
         .handles
         .remove(&handle_id)
