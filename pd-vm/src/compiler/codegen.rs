@@ -194,9 +194,17 @@ impl Compiler {
                 else_branch,
                 line,
             } => {
+                self.assembler.mark_line(*line);
+                if matches!(condition, Expr::Bool(true)) {
+                    self.compile_stmts(then_branch)?;
+                    return Ok(());
+                }
+                if matches!(condition, Expr::Bool(false)) {
+                    self.compile_stmts(else_branch)?;
+                    return Ok(());
+                }
                 let callable_snapshot = self.callable_bindings.clone();
                 let type_state_snapshot = self.type_state.clone();
-                self.assembler.mark_line(*line);
                 let else_label = self.fresh_label("else");
                 let end_label = self.fresh_label("endif");
                 self.compile_scalar_expr(condition)?;

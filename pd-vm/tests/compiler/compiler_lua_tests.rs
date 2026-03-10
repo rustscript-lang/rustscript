@@ -1,6 +1,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 use common::*;
+use vm::disassemble_program;
 
 #[test]
 fn lua_runtime_cases_work() {
@@ -245,6 +246,31 @@ fn lua_runtime_cases_work() {
     ];
 
     run_runtime_cases(&cases);
+}
+
+#[test]
+fn lua_do_block_lowers_without_synthetic_true_guard() {
+    let compiled = compile_source_with_flavor(
+        r#"
+            local value = 1
+            do
+                value = value + 41
+            end
+            value
+        "#,
+        SourceFlavor::Lua,
+    )
+    .expect("lua source should compile");
+
+    let disasm = disassemble_program(&compiled.program);
+    assert!(
+        !disasm.contains("Bool(true)"),
+        "do block should not materialize a synthetic true guard:\n{disasm}"
+    );
+    assert!(
+        !disasm.contains("brfalse"),
+        "do block should not materialize a synthetic branch:\n{disasm}"
+    );
 }
 
 #[test]
