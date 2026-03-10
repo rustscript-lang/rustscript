@@ -21,8 +21,8 @@ use self::symbols::is_virtual_host_namespace_spec;
 use super::{
     ParseError, ReplLocalBinding, STDLIB_PRINT_ARITY, STDLIB_PRINT_NAME,
     ir::{
-        ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, MatchTypePattern,
-        Stmt,
+        ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern,
+        MatchTypePattern, Stmt, TypeSchema,
     },
 };
 
@@ -99,6 +99,7 @@ pub(super) struct Parser {
     next_function: u16,
     closure_scopes: Vec<HashMap<String, LocalSlot>>,
     closure_capture_contexts: Vec<ClosureCaptureContext>,
+    local_schemas: HashMap<LocalSlot, TypeSchema>,
     allow_implicit_externs: bool,
     allow_implicit_semicolons: bool,
     enforce_mutable_bindings: bool,
@@ -146,6 +147,7 @@ impl Parser {
             next_function: 0,
             closure_scopes: Vec::new(),
             closure_capture_contexts: Vec::new(),
+            local_schemas: HashMap::new(),
             allow_implicit_externs,
             allow_implicit_semicolons,
             enforce_mutable_bindings,
@@ -223,5 +225,9 @@ impl Parser {
             .collect::<Vec<_>>();
         locals.sort_by_key(|binding| self.locals.get(&binding.name).copied().unwrap_or(0));
         locals
+    }
+
+    pub(super) fn local_schemas(&self) -> HashMap<LocalSlot, TypeSchema> {
+        self.local_schemas.clone()
     }
 }

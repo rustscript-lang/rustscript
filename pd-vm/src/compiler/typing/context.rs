@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::builtins::BuiltinFunction;
 
 use super::super::CompileError;
-use super::super::ir::{ClosureExpr, Expr, FunctionImpl, LocalSlot, Stmt};
+use super::super::ir::{ClosureExpr, Expr, FunctionImpl, LocalSlot, Stmt, TypeSchema};
 use super::helpers::{
     bind_expr_result_to_slot, bound_type_label, display_name_for_builtin,
     function_body_contains_param_add, infer_binary_type, infer_unary_type, is_numeric_bound_type,
@@ -17,6 +17,7 @@ use super::validate::{validate_host_signature, validate_signature_overloads};
 
 pub(super) struct TypeContext<'a> {
     pub(super) function_impls: &'a HashMap<u16, FunctionImpl>,
+    pub(super) declared_local_schemas: &'a HashMap<LocalSlot, TypeSchema>,
     pub(super) function_names: &'a HashMap<u16, String>,
     pub(super) host_import_return_types: &'a HashMap<u16, BoundType>,
     pub(super) host_import_signatures: &'a HashMap<u16, HostCallableSignature>,
@@ -28,12 +29,14 @@ pub(super) struct TypeContext<'a> {
 impl<'a> TypeContext<'a> {
     pub(super) fn new(
         function_impls: &'a HashMap<u16, FunctionImpl>,
+        declared_local_schemas: &'a HashMap<LocalSlot, TypeSchema>,
         function_names: &'a HashMap<u16, String>,
         host_import_return_types: &'a HashMap<u16, BoundType>,
         host_import_signatures: &'a HashMap<u16, HostCallableSignature>,
     ) -> Self {
         Self {
             function_impls,
+            declared_local_schemas,
             function_names,
             host_import_return_types,
             host_import_signatures,
@@ -48,6 +51,49 @@ impl<'a> TypeContext<'a> {
             .get(&index)
             .map(String::as_str)
             .unwrap_or("<anonymous>")
+    }
+
+    pub(super) fn declared_local_schema(&self, slot: LocalSlot) -> Option<&TypeSchema> {
+        self.declared_local_schemas.get(&slot)
+    }
+
+    pub(super) fn expr_has_declared_schema(
+        &self,
+        expr: &Expr,
+        state: &LocalTypeState,
+    ) -> bool {
+        match expr {
+            Expr::Var(slot) | Expr::MoveVar(slot) => {
+                state.has_declared_schema(*slot) || self.declared_local_schema(*slot).is_some()
+            }
+            Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+                self.expr_has_declared_schema(inner, state)
+            }
+            Expr::Call(index, args) => match BuiltinFunction::from_call_index(*index) {
+                Some(BuiltinFunction::Get)
+                | Some(BuiltinFunction::Set)
+                | Some(BuiltinFunction::Slice)
+                | Some(BuiltinFunction::Keys)
+                | Some(BuiltinFunction::Len) => args
+                    .first()
+                    .is_some_and(|container| self.expr_has_declared_schema(container, state)),
+                _ => false,
+            },
+            Expr::IfElse {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.expr_has_declared_schema(then_expr, state)
+                    || self.expr_has_declared_schema(else_expr, state)
+            }
+            Expr::Match { value, default, .. } => {
+                self.expr_has_declared_schema(value, state)
+                    || self.expr_has_declared_schema(default, state)
+            }
+            Expr::Block { expr, .. } => self.expr_has_declared_schema(expr, state),
+            _ => false,
+        }
     }
 
     pub(super) fn function_requires_strict_add_types(&self, index: u16) -> bool {
@@ -103,6 +149,70 @@ impl<'a> TypeContext<'a> {
         }
         self.observed_function_param_types
             .insert(index, merged_types);
+    }
+
+    pub(super) fn infer_expr_schema(
+        &mut self,
+        expr: &Expr,
+        state: &LocalTypeState,
+    ) -> Option<TypeSchema> {
+        match expr {
+            Expr::Null => Some(TypeSchema::Null),
+            Expr::Int(_) => Some(TypeSchema::Int),
+            Expr::Float(_) => Some(TypeSchema::Float),
+            Expr::Bool(_) => Some(TypeSchema::Bool),
+            Expr::String(_) => Some(TypeSchema::String),
+            Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+                self.infer_expr_schema(inner, state)
+            }
+            Expr::Var(slot) | Expr::MoveVar(slot) => state
+                .schema(*slot)
+                .cloned()
+                .or_else(|| self.declared_local_schema(*slot).cloned()),
+            Expr::Call(index, args) => {
+                let builtin = BuiltinFunction::from_call_index(*index)?;
+                self.infer_builtin_call_schema(builtin, args, state)
+            }
+            Expr::IfElse {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                let then_schema = self.infer_expr_schema(then_expr, state);
+                let else_schema = self.infer_expr_schema(else_expr, state);
+                match (then_schema, else_schema) {
+                    (Some(TypeSchema::Null), rhs) => rhs,
+                    (lhs, Some(TypeSchema::Null)) => lhs,
+                    (Some(lhs), Some(rhs)) if lhs == rhs => Some(lhs),
+                    _ => None,
+                }
+            }
+            Expr::Match { arms, default, .. } => {
+                let default_schema = self.infer_expr_schema(default, state);
+                let mut arm_schema = None;
+                for (_, arm_expr) in arms {
+                    let current = self.infer_expr_schema(arm_expr, state);
+                    match (&arm_schema, &current) {
+                        (None, _) => arm_schema = current,
+                        (Some(lhs), Some(rhs)) if lhs == rhs => {}
+                        _ => return None,
+                    }
+                }
+                match (arm_schema, default_schema) {
+                    (None, rhs) => rhs,
+                    (Some(lhs), Some(TypeSchema::Null)) => Some(lhs),
+                    (Some(TypeSchema::Null), rhs) => rhs,
+                    (Some(lhs), Some(rhs)) if lhs == rhs => Some(lhs),
+                    _ => None,
+                }
+            }
+            Expr::Block { stmts, expr } => {
+                let mut nested = state.clone();
+                self.apply_stmts(stmts, &mut nested);
+                self.infer_expr_schema(expr, &nested)
+            }
+            _ => None,
+        }
     }
 
     pub(super) fn infer_expr_type(&mut self, expr: &Expr, state: &LocalTypeState) -> BoundType {
@@ -255,7 +365,9 @@ impl<'a> TypeContext<'a> {
             BuiltinFunction::Set if args.len() == 3 => {
                 self.infer_set_return_type(&args[0], &args[2], state)
             }
-            BuiltinFunction::Get if args.len() == 2 => self.infer_get_return_type(&args[0], state),
+            BuiltinFunction::Get if args.len() == 2 => {
+                self.infer_get_return_type(&args[0], &args[1], state)
+            }
             BuiltinFunction::Keys if args.len() == 1 => {
                 self.infer_keys_return_type(&args[0], state)
             }
@@ -278,6 +390,44 @@ impl<'a> TypeContext<'a> {
                 self.infer_numeric_triplet_return_type(&args[0], &args[1], &args[2], state)
             }
             _ => BoundType::from(builtin.static_return_type()),
+        }
+    }
+
+    fn infer_builtin_call_schema(
+        &mut self,
+        builtin: BuiltinFunction,
+        args: &[Expr],
+        state: &LocalTypeState,
+    ) -> Option<TypeSchema> {
+        match builtin {
+            BuiltinFunction::ArrayNew if args.is_empty() => {
+                Some(TypeSchema::Array(Box::new(TypeSchema::Unknown)))
+            }
+            BuiltinFunction::MapNew if args.is_empty() => Some(TypeSchema::Object(HashMap::new())),
+            BuiltinFunction::ArrayPush if args.len() == 2 => {
+                let array_schema = self.infer_expr_schema(&args[0], state);
+                let value_schema = self
+                    .infer_expr_schema(&args[1], state)
+                    .or_else(|| schema_from_bound_type(self.infer_expr_type(&args[1], state)));
+                Some(merge_array_schema(array_schema, value_schema))
+            }
+            BuiltinFunction::Set if args.len() == 3 => {
+                let container_schema = self.infer_expr_schema(&args[0], state);
+                let value_schema = self
+                    .infer_expr_schema(&args[2], state)
+                    .or_else(|| schema_from_bound_type(self.infer_expr_type(&args[2], state)));
+                infer_set_schema(container_schema, &args[1], value_schema)
+            }
+            BuiltinFunction::Get if args.len() == 2 => self
+                .infer_expr_schema(&args[0], state)
+                .and_then(|schema| infer_access_schema(&schema, &args[1], self, state).ok()),
+            BuiltinFunction::Slice if args.len() == 3 => match self.infer_expr_schema(&args[0], state)
+            {
+                Some(TypeSchema::Array(element)) => Some(TypeSchema::Array(element)),
+                Some(TypeSchema::String) => Some(TypeSchema::String),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -361,8 +511,15 @@ impl<'a> TypeContext<'a> {
     pub(super) fn infer_get_return_type(
         &mut self,
         container: &Expr,
+        key: &Expr,
         state: &LocalTypeState,
     ) -> BoundType {
+        if let Some(schema) = self
+            .infer_expr_schema(container, state)
+            .and_then(|schema| infer_access_schema(&schema, key, self, state).ok())
+        {
+            return bound_type_from_schema(&schema);
+        }
         match self.infer_expr_type(container, state) {
             BoundType::String => BoundType::String,
             BoundType::ArrayOf(Some(element_type)) | BoundType::MapOf(Some(element_type)) => {
@@ -491,7 +648,13 @@ impl<'a> TypeContext<'a> {
         }
         let mut nested = LocalTypeState::default();
         for (source_slot, captured_slot) in capture_copies {
-            nested.copy_binding_from(caller_state, *source_slot, *captured_slot);
+            nested.copy_binding_from(
+                caller_state,
+                *source_slot,
+                *captured_slot,
+                self.declared_local_schema(*source_slot).cloned(),
+                self.declared_local_schema(*source_slot).is_some(),
+            );
         }
         for (arg, slot) in args.iter().zip(param_slots.iter()) {
             self.bind_expr_to_slot(&mut nested, *slot, arg, caller_state);
@@ -681,8 +844,174 @@ impl<'a> TypeContext<'a> {
             BoundType::Unknown
         } else {
             let ty = self.infer_expr_type(expr, expr_state);
-            state.set(slot, ty);
+            let schema = self
+                .declared_local_schema(slot)
+                .cloned()
+                .or_else(|| self.infer_expr_schema(expr, expr_state));
+            let from_declared_schema = self.declared_local_schema(slot).is_some()
+                || self.expr_has_declared_schema(expr, expr_state);
+            let ty = self
+                .declared_local_schema(slot)
+                .map(bound_type_from_schema)
+                .unwrap_or(ty);
+            state.set_with_schema_origin(slot, ty, schema, from_declared_schema);
             ty
         }
+    }
+}
+
+fn schema_from_bound_type(ty: BoundType) -> Option<TypeSchema> {
+    match ty {
+        BoundType::Unknown => None,
+        BoundType::Null => Some(TypeSchema::Null),
+        BoundType::Int => Some(TypeSchema::Int),
+        BoundType::Float => Some(TypeSchema::Float),
+        BoundType::Bool => Some(TypeSchema::Bool),
+        BoundType::String => Some(TypeSchema::String),
+        BoundType::Array | BoundType::ArrayOf(_) => {
+            Some(TypeSchema::Array(Box::new(TypeSchema::Unknown)))
+        }
+        BoundType::Map | BoundType::MapOf(_) => Some(TypeSchema::Map(Box::new(TypeSchema::Unknown))),
+    }
+}
+
+pub(super) fn bound_type_from_schema(schema: &TypeSchema) -> BoundType {
+    match schema {
+        TypeSchema::Unknown => BoundType::Unknown,
+        TypeSchema::Null => BoundType::Null,
+        TypeSchema::Int => BoundType::Int,
+        TypeSchema::Float => BoundType::Float,
+        TypeSchema::Bool => BoundType::Bool,
+        TypeSchema::String => BoundType::String,
+        TypeSchema::Array(_) => BoundType::Array,
+        TypeSchema::Map(_) | TypeSchema::Object(_) => BoundType::Map,
+    }
+}
+
+fn merge_array_schema(current: Option<TypeSchema>, next: Option<TypeSchema>) -> TypeSchema {
+    let existing = match current {
+        Some(TypeSchema::Array(existing)) => *existing,
+        _ => TypeSchema::Unknown,
+    };
+    let merged = match (existing.clone(), next) {
+        (TypeSchema::Unknown, Some(next)) => next,
+        (existing, Some(next)) if existing == next => existing,
+        (existing, None) => existing,
+        _ => TypeSchema::Unknown,
+    };
+    TypeSchema::Array(Box::new(merged))
+}
+
+fn infer_set_schema(
+    container: Option<TypeSchema>,
+    key: &Expr,
+    value: Option<TypeSchema>,
+) -> Option<TypeSchema> {
+    match container {
+        Some(TypeSchema::Object(mut fields)) => {
+            let Expr::String(name) = key else {
+                return Some(TypeSchema::Map(Box::new(TypeSchema::Unknown)));
+            };
+            fields.insert(name.clone(), value.unwrap_or(TypeSchema::Unknown));
+            Some(TypeSchema::Object(fields))
+        }
+        Some(TypeSchema::Map(existing)) => {
+            let merged = match (*existing, value) {
+                (TypeSchema::Unknown, Some(next)) => next,
+                (existing, Some(next)) if existing == next => existing,
+                (existing, None) => existing,
+                _ => TypeSchema::Unknown,
+            };
+            Some(TypeSchema::Map(Box::new(merged)))
+        }
+        Some(TypeSchema::Array(existing)) => {
+            let merged = match (*existing, value) {
+                (TypeSchema::Unknown, Some(next)) => next,
+                (existing, Some(next)) if existing == next => existing,
+                (existing, None) => existing,
+                _ => TypeSchema::Unknown,
+            };
+            Some(TypeSchema::Array(Box::new(merged)))
+        }
+        Some(other) => Some(other),
+        None => match key {
+            Expr::String(name) => {
+                let mut fields = HashMap::new();
+                fields.insert(name.clone(), value.unwrap_or(TypeSchema::Unknown));
+                Some(TypeSchema::Object(fields))
+            }
+            Expr::Int(_) => Some(TypeSchema::Map(Box::new(
+                value.unwrap_or(TypeSchema::Unknown),
+            ))),
+            _ => Some(TypeSchema::Map(Box::new(TypeSchema::Unknown))),
+        },
+    }
+}
+
+pub(super) fn infer_access_schema(
+    schema: &TypeSchema,
+    key: &Expr,
+    context: &mut TypeContext<'_>,
+    state: &LocalTypeState,
+) -> Result<TypeSchema, String> {
+    match schema {
+        TypeSchema::Object(fields) => match key {
+            Expr::String(name) => fields
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("field '{name}' is not declared in the object schema")),
+            other => {
+                let key_ty = context.infer_expr_type(other, state);
+                if matches!(key_ty, BoundType::String | BoundType::Unknown) {
+                    Ok(collapse_object_field_schema(fields))
+                } else {
+                    Err(format!(
+                        "schema-typed object access requires a string field name, got {}",
+                        bound_type_label(key_ty)
+                    ))
+                }
+            }
+        },
+        TypeSchema::Array(element) => {
+            let key_ty = context.infer_expr_type(key, state);
+            if matches!(key_ty, BoundType::Unknown | BoundType::Int) {
+                Ok((**element).clone())
+            } else {
+                Err(format!(
+                    "schema-typed array access requires an int index, got {}",
+                    bound_type_label(key_ty)
+                ))
+            }
+        }
+        TypeSchema::Map(value) => Ok((**value).clone()),
+        other => Err(format!(
+            "cannot access fields on schema type '{}'",
+            schema_label(other)
+        )),
+    }
+}
+
+fn collapse_object_field_schema(fields: &HashMap<String, TypeSchema>) -> TypeSchema {
+    let mut values = fields.values();
+    let Some(first) = values.next() else {
+        return TypeSchema::Unknown;
+    };
+    if values.all(|schema| schema == first) {
+        first.clone()
+    } else {
+        TypeSchema::Unknown
+    }
+}
+
+pub(super) fn schema_label(schema: &TypeSchema) -> &'static str {
+    match schema {
+        TypeSchema::Unknown => "unknown",
+        TypeSchema::Null => "null",
+        TypeSchema::Int => "int",
+        TypeSchema::Float => "float",
+        TypeSchema::Bool => "bool",
+        TypeSchema::String => "string",
+        TypeSchema::Array(_) => "array",
+        TypeSchema::Map(_) | TypeSchema::Object(_) => "map",
     }
 }

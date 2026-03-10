@@ -7,6 +7,19 @@ use super::ParseError;
 
 pub type LocalSlot = u16;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypeSchema {
+    Unknown,
+    Null,
+    Int,
+    Float,
+    Bool,
+    String,
+    Array(Box<TypeSchema>),
+    Map(Box<TypeSchema>),
+    Object(HashMap<String, TypeSchema>),
+}
+
 fn known_host_accepts_arity(name: &str, arity: u8) -> bool {
     if let Some(function) = edge_abi::function_by_name(name) {
         return function.param_types.len() == usize::from(arity);
@@ -191,6 +204,7 @@ pub struct FrontendIr {
     pub stmts: Vec<Stmt>,
     pub locals: usize,
     pub local_bindings: Vec<(String, LocalSlot)>,
+    pub local_schemas: HashMap<LocalSlot, TypeSchema>,
     pub functions: Vec<FunctionDecl>,
     pub function_impls: HashMap<u16, FunctionImpl>,
     pub stmt_sources: Vec<Option<String>>,
@@ -341,6 +355,7 @@ impl LocalIrBuilder {
             stmts,
             locals: self.next_local as usize,
             local_bindings,
+            local_schemas: HashMap::new(),
             functions: self.functions,
             function_impls: HashMap::new(),
             stmt_sources: Vec::new(),

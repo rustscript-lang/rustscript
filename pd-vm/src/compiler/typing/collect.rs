@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::bytecode::ValueType;
 
-use super::super::ir::{ClosureExpr, FunctionImpl, LocalSlot, Stmt};
+use super::super::ir::{ClosureExpr, FunctionImpl, LocalSlot, Stmt, TypeSchema};
 use super::context::TypeContext;
 use super::helpers::bind_expr_result_to_slot;
 use super::state::{BoundType, HostCallableSignature, LocalTypeState, stabilize_loop_state};
@@ -38,10 +38,12 @@ pub(super) fn collect_function_types(
     host_import_return_types: &HashMap<u16, BoundType>,
     host_import_signatures: &HashMap<u16, HostCallableSignature>,
     observed_function_param_types: &HashMap<u16, Vec<BoundType>>,
+    declared_local_schemas: &HashMap<LocalSlot, TypeSchema>,
 ) {
     let mut state = LocalTypeState::default();
     let mut context = TypeContext::new(
         function_impls,
+        declared_local_schemas,
         function_names,
         host_import_return_types,
         host_import_signatures,
@@ -58,7 +60,13 @@ pub(super) fn collect_function_types(
         let ty = state.get(*source_slot);
         record_local_type(local_types, *captured_slot, ty);
         let source_state = state.clone();
-        state.copy_binding_from(&source_state, *source_slot, *captured_slot);
+        state.copy_binding_from(
+            &source_state,
+            *source_slot,
+            *captured_slot,
+            declared_local_schemas.get(source_slot).cloned(),
+            declared_local_schemas.contains_key(source_slot),
+        );
     }
     collect_stmt_types(
         &function_impl.body_stmts,
@@ -92,7 +100,13 @@ pub(super) fn collect_stmt_types(
                         let ty = state.get(*source_slot);
                         record_local_type(local_types, *captured_slot, ty);
                         let source_state = state.clone();
-                        state.copy_binding_from(&source_state, *source_slot, *captured_slot);
+                        state.copy_binding_from(
+                            &source_state,
+                            *source_slot,
+                            *captured_slot,
+                            context.declared_local_schema(*source_slot).cloned(),
+                            context.declared_local_schema(*source_slot).is_some(),
+                        );
                     }
                 }
             }
