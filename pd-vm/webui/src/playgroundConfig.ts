@@ -48,6 +48,14 @@ use json;
 use runtime;
 
 // Complex RustScript example with closure capture, stdlib module use, and host calls.
+struct Stats {
+    score: int
+}
+
+struct Profile {
+    stats: Stats
+}
+
 let mut total = 0;
 for (let mut i = 0; i < 4; i = i + 1) {
     total = total + i;
@@ -68,9 +76,9 @@ let add = |value| value + base;
 base = 8;
 let mut closure_value = add(5);
 
-let profile = { stats: { score: closure_value } };
-let chained_score = profile?.stats?.score;
-let missing_score = profile?.missing?.value;
+let profile: Profile = { stats: { score: closure_value } };
+let stats = profile?.stats;
+let chained_score = stats?.score;
 
 let matched = match chained_score {
     12 => closure_value,
