@@ -13,6 +13,9 @@
       "include": "#strings"
     },
     {
+      "include": "#struct-declaration"
+    },
+    {
       "include": "#use-declaration"
     },
     {
@@ -32,6 +35,9 @@
     },
     {
       "include": "#keywords"
+    },
+    {
+      "include": "#type-annotations"
     },
     {
       "include": "#wildcard-pattern"
@@ -181,6 +187,10 @@
           "match": "\\bpub\\b"
         },
         {
+          "name": "storage.type.rss",
+          "match": "\\bstruct\\b"
+        },
+        {
           "name": "storage.type.function.rss",
           "match": "\\bfn\\b"
         },
@@ -195,6 +205,108 @@
         {
           "name": "keyword.control.rss",
           "match": "\\b(?:for|if|else|match|while|break|continue|use|as)\\b"
+        }
+      ]
+    },
+    "struct-declaration": {
+      "patterns": [
+        {
+          "name": "meta.struct.declaration.rss",
+          "begin": "\\b(struct)(\\s+)([A-Za-z_][A-Za-z0-9_]*)(\\s*)(\\{)",
+          "beginCaptures": {
+            "1": {
+              "name": "storage.type.rss"
+            },
+            "3": {
+              "name": "entity.name.type.rss"
+            },
+            "5": {
+              "name": "punctuation.section.block.begin.rss"
+            }
+          },
+          "end": "\\}",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.section.block.end.rss"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#comments"
+            },
+            {
+              "include": "#strings"
+            },
+            {
+              "include": "#struct-field"
+            },
+            {
+              "include": "#type-annotations"
+            },
+            {
+              "name": "punctuation.separator.rss",
+              "match": "[\\[\\]{}(),;:]"
+            }
+          ]
+        }
+      ]
+    },
+    "struct-field": {
+      "patterns": [
+        {
+          "name": "meta.struct.field.rss",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(\\s*)(:)",
+          "captures": {
+            "1": {
+              "name": "variable.other.member.rss"
+            },
+            "3": {
+              "name": "punctuation.separator.type.rss"
+            }
+          }
+        }
+      ]
+    },
+    "type-annotations": {
+      "patterns": [
+        {
+          "name": "meta.type.annotation.rss",
+          "match": "(:)(\\s*)([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "punctuation.separator.type.rss"
+            },
+            "3": {
+              "name": "support.type.rss"
+            }
+          }
+        },
+        {
+          "name": "meta.type.annotation.array.rss",
+          "match": "(\\[)(\\s*)([A-Za-z_][A-Za-z0-9_]*)(\\s*)(\\])",
+          "captures": {
+            "1": {
+              "name": "punctuation.section.brackets.begin.rss"
+            },
+            "3": {
+              "name": "support.type.rss"
+            },
+            "5": {
+              "name": "punctuation.section.brackets.end.rss"
+            }
+          }
+        },
+        {
+          "name": "meta.return.type.rss",
+          "match": "(->)(\\s*)([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.operator.rss"
+            },
+            "3": {
+              "name": "support.type.rss"
+            }
+          }
         }
       ]
     },
@@ -245,7 +357,7 @@
       "patterns": [
         {
           "name": "entity.name.function.rss",
-          "match": "\\b(?!pub\\b|fn\\b|let\\b|mut\\b|for\\b|if\\b|else\\b|match\\b|while\\b|break\\b|continue\\b|use\\b|as\\b|true\\b|false\\b|null\\b)([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()"
+          "match": "\\b(?!pub\\b|struct\\b|fn\\b|let\\b|mut\\b|for\\b|if\\b|else\\b|match\\b|while\\b|break\\b|continue\\b|use\\b|as\\b|true\\b|false\\b|null\\b)([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()"
         }
       ]
     },
