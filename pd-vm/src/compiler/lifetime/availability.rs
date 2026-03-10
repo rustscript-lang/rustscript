@@ -302,7 +302,12 @@ impl AvailabilityAnalyzer {
                 }
                 Ok((stmt.clone(), out))
             }
-            Stmt::Let { index, expr, line } => {
+            Stmt::Let {
+                index,
+                declared_struct,
+                expr,
+                line,
+            } => {
                 let mut out = self.analyze_expr(expr, &state, *line)?;
                 let mut rewritten_expr = expr.clone();
                 if out.reachable {
@@ -321,6 +326,7 @@ impl AvailabilityAnalyzer {
                 Ok((
                     Stmt::Let {
                         index: *index,
+                        declared_struct: declared_struct.clone(),
                         expr: rewritten_expr,
                         line: *line,
                     },

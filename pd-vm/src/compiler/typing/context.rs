@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::builtins::BuiltinFunction;
 
@@ -17,31 +17,33 @@ use super::validate::{validate_host_signature, validate_signature_overloads};
 
 pub(super) struct TypeContext<'a> {
     pub(super) function_impls: &'a HashMap<u16, FunctionImpl>,
-    pub(super) declared_local_schemas: &'a HashMap<LocalSlot, TypeSchema>,
+    pub(super) struct_schemas: &'a HashMap<String, TypeSchema>,
     pub(super) function_names: &'a HashMap<u16, String>,
     pub(super) host_import_return_types: &'a HashMap<u16, BoundType>,
     pub(super) host_import_signatures: &'a HashMap<u16, HostCallableSignature>,
     pub(super) active_functions: Vec<u16>,
     pub(super) observed_function_param_types: HashMap<u16, Vec<BoundType>>,
+    pub(super) observed_function_param_schemas: HashMap<u16, Vec<Option<TypeSchema>>>,
     pub(super) function_param_conflicts: HashMap<u16, String>,
 }
 
 impl<'a> TypeContext<'a> {
     pub(super) fn new(
         function_impls: &'a HashMap<u16, FunctionImpl>,
-        declared_local_schemas: &'a HashMap<LocalSlot, TypeSchema>,
+        struct_schemas: &'a HashMap<String, TypeSchema>,
         function_names: &'a HashMap<u16, String>,
         host_import_return_types: &'a HashMap<u16, BoundType>,
         host_import_signatures: &'a HashMap<u16, HostCallableSignature>,
     ) -> Self {
         Self {
             function_impls,
-            declared_local_schemas,
+            struct_schemas,
             function_names,
             host_import_return_types,
             host_import_signatures,
             active_functions: Vec::new(),
             observed_function_param_types: HashMap::new(),
+            observed_function_param_schemas: HashMap::new(),
             function_param_conflicts: HashMap::new(),
         }
     }
@@ -53,18 +55,39 @@ impl<'a> TypeContext<'a> {
             .unwrap_or("<anonymous>")
     }
 
-    pub(super) fn declared_local_schema(&self, slot: LocalSlot) -> Option<&TypeSchema> {
-        self.declared_local_schemas.get(&slot)
+    pub(super) fn resolve_struct_schema(&self, name: &str) -> Option<&TypeSchema> {
+        self.struct_schemas.get(name)
+    }
+
+    pub(super) fn resolve_schema<'b>(&'b self, schema: &'b TypeSchema) -> &'b TypeSchema {
+        self.resolve_schema_with_seen(schema, &mut HashSet::new())
+    }
+
+    fn resolve_schema_with_seen<'b>(
+        &'b self,
+        schema: &'b TypeSchema,
+        seen: &mut HashSet<&'b str>,
+    ) -> &'b TypeSchema {
+        let TypeSchema::Named(name) = schema else {
+            return schema;
+        };
+        if !seen.insert(name.as_str()) {
+            return schema;
+        }
+        self.struct_schemas
+            .get(name)
+            .map(|next| self.resolve_schema_with_seen(next, seen))
+            .unwrap_or(schema)
     }
 
     pub(super) fn expr_has_declared_schema(
-        &self,
+        &mut self,
         expr: &Expr,
         state: &LocalTypeState,
     ) -> bool {
         match expr {
             Expr::Var(slot) | Expr::MoveVar(slot) => {
-                state.has_declared_schema(*slot) || self.declared_local_schema(*slot).is_some()
+                state.has_declared_schema(*slot)
             }
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.expr_has_declared_schema(inner, state)
@@ -87,11 +110,36 @@ impl<'a> TypeContext<'a> {
                 self.expr_has_declared_schema(then_expr, state)
                     || self.expr_has_declared_schema(else_expr, state)
             }
-            Expr::Match { value, default, .. } => {
-                self.expr_has_declared_schema(value, state)
-                    || self.expr_has_declared_schema(default, state)
+            Expr::Match {
+                value_slot,
+                value,
+                arms,
+                default,
+                ..
+            } => {
+                if self.expr_has_declared_schema(value, state) {
+                    return true;
+                }
+                let value_ty = self.infer_expr_type(value, state);
+                let mut nested = state.clone();
+                bind_expr_result_to_slot(
+                    &mut nested,
+                    *value_slot,
+                    None,
+                    value,
+                    state,
+                    value_ty,
+                    self,
+                );
+                arms.iter()
+                    .any(|(_, arm_expr)| self.expr_has_declared_schema(arm_expr, &nested))
+                    || self.expr_has_declared_schema(default, &nested)
             }
-            Expr::Block { expr, .. } => self.expr_has_declared_schema(expr, state),
+            Expr::Block { stmts, expr } => {
+                let mut nested = state.clone();
+                self.apply_stmts(stmts, &mut nested);
+                self.expr_has_declared_schema(expr, &nested)
+            }
             _ => false,
         }
     }
@@ -117,16 +165,23 @@ impl<'a> TypeContext<'a> {
         let function_name = self.function_name(index).to_string();
         let actual = args
             .iter()
-            .map(|arg| self.infer_expr_type(arg, state))
+            .map(|arg| (self.infer_expr_type(arg, state), self.infer_expr_schema(arg, state)))
             .collect::<Vec<_>>();
         let mut merged_types = self
             .observed_function_param_types
             .remove(&index)
             .unwrap_or_else(|| vec![BoundType::Unknown; actual.len()]);
+        let mut merged_schemas = self
+            .observed_function_param_schemas
+            .remove(&index)
+            .unwrap_or_else(|| vec![None; actual.len()]);
         if merged_types.len() < actual.len() {
             merged_types.resize(actual.len(), BoundType::Unknown);
         }
-        for (arg_index, actual_ty) in actual.into_iter().enumerate() {
+        if merged_schemas.len() < actual.len() {
+            merged_schemas.resize(actual.len(), None);
+        }
+        for (arg_index, (actual_ty, actual_schema)) in actual.into_iter().enumerate() {
             let current = merged_types[arg_index];
             match merge_observed_function_param_type(current, actual_ty) {
                 Ok(merged) => merged_types[arg_index] = merged,
@@ -146,9 +201,13 @@ impl<'a> TypeContext<'a> {
                     }
                 }
             }
+            merged_schemas[arg_index] =
+                merge_observed_function_param_schema(merged_schemas[arg_index].clone(), actual_schema);
         }
         self.observed_function_param_types
             .insert(index, merged_types);
+        self.observed_function_param_schemas
+            .insert(index, merged_schemas);
     }
 
     pub(super) fn infer_expr_schema(
@@ -167,8 +226,7 @@ impl<'a> TypeContext<'a> {
             }
             Expr::Var(slot) | Expr::MoveVar(slot) => state
                 .schema(*slot)
-                .cloned()
-                .or_else(|| self.declared_local_schema(*slot).cloned()),
+                .cloned(),
             Expr::Call(index, args) => {
                 let builtin = BuiltinFunction::from_call_index(*index)?;
                 self.infer_builtin_call_schema(builtin, args, state)
@@ -187,11 +245,28 @@ impl<'a> TypeContext<'a> {
                     _ => None,
                 }
             }
-            Expr::Match { arms, default, .. } => {
-                let default_schema = self.infer_expr_schema(default, state);
+            Expr::Match {
+                value_slot,
+                value,
+                arms,
+                default,
+                ..
+            } => {
+                let value_ty = self.infer_expr_type(value, state);
+                let mut nested = state.clone();
+                bind_expr_result_to_slot(
+                    &mut nested,
+                    *value_slot,
+                    None,
+                    value,
+                    state,
+                    value_ty,
+                    self,
+                );
+                let default_schema = self.infer_expr_schema(default, &nested);
                 let mut arm_schema = None;
                 for (_, arm_expr) in arms {
-                    let current = self.infer_expr_schema(arm_expr, state);
+                    let current = self.infer_expr_schema(arm_expr, &nested);
                     match (&arm_schema, &current) {
                         (None, _) => arm_schema = current,
                         (Some(lhs), Some(rhs)) if lhs == rhs => {}
@@ -271,7 +346,15 @@ impl<'a> TypeContext<'a> {
             } => {
                 let mut nested = state.clone();
                 let value_ty = self.infer_expr_type(value, state);
-                bind_expr_result_to_slot(&mut nested, *value_slot, value, state, value_ty, self);
+                bind_expr_result_to_slot(
+                    &mut nested,
+                    *value_slot,
+                    None,
+                    value,
+                    state,
+                    value_ty,
+                    self,
+                );
                 let mut arm_type = BoundType::Unknown;
                 for (_pattern, arm_expr) in arms {
                     let ty = self.infer_expr_type(arm_expr, &nested);
@@ -643,24 +726,35 @@ impl<'a> TypeContext<'a> {
         args: &[Expr],
         caller_state: &LocalTypeState,
     ) -> BoundType {
-        if param_slots.len() != args.len() {
+        let Some(mut nested) =
+            self.build_callable_state(param_slots, capture_copies, Some(args), caller_state)
+        else {
             return BoundType::Unknown;
-        }
-        let mut nested = LocalTypeState::default();
-        for (source_slot, captured_slot) in capture_copies {
-            nested.copy_binding_from(
-                caller_state,
-                *source_slot,
-                *captured_slot,
-                self.declared_local_schema(*source_slot).cloned(),
-                self.declared_local_schema(*source_slot).is_some(),
-            );
-        }
-        for (arg, slot) in args.iter().zip(param_slots.iter()) {
-            self.bind_expr_to_slot(&mut nested, *slot, arg, caller_state);
-        }
+        };
         self.apply_stmts(body_stmts, &mut nested);
         self.infer_expr_type(body_expr, &nested)
+    }
+
+    pub(super) fn build_callable_state(
+        &mut self,
+        param_slots: &[LocalSlot],
+        capture_copies: &[(LocalSlot, LocalSlot)],
+        args: Option<&[Expr]>,
+        caller_state: &LocalTypeState,
+    ) -> Option<LocalTypeState> {
+        let mut nested = LocalTypeState::default();
+        for (source_slot, captured_slot) in capture_copies {
+            nested.copy_binding_from(caller_state, *source_slot, *captured_slot, None, false);
+        }
+        if let Some(args) = args {
+            if param_slots.len() != args.len() {
+                return None;
+            }
+            for (arg, slot) in args.iter().zip(param_slots.iter()) {
+                self.bind_expr_to_slot(&mut nested, *slot, None, arg, caller_state);
+            }
+        }
+        Some(nested)
     }
 
     pub(super) fn validate_call_argument_types(
@@ -773,9 +867,22 @@ impl<'a> TypeContext<'a> {
                 Stmt::ClosureLet { closure, .. } => {
                     let _ = self.infer_expr_type(&closure.body, state);
                 }
-                Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
+                Stmt::Let {
+                    index,
+                    declared_struct,
+                    expr,
+                    ..
+                } => {
                     let expr_state = state.clone();
-                    self.bind_expr_to_slot(state, *index, expr, &expr_state);
+                    let declared_schema = declared_struct
+                        .as_deref()
+                        .and_then(|name| self.resolve_struct_schema(name))
+                        .cloned();
+                    self.bind_expr_to_slot(state, *index, declared_schema.as_ref(), expr, &expr_state);
+                }
+                Stmt::Assign { index, expr, .. } => {
+                    let expr_state = state.clone();
+                    self.bind_expr_to_slot(state, *index, None, expr, &expr_state);
                 }
                 Stmt::Expr { expr, .. } => {
                     let _ = self.infer_expr_type(expr, state);
@@ -836,6 +943,7 @@ impl<'a> TypeContext<'a> {
         &mut self,
         state: &mut LocalTypeState,
         slot: LocalSlot,
+        declared_schema: Option<&TypeSchema>,
         expr: &Expr,
         expr_state: &LocalTypeState,
     ) -> BoundType {
@@ -844,19 +952,34 @@ impl<'a> TypeContext<'a> {
             BoundType::Unknown
         } else {
             let ty = self.infer_expr_type(expr, expr_state);
-            let schema = self
-                .declared_local_schema(slot)
+            let slot_declared_schema = declared_schema
                 .cloned()
+                .or_else(|| expr_state.has_declared_schema(slot).then(|| expr_state.schema(slot).cloned()).flatten());
+            let schema = slot_declared_schema
+                .clone()
                 .or_else(|| self.infer_expr_schema(expr, expr_state));
-            let from_declared_schema = self.declared_local_schema(slot).is_some()
+            let from_declared_schema = slot_declared_schema.is_some()
+                || expr_state.has_declared_schema(slot)
                 || self.expr_has_declared_schema(expr, expr_state);
-            let ty = self
-                .declared_local_schema(slot)
+            let ty = slot_declared_schema
+                .as_ref()
                 .map(bound_type_from_schema)
                 .unwrap_or(ty);
             state.set_with_schema_origin(slot, ty, schema, from_declared_schema);
             ty
         }
+    }
+}
+
+fn merge_observed_function_param_schema(
+    current: Option<TypeSchema>,
+    next: Option<TypeSchema>,
+) -> Option<TypeSchema> {
+    match (current, next) {
+        (None, rhs) => rhs,
+        (lhs, None) => lhs,
+        (Some(lhs), Some(rhs)) if lhs == rhs => Some(lhs),
+        _ => None,
     }
 }
 
@@ -875,7 +998,7 @@ fn schema_from_bound_type(ty: BoundType) -> Option<TypeSchema> {
     }
 }
 
-pub(super) fn bound_type_from_schema(schema: &TypeSchema) -> BoundType {
+pub(crate) fn bound_type_from_schema(schema: &TypeSchema) -> BoundType {
     match schema {
         TypeSchema::Unknown => BoundType::Unknown,
         TypeSchema::Null => BoundType::Null,
@@ -883,6 +1006,7 @@ pub(super) fn bound_type_from_schema(schema: &TypeSchema) -> BoundType {
         TypeSchema::Float => BoundType::Float,
         TypeSchema::Bool => BoundType::Bool,
         TypeSchema::String => BoundType::String,
+        TypeSchema::Named(_) => BoundType::Map,
         TypeSchema::Array(_) => BoundType::Array,
         TypeSchema::Map(_) | TypeSchema::Object(_) => BoundType::Map,
     }
@@ -908,6 +1032,7 @@ fn infer_set_schema(
     value: Option<TypeSchema>,
 ) -> Option<TypeSchema> {
     match container {
+        Some(TypeSchema::Named(name)) => Some(TypeSchema::Named(name)),
         Some(TypeSchema::Object(mut fields)) => {
             let Expr::String(name) = key else {
                 return Some(TypeSchema::Map(Box::new(TypeSchema::Unknown)));
@@ -954,7 +1079,8 @@ pub(super) fn infer_access_schema(
     context: &mut TypeContext<'_>,
     state: &LocalTypeState,
 ) -> Result<TypeSchema, String> {
-    match schema {
+    match context.resolve_schema(schema).clone() {
+        TypeSchema::Named(name) => Err(format!("unknown struct schema '{name}'")),
         TypeSchema::Object(fields) => match key {
             Expr::String(name) => fields
                 .get(name)
@@ -963,7 +1089,7 @@ pub(super) fn infer_access_schema(
             other => {
                 let key_ty = context.infer_expr_type(other, state);
                 if matches!(key_ty, BoundType::String | BoundType::Unknown) {
-                    Ok(collapse_object_field_schema(fields))
+                    Ok(collapse_object_field_schema(&fields))
                 } else {
                     Err(format!(
                         "schema-typed object access requires a string field name, got {}",
@@ -975,7 +1101,7 @@ pub(super) fn infer_access_schema(
         TypeSchema::Array(element) => {
             let key_ty = context.infer_expr_type(key, state);
             if matches!(key_ty, BoundType::Unknown | BoundType::Int) {
-                Ok((**element).clone())
+                Ok((*element).clone())
             } else {
                 Err(format!(
                     "schema-typed array access requires an int index, got {}",
@@ -983,10 +1109,10 @@ pub(super) fn infer_access_schema(
                 ))
             }
         }
-        TypeSchema::Map(value) => Ok((**value).clone()),
+        TypeSchema::Map(value) => Ok((*value).clone()),
         other => Err(format!(
             "cannot access fields on schema type '{}'",
-            schema_label(other)
+            schema_label(&other)
         )),
     }
 }
@@ -1011,6 +1137,7 @@ pub(super) fn schema_label(schema: &TypeSchema) -> &'static str {
         TypeSchema::Float => "float",
         TypeSchema::Bool => "bool",
         TypeSchema::String => "string",
+        TypeSchema::Named(_) => "map",
         TypeSchema::Array(_) => "array",
         TypeSchema::Map(_) | TypeSchema::Object(_) => "map",
     }

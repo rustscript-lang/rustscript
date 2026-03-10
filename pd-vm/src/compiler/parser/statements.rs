@@ -25,6 +25,9 @@ impl Parser {
         if self.match_kind(&TokenKind::Fn) {
             return self.parse_fn_decl(false);
         }
+        if self.match_kind(&TokenKind::Struct) {
+            return self.parse_struct_decl();
+        }
         if self.match_kind(&TokenKind::Let) {
             if self.dialect.allow_require_declaration() && self.check_js_require_declaration_start()
             {
@@ -263,6 +266,23 @@ impl Parser {
         Ok(named)
     }
 
+    pub(super) fn parse_struct_decl(&mut self) -> Result<Stmt, ParseError> {
+        let line = self.last_line();
+        let name = self.expect_ident("expected struct name after 'struct'")?;
+        self.expect(&TokenKind::LBrace, "expected '{' after struct name")?;
+        let fields = self.parse_object_type_schema_fields()?;
+        self.expect(&TokenKind::RBrace, "expected '}' after struct body")?;
+        if self.struct_schemas.insert(name.clone(), TypeSchema::Object(fields)).is_some() {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: format!("duplicate struct schema '{name}'"),
+            });
+        }
+        Ok(Stmt::Noop { line })
+    }
+
     pub(super) fn parse_return_stmt(&mut self) -> Result<Stmt, ParseError> {
         let line = self.current_line_u32();
         let _ = self.match_ident_literal("return");
@@ -475,9 +495,13 @@ impl Parser {
         let ty = if self.match_kind(&TokenKind::Null) {
             ValueType::Null
         } else {
+            let span = self.current_span();
             let name = self.expect_ident("expected return type after '->'")?;
             match name.as_str() {
-                "unknown" => ValueType::Unknown,
+                "unknown" => {
+                    self.unknown_type_spans.push(span);
+                    ValueType::Unknown
+                }
                 "int" => ValueType::Int,
                 "float" => ValueType::Float,
                 "bool" => ValueType::Bool,
@@ -500,6 +524,26 @@ impl Parser {
         Ok(ty)
     }
 
+    fn parse_object_type_schema_fields(&mut self) -> Result<HashMap<String, TypeSchema>, ParseError> {
+        let mut fields = HashMap::new();
+        if !self.check(&TokenKind::RBrace) {
+            loop {
+                let field = self.expect_ident("expected field name in object type schema")?;
+                self.expect(&TokenKind::Colon, "expected ':' after schema field name")?;
+                let field_schema = self.parse_declared_type_schema()?;
+                fields.insert(field, field_schema);
+                if self.match_kind(&TokenKind::Comma) {
+                    if self.check(&TokenKind::RBrace) {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        Ok(fields)
+    }
+
     pub(super) fn parse_declared_type_schema(&mut self) -> Result<TypeSchema, ParseError> {
         if self.match_kind(&TokenKind::LBracket) {
             let element = self.parse_declared_type_schema()?;
@@ -508,22 +552,7 @@ impl Parser {
         }
 
         if self.match_kind(&TokenKind::LBrace) {
-            let mut fields = HashMap::new();
-            if !self.check(&TokenKind::RBrace) {
-                loop {
-                    let field = self.expect_ident("expected field name in object type schema")?;
-                    self.expect(&TokenKind::Colon, "expected ':' after schema field name")?;
-                    let field_schema = self.parse_declared_type_schema()?;
-                    fields.insert(field, field_schema);
-                    if self.match_kind(&TokenKind::Comma) {
-                        if self.check(&TokenKind::RBrace) {
-                            break;
-                        }
-                        continue;
-                    }
-                    break;
-                }
-            }
+            let fields = self.parse_object_type_schema_fields()?;
             self.expect(&TokenKind::RBrace, "expected '}' after object type schema")?;
             return Ok(TypeSchema::Object(fields));
         }
@@ -532,24 +561,33 @@ impl Parser {
             return Ok(TypeSchema::Null);
         }
 
+        let span = self.current_span();
         let name = self.expect_ident("expected type schema")?;
         match name.as_str() {
-            "unknown" => Ok(TypeSchema::Unknown),
+            "unknown" => {
+                self.unknown_type_spans.push(span);
+                Ok(TypeSchema::Unknown)
+            }
             "int" => Ok(TypeSchema::Int),
             "float" => Ok(TypeSchema::Float),
             "bool" => Ok(TypeSchema::Bool),
             "string" => Ok(TypeSchema::String),
             "array" => Ok(TypeSchema::Array(Box::new(TypeSchema::Unknown))),
             "map" => Ok(TypeSchema::Map(Box::new(TypeSchema::Unknown))),
-            other => Err(ParseError {
-                span: None,
-                code: None,
-                line: self.current_line(),
-                message: format!(
-                    "unknown type schema '{other}', expected unknown/null/int/float/bool/string/array/map/[...]/{{...}}"
-                ),
-            }),
+            other => {
+                self.schema_reference_sites
+                    .push((other.to_string(), self.current_line(), span));
+                Ok(TypeSchema::Named(other.to_string()))
+            }
         }
+    }
+
+    pub(super) fn parse_declared_struct_name(&mut self) -> Result<String, ParseError> {
+        let span = self.current_span();
+        let name = self.expect_ident("expected struct name after ':'")?;
+        self.schema_reference_sites
+            .push((name.clone(), self.current_line(), span));
+        Ok(name)
     }
 
     pub(super) fn parse_function_impl_block(
@@ -672,8 +710,8 @@ impl Parser {
         } else {
             self.expect_ident("expected identifier after 'let'")?
         };
-        let declared_schema = if self.match_kind(&TokenKind::Colon) {
-            Some(self.parse_declared_type_schema()?)
+        let declared_struct = if self.match_kind(&TokenKind::Colon) {
+            Some(self.parse_declared_struct_name()?)
         } else {
             None
         };
@@ -690,29 +728,35 @@ impl Parser {
                 .and_then(|scope| scope.get(&name))
                 .copied()
             {
-                if let Some(schema) = declared_schema {
-                    self.local_schemas.insert(index, schema);
-                }
                 self.apply_let_binding_mutability(index, declared_mutable, false);
-                return Ok(Stmt::Let { index, expr, line });
+                return Ok(Stmt::Let {
+                    index,
+                    declared_struct,
+                    expr,
+                    line,
+                });
             }
             let index = self.allocate_hidden_local()?;
             if let Some(scope) = self.closure_scopes.last_mut() {
                 scope.insert(name, index);
             }
-            if let Some(schema) = declared_schema {
-                self.local_schemas.insert(index, schema);
-            }
             self.apply_let_binding_mutability(index, declared_mutable, true);
-            return Ok(Stmt::Let { index, expr, line });
+            return Ok(Stmt::Let {
+                index,
+                declared_struct,
+                expr,
+                line,
+            });
         }
 
         let (index, created) = self.get_or_assign_local(&name)?;
-        if let Some(schema) = declared_schema {
-            self.local_schemas.insert(index, schema);
-        }
         self.apply_let_binding_mutability(index, declared_mutable, created);
-        Ok(Stmt::Let { index, expr, line })
+        Ok(Stmt::Let {
+            index,
+            declared_struct,
+            expr,
+            line,
+        })
     }
 
     pub(super) fn parse_assign_with_terminator(

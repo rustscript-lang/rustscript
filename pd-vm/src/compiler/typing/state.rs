@@ -321,6 +321,7 @@ where
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TypeInferenceResult {
     pub local_types: Vec<ValueType>,
+    pub callable_slots: Vec<bool>,
 }
 
 #[derive(Clone, Debug)]

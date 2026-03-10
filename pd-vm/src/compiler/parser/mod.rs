@@ -99,7 +99,9 @@ pub(super) struct Parser {
     next_function: u16,
     closure_scopes: Vec<HashMap<String, LocalSlot>>,
     closure_capture_contexts: Vec<ClosureCaptureContext>,
-    local_schemas: HashMap<LocalSlot, TypeSchema>,
+    struct_schemas: HashMap<String, TypeSchema>,
+    schema_reference_sites: Vec<(String, usize, Span)>,
+    unknown_type_spans: Vec<Span>,
     allow_implicit_externs: bool,
     allow_implicit_semicolons: bool,
     enforce_mutable_bindings: bool,
@@ -147,7 +149,9 @@ impl Parser {
             next_function: 0,
             closure_scopes: Vec::new(),
             closure_capture_contexts: Vec::new(),
-            local_schemas: HashMap::new(),
+            struct_schemas: HashMap::new(),
+            schema_reference_sites: Vec::new(),
+            unknown_type_spans: Vec::new(),
             allow_implicit_externs,
             allow_implicit_semicolons,
             enforce_mutable_bindings,
@@ -189,6 +193,7 @@ impl Parser {
         while !self.check(&TokenKind::Eof) {
             stmts.push(self.parse_stmt()?);
         }
+        self.validate_schema_reference_sites()?;
         Ok(stmts)
     }
 
@@ -227,7 +232,26 @@ impl Parser {
         locals
     }
 
-    pub(super) fn local_schemas(&self) -> HashMap<LocalSlot, TypeSchema> {
-        self.local_schemas.clone()
+    pub(super) fn struct_schemas(&self) -> HashMap<String, TypeSchema> {
+        self.struct_schemas.clone()
+    }
+
+    pub(super) fn unknown_type_spans(&self) -> Vec<Span> {
+        self.unknown_type_spans.clone()
+    }
+
+    fn validate_schema_reference_sites(&self) -> Result<(), ParseError> {
+        for (name, line, span) in &self.schema_reference_sites {
+            if self.struct_schemas.contains_key(name) {
+                continue;
+            }
+            return Err(ParseError {
+                span: Some(*span),
+                code: None,
+                line: *line,
+                message: format!("unknown struct schema '{name}'"),
+            });
+        }
+        Ok(())
     }
 }

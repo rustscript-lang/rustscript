@@ -15,6 +15,7 @@ pub enum TypeSchema {
     Float,
     Bool,
     String,
+    Named(String),
     Array(Box<TypeSchema>),
     Map(Box<TypeSchema>),
     Object(HashMap<String, TypeSchema>),
@@ -125,6 +126,7 @@ pub enum Stmt {
     },
     Let {
         index: LocalSlot,
+        declared_struct: Option<String>,
         expr: Expr,
         line: u32,
     },
@@ -204,7 +206,8 @@ pub struct FrontendIr {
     pub stmts: Vec<Stmt>,
     pub locals: usize,
     pub local_bindings: Vec<(String, LocalSlot)>,
-    pub local_schemas: HashMap<LocalSlot, TypeSchema>,
+    pub struct_schemas: HashMap<String, TypeSchema>,
+    pub unknown_type_spans: Vec<crate::compiler::source_map::Span>,
     pub functions: Vec<FunctionDecl>,
     pub function_impls: HashMap<u16, FunctionImpl>,
     pub stmt_sources: Vec<Option<String>>,
@@ -235,7 +238,12 @@ impl LocalIrBuilder {
         line: u32,
     ) -> Result<Stmt, ParseError> {
         let index = self.alloc_local_named(name)?;
-        Ok(Stmt::Let { index, expr, line })
+        Ok(Stmt::Let {
+            index,
+            declared_struct: None,
+            expr,
+            line,
+        })
     }
 
     pub(crate) fn lower_assign(
@@ -355,7 +363,8 @@ impl LocalIrBuilder {
             stmts,
             locals: self.next_local as usize,
             local_bindings,
-            local_schemas: HashMap::new(),
+            struct_schemas: HashMap::new(),
+            unknown_type_spans: Vec::new(),
             functions: self.functions,
             function_impls: HashMap::new(),
             stmt_sources: Vec::new(),

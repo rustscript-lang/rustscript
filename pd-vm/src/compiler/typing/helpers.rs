@@ -4,7 +4,9 @@ use crate::builtins::{BuiltinFunction, CallableParam, CallableParamType};
 
 use super::super::CompileError;
 use super::super::ir::{Expr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, TypeSchema};
-use super::collect::{observed_function_param_slice, seed_function_param_state};
+use super::collect::{
+    observed_function_param_schema_slice, observed_function_param_slice, seed_function_param_state,
+};
 use super::context::{TypeContext, bound_type_from_schema};
 use super::infer_expr_type;
 use super::state::{
@@ -18,15 +20,16 @@ pub(super) fn legalize_function_impl(
     function_impl: &mut FunctionImpl,
     function_impls: &HashMap<u16, FunctionImpl>,
     function_names: &HashMap<u16, String>,
+    struct_schemas: &HashMap<String, TypeSchema>,
     host_import_return_types: &HashMap<u16, BoundType>,
     host_import_signatures: &HashMap<u16, HostCallableSignature>,
     observed_function_param_types: &HashMap<u16, Vec<BoundType>>,
-    declared_local_schemas: &HashMap<LocalSlot, TypeSchema>,
+    observed_function_param_schemas: &HashMap<u16, Vec<Option<TypeSchema>>>,
 ) {
     let mut state = LocalTypeState::default();
     let mut context = TypeContext::new(
         function_impls,
-        declared_local_schemas,
+        struct_schemas,
         function_names,
         host_import_return_types,
         host_import_signatures,
@@ -35,16 +38,11 @@ pub(super) fn legalize_function_impl(
         &mut state,
         &function_impl.param_slots,
         observed_function_param_slice(observed_function_param_types, function_index),
+        observed_function_param_schema_slice(observed_function_param_schemas, function_index),
     );
     for (source_slot, captured_slot) in &function_impl.capture_copies {
         let source_state = state.clone();
-        state.copy_binding_from(
-            &source_state,
-            *source_slot,
-            *captured_slot,
-            context.declared_local_schema(*source_slot).cloned(),
-            context.declared_local_schema(*source_slot).is_some(),
-        );
+        state.copy_binding_from(&source_state, *source_slot, *captured_slot, None, false);
     }
     legalize_stmts(&mut function_impl.body_stmts, &mut state, &mut context);
     let _ = legalize_expr(&mut function_impl.body_expr, &state, &mut context);
@@ -54,7 +52,6 @@ pub(super) fn validate_function_impl(
     function_index: u16,
     function_impl: &FunctionImpl,
     source_name: Option<&str>,
-    declared_local_schemas: &HashMap<LocalSlot, TypeSchema>,
     context: &mut TypeContext<'_>,
 ) -> Result<(), CompileError> {
     if let Some(detail) = context
@@ -77,16 +74,14 @@ pub(super) fn validate_function_impl(
         &mut state,
         &function_impl.param_slots,
         observed_function_param_slice(&context.observed_function_param_types, function_index),
+        observed_function_param_schema_slice(
+            &context.observed_function_param_schemas,
+            function_index,
+        ),
     );
     for (source_slot, captured_slot) in &function_impl.capture_copies {
         let source_state = state.clone();
-        state.copy_binding_from(
-            &source_state,
-            *source_slot,
-            *captured_slot,
-            declared_local_schemas.get(source_slot).cloned(),
-            declared_local_schemas.contains_key(source_slot),
-        );
+        state.copy_binding_from(&source_state, *source_slot, *captured_slot, None, false);
     }
     validate_stmts(
         &function_impl.body_stmts,
@@ -124,10 +119,32 @@ pub(super) fn legalize_stmts(
             Stmt::ClosureLet { closure, .. } => {
                 let _ = legalize_expr(&mut closure.body, state, context);
             }
-            Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
+            Stmt::Let {
+                index,
+                declared_struct,
+                expr,
+                ..
+            } => {
                 let expr_state = state.clone();
                 let ty = legalize_expr(expr, &expr_state, context);
-                bind_expr_result_to_slot(state, *index, expr, &expr_state, ty, context);
+                let declared_schema = declared_struct
+                    .as_deref()
+                    .and_then(|name| context.resolve_struct_schema(name))
+                    .cloned();
+                bind_expr_result_to_slot(
+                    state,
+                    *index,
+                    declared_schema.as_ref(),
+                    expr,
+                    &expr_state,
+                    ty,
+                    context,
+                );
+            }
+            Stmt::Assign { index, expr, .. } => {
+                let expr_state = state.clone();
+                let ty = legalize_expr(expr, &expr_state, context);
+                bind_expr_result_to_slot(state, *index, None, expr, &expr_state, ty, context);
             }
             Stmt::Expr { expr, .. } => {
                 let _ = legalize_expr(expr, state, context);
@@ -198,7 +215,12 @@ pub(super) fn validate_stmts(
                     false,
                 )?;
             }
-            Stmt::Let { index, expr, line } | Stmt::Assign { index, expr, line } => {
+            Stmt::Let {
+                index,
+                declared_struct,
+                expr,
+                line,
+            } => {
                 let expr_state = state.clone();
                 let ty = validate_expr(
                     expr,
@@ -208,14 +230,37 @@ pub(super) fn validate_stmts(
                     context,
                     strict_function_add_types,
                 )?;
+                let declared_schema = declared_struct
+                    .as_deref()
+                    .and_then(|name| context.resolve_struct_schema(name))
+                    .cloned();
                 validate_declared_local_schema(
-                    *index,
+                    declared_schema.as_ref(),
                     ty,
                     Some(*line),
                     source_name,
-                    context,
                 )?;
-                bind_expr_result_to_slot(state, *index, expr, &expr_state, ty, context);
+                bind_expr_result_to_slot(
+                    state,
+                    *index,
+                    declared_schema.as_ref(),
+                    expr,
+                    &expr_state,
+                    ty,
+                    context,
+                );
+            }
+            Stmt::Assign { index, expr, line } => {
+                let expr_state = state.clone();
+                let ty = validate_expr(
+                    expr,
+                    &expr_state,
+                    Some(*line),
+                    source_name,
+                    context,
+                    strict_function_add_types,
+                )?;
+                bind_expr_result_to_slot(state, *index, None, expr, &expr_state, ty, context);
             }
             Stmt::Expr { expr, line } => {
                 let _ = validate_expr(
@@ -335,13 +380,12 @@ pub(super) fn validate_stmts(
 }
 
 fn validate_declared_local_schema(
-    slot: LocalSlot,
+    schema: Option<&TypeSchema>,
     actual: BoundType,
     line: Option<u32>,
     source_name: Option<&str>,
-    context: &TypeContext<'_>,
 ) -> Result<(), CompileError> {
-    let Some(schema) = context.declared_local_schema(slot) else {
+    let Some(schema) = schema else {
         return Ok(());
     };
     let expected = bound_type_from_schema(schema);
@@ -357,8 +401,7 @@ fn validate_declared_local_schema(
         line,
         source_name: owned_source_name(source_name),
         detail: format!(
-            "local slot {} is declared as schema type '{}' but was assigned {}",
-            slot,
+            "local is declared as schema type '{}' but was assigned {}",
             schema_type_label(schema),
             bound_type_label(actual)
         ),
@@ -373,6 +416,7 @@ fn schema_type_label(schema: &TypeSchema) -> &'static str {
         TypeSchema::Float => "float",
         TypeSchema::Bool => "bool",
         TypeSchema::String => "string",
+        TypeSchema::Named(_) => "map",
         TypeSchema::Array(_) => "array",
         TypeSchema::Map(_) | TypeSchema::Object(_) => "map",
     }
@@ -381,6 +425,7 @@ fn schema_type_label(schema: &TypeSchema) -> &'static str {
 pub(super) fn bind_expr_result_to_slot(
     state: &mut LocalTypeState,
     slot: LocalSlot,
+    declared_schema: Option<&TypeSchema>,
     expr: &Expr,
     expr_state: &LocalTypeState,
     ty: BoundType,
@@ -389,14 +434,17 @@ pub(super) fn bind_expr_result_to_slot(
     if let Some(callable) = context.callable_binding_from_expr(expr, expr_state) {
         state.bind_callable(slot, callable);
     } else {
-        let schema = context
-            .declared_local_schema(slot)
+        let slot_declared_schema = declared_schema
             .cloned()
+            .or_else(|| expr_state.has_declared_schema(slot).then(|| expr_state.schema(slot).cloned()).flatten());
+        let schema = slot_declared_schema
+            .clone()
             .or_else(|| context.infer_expr_schema(expr, expr_state));
-        let from_declared_schema = context.declared_local_schema(slot).is_some()
+        let from_declared_schema = slot_declared_schema.is_some()
+            || expr_state.has_declared_schema(slot)
             || context.expr_has_declared_schema(expr, expr_state);
-        let ty = context
-            .declared_local_schema(slot)
+        let ty = slot_declared_schema
+            .as_ref()
             .map(bound_type_from_schema)
             .unwrap_or(ty);
         state.set_with_schema_origin(slot, ty, schema, from_declared_schema);
@@ -818,7 +866,15 @@ pub(super) fn legalize_expr(
         } => {
             let mut nested = state.clone();
             let value_ty = legalize_expr(value, state, context);
-            bind_expr_result_to_slot(&mut nested, *value_slot, value, state, value_ty, context);
+            bind_expr_result_to_slot(
+                &mut nested,
+                *value_slot,
+                None,
+                value,
+                state,
+                value_ty,
+                context,
+            );
             let mut arm_type = BoundType::Unknown;
             for (_pattern, arm_expr) in arms.iter_mut() {
                 let ty = legalize_expr(arm_expr, &nested, context);

@@ -5,7 +5,7 @@ use crate::builtins::BuiltinFunction;
 
 use super::{
     ParseError, SourceError, SourcePathError,
-    ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt},
+    ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, TypeSchema},
 };
 
 pub(super) struct ParsedUnit {
@@ -33,7 +33,8 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
     let mut merged_stmts = Vec::new();
     let mut merged_stmt_sources = Vec::new();
     let mut merged_local_bindings = Vec::new();
-    let mut merged_local_schemas = HashMap::new();
+    let mut merged_struct_schemas = HashMap::<String, TypeSchema>::new();
+    let mut merged_unknown_type_spans = Vec::new();
     let mut merged_functions = Vec::new();
     let mut merged_function_impls = HashMap::<u16, FunctionImpl>::new();
     let mut merged_function_sources = HashMap::<u16, String>::new();
@@ -70,10 +71,24 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
             merged_local_bindings.push((scoped_name, remapped_index));
         }
 
-        for (index, schema) in unit.parsed.local_schemas {
-            let remapped_index = remap_local_index(index, unit_local_base)?;
-            merged_local_schemas.insert(remapped_index, schema);
+        for (name, schema) in unit.parsed.struct_schemas {
+            if let Some(existing) = merged_struct_schemas.get(&name) {
+                if existing != &schema {
+                    return Err(SourcePathError::Source(SourceError::Parse(ParseError {
+                        span: None,
+                        code: None,
+                        line: 1,
+                        message: format!(
+                            "struct schema '{}' declared with conflicting definitions across imported modules",
+                            name
+                        ),
+                    })));
+                }
+                continue;
+            }
+            merged_struct_schemas.insert(name, schema);
         }
+        merged_unknown_type_spans.extend(unit.parsed.unknown_type_spans);
 
         for (unit_index, mut function_impl) in unit.parsed.function_impls {
             let merged_index = function_map.get(&unit_index).copied().ok_or_else(|| {
@@ -133,7 +148,8 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
         stmts: merged_stmts,
         locals: local_base,
         local_bindings: merged_local_bindings,
-        local_schemas: merged_local_schemas,
+        struct_schemas: merged_struct_schemas,
+        unknown_type_spans: merged_unknown_type_spans,
         functions: merged_functions,
         function_impls: merged_function_impls,
         stmt_sources: merged_stmt_sources,

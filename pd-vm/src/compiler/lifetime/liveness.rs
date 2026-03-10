@@ -148,13 +148,19 @@ impl LivenessRewriter {
                     Vec::new(),
                 )
             }
-            Stmt::Let { index, expr, line } => {
+            Stmt::Let {
+                index,
+                declared_struct,
+                expr,
+                line,
+            } => {
                 let mut live_before = live_after.clone();
                 self.kill_slot(&mut live_before, *index);
                 self.union_inplace(&mut live_before, &self.uses_expr(expr));
                 (
                     Stmt::Let {
                         index: *index,
+                        declared_struct: declared_struct.clone(),
                         expr: expr.clone(),
                         line: *line,
                     },

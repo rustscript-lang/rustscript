@@ -129,7 +129,8 @@ fn parse_with_parser(
         stmts,
         locals: parser.local_count(),
         local_bindings: parser.local_bindings(),
-        local_schemas: parser.local_schemas(),
+        struct_schemas: parser.struct_schemas(),
+        unknown_type_spans: parser.unknown_type_spans(),
         functions: parser.function_decls(),
         function_impls: parser.function_impls(),
         stmt_sources: Vec::new(),
@@ -174,7 +175,8 @@ fn parse_repl_with_parser(
             stmts,
             locals: parser.local_count(),
             local_bindings: parser.local_bindings(),
-            local_schemas: parser.local_schemas(),
+            struct_schemas: parser.struct_schemas(),
+            unknown_type_spans: parser.unknown_type_spans(),
             functions: parser.function_decls(),
             function_impls: parser.function_impls(),
             stmt_sources: Vec::new(),
@@ -204,7 +206,16 @@ fn parse_lowered_with_mapping(
         enforce_mutable_bindings,
         rustscript::parser_dialect(),
     ) {
-        Ok(ir) => Ok(ir),
+        Ok(mut ir) => {
+            map_spans_to_original_source(
+                &mut ir.unknown_type_spans,
+                &lowered,
+                &source_map,
+                lowered_source_id,
+                original_source_id,
+            );
+            Ok(ir)
+        }
         Err(mut err) => {
             err = err.with_line_span_from_source(&source_map, lowered_source_id);
             let mapped_span = err.span.and_then(|span| {
@@ -260,7 +271,16 @@ fn parse_lowered_repl_with_mapping(
         enforce_mutable_bindings,
         rustscript::parser_dialect(),
     ) {
-        Ok(result) => Ok(result),
+        Ok(mut result) => {
+            map_spans_to_original_source(
+                &mut result.ir.unknown_type_spans,
+                &lowered,
+                &source_map,
+                lowered_source_id,
+                original_source_id,
+            );
+            Ok(result)
+        }
         Err(mut err) => {
             err = err.with_line_span_from_source(&source_map, lowered_source_id);
             let mapped_span = err.span.and_then(|span| {
@@ -291,6 +311,24 @@ fn parse_lowered_repl_with_mapping(
                 err.span = source_map.line_span(original_source_id, original_line);
             }
             Err(err)
+        }
+    }
+}
+
+fn map_spans_to_original_source(
+    spans: &mut Vec<crate::compiler::source_map::Span>,
+    lowered: &LoweredSource,
+    source_map: &SourceMap,
+    lowered_source_id: u32,
+    original_source_id: u32,
+) {
+    for span in spans.iter_mut() {
+        if let Some(mapped) =
+            lowered
+                .mapping
+                .map_span(source_map, lowered_source_id, original_source_id, *span)
+        {
+            *span = mapped;
         }
     }
 }

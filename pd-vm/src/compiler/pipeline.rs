@@ -20,6 +20,13 @@ pub(super) struct LocalDebugRange {
     pub(super) last_line: Option<u32>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownInferredLocal {
+    pub name: String,
+    pub line: usize,
+    pub span: Option<crate::compiler::source_map::Span>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct CompileBehavior {
     clear_dead_locals: bool,
@@ -76,7 +83,9 @@ fn record_stmt_local_debug_ranges(stmt: &Stmt, ranges: &mut HashMap<LocalSlot, L
         Stmt::Drop { index, line } => {
             note_local_use(ranges, *index, *line);
         }
-        Stmt::Let { index, expr, line } => {
+        Stmt::Let {
+            index, expr, line, ..
+        } => {
             note_local_decl(ranges, *index, *line);
             record_expr_local_debug_ranges(expr, *line, ranges);
         }
@@ -327,7 +336,7 @@ fn compile_parsed_output_with_entry_locals(
         stmts,
         locals,
         local_bindings,
-        local_schemas,
+        struct_schemas,
         functions,
         function_impls,
         ..
@@ -367,7 +376,7 @@ fn compile_parsed_output_with_entry_locals(
     compiler.set_type_inference(type_info);
     compiler.set_source(source);
     compiler.set_function_impls(function_impls);
-    compiler.set_local_schemas(local_schemas);
+    compiler.set_struct_schemas(struct_schemas);
     compiler.set_host_import_return_types(host_import_return_types);
     compiler.set_host_import_signatures(host_import_signatures);
     compiler.set_call_index_remap(call_index_remap);
@@ -412,6 +421,176 @@ pub fn lint_trailing_function_return_semicolons(
         return Ok(Vec::new());
     };
     parser::lint_trailing_function_return_semicolons(source, 0, dialect)
+}
+
+pub fn lint_unknown_type_annotations(
+    source: &str,
+    flavor: SourceFlavor,
+) -> Result<Vec<crate::compiler::source_map::Span>, SourceError> {
+    let mut source_map = SourceMap::new();
+    let source_id = source_map.add_source("<source>", source.to_string());
+    let parsed = frontends::parse_source(source, flavor).map_err(|err| {
+        SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
+    })?;
+    Ok(parsed.unknown_type_spans)
+}
+
+pub fn lint_unknown_inferred_local_types(
+    source: &str,
+    flavor: SourceFlavor,
+) -> Result<Vec<UnknownInferredLocal>, SourceError> {
+    lint_unknown_inferred_local_types_impl(source, flavor)
+}
+
+pub fn lint_unknown_inferred_local_types_with_options(
+    source: &str,
+    flavor: SourceFlavor,
+    options: CompileSourceFileOptions,
+) -> Result<Vec<UnknownInferredLocal>, SourcePathError> {
+    let source_owned = source.to_string();
+    run_with_compiler_stack(move || {
+        lint_unknown_inferred_local_types_with_options_impl(&source_owned, flavor, &options)
+    })
+}
+
+pub fn lint_unknown_inferred_local_types_at_path_with_options(
+    path: impl AsRef<Path>,
+    source: &str,
+    flavor: SourceFlavor,
+    options: CompileSourceFileOptions,
+) -> Result<Vec<UnknownInferredLocal>, SourcePathError> {
+    let path = path.as_ref().to_path_buf();
+    let source_owned = source.to_string();
+    run_with_compiler_stack(move || {
+        lint_unknown_inferred_local_types_at_path_with_options_impl(
+            &path,
+            &source_owned,
+            flavor,
+            &options,
+        )
+    })
+}
+
+fn lint_unknown_inferred_local_types_impl(
+    source: &str,
+    flavor: SourceFlavor,
+) -> Result<Vec<UnknownInferredLocal>, SourceError> {
+    let mut source_map = SourceMap::new();
+    let source_id = source_map.add_source("<source>", source.to_string());
+    let parsed = frontends::parse_source(source, flavor).map_err(|err| {
+        SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
+    })?;
+    Ok(collect_unknown_inferred_local_types(
+        &source_map, source_id, parsed,
+    ))
+}
+
+fn lint_unknown_inferred_local_types_with_options_impl(
+    source: &str,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+) -> Result<Vec<UnknownInferredLocal>, SourcePathError> {
+    if !options.has_module_overrides() {
+        return lint_unknown_inferred_local_types_impl(source, flavor).map_err(SourcePathError::Source);
+    }
+
+    let path = virtual_inmemory_entry_path(flavor);
+    lint_unknown_inferred_local_types_at_path_with_options_impl(&path, source, flavor, options)
+}
+
+fn lint_unknown_inferred_local_types_at_path_with_options_impl(
+    path: &Path,
+    source: &str,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+) -> Result<Vec<UnknownInferredLocal>, SourcePathError> {
+    let mut source_map = SourceMap::new();
+    let source_id = source_map.add_source(path.display().to_string(), source.to_string());
+    let (_root_parse_source, units) = load_units_for_source_file(path, flavor, source, options)?;
+    let parsed = units
+        .into_iter()
+        .last()
+        .map(|unit| unit.parsed)
+        .expect("root parsed unit should always be present");
+    Ok(collect_unknown_inferred_local_types(
+        &source_map, source_id, parsed,
+    ))
+}
+
+fn collect_unknown_inferred_local_types(
+    source_map: &SourceMap,
+    source_id: u32,
+    parsed: FrontendIr,
+) -> Vec<UnknownInferredLocal> {
+    let local_debug_ranges = collect_local_debug_ranges(&parsed.stmts, &parsed.function_impls);
+    let parsed = typing::legalize_builtins_and_bind_types(parsed);
+    let type_info = typing::infer_types(&parsed);
+
+    let mut warnings = Vec::new();
+    for (name, slot) in &parsed.local_bindings {
+        let Some(range) = local_debug_ranges.get(slot) else {
+            continue;
+        };
+        let Some(line_u32) = range.declared_line else {
+            continue;
+        };
+        let slot_index = usize::from(*slot);
+        if type_info
+            .callable_slots
+            .get(slot_index)
+            .copied()
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if type_info.local_types.get(slot_index) != Some(&crate::ValueType::Unknown) {
+            continue;
+        }
+        let line = usize::try_from(line_u32).unwrap_or(usize::MAX);
+        warnings.push(UnknownInferredLocal {
+            name: name.clone(),
+            line,
+            span: find_local_name_span(&source_map, source_id, line, name)
+                .or_else(|| source_map.line_span(source_id, line)),
+        });
+    }
+    warnings
+}
+
+fn find_local_name_span(
+    source_map: &SourceMap,
+    source_id: u32,
+    line: usize,
+    name: &str,
+) -> Option<crate::compiler::source_map::Span> {
+    let file = source_map.file(source_id)?;
+    let line_range = file.line_span(line)?;
+    let line_text = file.line_text(line)?;
+    let mut search_start = 0usize;
+    while let Some(relative) = line_text[search_start..].find(name) {
+        let start = search_start + relative;
+        let end = start + name.len();
+        let prev_ok = start == 0
+            || !line_text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_ident_char);
+        let next_ok = end == line_text.len()
+            || !line_text[end..].chars().next().is_some_and(is_ident_char);
+        if prev_ok && next_ok {
+            return Some(crate::compiler::source_map::Span::new(
+                source_id,
+                line_range.start + start,
+                line_range.start + end,
+            ));
+        }
+        search_start = end;
+    }
+    None
+}
+
+fn is_ident_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 pub fn compile_source_for_repl(source: &str) -> Result<CompiledProgram, SourceError> {

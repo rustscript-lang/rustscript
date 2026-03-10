@@ -159,6 +159,7 @@ fn statement_looks_like_function_return(tokens: &[Token], start: usize, end: usi
     match &first.kind {
         TokenKind::Let
         | TokenKind::Fn
+        | TokenKind::Struct
         | TokenKind::Pub
         | TokenKind::Use
         | TokenKind::Import

@@ -508,11 +508,13 @@ fn lower_lua_non_strict_compare(
         stmts: vec![
             Stmt::Let {
                 index: lhs_slot,
+                declared_struct: None,
                 expr: lhs.expr,
                 line: 1,
             },
             Stmt::Let {
                 index: rhs_slot,
+                declared_struct: None,
                 expr: rhs.expr,
                 line: 1,
             },
@@ -688,11 +690,13 @@ fn build_lua_optional_member_expr(
         stmts: vec![
             Stmt::Let {
                 index: target_slot,
+                declared_struct: None,
                 expr: target,
                 line,
             },
             Stmt::Let {
                 index: result_slot,
+                declared_struct: None,
                 expr: Expr::Null,
                 line,
             },
@@ -704,6 +708,7 @@ fn build_lua_optional_member_expr(
                 then_branch: vec![
                     Stmt::Let {
                         index: keys_slot,
+                        declared_struct: None,
                         expr: Expr::Call(
                             BuiltinFunction::Keys.call_index(),
                             vec![Expr::Var(target_slot)],
@@ -712,11 +717,13 @@ fn build_lua_optional_member_expr(
                     },
                     Stmt::Let {
                         index: idx_slot,
+                        declared_struct: None,
                         expr: Expr::Int(0),
                         line,
                     },
                     Stmt::Let {
                         index: found_slot,
+                        declared_struct: None,
                         expr: Expr::Bool(false),
                         line,
                     },

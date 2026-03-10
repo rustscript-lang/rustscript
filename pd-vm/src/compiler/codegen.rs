@@ -15,7 +15,7 @@ pub struct Compiler {
     next_label_id: u32,
     loop_stack: Vec<LoopContext>,
     function_impls: HashMap<u16, FunctionImpl>,
-    local_schemas: HashMap<LocalSlot, TypeSchema>,
+    struct_schemas: HashMap<String, TypeSchema>,
     host_import_return_types: HashMap<u16, typing::BoundType>,
     host_import_signatures: HashMap<u16, typing::HostCallableSignature>,
     call_index_remap: HashMap<u16, u16>,
@@ -58,7 +58,7 @@ impl Compiler {
             next_label_id: 0,
             loop_stack: Vec::new(),
             function_impls: HashMap::new(),
-            local_schemas: HashMap::new(),
+            struct_schemas: HashMap::new(),
             host_import_return_types: HashMap::new(),
             host_import_signatures: HashMap::new(),
             call_index_remap: HashMap::new(),
@@ -99,8 +99,8 @@ impl Compiler {
         self.function_impls = function_impls;
     }
 
-    pub fn set_local_schemas(&mut self, local_schemas: HashMap<LocalSlot, TypeSchema>) {
-        self.local_schemas = local_schemas;
+    pub fn set_struct_schemas(&mut self, struct_schemas: HashMap<String, TypeSchema>) {
+        self.struct_schemas = struct_schemas;
     }
 
     pub(crate) fn set_host_import_return_types(
@@ -152,13 +152,22 @@ impl Compiler {
             Stmt::Noop { line } => {
                 self.assembler.mark_line(*line);
             }
-            Stmt::Let { index, expr, line } => {
+            Stmt::Let {
+                index,
+                declared_struct,
+                expr,
+                line,
+            } => {
                 self.assembler.mark_line(*line);
-                self.assign_expr_to_slot(*index, expr)?;
+                let declared_schema = declared_struct
+                    .as_deref()
+                    .and_then(|name| self.struct_schemas.get(name))
+                    .cloned();
+                self.assign_expr_to_slot(*index, declared_schema.as_ref(), expr)?;
             }
             Stmt::Assign { index, expr, line } => {
                 self.assembler.mark_line(*line);
-                self.assign_expr_to_slot(*index, expr)?;
+                self.assign_expr_to_slot(*index, None, expr)?;
             }
             Stmt::ClosureLet { line, closure } => {
                 self.assembler.mark_line(*line);
@@ -286,7 +295,7 @@ impl Compiler {
             }
             Stmt::Drop { index, line } => {
                 self.assembler.mark_line(*line);
-                self.assign_expr_to_slot(*index, &Expr::Null)?;
+                self.assign_expr_to_slot(*index, None, &Expr::Null)?;
             }
         }
         Ok(())
@@ -858,7 +867,12 @@ impl Compiler {
         }
     }
 
-    fn assign_expr_to_slot(&mut self, slot: LocalSlot, expr: &Expr) -> Result<(), CompileError> {
+    fn assign_expr_to_slot(
+        &mut self,
+        slot: LocalSlot,
+        declared_schema: Option<&TypeSchema>,
+        expr: &Expr,
+    ) -> Result<(), CompileError> {
         if let Some(callable) = self.callable_binding_from_expr(expr)? {
             self.callable_bindings.insert(slot, callable.clone());
             match callable {
@@ -871,7 +885,27 @@ impl Compiler {
         self.callable_bindings.remove(&slot);
         self.compile_scalar_expr(expr)?;
         self.emit_stloc(slot)?;
-        self.type_state.set(slot, ty);
+        let slot_declared_schema = declared_schema
+            .cloned()
+            .or_else(|| self.type_state.has_declared_schema(slot).then(|| self.type_state.schema(slot).cloned()).flatten());
+        let schema = slot_declared_schema
+            .clone()
+            .or_else(|| typing::infer_expr_schema_with_function_impls_and_imports(
+                expr,
+                &self.type_state,
+                &self.function_impls,
+                &self.struct_schemas,
+                &self.host_import_return_types,
+                &self.host_import_signatures,
+            ));
+        let from_declared_schema =
+            slot_declared_schema.is_some() || self.type_state.has_declared_schema(slot);
+        let ty = slot_declared_schema
+            .as_ref()
+            .map(typing::bound_type_from_schema)
+            .unwrap_or(ty);
+        self.type_state
+            .set_with_schema_origin(slot, ty, schema, from_declared_schema);
         Ok(())
     }
 
@@ -935,7 +969,7 @@ impl Compiler {
         let frame_slots = collect_function_frame_slots(function_impl);
         let callable_snapshot = self.callable_bindings.clone();
         for (arg, slot) in args.iter().zip(function_impl.param_slots.iter()) {
-            self.assign_expr_to_slot(*slot, arg)?;
+            self.assign_expr_to_slot(*slot, None, arg)?;
         }
         if self.inline_call_stack.contains(&index) {
             self.callable_bindings = callable_snapshot;
@@ -970,7 +1004,7 @@ impl Compiler {
         let frame_slots = collect_closure_frame_slots(closure);
         let callable_snapshot = self.callable_bindings.clone();
         for (arg, slot) in args.iter().zip(closure.param_slots.iter()) {
-            self.assign_expr_to_slot(*slot, arg)?;
+            self.assign_expr_to_slot(*slot, None, arg)?;
         }
         let result = self.compile_expr(&closure.body);
         self.callable_bindings = callable_snapshot;
@@ -1083,7 +1117,7 @@ impl Compiler {
             expr,
             &self.type_state,
             &self.function_impls,
-            &self.local_schemas,
+            &self.struct_schemas,
             &self.host_import_return_types,
             &self.host_import_signatures,
         )
@@ -1099,7 +1133,7 @@ impl Compiler {
             stmts,
             &mut state,
             &self.function_impls,
-            &self.local_schemas,
+            &self.struct_schemas,
             &self.host_import_return_types,
             &self.host_import_signatures,
         );

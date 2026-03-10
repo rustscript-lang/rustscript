@@ -376,7 +376,15 @@ pub(super) fn validate_expr(
                 strict_function_add_types,
             )?;
             let mut nested = state.clone();
-            bind_expr_result_to_slot(&mut nested, *value_slot, value, state, value_ty, context);
+            bind_expr_result_to_slot(
+                &mut nested,
+                *value_slot,
+                None,
+                value,
+                state,
+                value_ty,
+                context,
+            );
             let mut arm_type = BoundType::Unknown;
             for (_pattern, arm_expr) in arms {
                 let ty = validate_expr(
@@ -453,26 +461,36 @@ fn validate_expr_children(
                     strict_function_add_types,
                 )?;
             }
+            if let Expr::LocalCall(slot, args) = expr
+                && let Some(InferredCallable::Closure(closure)) = state.callable(*slot).cloned()
+            {
+                validate_callable_body(
+                    closure.param_slots.as_slice(),
+                    closure.capture_copies.as_slice(),
+                    &[],
+                    &closure.body,
+                    Some(args.as_slice()),
+                    state,
+                    line_context,
+                    source_name,
+                    context,
+                )?;
+            }
         }
         Expr::Closure(closure) => {
-            let _ = validate_expr(
+            validate_callable_body(
+                closure.param_slots.as_slice(),
+                closure.capture_copies.as_slice(),
+                &[],
                 &closure.body,
+                None,
                 state,
                 line_context,
                 source_name,
                 context,
-                false,
             )?;
         }
         Expr::ClosureCall(closure, args) => {
-            let _ = validate_expr(
-                &closure.body,
-                state,
-                line_context,
-                source_name,
-                context,
-                false,
-            )?;
             for arg in args {
                 let _ = validate_expr(
                     arg,
@@ -483,9 +501,48 @@ fn validate_expr_children(
                     strict_function_add_types,
                 )?;
             }
+            validate_callable_body(
+                closure.param_slots.as_slice(),
+                closure.capture_copies.as_slice(),
+                &[],
+                &closure.body,
+                Some(args.as_slice()),
+                state,
+                line_context,
+                source_name,
+                context,
+            )?;
         }
         _ => {}
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_callable_body(
+    param_slots: &[LocalSlot],
+    capture_copies: &[(LocalSlot, LocalSlot)],
+    body_stmts: &[super::super::ir::Stmt],
+    body_expr: &Expr,
+    args: Option<&[Expr]>,
+    state: &LocalTypeState,
+    line_context: Option<u32>,
+    source_name: Option<&str>,
+    context: &mut TypeContext<'_>,
+) -> Result<(), CompileError> {
+    let Some(mut nested) = context.build_callable_state(param_slots, capture_copies, args, state)
+    else {
+        return Ok(());
+    };
+    validate_stmts(body_stmts, &mut nested, line_context, source_name, context, false)?;
+    let _ = validate_expr(
+        body_expr,
+        &nested,
+        line_context,
+        source_name,
+        context,
+        false,
+    )?;
     Ok(())
 }
 
@@ -528,7 +585,12 @@ fn refine_state_for_condition(
 ) -> LocalTypeState {
     let mut refined = state.clone();
     if truthy && let Some((slot, ty)) = extract_type_guard(condition) {
-        refined.set(slot, ty);
+        refined.set_with_schema_origin(
+            slot,
+            ty,
+            state.schema(slot).cloned(),
+            state.has_declared_schema(slot),
+        );
     }
     refined
 }

@@ -299,6 +299,7 @@ impl Parser {
             || self.check(&TokenKind::Use)
             || (self.dialect.allow_import_stmt() && self.check(&TokenKind::Import))
             || self.check(&TokenKind::Fn)
+            || self.check(&TokenKind::Struct)
             || self.check(&TokenKind::Let)
             || self.check(&TokenKind::For)
             || self.check(&TokenKind::While)

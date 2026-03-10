@@ -66,11 +66,13 @@ impl Parser {
             stmts: vec![
                 Stmt::Let {
                     index: lhs_slot,
+                    declared_struct: None,
                     expr: lhs,
                     line,
                 },
                 Stmt::Let {
                     index: rhs_slot,
+                    declared_struct: None,
                     expr: rhs,
                     line,
                 },

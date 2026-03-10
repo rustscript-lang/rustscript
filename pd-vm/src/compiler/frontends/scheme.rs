@@ -606,11 +606,13 @@ fn build_scheme_optional_member_expr(
         stmts: vec![
             Stmt::Let {
                 index: target_slot,
+                declared_struct: None,
                 expr: target,
                 line: line_u32,
             },
             Stmt::Let {
                 index: result_slot,
+                declared_struct: None,
                 expr: Expr::Null,
                 line: line_u32,
             },
@@ -622,6 +624,7 @@ fn build_scheme_optional_member_expr(
                 then_branch: vec![
                     Stmt::Let {
                         index: keys_slot,
+                        declared_struct: None,
                         expr: Expr::Call(
                             BuiltinFunction::Keys.call_index(),
                             vec![Expr::Var(target_slot)],
@@ -630,11 +633,13 @@ fn build_scheme_optional_member_expr(
                     },
                     Stmt::Let {
                         index: idx_slot,
+                        declared_struct: None,
                         expr: Expr::Int(0),
                         line: line_u32,
                     },
                     Stmt::Let {
                         index: found_slot,
+                        declared_struct: None,
                         expr: Expr::Bool(false),
                         line: line_u32,
                     },
@@ -1601,11 +1606,13 @@ fn lower_scheme_non_strict_compare(
         stmts: vec![
             Stmt::Let {
                 index: lhs_slot,
+                declared_struct: None,
                 expr: lhs,
                 line: 1,
             },
             Stmt::Let {
                 index: rhs_slot,
+                declared_struct: None,
                 expr: rhs,
                 line: 1,
             },
