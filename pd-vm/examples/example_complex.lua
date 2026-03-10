@@ -44,7 +44,7 @@ local function keep(value)
     return value
 end
 local regex_ok = re.match("^lua$", "LUA", "i")
-local payload = { lang = "lua", score = closure_value, chained = chained_score }
+local payload = { lang = "lua", score = closure_value, chained = closure_value }
 local payload_json = json.encode(payload)
 local payload_decoded = json.decode(payload_json)
 local json_score = payload_decoded.score
@@ -56,8 +56,12 @@ end
 
 local unpack_ok = first_only == closure_value and first_score == closure_value and second_score == total and third_score == nil and branch_a == closure_value and branch_b == nil and branch_c == nil
 
-if regex_ok and io_ok and sleep_ok and json_score == chained_score and unpack_ok then
-    print(keep(branch_a))
+if chained_score ~= nil then
+    if regex_ok and io_ok and sleep_ok and json_score == closure_value and unpack_ok and missing_score == nil then
+        print(keep(chained_score))
+    else
+        print(0)
+    end
 else
     print(0)
 end

@@ -659,6 +659,28 @@ impl AvailabilityAnalyzer {
                 self.mark_field_moved(&mut out, *root, field_key);
                 Ok(out)
             }
+            Expr::OptionalGet {
+                container,
+                key,
+                container_slot,
+                key_slot,
+            } => {
+                let container_state = self.analyze_expr(container, state, line)?;
+                let mut out = self.analyze_expr(key, &container_state, line)?;
+                self.mark_available(&mut out, *container_slot, line)?;
+                self.mark_available(&mut out, *key_slot, line)?;
+                Ok(out)
+            }
+            Expr::OptionUnwrapOr {
+                value,
+                value_slot,
+                fallback,
+            } => {
+                let mut value_state = self.analyze_expr(value, state, line)?;
+                self.mark_available(&mut value_state, *value_slot, line)?;
+                let then_state = self.analyze_expr(fallback, &value_state, line)?;
+                Ok(self.merge_states(then_state, value_state))
+            }
             Expr::Call(index, args) => {
                 if !self.enable_local_move_semantics {
                     if let Some(root_slot) = self.extract_collection_mutation_root(*index, args) {
@@ -775,8 +797,12 @@ impl AvailabilityAnalyzer {
                 self.mark_available(&mut value_state, *value_slot, line)?;
 
                 let mut merged_state: Option<FlowState> = None;
-                for (_, arm_expr) in arms {
-                    let arm_state = self.analyze_expr(arm_expr, &value_state, line)?;
+                for (pattern, arm_expr) in arms {
+                    let mut arm_state_in = value_state.clone();
+                    if let Some(binding_slot) = pattern.binding_slot() {
+                        self.mark_available(&mut arm_state_in, binding_slot, line)?;
+                    }
+                    let arm_state = self.analyze_expr(arm_expr, &arm_state_in, line)?;
                     merged_state = Some(match merged_state {
                         Some(existing) => self.merge_states(existing, arm_state),
                         None => arm_state,

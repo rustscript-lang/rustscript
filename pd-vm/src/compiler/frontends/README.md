@@ -46,8 +46,8 @@ Supported syntax and features:
 - Expressions: literals (`int`, `float`, `bool`, `string`, `null`), arithmetic (`+ - * / %`),
   logical (`! && ||`), comparison (`== != < >`), function calls, closures (`|...| expr`),
   if-expression form (`if cond => { ... } else => { ... }`), match expressions.
-- Match patterns: int/string/null literals, wildcard `_`, and type constructors
-  `Some(TypeName)` / `Option::Some(TypeName)`.
+- Match patterns: int/string/null literals, wildcard `_`, `None`, non-null binding patterns
+  `Some(name)`, and type constructors `Some(TypeName)` / `Option::Some(TypeName)`.
 - Collections: array literal `[]`, brace literals for arrays/maps, `obj.member`, `obj[key]`,
   optional chaining (`?.` and `?.[key]`), slice syntax (`[a:b]`, `[:b]`, `[a:]`), map key
   literals including `null`.
@@ -64,6 +64,11 @@ Supported syntax and features:
   - Known mixed numeric arithmetic widens to `float`.
   - `if`-expression branches and `if`/`else` local merges with conflicting known concrete types are
     rejected during compilation.
+  - Optional chaining in RustScript requires the container to come from a user-declared schema.
+  - Values produced by RustScript optional chaining stay optional until handled with
+    `.unwrap_or(...)`, a `!= null` refinement, or a `match` arm that binds `Some(name)`.
+  - After `.unwrap_or(...)`, a successful `!= null` refinement, or a `Some(name)` match arm, the
+    compiler and lint layer keep the concrete inner type instead of degrading to `unknown`.
 - RustScript ownership and liveness behavior (current):
   - `let` bindings are immutable by default; use `let mut` for mutable bindings.
   - Reassignment (`x = ...`), indexed/member mutation (`x[i] = ...`, `x.k = ...`), and `&mut`

@@ -157,6 +157,7 @@ pub(crate) struct LocalTypeState {
     by_slot: HashMap<LocalSlot, BoundType>,
     schemas: HashMap<LocalSlot, TypeSchema>,
     declared_schema_slots: HashSet<LocalSlot>,
+    optional_slots: HashSet<LocalSlot>,
     callables: HashMap<LocalSlot, InferredCallable>,
 }
 
@@ -180,12 +181,16 @@ impl LocalTypeState {
         self.declared_schema_slots.contains(&slot)
     }
 
+    pub(crate) fn is_optional(&self, slot: LocalSlot) -> bool {
+        self.optional_slots.contains(&slot)
+    }
+
     pub(super) fn iter_slots(&self) -> impl Iterator<Item = LocalSlot> + '_ {
         self.by_slot.keys().copied()
     }
 
     pub(crate) fn set(&mut self, slot: LocalSlot, ty: BoundType) {
-        self.set_with_schema_origin(slot, ty, None, false);
+        self.set_with_optional_schema_origin(slot, ty, None, false, false);
     }
 
     pub(crate) fn set_with_schema_origin(
@@ -194,6 +199,17 @@ impl LocalTypeState {
         ty: BoundType,
         schema: Option<TypeSchema>,
         from_declared_schema: bool,
+    ) {
+        self.set_with_optional_schema_origin(slot, ty, schema, from_declared_schema, false);
+    }
+
+    pub(crate) fn set_with_optional_schema_origin(
+        &mut self,
+        slot: LocalSlot,
+        ty: BoundType,
+        schema: Option<TypeSchema>,
+        from_declared_schema: bool,
+        optional: bool,
     ) {
         if ty == BoundType::Unknown {
             self.by_slot.remove(&slot);
@@ -210,6 +226,11 @@ impl LocalTypeState {
         } else {
             self.declared_schema_slots.remove(&slot);
         }
+        if optional {
+            self.optional_slots.insert(slot);
+        } else {
+            self.optional_slots.remove(&slot);
+        }
         self.callables.remove(&slot);
     }
 
@@ -217,6 +238,7 @@ impl LocalTypeState {
         self.by_slot.remove(&slot);
         self.schemas.remove(&slot);
         self.declared_schema_slots.remove(&slot);
+        self.optional_slots.remove(&slot);
         self.callables.insert(slot, callable);
     }
 
@@ -245,6 +267,11 @@ impl LocalTypeState {
                 source.schema(source_slot).cloned().or(fallback_schema),
                 source.has_declared_schema(source_slot) || fallback_from_declared_schema,
             );
+            if source.is_optional(source_slot) {
+                self.optional_slots.insert(slot);
+            } else {
+                self.optional_slots.remove(&slot);
+            }
         }
     }
 
@@ -252,6 +279,7 @@ impl LocalTypeState {
         self.by_slot.clear();
         self.schemas.clear();
         self.declared_schema_slots.clear();
+        self.optional_slots.clear();
         self.callables.clear();
         for slot in lhs.iter_slots().chain(rhs.iter_slots()) {
             let l = lhs.get(slot);
@@ -267,6 +295,9 @@ impl LocalTypeState {
             }
             if lhs.has_declared_schema(slot) && rhs.has_declared_schema(slot) {
                 self.declared_schema_slots.insert(slot);
+            }
+            if lhs.is_optional(slot) || rhs.is_optional(slot) {
+                self.optional_slots.insert(slot);
             }
         }
         for slot in lhs.callables.keys().chain(rhs.callables.keys()) {

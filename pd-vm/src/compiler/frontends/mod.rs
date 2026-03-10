@@ -316,7 +316,7 @@ fn parse_lowered_repl_with_mapping(
 }
 
 fn map_spans_to_original_source(
-    spans: &mut Vec<crate::compiler::source_map::Span>,
+    spans: &mut [crate::compiler::source_map::Span],
     lowered: &LoweredSource,
     source_map: &SourceMap,
     lowered_source_id: u32,

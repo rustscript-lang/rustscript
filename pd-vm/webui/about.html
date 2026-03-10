@@ -70,10 +70,11 @@
     <ul>
       <li><strong>Statements:</strong> <code>use</code>, <code>fn</code>, <code>pub fn</code>, <code>let</code>, assignment, indexed/member assignment, <code>if</code>/<code>else</code>, <code>while</code>, C-style <code>for</code>, <code>break</code>, <code>continue</code>.</li>
       <li><strong>Expressions:</strong> literals (<code>int</code>, <code>float</code>, <code>bool</code>, <code>string</code>, <code>null</code>), arithmetic, logical, comparison, function calls, closures (<code>|...| expr</code>), if-expression form (<code>if cond => { ... } else => { ... }</code>), match expressions.</li>
-      <li><strong>Match patterns:</strong> int/string/null literals, wildcard <code>_</code>, and type constructors <code>Some(TypeName)</code> / <code>Option::Some(TypeName)</code>.</li>
+      <li><strong>Match patterns:</strong> int/string/null literals, wildcard <code>_</code>, <code>None</code>, non-null binding patterns <code>Some(name)</code>, and type constructors <code>Some(TypeName)</code> / <code>Option::Some(TypeName)</code>.</li>
       <li><strong>Collections:</strong> array literal <code>[]</code>, brace literals for arrays/maps, <code>obj.member</code>, <code>obj[key]</code>, optional chaining (<code>?.</code> and <code>?.[key]</code>), slice syntax (<code>[a:b]</code>, <code>[:b]</code>, <code>[a:]</code>), map key literals including <code>null</code>.</li>
       <li><strong>Builtins:</strong> namespaces <code>io::...</code>, <code>re::...</code>, <code>json::...</code>, and <code>jit::...</code>.</li>
       <li><strong>Default runtime host namespace:</strong> <code>use runtime;</code> then <code>runtime::sleep(ms)</code>. In the browser playground this validates the argument and returns immediately because wasm cannot block the UI thread.</li>
+      <li><strong>Optional-chain typing:</strong> in RustScript, <code>?.</code> requires a user-declared schema. Optional results must be handled with <code>.unwrap_or(...)</code>, a <code>!= null</code> refinement, or a <code>match</code> arm that binds <code>Some(name)</code> before normal use, and handled values keep their concrete type in both compiler and lint diagnostics.</li>
     </ul>
 
     <h3>Ownership And Liveness Behavior</h3>
@@ -98,7 +99,7 @@
       <li>Recursive RustScript function declarations are not supported by current inlining-based lowering.</li>
       <li>Function declarations implicitly capture outer locals (snapshot at declaration time).</li>
       <li>In move-semantics mode, implicit captures follow expression semantics.</li>
-      <li><code>match</code> patterns are limited to int/string/null literals, <code>_</code>, and type constructors (<code>Some(TypeName)</code>).</li>
+      <li><code>match</code> patterns are limited to int/string/null literals, <code>None</code>, <code>Some(name)</code>, <code>_</code>, and type constructors (<code>Some(TypeName)</code>).</li>
       <li><code>break</code> and <code>continue</code> are only valid inside loops.</li>
       <li>Host import namespace support allows <code>vm</code>, virtual host namespaces like <code>runtime::</code>, and builtin namespaces <code>io::</code>, <code>re::</code>, <code>json::</code>, and <code>jit::</code>.</li>
     </ul>

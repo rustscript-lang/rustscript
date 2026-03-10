@@ -2069,6 +2069,29 @@ fn rustscript_if_and_match_runtime_cases_work() {
             expected_stack: vec![Value::Int(6)],
             expected_locals: None,
         },
+        RuntimeCase {
+            name: "match expression supports None and Some binding for optional values",
+            source: r#"
+                struct Data { values: [int] }
+                let data: Data = { values: [41] };
+
+                let present = match data?.values?.[0] {
+                    None => 0,
+                    Some(value) => value + 1,
+                    _ => 0,
+                };
+                let missing = match data?.values?.[1] {
+                    None => 1,
+                    Some(value) => value,
+                    _ => 0,
+                };
+
+                present + missing;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(43)],
+            expected_locals: None,
+        },
     ];
     run_runtime_cases(&cases);
 }
@@ -2095,7 +2118,7 @@ fn rustscript_if_and_match_parse_rejection_cases_work() {
                 };
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_contains_all: &["int/string/null literals, type patterns"],
+            expected_contains_all: &["int/string/null literals, None, Some(name), type patterns"],
         },
     ];
     for case in &cases {
@@ -2842,6 +2865,162 @@ fn rustscript_recursive_struct_schema_compile_rejections_work() {
     ];
 
     run_source_error_cases(&cases);
+}
+
+#[test]
+fn rustscript_optional_chain_requires_declared_schema_and_explicit_handling() {
+    let runtime_cases = vec![rustscript_runtime_case(
+        "declared schema optional chain unwrap_or keeps concrete type",
+        r#"
+            struct Stats { score: int }
+            struct Profile { stats: Stats }
+
+            let present: Profile = { stats: { score: 41 } };
+            let missing: Profile = null;
+
+            let present_score = present?.stats?.score.unwrap_or(0);
+            let missing_score = missing?.stats?.score.unwrap_or(0);
+            present_score + missing_score + 1;
+        "#,
+        vec![Value::Int(42)],
+    )];
+    run_runtime_cases(&runtime_cases);
+
+    let error_cases = vec![
+        SourceErrorCase {
+            name: "optional chain rejects undeclared rustscript schema",
+            source: r#"
+                let profile = { stats: { score: 41 } };
+                profile?.stats?.score.unwrap_or(0);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &[
+                "optional access requires a user-declared schema in RustScript",
+            ],
+        },
+        SourceErrorCase {
+            name: "optional chain result must be unwrapped before arithmetic",
+            source: r#"
+                struct Stats { score: int }
+                struct Profile { stats: Stats }
+
+                let profile: Profile = { stats: { score: 41 } };
+                let score = profile?.stats?.score;
+                score + 1;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &["optional value must be unwrapped before binary operation"],
+        },
+        SourceErrorCase {
+            name: "optional chain capture in fn must be handled before arithmetic",
+            source: r#"
+                struct Stats { score: int }
+                struct Profile { stats: Stats }
+
+                let profile: Profile = { stats: { score: 41 } };
+                let score = profile?.stats?.score;
+
+                fn add() {
+                    score + 1
+                }
+
+                add();
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &["optional value must be unwrapped before binary operation"],
+        },
+        SourceErrorCase {
+            name: "Some and None match patterns require an optional value",
+            source: r#"
+                let value = 41;
+                match value {
+                    None => 0,
+                    Some(found) => found + 1,
+                    _ => 0,
+                };
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &["Some(...) and None match patterns require an optional value"],
+        },
+    ];
+    run_source_error_cases(&error_cases);
+}
+
+#[test]
+fn rustscript_optional_chain_rejects_statistically_mismatched_declared_schemas() {
+    let error_cases = vec![
+        SourceErrorCase {
+            name: "optional chain rejects wrong nested field type under declared schema",
+            source: r#"
+                struct Stats { score: int }
+                struct Profile { stats: Stats }
+
+                let profile: Profile = { stats: { score: "oops" } };
+                profile?.stats?.score.unwrap_or(0);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &[
+                "field 'stats.score' is declared as schema type 'int' but was assigned string",
+            ],
+        },
+        SourceErrorCase {
+            name: "optional chain rejects missing required nested field under declared schema",
+            source: r#"
+                struct Stats { score: int }
+                struct Profile { stats: Stats }
+
+                let profile: Profile = {};
+                profile?.stats?.score.unwrap_or(0);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &[
+                "field 'stats' is required by the declared schema but is missing",
+            ],
+        },
+        SourceErrorCase {
+            name: "optional chain rejects reassignment that violates declared schema",
+            source: r#"
+                struct Stats { score: int }
+                struct Profile { stats: Stats }
+
+                let mut profile: Profile = { stats: { score: 41 } };
+                profile = { stats: { score: "oops" } };
+                profile?.stats?.score.unwrap_or(0);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &[
+                "field 'stats.score' is declared as schema type 'int' but was assigned string",
+            ],
+        },
+        SourceErrorCase {
+            name: "optional match binding still rejects wrong nested field type under declared schema",
+            source: r#"
+                struct Stats { score: int }
+                struct Profile { stats: Stats }
+
+                let profile: Profile = { stats: { score: "oops" } };
+                match profile?.stats?.score {
+                    None => 0,
+                    Some(score) => score + 1,
+                    _ => 0,
+                };
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &[
+                "field 'stats.score' is declared as schema type 'int' but was assigned string",
+            ],
+        },
+    ];
+
+    run_source_error_cases(&error_cases);
 }
 
 #[test]

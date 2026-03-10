@@ -77,11 +77,13 @@ base = 8;
 let mut closure_value = add(5);
 
 let profile: Profile = { stats: { score: closure_value } };
-let stats = profile?.stats;
-let chained_score = stats?.score;
-
-let matched = match chained_score {
-    12 => closure_value,
+let matched = match profile?.stats?.score {
+    None => 0,
+    Some(score) => if score == 12 => {
+        closure_value
+    } else => {
+        0
+    },
     _ => 0,
 };
 

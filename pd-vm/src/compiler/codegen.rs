@@ -205,10 +205,15 @@ impl Compiler {
                 }
                 let callable_snapshot = self.callable_bindings.clone();
                 let type_state_snapshot = self.type_state.clone();
+                let then_refined_type_state =
+                    typing::refine_state_for_condition(&type_state_snapshot, condition, true);
+                let else_refined_type_state =
+                    typing::refine_state_for_condition(&type_state_snapshot, condition, false);
                 let else_label = self.fresh_label("else");
                 let end_label = self.fresh_label("endif");
                 self.compile_scalar_expr(condition)?;
                 self.assembler.brfalse_label(&else_label);
+                self.type_state = then_refined_type_state;
                 self.compile_stmts(then_branch)?;
                 let then_type_state = self.type_state.clone();
                 self.assembler.br_label(&end_label);
@@ -216,7 +221,7 @@ impl Compiler {
                     .label(&else_label)
                     .map_err(CompileError::Assembler)?;
                 self.callable_bindings = callable_snapshot.clone();
-                self.type_state = type_state_snapshot.clone();
+                self.type_state = else_refined_type_state;
                 self.compile_stmts(else_branch)?;
                 let else_type_state = self.type_state.clone();
                 self.assembler
@@ -237,9 +242,8 @@ impl Compiler {
                 self.assembler.mark_line(*line);
                 self.compile_stmt(init)?;
                 let loop_entry_type_state = self.type_state.clone();
-                let stabilized_loop_type_state = self.stabilize_loop_type_state(
-                    &loop_entry_type_state,
-                    |iterated| {
+                let stabilized_loop_type_state =
+                    self.stabilize_loop_type_state(&loop_entry_type_state, |iterated| {
                         let _ = typing::infer_expr_type_with_function_impls_and_imports(
                             condition,
                             iterated,
@@ -264,8 +268,7 @@ impl Compiler {
                             &self.host_import_return_types,
                             &self.host_import_signatures,
                         );
-                    },
-                );
+                    });
                 self.type_state = stabilized_loop_type_state;
                 let start_label = self.fresh_label("for_start");
                 let continue_label = self.fresh_label("for_continue");
@@ -382,6 +385,21 @@ impl Compiler {
             }
             Expr::String(value) => {
                 self.assembler.push_const(Value::string(value.clone()));
+            }
+            Expr::OptionalGet {
+                container,
+                key,
+                container_slot,
+                key_slot,
+            } => {
+                self.compile_optional_get_expr(container, key, *container_slot, *key_slot)?;
+            }
+            Expr::OptionUnwrapOr {
+                value,
+                value_slot,
+                fallback,
+            } => {
+                self.compile_option_unwrap_or_expr(value, *value_slot, fallback)?;
             }
             Expr::FunctionRef(_) => {
                 return Err(CompileError::CallableUsedAsValue);
@@ -557,19 +575,31 @@ impl Compiler {
                 then_expr,
                 else_expr,
             } => {
+                let callable_snapshot = self.callable_bindings.clone();
+                let type_state_snapshot = self.type_state.clone();
                 self.compile_scalar_expr(condition)?;
                 let else_label = self.fresh_label("if_else");
                 let end_label = self.fresh_label("if_end");
                 self.assembler.brfalse_label(&else_label);
+                self.type_state =
+                    typing::refine_state_for_condition(&type_state_snapshot, condition, true);
                 self.compile_expr(then_expr)?;
+                let then_type_state = self.type_state.clone();
                 self.assembler.br_label(&end_label);
                 self.assembler
                     .label(&else_label)
                     .map_err(CompileError::Assembler)?;
+                self.callable_bindings = callable_snapshot.clone();
+                self.type_state =
+                    typing::refine_state_for_condition(&type_state_snapshot, condition, false);
                 self.compile_expr(else_expr)?;
+                let else_type_state = self.type_state.clone();
                 self.assembler
                     .label(&end_label)
                     .map_err(CompileError::Assembler)?;
+                self.callable_bindings = callable_snapshot;
+                self.type_state
+                    .merge_from_branches(&then_type_state, &else_type_state);
             }
             Expr::Match {
                 value_slot,
@@ -580,23 +610,54 @@ impl Compiler {
             } => {
                 self.compile_scalar_expr(value)?;
                 self.emit_stloc(*value_slot)?;
+                let callable_snapshot = self.callable_bindings.clone();
+                let match_entry_type_state = self.type_state.clone();
                 let end_label = self.fresh_label("match_end");
+                let mut merged_type_state: Option<typing::LocalTypeState> = None;
                 for (pattern, arm_expr) in arms {
                     let next_label = self.fresh_label("match_next");
+                    self.callable_bindings = callable_snapshot.clone();
+                    self.type_state = match_entry_type_state.clone();
                     self.compile_match_pattern_condition(*value_slot, pattern)?;
                     self.assembler.brfalse_label(&next_label);
+                    self.bind_match_pattern_slot(
+                        pattern,
+                        value,
+                        *value_slot,
+                        &match_entry_type_state,
+                    )?;
                     self.compile_scalar_expr(arm_expr)?;
                     self.emit_stloc(*result_slot)?;
+                    let arm_type_state = self.type_state.clone();
+                    merged_type_state = Some(match merged_type_state {
+                        Some(existing) => {
+                            let mut merged = typing::LocalTypeState::default();
+                            merged.merge_from_branches(&existing, &arm_type_state);
+                            merged
+                        }
+                        None => arm_type_state,
+                    });
                     self.assembler.br_label(&end_label);
                     self.assembler
                         .label(&next_label)
                         .map_err(CompileError::Assembler)?;
                 }
+                self.callable_bindings = callable_snapshot.clone();
+                self.type_state = match_entry_type_state.clone();
                 self.compile_scalar_expr(default)?;
                 self.emit_stloc(*result_slot)?;
+                let default_type_state = self.type_state.clone();
                 self.assembler
                     .label(&end_label)
                     .map_err(CompileError::Assembler)?;
+                self.callable_bindings = callable_snapshot;
+                self.type_state = if let Some(existing) = merged_type_state {
+                    let mut merged = typing::LocalTypeState::default();
+                    merged.merge_from_branches(&existing, &default_type_state);
+                    merged
+                } else {
+                    default_type_state
+                };
                 self.emit_copy_ldloc(*result_slot)?;
             }
             Expr::Block { stmts, expr } => {
@@ -605,6 +666,136 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    fn compile_optional_get_expr(
+        &mut self,
+        container: &Expr,
+        key: &Expr,
+        container_slot: LocalSlot,
+        key_slot: LocalSlot,
+    ) -> Result<(), CompileError> {
+        self.compile_scalar_expr(container)?;
+        self.emit_stloc(container_slot)?;
+        self.compile_scalar_expr(key)?;
+        self.emit_stloc(key_slot)?;
+
+        let map_lookup = Expr::IfElse {
+            condition: Box::new(Expr::Eq(
+                Box::new(Expr::Call(
+                    BuiltinFunction::Len.call_index(),
+                    vec![Expr::Call(
+                        BuiltinFunction::Set.call_index(),
+                        vec![Expr::Var(container_slot), Expr::Var(key_slot), Expr::Null],
+                    )],
+                )),
+                Box::new(Expr::Call(
+                    BuiltinFunction::Len.call_index(),
+                    vec![Expr::Var(container_slot)],
+                )),
+            )),
+            then_expr: Box::new(Expr::Call(
+                BuiltinFunction::Get.call_index(),
+                vec![Expr::Var(container_slot), Expr::Var(key_slot)],
+            )),
+            else_expr: Box::new(Expr::Null),
+        };
+        let index_lookup = Expr::IfElse {
+            condition: Box::new(Expr::Eq(
+                Box::new(Expr::Call(
+                    BuiltinFunction::TypeOf.call_index(),
+                    vec![Expr::Var(key_slot)],
+                )),
+                Box::new(Expr::String("int".to_string())),
+            )),
+            then_expr: Box::new(Expr::IfElse {
+                condition: Box::new(Expr::Lt(
+                    Box::new(Expr::Var(key_slot)),
+                    Box::new(Expr::Int(0)),
+                )),
+                then_expr: Box::new(Expr::Null),
+                else_expr: Box::new(Expr::IfElse {
+                    condition: Box::new(Expr::Lt(
+                        Box::new(Expr::Var(key_slot)),
+                        Box::new(Expr::Call(
+                            BuiltinFunction::Len.call_index(),
+                            vec![Expr::Var(container_slot)],
+                        )),
+                    )),
+                    then_expr: Box::new(Expr::Call(
+                        BuiltinFunction::Get.call_index(),
+                        vec![Expr::Var(container_slot), Expr::Var(key_slot)],
+                    )),
+                    else_expr: Box::new(Expr::Null),
+                }),
+            }),
+            else_expr: Box::new(Expr::Null),
+        };
+        let lowered = Expr::IfElse {
+            condition: Box::new(Expr::Eq(
+                Box::new(Expr::Call(
+                    BuiltinFunction::TypeOf.call_index(),
+                    vec![Expr::Var(container_slot)],
+                )),
+                Box::new(Expr::String("null".to_string())),
+            )),
+            then_expr: Box::new(Expr::Null),
+            else_expr: Box::new(Expr::IfElse {
+                condition: Box::new(Expr::Eq(
+                    Box::new(Expr::Call(
+                        BuiltinFunction::TypeOf.call_index(),
+                        vec![Expr::Var(container_slot)],
+                    )),
+                    Box::new(Expr::String("map".to_string())),
+                )),
+                then_expr: Box::new(map_lookup),
+                else_expr: Box::new(Expr::IfElse {
+                    condition: Box::new(Expr::Eq(
+                        Box::new(Expr::Call(
+                            BuiltinFunction::TypeOf.call_index(),
+                            vec![Expr::Var(container_slot)],
+                        )),
+                        Box::new(Expr::String("array".to_string())),
+                    )),
+                    then_expr: Box::new(index_lookup.clone()),
+                    else_expr: Box::new(Expr::IfElse {
+                        condition: Box::new(Expr::Eq(
+                            Box::new(Expr::Call(
+                                BuiltinFunction::TypeOf.call_index(),
+                                vec![Expr::Var(container_slot)],
+                            )),
+                            Box::new(Expr::String("string".to_string())),
+                        )),
+                        then_expr: Box::new(index_lookup),
+                        else_expr: Box::new(Expr::Null),
+                    }),
+                }),
+            }),
+        };
+
+        self.compile_expr(&lowered)
+    }
+
+    fn compile_option_unwrap_or_expr(
+        &mut self,
+        value: &Expr,
+        value_slot: LocalSlot,
+        fallback: &Expr,
+    ) -> Result<(), CompileError> {
+        self.compile_scalar_expr(value)?;
+        self.emit_stloc(value_slot)?;
+        let lowered = Expr::IfElse {
+            condition: Box::new(Expr::Eq(
+                Box::new(Expr::Call(
+                    BuiltinFunction::TypeOf.call_index(),
+                    vec![Expr::Var(value_slot)],
+                )),
+                Box::new(Expr::String("null".to_string())),
+            )),
+            then_expr: Box::new(fallback.clone()),
+            else_expr: Box::new(Expr::Var(value_slot)),
+        };
+        self.compile_expr(&lowered)
     }
 
     fn bind_closure_captures(&mut self, closure: &ClosureExpr) -> Result<(), CompileError> {
@@ -813,6 +1004,31 @@ impl Compiler {
                     *mode = CaptureBindingMode::Move;
                 }
             }
+            Expr::OptionalGet {
+                container,
+                key,
+                container_slot,
+                key_slot,
+            } => {
+                if *container_slot == captured_slot || *key_slot == captured_slot {
+                    *seen = true;
+                    *mode = (*mode).max(context);
+                }
+                self.capture_mode_for_expr(container, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(key, captured_slot, context, mode, seen);
+            }
+            Expr::OptionUnwrapOr {
+                value,
+                value_slot,
+                fallback,
+            } => {
+                if *value_slot == captured_slot {
+                    *seen = true;
+                    *mode = (*mode).max(context);
+                }
+                self.capture_mode_for_expr(value, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(fallback, captured_slot, context, mode, seen);
+            }
             Expr::Call(_, args) | Expr::LocalCall(_, args) => {
                 for arg in args {
                     self.capture_mode_for_expr(arg, captured_slot, context, mode, seen);
@@ -954,7 +1170,26 @@ impl Compiler {
             }
             return Ok(());
         }
-        let ty = self.infer_bound_type(expr);
+        let optional = typing::expr_is_optional_with_function_impls_and_imports(
+            expr,
+            &self.type_state,
+            &self.function_impls,
+            &self.struct_schemas,
+            &self.host_import_return_types,
+            &self.host_import_signatures,
+        );
+        let ty = if optional {
+            typing::infer_optional_expr_inner_type_with_function_impls_and_imports(
+                expr,
+                &self.type_state,
+                &self.function_impls,
+                &self.struct_schemas,
+                &self.host_import_return_types,
+                &self.host_import_signatures,
+            )
+        } else {
+            self.infer_bound_type(expr)
+        };
         self.callable_bindings.remove(&slot);
         self.compile_scalar_expr(expr)?;
         self.emit_stloc(slot)?;
@@ -965,14 +1200,25 @@ impl Compiler {
                 .flatten()
         });
         let schema = slot_declared_schema.clone().or_else(|| {
-            typing::infer_expr_schema_with_function_impls_and_imports(
-                expr,
-                &self.type_state,
-                &self.function_impls,
-                &self.struct_schemas,
-                &self.host_import_return_types,
-                &self.host_import_signatures,
-            )
+            if optional {
+                typing::infer_optional_expr_inner_schema_with_function_impls_and_imports(
+                    expr,
+                    &self.type_state,
+                    &self.function_impls,
+                    &self.struct_schemas,
+                    &self.host_import_return_types,
+                    &self.host_import_signatures,
+                )
+            } else {
+                typing::infer_expr_schema_with_function_impls_and_imports(
+                    expr,
+                    &self.type_state,
+                    &self.function_impls,
+                    &self.struct_schemas,
+                    &self.host_import_return_types,
+                    &self.host_import_signatures,
+                )
+            }
         });
         let from_declared_schema =
             slot_declared_schema.is_some() || self.type_state.has_declared_schema(slot);
@@ -980,8 +1226,13 @@ impl Compiler {
             .as_ref()
             .map(typing::bound_type_from_schema)
             .unwrap_or(ty);
-        self.type_state
-            .set_with_schema_origin(slot, ty, schema, from_declared_schema);
+        self.type_state.set_with_optional_schema_origin(
+            slot,
+            ty,
+            schema,
+            from_declared_schema,
+            optional,
+        );
         Ok(())
     }
 
@@ -1136,6 +1387,17 @@ impl Compiler {
                 self.assembler.push_const(Value::Null);
                 self.assembler.ceq();
             }
+            MatchPattern::None => {
+                self.emit_copy_ldloc(value_slot)?;
+                self.assembler.push_const(Value::Null);
+                self.assembler.ceq();
+            }
+            MatchPattern::SomeBinding(_) => {
+                self.emit_copy_ldloc(value_slot)?;
+                self.assembler.push_const(Value::Null);
+                self.assembler.ceq();
+                self.assembler.not();
+            }
             MatchPattern::Type(type_pattern) => {
                 self.compile_match_type_pattern_condition(value_slot, type_pattern)?;
             }
@@ -1185,6 +1447,39 @@ impl Compiler {
         self.assembler
             .push_const(Value::string(expected.to_string()));
         self.assembler.ceq();
+        Ok(())
+    }
+
+    fn bind_match_pattern_slot(
+        &mut self,
+        pattern: &MatchPattern,
+        value: &Expr,
+        value_slot: LocalSlot,
+        match_entry_type_state: &typing::LocalTypeState,
+    ) -> Result<(), CompileError> {
+        let Some(binding_slot) = pattern.binding_slot() else {
+            return Ok(());
+        };
+        let ty = typing::infer_optional_expr_inner_type_with_function_impls_and_imports(
+            value,
+            match_entry_type_state,
+            &self.function_impls,
+            &self.struct_schemas,
+            &self.host_import_return_types,
+            &self.host_import_signatures,
+        );
+        let schema = typing::infer_optional_expr_inner_schema_with_function_impls_and_imports(
+            value,
+            match_entry_type_state,
+            &self.function_impls,
+            &self.struct_schemas,
+            &self.host_import_return_types,
+            &self.host_import_signatures,
+        );
+        self.emit_copy_ldloc(value_slot)?;
+        self.emit_stloc(binding_slot)?;
+        self.type_state
+            .set_with_optional_schema_origin(binding_slot, ty, schema, false, false);
         Ok(())
     }
 
@@ -1448,6 +1743,26 @@ fn collect_expr_slot_footprint(expr: &Expr, slots: &mut BTreeSet<LocalSlot>) {
         }
         Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
             slots.insert(*root);
+        }
+        Expr::OptionalGet {
+            container,
+            key,
+            container_slot,
+            key_slot,
+        } => {
+            slots.insert(*container_slot);
+            slots.insert(*key_slot);
+            collect_expr_slot_footprint(container, slots);
+            collect_expr_slot_footprint(key, slots);
+        }
+        Expr::OptionUnwrapOr {
+            value,
+            value_slot,
+            fallback,
+        } => {
+            slots.insert(*value_slot);
+            collect_expr_slot_footprint(value, slots);
+            collect_expr_slot_footprint(fallback, slots);
         }
         Expr::Call(_, args) => {
             for arg in args {

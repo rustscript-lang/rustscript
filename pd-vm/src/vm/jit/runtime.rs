@@ -315,7 +315,8 @@ impl Vm {
                 }
                 TraceStep::IAddImm(imm) => {
                     let lhs = self.pop_int()?;
-                    self.stack.push(crate::bytecode::Value::Int(lhs.wrapping_add(*imm)));
+                    self.stack
+                        .push(crate::bytecode::Value::Int(lhs.wrapping_add(*imm)));
                 }
                 TraceStep::ILocalAddImm { local, imm } => {
                     let lhs = self
@@ -323,7 +324,8 @@ impl Vm {
                         .get(*local as usize)
                         .ok_or(VmError::InvalidLocal(*local))?
                         .as_int()?;
-                    self.stack.push(crate::bytecode::Value::Int(lhs.wrapping_add(*imm)));
+                    self.stack
+                        .push(crate::bytecode::Value::Int(lhs.wrapping_add(*imm)));
                 }
                 TraceStep::FAdd => {
                     self.float_add_op()?;
@@ -358,7 +360,8 @@ impl Vm {
                 }
                 TraceStep::ISubImm(imm) => {
                     let lhs = self.pop_int()?;
-                    self.stack.push(crate::bytecode::Value::Int(lhs.wrapping_sub(*imm)));
+                    self.stack
+                        .push(crate::bytecode::Value::Int(lhs.wrapping_sub(*imm)));
                 }
                 TraceStep::ILocalSubImm { local, imm } => {
                     let lhs = self
@@ -366,7 +369,8 @@ impl Vm {
                         .get(*local as usize)
                         .ok_or(VmError::InvalidLocal(*local))?
                         .as_int()?;
-                    self.stack.push(crate::bytecode::Value::Int(lhs.wrapping_sub(*imm)));
+                    self.stack
+                        .push(crate::bytecode::Value::Int(lhs.wrapping_sub(*imm)));
                 }
                 TraceStep::FSub => {
                     self.float_binary_numeric_op(|lhs, rhs| Ok(lhs - rhs))?;
@@ -398,7 +402,8 @@ impl Vm {
                 }
                 TraceStep::IMulImm(imm) => {
                     let lhs = self.pop_int()?;
-                    self.stack.push(crate::bytecode::Value::Int(lhs.wrapping_mul(*imm)));
+                    self.stack
+                        .push(crate::bytecode::Value::Int(lhs.wrapping_mul(*imm)));
                 }
                 TraceStep::ILocalMulImm { local, imm } => {
                     let lhs = self
@@ -406,7 +411,8 @@ impl Vm {
                         .get(*local as usize)
                         .ok_or(VmError::InvalidLocal(*local))?
                         .as_int()?;
-                    self.stack.push(crate::bytecode::Value::Int(lhs.wrapping_mul(*imm)));
+                    self.stack
+                        .push(crate::bytecode::Value::Int(lhs.wrapping_mul(*imm)));
                 }
                 TraceStep::FMul => {
                     self.float_binary_numeric_op(|lhs, rhs| Ok(lhs * rhs))?;
@@ -436,7 +442,9 @@ impl Vm {
                 TraceStep::IDivImm(imm) => {
                     let lhs = self.pop_int()?;
                     self.stack
-                        .push(crate::bytecode::Value::Int(crate::vm::checked_int_div(lhs, *imm)?));
+                        .push(crate::bytecode::Value::Int(crate::vm::checked_int_div(
+                            lhs, *imm,
+                        )?));
                 }
                 TraceStep::ILocalDivImm { local, imm } => {
                     let lhs = self
@@ -445,7 +453,9 @@ impl Vm {
                         .ok_or(VmError::InvalidLocal(*local))?
                         .as_int()?;
                     self.stack
-                        .push(crate::bytecode::Value::Int(crate::vm::checked_int_div(lhs, *imm)?));
+                        .push(crate::bytecode::Value::Int(crate::vm::checked_int_div(
+                            lhs, *imm,
+                        )?));
                 }
                 TraceStep::FDiv => {
                     self.float_binary_numeric_op(|lhs, rhs| Ok(lhs / rhs))?;
@@ -475,7 +485,9 @@ impl Vm {
                 TraceStep::IModImm(imm) => {
                     let lhs = self.pop_int()?;
                     self.stack
-                        .push(crate::bytecode::Value::Int(crate::vm::checked_int_rem(lhs, *imm)?));
+                        .push(crate::bytecode::Value::Int(crate::vm::checked_int_rem(
+                            lhs, *imm,
+                        )?));
                 }
                 TraceStep::ILocalModImm { local, imm } => {
                     let lhs = self
@@ -484,7 +496,9 @@ impl Vm {
                         .ok_or(VmError::InvalidLocal(*local))?
                         .as_int()?;
                     self.stack
-                        .push(crate::bytecode::Value::Int(crate::vm::checked_int_rem(lhs, *imm)?));
+                        .push(crate::bytecode::Value::Int(crate::vm::checked_int_rem(
+                            lhs, *imm,
+                        )?));
                 }
                 TraceStep::FMod => {
                     self.float_binary_numeric_op(|lhs, rhs| Ok(lhs % rhs))?;
@@ -634,7 +648,8 @@ impl Vm {
                         .get(*local as usize)
                         .ok_or(VmError::InvalidLocal(*local))?
                         .as_int()?;
-                    self.stack.push(crate::bytecode::Value::Int(lhs.wrapping_shl(*amount)));
+                    self.stack
+                        .push(crate::bytecode::Value::Int(lhs.wrapping_shl(*amount)));
                 }
                 TraceStep::Stloc(index) => {
                     let value = self.pop_value()?;

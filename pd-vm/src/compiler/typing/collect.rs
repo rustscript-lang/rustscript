@@ -4,8 +4,9 @@ use crate::bytecode::ValueType;
 
 use super::super::ir::{ClosureExpr, Expr, FunctionImpl, LocalSlot, Stmt, TypeSchema};
 use super::context::TypeContext;
-use super::helpers::bind_expr_result_to_slot;
+use super::helpers::{bind_expr_result_to_slot, refine_state_for_match_pattern};
 use super::state::{BoundType, HostCallableSignature, LocalTypeState, stabilize_loop_state};
+use super::validate::refine_state_for_condition;
 
 pub(super) fn observed_function_param_slice(
     observed: &HashMap<u16, Vec<BoundType>>,
@@ -58,12 +59,7 @@ pub(super) fn seed_function_capture_state(
         if let Some(callable) = observed.callable(*captured_slot).cloned() {
             state.bind_callable(*captured_slot, callable);
         } else {
-            state.set_with_schema_origin(
-                *captured_slot,
-                observed.get(*captured_slot),
-                observed.schema(*captured_slot).cloned(),
-                observed.has_declared_schema(*captured_slot),
-            );
+            state.copy_binding_from(observed, *captured_slot, *captured_slot, None, false);
         }
     }
 }
@@ -90,6 +86,7 @@ pub(super) fn collect_function_types(
         function_names,
         host_import_return_types,
         host_import_signatures,
+        false,
     );
     seed_function_param_state(
         &mut state,
@@ -144,10 +141,12 @@ pub(super) fn collect_stmt_types(
             Stmt::FuncDecl {
                 index, has_impl, ..
             } => {
-                if *has_impl
-                    && let Some(function_impl) = context.function_impls.get(index)
-                {
-                    context.observe_function_capture_state(*index, &function_impl.capture_copies, state);
+                if *has_impl && let Some(function_impl) = context.function_impls.get(index) {
+                    context.observe_function_capture_state(
+                        *index,
+                        &function_impl.capture_copies,
+                        state,
+                    );
                     for (source_slot, captured_slot) in &function_impl.capture_copies {
                         let ty = state.get(*source_slot);
                         record_local_type(local_types, *captured_slot, ty);
@@ -212,8 +211,8 @@ pub(super) fn collect_stmt_types(
                 ..
             } => {
                 collect_expr_types(condition, state, local_types, callable_slots, context);
-                let mut then_state = state.clone();
-                let mut else_state = state.clone();
+                let mut then_state = refine_state_for_condition(state, condition, true);
+                let mut else_state = refine_state_for_condition(state, condition, false);
                 collect_stmt_types(
                     then_branch,
                     &mut then_state,
@@ -286,6 +285,18 @@ fn collect_expr_types(
         | Expr::MoveField { .. }
         | Expr::MoveIndex { .. }
         | Expr::FunctionRef(_) => {
+            let _ = context.infer_expr_type(expr, state);
+        }
+        Expr::OptionalGet { container, key, .. } => {
+            collect_expr_types(container, state, local_types, callable_slots, context);
+            collect_expr_types(key, state, local_types, callable_slots, context);
+            let _ = context.infer_expr_type(expr, state);
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            collect_expr_types(value, state, local_types, callable_slots, context);
+            collect_expr_types(fallback, state, local_types, callable_slots, context);
             let _ = context.infer_expr_type(expr, state);
         }
         Expr::Call(_, args) | Expr::LocalCall(_, args) => {
@@ -373,8 +384,12 @@ fn collect_expr_types(
                 context,
             );
             record_local_type(local_types, *value_slot, nested.get(*value_slot));
-            for (_, arm_expr) in arms {
-                collect_expr_types(arm_expr, &nested, local_types, callable_slots, context);
+            for (pattern, arm_expr) in arms {
+                let arm_state = refine_state_for_match_pattern(&nested, pattern, *value_slot);
+                if let Some(binding_slot) = pattern.binding_slot() {
+                    record_local_type(local_types, binding_slot, arm_state.get(binding_slot));
+                }
+                collect_expr_types(arm_expr, &arm_state, local_types, callable_slots, context);
             }
             collect_expr_types(default, &nested, local_types, callable_slots, context);
             let _ = context.infer_expr_type(expr, state);

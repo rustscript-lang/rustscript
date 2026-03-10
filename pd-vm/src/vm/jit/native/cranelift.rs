@@ -27,7 +27,7 @@ mod layout;
 use super::exec::ExecutableBuffer;
 use bridge::{pd_vm_cranelift_sconcat, pd_vm_cranelift_step};
 use codegen::{
-    emit_helper_step, emit_inline_or_helper_step, emit_interrupt_tick_inline,
+    HelperEmitCtx, emit_helper_step, emit_inline_or_helper_step, emit_interrupt_tick_inline,
     emit_interrupt_tick_inline_guarded, entry_signature, helper_signature, jump_with_status,
     resolve_offsets,
 };
@@ -264,10 +264,12 @@ pub(crate) fn compile_trace(
             }
             emit_helper_step(
                 &mut b,
-                vm_ptr,
-                helper_ref,
-                exit_block,
-                offsets,
+                HelperEmitCtx {
+                    vm_ptr,
+                    helper_ref,
+                    exit_block,
+                    offsets,
+                },
                 step_ip,
                 trace.root_ip,
                 step,

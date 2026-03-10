@@ -1,4 +1,5 @@
 #![cfg(feature = "runtime")]
+#![allow(clippy::duplicate_mod)]
 
 #[path = "vm/drop_contract_tests.rs"]
 mod drop_contract_tests;

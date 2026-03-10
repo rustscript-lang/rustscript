@@ -638,7 +638,10 @@ impl Parser {
             }
 
             let (body_expr, body_expr_line) = if let Some(expr) = trailing_expr {
-                (expr, trailing_expr_line.expect("trailing expr should record a line"))
+                (
+                    expr,
+                    trailing_expr_line.expect("trailing expr should record a line"),
+                )
             } else {
                 let Some(last_stmt) = body_stmts.pop() else {
                     return Err(ParseError {

@@ -1,6 +1,14 @@
 use super::layout::checked_add_i32;
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) struct HelperEmitCtx {
+    pub(super) vm_ptr: cranelift_codegen::ir::Value,
+    pub(super) helper_ref: FuncRef,
+    pub(super) exit_block: Block,
+    pub(super) offsets: ResolvedOffsets,
+}
+
 pub(super) fn emit_interrupt_tick_inline(
     b: &mut FunctionBuilder,
     vm_ptr: cranelift_codegen::ir::Value,
@@ -1946,9 +1954,11 @@ fn emit_inline_stack_float_imm_binop(
         top_addr,
         layout.value.float_payload_offset,
     );
-    let imm_val = b.ins().f64const(cranelift_codegen::ir::immediates::Ieee64::with_bits(
-        imm_bits,
-    ));
+    let imm_val = b
+        .ins()
+        .f64const(cranelift_codegen::ir::immediates::Ieee64::with_bits(
+            imm_bits,
+        ));
     let out = match kind {
         FloatImmBinopKind::Add => b.ins().fadd(lhs, imm_val),
         FloatImmBinopKind::Sub => b.ins().fsub(lhs, imm_val),
@@ -2016,12 +2026,14 @@ fn emit_inline_local_numeric_imm_op(
     let local_addr = value_addr(b, pointer_type, locals_ptr, local_index, layout.value.size);
     let local_tag = load_tag_i32(b, layout.value, local_addr);
     let type_matches = match imm {
-        NumberImmediate::Int(_) => b
-            .ins()
-            .icmp_imm(IntCC::Equal, local_tag, i64::from(layout.value.int_tag)),
-        NumberImmediate::Float(_) => b
-            .ins()
-            .icmp_imm(IntCC::Equal, local_tag, i64::from(layout.value.float_tag)),
+        NumberImmediate::Int(_) => {
+            b.ins()
+                .icmp_imm(IntCC::Equal, local_tag, i64::from(layout.value.int_tag))
+        }
+        NumberImmediate::Float(_) => {
+            b.ins()
+                .icmp_imm(IntCC::Equal, local_tag, i64::from(layout.value.float_tag))
+        }
     };
     b.ins().brif(type_matches, type_ok, &[], exit, &[]);
 
@@ -2058,7 +2070,12 @@ fn emit_inline_local_numeric_imm_op(
                         b.ins().jump(exit, &[]);
                         b.switch_to_block(exit);
                         emit_trace_exit_to_step_ip(
-                            b, vm_ptr, exit_block, pointer_type, offsets, step_ip,
+                            b,
+                            vm_ptr,
+                            exit_block,
+                            pointer_type,
+                            offsets,
+                            step_ip,
                         )?;
                         b.switch_to_block(next);
                         return Ok(());
@@ -2087,8 +2104,9 @@ fn emit_inline_local_numeric_imm_op(
                     store_bool_in_value(b, layout.value, dst_addr, cmp);
                 }
                 LocalNumericImmOpKind::Shl => {
-                    let amount = u32::try_from(imm)
-                        .map_err(|_| VmError::JitNative("shift immediate out of range".to_string()))?;
+                    let amount = u32::try_from(imm).map_err(|_| {
+                        VmError::JitNative("shift immediate out of range".to_string())
+                    })?;
                     let rhs = b.ins().iconst(types::I64, i64::from(amount));
                     let out = b.ins().ishl(lhs, rhs);
                     store_int_in_value(b, layout.value, dst_addr, out);
@@ -2102,9 +2120,11 @@ fn emit_inline_local_numeric_imm_op(
                 local_addr,
                 layout.value.float_payload_offset,
             );
-            let rhs = b.ins().f64const(cranelift_codegen::ir::immediates::Ieee64::with_bits(
-                imm_bits,
-            ));
+            let rhs = b
+                .ins()
+                .f64const(cranelift_codegen::ir::immediates::Ieee64::with_bits(
+                    imm_bits,
+                ));
             match kind {
                 LocalNumericImmOpKind::Add => {
                     let out = b.ins().fadd(lhs, rhs);
@@ -2187,8 +2207,7 @@ fn emit_inline_sconcat(
         .ins()
         .icmp_imm(IntCC::Equal, status, STATUS_CONTINUE as i64);
     let else_args = [BlockArg::Value(status)];
-    b.ins()
-        .brif(is_continue, next, &[], exit_block, &else_args);
+    b.ins().brif(is_continue, next, &[], exit_block, &else_args);
 
     b.switch_to_block(next);
     let _ = root_ip;
@@ -3192,10 +3211,7 @@ fn emit_inline_guard_true(
 
 pub(super) fn emit_helper_step(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    helper_ref: FuncRef,
-    exit_block: Block,
-    offsets: ResolvedOffsets,
+    ctx: HelperEmitCtx,
     step_ip: usize,
     root_ip: usize,
     step: &TraceStep,
@@ -3203,12 +3219,20 @@ pub(super) fn emit_helper_step(
     let tuple = step_to_call(step, root_ip)?;
     let next = b.create_block();
     emit_helper_step_from_call_tuple(
-        b, vm_ptr, helper_ref, exit_block, next, offsets, step_ip, tuple,
+        b,
+        ctx.vm_ptr,
+        ctx.helper_ref,
+        ctx.exit_block,
+        next,
+        ctx.offsets,
+        step_ip,
+        tuple,
     );
     b.switch_to_block(next);
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_helper_step_from_call_tuple(
     b: &mut FunctionBuilder,
     vm_ptr: cranelift_codegen::ir::Value,

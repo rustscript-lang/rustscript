@@ -301,6 +301,16 @@ impl AvailabilityAnalyzer {
                     *mode = CaptureBindingMode::Move;
                 }
             }
+            Expr::OptionalGet { container, key, .. } => {
+                self.capture_mode_for_expr(container, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(key, captured_slot, context, mode, seen);
+            }
+            Expr::OptionUnwrapOr {
+                value, fallback, ..
+            } => {
+                self.capture_mode_for_expr(value, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(fallback, captured_slot, context, mode, seen);
+            }
             Expr::Call(_, args) | Expr::LocalCall(_, args) => {
                 for arg in args {
                     self.capture_mode_for_expr(arg, captured_slot, context, mode, seen);
@@ -396,7 +406,12 @@ impl AvailabilityAnalyzer {
                 arms,
                 default,
             } => {
-                if *value_slot == captured_slot || *result_slot == captured_slot {
+                if *value_slot == captured_slot
+                    || *result_slot == captured_slot
+                    || arms
+                        .iter()
+                        .any(|(pattern, _)| pattern.binding_slot() == Some(captured_slot))
+                {
                     *seen = true;
                     *mode = (*mode).max(context);
                 }

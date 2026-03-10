@@ -1011,6 +1011,78 @@ mod runtime_tests {
     }
 
     #[test]
+    fn lint_reports_optional_usage_errors_and_keeps_concrete_types_after_handling() {
+        let error_source = r#"
+            struct Stats { score: int }
+            struct Profile { stats: Stats }
+
+            let profile: Profile = { stats: { score: 41 } };
+            let score = profile?.stats?.score;
+            score + 1;
+        "#;
+
+        let report = lint_source_with_flavor(error_source, SourceFlavor::RustScript);
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.severity == LintSeverity::Error
+                    && diagnostic
+                        .message
+                        .contains("optional value must be unwrapped before binary operation")
+            }),
+            "expected optional usage error, got {:?}",
+            report.diagnostics
+        );
+
+        let ok_source = r#"
+            struct Stats { score: int }
+            struct Profile { stats: Stats }
+
+            let profile: Profile = { stats: { score: 41 } };
+            let score = profile?.stats?.score.unwrap_or(0);
+            score + 1;
+        "#;
+
+        let report = lint_source_with_flavor(ok_source, SourceFlavor::RustScript);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("local 'score'")),
+            "unwrap_or should keep 'score' concrete for lint, got {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity != LintSeverity::Error),
+            "unwrap_or example should not emit lint errors, got {:?}",
+            report.diagnostics
+        );
+
+        let match_source = r#"
+            struct Data { values: [int] }
+            let data: Data = { values: [41] };
+            let result = match data?.values?.[0] {
+                None => 0,
+                Some(value) => value + 1,
+                _ => 0,
+            };
+            result;
+        "#;
+
+        let report = lint_source_with_flavor(match_source, SourceFlavor::RustScript);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity != LintSeverity::Error),
+            "Some(value) match handling should keep the inner type concrete for lint, got {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
     fn run_reports_unknown_local_warnings_after_successful_compile() {
         let source = r#"
             let arr = [1, "two"];

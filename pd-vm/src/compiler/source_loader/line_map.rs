@@ -89,6 +89,16 @@ fn remap_expr_line_numbers(expr: &mut Expr, offset: u32) {
             }
         }
         Expr::Closure(closure) => remap_closure_line_numbers(closure, offset),
+        Expr::OptionalGet { container, key, .. } => {
+            remap_expr_line_numbers(container, offset);
+            remap_expr_line_numbers(key, offset);
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            remap_expr_line_numbers(value, offset);
+            remap_expr_line_numbers(fallback, offset);
+        }
         Expr::Add(lhs, rhs)
         | Expr::Sub(lhs, rhs)
         | Expr::Mul(lhs, rhs)

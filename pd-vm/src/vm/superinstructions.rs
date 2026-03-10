@@ -168,8 +168,12 @@ impl Vm {
                     if stack_len < 2 {
                         return Ok(false);
                     }
-                    let rhs = stack[stack_len - 1].take().expect("rhs scalar should exist");
-                    let lhs = stack[stack_len - 2].take().expect("lhs scalar should exist");
+                    let rhs = stack[stack_len - 1]
+                        .take()
+                        .expect("rhs scalar should exist");
+                    let lhs = stack[stack_len - 2]
+                        .take()
+                        .expect("lhs scalar should exist");
                     stack_len -= 2;
                     let lhs_f = match lhs {
                         ScalarValue::Int(value) => value as f64,
@@ -232,7 +236,10 @@ impl Vm {
                     let Some(dst) = self.decoded_local_index_at(cursor) else {
                         return Ok(false);
                     };
-                    let value = stack[0].take().expect("result scalar should exist").into_value();
+                    let value = stack[0]
+                        .take()
+                        .expect("result scalar should exist")
+                        .into_value();
                     self.store_local_with_drop_contract(dst, value)?;
                     self.ip = cursor + 2;
                     return Ok(true);
@@ -247,8 +254,12 @@ impl Vm {
                     let Some(target) = self.decoded_jump_target_at(cursor + 1) else {
                         return Ok(false);
                     };
-                    let rhs = stack[stack_len - 1].take().expect("rhs scalar should exist");
-                    let lhs = stack[stack_len - 2].take().expect("lhs scalar should exist");
+                    let rhs = stack[stack_len - 1]
+                        .take()
+                        .expect("rhs scalar should exist");
+                    let lhs = stack[stack_len - 2]
+                        .take()
+                        .expect("lhs scalar should exist");
                     let lhs_f = match lhs {
                         ScalarValue::Int(value) => value as f64,
                         ScalarValue::Float(value) => value,

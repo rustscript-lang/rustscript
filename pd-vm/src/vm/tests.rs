@@ -344,8 +344,8 @@ fn shared_map_survives_local_overwrite_after_copy_like_read() {
 
 #[test]
 fn interpreter_ldloc_preserves_local_slot() {
-    let program = Program::new(vec![], vec![OpCode::Ldloc as u8, 0, OpCode::Ret as u8])
-        .with_local_count(1);
+    let program =
+        Program::new(vec![], vec![OpCode::Ldloc as u8, 0, OpCode::Ret as u8]).with_local_count(1);
     let mut vm = Vm::new(program);
     let map_value = Value::map(vec![(Value::string("k"), Value::Int(9))]);
     vm.set_local(0, map_value.clone())
@@ -355,7 +355,11 @@ fn interpreter_ldloc_preserves_local_slot() {
     assert!(matches!(outcome, ExecOutcome::Continue));
     assert_eq!(vm.ip, 2);
     assert_eq!(vm.locals[0], map_value, "ldloc should leave local intact");
-    assert_eq!(vm.stack(), &[map_value], "stack should receive copied value");
+    assert_eq!(
+        vm.stack(),
+        &[map_value],
+        "stack should receive copied value"
+    );
     assert_shared_heap_backing(&vm.locals[0], &vm.stack()[0]);
     assert_eq!(vm.drop_contract_event_count(), 0);
 }
@@ -386,7 +390,7 @@ fn interpreter_explicit_move_sequence_clears_local_slot() {
     let ldloc = step_once(&mut vm).expect("ldloc should execute");
     assert!(matches!(ldloc, ExecOutcome::Continue));
     assert_eq!(vm.locals[0], map_value);
-    assert_eq!(vm.stack(), &[map_value.clone()]);
+    assert_eq!(vm.stack(), std::slice::from_ref(&map_value));
     assert_shared_heap_backing(&vm.locals[0], &vm.stack()[0]);
 
     let ldc = step_once(&mut vm).expect("ldc should execute");
@@ -428,7 +432,10 @@ fn interpreter_fuses_ldloc_ldc_add_stloc_without_touching_stack() {
     assert_eq!(vm.ip, 10, "fusion should consume ldc/add/stloc");
     assert_eq!(vm.locals[0], Value::Int(41));
     assert_eq!(vm.locals[1], Value::Int(42));
-    assert!(vm.stack().is_empty(), "fusion should avoid transient stack traffic");
+    assert!(
+        vm.stack().is_empty(),
+        "fusion should avoid transient stack traffic"
+    );
 }
 
 #[test]
@@ -465,7 +472,10 @@ fn interpreter_fuses_ldloc_ldc_compare_brfalse() {
     let outcome = step_once(&mut vm).expect("fused compare should execute");
     assert!(matches!(outcome, ExecOutcome::Continue));
     assert_eq!(vm.ip, 15, "fusion should jump directly to branch target");
-    assert!(vm.stack().is_empty(), "fusion should avoid bool stack traffic");
+    assert!(
+        vm.stack().is_empty(),
+        "fusion should avoid bool stack traffic"
+    );
 }
 
 #[test]

@@ -1,11 +1,11 @@
 use crate::builtins::{BuiltinFunction, CallableParam, CallableParamType, CallableSignature};
 
 use super::super::CompileError;
-use super::super::ir::{Expr, LocalSlot};
+use super::super::ir::{Expr, LocalSlot, MatchPattern};
 use super::context::{TypeContext, infer_access_schema};
 use super::helpers::{
     bind_expr_result_to_slot, bound_type_label, infer_binary_type, infer_unary_type,
-    is_numeric_bound_type, validate_stmts,
+    is_numeric_bound_type, refine_state_for_match_pattern, validate_stmts,
 };
 use super::state::{BoundType, InferredCallable, LocalTypeState, are_compatible_bound_types};
 
@@ -194,6 +194,78 @@ pub(super) fn validate_expr(
         Expr::Float(_) => BoundType::Float,
         Expr::Bool(_) => BoundType::Bool,
         Expr::String(_) => BoundType::String,
+        Expr::OptionalGet { container, key, .. } => {
+            let _ = validate_expr(
+                container,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            let _ = validate_expr(
+                key,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            ensure_expr_not_optional(
+                key,
+                state,
+                line_context,
+                source_name,
+                context,
+                "optional access key",
+            )?;
+            validate_optional_get_access(expr, state, line_context, source_name, context)?;
+            context.infer_expr_type(expr, state)
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            let _ = validate_expr(
+                value,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            let fallback_ty = validate_expr(
+                fallback,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            if !context.expr_is_optional(value, state) {
+                return Err(optional_usage_error(
+                    line_context,
+                    source_name,
+                    "unwrap_or() requires an optional value",
+                ));
+            }
+            ensure_expr_not_optional(
+                fallback,
+                state,
+                line_context,
+                source_name,
+                context,
+                "unwrap_or() fallback",
+            )?;
+            let inner_ty = context.infer_optional_expr_inner_type(value, state);
+            ensure_compatible_if_else_types(
+                line_context,
+                source_name,
+                "unwrap_or result",
+                inner_ty,
+                fallback_ty,
+            )?;
+            context.infer_expr_type(expr, state)
+        }
         Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => validate_expr(
             inner,
             state,
@@ -257,6 +329,17 @@ pub(super) fn validate_expr(
                 context,
                 strict_function_add_types,
             )?;
+            if context.expr_is_optional(lhs, state) || context.expr_is_optional(rhs, state) {
+                if matches!(expr, Expr::Eq(_, _)) && comparison_accepts_optional(lhs, rhs) {
+                    return Ok(BoundType::Bool);
+                } else {
+                    return Err(optional_usage_error(
+                        line_context,
+                        source_name,
+                        "binary operation",
+                    ));
+                }
+            }
             let inferred = infer_binary_type(expr, lhs_ty, rhs_ty);
             if strict_function_add_types
                 && matches!(expr, Expr::Add(_, _))
@@ -283,6 +366,13 @@ pub(super) fn validate_expr(
                 context,
                 strict_function_add_types,
             )?;
+            if context.expr_is_optional(inner, state) {
+                return Err(optional_usage_error(
+                    line_context,
+                    source_name,
+                    "unary operation",
+                ));
+            }
             infer_unary_type(expr, inner_ty)
         }
         Expr::IfElse {
@@ -350,9 +440,7 @@ pub(super) fn validate_expr(
                 then_ty,
                 else_ty,
             )?;
-            if then_ty == else_ty {
-                then_ty
-            } else if matches!(static_condition, Some(true)) {
+            if then_ty == else_ty || matches!(static_condition, Some(true)) {
                 then_ty
             } else if matches!(static_condition, Some(false)) {
                 else_ty
@@ -386,10 +474,12 @@ pub(super) fn validate_expr(
                 context,
             );
             let mut arm_type = BoundType::Unknown;
-            for (_pattern, arm_expr) in arms {
+            for (pattern, arm_expr) in arms {
+                validate_match_pattern(pattern, *value_slot, &nested, line_context, source_name)?;
+                let arm_state = refine_state_for_match_pattern(&nested, pattern, *value_slot);
                 let ty = validate_expr(
                     arm_expr,
-                    &nested,
+                    &arm_state,
                     line_context,
                     source_name,
                     context,
@@ -460,6 +550,14 @@ fn validate_expr_children(
                     context,
                     strict_function_add_types,
                 )?;
+                ensure_expr_not_optional(
+                    arg,
+                    state,
+                    line_context,
+                    source_name,
+                    context,
+                    "call argument",
+                )?;
             }
             if let Expr::LocalCall(slot, args) = expr
                 && let Some(InferredCallable::Closure(closure)) = state.callable(*slot).cloned()
@@ -499,6 +597,14 @@ fn validate_expr_children(
                     source_name,
                     context,
                     strict_function_add_types,
+                )?;
+                ensure_expr_not_optional(
+                    arg,
+                    state,
+                    line_context,
+                    source_name,
+                    context,
+                    "call argument",
                 )?;
             }
             validate_callable_body(
@@ -566,6 +672,13 @@ fn validate_schema_access(
     if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get) || args.len() != 2 {
         return Ok(());
     }
+    if context.expr_is_optional(&args[0], state) {
+        return Err(optional_usage_error(
+            line_context,
+            source_name,
+            "member/index access",
+        ));
+    }
     if !context.expr_has_declared_schema(&args[0], state) {
         return Ok(());
     }
@@ -581,22 +694,113 @@ fn validate_schema_access(
         })
 }
 
+fn validate_optional_get_access(
+    expr: &Expr,
+    state: &LocalTypeState,
+    line_context: Option<u32>,
+    source_name: Option<&str>,
+    context: &mut TypeContext<'_>,
+) -> Result<(), CompileError> {
+    let Expr::OptionalGet { container, key, .. } = expr else {
+        return Ok(());
+    };
+    if context.require_declared_schema_for_optional_access
+        && !context.expr_has_declared_schema(container, state)
+    {
+        return Err(CompileError::InvalidFieldAccess {
+            line: line_context,
+            source_name: owned_source_name(source_name),
+            detail: "optional access requires a user-declared schema in RustScript".to_string(),
+        });
+    }
+    if !context.expr_has_declared_schema(container, state) {
+        return Ok(());
+    }
+    let Some(container_schema) = context.infer_optional_expr_inner_schema(container, state) else {
+        return Ok(());
+    };
+    infer_access_schema(&container_schema, key, context, state)
+        .map(|_| ())
+        .map_err(|detail| CompileError::InvalidFieldAccess {
+            line: line_context,
+            source_name: owned_source_name(source_name),
+            detail,
+        })
+}
+
+fn optional_usage_error(
+    line: Option<u32>,
+    source_name: Option<&str>,
+    context: &str,
+) -> CompileError {
+    CompileError::InvalidFieldAccess {
+        line,
+        source_name: owned_source_name(source_name),
+        detail: format!("optional value must be unwrapped before {context}"),
+    }
+}
+
+fn ensure_expr_not_optional(
+    expr: &Expr,
+    state: &LocalTypeState,
+    line_context: Option<u32>,
+    source_name: Option<&str>,
+    context: &mut TypeContext<'_>,
+    usage: &str,
+) -> Result<(), CompileError> {
+    if context.expr_is_optional(expr, state) {
+        return Err(optional_usage_error(line_context, source_name, usage));
+    }
+    Ok(())
+}
+
+fn comparison_accepts_optional(lhs: &Expr, rhs: &Expr) -> bool {
+    matches!(lhs, Expr::Null) || matches!(rhs, Expr::Null)
+}
+
+fn validate_match_pattern(
+    pattern: &MatchPattern,
+    value_slot: LocalSlot,
+    state: &LocalTypeState,
+    line_context: Option<u32>,
+    source_name: Option<&str>,
+) -> Result<(), CompileError> {
+    if pattern.requires_optional_value() && !state.is_optional(value_slot) {
+        return Err(CompileError::InvalidFieldAccess {
+            line: line_context,
+            source_name: owned_source_name(source_name),
+            detail: "Some(...) and None match patterns require an optional value".to_string(),
+        });
+    }
+    Ok(())
+}
+
 pub(super) fn owned_source_name(source_name: Option<&str>) -> Option<String> {
     source_name.map(str::to_string)
 }
 
-fn refine_state_for_condition(
+pub(super) fn refine_state_for_condition(
     state: &LocalTypeState,
     condition: &Expr,
     truthy: bool,
 ) -> LocalTypeState {
     let mut refined = state.clone();
     if truthy && let Some((slot, ty)) = extract_type_guard(condition) {
-        refined.set_with_schema_origin(
+        refined.set_with_optional_schema_origin(
             slot,
             ty,
             state.schema(slot).cloned(),
             state.has_declared_schema(slot),
+            false,
+        );
+    }
+    if truthy && let Some(slot) = extract_non_null_guard(condition) {
+        refined.set_with_optional_schema_origin(
+            slot,
+            state.get(slot),
+            state.schema(slot).cloned(),
+            state.has_declared_schema(slot),
+            false,
         );
     }
     refined
@@ -607,6 +811,19 @@ fn extract_type_guard(condition: &Expr) -> Option<(LocalSlot, BoundType)> {
         return None;
     };
     extract_type_guard_side(lhs, rhs).or_else(|| extract_type_guard_side(rhs, lhs))
+}
+
+fn extract_non_null_guard(condition: &Expr) -> Option<LocalSlot> {
+    let Expr::Not(inner) = condition else {
+        return None;
+    };
+    let Expr::Eq(lhs, rhs) = inner.as_ref() else {
+        return None;
+    };
+    match (lhs.as_ref(), rhs.as_ref()) {
+        (Expr::Var(slot), Expr::Null) | (Expr::Null, Expr::Var(slot)) => Some(*slot),
+        _ => None,
+    }
 }
 
 fn extract_type_guard_side(lhs: &Expr, rhs: &Expr) -> Option<(LocalSlot, BoundType)> {
