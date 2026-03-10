@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-pub(crate) mod builtins_impl;
 pub mod diagnostics;
 mod epoch;
 mod fuel;
@@ -28,7 +27,7 @@ pub(crate) enum NumericValue {
 }
 
 impl Value {
-    fn as_int(&self) -> Result<i64, VmError> {
+    pub(crate) fn as_int(&self) -> Result<i64, VmError> {
         match self {
             Value::Int(value) => Ok(*value),
             _ => Err(VmError::TypeMismatch("int")),
@@ -220,7 +219,7 @@ pub struct Vm {
     runtime_print_sink: Option<Box<RuntimePrintSink>>,
     waiting_host_op: Option<WaitingHostOp>,
     next_host_op_id: HostOpId,
-    io_state: builtins_impl::IoState,
+    pub(crate) io_state: crate::builtins::runtime::IoState,
     epoch_handle: EpochHandle,
     epoch_counter_ptr: usize,
     interrupt_mode: InterruptMode,
@@ -429,7 +428,7 @@ impl Vm {
             runtime_print_sink: None,
             waiting_host_op: None,
             next_host_op_id: 1,
-            io_state: builtins_impl::IoState::default(),
+            io_state: crate::builtins::runtime::IoState::default(),
             epoch_handle,
             epoch_counter_ptr,
             interrupt_mode: InterruptMode::None,
@@ -561,7 +560,7 @@ impl Vm {
         self.call_depth = 0;
         self.waiting_host_op = None;
         self.next_host_op_id = 1;
-        self.io_state = builtins_impl::IoState::default();
+        self.io_state = crate::builtins::runtime::IoState::default();
     }
 
     pub fn drop_contract_event_count(&self) -> u64 {
@@ -595,7 +594,7 @@ impl Drop for Vm {
     fn drop(&mut self) {
         self.clear_stack_with_drop_contract();
         self.clear_locals_with_drop_contract();
-        builtins_impl::close_all_handles(self);
+        crate::builtins::runtime::close_all_handles(self);
     }
 }
 

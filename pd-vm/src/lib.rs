@@ -1,5 +1,4 @@
 mod builtins;
-mod function_metadata;
 
 pub mod assembler;
 pub mod bytecode;
@@ -20,6 +19,8 @@ pub mod vm;
 pub mod vmbc;
 
 pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, assemble};
+#[cfg(feature = "runtime")]
+pub use builtins::runtime::print::{PrintHostFunction, PrintlnHostFunction, format_value};
 pub use builtins::{
     BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec, CallableDef, CallableParam,
     CallableParamType, CallableSignature, LanguageBuiltinSpec, builtin_namespace_specs,
@@ -50,8 +51,6 @@ pub use jit::{
     JitAttempt, JitConfig, JitNyiDoc, JitNyiReason, JitSnapshot, JitTrace, JitTraceTerminal,
     TraceJitEngine,
 };
-#[cfg(feature = "runtime")]
-pub use vm::builtins_impl::print::{PrintHostFunction, PrintlnHostFunction, format_value};
 #[cfg(feature = "runtime")]
 pub use vm::diagnostics::render_vm_error;
 #[cfg(feature = "runtime")]

@@ -3,10 +3,10 @@
 use std::task::{Context, Poll};
 
 use crate::builtins::BuiltinFunction;
-
-use super::{CallOutcome, HostOpId, Value, Vm, VmResult};
+use crate::vm::{CallOutcome, HostOpId, Value, Vm, VmResult};
 
 mod core;
+mod host;
 #[cfg(not(target_arch = "wasm32"))]
 mod io;
 #[cfg(target_arch = "wasm32")]
@@ -16,19 +16,18 @@ mod json;
 mod math;
 pub(crate) mod print;
 mod regex;
-mod runtime;
 mod typed;
 
 #[cfg(target_arch = "wasm32")]
 use io_wasm as io;
 
-pub(in crate::vm) use io::IoState;
+pub(crate) use io::IoState;
 use typed::{
     AnyValue, BuiltinResult, IntoBuiltinCallOutcome, IntoHostCallOutcome, NumberValue,
     UnknownValue, VmArray, VmMap, arg, return_values,
 };
 
-pub(super) enum BuiltinCallOutcome {
+pub(crate) enum BuiltinCallOutcome {
     Return(Vec<Value>),
     Pending(HostOpId),
 }
@@ -38,7 +37,7 @@ include!(concat!(
     "/builtin_runtime_dispatch_generated.rs"
 ));
 
-pub(super) fn execute_builtin_call(
+pub(crate) fn execute_builtin_call(
     vm: &mut Vm,
     builtin: BuiltinFunction,
     args: Vec<Value>,
@@ -76,7 +75,7 @@ pub(super) fn execute_builtin_call(
     }
 }
 
-pub(super) fn poll_builtin_io_op(
+pub(crate) fn poll_builtin_io_op(
     vm: &mut Vm,
     op_id: HostOpId,
     cx: &mut Context<'_>,
@@ -84,7 +83,7 @@ pub(super) fn poll_builtin_io_op(
     io::poll_builtin_io_op(vm, op_id, cx)
 }
 
-pub(super) fn close_all_handles(vm: &mut Vm) {
+pub(crate) fn close_all_handles(vm: &mut Vm) {
     io::close_all_handles(vm);
 }
 

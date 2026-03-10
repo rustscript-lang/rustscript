@@ -1,10 +1,14 @@
 // Shared builtin catalog (ids, names, arity, call-index mapping).
-// VM execution logic lives under vm/builtins_impl/.
+// Runtime execution logic lives under builtins/runtime/.
 
+mod metadata;
+#[cfg(feature = "runtime")]
+pub(crate) mod runtime;
+
+pub use self::metadata::{CallableDef, CallableParam, CallableParamType, CallableSignature};
 use crate::ValueType;
-pub use crate::function_metadata::{
-    CallableDef, CallableParam, CallableParamType, CallableSignature,
-};
+#[cfg(feature = "runtime")]
+pub(crate) use crate::vm::{HostFunctionRegistry, Value, Vm, VmResult};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LanguageBuiltinSpec {

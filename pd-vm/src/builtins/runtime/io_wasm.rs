@@ -2,10 +2,10 @@ use std::task::{Context, Poll};
 
 use pd_host_function::pd_host_function;
 
-use super::super::{HostOpId, Value, Vm, VmError, VmResult};
 use super::BuiltinResult;
+use crate::vm::{HostOpId, Value, Vm, VmError, VmResult};
 
-pub(in crate::vm) struct IoState;
+pub(crate) struct IoState;
 
 impl Default for IoState {
     fn default() -> Self {

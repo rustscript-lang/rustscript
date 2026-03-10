@@ -1,63 +1,23 @@
-use super::*;
-#[cfg(feature = "runtime")]
-use crate::vm::Vm;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use crate::HostImport;
+
+use super::codegen::Compiler;
+use super::frontends;
+use super::ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt};
+use super::linker::merge_units;
+use super::source_loader::load_units_for_source_file;
+use super::source_map::SourceMap;
+use super::{
+    CompileSourceFileOptions, CompiledProgram, CompiledReplProgram, ParseError, ReplLocalBinding,
+    SourceError, SourceFlavor, SourcePathError, lifetime, parser, typing,
+};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct LocalDebugRange {
     pub(super) declared_line: Option<u32>,
     pub(super) last_line: Option<u32>,
-}
-
-impl CompiledProgram {
-    #[cfg(feature = "runtime")]
-    pub fn into_vm(self) -> Vm {
-        Vm::new(self.program)
-    }
-}
-
-pub(super) fn normalize_import_spec(spec: String) -> String {
-    normalize_import_key(spec.trim())
-}
-
-fn normalize_import_key(spec: &str) -> String {
-    let normalized = spec.replace('\\', "/");
-    let (prefix, remainder) = split_windows_prefix(&normalized);
-    let absolute = remainder.starts_with('/');
-    let mut segments = Vec::<&str>::new();
-
-    for segment in remainder.split('/') {
-        if segment.is_empty() || segment == "." {
-            continue;
-        }
-        if segment == ".." {
-            match segments.last().copied() {
-                Some(existing) if existing != ".." => {
-                    segments.pop();
-                }
-                _ if !absolute => segments.push(".."),
-                _ => {}
-            }
-            continue;
-        }
-        segments.push(segment);
-    }
-
-    let mut out = String::new();
-    out.push_str(prefix);
-    if absolute {
-        out.push('/');
-    }
-    out.push_str(&segments.join("/"));
-    out
-}
-
-fn split_windows_prefix(input: &str) -> (&str, &str) {
-    let bytes = input.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        (&input[..2], &input[2..])
-    } else {
-        ("", input)
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -353,8 +313,8 @@ fn compile_parsed_output_with_entry_locals(
     // Normal compilation passes no entry locals. The REPL uses this hook to treat
     // carried-over locals from prior entries as already available at snippet start.
     let local_debug_ranges = collect_named_local_debug_ranges(&parsed);
-    let parsed = opt::legalize_builtins_and_bind_types(parsed);
-    opt::validate_if_else_type_consistency(&parsed).map_err(SourceError::Compile)?;
+    let parsed = typing::legalize_builtins_and_bind_types(parsed);
+    typing::validate_if_else_type_consistency(&parsed).map_err(SourceError::Compile)?;
     let parsed = lifetime::enforce_local_availability_with_entry_locals(
         parsed,
         entry_definite_locals,
@@ -362,7 +322,7 @@ fn compile_parsed_output_with_entry_locals(
         enable_local_move_semantics,
     )
     .map_err(SourceError::Parse)?;
-    let type_info = opt::infer_types(&parsed);
+    let type_info = typing::infer_types(&parsed);
     let FrontendIr {
         stmts,
         locals,
@@ -398,9 +358,9 @@ fn compile_parsed_output_with_entry_locals(
     let host_import_return_types = functions
         .iter()
         .filter(|func| !function_impls.contains_key(&func.index))
-        .map(|func| (func.index, opt::BoundType::from(func.return_type)))
+        .map(|func| (func.index, typing::BoundType::from(func.return_type)))
         .collect::<HashMap<_, _>>();
-    let host_import_signatures = opt::build_host_import_signatures(&functions, &function_impls);
+    let host_import_signatures = typing::build_host_import_signatures(&functions, &function_impls);
 
     let mut compiler = Compiler::new();
     compiler.set_type_inference(type_info);
@@ -573,8 +533,7 @@ fn compile_source_with_flavor_and_options_impl(
     }
 
     let path = virtual_inmemory_entry_path(flavor);
-    let (_root_parse_source, units) =
-        source_loader::load_units_for_source_file(&path, flavor, source, options)?;
+    let (_root_parse_source, units) = load_units_for_source_file(&path, flavor, source, options)?;
     let merged = merge_units(units)?;
     compile_parsed_output(
         source.to_string(),
@@ -591,8 +550,7 @@ fn compile_source_at_path_with_flavor_and_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    let (_root_parse_source, units) =
-        source_loader::load_units_for_source_file(path, flavor, source, options)?;
+    let (_root_parse_source, units) = load_units_for_source_file(path, flavor, source, options)?;
     let merged = merge_units(units)?;
     compile_parsed_output(
         source.to_string(),
@@ -632,7 +590,7 @@ fn compile_source_file_impl(
     let flavor = SourceFlavor::from_path(path)?;
     let source_raw = std::fs::read_to_string(path)?;
     let (_root_parse_source, units) =
-        source_loader::load_units_for_source_file(path, flavor, &source_raw, options)?;
+        load_units_for_source_file(path, flavor, &source_raw, options)?;
     let merged = merge_units(units)?;
     compile_parsed_output(
         source_raw,

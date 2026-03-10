@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use super::super::{Value, Vm, VmError, VmResult};
 use super::AnyValue;
 use super::print::format_value;
+use crate::vm::{Value, Vm, VmError, VmResult};
 use pd_host_function::pd_host_function;
 
 #[cfg_attr(not(test), allow(dead_code))]

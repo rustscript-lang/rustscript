@@ -1,7 +1,7 @@
 use regex::Regex;
 
-use super::super::{Value, VmError, VmResult};
 use super::VmArray;
+use crate::vm::{Value, VmError, VmResult};
 use pd_host_function::pd_host_function;
 
 #[pd_host_function(name = "re::match")]

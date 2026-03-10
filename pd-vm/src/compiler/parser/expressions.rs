@@ -1810,3 +1810,16 @@ impl Parser {
         Ok(args)
     }
 }
+
+fn match_type_pattern_from_ident(name: &str) -> Option<MatchTypePattern> {
+    match name {
+        "Int" | "int" => Some(MatchTypePattern::Int),
+        "Float" | "float" => Some(MatchTypePattern::Float),
+        "Number" | "number" => Some(MatchTypePattern::Number),
+        "Bool" | "bool" => Some(MatchTypePattern::Bool),
+        "String" | "string" => Some(MatchTypePattern::String),
+        "Array" | "array" => Some(MatchTypePattern::Array),
+        "Map" | "map" => Some(MatchTypePattern::Map),
+        _ => None,
+    }
+}

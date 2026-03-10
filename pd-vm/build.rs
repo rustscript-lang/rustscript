@@ -74,20 +74,20 @@ fn main() {
 
     let namespace_manifest = manifest_dir
         .join("src")
-        .join("vm")
-        .join("builtins_impl")
+        .join("builtins")
+        .join("runtime")
         .join("namespaces.rs");
     println!("cargo:rerun-if-changed={}", namespace_manifest.display());
     let namespaces = parse_namespace_manifest(&namespace_manifest);
 
     let host_sources = [SourceSpec {
-        path: "src/vm/builtins_impl/runtime.rs".to_string(),
-        module: "runtime".to_string(),
+        path: "src/builtins/runtime/host.rs".to_string(),
+        module: "host".to_string(),
         category: SourceCategory::DefaultHost,
     }];
     let builtin_sources = builtin_source_specs(&namespaces);
     let core_sources = [SourceSpec {
-        path: "src/vm/builtins_impl/core.rs".to_string(),
+        path: "src/builtins/runtime/core.rs".to_string(),
         module: "core".to_string(),
         category: SourceCategory::MetadataOnlyBuiltin,
     }];
@@ -160,7 +160,7 @@ fn builtin_source_specs(namespaces: &[NamespaceDecl]) -> Vec<SourceSpec> {
     namespaces
         .iter()
         .map(|namespace| SourceSpec {
-            path: format!("src/vm/builtins_impl/{}.rs", namespace.module),
+            path: format!("src/builtins/runtime/{}.rs", namespace.module),
             module: namespace.module.clone(),
             category: SourceCategory::NamespacedBuiltin,
         })

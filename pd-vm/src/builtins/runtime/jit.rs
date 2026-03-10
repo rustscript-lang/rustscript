@@ -1,7 +1,7 @@
 use pd_host_function::pd_host_function;
 
-use super::super::{Value, Vm, VmResult};
 use super::VmMap;
+use crate::vm::{Value, Vm, VmResult};
 
 fn config_as_map(vm: &Vm) -> VmMap {
     let config = vm.jit_config();

@@ -1,5 +1,5 @@
-use super::super::{CallOutcome, HostOpId, Value, VmError, VmResult};
 use super::BuiltinCallOutcome;
+use crate::vm::{CallOutcome, HostOpId, Value, VmError, VmResult};
 
 pub(super) type AnyValue = Value;
 pub(super) type UnknownValue = Value;

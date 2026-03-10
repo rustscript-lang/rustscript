@@ -61,7 +61,7 @@ impl HostFunctionRegistry {
             by_name: HashMap::new(),
             plan_cache: HashMap::new(),
         };
-        builtins_impl::register_default_host_functions(&mut registry);
+        crate::builtins::runtime::register_default_host_functions(&mut registry);
         registry
     }
 
@@ -392,7 +392,7 @@ impl Vm {
                 unsafe { (&mut *bridge_ptr).poll_op(waiting.op_id, cx) }
             }
             WaitingHostOpSource::BuiltinIo => {
-                builtins_impl::poll_builtin_io_op(self, waiting.op_id, cx)
+                crate::builtins::runtime::poll_builtin_io_op(self, waiting.op_id, cx)
             }
         };
 
@@ -459,14 +459,14 @@ impl Vm {
             if self.builtin_overrides.contains_key(&index) {
                 return self.execute_builtin_override_call(index, args, call_ip);
             }
-            match builtins_impl::execute_builtin_call(self, builtin, args)? {
-                builtins_impl::BuiltinCallOutcome::Return(values) => {
+            match crate::builtins::runtime::execute_builtin_call(self, builtin, args)? {
+                crate::builtins::runtime::BuiltinCallOutcome::Return(values) => {
                     for value in values {
                         self.stack.push(value);
                     }
                     return Ok(HostCallExecOutcome::Returned);
                 }
-                builtins_impl::BuiltinCallOutcome::Pending(op_id) => {
+                crate::builtins::runtime::BuiltinCallOutcome::Pending(op_id) => {
                     let resume_ip = self.call_resume_ip(call_ip)?;
                     self.set_waiting_host_op(op_id, WaitingHostOpSource::BuiltinIo)?;
                     self.ip = resume_ip;
@@ -626,7 +626,7 @@ impl Vm {
                 .map(|import| import.name.clone())
                 .collect::<Vec<_>>();
             for name in import_names {
-                let _ = builtins_impl::bind_default_host_function(self, &name);
+                let _ = crate::builtins::runtime::bind_default_host_function(self, &name);
             }
         }
 
@@ -644,7 +644,7 @@ impl Vm {
 
             let bound = if let Some(bound) = self.host_function_symbols.get(&import.name).copied() {
                 bound
-            } else if builtins_impl::bind_default_host_function(self, &import.name) {
+            } else if crate::builtins::runtime::bind_default_host_function(self, &import.name) {
                 self.host_function_symbols
                     .get(&import.name)
                     .copied()

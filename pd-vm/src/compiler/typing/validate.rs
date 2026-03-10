@@ -298,53 +298,64 @@ pub(super) fn validate_expr(
             )?;
             let then_state = refine_state_for_condition(state, condition, true);
             let else_state = refine_state_for_condition(state, condition, false);
-            if let Some(true) = eval_static_bool(condition) {
-                validate_expr(
-                    then_expr,
-                    &then_state,
-                    line_context,
-                    source_name,
-                    context,
-                    strict_function_add_types,
-                )?
-            } else if let Some(false) = eval_static_bool(condition) {
-                validate_expr(
-                    else_expr,
-                    &else_state,
-                    line_context,
-                    source_name,
-                    context,
-                    strict_function_add_types,
-                )?
+            let static_condition = eval_static_bool(condition);
+            let (then_ty, else_ty) = match static_condition {
+                Some(true) => (
+                    validate_expr(
+                        then_expr,
+                        &then_state,
+                        line_context,
+                        source_name,
+                        context,
+                        strict_function_add_types,
+                    )?,
+                    context.infer_expr_type(else_expr, &else_state),
+                ),
+                Some(false) => (
+                    context.infer_expr_type(then_expr, &then_state),
+                    validate_expr(
+                        else_expr,
+                        &else_state,
+                        line_context,
+                        source_name,
+                        context,
+                        strict_function_add_types,
+                    )?,
+                ),
+                None => (
+                    validate_expr(
+                        then_expr,
+                        &then_state,
+                        line_context,
+                        source_name,
+                        context,
+                        strict_function_add_types,
+                    )?,
+                    validate_expr(
+                        else_expr,
+                        &else_state,
+                        line_context,
+                        source_name,
+                        context,
+                        strict_function_add_types,
+                    )?,
+                ),
+            };
+            ensure_compatible_if_else_types(
+                line_context,
+                source_name,
+                "expression result",
+                then_ty,
+                else_ty,
+            )?;
+            if then_ty == else_ty {
+                then_ty
+            } else if matches!(static_condition, Some(true)) {
+                then_ty
+            } else if matches!(static_condition, Some(false)) {
+                else_ty
             } else {
-                let then_ty = validate_expr(
-                    then_expr,
-                    &then_state,
-                    line_context,
-                    source_name,
-                    context,
-                    strict_function_add_types,
-                )?;
-                let else_ty = validate_expr(
-                    else_expr,
-                    &else_state,
-                    line_context,
-                    source_name,
-                    context,
-                    strict_function_add_types,
-                )?;
-                ensure_compatible_if_else_types(
-                    line_context,
-                    source_name,
-                    "expression result",
-                    then_ty,
-                    else_ty,
-                )?;
-                if then_ty == else_ty {
-                    then_ty
-                } else {
-                    BoundType::Unknown
-                }
+                BoundType::Unknown
             }
         }
         Expr::Match {
