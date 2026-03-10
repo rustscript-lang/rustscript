@@ -159,7 +159,7 @@ fn render_vm_error_includes_ip_and_source_line() {
 
 #[test]
 fn render_compile_error_highlights_invalid_schema_field_access_line() {
-    let source = "let user: {name: string} = { name: \"Ada\" };\nuser.age;\n";
+    let source = "struct User { name: string }\nlet user: User = { name: \"Ada\" };\nuser.age;\n";
 
     let err = match compile_source(source) {
         Ok(_) => panic!("compile should reject invalid schema field access"),

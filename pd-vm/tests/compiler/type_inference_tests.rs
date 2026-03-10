@@ -611,12 +611,19 @@ fn compiler_infers_dynamic_slice_end_bindings_inside_function_bodies() {
 #[test]
 fn compiler_propagates_declared_object_schema_through_nested_fields_and_arrays() {
     let source = r#"
+        struct Age { first: int }
+        struct User {
+            name: string,
+            age: Age,
+            colors: [int],
+        }
+
         let some_map = {
             name: "Ada",
             age: { first: 41 },
             colors: [7, 8]
         };
-        let user: {name: string, age: { first: int }, colors: [ int ] } = some_map;
+        let user: User = some_map;
         let total = user.age.first + user.colors[0];
         total;
     "#;
@@ -647,120 +654,25 @@ fn compiler_infers_object_literal_shape_without_explicit_alias() {
 }
 
 #[test]
-fn compiler_rejects_missing_field_from_declared_object_schema() {
+fn compiler_attaches_operand_types_for_named_struct_fields_and_arrays() {
     let source = r#"
-        let user: {name: string} = { name: "Ada" };
-        user.age;
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("compile should reject missing schema field access"),
-        Err(err) => err,
-    };
-    let rendered = format!("{err:?}");
-    assert!(
-        rendered.contains("InvalidFieldAccess"),
-        "unexpected error: {rendered}"
-    );
-    assert!(
-        rendered.contains("field 'age' is not declared"),
-        "expected schema field detail in error: {rendered}"
-    );
-}
-
-#[test]
-fn compiler_rejects_wrong_index_type_for_declared_schema_array() {
-    let source = r#"
-        let user: {colors: [ int ]} = { colors: [1, 2] };
-        user.colors["first"];
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("compile should reject wrong schema array index type"),
-        Err(err) => err,
-    };
-    let rendered = format!("{err:?}");
-    assert!(
-        rendered.contains("InvalidFieldAccess"),
-        "unexpected error: {rendered}"
-    );
-    assert!(
-        rendered.contains("array access requires an int index"),
-        "expected schema array detail in error: {rendered}"
-    );
-}
-
-#[test]
-fn compiler_rejects_optional_chain_to_undeclared_schema_field() {
-    let source = r#"
-        let user: {name: string} = { name: "Ada" };
-        user?.age;
-    "#;
-
-    let err = match compile_source(source) {
-        Ok(_) => panic!("compile should reject optional access to missing schema field"),
-        Err(err) => err,
-    };
-    let rendered = format!("{err:?}");
-    assert!(
-        rendered.contains("InvalidFieldAccess"),
-        "unexpected error: {rendered}"
-    );
-    assert!(
-        rendered.contains("field 'age' is not declared"),
-        "expected schema field detail in error: {rendered}"
-    );
-}
-
-#[test]
-fn compiler_propagates_declared_schema_through_optional_chain_subobjects() {
-    let source = r#"
-        let user: {age: { first: int }} = { age: { first: 41 } };
-        let age = user?.age;
-        age?.first;
-    "#;
-
-    let compiled = compile_source(source).expect("compile should succeed");
-
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(41)]);
-}
-
-#[test]
-fn compiler_propagates_declared_schema_through_functions_and_closures() {
-    let source = r#"
-        fn first_age(user) {
-            user.age.first;
+        struct Age { first: int }
+        struct User {
+            name: string,
+            age: Age,
+            colors: [int],
         }
 
-        let user_for_fn: {age: { first: int }} = { age: { first: 41 } };
-        let user_for_capture: {age: { first: int }} = { age: { first: 41 } };
-        let user_for_closure: {age: { first: int }} = { age: { first: 41 } };
-        let read = || user_for_capture.age.first;
-        let pick = |entry| entry.age.first;
-        let via_fn = first_age(user_for_fn) + 1;
-        let via_capture = read() + 2;
-        let via_closure_param = pick(user_for_closure) + 3;
-        via_fn;
-        via_capture;
-        via_closure_param;
+        let some_map = {
+            name: "Ada",
+            age: { first: 41 },
+            colors: [7, 8]
+        };
+        let user: User = some_map;
+        let total = user.age.first + user.colors[0];
+        total;
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    assert_opcode_operand_types(
-        &compiled,
-        OpCode::Add,
-        &[
-            (ValueType::Int, ValueType::Int),
-            (ValueType::Int, ValueType::Int),
-            (ValueType::Int, ValueType::Int),
-        ],
-    );
-
-    let mut vm = Vm::new(compiled.program);
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(42), Value::Int(43), Value::Int(44)]);
+    assert_last_opcode_operand_types(&compiled, OpCode::Add, (ValueType::Int, ValueType::Int));
 }

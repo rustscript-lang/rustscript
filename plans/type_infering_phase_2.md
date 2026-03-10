@@ -85,7 +85,7 @@ match builtin {
 ```
 
 > [!TIP]
-> The namespace builtins are generated from [build.rs](pd-vm/build.rs). You could add a [return_type](pd-vm/tests/type_inference_tests.rs#174-234) field to `NamespaceMemberDecl` so the build script generates return type metadata automatically. But for now, manually expanding the match arms is simpler and lower risk.
+> The namespace builtins are generated from [build.rs](pd-vm/build.rs). You could add a [return_type](pd-vm/tests/compiler/type_inference_tests.rs#174-234) field to `NamespaceMemberDecl` so the build script generates return type metadata automatically. But for now, manually expanding the match arms is simpler and lower risk.
 
 **Verification**: Add tests asserting `typeof(concat("a", "b"))` is inferred as `String` at compile time (constant-folded by existing `TypeOf` folding), and that `keys(m)` infers as `Array`, etc.
 

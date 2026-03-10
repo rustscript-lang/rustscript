@@ -91,7 +91,7 @@ xychart-beta
 
 ## 3) VM-only Microbenchmark (Harness B)
 
-Test: `pd-vm/tests/perf_tests.rs::perf_cooperative_fuel_configuration_impacts_latency`
+Test: `pd-vm/tests/jit/perf_tests.rs::perf_cooperative_fuel_configuration_impacts_latency`
 
 Baseline:
 

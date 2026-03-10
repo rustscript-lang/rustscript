@@ -370,7 +370,7 @@ cargo test -p pd-vm --test example_tests
 Manual perf characterization (ignored by default):
 
 ```powershell
-cargo test -p pd-vm --test perf_tests -- --ignored --nocapture
+cargo test -p pd-vm --test jit_tests perf_ -- --ignored --nocapture
 ```
 
 Migration perf record (handwritten vs Cranelift baseline before handwritten backend removal):

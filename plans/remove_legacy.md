@@ -1,6 +1,6 @@
 # Remove Aliases, Backward Compat, and Legacy Behaviors
 
-Full audit of all `pd-*` crates. No `#[deprecated]` attributes, LEGACY/COMPAT comments, or compat feature flags exist in `pd-vm`, [pd-edge](file:///d:/Workspace/project-d/Dockerfile.pd-edge), or `pd-edge-abi`. All found items are in [pd-controller](file:///d:/Workspace/project-d/Dockerfile.pd-controller). One test in `pd-vm` ([assemble_rejects_legacy_opcode_literals](file:///d:/Workspace/project-d/pd-vm/tests/vm_runtime_tests.rs#435-444)) tests that old opcode names stay rejected—that is a regression guard and should **not** be removed.
+Full audit of all `pd-*` crates. No `#[deprecated]` attributes, LEGACY/COMPAT comments, or compat feature flags exist in `pd-vm`, [pd-edge](file:///d:/Workspace/project-d/Dockerfile.pd-edge), or `pd-edge-abi`. All found items are in [pd-controller](file:///d:/Workspace/project-d/Dockerfile.pd-controller). One test in `pd-vm` ([assemble_rejects_legacy_opcode_literals](file:///d:/Workspace/project-d/pd-vm/tests/vm/vm_runtime_tests.rs#437-445)) tests that old opcode names stay rejected—that is a regression guard and should **not** be removed.
 
 ---
 
@@ -192,7 +192,7 @@ cargo build --workspace
 
 **pd-vm tests** (to confirm regression guard is untouched):
 ```
-cargo test -p pd-vm --test vm_runtime_tests assemble_rejects_legacy_opcode_literals
+cargo test -p pd-vm --test vm_tests assemble_rejects_legacy_opcode_literals
 ```
 
 ### Manual Verification
@@ -200,4 +200,4 @@ cargo test -p pd-vm --test vm_runtime_tests assemble_rejects_legacy_opcode_liter
 1. Run [pd-controller](file:///d:/Workspace/project-d/Dockerfile.pd-controller) with a fresh (empty) `--state-path`. Confirm it starts without warnings.
 2. Verify that saving a program and reloading the controller re-reads it correctly.
 3. In the UI, create a graph that uses the `string_slice` block. Confirm it generates correct code with [start](file:///d:/Workspace/project-d/pd-controller/src/server/handlers.rs#1324-1375)/[end](file:///d:/Workspace/project-d/pd-controller/src/server/ui_codegen.rs#2270-2276) fields and no `length` fallback.
-4. Submit a `POST /rpc/v1/programs/{id}/versions` with a [source](file:///d:/Workspace/project-d/pd-controller/src/server/ui_codegen.rs#3164-3207)-only payload (no `nodes`, no [blocks](file:///d:/Workspace/project-d/pd-controller/src/server/handlers.rs#124-129), `flow_synced: false`) and confirm it is still accepted (this was always valid; the compat guard we're removing only silently mutated `flow_synced`, which was already [false](file:///d:/Workspace/project-d/pd-vm/tests/vm_runtime_tests.rs#61-79) in that payload).
+4. Submit a `POST /rpc/v1/programs/{id}/versions` with a [source](file:///d:/Workspace/project-d/pd-controller/src/server/ui_codegen.rs#3164-3207)-only payload (no `nodes`, no [blocks](file:///d:/Workspace/project-d/pd-controller/src/server/handlers.rs#124-129), `flow_synced: false`) and confirm it is still accepted (this was always valid; the compat guard we're removing only silently mutated `flow_synced`, which was already [false](file:///d:/Workspace/project-d/pd-vm/tests/vm/vm_runtime_tests.rs#61-79) in that payload).

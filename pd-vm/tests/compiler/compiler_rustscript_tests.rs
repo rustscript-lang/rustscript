@@ -2473,6 +2473,192 @@ fn rustscript_non_strict_comparisons_and_integer_edge_literals_work() {
 }
 
 #[test]
+fn rustscript_referenced_struct_schema_runtime_cases_work() {
+    let cases = vec![
+        rustscript_runtime_case(
+            "referenced struct schema propagates through optional chain subobject",
+            r#"
+                struct Age { first: int }
+                struct User { age: Age }
+                let user: User = { age: { first: 41 } };
+                let age = user?.age;
+                age?.first;
+            "#,
+            vec![Value::Int(41)],
+        ),
+        rustscript_runtime_case(
+            "referenced struct schema propagates through functions and closures",
+            r#"
+                struct Age { first: int }
+                struct User { age: Age }
+
+                fn first_age(user) {
+                    user.age.first
+                }
+
+                let user_for_fn: User = { age: { first: 41 } };
+                let user_for_capture: User = { age: { first: 41 } };
+                let user_for_closure: User = { age: { first: 41 } };
+                let read = || user_for_capture.age.first;
+                let pick = |entry| entry.age.first;
+                let via_fn = first_age(user_for_fn) + 1;
+                let via_capture = read() + 2;
+                let via_closure_param = pick(user_for_closure) + 3;
+                via_fn;
+                via_capture;
+                via_closure_param;
+            "#,
+            vec![Value::Int(42), Value::Int(43), Value::Int(44)],
+        ),
+    ];
+
+    run_runtime_cases(&cases);
+}
+
+#[test]
+fn rustscript_referenced_struct_schema_compile_rejections_work() {
+    let cases = vec![
+        SourceErrorCase {
+            name: "referenced struct schema rejects missing field access",
+            source: r#"
+                struct User { name: string }
+                let user: User = { name: "Ada" };
+                user.age;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &["field 'age' is not declared"],
+        },
+        SourceErrorCase {
+            name: "referenced struct schema rejects wrong array index type",
+            source: r#"
+                struct User { colors: [int] }
+                let user: User = { colors: [1, 2] };
+                user.colors["first"];
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &["array access requires an int index"],
+        },
+        SourceErrorCase {
+            name: "referenced struct schema rejects optional access to missing field",
+            source: r#"
+                struct User { name: string }
+                let user: User = { name: "Ada" };
+                user?.age;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &["field 'age' is not declared"],
+        },
+        SourceErrorCase {
+            name: "referenced struct schema rejects invalid function param field",
+            source: r#"
+                struct Age { first: int }
+                struct User { age: Age }
+
+                fn first_age(user) {
+                    user.age.agxe
+                }
+
+                let user: User = { age: { first: 41 } };
+                first_age(user);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &["field 'agxe' is not declared"],
+        },
+        SourceErrorCase {
+            name: "referenced struct schema rejects invalid closure capture field",
+            source: r#"
+                struct Age { first: int }
+                struct User { age: Age }
+                let user: User = { age: { first: 41 } };
+                let read = || user.age.agxe;
+                read();
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &["field 'agxe' is not declared"],
+        },
+        SourceErrorCase {
+            name: "referenced struct schema rejects invalid closure param field",
+            source: r#"
+                struct Age { first: int }
+                struct User { age: Age }
+                let pick = |entry| entry.age.agxe;
+                let user: User = { age: { first: 41 } };
+                pick(user);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &["field 'agxe' is not declared"],
+        },
+    ];
+
+    run_source_error_cases(&cases);
+}
+
+#[test]
+fn rustscript_recursive_struct_schema_runtime_cases_work() {
+    let cases = vec![rustscript_runtime_case(
+        "self recursive struct schema propagates after optional chain assignment",
+        r#"
+            struct Node {
+                value: int,
+                next: Node,
+            }
+
+            let node: Node = { value: 1, next: { value: 41, next: {} }};
+            let next = node?.next;
+            next?.value;
+        "#,
+        vec![Value::Int(41)],
+    )];
+
+    run_runtime_cases(&cases);
+}
+
+#[test]
+fn rustscript_recursive_struct_schema_compile_rejections_work() {
+    let cases = vec![
+        SourceErrorCase {
+            name: "self recursive struct schema rejects invalid direct field after optional chain assignment",
+            source: r#"
+                struct Node {
+                    value: int,
+                    next: Node,
+                }
+
+                let node: Node = { value: 1, next: { value: 41, next: {} }};
+                node.next.agxe;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &["field 'agxe' is not declared"],
+        },
+        SourceErrorCase {
+            name: "self recursive struct schema rejects invalid optional field after optional chain assignment",
+            source: r#"
+                struct Node {
+                    value: int,
+                    next: Node,
+                }
+
+                let node: Node = { value: 1, next: { value: 41, next: {} }};
+                let next = node?.next;
+                next?.agxe;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &["field 'agxe' is not declared"],
+        },
+    ];
+
+    run_source_error_cases(&cases);
+}
+
+#[test]
 fn rustscript_positive_min_magnitude_literal_is_rejected_with_hint() {
     expect_parse_error_contains_any_case(
         "positive min magnitude literal is rejected with hint",

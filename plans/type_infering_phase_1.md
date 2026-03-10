@@ -41,8 +41,8 @@ Reduce dynamic dispatch and type ambiguity across the compiler, interpreter, tra
 ## Verification 1
 
 - [pd-vm/tests/wire_tests.rs](pd-vm/tests/wire_tests.rs): round-trip `Program.type_map`
-- [pd-vm/tests/type_inference_tests.rs](pd-vm/tests/type_inference_tests.rs): compiler attaches known operand types to emitted bytecode
-- [pd-vm/tests/compiler_common_tests.rs](pd-vm/tests/compiler_common_tests.rs): compile/runtime sanity remains intact with the new metadata attached
+- [pd-vm/tests/compiler/type_inference_tests.rs](pd-vm/tests/compiler/type_inference_tests.rs): compiler attaches known operand types to emitted bytecode
+- [pd-vm/tests/compiler/compiler_common_tests.rs](pd-vm/tests/compiler/compiler_common_tests.rs): compile/runtime sanity remains intact with the new metadata attached
 
 ## Phase 2: Use Metadata in the Interpreter and Trace JIT
 
@@ -76,7 +76,7 @@ Reduce dynamic dispatch and type ambiguity across the compiler, interpreter, tra
 - [pd-vm/tests/jit_tests.rs](pd-vm/tests/jit_tests.rs): typed int/float/string trace-step coverage
 - [pd-vm/tests/jit_tests.rs](pd-vm/tests/jit_tests.rs): typed float math lowers natively without helper-bridge hits
 - [pd-vm/tests/jit_tests.rs](pd-vm/tests/jit_tests.rs): typed float compare/equality lowers natively without helper-bridge hits
-- [pd-vm/tests/perf_tests.rs](pd-vm/tests/perf_tests.rs): `perf_jit_native_reduces_tight_loop_latency`
+- [pd-vm/tests/jit/perf_tests.rs](pd-vm/tests/jit/perf_tests.rs): `perf_jit_native_reduces_tight_loop_latency`
 
 ## Phase 3: Improve Inference Quality and Reject Known-Bad Programs Earlier
 
@@ -114,7 +114,7 @@ Reduce dynamic dispatch and type ambiguity across the compiler, interpreter, tra
 
 ## Verification 3
 
-- [pd-vm/tests/type_inference_tests.rs](pd-vm/tests/type_inference_tests.rs):
+- [pd-vm/tests/compiler/type_inference_tests.rs](pd-vm/tests/compiler/type_inference_tests.rs):
   - callable return propagation through functions and closures
   - `"text" + 123` string-concat inference
   - loop stability for `for`/`while`
@@ -123,11 +123,11 @@ Reduce dynamic dispatch and type ambiguity across the compiler, interpreter, tra
   - homogeneous container `get` inference
   - explicit host return-type propagation
   - generated builtin/namespace return-type propagation
-- [pd-vm/tests/compiler_common_tests.rs](pd-vm/tests/compiler_common_tests.rs):
+- [pd-vm/tests/compiler/compiler_common_tests.rs](pd-vm/tests/compiler/compiler_common_tests.rs):
   - data-driven `if/else` mismatch rejection cases
   - shadowed outer-local mismatch cases
   - loop-carried shadowed mismatch cases
-- [pd-vm/tests/diagnostics_tests.rs](pd-vm/tests/diagnostics_tests.rs): rendered compile diagnostics for `if/else` mismatches
+- [pd-vm/tests/compiler/diagnostics_tests.rs](pd-vm/tests/compiler/diagnostics_tests.rs): rendered compile diagnostics for `if/else` mismatches
 - [pd-vm/pd-vm-lint-wasm/src/lib.rs](pd-vm/pd-vm-lint-wasm/src/lib.rs): structured wasm diagnostic coverage
 - [pd-vm/pd-vm-runtime-wasm/src/lib.rs](pd-vm/pd-vm-runtime-wasm/src/lib.rs): structured wasm runtime-analyzer coverage
 

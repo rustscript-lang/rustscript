@@ -262,7 +262,7 @@ cargo run -p pd-edge --example http_proxy_perf_framework --release -- \
 Second harness (VM-only microbenchmark in `pd-vm`):
 
 ```bash
-cargo test -p pd-vm --release --test perf_tests perf_cooperative_fuel_configuration_impacts_latency -- --ignored --nocapture
+cargo test -p pd-vm --release --test jit_tests perf_cooperative_fuel_configuration_impacts_latency -- --ignored --nocapture
 ```
 
 ### Latest Snapshot (2026-03-07, Local Windows x86_64 Dev Machine)
@@ -295,7 +295,7 @@ Fuel-check-interval sweep (fixed fuel `50000`, scenario `no_host_calls_program`)
 | `16` | `1.711 / 3.021 / 4.313 / 34,910` | `1.531 / 4.711 / 8.795 / 32,238` |
 | `64` | `1.808 / 3.670 / 5.534 / 32,247` | `1.356 / 4.129 / 9.361 / 35,537` |
 
-Harness B: VM microbenchmark (`pd-vm/tests/perf_tests.rs::perf_cooperative_fuel_configuration_impacts_latency`)
+Harness B: VM microbenchmark (`pd-vm/tests/jit/perf_tests.rs::perf_cooperative_fuel_configuration_impacts_latency`)
 
 Baseline (`fuel disabled`): median latency `42,667 us`
 
