@@ -261,7 +261,7 @@ fn host_function_registry_includes_default_runtime_sleep() {
     )
     .expect("source should compile");
     let mut vm = Vm::new(compiled.program);
-    let mut registry = HostFunctionRegistry::new();
+    let registry = HostFunctionRegistry::new();
     registry
         .bind_vm_cached(&mut vm)
         .expect("registry should bind runtime::sleep");

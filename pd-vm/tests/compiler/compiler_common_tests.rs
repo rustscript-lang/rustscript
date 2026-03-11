@@ -558,6 +558,29 @@ fn host_function_registry_caches_import_plan_across_vms() {
 }
 
 #[test]
+fn host_function_registry_shared_plan_cache_survives_clone() {
+    let source = include_str!("../../examples/example.rss");
+    let compiled = compile_source(source).expect("compile should succeed");
+
+    let mut registry = HostFunctionRegistry::new();
+    registry.register("print", 1, || Box::new(PrintBuiltin));
+    registry.register("add_one", 1, || Box::new(AddOne));
+
+    let first_plan = registry
+        .prepare_shared_plan(&compiled.program.imports)
+        .expect("shared plan should build");
+    let cloned = registry.clone();
+    let second_plan = cloned
+        .prepare_shared_plan(&compiled.program.imports)
+        .expect("cloned registry should reuse shared plan");
+
+    assert!(
+        std::sync::Arc::ptr_eq(&first_plan, &second_plan),
+        "cloned registries should share prepared host binding plans"
+    );
+}
+
+#[test]
 fn compile_source_supports_static_function_pointer_binding() {
     let source = r#"
         fn add_one(x);

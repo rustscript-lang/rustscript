@@ -4,7 +4,7 @@ use crate::builtins::BuiltinFunction;
 use crate::debug_info::DebugInfo;
 use crate::vm::{OpCode, Program, Value, ValueType};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JitConfig {
     pub enabled: bool,
     pub hot_loop_threshold: u32,

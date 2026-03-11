@@ -208,7 +208,7 @@ pub struct Vm {
     ip: usize,
     stack: Vec<Value>,
     locals: Vec<Value>,
-    operand_type_hints: Option<Box<[PackedOperandTypes]>>,
+    operand_type_hints: Option<Arc<[PackedOperandTypes]>>,
     decoded_instruction_data: Arc<crate::bytecode::DecodedInstructionData>,
     host_functions: Vec<VmHostFunction>,
     host_function_symbols: HashMap<String, u16>,
@@ -258,22 +258,6 @@ fn logical_shr_i64(value: i64, amount: u32) -> i64 {
 #[inline(always)]
 const fn pack_operand_types(lhs: ValueType, rhs: ValueType) -> PackedOperandTypes {
     lhs as u8 | ((rhs as u8) << 4)
-}
-
-fn build_operand_type_hints(program: &Program) -> Option<Box<[PackedOperandTypes]>> {
-    let type_map = program.type_map.as_ref()?;
-    if type_map.operand_types.is_empty() {
-        return None;
-    }
-
-    let mut hints = vec![NO_OPERAND_TYPE_HINT; program.code.len()];
-    for (offset, (lhs, rhs)) in &type_map.operand_types {
-        let Some(entry) = hints.get_mut(*offset) else {
-            continue;
-        };
-        *entry = pack_operand_types(*lhs, *rhs);
-    }
-    Some(hints.into_boxed_slice())
 }
 
 #[inline(always)]
@@ -329,14 +313,22 @@ fn hash_type_map(type_map: Option<&crate::bytecode::TypeMap>, state: &mut impl H
 
 impl Vm {
     pub fn new(program: Program) -> Self {
-        Self::new_shared(Arc::new(program))
+        Self::new_shared_with_jit_config(Arc::new(program), jit::JitConfig::default())
+    }
+
+    pub fn new_with_jit_config(program: Program, jit_config: jit::JitConfig) -> Self {
+        Self::new_shared_with_jit_config(Arc::new(program), jit_config)
     }
 
     pub fn new_shared(program: Arc<Program>) -> Self {
+        Self::new_shared_with_jit_config(program, jit::JitConfig::default())
+    }
+
+    pub fn new_shared_with_jit_config(program: Arc<Program>, jit_config: jit::JitConfig) -> Self {
         let program_constants_ptr = program.constants.as_ptr();
         let program_constants_len = program.constants.len();
         let local_count = program.local_count;
-        let operand_type_hints = build_operand_type_hints(program.as_ref());
+        let operand_type_hints = program.shared_operand_type_hints();
         let decoded_instruction_data = program.shared_decoded_instruction_data();
         let epoch_handle = EpochHandle::default();
         let epoch_counter_ptr = epoch_handle.as_ptr() as usize;
@@ -358,7 +350,7 @@ impl Vm {
             resolved_calls: Vec::new(),
             resolved_calls_dirty: true,
             call_depth: 0,
-            jit: jit::TraceJitEngine::default(),
+            jit: jit::TraceJitEngine::new(jit_config),
             native_traces: HashMap::new(),
             native_trace_exec_count: 0,
             jit_native_bridge_stats_enabled: false,

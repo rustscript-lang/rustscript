@@ -445,6 +445,7 @@ pub struct Program {
     pub debug: Option<crate::debug_info::DebugInfo>,
     pub type_map: Option<TypeMap>,
     decoded_instruction_data_cache: Arc<OnceLock<Arc<DecodedInstructionData>>>,
+    operand_type_hints_cache: Arc<OnceLock<Option<Arc<[u8]>>>>,
 }
 
 impl Program {
@@ -458,6 +459,7 @@ impl Program {
             debug: None,
             type_map: None,
             decoded_instruction_data_cache: Arc::new(OnceLock::new()),
+            operand_type_hints_cache: Arc::new(OnceLock::new()),
         }
     }
 
@@ -475,6 +477,7 @@ impl Program {
             debug,
             type_map: None,
             decoded_instruction_data_cache: Arc::new(OnceLock::new()),
+            operand_type_hints_cache: Arc::new(OnceLock::new()),
         }
     }
 
@@ -493,6 +496,7 @@ impl Program {
             debug,
             type_map: None,
             decoded_instruction_data_cache: Arc::new(OnceLock::new()),
+            operand_type_hints_cache: Arc::new(OnceLock::new()),
         }
     }
 
@@ -503,6 +507,7 @@ impl Program {
 
     pub fn with_type_map(mut self, type_map: TypeMap) -> Self {
         self.type_map = Some(type_map);
+        self.operand_type_hints_cache = Arc::new(OnceLock::new());
         self
     }
 
@@ -512,6 +517,28 @@ impl Program {
                 .get_or_init(|| Arc::new(DecodedInstructionData::build(self))),
         )
     }
+
+    pub(crate) fn shared_operand_type_hints(&self) -> Option<Arc<[u8]>> {
+        self.operand_type_hints_cache
+            .get_or_init(|| build_operand_type_hints(self.code.len(), self.type_map.as_ref()))
+            .clone()
+    }
+}
+
+fn build_operand_type_hints(code_len: usize, type_map: Option<&TypeMap>) -> Option<Arc<[u8]>> {
+    let type_map = type_map?;
+    if type_map.operand_types.is_empty() {
+        return None;
+    }
+
+    let mut hints = vec![0u8; code_len];
+    for (offset, (lhs, rhs)) in &type_map.operand_types {
+        let Some(entry) = hints.get_mut(*offset) else {
+            continue;
+        };
+        *entry = (*lhs as u8) | ((*rhs as u8) << 4);
+    }
+    Some(Arc::from(hints.into_boxed_slice()))
 }
 
 fn read_u32_at(code: &[u8], offset: usize) -> Option<u32> {

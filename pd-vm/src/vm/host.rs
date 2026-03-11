@@ -1,3 +1,4 @@
+use std::sync::{Arc, OnceLock, RwLock};
 use std::task::{Context, Poll, Wake, Waker};
 
 use crate::builtins::BuiltinFunction;
@@ -25,11 +26,13 @@ pub type StaticHostFunction = fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>;
 
 type HostFactory = dyn Fn() -> Box<dyn HostFunction> + Send + Sync;
 
+#[derive(Clone)]
 enum RegistryEntryKind {
-    Factory(Box<HostFactory>),
+    Factory(Arc<HostFactory>),
     Static(StaticHostFunction),
 }
 
+#[derive(Clone)]
 struct RegistryEntry {
     arity: u8,
     kind: RegistryEntryKind,
@@ -42,10 +45,11 @@ pub struct HostBindingPlan {
     resolved_calls: Vec<u16>,
 }
 
+#[derive(Clone)]
 pub struct HostFunctionRegistry {
-    entries: Vec<RegistryEntry>,
-    by_name: HashMap<String, u16>,
-    plan_cache: HashMap<Vec<HostImport>, HostBindingPlan>,
+    entries: Arc<Vec<RegistryEntry>>,
+    by_name: Arc<HashMap<String, u16>>,
+    plan_cache: Arc<RwLock<HashMap<Vec<HostImport>, Arc<HostBindingPlan>>>>,
 }
 
 impl Default for HostFunctionRegistry {
@@ -55,14 +59,28 @@ impl Default for HostFunctionRegistry {
 }
 
 impl HostFunctionRegistry {
+    fn empty() -> Self {
+        Self {
+            entries: Arc::new(Vec::new()),
+            by_name: Arc::new(HashMap::new()),
+            plan_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
     pub fn new() -> Self {
-        let mut registry = Self {
-            entries: Vec::new(),
-            by_name: HashMap::new(),
-            plan_cache: HashMap::new(),
-        };
-        crate::builtins::runtime::register_default_host_functions(&mut registry);
-        registry
+        static DEFAULT_REGISTRY: OnceLock<HostFunctionRegistry> = OnceLock::new();
+
+        DEFAULT_REGISTRY
+            .get_or_init(|| {
+                let mut registry = Self::empty();
+                crate::builtins::runtime::register_default_host_functions(&mut registry);
+                registry
+            })
+            .clone()
+    }
+
+    fn invalidate_plan_cache(&mut self) {
+        self.plan_cache = Arc::new(RwLock::new(HashMap::new()));
     }
 
     pub fn register<F>(&mut self, name: impl Into<String>, arity: u8, factory: F)
@@ -71,21 +89,22 @@ impl HostFunctionRegistry {
     {
         let name = name.into();
         if let Some(&slot) = self.by_name.get(&name)
-            && let Some(entry) = self.entries.get_mut(slot as usize)
+            && let Some(entry) = Arc::make_mut(&mut self.entries).get_mut(slot as usize)
         {
             entry.arity = arity;
-            entry.kind = RegistryEntryKind::Factory(Box::new(factory));
-            self.plan_cache.clear();
+            entry.kind = RegistryEntryKind::Factory(Arc::new(factory));
+            self.invalidate_plan_cache();
             return;
         }
 
-        let slot = self.entries.len() as u16;
-        self.entries.push(RegistryEntry {
+        let entries = Arc::make_mut(&mut self.entries);
+        let slot = entries.len() as u16;
+        entries.push(RegistryEntry {
             arity,
-            kind: RegistryEntryKind::Factory(Box::new(factory)),
+            kind: RegistryEntryKind::Factory(Arc::new(factory)),
         });
-        self.by_name.insert(name, slot);
-        self.plan_cache.clear();
+        Arc::make_mut(&mut self.by_name).insert(name, slot);
+        self.invalidate_plan_cache();
     }
 
     pub fn register_static(
@@ -96,81 +115,92 @@ impl HostFunctionRegistry {
     ) {
         let name = name.into();
         if let Some(&slot) = self.by_name.get(&name)
-            && let Some(entry) = self.entries.get_mut(slot as usize)
+            && let Some(entry) = Arc::make_mut(&mut self.entries).get_mut(slot as usize)
         {
             entry.arity = arity;
             entry.kind = RegistryEntryKind::Static(function);
-            self.plan_cache.clear();
+            self.invalidate_plan_cache();
             return;
         }
 
-        let slot = self.entries.len() as u16;
-        self.entries.push(RegistryEntry {
+        let entries = Arc::make_mut(&mut self.entries);
+        let slot = entries.len() as u16;
+        entries.push(RegistryEntry {
             arity,
             kind: RegistryEntryKind::Static(function),
         });
-        self.by_name.insert(name, slot);
-        self.plan_cache.clear();
+        Arc::make_mut(&mut self.by_name).insert(name, slot);
+        self.invalidate_plan_cache();
     }
 
-    pub fn bind_vm_cached(&mut self, vm: &mut Vm) -> VmResult<()> {
-        let plan = self.prepare_plan(&vm.program.imports)?;
+    pub fn bind_vm_cached(&self, vm: &mut Vm) -> VmResult<()> {
+        let plan = self.prepare_shared_plan(&vm.program.imports)?;
         self.bind_vm_with_plan(vm, &plan)
     }
 
-    pub fn prepare_plan(&mut self, imports: &[HostImport]) -> VmResult<HostBindingPlan> {
-        self.plan_for_imports(imports).cloned()
+    pub fn prepare_plan(&self, imports: &[HostImport]) -> VmResult<HostBindingPlan> {
+        Ok(self.prepare_shared_plan(imports)?.as_ref().clone())
     }
 
-    fn plan_for_imports(&mut self, imports: &[HostImport]) -> VmResult<&HostBindingPlan> {
-        if !self.plan_cache.contains_key(imports) {
-            let mut registry_slot_to_vm_slot: HashMap<u16, u16> = HashMap::new();
-            let mut registry_slots = Vec::new();
-            let mut resolved_calls = Vec::with_capacity(imports.len());
+    pub fn prepare_shared_plan(&self, imports: &[HostImport]) -> VmResult<Arc<HostBindingPlan>> {
+        self.plan_for_imports(imports)
+    }
 
-            for import in imports {
-                let registry_slot = self
-                    .by_name
-                    .get(&import.name)
-                    .copied()
-                    .ok_or_else(|| VmError::UnboundImport(import.name.clone()))?;
-                let entry = self
-                    .entries
-                    .get(registry_slot as usize)
-                    .ok_or(VmError::InvalidCall(registry_slot))?;
-                if entry.arity != import.arity {
-                    return Err(VmError::InvalidCallArity {
-                        import: import.name.clone(),
-                        expected: entry.arity,
-                        got: import.arity,
-                    });
-                }
-
-                let vm_slot = if let Some(&existing) = registry_slot_to_vm_slot.get(&registry_slot)
-                {
-                    existing
-                } else {
-                    let slot = registry_slots.len() as u16;
-                    registry_slots.push(registry_slot);
-                    registry_slot_to_vm_slot.insert(registry_slot, slot);
-                    slot
-                };
-                resolved_calls.push(vm_slot);
-            }
-
-            self.plan_cache.insert(
-                imports.to_vec(),
-                HostBindingPlan {
-                    import_signature: imports.to_vec(),
-                    registry_slots,
-                    resolved_calls,
-                },
-            );
+    fn plan_for_imports(&self, imports: &[HostImport]) -> VmResult<Arc<HostBindingPlan>> {
+        if let Some(plan) = self
+            .plan_cache
+            .read()
+            .expect("host binding plan cache read lock should not be poisoned")
+            .get(imports)
+            .cloned()
+        {
+            return Ok(plan);
         }
 
-        self.plan_cache
-            .get(imports)
-            .ok_or_else(|| VmError::HostError("host binding plan cache lookup failed".to_string()))
+        let mut registry_slot_to_vm_slot: HashMap<u16, u16> = HashMap::new();
+        let mut registry_slots = Vec::new();
+        let mut resolved_calls = Vec::with_capacity(imports.len());
+
+        for import in imports {
+            let registry_slot = self
+                .by_name
+                .get(&import.name)
+                .copied()
+                .ok_or_else(|| VmError::UnboundImport(import.name.clone()))?;
+            let entry = self
+                .entries
+                .get(registry_slot as usize)
+                .ok_or(VmError::InvalidCall(registry_slot))?;
+            if entry.arity != import.arity {
+                return Err(VmError::InvalidCallArity {
+                    import: import.name.clone(),
+                    expected: entry.arity,
+                    got: import.arity,
+                });
+            }
+
+            let vm_slot = if let Some(&existing) = registry_slot_to_vm_slot.get(&registry_slot) {
+                existing
+            } else {
+                let slot = registry_slots.len() as u16;
+                registry_slots.push(registry_slot);
+                registry_slot_to_vm_slot.insert(registry_slot, slot);
+                slot
+            };
+            resolved_calls.push(vm_slot);
+        }
+
+        let import_key = imports.to_vec();
+        let computed = Arc::new(HostBindingPlan {
+            import_signature: import_key.clone(),
+            registry_slots,
+            resolved_calls,
+        });
+        let mut cache = self
+            .plan_cache
+            .write()
+            .expect("host binding plan cache write lock should not be poisoned");
+        Ok(cache.entry(import_key).or_insert_with(|| computed).clone())
     }
 
     pub fn bind_vm_with_plan(&self, vm: &mut Vm, plan: &HostBindingPlan) -> VmResult<()> {
@@ -185,6 +215,7 @@ impl HostFunctionRegistry {
             ));
         }
 
+        vm.host_functions.reserve(plan.registry_slots.len());
         for &registry_slot in &plan.registry_slots {
             let entry = self
                 .entries

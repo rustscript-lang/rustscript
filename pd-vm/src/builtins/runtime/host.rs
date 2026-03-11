@@ -131,7 +131,7 @@ mod tests {
                 .expect("sink should be lockable")
                 .push(rendered);
         });
-        let mut registry = HostFunctionRegistry::new();
+        let registry = HostFunctionRegistry::new();
         registry
             .bind_vm_cached(&mut vm)
             .expect("registry should bind print");
