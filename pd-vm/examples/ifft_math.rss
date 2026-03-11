@@ -55,8 +55,8 @@ fn ifft(freq_re, freq_im) {
     let bit_count = exact_log2(n);
     assert(bit_count >= 0);
 
-    let mut out_re =[];
-    let mut out_im =[];
+    let mut out_re = [];
+    let mut out_im = [];
     let mut i = 0;
     while i < n {
         let j = reverse_bits(i, bit_count);
@@ -107,8 +107,8 @@ fn ifft(freq_re, freq_im) {
 }
 
 // These bins are the forward DFT of [1, 2, 3, 4].
-let spectrum_re =[10.0,-2.0,-2.0,-2.0];
-let spectrum_im =[0.0, 2.0, 0.0,-2.0];
+let spectrum_re = [10.0,-2.0,-2.0,-2.0];
+let spectrum_im = [0.0, 2.0, 0.0,-2.0];
 
 let signal = ifft(spectrum_re, spectrum_im);
 let signal_re = signal.re;

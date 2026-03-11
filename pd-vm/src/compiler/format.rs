@@ -87,4 +87,25 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    fn adds_space_before_array_literals_after_assignment() {
+        let input = "let a =[1, \"a\"];\n";
+        let formatted = format_source_with_flavor(input, SourceFlavor::RustScript)
+            .expect("formatting should succeed");
+
+        assert_eq!(formatted, "let a = [1, \"a\"];\n");
+    }
+
+    #[test]
+    fn keeps_namespace_keyword_calls_tight_to_open_paren() {
+        let input = "let regex_ok = re::match (\"(?i)^rustscript$\", \"RUSTSCRIPT\");\n";
+        let formatted = format_source_with_flavor(input, SourceFlavor::RustScript)
+            .expect("formatting should succeed");
+
+        assert_eq!(
+            formatted,
+            "let regex_ok = re::match(\"(?i)^rustscript$\", \"RUSTSCRIPT\");\n"
+        );
+    }
 }

@@ -192,6 +192,13 @@ impl<'a> SourceFormatter<'a> {
             .expect("formatter token index should be valid")
             .kind
             .clone();
+        if self.should_emit_keyword_as_word(&kind) {
+            let text = self.token_text(self.index).to_string();
+            self.emit_word(&text);
+            self.cursor = self.tokens[self.index].span.hi;
+            self.index += 1;
+            return Ok(());
+        }
         match kind {
             TokenKind::Pub => {
                 self.emit_keyword("pub", PrevKind::Pub, true);
@@ -573,7 +580,9 @@ impl<'a> SourceFormatter<'a> {
     }
 
     fn emit_open_bracket(&mut self) {
-        self.clear_pending_space();
+        if self.should_tighten_before_open_bracket() {
+            self.clear_pending_space();
+        }
         self.write_raw("[");
         self.contexts.push(Context {
             kind: ContextKind::Bracket,
@@ -793,6 +802,44 @@ impl<'a> SourceFormatter<'a> {
         matches!(
             self.peek_kind_at(index),
             Some(TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace)
+        )
+    }
+
+    fn should_emit_keyword_as_word(&self, kind: &TokenKind) -> bool {
+        matches!(
+            self.prev_kind,
+            Some(PrevKind::PathSeparator | PrevKind::Dot | PrevKind::OptionalAccess)
+        ) && matches!(
+            kind,
+            TokenKind::Pub
+                | TokenKind::Use
+                | TokenKind::Import
+                | TokenKind::From
+                | TokenKind::As
+                | TokenKind::Fn
+                | TokenKind::Struct
+                | TokenKind::Let
+                | TokenKind::For
+                | TokenKind::If
+                | TokenKind::Else
+                | TokenKind::Match
+                | TokenKind::While
+                | TokenKind::Break
+                | TokenKind::Continue
+        )
+    }
+
+    fn should_tighten_before_open_bracket(&self) -> bool {
+        matches!(
+            self.prev_kind,
+            Some(
+                PrevKind::Word
+                    | PrevKind::RParen
+                    | PrevKind::RBracket
+                    | PrevKind::RBrace
+                    | PrevKind::Dot
+                    | PrevKind::OptionalAccess
+            )
         )
     }
 
