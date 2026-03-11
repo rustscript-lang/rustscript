@@ -4,7 +4,7 @@ use pd_edge_host_function::pd_edge_host_function;
 use vm::bytecode::VmMap;
 use vm::{CallOutcome, Vm, VmError};
 
-use super::super::super::{
+use super::super::{
     SharedProxyVmContext, is_valid_request_path, is_valid_upstream, parse_header,
     parse_header_name, parse_headers_map, serialize_query_pairs,
 };
@@ -20,8 +20,7 @@ async fn apply_upstream_query(
         )));
     }
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_upstream_request();
-    context.outbound_request_query = query.to_string();
+    context.outbound_request.query = query.to_string();
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -34,9 +33,9 @@ async fn set_upstream_request_header(
 ) -> Result<CallOutcome, VmError> {
     let (header_name, header_value) = parse_header(name, value)?;
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_upstream_request();
     context
-        .outbound_request_headers
+        .outbound_request
+        .headers
         .insert(header_name, header_value);
     Ok(CallOutcome::Return(vec![]))
 }
@@ -49,8 +48,7 @@ async fn remove_upstream_request_header(
 ) -> Result<CallOutcome, VmError> {
     let header_name = parse_header_name(name)?;
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_upstream_request();
-    context.outbound_request_headers.remove(header_name);
+    context.outbound_request.headers.remove(header_name);
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -63,8 +61,7 @@ async fn set_upstream_request_method(
     let parsed = Method::from_bytes(method.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid http method '{method}'")))?;
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_upstream_request();
-    context.outbound_request_method = parsed;
+    context.outbound_request.method = parsed;
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -80,8 +77,7 @@ async fn set_upstream_request_path(
         )));
     }
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_upstream_request();
-    context.outbound_request_path = path;
+    context.outbound_request.path = path;
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -106,8 +102,7 @@ async fn set_upstream_request_target(
         )));
     }
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_upstream_request();
-    context.upstream = Some(upstream);
+    context.outbound_request.target = Some(upstream);
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -118,9 +113,7 @@ async fn set_upstream_request_body(
     body: String,
 ) -> Result<CallOutcome, VmError> {
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_upstream_request();
-    context.outbound_request_body = body.into_bytes();
-    context.outbound_request_body_overridden = true;
+    context.outbound_request.body_override = Some(body.into_bytes());
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -133,9 +126,9 @@ async fn add_upstream_request_header(
 ) -> Result<CallOutcome, VmError> {
     let (header_name, header_value) = parse_header(name, value)?;
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_upstream_request();
     context
-        .outbound_request_headers
+        .outbound_request
+        .headers
         .append(header_name, header_value);
     Ok(CallOutcome::Return(vec![]))
 }
@@ -148,8 +141,7 @@ async fn clear_upstream_request_header(
 ) -> Result<CallOutcome, VmError> {
     let header_name = parse_header_name(name)?;
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_upstream_request();
-    context.outbound_request_headers.remove(header_name);
+    context.outbound_request.headers.remove(header_name);
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -161,11 +153,10 @@ async fn set_upstream_request_headers(
 ) -> Result<CallOutcome, VmError> {
     let headers = parse_headers_map(headers)?;
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_upstream_request();
     for (name, values) in headers {
-        context.outbound_request_headers.remove(name.clone());
+        context.outbound_request.headers.remove(name.clone());
         for value in values {
-            context.outbound_request_headers.append(name.clone(), value);
+            context.outbound_request.headers.append(name.clone(), value);
         }
     }
     Ok(CallOutcome::Return(vec![]))
@@ -188,12 +179,11 @@ async fn set_upstream_request_query_arg(
     value: String,
 ) -> Result<CallOutcome, VmError> {
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_upstream_request();
-    let mut pairs = url::form_urlencoded::parse(context.outbound_request_query.as_bytes())
+    let mut pairs = url::form_urlencoded::parse(context.outbound_request.query.as_bytes())
         .map(|(name, value)| (name.into_owned(), value.into_owned()))
         .collect::<Vec<_>>();
     pairs.retain(|(name, _)| name != &key);
     pairs.push((key, value));
-    context.outbound_request_query = serialize_query_pairs(pairs);
+    context.outbound_request.query = serialize_query_pairs(pairs);
     Ok(CallOutcome::Return(vec![]))
 }

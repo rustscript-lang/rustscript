@@ -3,17 +3,28 @@ use edge_abi::symbols::http::upstream::response as http_upstream_response;
 use pd_edge_host_function::pd_edge_host_function;
 use vm::{CallOutcome, Value, Vm, VmError};
 
-use super::super::super::{SharedProxyVmContext, headers_to_value_map};
+use super::super::{
+    SharedProxyVmContext, ensure_upstream_response_started, headers_to_value_map,
+    read_upstream_response_all, read_upstream_response_next_chunk, upstream_response_eof,
+};
+
+#[pd_edge_host_function(name = http_upstream_response::ENABLE_PROCESSING.name, scope = http)]
+async fn enable_upstream_response_processing(
+    _vm: &mut Vm,
+    _context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    Ok(CallOutcome::Return(vec![]))
+}
 
 #[pd_edge_host_function(name = http_upstream_response::GET_STATUS.name, scope = http)]
 async fn get_upstream_response_status(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_upstream_response();
-    let status = context.upstream_response_status.unwrap_or(0);
-    Ok(CallOutcome::Return(vec![Value::Int(status as i64)]))
+    let upstream_response = ensure_upstream_response_started(&context).await?;
+    Ok(CallOutcome::Return(vec![Value::Int(
+        upstream_response.status as i64,
+    )]))
 }
 
 #[pd_edge_host_function(name = http_upstream_response::GET_HEADER.name, scope = http)]
@@ -24,10 +35,9 @@ async fn get_upstream_response_header(
 ) -> Result<CallOutcome, VmError> {
     let header_name = HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
-    let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_upstream_response();
-    let value = context
-        .upstream_response_headers
+    let upstream_response = ensure_upstream_response_started(&context).await?;
+    let value = upstream_response
+        .headers
         .get(&header_name)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
@@ -39,10 +49,9 @@ async fn get_upstream_response_headers(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_upstream_response();
+    let upstream_response = ensure_upstream_response_started(&context).await?;
     Ok(CallOutcome::Return(vec![headers_to_value_map(
-        &context.upstream_response_headers,
+        &upstream_response.headers,
     )]))
 }
 
@@ -51,11 +60,36 @@ async fn get_upstream_response_body(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_upstream_response();
-    let value = context
-        .upstream_response_content
-        .clone()
-        .unwrap_or_default();
+    let body = read_upstream_response_all(&context).await?;
+    let value = String::from_utf8_lossy(&body).into_owned();
     Ok(CallOutcome::Return(vec![Value::string(value)]))
+}
+
+#[pd_edge_host_function(
+    name = http_upstream_response::body::NEXT_CHUNK.name,
+    scope = http_extension
+)]
+async fn get_upstream_response_body_chunk(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    max_bytes: i64,
+) -> Result<CallOutcome, VmError> {
+    if max_bytes <= 0 {
+        return Err(VmError::HostError(format!(
+            "body chunk size must be > 0, got '{max_bytes}'",
+        )));
+    }
+    let chunk = read_upstream_response_next_chunk(&context, max_bytes as usize).await?;
+    Ok(CallOutcome::Return(vec![Value::string(
+        String::from_utf8_lossy(&chunk).into_owned(),
+    )]))
+}
+
+#[pd_edge_host_function(name = http_upstream_response::body::EOF.name, scope = http_extension)]
+async fn get_upstream_response_body_eof(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    let eof = upstream_response_eof(&context).await?;
+    Ok(CallOutcome::Return(vec![Value::Bool(eof)]))
 }

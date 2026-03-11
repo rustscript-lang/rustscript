@@ -4,7 +4,7 @@ use pd_edge_host_function::pd_edge_host_function;
 use vm::bytecode::VmMap;
 use vm::{CallOutcome, Value, Vm, VmError};
 
-use super::super::{
+use super::{
     SharedProxyVmContext, headers_to_value_map, parse_header, parse_header_name, parse_headers_map,
 };
 
@@ -17,8 +17,10 @@ async fn set_response_header(
 ) -> Result<CallOutcome, VmError> {
     let (header_name, header_value) = parse_header(name, value)?;
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_response_output();
-    context.response_headers.insert(header_name, header_value);
+    context
+        .response_output
+        .headers
+        .insert(header_name, header_value);
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -30,8 +32,7 @@ async fn remove_response_header(
 ) -> Result<CallOutcome, VmError> {
     let header_name = parse_header_name(name)?;
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_response_output();
-    context.response_headers.remove(header_name);
+    context.response_output.headers.remove(header_name);
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -42,8 +43,7 @@ async fn set_response_body(
     body: String,
 ) -> Result<CallOutcome, VmError> {
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_response_output();
-    context.response_content = Some(body);
+    context.response_output.body = Some(body);
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -59,8 +59,7 @@ async fn set_response_status(
         )));
     }
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_response_output();
-    context.response_status = Some(status as u16);
+    context.response_output.status = Some(status as u16);
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -69,9 +68,8 @@ async fn get_response_status(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_response_output();
-    let status = context.response_status.unwrap_or(0);
+    let context = context.lock().expect("vm context lock poisoned");
+    let status = context.response_output.status.unwrap_or(0);
     Ok(CallOutcome::Return(vec![Value::Int(status as i64)]))
 }
 
@@ -80,9 +78,8 @@ async fn get_response_body(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_response_output();
-    let value = context.response_content.clone().unwrap_or_default();
+    let context = context.lock().expect("vm context lock poisoned");
+    let value = context.response_output.body.clone().unwrap_or_default();
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 
@@ -94,10 +91,10 @@ async fn get_response_header(
 ) -> Result<CallOutcome, VmError> {
     let header_name = HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
-    let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_response_output();
+    let context = context.lock().expect("vm context lock poisoned");
     let value = context
-        .response_headers
+        .response_output
+        .headers
         .get(&header_name)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
@@ -109,10 +106,9 @@ async fn get_response_headers(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_response_output();
+    let context = context.lock().expect("vm context lock poisoned");
     Ok(CallOutcome::Return(vec![headers_to_value_map(
-        &context.response_headers,
+        &context.response_output.headers,
     )]))
 }
 
@@ -125,8 +121,10 @@ async fn add_response_header(
 ) -> Result<CallOutcome, VmError> {
     let (header_name, header_value) = parse_header(name, value)?;
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_response_output();
-    context.response_headers.append(header_name, header_value);
+    context
+        .response_output
+        .headers
+        .append(header_name, header_value);
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -138,8 +136,7 @@ async fn clear_response_header(
 ) -> Result<CallOutcome, VmError> {
     let header_name = parse_header_name(name)?;
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_response_output();
-    context.response_headers.remove(header_name);
+    context.response_output.headers.remove(header_name);
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -151,11 +148,10 @@ async fn set_response_headers(
 ) -> Result<CallOutcome, VmError> {
     let headers = parse_headers_map(headers)?;
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_response_output();
     for (name, values) in headers {
-        context.response_headers.remove(name.clone());
+        context.response_output.headers.remove(name.clone());
         for value in values {
-            context.response_headers.append(name.clone(), value);
+            context.response_output.headers.append(name.clone(), value);
         }
     }
     Ok(CallOutcome::Return(vec![]))

@@ -23,6 +23,7 @@ This crate now ships two binaries with different scopes:
   - [Example](#example)
 - [HTTP Proxy Performance Framework](#http-proxy-performance-framework)
   - [Latest Snapshot (2026-03-11, Local Windows x86_64 Dev Machine)](#latest-snapshot-2026-03-11-local-windows-x8664-dev-machine)
+- [Layered DAGs](#layered-dags)
 - [ABI Source of Truth](#abi-source-of-truth)
 - [Release Artifacts](#release-artifacts)
 - [Docker](#docker)
@@ -339,6 +340,207 @@ Artifacts written by these runs:
 - `target/http_proxy_fuel_sweep_async.json`
 - `target/http_proxy_fuel_sweep_threading.json`
 - `target/pd_vm_perf_cooperative_fuel_2026-03-11.txt`
+
+## Layered DAGs
+
+Current state:
+
+- HTTP is implemented today as an explicit graph in [`pd-edge/src/abi_impl/http/state.rs`](src/abi_impl/http/state.rs).
+- TCP and TLS DAGs below are the target architecture for the next layers. They describe how the stack should evolve; they are not fully implemented yet.
+
+Core model:
+
+- Each subsystem owns its own forward-only DAG.
+- A node in one DAG may export a capability that becomes the ingress node of a deeper DAG.
+- The same DAG schema can be instantiated multiple times, for example once for downstream and once for upstream.
+- Callers may jump directly to any reachable node if the jump is monotonic: all prerequisite edges are already satisfied or can be advanced forward by the engine.
+- No subsystem is allowed to move another subsystem backward.
+
+### TCP DAG
+
+TCP is the outer transport DAG. It owns socket lifecycle, byte availability, and connection teardown.
+
+Rules:
+
+- `tcp.connected` is the outer capability that permits deeper protocol parsing.
+- `tcp.rx` and `tcp.tx` are monotonic byte streams. Reading and writing advance offsets; they do not rewind.
+- Half-close and full close are terminal forward states, not side channels.
+- TLS attaches to the TCP DAG through the exported byte-stream capability, not by bypassing TCP state.
+
+```mermaid
+flowchart TD
+    A[tcp.listener or tcp.dial pending] --> B[tcp.accepted or tcp.outbound dialed]
+    B --> C[tcp.connected]
+    C --> D[tcp.rx byte stream]
+    C --> E[tcp.tx byte stream]
+    D --> F[tcp.remote eof]
+    E --> G[tcp.local eof]
+    C --> H[tcp.error]
+    C --> I[tls ingress may attach here]
+    F --> J[tcp.closed]
+    G --> J
+    H --> J
+```
+
+### TLS DAG
+
+TLS is a DAG over the TCP byte stream. Its job is not just handshake; it also owns the mapping between ciphertext records and plaintext application bytes.
+
+Rules:
+
+- TLS enters only after `tcp.connected` exists and a TLS parser is attached to the TCP byte stream.
+- `tls.session.selected` is a logical node, not a hardcoded code path. It may be reached by a full handshake or by session reuse.
+- `tls.plaintext` is the exported capability for HTTP or another application protocol.
+- `tls.close_notify`, transport close, and handshake failure are forward exits from the TLS DAG.
+
+```mermaid
+flowchart TD
+    A[tcp byte stream] --> B[tls record stream]
+    B --> C[tls peer hello parsed]
+    C --> D{session reusable?}
+    D -->|yes| E[tls.session.selected from cache or ticket]
+    D -->|no| F[tls.full handshake path]
+    F --> E
+    E --> G[tls handshake complete]
+    G --> H[tls plaintext stream]
+    H --> I[http ingress may attach here]
+    H --> J[tls close_notify]
+    J --> K[tls closed]
+    C --> L[tls handshake error]
+    L --> K
+```
+
+TLS session reuse is exactly why advancement must be generic. The system should not special-case reuse at every call site. Instead, the DAG engine should be able to satisfy the goal `tls.handshake complete` by selecting one of multiple legal forward paths:
+
+- full handshake
+- resumed session
+- future variants such as 0-RTT, if supported later
+
+### HTTP DAG
+
+HTTP is the application DAG over the plaintext stream. Today this is the most concrete part of the model and is represented in [`pd-edge/src/abi_impl/http/state.rs`](src/abi_impl/http/state.rs).
+
+Rules:
+
+- `request.head` is eager and immutable. It comes from already-parsed request metadata, so exposing it is not additional network I/O.
+- `request.body` starts unread and only advances when a host call or resolver consumes bytes.
+- `outbound.request` starts as a draft seeded from `request.head`.
+- `response.output` starts empty and is populated by VM host calls for local response construction.
+- `upstream.response` starts as `NotStarted` and becomes `Ready` only when the DAG actually needs upstream response data.
+
+```mermaid
+flowchart TD
+    A[http ingress admitted] --> B[request.head ready]
+    A --> C[request.body unread stream]
+    B --> D[VM execution]
+    C -. http.request.body::* / io::read* consume real IO .-> D
+    D -->|http.upstream.request::*| E[outbound.request draft]
+    D -->|http.response::*| F[response.output draft]
+    D -->|http.upstream.response::* or io reads| G{upstream.response ready?}
+    E --> G
+    G -->|no| H[host call or resolver performs upstream exchange]
+    C -. if no outbound body override .-> H
+    H --> I[upstream.response headers + stream]
+    G -->|yes| I
+    I -->|body::next_chunk / get_body / eof| D
+    D --> J[graph resolver after VM halt]
+    E --> J
+    F --> J
+    I --> J
+    J -->|response.output.body set| K[build client response from response.output]
+    J -->|otherwise and upstream target exists| L[start upstream if needed and materialize response]
+    K --> M[return client response]
+    L --> M
+```
+
+### Entering And Leaving A Deeper DAG
+
+A deeper DAG is entered when the outer DAG publishes an ingress capability for it.
+
+Examples:
+
+- TCP exports `tcp.connected` plus the TCP byte stream. TLS can attach there.
+- TLS exports `tls.plaintext stream`. HTTP can attach there.
+- HTTP may export a response body stream that is handed back upward to TLS plaintext framing, then to TCP transmission.
+
+Rules for entering:
+
+- Entering a deeper DAG does not replace the outer DAG. The outer DAG remains the owner of transport, buffering, and teardown.
+- The inner DAG can request more outer progress, but only through declared advance goals.
+- The inner DAG cannot mutate outer history that has already been published.
+
+Rules for leaving:
+
+- You leave a deeper DAG when it reaches an exported egress node such as `http message complete`, `tls close_notify`, or `tls handshake error`.
+- Leaving does not imply the outer DAG is done. The outer DAG may continue with another message, another handshake branch, or connection teardown.
+- Returning to a shallower layer is valid if it is still a forward move in the combined graph.
+
+### Generic Advancement Mechanism
+
+To avoid writing one-off state machine code for every feature, each DAG should expose goals rather than bespoke step functions.
+
+Suggested model:
+
+- `advance(goal)`: move the subsystem to a requested node or exported capability.
+- `goal` is declared in terms of a node, not a concrete procedure.
+- each goal has one or more legal transition paths with explicit prerequisites and side effects.
+- transitions are idempotent once their output node is published.
+- transitions may consume I/O, parse buffered data, allocate derived state, or reuse cached state.
+
+In that model, TLS session reuse becomes a normal transition set:
+
+- `advance(tls.handshake complete)` may choose `full_handshake`
+- or `advance(tls.handshake complete)` may choose `resume_session`
+
+The caller asks for the node, not the path.
+
+### Downstream And Upstream As Independent DAG Instances
+
+The clean model is to treat downstream and upstream as separate DAG instances with explicit connection points.
+
+- downstream TCP/TLS/HTTP describe bytes and messages coming from the client toward the VM
+- upstream TCP/TLS/HTTP describe bytes and messages going from the VM toward the origin
+- the VM and graph resolver connect them, but they do not collapse them into one giant implicit state machine
+
+```mermaid
+flowchart LR
+    subgraph Downstream
+        D1[tcp.downstream]
+        D2[tls.downstream]
+        D3[http.downstream request/response]
+        D1 --> D2 --> D3
+    end
+
+    subgraph Control
+        V[VM host calls + graph resolver]
+    end
+
+    subgraph Upstream
+        U3[http.upstream request/response]
+        U2[tls.upstream]
+        U1[tcp.upstream]
+        U3 --> U2 --> U1
+    end
+
+    D3 --> V
+    V --> U3
+    U3 --> V
+    V --> D3
+```
+
+This gives the flexibility target:
+
+- you can jump into TCP, TLS, or HTTP as long as the target node is reachable from the current frontier
+- you can jump back out from HTTP to TLS or TCP when the inner DAG has exported a forward egress node
+- you can materialize only the parts you need, late
+- you do not need a custom driver for every feature such as TLS session reuse, early response generation, or future non-HTTP protocols
+
+Node ownership in current code:
+
+- HTTP nodes and resolver: [`pd-edge/src/abi_impl/http/state.rs`](src/abi_impl/http/state.rs)
+- HTTP validation and map conversion helpers: [`pd-edge/src/abi_impl/http/helpers.rs`](src/abi_impl/http/helpers.rs)
+- HTTP host-call entrypoints that mutate or read nodes: [`pd-edge/src/abi_impl/http/`](src/abi_impl/http/)
+- data-plane orchestration as black-box VM execution plus graph resolution: [`pd-edge/src/runtime/http_plane/proxy_path.rs`](src/runtime/http_plane/proxy_path.rs)
 
 ## ABI Source of Truth
 

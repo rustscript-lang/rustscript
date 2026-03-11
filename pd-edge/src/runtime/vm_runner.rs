@@ -14,8 +14,8 @@ use super::{
 };
 use crate::{
     abi_impl::{
-        SharedProxyVmContext, SharedVmAsyncOps, VmAsyncOpBridge, VmExecutionOutcome,
-        enter_edge_host_context, new_shared_vm_async_ops, snapshot_execution_outcome,
+        SharedProxyVmContext, SharedVmAsyncOps, VmAsyncOpBridge, enter_edge_host_context,
+        new_shared_vm_async_ops,
     },
     debug_session::{SharedDebugSession, run_vm_with_optional_debugger},
     logging::category_program,
@@ -41,7 +41,7 @@ impl VmRunnerStoreData {
 
 type VmRunnerStore = Store<VmRunnerStoreData>;
 type VmExecutionModeFuture =
-    Pin<Box<dyn Future<Output = Result<VmExecutionOutcome, VmExecutionError>> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = Result<(), VmExecutionError>> + Send + 'static>>;
 
 trait VmModeRunner {
     fn execute(
@@ -116,7 +116,7 @@ pub async fn execute_vm_with_context(
     debug: VmDebugInvocation,
     register_host_modules: HostModuleRegistrar,
     vm_execution: VmExecutionConfig,
-) -> Result<VmExecutionOutcome, VmExecutionError> {
+) -> Result<(), VmExecutionError> {
     let program = program.program.clone();
     let async_ops = new_shared_vm_async_ops();
     let vm_store = new_vm_runner_store(program, vm_context, async_ops);
@@ -192,10 +192,10 @@ async fn execute_vm_with_async_mode(
     debug: VmDebugInvocation,
     register_host_modules: HostModuleRegistrar,
     vm_execution: VmExecutionConfig,
-) -> Result<VmExecutionOutcome, VmExecutionError> {
+) -> Result<(), VmExecutionError> {
     let started = std::time::Instant::now();
     let request_id = debug.request_id.clone();
-    let (outcome, mut profile) = run_vm_async(
+    let mut profile = run_vm_async(
         vm_store,
         debug_session,
         debug,
@@ -207,7 +207,7 @@ async fn execute_vm_with_async_mode(
     profile.queue_wait_us = 0;
     profile.blocking_run_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
     maybe_log_tail_profile(&request_id, &profile);
-    Ok(outcome)
+    Ok(())
 }
 
 async fn execute_vm_with_threading_mode(
@@ -216,7 +216,7 @@ async fn execute_vm_with_threading_mode(
     debug: VmDebugInvocation,
     register_host_modules: HostModuleRegistrar,
     vm_execution: VmExecutionConfig,
-) -> Result<VmExecutionOutcome, VmExecutionError> {
+) -> Result<(), VmExecutionError> {
     let queued_at = std::time::Instant::now();
     let task = tokio::task::spawn_blocking(move || {
         let queue_wait_us = u64::try_from(queued_at.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -231,12 +231,12 @@ async fn execute_vm_with_threading_mode(
         );
 
         match result {
-            Ok((outcome, mut profile)) => {
+            Ok(mut profile) => {
                 profile.queue_wait_us = queue_wait_us;
                 profile.blocking_run_us =
                     u64::try_from(threading_started.elapsed().as_micros()).unwrap_or(u64::MAX);
                 maybe_log_tail_profile(&request_id, &profile);
-                Ok(outcome)
+                Ok(())
             }
             Err(err) => Err(err),
         }
@@ -255,7 +255,7 @@ async fn run_vm_async(
     debug: VmDebugInvocation,
     register_host_modules: HostModuleRegistrar,
     vm_execution: VmExecutionConfig,
-) -> Result<(VmExecutionOutcome, VmExecutionProfile), VmExecutionError> {
+) -> Result<VmExecutionProfile, VmExecutionError> {
     let interrupt = configure_vm_interrupt(&mut vm_store, vm_execution)?;
     register_host_modules_from_store(&mut vm_store, register_host_modules)?;
     let mut profile = VmExecutionProfile::default();
@@ -302,10 +302,7 @@ async fn run_vm_async(
         }
     }
 
-    Ok((
-        snapshot_execution_outcome(&vm_store.data().vm_context),
-        profile,
-    ))
+    Ok(profile)
 }
 
 fn run_vm_threading(
@@ -314,7 +311,7 @@ fn run_vm_threading(
     debug: VmDebugInvocation,
     register_host_modules: HostModuleRegistrar,
     vm_execution: VmExecutionConfig,
-) -> Result<(VmExecutionOutcome, VmExecutionProfile), VmExecutionError> {
+) -> Result<VmExecutionProfile, VmExecutionError> {
     let interrupt = configure_vm_interrupt(&mut vm_store, vm_execution)?;
     register_host_modules_from_store(&mut vm_store, register_host_modules)?;
     let mut profile = VmExecutionProfile::default();
@@ -360,10 +357,7 @@ fn run_vm_threading(
         }
     }
 
-    Ok((
-        snapshot_execution_outcome(&vm_store.data().vm_context),
-        profile,
-    ))
+    Ok(profile)
 }
 
 fn new_vm_runner_store(
@@ -578,7 +572,7 @@ mod tests {
             execution_mode: VmExecutionMode::Threading,
         };
 
-        let (_outcome, profile) = tokio::task::spawn_blocking(move || {
+        let profile = tokio::task::spawn_blocking(move || {
             run_vm_threading(store, debug_session, debug, no_host_modules, execution)
         })
         .await

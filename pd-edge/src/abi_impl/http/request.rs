@@ -3,7 +3,7 @@ use edge_abi::symbols::http::request as http_request;
 use pd_edge_host_function::pd_edge_host_function;
 use vm::{CallOutcome, Value, Vm, VmError};
 
-use super::super::{
+use super::{
     SharedProxyVmContext, headers_to_value_map, query_to_value_map, read_request_body_all,
     read_request_body_next_chunk, request_body_eof, request_path_with_query,
 };
@@ -26,22 +26,21 @@ async fn request_field_outcome(
     context: SharedProxyVmContext,
     field: RequestField,
 ) -> Result<CallOutcome, VmError> {
-    let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_request_line();
+    let context = context.lock().expect("vm context lock poisoned");
     let value = match field {
-        RequestField::Id => context.inbound_request_id.clone(),
-        RequestField::Method => context.inbound_request_method.as_str().to_string(),
-        RequestField::Path => context.inbound_request_path.clone(),
-        RequestField::Query => context.inbound_request_query.clone(),
-        RequestField::RawQuery => context.inbound_request_query.clone(),
+        RequestField::Id => context.request_head.request_id.clone(),
+        RequestField::Method => context.request_head.method.as_str().to_string(),
+        RequestField::Path => context.request_head.path.clone(),
+        RequestField::Query => context.request_head.query.clone(),
+        RequestField::RawQuery => context.request_head.query.clone(),
         RequestField::PathWithQuery => request_path_with_query(
-            context.inbound_request_path.as_str(),
-            context.inbound_request_query.as_str(),
+            context.request_head.path.as_str(),
+            context.request_head.query.as_str(),
         ),
-        RequestField::HttpVersion => context.inbound_request_http_version.clone(),
-        RequestField::Scheme => context.inbound_request_scheme.clone(),
-        RequestField::Host => context.inbound_request_host.clone(),
-        RequestField::ClientIp => context.inbound_request_client_ip.clone(),
+        RequestField::HttpVersion => context.request_head.http_version.clone(),
+        RequestField::Scheme => context.request_head.scheme.clone(),
+        RequestField::Host => context.request_head.host.clone(),
+        RequestField::ClientIp => context.request_head.client_ip.clone(),
     };
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
@@ -134,10 +133,10 @@ async fn get_request_header(
 ) -> Result<CallOutcome, VmError> {
     let header_name = HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
-    let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_request_headers();
+    let context = context.lock().expect("vm context lock poisoned");
     let value = context
-        .inbound_request_headers
+        .request_head
+        .headers
         .get(&header_name)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
@@ -149,10 +148,9 @@ async fn get_request_headers(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_request_headers();
+    let context = context.lock().expect("vm context lock poisoned");
     Ok(CallOutcome::Return(vec![headers_to_value_map(
-        &context.inbound_request_headers,
+        &context.request_head.headers,
     )]))
 }
 
@@ -162,9 +160,8 @@ async fn get_request_query_arg(
     context: SharedProxyVmContext,
     name: String,
 ) -> Result<CallOutcome, VmError> {
-    let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_request_line();
-    let value = url::form_urlencoded::parse(context.inbound_request_query.as_bytes())
+    let context = context.lock().expect("vm context lock poisoned");
+    let value = url::form_urlencoded::parse(context.request_head.query.as_bytes())
         .find_map(|(key, value)| {
             if key == name {
                 Some(value.into_owned())
@@ -181,10 +178,9 @@ async fn get_request_query_args(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_request_line();
+    let context = context.lock().expect("vm context lock poisoned");
     Ok(CallOutcome::Return(vec![query_to_value_map(
-        &context.inbound_request_query,
+        &context.request_head.query,
     )]))
 }
 
@@ -230,9 +226,8 @@ async fn get_request_port(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    let mut context = context.lock().expect("vm context lock poisoned");
-    context.touch_request_line();
+    let context = context.lock().expect("vm context lock poisoned");
     Ok(CallOutcome::Return(vec![Value::Int(
-        context.inbound_request_port as i64,
+        context.request_head.port as i64,
     )]))
 }
