@@ -3,6 +3,17 @@ mod common;
 use common::*;
 use vm::OpCode;
 
+const LOCAL_SLOT_COMPAT_THRESHOLD: usize = 8;
+
+fn sequential_locals_source(local_count: usize) -> String {
+    let mut source = String::new();
+    for idx in 0..local_count {
+        source.push_str(&format!("let v{idx} = {idx};\n"));
+    }
+    source.push_str(&format!("v{};\n", local_count - 1));
+    source
+}
+
 #[test]
 fn compiler_emits_expression() {
     let expr = Expr::Mul(
@@ -171,6 +182,92 @@ fn compiler_reuses_slots_when_declared_locals_exceed_bytecode_limit() {
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(599)]);
+}
+
+#[test]
+fn compiler_preserves_source_slots_at_compat_threshold() {
+    use std::collections::HashSet;
+
+    let source = sequential_locals_source(LOCAL_SLOT_COMPAT_THRESHOLD);
+
+    let compiled = compile_source(&source).expect("compile should succeed");
+    assert_eq!(
+        compiled.locals, LOCAL_SLOT_COMPAT_THRESHOLD,
+        "locals at the compat threshold should keep source slot identities"
+    );
+
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("compiled program should include debug info");
+    let locals = debug
+        .locals
+        .iter()
+        .filter(|local| local.name.starts_with('v'))
+        .collect::<Vec<_>>();
+    assert_eq!(locals.len(), LOCAL_SLOT_COMPAT_THRESHOLD);
+
+    let distinct_slots = locals
+        .iter()
+        .map(|local| local.index)
+        .collect::<HashSet<_>>()
+        .len();
+    assert_eq!(
+        distinct_slots, LOCAL_SLOT_COMPAT_THRESHOLD,
+        "debug locals at the threshold should retain distinct physical slots"
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::Int((LOCAL_SLOT_COMPAT_THRESHOLD - 1) as i64)]
+    );
+}
+
+#[test]
+fn compiler_reuses_slots_immediately_above_compat_threshold() {
+    use std::collections::HashSet;
+
+    let source = sequential_locals_source(LOCAL_SLOT_COMPAT_THRESHOLD + 1);
+
+    let compiled = compile_source(&source).expect("compile should succeed");
+    assert!(
+        compiled.locals <= LOCAL_SLOT_COMPAT_THRESHOLD,
+        "locals above the compat threshold should be remapped into a smaller physical slot set"
+    );
+
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("compiled program should include debug info");
+    let locals = debug
+        .locals
+        .iter()
+        .filter(|local| local.name.starts_with('v'))
+        .collect::<Vec<_>>();
+    assert_eq!(locals.len(), LOCAL_SLOT_COMPAT_THRESHOLD + 1);
+
+    let distinct_slots = locals
+        .iter()
+        .map(|local| local.index)
+        .collect::<HashSet<_>>()
+        .len();
+    assert!(
+        distinct_slots < locals.len(),
+        "debug locals above the threshold should show physical slot reuse"
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::Int(LOCAL_SLOT_COMPAT_THRESHOLD as i64)]
+    );
 }
 
 #[test]

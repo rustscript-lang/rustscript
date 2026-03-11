@@ -42,6 +42,31 @@ fn compile_run_vm(source: &str) -> Vm {
     vm
 }
 
+fn local_visible_at_current_line(vm: &Vm, name: &str) -> bool {
+    let info = vm
+        .debug_info()
+        .expect("compiled program should include debug info");
+    let local = info
+        .locals
+        .iter()
+        .find(|local| local.name == name)
+        .unwrap_or_else(|| panic!("expected local '{name}' in debug info"));
+    let Some(line) = info.line_for_offset(vm.ip()) else {
+        return true;
+    };
+    if let Some(declared_line) = local.declared_line
+        && line < declared_line
+    {
+        return false;
+    }
+    if let Some(last_line) = local.last_line
+        && line > last_line
+    {
+        return false;
+    }
+    true
+}
+
 /// Host function that returns Pending on first call, then returns empty result on resume.
 struct PendingOnce {
     call_count: Arc<AtomicUsize>,
@@ -447,7 +472,6 @@ fn dead_local_slot_is_null_after_drop() {
         .as_ref()
         .expect("debug info should exist");
     let a_index = debug.local_index("a").expect("a binding should exist");
-
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -673,13 +697,13 @@ fn reset_for_reuse_clears_all_locals_to_null() {
 }
 
 // ---------------------------------------------------------------------------
-// 10. Host-op boundary: locals Null verification
+// 10. Host-op boundary: dead-local visibility and drop verification
 // ---------------------------------------------------------------------------
 
 #[test]
-fn drop_events_across_host_op_verify_local_null() {
-    // Dead local goes out of scope before a host-op wait.  Verify both the
-    // counter and the actual slot being Null.
+fn drop_events_across_host_op_hide_dead_local_before_wait() {
+    // Dead local goes out of scope before a host-op wait. Verify both the
+    // drop counter and that the local is hidden at the wait line.
     let source = r#"
         fn wait();
         let a = { tag: "before-wait" };
@@ -689,13 +713,6 @@ fn drop_events_across_host_op_verify_local_null() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let debug = compiled
-        .program
-        .debug
-        .as_ref()
-        .expect("debug info should exist");
-    let a_index = debug.local_index("a").expect("a binding should exist");
-
     let calls = Arc::new(AtomicUsize::new(0));
     let mut vm = Vm::new(compiled.program);
     vm.register_function(Box::new(PendingOnce {
@@ -707,9 +724,13 @@ fn drop_events_across_host_op_verify_local_null() {
     let status = vm.run().expect("first run should wait");
     assert_eq!(status, VmStatus::Waiting(900));
     assert_eq!(
-        vm.locals()[a_index as usize],
-        Value::Null,
-        "local 'a' should be Null while waiting (dropped before wait call)"
+        vm.drop_contract_event_count(),
+        3,
+        "dead local should have triggered its recursive drop before the wait boundary"
+    );
+    assert!(
+        !local_visible_at_current_line(&vm, "a"),
+        "dead local should not remain visible while waiting at the host call"
     );
 
     // Complete and resume.
@@ -718,9 +739,13 @@ fn drop_events_across_host_op_verify_local_null() {
     let status = vm.resume().expect("resume should halt");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
-        vm.locals()[a_index as usize],
-        Value::Null,
-        "local 'a' should remain Null after resume"
+        vm.drop_contract_event_count(),
+        4,
+        "resume should only account for the final live marker drop"
+    );
+    assert!(
+        !local_visible_at_current_line(&vm, "a"),
+        "dead local should remain hidden after resume"
     );
 }
 
