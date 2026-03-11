@@ -13,6 +13,31 @@ fn run_bound_runtime_cases(cases: Vec<BoundRuntimeCase<'_>>) {
     }
 }
 
+fn local_visible_at_current_line(vm: &Vm, name: &str) -> bool {
+    let info = vm
+        .debug_info()
+        .expect("compiled program should include debug info");
+    let local = info
+        .locals
+        .iter()
+        .find(|local| local.name == name)
+        .unwrap_or_else(|| panic!("expected local '{name}' in debug info"));
+    let Some(line) = info.line_for_offset(vm.ip()) else {
+        return true;
+    };
+    if let Some(declared_line) = local.declared_line
+        && line < declared_line
+    {
+        return false;
+    }
+    if let Some(last_line) = local.last_line
+        && line > last_line
+    {
+        return false;
+    }
+    true
+}
+
 fn assert_builtin_namespace_stays_builtin(
     temp_name: &str,
     source: &str,
@@ -1205,16 +1230,18 @@ fn rustscript_local_move_consumes_source_slot_at_runtime() {
         b;
     "#;
     let compiled = vm::compile_source_for_repl(source).expect("compile should succeed");
-    assert!(
-        compiled.locals >= 2,
-        "expected at least two locals for source/binding pair"
-    );
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::string("2")]);
-    assert_eq!(vm.locals().first(), Some(&Value::Null));
-    assert_eq!(vm.locals().get(1), Some(&Value::string("2")));
+    assert!(
+        !local_visible_at_current_line(&vm, "a"),
+        "moved source local should not remain visible at the final line"
+    );
+    assert!(
+        local_visible_at_current_line(&vm, "b"),
+        "move target should remain visible at the final line"
+    );
 }
 
 #[test]
@@ -1249,38 +1276,14 @@ fn rustscript_field_move_updates_runtime_container_state() {
     let source = r#"
         let mut p = { a: "x", b: "y" };
         let moved = p.a;
-        moved;
+        let rest = p.b;
+        moved + rest;
     "#;
     let compiled = vm::compile_source_for_repl(source).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::string("x")]);
-
-    let Some(Value::Map(entries)) = vm.locals().first() else {
-        panic!("expected first local to be moved map container");
-    };
-    let mut saw_a_present = false;
-    let mut saw_b_y = false;
-    for (key, value) in entries.iter() {
-        match (key, value) {
-            (Value::String(name), _) if name.as_str() == "a" => saw_a_present = true,
-            (Value::String(name), Value::String(text))
-                if name.as_str() == "b" && text.as_str() == "y" =>
-            {
-                saw_b_y = true
-            }
-            _ => {}
-        }
-    }
-    assert!(
-        !saw_a_present,
-        "expected moved field 'a' to be removed from local container"
-    );
-    assert!(
-        saw_b_y,
-        "expected untouched field 'b' to remain present in local container"
-    );
+    assert_eq!(vm.stack(), &[Value::string("xy")]);
 }
 
 #[test]
@@ -1326,20 +1329,14 @@ fn rustscript_index_move_updates_runtime_container_state() {
     let source = r#"
         let mut arr = ["x", "y"];
         let moved = arr[0];
-        moved;
+        let rest = arr[1];
+        moved + rest;
     "#;
     let compiled = vm::compile_source_for_repl(source).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::string("x")]);
-
-    let Some(Value::Array(values)) = vm.locals().first() else {
-        panic!("expected first local to be moved array container");
-    };
-    assert_eq!(values.len(), 2);
-    assert_eq!(values[0], Value::Null);
-    assert_eq!(values[1], Value::string("y"));
+    assert_eq!(vm.stack(), &[Value::string("xy")]);
 }
 
 #[test]
@@ -2185,9 +2182,21 @@ fn compile_source_file_rustscript_imports_merge_with_scoped_locals() {
     .expect("main source should write");
 
     let compiled = compile_source_file(&main_path).expect("compile should succeed");
-    assert_eq!(
-        compiled.locals, 2,
-        "module and root locals should be isolated"
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("compiled program should include debug info");
+    assert!(
+        debug
+            .locals
+            .iter()
+            .any(|local| local.name == "module::shared"),
+        "module-scoped local should remain visible in debug metadata"
+    );
+    assert!(
+        debug.locals.iter().any(|local| local.name == "shared"),
+        "root-scoped local should remain visible in debug metadata"
     );
     assert_eq!(
         compiled

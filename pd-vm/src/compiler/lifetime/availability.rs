@@ -14,6 +14,8 @@ use self::consumption::{
     compute_function_consumed_param_positions, extract_passthrough_return_slot,
 };
 
+const LOCAL_SLOT_ALLOCATOR_COMPAT_THRESHOLD: usize = 8;
+
 #[derive(Clone, PartialEq, Eq)]
 struct FlowState {
     reachable: bool,
@@ -137,7 +139,11 @@ pub(super) fn enforce_local_availability(
         }
     }
 
-    if ir.locals > (u8::MAX as usize + 1) {
+    // Preserve source-local slot identity for tiny programs. Once the frontend
+    // grows past the compat threshold, compact onto the minimal physical slot
+    // set while still rejecting programs that need more than 256 simultaneous
+    // locals.
+    if ir.locals > LOCAL_SLOT_ALLOCATOR_COMPAT_THRESHOLD {
         let allocator = LocalSlotAllocator::new(ir.locals, &ir.local_bindings, &ir.function_impls);
         ir = allocator.allocate(ir)?;
     }
