@@ -317,6 +317,10 @@ pub trait EdgeProtocolHostModule {
         context: SharedProxyVmContext,
         async_ops: SharedVmAsyncOps,
     ) -> Result<(), VmError>;
+
+    fn scope_mask(&self) -> Option<u8> {
+        None
+    }
 }
 
 pub struct RuntimeProtocolHostModule;
@@ -329,6 +333,10 @@ impl EdgeProtocolHostModule for RuntimeProtocolHostModule {
         async_ops: SharedVmAsyncOps,
     ) -> Result<(), VmError> {
         register_runtime_host_module(vm, context, async_ops)
+    }
+
+    fn scope_mask(&self) -> Option<u8> {
+        Some(1 << 0)
     }
 }
 
@@ -343,9 +351,16 @@ impl EdgeProtocolHostModule for HttpProtocolHostModule {
     ) -> Result<(), VmError> {
         register_http_host_module(vm, context, async_ops)
     }
+
+    fn scope_mask(&self) -> Option<u8> {
+        Some(1 << 1)
+    }
 }
 
-fn unbound_edge_abi_function(_vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, VmError> {
+pub(crate) fn unbound_edge_abi_function(
+    _vm: &mut Vm,
+    _args: &[Value],
+) -> Result<CallOutcome, VmError> {
     Err(VmError::HostError(
         "edge ABI host function is not bound".to_string(),
     ))
@@ -378,6 +393,33 @@ pub fn register_protocol_modules(
     async_ops: SharedVmAsyncOps,
     modules: &[&dyn EdgeProtocolHostModule],
 ) -> Result<(), VmError> {
+    let mut scope_mask_bits = 0u8;
+    for module in modules {
+        let Some(scope_mask) = module.scope_mask() else {
+            ensure_edge_abi_host_slots(vm)?;
+            for module in modules {
+                module.register(vm, context.clone(), async_ops.clone())?;
+            }
+            return Ok(());
+        };
+        scope_mask_bits |= scope_mask;
+    }
+    if scope_mask_bits != 0 && vm.bound_function_count() == 0 {
+        let mut scopes = Vec::new();
+        if scope_mask_bits & (1 << 0) != 0 {
+            scopes.push(registry::EdgeHostScope::Runtime);
+        }
+        if scope_mask_bits & (1 << 1) != 0 {
+            scopes.push(registry::EdgeHostScope::Http);
+        }
+        if scope_mask_bits & (1 << 2) != 0 {
+            scopes.push(registry::EdgeHostScope::HttpExtension);
+        }
+        if scope_mask_bits & (1 << 3) != 0 {
+            scopes.push(registry::EdgeHostScope::Io);
+        }
+        return registry::bind_host_scopes(vm, &scopes);
+    }
     ensure_edge_abi_host_slots(vm)?;
     for module in modules {
         module.register(vm, context.clone(), async_ops.clone())?;
@@ -843,11 +885,10 @@ pub async fn resolve_outbound_request_body(
 
 pub fn register_host_module(
     vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
+    _context: SharedProxyVmContext,
+    _async_ops: SharedVmAsyncOps,
 ) -> Result<(), VmError> {
-    static RUNTIME_PROTOCOL_MODULE: RuntimeProtocolHostModule = RuntimeProtocolHostModule;
-    register_protocol_modules(vm, context, async_ops, &[&RUNTIME_PROTOCOL_MODULE])
+    registry::bind_host_scopes(vm, &[registry::EdgeHostScope::Runtime])
 }
 
 pub fn register_http_plane_host_module(
@@ -855,6 +896,17 @@ pub fn register_http_plane_host_module(
     context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
 ) -> Result<(), VmError> {
+    if vm.bound_function_count() == 0 {
+        return registry::bind_host_scopes(
+            vm,
+            &[
+                registry::EdgeHostScope::Http,
+                registry::EdgeHostScope::Runtime,
+                registry::EdgeHostScope::HttpExtension,
+                registry::EdgeHostScope::Io,
+            ],
+        );
+    }
     static HTTP_PROTOCOL_MODULE: HttpProtocolHostModule = HttpProtocolHostModule;
     static RUNTIME_PROTOCOL_MODULE: RuntimeProtocolHostModule = RuntimeProtocolHostModule;
     register_protocol_modules(
@@ -869,20 +921,18 @@ pub fn register_http_plane_host_module(
 
 pub fn register_runtime_host_module(
     vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
+    _context: SharedProxyVmContext,
+    _async_ops: SharedVmAsyncOps,
 ) -> Result<(), VmError> {
-    ensure_edge_abi_host_slots(vm)?;
-    runtime::register_runtime_host_module(vm, context, async_ops)
+    registry::bind_host_scopes(vm, &[registry::EdgeHostScope::Runtime])
 }
 
 pub fn register_http_host_module(
     vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
+    _context: SharedProxyVmContext,
+    _async_ops: SharedVmAsyncOps,
 ) -> Result<(), VmError> {
-    ensure_edge_abi_host_slots(vm)?;
-    http::register_http_host_module(vm, context, async_ops)
+    registry::bind_host_scopes(vm, &[registry::EdgeHostScope::Http])
 }
 
 fn schedule_future_call<F>(
@@ -909,6 +959,14 @@ where
     schedule_future_call(vm, &async_ops, future)
 }
 
+pub(crate) fn schedule_current_ready_call(
+    vm: &mut Vm,
+    values: Vec<Value>,
+) -> Result<CallOutcome, VmError> {
+    let async_ops = current_async_ops()?;
+    schedule_ready_call(vm, &async_ops, values)
+}
+
 fn schedule_ready_call(
     vm: &mut Vm,
     async_ops: &SharedVmAsyncOps,
@@ -917,6 +975,17 @@ fn schedule_ready_call(
     let mut ops = async_ops.lock().expect("vm async ops lock poisoned");
     let op_id = ops.schedule_ready(vm, Ok(values))?;
     Ok(CallOutcome::Pending(op_id))
+}
+
+pub(crate) fn adapt_edge_call_outcome(
+    vm: &mut Vm,
+    outcome: CallOutcome,
+) -> Result<CallOutcome, VmError> {
+    match outcome {
+        CallOutcome::Return(values) => schedule_current_ready_call(vm, values),
+        CallOutcome::Yield => Ok(CallOutcome::Yield),
+        CallOutcome::Pending(op_id) => Ok(CallOutcome::Pending(op_id)),
+    }
 }
 
 async fn read_request_body_all(context: &SharedProxyVmContext) -> Result<Vec<u8>, VmError> {
@@ -1134,5 +1203,80 @@ fn is_valid_upstream(value: &str) -> bool {
     match port.parse::<u16>() {
         Ok(port) => port != 0,
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::http::HeaderMap;
+    use edge_abi::symbols::{http::request as http_request, runtime as edge_runtime};
+    use vm::{HostImport, OpCode, Program, ValueType, Vm};
+
+    use super::{
+        ProxyVmContext, RateLimiterStore, SharedProxyVmContext, new_shared_vm_async_ops,
+        register_host_module, register_http_plane_host_module,
+    };
+
+    fn test_context() -> SharedProxyVmContext {
+        Arc::new(Mutex::new(ProxyVmContext::from_request_headers(
+            HeaderMap::new(),
+            Arc::new(Mutex::new(RateLimiterStore::new())),
+        )))
+    }
+
+    #[test]
+    fn register_host_module_binds_cached_runtime_scope_plan() {
+        let imports = vec![HostImport {
+            name: edge_runtime::SLEEP.name.to_string(),
+            arity: 1,
+            return_type: ValueType::Unknown,
+        }];
+        let program =
+            Program::with_imports_and_debug(vec![], vec![OpCode::Ret as u8], imports, None);
+
+        let mut first = Vm::new(program.clone());
+        register_host_module(&mut first, test_context(), new_shared_vm_async_ops())
+            .expect("first runtime vm should bind");
+        assert_eq!(first.bound_function_count(), 1);
+
+        let mut second = Vm::new(program);
+        register_host_module(&mut second, test_context(), new_shared_vm_async_ops())
+            .expect("second runtime vm should reuse cached plan");
+        assert_eq!(second.bound_function_count(), 1);
+    }
+
+    #[test]
+    fn register_http_plane_host_module_binds_cached_multi_scope_plan() {
+        let imports = vec![
+            HostImport {
+                name: http_request::GET_METHOD.name.to_string(),
+                arity: 0,
+                return_type: ValueType::Unknown,
+            },
+            HostImport {
+                name: "http::request::body::next_chunk".to_string(),
+                arity: 1,
+                return_type: ValueType::Unknown,
+            },
+            HostImport {
+                name: "io::exists".to_string(),
+                arity: 1,
+                return_type: ValueType::Unknown,
+            },
+            HostImport {
+                name: edge_runtime::SLEEP.name.to_string(),
+                arity: 1,
+                return_type: ValueType::Unknown,
+            },
+        ];
+        let program =
+            Program::with_imports_and_debug(vec![], vec![OpCode::Ret as u8], imports, None);
+        let mut vm = Vm::new(program);
+        register_http_plane_host_module(&mut vm, test_context(), new_shared_vm_async_ops())
+            .expect("http plane vm should bind all cached scopes");
+
+        assert_eq!(vm.bound_function_count(), 4);
     }
 }

@@ -28,10 +28,13 @@ pub(crate) fn expand_pd_edge_host_function(
         item.sig.ident = impl_name.clone();
     }
     let wrapper = generate_edge_host_binder(&item, &wrapper_name, &edge_attr)?;
-    let registration = generate_edge_host_registration(&wrapper_name, edge_attr.scope);
+    let static_wrapper =
+        generate_scoped_edge_host_static_wrapper(&item, &wrapper_name, &edge_attr)?;
+    let registration = generate_edge_host_registration(&item, &wrapper_name, &edge_attr)?;
     Ok(quote! {
         #item
         #wrapper
+        #static_wrapper
         #registration
     })
 }
@@ -408,35 +411,161 @@ fn generate_edge_host_binder(
     })
 }
 
-fn generate_edge_host_registration(
+fn generate_scoped_edge_host_static_wrapper(
+    item: &ItemFn,
     wrapper_name: &syn::Ident,
-    scope: Option<EdgeHostScopeAttr>,
-) -> proc_macro2::TokenStream {
-    let Some(scope) = scope else {
-        return quote!();
+    attr: &EdgeHostAttr,
+) -> Result<proc_macro2::TokenStream, Error> {
+    let Some(_scope) = attr.scope else {
+        return Ok(quote!());
     };
+    let impl_name = &item.sig.ident;
+    let static_wrapper_name = format_ident!("__pd_edge_static_{}", wrapper_name);
+    let mut setup_stmts = Vec::<proc_macro2::TokenStream>::new();
+    let mut call_args = Vec::<proc_macro2::TokenStream>::new();
+    let mut extract_stmts = Vec::<proc_macro2::TokenStream>::new();
+    let mut arg_index = 0usize;
 
-    let register_name = format_ident!("__pd_edge_register_{}", wrapper_name);
-    let entry_name = format_ident!("__pd_edge_registration_{}", wrapper_name);
-    let scope_tokens = edge_scope_tokens(scope);
+    for input in &item.sig.inputs {
+        let FnArg::Typed(pat_type) = input else {
+            return Err(Error::new_spanned(input, "methods are not supported"));
+        };
+        let Pat::Ident(PatIdent { ident, .. }) = pat_type.pat.as_ref() else {
+            return Err(Error::new_spanned(
+                &pat_type.pat,
+                "edge host parameters must use identifier patterns",
+            ));
+        };
+        let ty = &pat_type.ty;
 
-    quote! {
-        fn #register_name(
-            bind_vm: &mut ::vm::Vm,
-            bind_context: &crate::abi_impl::SharedProxyVmContext,
-            bind_async_ops: &crate::abi_impl::SharedVmAsyncOps,
-        ) {
-            #wrapper_name(bind_vm, bind_context, bind_async_ops);
+        if is_vm_context_type(ty) {
+            call_args.push(quote!(vm));
+            continue;
         }
 
+        if is_edge_async_ops_type(ty) {
+            setup_stmts.push(quote!(let #ident = crate::abi_impl::current_async_ops()?;));
+            call_args.push(quote!(#ident));
+            continue;
+        }
+
+        if is_edge_context_type(ty) {
+            setup_stmts.push(quote!(let #ident = crate::abi_impl::current_vm_context()?;));
+            call_args.push(quote!(#ident));
+            continue;
+        }
+
+        if is_value_slice_type(ty) {
+            return Err(Error::new_spanned(
+                ty,
+                "scoped pd_edge_host_function does not support raw args",
+            ));
+        }
+
+        if attr.bind_params.iter().any(|candidate| candidate == ident) {
+            return Err(Error::new_spanned(
+                ident,
+                "scoped pd_edge_host_function does not support bind(...)",
+            ));
+        }
+
+        let decoder = edge_arg_decoder_kind(ty)?;
+        extract_stmts.push(edge_extract_stmt(ident, decoder, arg_index, wrapper_name));
+        call_args.push(quote!(#ident));
+        arg_index += 1;
+    }
+
+    let _ = u8::try_from(arg_index).map_err(|_| {
+        Error::new_spanned(
+            &item.sig.ident,
+            "edge host functions must have 255 arguments or fewer",
+        )
+    })?;
+    let call_expr = match edge_output_kind(&item.sig.output)? {
+        Some(EdgeOutputKind::ResultCallOutcome) => quote!(#impl_name(#(#call_args),*)),
+        Some(EdgeOutputKind::CallOutcome) => quote!(Ok(#impl_name(#(#call_args),*))),
+        None => {
+            return Err(Error::new_spanned(
+                &item.sig.output,
+                "edge host functions must return CallOutcome or Result<CallOutcome, VmError>",
+            ));
+        }
+    };
+
+    Ok(quote! {
+        fn #static_wrapper_name(
+            vm: &mut ::vm::Vm,
+            args: &[::vm::Value],
+        ) -> Result<::vm::CallOutcome, ::vm::VmError> {
+            if args.len() != #arg_index {
+                return Err(::vm::VmError::HostError(format!(
+                    "expected {} arguments, got {}",
+                    #arg_index,
+                    args.len()
+                )));
+            }
+            #(#setup_stmts)*
+            let __pd_edge_outcome = {
+                #(#extract_stmts)*
+                #call_expr
+            }?;
+            crate::abi_impl::adapt_edge_call_outcome(vm, __pd_edge_outcome)
+        }
+    })
+}
+
+fn generate_edge_host_registration(
+    item: &ItemFn,
+    wrapper_name: &syn::Ident,
+    attr: &EdgeHostAttr,
+) -> Result<proc_macro2::TokenStream, Error> {
+    let Some(scope) = attr.scope else {
+        return Ok(quote!());
+    };
+
+    let entry_name = format_ident!("__pd_edge_registration_{}", wrapper_name);
+    let scope_tokens = edge_scope_tokens(scope);
+    let static_wrapper_name = format_ident!("__pd_edge_static_{}", wrapper_name);
+    let mut arity = 0usize;
+
+    for input in &item.sig.inputs {
+        let FnArg::Typed(pat_type) = input else {
+            return Err(Error::new_spanned(input, "methods are not supported"));
+        };
+        if is_vm_context_type(&pat_type.ty)
+            || is_edge_async_ops_type(&pat_type.ty)
+            || is_edge_context_type(&pat_type.ty)
+        {
+            continue;
+        }
+        if is_value_slice_type(&pat_type.ty) {
+            return Err(Error::new_spanned(
+                &pat_type.ty,
+                "scoped pd_edge_host_function does not support raw args",
+            ));
+        }
+        arity += 1;
+    }
+
+    let arity = u8::try_from(arity).map_err(|_| {
+        Error::new_spanned(
+            &item.sig.ident,
+            "edge host functions must have 255 arguments or fewer",
+        )
+    })?;
+    let name_expr = &attr.name;
+
+    Ok(quote! {
         #[::linkme::distributed_slice(crate::abi_impl::registry::PD_EDGE_HOST_FUNCTIONS)]
         #[allow(non_upper_case_globals)]
         static #entry_name: crate::abi_impl::registry::EdgeHostRegistration =
             crate::abi_impl::registry::EdgeHostRegistration {
                 scope: #scope_tokens,
-                register: #register_name,
+                name: #name_expr,
+                arity: #arity,
+                function: #static_wrapper_name,
             };
-    }
+    })
 }
 
 fn find_vm_param_ident(item: &ItemFn) -> Option<Ident> {

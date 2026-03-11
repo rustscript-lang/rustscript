@@ -4,21 +4,7 @@ use edge_abi::symbols::{rate_limit as edge_rate_limit, runtime as edge_runtime};
 use pd_edge_host_function::pd_edge_host_function;
 use vm::{CallOutcome, Value, Vm, VmError};
 
-use super::{SharedProxyVmContext, SharedVmAsyncOps, current_vm_context};
-
-pub(super) fn register_runtime_host_module(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-) -> Result<(), VmError> {
-    super::registry::register_host_scope(
-        vm,
-        &context,
-        &async_ops,
-        super::registry::EdgeHostScope::Runtime,
-    );
-    Ok(())
-}
+use super::current_vm_context;
 
 #[pd_edge_host_function(name = edge_runtime::SLEEP.name, scope = runtime)]
 async fn runtime_sleep(_vm: &mut Vm, millis: i64) -> Result<CallOutcome, VmError> {
