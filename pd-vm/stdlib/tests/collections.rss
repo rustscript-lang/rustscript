@@ -30,6 +30,20 @@ assert(has(merged, "missing") == false);
 assert(get_or(merged, "y", 0) == 20);
 assert(get_or(merged, "missing", 9) == 9);
 
+let mut sparse = {keep: 1, drop: null};
+assert(has(sparse, "keep"));
+assert(has(sparse, "drop") == false);
+sparse.keep = null;
+assert(has(sparse, "keep") == false);
+
+let mut pruned = {x: 1, y: 2};
+pruned.y = null;
+let mut merged_without = merge(pruned, {z: 3});
+assert(has(merged_without, "x"));
+assert(has(merged_without, "y") == false);
+assert(has(merged_without, "z"));
+assert(get_or(merged_without, "y", 9) == 9);
+
 let mut only_values = values(merged);
 assert(only_values.length == 3);
 assert(contains(only_values, 1));

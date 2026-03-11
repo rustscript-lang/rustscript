@@ -43,6 +43,10 @@ let matched = match profile?.stats?.score {
     _ => 0,
 };
 
+let a=[1, "a"];
+let b=a[1];
+
+
 let regex_ok = re::match("(?i)^rustscript$", "RUSTSCRIPT");
 let payload = {
     lang: "rustscript",
