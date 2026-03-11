@@ -50,6 +50,7 @@ pub(super) enum TokenKind {
     Colon,
     Question,
     Dot,
+    Ellipsis,
     Semicolon,
     Equal,
     EqualEqual,
@@ -244,7 +245,26 @@ impl<'a> Lexer<'a> {
             }
             '.' => {
                 self.advance();
-                TokenKind::Dot
+                if self.current == Some('.') {
+                    self.advance();
+                    if self.current == Some('.') {
+                        self.advance();
+                        TokenKind::Ellipsis
+                    } else {
+                        return Err(ParseError {
+                            line,
+                            message: "unexpected '..'; use '...' for a variadic schema".to_string(),
+                            span: Some(Span::new(
+                                self.source_id,
+                                start,
+                                self.offset.max(start + 2),
+                            )),
+                            code: None,
+                        });
+                    }
+                } else {
+                    TokenKind::Dot
+                }
             }
             ';' => {
                 self.advance();

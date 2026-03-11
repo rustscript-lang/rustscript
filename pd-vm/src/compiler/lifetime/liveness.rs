@@ -160,7 +160,7 @@ impl LivenessRewriter {
             }
             Stmt::Let {
                 index,
-                declared_struct,
+                declared_schema,
                 expr,
                 line,
             } => {
@@ -170,7 +170,7 @@ impl LivenessRewriter {
                 (
                     Stmt::Let {
                         index: *index,
-                        declared_struct: declared_struct.clone(),
+                        declared_schema: declared_schema.clone(),
                         expr: expr.clone(),
                         line: *line,
                     },

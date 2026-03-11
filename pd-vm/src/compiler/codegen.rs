@@ -154,15 +154,11 @@ impl Compiler {
             }
             Stmt::Let {
                 index,
-                declared_struct,
+                declared_schema,
                 expr,
                 line,
             } => {
                 self.assembler.mark_line(*line);
-                let declared_schema = declared_struct
-                    .as_deref()
-                    .and_then(|name| self.struct_schemas.get(name))
-                    .cloned();
                 self.assign_expr_to_slot(*index, declared_schema.as_ref(), expr)?;
             }
             Stmt::Assign { index, expr, line } => {

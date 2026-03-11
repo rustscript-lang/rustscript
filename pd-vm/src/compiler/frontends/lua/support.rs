@@ -166,7 +166,7 @@ pub(super) fn lower_lua_multi_local_binding(
         .map_err(|err| ParseError::at_line(line as usize, err.to_string()))?;
     stmts.push(Stmt::Let {
         index: temp_slot,
-        declared_struct: None,
+        declared_schema: None,
         expr: expr.expr,
         line,
     });
@@ -292,7 +292,7 @@ pub(super) fn build_lua_return_expr(
         expr: Expr::Block {
             stmts: vec![Stmt::Let {
                 index: packed_slot,
-                declared_struct: None,
+                declared_schema: None,
                 expr: last.expr,
                 line,
             }],

@@ -585,6 +585,102 @@ fn compiler_type_inference_runtime_cases_cover_schema_and_optional_flows() {
             }],
         ),
         rustscript_type_inference_runtime_case(
+            "local let bindings accept homogeneous array schemas",
+            r#"
+                let values: [int] = [1, 2, 3];
+                let total = values[0] + values[2];
+                total;
+            "#,
+            vec![Value::Int(4)],
+            &[TypeMetadataExpectation::LastExact {
+                opcode: OpCode::Add,
+                expected: (ValueType::Int, ValueType::Int),
+            }],
+        ),
+        rustscript_type_inference_runtime_case(
+            "local let bindings accept postfix array schema aliases",
+            r#"
+                let data2: int[] = [1, 2, 3];
+                let total = data2[0] + data2[2];
+                total;
+            "#,
+            vec![Value::Int(4)],
+            &[TypeMetadataExpectation::LastExact {
+                opcode: OpCode::Add,
+                expected: (ValueType::Int, ValueType::Int),
+            }],
+        ),
+        rustscript_type_inference_runtime_case(
+            "variadic homogeneous array schemas accept rest syntax",
+            r#"
+                let values: [int...] = [1, 2, 3];
+                let total = values[1] + values[2];
+                total;
+            "#,
+            vec![Value::Int(5)],
+            &[TypeMetadataExpectation::LastExact {
+                opcode: OpCode::Add,
+                expected: (ValueType::Int, ValueType::Int),
+            }],
+        ),
+        rustscript_type_inference_runtime_case(
+            "indexed array schemas keep per-index types on local annotations",
+            r#"
+                let values: [int, string, bool] = [41, "Ada", true];
+                let numeric = values[0] + 1;
+                let text = values[1] + "!";
+                let enabled = if values[2] => {
+                    1
+                } else => {
+                    0
+                };
+                numeric;
+                text;
+                enabled;
+            "#,
+            vec![Value::Int(42), Value::string("Ada!"), Value::Int(1)],
+            &[TypeMetadataExpectation::Present {
+                opcode: OpCode::Add,
+                expected: &[(ValueType::Int, ValueType::Int)],
+            }],
+        ),
+        rustscript_type_inference_runtime_case(
+            "indexed array schemas support typed rest entries",
+            r#"
+                let values: [int, string, bool, string...] = [2, "a", true, "b", "c"];
+                let numeric = values[0] + 1;
+                let text = values[3] + values[4];
+                let enabled = if values[2] => {
+                    1
+                } else => {
+                    0
+                };
+                numeric;
+                text;
+                enabled;
+            "#,
+            vec![Value::Int(3), Value::string("bc"), Value::Int(1)],
+            &[TypeMetadataExpectation::Present {
+                opcode: OpCode::Add,
+                expected: &[(ValueType::Int, ValueType::Int)],
+            }],
+        ),
+        rustscript_type_inference_runtime_case(
+            "struct field schemas accept postfix array schema aliases",
+            r#"
+                struct Data { values: int[] }
+                let data: Data = { values: [40, 2] };
+                let values = data.values.copy();
+                let total = values[0] + values[1];
+                total;
+            "#,
+            vec![Value::Int(42)],
+            &[TypeMetadataExpectation::LastExact {
+                opcode: OpCode::Add,
+                expected: (ValueType::Int, ValueType::Int),
+            }],
+        ),
+        rustscript_type_inference_runtime_case(
             "declared object schemas propagate through nested fields and arrays",
             r#"
                 struct Age { first: int }

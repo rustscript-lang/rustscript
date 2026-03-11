@@ -166,7 +166,7 @@ pub(super) fn collect_stmt_types(
             }
             Stmt::Let {
                 index,
-                declared_struct,
+                declared_schema,
                 expr,
                 ..
             } => {
@@ -174,10 +174,6 @@ pub(super) fn collect_stmt_types(
                 collect_expr_types(expr, &expr_state, local_types, callable_slots, context);
                 let ty = context.infer_expr_type(expr, &expr_state);
                 record_local_type(local_types, *index, ty);
-                let declared_schema = declared_struct
-                    .as_deref()
-                    .and_then(|name| context.resolve_struct_schema(name))
-                    .cloned();
                 bind_expr_result_to_slot(
                     state,
                     *index,
