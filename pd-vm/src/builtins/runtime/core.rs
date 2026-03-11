@@ -26,12 +26,8 @@ pub(super) fn builtin_len(args: &[Value]) -> VmResult<Vec<Value>> {
     let value = arg::<&Value>(args, 0, "len value")?;
     match value {
         Value::String(text) => Ok(return_values(builtin_len_string_impl(text.as_str()))),
-        Value::Array(values) => Ok(return_values(builtin_len_array_impl(
-            unwrap_or_clone_shared(values.clone()),
-        ))),
-        Value::Map(entries) => Ok(return_values(builtin_len_map_impl(unwrap_or_clone_shared(
-            entries.clone(),
-        )))),
+        Value::Array(values) => Ok(return_values(values.len())),
+        Value::Map(entries) => Ok(return_values(entries.len())),
         _ => Err(VmError::TypeMismatch("string/array/map")),
     }
 }
@@ -545,12 +541,8 @@ pub(super) fn builtin_count_map_impl(entries: VmMap) -> i64 {
 pub(super) fn builtin_count(args: &[Value]) -> VmResult<Vec<Value>> {
     let container = arg::<&Value>(args, 0, "count container")?;
     match container {
-        Value::Array(values) => Ok(return_values(builtin_count_array_impl(
-            unwrap_or_clone_shared(values.clone()),
-        ))),
-        Value::Map(entries) => Ok(return_values(builtin_count_map_impl(
-            unwrap_or_clone_shared(entries.clone()),
-        ))),
+        Value::Array(values) => Ok(return_values(values.len())),
+        Value::Map(entries) => Ok(return_values(entries.len())),
         _ => Err(VmError::TypeMismatch("array/map")),
     }
 }
@@ -673,5 +665,38 @@ mod tests {
 
         assert!(builtin_has_map_impl(map.clone(), alias));
         assert!(!builtin_has_map_impl(map, structural_peer));
+    }
+
+    #[test]
+    fn len_and_count_dispatch_return_shared_container_sizes() {
+        let array = Value::array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        let map = Value::map(vec![
+            (Value::string("a"), Value::Int(1)),
+            (Value::string("b"), Value::Int(2)),
+        ]);
+
+        let array_len = builtin_len(&[array.clone()]).expect("array len should succeed");
+        let [Value::Int(array_len)] = array_len.as_slice() else {
+            panic!("expected int result");
+        };
+        assert_eq!(*array_len, 3);
+
+        let array_count = builtin_count(&[array]).expect("array count should succeed");
+        let [Value::Int(array_count)] = array_count.as_slice() else {
+            panic!("expected int result");
+        };
+        assert_eq!(*array_count, 3);
+
+        let map_len = builtin_len(&[map.clone()]).expect("map len should succeed");
+        let [Value::Int(map_len)] = map_len.as_slice() else {
+            panic!("expected int result");
+        };
+        assert_eq!(*map_len, 2);
+
+        let map_count = builtin_count(&[map]).expect("map count should succeed");
+        let [Value::Int(map_count)] = map_count.as_slice() else {
+            panic!("expected int result");
+        };
+        assert_eq!(*map_count, 2);
     }
 }
