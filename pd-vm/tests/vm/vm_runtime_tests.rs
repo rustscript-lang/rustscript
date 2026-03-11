@@ -1009,7 +1009,7 @@ fn map_equality_ignores_entry_order() {
 #[test]
 fn get_and_set_use_hash_map_overwrite_semantics() {
     const BUILTIN_GET: u16 = 0xFFB6;
-    const BUILTIN_SET: u16 = 0xFFB7;
+    const BUILTIN_SET: u16 = 0xFFB8;
 
     let map = Value::map(vec![
         (Value::string("k"), Value::Int(1)),
@@ -1047,7 +1047,7 @@ fn get_and_set_use_hash_map_overwrite_semantics() {
 
 #[test]
 fn set_rejects_sparse_array_indexes() {
-    const BUILTIN_SET: u16 = 0xFFB7;
+    const BUILTIN_SET: u16 = 0xFFB8;
 
     let constants = vec![
         Value::array(vec![Value::Int(10), Value::Int(20)]),

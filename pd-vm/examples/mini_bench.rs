@@ -873,6 +873,16 @@ fn build_compiler_stress_source(line_count: usize) -> String {
 
 fn build_complex_rss_source() -> String {
     r#"
+    struct Stats {
+        score: int,
+        values: [int],
+    }
+
+    struct Profile {
+        stats: Stats,
+        name: string,
+    }
+
     fn keep(value) { value }
 
     let mut total = 0;
@@ -885,15 +895,16 @@ fn build_complex_rss_source() -> String {
     let mut base = 8;
     let closure_value = add(5);
 
-    let profile = {
+    let profile: Profile = {
         stats: {
             score: closure_value,
             values: [1, 2, 3, 4],
         },
         name: "rss",
     };
-    let chained_score = profile?.stats?.score;
-    let missing_score = profile?.missing?.value;
+    let missing: Profile = null;
+    let chained_score = profile?.stats?.score.unwrap_or(0);
+    let missing_score = missing?.stats?.score.unwrap_or(0);
     let arr = profile.stats.values;
 
     let mut picked = match chained_score {

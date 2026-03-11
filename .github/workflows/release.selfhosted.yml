@@ -36,9 +36,9 @@ jobs:
       - name: Build wasm linter and bundle for WebUI
         shell: bash
         run: |
-          cargo build -p pd-vm-lint-wasm --target wasm32-unknown-unknown --release --locked
+          cargo build -p pd-vm-wasm --target wasm32-unknown-unknown --release --locked
           mkdir -p pd-controller/webui/public/wasm
-          cp target/wasm32-unknown-unknown/release/pd_vm_lint_wasm.wasm pd-controller/webui/public/wasm/pd_vm_lint_wasm.wasm
+          cp target/wasm32-unknown-unknown/release/pd_vm_wasm.wasm pd-controller/webui/public/wasm/pd_vm_wasm.wasm
 
       - name: Build WebUI assets
         shell: bash
@@ -47,7 +47,7 @@ jobs:
           bun install --frozen-lockfile
           bun run tsc --noEmit
           bun run vite build
-          test -f dist/wasm/pd_vm_lint_wasm.wasm
+          test -f dist/wasm/pd_vm_wasm.wasm
 
       - name: Compute git build metadata
         shell: bash

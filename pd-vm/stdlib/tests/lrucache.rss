@@ -1,0 +1,99 @@
+use super::rss::lrucache::{capacity, clear, entries, get, has, is_empty, keys, len, new, newest, oldest, peek, put, remove, touch, values};
+
+let mut cache = new(2);
+assert(capacity(cache) == 2);
+assert(len(cache) == 0);
+assert(is_empty(cache));
+
+cache = put(cache, "a", 1);
+cache = put(cache, "b", 2);
+
+let mut initial_keys = keys(cache);
+assert(initial_keys.length == 2);
+assert(initial_keys[0] == "a");
+assert(initial_keys[1] == "b");
+
+let mut peeked = peek(cache, "a");
+assert(peeked.found);
+assert(peeked.value == 1);
+let mut still_initial = keys(cache);
+assert(still_initial[0] == "a");
+assert(still_initial[1] == "b");
+
+let mut accessed = get(cache, "a");
+assert(accessed.found);
+assert(accessed.value == 1);
+cache = accessed.cache;
+let mut after_get = keys(cache);
+assert(after_get[0] == "b");
+assert(after_get[1] == "a");
+
+let mut lru_entry = oldest(cache);
+assert(lru_entry.found);
+assert(lru_entry.key == "b");
+assert(lru_entry.value == 2);
+
+let mut mru_entry = newest(cache);
+assert(mru_entry.found);
+assert(mru_entry.key == "a");
+assert(mru_entry.value == 1);
+
+cache = put(cache, "c", 3);
+let mut after_evict = keys(cache);
+assert(after_evict[0] == "a");
+assert(after_evict[1] == "c");
+assert(has(cache, "a"));
+assert(has(cache, "b") == false);
+assert(has(cache, "c"));
+
+let mut cache_values = values(cache);
+assert(cache_values.length == 2);
+assert(cache_values[0] == 1);
+assert(cache_values[1] == 3);
+
+cache = put(cache, "a", 10);
+let mut after_update = keys(cache);
+assert(after_update[0] == "c");
+assert(after_update[1] == "a");
+let mut updated = peek(cache, "a");
+assert(updated.found);
+assert(updated.value == 10);
+
+let mut missed = get(cache, "missing");
+assert(missed.found == false);
+cache = missed.cache;
+let mut after_miss = keys(cache);
+assert(after_miss[0] == "c");
+assert(after_miss[1] == "a");
+
+cache = touch(cache, "c");
+let mut after_touch = keys(cache);
+assert(after_touch[0] == "a");
+assert(after_touch[1] == "c");
+
+let mut rows = entries(cache);
+assert(rows.length == 2);
+let mut first_row = rows[0].copy();
+let mut second_row = rows[1].copy();
+assert(first_row[0] == "a");
+assert(first_row[1] == 10);
+assert(second_row[0] == "c");
+assert(second_row[1] == 3);
+
+cache = remove(cache, "a");
+assert(len(cache) == 1);
+let mut after_remove = keys(cache);
+assert(after_remove[0] == "c");
+
+cache = clear(cache);
+assert(capacity(cache) == 2);
+assert(len(cache) == 0);
+assert(is_empty(cache));
+assert(oldest(cache).found == false);
+assert(newest(cache).found == false);
+
+let mut disabled = new(0);
+disabled = put(disabled, "x", 1);
+assert(capacity(disabled) == 0);
+assert(len(disabled) == 0);
+assert(has(disabled, "x") == false);
