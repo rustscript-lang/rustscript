@@ -540,7 +540,8 @@ fn find_declared_schema_mismatch_with_recursion(
         | (TypeSchema::Bool, TypeSchema::Bool)
         | (TypeSchema::String, TypeSchema::String) => None,
         (expected, actual)
-            if expected.array_prefix_and_rest().is_some() && actual.array_prefix_and_rest().is_some() =>
+            if expected.array_prefix_and_rest().is_some()
+                && actual.array_prefix_and_rest().is_some() =>
         {
             find_declared_array_mismatch_with_recursion(
                 expected,
@@ -636,9 +637,7 @@ fn find_declared_array_mismatch_with_recursion(
     recursive_named: &mut HashSet<String>,
     allow_partial_object: bool,
 ) -> Option<String> {
-    let Some((expected_prefix, expected_rest)) = expected.array_prefix_and_rest() else {
-        return None;
-    };
+    let (expected_prefix, expected_rest) = expected.array_prefix_and_rest()?;
     let Some((actual_prefix, actual_rest)) = actual.array_prefix_and_rest() else {
         return Some(format!(
             "{} is declared as schema type '{}' but was assigned {}",

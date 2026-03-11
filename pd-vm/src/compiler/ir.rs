@@ -49,7 +49,7 @@ impl TypeSchema {
         let Some(first) = items.next().cloned().or_else(|| rest.cloned()) else {
             return Some(TypeSchema::Unknown);
         };
-        if items.all(|schema| schema == &first) && rest.map_or(true, |schema| schema == &first) {
+        if items.all(|schema| schema == &first) && rest.is_none_or(|schema| schema == &first) {
             Some(first)
         } else {
             Some(TypeSchema::Unknown)

@@ -1,5 +1,6 @@
 mod cursor;
 mod expressions;
+mod format;
 mod lexer;
 mod lint;
 mod statements;
@@ -86,6 +87,13 @@ pub(super) fn lint_trailing_function_return_semicolons(
     dialect: &'static dyn ParserDialect,
 ) -> Result<Vec<ParseError>, ParseError> {
     lint::lint_trailing_function_return_semicolons(source, source_id, dialect)
+}
+
+pub(super) fn format_source(
+    source: &str,
+    dialect: &'static dyn ParserDialect,
+) -> Result<String, ParseError> {
+    format::format_source(source, dialect)
 }
 
 pub(super) struct Parser {
