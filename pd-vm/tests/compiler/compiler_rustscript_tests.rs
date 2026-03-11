@@ -223,6 +223,18 @@ fn rustscript_builtin_and_namespace_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
+            name: "plus equal is supported for numeric locals",
+            source: r#"
+                let mut total = 1;
+                total += 2;
+                total += 3;
+                total;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(6)],
+            expected_locals: None,
+        },
+        RuntimeCase {
             name: "math namespace builtins provide numeric helpers",
             source: r#"
                 use math;
@@ -242,6 +254,21 @@ fn rustscript_builtin_and_namespace_runtime_cases_work() {
         },
     ];
     run_runtime_cases(&cases);
+}
+
+#[test]
+fn rustscript_plus_equal_rejects_non_numeric_values() {
+    let case = SourceErrorCase {
+        name: "plus equal rejects strings",
+        source: r#"
+            let mut value = "a";
+            value += "b";
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_kind: SourceErrorKind::Compile(CompileErrorKind::BinaryOperandTypeMismatch),
+        expected_contains_all: &["'+=' assignment requires a numeric local"],
+    };
+    expect_source_error_case(&case);
 }
 
 #[test]

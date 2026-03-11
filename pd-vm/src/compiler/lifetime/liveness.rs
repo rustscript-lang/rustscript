@@ -181,12 +181,18 @@ impl LivenessRewriter {
                     }],
                 )
             }
-            Stmt::Assign { index, expr, line } => {
+            Stmt::Assign {
+                kind,
+                index,
+                expr,
+                line,
+            } => {
                 let mut live_before = live_after.clone();
                 self.kill_slot(&mut live_before, *index);
                 self.union_inplace(&mut live_before, &self.uses_expr(expr));
                 (
                     Stmt::Assign {
+                        kind: kind.clone(),
                         index: *index,
                         expr: expr.clone(),
                         line: *line,

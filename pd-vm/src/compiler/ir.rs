@@ -182,6 +182,27 @@ pub enum Expr {
 }
 
 #[derive(Clone, Debug)]
+pub enum AssignmentKind {
+    Set,
+    Add,
+    Increment,
+}
+
+impl AssignmentKind {
+    pub(crate) fn requires_numeric_operands(&self) -> bool {
+        matches!(self, Self::Add | Self::Increment)
+    }
+
+    pub(crate) fn diagnostic_label(&self) -> &'static str {
+        match self {
+            Self::Set => "'=' assignment",
+            Self::Add => "'+=' assignment",
+            Self::Increment => "'++' increment",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum Stmt {
     Noop {
         line: u32,
@@ -193,6 +214,7 @@ pub enum Stmt {
         line: u32,
     },
     Assign {
+        kind: AssignmentKind,
         index: LocalSlot,
         expr: Expr,
         line: u32,
@@ -324,7 +346,12 @@ impl LocalIrBuilder {
                 message: format!("unknown local '{name}'"),
             });
         };
-        Ok(Stmt::Assign { index, expr, line })
+        Ok(Stmt::Assign {
+            kind: AssignmentKind::Set,
+            index,
+            expr,
+            line,
+        })
     }
 
     pub(crate) fn resolve_local_expr(&self, name: &str) -> Option<Expr> {

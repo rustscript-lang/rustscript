@@ -161,7 +161,9 @@ impl Compiler {
                 self.assembler.mark_line(*line);
                 self.assign_expr_to_slot(*index, declared_schema.as_ref(), expr)?;
             }
-            Stmt::Assign { index, expr, line } => {
+            Stmt::Assign {
+                index, expr, line, ..
+            } => {
                 self.assembler.mark_line(*line);
                 self.assign_expr_to_slot(*index, None, expr)?;
             }

@@ -253,7 +253,32 @@ impl Parser {
                     ..
                 }),
                 Some(Token {
-                    kind: TokenKind::Equal,
+                    kind: TokenKind::Equal | TokenKind::PlusEqual,
+                    ..
+                })
+            )
+        )
+    }
+
+    pub(super) fn check_increment_start(&self) -> bool {
+        matches!(
+            (self.tokens.get(self.pos), self.tokens.get(self.pos + 1)),
+            (
+                Some(Token {
+                    kind: TokenKind::PlusPlus,
+                    ..
+                }),
+                Some(Token {
+                    kind: TokenKind::Ident(_),
+                    ..
+                })
+            ) | (
+                Some(Token {
+                    kind: TokenKind::Ident(_),
+                    ..
+                }),
+                Some(Token {
+                    kind: TokenKind::PlusPlus,
                     ..
                 })
             )
@@ -307,6 +332,7 @@ impl Parser {
             || self.check(&TokenKind::Continue)
             || (self.dialect.allow_return_stmt() && self.check_ident_literal("return"))
             || self.check_assignment_start()
+            || self.check_increment_start()
             || self.check_index_assignment_start()
         {
             return true;

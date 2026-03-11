@@ -25,8 +25,8 @@ use self::source_map::{SourceMap, Span};
 pub use self::codegen::Compiler;
 pub use self::format::{FormatError, format_source, format_source_with_flavor};
 pub use self::ir::{
-    ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern,
-    MatchTypePattern, Stmt, TypeSchema,
+    AssignmentKind, ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot,
+    MatchPattern, MatchTypePattern, Stmt, TypeSchema,
 };
 pub use self::pipeline::{
     InferredLocalTypeHint, UnknownInferredLocal, collect_inferred_local_type_hints,

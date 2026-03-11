@@ -10,7 +10,7 @@ use self::reader::{
     split_namespace_segments,
 };
 use super::super::ParseError;
-use super::super::ir::{Expr, FrontendIr, LocalIrBuilder, Stmt};
+use super::super::ir::{AssignmentKind, Expr, FrontendIr, LocalIrBuilder, Stmt};
 use super::{is_ident_continue, is_ident_start};
 use crate::builtins::{BuiltinFunction, is_builtin_namespace, resolve_builtin_namespace_call};
 
@@ -656,17 +656,20 @@ fn build_scheme_optional_member_expr(
                             ),
                             then_branch: vec![
                                 Stmt::Assign {
+                                    kind: AssignmentKind::Set,
                                     index: found_slot,
                                     expr: Expr::Bool(true),
                                     line: line_u32,
                                 },
                                 Stmt::Assign {
+                                    kind: AssignmentKind::Set,
                                     index: idx_slot,
                                     expr: keys_len_expr(),
                                     line: line_u32,
                                 },
                             ],
                             else_branch: vec![Stmt::Assign {
+                                kind: AssignmentKind::Set,
                                 index: idx_slot,
                                 expr: Expr::Add(
                                     Box::new(Expr::Var(idx_slot)),
@@ -681,6 +684,7 @@ fn build_scheme_optional_member_expr(
                     Stmt::IfElse {
                         condition: Expr::Var(found_slot),
                         then_branch: vec![Stmt::Assign {
+                            kind: AssignmentKind::Set,
                             index: result_slot,
                             expr: Expr::Call(
                                 BuiltinFunction::Get.call_index(),

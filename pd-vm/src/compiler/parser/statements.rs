@@ -50,6 +50,9 @@ impl Parser {
         if self.match_kind(&TokenKind::Continue) {
             return self.parse_loop_control_stmt(false);
         }
+        if self.check_increment_start() {
+            return self.parse_increment_with_terminator(true);
+        }
         if self.check_index_assignment_start() {
             return self.parse_index_assign_with_terminator(true);
         }
@@ -834,15 +837,57 @@ impl Parser {
     ) -> Result<Stmt, ParseError> {
         let line = self.current_line_u32();
         let name = self.expect_ident("expected identifier before '='")?;
-        self.expect(&TokenKind::Equal, "expected '=' after identifier")?;
-        let expr = self.parse_expr()?;
+        let index = self.get_local(&name)?;
+        self.require_local_mutable_for_operation(index, Some(name.as_str()), line, "assign to")?;
+
+        let (kind, expr) = if self.match_kind(&TokenKind::Equal) {
+            (AssignmentKind::Set, self.parse_expr()?)
+        } else if self.match_kind(&TokenKind::PlusEqual) {
+            let rhs = self.parse_expr()?;
+            (AssignmentKind::Add, self.build_numeric_addition_expr(index, rhs))
+        } else {
+            return Err(ParseError {
+                span: Some(self.current_span()),
+                code: None,
+                line: self.current_line(),
+                message: "expected '=' or '+=' after identifier".to_string(),
+            });
+        };
         if expect_terminator {
             self.consume_stmt_terminator("expected ';' after assignment")?;
         }
 
+        Ok(Stmt::Assign {
+            kind,
+            index,
+            expr,
+            line,
+        })
+    }
+
+    pub(super) fn parse_increment_with_terminator(
+        &mut self,
+        expect_terminator: bool,
+    ) -> Result<Stmt, ParseError> {
+        let line = self.current_line_u32();
+        let name = if self.match_kind(&TokenKind::PlusPlus) {
+            self.expect_ident("expected identifier after '++'")?
+        } else {
+            let name = self.expect_ident("expected identifier before '++'")?;
+            self.expect(&TokenKind::PlusPlus, "expected '++' after identifier")?;
+            name
+        };
         let index = self.get_local(&name)?;
-        self.require_local_mutable_for_operation(index, Some(name.as_str()), line, "assign to")?;
-        Ok(Stmt::Assign { index, expr, line })
+        self.require_local_mutable_for_operation(index, Some(name.as_str()), line, "increment")?;
+        if expect_terminator {
+            self.consume_stmt_terminator("expected ';' after increment")?;
+        }
+        Ok(Stmt::Assign {
+            kind: AssignmentKind::Increment,
+            index,
+            expr: self.build_numeric_addition_expr(index, Expr::Int(1)),
+            line,
+        })
     }
 
     pub(super) fn parse_for(&mut self) -> Result<Stmt, ParseError> {
@@ -851,6 +896,8 @@ impl Parser {
 
         let init = if self.match_kind(&TokenKind::Let) {
             self.parse_let_with_terminator(false)?
+        } else if self.check_increment_start() {
+            self.parse_increment_with_terminator(false)?
         } else if self.check_assignment_start() {
             self.parse_assign_with_terminator(false)?
         } else {
@@ -866,7 +913,9 @@ impl Parser {
         let condition = self.parse_expr()?;
         self.expect(&TokenKind::Semicolon, "expected ';' after for condition")?;
 
-        let post = if self.check_assignment_start() {
+        let post = if self.check_increment_start() {
+            self.parse_increment_with_terminator(false)?
+        } else if self.check_assignment_start() {
             self.parse_assign_with_terminator(false)?
         } else {
             let post_line = self.current_line_u32();

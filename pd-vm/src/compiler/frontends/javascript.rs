@@ -48,6 +48,14 @@ impl ParserDialect for JavaScriptDialect {
     fn allow_namespace_path_separator(&self) -> bool {
         false
     }
+
+    fn allow_plus_equal_operator(&self) -> bool {
+        true
+    }
+
+    fn allow_increment_operator(&self) -> bool {
+        true
+    }
 }
 
 static JAVASCRIPT_DIALECT: JavaScriptDialect = JavaScriptDialect;
