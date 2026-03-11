@@ -717,16 +717,15 @@ impl<'a> TypeContext<'a> {
             BuiltinFunction::Get if args.len() == 2 => self
                 .infer_expr_schema(&args[0], state)
                 .and_then(|schema| infer_access_schema(&schema, &args[1], self, state).ok()),
-            BuiltinFunction::Slice if args.len() == 3 => match self.infer_expr_schema(&args[0], state)
-            {
-                Some(schema) if schema.array_prefix_and_rest().is_some() => {
-                    schema.collapsed_array_item_schema().map(|element| {
-                        TypeSchema::Array(Box::new(element))
-                    })
+            BuiltinFunction::Slice if args.len() == 3 => {
+                match self.infer_expr_schema(&args[0], state) {
+                    Some(schema) if schema.array_prefix_and_rest().is_some() => schema
+                        .collapsed_array_item_schema()
+                        .map(|element| TypeSchema::Array(Box::new(element))),
+                    Some(TypeSchema::String) => Some(TypeSchema::String),
+                    _ => None,
                 }
-                Some(TypeSchema::String) => Some(TypeSchema::String),
-                _ => None,
-            },
+            }
             _ => None,
         }
     }
@@ -1272,12 +1271,12 @@ fn infer_set_schema(
             fields.insert(name.clone(), value.unwrap_or(TypeSchema::Unknown));
             Some(TypeSchema::Object(fields))
         }
-        Some(TypeSchema::Map(existing)) => {
-            Some(TypeSchema::Map(Box::new(merge_schema_value(*existing, value))))
-        }
-        Some(TypeSchema::Array(existing)) => {
-            Some(TypeSchema::Array(Box::new(merge_schema_value(*existing, value))))
-        }
+        Some(TypeSchema::Map(existing)) => Some(TypeSchema::Map(Box::new(merge_schema_value(
+            *existing, value,
+        )))),
+        Some(TypeSchema::Array(existing)) => Some(TypeSchema::Array(Box::new(merge_schema_value(
+            *existing, value,
+        )))),
         Some(TypeSchema::ArrayTuple(mut items)) => {
             if let Some(index) = literal_int_index(key) {
                 let value = value.unwrap_or(TypeSchema::Unknown);

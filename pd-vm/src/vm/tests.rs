@@ -25,11 +25,18 @@ fn vm_instances_share_decoded_instruction_metadata_across_program_clones() {
     .expect("source should compile");
 
     let base_program = compiled.program.with_local_count(compiled.locals.max(8));
-    let vm_one = Vm::new(base_program.clone().with_local_count(base_program.local_count + 8));
+    let vm_one = Vm::new(
+        base_program
+            .clone()
+            .with_local_count(base_program.local_count + 8),
+    );
     let vm_two = Vm::new(base_program.with_local_count(compiled.locals.max(8) + 16));
 
     assert!(
-        Arc::ptr_eq(&vm_one.decoded_instruction_data, &vm_two.decoded_instruction_data),
+        Arc::ptr_eq(
+            &vm_one.decoded_instruction_data,
+            &vm_two.decoded_instruction_data
+        ),
         "program clones should share decoded instruction metadata"
     );
 }

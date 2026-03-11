@@ -558,7 +558,7 @@ impl Parser {
     }
 
     pub(super) fn parse_declared_type_schema(&mut self) -> Result<TypeSchema, ParseError> {
-        if self.match_kind(&TokenKind::LBracket) {
+        let mut schema = if self.match_kind(&TokenKind::LBracket) {
             let mut elements = Vec::new();
             let mut rest = None;
             if self.check(&TokenKind::RBracket) {
@@ -594,7 +594,7 @@ impl Parser {
                 break;
             }
             self.expect(&TokenKind::RBracket, "expected ']' after array type schema")?;
-            return Ok(match (elements.len(), rest) {
+            match (elements.len(), rest) {
                 (0, Some(rest)) => TypeSchema::Array(Box::new(rest)),
                 (1, None) => TypeSchema::Array(Box::new(elements.pop().unwrap())),
                 (_, Some(rest)) => TypeSchema::ArrayTupleRest {
@@ -602,10 +602,8 @@ impl Parser {
                     rest: Box::new(rest),
                 },
                 _ => TypeSchema::ArrayTuple(elements),
-            });
-        }
-
-        if self.match_kind(&TokenKind::LBrace) {
+            }
+        } else if self.match_kind(&TokenKind::LBrace) {
             return Err(ParseError {
                 span: None,
                 code: None,
@@ -613,31 +611,42 @@ impl Parser {
                 message: "inline object type schema is not supported; declare a struct and reference it by name"
                     .to_string(),
             });
+        } else if self.match_kind(&TokenKind::Null) {
+            TypeSchema::Null
+        } else {
+            let span = self.current_span();
+            let name = self.expect_ident("expected type schema")?;
+            match name.as_str() {
+                "unknown" => {
+                    self.unknown_type_spans.push(span);
+                    TypeSchema::Unknown
+                }
+                "int" => TypeSchema::Int,
+                "float" => TypeSchema::Float,
+                "bool" => TypeSchema::Bool,
+                "string" => TypeSchema::String,
+                "array" => TypeSchema::Array(Box::new(TypeSchema::Unknown)),
+                "map" => TypeSchema::Map(Box::new(TypeSchema::Unknown)),
+                other => {
+                    self.schema_reference_sites.push((
+                        other.to_string(),
+                        self.current_line(),
+                        span,
+                    ));
+                    TypeSchema::Named(other.to_string())
+                }
+            }
+        };
+
+        while self.match_kind(&TokenKind::LBracket) {
+            self.expect(
+                &TokenKind::RBracket,
+                "expected ']' after array schema alias",
+            )?;
+            schema = TypeSchema::Array(Box::new(schema));
         }
 
-        if self.match_kind(&TokenKind::Null) {
-            return Ok(TypeSchema::Null);
-        }
-
-        let span = self.current_span();
-        let name = self.expect_ident("expected type schema")?;
-        match name.as_str() {
-            "unknown" => {
-                self.unknown_type_spans.push(span);
-                Ok(TypeSchema::Unknown)
-            }
-            "int" => Ok(TypeSchema::Int),
-            "float" => Ok(TypeSchema::Float),
-            "bool" => Ok(TypeSchema::Bool),
-            "string" => Ok(TypeSchema::String),
-            "array" => Ok(TypeSchema::Array(Box::new(TypeSchema::Unknown))),
-            "map" => Ok(TypeSchema::Map(Box::new(TypeSchema::Unknown))),
-            other => {
-                self.schema_reference_sites
-                    .push((other.to_string(), self.current_line(), span));
-                Ok(TypeSchema::Named(other.to_string()))
-            }
-        }
+        Ok(schema)
     }
 
     pub(super) fn parse_function_impl_block(

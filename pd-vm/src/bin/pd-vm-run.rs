@@ -7,9 +7,10 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use vm::{
     CallOutcome, Debugger, DisassembleOptions, FunctionDecl, HostFunction, HostImport,
-    ReplLocalBinding, SourceMap, SourcePathError, Value, Vm, VmError, VmRecording, VmStatus,
-    compile_source_file, compile_source_for_repl_with_locals, disassemble_vmbc_with_options,
-    encode_program, render_source_error, render_vm_error, replay_recording_stdio,
+    ReplLocalBinding, SourceFlavor, SourceMap, SourcePathError, Value, Vm, VmError, VmRecording,
+    VmStatus, compile_source_file, compile_source_for_repl_with_locals,
+    disassemble_vmbc_with_options, encode_program, format_source_with_flavor,
+    render_source_error, render_vm_error, replay_recording_stdio,
 };
 
 const DEFAULT_SOURCE: &str = "examples/example.rss";
@@ -26,6 +27,8 @@ struct CliConfig {
     record_path: Option<String>,
     view_recording_path: Option<String>,
     show_source: bool,
+    fmt: bool,
+    fmt_check: bool,
     repl: bool,
     debug: bool,
     tcp_addr: Option<String>,
@@ -52,6 +55,8 @@ impl Default for CliConfig {
             record_path: None,
             view_recording_path: None,
             show_source: false,
+            fmt: false,
+            fmt_check: false,
             repl: false,
             debug: false,
             tcp_addr: None,
@@ -85,6 +90,9 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.help {
         print_usage();
         return Ok(());
+    }
+    if cli.fmt {
+        return run_fmt(&cli);
     }
     if cli.repl {
         return run_repl();
@@ -317,6 +325,51 @@ fn render_source_path_error(source_path: &Path, err: &SourcePathError) -> String
     }
 }
 
+fn render_format_path_error(source_path: &Path, source: &str, err: &vm::FormatError) -> String {
+    match err {
+        vm::FormatError::Parse(parse) => {
+            let mut source_map = SourceMap::new();
+            let source_id = source_map.add_source(source_path.display().to_string(), source.to_string());
+            let parse = parse
+                .clone()
+                .with_line_span_from_source(&source_map, source_id);
+            render_source_error(&source_map, &parse, true)
+        }
+        vm::FormatError::UnsupportedFlavor(_) => err.to_string(),
+    }
+}
+
+fn run_fmt(cli: &CliConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let source_arg = cli
+        .source
+        .as_deref()
+        .ok_or_else(|| io::Error::other("fmt mode requires a source path"))?;
+    let source_path = resolve_source_path(Some(source_arg))?;
+    let flavor = source_flavor_from_path(&source_path)?;
+    let source = std::fs::read_to_string(&source_path)?;
+    let formatted = format_source_with_flavor(&source, flavor)
+        .map_err(|err| io::Error::other(render_format_path_error(&source_path, &source, &err)))?;
+
+    if cli.fmt_check {
+        if formatted == source {
+            return Ok(());
+        }
+        return Err(Box::new(io::Error::other(format!(
+            "would reformat {}",
+            source_path.display()
+        ))));
+    }
+
+    if formatted == source {
+        println!("already formatted {}", source_path.display());
+        return Ok(());
+    }
+
+    std::fs::write(&source_path, formatted)?;
+    println!("formatted {}", source_path.display());
+    Ok(())
+}
+
 fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
     let mut cfg = CliConfig::default();
     if args.is_empty() {
@@ -341,6 +394,11 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
         && first == "repl"
     {
         cfg.repl = true;
+        index = 1;
+    } else if let Some(first) = args.first()
+        && first == "fmt"
+    {
+        cfg.fmt = true;
         index = 1;
     } else if let Some(first) = args.first()
         && first == "aot"
@@ -487,6 +545,10 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
                 cfg.show_source = true;
                 index += 1;
             }
+            "--check" => {
+                cfg.fmt_check = true;
+                index += 1;
+            }
             "--repl" => {
                 cfg.repl = true;
                 index += 1;
@@ -511,6 +573,9 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
 
     if !cfg.jit_dump_show_machine_code && !cfg.jit_dump {
         return Err("--jit-dump-no-code requires --jit-dump or --dump-jit".to_string());
+    }
+    if cfg.fmt_check && !cfg.fmt {
+        return Err("--check requires fmt mode".to_string());
     }
     if cfg.fuel.is_some() && cfg.epoch_deadline.is_some() {
         return Err("--fuel and --epoch-deadline are mutually exclusive".to_string());
@@ -573,6 +638,34 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
         }
     } else if cfg.show_source {
         return Err("--show-source requires --disasm-vmbc".to_string());
+    }
+
+    if cfg.fmt {
+        if cfg.source.is_none() && !cfg.help {
+            return Err("fmt mode requires a source path".to_string());
+        }
+        if cfg.repl
+            || cfg.debug
+            || cfg.tcp_addr.is_some()
+            || cfg.jit_dump
+            || cfg.jit_hot_loop_threshold.is_some()
+            || cfg.fuel.is_some()
+            || cfg.epoch_deadline.is_some()
+            || cfg.aot_fuel_check_interval.is_some()
+            || cfg.epoch_check_interval.is_some()
+            || cfg.emit_vmbc_path.is_some()
+            || cfg.emit_aot_path.is_some()
+            || cfg.disasm_vmbc_path.is_some()
+            || cfg.run_aot_path.is_some()
+            || cfg.record_path.is_some()
+            || cfg.view_recording_path.is_some()
+            || cfg.show_source
+        {
+            return Err(
+                "fmt mode cannot be combined with repl/debug/jit/fuel/epoch/emit/disasm/run-aot/record flags"
+                    .to_string(),
+            );
+        }
     }
 
     if cfg.emit_vmbc_path.is_some() && cfg.emit_aot_path.is_some() {
@@ -685,6 +778,15 @@ fn resolve_source_path(arg: Option<&str>) -> Result<PathBuf, io::Error> {
     Ok(Path::new(env!("CARGO_MANIFEST_DIR")).join(provided))
 }
 
+fn source_flavor_from_path(path: &Path) -> Result<SourceFlavor, io::Error> {
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| io::Error::other(SourcePathError::MissingExtension))?;
+    SourceFlavor::from_extension(ext)
+        .ok_or_else(|| io::Error::other(SourcePathError::UnsupportedExtension(ext.to_string())))
+}
+
 fn parse_cli_u32_flag(flag: &str, raw: &str) -> Result<u32, String> {
     raw.parse::<u32>()
         .map_err(|_| format!("invalid {flag} value '{raw}'"))
@@ -732,6 +834,7 @@ fn print_usage() {
     println!("  pd-vm-run                  (defaults to REPL)");
     println!("  pd-vm-run --version");
     println!("  pd-vm-run [source_path]");
+    println!("  pd-vm-run fmt [--check] <source_path>");
     println!("  pd-vm-run --repl");
     println!("  pd-vm-run repl");
     println!("  pd-vm-run --emit-vmbc <output.vmbc> [source_path]");
@@ -757,6 +860,7 @@ fn print_usage() {
     println!("Options:");
     println!("  -V, --version              Show version with git metadata");
     println!("  -h, --help                 Show this help");
+    println!("      --check                In fmt mode, fail if formatting would change the file");
 }
 
 fn binary_version_text() -> String {
@@ -1275,6 +1379,8 @@ mod tests {
         assert!(cfg.emit_vmbc_path.is_none());
         assert!(cfg.disasm_vmbc_path.is_none());
         assert!(!cfg.show_source);
+        assert!(!cfg.fmt);
+        assert!(!cfg.fmt_check);
     }
 
     #[test]
@@ -1595,6 +1701,43 @@ mod tests {
     fn parse_cli_repl_flag() {
         let cfg = parse_cli_args(&[s("--repl")]).expect("parse should succeed");
         assert!(cfg.repl);
+    }
+
+    #[test]
+    fn parse_cli_fmt_command() {
+        let cfg = parse_cli_args(&[s("fmt"), s("examples/example.rss")]).expect("parse should succeed");
+        assert!(cfg.fmt);
+        assert!(!cfg.fmt_check);
+        assert_eq!(cfg.source.as_deref(), Some("examples/example.rss"));
+    }
+
+    #[test]
+    fn parse_cli_fmt_check_flag() {
+        let cfg = parse_cli_args(&[s("fmt"), s("--check"), s("examples/example.rss")])
+            .expect("parse should succeed");
+        assert!(cfg.fmt);
+        assert!(cfg.fmt_check);
+        assert_eq!(cfg.source.as_deref(), Some("examples/example.rss"));
+    }
+
+    #[test]
+    fn parse_cli_fmt_requires_source_path() {
+        let err = parse_cli_args(&[s("fmt")]).expect_err("parse should fail");
+        assert!(err.contains("requires a source path"));
+    }
+
+    #[test]
+    fn parse_cli_check_requires_fmt() {
+        let err = parse_cli_args(&[s("--check"), s("examples/example.rss")])
+            .expect_err("parse should fail");
+        assert!(err.contains("requires fmt mode"));
+    }
+
+    #[test]
+    fn parse_cli_fmt_rejects_debug_flag() {
+        let err = parse_cli_args(&[s("fmt"), s("--debug"), s("examples/example.rss")])
+            .expect_err("parse should fail");
+        assert!(err.contains("fmt mode"));
     }
 
     #[test]

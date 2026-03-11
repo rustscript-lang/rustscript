@@ -9,6 +9,7 @@ use crate::vm::Vm;
 
 mod codegen;
 pub mod diagnostics;
+mod format;
 mod frontends;
 pub mod ir;
 mod lifetime;
@@ -22,6 +23,7 @@ mod typing;
 use self::source_map::{SourceMap, Span};
 
 pub use self::codegen::Compiler;
+pub use self::format::{FormatError, format_source, format_source_with_flavor};
 pub use self::ir::{
     ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern,
     MatchTypePattern, Stmt, TypeSchema,
