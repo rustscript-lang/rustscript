@@ -8,13 +8,6 @@ use super::super::{ExecOutcome, HostCallExecOutcome, Value, Vm, VmError, VmResul
 ))]
 use super::JitTrace;
 use super::{JitTraceTerminal, TraceStep, native};
-#[cfg(any(
-    all(
-        target_arch = "x86_64",
-        any(target_os = "windows", all(unix, not(target_os = "macos")))
-    ),
-    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
-))]
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 #[cfg(any(
@@ -289,13 +282,22 @@ impl Vm {
         let Some(trace) = self.jit.trace_clone(trace_id) else {
             return Ok(ExecOutcome::Continue);
         };
-        for (step_index, step) in trace.steps.iter().enumerate() {
+        let step_indices_by_ip = trace
+            .step_ips
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(step_index, step_ip)| (step_ip, step_index))
+            .collect::<HashMap<_, _>>();
+        let mut step_index = 0usize;
+        while step_index < trace.steps.len() {
             self.ip = trace
                 .step_ips
                 .get(step_index)
                 .copied()
                 .unwrap_or(trace.root_ip);
             self.charge_interrupt_tick()?;
+            let step = &trace.steps[step_index];
             match step {
                 TraceStep::Nop => {}
                 TraceStep::Ldc(index) => {
@@ -697,6 +699,21 @@ impl Vm {
                         return Ok(ExecOutcome::Continue);
                     }
                 }
+                TraceStep::LoopIfFalse { target_ip, exit_ip } => {
+                    let condition = self.pop_bool()?;
+                    if !condition {
+                        step_index = *step_indices_by_ip.get(target_ip).ok_or_else(|| {
+                            VmError::JitNative(format!(
+                                "trace {} is missing loop target step_ip {}",
+                                trace.id, target_ip
+                            ))
+                        })?;
+                        continue;
+                    }
+                    self.ip = *exit_ip;
+                    self.jit.mark_trace_executed(trace_id);
+                    return Ok(ExecOutcome::Continue);
+                }
                 TraceStep::JumpToIp { target_ip } => {
                     self.jump_to(*target_ip)?;
                     self.jit.mark_trace_executed(trace_id);
@@ -712,6 +729,7 @@ impl Vm {
                     return Ok(ExecOutcome::Halted);
                 }
             }
+            step_index += 1;
         }
         self.jit.mark_trace_executed(trace_id);
         Ok(ExecOutcome::Continue)

@@ -15,13 +15,13 @@ graph LR
 
 | Property | Current Value |
 |---|---|
-| **Compilation unit** | Individual linear traces (straight-line code, forward guards only) |
-| **IR** | `TraceStep` — 22 variants, 1:1 with opcodes except branches become `GuardFalse`/`JumpToRoot`/`JumpToIp` |
+| **Compilation unit** | Individual traces (mostly linear, with optional in-trace `LoopIfFalse` back-edges) |
+| **IR** | `TraceStep` — 23 variants, 1:1 with opcodes except branches become `GuardFalse`/`LoopIfFalse`/`JumpToRoot`/`JumpToIp` |
 | **Codegen backend** | Cranelift (via `cranelift-codegen` crate, no `cranelift-jit` module used directly) |
-| **Opcode coverage** | All 25 `OpCode` variants handled; `Brfalse` with backward target is rejected as NYI |
-| **Branch model** | Traces are linear; `Brfalse` becomes a forward guard, backward `Br` terminates the trace |
+| **Opcode coverage** | All 25 `OpCode` variants handled; backward `Brfalse` is supported when it targets an earlier step in the same trace |
+| **Branch model** | Traces are still trace-oriented rather than full CFGs; `Brfalse` becomes `GuardFalse` or `LoopIfFalse`, and backward `Br` still terminates the trace |
 | **Call model** | All `Call` ops dispatch to host functions via a bridge ([pd_vm_cranelift_step](pd-vm/src/vm/jit/native/bridge.rs#53-247)); no intra-program call frames |
-| **Dispatch** | Interpreter loop enters traces at known root IPs; traces exit back to interpreter on guard failure, backward branch, or halt |
+| **Dispatch** | Interpreter loop enters traces at known root IPs; traces exit back to interpreter on guard failure, `LoopIfFalse` fallthrough, backward `Br`, or halt |
 | **Yielding/Async** | `CallOutcome::Yield` rewinds IP and re-pushes args (unsupported in native-only AOT); `Pending` advances IP |
 
 ### Key Files and Sizes
@@ -58,7 +58,7 @@ This requires handling:
 | Aspect | Current | Required |
 |---|---|---|
 | CFG | Not constructed; traces are linear | Must build a full CFG from bytecode |
-| Backward branches | `BackwardGuard` → NYI rejection | Must become normal conditional branches in native code |
+| Backward branches | In-trace backward `Brfalse` lowers to `LoopIfFalse`; full CFG branching is still not modeled | Must become normal conditional branches in native code |
 | Forward branches | `GuardFalse` (side exit) | Must become standard Cranelift `brif` with both targets |
 | Irreducible loops | Not relevant | Must handle (or prove the compiler never emits them) |
 

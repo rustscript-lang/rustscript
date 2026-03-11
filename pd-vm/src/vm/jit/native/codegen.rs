@@ -289,6 +289,7 @@ pub(super) fn emit_inline_or_helper_step(
     root_ip: usize,
     step_ip: usize,
     step: &TraceStep,
+    loop_target_block: Option<Block>,
 ) -> VmResult<bool> {
     match step {
         TraceStep::Nop => Ok(true),
@@ -1147,6 +1148,24 @@ pub(super) fn emit_inline_or_helper_step(
                 root_ip,
                 *exit_ip,
                 step_ip,
+            )?;
+            Ok(true)
+        }
+        TraceStep::LoopIfFalse { exit_ip, .. } => {
+            let loop_target_block = loop_target_block.ok_or_else(|| {
+                VmError::JitNative("loop_if_false is missing a target block".to_string())
+            })?;
+            emit_inline_loop_if_false(
+                b,
+                vm_ptr,
+                helper_ref,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                *exit_ip,
+                step_ip,
+                loop_target_block,
             )?;
             Ok(true)
         }
@@ -3133,6 +3152,83 @@ fn emit_inline_guard_false(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn emit_inline_loop_if_false(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    helper_ref: FuncRef,
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    layout: NativeStackLayout,
+    offsets: ResolvedOffsets,
+    exit_ip: usize,
+    step_ip: usize,
+    loop_target_block: Block,
+) -> VmResult<()> {
+    let slow = b.create_block();
+    let len_ok = b.create_block();
+    let bool_ok = b.create_block();
+    let branch_true = b.create_block();
+
+    let len = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_len);
+    let has_stack = b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, len, 1);
+    b.ins().brif(has_stack, len_ok, &[], slow, &[]);
+
+    b.switch_to_block(len_ok);
+    let one = b.ins().iconst(pointer_type, 1);
+    let idx = b.ins().isub(len, one);
+    let stack_ptr = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_ptr);
+    let top_addr = value_addr(b, pointer_type, stack_ptr, idx, layout.value.size);
+    let top_tag = load_tag_i32(b, layout.value, top_addr);
+    let is_bool = b
+        .ins()
+        .icmp_imm(IntCC::Equal, top_tag, i64::from(layout.value.bool_tag));
+    b.ins().brif(is_bool, bool_ok, &[], slow, &[]);
+
+    b.switch_to_block(bool_ok);
+    let new_len = b.ins().isub(len, one);
+    b.ins()
+        .store(MemFlags::new(), new_len, vm_ptr, offsets.stack_len);
+    let cond = b.ins().load(
+        types::I8,
+        MemFlags::new(),
+        top_addr,
+        layout.value.bool_payload_offset,
+    );
+    let cond_true = b.ins().icmp_imm(IntCC::NotEqual, cond, 0);
+    b.ins()
+        .brif(cond_true, branch_true, &[], loop_target_block, &[]);
+
+    b.switch_to_block(branch_true);
+    let exit_ip = i64::try_from(exit_ip)
+        .map_err(|_| VmError::JitNative("guard exit ip out of range".to_string()))?;
+    let exit_ip_val = b.ins().iconst(pointer_type, exit_ip);
+    b.ins()
+        .store(MemFlags::new(), exit_ip_val, vm_ptr, offsets.vm_ip);
+    let status = b.ins().iconst(types::I32, STATUS_TRACE_EXIT as i64);
+    jump_with_status(b, exit_block, status);
+
+    b.switch_to_block(slow);
+    emit_helper_step_from_call_tuple(
+        b,
+        vm_ptr,
+        helper_ref,
+        exit_block,
+        loop_target_block,
+        offsets,
+        step_ip,
+        (OP_LOOP_IF_FALSE, exit_ip, 0, 0),
+    );
+
+    let dead = b.create_block();
+    b.switch_to_block(dead);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_inline_guard_true(
     b: &mut FunctionBuilder,
     vm_ptr: cranelift_codegen::ir::Value,
@@ -3554,6 +3650,12 @@ fn step_to_call(step: &TraceStep, root_ip: usize) -> VmResult<(i64, i64, i64, i6
                 VmError::JitNative("guard exit ip out of range for i64".to_string())
             })?;
             (OP_GUARD_FALSE, exit_ip, 0, 0)
+        }
+        TraceStep::LoopIfFalse { exit_ip, .. } => {
+            let exit_ip = i64::try_from(*exit_ip).map_err(|_| {
+                VmError::JitNative("guard exit ip out of range for i64".to_string())
+            })?;
+            (OP_LOOP_IF_FALSE, exit_ip, 0, 0)
         }
         TraceStep::GuardTrue { exit_ip } => {
             let exit_ip = i64::try_from(*exit_ip).map_err(|_| {

@@ -14,6 +14,7 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -65,6 +66,7 @@ const OP_GUARD_FALSE: i64 = 22;
 const OP_JUMP: i64 = 23;
 const OP_BUILTIN_CALL: i64 = 24;
 const OP_GUARD_TRUE: i64 = 25;
+const OP_LOOP_IF_FALSE: i64 = 26;
 
 pub(crate) struct CompiledTrace {
     pub(crate) entry: *const u8,
@@ -203,12 +205,27 @@ pub(crate) fn compile_trace(
         let mut b = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
 
         let entry_block = b.create_block();
+        let root_block = b.create_block();
         let exit_block = b.create_block();
         b.append_block_param(exit_block, types::I32);
+        let loop_target_indices_by_step = resolve_loop_target_indices(trace)?;
+        let mut step_blocks = HashMap::new();
+        step_blocks.insert(0usize, root_block);
+        for target_step_index in loop_target_indices_by_step
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>()
+        {
+            step_blocks
+                .entry(target_step_index)
+                .or_insert_with(|| b.create_block());
+        }
 
         b.switch_to_block(entry_block);
         b.append_block_params_for_function_params(entry_block);
         let vm_ptr = b.block_params(entry_block)[0];
+        b.ins().jump(root_block, &[]);
+        b.switch_to_block(root_block);
 
         let helper_ref = b.import_signature(helper_sig.clone());
         let vm_status_helper_ref = b.import_signature(entry_signature(pointer_type, call_conv));
@@ -216,6 +233,12 @@ pub(crate) fn compile_trace(
 
         let mut step_index = 0usize;
         while step_index < trace.steps.len() {
+            if step_index != 0
+                && let Some(&block) = step_blocks.get(&step_index)
+            {
+                b.ins().jump(block, &[]);
+                b.switch_to_block(block);
+            }
             let step_ip = trace
                 .step_ips
                 .get(step_index)
@@ -245,6 +268,10 @@ pub(crate) fn compile_trace(
                 }
             }
             let step = &trace.steps[step_index];
+            let loop_target_block = loop_target_indices_by_step
+                .get(&step_index)
+                .and_then(|target_step_index| step_blocks.get(target_step_index))
+                .copied();
             if emit_inline_or_helper_step(
                 &mut b,
                 vm_ptr,
@@ -258,6 +285,7 @@ pub(crate) fn compile_trace(
                 trace.root_ip,
                 step_ip,
                 step,
+                loop_target_block,
             )? {
                 step_index += 1;
                 continue;
@@ -319,6 +347,36 @@ pub(crate) fn compile_trace(
     })
 }
 
+fn resolve_loop_target_indices(trace: &JitTrace) -> VmResult<HashMap<usize, usize>> {
+    let step_indices_by_ip = trace
+        .step_ips
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(step_index, step_ip)| (step_ip, step_index))
+        .collect::<HashMap<_, _>>();
+    let mut targets = HashMap::new();
+    for (step_index, step) in trace.steps.iter().enumerate() {
+        let TraceStep::LoopIfFalse { target_ip, .. } = step else {
+            continue;
+        };
+        let Some(&target_step_index) = step_indices_by_ip.get(target_ip) else {
+            return Err(VmError::JitNative(format!(
+                "trace {} loop target step_ip {} is missing",
+                trace.id, target_ip
+            )));
+        };
+        if target_step_index >= step_index {
+            return Err(VmError::JitNative(format!(
+                "trace {} loop target step_ip {} must resolve to an earlier step",
+                trace.id, target_ip
+            )));
+        }
+        targets.insert(step_index, target_step_index);
+    }
+    Ok(targets)
+}
+
 pub(crate) fn load_compiled_trace(code: &[u8]) -> VmResult<CompiledTrace> {
     let keepalive = TraceKeepAlive::from_code(code)?;
     let entry = keepalive.entry();
@@ -356,5 +414,6 @@ mod tests {
     fn native_opcodes_remain_stable() {
         assert_eq!(OP_LDLOC, 19);
         assert_eq!(OP_STLOC, 20);
+        assert_eq!(OP_LOOP_IF_FALSE, 26);
     }
 }

@@ -1,10 +1,10 @@
 use super::super::{Vm, VmError, VmResult};
 use super::{JitTrace, JitTraceTerminal, TraceStep, native};
 use crate::{HostImport, Value, ValueType};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 const AOT_MAGIC: [u8; 4] = *b"VMAO";
-const AOT_VERSION: u16 = 6;
+const AOT_VERSION: u16 = 7;
 const AOT_FLAGS: u16 = 0;
 const AOT_NATIVE_ABI_VERSION: u16 = 1;
 const DEFAULT_AOT_BUNDLE_FUEL_CHECK_INTERVAL: u32 = 64;
@@ -746,6 +746,11 @@ fn encode_trace_step(step: &TraceStep, out: &mut Vec<u8>) -> VmResult<()> {
             out.push(21);
             write_aot_u32(*exit_ip, "guard exit_ip", out)?;
         }
+        TraceStep::LoopIfFalse { target_ip, exit_ip } => {
+            out.push(69);
+            write_aot_u32(*target_ip, "loop target_ip", out)?;
+            write_aot_u32(*exit_ip, "loop exit_ip", out)?;
+        }
         TraceStep::GuardTrue { exit_ip } => {
             out.push(43);
             write_aot_u32(*exit_ip, "guard exit_ip", out)?;
@@ -883,6 +888,10 @@ fn decode_trace_step(cursor: &mut AotCursor<'_>) -> VmResult<TraceStep> {
         21 => TraceStep::GuardFalse {
             exit_ip: cursor.read_u32("guard exit_ip")? as usize,
         },
+        69 => TraceStep::LoopIfFalse {
+            target_ip: cursor.read_u32("loop target_ip")? as usize,
+            exit_ip: cursor.read_u32("loop exit_ip")? as usize,
+        },
         43 => TraceStep::GuardTrue {
             exit_ip: cursor.read_u32("guard exit_ip")? as usize,
         },
@@ -1013,7 +1022,14 @@ fn validate_aot_trace(trace: &JitTrace, code_len: usize) -> VmResult<()> {
             )));
         }
     }
-    for step in &trace.steps {
+    let step_indices_by_ip = trace
+        .step_ips
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(step_index, step_ip)| (step_ip, step_index))
+        .collect::<HashMap<_, _>>();
+    for (step_index, step) in trace.steps.iter().enumerate() {
         match step {
             TraceStep::BuiltinCall { call_ip, .. } | TraceStep::Call { call_ip, .. } => {
                 let Some(resume_ip) = call_ip.checked_add(4) else {
@@ -1034,6 +1050,26 @@ fn validate_aot_trace(trace: &JitTrace, code_len: usize) -> VmResult<()> {
                     return Err(VmError::JitNative(format!(
                         "trace {} guard exit_ip {} is out of range for code_len {}",
                         trace.id, exit_ip, code_len
+                    )));
+                }
+            }
+            TraceStep::LoopIfFalse { target_ip, exit_ip } => {
+                if *exit_ip >= code_len {
+                    return Err(VmError::JitNative(format!(
+                        "trace {} loop exit_ip {} is out of range for code_len {}",
+                        trace.id, exit_ip, code_len
+                    )));
+                }
+                let Some(&target_step_index) = step_indices_by_ip.get(target_ip) else {
+                    return Err(VmError::JitNative(format!(
+                        "trace {} loop target_ip {} does not resolve within the trace",
+                        trace.id, target_ip
+                    )));
+                };
+                if target_step_index >= step_index {
+                    return Err(VmError::JitNative(format!(
+                        "trace {} loop target_ip {} must resolve to an earlier step",
+                        trace.id, target_ip
                     )));
                 }
             }

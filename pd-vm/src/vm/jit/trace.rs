@@ -40,7 +40,6 @@ pub enum JitNyiReason {
     UnsupportedArch,
     HotLoopThresholdZero,
     UnsupportedOpcode(u8),
-    BackwardGuard { target: usize },
     InvalidJumpTarget { target: usize },
     InvalidImmediate(&'static str),
     TraceTooLong { limit: usize },
@@ -55,11 +54,8 @@ impl JitNyiReason {
             }
             JitNyiReason::HotLoopThresholdZero => "hot_loop_threshold must be > 0".to_string(),
             JitNyiReason::UnsupportedOpcode(op) => format!("unsupported opcode 0x{op:02X}"),
-            JitNyiReason::BackwardGuard { target } => {
-                format!("opcode brfalse with backward target {target} is NYI")
-            }
             JitNyiReason::InvalidJumpTarget { target } => {
-                format!("jump target {target} is out of bytecode bounds")
+                format!("jump target {target} is invalid or out of bytecode bounds")
             }
             JitNyiReason::InvalidImmediate(kind) => {
                 format!("failed to decode immediate operand for {kind}")
@@ -194,6 +190,10 @@ pub enum TraceStep {
         call_ip: usize,
     },
     GuardFalse {
+        exit_ip: usize,
+    },
+    LoopIfFalse {
+        target_ip: usize,
         exit_ip: usize,
     },
     GuardTrue {
@@ -511,6 +511,12 @@ impl TraceJitEngine {
                     trace.id
                 ));
             }
+            if let Some(target) = missing_loop_if_false_target(&trace.steps, &trace.step_ips) {
+                return Err(format!(
+                    "precompiled trace {} targets missing loop step_ip {}",
+                    trace.id, target
+                ));
+            }
             if compiled_by_root.insert(trace.root_ip, trace.id).is_some() {
                 return Err(format!(
                     "duplicate precompiled trace root_ip {}",
@@ -644,13 +650,13 @@ impl TraceJitEngine {
             if opcode == OpCode::Ret as u8 {
                 step_ips.push(instr_ip);
                 steps.push(TraceStep::Ret);
-                return Ok(self.finish_trace(
+                return self.finish_trace(
                     program,
                     root_ip,
                     steps,
                     step_ips,
                     JitTraceTerminal::Halt,
-                ));
+                );
             }
             if opcode == OpCode::Ldc as u8 {
                 let value = read_u32(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("ldc"))?;
@@ -758,59 +764,39 @@ impl TraceJitEngine {
                 continue;
             }
             if opcode == OpCode::Brfalse as u8 {
-                let target_u32 =
-                    read_u32(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("brfalse"))?;
-                let target = target_u32 as usize;
-                if target <= ip {
-                    return Err(JitNyiReason::BackwardGuard { target });
-                }
-                if target >= code.len() {
-                    return Err(JitNyiReason::InvalidJumpTarget { target });
-                }
-                step_ips.push(instr_ip);
-                if can_prefer_join_path(program, &steps)
-                    && let Some(side_entry_ip) = straight_line_if_join_side_entry(code, ip, target)
-                {
-                    steps.push(TraceStep::GuardTrue {
-                        exit_ip: side_entry_ip,
-                    });
-                    ip = target;
-                } else {
-                    steps.push(TraceStep::GuardFalse { exit_ip: target });
+                match record_trace_branch(
+                    program,
+                    code,
+                    root_ip,
+                    instr_ip,
+                    opcode,
+                    &mut ip,
+                    &mut steps,
+                    &mut step_ips,
+                )? {
+                    TraceBranchOutcome::Continue => {}
+                    TraceBranchOutcome::Finish(terminal) => {
+                        return self.finish_trace(program, root_ip, steps, step_ips, terminal);
+                    }
                 }
                 continue;
             }
             if opcode == OpCode::Br as u8 {
-                let target_u32 =
-                    read_u32(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("br"))?;
-                let target = target_u32 as usize;
-                if target >= code.len() {
-                    return Err(JitNyiReason::InvalidJumpTarget { target });
+                match record_trace_branch(
+                    program,
+                    code,
+                    root_ip,
+                    instr_ip,
+                    opcode,
+                    &mut ip,
+                    &mut steps,
+                    &mut step_ips,
+                )? {
+                    TraceBranchOutcome::Continue => {}
+                    TraceBranchOutcome::Finish(terminal) => {
+                        return self.finish_trace(program, root_ip, steps, step_ips, terminal);
+                    }
                 }
-                if target == root_ip {
-                    step_ips.push(instr_ip);
-                    steps.push(TraceStep::JumpToRoot);
-                    return Ok(self.finish_trace(
-                        program,
-                        root_ip,
-                        steps,
-                        step_ips,
-                        JitTraceTerminal::LoopBack,
-                    ));
-                }
-                if target < ip {
-                    step_ips.push(instr_ip);
-                    steps.push(TraceStep::JumpToIp { target_ip: target });
-                    return Ok(self.finish_trace(
-                        program,
-                        root_ip,
-                        steps,
-                        step_ips,
-                        JitTraceTerminal::BranchExit,
-                    ));
-                }
-                // Follow forward unconditional branches to avoid creating tiny branch-exit traces.
-                ip = target;
                 continue;
             }
             if opcode == OpCode::Call as u8 {
@@ -868,13 +854,13 @@ impl TraceJitEngine {
             if opcode == OpCode::Ret as u8 {
                 step_ips.push(instr_ip);
                 steps.push(TraceStep::Ret);
-                return Ok(self.finish_trace(
+                return self.finish_trace(
                     program,
                     root_ip,
                     steps,
                     step_ips,
                     JitTraceTerminal::Halt,
-                ));
+                );
             }
             if opcode == OpCode::Ldc as u8 {
                 let value = read_u32(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("ldc"))?;
@@ -982,59 +968,39 @@ impl TraceJitEngine {
                 continue;
             }
             if opcode == OpCode::Brfalse as u8 {
-                let target_u32 =
-                    read_u32(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("brfalse"))?;
-                let target = target_u32 as usize;
-                if target <= ip {
-                    return Err(JitNyiReason::BackwardGuard { target });
-                }
-                if target >= code.len() {
-                    return Err(JitNyiReason::InvalidJumpTarget { target });
-                }
-                step_ips.push(instr_ip);
-                if can_prefer_join_path(program, &steps)
-                    && let Some(side_entry_ip) = straight_line_if_join_side_entry(code, ip, target)
-                {
-                    steps.push(TraceStep::GuardTrue {
-                        exit_ip: side_entry_ip,
-                    });
-                    ip = target;
-                } else {
-                    steps.push(TraceStep::GuardFalse { exit_ip: target });
+                match record_trace_branch(
+                    program,
+                    code,
+                    root_ip,
+                    instr_ip,
+                    opcode,
+                    &mut ip,
+                    &mut steps,
+                    &mut step_ips,
+                )? {
+                    TraceBranchOutcome::Continue => {}
+                    TraceBranchOutcome::Finish(terminal) => {
+                        return self.finish_trace(program, root_ip, steps, step_ips, terminal);
+                    }
                 }
                 continue;
             }
             if opcode == OpCode::Br as u8 {
-                let target_u32 =
-                    read_u32(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("br"))?;
-                let target = target_u32 as usize;
-                if target >= code.len() {
-                    return Err(JitNyiReason::InvalidJumpTarget { target });
+                match record_trace_branch(
+                    program,
+                    code,
+                    root_ip,
+                    instr_ip,
+                    opcode,
+                    &mut ip,
+                    &mut steps,
+                    &mut step_ips,
+                )? {
+                    TraceBranchOutcome::Continue => {}
+                    TraceBranchOutcome::Finish(terminal) => {
+                        return self.finish_trace(program, root_ip, steps, step_ips, terminal);
+                    }
                 }
-                if target == root_ip {
-                    step_ips.push(instr_ip);
-                    steps.push(TraceStep::JumpToRoot);
-                    return Ok(self.finish_trace(
-                        program,
-                        root_ip,
-                        steps,
-                        step_ips,
-                        JitTraceTerminal::LoopBack,
-                    ));
-                }
-                if target < ip {
-                    step_ips.push(instr_ip);
-                    steps.push(TraceStep::JumpToIp { target_ip: target });
-                    return Ok(self.finish_trace(
-                        program,
-                        root_ip,
-                        steps,
-                        step_ips,
-                        JitTraceTerminal::BranchExit,
-                    ));
-                }
-                // Follow forward unconditional branches to avoid creating tiny branch-exit traces.
-                ip = target;
                 continue;
             }
             if opcode == OpCode::Call as u8 {
@@ -1078,13 +1044,16 @@ impl TraceJitEngine {
         steps: Vec<TraceStep>,
         step_ips: Vec<usize>,
         terminal: JitTraceTerminal,
-    ) -> usize {
+    ) -> Result<usize, JitNyiReason> {
         let (steps, step_ips) = optimize_trace_steps(program, steps, step_ips);
         debug_assert_eq!(
             steps.len(),
             step_ips.len(),
             "trace steps and step_ips must stay aligned"
         );
+        if let Some(target) = missing_loop_if_false_target(&steps, &step_ips) {
+            return Err(JitNyiReason::InvalidJumpTarget { target });
+        }
         let id = self.traces.len();
         let start_line = program
             .debug
@@ -1111,7 +1080,7 @@ impl TraceJitEngine {
             terminal,
             executions: 0,
         });
-        id
+        Ok(id)
     }
 
     fn is_loop_header(&mut self, program: &Program, ip: usize) -> bool {
@@ -1174,36 +1143,120 @@ fn can_prefer_join_path(program: &Program, steps: &[TraceStep]) -> bool {
     )
 }
 
+enum TraceBranchOutcome {
+    Continue,
+    Finish(JitTraceTerminal),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_trace_branch(
+    program: &Program,
+    code: &[u8],
+    root_ip: usize,
+    instr_ip: usize,
+    opcode: u8,
+    ip: &mut usize,
+    steps: &mut Vec<TraceStep>,
+    step_ips: &mut Vec<usize>,
+) -> Result<TraceBranchOutcome, JitNyiReason> {
+    if opcode == OpCode::Brfalse as u8 {
+        let target_u32 = read_u32(code, ip).ok_or(JitNyiReason::InvalidImmediate("brfalse"))?;
+        let target = target_u32 as usize;
+        if target >= code.len() {
+            return Err(JitNyiReason::InvalidJumpTarget { target });
+        }
+        let fallthrough_ip = *ip;
+        step_ips.push(instr_ip);
+        if target < fallthrough_ip {
+            if step_ips[..step_ips.len().saturating_sub(1)].contains(&target) {
+                steps.push(TraceStep::LoopIfFalse {
+                    target_ip: target,
+                    exit_ip: fallthrough_ip,
+                });
+                return Ok(TraceBranchOutcome::Finish(JitTraceTerminal::BranchExit));
+            }
+            steps.push(TraceStep::GuardFalse { exit_ip: target });
+            return Ok(TraceBranchOutcome::Continue);
+        }
+        if can_prefer_join_path(program, steps)
+            && let Some(side_entry_ip) =
+                straight_line_if_join_side_entry(code, fallthrough_ip, target)
+        {
+            steps.push(TraceStep::GuardTrue {
+                exit_ip: side_entry_ip,
+            });
+            *ip = target;
+        } else {
+            steps.push(TraceStep::GuardFalse { exit_ip: target });
+        }
+        return Ok(TraceBranchOutcome::Continue);
+    }
+
+    let target_u32 = read_u32(code, ip).ok_or(JitNyiReason::InvalidImmediate("br"))?;
+    let target = target_u32 as usize;
+    if target >= code.len() {
+        return Err(JitNyiReason::InvalidJumpTarget { target });
+    }
+    if target == root_ip {
+        step_ips.push(instr_ip);
+        steps.push(TraceStep::JumpToRoot);
+        return Ok(TraceBranchOutcome::Finish(JitTraceTerminal::LoopBack));
+    }
+    if target < *ip {
+        step_ips.push(instr_ip);
+        steps.push(TraceStep::JumpToIp { target_ip: target });
+        return Ok(TraceBranchOutcome::Finish(JitTraceTerminal::BranchExit));
+    }
+    // Follow forward unconditional branches to avoid creating tiny branch-exit traces.
+    *ip = target;
+    Ok(TraceBranchOutcome::Continue)
+}
+
 fn optimize_trace_steps(
     program: &Program,
     steps: Vec<TraceStep>,
     step_ips: Vec<usize>,
 ) -> (Vec<TraceStep>, Vec<usize>) {
     debug_assert_eq!(steps.len(), step_ips.len());
+    let loop_targets = steps
+        .iter()
+        .filter_map(|step| match step {
+            TraceStep::LoopIfFalse { target_ip, .. } => Some(*target_ip),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
     let mut optimized_steps = Vec::with_capacity(steps.len());
     let mut optimized_ips = Vec::with_capacity(step_ips.len());
     let mut cursor = 0usize;
 
     while cursor < steps.len() {
-        if let Some((step, consumed)) = fuse_local_int_immediate_step(program, &steps[cursor..]) {
+        if let Some((step, consumed)) = fuse_local_int_immediate_step(program, &steps[cursor..])
+            && fusion_preserves_loop_targets(&loop_targets, &step_ips, cursor, consumed)
+        {
             optimized_steps.push(step);
             optimized_ips.push(step_ips[cursor]);
             cursor += consumed;
             continue;
         }
-        if let Some((step, consumed)) = fuse_local_float_immediate_step(program, &steps[cursor..]) {
+        if let Some((step, consumed)) = fuse_local_float_immediate_step(program, &steps[cursor..])
+            && fusion_preserves_loop_targets(&loop_targets, &step_ips, cursor, consumed)
+        {
             optimized_steps.push(step);
             optimized_ips.push(step_ips[cursor]);
             cursor += consumed;
             continue;
         }
-        if let Some((step, consumed)) = fuse_stack_int_immediate_step(program, &steps[cursor..]) {
+        if let Some((step, consumed)) = fuse_stack_int_immediate_step(program, &steps[cursor..])
+            && fusion_preserves_loop_targets(&loop_targets, &step_ips, cursor, consumed)
+        {
             optimized_steps.push(step);
             optimized_ips.push(step_ips[cursor]);
             cursor += consumed;
             continue;
         }
-        if let Some((step, consumed)) = fuse_stack_float_immediate_step(program, &steps[cursor..]) {
+        if let Some((step, consumed)) = fuse_stack_float_immediate_step(program, &steps[cursor..])
+            && fusion_preserves_loop_targets(&loop_targets, &step_ips, cursor, consumed)
+        {
             optimized_steps.push(step);
             optimized_ips.push(step_ips[cursor]);
             cursor += consumed;
@@ -1216,6 +1269,27 @@ fn optimize_trace_steps(
     }
 
     (optimized_steps, optimized_ips)
+}
+
+fn fusion_preserves_loop_targets(
+    loop_targets: &HashSet<usize>,
+    step_ips: &[usize],
+    cursor: usize,
+    consumed: usize,
+) -> bool {
+    !step_ips[cursor.saturating_add(1)..cursor.saturating_add(consumed)]
+        .iter()
+        .any(|ip| loop_targets.contains(ip))
+}
+
+fn missing_loop_if_false_target(steps: &[TraceStep], step_ips: &[usize]) -> Option<usize> {
+    let step_ip_set = step_ips.iter().copied().collect::<HashSet<_>>();
+    steps.iter().find_map(|step| match step {
+        TraceStep::LoopIfFalse { target_ip, .. } if !step_ip_set.contains(target_ip) => {
+            Some(*target_ip)
+        }
+        _ => None,
+    })
 }
 
 fn fuse_local_int_immediate_step(
@@ -1447,6 +1521,7 @@ fn trace_step_name(step: &TraceStep) -> &'static str {
         TraceStep::BuiltinCall { .. } => "call",
         TraceStep::Call { .. } => "call",
         TraceStep::GuardFalse { .. } => "guard_false",
+        TraceStep::LoopIfFalse { .. } => "loop_if_false",
         TraceStep::GuardTrue { .. } => "guard_true",
         TraceStep::JumpToIp { .. } => "jump_ip",
         TraceStep::JumpToRoot => "jump_root",
@@ -1575,10 +1650,6 @@ fn read_u16(code: &[u8], ip: &mut usize) -> Option<u16> {
 fn nyi_reference() -> Vec<JitNyiDoc> {
     vec![
         JitNyiDoc {
-            item: "brfalse (backward target)",
-            reason: "only forward guard exits are supported",
-        },
-        JitNyiDoc {
             item: "Oversized traces",
             reason: "trace recording stops at max_trace_len",
         },
@@ -1587,4 +1658,45 @@ fn nyi_reference() -> Vec<JitNyiDoc> {
             reason: "native emission currently supports x86_64 on windows plus unix non-macos, and aarch64 on linux/macos",
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finish_trace_preserves_targeted_step_ips_during_fusion() {
+        let program = Program::new(vec![Value::Int(1)], vec![]);
+        let steps = vec![
+            TraceStep::Ldloc(0),
+            TraceStep::Ldc(0),
+            TraceStep::IAdd,
+            TraceStep::LoopIfFalse {
+                target_ip: 17,
+                exit_ip: 40,
+            },
+        ];
+        let step_ips = vec![10, 12, 17, 20];
+
+        let mut engine = TraceJitEngine::new(JitConfig {
+            enabled: true,
+            hot_loop_threshold: 1,
+            max_trace_len: 16,
+        });
+        let trace_id = engine
+            .finish_trace(
+                &program,
+                10,
+                steps.clone(),
+                step_ips.clone(),
+                JitTraceTerminal::BranchExit,
+            )
+            .expect("finish_trace should keep targeted step ips intact");
+        let trace = engine
+            .trace_clone(trace_id)
+            .expect("compiled trace should be stored");
+
+        assert_eq!(trace.steps, steps);
+        assert_eq!(trace.step_ips, step_ips);
+    }
 }
