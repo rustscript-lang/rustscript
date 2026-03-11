@@ -1,14 +1,15 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use vm::{
-    CallOutcome, Debugger, DisassembleOptions, FunctionDecl, HostFunction, HostImport,
-    ReplLocalBinding, SourceFlavor, SourceMap, SourcePathError, Value, Vm, VmError, VmRecording,
-    VmStatus, compile_source_file, compile_source_for_repl_with_locals,
+    CallOutcome, Debugger, DisassembleOptions, FunctionDecl, HostFunctionRegistry, HostImport,
+    JitConfig, ReplLocalBinding, SourceFlavor, SourceMap, SourcePathError, Value, Vm, VmError,
+    VmRecording, VmStatus, compile_source_file, compile_source_for_repl_with_locals,
     disassemble_vmbc_with_options, encode_program, format_source_with_flavor, render_source_error,
     render_vm_error, replay_recording_stdio,
 };
@@ -134,7 +135,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     let compiled = compile_source_file(&source_path)
         .map_err(|err| io::Error::other(render_source_path_error(&source_path, &err)))?;
     if let Some(output_path) = cli.emit_aot_path.as_ref() {
-        let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+        let mut vm = new_cli_vm(compiled.program.with_local_count(compiled.locals), &cli);
         let encoded = match cli.aot_fuel_check_interval.or(cli.epoch_check_interval) {
             Some(interval) => vm
                 .emit_aot_bundle_with_fuel_check_interval(interval)
@@ -159,7 +160,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let recording_program = cli.record_path.as_ref().map(|_| compiled.program.clone());
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = new_cli_vm(compiled.program.with_local_count(compiled.locals), &cli);
     apply_runtime_flags(&mut vm, &cli)?;
     register_functions(&mut vm, &compiled.functions)?;
 
@@ -223,11 +224,6 @@ fn apply_runtime_flags(vm: &mut Vm, cli: &CliConfig) -> Result<(), io::Error> {
     if let Some(deadline) = cli.epoch_deadline {
         vm.set_epoch_deadline(deadline)
             .map_err(|err| io::Error::other(render_vm_error(vm, &err)))?;
-    }
-    if let Some(hot_loop) = cli.jit_hot_loop_threshold {
-        let mut jit_config = vm.jit_config().clone();
-        jit_config.hot_loop_threshold = hot_loop;
-        vm.set_jit_config(jit_config);
     }
     Ok(())
 }
@@ -802,19 +798,30 @@ fn register_functions(vm: &mut Vm, functions: &[FunctionDecl]) -> Result<(), io:
 
 fn register_imports(vm: &mut Vm, imports: &[HostImport]) -> Result<(), io::Error> {
     for import in imports {
-        if import.name.starts_with("__prim_") {
-            continue;
+        if import.name.starts_with("http::") {
+            return Err(io::Error::other(format!(
+                "host function '{}' requires pd-edge runtime context",
+                import.name,
+            )));
         }
-        register_named_function(vm, &import.name)?;
     }
+    if imports.is_empty() {
+        return Ok(());
+    }
+    let plan = cli_host_registry()
+        .prepare_shared_plan(imports)
+        .map_err(|err| io::Error::other(render_vm_error(vm, &err)))?;
+    cli_host_registry()
+        .bind_vm_with_plan(vm, &plan)
+        .map_err(|err| io::Error::other(render_vm_error(vm, &err)))?;
     Ok(())
 }
 
 fn register_named_function(vm: &mut Vm, name: &str) -> Result<(), io::Error> {
     match name {
-        "print" => vm.bind_function("print", Box::new(PrintFunction)),
-        "add_one" => vm.bind_function("add_one", Box::new(AddOneFunction)),
-        "echo" => vm.bind_function("echo", Box::new(EchoFunction)),
+        "print" => vm.bind_static_function("print", print_host_function),
+        "add_one" => vm.bind_static_function("add_one", add_one_host_function),
+        "echo" => vm.bind_static_function("echo", echo_host_function),
         "runtime::sleep" => {}
         value if value.starts_with("http::") => {
             return Err(io::Error::other(format!(
@@ -828,6 +835,29 @@ fn register_named_function(vm: &mut Vm, name: &str) -> Result<(), io::Error> {
         }
     }
     Ok(())
+}
+
+fn new_cli_vm(program: vm::Program, cli: &CliConfig) -> Vm {
+    Vm::new_with_jit_config(program, cli_jit_config(cli))
+}
+
+fn cli_jit_config(cli: &CliConfig) -> JitConfig {
+    let mut jit_config = JitConfig::default();
+    if let Some(hot_loop_threshold) = cli.jit_hot_loop_threshold {
+        jit_config.hot_loop_threshold = hot_loop_threshold;
+    }
+    jit_config
+}
+
+fn cli_host_registry() -> &'static HostFunctionRegistry {
+    static REGISTRY: OnceLock<HostFunctionRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let mut registry = HostFunctionRegistry::new();
+        registry.register_static("print", 1, print_host_function);
+        registry.register_static("add_one", 1, add_one_host_function);
+        registry.register_static("echo", 1, echo_host_function);
+        registry
+    })
 }
 
 fn print_usage() {
@@ -932,11 +962,12 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                 };
-                let mut vm = Vm::new(
+                let mut vm = Vm::new_with_jit_config(
                     compiled
                         .compiled
                         .program
                         .with_local_count(compiled.compiled.locals),
+                    JitConfig::default(),
                 );
                 if let Err(err) = register_functions(&mut vm, &compiled.compiled.functions) {
                     println!("{err}");
@@ -1245,35 +1276,23 @@ fn render_repl_compile_error(snippet: &str, err: &vm::SourceError) -> String {
     }
 }
 
-struct PrintFunction;
-
-impl HostFunction for PrintFunction {
-    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
-        let rendered = args.iter().map(format_value).collect::<Vec<_>>().join(" ");
-        println!("{rendered}");
-        Ok(CallOutcome::Return(args.to_vec()))
-    }
+fn print_host_function(_vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
+    let rendered = args.iter().map(format_value).collect::<Vec<_>>().join(" ");
+    println!("{rendered}");
+    Ok(CallOutcome::Return(args.to_vec()))
 }
 
-struct AddOneFunction;
-
-impl HostFunction for AddOneFunction {
-    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
-        let value = match args.first() {
-            Some(Value::Int(value)) => *value,
-            _ => return Err(VmError::TypeMismatch("int")),
-        };
-        Ok(CallOutcome::Return(vec![Value::Int(value + 1)]))
-    }
+fn add_one_host_function(_vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
+    let value = match args.first() {
+        Some(Value::Int(value)) => *value,
+        _ => return Err(VmError::TypeMismatch("int")),
+    };
+    Ok(CallOutcome::Return(vec![Value::Int(value + 1)]))
 }
 
-struct EchoFunction;
-
-impl HostFunction for EchoFunction {
-    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
-        let value = args.first().cloned().ok_or(VmError::StackUnderflow)?;
-        Ok(CallOutcome::Return(vec![value]))
-    }
+fn echo_host_function(_vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
+    let value = args.first().cloned().ok_or(VmError::StackUnderflow)?;
+    Ok(CallOutcome::Return(vec![value]))
 }
 
 fn format_value(value: &Value) -> String {
@@ -1316,7 +1335,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{Path, compile_source_file, parse_cli_args, register_imports};
-    use vm::{Value, Vm, VmStatus};
+    use vm::{HostImport, OpCode, Program, Value, ValueType, Vm, VmStatus};
 
     fn s(value: &str) -> String {
         value.to_string()
@@ -1345,6 +1364,32 @@ mod tests {
         }
         super::sync_repl_session(&vm, &compiled.bindings, session);
         vm
+    }
+
+    #[test]
+    fn register_imports_binds_cached_cli_host_registry_plan() {
+        let imports = vec![
+            HostImport {
+                name: "print".to_string(),
+                arity: 1,
+                return_type: ValueType::Unknown,
+            },
+            HostImport {
+                name: "echo".to_string(),
+                arity: 1,
+                return_type: ValueType::Unknown,
+            },
+        ];
+        let program =
+            Program::with_imports_and_debug(vec![], vec![OpCode::Ret as u8], imports.clone(), None);
+
+        let mut first = Vm::new(program.clone());
+        register_imports(&mut first, &imports).expect("first vm should bind imports");
+        assert_eq!(first.bound_function_count(), 2);
+
+        let mut second = Vm::new(program);
+        register_imports(&mut second, &imports).expect("second vm should reuse cached plan");
+        assert_eq!(second.bound_function_count(), 2);
     }
 
     fn temp_aot_path(name: &str) -> std::path::PathBuf {
