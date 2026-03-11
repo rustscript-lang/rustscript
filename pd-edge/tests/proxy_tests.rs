@@ -1,6 +1,7 @@
 use std::{
     io::Read,
     net::{SocketAddr, TcpStream},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -17,7 +18,7 @@ use edge::{
     ActiveControlPlaneConfig, CommandResultPayload, ControlPlaneCommand, EdgeCommandResult,
     EdgePollRequest, EdgePollResponse, FN_HTTP_RESPONSE_SET_BODY, FN_HTTP_RESPONSE_SET_HEADER,
     FN_HTTP_UPSTREAM_REQUEST_SET_TARGET, SharedState, build_admin_app, build_http_proxy_app,
-    spawn_active_control_plane_client,
+    compile_edge_source_file, spawn_active_control_plane_client,
 };
 use tokio::{sync::Notify, task::JoinHandle, time::timeout};
 use vm::{BytecodeBuilder, Program, Value, compile_source, encode_program};
@@ -40,6 +41,50 @@ async fn spawn_proxy(
     let (data_addr, data_handle) = spawn_server(build_http_proxy_app(state.clone())).await;
     let (admin_addr, admin_handle) = spawn_server(build_admin_app(state)).await;
     (data_addr, admin_addr, data_handle, admin_handle)
+}
+
+async fn spawn_chunked_upstream(chunks: Vec<&'static str>) -> (SocketAddr, JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener should have addr");
+    let chunks = chunks
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<String>>();
+    let handle = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.expect("accept should succeed");
+            let response_chunks = chunks.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .expect("response head should write");
+                for chunk in response_chunks {
+                    let frame = format!("{:X}\r\n{}\r\n", chunk.len(), chunk);
+                    stream
+                        .write_all(frame.as_bytes())
+                        .await
+                        .expect("chunk should write");
+                    stream.flush().await.expect("chunk flush should succeed");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                stream
+                    .write_all(b"0\r\n\r\n")
+                    .await
+                    .expect("terminator should write");
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (addr, handle)
 }
 
 fn build_short_circuit_program(body: &str, header: Option<(&str, &str)>) -> Program {
@@ -746,6 +791,71 @@ async fn http_request_body_chunk_api_reads_in_chunks() {
         "abcdefghij"
     );
 
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn sample_proxy_program_streams_or_buffers_upstream_body() {
+    let (upstream_addr, upstream_handle) = spawn_chunked_upstream(vec!["ab", "cd", "ef"]).await;
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_proxy_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let upstream_target = format!("http://{upstream_addr}/sample");
+    let streaming = client
+        .get(format!("http://{data_addr}/proxy"))
+        .header("x-upstream-target", &upstream_target)
+        .header("Streaming", "1")
+        .send()
+        .await
+        .expect("streaming request should complete");
+    assert_eq!(streaming.status(), StatusCode::OK);
+    assert_eq!(
+        streaming
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+    assert_eq!(
+        streaming
+            .headers()
+            .get("x-stream")
+            .and_then(|value| value.to_str().ok()),
+        None
+    );
+    assert_eq!(
+        streaming.text().await.expect("streaming body should read"),
+        "abAcdAefA"
+    );
+
+    let buffered = client
+        .get(format!("http://{data_addr}/proxy"))
+        .header("x-upstream-target", &upstream_target)
+        .send()
+        .await
+        .expect("buffered request should complete");
+    assert_eq!(buffered.status(), StatusCode::OK);
+    assert_eq!(
+        buffered
+            .headers()
+            .get("x-stream")
+            .and_then(|value| value.to_str().ok()),
+        Some("false")
+    );
+    assert_eq!(
+        buffered.text().await.expect("buffered body should read"),
+        "abcdef"
+    );
+
+    upstream_handle.abort();
     data_handle.abort();
     admin_handle.abort();
 }
