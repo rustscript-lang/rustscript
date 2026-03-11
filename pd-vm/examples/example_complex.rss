@@ -43,10 +43,10 @@ let matched = match profile?.stats?.score {
     _ => 0,
 };
 
-let a =[1, "a"];
+let a = [1, "a"];
 let b = a[1];
 
-let regex_ok = re::match ("(?i)^rustscript$", "RUSTSCRIPT");
+let regex_ok = re::match("(?i)^rustscript$", "RUSTSCRIPT");
 let payload = {
     lang: "rustscript",
     score: closure_value,
@@ -57,7 +57,7 @@ let payload_decoded = json::decode(payload_json);
 let json_score = payload_decoded.score;
 let sleep_ok = runtime::sleep(100);
 let io_ok = if true => {
-    io::exists(".");
+    io::exists(".")
 } else => {
     false
 };

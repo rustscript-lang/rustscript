@@ -410,7 +410,7 @@ pub fn keys(cache) {
     let state: LruCacheState = cache;
     let nodes = state.nodes;
     let mut current = state.head;
-    let mut out =[];
+    let mut out = [];
     while current != 0 {
         let node: LruNode =&((&nodes)[current]);
         let next_id = node.next;
@@ -424,7 +424,7 @@ pub fn values(cache) {
     let state: LruCacheState = cache;
     let nodes = state.nodes;
     let mut current = state.head;
-    let mut out =[];
+    let mut out = [];
     while current != 0 {
         let node: LruNode =&((&nodes)[current]);
         let next_id = node.next;
@@ -438,11 +438,11 @@ pub fn entries(cache) {
     let state: LruCacheState = cache;
     let nodes = state.nodes;
     let mut current = state.head;
-    let mut out =[];
+    let mut out = [];
     while current != 0 {
         let node: LruNode =&((&nodes)[current]);
         let next_id = node.next;
-        out[out.length] =[node.key, node.value];
+        out[out.length] = [node.key, node.value];
         current = next_id;
     }
     out

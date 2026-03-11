@@ -19,7 +19,7 @@ pub fn contains(values, needle) {
 }
 
 pub fn reverse(values) {
-    let mut out =[];
+    let mut out = [];
     for (
         let mut reverse_index = values.length - 1;
         reverse_index >-1;
@@ -31,7 +31,7 @@ pub fn reverse(values) {
 }
 
 pub fn dedup(values) {
-    let mut out =[];
+    let mut out = [];
     for (let mut dedup_index = 0; dedup_index < values.length; dedup_index = dedup_index + 1) {
         let value = values[dedup_index];
         if contains(out, value) == false {
@@ -56,7 +56,7 @@ pub fn get_or(map, key, fallback) {
 
 pub fn values(map) {
     let keys =(&map).keys;
-    let mut out =[];
+    let mut out = [];
     for (let mut value_index = 0; value_index <(&keys).length; value_index = value_index + 1) {
         let key =(&keys)[value_index];
         out[out.length] = map[key];
@@ -66,10 +66,10 @@ pub fn values(map) {
 
 pub fn entries(map) {
     let keys =(&map).keys;
-    let mut out =[];
+    let mut out = [];
     for (let mut entry_index = 0; entry_index <(&keys).length; entry_index = entry_index + 1) {
         let key =(&keys)[entry_index];
-        out[out.length] =[key, map[key]];
+        out[out.length] = [key, map[key]];
     }
     out;
 }
@@ -92,8 +92,8 @@ pub fn merge(lhs, rhs) {
 }
 
 pub fn deep_compare(lhs, rhs) {
-    let mut left_pending =[lhs];
-    let mut right_pending =[rhs];
+    let mut left_pending = [lhs];
+    let mut right_pending = [rhs];
     let mut out = true;
 
     while (&left_pending).length > 0 {

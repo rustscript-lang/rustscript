@@ -26,7 +26,7 @@ pub fn append_text(path, text) {
 
 pub fn read_lines(path) {
     let text = read_text(path);
-    let mut lines =[];
+    let mut lines = [];
     let text_len =(&text).length;
     let mut start = 0;
     for (let mut index = 0; index < text_len; index = index + 1) {
