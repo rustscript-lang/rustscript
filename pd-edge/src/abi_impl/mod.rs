@@ -63,6 +63,7 @@ enum PendingOp {
 #[derive(Default)]
 pub struct VmAsyncOps {
     pending: HashMap<HostOpId, PendingOp>,
+    next_op_id: HostOpId,
     runtime_handle: Option<tokio::runtime::Handle>,
 }
 
@@ -70,6 +71,7 @@ impl VmAsyncOps {
     pub fn new() -> Self {
         Self {
             pending: HashMap::new(),
+            next_op_id: 1,
             runtime_handle: tokio::runtime::Handle::try_current().ok(),
         }
     }
@@ -77,16 +79,26 @@ impl VmAsyncOps {
     pub fn with_runtime_handle(runtime_handle: tokio::runtime::Handle) -> Self {
         Self {
             pending: HashMap::new(),
+            next_op_id: 1,
             runtime_handle: Some(runtime_handle),
         }
     }
 
-    pub fn schedule_ready(
-        &mut self,
-        vm: &mut Vm,
-        result: AsyncOpResult,
-    ) -> Result<HostOpId, VmError> {
-        let op_id = vm.allocate_host_op_id();
+    fn allocate_op_id(&mut self) -> Result<HostOpId, VmError> {
+        for _ in 0..u16::MAX {
+            let op_id = self.next_op_id;
+            self.next_op_id = self.next_op_id.wrapping_add(1).max(1);
+            if !self.pending.contains_key(&op_id) {
+                return Ok(op_id);
+            }
+        }
+        Err(VmError::HostError(
+            "exhausted edge async host op ids".to_string(),
+        ))
+    }
+
+    pub fn schedule_ready(&mut self, result: AsyncOpResult) -> Result<HostOpId, VmError> {
+        let op_id = self.allocate_op_id()?;
         let (sender, receiver) = oneshot::channel();
         self.insert_pending(op_id, PendingOp::Receiver(receiver))?;
         sender
@@ -95,11 +107,11 @@ impl VmAsyncOps {
         Ok(op_id)
     }
 
-    pub fn schedule_future<F>(&mut self, vm: &mut Vm, future: F) -> Result<HostOpId, VmError>
+    pub fn schedule_future<F>(&mut self, future: F) -> Result<HostOpId, VmError>
     where
         F: Future<Output = AsyncOpResult> + Send + 'static,
     {
-        let op_id = vm.allocate_host_op_id();
+        let op_id = self.allocate_op_id()?;
         if self.runtime_handle.is_none() {
             self.runtime_handle = tokio::runtime::Handle::try_current().ok();
         }
@@ -254,7 +266,7 @@ impl AsyncHostAdapter {
 impl HostFunction for AsyncHostAdapter {
     fn call(&mut self, vm: &mut Vm, args: &[Value]) -> HostCallResult {
         match self.inner.call(vm, args)? {
-            CallOutcome::Return(values) => schedule_ready_call(vm, &self.async_ops, values),
+            CallOutcome::Return(values) => schedule_ready_call(&self.async_ops, values),
             CallOutcome::Yield => Ok(CallOutcome::Yield),
             CallOutcome::Pending(op_id) => Ok(CallOutcome::Pending(op_id)),
         }
@@ -936,7 +948,7 @@ pub fn register_http_host_module(
 }
 
 fn schedule_future_call<F>(
-    vm: &mut Vm,
+    _vm: &mut Vm,
     async_ops: &SharedVmAsyncOps,
     future: F,
 ) -> Result<CallOutcome, VmError>
@@ -944,7 +956,7 @@ where
     F: Future<Output = AsyncOpResult> + Send + 'static,
 {
     let mut ops = async_ops.lock().expect("vm async ops lock poisoned");
-    let op_id = ops.schedule_future(vm, future)?;
+    let op_id = ops.schedule_future(future)?;
     Ok(CallOutcome::Pending(op_id))
 }
 
@@ -960,20 +972,19 @@ where
 }
 
 pub(crate) fn schedule_current_ready_call(
-    vm: &mut Vm,
+    _vm: &mut Vm,
     values: Vec<Value>,
 ) -> Result<CallOutcome, VmError> {
     let async_ops = current_async_ops()?;
-    schedule_ready_call(vm, &async_ops, values)
+    schedule_ready_call(&async_ops, values)
 }
 
 fn schedule_ready_call(
-    vm: &mut Vm,
     async_ops: &SharedVmAsyncOps,
     values: Vec<Value>,
 ) -> Result<CallOutcome, VmError> {
     let mut ops = async_ops.lock().expect("vm async ops lock poisoned");
-    let op_id = ops.schedule_ready(vm, Ok(values))?;
+    let op_id = ops.schedule_ready(Ok(values))?;
     Ok(CallOutcome::Pending(op_id))
 }
 
@@ -983,6 +994,18 @@ pub(crate) fn adapt_edge_call_outcome(
 ) -> Result<CallOutcome, VmError> {
     match outcome {
         CallOutcome::Return(values) => schedule_current_ready_call(vm, values),
+        CallOutcome::Yield => Ok(CallOutcome::Yield),
+        CallOutcome::Pending(op_id) => Ok(CallOutcome::Pending(op_id)),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn adapt_edge_args_call_outcome(outcome: CallOutcome) -> Result<CallOutcome, VmError> {
+    match outcome {
+        CallOutcome::Return(values) => {
+            let async_ops = current_async_ops()?;
+            schedule_ready_call(&async_ops, values)
+        }
         CallOutcome::Yield => Ok(CallOutcome::Yield),
         CallOutcome::Pending(op_id) => Ok(CallOutcome::Pending(op_id)),
     }
@@ -1209,15 +1232,39 @@ fn is_valid_upstream(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Wake, Waker};
 
     use axum::http::HeaderMap;
-    use edge_abi::symbols::{http::request as http_request, runtime as edge_runtime};
-    use vm::{HostImport, OpCode, Program, ValueType, Vm};
+    use edge_abi::symbols::{
+        http::{request as http_request, response as http_response},
+        runtime as edge_runtime,
+    };
+    use pd_edge_host_function::pd_edge_host_function;
+    use vm::{
+        BytecodeBuilder, CallOutcome, HostImport, OpCode, Program, ValueType, Vm, VmError, VmStatus,
+    };
 
     use super::{
-        ProxyVmContext, RateLimiterStore, SharedProxyVmContext, new_shared_vm_async_ops,
-        register_host_module, register_http_plane_host_module,
+        ProxyVmContext, RateLimiterStore, SharedProxyVmContext, VmAsyncOpBridge,
+        current_vm_context, enter_edge_host_context, new_shared_vm_async_ops, register_host_module,
+        register_http_plane_host_module,
     };
+
+    struct TestNoopWake;
+
+    impl Wake for TestNoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn test_waker() -> Waker {
+        Waker::from(Arc::new(TestNoopWake))
+    }
+
+    #[pd_edge_host_function(name = "test::yield_pending_tls", scope = http_extension)]
+    async fn yield_pending_tls(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
+        tokio::task::yield_now().await;
+        Ok(CallOutcome::Return(vec![]))
+    }
 
     fn test_context() -> SharedProxyVmContext {
         Arc::new(Mutex::new(ProxyVmContext::from_request_headers(
@@ -1278,5 +1325,92 @@ mod tests {
             .expect("http plane vm should bind all cached scopes");
 
         assert_eq!(vm.bound_function_count(), 4);
+    }
+
+    #[test]
+    fn http_response_set_body_scoped_binding_runs_under_edge_context() {
+        let imports = vec![HostImport {
+            name: http_response::SET_BODY.name.to_string(),
+            arity: 1,
+            return_type: ValueType::Unknown,
+        }];
+        let mut bc = BytecodeBuilder::new();
+        bc.ldc(0);
+        bc.call(0, 1);
+        bc.ret();
+        let program = Program::with_imports_and_debug(
+            vec![vm::Value::string("payload")],
+            bc.finish(),
+            imports,
+            None,
+        );
+        let context = test_context();
+        let async_ops = new_shared_vm_async_ops();
+        let mut vm = Vm::new(program);
+        vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));
+        register_http_plane_host_module(&mut vm, context.clone(), async_ops.clone())
+            .expect("http plane vm should bind");
+
+        let status = {
+            let _host_context = enter_edge_host_context(context.clone(), async_ops.clone());
+            vm.run().expect("edge host call should execute")
+        };
+        if status == VmStatus::Waiting(vm.waiting_host_op_id().expect("waiting op id should exist"))
+        {
+            vm.wait_for_host_op_blocking()
+                .expect("ready edge host op should complete");
+            let _host_context = enter_edge_host_context(context.clone(), async_ops.clone());
+            assert_eq!(vm.resume().expect("vm should resume"), VmStatus::Halted);
+        } else {
+            assert_eq!(status, VmStatus::Halted);
+        }
+
+        let guard = context.lock().expect("vm context lock poisoned");
+        assert_eq!(guard.response_content.as_deref(), Some("payload"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_host_poll_does_not_leave_tls_context_installed() {
+        let imports = vec![HostImport {
+            name: "test::yield_pending_tls".to_string(),
+            arity: 0,
+            return_type: ValueType::Unknown,
+        }];
+        let mut bc = BytecodeBuilder::new();
+        bc.call(0, 0);
+        bc.ret();
+        let program = Program::with_imports_and_debug(vec![], bc.finish(), imports, None);
+        let context = test_context();
+        let async_ops = new_shared_vm_async_ops();
+        let mut vm = Vm::new(program);
+        vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));
+        register_http_plane_host_module(&mut vm, context.clone(), async_ops.clone())
+            .expect("http plane vm should bind");
+
+        let status = {
+            let _host_context = enter_edge_host_context(context.clone(), async_ops.clone());
+            vm.run().expect("async host call should start")
+        };
+        assert_eq!(
+            status,
+            VmStatus::Waiting(vm.waiting_host_op_id().expect("waiting op id should exist"))
+        );
+
+        let waker = test_waker();
+        let mut poll_context = Context::from_waker(&waker);
+        assert!(matches!(
+            vm.poll_waiting_host_op(&mut poll_context),
+            Poll::Pending
+        ));
+        assert!(
+            current_vm_context().is_err(),
+            "async host poll must not leak TLS context between polls"
+        );
+
+        vm.await_waiting_host_op()
+            .await
+            .expect("host op should complete on second poll");
+        let _host_context = enter_edge_host_context(context.clone(), async_ops.clone());
+        assert_eq!(vm.resume().expect("vm should halt"), VmStatus::Halted);
     }
 }

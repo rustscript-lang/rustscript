@@ -208,13 +208,7 @@ fn transform_async_edge_function(item: &mut ItemFn) -> Result<(), Error> {
     let original_block = item.block.clone();
     item.sig.asyncness = None;
     *item.block = syn::parse2(quote!({
-        let __pd_edge_future_vm_context = crate::abi_impl::current_vm_context()?;
-        let __pd_edge_future_async_ops = crate::abi_impl::current_async_ops()?;
         crate::abi_impl::schedule_current_future_call(#vm_ident, async move {
-            let _pd_edge_host_context_guard = crate::abi_impl::enter_edge_host_context(
-                __pd_edge_future_vm_context,
-                __pd_edge_future_async_ops,
-            );
             let __pd_edge_outcome = (async move #original_block).await?;
             match __pd_edge_outcome {
                 ::vm::CallOutcome::Return(values) => Ok(values),
@@ -421,6 +415,7 @@ fn generate_scoped_edge_host_static_wrapper(
     };
     let impl_name = &item.sig.ident;
     let static_wrapper_name = format_ident!("__pd_edge_static_{}", wrapper_name);
+    let uses_vm = scoped_wrapper_uses_vm(item);
     let mut setup_stmts = Vec::<proc_macro2::TokenStream>::new();
     let mut call_args = Vec::<proc_macro2::TokenStream>::new();
     let mut extract_stmts = Vec::<proc_macro2::TokenStream>::new();
@@ -492,26 +487,48 @@ fn generate_scoped_edge_host_static_wrapper(
         }
     };
 
-    Ok(quote! {
-        fn #static_wrapper_name(
-            vm: &mut ::vm::Vm,
-            args: &[::vm::Value],
-        ) -> Result<::vm::CallOutcome, ::vm::VmError> {
-            if args.len() != #arg_index {
-                return Err(::vm::VmError::HostError(format!(
-                    "expected {} arguments, got {}",
-                    #arg_index,
-                    args.len()
-                )));
+    if uses_vm {
+        Ok(quote! {
+            fn #static_wrapper_name(
+                vm: &mut ::vm::Vm,
+                args: &[::vm::Value],
+            ) -> Result<::vm::CallOutcome, ::vm::VmError> {
+                if args.len() != #arg_index {
+                    return Err(::vm::VmError::HostError(format!(
+                        "expected {} arguments, got {}",
+                        #arg_index,
+                        args.len()
+                    )));
+                }
+                #(#setup_stmts)*
+                let __pd_edge_outcome = {
+                    #(#extract_stmts)*
+                    #call_expr
+                }?;
+                crate::abi_impl::adapt_edge_call_outcome(vm, __pd_edge_outcome)
             }
-            #(#setup_stmts)*
-            let __pd_edge_outcome = {
-                #(#extract_stmts)*
-                #call_expr
-            }?;
-            crate::abi_impl::adapt_edge_call_outcome(vm, __pd_edge_outcome)
-        }
-    })
+        })
+    } else {
+        Ok(quote! {
+            fn #static_wrapper_name(
+                args: &[::vm::Value],
+            ) -> Result<::vm::CallOutcome, ::vm::VmError> {
+                if args.len() != #arg_index {
+                    return Err(::vm::VmError::HostError(format!(
+                        "expected {} arguments, got {}",
+                        #arg_index,
+                        args.len()
+                    )));
+                }
+                #(#setup_stmts)*
+                let __pd_edge_outcome = {
+                    #(#extract_stmts)*
+                    #call_expr
+                }?;
+                crate::abi_impl::adapt_edge_args_call_outcome(__pd_edge_outcome)
+            }
+        })
+    }
 }
 
 fn generate_edge_host_registration(
@@ -526,6 +543,11 @@ fn generate_edge_host_registration(
     let entry_name = format_ident!("__pd_edge_registration_{}", wrapper_name);
     let scope_tokens = edge_scope_tokens(scope);
     let static_wrapper_name = format_ident!("__pd_edge_static_{}", wrapper_name);
+    let function_kind = if scoped_wrapper_uses_vm(item) {
+        quote!(crate::abi_impl::registry::EdgeHostRegistrationFunction::Static(#static_wrapper_name))
+    } else {
+        quote!(crate::abi_impl::registry::EdgeHostRegistrationFunction::ArgsStatic(#static_wrapper_name))
+    };
     let mut arity = 0usize;
 
     for input in &item.sig.inputs {
@@ -563,8 +585,15 @@ fn generate_edge_host_registration(
                 scope: #scope_tokens,
                 name: #name_expr,
                 arity: #arity,
-                function: #static_wrapper_name,
+                function: #function_kind,
             };
+    })
+}
+
+fn scoped_wrapper_uses_vm(item: &ItemFn) -> bool {
+    item.sig.inputs.iter().any(|input| match input {
+        FnArg::Typed(pat_type) => is_vm_context_type(&pat_type.ty),
+        FnArg::Receiver(_) => false,
     })
 }
 

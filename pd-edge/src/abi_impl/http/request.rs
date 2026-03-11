@@ -4,7 +4,7 @@ use pd_edge_host_function::pd_edge_host_function;
 use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::super::{
-    current_vm_context, headers_to_value_map, query_to_value_map, read_request_body_all,
+    SharedProxyVmContext, headers_to_value_map, query_to_value_map, read_request_body_all,
     read_request_body_next_chunk, request_body_eof, request_path_with_query,
 };
 
@@ -22,8 +22,10 @@ enum RequestField {
     ClientIp,
 }
 
-fn request_field_outcome(field: RequestField) -> Result<CallOutcome, VmError> {
-    let context = current_vm_context()?;
+async fn request_field_outcome(
+    context: SharedProxyVmContext,
+    field: RequestField,
+) -> Result<CallOutcome, VmError> {
     let mut context = context.lock().expect("vm context lock poisoned");
     context.touch_request_line();
     let value = match field {
@@ -45,60 +47,93 @@ fn request_field_outcome(field: RequestField) -> Result<CallOutcome, VmError> {
 }
 
 #[pd_edge_host_function(name = http_request::GET_ID.name, scope = http)]
-async fn get_request_id(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
-    request_field_outcome(RequestField::Id)
+async fn get_request_id(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::Id).await
 }
 
 #[pd_edge_host_function(name = http_request::GET_METHOD.name, scope = http)]
-async fn get_request_method(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
-    request_field_outcome(RequestField::Method)
+async fn get_request_method(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::Method).await
 }
 
 #[pd_edge_host_function(name = http_request::GET_PATH.name, scope = http)]
-async fn get_request_path(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
-    request_field_outcome(RequestField::Path)
+async fn get_request_path(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::Path).await
 }
 
 #[pd_edge_host_function(name = http_request::GET_QUERY.name, scope = http)]
-async fn get_request_query(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
-    request_field_outcome(RequestField::Query)
+async fn get_request_query(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::Query).await
 }
 
 #[pd_edge_host_function(name = http_request::GET_SCHEME.name, scope = http)]
-async fn get_request_scheme(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
-    request_field_outcome(RequestField::Scheme)
+async fn get_request_scheme(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::Scheme).await
 }
 
 #[pd_edge_host_function(name = http_request::GET_HOST.name, scope = http)]
-async fn get_request_host(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
-    request_field_outcome(RequestField::Host)
+async fn get_request_host(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::Host).await
 }
 
 #[pd_edge_host_function(name = http_request::GET_CLIENT_IP.name, scope = http)]
-async fn get_request_client_ip(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
-    request_field_outcome(RequestField::ClientIp)
+async fn get_request_client_ip(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::ClientIp).await
 }
 
 #[pd_edge_host_function(name = http_request::GET_PATH_WITH_QUERY.name, scope = http)]
-async fn get_request_path_with_query(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
-    request_field_outcome(RequestField::PathWithQuery)
+async fn get_request_path_with_query(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::PathWithQuery).await
 }
 
 #[pd_edge_host_function(name = http_request::GET_RAW_QUERY.name, scope = http)]
-async fn get_request_raw_query(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
-    request_field_outcome(RequestField::RawQuery)
+async fn get_request_raw_query(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::RawQuery).await
 }
 
 #[pd_edge_host_function(name = http_request::GET_HTTP_VERSION.name, scope = http)]
-async fn get_request_http_version(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
-    request_field_outcome(RequestField::HttpVersion)
+async fn get_request_http_version(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::HttpVersion).await
 }
 
 #[pd_edge_host_function(name = http_request::GET_HEADER.name, scope = http)]
-async fn get_request_header(_vm: &mut Vm, name: String) -> Result<CallOutcome, VmError> {
+async fn get_request_header(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    name: String,
+) -> Result<CallOutcome, VmError> {
     let header_name = HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
-    let context = current_vm_context()?;
     let mut context = context.lock().expect("vm context lock poisoned");
     context.touch_request_headers();
     let value = context
@@ -110,8 +145,10 @@ async fn get_request_header(_vm: &mut Vm, name: String) -> Result<CallOutcome, V
 }
 
 #[pd_edge_host_function(name = http_request::GET_HEADERS.name, scope = http)]
-async fn get_request_headers(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
-    let context = current_vm_context()?;
+async fn get_request_headers(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
     let mut context = context.lock().expect("vm context lock poisoned");
     context.touch_request_headers();
     Ok(CallOutcome::Return(vec![headers_to_value_map(
@@ -120,8 +157,11 @@ async fn get_request_headers(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
 }
 
 #[pd_edge_host_function(name = http_request::GET_QUERY_ARG.name, scope = http)]
-async fn get_request_query_arg(_vm: &mut Vm, name: String) -> Result<CallOutcome, VmError> {
-    let context = current_vm_context()?;
+async fn get_request_query_arg(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    name: String,
+) -> Result<CallOutcome, VmError> {
     let mut context = context.lock().expect("vm context lock poisoned");
     context.touch_request_line();
     let value = url::form_urlencoded::parse(context.inbound_request_query.as_bytes())
@@ -137,8 +177,10 @@ async fn get_request_query_arg(_vm: &mut Vm, name: String) -> Result<CallOutcome
 }
 
 #[pd_edge_host_function(name = http_request::GET_QUERY_ARGS.name, scope = http)]
-async fn get_request_query_args(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
-    let context = current_vm_context()?;
+async fn get_request_query_args(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
     let mut context = context.lock().expect("vm context lock poisoned");
     context.touch_request_line();
     Ok(CallOutcome::Return(vec![query_to_value_map(
@@ -147,8 +189,10 @@ async fn get_request_query_args(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
 }
 
 #[pd_edge_host_function(name = http_request::GET_BODY.name, scope = http)]
-async fn get_request_body(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
-    let context = current_vm_context()?;
+async fn get_request_body(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
     let body = read_request_body_all(&context).await?;
     Ok(CallOutcome::Return(vec![Value::string(
         String::from_utf8_lossy(&body).into_owned(),
@@ -156,13 +200,16 @@ async fn get_request_body(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
 }
 
 #[pd_edge_host_function(name = "http::request::body::next_chunk", scope = http_extension)]
-async fn get_request_body_chunk(_vm: &mut Vm, max_bytes: i64) -> Result<CallOutcome, VmError> {
+async fn get_request_body_chunk(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    max_bytes: i64,
+) -> Result<CallOutcome, VmError> {
     if max_bytes <= 0 {
         return Err(VmError::HostError(format!(
             "body chunk size must be > 0, got '{max_bytes}'",
         )));
     }
-    let context = current_vm_context()?;
     let chunk = read_request_body_next_chunk(&context, max_bytes as usize).await?;
     Ok(CallOutcome::Return(vec![Value::string(
         String::from_utf8_lossy(&chunk).into_owned(),
@@ -170,15 +217,19 @@ async fn get_request_body_chunk(_vm: &mut Vm, max_bytes: i64) -> Result<CallOutc
 }
 
 #[pd_edge_host_function(name = "http::request::body::eof", scope = http_extension)]
-async fn get_request_body_eof(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
-    let context = current_vm_context()?;
+async fn get_request_body_eof(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
     let eof = request_body_eof(&context).await?;
     Ok(CallOutcome::Return(vec![Value::Bool(eof)]))
 }
 
 #[pd_edge_host_function(name = http_request::GET_PORT.name, scope = http)]
-async fn get_request_port(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
-    let context = current_vm_context()?;
+async fn get_request_port(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
     let mut context = context.lock().expect("vm context lock poisoned");
     context.touch_request_line();
     Ok(CallOutcome::Return(vec![Value::Int(

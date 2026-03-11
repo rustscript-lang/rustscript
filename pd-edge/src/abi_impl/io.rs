@@ -4,7 +4,7 @@ use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::{
     EDGE_IO_HANDLE_DYNAMIC_BASE, EdgeVirtualIoHandle, ProxyVmContext, SharedProxyVmContext,
-    SharedVmAsyncOps, consume_request_body_all, current_vm_context, read_request_body_next_line,
+    SharedVmAsyncOps, consume_request_body_all, read_request_body_next_line,
     resolve_outbound_request_body,
 };
 
@@ -292,9 +292,12 @@ fn write_io_target(
 }
 
 #[pd_edge_host_function(name = "io::open", scope = io)]
-async fn io_open(_vm: &mut Vm, path: String, mode: String) -> Result<CallOutcome, VmError> {
-    tokio::task::yield_now().await;
-    let context = current_vm_context()?;
+async fn io_open(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    path: String,
+    mode: String,
+) -> Result<CallOutcome, VmError> {
     let explicit_target = edge_io_target_from_string(&path);
     let mode = mode.trim().to_ascii_lowercase();
     let values = match mode.as_str() {
@@ -368,16 +371,17 @@ async fn io_open(_vm: &mut Vm, path: String, mode: String) -> Result<CallOutcome
 
 #[pd_edge_host_function(name = "io::popen", scope = io)]
 async fn io_popen(_vm: &mut Vm, _command: String, _mode: String) -> Result<CallOutcome, VmError> {
-    tokio::task::yield_now().await;
     Err(VmError::HostError(
         "io::popen is disabled in edge runtime; use protocol-specific async host APIs".to_string(),
     ))
 }
 
 #[pd_edge_host_function(name = "io::read_all", scope = io)]
-async fn io_read_all(_vm: &mut Vm, source: Value) -> Result<CallOutcome, VmError> {
-    tokio::task::yield_now().await;
-    let context = current_vm_context()?;
+async fn io_read_all(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    source: Value,
+) -> Result<CallOutcome, VmError> {
     let text = match &source {
         Value::String(literal) => match edge_io_target_from_string(literal) {
             Some(target) => read_io_target_all(&context, target).await?,
@@ -399,9 +403,11 @@ async fn io_read_all(_vm: &mut Vm, source: Value) -> Result<CallOutcome, VmError
 }
 
 #[pd_edge_host_function(name = "io::read_line", scope = io)]
-async fn io_read_line(_vm: &mut Vm, source: Value) -> Result<CallOutcome, VmError> {
-    tokio::task::yield_now().await;
-    let context = current_vm_context()?;
+async fn io_read_line(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    source: Value,
+) -> Result<CallOutcome, VmError> {
     let text = match &source {
         Value::String(literal) => match edge_io_target_from_string(literal) {
             Some(target) => read_io_target_line(&context, target).await?,
@@ -426,9 +432,12 @@ async fn io_read_line(_vm: &mut Vm, source: Value) -> Result<CallOutcome, VmErro
 }
 
 #[pd_edge_host_function(name = "io::write", scope = io)]
-async fn io_write(_vm: &mut Vm, target_arg: Value, text: String) -> Result<CallOutcome, VmError> {
-    tokio::task::yield_now().await;
-    let context = current_vm_context()?;
+async fn io_write(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    target_arg: Value,
+    text: String,
+) -> Result<CallOutcome, VmError> {
     let target = {
         let guard = context.lock().expect("vm context lock poisoned");
         resolve_edge_io_write_target(&guard, &target_arg)?
@@ -447,9 +456,11 @@ async fn io_write(_vm: &mut Vm, target_arg: Value, text: String) -> Result<CallO
 }
 
 #[pd_edge_host_function(name = "io::flush", scope = io)]
-async fn io_flush(_vm: &mut Vm, target: Value) -> Result<CallOutcome, VmError> {
-    tokio::task::yield_now().await;
-    let context = current_vm_context()?;
+async fn io_flush(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    target: Value,
+) -> Result<CallOutcome, VmError> {
     match target {
         Value::Int(handle) => {
             if decode_edge_io_handle(handle).is_err() {
@@ -468,9 +479,11 @@ async fn io_flush(_vm: &mut Vm, target: Value) -> Result<CallOutcome, VmError> {
 }
 
 #[pd_edge_host_function(name = "io::close", scope = io)]
-async fn io_close(_vm: &mut Vm, target: Value) -> Result<CallOutcome, VmError> {
-    tokio::task::yield_now().await;
-    let context = current_vm_context()?;
+async fn io_close(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    target: Value,
+) -> Result<CallOutcome, VmError> {
     match target {
         Value::Int(handle) => {
             if decode_edge_io_handle(handle).is_err() {
@@ -490,7 +503,6 @@ async fn io_close(_vm: &mut Vm, target: Value) -> Result<CallOutcome, VmError> {
 
 #[pd_edge_host_function(name = "io::exists", scope = io)]
 async fn io_exists(_vm: &mut Vm, path: String) -> Result<CallOutcome, VmError> {
-    tokio::task::yield_now().await;
     let exists = if edge_io_readable_path(&path)
         || edge_io_target_from_string(&path).is_some()
         || path_targets_upstream_request(&path)
