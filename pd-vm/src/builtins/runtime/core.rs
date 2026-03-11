@@ -167,7 +167,7 @@ pub(super) fn builtin_array_push(args: Vec<Value>) -> VmResult<Vec<Value>> {
 /// Create an empty map.
 #[pd_host_function(name = "map_new")]
 pub(super) fn builtin_map_new_impl() -> VmMap {
-    Vec::new()
+    VmMap::new()
 }
 
 /// Read a string entry.
@@ -208,12 +208,43 @@ pub(super) fn builtin_get_array_impl(items: VmArray, index: i64) -> VmResult<Unk
 /// Read a map value by key.
 #[pd_host_function(name = "get")]
 pub(super) fn builtin_get_map_impl(entries: VmMap, key: AnyValue) -> VmResult<UnknownValue> {
-    for (existing_key, value) in entries {
-        if existing_key == key {
-            return Ok(value);
-        }
+    entries
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| VmError::HostError("map key not found".to_string()))
+}
+
+/// Check whether an array contains a valid index.
+#[pd_host_function(name = "has")]
+pub(super) fn builtin_has_array_impl(items: VmArray, index: i64) -> bool {
+    if index < 0 {
+        return false;
     }
-    Err(VmError::HostError("map key not found".to_string()))
+    usize::try_from(index)
+        .ok()
+        .is_some_and(|index| index < items.len())
+}
+
+/// Check whether a map contains a key.
+#[pd_host_function(name = "has")]
+pub(super) fn builtin_has_map_impl(entries: VmMap, key: AnyValue) -> bool {
+    entries.get(&key).is_some()
+}
+
+pub(super) fn builtin_has(args: &[Value]) -> VmResult<Vec<Value>> {
+    let container = arg::<&Value>(args, 0, "has container")?;
+    let key = arg::<&Value>(args, 1, "has key")?;
+    match container {
+        Value::Array(values) => Ok(return_values(builtin_has_array_impl(
+            unwrap_or_clone_shared(values.clone()),
+            key.as_int()?,
+        ))),
+        Value::Map(entries) => Ok(return_values(builtin_has_map_impl(
+            unwrap_or_clone_shared(entries.clone()),
+            key.clone(),
+        ))),
+        _ => Err(VmError::TypeMismatch("array/map")),
+    }
 }
 
 pub(super) fn builtin_get(args: Vec<Value>) -> VmResult<Vec<Value>> {
@@ -436,13 +467,10 @@ pub(super) fn builtin_set_array_impl(
 /// Update a map entry and return the updated map.
 #[pd_host_function(name = "set")]
 pub(super) fn builtin_set_map_impl(mut entries: VmMap, key: AnyValue, value: AnyValue) -> VmMap {
-    if let Some((_, existing_value)) = entries
-        .iter_mut()
-        .find(|(existing_key, _)| *existing_key == key)
-    {
-        *existing_value = value;
+    if matches!(value, Value::Null) {
+        entries.remove(&key);
     } else {
-        entries.push((key, value));
+        entries.insert(key, value);
     }
     entries
 }
@@ -599,14 +627,51 @@ mod tests {
             panic!("expected map alias");
         };
 
-        assert_eq!(
-            alias_entries.as_ref(),
-            &vec![(Value::string("k"), Value::Int(1))]
-        );
-        assert_eq!(result.as_ref(), &vec![(Value::string("k"), Value::Int(9))]);
+        assert_eq!(alias_entries.len(), 1);
+        assert_eq!(alias_entries.get(&Value::string("k")), Some(&Value::Int(1)));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.get(&Value::string("k")), Some(&Value::Int(9)));
         assert!(
             !Arc::ptr_eq(alias_entries, result),
             "mutating a shared map should detach backing storage"
         );
+    }
+
+    #[test]
+    fn set_map_null_removes_entry() {
+        let shared = Value::map(vec![(Value::string("drop"), Value::Int(1))]);
+        let alias = shared.clone();
+
+        let out = builtin_set(vec![shared, Value::string("drop"), Value::Null])
+            .expect("map null set should work");
+        let [Value::Map(result)] = out.as_slice() else {
+            panic!("expected map result");
+        };
+        let Value::Map(alias_entries) = &alias else {
+            panic!("expected map alias");
+        };
+
+        assert_eq!(alias_entries.len(), 1);
+        assert_eq!(
+            alias_entries.get(&Value::string("drop")),
+            Some(&Value::Int(1))
+        );
+        assert_eq!(result.len(), 0);
+        assert_eq!(result.get(&Value::string("drop")), None);
+        assert!(
+            !Arc::ptr_eq(alias_entries, result),
+            "mutating a shared map should detach backing storage"
+        );
+    }
+
+    #[test]
+    fn has_map_uses_identity_for_heap_keys() {
+        let key = Value::array(vec![Value::Int(1), Value::Int(2)]);
+        let alias = key.clone();
+        let structural_peer = Value::array(vec![Value::Int(1), Value::Int(2)]);
+        let map = VmMap::from(vec![(key, Value::Bool(true))]);
+
+        assert!(builtin_has_map_impl(map.clone(), alias));
+        assert!(!builtin_has_map_impl(map, structural_peer));
     }
 }

@@ -295,7 +295,7 @@ fn json_encode_rejects_non_string_map_keys() {
 }
 
 #[test]
-fn json_encode_rejects_duplicate_map_keys() {
+fn json_encode_uses_last_duplicate_map_entry_from_constructor() {
     let duplicate_map = Value::map(vec![
         (Value::string("k"), Value::Int(1)),
         (Value::string("k"), Value::Int(2)),
@@ -310,15 +310,29 @@ fn json_encode_rejects_duplicate_map_keys() {
     compiled.program.constants = vec![duplicate_map];
 
     let mut vm = Vm::new(compiled.program);
-    let err = vm
-        .run()
-        .expect_err("json::encode should reject duplicate map keys");
-    match err {
-        vm::VmError::HostError(message) => {
-            assert!(message.contains("duplicate key 'k'"), "{message}");
-        }
-        other => panic!("unexpected vm error: {other}"),
-    }
+    let status = vm.run().expect("json::encode should succeed");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("{\"k\":2}")]);
+}
+
+#[test]
+fn member_has_lowering_checks_container_membership() {
+    let compiled = compile_source(
+        r#"
+        let map = {"a": 1};
+        let array = [10, 20];
+        map.has("a")
+            && map.has("missing") == false
+            && array.has(1)
+            && array.has(2) == false;
+    "#,
+    )
+    .expect("source should compile");
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Bool(true)]);
 }
 
 #[test]
@@ -993,7 +1007,7 @@ fn map_equality_ignores_entry_order() {
 }
 
 #[test]
-fn get_and_set_use_the_first_duplicate_map_entry() {
+fn get_and_set_use_hash_map_overwrite_semantics() {
     const BUILTIN_GET: u16 = 0xFFB6;
     const BUILTIN_SET: u16 = 0xFFB7;
 
@@ -1012,7 +1026,7 @@ fn get_and_set_use_the_first_duplicate_map_entry() {
     let mut get_vm = Vm::new(Program::new(constants.clone(), get_bc.finish()));
     let get_status = get_vm.run().expect("get should succeed");
     assert_eq!(get_status, VmStatus::Halted);
-    assert_eq!(get_vm.stack(), &[Value::Int(1)]);
+    assert_eq!(get_vm.stack(), &[Value::Int(2)]);
 
     let mut set_bc = BytecodeBuilder::new();
     set_bc.ldc(0);
@@ -1026,14 +1040,9 @@ fn get_and_set_use_the_first_duplicate_map_entry() {
     let [Value::Map(entries)] = set_vm.stack() else {
         panic!("expected map result, got {:?}", set_vm.stack());
     };
-    assert_eq!(
-        entries.as_ref(),
-        &vec![
-            (Value::string("k"), Value::Int(9)),
-            (Value::string("k"), Value::Int(2)),
-            (Value::string("z"), Value::Int(3)),
-        ]
-    );
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.get(&Value::string("k")), Some(&Value::Int(9)));
+    assert_eq!(entries.get(&Value::string("z")), Some(&Value::Int(3)));
 }
 
 #[test]

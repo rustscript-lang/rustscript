@@ -15,7 +15,9 @@ use edge_abi::FUNCTIONS as EDGE_ABI_FUNCTIONS;
 use http_body_util::BodyExt;
 use tokio::sync::oneshot;
 use url::Url;
-use vm::{CallOutcome, HostAsyncBridge, HostFunction, HostOpId, Value, Vm, VmError};
+use vm::{
+    CallOutcome, HostAsyncBridge, HostFunction, HostOpId, Value, Vm, VmError, bytecode::VmMap,
+};
 
 mod http;
 mod io;
@@ -921,7 +923,7 @@ fn expect_int(args: &[Value], index: usize) -> Result<i64, VmError> {
     }
 }
 
-fn expect_map(args: &[Value], index: usize) -> Result<Vec<(Value, Value)>, VmError> {
+fn expect_map(args: &[Value], index: usize) -> Result<VmMap, VmError> {
     match args.get(index) {
         Some(Value::Map(entries)) => Ok(entries.as_ref().clone()),
         _ => Err(VmError::TypeMismatch("map")),

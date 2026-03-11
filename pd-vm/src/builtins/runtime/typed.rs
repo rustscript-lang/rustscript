@@ -1,10 +1,10 @@
 use super::BuiltinCallOutcome;
+pub(super) use crate::bytecode::VmMap;
 use crate::vm::{CallOutcome, HostOpId, Value, VmError, VmResult};
 
 pub(super) type AnyValue = Value;
 pub(super) type UnknownValue = Value;
 pub(super) type VmArray = Vec<Value>;
-pub(super) type VmMap = Vec<(Value, Value)>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum NumberValue {
@@ -242,6 +242,12 @@ impl IntoVmValue for Vec<Value> {
 impl IntoVmValue for Vec<(Value, Value)> {
     fn into_vm_value(self) -> Value {
         Value::map(self)
+    }
+}
+
+impl IntoVmValue for VmMap {
+    fn into_vm_value(self) -> Value {
+        Value::Map(self.into())
     }
 }
 

@@ -820,6 +820,11 @@ impl Parser {
                     expr = self.build_option_unwrap_or_expr(expr, fallback)?;
                 } else if member == "length" {
                     expr = self.build_builtin_call_expr(BuiltinFunction::Len, vec![expr])?;
+                } else if member == "has" && self.check(&TokenKind::LParen) {
+                    self.expect(&TokenKind::LParen, "expected '(' after '.has'")?;
+                    let mut args = vec![expr];
+                    args.extend(self.parse_call_args()?);
+                    expr = self.build_builtin_call_expr(BuiltinFunction::Has, args)?;
                 } else if member == "keys" {
                     expr = self.build_builtin_call_expr(BuiltinFunction::Keys, vec![expr])?;
                 } else {

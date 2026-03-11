@@ -312,7 +312,7 @@ fn decode_value(cursor: &mut RecordingCursor<'_>) -> Result<Value, VmRecordingEr
                 let value = decode_value(cursor)?;
                 entries.push((key, value));
             }
-            Ok(Value::Map(entries.into()))
+            Ok(Value::map(entries))
         }
         _ => Err(VmRecordingError::InvalidFormat("invalid value tag")),
     }

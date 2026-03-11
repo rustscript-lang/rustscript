@@ -1190,6 +1190,7 @@ fn core_prefix_builtin_order() -> &'static [&'static str] {
         "array_push",
         "map_new",
         "get",
+        "has",
         "set",
         "keys",
     ]
@@ -1212,6 +1213,7 @@ fn required_language_builtin_stubs() -> &'static [&'static str] {
         "array_push",
         "map_new",
         "get",
+        "has",
         "set",
         "keys",
         "count",

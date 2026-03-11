@@ -56,6 +56,7 @@ pub(crate) fn execute_builtin_call(
             core::builtin_map_new_impl(),
         ))),
         BuiltinFunction::Get => core::builtin_get(args).map(BuiltinCallOutcome::Return),
+        BuiltinFunction::Has => core::builtin_has(&args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Set => core::builtin_set(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Keys => core::builtin_keys(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Count => core::builtin_count(&args).map(BuiltinCallOutcome::Return),
