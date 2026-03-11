@@ -227,7 +227,8 @@ fn lint_unknown_inferred_local_types_includes_function_scope_locals() {
     let source = r#"
 fn nothing() {
     let a = [1, "2"];
-    let b = a[0];
+    let idx = 0;
+    let b = a[idx];
     0
 }
 "#;
@@ -237,7 +238,7 @@ fn nothing() {
     assert!(
         warnings
             .iter()
-            .any(|warning| warning.name == "b" && warning.line == 4),
+            .any(|warning| warning.name == "b" && warning.line == 5),
         "expected function-local unknown inferred warning for 'b', got {warnings:?}"
     );
 }

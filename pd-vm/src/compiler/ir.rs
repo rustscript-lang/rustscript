@@ -17,8 +17,44 @@ pub enum TypeSchema {
     String,
     Named(String),
     Array(Box<TypeSchema>),
+    ArrayTuple(Vec<TypeSchema>),
+    ArrayTupleRest {
+        prefix: Vec<TypeSchema>,
+        rest: Box<TypeSchema>,
+    },
     Map(Box<TypeSchema>),
     Object(HashMap<String, TypeSchema>),
+}
+
+impl TypeSchema {
+    pub(crate) fn array_prefix_and_rest(&self) -> Option<(&[TypeSchema], Option<&TypeSchema>)> {
+        match self {
+            TypeSchema::Array(element) => Some((&[], Some(element.as_ref()))),
+            TypeSchema::ArrayTuple(items) => Some((items.as_slice(), None)),
+            TypeSchema::ArrayTupleRest { prefix, rest } => {
+                Some((prefix.as_slice(), Some(rest.as_ref())))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn array_item_schema_at(&self, index: usize) -> Option<TypeSchema> {
+        let (prefix, rest) = self.array_prefix_and_rest()?;
+        prefix.get(index).cloned().or_else(|| rest.cloned())
+    }
+
+    pub(crate) fn collapsed_array_item_schema(&self) -> Option<TypeSchema> {
+        let (prefix, rest) = self.array_prefix_and_rest()?;
+        let mut items = prefix.iter();
+        let Some(first) = items.next().cloned().or_else(|| rest.cloned()) else {
+            return Some(TypeSchema::Unknown);
+        };
+        if items.all(|schema| schema == &first) && rest.map_or(true, |schema| schema == &first) {
+            Some(first)
+        } else {
+            Some(TypeSchema::Unknown)
+        }
+    }
 }
 
 fn known_host_accepts_arity(name: &str, arity: u8) -> bool {
@@ -152,7 +188,7 @@ pub enum Stmt {
     },
     Let {
         index: LocalSlot,
-        declared_struct: Option<String>,
+        declared_schema: Option<TypeSchema>,
         expr: Expr,
         line: u32,
     },
@@ -268,7 +304,7 @@ impl LocalIrBuilder {
         let index = self.alloc_local_named(name)?;
         Ok(Stmt::Let {
             index,
-            declared_struct: None,
+            declared_schema: None,
             expr,
             line,
         })

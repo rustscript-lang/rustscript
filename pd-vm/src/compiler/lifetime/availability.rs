@@ -314,7 +314,7 @@ impl AvailabilityAnalyzer {
             }
             Stmt::Let {
                 index,
-                declared_struct,
+                declared_schema,
                 expr,
                 line,
             } => {
@@ -336,7 +336,7 @@ impl AvailabilityAnalyzer {
                 Ok((
                     Stmt::Let {
                         index: *index,
-                        declared_struct: declared_struct.clone(),
+                        declared_schema: declared_schema.clone(),
                         expr: rewritten_expr,
                         line: *line,
                     },

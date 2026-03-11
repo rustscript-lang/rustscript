@@ -559,15 +559,60 @@ impl Parser {
 
     pub(super) fn parse_declared_type_schema(&mut self) -> Result<TypeSchema, ParseError> {
         if self.match_kind(&TokenKind::LBracket) {
-            let element = self.parse_declared_type_schema()?;
+            let mut elements = Vec::new();
+            let mut rest = None;
+            if self.check(&TokenKind::RBracket) {
+                return Err(ParseError {
+                    span: None,
+                    code: None,
+                    line: self.current_line(),
+                    message: "expected at least one item in array type schema".to_string(),
+                });
+            }
+            loop {
+                let element = self.parse_declared_type_schema()?;
+                if self.match_kind(&TokenKind::Ellipsis) {
+                    rest = Some(element);
+                    if self.match_kind(&TokenKind::Comma) && !self.check(&TokenKind::RBracket) {
+                        return Err(ParseError {
+                            span: None,
+                            code: None,
+                            line: self.current_line(),
+                            message: "variadic array schema entry must be the final item"
+                                .to_string(),
+                        });
+                    }
+                    break;
+                }
+                elements.push(element);
+                if self.match_kind(&TokenKind::Comma) {
+                    if self.check(&TokenKind::RBracket) {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
             self.expect(&TokenKind::RBracket, "expected ']' after array type schema")?;
-            return Ok(TypeSchema::Array(Box::new(element)));
+            return Ok(match (elements.len(), rest) {
+                (0, Some(rest)) => TypeSchema::Array(Box::new(rest)),
+                (1, None) => TypeSchema::Array(Box::new(elements.pop().unwrap())),
+                (_, Some(rest)) => TypeSchema::ArrayTupleRest {
+                    prefix: elements,
+                    rest: Box::new(rest),
+                },
+                _ => TypeSchema::ArrayTuple(elements),
+            });
         }
 
         if self.match_kind(&TokenKind::LBrace) {
-            let fields = self.parse_object_type_schema_fields()?;
-            self.expect(&TokenKind::RBrace, "expected '}' after object type schema")?;
-            return Ok(TypeSchema::Object(fields));
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: "inline object type schema is not supported; declare a struct and reference it by name"
+                    .to_string(),
+            });
         }
 
         if self.match_kind(&TokenKind::Null) {
@@ -593,14 +638,6 @@ impl Parser {
                 Ok(TypeSchema::Named(other.to_string()))
             }
         }
-    }
-
-    pub(super) fn parse_declared_struct_name(&mut self) -> Result<String, ParseError> {
-        let span = self.current_span();
-        let name = self.expect_ident("expected struct name after ':'")?;
-        self.schema_reference_sites
-            .push((name.clone(), self.current_line(), span));
-        Ok(name)
     }
 
     pub(super) fn parse_function_impl_block(
@@ -732,8 +769,8 @@ impl Parser {
         } else {
             self.expect_ident("expected identifier after 'let'")?
         };
-        let declared_struct = if self.match_kind(&TokenKind::Colon) {
-            Some(self.parse_declared_struct_name()?)
+        let declared_schema = if self.match_kind(&TokenKind::Colon) {
+            Some(self.parse_declared_type_schema()?)
         } else {
             None
         };
@@ -753,7 +790,7 @@ impl Parser {
                 self.apply_let_binding_mutability(index, declared_mutable, false);
                 return Ok(Stmt::Let {
                     index,
-                    declared_struct,
+                    declared_schema,
                     expr,
                     line,
                 });
@@ -766,7 +803,7 @@ impl Parser {
             self.apply_let_binding_mutability(index, declared_mutable, true);
             return Ok(Stmt::Let {
                 index,
-                declared_struct,
+                declared_schema,
                 expr,
                 line,
             });
@@ -776,7 +813,7 @@ impl Parser {
         self.apply_let_binding_mutability(index, declared_mutable, created);
         Ok(Stmt::Let {
             index,
-            declared_struct,
+            declared_schema,
             expr,
             line,
         })

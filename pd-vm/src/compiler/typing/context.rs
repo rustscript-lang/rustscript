@@ -717,13 +717,16 @@ impl<'a> TypeContext<'a> {
             BuiltinFunction::Get if args.len() == 2 => self
                 .infer_expr_schema(&args[0], state)
                 .and_then(|schema| infer_access_schema(&schema, &args[1], self, state).ok()),
-            BuiltinFunction::Slice if args.len() == 3 => {
-                match self.infer_expr_schema(&args[0], state) {
-                    Some(TypeSchema::Array(element)) => Some(TypeSchema::Array(element)),
-                    Some(TypeSchema::String) => Some(TypeSchema::String),
-                    _ => None,
+            BuiltinFunction::Slice if args.len() == 3 => match self.infer_expr_schema(&args[0], state)
+            {
+                Some(schema) if schema.array_prefix_and_rest().is_some() => {
+                    schema.collapsed_array_item_schema().map(|element| {
+                        TypeSchema::Array(Box::new(element))
+                    })
                 }
-            }
+                Some(TypeSchema::String) => Some(TypeSchema::String),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1071,15 +1074,11 @@ impl<'a> TypeContext<'a> {
                 }
                 Stmt::Let {
                     index,
-                    declared_struct,
+                    declared_schema,
                     expr,
                     ..
                 } => {
                     let expr_state = state.clone();
-                    let declared_schema = declared_struct
-                        .as_deref()
-                        .and_then(|name| self.resolve_struct_schema(name))
-                        .cloned();
                     self.bind_expr_to_slot(
                         state,
                         *index,
@@ -1230,23 +1229,33 @@ pub(crate) fn bound_type_from_schema(schema: &TypeSchema) -> BoundType {
         TypeSchema::Bool => BoundType::Bool,
         TypeSchema::String => BoundType::String,
         TypeSchema::Named(_) => BoundType::Map,
-        TypeSchema::Array(_) => BoundType::Array,
+        TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
+            BoundType::Array
+        }
         TypeSchema::Map(_) | TypeSchema::Object(_) => BoundType::Map,
     }
 }
 
 fn merge_array_schema(current: Option<TypeSchema>, next: Option<TypeSchema>) -> TypeSchema {
-    let existing = match current {
-        Some(TypeSchema::Array(existing)) => *existing,
-        _ => TypeSchema::Unknown,
-    };
-    let merged = match (existing.clone(), next) {
-        (TypeSchema::Unknown, Some(next)) => next,
-        (existing, Some(next)) if existing == next => existing,
-        (existing, None) => existing,
-        _ => TypeSchema::Unknown,
-    };
-    TypeSchema::Array(Box::new(merged))
+    let next = next.unwrap_or(TypeSchema::Unknown);
+    match current {
+        Some(TypeSchema::ArrayTuple(mut items)) => {
+            items.push(next);
+            TypeSchema::ArrayTuple(items)
+        }
+        Some(TypeSchema::ArrayTupleRest { prefix, rest }) => TypeSchema::ArrayTupleRest {
+            prefix,
+            rest: Box::new(merge_schema_value(*rest, Some(next))),
+        },
+        Some(TypeSchema::Array(existing)) if *existing == TypeSchema::Unknown => {
+            TypeSchema::ArrayTuple(vec![next])
+        }
+        Some(TypeSchema::Array(existing)) => {
+            TypeSchema::Array(Box::new(merge_schema_value(*existing, Some(next))))
+        }
+        Some(other) => other,
+        None => TypeSchema::ArrayTuple(vec![next]),
+    }
 }
 
 fn infer_set_schema(
@@ -1264,22 +1273,45 @@ fn infer_set_schema(
             Some(TypeSchema::Object(fields))
         }
         Some(TypeSchema::Map(existing)) => {
-            let merged = match (*existing, value) {
-                (TypeSchema::Unknown, Some(next)) => next,
-                (existing, Some(next)) if existing == next => existing,
-                (existing, None) => existing,
-                _ => TypeSchema::Unknown,
-            };
-            Some(TypeSchema::Map(Box::new(merged)))
+            Some(TypeSchema::Map(Box::new(merge_schema_value(*existing, value))))
         }
         Some(TypeSchema::Array(existing)) => {
-            let merged = match (*existing, value) {
-                (TypeSchema::Unknown, Some(next)) => next,
-                (existing, Some(next)) if existing == next => existing,
-                (existing, None) => existing,
-                _ => TypeSchema::Unknown,
-            };
-            Some(TypeSchema::Array(Box::new(merged)))
+            Some(TypeSchema::Array(Box::new(merge_schema_value(*existing, value))))
+        }
+        Some(TypeSchema::ArrayTuple(mut items)) => {
+            if let Some(index) = literal_int_index(key) {
+                let value = value.unwrap_or(TypeSchema::Unknown);
+                if let Some(existing) = items.get_mut(index) {
+                    *existing = merge_schema_value(existing.clone(), Some(value));
+                } else if index == items.len() {
+                    items.push(value);
+                } else {
+                    return Some(TypeSchema::Array(Box::new(TypeSchema::Unknown)));
+                }
+                Some(TypeSchema::ArrayTuple(items))
+            } else {
+                let merged = merge_schema_value(
+                    TypeSchema::ArrayTuple(items).collapsed_array_item_schema()?,
+                    value,
+                );
+                Some(TypeSchema::Array(Box::new(merged)))
+            }
+        }
+        Some(TypeSchema::ArrayTupleRest { mut prefix, rest }) => {
+            if let Some(index) = literal_int_index(key) {
+                if let Some(existing) = prefix.get_mut(index) {
+                    *existing = merge_schema_value(existing.clone(), value);
+                    return Some(TypeSchema::ArrayTupleRest { prefix, rest });
+                }
+                return Some(TypeSchema::ArrayTupleRest {
+                    prefix,
+                    rest: Box::new(merge_schema_value(*rest, value)),
+                });
+            }
+            Some(TypeSchema::ArrayTupleRest {
+                prefix,
+                rest: Box::new(merge_schema_value(*rest, value)),
+            })
         }
         Some(other) => Some(other),
         None => match key {
@@ -1302,7 +1334,26 @@ pub(super) fn infer_access_schema(
     context: &mut TypeContext<'_>,
     state: &LocalTypeState,
 ) -> Result<TypeSchema, String> {
-    match context.resolve_schema(schema).clone() {
+    let resolved = context.resolve_schema(schema).clone();
+    if resolved.array_prefix_and_rest().is_some() {
+        let key_ty = context.infer_expr_type(key, state);
+        if matches!(key_ty, BoundType::Unknown | BoundType::Int) {
+            if let Some(index) = literal_int_index(key) {
+                return Ok(resolved
+                    .array_item_schema_at(index)
+                    .unwrap_or(TypeSchema::Unknown));
+            }
+            return Ok(resolved
+                .collapsed_array_item_schema()
+                .unwrap_or(TypeSchema::Unknown));
+        }
+        return Err(format!(
+            "schema-typed array access requires an int index, got {}",
+            bound_type_label(key_ty)
+        ));
+    }
+
+    match resolved {
         TypeSchema::Named(name) => Err(format!("unknown struct schema '{name}'")),
         TypeSchema::Object(fields) => match key {
             Expr::String(name) => fields
@@ -1321,17 +1372,6 @@ pub(super) fn infer_access_schema(
                 }
             }
         },
-        TypeSchema::Array(element) => {
-            let key_ty = context.infer_expr_type(key, state);
-            if matches!(key_ty, BoundType::Unknown | BoundType::Int) {
-                Ok((*element).clone())
-            } else {
-                Err(format!(
-                    "schema-typed array access requires an int index, got {}",
-                    bound_type_label(key_ty)
-                ))
-            }
-        }
         TypeSchema::String => {
             let key_ty = context.infer_expr_type(key, state);
             if matches!(key_ty, BoundType::Unknown | BoundType::Int) {
@@ -1343,7 +1383,7 @@ pub(super) fn infer_access_schema(
                 ))
             }
         }
-        TypeSchema::Map(value) => Ok((*value).clone()),
+        TypeSchema::Map(value) => Ok(*value),
         other => Err(format!(
             "cannot access fields on schema type '{}'",
             schema_label(&other)
@@ -1372,7 +1412,25 @@ pub(super) fn schema_label(schema: &TypeSchema) -> &'static str {
         TypeSchema::Bool => "bool",
         TypeSchema::String => "string",
         TypeSchema::Named(_) => "map",
-        TypeSchema::Array(_) => "array",
+        TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
+            "array"
+        }
         TypeSchema::Map(_) | TypeSchema::Object(_) => "map",
     }
+}
+
+fn merge_schema_value(current: TypeSchema, next: Option<TypeSchema>) -> TypeSchema {
+    match (current, next) {
+        (TypeSchema::Unknown, Some(next)) => next,
+        (current, Some(next)) if current == next => current,
+        (current, None) => current,
+        _ => TypeSchema::Unknown,
+    }
+}
+
+fn literal_int_index(key: &Expr) -> Option<usize> {
+    let Expr::Int(index) = key else {
+        return None;
+    };
+    usize::try_from(*index).ok()
 }

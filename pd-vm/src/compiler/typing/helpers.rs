@@ -144,16 +144,12 @@ pub(super) fn legalize_stmts(
             }
             Stmt::Let {
                 index,
-                declared_struct,
+                declared_schema,
                 expr,
                 ..
             } => {
                 let expr_state = state.clone();
                 let ty = legalize_expr(expr, &expr_state, context);
-                let declared_schema = declared_struct
-                    .as_deref()
-                    .and_then(|name| context.resolve_struct_schema(name))
-                    .cloned();
                 bind_expr_result_to_slot(
                     state,
                     *index,
@@ -264,7 +260,7 @@ pub(super) fn validate_stmts(
             }
             Stmt::Let {
                 index,
-                declared_struct,
+                declared_schema,
                 expr,
                 line,
             } => {
@@ -277,10 +273,6 @@ pub(super) fn validate_stmts(
                     context,
                     strict_function_add_types,
                 )?;
-                let declared_schema = declared_struct
-                    .as_deref()
-                    .and_then(|name| context.resolve_struct_schema(name))
-                    .cloned();
                 let actual_schema = inferred_expr_assignment_schema(expr, &expr_state, context);
                 validate_declared_local_schema(
                     declared_schema.as_ref(),
@@ -547,8 +539,10 @@ fn find_declared_schema_mismatch_with_recursion(
         | (TypeSchema::Float, TypeSchema::Float)
         | (TypeSchema::Bool, TypeSchema::Bool)
         | (TypeSchema::String, TypeSchema::String) => None,
-        (TypeSchema::Array(expected), TypeSchema::Array(actual)) => {
-            find_declared_schema_mismatch_with_recursion(
+        (expected, actual)
+            if expected.array_prefix_and_rest().is_some() && actual.array_prefix_and_rest().is_some() =>
+        {
+            find_declared_array_mismatch_with_recursion(
                 expected,
                 actual,
                 context,
@@ -634,6 +628,79 @@ fn find_declared_schema_mismatch_with_recursion(
     }
 }
 
+fn find_declared_array_mismatch_with_recursion(
+    expected: &TypeSchema,
+    actual: &TypeSchema,
+    context: &TypeContext<'_>,
+    path: String,
+    recursive_named: &mut HashSet<String>,
+    allow_partial_object: bool,
+) -> Option<String> {
+    let Some((expected_prefix, expected_rest)) = expected.array_prefix_and_rest() else {
+        return None;
+    };
+    let Some((actual_prefix, actual_rest)) = actual.array_prefix_and_rest() else {
+        return Some(format!(
+            "{} is declared as schema type '{}' but was assigned {}",
+            schema_path_label(&path),
+            schema_type_label(expected),
+            schema_type_label(actual)
+        ));
+    };
+
+    for (index, expected_item) in expected_prefix.iter().enumerate() {
+        let actual_item = actual_prefix.get(index).or(actual_rest);
+        let Some(actual_item) = actual_item else {
+            return Some(format!(
+                "{} is required by the declared schema but is missing",
+                schema_path_label(&extend_array_schema_path(&path, index))
+            ));
+        };
+        let item_path = extend_array_schema_path(&path, index);
+        if let Some(detail) = find_declared_schema_mismatch_with_recursion(
+            expected_item,
+            actual_item,
+            context,
+            item_path,
+            recursive_named,
+            allow_partial_object,
+        ) {
+            return Some(detail);
+        }
+    }
+
+    if let Some(expected_rest) = expected_rest {
+        for (index, actual_item) in actual_prefix.iter().enumerate().skip(expected_prefix.len()) {
+            let item_path = extend_array_schema_path(&path, index);
+            if let Some(detail) = find_declared_schema_mismatch_with_recursion(
+                expected_rest,
+                actual_item,
+                context,
+                item_path,
+                recursive_named,
+                allow_partial_object,
+            ) {
+                return Some(detail);
+            }
+        }
+        if let Some(actual_rest) = actual_rest {
+            let item_path = extend_array_schema_path(&path, expected_prefix.len());
+            if let Some(detail) = find_declared_schema_mismatch_with_recursion(
+                expected_rest,
+                actual_rest,
+                context,
+                item_path,
+                recursive_named,
+                allow_partial_object,
+            ) {
+                return Some(detail);
+            }
+        }
+    }
+
+    None
+}
+
 fn extend_schema_path(path: &str, segment: &str) -> String {
     if path.is_empty() {
         segment.to_string()
@@ -642,9 +709,19 @@ fn extend_schema_path(path: &str, segment: &str) -> String {
     }
 }
 
+fn extend_array_schema_path(path: &str, index: usize) -> String {
+    if path.is_empty() {
+        format!("[{index}]")
+    } else {
+        format!("{path}[{index}]")
+    }
+}
+
 fn schema_path_label(path: &str) -> String {
     if path.is_empty() {
         "value".to_string()
+    } else if path.starts_with('[') {
+        format!("index {path}")
     } else {
         format!("field '{path}'")
     }
@@ -659,7 +736,9 @@ fn schema_type_label(schema: &TypeSchema) -> &'static str {
         TypeSchema::Bool => "bool",
         TypeSchema::String => "string",
         TypeSchema::Named(_) => "map",
-        TypeSchema::Array(_) => "array",
+        TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
+            "array"
+        }
         TypeSchema::Map(_) | TypeSchema::Object(_) => "map",
     }
 }
