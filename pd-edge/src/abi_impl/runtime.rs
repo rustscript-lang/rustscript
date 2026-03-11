@@ -4,7 +4,7 @@ use edge_abi::symbols::{rate_limit as edge_rate_limit, runtime as edge_runtime};
 use pd_edge_host_function::pd_edge_host_function;
 use vm::{CallOutcome, Value, Vm, VmError};
 
-use super::current_vm_context;
+use super::SharedProxyVmContext;
 
 #[pd_edge_host_function(name = edge_runtime::SLEEP.name, scope = runtime)]
 async fn runtime_sleep(_vm: &mut Vm, millis: i64) -> Result<CallOutcome, VmError> {
@@ -22,6 +22,7 @@ async fn runtime_sleep(_vm: &mut Vm, millis: i64) -> Result<CallOutcome, VmError
 #[pd_edge_host_function(name = edge_rate_limit::ALLOW.name, scope = runtime)]
 async fn rate_limit_allow(
     _vm: &mut Vm,
+    context: SharedProxyVmContext,
     key: String,
     limit: i64,
     window_seconds: i64,
@@ -30,7 +31,6 @@ async fn rate_limit_allow(
         return Ok(CallOutcome::Return(vec![Value::Bool(false)]));
     }
 
-    let context = current_vm_context()?;
     let rate_limiter = {
         let context = context.lock().expect("vm context lock poisoned");
         context.rate_limiter.clone()

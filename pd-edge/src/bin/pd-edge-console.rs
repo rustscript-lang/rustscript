@@ -757,7 +757,7 @@ impl HostFunction for ConsoleStderrFlushFunction {
 }
 
 fn schedule_future_call<F>(
-    vm: &mut Vm,
+    _vm: &mut Vm,
     async_ops: &SharedVmAsyncOps,
     future: F,
 ) -> Result<CallOutcome, VmError>
@@ -765,7 +765,7 @@ where
     F: std::future::Future<Output = Result<Vec<Value>, VmError>> + Send + 'static,
 {
     let mut ops = async_ops.lock().expect("vm async ops lock poisoned");
-    let op_id = ops.schedule_future(vm, future)?;
+    let op_id = ops.schedule_future(future)?;
     Ok(CallOutcome::Pending(op_id))
 }
 

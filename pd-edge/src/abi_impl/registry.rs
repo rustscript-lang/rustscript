@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
 use edge_abi::FUNCTIONS as EDGE_ABI_FUNCTIONS;
-use vm::{HostFunctionRegistry, StaticHostFunction, Vm, VmError};
+use vm::{HostFunctionRegistry, StaticHostArgsFunction, StaticHostFunction, Vm, VmError};
 
 use super::{SharedProxyVmContext, SharedVmAsyncOps};
 
@@ -14,11 +14,18 @@ pub(crate) enum EdgeHostScope {
     Io,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) enum EdgeHostRegistrationFunction {
+    Static(StaticHostFunction),
+    ArgsStatic(StaticHostArgsFunction),
+}
+
 pub(crate) struct EdgeHostRegistration {
     pub scope: EdgeHostScope,
     pub name: &'static str,
     pub arity: u8,
-    pub function: StaticHostFunction,
+    pub function: EdgeHostRegistrationFunction,
 }
 
 #[::linkme::distributed_slice]
@@ -70,7 +77,14 @@ fn cached_registry_for_scope_mask(scope_mask_bits: u8) -> HostFunctionRegistry {
     }
     for registration in PD_EDGE_HOST_FUNCTIONS {
         if registration_matches_scope_mask(registration, scope_mask_bits) {
-            registry.register_static(registration.name, registration.arity, registration.function);
+            match registration.function {
+                EdgeHostRegistrationFunction::Static(function) => {
+                    registry.register_static(registration.name, registration.arity, function);
+                }
+                EdgeHostRegistrationFunction::ArgsStatic(function) => {
+                    registry.register_static_args(registration.name, registration.arity, function);
+                }
+            }
         }
     }
 
@@ -88,8 +102,13 @@ pub(crate) fn bind_host_scopes(vm: &mut Vm, scopes: &[EdgeHostScope]) -> Result<
     if scope_mask_bits == 0 {
         return Ok(());
     }
-    if vm.bound_function_count() == 0 {
+    if vm.bound_function_count() == 0 && !vm.program().imports.is_empty() {
         return cached_registry_for_scope_mask(scope_mask_bits).bind_vm_cached(vm);
+    }
+    if vm.bound_function_count() == 0 {
+        for function in EDGE_ABI_FUNCTIONS {
+            vm.bind_static_function(function.name, super::unbound_edge_abi_function);
+        }
     }
     bind_host_scopes_direct(vm, scopes);
     Ok(())
@@ -99,7 +118,14 @@ pub(crate) fn bind_host_scopes_direct(vm: &mut Vm, scopes: &[EdgeHostScope]) {
     let scope_mask_bits = scopes_mask(scopes);
     for registration in PD_EDGE_HOST_FUNCTIONS {
         if registration_matches_scope_mask(registration, scope_mask_bits) {
-            vm.bind_static_function(registration.name, registration.function);
+            match registration.function {
+                EdgeHostRegistrationFunction::Static(function) => {
+                    vm.bind_static_function(registration.name, function);
+                }
+                EdgeHostRegistrationFunction::ArgsStatic(function) => {
+                    vm.bind_static_args_function(registration.name, function);
+                }
+            }
         }
     }
 }
