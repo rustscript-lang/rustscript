@@ -596,6 +596,21 @@ fn compile_source_supports_static_function_pointer_binding() {
 }
 
 #[test]
+fn compile_source_supports_static_args_function_pointer_binding() {
+    let source = r#"
+        fn add_one(x);
+        add_one(41);
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    vm.bind_static_args_function("add_one", static_add_one_args);
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+}
+
+#[test]
 fn host_function_registry_caches_static_function_pointer_plan_across_vms() {
     let source = include_str!("../../examples/example.rss");
     let compiled = compile_source(source).expect("compile should succeed");
@@ -621,6 +636,35 @@ fn host_function_registry_caches_static_function_pointer_plan_across_vms() {
     registry
         .bind_vm_with_plan(&mut vm2, &plan)
         .expect("cached static host binding should succeed");
+    let status2 = vm2.run().expect("vm should run");
+    assert_eq!(status2, VmStatus::Halted);
+    assert_eq!(vm2.stack(), &[Value::Int(6)]);
+}
+
+#[test]
+fn host_function_registry_caches_static_args_function_pointer_plan_across_vms() {
+    let source = include_str!("../../examples/example.rss");
+    let compiled = compile_source(source).expect("compile should succeed");
+
+    let mut registry = HostFunctionRegistry::new();
+    registry.register_static_args("print", 1, |args| Ok(CallOutcome::Return(args.to_vec())));
+    registry.register_static_args("add_one", 1, static_add_one_args);
+    let plan = registry
+        .prepare_plan(&compiled.program.imports)
+        .expect("plan should build");
+
+    let mut vm1 = Vm::new(compiled.program.clone());
+    registry
+        .bind_vm_with_plan(&mut vm1, &plan)
+        .expect("cached static args host binding should succeed");
+    let status1 = vm1.run().expect("vm should run");
+    assert_eq!(status1, VmStatus::Halted);
+    assert_eq!(vm1.stack(), &[Value::Int(6)]);
+
+    let mut vm2 = Vm::new(compiled.program);
+    registry
+        .bind_vm_with_plan(&mut vm2, &plan)
+        .expect("cached static args host binding should succeed");
     let status2 = vm2.run().expect("vm should run");
     assert_eq!(status2, VmStatus::Halted);
     assert_eq!(vm2.stack(), &[Value::Int(6)]);

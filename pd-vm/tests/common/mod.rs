@@ -2,9 +2,9 @@
 
 pub use vm::{
     Assembler, BytecodeBuilder, CallOutcome, CompileSourceFileOptions, Compiler, Expr,
-    HostFunction, HostFunctionRegistry, Program, SourceFlavor, Stmt, Store, Value, Vm, VmStatus,
-    assemble, compile_source, compile_source_file, compile_source_file_with_options,
-    compile_source_with_flavor,
+    HostArgsFunction, HostFunction, HostFunctionRegistry, Program, SourceFlavor,
+    StaticHostArgsFunction, Stmt, Store, Value, Vm, VmStatus, assemble, compile_source,
+    compile_source_file, compile_source_file_with_options, compile_source_with_flavor,
 };
 
 pub struct RuntimeCase<'a> {
@@ -352,6 +352,14 @@ pub fn static_add_one(_vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::V
     Ok(CallOutcome::Return(vec![Value::Int(value + 1)]))
 }
 
+pub fn static_add_one_args(args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    let value = match args.first() {
+        Some(Value::Int(value)) => *value,
+        _ => 0,
+    };
+    Ok(CallOutcome::Return(vec![Value::Int(value + 1)]))
+}
+
 pub fn make_add_one() -> Box<dyn HostFunction> {
     Box::new(AddOne)
 }
@@ -410,6 +418,7 @@ fn common_helpers_are_referenced() {
     let _ = expect_parse_error_contains_any_with_flavor as fn(&str, SourceFlavor, &[&str]);
     let _ = expect_parse_error_contains_any_case as fn(&str, &str, SourceFlavor, &[&str]);
     let _ = static_add_one as fn(&mut Vm, &[Value]) -> Result<CallOutcome, vm::VmError>;
+    let _ = static_add_one_args as StaticHostArgsFunction;
     let _ = make_add_one as fn() -> Box<dyn HostFunction>;
     let _ = make_echo_string as fn() -> Box<dyn HostFunction>;
     let _ = make_print_builtin as fn() -> Box<dyn HostFunction>;

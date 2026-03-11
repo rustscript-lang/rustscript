@@ -96,6 +96,42 @@ fn call_can_yield_and_resume() {
 }
 
 #[test]
+fn args_only_call_can_yield_and_resume_without_rebuilding_args() {
+    struct YieldOnceArgs {
+        yielded: bool,
+    }
+
+    impl HostArgsFunction for YieldOnceArgs {
+        fn call(&mut self, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            assert_eq!(args, &[Value::Int(4)]);
+            if !self.yielded {
+                self.yielded = true;
+                Ok(CallOutcome::Yield)
+            } else {
+                Ok(CallOutcome::Return(vec![Value::Int(42)]))
+            }
+        }
+    }
+
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.call(0, 1);
+    bc.ret();
+
+    let program = Program::new(vec![Value::Int(4)], bc.finish());
+    let mut vm = Vm::new(program);
+    vm.register_args_function(Box::new(YieldOnceArgs { yielded: false }));
+
+    let status = vm.run().expect("first run should yield");
+    assert_eq!(status, VmStatus::Yielded);
+    assert_eq!(vm.stack(), &[Value::Int(4)]);
+
+    let resumed = vm.resume().expect("resume should halt");
+    assert_eq!(resumed, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+}
+
+#[test]
 fn call_can_wait_for_host_op_and_resume_without_replay() {
     struct PendingOnce {
         called: bool,
@@ -123,6 +159,48 @@ fn call_can_wait_for_host_op_and_resume_without_replay() {
 
     let status = vm.run().expect("first run should wait on host op");
     assert_eq!(status, VmStatus::Waiting(99));
+
+    vm.complete_host_op(99, vec![Value::Int(7)])
+        .expect("host op completion should succeed");
+    let resumed = vm.resume().expect("resume should halt after completion");
+    assert_eq!(resumed, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(7)]);
+}
+
+#[test]
+fn args_only_call_can_wait_for_host_op_and_resume_without_replay() {
+    struct PendingOnceArgs {
+        called: bool,
+    }
+
+    impl HostArgsFunction for PendingOnceArgs {
+        fn call(&mut self, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            assert_eq!(args, &[Value::Int(4)]);
+            if self.called {
+                return Err(vm::VmError::HostError(
+                    "pending host should not be replayed".to_string(),
+                ));
+            }
+            self.called = true;
+            Ok(CallOutcome::Pending(99))
+        }
+    }
+
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.call(0, 1);
+    bc.ret();
+    let program = Program::new(vec![Value::Int(4)], bc.finish());
+
+    let mut vm = Vm::new(program);
+    vm.register_args_function(Box::new(PendingOnceArgs { called: false }));
+
+    let status = vm.run().expect("first run should wait on host op");
+    assert_eq!(status, VmStatus::Waiting(99));
+    assert!(
+        vm.stack().is_empty(),
+        "pending args-only call should consume args"
+    );
 
     vm.complete_host_op(99, vec![Value::Int(7)])
         .expect("host op completion should succeed");

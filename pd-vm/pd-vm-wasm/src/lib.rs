@@ -964,7 +964,7 @@ mod lint_tests {
                 diagnostic.severity.as_str() == "warning"
                     && diagnostic
                         .message
-                        .contains("compiler could not determine the type of local 'value'")
+                        .contains("compiler could not determine the type of local 'values'")
             }),
             "expected path-aware lint to keep the unknown-local warning, got {:?}",
             report.diagnostics

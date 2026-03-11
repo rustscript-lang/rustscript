@@ -658,11 +658,19 @@ fn render_builtin_runtime_dispatch(
             .as_ref()
             .expect("host wrappers should exist");
         let adapter_name = host_wrapper_adapter_name(callable);
-        writeln!(
-            &mut out,
-            "fn {adapter_name}(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {{"
-        )
-        .unwrap();
+        if wrapper_uses_vm(wrapper) {
+            writeln!(
+                &mut out,
+                "fn {adapter_name}(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {{"
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                &mut out,
+                "fn {adapter_name}(args: &[Value]) -> VmResult<CallOutcome> {{"
+            )
+            .unwrap();
+        }
         writeln!(
             &mut out,
             "    {}",
@@ -684,14 +692,29 @@ fn render_builtin_runtime_dispatch(
     )
     .unwrap();
     for callable in host_callables {
-        writeln!(
-            &mut out,
-            "    registry.register_static({:?}, {}, {});",
-            callable.name,
-            callable.params.len(),
-            host_wrapper_adapter_name(callable)
-        )
-        .unwrap();
+        let wrapper = callable
+            .wrapper
+            .as_ref()
+            .expect("host wrappers should exist");
+        if wrapper_uses_vm(wrapper) {
+            writeln!(
+                &mut out,
+                "    registry.register_static({:?}, {}, {});",
+                callable.name,
+                callable.params.len(),
+                host_wrapper_adapter_name(callable)
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                &mut out,
+                "    registry.register_static_args({:?}, {}, {});",
+                callable.name,
+                callable.params.len(),
+                host_wrapper_adapter_name(callable)
+            )
+            .unwrap();
+        }
     }
     writeln!(&mut out, "}}").unwrap();
     writeln!(&mut out).unwrap();
@@ -703,14 +726,28 @@ fn render_builtin_runtime_dispatch(
     .unwrap();
     writeln!(&mut out, "    match name {{").unwrap();
     for callable in host_callables {
+        let wrapper = callable
+            .wrapper
+            .as_ref()
+            .expect("host wrappers should exist");
         writeln!(&mut out, "        {:?} => {{", callable.name).unwrap();
-        writeln!(
-            &mut out,
-            "            vm.bind_static_function({:?}, {});",
-            callable.name,
-            host_wrapper_adapter_name(callable)
-        )
-        .unwrap();
+        if wrapper_uses_vm(wrapper) {
+            writeln!(
+                &mut out,
+                "            vm.bind_static_function({:?}, {});",
+                callable.name,
+                host_wrapper_adapter_name(callable)
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                &mut out,
+                "            vm.bind_static_args_function({:?}, {});",
+                callable.name,
+                host_wrapper_adapter_name(callable)
+            )
+            .unwrap();
+        }
         writeln!(&mut out, "            true").unwrap();
         writeln!(&mut out, "        }}").unwrap();
     }
@@ -721,7 +758,7 @@ fn render_builtin_runtime_dispatch(
 
     writeln!(
         &mut out,
-        "fn execute_namespaced_builtin_call(vm: &mut Vm, builtin: BuiltinFunction, args: Vec<Value>) -> VmResult<BuiltinCallOutcome> {{"
+        "fn execute_namespaced_builtin_call(vm: &mut Vm, builtin: BuiltinFunction, args: &mut [Value]) -> VmResult<BuiltinCallOutcome> {{"
     )
     .unwrap();
     writeln!(&mut out, "    match builtin {{").unwrap();
@@ -741,7 +778,7 @@ fn render_builtin_runtime_dispatch(
                 &callable.module,
                 wrapper,
                 SourceCategory::NamespacedBuiltin,
-                "&args",
+                "args",
             )
         )
         .unwrap();
@@ -1424,6 +1461,13 @@ fn wrapper_name_for_callable(rust_ident: &str) -> String {
 
 fn host_wrapper_adapter_name(callable: &CallableDecl) -> String {
     format!("__pd_host_adapter_{}", callable.rust_ident)
+}
+
+fn wrapper_uses_vm(wrapper: &WrapperDecl) -> bool {
+    wrapper
+        .params
+        .iter()
+        .any(|param| matches!(param, WrapperParamKind::Vm))
 }
 
 fn generated_wrapper_decl(function: &ItemFn) -> WrapperDecl {

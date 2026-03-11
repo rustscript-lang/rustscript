@@ -40,10 +40,10 @@ include!(concat!(
 pub(crate) fn execute_builtin_call(
     vm: &mut Vm,
     builtin: BuiltinFunction,
-    args: Vec<Value>,
+    args: &mut [Value],
 ) -> VmResult<BuiltinCallOutcome> {
     match builtin {
-        BuiltinFunction::Len => core::builtin_len(&args).map(BuiltinCallOutcome::Return),
+        BuiltinFunction::Len => core::builtin_len(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Slice => core::builtin_slice(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Concat => core::builtin_concat(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::ArrayNew => Ok(BuiltinCallOutcome::Return(return_values(
@@ -56,19 +56,19 @@ pub(crate) fn execute_builtin_call(
             core::builtin_map_new_impl(),
         ))),
         BuiltinFunction::Get => core::builtin_get(args).map(BuiltinCallOutcome::Return),
-        BuiltinFunction::Has => core::builtin_has(&args).map(BuiltinCallOutcome::Return),
+        BuiltinFunction::Has => core::builtin_has(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Set => core::builtin_set(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Keys => core::builtin_keys(args).map(BuiltinCallOutcome::Return),
-        BuiltinFunction::Count => core::builtin_count(&args).map(BuiltinCallOutcome::Return),
-        BuiltinFunction::FormatTemplate => core::builtin_format_template(&args)
+        BuiltinFunction::Count => core::builtin_count(args).map(BuiltinCallOutcome::Return),
+        BuiltinFunction::FormatTemplate => core::builtin_format_template(args)
             .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
         BuiltinFunction::ToString => {
-            core::builtin_to_string(&args).map(IntoBuiltinCallOutcome::into_builtin_call_outcome)
+            core::builtin_to_string(args).map(IntoBuiltinCallOutcome::into_builtin_call_outcome)
         }
         BuiltinFunction::TypeOf => {
-            core::builtin_type_of(&args).map(IntoBuiltinCallOutcome::into_builtin_call_outcome)
+            core::builtin_type_of(args).map(IntoBuiltinCallOutcome::into_builtin_call_outcome)
         }
-        BuiltinFunction::Assert => core::builtin_assert(&args).map(|()| {
+        BuiltinFunction::Assert => core::builtin_assert(args).map(|()| {
             // Successful asserts are control checks, not value-producing expressions.
             BuiltinCallOutcome::Return(Vec::new())
         }),
@@ -96,10 +96,10 @@ mod tests {
     #[test]
     fn builtin_assert_success_returns_no_stack_value() {
         let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+        let mut args = [Value::Bool(true)];
 
-        let outcome =
-            execute_builtin_call(&mut vm, BuiltinFunction::Assert, vec![Value::Bool(true)])
-                .expect("assert should succeed");
+        let outcome = execute_builtin_call(&mut vm, BuiltinFunction::Assert, &mut args)
+            .expect("assert should succeed");
 
         match outcome {
             BuiltinCallOutcome::Return(values) => assert!(

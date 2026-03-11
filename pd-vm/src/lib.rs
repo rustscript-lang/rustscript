@@ -60,9 +60,9 @@ pub use jit::{
 pub use vm::diagnostics::render_vm_error;
 #[cfg(feature = "runtime")]
 pub use vm::{
-    CallOutcome, EpochCheckpoint, EpochHandle, FuelCheckpoint, HostAsyncBridge, HostBindingPlan,
-    HostFunction, HostFunctionRegistry, HostOpId, StaticHostFunction, Store, Vm, VmError, VmResult,
-    VmStatus, VmYieldReason,
+    CallOutcome, EpochCheckpoint, EpochHandle, FuelCheckpoint, HostArgsFunction, HostAsyncBridge,
+    HostBindingPlan, HostFunction, HostFunctionRegistry, HostOpId, StaticHostArgsFunction,
+    StaticHostFunction, Store, Vm, VmError, VmResult, VmStatus, VmYieldReason,
 };
 #[cfg(feature = "runtime")]
 pub use vmbc::{
