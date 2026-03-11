@@ -22,7 +22,7 @@ This crate now ships two binaries with different scopes:
 - [Active Control-Plane RPC](#active-control-plane-rpc)
   - [Example](#example)
 - [HTTP Proxy Performance Framework](#http-proxy-performance-framework)
-  - [Latest Snapshot (2026-03-07, Local Windows x86_64 Dev Machine)](#latest-snapshot-2026-03-07-local-windows-x8664-dev-machine)
+  - [Latest Snapshot (2026-03-11, Local Windows x86_64 Dev Machine)](#latest-snapshot-2026-03-11-local-windows-x8664-dev-machine)
 - [ABI Source of Truth](#abi-source-of-truth)
 - [Release Artifacts](#release-artifacts)
 - [Docker](#docker)
@@ -207,7 +207,7 @@ Run the built-in framework to benchmark these scenarios:
 - proxy with a compute-only program (no host calls; baseline workload)
 - proxy with additive async HTTP host calls on top of the same workload (`get_method/get_path/get_header/get_body` + `set_header/set_body`) and explicit termination (no upstream target)
 
-Detailed report with charts: [`docs/HTTP_PROXY_PERF_REPORT_2026-03-07.md`](docs/HTTP_PROXY_PERF_REPORT_2026-03-07.md)
+Detailed report with charts: [`docs/HTTP_PROXY_PERF_REPORT_2026-03-11.md`](docs/HTTP_PROXY_PERF_REPORT_2026-03-11.md)
 
 Build the proxy binary once before running benchmarks so the framework does not accidentally run a stale executable:
 
@@ -243,7 +243,7 @@ cargo run -p pd-edge --example http_proxy_perf_framework --release -- \
   --requests 3000 \
   --warmup-requests 300 \
   --concurrency 64 \
-  --fuel-latency-fuels "1,8,64,512,4096,50000" \
+  --fuel-latency-fuels "1,2,4,8,10,16,32,64,512,4096,50000" \
   --fuel-latency-check-intervals "1,4,16,64" \
   --json-out target/http_proxy_fuel_sweep_async.json
 
@@ -254,7 +254,7 @@ cargo run -p pd-edge --example http_proxy_perf_framework --release -- \
   --requests 3000 \
   --warmup-requests 300 \
   --concurrency 64 \
-  --fuel-latency-fuels "1,8,64,512,4096,50000" \
+  --fuel-latency-fuels "1,2,4,8,10,16,32,64,512,4096,50000" \
   --fuel-latency-check-intervals "1,4,16,64" \
   --json-out target/http_proxy_fuel_sweep_threading.json
 ```
@@ -265,72 +265,72 @@ Second harness (VM-only microbenchmark in `pd-vm`):
 cargo test -p pd-vm --release --test jit_tests perf_cooperative_fuel_configuration_impacts_latency -- --ignored --nocapture
 ```
 
-### Latest Snapshot (2026-03-07, Local Windows x86_64 Dev Machine)
+### Latest Snapshot (2026-03-11, Local Windows x86_64 Dev Machine)
 
 Harness A: HTTP end-to-end (`pd-edge/examples/http_proxy_perf_framework.rs`)
 
 | Scenario | Async (RPS / p50 / p95 / p99 ms) | Threading (RPS / p50 / p95 / p99 ms) |
 |---|---:|---:|
-| `raw_no_program` | `80,753 / 1.485 / 2.612 / 3.195` | `84,774 / 1.414 / 2.544 / 3.207` |
-| `no_host_calls_program` | `31,214 / 3.918 / 6.972 / 8.831` | `26,598 / 3.812 / 10.454 / 30.124` |
-| `host_calls_terminate` | `25,383 / 4.768 / 8.925 / 11.742` | `27,021 / 4.172 / 9.454 / 14.503` |
+| `raw_no_program` | `98,941 / 1.233 / 2.032 / 2.523` | `104,751 / 1.144 / 1.983 / 2.433` |
+| `no_host_calls_program` | `43,846 / 2.801 / 4.866 / 5.945` | `42,757 / 2.613 / 6.357 / 9.942` |
+| `host_calls_terminate` | `42,250 / 2.937 / 5.002 / 6.171` | `41,393 / 2.749 / 6.115 / 9.715` |
 
 Fuel sweep (fixed interval `1`, scenario `no_host_calls_program`):
 
 | Fuel | Async (p50 / p95 / p99 ms / RPS) | Threading (p50 / p95 / p99 ms / RPS) |
 |---:|---:|---:|
-| `1` | `error` | `error` |
-| `8` | `error` | `error` |
-| `64` | `2.942 / 6.614 / 9.705 / 18,565` | `3.717 / 5.890 / 8.271 / 16,682` |
-| `512` | `1.845 / 3.838 / 5.393 / 30,841` | `1.953 / 6.535 / 11.394 / 24,239` |
-| `4096` | `1.575 / 3.193 / 4.811 / 36,327` | `1.577 / 9.448 / 15.266 / 24,069` |
-| `50000` | `1.663 / 3.420 / 4.755 / 34,399` | `2.275 / 6.642 / 12.567 / 22,095` |
+| `1` | `105.298 / 138.863 / 146.916 / 600` | `76.729 / 124.234 / 135.187 / 715` |
+| `8` | `9.134 / 11.424 / 27.760 / 6,688` | `9.254 / 15.927 / 27.765 / 5,827` |
+| `64` | `2.054 / 3.890 / 5.488 / 27,917` | `2.156 / 3.773 / 4.252 / 27,694` |
+| `512` | `1.376 / 2.521 / 3.460 / 42,025` | `1.501 / 2.678 / 3.070 / 39,060` |
+| `4096` | `1.172 / 3.052 / 4.685 / 44,031` | `1.319 / 3.478 / 4.366 / 40,453` |
+| `50000` | `1.423 / 2.424 / 2.990 / 42,500` | `1.073 / 3.328 / 6.703 / 44,639` |
 
 Fuel-check-interval sweep (fixed fuel `50000`, scenario `no_host_calls_program`):
 
 | Interval | Async (p50 / p95 / p99 ms / RPS) | Threading (p50 / p95 / p99 ms / RPS) |
 |---:|---:|---:|
-| `1` | `1.668 / 3.005 / 4.271 / 35,320` | `2.095 / 5.502 / 11.535 / 24,528` |
-| `4` | `1.682 / 2.890 / 3.966 / 35,947` | `1.695 / 5.410 / 10.466 / 28,842` |
-| `16` | `1.711 / 3.021 / 4.313 / 34,910` | `1.531 / 4.711 / 8.795 / 32,238` |
-| `64` | `1.808 / 3.670 / 5.534 / 32,247` | `1.356 / 4.129 / 9.361 / 35,537` |
+| `1` | `1.491 / 2.738 / 3.577 / 39,865` | `1.048 / 3.239 / 6.844 / 45,973` |
+| `4` | `1.391 / 2.585 / 3.354 / 42,300` | `1.077 / 3.207 / 5.883 / 45,722` |
+| `16` | `1.350 / 2.438 / 3.047 / 43,372` | `1.077 / 3.184 / 6.435 / 45,500` |
+| `64` | `1.324 / 2.328 / 2.987 / 45,168` | `1.044 / 3.111 / 6.276 / 46,496` |
 
 Harness B: VM microbenchmark (`pd-vm/tests/jit/perf_tests.rs::perf_cooperative_fuel_configuration_impacts_latency`)
 
-Baseline (`fuel disabled`): median latency `42,667 us`
+Baseline (`fuel disabled`): median latency `16,487 us`
 
 Fuel sweep (`fixed_check_interval=1`):
 
 | Fuel | Median Latency (us) | Median Yields | Slowdown vs Baseline |
 |---:|---:|---:|---:|
-| `1` | `76,903` | `4,100,147` | `1.80x` |
-| `2` | `59,548` | `2,050,073` | `1.40x` |
-| `4` | `49,541` | `1,025,036` | `1.16x` |
-| `8` | `46,577` | `512,518` | `1.09x` |
-| `16` | `43,663` | `256,259` | `1.02x` |
-| `32` | `43,189` | `128,129` | `1.01x` |
-| `64` | `42,624` | `64,064` | `1.00x` |
-| `128` | `42,370` | `32,032` | `0.99x` |
-| `256` | `41,822` | `16,016` | `0.98x` |
-| `512` | `42,189` | `8,008` | `0.99x` |
-| `1024` | `42,078` | `4,004` | `0.99x` |
-| `2048` | `47,115` | `2,002` | `1.10x` |
-| `4096` | `57,562` | `1,001` | `1.35x` |
-| `8192` | `56,234` | `500` | `1.32x` |
+| `1` | `66,886` | `4,100,091` | `4.06x` |
+| `2` | `48,050` | `2,050,045` | `2.91x` |
+| `4` | `40,954` | `1,025,022` | `2.48x` |
+| `8` | `37,086` | `512,511` | `2.25x` |
+| `16` | `35,881` | `256,255` | `2.18x` |
+| `32` | `34,548` | `128,127` | `2.10x` |
+| `64` | `33,860` | `64,063` | `2.05x` |
+| `128` | `33,601` | `32,031` | `2.04x` |
+| `256` | `33,025` | `16,015` | `2.00x` |
+| `512` | `33,544` | `8,007` | `2.03x` |
+| `1024` | `33,002` | `4,003` | `2.00x` |
+| `2048` | `33,222` | `2,001` | `2.02x` |
+| `4096` | `32,882` | `1,000` | `1.99x` |
+| `8192` | `32,980` | `500` | `2.00x` |
 
 Fuel-check-interval sweep (`fixed_fuel=4096`):
 
 | Interval | Median Latency (us) | Median Yields | Slowdown vs Baseline |
 |---:|---:|---:|---:|
-| `1` | `50,944` | `1,001` | `1.19x` |
-| `2` | `53,379` | `1,001` | `1.25x` |
-| `4` | `55,211` | `1,001` | `1.29x` |
-| `8` | `60,637` | `1,001` | `1.42x` |
-| `16` | `58,917` | `1,001` | `1.38x` |
-| `32` | `52,209` | `1,001` | `1.22x` |
-| `64` | `53,674` | `1,000` | `1.26x` |
-| `128` | `55,537` | `1,000` | `1.30x` |
-| `256` | `51,369` | `1,000` | `1.20x` |
+| `1` | `33,223` | `1,000` | `2.02x` |
+| `2` | `36,420` | `1,000` | `2.21x` |
+| `4` | `32,622` | `1,000` | `1.98x` |
+| `8` | `32,898` | `1,000` | `2.00x` |
+| `16` | `33,880` | `1,000` | `2.05x` |
+| `32` | `33,361` | `1,000` | `2.02x` |
+| `64` | `32,521` | `1,000` | `1.97x` |
+| `128` | `32,741` | `1,000` | `1.99x` |
+| `256` | `32,604` | `1,000` | `1.98x` |
 
 Artifacts written by these runs:
 
@@ -338,7 +338,7 @@ Artifacts written by these runs:
 - `target/http_proxy_perf_mode_threading.json`
 - `target/http_proxy_fuel_sweep_async.json`
 - `target/http_proxy_fuel_sweep_threading.json`
-- `target/pd_vm_perf_cooperative_fuel_2026-03-07.txt`
+- `target/pd_vm_perf_cooperative_fuel_2026-03-11.txt`
 
 ## ABI Source of Truth
 

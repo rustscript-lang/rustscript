@@ -1,11 +1,5 @@
 use super::*;
 
-pub(super) struct DecodedInstructionData {
-    ldc_values: Box<[Option<Value>]>,
-    jump_targets: Box<[Option<usize>]>,
-    local_indices: Box<[Option<u8>]>,
-}
-
 #[derive(Clone, Copy, Debug)]
 enum ScalarValue {
     Int(i64),
@@ -31,52 +25,7 @@ impl ScalarValue {
     }
 }
 
-pub(super) fn build_decoded_instruction_data(program: &Program) -> DecodedInstructionData {
-    let mut ldc_values = vec![None; program.code.len()];
-    let mut jump_targets = vec![None; program.code.len()];
-    let mut local_indices = vec![None; program.code.len()];
-    let mut ip = 0usize;
-    while ip < program.code.len() {
-        let opcode = match OpCode::try_from(program.code[ip]) {
-            Ok(opcode) => opcode,
-            Err(_) => break,
-        };
-        match opcode {
-            OpCode::Ldc => {
-                if let Some(raw_index) = Vm::read_u32_at(&program.code, ip + 1)
-                    && let Some(value) = program.constants.get(raw_index as usize)
-                {
-                    ldc_values[ip] = Some(value.clone());
-                }
-            }
-            OpCode::Br | OpCode::Brfalse => {
-                if let Some(target) = Vm::read_u32_at(&program.code, ip + 1) {
-                    jump_targets[ip] = Some(target as usize);
-                }
-            }
-            OpCode::Ldloc | OpCode::Stloc => {
-                if let Some(index) = program.code.get(ip + 1).copied() {
-                    local_indices[ip] = Some(index);
-                }
-            }
-            _ => {}
-        }
-        ip = ip.saturating_add(1 + opcode.operand_len());
-    }
-    DecodedInstructionData {
-        ldc_values: ldc_values.into_boxed_slice(),
-        jump_targets: jump_targets.into_boxed_slice(),
-        local_indices: local_indices.into_boxed_slice(),
-    }
-}
-
 impl Vm {
-    #[inline(always)]
-    fn read_u32_at(code: &[u8], offset: usize) -> Option<u32> {
-        let bytes = code.get(offset..offset + 4)?;
-        Some(u32::from_le_bytes(bytes.try_into().ok()?))
-    }
-
     #[inline(always)]
     pub(super) fn decoded_ldc_value_at(&self, opcode_ip: usize) -> Option<&Value> {
         self.decoded_instruction_data

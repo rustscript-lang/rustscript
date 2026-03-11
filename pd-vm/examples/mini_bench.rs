@@ -347,6 +347,7 @@ fn benchmark_runtime(config: &BenchConfig) -> Result<(), String> {
                 &aes_compiled.program,
                 &aes_expected,
                 config.run_trials,
+                false,
             )?;
         }
         Err(err) => {
@@ -362,6 +363,7 @@ fn benchmark_runtime(config: &BenchConfig) -> Result<(), String> {
         &hot_loop.program,
         &hot_expected,
         config.run_trials,
+        true,
     )?;
     println!();
     Ok(())
@@ -372,6 +374,7 @@ fn benchmark_runtime_workload(
     program: &Program,
     expected_stack: &[Value],
     trials: usize,
+    include_aot: bool,
 ) -> Result<(), String> {
     let interpreter =
         measure_runtime_mode(program, expected_stack, PerfExecMode::Interpreter, trials)?;
@@ -393,14 +396,21 @@ fn benchmark_runtime_workload(
             average_duration(&jit.samples).as_micros(),
         );
 
-        let aot = measure_runtime_mode(program, expected_stack, PerfExecMode::Aot, trials)?;
-        println!(
-            "  {:<16} mode={:<12} median_us={:<10} avg_us={:<10}",
-            label,
-            aot.mode.label(),
-            aot.median.as_micros(),
-            average_duration(&aot.samples).as_micros(),
-        );
+        if include_aot {
+            let aot = measure_runtime_mode(program, expected_stack, PerfExecMode::Aot, trials)?;
+            println!(
+                "  {:<16} mode={:<12} median_us={:<10} avg_us={:<10}",
+                label,
+                aot.mode.label(),
+                aot.median.as_micros(),
+                average_duration(&aot.samples).as_micros(),
+            );
+        } else {
+            println!(
+                "  {:<16} mode=aot          skipped known_aot_abort_on_current_head",
+                label
+            );
+        }
     } else {
         println!(
             "  {:<16} mode=jit/aot      unsupported on this target",

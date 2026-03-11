@@ -1,7 +1,7 @@
 use std::collections::{HashMap, hash_map};
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub type SharedString = Arc<String>;
 pub type SharedArray = Arc<Vec<Value>>;
@@ -388,6 +388,54 @@ pub struct HostImport {
     pub return_type: ValueType,
 }
 
+#[derive(Debug)]
+pub(crate) struct DecodedInstructionData {
+    pub(crate) ldc_values: Box<[Option<Value>]>,
+    pub(crate) jump_targets: Box<[Option<usize>]>,
+    pub(crate) local_indices: Box<[Option<u8>]>,
+}
+
+impl DecodedInstructionData {
+    fn build(program: &Program) -> Self {
+        let mut ldc_values = vec![None; program.code.len()];
+        let mut jump_targets = vec![None; program.code.len()];
+        let mut local_indices = vec![None; program.code.len()];
+        let mut ip = 0usize;
+        while ip < program.code.len() {
+            let opcode = match OpCode::try_from(program.code[ip]) {
+                Ok(opcode) => opcode,
+                Err(_) => break,
+            };
+            match opcode {
+                OpCode::Ldc => {
+                    if let Some(raw_index) = read_u32_at(&program.code, ip + 1)
+                        && let Some(value) = program.constants.get(raw_index as usize)
+                    {
+                        ldc_values[ip] = Some(value.clone());
+                    }
+                }
+                OpCode::Br | OpCode::Brfalse => {
+                    if let Some(target) = read_u32_at(&program.code, ip + 1) {
+                        jump_targets[ip] = Some(target as usize);
+                    }
+                }
+                OpCode::Ldloc | OpCode::Stloc => {
+                    if let Some(index) = program.code.get(ip + 1).copied() {
+                        local_indices[ip] = Some(index);
+                    }
+                }
+                _ => {}
+            }
+            ip = ip.saturating_add(1 + opcode.operand_len());
+        }
+        Self {
+            ldc_values: ldc_values.into_boxed_slice(),
+            jump_targets: jump_targets.into_boxed_slice(),
+            local_indices: local_indices.into_boxed_slice(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Program {
     pub constants: Vec<Value>,
@@ -396,6 +444,7 @@ pub struct Program {
     pub imports: Vec<HostImport>,
     pub debug: Option<crate::debug_info::DebugInfo>,
     pub type_map: Option<TypeMap>,
+    decoded_instruction_data_cache: Arc<OnceLock<Arc<DecodedInstructionData>>>,
 }
 
 impl Program {
@@ -408,6 +457,7 @@ impl Program {
             imports: Vec::new(),
             debug: None,
             type_map: None,
+            decoded_instruction_data_cache: Arc::new(OnceLock::new()),
         }
     }
 
@@ -424,6 +474,7 @@ impl Program {
             imports: Vec::new(),
             debug,
             type_map: None,
+            decoded_instruction_data_cache: Arc::new(OnceLock::new()),
         }
     }
 
@@ -441,6 +492,7 @@ impl Program {
             imports,
             debug,
             type_map: None,
+            decoded_instruction_data_cache: Arc::new(OnceLock::new()),
         }
     }
 
@@ -453,6 +505,18 @@ impl Program {
         self.type_map = Some(type_map);
         self
     }
+
+    pub(crate) fn shared_decoded_instruction_data(&self) -> Arc<DecodedInstructionData> {
+        Arc::clone(
+            self.decoded_instruction_data_cache
+                .get_or_init(|| Arc::new(DecodedInstructionData::build(self))),
+        )
+    }
+}
+
+fn read_u32_at(code: &[u8], offset: usize) -> Option<u32> {
+    let bytes = code.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
 fn infer_local_count_from_code(code: &[u8]) -> usize {

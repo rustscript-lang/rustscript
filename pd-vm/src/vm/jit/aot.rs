@@ -182,14 +182,15 @@ impl Vm {
         {
             let bundle = decode_aot_bundle(bytes)?;
             let fuel_check_interval = bundle.fuel_check_interval;
-            let mut vm = Vm::new(crate::Program {
-                constants: bundle.constants,
-                code: vec![AOT_PLACEHOLDER_OPCODE; bundle.code_len],
-                local_count: bundle.local_count,
-                imports: bundle.imports,
-                debug: None,
-                type_map: None,
-            });
+            let mut vm = Vm::new(
+                crate::Program::with_imports_and_debug(
+                    bundle.constants,
+                    vec![AOT_PLACEHOLDER_OPCODE; bundle.code_len],
+                    bundle.imports,
+                    None,
+                )
+                .with_local_count(bundle.local_count),
+            );
             vm.native_only_aot = true;
             vm.native_aot_interrupt_check_interval = Some(fuel_check_interval);
             vm.native_aot_interrupt_mode = bundle.interrupt_mode.map(aot_vm_interrupt_mode);

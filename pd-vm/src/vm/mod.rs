@@ -18,7 +18,6 @@ pub use self::host::{
     StaticHostFunction,
 };
 use self::host::{HostCallExecOutcome, VmHostFunction, WaitingHostOp};
-use self::superinstructions::{DecodedInstructionData, build_decoded_instruction_data};
 pub use crate::bytecode::{HostImport, OpCode, Program, Value, ValueType};
 use crate::bytecode::{StableHasher, hash_value};
 pub use store::Store;
@@ -210,7 +209,7 @@ pub struct Vm {
     stack: Vec<Value>,
     locals: Vec<Value>,
     operand_type_hints: Option<Box<[PackedOperandTypes]>>,
-    decoded_instruction_data: DecodedInstructionData,
+    decoded_instruction_data: Arc<crate::bytecode::DecodedInstructionData>,
     host_functions: Vec<VmHostFunction>,
     host_function_symbols: HashMap<String, u16>,
     builtin_overrides: HashMap<u16, u16>,
@@ -338,7 +337,7 @@ impl Vm {
         let program_constants_len = program.constants.len();
         let local_count = program.local_count;
         let operand_type_hints = build_operand_type_hints(program.as_ref());
-        let decoded_instruction_data = build_decoded_instruction_data(program.as_ref());
+        let decoded_instruction_data = program.shared_decoded_instruction_data();
         let epoch_handle = EpochHandle::default();
         let epoch_counter_ptr = epoch_handle.as_ptr() as usize;
         Self {

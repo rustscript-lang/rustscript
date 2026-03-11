@@ -8,6 +8,33 @@ fn native_cache_test_lock() -> &'static Mutex<()> {
 }
 
 #[test]
+fn vm_instances_share_decoded_instruction_metadata_across_program_clones() {
+    let compiled = crate::compile_source(
+        r#"
+        let mut i = 0;
+        let mut sum = 0;
+        while i < 16 {
+            let a = i + 7;
+            let b = a - 3;
+            sum = sum + b;
+            i = i + 1;
+        }
+        sum;
+    "#,
+    )
+    .expect("source should compile");
+
+    let base_program = compiled.program.with_local_count(compiled.locals.max(8));
+    let vm_one = Vm::new(base_program.clone().with_local_count(base_program.local_count + 8));
+    let vm_two = Vm::new(base_program.with_local_count(compiled.locals.max(8) + 16));
+
+    assert!(
+        Arc::ptr_eq(&vm_one.decoded_instruction_data, &vm_two.decoded_instruction_data),
+        "program clones should share decoded instruction metadata"
+    );
+}
+
+#[test]
 #[cfg(any(
     all(
         target_arch = "x86_64",
