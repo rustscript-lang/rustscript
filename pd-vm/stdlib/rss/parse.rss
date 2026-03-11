@@ -1,5 +1,4 @@
 // Parsing helpers implemented in pure RustScript.
-
 fn is_whitespace(ch) {
     match ch {
         " " => true,
@@ -11,7 +10,7 @@ fn is_whitespace(ch) {
 }
 
 fn trim(value) {
-    let value_len = (&value).length;
+    let value_len =(&value).length;
     let mut start = 0;
     while start < value_len {
         if is_whitespace((&value)[start:(start + 1)]) {
@@ -96,7 +95,7 @@ fn digit_value(ch) {
         "Y" => 34,
         "z" => 35,
         "Z" => 35,
-        _ => -1,
+        _ =>-1,
     };
 }
 
@@ -106,13 +105,13 @@ fn is_valid_base(base) {
 
 pub fn is_int_literal_base(value, base) {
     let text = trim(value);
-    let text_len = (&text).length;
+    let text_len =(&text).length;
     let mut out = true;
     let mut index = 0;
     if is_valid_base(base) == false || text_len == 0 {
         out = false;
     } else {
-        let first = (&text)[0:1];
+        let first =(&text)[0:1];
         if first == "+" || first == "-" {
             index = 1;
         }
@@ -143,14 +142,14 @@ pub fn try_parse_int_base(value, base) {
         let mut sign = 1;
         let mut index = 0;
         let mut parsed = 0;
-        let first = (&text)[0:1];
+        let first =(&text)[0:1];
         if first == "-" {
-            sign = -1;
+            sign =-1;
             index = 1;
         } else if first == "+" {
             index = 1;
         }
-        while index < (&text).length {
+        while index <(&text).length {
             parsed = parsed * base + digit_value((&text)[index:(index + 1)]);
             index = index + 1;
         }

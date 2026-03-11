@@ -1,7 +1,6 @@
 // Set helpers implemented in pure RustScript using arrays with stable insertion order.
-
 fn index_of(values, needle) {
-    let mut out = -1;
+    let mut out =-1;
     for (let mut index = 0; index < values.length; index = index + 1) {
         if values[index] == needle {
             out = index;
@@ -12,11 +11,11 @@ fn index_of(values, needle) {
 }
 
 pub fn has(values, needle) {
-    index_of(values, needle) > -1;
+    index_of(values, needle) >-1;
 }
 
 pub fn from(values) {
-    let mut out = [];
+    let mut out =[];
     for (let mut index = 0; index < values.length; index = index + 1) {
         let value = values[index];
         if has(out, value) == false {
@@ -35,7 +34,7 @@ pub fn add(values, needle) {
 }
 
 pub fn remove(values, needle) {
-    let mut out = [];
+    let mut out =[];
     for (let mut index = 0; index < values.length; index = index + 1) {
         let value = values[index];
         if value != needle && has(out, value) == false {
@@ -59,9 +58,9 @@ pub fn union(lhs, rhs) {
 pub fn intersect(lhs, rhs) {
     let left = from(lhs);
     let right = from(rhs);
-    let mut out = [];
-    for (let mut index = 0; index < (&left).length; index = index + 1) {
-        let value = (&left)[index];
+    let mut out =[];
+    for (let mut index = 0; index <(&left).length; index = index + 1) {
+        let value =(&left)[index];
         if has(right, value) {
             out[out.length] = value;
         }
@@ -72,9 +71,9 @@ pub fn intersect(lhs, rhs) {
 pub fn difference(lhs, rhs) {
     let left = from(lhs);
     let right = from(rhs);
-    let mut out = [];
-    for (let mut index = 0; index < (&left).length; index = index + 1) {
-        let value = (&left)[index];
+    let mut out =[];
+    for (let mut index = 0; index <(&left).length; index = index + 1) {
+        let value =(&left)[index];
         if has(right, value) == false {
             out[out.length] = value;
         }
@@ -86,8 +85,8 @@ pub fn is_subset(lhs, rhs) {
     let left = from(lhs);
     let right = from(rhs);
     let mut out = true;
-    for (let mut index = 0; index < (&left).length; index = index + 1) {
-        if has(right, (&left)[index]) == false {
+    for (let mut index = 0; index <(&left).length; index = index + 1) {
+        if has(right,(&left)[index]) == false {
             out = false;
             break;
         }

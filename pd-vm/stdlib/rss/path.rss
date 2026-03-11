@@ -1,11 +1,10 @@
 // Path helpers implemented in pure RustScript.
-
 fn is_separator(ch) {
     ch == "/" || ch == "\\";
 }
 
 fn trim_trailing_separators(path) {
-    let mut end = (&path).length;
+    let mut end =(&path).length;
     while end > 1 && is_separator((&path)[(end - 1):end]) {
         end = end - 1;
     }
@@ -14,9 +13,13 @@ fn trim_trailing_separators(path) {
 
 pub fn normalize_sep(path) {
     let mut out = "";
-    for (let mut index = 0; index < (&path).length; index = index + 1) {
-        let ch = (&path)[index:(index + 1)];
-        let segment = if ch == "\\" => { "/" } else => { ch };
+    for (let mut index = 0; index <(&path).length; index = index + 1) {
+        let ch =(&path)[index:(index + 1)];
+        let segment = if ch == "\\" => {
+            "/"
+        } else => {
+            ch
+        };
         out = out + segment;
     }
     out;
@@ -30,10 +33,10 @@ pub fn join(lhs, rhs) {
     } else if (&right).length == 0 => {
         left
     } else => {
-        let left_last = (&left)[((&left).length - 1):(&left).length];
-        let right_first = (&right)[0:1];
+        let left_last =(&left)[((&left).length - 1):(&left).length];
+        let right_first =(&right)[0:1];
         if is_separator(left_last) && is_separator(right_first) => {
-            left + (&right)[1:(&right).length]
+            left +(&right)[1:(&right).length]
         } else if is_separator(left_last) || is_separator(right_first) => {
             left + right
         } else => {
@@ -46,8 +49,8 @@ pub fn join(lhs, rhs) {
 pub fn basename(path) {
     let normalized = trim_trailing_separators(normalize_sep(path));
     let mut start = 0;
-    let mut index = (&normalized).length - 1;
-    while index > -1 {
+    let mut index =(&normalized).length - 1;
+    while index >-1 {
         if (&normalized)[index:(index + 1)] == "/" {
             start = index + 1;
             break;
@@ -59,9 +62,9 @@ pub fn basename(path) {
 
 pub fn dirname(path) {
     let normalized = trim_trailing_separators(normalize_sep(path));
-    let mut cut = -1;
-    let mut index = (&normalized).length - 1;
-    while index > -1 {
+    let mut cut =-1;
+    let mut index =(&normalized).length - 1;
+    while index >-1 {
         if (&normalized)[index:(index + 1)] == "/" {
             cut = index;
             break;
@@ -80,9 +83,9 @@ pub fn dirname(path) {
 
 pub fn extname(path) {
     let name = basename(path);
-    let mut dot = -1;
-    let mut index = (&name).length - 1;
-    while index > -1 {
+    let mut dot =-1;
+    let mut index =(&name).length - 1;
+    while index >-1 {
         if (&name)[index:(index + 1)] == "." {
             dot = index;
             break;

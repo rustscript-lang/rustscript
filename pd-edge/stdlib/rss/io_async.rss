@@ -2,7 +2,6 @@
 // Import this module from edge programs via:
 //   use edge::io_async as io_async;
 // and compile with edge::compile_edge_source_file(...).
-
 use http;
 
 pub fn request_body_read() {

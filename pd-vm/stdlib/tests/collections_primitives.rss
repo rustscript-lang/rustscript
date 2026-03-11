@@ -3,7 +3,7 @@ assert(array_from_braces.length == 3);
 assert(array_from_braces[0] == 1);
 assert(array_from_braces[2] == 3);
 
-let mut values = [];
+let mut values =[];
 values[values.length] = 10;
 values[values.length] = 20;
 assert(values.length == 2);

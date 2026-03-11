@@ -936,16 +936,15 @@ impl<'a> SourceFormatter<'a> {
     }
 
     fn note_context_newline(&mut self) {
-        if let Some(context) = self.contexts.last_mut() {
-            if !context.indented
-                && !matches!(
-                    context.kind,
-                    ContextKind::Brace(BraceKind::Block | BraceKind::MatchBody | BraceKind::StructBody)
-                )
-            {
-                context.indented = true;
-                self.indent += 1;
-            }
+        if let Some(context) = self.contexts.last_mut()
+            && !context.indented
+            && !matches!(
+                context.kind,
+                ContextKind::Brace(BraceKind::Block | BraceKind::MatchBody | BraceKind::StructBody)
+            )
+        {
+            context.indented = true;
+            self.indent += 1;
         }
     }
 

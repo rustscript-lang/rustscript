@@ -1,11 +1,11 @@
 use re;
 
-assert(re::match("^foo", "foobar"));
-assert(re::match("^foo", "barfoo") == false);
-assert(re::match("^foo", "foobar"));
-assert(re::match("(?i)^foo$", "FoO"));
-assert(re::match("(?is)^foo.bar$", "FoO\nbar"));
-assert(re::match("(?m)^bar$", "foo\nbar\nbaz"));
+assert(re::match ("^foo", "foobar"));
+assert(re::match ("^foo", "barfoo") == false);
+assert(re::match ("^foo", "foobar"));
+assert(re::match ("(?i)^foo$", "FoO"));
+assert(re::match ("(?is)^foo.bar$", "FoO\nbar"));
+assert(re::match ("(?m)^bar$", "foo\nbar\nbaz"));
 
 let mut first = re::find("bar+", "foobarr");
 assert(first == "barr");

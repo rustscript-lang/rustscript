@@ -6,7 +6,6 @@
 //
 // Node ids start at 1. The cache uses `0` as the internal "no link" sentinel,
 // because storing `null` into a map entry now deletes that entry.
-
 struct LruNode {
     key: unknown,
     value: unknown,
@@ -127,7 +126,7 @@ fn evict_oldest(limit, size, next_id, lookup, nodes, head, tail) {
     let out = if size == 0 || head == 0 => {
         make_cache(limit, size, next_id, head, tail, lookup, nodes)
     } else => {
-        let head_node: LruNode = &((&nodes)[head]);
+        let head_node: LruNode =&((&nodes)[head]);
         let next_head = head_node.next;
         let evicted_key = head_node.key.copy();
         let mut next_lookup = lookup;
@@ -142,7 +141,7 @@ fn evict_oldest(limit, size, next_id, lookup, nodes, head, tail) {
         };
 
         if next_head != 0 {
-            let mut next_node: LruNode = (&next_nodes)[next_head];
+            let mut next_node: LruNode =(&next_nodes)[next_head];
             next_node.prev = 0;
             next_nodes[next_head] = next_node;
         }
@@ -162,7 +161,7 @@ fn evict_oldest(limit, size, next_id, lookup, nodes, head, tail) {
 
 fn entry_report(cache, id) {
     let out = if id != 0 => {
-        let node: LruNode = &((&cache).nodes[id]);
+        let node: LruNode =&((&cache).nodes[id]);
         {found: true, key: node.key, value: node.value}
     } else => {
         {found: false, key: null, value: null}
@@ -199,8 +198,8 @@ pub fn peek(cache, key) {
     let state: LruCacheState = cache;
     let lookup = state.lookup;
     let out = if lookup.has(key) => {
-        let id = (&lookup)[key];
-        let node: LruNode = &((&state.nodes)[id]);
+        let id =(&lookup)[key];
+        let node: LruNode =&((&state.nodes)[id]);
         {found: true, value: node.value}
     } else => {
         {found: false, value: null}
@@ -219,13 +218,13 @@ pub fn get(cache, key) {
     let nodes = state.nodes;
 
     let out = if lookup.has(key) => {
-        let id = (&lookup)[key];
-        let node: LruNode = &((&nodes)[id]);
+        let id =(&lookup)[key];
+        let node: LruNode =&((&nodes)[id]);
         let value = node.value;
         let next_cache = if id == tail => {
             make_cache(limit, size, next_id, head, tail, lookup, nodes)
         } else => {
-            let node_copy: LruNode = (&nodes)[id];
+            let node_copy: LruNode =(&nodes)[id];
             let unlinked: LinkState = unlink_node(nodes, head, tail, id, node_copy.copy());
             let relinked: LinkState = append_existing_node(
                 unlinked.nodes,
@@ -269,8 +268,8 @@ pub fn put(cache, key, value) {
         make_cache(0, 0, 1, 0, 0, {}, {})
     } else => {
         if lookup.has(key) => {
-            let id = (&lookup)[key];
-            let mut node: LruNode = (&nodes)[id];
+            let id =(&lookup)[key];
+            let mut node: LruNode =(&nodes)[id];
             node.value = value;
             if id == tail => {
                 let mut next_nodes = nodes;
@@ -340,9 +339,9 @@ pub fn touch(cache, key) {
     let nodes = state.nodes;
 
     let out = if lookup.has(key) => {
-        let id = (&lookup)[key];
+        let id =(&lookup)[key];
         if id != tail => {
-            let node: LruNode = (&nodes)[id];
+            let node: LruNode =(&nodes)[id];
             let unlinked: LinkState = unlink_node(nodes, head, tail, id, node.copy());
             let relinked: LinkState = append_existing_node(
                 unlinked.nodes,
@@ -380,8 +379,8 @@ pub fn remove(cache, key) {
     let nodes = state.nodes;
 
     let out = if lookup.has(key) => {
-        let id = (&lookup)[key];
-        let node: LruNode = (&nodes)[id];
+        let id =(&lookup)[key];
+        let node: LruNode =(&nodes)[id];
         let mut next_lookup = lookup;
         next_lookup[key] = null;
         let unlinked: LinkState = unlink_node(nodes, head, tail, id, node);
@@ -411,9 +410,9 @@ pub fn keys(cache) {
     let state: LruCacheState = cache;
     let nodes = state.nodes;
     let mut current = state.head;
-    let mut out = [];
+    let mut out =[];
     while current != 0 {
-        let node: LruNode = &((&nodes)[current]);
+        let node: LruNode =&((&nodes)[current]);
         let next_id = node.next;
         out[out.length] = node.key;
         current = next_id;
@@ -425,9 +424,9 @@ pub fn values(cache) {
     let state: LruCacheState = cache;
     let nodes = state.nodes;
     let mut current = state.head;
-    let mut out = [];
+    let mut out =[];
     while current != 0 {
-        let node: LruNode = &((&nodes)[current]);
+        let node: LruNode =&((&nodes)[current]);
         let next_id = node.next;
         out[out.length] = node.value;
         current = next_id;
@@ -439,11 +438,11 @@ pub fn entries(cache) {
     let state: LruCacheState = cache;
     let nodes = state.nodes;
     let mut current = state.head;
-    let mut out = [];
+    let mut out =[];
     while current != 0 {
-        let node: LruNode = &((&nodes)[current]);
+        let node: LruNode =&((&nodes)[current]);
         let next_id = node.next;
-        out[out.length] = [node.key, node.value];
+        out[out.length] =[node.key, node.value];
         current = next_id;
     }
     out

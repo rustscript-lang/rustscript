@@ -5,7 +5,7 @@ assert(ascending.length == 5);
 assert(ascending[0] == 0);
 assert(ascending[4] == 4);
 
-let mut descending = range_step(10, 0, -3);
+let mut descending = range_step(10, 0,-3);
 assert(descending.length == 4);
 assert(descending[0] == 10);
 assert(descending[1] == 7);
@@ -18,7 +18,7 @@ let mut second_pair = pairs[1].copy();
 assert(second_pair[0] == 1);
 assert(second_pair[1] == "b");
 
-let mut zipped = zip([1, 2, 3], ["a", "b"]);
+let mut zipped = zip([1, 2, 3],["a", "b"]);
 assert(zipped.length == 2);
 let mut first_zip = zipped[0].copy();
 assert(first_zip[0] == 1);

@@ -1,7 +1,6 @@
 use math as native_math;
 
 // Numeric helpers built on the VM math namespace plus a few pure RustScript utilities.
-
 pub fn pi() {
     native_math::pi();
 }

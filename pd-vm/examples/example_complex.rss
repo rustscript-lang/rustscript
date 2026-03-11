@@ -32,7 +32,7 @@ let add = |value| value + base;
 let base = 8;
 let closure_value = add(5);
 
-let profile: Profile = { stats: { score: closure_value } };
+let profile: Profile = {stats: {score: closure_value}};
 let matched = match profile?.stats?.score {
     None => 0,
     Some(score) => if score == 12 => {
@@ -43,11 +43,10 @@ let matched = match profile?.stats?.score {
     _ => 0,
 };
 
-let a=[1, "a"];
-let b=a[1];
+let a =[1, "a"];
+let b = a[1];
 
-
-let regex_ok = re::match("(?i)^rustscript$", "RUSTSCRIPT");
+let regex_ok = re::match ("(?i)^rustscript$", "RUSTSCRIPT");
 let payload = {
     lang: "rustscript",
     score: closure_value,

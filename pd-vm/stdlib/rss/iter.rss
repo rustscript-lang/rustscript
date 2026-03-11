@@ -1,7 +1,6 @@
 // Iteration helpers implemented in pure RustScript.
-
 pub fn range_step(start, stop, step) {
-    let mut out = [];
+    let mut out =[];
     if step != 0 {
         if step > 0 {
             for (let mut value = start; value < stop; value = value + step) {
@@ -21,21 +20,21 @@ pub fn range(stop) {
 }
 
 pub fn enumerate(values) {
-    let mut out = [];
+    let mut out =[];
     for (let mut index = 0; index < values.length; index = index + 1) {
-        out[out.length] = [index, values[index]];
+        out[out.length] =[index, values[index]];
     }
     out;
 }
 
 pub fn zip(lhs, rhs) {
-    let mut out = [];
+    let mut out =[];
     let mut limit = lhs.length;
     if rhs.length < limit {
         limit = rhs.length;
     }
     for (let mut index = 0; index < limit; index = index + 1) {
-        out[out.length] = [lhs[index], rhs[index]];
+        out[out.length] =[lhs[index], rhs[index]];
     }
     out;
 }
@@ -50,7 +49,11 @@ pub fn take(values, count) {
 }
 
 pub fn skip(values, count) {
-    let start = if count > 0 => { count } else => { 0 };
+    let start = if count > 0 => {
+        count
+    } else => {
+        0
+    };
     let bounded_start = if start > values.length => {
         values.length
     } else => {
@@ -60,7 +63,7 @@ pub fn skip(values, count) {
 }
 
 pub fn chunk(values, size) {
-    let mut out = [];
+    let mut out =[];
     if size > 0 {
         let value_len = values.length;
         for (let mut index = 0; index < value_len; index = index + size) {
@@ -105,7 +108,7 @@ pub fn all_true(values) {
 }
 
 pub fn map(values, func) {
-    let mut out = [];
+    let mut out =[];
     for (let mut index = 0; index < values.length; index = index + 1) {
         out[out.length] = func(values[index]);
     }
@@ -113,7 +116,7 @@ pub fn map(values, func) {
 }
 
 pub fn filter(values, pred) {
-    let mut out = [];
+    let mut out =[];
     for (let mut index = 0; index < values.length; index = index + 1) {
         let value = values[index];
         if pred(value) {

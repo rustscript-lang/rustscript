@@ -1,5 +1,4 @@
 // String helpers implemented in pure RustScript using language syntax.
-
 fn is_whitespace(ch) {
     match ch {
         " " => true,
@@ -45,13 +44,13 @@ pub fn split(value, separator) {
     let value_len = value.length;
     let separator_len = separator.length;
     let out = if separator_len == 0 => {
-        let mut out = [];
+        let mut out =[];
         for (let mut char_index = 0; char_index < value_len; char_index = char_index + 1) {
             out[out.length] = value[char_index:(char_index + 1)];
         }
         out
     } else => {
-        let mut out = [];
+        let mut out =[];
         let mut cursor = 0;
         let mut part_start = 0;
         let limit = value_len - separator_len + 1;

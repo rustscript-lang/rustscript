@@ -11,7 +11,7 @@ assert(is_int_literal("3.14") == false);
 
 assert(try_parse_int("0") == 0);
 assert(try_parse_int(" 42 ") == 42);
-assert(try_parse_int("-17") == -17);
+assert(try_parse_int("-17") ==-17);
 assert(try_parse_int("+9") == 9);
 assert(type(try_parse_int("nope")) == "null");
 assert(parse_int_or("nope", 7) == 7);
@@ -26,7 +26,7 @@ assert(is_int_literal_base("10", 37) == false);
 assert(try_parse_int_base("1011", 2) == 11);
 assert(try_parse_int_base("7f", 16) == 127);
 assert(try_parse_int_base("zz", 36) == 1295);
-assert(try_parse_int_base(" -1A ", 16) == -26);
+assert(try_parse_int_base(" -1A ", 16) ==-26);
 assert(type(try_parse_int_base("19", 8)) == "null");
 assert(parse_int_base_or("19", 8, 99) == 99);
 

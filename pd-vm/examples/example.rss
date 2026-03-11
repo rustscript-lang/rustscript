@@ -6,11 +6,15 @@ while i < 3 {
 }
 
 let base = 1;
-fn bump_with_base(v) { v + base }
+fn bump_with_base(v) {
+    v + base
+}
 
 fn drive(seed) {
-    fn inner(v) { v + seed }
-    inner(2);
+    fn inner(v) {
+        v + seed
+    }
+    inner(2)
 }
 
 if total != 3 {
