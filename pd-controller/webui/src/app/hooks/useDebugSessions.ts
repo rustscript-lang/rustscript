@@ -7,6 +7,7 @@ import { lintWithWasm } from "@/app/lint/wasmLinter";
 import { LINT_MARKER_OWNER, lintFailureMarker, lintMarkersFromReport } from "@/app/monaco/lintMarkers";
 import { ensureCompletionCatalogProviders, lookupCallableHover } from "@/app/monaco/completionCatalog";
 import { getLocalTypeHints, lookupLocalTypeHover, lookupVisibleLocalTypeHint } from "@/app/monaco/localTypeHover";
+import { ensureFormattingProviders } from "@/app/monaco/formatting";
 import { ensureRustScriptLanguage } from "@/app/monaco/rustscriptLanguage";
 import type {
   DebugCommandRequest,
@@ -411,6 +412,7 @@ export function useDebugSessions({ onError, edgeSummaries, showDebugSessionsSect
   const onDebugEditorMount: OnMount = useCallback((editor, monaco) => {
     ensureRustScriptLanguage(monaco);
     void ensureCompletionCatalogProviders(monaco);
+    ensureFormattingProviders(monaco);
     debugEditorRef.current = editor;
     debugMonacoRef.current = monaco;
     setDebugEditorReadyTick((value) => value + 1);

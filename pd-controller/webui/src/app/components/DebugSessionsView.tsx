@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 
 import { debugPhaseClasses, debugPhaseLabel, formatUnixMs, monacoLanguageForFlavor } from "@/app/helpers";
+import { ensureFormattingProviders } from "@/app/monaco/formatting";
 import { ensureRustScriptLanguage } from "@/app/monaco/rustscriptLanguage";
 import { RowActionMenu } from "@/app/components/RowActionMenu";
 import type {
@@ -553,7 +554,10 @@ export function DebugSessionsView({
                 <div className="rounded-md border bg-slate-950 text-slate-100">
                   <div className="h-[68vh]">
                     <Editor
-                      beforeMount={ensureRustScriptLanguage}
+                      beforeMount={(monaco) => {
+                        ensureRustScriptLanguage(monaco);
+                        ensureFormattingProviders(monaco);
+                      }}
                       onMount={onDebugEditorMount}
                       language={monacoLanguageForFlavor(selectedDebugSession.source_flavor)}
                       value={selectedDebugSession.source_code}

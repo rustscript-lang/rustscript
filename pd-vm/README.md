@@ -141,6 +141,8 @@ Native JIT codegen uses Cranelift.
 - Cranelift is part of the Bytecode Alliance/Wasmtime ecosystem
 - NYI behavior is shared by the trace recorder (`TraceJitEngine`) and is backend-independent.
 - Some operations may use helper fallback paths internally, but that is not counted as trace-recorder NYI.
+- Backward `brfalse` can stay inside a trace as a `LoopIfFalse` back-edge when the target already
+  exists in the recorded trace; backward targets outside the trace still become side exits.
 
 Library hooks:
 
@@ -689,7 +691,8 @@ Scheme frontend:
 The VM includes a trace-based JIT path inspired by LuaJIT hot-loop tracing:
 
 - hot bytecode loop heads are detected
-- a straight-line trace is recorded from each hot root
+- a trace is recorded from each hot root
+- backward `brfalse` can loop inside the trace when it targets an earlier recorded step
 - native machine code is emitted per compiled trace and invoked by the VM
 - the native bridge executes trace semantics without bytecode re-decoding
 - unsupported shapes fall back to interpreter and are recorded as NYI
@@ -697,6 +700,5 @@ The VM includes a trace-based JIT path inspired by LuaJIT hot-loop tracing:
 
 Current NYI in trace compiler:
 
-- backward `brfalse` targets (only forward guard exits are supported)
 - traces longer than configured max trace length
 - unsupported native targets (currently `x86_64` Windows/Unix-non-macOS and `aarch64` Linux/macOS)

@@ -21,6 +21,12 @@ export type LintReport = {
   diagnostics: LintDiagnostic[];
 };
 
+export type FormatReport = {
+  ok: boolean;
+  formatted: string | null;
+  error: string | null;
+};
+
 export type CompletionEntryKind = "function" | "module" | "snippet";
 
 export type CompletionEntry = {
@@ -50,6 +56,12 @@ type WasmLinterExports = {
   wasm_alloc(len: number): number;
   wasm_dealloc(ptr: number, len: number): void;
   lint_source_json(sourcePtr: number, sourceLen: number, flavorPtr: number, flavorLen: number): bigint;
+  format_source_json?: (
+    sourcePtr: number,
+    sourceLen: number,
+    flavorPtr: number,
+    flavorLen: number
+  ) => bigint;
   local_type_hints_json?: (
     sourcePtr: number,
     sourceLen: number,
@@ -139,6 +151,24 @@ function normalizeReport(parsed: unknown): LintReport {
     });
   }
   return { diagnostics };
+}
+
+function normalizeFormatReport(parsed: unknown): FormatReport {
+  if (!parsed || typeof parsed !== "object") {
+    return {
+      ok: false,
+      formatted: null,
+      error: "invalid format response"
+    };
+  }
+  const rawOk = (parsed as { ok?: unknown }).ok;
+  const rawFormatted = (parsed as { formatted?: unknown }).formatted;
+  const rawError = (parsed as { error?: unknown }).error;
+  return {
+    ok: typeof rawOk === "boolean" ? rawOk : typeof rawFormatted === "string",
+    formatted: typeof rawFormatted === "string" ? rawFormatted : null,
+    error: typeof rawError === "string" ? rawError : null
+  };
 }
 
 function normalizeCompletionKind(raw: unknown): CompletionEntryKind {
@@ -283,6 +313,60 @@ export async function lintWithWasm(source: string, flavor: SourceFlavor): Promis
     }
     const json = decoder.decode(readBytes(wasm, resultPtr, resultLen));
     return normalizeReport(JSON.parse(json));
+  } finally {
+    if (sourcePtr !== 0) {
+      wasm.wasm_dealloc(sourcePtr, sourceBytes.length);
+    }
+    if (flavorPtr !== 0) {
+      wasm.wasm_dealloc(flavorPtr, flavorBytes.length);
+    }
+    if (resultPtr !== 0 && resultLen > 0) {
+      wasm.wasm_dealloc(resultPtr, resultLen);
+    }
+  }
+}
+
+export async function formatWithWasm(
+  source: string,
+  flavor: SourceFlavor
+): Promise<FormatReport> {
+  const wasm = await loadWasm();
+  if (typeof wasm.format_source_json !== "function") {
+    return {
+      ok: false,
+      formatted: null,
+      error: "formatting wasm export is unavailable"
+    };
+  }
+
+  const sourceBytes = encoder.encode(source);
+  const flavorBytes = encoder.encode(flavor);
+  let sourcePtr = 0;
+  let flavorPtr = 0;
+  let resultPtr = 0;
+  let resultLen = 0;
+
+  try {
+    sourcePtr = writeBytes(wasm, sourceBytes);
+    flavorPtr = writeBytes(wasm, flavorBytes);
+    const packed = wasm.format_source_json(
+      sourcePtr,
+      sourceBytes.length,
+      flavorPtr,
+      flavorBytes.length
+    );
+    const unpacked = unpackPtrLen(packed);
+    resultPtr = unpacked.ptr;
+    resultLen = unpacked.len;
+    if (resultPtr === 0 || resultLen === 0) {
+      return {
+        ok: false,
+        formatted: null,
+        error: "empty format response"
+      };
+    }
+    const json = decoder.decode(readBytes(wasm, resultPtr, resultLen));
+    return normalizeFormatReport(JSON.parse(json));
   } finally {
     if (sourcePtr !== 0) {
       wasm.wasm_dealloc(sourcePtr, sourceBytes.length);

@@ -24,6 +24,7 @@ export interface PlaygroundUi {
   stopButtonEl: HTMLButtonElement;
   lintStatusEl: HTMLSpanElement;
   sessionStatusEl: HTMLSpanElement;
+  formatButtonEl: HTMLButtonElement;
   loadSampleButtonEl: HTMLButtonElement;
   diagnosticsPanelEl: HTMLElement;
   outputPanelEl: HTMLElement;
@@ -89,6 +90,9 @@ const ICONS: Record<string, string> = {
   out: iconSvg('<polyline points="9 14 4 9 9 4"></polyline><path d="M20 20v-7a4 4 0 0 0-4-4H4"></path>'),
   continue: iconSvg('<polygon points="7 4 20 12 7 20 7 4" fill="currentColor" stroke="none"></polygon>'),
   stop: iconSvg('<rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor" stroke="none"></rect>'),
+  format: iconSvg(
+    '<line x1="7" y1="7" x2="19" y2="7"></line><line x1="10" y1="12" x2="19" y2="12"></line><line x1="7" y1="17" x2="19" y2="17"></line><path d="M4 5v4"></path><path d="M4 15v4"></path>'
+  ),
   reset_sample: iconSvg(
     '<path d="M3 12a9 9 0 0 1 15.5-6.36L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-15.5 6.36L3 16"></path><path d="M8 16H3v5"></path>'
   )
@@ -227,6 +231,13 @@ export function mountPlaygroundUi(
           </div>
           <div class="toolbar-right">
             <button
+              id="format-button"
+              class="toolbar-action toolbar-utility-button toolbar-utility-button--icon"
+              type="button"
+              title="Format Document"
+              aria-label="Format Document"
+            ></button>
+            <button
               id="load-sample-button"
               class="toolbar-action toolbar-utility-button toolbar-utility-button--icon"
               type="button"
@@ -329,6 +340,7 @@ export function mountPlaygroundUi(
     stopButtonEl: queryRequired("#stop-button"),
     lintStatusEl: queryRequired("#lint-status"),
     sessionStatusEl: queryRequired("#session-status"),
+    formatButtonEl: queryRequired("#format-button"),
     loadSampleButtonEl: queryRequired("#load-sample-button"),
     diagnosticsPanelEl: queryRequired("#diagnostics"),
     outputPanelEl: queryRequired("#run-output"),
@@ -367,6 +379,7 @@ export function mountPlaygroundUi(
   mountIconButton(ui.debugOutButtonEl, "out", "Out");
   mountIconButton(ui.debugContinueButtonEl, "continue", "Continue");
   mountIconButton(ui.stopButtonEl, "stop", "Stop");
+  mountIconButton(ui.formatButtonEl, "format", "Format Document");
   mountIconButton(ui.loadSampleButtonEl, "reset_sample", "Reset to Sample");
 
   return ui;
