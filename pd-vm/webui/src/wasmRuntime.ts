@@ -21,6 +21,12 @@ export type LintReport = {
   diagnostics: LintDiagnostic[];
 };
 
+export type FormatReport = {
+  ok: boolean;
+  formatted: string | null;
+  error: string | null;
+};
+
 export type RunReport = {
   ok: boolean;
   diagnostics: LintDiagnostic[];
@@ -126,6 +132,12 @@ type WasmRuntimeExports = {
   wasm_alloc(len: number): number;
   wasm_dealloc(ptr: number, len: number): void;
   lint_source_json(sourcePtr: number, sourceLen: number, flavorPtr: number, flavorLen: number): bigint;
+  format_source_json?: (
+    sourcePtr: number,
+    sourceLen: number,
+    flavorPtr: number,
+    flavorLen: number
+  ) => bigint;
   local_type_hints_json?: (
     sourcePtr: number,
     sourceLen: number,
@@ -243,6 +255,24 @@ function normalizeLintReport(raw: unknown): LintReport {
     diagnostics.push({ line, severity, message, rendered, span });
   }
   return { diagnostics };
+}
+
+function normalizeFormatReport(raw: unknown): FormatReport {
+  if (!raw || typeof raw !== "object") {
+    return {
+      ok: false,
+      formatted: null,
+      error: "invalid format response"
+    };
+  }
+  const rawOk = (raw as { ok?: unknown }).ok;
+  const rawFormatted = (raw as { formatted?: unknown }).formatted;
+  const rawError = (raw as { error?: unknown }).error;
+  return {
+    ok: typeof rawOk === "boolean" ? rawOk : typeof rawFormatted === "string",
+    formatted: typeof rawFormatted === "string" ? rawFormatted : null,
+    error: typeof rawError === "string" ? rawError : null
+  };
 }
 
 function normalizeRunReport(raw: unknown): RunReport {
@@ -619,6 +649,29 @@ export async function lintWithWasm(source: string, flavor: SourceFlavor): Promis
     flavor
   );
   return normalizeLintReport(raw);
+}
+
+export async function formatWithWasm(source: string, flavor: SourceFlavor): Promise<FormatReport> {
+  const wasm = await loadWasm();
+  if (typeof wasm.format_source_json !== "function") {
+    return {
+      ok: false,
+      formatted: null,
+      error: "formatting wasm export is unavailable"
+    };
+  }
+  const raw = await invokePackedJson(
+    (instance, sourcePtr, sourceLen, flavorPtr, flavorLen) => {
+      const invoke = instance.format_source_json;
+      if (!invoke) {
+        return 0n;
+      }
+      return invoke(sourcePtr, sourceLen, flavorPtr, flavorLen);
+    },
+    source,
+    flavor
+  );
+  return normalizeFormatReport(raw);
 }
 
 export async function runWithWasm(

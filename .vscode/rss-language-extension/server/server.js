@@ -43,7 +43,8 @@ connection.onInitialize(() => {
         triggerCharacters: [":", ".", "("]
       },
       hoverProvider: true,
-      documentSymbolProvider: true
+      documentSymbolProvider: true,
+      documentFormattingProvider: true
     }
   };
 });
@@ -182,6 +183,28 @@ connection.onDocumentSymbol((params) => {
     return [];
   }
   return collectDocumentSymbols(document);
+});
+
+connection.onDocumentFormatting(async (params) => {
+  const document = documents.get(params.textDocument.uri);
+  if (!document) {
+    return [];
+  }
+
+  const formatted = await runWasmFormat(document);
+  if (formatted === null || formatted === document.getText()) {
+    return [];
+  }
+
+  return [
+    {
+      range: {
+        start: { line: 0, character: 0 },
+        end: document.positionAt(document.getText().length)
+      },
+      newText: formatted
+    }
+  ];
 });
 
 documents.listen(connection);
@@ -714,6 +737,24 @@ function mapCompletionKind(kind) {
   return CompletionItemKind.Snippet;
 }
 
+function normalizeFormatReport(raw) {
+  if (!raw || typeof raw !== "object") {
+    return {
+      ok: false,
+      formatted: null,
+      error: "invalid format response"
+    };
+  }
+  const rawOk = raw.ok;
+  const rawFormatted = raw.formatted;
+  const rawError = raw.error;
+  return {
+    ok: typeof rawOk === "boolean" ? rawOk : typeof rawFormatted === "string",
+    formatted: typeof rawFormatted === "string" ? rawFormatted : null,
+    error: typeof rawError === "string" ? rawError : null
+  };
+}
+
 async function runWasmLint(document) {
   const wasm = await ensureWasmLoaded();
   if (!wasm) {
@@ -779,6 +820,56 @@ async function runWasmLint(document) {
     freeBytes(wasm, flavorPtr, flavorBytes.length);
     freeBytes(wasm, pathPtr, pathBytes.length);
     freeBytes(wasm, overridesPtr, overridesBytes.length);
+    freeBytes(wasm, resultPtr, resultLen);
+  }
+}
+
+async function runWasmFormat(document) {
+  const wasm = await ensureWasmLoaded();
+  if (!wasm || typeof wasm.format_source_json !== "function") {
+    return null;
+  }
+
+  const source = document.getText();
+  const sourceBytes = encoder.encode(source);
+  const flavorBytes = encoder.encode(FLAVOR);
+  let sourcePtr = 0;
+  let flavorPtr = 0;
+  let resultPtr = 0;
+  let resultLen = 0;
+
+  try {
+    sourcePtr = writeBytes(wasm, sourceBytes);
+    flavorPtr = writeBytes(wasm, flavorBytes);
+    const packed = wasm.format_source_json(
+      sourcePtr,
+      sourceBytes.length,
+      flavorPtr,
+      flavorBytes.length
+    );
+    const unpacked = unpackPtrLen(packed);
+    resultPtr = unpacked.ptr;
+    resultLen = unpacked.len;
+
+    if (resultPtr === 0 || resultLen === 0) {
+      return null;
+    }
+
+    const resultBytes = readBytes(wasm, resultPtr, resultLen);
+    const report = normalizeFormatReport(JSON.parse(decoder.decode(resultBytes)));
+    if (!report.ok || typeof report.formatted !== "string") {
+      const detail = report.error || "unknown formatter error";
+      connection.console.warn(`RustScript formatting failed: ${detail}`);
+      return null;
+    }
+
+    return report.formatted;
+  } catch (error) {
+    connection.console.error(`RustScript formatting failed: ${errorMessage(error)}`);
+    return null;
+  } finally {
+    freeBytes(wasm, sourcePtr, sourceBytes.length);
+    freeBytes(wasm, flavorPtr, flavorBytes.length);
     freeBytes(wasm, resultPtr, resultLen);
   }
 }

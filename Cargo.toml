@@ -4,6 +4,7 @@ members = [
 	"pd-vm",
 	"pd-vm/pd-vm-wasm",
 	"pd-edge-abi",
+	"pd-edge/pd-edge-host-function",
 	"pd-edge",
 	"pd-controller",
 ]

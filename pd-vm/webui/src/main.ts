@@ -40,6 +40,7 @@ import { mountPlaygroundUi } from "./playgroundShell";
 import {
   completionCatalogWithWasm,
   debugCommandWithWasm,
+  formatWithWasm,
   lintWithWasm,
   runCommandWithWasm,
   runWithWasm,
@@ -247,6 +248,40 @@ function registerCatalogCompletions(catalog: CompletionCatalog): void {
   registerCompletionProvider("scheme", catalog.scheme, ["(", "."]);
 }
 
+let formattingProvidersRegistered = false;
+
+function registerFormattingProvider(languageId: string, flavor: SourceFlavor): void {
+  monaco.languages.registerDocumentFormattingEditProvider(languageId, {
+    async provideDocumentFormattingEdits(model) {
+      const source = model.getValue();
+      const report = await formatWithWasm(source, flavor);
+      if (!report.ok || report.formatted === null) {
+        const detail = report.error ?? "unknown formatter error";
+        console.warn(`formatting failed for ${languageId}: ${detail}`);
+        return [];
+      }
+      if (report.formatted === source) {
+        return [];
+      }
+      return [
+        {
+          range: model.getFullModelRange(),
+          text: report.formatted
+        }
+      ];
+    }
+  });
+}
+
+function registerWasmFormattingProviders(): void {
+  if (formattingProvidersRegistered) {
+    return;
+  }
+  registerFormattingProvider("rustscript", "rustscript");
+  registerFormattingProvider("javascript", "javascript");
+  formattingProvidersRegistered = true;
+}
+
 async function lookupCallableHover(
   model: monaco.editor.ITextModel,
   position: monaco.Position
@@ -422,6 +457,7 @@ const {
   stopButtonEl,
   lintStatusEl,
   sessionStatusEl,
+  formatButtonEl,
   loadSampleButtonEl,
   diagnosticsPanelEl,
   outputPanelEl,
@@ -460,6 +496,7 @@ for (const flavor of FLAVOR_OPTIONS) {
 
 ensureRustScriptLanguage(monaco);
 ensureSchemeLanguage(monaco);
+registerWasmFormattingProviders();
 
 void loadCompletionCatalog()
   .then((catalog) => {
@@ -544,6 +581,7 @@ let runPollTimer: number | null = null;
 let runPollGeneration = 0;
 let pendingRunEpochTicks = 0;
 let debugBusy = false;
+let formatBusy = false;
 let debugSessionActive = false;
 let debugCurrentLine: number | null = null;
 let debugFuelState: FuelState = defaultFuelState();
@@ -1038,6 +1076,20 @@ function syncStopButtonState(): void {
   stopButtonEl.disabled = !(canStopDebug || canStopRun);
 }
 
+function flavorSupportsFormatting(flavor: SourceFlavor): boolean {
+  return flavor === "rustscript" || flavor === "javascript";
+}
+
+function syncFormatButtonState(): void {
+  formatButtonEl.disabled =
+    formatBusy ||
+    runBusy ||
+    debugBusy ||
+    runSessionActive ||
+    debugSessionActive ||
+    !flavorSupportsFormatting(currentFlavor);
+}
+
 function applyDebugControlState(): void {
   const hasSession = debugSessionActive;
   const disableCommands = !hasSession || debugBusy;
@@ -1051,12 +1103,14 @@ function applyDebugControlState(): void {
   debugOutButtonEl.disabled = disableCommands;
   debugContinueButtonEl.disabled = disableCommands;
   syncStopButtonState();
+  syncFormatButtonState();
   syncFuelPanel();
 }
 
 function applyRunControlState(): void {
   runButtonEl.disabled = runBusy;
   syncStopButtonState();
+  syncFormatButtonState();
   syncFuelPanel();
 }
 
@@ -1572,7 +1626,32 @@ flavorSelectEl.addEventListener("change", () => {
   applyInactiveRunState();
   applyInactiveDebugState("<no debugger output>");
   applyDebugDecorations();
+  syncFormatButtonState();
   scheduleLint();
+});
+
+async function formatCurrentDocument(): Promise<void> {
+  if (formatButtonEl.disabled) {
+    return;
+  }
+
+  formatBusy = true;
+  syncFormatButtonState();
+  try {
+    const formatAction = editor.getAction("editor.action.formatDocument");
+    if (!formatAction) {
+      return;
+    }
+    await formatAction.run();
+    editor.focus();
+  } finally {
+    formatBusy = false;
+    syncFormatButtonState();
+  }
+}
+
+formatButtonEl.addEventListener("click", () => {
+  void formatCurrentDocument();
 });
 
 loadSampleButtonEl.addEventListener("click", () => {
@@ -1910,4 +1989,5 @@ runResumeButtonEl.addEventListener("click", () => {
 applyInactiveRunState();
 applyDebugControlState();
 applyDebugDecorations();
+syncFormatButtonState();
 scheduleLint();

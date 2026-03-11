@@ -6,6 +6,7 @@ import { monacoLanguageForFlavor } from "@/app/helpers";
 import { lintWithWasm } from "@/app/lint/wasmLinter";
 import { LINT_MARKER_OWNER, lintFailureMarker, lintMarkersFromReport } from "@/app/monaco/lintMarkers";
 import { ensureCompletionCatalogProviders, lookupCallableHover } from "@/app/monaco/completionCatalog";
+import { ensureFormattingProviders } from "@/app/monaco/formatting";
 import { lookupLocalTypeHover } from "@/app/monaco/localTypeHover";
 import { ensureRustScriptLanguage } from "@/app/monaco/rustscriptLanguage";
 import type { SourceFlavor, UiSourceBundle } from "@/app/types";
@@ -51,6 +52,7 @@ export function HighlightedCode({
   const onEditorMount: OnMount = useCallback((editor, monaco) => {
     ensureRustScriptLanguage(monaco);
     void ensureCompletionCatalogProviders(monaco);
+    ensureFormattingProviders(monaco);
     editorRef.current = editor;
     monacoRef.current = monaco;
     if (!(enableLint && !readOnly)) {
@@ -64,6 +66,7 @@ export function HighlightedCode({
   const onBeforeMount = useCallback((monaco: typeof import("monaco-editor")) => {
     ensureRustScriptLanguage(monaco);
     void ensureCompletionCatalogProviders(monaco);
+    ensureFormattingProviders(monaco);
   }, []);
 
   useEffect(() => {

@@ -8,7 +8,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use vm::{
-    CompileSourceFileOptions, InferredLocalTypeHint, SourceFlavor,
+    CompileSourceFileOptions, InferredLocalTypeHint, SourceFlavor, format_source_with_flavor,
     collect_inferred_local_type_hints_at_path_with_options,
     collect_inferred_local_type_hints_with_options,
 };
@@ -32,6 +32,13 @@ struct LintResponse {
 #[derive(Serialize)]
 struct LocalTypeHintsResponse {
     hints: Vec<LocalTypeHintJson>,
+}
+
+#[derive(Serialize)]
+struct FormatResponse {
+    ok: bool,
+    formatted: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -169,6 +176,23 @@ fn local_type_hints_to_json(hints: Vec<InferredLocalTypeHint>) -> Vec<u8> {
     serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"hints\":[]}".to_vec())
 }
 
+fn format_response_to_json(result: Result<String, vm::FormatError>) -> Vec<u8> {
+    let response = match result {
+        Ok(formatted) => FormatResponse {
+            ok: true,
+            formatted: Some(formatted),
+            error: None,
+        },
+        Err(err) => FormatResponse {
+            ok: false,
+            formatted: None,
+            error: Some(err.to_string()),
+        },
+    };
+    serde_json::to_vec(&response)
+        .unwrap_or_else(|_| b"{\"ok\":false,\"formatted\":null,\"error\":\"format failed\"}".to_vec())
+}
+
 fn local_type_hints_with_flavor(source: &str, flavor: SourceFlavor) -> Vec<InferredLocalTypeHint> {
     collect_inferred_local_type_hints_with_options(
         source,
@@ -294,6 +318,16 @@ fn invalid_utf8_local_type_response(label: &str, err: &std::str::Utf8Error) -> V
     let response = LocalTypeHintsResponse { hints: Vec::new() };
     let _ = (label, err);
     serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"hints\":[]}".to_vec())
+}
+
+fn invalid_utf8_format_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8> {
+    let response = FormatResponse {
+        ok: false,
+        formatted: None,
+        error: Some(format!("invalid utf-8 {label}: {err}")),
+    };
+    serde_json::to_vec(&response)
+        .unwrap_or_else(|_| b"{\"ok\":false,\"formatted\":null,\"error\":\"invalid utf-8\"}".to_vec())
 }
 
 #[cfg(feature = "runtime")]
@@ -507,6 +541,27 @@ pub extern "C" fn lint_source_json(
     };
     let report = lint_source_with_flavor(source, parse_flavor(flavor_raw));
     leak_bytes(lint_response_to_json(report))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn format_source_json(
+    source_ptr: u32,
+    source_len: u32,
+    flavor_ptr: u32,
+    flavor_len: u32,
+) -> u64 {
+    let source = match std::str::from_utf8(unpack_input(source_ptr, source_len)) {
+        Ok(value) => value,
+        Err(err) => return leak_bytes(invalid_utf8_format_response("source", &err)),
+    };
+    let flavor_raw = match std::str::from_utf8(unpack_input(flavor_ptr, flavor_len)) {
+        Ok(value) => value,
+        Err(err) => return leak_bytes(invalid_utf8_format_response("flavor", &err)),
+    };
+    leak_bytes(format_response_to_json(format_source_with_flavor(
+        source,
+        parse_flavor(flavor_raw),
+    )))
 }
 
 #[unsafe(no_mangle)]
