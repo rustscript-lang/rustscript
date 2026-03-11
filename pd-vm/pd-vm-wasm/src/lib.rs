@@ -8,9 +8,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use vm::{
-    CompileSourceFileOptions, InferredLocalTypeHint, SourceFlavor, format_source_with_flavor,
+    CompileSourceFileOptions, InferredLocalTypeHint, SourceFlavor,
     collect_inferred_local_type_hints_at_path_with_options,
-    collect_inferred_local_type_hints_with_options,
+    collect_inferred_local_type_hints_with_options, format_source_with_flavor,
 };
 
 use crate::analyzer::{
@@ -189,8 +189,9 @@ fn format_response_to_json(result: Result<String, vm::FormatError>) -> Vec<u8> {
             error: Some(err.to_string()),
         },
     };
-    serde_json::to_vec(&response)
-        .unwrap_or_else(|_| b"{\"ok\":false,\"formatted\":null,\"error\":\"format failed\"}".to_vec())
+    serde_json::to_vec(&response).unwrap_or_else(|_| {
+        b"{\"ok\":false,\"formatted\":null,\"error\":\"format failed\"}".to_vec()
+    })
 }
 
 fn local_type_hints_with_flavor(source: &str, flavor: SourceFlavor) -> Vec<InferredLocalTypeHint> {
@@ -326,8 +327,9 @@ fn invalid_utf8_format_response(label: &str, err: &std::str::Utf8Error) -> Vec<u
         formatted: None,
         error: Some(format!("invalid utf-8 {label}: {err}")),
     };
-    serde_json::to_vec(&response)
-        .unwrap_or_else(|_| b"{\"ok\":false,\"formatted\":null,\"error\":\"invalid utf-8\"}".to_vec())
+    serde_json::to_vec(&response).unwrap_or_else(|_| {
+        b"{\"ok\":false,\"formatted\":null,\"error\":\"invalid utf-8\"}".to_vec()
+    })
 }
 
 #[cfg(feature = "runtime")]

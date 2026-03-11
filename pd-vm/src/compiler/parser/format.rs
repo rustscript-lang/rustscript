@@ -292,7 +292,9 @@ impl<'a> SourceFormatter<'a> {
                 self.prev_kind = Some(PrevKind::Comma);
                 let should_break = matches!(
                     self.contexts.last().map(|context| context.kind),
-                    Some(ContextKind::Brace(BraceKind::MatchBody | BraceKind::StructBody))
+                    Some(ContextKind::Brace(
+                        BraceKind::MatchBody | BraceKind::StructBody
+                    ))
                 );
                 if should_break {
                     self.pending_code_break = true;
@@ -562,7 +564,9 @@ impl<'a> SourceFormatter<'a> {
     fn emit_open_paren(&mut self) {
         let needs_space = matches!(
             self.prev_kind,
-            Some(PrevKind::If | PrevKind::For | PrevKind::While | PrevKind::Match | PrevKind::Import)
+            Some(
+                PrevKind::If | PrevKind::For | PrevKind::While | PrevKind::Match | PrevKind::Import
+            )
         );
         if needs_space {
             self.request_space();
@@ -637,8 +641,10 @@ impl<'a> SourceFormatter<'a> {
         self.prev_kind = Some(PrevKind::RBrace);
         self.pending_code_break = false;
 
-        if matches!(context.kind, ContextKind::Brace(BraceKind::Block | BraceKind::StructBody))
-            && self.should_break_after_block(next_kind.as_ref())
+        if matches!(
+            context.kind,
+            ContextKind::Brace(BraceKind::Block | BraceKind::StructBody)
+        ) && self.should_break_after_block(next_kind.as_ref())
         {
             self.pending_code_break = true;
             self.at_stmt_start = true;
@@ -742,8 +748,7 @@ impl<'a> SourceFormatter<'a> {
     fn should_break_after_block(&self, next_kind: Option<&TokenKind>) -> bool {
         !matches!(
             next_kind,
-            None
-                | Some(TokenKind::Else)
+            None | Some(TokenKind::Else)
                 | Some(TokenKind::Semicolon)
                 | Some(TokenKind::Comma)
                 | Some(TokenKind::Dot)
@@ -874,7 +879,10 @@ impl<'a> SourceFormatter<'a> {
     }
 
     fn return_has_inline_value(&self, next: Option<&TokenKind>) -> bool {
-        !matches!(next, None | Some(TokenKind::Semicolon | TokenKind::RBrace | TokenKind::Eof))
+        !matches!(
+            next,
+            None | Some(TokenKind::Semicolon | TokenKind::RBrace | TokenKind::Eof)
+        )
     }
 
     fn is_continuation_operator(kind: &TokenKind) -> bool {
@@ -1064,8 +1072,8 @@ impl<'a> SourceFormatter<'a> {
 #[cfg(test)]
 mod tests {
     use super::format_source;
-    use crate::compiler::frontends;
     use crate::compiler::SourceFlavor;
+    use crate::compiler::frontends;
 
     #[test]
     fn collapses_binary_operator_breaks_in_tail_expressions() {

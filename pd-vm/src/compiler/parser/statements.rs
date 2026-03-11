@@ -844,7 +844,10 @@ impl Parser {
             (AssignmentKind::Set, self.parse_expr()?)
         } else if self.match_kind(&TokenKind::PlusEqual) {
             let rhs = self.parse_expr()?;
-            (AssignmentKind::Add, self.build_numeric_addition_expr(index, rhs))
+            (
+                AssignmentKind::Add,
+                self.build_numeric_addition_expr(index, rhs),
+            )
         } else {
             return Err(ParseError {
                 span: Some(self.current_span()),

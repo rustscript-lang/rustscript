@@ -9,8 +9,8 @@ use vm::{
     CallOutcome, Debugger, DisassembleOptions, FunctionDecl, HostFunction, HostImport,
     ReplLocalBinding, SourceFlavor, SourceMap, SourcePathError, Value, Vm, VmError, VmRecording,
     VmStatus, compile_source_file, compile_source_for_repl_with_locals,
-    disassemble_vmbc_with_options, encode_program, format_source_with_flavor,
-    render_source_error, render_vm_error, replay_recording_stdio,
+    disassemble_vmbc_with_options, encode_program, format_source_with_flavor, render_source_error,
+    render_vm_error, replay_recording_stdio,
 };
 
 const DEFAULT_SOURCE: &str = "examples/example.rss";
@@ -329,7 +329,8 @@ fn render_format_path_error(source_path: &Path, source: &str, err: &vm::FormatEr
     match err {
         vm::FormatError::Parse(parse) => {
             let mut source_map = SourceMap::new();
-            let source_id = source_map.add_source(source_path.display().to_string(), source.to_string());
+            let source_id =
+                source_map.add_source(source_path.display().to_string(), source.to_string());
             let parse = parse
                 .clone()
                 .with_line_span_from_source(&source_map, source_id);
@@ -1705,7 +1706,8 @@ mod tests {
 
     #[test]
     fn parse_cli_fmt_command() {
-        let cfg = parse_cli_args(&[s("fmt"), s("examples/example.rss")]).expect("parse should succeed");
+        let cfg =
+            parse_cli_args(&[s("fmt"), s("examples/example.rss")]).expect("parse should succeed");
         assert!(cfg.fmt);
         assert!(!cfg.fmt_check);
         assert_eq!(cfg.source.as_deref(), Some("examples/example.rss"));

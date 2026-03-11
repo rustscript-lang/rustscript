@@ -59,7 +59,10 @@ mod tests {
         let formatted = format_source_with_flavor(input, SourceFlavor::RustScript)
             .expect("formatting should succeed");
 
-        assert_eq!(formatted, "let base = 7;\nlet add = |value| value + base;\n");
+        assert_eq!(
+            formatted,
+            "let base = 7;\nlet add = |value| value + base;\n"
+        );
     }
 
     #[test]
