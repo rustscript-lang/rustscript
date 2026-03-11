@@ -4,8 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use vm::{
     ParseError, SourceError, SourceFlavor, SourceMap, SourcePathError, Span, Vm,
     collect_inferred_local_type_hints, compile_source, compile_source_file,
-    lint_unknown_inferred_local_types, render_compile_error, render_source_error,
-    render_vm_error,
+    lint_unknown_inferred_local_types, render_compile_error, render_source_error, render_vm_error,
 };
 
 #[test]
@@ -250,8 +249,8 @@ let total = 1;
 print(total);
 "#;
 
-    let hints =
-        collect_inferred_local_type_hints(source, SourceFlavor::RustScript).expect("type hints should succeed");
+    let hints = collect_inferred_local_type_hints(source, SourceFlavor::RustScript)
+        .expect("type hints should succeed");
     let total = hints
         .iter()
         .find(|hint| hint.name == "total")
@@ -272,8 +271,8 @@ fn plus_one(amount) {
 plus_one(2);
 "#;
 
-    let hints =
-        collect_inferred_local_type_hints(source, SourceFlavor::RustScript).expect("type hints should succeed");
+    let hints = collect_inferred_local_type_hints(source, SourceFlavor::RustScript)
+        .expect("type hints should succeed");
     let amount = hints
         .iter()
         .find(|hint| hint.name == "amount")
@@ -294,8 +293,8 @@ fn plus_one(amount) {
 plus_one(2);
 "#;
 
-    let hints =
-        collect_inferred_local_type_hints(source, SourceFlavor::RustScript).expect("type hints should succeed");
+    let hints = collect_inferred_local_type_hints(source, SourceFlavor::RustScript)
+        .expect("type hints should succeed");
     let total = hints
         .iter()
         .find(|hint| hint.name == "total")

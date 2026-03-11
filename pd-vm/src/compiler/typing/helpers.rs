@@ -1077,6 +1077,7 @@ pub(super) fn display_name_for_builtin(builtin: BuiltinFunction) -> String {
         BuiltinFunction::ArrayPush => "array_push".to_string(),
         BuiltinFunction::MapNew => "map_new".to_string(),
         BuiltinFunction::Get => "get".to_string(),
+        BuiltinFunction::Has => "has".to_string(),
         BuiltinFunction::Set => "set".to_string(),
         BuiltinFunction::Keys => "keys".to_string(),
         BuiltinFunction::Count => "count".to_string(),

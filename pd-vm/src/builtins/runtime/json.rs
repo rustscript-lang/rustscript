@@ -8,8 +8,6 @@ use crate::vm::{Value, VmError, VmResult};
 use pd_host_function::pd_host_function;
 
 /// Encodes a `Value` into a JSON string.
-/// Note: When encoding a `Value::Map`, this function enforces a strict unique-keys contract.
-/// If the map contains duplicate keys, it will return an error rather than silently omitting data.
 #[pd_host_function(name = "json::encode")]
 pub(super) fn builtin_json_encode(value: &AnyValue) -> VmResult<String> {
     let json_value = vm_to_json_value(value)?;
@@ -55,11 +53,6 @@ fn vm_to_json_value(value: &Value) -> VmResult<JsonValue> {
                         ));
                     }
                 };
-                if out.contains_key(key.as_str()) {
-                    return Err(VmError::HostError(format!(
-                        "json_encode map keys must be unique strings; duplicate key '{key}'"
-                    )));
-                }
                 out.insert(key.as_str().to_string(), vm_to_json_value(value)?);
             }
             Ok(JsonValue::Object(out))

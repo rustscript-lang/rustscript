@@ -986,14 +986,12 @@ fn rustscript_move_and_alias_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
-            name: "bool and null fields are copy by default",
+            name: "bool fields are copy by default and null object entries are omitted",
             source: r#"
                 let p = { b: true, n: null };
                 let b1 = p.b;
                 let b2 = p.b;
-                let n1 = p.n;
-                let n2 = p.n;
-                if b1 && b2 && n1 == null && n2 == null {
+                if b1 && b2 && !p.has("n") {
                     1;
                 } else {
                     0;
@@ -1235,11 +1233,11 @@ fn rustscript_field_move_updates_runtime_container_state() {
     let Some(Value::Map(entries)) = vm.locals().first() else {
         panic!("expected first local to be moved map container");
     };
-    let mut saw_a_null = false;
+    let mut saw_a_present = false;
     let mut saw_b_y = false;
     for (key, value) in entries.iter() {
         match (key, value) {
-            (Value::String(name), Value::Null) if name.as_str() == "a" => saw_a_null = true,
+            (Value::String(name), _) if name.as_str() == "a" => saw_a_present = true,
             (Value::String(name), Value::String(text))
                 if name.as_str() == "b" && text.as_str() == "y" =>
             {
@@ -1249,8 +1247,8 @@ fn rustscript_field_move_updates_runtime_container_state() {
         }
     }
     assert!(
-        saw_a_null,
-        "expected moved field 'a' to be null in local container"
+        !saw_a_present,
+        "expected moved field 'a' to be removed from local container"
     );
     assert!(
         saw_b_y,
@@ -1273,11 +1271,11 @@ fn rustscript_field_move_expr_statement_updates_runtime_container_state() {
     let Some(Value::Map(entries)) = vm.locals().first() else {
         panic!("expected first local to be moved map container");
     };
-    let mut saw_a_null = false;
+    let mut saw_a_present = false;
     let mut saw_b_y = false;
     for (key, value) in entries.iter() {
         match (key, value) {
-            (Value::String(name), Value::Null) if name.as_str() == "a" => saw_a_null = true,
+            (Value::String(name), _) if name.as_str() == "a" => saw_a_present = true,
             (Value::String(name), Value::String(text))
                 if name.as_str() == "b" && text.as_str() == "y" =>
             {
@@ -1287,8 +1285,8 @@ fn rustscript_field_move_expr_statement_updates_runtime_container_state() {
         }
     }
     assert!(
-        saw_a_null,
-        "expected moved field 'a' to be null in local container"
+        !saw_a_present,
+        "expected moved field 'a' to be removed from local container"
     );
     assert!(
         saw_b_y,

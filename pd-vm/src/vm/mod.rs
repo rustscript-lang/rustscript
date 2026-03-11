@@ -20,6 +20,7 @@ pub use self::host::{
 use self::host::{HostCallExecOutcome, VmHostFunction, WaitingHostOp};
 use self::superinstructions::{DecodedInstructionData, build_decoded_instruction_data};
 pub use crate::bytecode::{HostImport, OpCode, Program, Value, ValueType};
+use crate::bytecode::{StableHasher, hash_value};
 pub use store::Store;
 
 #[derive(Clone, Copy, Debug)]
@@ -250,28 +251,6 @@ pub(crate) enum ExecOutcome {
     Waiting(HostOpId),
 }
 
-#[derive(Default)]
-struct StableHasher(u64);
-
-impl Hasher for StableHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-        const PRIME: u64 = 0x100000001b3;
-
-        if self.0 == 0 {
-            self.0 = OFFSET_BASIS;
-        }
-        for byte in bytes {
-            self.0 ^= u64::from(*byte);
-            self.0 = self.0.wrapping_mul(PRIME);
-        }
-    }
-}
-
 #[inline(always)]
 fn logical_shr_i64(value: i64, amount: u32) -> i64 {
     ((value as u64) >> amount) as i64
@@ -347,54 +326,6 @@ fn hash_type_map(type_map: Option<&crate::bytecode::TypeMap>, state: &mut impl H
         .collect::<Vec<_>>();
     operand_entries.sort_unstable_by_key(|(offset, _)| *offset);
     operand_entries.hash(state);
-}
-
-fn hash_value(value: &Value, state: &mut impl Hasher) {
-    match value {
-        Value::Null => {
-            6u8.hash(state);
-        }
-        Value::Int(value) => {
-            0u8.hash(state);
-            value.hash(state);
-        }
-        Value::Float(value) => {
-            1u8.hash(state);
-            value.to_bits().hash(state);
-        }
-        Value::Bool(value) => {
-            2u8.hash(state);
-            value.hash(state);
-        }
-        Value::String(value) => {
-            3u8.hash(state);
-            value.hash(state);
-        }
-        Value::Array(values) => {
-            4u8.hash(state);
-            values.len().hash(state);
-            for value in values.iter() {
-                hash_value(value, state);
-            }
-        }
-        Value::Map(entries) => {
-            5u8.hash(state);
-            entries.len().hash(state);
-            let mut entry_hashes = entries
-                .iter()
-                .map(|(key, value)| {
-                    let mut entry_hasher = StableHasher::default();
-                    hash_value(key, &mut entry_hasher);
-                    hash_value(value, &mut entry_hasher);
-                    entry_hasher.finish()
-                })
-                .collect::<Vec<_>>();
-            entry_hashes.sort_unstable();
-            for entry_hash in entry_hashes {
-                entry_hash.hash(state);
-            }
-        }
-    }
 }
 
 impl Vm {

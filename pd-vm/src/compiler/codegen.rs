@@ -681,18 +681,9 @@ impl Compiler {
         self.emit_stloc(key_slot)?;
 
         let map_lookup = Expr::IfElse {
-            condition: Box::new(Expr::Eq(
-                Box::new(Expr::Call(
-                    BuiltinFunction::Len.call_index(),
-                    vec![Expr::Call(
-                        BuiltinFunction::Set.call_index(),
-                        vec![Expr::Var(container_slot), Expr::Var(key_slot), Expr::Null],
-                    )],
-                )),
-                Box::new(Expr::Call(
-                    BuiltinFunction::Len.call_index(),
-                    vec![Expr::Var(container_slot)],
-                )),
+            condition: Box::new(Expr::Call(
+                BuiltinFunction::Has.call_index(),
+                vec![Expr::Var(container_slot), Expr::Var(key_slot)],
             )),
             then_expr: Box::new(Expr::Call(
                 BuiltinFunction::Get.call_index(),

@@ -51,6 +51,21 @@ Supported syntax and features:
 - Collections: array literal `[]`, brace literals for arrays/maps, `obj.member`, `obj[key]`,
   optional chaining (`?.` and `?.[key]`), slice syntax (`[a:b]`, `[:b]`, `[a:]`), map key
   literals including `null`.
+- Runtime map semantics:
+  - Bare keys in brace literals (`{a: 1}`, `{"x": 2}`, `{null: 3}`) are limited to
+    identifier/string/int/float/bool/null literals.
+  - Bracketed keys (`{[expr]: value}`) allow any runtime expression as a key.
+  - Runtime map keys and values may be any VM value (`null`, `int`, `float`, `bool`, `string`,
+    `array`, `map`). Callable values are still excluded by the existing collection limits.
+  - Scalar and string keys compare by value. Array and map keys compare by heap identity, so
+    separately allocated but structurally equal arrays/maps are different keys.
+  - Duplicate inserts are last-write-wins; `0.0` and `-0.0` are treated as the same key; `NaN`
+    keys match by bit pattern rather than normal float `==`.
+  - Setting a map entry to `null`/`None` removes that key, including during map/object literal
+    construction, so `{a: null}` omits `a`.
+  - Composite keys are stable after insertion because container writes detach before mutation, so
+    mutating an alias later creates a new value instead of changing a key already stored in a map.
+  - Membership checks use method-like lowering on arrays/maps: `container.has(key)`.
 - Host/runtime calls:
   - builtins via namespaces: `io::...`, `re::...`, `json::...`, `jit::...`, `math::...`
   - host namespaces via `use <namespace>;` / `use <namespace> as <alias>;` / `use <namespace>::{name as local};`
@@ -147,7 +162,7 @@ Current subset limits:
 
 - Arrow closures with block bodies are rejected (`(x) => { ... }`).
 - Direct calls to VM helper builtins like `len/get/set/count/...` are rejected; use language syntax
-  (`.length`, indexing, assignment, `typeof`, namespace forms).
+  (`.length`, `.keys`, `.has(...)`, indexing, assignment, `typeof`, namespace forms).
 - Undeclared host calls are rejected (import the relevant host namespace first).
 
 ## Lua Subset (`.lua`)

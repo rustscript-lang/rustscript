@@ -6,14 +6,14 @@ use crate::vm::{Value, Vm, VmResult};
 fn config_as_map(vm: &Vm) -> VmMap {
     let config = vm.jit_config();
     let max_trace_len = i64::try_from(config.max_trace_len).unwrap_or(i64::MAX);
-    vec![
+    VmMap::from_entries(vec![
         (Value::string("enabled"), Value::Bool(config.enabled)),
         (
             Value::string("hot_loop_threshold"),
             Value::Int(i64::from(config.hot_loop_threshold)),
         ),
         (Value::string("max_trace_len"), Value::Int(max_trace_len)),
-    ]
+    ])
 }
 
 #[pd_host_function(name = "jit::set_config")]

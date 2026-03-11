@@ -1,9 +1,298 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map};
+use std::fmt;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::Arc;
 
 pub type SharedString = Arc<String>;
 pub type SharedArray = Arc<Vec<Value>>;
-pub type SharedMap = Arc<Vec<(Value, Value)>>;
+pub type SharedMap = Arc<VmMap>;
+
+type VmMapStorage = HashMap<MapKey, Value, BuildHasherDefault<StableHasher>>;
+
+/// Runtime map storage for VM values.
+///
+/// Keys and values may be any runtime [`Value`]. Key equality is hybrid:
+/// scalars and strings compare by value, while arrays and maps compare by
+/// heap-object identity. Float keys use canonicalized IEEE bits: `0.0` /
+/// `-0.0` are treated as the same key, while `NaN` keys only compare equal
+/// when their bit patterns match. Duplicate inserts overwrite the prior value
+/// for the same key.
+///
+/// Heap-backed keys remain stable after insertion. Values are reference-counted
+/// and container writes detach before mutation, so later writes through an
+/// alias create a new heap object instead of mutating a key already stored in
+/// the map.
+#[derive(Clone, Default)]
+pub struct VmMap {
+    entries: VmMapStorage,
+}
+
+#[derive(Clone, Debug)]
+struct MapKey(Value);
+
+pub struct VmMapIter<'a> {
+    inner: hash_map::Iter<'a, MapKey, Value>,
+}
+
+pub struct VmMapIntoIter {
+    inner: hash_map::IntoIter<MapKey, Value>,
+}
+
+#[derive(Default)]
+pub(crate) struct StableHasher(u64);
+
+impl Hasher for StableHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+        const PRIME: u64 = 0x100000001b3;
+
+        if self.0 == 0 {
+            self.0 = OFFSET_BASIS;
+        }
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(PRIME);
+        }
+    }
+}
+
+impl VmMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_entries(entries: Vec<(Value, Value)>) -> Self {
+        let mut out = Self::new();
+        for (key, value) in entries {
+            out.insert(key, value);
+        }
+        out
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn iter(&self) -> VmMapIter<'_> {
+        VmMapIter {
+            inner: self.entries.iter(),
+        }
+    }
+
+    pub fn get(&self, key: &Value) -> Option<&Value> {
+        self.entries.get(&MapKey::new(key.clone()))
+    }
+
+    pub fn insert(&mut self, key: Value, value: Value) -> Option<Value> {
+        self.entries.insert(MapKey::new(key), value)
+    }
+
+    pub fn remove(&mut self, key: &Value) -> Option<Value> {
+        self.entries.remove(&MapKey::new(key.clone()))
+    }
+}
+
+impl From<Vec<(Value, Value)>> for VmMap {
+    fn from(value: Vec<(Value, Value)>) -> Self {
+        Self::from_entries(value)
+    }
+}
+
+impl IntoIterator for VmMap {
+    type Item = (Value, Value);
+    type IntoIter = VmMapIntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        VmMapIntoIter {
+            inner: self.entries.into_iter(),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a VmMap {
+    type Item = (&'a Value, &'a Value);
+    type IntoIter = VmMapIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl fmt::Debug for VmMap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+impl PartialEq for VmMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Eq for VmMap {}
+
+impl MapKey {
+    fn new(value: Value) -> Self {
+        Self(value)
+    }
+
+    fn value(&self) -> &Value {
+        &self.0
+    }
+
+    fn into_value(self) -> Value {
+        self.0
+    }
+}
+
+impl PartialEq for MapKey {
+    fn eq(&self, other: &Self) -> bool {
+        map_key_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for MapKey {}
+
+impl Hash for MapKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        hash_map_key(&self.0, state);
+    }
+}
+
+impl<'a> Iterator for VmMapIter<'a> {
+    type Item = (&'a Value, &'a Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(key, value)| (key.value(), value))
+    }
+}
+
+impl Iterator for VmMapIntoIter {
+    type Item = (Value, Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next()
+            .map(|(key, value)| (key.into_value(), value))
+    }
+}
+
+fn hash_map_key(value: &Value, state: &mut impl Hasher) {
+    match value {
+        Value::Null => {
+            6u8.hash(state);
+        }
+        Value::Int(value) => {
+            0u8.hash(state);
+            value.hash(state);
+        }
+        Value::Float(value) => {
+            1u8.hash(state);
+            canonical_float_key_bits(*value).hash(state);
+        }
+        Value::Bool(value) => {
+            2u8.hash(state);
+            value.hash(state);
+        }
+        Value::String(value) => {
+            3u8.hash(state);
+            value.hash(state);
+        }
+        Value::Array(values) => {
+            4u8.hash(state);
+            Arc::as_ptr(values).hash(state);
+        }
+        Value::Map(entries) => {
+            5u8.hash(state);
+            Arc::as_ptr(entries).hash(state);
+        }
+    }
+}
+
+fn map_key_eq(lhs: &Value, rhs: &Value) -> bool {
+    match (lhs, rhs) {
+        (Value::Null, Value::Null) => true,
+        (Value::Int(lhs), Value::Int(rhs)) => lhs == rhs,
+        (Value::Float(lhs), Value::Float(rhs)) => {
+            canonical_float_key_bits(*lhs) == canonical_float_key_bits(*rhs)
+        }
+        (Value::Bool(lhs), Value::Bool(rhs)) => lhs == rhs,
+        (Value::String(lhs), Value::String(rhs)) => lhs == rhs,
+        (Value::Array(lhs), Value::Array(rhs)) => Arc::ptr_eq(lhs, rhs),
+        (Value::Map(lhs), Value::Map(rhs)) => Arc::ptr_eq(lhs, rhs),
+        _ => false,
+    }
+}
+
+/// Hash a value structurally for VM-internal cache keys.
+///
+/// The hasher itself is a small deterministic 64-bit FNV-1a-style accumulator.
+/// Arrays hash recursively in order and maps hash recursively without caring
+/// about entry order, so the result is stable across allocations.
+pub(crate) fn hash_value(value: &Value, state: &mut impl Hasher) {
+    match value {
+        Value::Null => {
+            6u8.hash(state);
+        }
+        Value::Int(value) => {
+            0u8.hash(state);
+            value.hash(state);
+        }
+        Value::Float(value) => {
+            1u8.hash(state);
+            canonical_float_key_bits(*value).hash(state);
+        }
+        Value::Bool(value) => {
+            2u8.hash(state);
+            value.hash(state);
+        }
+        Value::String(value) => {
+            3u8.hash(state);
+            value.hash(state);
+        }
+        Value::Array(values) => {
+            4u8.hash(state);
+            values.len().hash(state);
+            for value in values.iter() {
+                hash_value(value, state);
+            }
+        }
+        Value::Map(entries) => {
+            5u8.hash(state);
+            entries.len().hash(state);
+            let mut entry_hashes = entries
+                .iter()
+                .map(|(key, value)| {
+                    let mut entry_hasher = StableHasher::default();
+                    hash_value(key, &mut entry_hasher);
+                    hash_value(value, &mut entry_hasher);
+                    entry_hasher.finish()
+                })
+                .collect::<Vec<_>>();
+            entry_hashes.sort_unstable();
+            for entry_hash in entry_hashes {
+                entry_hash.hash(state);
+            }
+        }
+    }
+}
+
+fn canonical_float_key_bits(value: f64) -> u64 {
+    if value == 0.0 {
+        0.0f64.to_bits()
+    } else {
+        value.to_bits()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum Value {
@@ -45,7 +334,7 @@ impl Value {
     }
 
     pub fn map(entries: Vec<(Value, Value)>) -> Self {
-        Self::Map(Arc::new(entries))
+        Self::Map(Arc::new(VmMap::from(entries)))
     }
 
     pub fn into_owned_string(self) -> Result<String, Self> {
@@ -62,7 +351,7 @@ impl Value {
         }
     }
 
-    pub fn into_owned_map(self) -> Result<Vec<(Value, Value)>, Self> {
+    pub fn into_owned_map(self) -> Result<VmMap, Self> {
         match self {
             Self::Map(entries) => Ok(unwrap_or_clone_shared(entries)),
             other => Err(other),
@@ -86,28 +375,10 @@ impl PartialEq for Value {
             (Self::Bool(lhs), Self::Bool(rhs)) => lhs == rhs,
             (Self::String(lhs), Self::String(rhs)) => lhs == rhs,
             (Self::Array(lhs), Self::Array(rhs)) => lhs == rhs,
-            (Self::Map(lhs), Self::Map(rhs)) => map_entries_eq(lhs.as_slice(), rhs.as_slice()),
+            (Self::Map(lhs), Self::Map(rhs)) => lhs == rhs,
             _ => false,
         }
     }
-}
-
-fn map_entries_eq(lhs: &[(Value, Value)], rhs: &[(Value, Value)]) -> bool {
-    if lhs.len() != rhs.len() {
-        return false;
-    }
-    let mut matched = vec![false; rhs.len()];
-    'outer: for lhs_entry in lhs {
-        for (index, rhs_entry) in rhs.iter().enumerate() {
-            if matched[index] || lhs_entry != rhs_entry {
-                continue;
-            }
-            matched[index] = true;
-            continue 'outer;
-        }
-        return false;
-    }
-    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -391,5 +662,52 @@ mod tests {
             panic!("expected map values");
         };
         assert!(Arc::ptr_eq(lhs, rhs));
+    }
+
+    #[test]
+    fn composite_map_key_remains_stable_after_alias_detach() {
+        let source_key = Value::array(vec![Value::Int(1), Value::Int(2)]);
+        let alias = source_key.clone();
+        let lookup_key = source_key.clone();
+        let expected = Value::string("kept");
+
+        let mut map = VmMap::new();
+        map.insert(source_key, expected.clone());
+
+        let mutated_alias = match alias {
+            Value::Array(values) => {
+                let mut owned = unwrap_or_clone_shared(values);
+                owned[0] = Value::Int(9);
+                Value::array(owned)
+            }
+            other => panic!("expected array alias, got {other:?}"),
+        };
+
+        assert_eq!(map.get(&lookup_key), Some(&expected));
+        assert_eq!(
+            map.get(&Value::array(vec![Value::Int(1), Value::Int(2)])),
+            None
+        );
+        assert_eq!(map.get(&mutated_alias), None);
+    }
+
+    #[test]
+    fn nested_map_keys_use_identity_lookup() {
+        let nested_key = Value::map(vec![
+            (Value::string("a"), Value::Int(1)),
+            (Value::string("b"), Value::Int(2)),
+        ]);
+        let lookup_key = nested_key.clone();
+        let structural_peer = Value::map(vec![
+            (Value::string("b"), Value::Int(2)),
+            (Value::string("a"), Value::Int(1)),
+        ]);
+        let expected = Value::Bool(true);
+
+        let mut map = VmMap::new();
+        map.insert(nested_key, expected.clone());
+
+        assert_eq!(map.get(&lookup_key), Some(&expected));
+        assert_eq!(map.get(&structural_peer), None);
     }
 }

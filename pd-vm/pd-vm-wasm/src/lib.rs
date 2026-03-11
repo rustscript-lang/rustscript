@@ -9,7 +9,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use vm::{
     CompileSourceFileOptions, InferredLocalTypeHint, SourceFlavor,
-    collect_inferred_local_type_hints_at_path_with_options, collect_inferred_local_type_hints_with_options,
+    collect_inferred_local_type_hints_at_path_with_options,
+    collect_inferred_local_type_hints_with_options,
 };
 
 use crate::analyzer::{
@@ -724,10 +725,10 @@ pub extern "C" fn completion_catalog_json() -> u64 {
 mod lint_tests {
     use std::path::Path;
 
-    use serde_json::Value;
     use super::{parse_flavor, parse_module_overrides};
     use crate::analyzer::{lint_source_with_flavor, lint_source_with_flavor_at_path};
     use crate::completions::build_completion_catalog;
+    use serde_json::Value;
     use vm::{SourceFlavor, collect_inferred_local_type_hints};
 
     #[test]
@@ -793,8 +794,8 @@ mod lint_tests {
             plus_one(2);
         "#;
 
-        let hints =
-            collect_inferred_local_type_hints(source, SourceFlavor::RustScript).expect("type hints should succeed");
+        let hints = collect_inferred_local_type_hints(source, SourceFlavor::RustScript)
+            .expect("type hints should succeed");
         let payload: Value = serde_json::from_slice(&super::local_type_hints_to_json(hints))
             .expect("type hints should serialize as json");
         let items = payload["hints"]
