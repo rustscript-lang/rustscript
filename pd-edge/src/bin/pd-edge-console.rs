@@ -10,8 +10,8 @@ use axum::http::HeaderMap;
 use edge::{
     ActiveControlPlaneConfig, ProxyVmContext, SharedProxyVmContext, SharedState, SharedVmAsyncOps,
     VM_EPOCH_TICK_INTERVAL_MS, VmAsyncOpBridge, VmExecutionConfig, VmExecutionMode,
-    VmInterruptConfig, apply_program_from_bytes, compile_edge_source_file, init_logging,
-    new_shared_vm_async_ops, register_host_module, spawn_active_control_plane_client,
+    VmInterruptConfig, apply_program_from_bytes, compile_edge_source_file, enter_edge_host_context,
+    init_logging, new_shared_vm_async_ops, register_host_module, spawn_active_control_plane_client,
 };
 use tokio::{
     runtime::Handle,
@@ -527,7 +527,14 @@ async fn run_loaded_program_once(state: &SharedState) -> Result<(), Box<dyn std:
         if let Some((ticks_per_slice, _driver)) = &epoch_driver {
             store.set_epoch_deadline(*ticks_per_slice)?;
         }
-        match store.run() {
+        let status = {
+            let _host_context = enter_edge_host_context(
+                store.data().vm_context.clone(),
+                store.data().async_ops.clone(),
+            );
+            store.run()
+        };
+        match status {
             Ok(VmStatus::Halted) => {
                 println!("vm halted; stack={:?}", store.vm().stack());
                 break;

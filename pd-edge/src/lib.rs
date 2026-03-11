@@ -11,9 +11,10 @@ pub use edge_abi::*;
 pub use abi_impl::{
     EdgeProtocolHostModule, HttpProtocolHostModule, ProxyVmContext, RateLimiterStore,
     RuntimeProtocolHostModule, SharedProxyVmContext, SharedRateLimiter, SharedVmAsyncOps,
-    VmAsyncOpBridge, VmAsyncOps, VmExecutionOutcome, new_shared_vm_async_ops, register_host_module,
-    register_http_host_module, register_http_plane_host_module, register_protocol_modules,
-    register_runtime_host_module, snapshot_execution_outcome,
+    VmAsyncOpBridge, VmAsyncOps, VmExecutionOutcome, enter_edge_host_context,
+    new_shared_vm_async_ops, register_host_module, register_http_host_module,
+    register_http_plane_host_module, register_protocol_modules, register_runtime_host_module,
+    snapshot_execution_outcome,
 };
 pub use active_control_plane::{
     ActiveControlPlaneConfig, run_active_control_plane_client, spawn_active_control_plane_client,

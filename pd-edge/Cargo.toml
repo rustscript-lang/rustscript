@@ -21,6 +21,8 @@ axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["full"] }
 http-body-util = "0.1"
+pd-edge-host-function = { path = "./pd-edge-host-function" }
+linkme = "0.3"
 vm = { package = "pd-vm", path = "../pd-vm" }
 edge_abi = { package = "pd-edge-abi", path = "../pd-edge-abi" }
 serde = { version = "1", features = ["derive"] }

@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap},
     future::Future,
     pin::Pin,
@@ -21,6 +22,7 @@ use vm::{
 
 mod http;
 mod io;
+mod registry;
 mod runtime;
 
 pub type SharedRateLimiter = Arc<Mutex<RateLimiterStore>>;
@@ -30,6 +32,28 @@ type AsyncOpResult = Result<Vec<Value>, VmError>;
 type PendingFuture = Pin<Box<dyn Future<Output = AsyncOpResult> + Send + 'static>>;
 type HostCallResult = Result<CallOutcome, VmError>;
 type HostCallHandler = dyn FnMut(&mut Vm, &[Value]) -> HostCallResult + Send + 'static;
+
+#[derive(Clone)]
+struct ActiveEdgeHostContext {
+    vm_context: SharedProxyVmContext,
+    async_ops: SharedVmAsyncOps,
+}
+
+std::thread_local! {
+    static CURRENT_EDGE_HOST_CONTEXT: RefCell<Option<ActiveEdgeHostContext>> = const { RefCell::new(None) };
+}
+
+pub struct EdgeHostContextGuard {
+    previous: Option<ActiveEdgeHostContext>,
+}
+
+impl Drop for EdgeHostContextGuard {
+    fn drop(&mut self) {
+        CURRENT_EDGE_HOST_CONTEXT.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
 
 enum PendingOp {
     Receiver(oneshot::Receiver<AsyncOpResult>),
@@ -175,6 +199,45 @@ impl HostAsyncBridge for VmAsyncOpBridge {
 
 pub fn new_shared_vm_async_ops() -> SharedVmAsyncOps {
     Arc::new(Mutex::new(VmAsyncOps::new()))
+}
+
+pub fn enter_edge_host_context(
+    vm_context: SharedProxyVmContext,
+    async_ops: SharedVmAsyncOps,
+) -> EdgeHostContextGuard {
+    let next = ActiveEdgeHostContext {
+        vm_context,
+        async_ops,
+    };
+    let previous = CURRENT_EDGE_HOST_CONTEXT.with(|slot| slot.borrow_mut().replace(next));
+    EdgeHostContextGuard { previous }
+}
+
+pub(crate) fn current_vm_context() -> Result<SharedProxyVmContext, VmError> {
+    CURRENT_EDGE_HOST_CONTEXT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|context| context.vm_context.clone())
+            .ok_or_else(|| {
+                VmError::HostError(
+                    "pd-edge host context is unavailable outside Store-backed execution"
+                        .to_string(),
+                )
+            })
+    })
+}
+
+pub(crate) fn current_async_ops() -> Result<SharedVmAsyncOps, VmError> {
+    CURRENT_EDGE_HOST_CONTEXT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|context| context.async_ops.clone())
+            .ok_or_else(|| {
+                VmError::HostError(
+                    "pd-edge async ops are unavailable outside Store-backed execution".to_string(),
+                )
+            })
+    })
 }
 
 struct AsyncHostAdapter {
@@ -835,6 +898,17 @@ where
     Ok(CallOutcome::Pending(op_id))
 }
 
+pub(crate) fn schedule_current_future_call<F>(
+    vm: &mut Vm,
+    future: F,
+) -> Result<CallOutcome, VmError>
+where
+    F: Future<Output = AsyncOpResult> + Send + 'static,
+{
+    let async_ops = current_async_ops()?;
+    schedule_future_call(vm, &async_ops, future)
+}
+
 fn schedule_ready_call(
     vm: &mut Vm,
     async_ops: &SharedVmAsyncOps,
@@ -898,47 +972,12 @@ async fn request_body_eof(context: &SharedProxyVmContext) -> Result<bool, VmErro
     inbound.eof().await
 }
 
-fn expect_arg_count(args: &[Value], expected: usize) -> Result<(), VmError> {
-    if args.len() == expected {
-        Ok(())
-    } else {
-        Err(VmError::HostError(format!(
-            "expected {expected} arguments, got {}",
-            args.len()
-        )))
-    }
-}
-
-fn expect_string(args: &[Value], index: usize) -> Result<String, VmError> {
-    match args.get(index) {
-        Some(Value::String(value)) => Ok(value.to_string()),
-        _ => Err(VmError::TypeMismatch("string")),
-    }
-}
-
-fn expect_int(args: &[Value], index: usize) -> Result<i64, VmError> {
-    match args.get(index) {
-        Some(Value::Int(value)) => Ok(*value),
-        _ => Err(VmError::TypeMismatch("int")),
-    }
-}
-
-fn expect_map(args: &[Value], index: usize) -> Result<VmMap, VmError> {
-    match args.get(index) {
-        Some(Value::Map(entries)) => Ok(entries.as_ref().clone()),
-        _ => Err(VmError::TypeMismatch("map")),
-    }
-}
-
-fn parse_header_name_arg(args: &[Value], index: usize) -> Result<HeaderName, VmError> {
-    let name = expect_string(args, index)?;
+fn parse_header_name(name: String) -> Result<HeaderName, VmError> {
     HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))
 }
 
-fn parse_header_args(args: &[Value]) -> Result<(HeaderName, HeaderValue), VmError> {
-    let name = expect_string(args, 0)?;
-    let value = expect_string(args, 1)?;
+fn parse_header(name: String, value: String) -> Result<(HeaderName, HeaderValue), VmError> {
     let header_name = HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
     let header_value = HeaderValue::from_str(&value)
@@ -946,11 +985,7 @@ fn parse_header_args(args: &[Value]) -> Result<(HeaderName, HeaderValue), VmErro
     Ok((header_name, header_value))
 }
 
-fn parse_headers_map_arg(
-    args: &[Value],
-    index: usize,
-) -> Result<Vec<(HeaderName, Vec<HeaderValue>)>, VmError> {
-    let entries = expect_map(args, index)?;
+fn parse_headers_map(entries: VmMap) -> Result<Vec<(HeaderName, Vec<HeaderValue>)>, VmError> {
     let mut parsed = Vec::with_capacity(entries.len());
     for (key, value) in entries {
         let name = match key {

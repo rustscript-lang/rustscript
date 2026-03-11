@@ -15,7 +15,7 @@ use super::{
 use crate::{
     abi_impl::{
         SharedProxyVmContext, SharedVmAsyncOps, VmAsyncOpBridge, VmExecutionOutcome,
-        new_shared_vm_async_ops, snapshot_execution_outcome,
+        enter_edge_host_context, new_shared_vm_async_ops, snapshot_execution_outcome,
     },
     debug_session::{SharedDebugSession, run_vm_with_optional_debugger},
     logging::category_program,
@@ -262,16 +262,22 @@ async fn run_vm_async(
 
     loop {
         arm_epoch_interrupt_if_enabled(&mut vm_store, &interrupt, debug.attach_debugger)?;
-        let status = if debug.attach_debugger {
-            run_vm_with_optional_debugger(
-                &debug_session,
-                &debug.request_headers,
-                &debug.request_path,
-                &debug.request_id,
-                vm_store.vm_mut(),
-            )
-        } else {
-            vm_store.run()
+        let status = {
+            let _host_context = enter_edge_host_context(
+                vm_store.data().vm_context.clone(),
+                vm_store.data().async_ops.clone(),
+            );
+            if debug.attach_debugger {
+                run_vm_with_optional_debugger(
+                    &debug_session,
+                    &debug.request_headers,
+                    &debug.request_path,
+                    &debug.request_id,
+                    vm_store.vm_mut(),
+                )
+            } else {
+                vm_store.run()
+            }
         }
         .map_err(VmExecutionError::Vm)?;
         match status {
@@ -315,16 +321,22 @@ fn run_vm_threading(
 
     loop {
         arm_epoch_interrupt_if_enabled(&mut vm_store, &interrupt, debug.attach_debugger)?;
-        let status = if debug.attach_debugger {
-            run_vm_with_optional_debugger(
-                &debug_session,
-                &debug.request_headers,
-                &debug.request_path,
-                &debug.request_id,
-                vm_store.vm_mut(),
-            )
-        } else {
-            vm_store.run()
+        let status = {
+            let _host_context = enter_edge_host_context(
+                vm_store.data().vm_context.clone(),
+                vm_store.data().async_ops.clone(),
+            );
+            if debug.attach_debugger {
+                run_vm_with_optional_debugger(
+                    &debug_session,
+                    &debug.request_headers,
+                    &debug.request_path,
+                    &debug.request_id,
+                    vm_store.vm_mut(),
+                )
+            } else {
+                vm_store.run()
+            }
         }
         .map_err(VmExecutionError::Vm)?;
 

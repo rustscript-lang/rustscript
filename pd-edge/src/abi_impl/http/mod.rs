@@ -1,6 +1,6 @@
 use vm::{Vm, VmError};
 
-use super::{SharedProxyVmContext, SharedVmAsyncOps};
+use super::{SharedProxyVmContext, SharedVmAsyncOps, registry};
 
 mod request;
 mod response;
@@ -11,9 +11,7 @@ pub(super) fn register_http_host_module(
     context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
 ) -> Result<(), VmError> {
-    request::register(vm, context.clone(), async_ops.clone());
-    response::register(vm, context.clone(), async_ops.clone());
-    upstream::register(vm, context, async_ops);
+    registry::register_host_scope(vm, &context, &async_ops, registry::EdgeHostScope::Http);
     Ok(())
 }
 
@@ -22,5 +20,10 @@ pub(super) fn register_http_extensions(
     context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
 ) {
-    request::register_streaming_extensions(vm, context, async_ops);
+    registry::register_host_scope(
+        vm,
+        &context,
+        &async_ops,
+        registry::EdgeHostScope::HttpExtension,
+    );
 }

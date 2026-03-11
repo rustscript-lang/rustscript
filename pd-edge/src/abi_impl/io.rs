@@ -1,11 +1,11 @@
+use pd_edge_host_function::pd_edge_host_function;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
-use vm::{Value, Vm, VmError};
+use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::{
     EDGE_IO_HANDLE_DYNAMIC_BASE, EdgeVirtualIoHandle, ProxyVmContext, SharedProxyVmContext,
-    SharedVmAsyncOps, bind_async_host_handler, consume_request_body_all, expect_arg_count,
-    expect_string, read_request_body_next_line, resolve_outbound_request_body,
-    schedule_future_call,
+    SharedVmAsyncOps, consume_request_body_all, current_vm_context, read_request_body_next_line,
+    resolve_outbound_request_body,
 };
 
 const EDGE_IO_HANDLE_REQUEST_BODY: i64 = 1;
@@ -28,35 +28,17 @@ enum EdgeIoWriteTarget {
     Ignore,
 }
 
-macro_rules! bind_io_async {
-    ($vm:expr, $async_ops:expr, $symbol:literal, move |$vm_arg:ident, $args_arg:ident, $ops_arg:ident| $body:block) => {{
-        let async_ops_for_bind = $async_ops.clone();
-        let async_ops_for_call = async_ops_for_bind.clone();
-        bind_async_host_handler(
-            $vm,
-            &async_ops_for_bind,
-            $symbol,
-            move |$vm_arg, $args_arg| {
-                let $ops_arg = &async_ops_for_call;
-                $body
-            },
-        );
-    }};
-}
-
 pub(super) fn register_builtin_io_overrides(
     vm: &mut Vm,
     context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
 ) -> Result<(), VmError> {
-    bind_builtin_io_open(vm, &context, &async_ops);
-    bind_builtin_io_popen(vm, &async_ops);
-    bind_builtin_io_read_all(vm, &context, &async_ops);
-    bind_builtin_io_read_line(vm, &context, &async_ops);
-    bind_builtin_io_write(vm, &context, &async_ops);
-    bind_builtin_io_flush(vm, &context, &async_ops);
-    bind_builtin_io_close(vm, &context, &async_ops);
-    bind_builtin_io_exists(vm, &async_ops);
+    super::registry::register_host_scope(
+        vm,
+        &context,
+        &async_ops,
+        super::registry::EdgeHostScope::Io,
+    );
     Ok(())
 }
 
@@ -309,300 +291,213 @@ fn write_io_target(
     }
 }
 
-fn bind_builtin_io_open(vm: &mut Vm, context: &SharedProxyVmContext, async_ops: &SharedVmAsyncOps) {
-    let context = context.clone();
-    bind_io_async!(vm, async_ops, "io::open", move |vm, args, ops| {
-        expect_arg_count(args, 2)?;
-        let path = expect_string(args, 0)?;
-        let mode = expect_string(args, 1)?;
-        let explicit_target = edge_io_target_from_string(&path);
-        let context = context.clone();
-        schedule_future_call(vm, ops, async move {
-            tokio::task::yield_now().await;
-            let mode = mode.trim().to_ascii_lowercase();
-            match mode.as_str() {
-                "r" => {
-                    if let Some(target) = explicit_target {
-                        let handle = match target {
-                            EdgeIoHandleKind::Request => EDGE_IO_HANDLE_REQUEST_BODY,
-                            EdgeIoHandleKind::Response => EDGE_IO_HANDLE_RESPONSE_BODY,
-                            EdgeIoHandleKind::UpstreamRequest => {
-                                EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY
-                            }
-                            EdgeIoHandleKind::UpstreamResponse => {
-                                EDGE_IO_HANDLE_UPSTREAM_RESPONSE_BODY
-                            }
-                        };
-                        return Ok(vec![Value::Int(handle)]);
-                    }
-
-                    let buffered = match tokio::fs::read_to_string(&path).await {
-                        Ok(content) => content,
-                        Err(_) => path.clone(),
-                    };
-                    let mut guard = context.lock().expect("vm context lock poisoned");
-                    let handle = allocate_edge_virtual_io_handle(
-                        &mut guard,
-                        EdgeVirtualIoHandle::BufferedRead {
-                            text: buffered,
-                            offset: 0,
-                        },
-                    );
-                    Ok(vec![Value::Int(handle)])
-                }
-                "w" | "a" => {
-                    if let Some(target) = explicit_target {
-                        let handle = match target {
-                            EdgeIoHandleKind::Request => {
-                                return Err(VmError::HostError(
-                                    "edge io::open does not allow write mode on request body"
-                                        .to_string(),
-                                ));
-                            }
-                            EdgeIoHandleKind::Response => EDGE_IO_HANDLE_RESPONSE_BODY,
-                            EdgeIoHandleKind::UpstreamRequest => {
-                                EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY
-                            }
-                            EdgeIoHandleKind::UpstreamResponse => {
-                                return Err(VmError::HostError(
-                                    "edge io::open does not allow write mode on upstream response body"
-                                        .to_string(),
-                                ));
-                            }
-                        };
-                        return Ok(vec![Value::Int(handle)]);
-                    }
-
-                    let target = if path_targets_upstream_request(&path) {
-                        EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY
-                    } else {
-                        let mut guard = context.lock().expect("vm context lock poisoned");
-                        allocate_edge_virtual_io_handle(
-                            &mut guard,
-                            EdgeVirtualIoHandle::FileWrite {
-                                path: path.clone(),
-                                append: mode == "a",
-                            },
-                        )
-                    };
-                    Ok(vec![Value::Int(target)])
-                }
-                _ => Err(VmError::HostError(format!(
-                    "edge io::open only supports modes 'r', 'w', or 'a', got '{mode}'",
-                ))),
+#[pd_edge_host_function(name = "io::open", scope = io)]
+async fn io_open(_vm: &mut Vm, path: String, mode: String) -> Result<CallOutcome, VmError> {
+    tokio::task::yield_now().await;
+    let context = current_vm_context()?;
+    let explicit_target = edge_io_target_from_string(&path);
+    let mode = mode.trim().to_ascii_lowercase();
+    let values = match mode.as_str() {
+        "r" => {
+            if let Some(target) = explicit_target {
+                let handle = match target {
+                    EdgeIoHandleKind::Request => EDGE_IO_HANDLE_REQUEST_BODY,
+                    EdgeIoHandleKind::Response => EDGE_IO_HANDLE_RESPONSE_BODY,
+                    EdgeIoHandleKind::UpstreamRequest => EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY,
+                    EdgeIoHandleKind::UpstreamResponse => EDGE_IO_HANDLE_UPSTREAM_RESPONSE_BODY,
+                };
+                return Ok(CallOutcome::Return(vec![Value::Int(handle)]));
             }
-        })
-    });
-}
 
-fn bind_builtin_io_popen(vm: &mut Vm, async_ops: &SharedVmAsyncOps) {
-    bind_io_async!(vm, async_ops, "io::popen", move |vm, args, ops| {
-        expect_arg_count(args, 2)?;
-        schedule_future_call(vm, ops, async move {
-            tokio::task::yield_now().await;
-            Err(VmError::HostError(
-                "io::popen is disabled in edge runtime; use protocol-specific async host APIs"
-                    .to_string(),
-            ))
-        })
-    });
-}
-
-fn bind_builtin_io_read_all(
-    vm: &mut Vm,
-    context: &SharedProxyVmContext,
-    async_ops: &SharedVmAsyncOps,
-) {
-    let context = context.clone();
-    bind_io_async!(vm, async_ops, "io::read_all", move |vm, args, ops| {
-        expect_arg_count(args, 1)?;
-        let source = args
-            .first()
-            .cloned()
-            .ok_or(VmError::TypeMismatch("string/int"))?;
-        let context = context.clone();
-        schedule_future_call(vm, ops, async move {
-            tokio::task::yield_now().await;
-            let text = match &source {
-                Value::String(literal) => match edge_io_target_from_string(literal) {
-                    Some(target) => read_io_target_all(&context, target).await?,
-                    None => literal.to_string(),
+            let buffered = match tokio::fs::read_to_string(&path).await {
+                Ok(content) => content,
+                Err(_) => path.clone(),
+            };
+            let mut guard = context.lock().expect("vm context lock poisoned");
+            let handle = allocate_edge_virtual_io_handle(
+                &mut guard,
+                EdgeVirtualIoHandle::BufferedRead {
+                    text: buffered,
+                    offset: 0,
                 },
-                Value::Int(handle) => {
-                    let mut guard = context.lock().expect("vm context lock poisoned");
-                    match decode_edge_io_handle(*handle) {
-                        Ok(target) => {
-                            drop(guard);
-                            read_io_target_all(&context, target).await?
-                        }
-                        Err(_) => read_edge_virtual_handle_all(&mut guard, *handle)?,
+            );
+            vec![Value::Int(handle)]
+        }
+        "w" | "a" => {
+            if let Some(target) = explicit_target {
+                let handle = match target {
+                    EdgeIoHandleKind::Request => {
+                        return Err(VmError::HostError(
+                            "edge io::open does not allow write mode on request body".to_string(),
+                        ));
                     }
-                }
-                _ => return Err(VmError::TypeMismatch("string/int")),
-            };
-            Ok(vec![Value::string(text)])
-        })
-    });
-}
-
-fn bind_builtin_io_read_line(
-    vm: &mut Vm,
-    context: &SharedProxyVmContext,
-    async_ops: &SharedVmAsyncOps,
-) {
-    let context = context.clone();
-    bind_io_async!(vm, async_ops, "io::read_line", move |vm, args, ops| {
-        expect_arg_count(args, 1)?;
-        let source = args
-            .first()
-            .cloned()
-            .ok_or(VmError::TypeMismatch("string/int"))?;
-        let context = context.clone();
-        schedule_future_call(vm, ops, async move {
-            tokio::task::yield_now().await;
-            let text = match &source {
-                Value::String(literal) => match edge_io_target_from_string(literal) {
-                    Some(target) => read_io_target_line(&context, target).await?,
-                    None => {
-                        let mut lines = literal.lines();
-                        lines.next().unwrap_or_default().to_string()
+                    EdgeIoHandleKind::Response => EDGE_IO_HANDLE_RESPONSE_BODY,
+                    EdgeIoHandleKind::UpstreamRequest => EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY,
+                    EdgeIoHandleKind::UpstreamResponse => {
+                        return Err(VmError::HostError(
+                            "edge io::open does not allow write mode on upstream response body"
+                                .to_string(),
+                        ));
                     }
-                },
-                Value::Int(handle) => {
-                    let mut guard = context.lock().expect("vm context lock poisoned");
-                    match decode_edge_io_handle(*handle) {
-                        Ok(target) => {
-                            drop(guard);
-                            read_io_target_line(&context, target).await?
-                        }
-                        Err(_) => read_edge_virtual_handle_line(&mut guard, *handle)?,
-                    }
-                }
-                _ => return Err(VmError::TypeMismatch("string/int")),
-            };
-            Ok(vec![Value::string(text)])
-        })
-    });
-}
-
-fn bind_builtin_io_write(
-    vm: &mut Vm,
-    context: &SharedProxyVmContext,
-    async_ops: &SharedVmAsyncOps,
-) {
-    let context = context.clone();
-    bind_io_async!(vm, async_ops, "io::write", move |vm, args, ops| {
-        expect_arg_count(args, 2)?;
-        let target_arg = args
-            .first()
-            .cloned()
-            .ok_or(VmError::TypeMismatch("string/int"))?;
-        let text = expect_string(args, 1)?;
-        let context = context.clone();
-        schedule_future_call(vm, ops, async move {
-            tokio::task::yield_now().await;
-            let target = {
-                let guard = context.lock().expect("vm context lock poisoned");
-                resolve_edge_io_write_target(&guard, &target_arg)?
-            };
-            match target {
-                EdgeIoWriteTarget::Builtin(kind) => {
-                    let mut guard = context.lock().expect("vm context lock poisoned");
-                    write_io_target(&mut guard, kind, &text)?;
-                }
-                EdgeIoWriteTarget::FilePath { path, append } => {
-                    write_edge_file_path(&path, append, &text).await?;
-                }
-                EdgeIoWriteTarget::Ignore => {}
+                };
+                return Ok(CallOutcome::Return(vec![Value::Int(handle)]));
             }
-            Ok(vec![Value::Int(text.len() as i64)])
-        })
-    });
-}
 
-fn bind_builtin_io_flush(
-    vm: &mut Vm,
-    context: &SharedProxyVmContext,
-    async_ops: &SharedVmAsyncOps,
-) {
-    let context = context.clone();
-    bind_io_async!(vm, async_ops, "io::flush", move |vm, args, ops| {
-        expect_arg_count(args, 1)?;
-        let target = args
-            .first()
-            .cloned()
-            .ok_or(VmError::TypeMismatch("string/int"))?;
-        let context = context.clone();
-        schedule_future_call(vm, ops, async move {
-            tokio::task::yield_now().await;
-            match target {
-                Value::Int(handle) => {
-                    if decode_edge_io_handle(handle).is_err() {
-                        let guard = context.lock().expect("vm context lock poisoned");
-                        if !guard.edge_io_handles.contains_key(&handle) {
-                            return Err(VmError::HostError(format!(
-                                "edge io handle {handle} is invalid",
-                            )));
-                        }
-                    }
-                }
-                Value::String(_) => {}
-                _ => return Err(VmError::TypeMismatch("string/int")),
-            }
-            Ok(vec![Value::Bool(true)])
-        })
-    });
-}
-
-fn bind_builtin_io_close(
-    vm: &mut Vm,
-    context: &SharedProxyVmContext,
-    async_ops: &SharedVmAsyncOps,
-) {
-    let context = context.clone();
-    bind_io_async!(vm, async_ops, "io::close", move |vm, args, ops| {
-        expect_arg_count(args, 1)?;
-        let target = args
-            .first()
-            .cloned()
-            .ok_or(VmError::TypeMismatch("string/int"))?;
-        let context = context.clone();
-        schedule_future_call(vm, ops, async move {
-            tokio::task::yield_now().await;
-            match target {
-                Value::Int(handle) => {
-                    if decode_edge_io_handle(handle).is_err() {
-                        let mut guard = context.lock().expect("vm context lock poisoned");
-                        if guard.edge_io_handles.remove(&handle).is_none() {
-                            return Err(VmError::HostError(format!(
-                                "edge io handle {handle} is invalid",
-                            )));
-                        }
-                    }
-                }
-                Value::String(_) => {}
-                _ => return Err(VmError::TypeMismatch("string/int")),
-            }
-            Ok(vec![Value::Bool(true)])
-        })
-    });
-}
-
-fn bind_builtin_io_exists(vm: &mut Vm, async_ops: &SharedVmAsyncOps) {
-    bind_io_async!(vm, async_ops, "io::exists", move |vm, args, ops| {
-        expect_arg_count(args, 1)?;
-        let path = expect_string(args, 0)?;
-        schedule_future_call(vm, ops, async move {
-            tokio::task::yield_now().await;
-            let exists = if edge_io_readable_path(&path)
-                || edge_io_target_from_string(&path).is_some()
-                || path_targets_upstream_request(&path)
-            {
-                true
+            let target = if path_targets_upstream_request(&path) {
+                EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY
             } else {
-                tokio::fs::metadata(path.as_str()).await.is_ok()
+                let mut guard = context.lock().expect("vm context lock poisoned");
+                allocate_edge_virtual_io_handle(
+                    &mut guard,
+                    EdgeVirtualIoHandle::FileWrite {
+                        path: path.clone(),
+                        append: mode == "a",
+                    },
+                )
             };
-            Ok(vec![Value::Bool(exists)])
-        })
-    });
+            vec![Value::Int(target)]
+        }
+        _ => {
+            return Err(VmError::HostError(format!(
+                "edge io::open only supports modes 'r', 'w', or 'a', got '{mode}'",
+            )));
+        }
+    };
+    Ok(CallOutcome::Return(values))
+}
+
+#[pd_edge_host_function(name = "io::popen", scope = io)]
+async fn io_popen(_vm: &mut Vm, _command: String, _mode: String) -> Result<CallOutcome, VmError> {
+    tokio::task::yield_now().await;
+    Err(VmError::HostError(
+        "io::popen is disabled in edge runtime; use protocol-specific async host APIs".to_string(),
+    ))
+}
+
+#[pd_edge_host_function(name = "io::read_all", scope = io)]
+async fn io_read_all(_vm: &mut Vm, source: Value) -> Result<CallOutcome, VmError> {
+    tokio::task::yield_now().await;
+    let context = current_vm_context()?;
+    let text = match &source {
+        Value::String(literal) => match edge_io_target_from_string(literal) {
+            Some(target) => read_io_target_all(&context, target).await?,
+            None => literal.to_string(),
+        },
+        Value::Int(handle) => {
+            let mut guard = context.lock().expect("vm context lock poisoned");
+            match decode_edge_io_handle(*handle) {
+                Ok(target) => {
+                    drop(guard);
+                    read_io_target_all(&context, target).await?
+                }
+                Err(_) => read_edge_virtual_handle_all(&mut guard, *handle)?,
+            }
+        }
+        _ => return Err(VmError::TypeMismatch("string/int")),
+    };
+    Ok(CallOutcome::Return(vec![Value::string(text)]))
+}
+
+#[pd_edge_host_function(name = "io::read_line", scope = io)]
+async fn io_read_line(_vm: &mut Vm, source: Value) -> Result<CallOutcome, VmError> {
+    tokio::task::yield_now().await;
+    let context = current_vm_context()?;
+    let text = match &source {
+        Value::String(literal) => match edge_io_target_from_string(literal) {
+            Some(target) => read_io_target_line(&context, target).await?,
+            None => {
+                let mut lines = literal.lines();
+                lines.next().unwrap_or_default().to_string()
+            }
+        },
+        Value::Int(handle) => {
+            let mut guard = context.lock().expect("vm context lock poisoned");
+            match decode_edge_io_handle(*handle) {
+                Ok(target) => {
+                    drop(guard);
+                    read_io_target_line(&context, target).await?
+                }
+                Err(_) => read_edge_virtual_handle_line(&mut guard, *handle)?,
+            }
+        }
+        _ => return Err(VmError::TypeMismatch("string/int")),
+    };
+    Ok(CallOutcome::Return(vec![Value::string(text)]))
+}
+
+#[pd_edge_host_function(name = "io::write", scope = io)]
+async fn io_write(_vm: &mut Vm, target_arg: Value, text: String) -> Result<CallOutcome, VmError> {
+    tokio::task::yield_now().await;
+    let context = current_vm_context()?;
+    let target = {
+        let guard = context.lock().expect("vm context lock poisoned");
+        resolve_edge_io_write_target(&guard, &target_arg)?
+    };
+    match target {
+        EdgeIoWriteTarget::Builtin(kind) => {
+            let mut guard = context.lock().expect("vm context lock poisoned");
+            write_io_target(&mut guard, kind, &text)?;
+        }
+        EdgeIoWriteTarget::FilePath { path, append } => {
+            write_edge_file_path(&path, append, &text).await?;
+        }
+        EdgeIoWriteTarget::Ignore => {}
+    }
+    Ok(CallOutcome::Return(vec![Value::Int(text.len() as i64)]))
+}
+
+#[pd_edge_host_function(name = "io::flush", scope = io)]
+async fn io_flush(_vm: &mut Vm, target: Value) -> Result<CallOutcome, VmError> {
+    tokio::task::yield_now().await;
+    let context = current_vm_context()?;
+    match target {
+        Value::Int(handle) => {
+            if decode_edge_io_handle(handle).is_err() {
+                let guard = context.lock().expect("vm context lock poisoned");
+                if !guard.edge_io_handles.contains_key(&handle) {
+                    return Err(VmError::HostError(format!(
+                        "edge io handle {handle} is invalid",
+                    )));
+                }
+            }
+        }
+        Value::String(_) => {}
+        _ => return Err(VmError::TypeMismatch("string/int")),
+    }
+    Ok(CallOutcome::Return(vec![Value::Bool(true)]))
+}
+
+#[pd_edge_host_function(name = "io::close", scope = io)]
+async fn io_close(_vm: &mut Vm, target: Value) -> Result<CallOutcome, VmError> {
+    tokio::task::yield_now().await;
+    let context = current_vm_context()?;
+    match target {
+        Value::Int(handle) => {
+            if decode_edge_io_handle(handle).is_err() {
+                let mut guard = context.lock().expect("vm context lock poisoned");
+                if guard.edge_io_handles.remove(&handle).is_none() {
+                    return Err(VmError::HostError(format!(
+                        "edge io handle {handle} is invalid",
+                    )));
+                }
+            }
+        }
+        Value::String(_) => {}
+        _ => return Err(VmError::TypeMismatch("string/int")),
+    }
+    Ok(CallOutcome::Return(vec![Value::Bool(true)]))
+}
+
+#[pd_edge_host_function(name = "io::exists", scope = io)]
+async fn io_exists(_vm: &mut Vm, path: String) -> Result<CallOutcome, VmError> {
+    tokio::task::yield_now().await;
+    let exists = if edge_io_readable_path(&path)
+        || edge_io_target_from_string(&path).is_some()
+        || path_targets_upstream_request(&path)
+    {
+        true
+    } else {
+        tokio::fs::metadata(path.as_str()).await.is_ok()
+    };
+    Ok(CallOutcome::Return(vec![Value::Bool(exists)]))
 }

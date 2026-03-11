@@ -1,85 +1,52 @@
 use axum::http::HeaderName;
-use edge_abi::symbols::http::upstream::response as abi;
+use edge_abi::symbols::http::upstream::response as http_upstream_response;
+use pd_edge_host_function::pd_edge_host_function;
 use vm::{CallOutcome, Value, Vm, VmError};
 
-use super::super::super::{
-    SharedProxyVmContext, SharedVmAsyncOps, bind_async_host_handler, expect_arg_count,
-    expect_string, headers_to_value_map,
-};
+use super::super::super::{current_vm_context, headers_to_value_map};
 
-macro_rules! bind_upstream_response_handler {
-    ($vm:expr, $async_ops:expr, $symbol:expr, $context:expr, |$vm_arg:ident, $args_arg:ident, $context_arg:ident| $body:block) => {{
-        let context = $context.clone();
-        bind_async_host_handler(
-            $vm,
-            $async_ops,
-            ($symbol).name,
-            move |$vm_arg, $args_arg| {
-                let mut $context_arg = context.lock().expect("vm context lock poisoned");
-                $body
-            },
-        );
-    }};
+#[pd_edge_host_function(name = http_upstream_response::GET_STATUS.name, scope = http)]
+async fn get_upstream_response_status(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
+    let context = current_vm_context()?;
+    let mut context = context.lock().expect("vm context lock poisoned");
+    context.touch_upstream_response();
+    let status = context.upstream_response_status.unwrap_or(0);
+    Ok(CallOutcome::Return(vec![Value::Int(status as i64)]))
 }
 
-pub(super) fn register(vm: &mut Vm, context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) {
-    bind_upstream_response_handler!(
-        vm,
-        &async_ops,
-        abi::GET_STATUS,
-        context,
-        |_vm, args, context| {
-            expect_arg_count(args, 0)?;
-            context.touch_upstream_response();
-            let status = context.upstream_response_status.unwrap_or(0);
-            Ok(CallOutcome::Return(vec![Value::Int(status as i64)]))
-        }
-    );
-    bind_upstream_response_handler!(
-        vm,
-        &async_ops,
-        abi::GET_HEADER,
-        context,
-        |_vm, args, context| {
-            expect_arg_count(args, 1)?;
-            let name = expect_string(args, 0)?;
-            let header_name = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
-            context.touch_upstream_response();
-            let value = context
-                .upstream_response_headers
-                .get(&header_name)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("");
-            Ok(CallOutcome::Return(vec![Value::string(value)]))
-        }
-    );
-    bind_upstream_response_handler!(
-        vm,
-        &async_ops,
-        abi::GET_HEADERS,
-        context,
-        |_vm, args, context| {
-            expect_arg_count(args, 0)?;
-            context.touch_upstream_response();
-            Ok(CallOutcome::Return(vec![headers_to_value_map(
-                &context.upstream_response_headers,
-            )]))
-        }
-    );
-    bind_upstream_response_handler!(
-        vm,
-        &async_ops,
-        abi::GET_BODY,
-        context,
-        |_vm, args, context| {
-            expect_arg_count(args, 0)?;
-            context.touch_upstream_response();
-            let value = context
-                .upstream_response_content
-                .clone()
-                .unwrap_or_default();
-            Ok(CallOutcome::Return(vec![Value::string(value)]))
-        }
-    );
+#[pd_edge_host_function(name = http_upstream_response::GET_HEADER.name, scope = http)]
+async fn get_upstream_response_header(_vm: &mut Vm, name: String) -> Result<CallOutcome, VmError> {
+    let header_name = HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
+    let context = current_vm_context()?;
+    let mut context = context.lock().expect("vm context lock poisoned");
+    context.touch_upstream_response();
+    let value = context
+        .upstream_response_headers
+        .get(&header_name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    Ok(CallOutcome::Return(vec![Value::string(value)]))
+}
+
+#[pd_edge_host_function(name = http_upstream_response::GET_HEADERS.name, scope = http)]
+async fn get_upstream_response_headers(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
+    let context = current_vm_context()?;
+    let mut context = context.lock().expect("vm context lock poisoned");
+    context.touch_upstream_response();
+    Ok(CallOutcome::Return(vec![headers_to_value_map(
+        &context.upstream_response_headers,
+    )]))
+}
+
+#[pd_edge_host_function(name = http_upstream_response::GET_BODY.name, scope = http)]
+async fn get_upstream_response_body(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
+    let context = current_vm_context()?;
+    let mut context = context.lock().expect("vm context lock poisoned");
+    context.touch_upstream_response();
+    let value = context
+        .upstream_response_content
+        .clone()
+        .unwrap_or_default();
+    Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
