@@ -125,6 +125,21 @@ fn javascript_runtime_cases_work() {
             expected_locals: Some(1),
         },
         RuntimeCase {
+            name: "plus equal and increment operators are supported for numbers",
+            source: r#"
+                let total = 0;
+                for (let i = 0; i < 3; i++) {
+                    total += i;
+                }
+                let before = total++;
+                let after = ++total;
+                before + after + total;
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_stack: vec![Value::Int(13)],
+            expected_locals: None,
+        },
+        RuntimeCase {
             name: "float literal binding is supported",
             source: r#"
                 let a=1.1;
@@ -290,6 +305,33 @@ fn javascript_parse_rejection_cases_work() {
     for case in &cases {
         expect_parse_error_case(case);
     }
+}
+
+#[test]
+fn javascript_numeric_update_operators_reject_non_numeric_values() {
+    let cases = vec![
+        SourceErrorCase {
+            name: "plus equal rejects strings",
+            source: r#"
+                let value = "a";
+                value += "b";
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::BinaryOperandTypeMismatch),
+            expected_contains_all: &["'+=' assignment requires a numeric local"],
+        },
+        SourceErrorCase {
+            name: "increment rejects strings",
+            source: r#"
+                let value = "a";
+                value++;
+            "#,
+            flavor: SourceFlavor::JavaScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::BinaryOperandTypeMismatch),
+            expected_contains_all: &["'++' increment requires a numeric local"],
+        },
+    ];
+    run_source_error_cases(&cases);
 }
 
 #[test]

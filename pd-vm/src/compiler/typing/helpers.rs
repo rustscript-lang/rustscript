@@ -4,7 +4,7 @@ use crate::builtins::{BuiltinFunction, CallableParam, CallableParamType};
 
 use super::super::CompileError;
 use super::super::ir::{
-    Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, Stmt, TypeSchema,
+    AssignmentKind, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, Stmt, TypeSchema,
 };
 use super::collect::{
     observed_function_param_schema_slice, observed_function_param_slice,
@@ -292,7 +292,12 @@ pub(super) fn validate_stmts(
                     context,
                 );
             }
-            Stmt::Assign { index, expr, line } => {
+            Stmt::Assign {
+                kind,
+                index,
+                expr,
+                line,
+            } => {
                 let expr_state = state.clone();
                 let ty = validate_expr(
                     expr,
@@ -301,6 +306,16 @@ pub(super) fn validate_stmts(
                     source_name,
                     context,
                     strict_function_add_types,
+                )?;
+                validate_numeric_assignment_operands(
+                    kind,
+                    *index,
+                    expr,
+                    &expr_state,
+                    ty,
+                    Some(*line),
+                    source_name,
+                    context,
                 )?;
                 let declared_schema = state
                     .has_declared_schema(*index)
@@ -473,6 +488,54 @@ fn validate_declared_local_schema(
             bound_type_label(actual)
         ),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_numeric_assignment_operands(
+    kind: &AssignmentKind,
+    index: LocalSlot,
+    expr: &Expr,
+    expr_state: &LocalTypeState,
+    expr_ty: BoundType,
+    line: Option<u32>,
+    source_name: Option<&str>,
+    context: &mut TypeContext<'_>,
+) -> Result<(), CompileError> {
+    if !kind.requires_numeric_operands() {
+        return Ok(());
+    }
+
+    let target_ty = expr_state.get(index);
+    if !is_numeric_bound_type(target_ty) {
+        return Err(CompileError::BinaryOperandTypeMismatch {
+            line,
+            source_name: owned_source_name(source_name),
+            detail: format!(
+                "{} requires a numeric local, found {}",
+                kind.diagnostic_label(),
+                bound_type_label(target_ty)
+            ),
+        });
+    }
+
+    let rhs_ty = match expr {
+        Expr::Add(_, rhs) => context.infer_expr_type(rhs, expr_state),
+        _ => expr_ty,
+    };
+    if !is_numeric_bound_type(rhs_ty) || !is_numeric_bound_type(expr_ty) {
+        return Err(CompileError::BinaryOperandTypeMismatch {
+            line,
+            source_name: owned_source_name(source_name),
+            detail: format!(
+                "{} requires numeric operands, found {} and {}",
+                kind.diagnostic_label(),
+                bound_type_label(target_ty),
+                bound_type_label(rhs_ty)
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 fn inferred_expr_assignment_schema(

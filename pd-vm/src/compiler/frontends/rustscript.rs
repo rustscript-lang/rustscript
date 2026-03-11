@@ -12,6 +12,10 @@ impl ParserDialect for RustScriptDialect {
     fn allow_macro_calls(&self) -> bool {
         true
     }
+
+    fn allow_plus_equal_operator(&self) -> bool {
+        true
+    }
 }
 
 static RUSTSCRIPT_DIALECT: RustScriptDialect = RustScriptDialect;

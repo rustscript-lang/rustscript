@@ -32,6 +32,8 @@ pub(super) enum TokenKind {
     Bang,
     BangEqual,
     Plus,
+    PlusPlus,
+    PlusEqual,
     Minus,
     Star,
     Slash,
@@ -162,7 +164,15 @@ impl<'a> Lexer<'a> {
         let token = match ch {
             '+' => {
                 self.advance();
-                TokenKind::Plus
+                if self.current == Some('+') && self.dialect.allow_increment_operator() {
+                    self.advance();
+                    TokenKind::PlusPlus
+                } else if self.current == Some('=') && self.dialect.allow_plus_equal_operator() {
+                    self.advance();
+                    TokenKind::PlusEqual
+                } else {
+                    TokenKind::Plus
+                }
             }
             '!' => {
                 self.advance();

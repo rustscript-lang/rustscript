@@ -343,7 +343,12 @@ impl AvailabilityAnalyzer {
                     out,
                 ))
             }
-            Stmt::Assign { index, expr, line } => {
+            Stmt::Assign {
+                kind,
+                index,
+                expr,
+                line,
+            } => {
                 self.require_assignable(*index, &state, *line)?;
                 let mut out = self.analyze_expr(expr, &state, *line)?;
                 let mut rewritten_expr = expr.clone();
@@ -362,6 +367,7 @@ impl AvailabilityAnalyzer {
                 }
                 Ok((
                     Stmt::Assign {
+                        kind: kind.clone(),
                         index: *index,
                         expr: rewritten_expr,
                         line: *line,

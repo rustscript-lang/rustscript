@@ -141,6 +141,17 @@ impl Parser {
             let inner = self.parse_unary()?;
             return self.build_builtin_call_expr(BuiltinFunction::TypeOf, vec![inner]);
         }
+        if self.dialect.allow_increment_operator() && self.match_kind(&TokenKind::PlusPlus) {
+            let name = self.expect_ident("expected identifier after '++'")?;
+            let index = self.get_local(&name)?;
+            self.require_local_mutable_for_operation(
+                index,
+                Some(name.as_str()),
+                self.current_line_u32(),
+                "increment",
+            )?;
+            return self.build_increment_expr(index, true);
+        }
         if self.match_kind(&TokenKind::Minus) {
             if let Some(text) = self.match_int_min_magnitude() {
                 let _ = text;
@@ -850,9 +861,71 @@ impl Parser {
                 expr = self.build_optional_member_get_expr(expr, member)?;
                 continue;
             }
+            if self.dialect.allow_increment_operator() && self.match_kind(&TokenKind::PlusPlus) {
+                expr = self.build_postfix_increment_expr(expr)?;
+                break;
+            }
             break;
         }
         Ok(expr)
+    }
+
+    pub(super) fn build_numeric_addition_expr(&self, index: LocalSlot, rhs: Expr) -> Expr {
+        Expr::Add(Box::new(Expr::Var(index)), Box::new(rhs))
+    }
+
+    pub(super) fn build_increment_expr(
+        &mut self,
+        index: LocalSlot,
+        prefix: bool,
+    ) -> Result<Expr, ParseError> {
+        let line = self.current_line_u32();
+        let assign = Stmt::Assign {
+            kind: AssignmentKind::Increment,
+            index,
+            expr: self.build_numeric_addition_expr(index, Expr::Int(1)),
+            line,
+        };
+        if prefix {
+            return Ok(Expr::Block {
+                stmts: vec![assign],
+                expr: Box::new(Expr::Var(index)),
+            });
+        }
+
+        let previous_slot = self.allocate_hidden_local()?;
+        self.set_local_slot_mutable(previous_slot, false);
+        Ok(Expr::Block {
+            stmts: vec![
+                Stmt::Let {
+                    index: previous_slot,
+                    declared_schema: None,
+                    expr: Expr::Var(index),
+                    line,
+                },
+                assign,
+            ],
+            expr: Box::new(Expr::Var(previous_slot)),
+        })
+    }
+
+    pub(super) fn build_postfix_increment_expr(&mut self, expr: Expr) -> Result<Expr, ParseError> {
+        let Expr::Var(index) = expr else {
+            return Err(ParseError {
+                span: Some(self.current_span()),
+                code: None,
+                line: self.current_line(),
+                message: "increment target must be a local identifier".to_string(),
+            });
+        };
+        let name = self.find_local_name_by_slot(index);
+        self.require_local_mutable_for_operation(
+            index,
+            name.as_deref(),
+            self.current_line_u32(),
+            "increment",
+        )?;
+        self.build_increment_expr(index, false)
     }
 
     pub(super) fn build_slice_access_expr(
@@ -1506,7 +1579,12 @@ impl Parser {
         self.require_local_mutable_for_operation(index, Some(name.as_str()), line, "mutate")?;
         let expr =
             self.build_builtin_call_expr(BuiltinFunction::Set, vec![Expr::Var(index), key, value])?;
-        Ok(Stmt::Assign { index, expr, line })
+        Ok(Stmt::Assign {
+            kind: AssignmentKind::Set,
+            index,
+            expr,
+            line,
+        })
     }
 
     pub(super) fn check_index_assignment_start(&self) -> bool {

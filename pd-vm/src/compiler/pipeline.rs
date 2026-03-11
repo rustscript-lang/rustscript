@@ -102,7 +102,9 @@ fn record_stmt_local_debug_ranges(stmt: &Stmt, ranges: &mut HashMap<LocalSlot, L
             note_local_decl(ranges, *index, *line);
             record_expr_local_debug_ranges(expr, *line, ranges);
         }
-        Stmt::Assign { index, expr, line } => {
+        Stmt::Assign {
+            index, expr, line, ..
+        } => {
             note_local_use(ranges, *index, *line);
             record_expr_local_debug_ranges(expr, *line, ranges);
         }

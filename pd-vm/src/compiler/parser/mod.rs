@@ -22,8 +22,8 @@ use self::symbols::is_virtual_host_namespace_spec;
 use super::{
     ParseError, ReplLocalBinding, STDLIB_PRINT_ARITY, STDLIB_PRINT_NAME,
     ir::{
-        ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, MatchTypePattern,
-        Stmt, TypeSchema,
+        AssignmentKind, ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern,
+        MatchTypePattern, Stmt, TypeSchema,
     },
 };
 
@@ -77,6 +77,14 @@ pub(super) trait ParserDialect {
     }
 
     fn allow_macro_calls(&self) -> bool {
+        false
+    }
+
+    fn allow_plus_equal_operator(&self) -> bool {
+        false
+    }
+
+    fn allow_increment_operator(&self) -> bool {
         false
     }
 }

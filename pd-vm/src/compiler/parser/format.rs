@@ -92,6 +92,8 @@ enum PrevKind {
     FatArrow,
     ReturnArrow,
     Plus,
+    PlusPlus,
+    PlusEqual,
     Minus,
     Star,
     Slash,
@@ -354,7 +356,9 @@ impl<'a> SourceFormatter<'a> {
                     self.push_brace_expectation(BraceKind::Block);
                 }
             }
+            TokenKind::PlusPlus => self.emit_increment_operator(),
             TokenKind::Plus => self.emit_binary_operator("+", PrevKind::Plus),
+            TokenKind::PlusEqual => self.emit_binary_operator("+=", PrevKind::PlusEqual),
             TokenKind::Star => {
                 if self.prev_kind == Some(PrevKind::PathSeparator)
                     || self.prev_kind == Some(PrevKind::LBrace)
@@ -532,6 +536,19 @@ impl<'a> SourceFormatter<'a> {
         self.write_raw(text);
         self.prev_kind = Some(kind);
         self.request_space();
+        self.at_stmt_start = false;
+    }
+
+    fn emit_increment_operator(&mut self) {
+        let postfix = matches!(
+            self.prev_kind,
+            Some(PrevKind::Word | PrevKind::RParen | PrevKind::RBracket | PrevKind::RBrace)
+        );
+        if postfix {
+            self.clear_pending_space();
+        }
+        self.write_raw("++");
+        self.prev_kind = Some(PrevKind::PlusPlus);
         self.at_stmt_start = false;
     }
 
@@ -737,6 +754,7 @@ impl<'a> SourceFormatter<'a> {
                 | Some(TokenKind::GreaterEqual)
                 | Some(TokenKind::AmpersandAmpersand)
                 | Some(TokenKind::PipePipe)
+                | Some(TokenKind::PlusEqual)
         )
     }
 
@@ -816,6 +834,7 @@ impl<'a> SourceFormatter<'a> {
         matches!(
             kind,
             TokenKind::Plus
+                | TokenKind::PlusEqual
                 | TokenKind::Minus
                 | TokenKind::Star
                 | TokenKind::Slash
@@ -1012,5 +1031,21 @@ mod tests {
         .expect("formatting should succeed");
 
         assert_eq!(formatted, "fn mix(seed) {\n    v + seed\n}\n");
+    }
+
+    #[test]
+    fn formats_javascript_numeric_update_operators() {
+        let input = "let total=0;\ntotal+=1;\nlet before=total++;\nlet after=++total;\n";
+        let formatted = format_source(
+            input,
+            frontends::parser_dialect_for_flavor(SourceFlavor::JavaScript)
+                .expect("javascript formatter dialect should exist"),
+        )
+        .expect("formatting should succeed");
+
+        assert_eq!(
+            formatted,
+            "let total = 0;\ntotal += 1;\nlet before = total++;\nlet after = ++total;\n"
+        );
     }
 }
