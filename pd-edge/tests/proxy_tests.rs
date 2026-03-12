@@ -1,3 +1,5 @@
+#![cfg(feature = "http")]
+
 #[path = "proxy_tests/control_plane.rs"]
 mod control_plane;
 #[path = "proxy_tests/debug.rs"]
@@ -8,9 +10,11 @@ mod http;
 mod io;
 #[path = "proxy_tests/support.rs"]
 mod support;
+#[cfg(feature = "tls")]
 #[path = "proxy_tests/tls.rs"]
 mod tls;
 #[path = "proxy_tests/transport.rs"]
 mod transport;
+#[cfg(feature = "websocket")]
 #[path = "proxy_tests/websocket.rs"]
 mod websocket;

@@ -7,6 +7,13 @@ build = "build.rs"
 [lib]
 name = "edge_abi"
 
+[features]
+default = ["http", "tls", "websocket"]
+http = []
+tls = []
+websocket = ["http"]
+webrtc = ["http"]
+
 [dependencies]
 pd-host-function = { path = "../pd-vm/pd-host-function" }
 
