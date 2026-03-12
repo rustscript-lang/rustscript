@@ -12,7 +12,7 @@ struct LogEntry {
 
 fn parse_log_line(line) {
     let cleaned: string = string::trim(line);
-    let groups: [string] = re::captures(
+    let groups = re::captures(
         "^\\[(INFO|WARN|ERROR)\\]\\s+(feed/[a-z]+)\\s+-\\s+([0-9]+)ms\\s+-\\s+(.+)$",
         cleaned
     );
@@ -33,10 +33,10 @@ assert(string::non_empty(normalized_log));
 assert(re::match("(?m)^\\[INFO\\]", normalized_log));
 assert(re::find("feed/[a-z]+", normalized_log) == "feed/world");
 
-let lines: [string] = re::split("\\n+", normalized_log);
-let first_entry: LogEntry = parse_log_line(lines[0]);
-let warn_entry: LogEntry = parse_log_line(lines[1]);
-let error_entry: LogEntry = parse_log_line(lines[2]);
+let lines = re::split("\\n+", normalized_log);
+let first_entry = parse_log_line(lines[0]);
+let warn_entry = parse_log_line(lines[1]);
+let error_entry = parse_log_line(lines[2]);
 
 let first_level: string = first_entry.level;
 let first_route: string = first_entry.route;
@@ -55,17 +55,17 @@ assert(string::contains(warn_message.copy(), "cache"));
 assert(re::match("(?i).*payload.*", error_message.copy()));
 
 let rewritten_warn: string = string::replace(warn_message, "cache", "edge-cache");
-let rewritten_route: string = re::replace("^feed/", warn_route, "rss::");
-let error_words: [string] = re::split("\\s+", error_message.copy());
+let rewritten_route = re::replace("^feed/", warn_route, "rss::");
+let error_words = re::split("\\s+", error_message.copy());
 let error_word_count = error_words.length;
-let id_groups: [string] = re::captures("id=([0-9]+)", error_message);
+let id_groups = re::captures("id=([0-9]+)", error_message);
 let error_id: string = if id_groups.length == 2 => {
     id_groups[1]
 } else => {
     "none"
 };
-let levels: [string] = [first_level, warn_level, error_level];
-let slow_routes: [string] = [rewritten_route, string::replace(error_route, "/", "::")];
+let levels = [first_level, warn_level, error_level];
+let slow_routes = [rewritten_route, string::replace(error_route, "/", "::")];
 
 let summary = {
     levels: levels,

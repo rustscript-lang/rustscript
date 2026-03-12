@@ -1,9 +1,9 @@
-use stdlib::rss::math as math_std;
+use math;
 
 use json;
 
 fn nearly_equal(lhs, rhs) {
-    math_std::abs(lhs - rhs) < 0.000001
+    math::abs(lhs - rhs) < 0.000001
 }
 
 fn nearly_zero(value) {
@@ -30,41 +30,41 @@ let im1 = spectrum_im[1];
 let im2 = spectrum_im[2];
 let im3 = spectrum_im[3];
 
-let quarter_turn: float = math_std::pi() / 2.0;
-let half_turn: float = math_std::pi();
-let three_quarter_turn: float = quarter_turn * 3.0;
+let quarter_turn = math::pi() / 2.0;
+let half_turn = math::pi();
+let three_quarter_turn = quarter_turn * 3.0;
 
-let sample0: float = clean((re0 + re1 + re2 + re3) / 4.0);
-let sample1: float = clean(
+let sample0 = clean((re0 + re1 + re2 + re3) / 4.0);
+let sample1 = clean(
     (
-        re0 +(re1 * math_std::cos(quarter_turn) - im1 * math_std::sin(quarter_turn)) +(re2 * math_std::cos(half_turn) - im2 * math_std::sin(half_turn)) +(re3 * math_std::cos(three_quarter_turn) - im3 * math_std::sin(three_quarter_turn))
+        re0 +(re1 * math::cos(quarter_turn) - im1 * math::sin(quarter_turn)) +(re2 * math::cos(half_turn) - im2 * math::sin(half_turn)) +(re3 * math::cos(three_quarter_turn) - im3 * math::sin(three_quarter_turn))
     ) / 4.0
 );
-let sample2: float = clean(
+let sample2 = clean(
     (
-        re0 +(re1 * math_std::cos(half_turn) - im1 * math_std::sin(half_turn)) + re2 +(re3 * math_std::cos(half_turn) - im3 * math_std::sin(half_turn))
+        re0 +(re1 * math::cos(half_turn) - im1 * math::sin(half_turn)) + re2 +(re3 * math::cos(half_turn) - im3 * math::sin(half_turn))
     ) / 4.0
 );
-let sample3: float = clean(
+let sample3 = clean(
     (
-        re0 +(re1 * math_std::cos(three_quarter_turn) - im1 * math_std::sin(three_quarter_turn)) +(re2 * math_std::cos(half_turn) - im2 * math_std::sin(half_turn)) +(re3 * math_std::cos(quarter_turn) - im3 * math_std::sin(quarter_turn))
+        re0 +(re1 * math::cos(three_quarter_turn) - im1 * math::sin(three_quarter_turn)) +(re2 * math::cos(half_turn) - im2 * math::sin(half_turn)) +(re3 * math::cos(quarter_turn) - im3 * math::sin(quarter_turn))
     ) / 4.0
 );
 
-let imag0: float = clean((im0 + im1 + im2 + im3) / 4.0);
-let imag1: float = clean(
+let imag0 = clean((im0 + im1 + im2 + im3) / 4.0);
+let imag1 = clean(
     (
-        im0 +(re1 * math_std::sin(quarter_turn) + im1 * math_std::cos(quarter_turn)) +(re2 * math_std::sin(half_turn) + im2 * math_std::cos(half_turn)) +(re3 * math_std::sin(three_quarter_turn) + im3 * math_std::cos(three_quarter_turn))
+        im0 +(re1 * math::sin(quarter_turn) + im1 * math::cos(quarter_turn)) +(re2 * math::sin(half_turn) + im2 * math::cos(half_turn)) +(re3 * math::sin(three_quarter_turn) + im3 * math::cos(three_quarter_turn))
     ) / 4.0
 );
-let imag2: float = clean(
+let imag2 = clean(
     (
-        im0 +(re1 * math_std::sin(half_turn) + im1 * math_std::cos(half_turn)) + im2 +(re3 * math_std::sin(half_turn) + im3 * math_std::cos(half_turn))
+        im0 +(re1 * math::sin(half_turn) + im1 * math::cos(half_turn)) + im2 +(re3 * math::sin(half_turn) + im3 * math::cos(half_turn))
     ) / 4.0
 );
-let imag3: float = clean(
+let imag3 = clean(
     (
-        im0 +(re1 * math_std::sin(three_quarter_turn) + im1 * math_std::cos(three_quarter_turn)) +(re2 * math_std::sin(half_turn) + im2 * math_std::cos(half_turn)) +(re3 * math_std::sin(quarter_turn) + im3 * math_std::cos(quarter_turn))
+        im0 +(re1 * math::sin(three_quarter_turn) + im1 * math::cos(three_quarter_turn)) +(re2 * math::sin(half_turn) + im2 * math::cos(half_turn)) +(re3 * math::sin(quarter_turn) + im3 * math::cos(quarter_turn))
     ) / 4.0
 );
 
@@ -80,10 +80,10 @@ assert(nearly_zero(imag3));
 
 let summary = {
     samples: [
-        math_std::round(sample0),
-        math_std::round(sample1),
-        math_std::round(sample2),
-        math_std::round(sample3)
+        math::round(sample0),
+        math::round(sample1),
+        math::round(sample2),
+        math::round(sample3)
     ],
     imag_zero: [
         nearly_zero(imag0),

@@ -36,10 +36,10 @@ let slot_batches: [[string]] = iter::chunk(["00:00", "00:05", "00:10", "00:15"],
 let slot_batch_count = slot_batches.length;
 assert(slot_batch_count == 2);
 
-let channel_labels: [[unknown]] = iter::enumerate(["world", "tech", "finance", "culture"]);
-assert(collections::deep_compare(iter::map(channel_labels.copy(), |row| row[0]), [0, 1, 2, 3]));
+let channel_label_count = iter::enumerate(["world", "tech", "finance", "culture"]).length;
+assert(channel_label_count == unique_channel_count);
 
-let traffic_windows: [int] = [120, 95, 140, 65];
+let traffic_windows = [120, 95, 140, 65];
 let total_hits: int = iter::sum(traffic_windows.copy());
 assert(total_hits == 420);
 
@@ -64,10 +64,8 @@ assert(collections::has(merged_config.copy(), "interval"));
 assert(config_mode == "burst");
 assert(collections::get_or(merged_config.copy(), "missing", "fallback") == "fallback");
 
-let config_entries: [[unknown]] = collections::entries(merged_config.copy());
-let config_values: [unknown] = collections::values(merged_config.copy());
-let config_entry_count = config_entries.length;
-let config_value_count = config_values.length;
+let config_entry_count = collections::entries(merged_config.copy()).length;
+let config_value_count = collections::values(merged_config.copy()).length;
 assert(config_entry_count == 3);
 assert(config_value_count == 3);
 

@@ -1,7 +1,7 @@
-use super::stdlib::rss::math as math_std;
+use math;
 
 fn nearly_equal(lhs, rhs) {
-    math_std::abs(lhs - rhs) < 0.000001
+    math::abs(lhs - rhs) < 0.000001
 }
 
 fn nearly_zero(value) {
@@ -70,9 +70,9 @@ fn ifft(freq_re, freq_im) {
         let mut half = size / 2;
         let mut j = 0;
         while j < half {
-            let angle = 2.0 * math_std::pi() * j / size;
-            let wr = math_std::cos(angle);
-            let wi = math_std::sin(angle);
+            let angle = 2.0 * math::pi() * j / size;
+            let wr = math::cos(angle);
+            let wi = math::sin(angle);
             let mut k = j;
             while k < n {
                 let pair = k + half;
@@ -134,7 +134,7 @@ assert(nearly_zero(imag1));
 assert(nearly_zero(imag2));
 assert(nearly_zero(imag3));
 
-print(math_std::round(sample0));
-print(math_std::round(sample1));
-print(math_std::round(sample2));
-print(math_std::round(sample3));
+print(math::round(sample0));
+print(math::round(sample1));
+print(math::round(sample2));
+print(math::round(sample3));

@@ -411,6 +411,7 @@ async fn drive_tunnel(
     Ok("closed".to_string())
 }
 
+/// Returns the proxy byte stream handle for the current downstream flow.
 #[pd_edge_host_function(name = proxy_symbols::stream::DOWNSTREAM.name, scope = proxy)]
 async fn stream_downstream(
     _vm: &mut Vm,
@@ -420,6 +421,7 @@ async fn stream_downstream(
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 
+/// Returns the default upstream handle for the proxy byte stream.
 #[pd_edge_host_function(name = proxy_symbols::stream::DEFAULT_UPSTREAM.name, scope = proxy)]
 async fn stream_default_upstream(
     _vm: &mut Vm,
@@ -432,6 +434,7 @@ async fn stream_default_upstream(
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 
+/// Wraps an outbound HTTP exchange as a proxy byte stream.
 #[pd_edge_host_function(name = proxy_symbols::stream::EXCHANGE.name, scope = proxy)]
 async fn stream_exchange(
     _vm: &mut Vm,
@@ -448,6 +451,7 @@ async fn stream_exchange(
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 
+/// Wraps a TCP stream as a proxy byte stream.
 #[pd_edge_host_function(name = proxy_symbols::stream::FROM_TCP.name, scope = proxy)]
 async fn stream_from_tcp(
     _vm: &mut Vm,
@@ -459,6 +463,7 @@ async fn stream_from_tcp(
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 
+/// Wraps a TLS plaintext session as a proxy byte stream.
 #[pd_edge_host_function(name = proxy_symbols::stream::FROM_TLS_PLAINTEXT.name, scope = proxy)]
 async fn stream_from_tls_plaintext(
     _vm: &mut Vm,
@@ -470,6 +475,7 @@ async fn stream_from_tls_plaintext(
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 
+/// Wraps a WebSocket connection as a proxy byte stream.
 #[pd_edge_host_function(name = proxy_symbols::stream::FROM_WEBSOCKET_BINARY.name, scope = proxy)]
 async fn stream_from_websocket_binary(
     _vm: &mut Vm,
@@ -481,6 +487,7 @@ async fn stream_from_websocket_binary(
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 
+/// Pipes bytes from one proxy byte stream into another.
 #[pd_edge_host_function(name = proxy_symbols::PIPE.name, scope = proxy)]
 async fn proxy_pipe(
     _vm: &mut Vm,
@@ -494,6 +501,7 @@ async fn proxy_pipe(
     Ok(CallOutcome::Return(vec![Value::string(status)]))
 }
 
+/// Bidirectionally tunnels bytes between two proxy byte streams.
 #[pd_edge_host_function(name = proxy_symbols::TUNNEL.name, scope = proxy)]
 async fn proxy_tunnel(
     _vm: &mut Vm,
