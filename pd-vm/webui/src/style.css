@@ -186,19 +186,40 @@ body {
   gap: 0.4rem;
 }
 
+.sample-control {
+  display: inline-flex;
+  flex: 0 1 24rem;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+  max-width: min(100%, 24rem);
+}
+
+.sample-control label {
+  white-space: nowrap;
+}
+
+.toolbar .sample-control select {
+  min-width: 0;
+  width: 100%;
+}
+
 .toolbar-right {
   margin-left: auto;
   display: inline-flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: flex-end;
   gap: 0.55rem;
+  min-width: 0;
+  flex-shrink: 0;
 }
 
 .theme-control {
   --theme-segment-width: 2.2rem;
   position: relative;
   display: inline-grid;
+  flex: 0 0 auto;
   grid-template-columns: repeat(3, var(--theme-segment-width));
   align-items: center;
   gap: 0;
@@ -984,6 +1005,7 @@ body {
 
   .toolbar-right {
     width: 100%;
+    flex-wrap: wrap;
     justify-content: space-between;
   }
 
@@ -997,6 +1019,11 @@ body {
   }
 
   .toolbar select {
+    min-width: 100%;
+  }
+
+  .sample-control {
+    width: 100%;
     min-width: 100%;
   }
 

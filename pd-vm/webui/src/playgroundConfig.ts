@@ -1,3 +1,9 @@
+import complexExampleSource from "./examples/rss-complex-example.rss?raw";
+import ifftExampleSource from "./examples/rss-ifft-example.rss?raw";
+import collectionsIterExampleSource from "./examples/rss-collections-iter-example.rss?raw";
+import lruCacheExampleSource from "./examples/rss-lrucache-example.rss?raw";
+import stringsRegexExampleSource from "./examples/rss-strings-regex-example.rss?raw";
+
 import type { SourceFlavor } from "./wasmRuntime";
 
 export const MARKER_OWNER = "pd-vm-playground-lint";
@@ -20,6 +26,22 @@ export const DEFAULT_FUEL_HINT =
 export type InterruptModeChoice = "none" | "fuel" | "epoch";
 export type ThemePreference = "light" | "dark" | "system";
 export type ResolvedTheme = "light" | "dark";
+export type RssProgramKey =
+  | "complex"
+  | "ifft"
+  | "lrucache"
+  | "collections_iter"
+  | "strings_regex";
+
+export interface RssProgramOption {
+  key: RssProgramKey;
+  label: string;
+  description: string;
+  source: string;
+}
+
+export const DEFAULT_RSS_PROGRAM_KEY: RssProgramKey = "complex";
+export const CUSTOM_RSS_PROGRAM_KEY = "__custom__";
 
 export const FLAVOR_OPTIONS: Array<{ value: SourceFlavor; label: string }> = [
   { value: "rustscript", label: "RustScript (.rss)" },
@@ -39,74 +61,57 @@ export const THEME_OPTIONS: Array<{
   { value: "dark", label: "Dark", icon: "theme_dark", title: "Dark mode" }
 ];
 
+export const RSS_PROGRAM_OPTIONS: RssProgramOption[] = [
+  {
+    key: "complex",
+    label: "Demo",
+    description: "Default playground demo with closures, structs, option matching, JSON, regex, and runtime host calls.",
+    source: complexExampleSource.trim()
+  },
+  {
+    key: "ifft",
+    label: "IFFT Example",
+    description: "A meaningful inverse FFT implementation using arrays, loops, math helpers, and validation.",
+    source: ifftExampleSource.trim()
+  },
+  {
+    key: "lrucache",
+    label: "LRU Cache Example",
+    description: "Builds a rolling feed cache with stdlib lrucache operations, recency updates, and structured output.",
+    source: lruCacheExampleSource.trim()
+  },
+  {
+    key: "collections_iter",
+    label: "Collections + Iter",
+    description: "Transforms channel metrics with collections and iter helpers into a dashboard snapshot.",
+    source: collectionsIterExampleSource.trim()
+  },
+  {
+    key: "strings_regex",
+    label: "Strings + Regex",
+    description: "Parses log lines with string helpers, regex captures, and string rewriting into a summary report.",
+    source: stringsRegexExampleSource.trim()
+  }
+];
+
+const DEFAULT_RSS_PROGRAM_SOURCE =
+  RSS_PROGRAM_OPTIONS.find((option) => option.key === DEFAULT_RSS_PROGRAM_KEY)?.source ??
+  complexExampleSource.trim();
+
 export const SAMPLE_SOURCES: Record<SourceFlavor, string> = {
-  rustscript: `
-use stdlib::rss::strings as string;
-
-use re;
-use json;
-use runtime;
-
-// Complex RustScript example with closure capture, stdlib module use, and host calls.
-struct Stats {
-    score: int
-}
-
-struct Profile {
-    stats: Stats
-}
-
-let mut total = 0;
-for (let mut i = 0; i < 4; i = i + 1) {
-    total = total + i;
-}
-
-runtime::sleep(100);
-
-let total = if !string::non_empty("rustscript") => {
-    let zeroed = 0;
-    zeroed
-} else => {
-    let bumped = total + 1;
-    bumped
-};
-
-let mut base = 7;
-let add = |value| value + base;
-base = 8;
-let mut closure_value = add(5);
-
-let profile: Profile = { stats: { score: closure_value } };
-let matched = match profile?.stats?.score {
-    None => 0,
-    Some(score) => if score == 12 => {
-        closure_value
-    } else => {
-        0
-    },
-    _ => 0,
-};
-
-let regex_ok = re::match("(?i)^rustscript$", "RUSTSCRIPT");
-let payload = {
-    lang: "rustscript",
-    score: closure_value,
-    matched: matched,
-};
-let payload_json = json::encode(payload);
-let payload_decoded = json::decode(payload_json);
-let json_score = payload_decoded.score;
-
-if regex_ok && json_score == matched {
-    print("closure_value is {:3}", closure_value);
-} else {
-    print(0);
-}
-`,
+  rustscript: DEFAULT_RSS_PROGRAM_SOURCE,
   javascript: ["let value = 21;", "console.log(value + 21);", "value + 21;"].join("\n"),
   lua: ["local value = 21", "print(value + 21)", "value + 21"].join("\n"),
   scheme: ["(define value 21)", "(print (+ value 21))", "(+ value 21)"].join("\n")
 };
+
+export function rssProgramByKey(key: string): RssProgramOption | null {
+  return RSS_PROGRAM_OPTIONS.find((option) => option.key === key) ?? null;
+}
+
+export function matchRssProgramSource(source: string): RssProgramOption | null {
+  return RSS_PROGRAM_OPTIONS.find((option) => option.source === source.trim()) ?? null;
+}
 
 export function languageForFlavor(flavor: SourceFlavor): string {
   if (flavor === "rustscript") {

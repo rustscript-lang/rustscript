@@ -13,6 +13,7 @@ import {
   BREAKPOINT_GLYPH_CLASS,
   CURRENT_LINE_CLASS,
   CURRENT_LINE_MARKER_CLASS,
+  CUSTOM_RSS_PROGRAM_KEY,
   DEFAULT_FUEL_HINT,
   EPOCH_FLUSH_INTERVAL_MS,
   EPOCH_TICK_INTERVAL_MS,
@@ -21,7 +22,7 @@ import {
   FLAVOR_STORAGE_KEY,
   MARKER_OWNER,
   RUN_POLL_INTERVAL_MS,
-  SAMPLE_SOURCES,
+  RSS_PROGRAM_OPTIONS,
   THEME_OPTIONS,
   THEME_STORAGE_KEY,
   applyDocumentTheme,
@@ -29,10 +30,13 @@ import {
   loadCurrentFlavor,
   loadSourceForFlavor,
   loadThemePreference,
+  matchRssProgramSource,
   resolveTheme,
+  rssProgramByKey,
   sourceStorageKey,
   updateViewportHeightCssVar,
   type InterruptModeChoice,
+  type RssProgramOption,
   type ResolvedTheme,
   type ThemePreference
 } from "./playgroundConfig";
@@ -441,6 +445,7 @@ if (!app) {
 
 const {
   flavorSelectEl,
+  rssProgramSelectEl,
   themeControlEl,
   themeSystemButtonEl,
   themeLightButtonEl,
@@ -458,7 +463,6 @@ const {
   lintStatusEl,
   sessionStatusEl,
   formatButtonEl,
-  loadSampleButtonEl,
   diagnosticsPanelEl,
   outputPanelEl,
   stackPanelEl,
@@ -492,6 +496,14 @@ for (const flavor of FLAVOR_OPTIONS) {
   option.value = flavor.value;
   option.textContent = flavor.label;
   flavorSelectEl.append(option);
+}
+
+for (const program of RSS_PROGRAM_OPTIONS) {
+  const option = document.createElement("option");
+  option.value = program.key;
+  option.textContent = program.label;
+  option.title = program.description;
+  rssProgramSelectEl.append(option);
 }
 
 ensureRustScriptLanguage(monaco);
@@ -608,6 +620,7 @@ const themeButtons: Record<ThemePreference, HTMLButtonElement> = {
   light: themeLightButtonEl,
   dark: themeDarkButtonEl
 };
+const CUSTOM_RSS_PROGRAM_LABEL = "Custom Draft";
 
 function setStatus(node: HTMLElement, text: string, className: StatusClass): void {
   node.classList.remove("neutral", "ok", "warn", "error", "busy");
@@ -1041,7 +1054,7 @@ function activeBreakpoints(): Set<number> {
   return lineBreakpointsByFlavor[currentFlavor];
 }
 
-function resetEditorToSampleSource(): void {
+function stopSessionsBestEffort(): void {
   if (runSessionActive) {
     void runCommandWithWasm({ kind: "stop" }).catch(() => {
       // best effort stop
@@ -1052,16 +1065,89 @@ function resetEditorToSampleSource(): void {
       // best effort stop
     });
   }
+}
 
-  activeModel().setValue(SAMPLE_SOURCES[currentFlavor]);
-  monaco.editor.setModelMarkers(activeModel(), MARKER_OWNER, []);
+function ensureCustomRssProgramOption(): HTMLOptionElement {
+  const existing = rssProgramSelectEl.querySelector<HTMLOptionElement>(
+    `option[value="${CUSTOM_RSS_PROGRAM_KEY}"]`
+  );
+  if (existing) {
+    return existing;
+  }
+
+  const option = document.createElement("option");
+  option.value = CUSTOM_RSS_PROGRAM_KEY;
+  option.textContent = CUSTOM_RSS_PROGRAM_LABEL;
+  rssProgramSelectEl.insertBefore(option, rssProgramSelectEl.firstChild);
+  return option;
+}
+
+function removeCustomRssProgramOption(): void {
+  const existing = rssProgramSelectEl.querySelector<HTMLOptionElement>(
+    `option[value="${CUSTOM_RSS_PROGRAM_KEY}"]`
+  );
+  existing?.remove();
+}
+
+function rssProgramTooltip(description: string): string {
+  if (currentFlavor === "rustscript") {
+    return description;
+  }
+  return `${description} Selecting a program switches the editor to RustScript.`;
+}
+
+function syncRssProgramSelect(source = models.rustscript.getValue()): void {
+  const matchedProgram = matchRssProgramSource(source);
+  if (matchedProgram) {
+    removeCustomRssProgramOption();
+    rssProgramSelectEl.value = matchedProgram.key;
+    rssProgramSelectEl.title = rssProgramTooltip(matchedProgram.description);
+    return;
+  }
+
+  const customOption = ensureCustomRssProgramOption();
+  const customDescription = "Current RustScript editor contents differ from the built-in RSS programs.";
+  customOption.title = customDescription;
+  rssProgramSelectEl.value = CUSTOM_RSS_PROGRAM_KEY;
+  rssProgramSelectEl.title = rssProgramTooltip(customDescription);
+}
+
+function activateFlavor(next: SourceFlavor, stopSessions = true): void {
+  if (!(next in models)) {
+    return;
+  }
+  if (stopSessions) {
+    stopSessionsBestEffort();
+  }
+  currentFlavor = next;
+  flavorSelectEl.value = currentFlavor;
+  persistCurrentFlavor(currentFlavor);
+  editor.setModel(models[currentFlavor]);
+  applyInactiveRunState();
+  applyInactiveDebugState("<no debugger output>");
+  applyDebugDecorations();
+  syncFormatButtonState();
+  scheduleLint();
+  syncRssProgramSelect();
+}
+
+function loadEditorSource(flavor: SourceFlavor, source: string): void {
+  activateFlavor(flavor);
+  const model = models[flavor];
+  model.setValue(source);
+  monaco.editor.setModelMarkers(model, MARKER_OWNER, []);
   renderDiagnosticsList(diagnosticsPanelEl, []);
   setRunPanel(outputPanelEl, stackPanelEl, [], []);
   applyInactiveRunState();
   applyInactiveDebugState("<no debugger output>");
   setStatus(lintStatusEl, "lint: queued...", "busy");
   scheduleLint();
+  syncRssProgramSelect(flavor === "rustscript" ? source : models.rustscript.getValue());
   editor.focus();
+}
+
+function loadRssProgram(program: RssProgramOption): void {
+  loadEditorSource("rustscript", program.source);
 }
 
 function clearHoverInspect(): void {
@@ -1594,6 +1680,9 @@ editor.onMouseDown((event) => {
 for (const [flavor, model] of Object.entries(models) as Array<[SourceFlavor, monaco.editor.ITextModel]>) {
   model.onDidChangeContent(() => {
     scheduleSourcePersist(flavor);
+    if (flavor === "rustscript") {
+      syncRssProgramSelect(model.getValue());
+    }
     if (editor.getModel() === model) {
       scheduleLint();
     }
@@ -1603,31 +1692,10 @@ for (const [flavor, model] of Object.entries(models) as Array<[SourceFlavor, mon
 flavorSelectEl.value = currentFlavor;
 persistCurrentFlavor(currentFlavor);
 syncThemeButtons(themePreference);
+syncRssProgramSelect();
 flavorSelectEl.addEventListener("change", () => {
   const next = flavorSelectEl.value as SourceFlavor;
-  if (!(next in models)) {
-    return;
-  }
-
-  if (runSessionActive) {
-    void runCommandWithWasm({ kind: "stop" }).catch(() => {
-      // best effort stop
-    });
-  }
-  if (debugSessionActive) {
-    void debugCommandWithWasm({ kind: "stop" }).catch(() => {
-      // best effort stop
-    });
-  }
-
-  currentFlavor = next;
-  persistCurrentFlavor(currentFlavor);
-  editor.setModel(models[currentFlavor]);
-  applyInactiveRunState();
-  applyInactiveDebugState("<no debugger output>");
-  applyDebugDecorations();
-  syncFormatButtonState();
-  scheduleLint();
+  activateFlavor(next);
 });
 
 async function formatCurrentDocument(): Promise<void> {
@@ -1654,8 +1722,13 @@ formatButtonEl.addEventListener("click", () => {
   void formatCurrentDocument();
 });
 
-loadSampleButtonEl.addEventListener("click", () => {
-  resetEditorToSampleSource();
+rssProgramSelectEl.addEventListener("change", () => {
+  const selectedProgram = rssProgramByKey(rssProgramSelectEl.value);
+  if (!selectedProgram) {
+    syncRssProgramSelect();
+    return;
+  }
+  loadRssProgram(selectedProgram);
 });
 
 window.addEventListener("pagehide", () => {

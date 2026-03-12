@@ -1004,14 +1004,85 @@ mod lint_tests {
 mod runtime_tests {
     use std::time::Duration;
 
-    use super::parse_flavor;
+    use super::{format_source_with_flavor, parse_flavor};
     use crate::analyzer::{LintSeverity, lint_source_with_flavor};
     use crate::completions::build_completion_catalog;
     use crate::runtime::{
         DebugCommand, FuelConfig, RunCommand, debug_state, run_command, run_debug_command,
         run_source_with_flavor, start_debug_source_with_flavor, start_run_source_with_flavor,
     };
-    use vm::SourceFlavor;
+    use crate::stdlib::embedded_stdlib_compile_options;
+    use vm::{
+        CallOutcome, FunctionDecl, HostFunction, SourceFlavor, Value, Vm, VmStatus,
+        compile_source_with_flavor_and_options,
+    };
+
+    fn rss_playground_examples() -> [(&'static str, &'static str); 5] {
+        [
+            (
+                "Demo",
+                include_str!("../../webui/src/examples/rss-complex-example.rss"),
+            ),
+            (
+                "IFFT Example",
+                include_str!("../../webui/src/examples/rss-ifft-example.rss"),
+            ),
+            (
+                "LRU Cache Example",
+                include_str!("../../webui/src/examples/rss-lrucache-example.rss"),
+            ),
+            (
+                "Collections and Iter Example",
+                include_str!("../../webui/src/examples/rss-collections-iter-example.rss"),
+            ),
+            (
+                "Strings and Regex Example",
+                include_str!("../../webui/src/examples/rss-strings-regex-example.rss"),
+            ),
+        ]
+    }
+
+    struct TestPrintFunction;
+
+    impl HostFunction for TestPrintFunction {
+        fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            Ok(CallOutcome::Return(args.to_vec()))
+        }
+    }
+
+    fn register_fixture_functions(vm: &mut Vm, functions: &[FunctionDecl]) {
+        for decl in functions {
+            match decl.name.as_str() {
+                "print" => vm.bind_function("print", Box::new(TestPrintFunction)),
+                "runtime::sleep" => {}
+                other => panic!("unknown fixture host function '{other}'"),
+            }
+        }
+    }
+
+    fn run_rss_fixture_without_jit(source: &str) -> Vec<Value> {
+        let compiled = compile_source_with_flavor_and_options(
+            source,
+            SourceFlavor::RustScript,
+            embedded_stdlib_compile_options(),
+        )
+        .expect("playground example should compile for runtime verification");
+        let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+        let mut jit_config = vm.jit_config().clone();
+        jit_config.enabled = false;
+        vm.set_jit_config(jit_config);
+        register_fixture_functions(&mut vm, &compiled.functions);
+
+        loop {
+            match vm.run().expect("fixture VM should run") {
+                VmStatus::Halted => return vm.stack().to_vec(),
+                VmStatus::Yielded => continue,
+                VmStatus::Waiting(_op_id) => vm
+                    .wait_for_host_op_blocking()
+                    .expect("fixture VM should complete host operation"),
+            }
+        }
+    }
 
     #[test]
     fn parse_flavor_accepts_aliases() {
@@ -1043,6 +1114,36 @@ mod runtime_tests {
                 "lint should succeed for {flavor:?}, got diagnostics: {:?}",
                 report.diagnostics
             );
+        }
+    }
+
+    #[test]
+    fn playground_rss_examples_are_formatted_lint_clean_and_runnable() {
+        let options = embedded_stdlib_compile_options();
+
+        for (name, source) in rss_playground_examples() {
+            let formatted = format_source_with_flavor(source, SourceFlavor::RustScript)
+                .expect("playground example should format");
+            assert_eq!(
+                formatted, source,
+                "playground example '{name}' is not formatted"
+            );
+
+            compile_source_with_flavor_and_options(
+                source,
+                SourceFlavor::RustScript,
+                options.clone(),
+            )
+            .unwrap_or_else(|err| panic!("playground example '{name}' should compile: {err}"));
+
+            let lint = lint_source_with_flavor(source, SourceFlavor::RustScript);
+            assert!(
+                lint.diagnostics.is_empty(),
+                "playground example '{name}' should be lint clean, got {:?}",
+                lint.diagnostics
+            );
+
+            let _stack = run_rss_fixture_without_jit(source);
         }
     }
 
