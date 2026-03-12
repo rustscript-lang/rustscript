@@ -26,6 +26,7 @@ mod websocket;
 
 pub use self::http::{HttpRequestContext, ProxyVmContext, SharedProxyVmContext};
 #[cfg(test)]
+#[cfg(feature = "http2")]
 pub(crate) use self::http2::Http2SessionFrontier;
 pub(crate) use self::http2::{
     DownstreamHttp2ConnectionTracker, Http2DownstreamStreamAttachment,
@@ -684,10 +685,10 @@ mod tests {
     }
 
     fn test_context() -> SharedProxyVmContext {
-        Arc::new(Mutex::new(ProxyVmContext::from_request_headers(
+        Arc::new(ProxyVmContext::from_request_headers(
             HeaderMap::new(),
             Arc::new(Mutex::new(RateLimiterStore::new())),
-        )))
+        ))
     }
 
     #[test]
@@ -808,7 +809,7 @@ mod tests {
             assert_eq!(status, VmStatus::Halted);
         }
 
-        let guard = context.lock().expect("vm context lock poisoned");
+        let guard = context.lock_downstream();
         assert_eq!(
             guard.response_output.body.as_deref(),
             Some("payload".as_bytes())

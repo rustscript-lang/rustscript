@@ -39,23 +39,24 @@ fn with_exchange_request_mut<T>(
         &mut super::super::transport::TlsFlowState,
     ) -> T,
 ) -> Result<T, VmError> {
-    let mut guard = context.lock().expect("vm context lock poisoned");
+    let mut exchanges = context.lock_exchanges();
     if handle == default_upstream_exchange_handle() {
-        let super::state::ProxyVmContext {
-            outbound_request,
-            tcp_dag,
-            tls_dag,
-            ..
-        } = &mut *guard;
-        return Ok(mutate(
-            outbound_request,
-            &mut tcp_dag.default_upstream,
-            &mut tls_dag.default_upstream,
-        ));
+        let request = &mut exchanges
+            .exchanges
+            .get_mut(&handle)
+            .expect("default upstream exchange should exist")
+            .request;
+        let mut transport = context.lock_transport();
+        let mut tcp_flow = transport.tcp_dag.default_upstream.clone();
+        let mut tls_flow = transport.tls_dag.default_upstream.clone();
+        let result = mutate(request, &mut tcp_flow, &mut tls_flow);
+        transport.tcp_dag.default_upstream = tcp_flow;
+        transport.tls_dag.default_upstream = tls_flow;
+        return Ok(result);
     }
 
-    let exchange = guard
-        .outbound_exchanges
+    let exchange = exchanges
+        .exchanges
         .get_mut(&handle)
         .ok_or_else(|| unknown_exchange_handle(handle))?;
     Ok(mutate(

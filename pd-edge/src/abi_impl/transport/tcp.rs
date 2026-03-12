@@ -108,7 +108,7 @@ fn with_mutable_dynamic_tcp_socket_state<T>(
     let TcpStreamHandle::Dynamic(handle) = decode_stream(context, stream)? else {
         return Err(mutable_dynamic_tcp_stream_only());
     };
-    let mut guard = context.lock().expect("vm context lock poisoned");
+    let mut guard = context.lock_transport();
     let mut io_slot = guard.tcp_stream_ios.remove(&handle);
     let state = guard
         .tcp_streams
@@ -127,7 +127,7 @@ fn active_dynamic_tcp_stream_io(
     context: &SharedProxyVmContext,
     handle: i64,
 ) -> Option<SharedTcpStreamIo> {
-    let guard = context.lock().expect("vm context lock poisoned");
+    let guard = context.lock_transport();
     guard.tcp_stream_ios.get(&handle).cloned()
 }
 
@@ -135,7 +135,7 @@ fn dynamic_tcp_socket_state(
     context: &SharedProxyVmContext,
     handle: i64,
 ) -> Result<TcpSocketState, VmError> {
-    let guard = context.lock().expect("vm context lock poisoned");
+    let guard = context.lock_transport();
     guard
         .tcp_streams
         .get(&handle)
@@ -150,7 +150,7 @@ fn store_connected_dynamic_tcp_stream(
     local_addr: String,
     peer_addr: String,
 ) {
-    let mut guard = context.lock().expect("vm context lock poisoned");
+    let mut guard = context.lock_transport();
     if let Some(state) = guard.tcp_streams.get_mut(&handle) {
         state.mark_connected(local_addr, peer_addr);
     }
@@ -163,7 +163,7 @@ fn mark_dynamic_tcp_stream_failed(
     message: impl Into<String>,
 ) {
     let message = message.into();
-    let mut guard = context.lock().expect("vm context lock poisoned");
+    let mut guard = context.lock_transport();
     if let Some(state) = guard.tcp_streams.get_mut(&handle) {
         state.mark_failed(message);
     }
@@ -171,29 +171,33 @@ fn mark_dynamic_tcp_stream_failed(
 }
 
 fn mark_dynamic_tcp_stream_eof(context: &SharedProxyVmContext, handle: i64) {
-    let mut guard = context.lock().expect("vm context lock poisoned");
+    let mut guard = context.lock_transport();
     if let Some(state) = guard.tcp_streams.get_mut(&handle) {
         state.mark_read_eof();
     }
 }
 
 fn clear_dynamic_tcp_stream_eof(context: &SharedProxyVmContext, handle: i64) {
-    let mut guard = context.lock().expect("vm context lock poisoned");
+    let mut guard = context.lock_transport();
     if let Some(state) = guard.tcp_streams.get_mut(&handle) {
         state.clear_read_eof();
     }
 }
 
 fn note_stream_read(context: &SharedProxyVmContext, stream: TcpStreamHandle) {
-    let mut guard = context.lock().expect("vm context lock poisoned");
     match stream {
-        TcpStreamHandle::Reserved(TcpStreamRef::Downstream) => guard.tcp_dag.downstream.note_read(),
-        TcpStreamHandle::Reserved(TcpStreamRef::DefaultUpstream) => {
-            guard.tcp_dag.default_upstream.note_read()
+        TcpStreamHandle::Reserved(TcpStreamRef::Downstream) => {
+            context.lock_transport().tcp_dag.downstream.note_read()
         }
+        TcpStreamHandle::Reserved(TcpStreamRef::DefaultUpstream) => context
+            .lock_transport()
+            .tcp_dag
+            .default_upstream
+            .note_read(),
         TcpStreamHandle::OutboundExchange(handle) => {
-            let exchange = guard
-                .outbound_exchanges
+            let mut exchanges = context.lock_exchanges();
+            let exchange = exchanges
+                .exchanges
                 .get_mut(&handle)
                 .expect("exchange handle should exist while stream is in use");
             exchange.transport.tcp_flow.note_read();
@@ -203,17 +207,19 @@ fn note_stream_read(context: &SharedProxyVmContext, stream: TcpStreamHandle) {
 }
 
 fn note_stream_write(context: &SharedProxyVmContext, stream: TcpStreamHandle) {
-    let mut guard = context.lock().expect("vm context lock poisoned");
     match stream {
         TcpStreamHandle::Reserved(TcpStreamRef::Downstream) => {
-            guard.tcp_dag.downstream.note_write()
+            context.lock_transport().tcp_dag.downstream.note_write()
         }
-        TcpStreamHandle::Reserved(TcpStreamRef::DefaultUpstream) => {
-            guard.tcp_dag.default_upstream.note_write()
-        }
+        TcpStreamHandle::Reserved(TcpStreamRef::DefaultUpstream) => context
+            .lock_transport()
+            .tcp_dag
+            .default_upstream
+            .note_write(),
         TcpStreamHandle::OutboundExchange(handle) => {
-            let exchange = guard
-                .outbound_exchanges
+            let mut exchanges = context.lock_exchanges();
+            let exchange = exchanges
+                .exchanges
                 .get_mut(&handle)
                 .expect("exchange handle should exist while stream is in use");
             exchange.transport.tcp_flow.note_write();
@@ -441,13 +447,13 @@ async fn stream_get_phase(
     let phase = match decode_stream(&context, stream)? {
         TcpStreamHandle::Reserved(TcpStreamRef::Downstream) => "connected",
         TcpStreamHandle::Reserved(TcpStreamRef::DefaultUpstream) => {
-            let guard = context.lock().expect("vm context lock poisoned");
+            let guard = context.lock_transport();
             tcp_flow_phase_label(&guard.tcp_dag.default_upstream)
         }
         TcpStreamHandle::OutboundExchange(handle) => {
-            let guard = context.lock().expect("vm context lock poisoned");
+            let guard = context.lock_exchanges();
             let exchange = guard
-                .outbound_exchanges
+                .exchanges
                 .get(&handle)
                 .expect("exchange should exist while stream handle is in use");
             tcp_flow_phase_label(&exchange.transport.tcp_flow)
@@ -485,13 +491,13 @@ async fn stream_get_peer_addr(
     let peer_addr = match decode_stream(&context, stream)? {
         TcpStreamHandle::Reserved(TcpStreamRef::Downstream) => String::new(),
         TcpStreamHandle::Reserved(TcpStreamRef::DefaultUpstream) => {
-            let guard = context.lock().expect("vm context lock poisoned");
+            let guard = context.lock_transport();
             guard.tls_dag.default_upstream.peer_name().to_string()
         }
         TcpStreamHandle::OutboundExchange(handle) => {
-            let guard = context.lock().expect("vm context lock poisoned");
+            let guard = context.lock_exchanges();
             let exchange = guard
-                .outbound_exchanges
+                .exchanges
                 .get(&handle)
                 .expect("exchange should exist while stream handle is in use");
             exchange.transport.tls_flow.peer_name().to_string()

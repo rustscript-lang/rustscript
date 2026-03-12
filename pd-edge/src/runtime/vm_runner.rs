@@ -550,10 +550,10 @@ mod tests {
         )
         .expect("program should compile");
         let program = Arc::new(compiled.program.with_local_count(compiled.locals));
-        let context = Arc::new(Mutex::new(ProxyVmContext::from_request_headers(
+        let context = Arc::new(ProxyVmContext::from_request_headers(
             HeaderMap::new(),
             Arc::new(Mutex::new(RateLimiterStore::new())),
-        )));
+        ));
         let async_ops = new_shared_vm_async_ops();
         let store = new_vm_runner_store(program, context, async_ops);
         let debug = VmDebugInvocation {
