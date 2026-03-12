@@ -244,6 +244,28 @@ fn nothing() {
 }
 
 #[test]
+fn lint_unknown_inferred_local_types_respects_declared_schema_annotations() {
+    let source = r#"
+use json;
+struct Stats { score: int }
+struct Profile { stats: Stats }
+
+let payload_json = json::encode({});
+let payload_decoded: Profile = json::decode(payload_json);
+payload_decoded.stats.score;
+"#;
+
+    let warnings = lint_unknown_inferred_local_types(source, SourceFlavor::RustScript)
+        .expect("lint should succeed");
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| warning.name != "payload_decoded"),
+        "declared schema binding should not be reported as unknown, got {warnings:?}"
+    );
+}
+
+#[test]
 fn collect_inferred_local_type_hints_reports_visible_local_types() {
     let source = r#"
 let total = 1;
@@ -304,4 +326,28 @@ plus_one(2);
     assert_eq!(total.inferred_type, "int");
     assert_eq!(total.declared_line, Some(3));
     assert_eq!(total.last_line, Some(4));
+}
+
+#[test]
+fn collect_inferred_local_type_hints_use_declared_schema_bound_type() {
+    let source = r#"
+use json;
+struct Stats { score: int }
+struct Profile { stats: Stats }
+
+let payload_json = json::encode({});
+let payload_decoded: Profile = json::decode(payload_json);
+payload_decoded.stats.score;
+"#;
+
+    let hints = collect_inferred_local_type_hints(source, SourceFlavor::RustScript)
+        .expect("type hints should succeed");
+    let payload_decoded = hints
+        .iter()
+        .find(|hint| hint.name == "payload_decoded")
+        .expect("expected a type hint for payload_decoded");
+
+    assert_eq!(payload_decoded.inferred_type, "map");
+    assert_eq!(payload_decoded.declared_line, Some(7));
+    assert_eq!(payload_decoded.last_line, Some(8));
 }

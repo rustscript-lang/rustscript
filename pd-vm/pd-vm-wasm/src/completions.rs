@@ -1187,10 +1187,7 @@ mod tests {
                 function.name,
             );
             assert!(
-                catalog
-                    .scheme
-                    .iter()
-                    .any(|entry| entry.label == dot_label),
+                catalog.scheme.iter().any(|entry| entry.label == dot_label),
                 "missing Scheme completion for edge ABI function {}",
                 function.name,
             );
@@ -1198,10 +1195,15 @@ mod tests {
 
         for namespace in host_namespace_specs() {
             let rust_import = format!("use {};", namespace.root);
-            let js_import = format!("import * as {} from \"{}\";", namespace.root, namespace.root);
+            let js_import = format!(
+                "import * as {} from \"{}\";",
+                namespace.root, namespace.root
+            );
             let lua_import = format!("local {} = require(\"{}\")", namespace.root, namespace.root);
-            let scheme_import =
-                format!("(require (prefix-in {}. \"{}\"))", namespace.root, namespace.root);
+            let scheme_import = format!(
+                "(require (prefix-in {}. \"{}\"))",
+                namespace.root, namespace.root
+            );
 
             assert!(
                 catalog

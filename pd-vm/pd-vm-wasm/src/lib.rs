@@ -903,6 +903,34 @@ mod lint_tests {
     }
 
     #[test]
+    fn lint_avoids_unknown_warning_for_declared_json_decode_binding() {
+        let source = r#"
+            use json;
+            struct Stats { score: int }
+            struct Profile { stats: Stats }
+
+            let payload_json = json::encode({});
+            let payload_decoded: Profile = json::decode(payload_json);
+            payload_decoded.stats.score;
+        "#;
+
+        let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("local 'payload_decoded'")),
+            "declared schema binding should not surface an unknown-local warning, got {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.diagnostics.is_empty(),
+            "annotated json decode example should lint cleanly, got {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
     fn lint_with_context_resolves_relative_imports_from_real_document_path() {
         let path = Path::new("workspace/examples/list_comp_test.rss");
         let source = r#"
@@ -1240,6 +1268,37 @@ mod runtime_tests {
                 && diagnostic.rendered.contains("let value = arr[0];"),
             "expected rendered warning snippet, got {:?}",
             diagnostic.rendered
+        );
+    }
+
+    #[test]
+    fn lint_respects_declared_schema_annotations_for_json_decode_bindings() {
+        let source = r#"
+            use json;
+            struct Stats { score: int }
+            struct Profile { stats: Stats }
+
+            let payload_json = json::encode({});
+            let payload_decoded: Profile = json::decode(payload_json);
+            payload_decoded.stats.score;
+        "#;
+
+        let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("local 'payload_decoded'")),
+            "declared schema binding should not surface an unknown-local warning, got {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity != LintSeverity::Error),
+            "annotated json decode example should not emit lint errors, got {:?}",
+            report.diagnostics
         );
     }
 

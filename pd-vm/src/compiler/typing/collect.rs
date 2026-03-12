@@ -173,7 +173,6 @@ pub(super) fn collect_stmt_types(
                 let expr_state = state.clone();
                 collect_expr_types(expr, &expr_state, local_types, callable_slots, context);
                 let ty = context.infer_expr_type(expr, &expr_state);
-                record_local_type(local_types, *index, ty);
                 bind_expr_result_to_slot(
                     state,
                     *index,
@@ -183,6 +182,7 @@ pub(super) fn collect_stmt_types(
                     ty,
                     context,
                 );
+                record_local_type(local_types, *index, state.get(*index));
                 if state.callable(*index).is_some() {
                     record_callable_slot(callable_slots, *index);
                 }
@@ -191,8 +191,8 @@ pub(super) fn collect_stmt_types(
                 let expr_state = state.clone();
                 collect_expr_types(expr, &expr_state, local_types, callable_slots, context);
                 let ty = context.infer_expr_type(expr, &expr_state);
-                record_local_type(local_types, *index, ty);
                 bind_expr_result_to_slot(state, *index, None, expr, &expr_state, ty, context);
+                record_local_type(local_types, *index, state.get(*index));
                 if state.callable(*index).is_some() {
                     record_callable_slot(callable_slots, *index);
                 }
