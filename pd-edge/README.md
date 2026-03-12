@@ -346,12 +346,19 @@ Artifacts written by these runs:
 Current state:
 
 - HTTP is implemented today as an explicit graph in [`pd-edge/src/abi_impl/http/state.rs`](src/abi_impl/http/state.rs).
+- TCP, TLS, and UDP transport state live in [`pd-edge/src/abi_impl/transport/state.rs`](src/abi_impl/transport/state.rs), with UDP host ABI in [`pd-edge/src/abi_impl/transport/udp.rs`](src/abi_impl/transport/udp.rs).
 - WebSocket is implemented today as an explicit child DAG over outbound HTTP-upgrade handles in [`pd-edge/src/abi_impl/websocket/state.rs`](src/abi_impl/websocket/state.rs).
+- WebRTC is implemented today as a request-scoped peer-connection/data-channel DAG in [`pd-edge/src/abi_impl/webrtc/mod.rs`](src/abi_impl/webrtc/mod.rs).
 - Full cross-protocol graph: [`pd-edge/docs/full-dag.md`](docs/full-dag.md).
-- TCP, TLS, and outbound HTTP exchanges are exposed to programs through handle-based host calls:
+- `http`, `tls`, `websocket`, and `webrtc` are feature-gated DAG families. The default build enables `http`, `tls`, and `websocket`.
+- TCP, UDP, TLS, outbound HTTP exchanges, WebSocket connections, and WebRTC connections are exposed to programs through handle-based host calls:
   - `tcp::stream::downstream()` returns reserved socket handle `0`
   - `tcp::stream::default_upstream()` returns reserved socket handle `1`
   - `tcp::stream::{read, write, eof}` operate on those socket handles
+  - `udp::socket::downstream()` returns reserved socket handle `0`
+  - `udp::socket::default_upstream()` returns reserved socket handle `1`
+  - `udp::socket::new()` allocates independent outbound UDP socket handles starting at `2`
+  - `udp::socket::{bind, set_target, connect, get_phase, get_local_addr, get_peer_addr, send_text, recv_text, send_binary_base64, recv_binary_base64, close}` operate on any UDP socket handle
   - `tls::session::from_socket(sock)` projects a TLS-session handle from a socket handle
   - `tls::session::{set_alpn, set_verify, set_verify_hostname, set_trusted_certificate, set_certificate, set_private_key, set_sni, set_min_version, set_max_version}` configure the next outbound TLS handshake for that session handle
   - `tls::session::{is_present, handshake, get_phase, get_peer_name, get_server_name, get_alpn, get_peer_certificate, is_session_reused}` read back negotiated or observed TLS state
@@ -362,19 +369,29 @@ Current state:
   - `websocket::connection::default_upstream()` returns reserved websocket handle `1`
   - `websocket::connection::new()` allocates independent outbound websocket handles starting at `2`
   - `websocket::connection::{set_target, set_header, set_subprotocols, connect, send_text, read_text, send_binary_base64, read_binary_base64, eof, close, get_phase, get_subprotocol}` operate on any outbound websocket handle
+  - `webrtc::connection::downstream()` returns reserved webrtc handle `0`
+  - `webrtc::connection::default_upstream()` returns reserved webrtc handle `1`
+  - `webrtc::connection::new()` allocates independent outbound webrtc handles starting at `2`
+  - `webrtc::connection::{set_ice_servers, set_data_channel_label, set_remote_description, create_offer, create_answer, connect, send_text, read_text, send_binary_base64, read_binary_base64, eof, close, get_phase}` operate on any outbound webrtc handle
 - Directional `http::upstream::*` APIs remain as aliases over handle `1`.
 - Current runtime boundary:
+  - outbound UDP sockets are executable today
+  - downstream UDP handle `0` is reserved but inactive in the current one-shot HTTP runtime
   - outbound WebSocket connections are executable today
   - downstream handle `0` currently exposes upgrade-candidate detection and phase inspection, but not a post-`101` frame loop yet
+  - outbound WebRTC peer connections and data channels are executable today
+  - downstream WebRTC handle `0` is reserved but inactive in the current one-shot HTTP runtime
   - `wss://` currently uses the default verifier/client configuration only; custom TLS-session overrides are rejected for websocket connects until the manual websocket TLS connector reaches parity with the HTTP client path
+  - `proxy::pipe` and `proxy::tunnel` remain byte-stream only; UDP datagrams and WebRTC message queues are not adapted into that layer today
 
 Core model:
 
 - Each subsystem owns its own forward-only DAG.
-- A node in one DAG may export a capability that becomes the ingress node of a deeper DAG.
+- A node in one DAG may export a capability that becomes the ingress node of a deeper DAG, or the VM may allocate a sibling DAG instance directly such as a UDP socket, HTTP exchange, or WebRTC connection.
 - The same DAG schema can be instantiated multiple times, for example once for downstream and once for upstream.
 - Callers may jump directly to any reachable node if the jump is monotonic: all prerequisite edges are already satisfied or can be advanced forward by the engine.
 - No subsystem is allowed to move another subsystem backward.
+- Not every DAG is a byte stream. UDP preserves datagram boundaries, and WebRTC preserves data-channel message boundaries.
 
 ### TCP DAG
 
@@ -401,6 +418,33 @@ flowchart TD
     F --> J["tcp closed"]
     G --> J
     H --> J
+```
+
+### UDP DAG
+
+UDP is a sibling transport DAG to TCP. It owns local bind configuration, remote target selection, datagram send and receive progress, and close or failure state.
+
+Rules:
+
+- `udp.bound` and `udp.target configured` are independent forward edges. A handle may set only a bind address, only a target, or both.
+- `udp.connected` may be reached explicitly with `udp::socket::connect(handle)` or implicitly on the first `send_*` / `recv_*` call because the current runtime lazily connects outbound sockets.
+- Datagram boundaries are preserved. `recv_text` and `recv_binary_base64` each consume at most one datagram.
+- The program-facing API is handle-based: `0` is the reserved downstream placeholder, `1` is the default upstream socket, and `2+` are dynamically allocated sockets.
+- In the current one-shot HTTP runtime, only outbound UDP handles execute the full DAG.
+- UDP does not currently enter the proxy byte-stream layer because `proxy::pipe` and `proxy::tunnel` are stream-oriented.
+
+```mermaid
+flowchart TD
+    A["udp socket allocated"] --> B["udp bind configured"]
+    A --> C["udp target configured"]
+    B --> C
+    C --> D["udp connected"]
+    D --> E["udp tx datagrams"]
+    D --> F["udp rx datagrams"]
+    D --> G["udp failed"]
+    E --> H["udp closed"]
+    F --> H
+    G --> H
 ```
 
 ### TLS DAG
@@ -510,27 +554,59 @@ flowchart TD
     J --> K
 ```
 
+### WebRTC DAG
+
+WebRTC is a request-scoped peer-connection DAG that owns ICE configuration, SDP signaling state, data-channel readiness, and message I/O. Unlike WebSocket, it is not entered through an HTTP upgrade; the VM allocates or selects a WebRTC handle directly and drives signaling through host calls.
+
+Rules:
+
+- A WebRTC handle is handle-based: `0` is the reserved downstream placeholder, `1` is the default upstream connection, and `2+` are dynamically allocated outbound connections.
+- `set_ice_servers` and `set_data_channel_label` configure the connection before the peer connection is created. Those fields become read-only once the peer exists.
+- `set_remote_description`, `create_offer`, and `create_answer` advance the signaling nodes. `create_offer` also ensures the local data channel exists before the local description is published.
+- `connect` is the explicit request to wait for `webrtc.open`. `send_*` and `read_*` can also force that advancement implicitly because they require an open data channel.
+- `send_text`, `read_text`, `send_binary_base64`, and `read_binary_base64` advance message queues while preserving message boundaries.
+- Today, only outbound handles execute the full DAG. Downstream handle `0` is reserved so the ABI shape is stable, but the current one-shot HTTP runtime does not host a downstream peer connection yet.
+- WebRTC remains outside the proxy byte-stream layer today because data-channel messages are not adapted into `proxy::pipe` or `proxy::tunnel`.
+
+```mermaid
+flowchart TD
+    A["webrtc handle allocated or selected"] --> B["webrtc configured"]
+    B --> C["remote description set"]
+    B --> D["local offer or answer created"]
+    C --> D
+    D --> E["peer connecting"]
+    E --> F["data channel open"]
+    F --> G["rx message queue"]
+    F --> H["tx message queue"]
+    F --> I["webrtc failed"]
+    G --> J["webrtc closed"]
+    H --> J
+    I --> J
+```
+
 ### Entering And Leaving A Deeper DAG
 
-A deeper DAG is entered when the outer DAG publishes an ingress capability for it.
+A deeper DAG is entered when the outer DAG publishes an ingress capability for it. Some DAGs in the current runtime, such as UDP and WebRTC, are sibling DAGs instead: the VM allocates them directly inside the same request scope rather than descending from a parent byte stream.
 
 Examples:
 
 - TCP exports `tcp.connected` plus the TCP byte stream. TLS can attach there.
 - TLS exports `tls.plaintext stream`. HTTP can attach there.
 - HTTP exports `http upgrade ready`. WebSocket can attach there.
+- The VM may allocate a UDP socket directly. That starts a sibling transport DAG rather than descending through HTTP.
+- The VM may allocate a WebRTC connection directly. Signaling and data-channel progression happen on that sibling DAG rather than through an HTTP upgrade.
 - HTTP may export a response body stream that is handed back upward to TLS plaintext framing, then to TCP transmission.
 
 Rules for entering:
 
-- Entering a deeper DAG does not replace the outer DAG. The outer DAG remains the owner of transport, buffering, and teardown.
-- The inner DAG can request more outer progress, but only through declared advance goals.
+- Entering a deeper DAG or allocating a sibling DAG does not replace the outer DAGs that already exist. TCP/TLS/HTTP still own their own transport and buffering history, while UDP and WebRTC own independent handle-scoped state.
+- A deeper DAG can request more outer progress, but only through declared advance goals. A sibling DAG advances independently once its handle has been allocated and configured.
 - The inner DAG cannot mutate outer history that has already been published.
 
 Rules for leaving:
 
-- You leave a deeper DAG when it reaches an exported egress node such as `http message complete`, `tls close_notify`, or `tls handshake error`.
-- Leaving does not imply the outer DAG is done. The outer DAG may continue with another message, another handshake branch, or connection teardown.
+- You leave a deeper DAG when it reaches an exported egress node such as `http message complete`, `websocket.closed`, `tls close_notify`, or `tls handshake error`. Sibling DAGs such as UDP and WebRTC leave through their own terminal nodes such as `udp.closed`, `udp.failed`, `webrtc.closed`, or `webrtc.failed`.
+- Leaving does not imply the outer DAG is done. The outer DAG may continue with another message, another handshake branch, or connection teardown, while sibling DAGs may continue or terminate independently.
 - Returning to a shallower layer is valid if it is still a forward move in the combined graph.
 
 ### Generic Advancement Mechanism
@@ -558,7 +634,9 @@ The clean model is to treat downstream and upstream as separate DAG instances wi
 
 - downstream TCP/TLS/HTTP describe bytes and messages coming from the client toward the VM
 - upstream TCP/TLS/HTTP describe bytes and messages going from the VM toward the origin
-- the VM and graph resolver connect them, but they do not collapse them into one giant implicit state machine
+- upstream UDP sockets and upstream WebRTC connections are sibling DAG families connected through VM host calls rather than attached to the HTTP byte-stream chain
+- downstream UDP and downstream WebRTC handles currently exist only as reserved placeholders in the one-shot HTTP runtime
+- the VM and graph resolver connect these DAGs, but they do not collapse them into one giant implicit state machine
 
 ```mermaid
 flowchart LR
@@ -577,29 +655,37 @@ flowchart LR
         U3["http upstream request and response"]
         U2["tls upstream"]
         U1["tcp upstream"]
+        UU["udp upstream sockets"]
+        UW["webrtc upstream connections"]
         U3 --> U2 --> U1
     end
 
     D3 --> V
     V --> U3
     U3 --> V
+    V --> UU
+    UU --> V
+    V --> UW
+    UW --> V
     V --> D3
 ```
 
 This gives the flexibility target:
 
-- you can jump into TCP, TLS, HTTP, or WebSocket as long as the target node is reachable from the current frontier
-- you can jump back out from WebSocket to HTTP, then to TLS or TCP, when the inner DAG has exported a forward egress node
-- you can materialize only the parts you need, late
-- you do not need a custom driver for every feature such as TLS session reuse, early response generation, or future non-HTTP protocols
-- directional convenience APIs may remain as aliases, but the stable abstraction is the handle-based `tcp::stream::*` / `tls::session::*` / `websocket::connection::*` surface
+- you can jump into TCP, UDP, TLS, HTTP, WebSocket, or WebRTC as long as the target node is reachable from the current frontier and that DAG family is compiled in
+- you can jump back out from WebSocket to HTTP, then to TLS or TCP, when the inner DAG has exported a forward egress node; UDP and WebRTC exit through their own terminal nodes instead of rejoining the byte-stream stack
+- you can materialize only the parts you need, late, including sibling DAGs that have no parent byte stream
+- you do not need a custom driver for every feature such as TLS session reuse, early response generation, UDP datagram I/O, or WebRTC signaling and open-state transitions
+- directional convenience APIs may remain as aliases, but the stable abstraction is the handle-based `tcp::stream::*` / `udp::socket::*` / `tls::session::*` / `http::exchange::*` / `websocket::connection::*` / `webrtc::connection::*` surface
 
 Node ownership in current code:
 
+- TCP, TLS, and UDP transport nodes and state: [`pd-edge/src/abi_impl/transport/`](src/abi_impl/transport/)
 - HTTP nodes and resolver: [`pd-edge/src/abi_impl/http/state.rs`](src/abi_impl/http/state.rs)
 - HTTP validation and map conversion helpers: [`pd-edge/src/abi_impl/http/helpers.rs`](src/abi_impl/http/helpers.rs)
 - HTTP host-call entrypoints that mutate or read nodes: [`pd-edge/src/abi_impl/http/`](src/abi_impl/http/)
 - WebSocket nodes and frame IO: [`pd-edge/src/abi_impl/websocket/`](src/abi_impl/websocket/)
+- WebRTC nodes, signaling state, and data-channel IO: [`pd-edge/src/abi_impl/webrtc/`](src/abi_impl/webrtc/)
 - data-plane orchestration as black-box VM execution plus graph resolution: [`pd-edge/src/runtime/http_plane/proxy_path.rs`](src/runtime/http_plane/proxy_path.rs)
 
 ## ABI Source of Truth
@@ -648,7 +734,9 @@ docker run --rm -p 8080:8080 -p 8081:8081 fffonion/pd-edge:latest
 - `pd-edge/src/runtime.rs`: shared runtime state, telemetry, program apply/load, exports
 - `pd-edge/src/runtime/http_plane/`: HTTP data/admin plane handlers
 - `pd-edge/src/abi_impl/runtime.rs`: protocol-independent runtime host ABI
+- `pd-edge/src/abi_impl/transport/`: TCP/TLS/UDP transport DAG state and host ABI
 - `pd-edge/src/abi_impl/http/`: HTTP-specific host ABI
 - `pd-edge/src/abi_impl/websocket/`: WebSocket DAG state and host ABI
+- `pd-edge/src/abi_impl/webrtc/`: WebRTC DAG state and host ABI
 - `pd-edge/src/active_control_plane.rs`: active control-plane poll/report loop
 - `pd-edge/src/debug_session.rs`: on-demand debug session lifecycle

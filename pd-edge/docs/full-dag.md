@@ -6,7 +6,11 @@ Notes:
 
 - `exchange 1` is the reserved default upstream HTTP exchange.
 - `exchange n` represents additional outbound exchanges allocated with `http::exchange::new()`.
+- `udp socket 1` is the reserved default upstream UDP handle; `udp socket n` represents additional outbound sockets allocated with `udp::socket::new()`.
+- `webrtc connection 1` is the reserved default upstream WebRTC handle; `webrtc connection n` represents additional outbound connections allocated with `webrtc::connection::new()`.
+- The graph shows the union of currently supported DAG families. `http`, `tls`, `websocket`, and `webrtc` are feature-gated; the default build enables `http`, `tls`, and `websocket`.
 - The proxy layer is a capability layer, not a protocol DAG. It connects exported byte streams from TCP, TLS plaintext, HTTP bodies, and WebSocket binary adapters.
+- UDP datagrams and WebRTC data-channel messages do not currently flow through `proxy::pipe` or `proxy::tunnel`; they remain sibling message-oriented DAGs.
 - The graph is intentionally conceptual. It shows ingress and egress connections between DAGs, not every internal transition implemented by each subsystem.
 
 ```mermaid
@@ -52,6 +56,18 @@ flowchart LR
         DW0 --> DW1
     end
 
+    subgraph DS_UDP["Downstream UDP Placeholder"]
+        DU0["udp handle 0 reserved"]
+        DU1["downstream udp unavailable in current runtime"]
+        DU0 --> DU1
+    end
+
+    subgraph DS_WRTC["Downstream WebRTC Placeholder"]
+        DWR0["webrtc handle 0 reserved"]
+        DWR1["downstream webrtc unavailable in current runtime"]
+        DWR0 --> DWR1
+    end
+
     subgraph VM["VM And Resolver"]
         VM0["VM host calls"]
         VM1["graph resolver after VM halt"]
@@ -87,6 +103,24 @@ flowchart LR
         UTL0 --> UTL1
         UTL1 --> UTL2
         UTL2 --> UTL3
+    end
+
+    subgraph US_UDP["Upstream UDP Datagram DAG"]
+        UU0["udp socket allocated"]
+        UU1["udp bind configured"]
+        UU2["udp target configured"]
+        UU3["udp connected"]
+        UU4["udp tx datagrams"]
+        UU5["udp rx datagrams"]
+        UU6["udp closed or failed"]
+        UU0 --> UU1
+        UU0 --> UU2
+        UU1 --> UU2
+        UU2 --> UU3
+        UU3 --> UU4
+        UU3 --> UU5
+        UU4 --> UU6
+        UU5 --> UU6
     end
 
     subgraph EX1["Upstream HTTP Exchange 1 DAG"]
@@ -130,6 +164,26 @@ flowchart LR
         W4 --> W5
     end
 
+    subgraph WRTC["Outbound WebRTC Data-Channel DAG"]
+        R0["webrtc configured"]
+        R1["remote description set"]
+        R2["local offer or answer created"]
+        R3["peer connecting"]
+        R4["data channel open"]
+        R5["rx message queue"]
+        R6["tx message queue"]
+        R7["webrtc closed or failed"]
+        R0 --> R1
+        R0 --> R2
+        R1 --> R2
+        R2 --> R3
+        R3 --> R4
+        R4 --> R5
+        R4 --> R6
+        R5 --> R7
+        R6 --> R7
+    end
+
     DT1 --> DTL0
     DT1 --> DH0
     DTL2 --> DH0
@@ -142,10 +196,16 @@ flowchart LR
 
     VM0 --> U1A
     VM0 --> UN0
+    VM0 --> UU0
+    VM0 --> R0
     U1D --> VM0
     U1E --> VM0
     UN4 --> VM0
     UN5 --> VM0
+    UU4 --> VM0
+    UU5 --> VM0
+    R5 --> VM0
+    R6 --> VM0
 
     UT1 --> UTL0
     UT1 --> U1A
@@ -155,6 +215,7 @@ flowchart LR
 
     U1A --> W0
     UN1 --> W0
+    R0 -. signaling outside current DAG .-> R1
 
     DT2 --> PX0
     DT3 --> PX0
