@@ -24,8 +24,8 @@ use super::super::{
     transport::{
         CachedTlsSession, FIRST_DYNAMIC_TCP_STREAM_HANDLE, SharedTcpStreamIo,
         SharedTlsSessionCache, SharedUdpSocketIo, TcpFlowState, TcpSocketState, TcpTransportDag,
-        TlsFlowState, TlsProtocolVersion, TlsTransportDag, UdpSocketState, alpn_from_http_version,
-        tls_session_cache_key,
+        TlsFlowState, TlsProtocolVersion, TlsSessionCacheKey, TlsTransportDag, UdpSocketState,
+        alpn_from_http_version, tls_session_cache_key,
     },
     websocket::WebSocketConnectionState,
 };
@@ -34,6 +34,7 @@ use crate::abi_impl::transport::SharedTlsStreamIo;
 #[cfg(feature = "webrtc")]
 use crate::abi_impl::webrtc::WebRtcConnectionState;
 use crate::abi_impl::{http1, http2};
+use crate::cache::BoundedLruStore;
 
 #[derive(Debug)]
 pub struct HttpRequestContext {
@@ -190,6 +191,18 @@ impl InboundRequestBodyState {
 }
 
 type SharedInboundRequestBody = Arc<tokio::sync::Mutex<InboundRequestBodyState>>;
+pub(crate) type SharedUpstreamClientCache =
+    Arc<Mutex<BoundedLruStore<UpstreamClientCacheKey, reqwest::Client>>>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct UpstreamClientCacheKey {
+    tls_key: Option<TlsSessionCacheKey>,
+    http2_mode: http2::Http2UpstreamMode,
+}
+
+pub(crate) fn new_shared_upstream_client_cache(capacity: usize) -> SharedUpstreamClientCache {
+    Arc::new(Mutex::new(BoundedLruStore::new(capacity)))
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct HttpOutboundRequestNode {
@@ -581,6 +594,7 @@ pub struct ProxyVmContext {
     pub(crate) downstream_carrier_ref: Option<HttpCarrierRef>,
     pub(crate) upstream_carrier_ref: Option<HttpCarrierRef>,
     pub(crate) upstream_client: Option<reqwest::Client>,
+    pub(crate) upstream_client_cache: Option<SharedUpstreamClientCache>,
     pub(crate) tls_session_cache: Option<SharedTlsSessionCache>,
     pub(crate) upstream_http_sessions: Option<SharedHttpUpstreamSessions>,
     pub(crate) upstream_latency_ms: u64,
@@ -660,6 +674,7 @@ impl ProxyVmContext {
             downstream_carrier_ref: Some(HttpCarrierRef::DownstreamHttp1),
             upstream_carrier_ref: None,
             upstream_client: None,
+            upstream_client_cache: None,
             tls_session_cache: None,
             upstream_http_sessions: None,
             upstream_latency_ms: 0,
@@ -708,6 +723,10 @@ impl ProxyVmContext {
 
     pub fn attach_upstream_client(&mut self, client: reqwest::Client) {
         self.upstream_client = Some(client);
+    }
+
+    pub(crate) fn attach_upstream_client_cache(&mut self, cache: SharedUpstreamClientCache) {
+        self.upstream_client_cache = Some(cache);
     }
 
     pub(crate) fn attach_tls_session_cache(&mut self, cache: SharedTlsSessionCache) {
@@ -1099,6 +1118,7 @@ impl UpstreamResponseStartError {
 #[derive(Clone, Debug)]
 struct PreparedUpstreamRequest {
     client: reqwest::Client,
+    upstream_client_cache: Option<SharedUpstreamClientCache>,
     http_sessions: Option<SharedHttpUpstreamSessions>,
     http2_mode: http2::Http2UpstreamMode,
     tls_flow: TlsFlowState,
@@ -1251,6 +1271,7 @@ fn prepared_upstream_request(
             .upstream_client
             .clone()
             .ok_or(UpstreamResponseStartError::MissingClient)?,
+        upstream_client_cache: guard.upstream_client_cache.clone(),
         http_sessions: guard.upstream_http_sessions.clone(),
         http2_mode: http2::select_upstream_mode(&target, &tls_flow),
         tls_flow,
@@ -1315,6 +1336,7 @@ fn prepared_outbound_exchange_request(
             .upstream_client
             .clone()
             .ok_or(UpstreamResponseStartError::MissingClient)?,
+        upstream_client_cache: guard.upstream_client_cache.clone(),
         http_sessions: guard.upstream_http_sessions.clone(),
         http2_mode: http2::select_upstream_mode(&target, &tls_flow),
         tls_flow,
@@ -1352,17 +1374,51 @@ fn reqwest_tls_version(version: TlsProtocolVersion) -> reqwest::tls::Version {
     }
 }
 
-fn configured_upstream_client(
-    prepared: &PreparedUpstreamRequest,
-) -> Result<reqwest::Client, UpstreamResponseStartError> {
-    if !matches!(
+fn upstream_client_cache_key(prepared: &PreparedUpstreamRequest) -> Option<UpstreamClientCacheKey> {
+    let needs_configured_client = matches!(
         prepared.http2_mode,
         http2::Http2UpstreamMode::PriorKnowledge
-    ) && (!prepared.tls_flow.is_present() || !prepared.tls_flow.requires_custom_client())
-    {
-        return Ok(prepared.client.clone());
+    ) || prepared.tls_flow.requires_custom_client();
+    if !needs_configured_client {
+        return None;
     }
 
+    let tls_key = tls_session_cache_key(&prepared.target, &prepared.tls_flow);
+    if tls_key.is_none()
+        && !matches!(
+            prepared.http2_mode,
+            http2::Http2UpstreamMode::PriorKnowledge
+        )
+    {
+        return None;
+    }
+
+    Some(UpstreamClientCacheKey {
+        tls_key,
+        http2_mode: prepared.http2_mode,
+    })
+}
+
+fn cached_upstream_client(
+    cache: &SharedUpstreamClientCache,
+    key: &UpstreamClientCacheKey,
+) -> Option<reqwest::Client> {
+    let mut cache = cache.lock().expect("upstream client cache lock poisoned");
+    cache.get(key).cloned()
+}
+
+fn store_upstream_client(
+    cache: &SharedUpstreamClientCache,
+    key: UpstreamClientCacheKey,
+    client: reqwest::Client,
+) {
+    let mut cache = cache.lock().expect("upstream client cache lock poisoned");
+    let _ = cache.insert(key, client);
+}
+
+fn build_configured_upstream_client(
+    prepared: &PreparedUpstreamRequest,
+) -> Result<reqwest::Client, UpstreamResponseStartError> {
     if let (Some(min_version), Some(max_version)) = (
         prepared.tls_flow.min_version(),
         prepared.tls_flow.max_version(),
@@ -1430,6 +1486,31 @@ fn configured_upstream_client(
             "failed to build reqwest TLS client: {err}",
         ))
     })
+}
+
+fn configured_upstream_client(
+    prepared: &PreparedUpstreamRequest,
+) -> Result<reqwest::Client, UpstreamResponseStartError> {
+    if !matches!(
+        prepared.http2_mode,
+        http2::Http2UpstreamMode::PriorKnowledge
+    ) && (!prepared.tls_flow.is_present() || !prepared.tls_flow.requires_custom_client())
+    {
+        return Ok(prepared.client.clone());
+    }
+
+    let cache_key = upstream_client_cache_key(prepared);
+    if let (Some(cache), Some(key)) = (prepared.upstream_client_cache.as_ref(), cache_key.as_ref())
+        && let Some(client) = cached_upstream_client(cache, key)
+    {
+        return Ok(client);
+    }
+
+    let client = build_configured_upstream_client(prepared)?;
+    if let (Some(cache), Some(key)) = (prepared.upstream_client_cache.as_ref(), cache_key) {
+        store_upstream_client(cache, key, client.clone());
+    }
+    Ok(client)
 }
 
 fn response_peer_certificate_der(response: &reqwest::Response) -> Option<Vec<u8>> {

@@ -15,6 +15,7 @@ use vm::{Program, decode_program, validate_program};
 use crate::{
     HOST_FUNCTION_COUNT,
     abi_impl::{
+        http::{SharedUpstreamClientCache, new_shared_upstream_client_cache},
         RateLimiterStore, SharedHttpDownstreamSessions, SharedHttpUpstreamSessions,
         SharedRateLimiter, SharedTlsSessionCache, new_shared_http_downstream_sessions,
         new_shared_http_upstream_sessions, new_shared_tls_session_cache,
@@ -122,6 +123,7 @@ pub struct SharedState {
     pub active_program: Arc<RwLock<Option<Arc<LoadedProgram>>>>,
     pub max_program_bytes: usize,
     pub client: reqwest::Client,
+    pub(crate) upstream_client_cache: SharedUpstreamClientCache,
     pub(crate) tls_session_cache: SharedTlsSessionCache,
     pub(crate) upstream_http_sessions: SharedHttpUpstreamSessions,
     pub(crate) downstream_http2_sessions: SharedHttpDownstreamSessions,
@@ -190,6 +192,9 @@ impl SharedState {
                 .tls_info(true)
                 .build()
                 .expect("default upstream client should build"),
+            upstream_client_cache: new_shared_upstream_client_cache(
+                store_limits.upstream_http_reuse_entries,
+            ),
             tls_session_cache: new_shared_tls_session_cache(store_limits.tls_session_reuse_entries),
             upstream_http_sessions: new_shared_http_upstream_sessions(
                 store_limits.upstream_http_reuse_entries,

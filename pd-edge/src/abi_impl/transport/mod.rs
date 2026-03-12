@@ -13,7 +13,6 @@ mod udp;
 
 #[cfg(feature = "tls")]
 pub(crate) use state::SharedTlsStreamIo;
-#[cfg(feature = "http2")]
 pub(crate) use state::TlsSessionCacheKey;
 pub(crate) use state::{
     CachedTlsSession, FIRST_DYNAMIC_TCP_STREAM_HANDLE, SharedTcpStreamIo, SharedTlsSessionCache,

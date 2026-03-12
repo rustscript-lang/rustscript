@@ -150,6 +150,7 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
         {
             let mut guard = vm_context.lock().expect("vm context lock poisoned");
             guard.attach_upstream_client(state.client.clone());
+            guard.attach_upstream_client_cache(state.upstream_client_cache.clone());
             guard.attach_tls_session_cache(state.tls_session_cache.clone());
             guard.attach_upstream_http_sessions(state.upstream_http_sessions.clone());
             if let Some(attachment) = &downstream_http2_attachment {
