@@ -22,6 +22,8 @@ pub(crate) use edge::{
     enter_edge_host_context, new_shared_vm_async_ops, register_http_plane_host_module,
     spawn_active_control_plane_client,
 };
+#[cfg(feature = "webrtc")]
+pub(crate) use edge::sample_echo::spawn_webrtc_echo_server;
 #[cfg(feature = "websocket")]
 pub(crate) use futures_util::{SinkExt, StreamExt};
 pub(crate) use tokio::{sync::Notify, task::JoinHandle, time::timeout};

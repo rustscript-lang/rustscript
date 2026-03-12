@@ -1,0 +1,101 @@
+use http;
+use webrtc;
+
+// Request headers:
+// - x-webrtc-signal-target: required HTTP signaling endpoint, for example http://127.0.0.1:7008/offer
+// - x-webrtc-message: optional text payload
+// - x-webrtc-binary-base64: optional binary payload; when present the sample uses binary message APIs
+// - x-webrtc-handle: "default" to use webrtc::connection::default_upstream(), otherwise webrtc::connection::new()
+// - x-webrtc-data-channel-label: optional data channel label; defaults to "sample-channel"
+// - x-webrtc-ice-servers: optional comma-separated ICE server URLs
+let signal_target = http::request::get_header("x-webrtc-signal-target");
+let text_payload = http::request::get_header("x-webrtc-message");
+let binary_payload = http::request::get_header("x-webrtc-binary-base64");
+let requested_handle = http::request::get_header("x-webrtc-handle");
+let mut data_channel_label = http::request::get_header("x-webrtc-data-channel-label");
+let ice_servers = http::request::get_header("x-webrtc-ice-servers");
+
+if signal_target == "" {
+    http::response::set_status(400);
+    http::response::set_body("missing x-webrtc-signal-target");
+} else {
+    let mut connection = webrtc::connection::new();
+    let mut handle_label = "new";
+    if requested_handle == "default" {
+        connection = webrtc::connection::default_upstream();
+        handle_label = "default-upstream";
+    }
+    http::response::set_header("x-webrtc-handle", handle_label);
+
+    if webrtc::connection::is_present(connection) {
+        http::response::set_header("x-webrtc-present-before-configure", "true");
+    } else {
+        http::response::set_header("x-webrtc-present-before-configure", "false");
+    }
+
+    if ice_servers != "" {
+        webrtc::connection::set_ice_servers(connection, ice_servers);
+        http::response::set_header("x-webrtc-ice-servers", ice_servers);
+    }
+
+    if data_channel_label == "" {
+        data_channel_label = "sample-channel";
+    }
+    webrtc::connection::set_data_channel_label(connection, data_channel_label);
+    http::response::set_header("x-webrtc-data-channel-label", data_channel_label);
+
+    if webrtc::connection::is_present(connection) {
+        http::response::set_header("x-webrtc-present-after-configure", "true");
+    } else {
+        http::response::set_header("x-webrtc-present-after-configure", "false");
+    }
+
+    http::response::set_header("x-webrtc-phase-before-offer", webrtc::connection::get_phase(connection));
+    let offer = webrtc::connection::create_offer(connection);
+    http::response::set_header("x-webrtc-phase-after-offer", webrtc::connection::get_phase(connection));
+
+    let signal = http::exchange::new();
+    http::exchange::set_method(signal, "POST");
+    http::exchange::set_target(signal, signal_target);
+    http::exchange::set_header(signal, "content-type", "application/json");
+    http::exchange::set_body(signal, offer);
+    http::exchange::send(signal);
+
+    let answer = http::exchange::get_body(signal);
+    webrtc::connection::set_remote_description(connection, answer);
+    http::response::set_header("x-webrtc-phase-after-remote-description", webrtc::connection::get_phase(connection));
+
+    if webrtc::connection::connect(connection) {
+        http::response::set_header("x-webrtc-connected", "true");
+    } else {
+        http::response::set_header("x-webrtc-connected", "false");
+    }
+    http::response::set_header("x-webrtc-phase-after-connect", webrtc::connection::get_phase(connection));
+
+    if webrtc::connection::eof(connection) {
+        http::response::set_header("x-webrtc-eof-before-close", "true");
+    } else {
+        http::response::set_header("x-webrtc-eof-before-close", "false");
+    }
+
+    if binary_payload != "" {
+        webrtc::connection::send_binary_base64(connection, binary_payload);
+        let reply = webrtc::connection::read_binary_base64(connection);
+        http::response::set_header("x-webrtc-mode", "binary");
+        http::response::set_body(reply);
+    } else {
+        webrtc::connection::send_text(connection, text_payload);
+        let reply = webrtc::connection::read_text(connection);
+        http::response::set_header("x-webrtc-mode", "text");
+        http::response::set_body(reply);
+    }
+
+    webrtc::connection::close(connection);
+    http::response::set_header("x-webrtc-phase", webrtc::connection::get_phase(connection));
+    http::response::set_header("x-webrtc-phase-after-close", webrtc::connection::get_phase(connection));
+    if webrtc::connection::eof(connection) {
+        http::response::set_header("x-webrtc-eof-after-close", "true");
+    } else {
+        http::response::set_header("x-webrtc-eof-after-close", "false");
+    }
+}
