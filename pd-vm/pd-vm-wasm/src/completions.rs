@@ -986,6 +986,7 @@ fn push_unique(entries: &mut Vec<CompletionEntry>, entry: CompletionEntry) {
 #[cfg(test)]
 mod tests {
     use super::{build_completion_catalog, parse_pub_functions, signature_params, typed_signature};
+    use edge_abi::{FUNCTIONS as EDGE_HOST_FUNCTIONS, host_namespace_specs};
     use vm::{CallableParam, CallableParamType, CallableSignature};
 
     #[test]
@@ -1156,5 +1157,81 @@ mod tests {
                 .any(|entry| entry.label == "use math;"),
             "expected RustScript completion for use math;",
         );
+    }
+
+    #[test]
+    fn completion_catalog_tracks_every_edge_abi_entry() {
+        let catalog = build_completion_catalog();
+
+        for function in EDGE_HOST_FUNCTIONS {
+            let dot_label = function.name.replace("::", ".");
+            assert!(
+                catalog
+                    .rustscript
+                    .iter()
+                    .any(|entry| entry.label == function.name),
+                "missing RustScript completion for edge ABI function {}",
+                function.name,
+            );
+            assert!(
+                catalog
+                    .javascript
+                    .iter()
+                    .any(|entry| entry.label == dot_label),
+                "missing JavaScript completion for edge ABI function {}",
+                function.name,
+            );
+            assert!(
+                catalog.lua.iter().any(|entry| entry.label == dot_label),
+                "missing Lua completion for edge ABI function {}",
+                function.name,
+            );
+            assert!(
+                catalog
+                    .scheme
+                    .iter()
+                    .any(|entry| entry.label == dot_label),
+                "missing Scheme completion for edge ABI function {}",
+                function.name,
+            );
+        }
+
+        for namespace in host_namespace_specs() {
+            let rust_import = format!("use {};", namespace.root);
+            let js_import = format!("import * as {} from \"{}\";", namespace.root, namespace.root);
+            let lua_import = format!("local {} = require(\"{}\")", namespace.root, namespace.root);
+            let scheme_import =
+                format!("(require (prefix-in {}. \"{}\"))", namespace.root, namespace.root);
+
+            assert!(
+                catalog
+                    .rustscript
+                    .iter()
+                    .any(|entry| entry.label == rust_import),
+                "missing RustScript namespace import completion for {}",
+                namespace.root,
+            );
+            assert!(
+                catalog
+                    .javascript
+                    .iter()
+                    .any(|entry| entry.label == js_import),
+                "missing JavaScript namespace import completion for {}",
+                namespace.root,
+            );
+            assert!(
+                catalog.lua.iter().any(|entry| entry.label == lua_import),
+                "missing Lua namespace import completion for {}",
+                namespace.root,
+            );
+            assert!(
+                catalog
+                    .scheme
+                    .iter()
+                    .any(|entry| entry.label == scheme_import),
+                "missing Scheme namespace import completion for {}",
+                namespace.root,
+            );
+        }
     }
 }
