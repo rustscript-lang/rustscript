@@ -1120,6 +1120,107 @@ async fn dynamic_exchanges_can_multiplex_over_single_http2_connection() {
     admin_handle.abort();
 }
 
+#[cfg(all(feature = "tls", feature = "http2"))]
+#[tokio::test]
+async fn dynamic_exchange_body_chunks_can_be_read_independently_over_http2() {
+    let (upstream_addr, connection_count, upstream_handle) =
+        spawn_https_http2_multiplex_upstream().await;
+
+    let mut state = SharedState::new(1024 * 1024);
+    state.client = reqwest::Client::builder()
+        .tls_info(true)
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("http2 chunk test client should build");
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy_with_state(state).await;
+    let client = reqwest::Client::new();
+
+    let source = format!(
+        r#"
+        use http;
+
+        let slow = http::exchange::new();
+        let fast = http::exchange::new();
+
+        http::exchange::set_target(slow, "https://localhost:{}/slow");
+        http::exchange::set_target(fast, "https://localhost:{}/fast");
+
+        http::exchange::send(slow);
+        http::exchange::send(fast);
+
+        let fast_head = http::exchange::body::next_chunk(fast, 4);
+        let slow_head = http::exchange::body::next_chunk(slow, 4);
+        let fast_tail = http::exchange::body::next_chunk(fast, 32);
+        let slow_tail = http::exchange::body::next_chunk(slow, 32);
+
+        http::response::set_header("x-fast-version", http::exchange::get_http_version(fast));
+        http::response::set_header("x-slow-version", http::exchange::get_http_version(slow));
+        http::response::set_header(
+            "x-fast-eof",
+            if http::exchange::body::eof(fast) => {{ "true" }} else => {{ "false" }}
+        );
+        http::response::set_header(
+            "x-slow-eof",
+            if http::exchange::body::eof(slow) => {{ "true" }} else => {{ "false" }}
+        );
+        http::response::set_body(fast_head + "|" + slow_head + "|" + fast_tail + "|" + slow_tail);
+    "#,
+        upstream_addr.port(),
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/http2-chunks"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-fast-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-slow-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-fast-eof")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-slow-eof")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "fast|slow|-body|-body"
+    );
+    assert_eq!(
+        connection_count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "http2 chunk reads should stay on one upstream connection",
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
 #[tokio::test]
 async fn downstream_http2_requests_expose_version_metadata_to_vm_programs() {
     let state = SharedState::new(1024 * 1024);
@@ -1160,6 +1261,110 @@ async fn downstream_http2_requests_expose_version_metadata_to_vm_programs() {
             .expect("body should read")
             .as_ref(),
         b"ok"
+    );
+}
+
+#[tokio::test]
+async fn same_vm_program_handles_downstream_http11_and_http2_requests() {
+    let state = SharedState::new(1024 * 1024);
+    let source = r#"
+        use http;
+
+        http::response::set_status(201);
+        http::response::set_header("x-request-version", http::request::get_http_version());
+        http::response::set_header("x-method", http::request::get_method());
+        http::response::set_header("x-host", http::request::get_host());
+        http::response::set_body(
+            http::request::get_path_with_query() + "|" + http::request::get_body()
+        );
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    let program_bytes = encode_program(&compiled.program).expect("program should encode");
+    let report = edge::apply_program_from_bytes(&state, &program_bytes).await;
+    assert!(report.applied, "program should apply");
+
+    let http11_response = build_http_proxy_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/same-program?mode=http11")
+                .version(axum::http::Version::HTTP_11)
+                .header("host", "app.example.test")
+                .body(Body::from("payload-11"))
+                .expect("http1 request should build"),
+        )
+        .await
+        .expect("http1 request should complete");
+    assert_eq!(http11_response.status(), StatusCode::CREATED);
+    assert_eq!(
+        http11_response
+            .headers()
+            .get("x-request-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("1.1")
+    );
+    assert_eq!(
+        http11_response
+            .headers()
+            .get("x-method")
+            .and_then(|value| value.to_str().ok()),
+        Some("POST")
+    );
+    assert_eq!(
+        http11_response
+            .headers()
+            .get("x-host")
+            .and_then(|value| value.to_str().ok()),
+        Some("app.example.test")
+    );
+    assert_eq!(
+        to_bytes(http11_response.into_body(), usize::MAX)
+            .await
+            .expect("http1 body should read")
+            .as_ref(),
+        b"/same-program?mode=http11|payload-11"
+    );
+
+    let http2_response = build_http_proxy_app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/same-program?mode=http2")
+                .version(axum::http::Version::HTTP_2)
+                .header("host", "app.example.test")
+                .body(Body::from("payload-2"))
+                .expect("http2 request should build"),
+        )
+        .await
+        .expect("http2 request should complete");
+    assert_eq!(http2_response.status(), StatusCode::CREATED);
+    assert_eq!(
+        http2_response
+            .headers()
+            .get("x-request-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(
+        http2_response
+            .headers()
+            .get("x-method")
+            .and_then(|value| value.to_str().ok()),
+        Some("POST")
+    );
+    assert_eq!(
+        http2_response
+            .headers()
+            .get("x-host")
+            .and_then(|value| value.to_str().ok()),
+        Some("app.example.test")
+    );
+    assert_eq!(
+        to_bytes(http2_response.into_body(), usize::MAX)
+            .await
+            .expect("http2 body should read")
+            .as_ref(),
+        b"/same-program?mode=http2|payload-2"
     );
 }
 
