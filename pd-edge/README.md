@@ -347,6 +347,7 @@ Current state:
 
 - HTTP is implemented today as an explicit graph in [`pd-edge/src/abi_impl/http/state.rs`](src/abi_impl/http/state.rs).
 - WebSocket is implemented today as an explicit child DAG over outbound HTTP-upgrade handles in [`pd-edge/src/abi_impl/websocket/state.rs`](src/abi_impl/websocket/state.rs).
+- Full cross-protocol graph: [`pd-edge/docs/full-dag.md`](docs/full-dag.md).
 - TCP, TLS, and outbound HTTP exchanges are exposed to programs through handle-based host calls:
   - `tcp::stream::downstream()` returns reserved socket handle `0`
   - `tcp::stream::default_upstream()` returns reserved socket handle `1`
@@ -389,15 +390,15 @@ Rules:
 
 ```mermaid
 flowchart TD
-    A[tcp.listener or tcp.dial pending] --> B[tcp.accepted or tcp.outbound dialed]
-    B --> C[tcp.connected]
-    C --> D[tcp.rx byte stream]
-    C --> E[tcp.tx byte stream]
-    D --> F[tcp.remote eof]
-    E --> G[tcp.local eof]
-    C --> H[tcp.error]
-    C --> I[tls ingress may attach here]
-    F --> J[tcp.closed]
+    A["tcp listener or tcp dial pending"] --> B["tcp accepted or tcp outbound dialed"]
+    B --> C["tcp connected"]
+    C --> D["tcp rx byte stream"]
+    C --> E["tcp tx byte stream"]
+    D --> F["tcp remote eof"]
+    E --> G["tcp local eof"]
+    C --> H["tcp error"]
+    C --> I["tls ingress may attach here"]
+    F --> J["tcp closed"]
     G --> J
     H --> J
 ```
@@ -418,21 +419,21 @@ Rules:
 
 ```mermaid
 flowchart TD
-    A[tcp.connected] --> B[tls.configured]
-    B --> C[tls.client_hello_prepared]
-    C --> D[tls.client_hello_sent]
-    D --> E[tls.server_hello_received]
-    E --> F[tls.server_certificate_received]
-    F --> G{verification policy}
-    G -->|verify enabled| H[tls.server_certificate_verified]
-    G -->|verify relaxed| I[tls.verification_skipped]
-    H --> J{ALPN policy satisfied?}
+    A["tcp connected"] --> B["tls configured"]
+    B --> C["tls client hello prepared"]
+    C --> D["tls client hello sent"]
+    D --> E["tls server hello received"]
+    E --> F["tls server certificate received"]
+    F --> G{"verification policy"}
+    G -->|verify enabled| H["tls server certificate verified"]
+    G -->|verify relaxed| I["tls verification skipped"]
+    H --> J{"ALPN policy satisfied"}
     I --> J
-    J -->|yes| K[tls.plaintext_ready]
-    J -->|no| L[tls.failed]
-    K --> M[http ingress may attach here]
-    K --> N[tls.close_notify]
-    N --> O[tls.closed]
+    J -->|yes| K["tls plaintext ready"]
+    J -->|no| L["tls failed"]
+    K --> M["http ingress may attach here"]
+    K --> N["tls close notify"]
+    N --> O["tls closed"]
     L --> O
 ```
 
@@ -457,26 +458,26 @@ Rules:
 
 ```mermaid
 flowchart TD
-    A[http ingress admitted] --> B[request.head ready]
-    A --> C[request.body unread stream]
-    B --> D[VM execution]
-    C -. http.request.body::* / io::read* consume real IO .-> D
-    D -->|http::exchange::set_* / http.upstream.request::*| E[exchange[n].request draft]
-    D -->|http.response::*| F[response.output draft]
-    D -->|http::exchange::get_* / body::* / tcp::stream::read(handle)| G{exchange[n].response ready?}
+    A["http ingress admitted"] --> B["request head ready"]
+    A --> C["request body unread stream"]
+    B --> D["VM execution"]
+    C -.-> D
+    D --> E["exchange n request draft"]
+    D --> F["response output draft"]
+    D --> G{"exchange n response ready"}
     E --> G
-    G -->|no| H[host call or resolver performs outbound exchange n]
-    C -. if exchange 1 has no body override .-> H
-    H --> I[exchange[n].response headers + stream]
+    G -->|no| H["host call or resolver starts exchange n"]
+    C -.-> H
+    H --> I["exchange n response stream ready"]
     G -->|yes| I
-    I -->|body::next_chunk / get_body / eof| D
-    D --> J[graph resolver after VM halt]
+    I --> D
+    D --> J["graph resolver after VM halt"]
     E --> J
     F --> J
     I --> J
-    J -->|response.output.body set| K[build client response from response.output]
-    J -->|otherwise and exchange 1 target exists| L[start exchange 1 if needed and materialize response]
-    K --> M[return client response]
+    J -->|response output| K["build client response from response output"]
+    J -->|default exchange| L["start exchange 1 if needed"]
+    K --> M["return client response"]
     L --> M
 ```
 
@@ -495,16 +496,16 @@ Rules:
 
 ```mermaid
 flowchart TD
-    A[http exchange[n] upgrade-capable request] --> B[websocket.upgrade prepared]
-    B --> C[websocket.handshake started]
-    C --> D[websocket.open]
-    D --> E[websocket.rx frame stream]
-    D --> F[websocket.tx frame stream]
-    D --> G[websocket.subprotocol negotiated]
-    E --> H[websocket.close received]
-    F --> I[websocket.close sent]
-    D --> J[websocket.failed]
-    H --> K[websocket.closed]
+    A["http exchange n upgrade request"] --> B["websocket upgrade prepared"]
+    B --> C["websocket handshake started"]
+    C --> D["websocket open"]
+    D --> E["websocket rx frame stream"]
+    D --> F["websocket tx frame stream"]
+    D --> G["websocket subprotocol negotiated"]
+    E --> H["websocket close received"]
+    F --> I["websocket close sent"]
+    D --> J["websocket failed"]
+    H --> K["websocket closed"]
     I --> K
     J --> K
 ```
@@ -561,21 +562,21 @@ The clean model is to treat downstream and upstream as separate DAG instances wi
 
 ```mermaid
 flowchart LR
-    subgraph Downstream
-        D1[tcp.downstream]
-        D2[tls.downstream]
-        D3[http.downstream request/response]
+    subgraph Downstream["Downstream"]
+        D1["tcp downstream"]
+        D2["tls downstream"]
+        D3["http downstream request and response"]
         D1 --> D2 --> D3
     end
 
-    subgraph Control
-        V[VM host calls + graph resolver]
+    subgraph Control["Control"]
+        V["VM host calls and graph resolver"]
     end
 
-    subgraph Upstream
-        U3[http.upstream request/response]
-        U2[tls.upstream]
-        U1[tcp.upstream]
+    subgraph Upstream["Upstream"]
+        U3["http upstream request and response"]
+        U2["tls upstream"]
+        U1["tcp upstream"]
         U3 --> U2 --> U1
     end
 
