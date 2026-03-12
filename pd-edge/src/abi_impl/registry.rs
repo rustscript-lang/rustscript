@@ -12,6 +12,9 @@ pub(crate) enum EdgeHostScope {
     Http,
     HttpExtension,
     Io,
+    Transport,
+    WebSocket,
+    Proxy,
 }
 
 #[allow(dead_code)]
@@ -37,6 +40,9 @@ fn scope_mask(scope: EdgeHostScope) -> u8 {
         EdgeHostScope::Http => 1 << 1,
         EdgeHostScope::HttpExtension => 1 << 2,
         EdgeHostScope::Io => 1 << 3,
+        EdgeHostScope::Transport => 1 << 4,
+        EdgeHostScope::WebSocket => 1 << 5,
+        EdgeHostScope::Proxy => 1 << 6,
     }
 }
 

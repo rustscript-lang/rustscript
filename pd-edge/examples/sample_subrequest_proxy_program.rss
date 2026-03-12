@@ -1,0 +1,50 @@
+use http;
+use tcp;
+use tls;
+
+let primary_target = http::request::get_header("x-primary-target");
+let secondary_target = http::request::get_header("x-secondary-target");
+
+if primary_target == "" || secondary_target == "" {
+    http::response::set_status(400);
+    http::response::set_body("missing x-primary-target or x-secondary-target");
+} else {
+    let primary = http::exchange::default_upstream();
+    let secondary = http::exchange::new();
+
+    http::exchange::set_method(primary, "POST");
+    http::exchange::set_target(primary, primary_target);
+    http::exchange::set_header(primary, "x-exchange-id", "primary");
+    tcp::stream::write(primary, "alpha");
+
+    http::exchange::set_method(secondary, "POST");
+    http::exchange::set_target(secondary, secondary_target);
+    http::exchange::set_header(secondary, "x-exchange-id", "secondary");
+    tcp::stream::write(secondary, "beta");
+
+    http::exchange::send(primary);
+
+    let secondary_tls = tls::session::from_socket(secondary);
+    if tls::session::is_present(secondary_tls) && tls::session::handshake(secondary_tls) {
+        let peer_name = tls::session::get_peer_name(secondary_tls);
+        if peer_name != "" {
+            http::response::set_header("x-secondary-peer", peer_name);
+        }
+        let alpn = tls::session::get_alpn(secondary_tls);
+        if alpn != "" {
+            http::response::set_header("x-secondary-alpn", alpn);
+        }
+    }
+
+    let mut primary_body = "";
+    while !tcp::stream::eof(primary) {
+        primary_body = primary_body + tcp::stream::read(primary, 3);
+    }
+
+    let mut secondary_body = "";
+    while !http::exchange::body::eof(secondary) {
+        secondary_body = secondary_body + http::exchange::body::next_chunk(secondary, 4);
+    }
+
+    http::response::set_body(primary_body + "|" + secondary_body);
+}

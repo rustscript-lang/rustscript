@@ -11,10 +11,10 @@ use super::{
     SharedVmAsyncOps,
 };
 
-const EDGE_IO_HANDLE_REQUEST_BODY: i64 = 1;
-const EDGE_IO_HANDLE_RESPONSE_BODY: i64 = 2;
-const EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY: i64 = 3;
-const EDGE_IO_HANDLE_UPSTREAM_RESPONSE_BODY: i64 = 4;
+pub(crate) const EDGE_IO_HANDLE_REQUEST_BODY: i64 = 1;
+pub(crate) const EDGE_IO_HANDLE_RESPONSE_BODY: i64 = 2;
+pub(crate) const EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY: i64 = 3;
+pub(crate) const EDGE_IO_HANDLE_UPSTREAM_RESPONSE_BODY: i64 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EdgeIoHandleKind {
@@ -221,7 +221,10 @@ async fn read_io_target_all(
         }
         EdgeIoHandleKind::Response => {
             let guard = context.lock().expect("vm context lock poisoned");
-            Ok(guard.response_output.body.clone().unwrap_or_default())
+            Ok(
+                String::from_utf8_lossy(guard.response_output.body.as_deref().unwrap_or_default())
+                    .into_owned(),
+            )
         }
         EdgeIoHandleKind::UpstreamRequest => {
             let body = resolve_outbound_request_body(context).await?;
@@ -244,7 +247,10 @@ async fn read_io_target_line(
         }
         EdgeIoHandleKind::Response => {
             let guard = context.lock().expect("vm context lock poisoned");
-            Ok(guard.response_output.body.clone().unwrap_or_default())
+            Ok(
+                String::from_utf8_lossy(guard.response_output.body.as_deref().unwrap_or_default())
+                    .into_owned(),
+            )
         }
         EdgeIoHandleKind::UpstreamRequest => {
             let body = resolve_outbound_request_body(context).await?;
@@ -267,7 +273,7 @@ fn write_io_target(
             "edge io::write does not support request body read handle".to_string(),
         )),
         EdgeIoHandleKind::Response => {
-            context.response_output.body = Some(text.to_string());
+            context.response_output.body = Some(text.as_bytes().to_vec());
             Ok(())
         }
         EdgeIoHandleKind::UpstreamRequest => {

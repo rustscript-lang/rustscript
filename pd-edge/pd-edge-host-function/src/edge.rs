@@ -51,6 +51,9 @@ enum EdgeHostScopeAttr {
     Http,
     HttpExtension,
     Io,
+    Transport,
+    WebSocket,
+    Proxy,
 }
 
 fn parse_edge_host_attr(args: &Punctuated<Meta, Token![,]>) -> Result<EdgeHostAttr, Error> {
@@ -112,13 +115,13 @@ fn parse_edge_scope(value: &Expr) -> Result<EdgeHostScopeAttr, Error> {
             let Some(segment) = path.path.segments.last() else {
                 return Err(Error::new_spanned(
                     value,
-                    "scope must be one of runtime, http, http_extension, or io",
+                    "scope must be one of runtime, http, http_extension, io, transport, websocket, or proxy",
                 ));
             };
             if path.path.segments.len() != 1 {
                 return Err(Error::new_spanned(
                     value,
-                    "scope must be one of runtime, http, http_extension, or io",
+                    "scope must be one of runtime, http, http_extension, io, transport, websocket, or proxy",
                 ));
             }
             segment.ident.to_string()
@@ -128,14 +131,14 @@ fn parse_edge_scope(value: &Expr) -> Result<EdgeHostScopeAttr, Error> {
             _ => {
                 return Err(Error::new_spanned(
                     value,
-                    "scope must be one of runtime, http, http_extension, or io",
+                    "scope must be one of runtime, http, http_extension, io, transport, websocket, or proxy",
                 ));
             }
         },
         _ => {
             return Err(Error::new_spanned(
                 value,
-                "scope must be one of runtime, http, http_extension, or io",
+                "scope must be one of runtime, http, http_extension, io, transport, websocket, or proxy",
             ));
         }
     };
@@ -145,9 +148,12 @@ fn parse_edge_scope(value: &Expr) -> Result<EdgeHostScopeAttr, Error> {
         "http" => Ok(EdgeHostScopeAttr::Http),
         "http_extension" | "http_extensions" => Ok(EdgeHostScopeAttr::HttpExtension),
         "io" | "io_override" | "io_overrides" => Ok(EdgeHostScopeAttr::Io),
+        "transport" => Ok(EdgeHostScopeAttr::Transport),
+        "websocket" => Ok(EdgeHostScopeAttr::WebSocket),
+        "proxy" => Ok(EdgeHostScopeAttr::Proxy),
         _ => Err(Error::new_spanned(
             value,
-            "scope must be one of runtime, http, http_extension, or io",
+            "scope must be one of runtime, http, http_extension, io, transport, websocket, or proxy",
         )),
     }
 }
@@ -162,6 +168,15 @@ fn edge_scope_tokens(scope: EdgeHostScopeAttr) -> proc_macro2::TokenStream {
             quote!(crate::abi_impl::registry::EdgeHostScope::HttpExtension)
         }
         EdgeHostScopeAttr::Io => quote!(crate::abi_impl::registry::EdgeHostScope::Io),
+        EdgeHostScopeAttr::Transport => {
+            quote!(crate::abi_impl::registry::EdgeHostScope::Transport)
+        }
+        EdgeHostScopeAttr::WebSocket => {
+            quote!(crate::abi_impl::registry::EdgeHostScope::WebSocket)
+        }
+        EdgeHostScopeAttr::Proxy => {
+            quote!(crate::abi_impl::registry::EdgeHostScope::Proxy)
+        }
     }
 }
 

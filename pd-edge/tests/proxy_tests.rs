@@ -20,8 +20,33 @@ use edge::{
     FN_HTTP_UPSTREAM_REQUEST_SET_TARGET, SharedState, build_admin_app, build_http_proxy_app,
     compile_edge_source_file, spawn_active_control_plane_client,
 };
+use futures_util::{SinkExt, StreamExt};
 use tokio::{sync::Notify, task::JoinHandle, time::timeout};
+use tokio_rustls::{
+    TlsAcceptor,
+    rustls::{
+        self,
+        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    },
+};
+use tokio_tungstenite::{
+    accept_hdr_async,
+    tungstenite::{
+        Message,
+        handshake::server::{Request as WsRequest, Response as WsResponse},
+        http::HeaderValue as WsHeaderValue,
+    },
+};
 use vm::{BytecodeBuilder, Program, Value, compile_source, encode_program};
+
+fn ensure_rustls_provider() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .expect("rustls crypto provider should install");
+    });
+}
 
 async fn spawn_server(app: Router) -> (SocketAddr, JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -38,6 +63,12 @@ async fn spawn_proxy(
     max_program_bytes: usize,
 ) -> (SocketAddr, SocketAddr, JoinHandle<()>, JoinHandle<()>) {
     let state = SharedState::new(max_program_bytes);
+    spawn_proxy_with_state(state).await
+}
+
+async fn spawn_proxy_with_state(
+    state: SharedState,
+) -> (SocketAddr, SocketAddr, JoinHandle<()>, JoinHandle<()>) {
     let (data_addr, data_handle) = spawn_server(build_http_proxy_app(state.clone())).await;
     let (admin_addr, admin_handle) = spawn_server(build_admin_app(state)).await;
     (data_addr, admin_addr, data_handle, admin_handle)
@@ -85,6 +116,257 @@ async fn spawn_chunked_upstream(chunks: Vec<&'static str>) -> (SocketAddr, JoinH
         }
     });
     (addr, handle)
+}
+
+async fn spawn_websocket_echo_upstream() -> (SocketAddr, JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener should have addr");
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            tokio::spawn(async move {
+                let callback = |request: &WsRequest, mut response: WsResponse| {
+                    let requested = request
+                        .headers()
+                        .get("sec-websocket-protocol")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("");
+                    if requested
+                        .split(',')
+                        .map(str::trim)
+                        .any(|protocol| protocol == "chat")
+                    {
+                        response
+                            .headers_mut()
+                            .insert("sec-websocket-protocol", WsHeaderValue::from_static("chat"));
+                    }
+                    Ok(response)
+                };
+
+                let mut websocket = accept_hdr_async(stream, callback)
+                    .await
+                    .expect("websocket accept should succeed");
+                while let Some(message) = websocket.next().await {
+                    match message.expect("websocket message should decode") {
+                        Message::Text(text) => {
+                            websocket
+                                .send(Message::Text(format!("echo:{text}").into()))
+                                .await
+                                .expect("text reply should send");
+                        }
+                        Message::Binary(payload) => {
+                            websocket
+                                .send(Message::Binary(payload))
+                                .await
+                                .expect("binary reply should send");
+                        }
+                        Message::Ping(payload) => {
+                            websocket
+                                .send(Message::Pong(payload))
+                                .await
+                                .expect("pong should send");
+                        }
+                        Message::Pong(_) => {}
+                        Message::Close(frame) => {
+                            let _ = websocket.close(frame).await;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+    (addr, handle)
+}
+
+async fn spawn_https_echo_upstream() -> (SocketAddr, JoinHandle<()>) {
+    ensure_rustls_provider();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("certificate should generate");
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(
+                cert.serialize_der().expect("certificate should serialize"),
+            )],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.serialize_private_key_der())),
+        )
+        .expect("server config should build");
+    spawn_tls_echo_server(server_config, false).await
+}
+
+#[derive(Clone)]
+struct TlsTestMaterials {
+    ca_pem: String,
+    ca_der: Vec<u8>,
+    server_cert_der: Vec<u8>,
+    server_key_der: Vec<u8>,
+    client_cert_pem: String,
+    client_key_pem: String,
+}
+
+fn source_string_literal(value: &str) -> String {
+    serde_json::to_string(value).expect("source literal should serialize")
+}
+
+fn build_ca_signed_tls_materials() -> TlsTestMaterials {
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new());
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    let ca = rcgen::Certificate::from_params(ca_params).expect("ca certificate should build");
+
+    let mut server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]);
+    server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    let server =
+        rcgen::Certificate::from_params(server_params).expect("server certificate should build");
+
+    let mut client_params = rcgen::CertificateParams::new(vec!["client.local".to_string()]);
+    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let client =
+        rcgen::Certificate::from_params(client_params).expect("client certificate should build");
+
+    TlsTestMaterials {
+        ca_pem: ca.serialize_pem().expect("ca pem should serialize"),
+        ca_der: ca.serialize_der().expect("ca der should serialize"),
+        server_cert_der: server
+            .serialize_der_with_signer(&ca)
+            .expect("server cert should serialize"),
+        server_key_der: server.serialize_private_key_der(),
+        client_cert_pem: client
+            .serialize_pem_with_signer(&ca)
+            .expect("client cert should serialize"),
+        client_key_pem: client.serialize_private_key_pem(),
+    }
+}
+
+async fn spawn_tls_echo_server(
+    mut server_config: rustls::ServerConfig,
+    require_client_certificate: bool,
+) -> (SocketAddr, JoinHandle<()>) {
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener should have addr");
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                let mut stream = acceptor
+                    .accept(stream)
+                    .await
+                    .expect("tls accept should succeed");
+                let client_cert_count = stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .map(|certificates| certificates.len())
+                    .unwrap_or(0);
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 2048];
+                let mut expected_body_len = None;
+
+                loop {
+                    let read = stream
+                        .read(&mut buffer)
+                        .await
+                        .expect("request read should succeed");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if expected_body_len.is_none()
+                        && let Some(header_end) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let header_end = header_end + 4;
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                if !name.eq_ignore_ascii_case("content-length") {
+                                    return None;
+                                }
+                                value.trim().parse::<usize>().ok()
+                            })
+                            .unwrap_or(0);
+                        expected_body_len = Some(header_end + content_length);
+                    }
+                    if let Some(total_len) = expected_body_len
+                        && request.len() >= total_len
+                    {
+                        break;
+                    }
+                }
+
+                let body = if let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    request[header_end + 4..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let body = String::from_utf8_lossy(&body).into_owned();
+                let response_body = if require_client_certificate {
+                    format!("mtls:{client_cert_count}:{body}")
+                } else {
+                    body
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("response should write");
+                stream.flush().await.expect("response should flush");
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (addr, handle)
+}
+
+async fn spawn_ca_signed_https_echo_upstream(
+    materials: &TlsTestMaterials,
+    require_client_certificate: bool,
+) -> (SocketAddr, JoinHandle<()>) {
+    ensure_rustls_provider();
+
+    let builder = rustls::ServerConfig::builder();
+    let server_config = if require_client_certificate {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(materials.ca_der.clone()))
+            .expect("ca cert should be trusted");
+        let client_verifier = rustls::server::WebPkiClientVerifier::builder(roots.into())
+            .build()
+            .expect("client verifier should build");
+        builder.with_client_cert_verifier(client_verifier)
+    } else {
+        builder.with_no_client_auth()
+    }
+    .with_single_cert(
+        vec![CertificateDer::from(materials.server_cert_der.clone())],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(materials.server_key_der.clone())),
+    )
+    .expect("server config should build");
+
+    spawn_tls_echo_server(server_config, require_client_certificate).await
 }
 
 fn build_short_circuit_program(body: &str, header: Option<(&str, &str)>) -> Program {
@@ -854,6 +1136,964 @@ async fn sample_proxy_program_streams_or_buffers_upstream_body() {
         buffered.text().await.expect("buffered body should read"),
         "abcdef"
     );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn sample_transport_proxy_program_streams_plain_http_body() {
+    let (upstream_addr, upstream_handle) = spawn_chunked_upstream(vec!["ab", "cd", "ef"]).await;
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_transport_proxy_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let upstream_target = format!("http://{upstream_addr}/sample");
+    let response = client
+        .get(format!("http://{data_addr}/proxy"))
+        .header("x-upstream-target", &upstream_target)
+        .header("Streaming", "1")
+        .send()
+        .await
+        .expect("streaming request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-peer-name")
+            .and_then(|value| value.to_str().ok()),
+        None
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upload-pipe")
+            .and_then(|value| value.to_str().ok()),
+        Some("eof")
+    );
+    assert_eq!(
+        response.text().await.expect("response body should read"),
+        "abAcdAefA"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn sample_transport_proxy_program_handles_https_tls_session() {
+    let (upstream_addr, upstream_handle) = spawn_https_echo_upstream().await;
+    let mut state = SharedState::new(1024 * 1024);
+    state.client = reqwest::Client::builder()
+        .tls_info(true)
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("tls test client should build");
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy_with_state(state).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_transport_proxy_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let upstream_target = format!("https://localhost:{}/echo", upstream_addr.port());
+    let response = client
+        .post(format!("http://{data_addr}/proxy"))
+        .header("x-upstream-target", &upstream_target)
+        .body("secure-payload")
+        .send()
+        .await
+        .expect("https request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-stream")
+            .and_then(|value| value.to_str().ok()),
+        Some("false")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-peer-name")
+            .and_then(|value| value.to_str().ok()),
+        Some("localhost")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upload-pipe")
+            .and_then(|value| value.to_str().ok()),
+        Some("eof")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream-alpn")
+            .and_then(|value| value.to_str().ok()),
+        Some("http/1.1")
+    );
+    assert_eq!(
+        response.text().await.expect("response body should read"),
+        "secure-payload"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn sample_tunnel_proxy_program_tunnels_plain_http_body() {
+    let upstream_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let body = to_bytes(request.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        Response::new(Body::from(format!(
+            "tunnel:{}",
+            String::from_utf8_lossy(&body)
+        )))
+    }));
+    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_tunnel_proxy_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .post(format!("http://{data_addr}/tunnel"))
+        .header("x-upstream-target", format!("http://{upstream_addr}/echo"))
+        .body("abcdefghij")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-proxy-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("closed")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "tunnel:abcdefghij"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn sample_tunnel_proxy_program_tunnels_https_body_via_tls_plaintext_stream() {
+    let (upstream_addr, upstream_handle) = spawn_https_echo_upstream().await;
+    let mut state = SharedState::new(1024 * 1024);
+    state.client = reqwest::Client::builder()
+        .tls_info(true)
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("tls test client should build");
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy_with_state(state).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_tunnel_proxy_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .post(format!("http://{data_addr}/tls-tunnel"))
+        .header(
+            "x-upstream-target",
+            format!("https://localhost:{}/echo", upstream_addr.port()),
+        )
+        .body("secure-payload")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-proxy-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("closed")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-peer-name")
+            .and_then(|value| value.to_str().ok()),
+        Some("localhost")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream-alpn")
+            .and_then(|value| value.to_str().ok()),
+        Some("http/1.1")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "secure-payload"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_pipe_forwards_dynamic_exchange_response_via_proxy_stream_handle() {
+    let upstream_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let body = to_bytes(request.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        Response::new(Body::from(format!(
+            "dynamic:{}",
+            String::from_utf8_lossy(&body)
+        )))
+    }));
+    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use proxy;
+
+        let exchange = http::exchange::new();
+        http::exchange::set_target(exchange, "http://{upstream_addr}/dynamic");
+        http::exchange::set_body(exchange, "payload");
+
+        let response = proxy::stream::exchange(exchange);
+        let downstream = proxy::stream::downstream();
+        let status = proxy::pipe(response, downstream, 5);
+        http::response::set_header("x-proxy-status", status);
+        http::response::set_status(http::exchange::get_status(exchange));
+
+        let content_type = http::exchange::get_header(exchange, "content-type");
+        if content_type != "" {{
+            http::response::set_header("content-type", content_type);
+        }}
+    "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/dynamic-proxy"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-proxy-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("eof")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "dynamic:payload"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn tls_session_can_disable_verification_and_expose_handshake_phase() {
+    let (upstream_addr, upstream_handle) = spawn_https_echo_upstream().await;
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use tcp;
+        use tls;
+
+        let exchange = http::exchange::default_upstream();
+        http::exchange::set_target(exchange, "https://localhost:{}/echo");
+        http::exchange::set_body(exchange, "phase-body");
+
+        let session = tls::session::from_socket(exchange);
+        tls::session::set_verify(session, false);
+        tls::session::handshake(session);
+
+        http::response::set_header("x-phase", tls::session::get_phase(session));
+        http::response::set_header("x-peer-cert", tls::session::get_peer_certificate(session));
+        http::response::set_body(http::exchange::get_body(exchange));
+    "#,
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/tls-phase"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-phase")
+            .and_then(|value| value.to_str().ok()),
+        Some("plaintext-ready")
+    );
+    assert!(
+        response
+            .headers()
+            .get("x-peer-cert")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "phase-body"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn tls_session_accepts_custom_trusted_certificate_bundle() {
+    let materials = build_ca_signed_tls_materials();
+    let (upstream_addr, upstream_handle) =
+        spawn_ca_signed_https_echo_upstream(&materials, false).await;
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use tls;
+
+        let exchange = http::exchange::default_upstream();
+        http::exchange::set_target(exchange, "https://localhost:{}/echo");
+        http::exchange::set_body(exchange, "trusted-body");
+
+        let session = tls::session::from_socket(exchange);
+        tls::session::set_trusted_certificate(session, {});
+        tls::session::handshake(session);
+
+        http::response::set_header("x-phase", tls::session::get_phase(session));
+        http::response::set_header("x-alpn", tls::session::get_alpn(session));
+        http::response::set_body(http::exchange::get_body(exchange));
+    "#,
+        upstream_addr.port(),
+        source_string_literal(&materials.ca_pem),
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/tls-ca"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-phase")
+            .and_then(|value| value.to_str().ok()),
+        Some("plaintext-ready")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-alpn")
+            .and_then(|value| value.to_str().ok()),
+        Some("http/1.1")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "trusted-body"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn tls_session_supports_client_certificate_authentication() {
+    let materials = build_ca_signed_tls_materials();
+    let (upstream_addr, upstream_handle) =
+        spawn_ca_signed_https_echo_upstream(&materials, true).await;
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use tls;
+
+        let exchange = http::exchange::default_upstream();
+        http::exchange::set_target(exchange, "https://localhost:{}/echo");
+        http::exchange::set_body(exchange, "mtls-body");
+
+        let session = tls::session::from_socket(exchange);
+        tls::session::set_trusted_certificate(session, {});
+        tls::session::set_certificate(session, {});
+        tls::session::set_private_key(session, {});
+        tls::session::handshake(session);
+
+        http::response::set_header("x-phase", tls::session::get_phase(session));
+        http::response::set_body(http::exchange::get_body(exchange));
+    "#,
+        upstream_addr.port(),
+        source_string_literal(&materials.ca_pem),
+        source_string_literal(&materials.client_cert_pem),
+        source_string_literal(&materials.client_key_pem),
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/tls-mtls"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-phase")
+            .and_then(|value| value.to_str().ok()),
+        Some("plaintext-ready")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "mtls:1:mtls-body"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn tls_session_rejects_alpn_policy_mismatch() {
+    let (upstream_addr, upstream_handle) = spawn_https_echo_upstream().await;
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use tls;
+
+        let exchange = http::exchange::default_upstream();
+        http::exchange::set_target(exchange, "https://localhost:{}/echo");
+        let session = tls::session::from_socket(exchange);
+        tls::session::set_verify(session, false);
+        tls::session::set_alpn(session, "h2");
+        tls::session::handshake(session);
+    "#,
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/tls-alpn-mismatch"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn sample_subrequest_proxy_program_fans_out_across_default_and_dynamic_exchanges() {
+    let plain_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let body = to_bytes(request.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        Response::new(Body::from(format!(
+            "plain:{}",
+            String::from_utf8_lossy(&body)
+        )))
+    }));
+    let (plain_addr, plain_handle) = spawn_server(plain_app).await;
+    let (secure_addr, secure_handle) = spawn_https_echo_upstream().await;
+
+    let mut state = SharedState::new(1024 * 1024);
+    state.client = reqwest::Client::builder()
+        .tls_info(true)
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("tls test client should build");
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy_with_state(state).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_subrequest_proxy_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/fanout"))
+        .header("x-primary-target", format!("http://{plain_addr}/plain"))
+        .header(
+            "x-secondary-target",
+            format!("https://localhost:{}/secure", secure_addr.port()),
+        )
+        .send()
+        .await
+        .expect("fanout request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-secondary-peer")
+            .and_then(|value| value.to_str().ok()),
+        Some("localhost")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-secondary-alpn")
+            .and_then(|value| value.to_str().ok()),
+        Some("http/1.1")
+    );
+    assert_eq!(
+        response.text().await.expect("response body should read"),
+        "plain:alpha|beta"
+    );
+
+    plain_handle.abort();
+    secure_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn sample_websocket_proxy_program_round_trips_text_frames() {
+    let (upstream_addr, upstream_handle) = spawn_websocket_echo_upstream().await;
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_websocket_proxy_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/ws"))
+        .header("x-ws-target", format!("ws://{upstream_addr}/echo"))
+        .header("x-ws-message", "hello")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-phase")
+            .and_then(|value| value.to_str().ok()),
+        Some("closed")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-protocol")
+            .and_then(|value| value.to_str().ok()),
+        Some("chat")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "echo:hello"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn websocket_connection_can_round_trip_binary_frames() {
+    let (upstream_addr, upstream_handle) = spawn_websocket_echo_upstream().await;
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let payload = STANDARD.encode(b"bin-payload");
+    let source = format!(
+        r#"
+        use http;
+        use websocket;
+
+        let connection = websocket::connection::default_upstream();
+        websocket::connection::set_target(connection, "ws://{upstream_addr}/binary");
+        websocket::connection::connect(connection);
+        websocket::connection::send_binary_base64(connection, "{payload}");
+        let echoed = websocket::connection::read_binary_base64(connection);
+        http::response::set_header("x-phase", websocket::connection::get_phase(connection));
+        websocket::connection::close(connection, 1000, "binary-complete");
+        http::response::set_body(echoed);
+    "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/ws-binary"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-phase")
+            .and_then(|value| value.to_str().ok()),
+        Some("open")
+    );
+    assert_eq!(response.text().await.expect("body should read"), payload);
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn downstream_websocket_handle_exposes_upgrade_candidate_phase() {
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = r#"
+        use http;
+        use websocket;
+
+        let downstream = websocket::connection::downstream();
+        if websocket::connection::is_present(downstream) {
+            http::response::set_header("x-phase", websocket::connection::get_phase(downstream));
+            http::response::set_body("upgrade");
+        } else {
+            http::response::set_body("plain");
+        }
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/ws-downstream"))
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-phase")
+            .and_then(|value| value.to_str().ok()),
+        Some("upgrade-observed")
+    );
+    assert_eq!(response.text().await.expect("body should read"), "upgrade");
+
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn http_exchange_supports_multiple_dynamic_subrequests_in_one_vm_run() {
+    let first_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let body = to_bytes(request.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        Response::new(Body::from(format!(
+            "first:{}",
+            String::from_utf8_lossy(&body)
+        )))
+    }));
+    let second_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let body = to_bytes(request.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        Response::new(Body::from(format!(
+            "second:{}",
+            String::from_utf8_lossy(&body)
+        )))
+    }));
+    let (first_addr, first_handle) = spawn_server(first_app).await;
+    let (second_addr, second_handle) = spawn_server(second_app).await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use tcp;
+
+        let first = http::exchange::new();
+        let second = http::exchange::new();
+        if first == second {{
+            http::response::set_status(500);
+            http::response::set_body("same-handle");
+        }} else {{
+            http::exchange::set_target(first, "http://{first_addr}/one");
+            http::exchange::set_target(second, "http://{second_addr}/two");
+            tcp::stream::write(first, "one");
+            tcp::stream::write(second, "two");
+            http::response::set_body(
+                http::exchange::get_body(first) + "|" + http::exchange::get_body(second)
+            );
+        }}
+    "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/subrequests"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "first:one|second:two"
+    );
+
+    first_handle.abort();
+    second_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn dynamic_exchange_rejects_write_after_response_has_started() {
+    let upstream_app = Router::new().fallback(any(|_request: Request<Body>| async move {
+        Response::new(Body::from("upstream"))
+    }));
+    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use tcp;
+
+        let exchange = http::exchange::new();
+        http::exchange::set_target(exchange, "{upstream_addr}");
+        http::exchange::get_status(exchange);
+        tcp::stream::write(exchange, "late");
+    "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/late-dynamic-write"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn transport_downstream_tls_session_reflects_forwarded_https_metadata() {
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+
+    let source = r#"
+        use http;
+        use tcp;
+        use tls;
+
+        let sock = tcp::stream::downstream();
+        let session = tls::session::from_socket(sock);
+        if tls::session::is_present(session) {
+            http::response::set_header("x-tls", "true");
+            http::response::set_header("x-server-name", tls::session::get_server_name(session));
+            http::response::set_header("x-alpn", tls::session::get_alpn(session));
+        } else {
+            http::response::set_header("x-tls", "false");
+        }
+        http::response::set_body("ok");
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/tls"))
+        .header("x-forwarded-proto", "https")
+        .header("host", "app.example.test:443")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-tls")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-server-name")
+            .and_then(|value| value.to_str().ok()),
+        Some("app.example.test")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-alpn")
+            .and_then(|value| value.to_str().ok()),
+        Some("http/1.1")
+    );
+    assert_eq!(response.text().await.expect("body should read"), "ok");
+
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn transport_default_upstream_socket_accepts_multiple_writes_before_exchange() {
+    let upstream_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let body = to_bytes(request.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        Response::new(Body::from(String::from_utf8_lossy(&body).into_owned()))
+    }));
+    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use tcp;
+
+        http::upstream::request::set_target("{upstream_addr}");
+        let downstream = tcp::stream::downstream();
+        let upstream = tcp::stream::default_upstream();
+        while !tcp::stream::eof(downstream) {{
+            let chunk = tcp::stream::read(downstream, 3);
+            if chunk != "" {{
+                tcp::stream::write(upstream, chunk);
+            }}
+        }}
+        http::response::set_body(http::upstream::response::get_body());
+    "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .post(format!("http://{data_addr}/echo"))
+        .body("abcdefghij")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "abcdefghij"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn transport_default_upstream_socket_rejects_write_after_response_has_started() {
+    let upstream_app = Router::new().fallback(any(|_request: Request<Body>| async move {
+        Response::new(Body::from("upstream"))
+    }));
+    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use tcp;
+
+        http::upstream::request::set_target("{upstream_addr}");
+        let upstream = tcp::stream::default_upstream();
+        http::upstream::response::get_status();
+        tcp::stream::write(upstream, "late");
+    "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/late-write"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
     upstream_handle.abort();
     data_handle.abort();

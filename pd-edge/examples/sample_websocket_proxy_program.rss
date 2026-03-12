@@ -1,0 +1,27 @@
+use http;
+use websocket;
+
+let target = http::request::get_header("x-ws-target");
+let payload = http::request::get_header("x-ws-message");
+
+if target == "" {
+    http::response::set_status(400);
+    http::response::set_body("missing x-ws-target");
+} else {
+    let connection = websocket::connection::new();
+    websocket::connection::set_target(connection, target);
+    websocket::connection::set_subprotocols(connection, "chat");
+    websocket::connection::connect(connection);
+
+    websocket::connection::send_text(connection, payload);
+    let reply = websocket::connection::read_text(connection);
+    websocket::connection::close(connection, 1000, "sample-complete");
+    let phase = websocket::connection::get_phase(connection);
+    let protocol = websocket::connection::get_subprotocol(connection);
+
+    http::response::set_header("x-ws-phase", phase);
+    if protocol != "" {
+        http::response::set_header("x-ws-protocol", protocol);
+    }
+    http::response::set_body(reply);
+}

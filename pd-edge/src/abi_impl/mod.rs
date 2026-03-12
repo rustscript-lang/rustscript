@@ -14,8 +14,11 @@ use vm::{CallOutcome, HostAsyncBridge, HostFunction, HostOpId, Value, Vm, VmErro
 
 pub(crate) mod http;
 mod io;
+mod proxy;
 mod registry;
 mod runtime;
+mod transport;
+mod websocket;
 
 pub use self::http::{HttpRequestContext, ProxyVmContext, SharedProxyVmContext};
 
@@ -424,6 +427,9 @@ pub fn register_protocol_modules(
         if scope_mask_bits & (1 << 3) != 0 {
             scopes.push(registry::EdgeHostScope::Io);
         }
+        if scope_mask_bits & (1 << 4) != 0 {
+            scopes.push(registry::EdgeHostScope::Transport);
+        }
         return registry::bind_host_scopes(vm, &scopes);
     }
     ensure_edge_abi_host_slots(vm)?;
@@ -509,6 +515,9 @@ pub fn register_http_plane_host_module(
                 registry::EdgeHostScope::Runtime,
                 registry::EdgeHostScope::HttpExtension,
                 registry::EdgeHostScope::Io,
+                registry::EdgeHostScope::Transport,
+                registry::EdgeHostScope::WebSocket,
+                registry::EdgeHostScope::Proxy,
             ],
         );
     }
@@ -521,6 +530,9 @@ pub fn register_http_plane_host_module(
         &[&HTTP_PROTOCOL_MODULE, &RUNTIME_PROTOCOL_MODULE],
     )?;
     http::register_http_extensions(vm, context.clone(), async_ops.clone());
+    transport::register_transport_extensions(vm, context.clone(), async_ops.clone());
+    websocket::register_websocket_extensions(vm, context.clone(), async_ops.clone());
+    proxy::register_proxy_extensions(vm, context.clone(), async_ops.clone());
     io::register_builtin_io_overrides(vm, context, async_ops)
 }
 
@@ -741,7 +753,10 @@ mod tests {
         }
 
         let guard = context.lock().expect("vm context lock poisoned");
-        assert_eq!(guard.response_output.body.as_deref(), Some("payload"));
+        assert_eq!(
+            guard.response_output.body.as_deref(),
+            Some("payload".as_bytes())
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

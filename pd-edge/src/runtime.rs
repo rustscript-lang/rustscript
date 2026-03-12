@@ -151,7 +151,10 @@ impl SharedState {
         Self {
             active_program: Arc::new(RwLock::new(None)),
             max_program_bytes,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .tls_info(true)
+                .build()
+                .expect("default upstream client should build"),
             rate_limiter: Arc::new(std::sync::Mutex::new(RateLimiterStore::new())),
             debug_session: new_debug_session_store(),
             vm_execution: VmExecutionConfig::default(),

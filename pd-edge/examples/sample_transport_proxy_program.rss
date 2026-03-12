@@ -1,0 +1,61 @@
+use http;
+use proxy;
+use tcp;
+use tls;
+
+let target = http::request::get_header("x-upstream-target");
+
+if target == "" {
+    http::response::set_status(400);
+    http::response::set_body("missing x-upstream-target");
+} else {
+    // Configure the default outbound exchange first.
+    http::upstream::request::set_target(target);
+
+    let upstream = tcp::stream::default_upstream();
+    let upstream_tls = tls::session::from_socket(upstream);
+
+    // Stage the downstream request body into the pending upstream request body.
+    let request_body = proxy::stream::downstream();
+    let upstream_request = proxy::stream::default_upstream();
+    let upload_status = proxy::pipe(request_body, upstream_request, 8);
+    http::response::set_header("x-upload-pipe", upload_status);
+
+    // Starting the exchange performs the real network work, including TLS if present.
+    if tls::session::is_present(upstream_tls) && tls::session::handshake(upstream_tls) {
+        let peer_name = tls::session::get_peer_name(upstream_tls);
+        if peer_name != "" {
+            http::response::set_header("x-peer-name", peer_name);
+        }
+        let alpn = tls::session::get_alpn(upstream_tls);
+        if alpn != "" {
+            http::response::set_header("x-upstream-alpn", alpn);
+        }
+    }
+
+    let status = http::upstream::response::get_status();
+    let content_type = http::upstream::response::get_header("content-type");
+    if content_type != "" {
+        http::response::set_header("content-type", content_type);
+    }
+    http::response::set_status(status);
+
+    if http::request::get_header("Streaming") != "" {
+        // Stream the upstream response out incrementally after the exchange has started.
+        let downstream = tcp::stream::downstream();
+        while !tcp::stream::eof(upstream) {
+            let chunk = tcp::stream::read(upstream, 2);
+            if chunk != "" {
+                tcp::stream::write(downstream, chunk + "A");
+            }
+        }
+    } else {
+        // Or buffer the full upstream response before writing the final body.
+        let mut buffered = "";
+        while !tcp::stream::eof(upstream) {
+            buffered = buffered + tcp::stream::read(upstream, 64);
+        }
+        http::response::set_header("x-stream", "false");
+        http::response::set_body(buffered);
+    }
+}

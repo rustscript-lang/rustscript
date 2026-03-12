@@ -1,0 +1,55 @@
+use http;
+use proxy;
+use tcp;
+use tls;
+
+let target = http::request::get_header("x-upstream-target");
+
+if target == "" {
+    http::response::set_status(400);
+    http::response::set_body("missing x-upstream-target");
+} else {
+    // Bind the default outbound exchange to the requested target.
+    http::upstream::request::set_target(target);
+
+    // Export the downstream side as a byte-stream endpoint.
+    let downstream = proxy::stream::downstream();
+    let upstream_socket = tcp::stream::default_upstream();
+    let upstream_tls = tls::session::from_socket(upstream_socket);
+
+    let mut status = "";
+    if tls::session::is_present(upstream_tls) {
+        // Tunnel against decrypted TLS plaintext when the outbound side is HTTPS.
+        let upstream = proxy::stream::from_tls_plaintext(upstream_tls);
+        status = proxy::tunnel(downstream, upstream, 4);
+    } else {
+        // Plain HTTP can tunnel directly against the default upstream exchange stream.
+        let upstream = proxy::stream::default_upstream();
+        status = proxy::tunnel(downstream, upstream, 4);
+    }
+
+    http::response::set_header("x-proxy-status", status);
+
+    // After the tunnel completes, mirror response metadata that the exchange produced.
+    let upstream_status = http::upstream::response::get_status();
+    if upstream_status != 0 {
+        http::response::set_status(upstream_status);
+    }
+
+    let content_type = http::upstream::response::get_header("content-type");
+    if content_type != "" {
+        http::response::set_header("content-type", content_type);
+    }
+
+    if tls::session::is_present(upstream_tls) {
+        // TLS inspection data is only meaningful when the upstream path used TLS.
+        let peer_name = tls::session::get_peer_name(upstream_tls);
+        if peer_name != "" {
+            http::response::set_header("x-peer-name", peer_name);
+        }
+        let alpn = tls::session::get_alpn(upstream_tls);
+        if alpn != "" {
+            http::response::set_header("x-upstream-alpn", alpn);
+        }
+    }
+}

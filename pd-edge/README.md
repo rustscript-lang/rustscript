@@ -346,7 +346,26 @@ Artifacts written by these runs:
 Current state:
 
 - HTTP is implemented today as an explicit graph in [`pd-edge/src/abi_impl/http/state.rs`](src/abi_impl/http/state.rs).
-- TCP and TLS DAGs below are the target architecture for the next layers. They describe how the stack should evolve; they are not fully implemented yet.
+- WebSocket is implemented today as an explicit child DAG over outbound HTTP-upgrade handles in [`pd-edge/src/abi_impl/websocket/state.rs`](src/abi_impl/websocket/state.rs).
+- TCP, TLS, and outbound HTTP exchanges are exposed to programs through handle-based host calls:
+  - `tcp::stream::downstream()` returns reserved socket handle `0`
+  - `tcp::stream::default_upstream()` returns reserved socket handle `1`
+  - `tcp::stream::{read, write, eof}` operate on those socket handles
+  - `tls::session::from_socket(sock)` projects a TLS-session handle from a socket handle
+  - `tls::session::{set_alpn, set_verify, set_verify_hostname, set_trusted_certificate, set_certificate, set_private_key, set_sni, set_min_version, set_max_version}` configure the next outbound TLS handshake for that session handle
+  - `tls::session::{is_present, handshake, get_phase, get_peer_name, get_server_name, get_alpn, get_peer_certificate, is_session_reused}` read back negotiated or observed TLS state
+  - `http::exchange::default_upstream()` returns outbound exchange handle `1`
+  - `http::exchange::new()` allocates independent outbound exchange handles starting at `2`
+  - `http::exchange::{set_*, send, get_*}` operates on any outbound exchange handle
+  - `websocket::connection::downstream()` returns reserved websocket handle `0`
+  - `websocket::connection::default_upstream()` returns reserved websocket handle `1`
+  - `websocket::connection::new()` allocates independent outbound websocket handles starting at `2`
+  - `websocket::connection::{set_target, set_header, set_subprotocols, connect, send_text, read_text, send_binary_base64, read_binary_base64, eof, close, get_phase, get_subprotocol}` operate on any outbound websocket handle
+- Directional `http::upstream::*` APIs remain as aliases over handle `1`.
+- Current runtime boundary:
+  - outbound WebSocket connections are executable today
+  - downstream handle `0` currently exposes upgrade-candidate detection and phase inspection, but not a post-`101` frame loop yet
+  - `wss://` currently uses the default verifier/client configuration only; custom TLS-session overrides are rejected for websocket connects until the manual websocket TLS connector reaches parity with the HTTP client path
 
 Core model:
 
@@ -366,6 +385,7 @@ Rules:
 - `tcp.rx` and `tcp.tx` are monotonic byte streams. Reading and writing advance offsets; they do not rewind.
 - Half-close and full close are terminal forward states, not side channels.
 - TLS attaches to the TCP DAG through the exported byte-stream capability, not by bypassing TCP state.
+- The program-facing API is handle-based rather than direction-based. `0` and `1` are just the predefined handles for the current downstream and default upstream sockets.
 
 ```mermaid
 flowchart TD
@@ -390,24 +410,30 @@ Rules:
 
 - TLS enters only after `tcp.connected` exists and a TLS parser is attached to the TCP byte stream.
 - `tls.session.selected` is a logical node, not a hardcoded code path. It may be reached by a full handshake or by session reuse.
+- Outbound TLS configuration lives on the session node itself: ALPN policy, verification flags, trusted CA bundle, client certificate/key, SNI enablement, and min/max TLS version.
+- The current runtime can enforce verification, trust roots, client authentication, SNI enablement, and TLS version bounds per session. `set_alpn` is currently a negotiated-ALPN policy check over the resulting exchange, not a low-level custom ClientHello generator.
 - `tls.plaintext` is the exported capability for HTTP or another application protocol.
 - `tls.close_notify`, transport close, and handshake failure are forward exits from the TLS DAG.
+- The program-facing API is `tls::session::*`; session handles are derived from socket handles so a future subrequest can reuse the same calls.
 
 ```mermaid
 flowchart TD
-    A[tcp byte stream] --> B[tls record stream]
-    B --> C[tls peer hello parsed]
-    C --> D{session reusable?}
-    D -->|yes| E[tls.session.selected from cache or ticket]
-    D -->|no| F[tls.full handshake path]
-    F --> E
-    E --> G[tls handshake complete]
-    G --> H[tls plaintext stream]
-    H --> I[http ingress may attach here]
-    H --> J[tls close_notify]
-    J --> K[tls closed]
-    C --> L[tls handshake error]
-    L --> K
+    A[tcp.connected] --> B[tls.configured]
+    B --> C[tls.client_hello_prepared]
+    C --> D[tls.client_hello_sent]
+    D --> E[tls.server_hello_received]
+    E --> F[tls.server_certificate_received]
+    F --> G{verification policy}
+    G -->|verify enabled| H[tls.server_certificate_verified]
+    G -->|verify relaxed| I[tls.verification_skipped]
+    H --> J{ALPN policy satisfied?}
+    I --> J
+    J -->|yes| K[tls.plaintext_ready]
+    J -->|no| L[tls.failed]
+    K --> M[http ingress may attach here]
+    K --> N[tls.close_notify]
+    N --> O[tls.closed]
+    L --> O
 ```
 
 TLS session reuse is exactly why advancement must be generic. The system should not special-case reuse at every call site. Instead, the DAG engine should be able to satisfy the goal `tls.handshake complete` by selecting one of multiple legal forward paths:
@@ -424,9 +450,10 @@ Rules:
 
 - `request.head` is eager and immutable. It comes from already-parsed request metadata, so exposing it is not additional network I/O.
 - `request.body` starts unread and only advances when a host call or resolver consumes bytes.
-- `outbound.request` starts as a draft seeded from `request.head`.
+- `exchange[1].request` starts as the default upstream draft seeded from `request.head`.
+- `exchange[2+]` are additional outbound request/response DAG instances allocated by the VM.
 - `response.output` starts empty and is populated by VM host calls for local response construction.
-- `upstream.response` starts as `NotStarted` and becomes `Ready` only when the DAG actually needs upstream response data.
+- Each `exchange[n].response` starts as `NotStarted` and becomes `Ready` only when the DAG actually needs response data for that handle.
 
 ```mermaid
 flowchart TD
@@ -434,13 +461,13 @@ flowchart TD
     A --> C[request.body unread stream]
     B --> D[VM execution]
     C -. http.request.body::* / io::read* consume real IO .-> D
-    D -->|http.upstream.request::*| E[outbound.request draft]
+    D -->|http::exchange::set_* / http.upstream.request::*| E[exchange[n].request draft]
     D -->|http.response::*| F[response.output draft]
-    D -->|http.upstream.response::* or io reads| G{upstream.response ready?}
+    D -->|http::exchange::get_* / body::* / tcp::stream::read(handle)| G{exchange[n].response ready?}
     E --> G
-    G -->|no| H[host call or resolver performs upstream exchange]
-    C -. if no outbound body override .-> H
-    H --> I[upstream.response headers + stream]
+    G -->|no| H[host call or resolver performs outbound exchange n]
+    C -. if exchange 1 has no body override .-> H
+    H --> I[exchange[n].response headers + stream]
     G -->|yes| I
     I -->|body::next_chunk / get_body / eof| D
     D --> J[graph resolver after VM halt]
@@ -448,9 +475,38 @@ flowchart TD
     F --> J
     I --> J
     J -->|response.output.body set| K[build client response from response.output]
-    J -->|otherwise and upstream target exists| L[start upstream if needed and materialize response]
+    J -->|otherwise and exchange 1 target exists| L[start exchange 1 if needed and materialize response]
     K --> M[return client response]
     L --> M
+```
+
+### WebSocket DAG
+
+WebSocket is a child DAG over an HTTP upgrade-capable request. It owns the `101` handshake, negotiated subprotocol, and bidirectional frame stream after upgrade.
+
+Rules:
+
+- The websocket DAG is entered only from an HTTP request node that is being used as an upgrade request.
+- A websocket handle is the same reserved or dynamic handle number that already names the underlying outbound exchange: `0` for downstream, `1` for the default upstream exchange, and `2+` for additional allocated exchanges.
+- `websocket::connection::connect(handle)` is an explicit `advance(websocket.open)` request. `send_*` and `read_*` can also advance implicitly if the handle is configured but not open yet.
+- `send_text`, `read_text`, `send_binary_base64`, and `read_binary_base64` advance the frame-stream nodes, not the HTTP body DAG.
+- `close` is a forward edge into `websocket.closing` and then `websocket.closed`.
+- Today, only outbound handles execute the full frame DAG. Downstream handle `0` exposes the ingress node `upgrade-observed` so the model is documented and testable, but post-upgrade downstream frame execution still needs a persistent VM session runner.
+
+```mermaid
+flowchart TD
+    A[http exchange[n] upgrade-capable request] --> B[websocket.upgrade prepared]
+    B --> C[websocket.handshake started]
+    C --> D[websocket.open]
+    D --> E[websocket.rx frame stream]
+    D --> F[websocket.tx frame stream]
+    D --> G[websocket.subprotocol negotiated]
+    E --> H[websocket.close received]
+    F --> I[websocket.close sent]
+    D --> J[websocket.failed]
+    H --> K[websocket.closed]
+    I --> K
+    J --> K
 ```
 
 ### Entering And Leaving A Deeper DAG
@@ -461,6 +517,7 @@ Examples:
 
 - TCP exports `tcp.connected` plus the TCP byte stream. TLS can attach there.
 - TLS exports `tls.plaintext stream`. HTTP can attach there.
+- HTTP exports `http upgrade ready`. WebSocket can attach there.
 - HTTP may export a response body stream that is handed back upward to TLS plaintext framing, then to TCP transmission.
 
 Rules for entering:
@@ -530,16 +587,18 @@ flowchart LR
 
 This gives the flexibility target:
 
-- you can jump into TCP, TLS, or HTTP as long as the target node is reachable from the current frontier
-- you can jump back out from HTTP to TLS or TCP when the inner DAG has exported a forward egress node
+- you can jump into TCP, TLS, HTTP, or WebSocket as long as the target node is reachable from the current frontier
+- you can jump back out from WebSocket to HTTP, then to TLS or TCP, when the inner DAG has exported a forward egress node
 - you can materialize only the parts you need, late
 - you do not need a custom driver for every feature such as TLS session reuse, early response generation, or future non-HTTP protocols
+- directional convenience APIs may remain as aliases, but the stable abstraction is the handle-based `tcp::stream::*` / `tls::session::*` / `websocket::connection::*` surface
 
 Node ownership in current code:
 
 - HTTP nodes and resolver: [`pd-edge/src/abi_impl/http/state.rs`](src/abi_impl/http/state.rs)
 - HTTP validation and map conversion helpers: [`pd-edge/src/abi_impl/http/helpers.rs`](src/abi_impl/http/helpers.rs)
 - HTTP host-call entrypoints that mutate or read nodes: [`pd-edge/src/abi_impl/http/`](src/abi_impl/http/)
+- WebSocket nodes and frame IO: [`pd-edge/src/abi_impl/websocket/`](src/abi_impl/websocket/)
 - data-plane orchestration as black-box VM execution plus graph resolution: [`pd-edge/src/runtime/http_plane/proxy_path.rs`](src/runtime/http_plane/proxy_path.rs)
 
 ## ABI Source of Truth
@@ -589,5 +648,6 @@ docker run --rm -p 8080:8080 -p 8081:8081 fffonion/pd-edge:latest
 - `pd-edge/src/runtime/http_plane/`: HTTP data/admin plane handlers
 - `pd-edge/src/abi_impl/runtime.rs`: protocol-independent runtime host ABI
 - `pd-edge/src/abi_impl/http/`: HTTP-specific host ABI
+- `pd-edge/src/abi_impl/websocket/`: WebSocket DAG state and host ABI
 - `pd-edge/src/active_control_plane.rs`: active control-plane poll/report loop
 - `pd-edge/src/debug_session.rs`: on-demand debug session lifecycle

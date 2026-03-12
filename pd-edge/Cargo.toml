@@ -21,6 +21,7 @@ axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["full"] }
 http-body-util = "0.1"
+futures-util = "0.3"
 pd-edge-host-function = { path = "./pd-edge-host-function" }
 linkme = "0.3"
 vm = { package = "pd-vm", path = "../pd-vm" }
@@ -35,6 +36,11 @@ base64 = "0.22"
 rand = "0.8"
 uuid = { version = "1", features = ["v4"] }
 url = "2"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[dev-dependencies]
+rcgen = "0.12"
+tokio-rustls = "0.26"
