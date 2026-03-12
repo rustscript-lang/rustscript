@@ -292,3 +292,137 @@ async fn tls_session_rejects_alpn_policy_mismatch() {
     data_handle.abort();
     admin_handle.abort();
 }
+
+#[cfg(all(feature = "tls", feature = "http2"))]
+#[tokio::test]
+async fn tls_session_accepts_h2_alpn_policy_when_http2_is_negotiated() {
+    let (upstream_addr, _connection_count, upstream_handle) =
+        spawn_https_http2_multiplex_upstream().await;
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use tls;
+
+        let exchange = http::exchange::default_upstream();
+        http::exchange::set_target(exchange, "https://localhost:{}/fast");
+
+        let session = tls::session::from_socket(exchange);
+        tls::session::set_verify(session, false);
+        tls::session::set_alpn(session, "h2");
+        tls::session::handshake(session);
+
+        http::response::set_header("x-phase", tls::session::get_phase(session));
+        http::response::set_header("x-alpn", tls::session::get_alpn(session));
+        http::response::set_header("x-version", http::exchange::get_http_version(exchange));
+        http::response::set_body(http::exchange::get_body(exchange));
+    "#,
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/tls-alpn-h2"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-phase")
+            .and_then(|value| value.to_str().ok()),
+        Some("plaintext-ready")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-alpn")
+            .and_then(|value| value.to_str().ok()),
+        Some("h2")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "fast-body"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[cfg(all(feature = "tls", feature = "http2"))]
+#[tokio::test]
+async fn http2_capable_client_falls_back_to_http11_when_h2_is_unavailable() {
+    let (upstream_addr, upstream_handle) = spawn_https_echo_upstream().await;
+
+    let mut state = SharedState::new(1024 * 1024);
+    state.client = reqwest::Client::builder()
+        .tls_info(true)
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("http2 fallback test client should build");
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy_with_state(state).await;
+    let client = reqwest::Client::new();
+
+    let source = format!(
+        r#"
+        use http;
+        use tls;
+
+        http::upstream::request::set_target("https://localhost:{}/echo");
+        http::upstream::request::set_body("fallback-body");
+
+        let session = tls::session::from_socket(http::exchange::default_upstream());
+        http::response::set_header(
+            "x-version",
+            http::upstream::response::get_http_version()
+        );
+        http::response::set_header("x-alpn", tls::session::get_alpn(session));
+        http::response::set_body(http::upstream::response::get_body());
+    "#,
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/http2-fallback"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("1.1")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-alpn")
+            .and_then(|value| value.to_str().ok()),
+        Some("http/1.1")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "fallback-body"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}

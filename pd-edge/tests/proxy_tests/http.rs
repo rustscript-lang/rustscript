@@ -1,4 +1,5 @@
 use super::support::*;
+use tower::ServiceExt;
 
 #[tokio::test]
 async fn no_active_program_returns_404() {
@@ -1117,6 +1118,49 @@ async fn dynamic_exchanges_can_multiplex_over_single_http2_connection() {
     upstream_handle.abort();
     data_handle.abort();
     admin_handle.abort();
+}
+
+#[tokio::test]
+async fn downstream_http2_requests_expose_version_metadata_to_vm_programs() {
+    let state = SharedState::new(1024 * 1024);
+    let source = r#"
+        use http;
+
+        http::response::set_header("x-request-version", http::request::get_http_version());
+        http::response::set_body("ok");
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    let program_bytes = encode_program(&compiled.program).expect("program should encode");
+    let report = edge::apply_program_from_bytes(&state, &program_bytes).await;
+    assert!(report.applied, "program should apply");
+
+    let app = build_http_proxy_app(state);
+    let request = Request::builder()
+        .method("GET")
+        .uri("/http2-downstream")
+        .version(axum::http::Version::HTTP_2)
+        .header("host", "app.example.test")
+        .body(Body::empty())
+        .expect("request should build");
+    let response = app
+        .oneshot(request)
+        .await
+        .expect("in-process request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-request-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read")
+            .as_ref(),
+        b"ok"
+    );
 }
 
 #[tokio::test]
