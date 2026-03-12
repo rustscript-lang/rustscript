@@ -9,9 +9,16 @@ use re;
 //
 // Node ids start at 1. The cache uses `0` as the internal "no link" sentinel,
 // because storing `null` into a map entry now deletes that entry.
+struct FeedCacheItem {
+    day: string,
+    topic: string,
+    article_count: int,
+    slug: string
+}
+
 struct LruNode {
-    key: unknown,
-    value: unknown,
+    key: string,
+    value: FeedCacheItem,
     prev: int,
     next: int
 }
@@ -32,11 +39,43 @@ struct LruCacheState {
     nodes: map
 }
 
+struct FeedCachePeek {
+    found: bool,
+    value: FeedCacheItem
+}
+
+struct FeedCacheHit {
+    cache: LruCacheState,
+    found: bool,
+    value: FeedCacheItem
+}
+
+struct FeedCacheEntry {
+    found: bool,
+    key: string,
+    value: FeedCacheItem
+}
+
+struct FeedCacheRow {
+    key: string,
+    value: FeedCacheItem
+}
+
 fn normalized_capacity(raw_capacity) {
     let out = if raw_capacity > 0 => {
         raw_capacity
     } else => {
         0
+    };
+    out
+}
+
+fn empty_feed_item() {
+    let out: FeedCacheItem = {
+        day: "",
+        topic: "",
+        article_count: 0,
+        slug: ""
     };
     out
 }
@@ -162,11 +201,11 @@ fn evict_oldest(limit, size, next_id, lookup, nodes, head, tail) {
 }
 
 fn entry_report(cache, id) {
-    let out = if id != 0 => {
+    let out: FeedCacheEntry = if id != 0 => {
         let node: LruNode =&((&cache).nodes[id]);
-        {found: true, key: node.key, value: node.value}
+        {found: true, key: node.key.copy(), value: node.value.copy()}
     } else => {
-        {found: false, key: null, value: null}
+        {found: false, key: "", value: empty_feed_item()}
     };
     out
 }
@@ -199,12 +238,12 @@ pub fn has(cache, key) {
 pub fn peek(cache, key) {
     let state: LruCacheState = cache;
     let lookup = state.lookup;
-    let out = if lookup.has(key) => {
+    let out: FeedCachePeek = if lookup.has(key) => {
         let id: int =(&lookup)[key];
         let node: LruNode =&((&state.nodes)[id]);
-        {found: true, value: node.value}
+        {found: true, value: node.value.copy()}
     } else => {
-        {found: false, value: null}
+        {found: false, value: empty_feed_item()}
     };
     out
 }
@@ -219,7 +258,7 @@ pub fn get(cache, key) {
     let lookup = state.lookup;
     let nodes = state.nodes;
 
-    let out = if lookup.has(key) => {
+    let out: FeedCacheHit = if lookup.has(key) => {
         let id: int =(&lookup)[key];
         let node: LruNode =&((&nodes)[id]);
         let next_cache = if id == tail => {
@@ -244,12 +283,12 @@ pub fn get(cache, key) {
                 relinked.nodes
             )
         };
-        {cache: next_cache, found: true, value: node.value}
+        {cache: next_cache, found: true, value: node.value.copy()}
     } else => {
         {
             cache: make_cache(limit, size, next_id, head, tail, lookup, nodes),
             found: false,
-            value: null
+            value: empty_feed_item()
         }
     };
     out
@@ -411,11 +450,11 @@ pub fn keys(cache) {
     let state: LruCacheState = cache;
     let nodes = state.nodes;
     let mut current = state.head;
-    let mut out = [];
+    let mut out: [string] = [];
     while current != 0 {
         let node: LruNode =&((&nodes)[current]);
         let next_id = node.next;
-        out[out.length] = node.key;
+        out[out.length] = node.key.copy();
         current = next_id;
     }
     out
@@ -425,11 +464,11 @@ pub fn values(cache) {
     let state: LruCacheState = cache;
     let nodes = state.nodes;
     let mut current = state.head;
-    let mut out = [];
+    let mut out: [FeedCacheItem] = [];
     while current != 0 {
         let node: LruNode =&((&nodes)[current]);
         let next_id = node.next;
-        out[out.length] = node.value;
+        out[out.length] = node.value.copy();
         current = next_id;
     }
     out
@@ -439,11 +478,11 @@ pub fn entries(cache) {
     let state: LruCacheState = cache;
     let nodes = state.nodes;
     let mut current = state.head;
-    let mut out = [];
+    let mut out: [FeedCacheRow] = [];
     while current != 0 {
         let node: LruNode =&((&nodes)[current]);
         let next_id = node.next;
-        out[out.length] = [node.key, node.value];
+        out[out.length] = {key: node.key.copy(), value: node.value.copy()};
         current = next_id;
     }
     out
@@ -457,25 +496,6 @@ pub fn oldest(cache) {
 pub fn newest(cache) {
     let state: LruCacheState = cache;
     entry_report(state, state.tail)
-}
-
-struct FeedCacheItem {
-    day: string,
-    topic: string,
-    article_count: int,
-    slug: string
-}
-
-struct FeedCacheHit {
-    cache: LruCacheState,
-    found: bool,
-    value: FeedCacheItem
-}
-
-struct FeedCacheEntry {
-    found: bool,
-    key: string,
-    value: FeedCacheItem
 }
 
 let mut cache: LruCacheState = new(3);
@@ -543,7 +563,8 @@ for (let mut index = 0; index < visible_count; index = index + 1) {
     visible_topics[visible_topics.length] = item.topic;
     total_visible_articles = total_visible_articles + item.article_count;
 }
-assert(entries(cache)[2][0] == "build-ops");
+let cache_entries: [FeedCacheRow] = entries(cache);
+assert(cache_entries[2].key == "build-ops");
 
 let report = {
     order: keys(cache),

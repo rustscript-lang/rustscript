@@ -33,7 +33,7 @@ use axum::body::Bytes;
 use futures_util::{SinkExt, StreamExt};
 #[cfg(feature = "http")]
 use http_body_util::{BodyExt, Full};
-#[cfg(all(feature = "http", not(feature = "http2")))]
+#[cfg(any(feature = "webrtc", all(feature = "http", not(feature = "http2"))))]
 use hyper::server::conn::http1;
 #[cfg(feature = "http")]
 use hyper::{
@@ -730,7 +730,7 @@ fn http1_alpn_protocols() -> Vec<Vec<u8>> {
 fn generate_sample_https_tls_server_config() -> io::Result<Arc<ServerConfig>> {
     #[cfg(feature = "http2")]
     {
-        return generate_self_signed_tls_server_config(vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        generate_self_signed_tls_server_config(vec![b"h2".to_vec(), b"http/1.1".to_vec()])
     }
 
     #[cfg(not(feature = "http2"))]
