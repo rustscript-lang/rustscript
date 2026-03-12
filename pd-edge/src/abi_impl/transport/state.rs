@@ -186,67 +186,127 @@ impl TcpSocketPhase {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct TcpSocketState {
+struct SocketAddressState {
     present: bool,
-    phase: TcpSocketPhase,
     bind_address: Option<String>,
     target: Option<String>,
     local_address: Option<String>,
     peer_address: Option<String>,
-    read_eof: bool,
     failure_message: Option<String>,
+}
+
+impl SocketAddressState {
+    fn optional_value(value: String) -> Option<String> {
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    fn set_bind_address(&mut self, address: String) {
+        self.present = true;
+        self.bind_address = Self::optional_value(address);
+        self.local_address = None;
+        self.failure_message = None;
+    }
+
+    fn set_target(&mut self, target: String) {
+        self.present = true;
+        self.target = Self::optional_value(target);
+        self.peer_address = None;
+        self.failure_message = None;
+    }
+
+    fn mark_connected(&mut self, local_address: String, peer_address: String) {
+        self.present = true;
+        self.local_address = Some(local_address);
+        self.peer_address = Some(peer_address);
+        self.failure_message = None;
+    }
+
+    fn mark_present(&mut self) {
+        self.present = true;
+    }
+
+    fn clear_failure(&mut self) {
+        self.failure_message = None;
+    }
+
+    fn mark_failed(&mut self, message: impl Into<String>) {
+        self.present = true;
+        self.failure_message = Some(message.into());
+    }
+
+    fn is_present(&self) -> bool {
+        self.present
+    }
+
+    fn bind_address(&self) -> Option<&str> {
+        self.bind_address.as_deref()
+    }
+
+    fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
+    fn local_address(&self) -> &str {
+        self.local_address.as_deref().unwrap_or_default()
+    }
+
+    fn peer_address(&self) -> &str {
+        self.peer_address
+            .as_deref()
+            .or(self.target.as_deref())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn failure_message(&self) -> &str {
+        self.failure_message.as_deref().unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TcpSocketState {
+    core: SocketAddressState,
+    phase: TcpSocketPhase,
+    read_eof: bool,
 }
 
 impl TcpSocketState {
     pub(crate) fn set_bind_address(&mut self, address: String) {
-        self.present = true;
-        self.bind_address = if address.is_empty() {
-            None
-        } else {
-            Some(address)
-        };
-        self.local_address = None;
+        self.core.set_bind_address(address);
         self.read_eof = false;
-        self.failure_message = None;
         if self.phase == TcpSocketPhase::Inactive {
             self.phase = TcpSocketPhase::Bound;
         }
     }
 
     pub(crate) fn set_target(&mut self, target: String) {
-        self.present = true;
-        self.target = if target.is_empty() {
-            None
-        } else {
-            Some(target)
-        };
-        self.peer_address = None;
+        self.core.set_target(target);
         self.read_eof = false;
-        self.failure_message = None;
         self.phase = TcpSocketPhase::Configured;
     }
 
     pub(crate) fn mark_connected(&mut self, local_address: String, peer_address: String) {
-        self.present = true;
+        self.core.mark_connected(local_address, peer_address);
         self.phase = TcpSocketPhase::Connected;
-        self.local_address = Some(local_address);
-        self.peer_address = Some(peer_address);
         self.read_eof = false;
-        self.failure_message = None;
     }
 
     pub(crate) fn mark_upgraded_tls(&mut self) {
-        self.present = true;
+        self.core.mark_present();
+        self.core.clear_failure();
         self.phase = TcpSocketPhase::UpgradedTls;
         self.read_eof = false;
-        self.failure_message = None;
     }
 
     pub(crate) fn mark_http_attached(&mut self) {
-        self.present = true;
+        self.core.mark_present();
+        self.core.clear_failure();
         self.phase = TcpSocketPhase::AttachedHttp;
         self.read_eof = false;
-        self.failure_message = None;
     }
 
     pub(crate) fn mark_read_eof(&mut self) {
@@ -262,13 +322,12 @@ impl TcpSocketState {
     }
 
     pub(crate) fn mark_failed(&mut self, message: impl Into<String>) {
-        self.present = true;
+        self.core.mark_failed(message);
         self.phase = TcpSocketPhase::Failed;
-        self.failure_message = Some(message.into());
     }
 
     pub(crate) fn is_present(&self) -> bool {
-        self.present
+        self.core.is_present()
     }
 
     pub(crate) fn phase(&self) -> TcpSocketPhase {
@@ -276,22 +335,19 @@ impl TcpSocketState {
     }
 
     pub(crate) fn bind_address(&self) -> Option<&str> {
-        self.bind_address.as_deref()
+        self.core.bind_address()
     }
 
     pub(crate) fn target(&self) -> Option<&str> {
-        self.target.as_deref()
+        self.core.target()
     }
 
     pub(crate) fn local_address(&self) -> &str {
-        self.local_address.as_deref().unwrap_or_default()
+        self.core.local_address()
     }
 
     pub(crate) fn peer_address(&self) -> &str {
-        self.peer_address
-            .as_deref()
-            .or(self.target.as_deref())
-            .unwrap_or_default()
+        self.core.peer_address()
     }
 
     pub(crate) fn read_eof(&self) -> bool {
@@ -325,48 +381,26 @@ impl UdpSocketPhase {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UdpSocketState {
-    present: bool,
+    core: SocketAddressState,
     phase: UdpSocketPhase,
-    bind_address: Option<String>,
-    target: Option<String>,
-    local_address: Option<String>,
-    peer_address: Option<String>,
-    failure_message: Option<String>,
 }
 
 impl UdpSocketState {
     pub(crate) fn set_bind_address(&mut self, address: String) {
-        self.present = true;
-        self.bind_address = if address.is_empty() {
-            None
-        } else {
-            Some(address)
-        };
-        self.local_address = None;
-        self.failure_message = None;
+        self.core.set_bind_address(address);
         if self.phase == UdpSocketPhase::Inactive {
             self.phase = UdpSocketPhase::Bound;
         }
     }
 
     pub(crate) fn set_target(&mut self, target: String) {
-        self.present = true;
-        self.target = if target.is_empty() {
-            None
-        } else {
-            Some(target)
-        };
-        self.peer_address = None;
-        self.failure_message = None;
+        self.core.set_target(target);
         self.phase = UdpSocketPhase::Configured;
     }
 
     pub(crate) fn mark_connected(&mut self, local_address: String, peer_address: String) {
-        self.present = true;
+        self.core.mark_connected(local_address, peer_address);
         self.phase = UdpSocketPhase::Connected;
-        self.local_address = Some(local_address);
-        self.peer_address = Some(peer_address);
-        self.failure_message = None;
     }
 
     pub(crate) fn mark_closed(&mut self) {
@@ -374,13 +408,12 @@ impl UdpSocketState {
     }
 
     pub(crate) fn mark_failed(&mut self, message: impl Into<String>) {
-        self.present = true;
+        self.core.mark_failed(message);
         self.phase = UdpSocketPhase::Failed;
-        self.failure_message = Some(message.into());
     }
 
     pub(crate) fn is_present(&self) -> bool {
-        self.present
+        self.core.is_present()
     }
 
     pub(crate) fn phase(&self) -> UdpSocketPhase {
@@ -388,27 +421,24 @@ impl UdpSocketState {
     }
 
     pub(crate) fn bind_address(&self) -> Option<&str> {
-        self.bind_address.as_deref()
+        self.core.bind_address()
     }
 
     pub(crate) fn target(&self) -> Option<&str> {
-        self.target.as_deref()
+        self.core.target()
     }
 
     pub(crate) fn local_address(&self) -> &str {
-        self.local_address.as_deref().unwrap_or_default()
+        self.core.local_address()
     }
 
     pub(crate) fn peer_address(&self) -> &str {
-        self.peer_address
-            .as_deref()
-            .or(self.target.as_deref())
-            .unwrap_or_default()
+        self.core.peer_address()
     }
 
     #[cfg(test)]
     pub(crate) fn failure_message(&self) -> &str {
-        self.failure_message.as_deref().unwrap_or_default()
+        self.core.failure_message()
     }
 }
 
