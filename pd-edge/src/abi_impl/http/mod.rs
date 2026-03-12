@@ -7,19 +7,27 @@ use self::helpers::{
 };
 use super::{SharedVmAsyncOps, registry};
 
+mod exchange;
 mod helpers;
 mod request;
 mod response;
 mod state;
 mod upstream;
 
+pub(crate) use state::HttpOutboundRequestNode;
 pub use state::{HttpRequestContext, ProxyVmContext, SharedProxyVmContext};
 pub(crate) use state::{
-    consume_request_body_all, ensure_upstream_response_started, read_request_body_all,
-    read_request_body_next_chunk, read_request_body_next_line, read_upstream_response_all,
-    read_upstream_response_next_chunk, read_upstream_response_next_line, request_body_eof,
-    resolve_http_graph_response, resolve_outbound_request_body, upstream_response_available,
-    upstream_response_eof,
+    allocate_outbound_exchange_handle, append_outbound_exchange_body,
+    append_outbound_exchange_body_bytes, append_response_output_body_bytes, build_upstream_url,
+    consume_request_body_all, default_upstream_exchange_handle,
+    ensure_outbound_exchange_response_started, ensure_upstream_response_started,
+    is_hop_by_hop_header, outbound_exchange_exists, outbound_exchange_response_available,
+    outbound_exchange_response_eof, outbound_exchange_tls_flow,
+    read_outbound_exchange_response_all, read_outbound_exchange_response_next_chunk,
+    read_request_body_all, read_request_body_next_chunk, read_request_body_next_line,
+    read_upstream_response_all, read_upstream_response_next_chunk,
+    read_upstream_response_next_line, request_body_eof, resolve_http_graph_response,
+    resolve_outbound_request_body, upstream_response_available, upstream_response_eof,
 };
 
 pub(super) fn register_http_extensions(

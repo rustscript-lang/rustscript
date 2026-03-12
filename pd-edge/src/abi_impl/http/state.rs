@@ -15,7 +15,15 @@ use http_body_util::BodyExt;
 use url::Url;
 use vm::VmError;
 
-use super::super::{EDGE_IO_HANDLE_DYNAMIC_BASE, EdgeVirtualIoHandle, SharedRateLimiter};
+use super::super::{
+    EDGE_IO_HANDLE_DYNAMIC_BASE, EdgeVirtualIoHandle, SharedRateLimiter,
+    proxy::ProxyByteStreamState,
+    transport::{
+        TcpFlowState, TcpTransportDag, TlsFlowState, TlsProtocolVersion, TlsTransportDag,
+        alpn_from_http_version,
+    },
+    websocket::WebSocketConnectionState,
+};
 
 #[derive(Debug)]
 pub struct HttpRequestContext {
@@ -186,7 +194,7 @@ pub(crate) struct HttpOutboundRequestNode {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HttpResponseOutputNode {
     pub(crate) headers: HeaderMap,
-    pub(crate) body: Option<String>,
+    pub(crate) body: Option<Vec<u8>>,
     pub(crate) status: Option<u16>,
 }
 
@@ -309,6 +317,10 @@ impl UpstreamResponseBodyState {
 
 type SharedUpstreamResponseBody = Arc<tokio::sync::Mutex<UpstreamResponseBodyState>>;
 
+pub(crate) const DEFAULT_UPSTREAM_EXCHANGE_HANDLE: i64 = 1;
+const FIRST_DYNAMIC_EXCHANGE_HANDLE: i64 = 2;
+const FIRST_PROXY_STREAM_HANDLE: i64 = 4096;
+
 #[derive(Clone)]
 pub(crate) struct HttpUpstreamResponseSnapshot {
     pub(crate) status: u16,
@@ -333,14 +345,80 @@ pub(crate) enum HttpUpstreamResponseNode {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct HttpOutboundExchangeNode {
+    pub(crate) request: HttpOutboundRequestNode,
+    pub(crate) response: HttpUpstreamResponseNode,
+    pub(crate) tcp_dag: TcpFlowState,
+    pub(crate) tls_dag: TlsFlowState,
+    pub(crate) websocket_dag: WebSocketConnectionState,
+    pub(crate) upstream_latency_ms: u64,
+}
+
+impl HttpOutboundExchangeNode {
+    fn new() -> Self {
+        Self {
+            request: HttpOutboundRequestNode {
+                method: Method::GET,
+                path: "/".to_string(),
+                query: String::new(),
+                headers: HeaderMap::new(),
+                body_override: None,
+                target: None,
+            },
+            response: HttpUpstreamResponseNode::NotStarted,
+            tcp_dag: TcpFlowState::default(),
+            tls_dag: TlsFlowState::default(),
+            websocket_dag: WebSocketConnectionState::default(),
+            upstream_latency_ms: 0,
+        }
+    }
+
+    fn response_snapshot(&self) -> Result<HttpUpstreamResponseSnapshot, VmError> {
+        match &self.response {
+            HttpUpstreamResponseNode::Ready(snapshot) => Ok(snapshot.clone()),
+            HttpUpstreamResponseNode::NotStarted => Err(VmError::HostError(
+                "outbound exchange response is unavailable before the exchange starts".to_string(),
+            )),
+        }
+    }
+
+    fn response_ready(&self) -> bool {
+        matches!(self.response, HttpUpstreamResponseNode::Ready(_))
+    }
+
+    fn store_response(
+        &mut self,
+        status: u16,
+        headers: HeaderMap,
+        body: SharedUpstreamResponseBody,
+        latency_ms: u64,
+    ) {
+        self.response = HttpUpstreamResponseNode::Ready(HttpUpstreamResponseSnapshot {
+            status,
+            headers,
+            body,
+        });
+        self.upstream_latency_ms = latency_ms;
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ProxyVmContext {
     pub(crate) request_head: HttpRequestHead,
     pub(crate) inbound_request_body: SharedInboundRequestBody,
+    pub(crate) tcp_dag: TcpTransportDag,
+    pub(crate) tls_dag: TlsTransportDag,
+    pub(crate) downstream_websocket: WebSocketConnectionState,
+    pub(crate) default_upstream_websocket: WebSocketConnectionState,
     pub(crate) outbound_request: HttpOutboundRequestNode,
     pub(crate) response_output: HttpResponseOutputNode,
     pub(crate) upstream_response: HttpUpstreamResponseNode,
     pub(crate) upstream_client: Option<reqwest::Client>,
     pub(crate) upstream_latency_ms: u64,
+    pub(crate) next_outbound_exchange_handle: i64,
+    pub(crate) outbound_exchanges: HashMap<i64, HttpOutboundExchangeNode>,
+    pub(crate) next_proxy_stream_handle: i64,
+    pub(crate) proxy_stream_handles: HashMap<i64, ProxyByteStreamState>,
     pub(crate) rate_limiter: SharedRateLimiter,
     pub(crate) edge_io_next_handle: i64,
     pub(crate) edge_io_handles: HashMap<i64, EdgeVirtualIoHandle>,
@@ -361,15 +439,23 @@ impl ProxyVmContext {
             client_ip: request.client_ip,
             headers: HeaderMap::new(),
         };
+        let outbound_request = HttpOutboundRequestNode {
+            method: request_head.method.clone(),
+            path: request_head.path.clone(),
+            query: request_head.query.clone(),
+            headers: request_headers.clone(),
+            body_override: None,
+            target: None,
+        };
+        let tcp_dag = TcpTransportDag::for_http_request();
+        let tls_dag = TlsTransportDag::for_http_request(
+            request_head.scheme.as_str(),
+            request_head.host.as_str(),
+            request_head.http_version.as_str(),
+        );
+        let downstream_websocket = WebSocketConnectionState::for_http_request(&request_headers);
         Self {
-            outbound_request: HttpOutboundRequestNode {
-                method: request_head.method.clone(),
-                path: request_head.path.clone(),
-                query: request_head.query.clone(),
-                headers: request_headers.clone(),
-                body_override: None,
-                target: None,
-            },
+            outbound_request,
             request_head: HttpRequestHead {
                 headers: request_headers,
                 ..request_head
@@ -377,10 +463,18 @@ impl ProxyVmContext {
             inbound_request_body: Arc::new(tokio::sync::Mutex::new(InboundRequestBodyState::new(
                 request.body,
             ))),
+            tcp_dag,
+            tls_dag,
+            downstream_websocket,
+            default_upstream_websocket: WebSocketConnectionState::default(),
             response_output: HttpResponseOutputNode::default(),
             upstream_response: HttpUpstreamResponseNode::NotStarted,
             upstream_client: None,
             upstream_latency_ms: 0,
+            next_outbound_exchange_handle: FIRST_DYNAMIC_EXCHANGE_HANDLE,
+            outbound_exchanges: HashMap::new(),
+            next_proxy_stream_handle: FIRST_PROXY_STREAM_HANDLE,
+            proxy_stream_handles: HashMap::new(),
             rate_limiter,
             edge_io_next_handle: EDGE_IO_HANDLE_DYNAMIC_BASE,
             edge_io_handles: HashMap::new(),
@@ -444,10 +538,118 @@ impl ProxyVmContext {
 
 pub type SharedProxyVmContext = Arc<Mutex<ProxyVmContext>>;
 
+pub(crate) fn default_upstream_exchange_handle() -> i64 {
+    DEFAULT_UPSTREAM_EXCHANGE_HANDLE
+}
+
+pub(crate) fn allocate_outbound_exchange_handle(
+    context: &SharedProxyVmContext,
+) -> Result<i64, VmError> {
+    let mut guard = context.lock().expect("vm context lock poisoned");
+    let handle = guard.next_outbound_exchange_handle;
+    if handle == i64::MAX {
+        return Err(VmError::HostError(
+            "outbound exchange handle space exhausted".to_string(),
+        ));
+    }
+    guard.next_outbound_exchange_handle += 1;
+    guard
+        .outbound_exchanges
+        .insert(handle, HttpOutboundExchangeNode::new());
+    Ok(handle)
+}
+
+pub(crate) fn outbound_exchange_exists(context: &SharedProxyVmContext, handle: i64) -> bool {
+    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        return true;
+    }
+    let guard = context.lock().expect("vm context lock poisoned");
+    guard.outbound_exchanges.contains_key(&handle)
+}
+
+pub(crate) fn outbound_exchange_tls_flow(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<TlsFlowState, VmError> {
+    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        let guard = context.lock().expect("vm context lock poisoned");
+        return Ok(guard.tls_dag.default_upstream.clone());
+    }
+
+    let guard = context.lock().expect("vm context lock poisoned");
+    guard
+        .outbound_exchanges
+        .get(&handle)
+        .map(|exchange| exchange.tls_dag.clone())
+        .ok_or_else(|| VmError::HostError(format!("unknown outbound exchange handle {handle}")))
+}
+
+pub(crate) fn append_outbound_exchange_body(
+    context: &SharedProxyVmContext,
+    handle: i64,
+    text: &str,
+) -> Result<(), VmError> {
+    append_outbound_exchange_body_bytes(context, handle, text.as_bytes())
+}
+
+pub(crate) fn append_outbound_exchange_body_bytes(
+    context: &SharedProxyVmContext,
+    handle: i64,
+    bytes: &[u8],
+) -> Result<(), VmError> {
+    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        if upstream_response_available(context) {
+            return Err(VmError::HostError(
+                "default upstream stream is read-only after the upstream exchange has started"
+                    .to_string(),
+            ));
+        }
+        let mut guard = context.lock().expect("vm context lock poisoned");
+        guard.tcp_dag.default_upstream.note_write();
+        guard
+            .outbound_request
+            .body_override
+            .get_or_insert_with(Vec::new)
+            .extend_from_slice(bytes);
+        return Ok(());
+    }
+
+    let mut guard = context.lock().expect("vm context lock poisoned");
+    let exchange = guard
+        .outbound_exchanges
+        .get_mut(&handle)
+        .ok_or_else(|| VmError::HostError(format!("unknown outbound exchange handle {handle}")))?;
+    if exchange.response_ready() {
+        return Err(VmError::HostError(format!(
+            "outbound exchange handle {handle} is read-only after the exchange has started",
+        )));
+    }
+    exchange.tcp_dag.note_write();
+    exchange
+        .request
+        .body_override
+        .get_or_insert_with(Vec::new)
+        .extend_from_slice(bytes);
+    Ok(())
+}
+
+pub(crate) fn append_response_output_body_bytes(context: &SharedProxyVmContext, bytes: &[u8]) {
+    let mut guard = context.lock().expect("vm context lock poisoned");
+    guard.tcp_dag.downstream.note_write();
+    guard
+        .response_output
+        .body
+        .get_or_insert_with(Vec::new)
+        .extend_from_slice(bytes);
+}
+
 #[derive(Debug)]
 enum UpstreamResponseStartError {
+    UnknownExchangeHandle(i64),
     MissingTarget,
     MissingClient,
+    Protocol(String),
+    TlsConfiguration(String),
     ResolveOutboundBody(String),
     UpstreamRequest(String),
 }
@@ -455,6 +657,9 @@ enum UpstreamResponseStartError {
 impl UpstreamResponseStartError {
     fn as_vm_error(&self) -> VmError {
         match self {
+            Self::UnknownExchangeHandle(handle) => {
+                VmError::HostError(format!("unknown outbound exchange handle {handle}"))
+            }
             Self::MissingTarget => VmError::HostError(
                 "upstream target is unavailable before http::upstream::request::set_target"
                     .to_string(),
@@ -462,9 +667,10 @@ impl UpstreamResponseStartError {
             Self::MissingClient => VmError::HostError(
                 "upstream client is unavailable outside the HTTP data plane".to_string(),
             ),
-            Self::ResolveOutboundBody(message) | Self::UpstreamRequest(message) => {
-                VmError::HostError(message.clone())
-            }
+            Self::Protocol(message)
+            | Self::TlsConfiguration(message)
+            | Self::ResolveOutboundBody(message)
+            | Self::UpstreamRequest(message) => VmError::HostError(message.clone()),
         }
     }
 }
@@ -472,6 +678,7 @@ impl UpstreamResponseStartError {
 #[derive(Clone, Debug)]
 struct PreparedUpstreamRequest {
     client: reqwest::Client,
+    tls_flow: TlsFlowState,
     method: Method,
     path: String,
     query: String,
@@ -562,11 +769,17 @@ fn prepared_upstream_request(
     context: &SharedProxyVmContext,
 ) -> Result<PreparedUpstreamRequest, UpstreamResponseStartError> {
     let guard = context.lock().expect("vm context lock poisoned");
+    if guard.default_upstream_websocket.is_websocket_mode() {
+        return Err(UpstreamResponseStartError::Protocol(
+            "default upstream exchange is already owned by the websocket DAG".to_string(),
+        ));
+    }
     Ok(PreparedUpstreamRequest {
         client: guard
             .upstream_client
             .clone()
             .ok_or(UpstreamResponseStartError::MissingClient)?,
+        tls_flow: guard.tls_dag.default_upstream.clone(),
         method: guard.outbound_request.method.clone(),
         path: guard.outbound_request.path.clone(),
         query: guard.outbound_request.query.clone(),
@@ -582,26 +795,276 @@ fn prepared_upstream_request(
 async fn start_upstream_response(
     context: &SharedProxyVmContext,
 ) -> Result<HttpUpstreamResponseSnapshot, UpstreamResponseStartError> {
+    start_outbound_exchange_response(context, DEFAULT_UPSTREAM_EXCHANGE_HANDLE).await
+}
+
+pub(crate) async fn ensure_upstream_response_started(
+    context: &SharedProxyVmContext,
+) -> Result<HttpUpstreamResponseSnapshot, VmError> {
+    start_upstream_response(context)
+        .await
+        .map_err(|err| err.as_vm_error())
+}
+
+fn prepared_outbound_exchange_request(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<PreparedUpstreamRequest, UpstreamResponseStartError> {
+    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        return prepared_upstream_request(context);
+    }
+
+    let guard = context.lock().expect("vm context lock poisoned");
+    let exchange = guard
+        .outbound_exchanges
+        .get(&handle)
+        .ok_or(UpstreamResponseStartError::UnknownExchangeHandle(handle))?;
+    if exchange.websocket_dag.is_websocket_mode() {
+        return Err(UpstreamResponseStartError::Protocol(format!(
+            "outbound exchange handle {handle} is already owned by the websocket DAG",
+        )));
+    }
+    Ok(PreparedUpstreamRequest {
+        client: guard
+            .upstream_client
+            .clone()
+            .ok_or(UpstreamResponseStartError::MissingClient)?,
+        tls_flow: exchange.tls_dag.clone(),
+        method: exchange.request.method.clone(),
+        path: exchange.request.path.clone(),
+        query: exchange.request.query.clone(),
+        headers: exchange.request.headers.clone(),
+        target: exchange
+            .request
+            .target
+            .clone()
+            .ok_or(UpstreamResponseStartError::MissingTarget)?,
+    })
+}
+
+async fn resolve_outbound_exchange_body(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<Vec<u8>, VmError> {
+    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        return resolve_outbound_request_body(context).await;
+    }
+
+    let guard = context.lock().expect("vm context lock poisoned");
+    let exchange = guard
+        .outbound_exchanges
+        .get(&handle)
+        .ok_or_else(|| VmError::HostError(format!("unknown outbound exchange handle {handle}")))?;
+    Ok(exchange.request.body_override.clone().unwrap_or_default())
+}
+
+fn reqwest_tls_version(version: TlsProtocolVersion) -> reqwest::tls::Version {
+    match version {
+        TlsProtocolVersion::Tls1_0 => reqwest::tls::Version::TLS_1_0,
+        TlsProtocolVersion::Tls1_1 => reqwest::tls::Version::TLS_1_1,
+        TlsProtocolVersion::Tls1_2 => reqwest::tls::Version::TLS_1_2,
+        TlsProtocolVersion::Tls1_3 => reqwest::tls::Version::TLS_1_3,
+    }
+}
+
+fn configured_upstream_client(
+    prepared: &PreparedUpstreamRequest,
+) -> Result<reqwest::Client, UpstreamResponseStartError> {
+    if !prepared.tls_flow.is_present() || !prepared.tls_flow.requires_custom_client() {
+        return Ok(prepared.client.clone());
+    }
+
+    if let (Some(min_version), Some(max_version)) = (
+        prepared.tls_flow.min_version(),
+        prepared.tls_flow.max_version(),
+    ) && min_version > max_version
     {
-        let guard = context.lock().expect("vm context lock poisoned");
-        if let Ok(snapshot) = guard.upstream_response() {
-            return Ok(snapshot);
+        return Err(UpstreamResponseStartError::TlsConfiguration(format!(
+            "tls min version {} cannot be greater than max version {}",
+            min_version.as_str(),
+            max_version.as_str(),
+        )));
+    }
+
+    let mut builder = reqwest::Client::builder().tls_info(true);
+    if !prepared.tls_flow.verify_peer() {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    if !prepared.tls_flow.verify_hostname() {
+        builder = builder.danger_accept_invalid_hostnames(true);
+    }
+    if !prepared.tls_flow.sni_enabled() {
+        builder = builder.tls_sni(false);
+    }
+    if let Some(min_version) = prepared.tls_flow.min_version() {
+        builder = builder.min_tls_version(reqwest_tls_version(min_version));
+    }
+    if let Some(max_version) = prepared.tls_flow.max_version() {
+        builder = builder.max_tls_version(reqwest_tls_version(max_version));
+    }
+    if let Some(bundle) = prepared.tls_flow.trusted_certificate_pem() {
+        let certificates =
+            reqwest::Certificate::from_pem_bundle(bundle.as_bytes()).map_err(|err| {
+                UpstreamResponseStartError::TlsConfiguration(format!(
+                    "failed to parse trusted certificate bundle: {err}",
+                ))
+            })?;
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
         }
     }
 
-    let prepared = prepared_upstream_request(context)?;
-    let request_body = resolve_outbound_request_body(context)
+    match (
+        prepared.tls_flow.client_certificate_pem(),
+        prepared.tls_flow.client_private_key_pem(),
+    ) {
+        (Some(certificate_pem), Some(private_key_pem)) => {
+            let pem_bundle = format!("{certificate_pem}\n{private_key_pem}");
+            let identity = reqwest::Identity::from_pem(pem_bundle.as_bytes()).map_err(|err| {
+                UpstreamResponseStartError::TlsConfiguration(format!(
+                    "failed to parse client certificate identity: {err}",
+                ))
+            })?;
+            builder = builder.identity(identity);
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(UpstreamResponseStartError::TlsConfiguration(
+                "client certificate and private key must both be configured".to_string(),
+            ));
+        }
+        (None, None) => {}
+    }
+
+    builder.build().map_err(|err| {
+        UpstreamResponseStartError::TlsConfiguration(format!(
+            "failed to build reqwest TLS client: {err}",
+        ))
+    })
+}
+
+fn response_peer_certificate_der(response: &reqwest::Response) -> Option<Vec<u8>> {
+    response
+        .extensions()
+        .get::<reqwest::tls::TlsInfo>()
+        .and_then(|info| info.peer_certificate())
+        .map(|bytes| bytes.to_vec())
+}
+
+fn with_outbound_tls_flow_mut<T>(
+    context: &SharedProxyVmContext,
+    handle: i64,
+    mutate: impl FnOnce(&mut TlsFlowState) -> T,
+) -> Result<T, UpstreamResponseStartError> {
+    let mut guard = context.lock().expect("vm context lock poisoned");
+    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        return Ok(mutate(&mut guard.tls_dag.default_upstream));
+    }
+
+    let exchange = guard
+        .outbound_exchanges
+        .get_mut(&handle)
+        .ok_or(UpstreamResponseStartError::UnknownExchangeHandle(handle))?;
+    Ok(mutate(&mut exchange.tls_dag))
+}
+
+fn note_outbound_tls_prepared(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<(), UpstreamResponseStartError> {
+    with_outbound_tls_flow_mut(context, handle, |flow| {
+        flow.note_handshake_prepared();
+        flow.note_client_hello_sent();
+    })?;
+    Ok(())
+}
+
+fn note_outbound_tls_failure(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<(), UpstreamResponseStartError> {
+    with_outbound_tls_flow_mut(context, handle, TlsFlowState::mark_failed)?;
+    Ok(())
+}
+
+fn finalize_outbound_tls_handshake(
+    context: &SharedProxyVmContext,
+    handle: i64,
+    negotiated_alpn: Option<String>,
+    peer_certificate_der: Option<Vec<u8>>,
+) -> Result<(), UpstreamResponseStartError> {
+    with_outbound_tls_flow_mut(context, handle, |flow| {
+        flow.note_server_hello_received();
+        flow.note_server_certificate_received(peer_certificate_der);
+        if flow.verify_peer() && flow.verify_hostname() {
+            flow.note_server_certificate_verified();
+        } else {
+            flow.note_verification_skipped();
+        }
+        if !flow.accepts_negotiated_alpn(negotiated_alpn.as_deref()) {
+            flow.mark_failed();
+            return Err(UpstreamResponseStartError::UpstreamRequest(format!(
+                "tls ALPN mismatch: requested [{}], negotiated {}",
+                flow.desired_alpn().join(", "),
+                negotiated_alpn.as_deref().unwrap_or("none"),
+            )));
+        }
+        flow.mark_handshake_complete(negotiated_alpn);
+        Ok(())
+    })?
+}
+
+fn mark_outbound_tcp_connected(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<(), UpstreamResponseStartError> {
+    let mut guard = context.lock().expect("vm context lock poisoned");
+    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        guard.tcp_dag.default_upstream.mark_connected();
+        return Ok(());
+    }
+
+    let exchange = guard
+        .outbound_exchanges
+        .get_mut(&handle)
+        .ok_or(UpstreamResponseStartError::UnknownExchangeHandle(handle))?;
+    exchange.tcp_dag.mark_connected();
+    Ok(())
+}
+
+async fn start_outbound_exchange_response(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<HttpUpstreamResponseSnapshot, UpstreamResponseStartError> {
+    {
+        let guard = context.lock().expect("vm context lock poisoned");
+        if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+            if let Ok(snapshot) = guard.upstream_response() {
+                return Ok(snapshot);
+            }
+        } else {
+            let exchange = guard
+                .outbound_exchanges
+                .get(&handle)
+                .ok_or(UpstreamResponseStartError::UnknownExchangeHandle(handle))?;
+            if let Ok(snapshot) = exchange.response_snapshot() {
+                return Ok(snapshot);
+            }
+        }
+    }
+
+    let prepared = prepared_outbound_exchange_request(context, handle)?;
+    let request_body = resolve_outbound_exchange_body(context, handle)
         .await
         .map_err(|err| {
             UpstreamResponseStartError::ResolveOutboundBody(format!(
-                "failed to resolve outbound request body: {err}",
+                "failed to resolve outbound exchange body: {err}",
             ))
         })?;
     let (upstream_url, host_header) =
         build_upstream_url(&prepared.target, &prepared.path, &prepared.query);
+    let client = configured_upstream_client(&prepared)?;
 
-    let mut outbound = prepared
-        .client
+    let mut outbound = client
         .request(prepared.method.clone(), upstream_url)
         .body(request_body);
     for (name, value) in &prepared.headers {
@@ -613,12 +1076,24 @@ async fn start_upstream_response(
         outbound = outbound.header(HOST, host);
     }
 
+    note_outbound_tls_prepared(context, handle)?;
     let started = Instant::now();
     let upstream_response = outbound.send().await.map_err(|err| {
+        let _ = note_outbound_tls_failure(context, handle);
         UpstreamResponseStartError::UpstreamRequest(format!(
-            "upstream request failed while evaluating host call: {err}",
+            "outbound exchange {handle} failed while evaluating host call: {err}",
         ))
     })?;
+    let upstream_response_version = upstream_response.version();
+    let negotiated_alpn = alpn_from_http_version(upstream_response_version);
+    let peer_certificate_der = response_peer_certificate_der(&upstream_response);
+    finalize_outbound_tls_handshake(
+        context,
+        handle,
+        negotiated_alpn.clone(),
+        peer_certificate_der,
+    )?;
+    mark_outbound_tcp_connected(context, handle)?;
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let snapshot = HttpUpstreamResponseSnapshot {
         status: upstream_response.status().as_u16(),
@@ -629,10 +1104,27 @@ async fn start_upstream_response(
     };
 
     let mut guard = context.lock().expect("vm context lock poisoned");
-    if let Ok(existing) = guard.upstream_response() {
+    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        if let Ok(existing) = guard.upstream_response() {
+            return Ok(existing);
+        }
+        guard.store_upstream_response(
+            snapshot.status,
+            snapshot.headers.clone(),
+            snapshot.body.clone(),
+            latency_ms,
+        );
+        return Ok(snapshot);
+    }
+
+    let exchange = guard
+        .outbound_exchanges
+        .get_mut(&handle)
+        .ok_or(UpstreamResponseStartError::UnknownExchangeHandle(handle))?;
+    if let Ok(existing) = exchange.response_snapshot() {
         return Ok(existing);
     }
-    guard.store_upstream_response(
+    exchange.store_response(
         snapshot.status,
         snapshot.headers.clone(),
         snapshot.body.clone(),
@@ -641,10 +1133,11 @@ async fn start_upstream_response(
     Ok(snapshot)
 }
 
-pub(crate) async fn ensure_upstream_response_started(
+pub(crate) async fn ensure_outbound_exchange_response_started(
     context: &SharedProxyVmContext,
+    handle: i64,
 ) -> Result<HttpUpstreamResponseSnapshot, VmError> {
-    start_upstream_response(context)
+    start_outbound_exchange_response(context, handle)
         .await
         .map_err(|err| err.as_vm_error())
 }
@@ -654,10 +1147,38 @@ pub(crate) fn upstream_response_available(context: &SharedProxyVmContext) -> boo
     guard.upstream_response_ready()
 }
 
+#[allow(dead_code)]
+pub(crate) fn outbound_exchange_response_available(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> bool {
+    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        return upstream_response_available(context);
+    }
+    let guard = context.lock().expect("vm context lock poisoned");
+    guard
+        .outbound_exchanges
+        .get(&handle)
+        .map(HttpOutboundExchangeNode::response_ready)
+        .unwrap_or(false)
+}
+
 pub(crate) async fn read_upstream_response_all(
     context: &SharedProxyVmContext,
 ) -> Result<Vec<u8>, VmError> {
     let snapshot = ensure_upstream_response_started(context).await?;
+    let mut body = snapshot.body.lock().await;
+    body.read_all().await
+}
+
+pub(crate) async fn read_outbound_exchange_response_all(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<Vec<u8>, VmError> {
+    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        return read_upstream_response_all(context).await;
+    }
+    let snapshot = ensure_outbound_exchange_response_started(context, handle).await?;
     let mut body = snapshot.body.lock().await;
     body.read_all().await
 }
@@ -671,6 +1192,19 @@ pub(crate) async fn read_upstream_response_next_chunk(
     body.read_next_chunk(max_bytes).await
 }
 
+pub(crate) async fn read_outbound_exchange_response_next_chunk(
+    context: &SharedProxyVmContext,
+    handle: i64,
+    max_bytes: usize,
+) -> Result<Vec<u8>, VmError> {
+    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        return read_upstream_response_next_chunk(context, max_bytes).await;
+    }
+    let snapshot = ensure_outbound_exchange_response_started(context, handle).await?;
+    let mut body = snapshot.body.lock().await;
+    body.read_next_chunk(max_bytes).await
+}
+
 pub(crate) async fn read_upstream_response_next_line(
     context: &SharedProxyVmContext,
 ) -> Result<Vec<u8>, VmError> {
@@ -679,8 +1213,33 @@ pub(crate) async fn read_upstream_response_next_line(
     body.read_next_line().await
 }
 
+#[allow(dead_code)]
+pub(crate) async fn read_outbound_exchange_response_next_line(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<Vec<u8>, VmError> {
+    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        return read_upstream_response_next_line(context).await;
+    }
+    let snapshot = ensure_outbound_exchange_response_started(context, handle).await?;
+    let mut body = snapshot.body.lock().await;
+    body.read_next_line().await
+}
+
 pub(crate) async fn upstream_response_eof(context: &SharedProxyVmContext) -> Result<bool, VmError> {
     let snapshot = ensure_upstream_response_started(context).await?;
+    let mut body = snapshot.body.lock().await;
+    body.eof().await
+}
+
+pub(crate) async fn outbound_exchange_response_eof(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<bool, VmError> {
+    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        return upstream_response_eof(context).await;
+    }
+    let snapshot = ensure_outbound_exchange_response_started(context, handle).await?;
     let mut body = snapshot.body.lock().await;
     body.eof().await
 }
@@ -703,7 +1262,7 @@ fn text_response(status: StatusCode, text: &str) -> Response<Body> {
 }
 
 fn response_from_output(
-    body: String,
+    body: Vec<u8>,
     headers: HeaderMap,
     status_code: Option<u16>,
 ) -> Response<Body> {
@@ -747,13 +1306,21 @@ async fn response_from_upstream_snapshot(
 pub(crate) async fn resolve_http_graph_response(
     context: &SharedProxyVmContext,
 ) -> ResolvedHttpGraphResponse {
-    let (response_body, response_headers, response_status, has_upstream_target, upstream_response) = {
+    let (
+        response_body,
+        response_headers,
+        response_status,
+        has_upstream_target,
+        default_upstream_websocket_mode,
+        upstream_response,
+    ) = {
         let guard = context.lock().expect("vm context lock poisoned");
         (
             guard.response_output.body.clone(),
             guard.response_output.headers.clone(),
             guard.response_output.status,
             guard.outbound_request.target.is_some(),
+            guard.default_upstream_websocket.is_websocket_mode(),
             match &guard.upstream_response {
                 HttpUpstreamResponseNode::Ready(snapshot) => Some(snapshot.clone()),
                 HttpUpstreamResponseNode::NotStarted => None,
@@ -770,11 +1337,14 @@ pub(crate) async fn resolve_http_graph_response(
 
     let snapshot = if let Some(snapshot) = upstream_response {
         Some(snapshot)
-    } else if has_upstream_target {
+    } else if has_upstream_target && !default_upstream_websocket_mode {
         match start_upstream_response(context).await {
             Ok(snapshot) => Some(snapshot),
             Err(UpstreamResponseStartError::MissingTarget) => None,
-            Err(UpstreamResponseStartError::MissingClient)
+            Err(UpstreamResponseStartError::UnknownExchangeHandle(_))
+            | Err(UpstreamResponseStartError::MissingClient)
+            | Err(UpstreamResponseStartError::Protocol(_))
+            | Err(UpstreamResponseStartError::TlsConfiguration(_))
             | Err(UpstreamResponseStartError::ResolveOutboundBody(_)) => {
                 return ResolvedHttpGraphResponse {
                     response: text_response(
@@ -866,4 +1436,132 @@ pub(crate) async fn request_body_eof(context: &SharedProxyVmContext) -> Result<b
     };
     let mut inbound = body.lock().await;
     inbound.eof().await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::{HeaderMap, Request},
+        routing::any,
+    };
+
+    use super::{
+        ProxyVmContext, SharedProxyVmContext, allocate_outbound_exchange_handle,
+        append_outbound_exchange_body, ensure_outbound_exchange_response_started,
+        outbound_exchange_exists,
+    };
+    use crate::abi_impl::RateLimiterStore;
+
+    fn test_context() -> SharedProxyVmContext {
+        Arc::new(Mutex::new(ProxyVmContext::from_request_headers(
+            HeaderMap::new(),
+            Arc::new(Mutex::new(RateLimiterStore::new())),
+        )))
+    }
+
+    async fn spawn_server(app: Router) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server should run");
+        });
+        addr
+    }
+
+    #[test]
+    fn dynamic_exchange_handles_are_sequential_and_isolated() {
+        let context = test_context();
+
+        let first = allocate_outbound_exchange_handle(&context).expect("first handle should exist");
+        let second =
+            allocate_outbound_exchange_handle(&context).expect("second handle should exist");
+
+        assert_eq!(first, 2);
+        assert_eq!(second, 3);
+        assert!(outbound_exchange_exists(&context, first));
+        assert!(outbound_exchange_exists(&context, second));
+
+        append_outbound_exchange_body(&context, first, "alpha")
+            .expect("first exchange write should succeed");
+        append_outbound_exchange_body(&context, second, "beta")
+            .expect("second exchange write should succeed");
+
+        let guard = context.lock().expect("vm context lock poisoned");
+        assert_eq!(
+            guard.outbound_exchanges[&first]
+                .request
+                .body_override
+                .as_deref(),
+            Some("alpha".as_bytes())
+        );
+        assert_eq!(
+            guard.outbound_exchanges[&second]
+                .request
+                .body_override
+                .as_deref(),
+            Some("beta".as_bytes())
+        );
+        assert_eq!(guard.outbound_exchanges[&first].request.target, None);
+        assert_eq!(guard.outbound_exchanges[&second].request.target, None);
+        assert!(!guard.outbound_exchanges[&first].response_ready());
+        assert!(!guard.outbound_exchanges[&second].response_ready());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn starting_one_dynamic_exchange_only_advances_that_exchange_dag() {
+        let upstream_addr = spawn_server(Router::new().fallback(any(
+            |request: Request<Body>| async move {
+                let body = to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .expect("body should read");
+                Body::from(format!("echo:{}", String::from_utf8_lossy(&body)))
+            },
+        )))
+        .await;
+
+        let context = test_context();
+        {
+            let mut guard = context.lock().expect("vm context lock poisoned");
+            guard.attach_upstream_client(reqwest::Client::new());
+        }
+
+        let first = allocate_outbound_exchange_handle(&context).expect("first handle should exist");
+        let second =
+            allocate_outbound_exchange_handle(&context).expect("second handle should exist");
+        append_outbound_exchange_body(&context, first, "one")
+            .expect("first exchange write should succeed");
+
+        {
+            let mut guard = context.lock().expect("vm context lock poisoned");
+            let exchange = guard
+                .outbound_exchanges
+                .get_mut(&first)
+                .expect("first exchange should exist");
+            exchange.request.target = Some(upstream_addr.to_string());
+            exchange.tcp_dag.configure();
+            exchange.tls_dag.observe_target(&upstream_addr.to_string());
+        }
+
+        let snapshot = ensure_outbound_exchange_response_started(&context, first)
+            .await
+            .expect("exchange should start");
+        assert_eq!(snapshot.status, 200);
+
+        let guard = context.lock().expect("vm context lock poisoned");
+        assert!(guard.outbound_exchanges[&first].response_ready());
+        assert!(guard.outbound_exchanges[&first].tcp_dag.is_connected());
+        assert!(!guard.outbound_exchanges[&first].tls_dag.is_present());
+        assert!(!guard.outbound_exchanges[&second].response_ready());
+        assert!(!guard.outbound_exchanges[&second].tcp_dag.is_connected());
+        assert!(!guard.outbound_exchanges[&second].tls_dag.is_present());
+        assert!(!guard.tcp_dag.default_upstream.is_connected());
+        assert!(!guard.upstream_response_ready());
+    }
 }

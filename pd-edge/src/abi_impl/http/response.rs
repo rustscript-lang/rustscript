@@ -43,7 +43,7 @@ async fn set_response_body(
     body: String,
 ) -> Result<CallOutcome, VmError> {
     let mut context = context.lock().expect("vm context lock poisoned");
-    context.response_output.body = Some(body);
+    context.response_output.body = Some(body.into_bytes());
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -79,7 +79,9 @@ async fn get_response_body(
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
     let context = context.lock().expect("vm context lock poisoned");
-    let value = context.response_output.body.clone().unwrap_or_default();
+    let value =
+        String::from_utf8_lossy(context.response_output.body.as_deref().unwrap_or_default())
+            .into_owned();
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 

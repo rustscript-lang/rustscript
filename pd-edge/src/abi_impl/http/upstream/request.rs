@@ -4,6 +4,7 @@ use pd_edge_host_function::pd_edge_host_function;
 use vm::bytecode::VmMap;
 use vm::{CallOutcome, Vm, VmError};
 
+use super::super::super::transport::configure_upstream_transport_for_target;
 use super::super::{
     SharedProxyVmContext, is_valid_request_path, is_valid_upstream, parse_header,
     parse_header_name, parse_headers_map, serialize_query_pairs,
@@ -103,6 +104,12 @@ async fn set_upstream_request_target(
     }
     let mut context = context.lock().expect("vm context lock poisoned");
     context.outbound_request.target = Some(upstream);
+    let target = context
+        .outbound_request
+        .target
+        .clone()
+        .expect("upstream target should be set");
+    configure_upstream_transport_for_target(&mut context, &target);
     Ok(CallOutcome::Return(vec![]))
 }
 
