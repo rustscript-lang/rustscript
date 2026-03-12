@@ -1,3 +1,9 @@
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+    sync::{Arc, Mutex},
+};
+
 use axum::http::Version;
 use url::Url;
 
@@ -156,12 +162,40 @@ impl TlsHandshakePhase {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum TlsProtocolVersion {
     Tls1_0,
     Tls1_1,
     Tls1_2,
     Tls1_3,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct TlsSessionCacheKey {
+    pub(crate) origin: String,
+    pub(crate) desired_alpn: Vec<String>,
+    pub(crate) verify_peer: bool,
+    pub(crate) verify_hostname: bool,
+    pub(crate) sni_enabled: bool,
+    pub(crate) trusted_certificate_fingerprint: Option<u64>,
+    pub(crate) client_certificate_fingerprint: Option<u64>,
+    pub(crate) client_private_key_fingerprint: Option<u64>,
+    pub(crate) min_version: Option<TlsProtocolVersion>,
+    pub(crate) max_version: Option<TlsProtocolVersion>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CachedTlsSession {
+    pub(crate) negotiated_alpn: Option<String>,
+    pub(crate) peer_name: Option<String>,
+    pub(crate) server_name: Option<String>,
+    pub(crate) peer_certificate_der: Option<Vec<u8>>,
+}
+
+pub(crate) type SharedTlsSessionCache = Arc<Mutex<HashMap<TlsSessionCacheKey, CachedTlsSession>>>;
+
+pub(crate) fn new_shared_tls_session_cache() -> SharedTlsSessionCache {
+    Arc::new(Mutex::new(HashMap::new()))
 }
 
 impl TlsProtocolVersion {
@@ -359,6 +393,31 @@ impl TlsFlowState {
             self.session_path = TlsSessionPath::FullHandshake;
         }
         self.alpn = negotiated_alpn;
+    }
+
+    pub(crate) fn mark_session_reused(&mut self, cached: &CachedTlsSession) {
+        if !self.present {
+            return;
+        }
+
+        self.handshake_complete = true;
+        self.plaintext_ready = true;
+        self.session_path = TlsSessionPath::SessionReuse;
+        self.phase = TlsHandshakePhase::PlaintextReady;
+        self.alpn = cached.negotiated_alpn.clone();
+        self.peer_certificate_der = cached.peer_certificate_der.clone();
+        if let Some(peer_name) = &cached.peer_name {
+            self.peer_name = Some(peer_name.clone());
+        }
+        if self.sni_enabled {
+            if let Some(server_name) = &cached.server_name {
+                self.server_name = Some(server_name.clone());
+            } else {
+                self.server_name = self.peer_name.clone();
+            }
+        } else {
+            self.server_name = None;
+        }
     }
 
     pub(crate) fn mark_failed(&mut self) {
@@ -561,6 +620,46 @@ fn upstream_target_host(target: &str) -> Option<String> {
         .and_then(|url| url.host_str().map(str::to_string))
 }
 
+fn tls_session_origin(target: &str) -> Option<String> {
+    let url = Url::parse(target).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    let port = url.port_or_known_default()?;
+    Some(format!(
+        "{}://{}:{}",
+        url.scheme().to_ascii_lowercase(),
+        host,
+        port
+    ))
+}
+
+fn fingerprint_optional_pem(value: Option<&str>) -> Option<u64> {
+    let value = value?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+pub(crate) fn tls_session_cache_key(
+    target: &str,
+    flow: &TlsFlowState,
+) -> Option<TlsSessionCacheKey> {
+    if !flow.is_present() {
+        return None;
+    }
+    Some(TlsSessionCacheKey {
+        origin: tls_session_origin(target)?,
+        desired_alpn: flow.desired_alpn().to_vec(),
+        verify_peer: flow.verify_peer(),
+        verify_hostname: flow.verify_hostname(),
+        sni_enabled: flow.sni_enabled(),
+        trusted_certificate_fingerprint: fingerprint_optional_pem(flow.trusted_certificate_pem()),
+        client_certificate_fingerprint: fingerprint_optional_pem(flow.client_certificate_pem()),
+        client_private_key_fingerprint: fingerprint_optional_pem(flow.client_private_key_pem()),
+        min_version: flow.min_version(),
+        max_version: flow.max_version(),
+    })
+}
+
 fn normalize_authority_host(value: &str) -> Option<String> {
     Url::parse(&format!("http://{value}"))
         .ok()
@@ -572,9 +671,10 @@ mod tests {
     use axum::http::Version;
 
     use super::{
-        TCP_STREAM_DEFAULT_UPSTREAM, TCP_STREAM_DOWNSTREAM, TlsFlowState, TlsHandshakePhase,
-        TlsProtocolVersion, TlsSessionPath, TlsTransportDag, alpn_from_http_version,
-        decode_tcp_stream_handle, decode_tls_session_handle,
+        CachedTlsSession, TCP_STREAM_DEFAULT_UPSTREAM, TCP_STREAM_DOWNSTREAM, TlsFlowState,
+        TlsHandshakePhase, TlsProtocolVersion, TlsSessionPath, TlsTransportDag,
+        alpn_from_http_version, decode_tcp_stream_handle, decode_tls_session_handle,
+        tls_session_cache_key,
     };
 
     #[test]
@@ -686,6 +786,47 @@ mod tests {
         assert_eq!(flow.phase_label(), TlsHandshakePhase::Failed.as_str());
         assert!(!flow.handshake_complete());
         assert!(!flow.plaintext_ready());
+    }
+
+    #[test]
+    fn resumed_tls_session_marks_handshake_complete_without_full_handshake_path() {
+        let mut flow = TlsFlowState::default();
+        flow.observe_target("https://origin.example.net/api");
+        flow.mark_session_reused(&CachedTlsSession {
+            negotiated_alpn: Some("h2".to_string()),
+            peer_name: Some("origin.example.net".to_string()),
+            server_name: Some("origin.example.net".to_string()),
+            peer_certificate_der: Some(vec![7, 8, 9]),
+        });
+
+        assert!(flow.handshake_complete());
+        assert!(flow.plaintext_ready());
+        assert!(flow.is_session_reused());
+        assert_eq!(flow.phase_label(), "plaintext-ready");
+        assert_eq!(flow.alpn(), "h2");
+        assert_eq!(flow.peer_certificate_der(), Some(&[7, 8, 9][..]));
+    }
+
+    #[test]
+    fn tls_session_cache_key_is_origin_scoped_and_configuration_sensitive() {
+        let mut first = TlsFlowState::default();
+        first.observe_target("https://origin.example.net:8443/a");
+        first.set_verify_peer(false);
+        first.set_desired_alpn(vec!["h2".to_string()]);
+
+        let mut second = first.clone();
+        second.observe_target("https://origin.example.net:8443/b");
+
+        let first_key = tls_session_cache_key("https://origin.example.net:8443/a", &first)
+            .expect("key should build");
+        let second_key = tls_session_cache_key("https://origin.example.net:8443/b", &second)
+            .expect("key should build");
+        assert_eq!(first_key, second_key);
+
+        second.set_verify_hostname(false);
+        let changed_key = tls_session_cache_key("https://origin.example.net:8443/b", &second)
+            .expect("key should build");
+        assert_ne!(first_key, changed_key);
     }
 
     #[test]

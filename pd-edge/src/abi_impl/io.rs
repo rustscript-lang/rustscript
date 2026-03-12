@@ -3,32 +3,32 @@ use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::http::{
-    consume_request_body_all, read_request_body_next_line, read_upstream_response_all,
-    read_upstream_response_next_line, resolve_outbound_request_body, upstream_response_available,
+    append_outbound_exchange_body, append_response_output_body_bytes, consume_request_body_all,
+    default_upstream_exchange_handle, read_outbound_exchange_response_all,
+    read_outbound_exchange_response_next_line, read_request_body_next_line,
+    read_upstream_response_all, read_upstream_response_next_line,
 };
 use super::{
     EDGE_IO_HANDLE_DYNAMIC_BASE, EdgeVirtualIoHandle, ProxyVmContext, SharedProxyVmContext,
     SharedVmAsyncOps,
 };
 
-pub(crate) const EDGE_IO_HANDLE_REQUEST_BODY: i64 = 1;
-pub(crate) const EDGE_IO_HANDLE_RESPONSE_BODY: i64 = 2;
-pub(crate) const EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY: i64 = 3;
-pub(crate) const EDGE_IO_HANDLE_UPSTREAM_RESPONSE_BODY: i64 = 4;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdgeProtocolIoHandle {
+    Downstream,
+    OutboundExchange(i64),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EdgeIoHandleKind {
-    Request,
-    Response,
-    UpstreamRequest,
-    UpstreamResponse,
+enum EdgeIoReadSource {
+    Protocol(EdgeProtocolIoHandle),
+    VirtualHandle(i64),
 }
 
 #[derive(Clone, Debug)]
 enum EdgeIoWriteTarget {
-    Builtin(EdgeIoHandleKind),
+    Protocol(EdgeProtocolIoHandle),
     FilePath { path: String, append: bool },
-    Ignore,
 }
 
 pub(super) fn register_builtin_io_overrides(
@@ -45,53 +45,51 @@ pub(super) fn register_builtin_io_overrides(
     Ok(())
 }
 
-fn decode_edge_io_handle(handle: i64) -> Result<EdgeIoHandleKind, VmError> {
-    match handle {
-        EDGE_IO_HANDLE_REQUEST_BODY => Ok(EdgeIoHandleKind::Request),
-        EDGE_IO_HANDLE_RESPONSE_BODY => Ok(EdgeIoHandleKind::Response),
-        EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY => Ok(EdgeIoHandleKind::UpstreamRequest),
-        EDGE_IO_HANDLE_UPSTREAM_RESPONSE_BODY => Ok(EdgeIoHandleKind::UpstreamResponse),
-        _ => Err(VmError::HostError(format!(
-            "edge io handle {handle} is invalid; expected request/response/upstream request/upstream response handle",
-        ))),
+fn decode_protocol_io_handle(
+    context: &ProxyVmContext,
+    handle: i64,
+) -> Option<EdgeProtocolIoHandle> {
+    if handle == 0 {
+        return Some(EdgeProtocolIoHandle::Downstream);
     }
-}
-
-fn path_targets_upstream_request(path: &str) -> bool {
-    let normalized = path.trim().to_ascii_lowercase();
-    normalized.contains("upstream")
-}
-
-fn edge_io_target_from_string(value: &str) -> Option<EdgeIoHandleKind> {
-    let normalized = value.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "request_body" | "request.body" | "request" | "body" | "http.request.body"
-        | "inbound.body" => Some(EdgeIoHandleKind::Request),
-        "response_body"
-        | "response.body"
-        | "response"
-        | "http.response.body"
-        | "outbound.response.body" => Some(EdgeIoHandleKind::Response),
-        "upstream_body"
-        | "upstream.body"
-        | "upstream_request_body"
-        | "upstream.request.body"
-        | "outbound.body"
-        | "http.upstream.request.body" => Some(EdgeIoHandleKind::UpstreamRequest),
-        "upstream_response_body"
-        | "upstream.response.body"
-        | "http.upstream.response.body"
-        | "outbound.upstream.response.body" => Some(EdgeIoHandleKind::UpstreamResponse),
-        _ => None,
+    if handle == default_upstream_exchange_handle()
+        || context.outbound_exchanges.contains_key(&handle)
+    {
+        return Some(EdgeProtocolIoHandle::OutboundExchange(handle));
     }
+    None
 }
 
-fn edge_io_readable_path(path: &str) -> bool {
-    let normalized = path.trim().to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "request_body" | "request.body" | "request" | "body" | "http.request.body" | "inbound.body"
-    )
+fn invalid_io_handle_error(handle: i64) -> VmError {
+    VmError::HostError(format!(
+        "edge io handle {handle} is invalid; use io::open for file handles or pass a handle returned by http/tcp/tls",
+    ))
+}
+
+fn requires_io_handle_error(function_name: &str) -> VmError {
+    VmError::HostError(format!(
+        "edge {function_name} requires a handle; use io::open for files or pass a handle returned by http/tcp/tls",
+    ))
+}
+
+fn resolve_edge_io_read_source(
+    context: &ProxyVmContext,
+    value: &Value,
+    function_name: &str,
+) -> Result<EdgeIoReadSource, VmError> {
+    match value {
+        Value::Int(handle) => {
+            if let Some(target) = decode_protocol_io_handle(context, *handle) {
+                return Ok(EdgeIoReadSource::Protocol(target));
+            }
+            if context.edge_io_handles.contains_key(handle) {
+                return Ok(EdgeIoReadSource::VirtualHandle(*handle));
+            }
+            Err(invalid_io_handle_error(*handle))
+        }
+        Value::String(_) => Err(requires_io_handle_error(function_name)),
+        _ => Err(VmError::TypeMismatch("int")),
+    }
 }
 
 fn allocate_edge_virtual_io_handle(
@@ -159,8 +157,8 @@ fn resolve_edge_io_write_target(
 ) -> Result<EdgeIoWriteTarget, VmError> {
     match value {
         Value::Int(handle) => {
-            if let Ok(target) = decode_edge_io_handle(*handle) {
-                return Ok(EdgeIoWriteTarget::Builtin(target));
+            if let Some(target) = decode_protocol_io_handle(context, *handle) {
+                return Ok(EdgeIoWriteTarget::Protocol(target));
             }
             match context.edge_io_handles.get(handle) {
                 Some(EdgeVirtualIoHandle::FileWrite { path, append }) => {
@@ -177,14 +175,8 @@ fn resolve_edge_io_write_target(
                 ))),
             }
         }
-        Value::String(name) => {
-            if let Some(target) = edge_io_target_from_string(name) {
-                Ok(EdgeIoWriteTarget::Builtin(target))
-            } else {
-                Ok(EdgeIoWriteTarget::Ignore)
-            }
-        }
-        _ => Err(VmError::TypeMismatch("string/int")),
+        Value::String(_) => Err(requires_io_handle_error("io::write")),
+        _ => Err(VmError::TypeMismatch("int")),
     }
 }
 
@@ -212,77 +204,62 @@ async fn write_edge_file_path(path: &str, append: bool, text: &str) -> Result<()
 
 async fn read_io_target_all(
     context: &SharedProxyVmContext,
-    target: EdgeIoHandleKind,
+    target: EdgeProtocolIoHandle,
 ) -> Result<String, VmError> {
     match target {
-        EdgeIoHandleKind::Request => {
+        EdgeProtocolIoHandle::Downstream => {
             let body = consume_request_body_all(context).await?;
             Ok(String::from_utf8_lossy(&body).into_owned())
         }
-        EdgeIoHandleKind::Response => {
-            let guard = context.lock().expect("vm context lock poisoned");
-            Ok(
-                String::from_utf8_lossy(guard.response_output.body.as_deref().unwrap_or_default())
-                    .into_owned(),
-            )
-        }
-        EdgeIoHandleKind::UpstreamRequest => {
-            let body = resolve_outbound_request_body(context).await?;
-            Ok(String::from_utf8_lossy(&body).into_owned())
-        }
-        EdgeIoHandleKind::UpstreamResponse => {
+        EdgeProtocolIoHandle::OutboundExchange(handle)
+            if handle == default_upstream_exchange_handle() =>
+        {
             Ok(String::from_utf8_lossy(&read_upstream_response_all(context).await?).into_owned())
         }
+        EdgeProtocolIoHandle::OutboundExchange(handle) => Ok(String::from_utf8_lossy(
+            &read_outbound_exchange_response_all(context, handle).await?,
+        )
+        .into_owned()),
     }
 }
 
 async fn read_io_target_line(
     context: &SharedProxyVmContext,
-    target: EdgeIoHandleKind,
+    target: EdgeProtocolIoHandle,
 ) -> Result<String, VmError> {
     match target {
-        EdgeIoHandleKind::Request => {
+        EdgeProtocolIoHandle::Downstream => {
             let line = read_request_body_next_line(context).await?;
             Ok(String::from_utf8_lossy(&line).into_owned())
         }
-        EdgeIoHandleKind::Response => {
-            let guard = context.lock().expect("vm context lock poisoned");
+        EdgeProtocolIoHandle::OutboundExchange(handle)
+            if handle == default_upstream_exchange_handle() =>
+        {
             Ok(
-                String::from_utf8_lossy(guard.response_output.body.as_deref().unwrap_or_default())
+                String::from_utf8_lossy(&read_upstream_response_next_line(context).await?)
                     .into_owned(),
             )
         }
-        EdgeIoHandleKind::UpstreamRequest => {
-            let body = resolve_outbound_request_body(context).await?;
-            Ok(String::from_utf8_lossy(&body).into_owned())
-        }
-        EdgeIoHandleKind::UpstreamResponse => Ok(String::from_utf8_lossy(
-            &read_upstream_response_next_line(context).await?,
+        EdgeProtocolIoHandle::OutboundExchange(handle) => Ok(String::from_utf8_lossy(
+            &read_outbound_exchange_response_next_line(context, handle).await?,
         )
         .into_owned()),
     }
 }
 
 fn write_io_target(
-    context: &mut ProxyVmContext,
-    target: EdgeIoHandleKind,
+    context: &SharedProxyVmContext,
+    target: EdgeProtocolIoHandle,
     text: &str,
 ) -> Result<(), VmError> {
     match target {
-        EdgeIoHandleKind::Request => Err(VmError::HostError(
-            "edge io::write does not support request body read handle".to_string(),
-        )),
-        EdgeIoHandleKind::Response => {
-            context.response_output.body = Some(text.as_bytes().to_vec());
+        EdgeProtocolIoHandle::Downstream => {
+            append_response_output_body_bytes(context, text.as_bytes());
             Ok(())
         }
-        EdgeIoHandleKind::UpstreamRequest => {
-            context.outbound_request.body_override = Some(text.as_bytes().to_vec());
-            Ok(())
+        EdgeProtocolIoHandle::OutboundExchange(handle) => {
+            append_outbound_exchange_body(context, handle, text)
         }
-        EdgeIoHandleKind::UpstreamResponse => Err(VmError::HostError(
-            "edge io::write does not support upstream response body handles".to_string(),
-        )),
     }
 }
 
@@ -293,24 +270,12 @@ async fn io_open(
     path: String,
     mode: String,
 ) -> Result<CallOutcome, VmError> {
-    let explicit_target = edge_io_target_from_string(&path);
     let mode = mode.trim().to_ascii_lowercase();
     let values = match mode.as_str() {
         "r" => {
-            if let Some(target) = explicit_target {
-                let handle = match target {
-                    EdgeIoHandleKind::Request => EDGE_IO_HANDLE_REQUEST_BODY,
-                    EdgeIoHandleKind::Response => EDGE_IO_HANDLE_RESPONSE_BODY,
-                    EdgeIoHandleKind::UpstreamRequest => EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY,
-                    EdgeIoHandleKind::UpstreamResponse => EDGE_IO_HANDLE_UPSTREAM_RESPONSE_BODY,
-                };
-                return Ok(CallOutcome::Return(vec![Value::Int(handle)]));
-            }
-
-            let buffered = match tokio::fs::read_to_string(&path).await {
-                Ok(content) => content,
-                Err(_) => path.clone(),
-            };
+            let buffered = tokio::fs::read_to_string(&path)
+                .await
+                .map_err(|err| VmError::HostError(format!("edge io::open read failed: {err}")))?;
             let mut guard = context.lock().expect("vm context lock poisoned");
             let handle = allocate_edge_virtual_io_handle(
                 &mut guard,
@@ -322,38 +287,15 @@ async fn io_open(
             vec![Value::Int(handle)]
         }
         "w" | "a" => {
-            if let Some(target) = explicit_target {
-                let handle = match target {
-                    EdgeIoHandleKind::Request => {
-                        return Err(VmError::HostError(
-                            "edge io::open does not allow write mode on request body".to_string(),
-                        ));
-                    }
-                    EdgeIoHandleKind::Response => EDGE_IO_HANDLE_RESPONSE_BODY,
-                    EdgeIoHandleKind::UpstreamRequest => EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY,
-                    EdgeIoHandleKind::UpstreamResponse => {
-                        return Err(VmError::HostError(
-                            "edge io::open does not allow write mode on upstream response body"
-                                .to_string(),
-                        ));
-                    }
-                };
-                return Ok(CallOutcome::Return(vec![Value::Int(handle)]));
-            }
-
-            let target = if path_targets_upstream_request(&path) {
-                EDGE_IO_HANDLE_UPSTREAM_REQUEST_BODY
-            } else {
-                let mut guard = context.lock().expect("vm context lock poisoned");
-                allocate_edge_virtual_io_handle(
-                    &mut guard,
-                    EdgeVirtualIoHandle::FileWrite {
-                        path: path.clone(),
-                        append: mode == "a",
-                    },
-                )
-            };
-            vec![Value::Int(target)]
+            let mut guard = context.lock().expect("vm context lock poisoned");
+            let handle = allocate_edge_virtual_io_handle(
+                &mut guard,
+                EdgeVirtualIoHandle::FileWrite {
+                    path: path.clone(),
+                    append: mode == "a",
+                },
+            );
+            vec![Value::Int(handle)]
         }
         _ => {
             return Err(VmError::HostError(format!(
@@ -377,22 +319,16 @@ async fn io_read_all(
     context: SharedProxyVmContext,
     source: Value,
 ) -> Result<CallOutcome, VmError> {
-    let text = match &source {
-        Value::String(literal) => match edge_io_target_from_string(literal) {
-            Some(target) => read_io_target_all(&context, target).await?,
-            None => literal.to_string(),
-        },
-        Value::Int(handle) => {
+    let source = {
+        let guard = context.lock().expect("vm context lock poisoned");
+        resolve_edge_io_read_source(&guard, &source, "io::read_all")?
+    };
+    let text = match source {
+        EdgeIoReadSource::Protocol(target) => read_io_target_all(&context, target).await?,
+        EdgeIoReadSource::VirtualHandle(handle) => {
             let mut guard = context.lock().expect("vm context lock poisoned");
-            match decode_edge_io_handle(*handle) {
-                Ok(target) => {
-                    drop(guard);
-                    read_io_target_all(&context, target).await?
-                }
-                Err(_) => read_edge_virtual_handle_all(&mut guard, *handle)?,
-            }
+            read_edge_virtual_handle_all(&mut guard, handle)?
         }
-        _ => return Err(VmError::TypeMismatch("string/int")),
     };
     Ok(CallOutcome::Return(vec![Value::string(text)]))
 }
@@ -403,25 +339,16 @@ async fn io_read_line(
     context: SharedProxyVmContext,
     source: Value,
 ) -> Result<CallOutcome, VmError> {
-    let text = match &source {
-        Value::String(literal) => match edge_io_target_from_string(literal) {
-            Some(target) => read_io_target_line(&context, target).await?,
-            None => {
-                let mut lines = literal.lines();
-                lines.next().unwrap_or_default().to_string()
-            }
-        },
-        Value::Int(handle) => {
+    let source = {
+        let guard = context.lock().expect("vm context lock poisoned");
+        resolve_edge_io_read_source(&guard, &source, "io::read_line")?
+    };
+    let text = match source {
+        EdgeIoReadSource::Protocol(target) => read_io_target_line(&context, target).await?,
+        EdgeIoReadSource::VirtualHandle(handle) => {
             let mut guard = context.lock().expect("vm context lock poisoned");
-            match decode_edge_io_handle(*handle) {
-                Ok(target) => {
-                    drop(guard);
-                    read_io_target_line(&context, target).await?
-                }
-                Err(_) => read_edge_virtual_handle_line(&mut guard, *handle)?,
-            }
+            read_edge_virtual_handle_line(&mut guard, handle)?
         }
-        _ => return Err(VmError::TypeMismatch("string/int")),
     };
     Ok(CallOutcome::Return(vec![Value::string(text)]))
 }
@@ -438,14 +365,10 @@ async fn io_write(
         resolve_edge_io_write_target(&guard, &target_arg)?
     };
     match target {
-        EdgeIoWriteTarget::Builtin(kind) => {
-            let mut guard = context.lock().expect("vm context lock poisoned");
-            write_io_target(&mut guard, kind, &text)?;
-        }
+        EdgeIoWriteTarget::Protocol(kind) => write_io_target(&context, kind, &text)?,
         EdgeIoWriteTarget::FilePath { path, append } => {
             write_edge_file_path(&path, append, &text).await?;
         }
-        EdgeIoWriteTarget::Ignore => {}
     }
     Ok(CallOutcome::Return(vec![Value::Int(text.len() as i64)]))
 }
@@ -458,17 +381,15 @@ async fn io_flush(
 ) -> Result<CallOutcome, VmError> {
     match target {
         Value::Int(handle) => {
-            if decode_edge_io_handle(handle).is_err() {
-                let guard = context.lock().expect("vm context lock poisoned");
-                if !guard.edge_io_handles.contains_key(&handle) {
-                    return Err(VmError::HostError(format!(
-                        "edge io handle {handle} is invalid",
-                    )));
-                }
+            let guard = context.lock().expect("vm context lock poisoned");
+            if decode_protocol_io_handle(&guard, handle).is_none()
+                && !guard.edge_io_handles.contains_key(&handle)
+            {
+                return Err(invalid_io_handle_error(handle));
             }
         }
-        Value::String(_) => {}
-        _ => return Err(VmError::TypeMismatch("string/int")),
+        Value::String(_) => return Err(requires_io_handle_error("io::flush")),
+        _ => return Err(VmError::TypeMismatch("int")),
     }
     Ok(CallOutcome::Return(vec![Value::Bool(true)]))
 }
@@ -481,17 +402,16 @@ async fn io_close(
 ) -> Result<CallOutcome, VmError> {
     match target {
         Value::Int(handle) => {
-            if decode_edge_io_handle(handle).is_err() {
-                let mut guard = context.lock().expect("vm context lock poisoned");
-                if guard.edge_io_handles.remove(&handle).is_none() {
-                    return Err(VmError::HostError(format!(
-                        "edge io handle {handle} is invalid",
-                    )));
-                }
+            let mut guard = context.lock().expect("vm context lock poisoned");
+            if decode_protocol_io_handle(&guard, handle).is_some() {
+                return Ok(CallOutcome::Return(vec![Value::Bool(true)]));
+            }
+            if guard.edge_io_handles.remove(&handle).is_none() {
+                return Err(invalid_io_handle_error(handle));
             }
         }
-        Value::String(_) => {}
-        _ => return Err(VmError::TypeMismatch("string/int")),
+        Value::String(_) => return Err(requires_io_handle_error("io::close")),
+        _ => return Err(VmError::TypeMismatch("int")),
     }
     Ok(CallOutcome::Return(vec![Value::Bool(true)]))
 }
@@ -499,14 +419,9 @@ async fn io_close(
 #[pd_edge_host_function(name = "io::exists", scope = io)]
 async fn io_exists(
     _vm: &mut Vm,
-    context: SharedProxyVmContext,
+    _context: SharedProxyVmContext,
     path: String,
 ) -> Result<CallOutcome, VmError> {
-    let exists = match edge_io_target_from_string(&path) {
-        Some(EdgeIoHandleKind::UpstreamResponse) => upstream_response_available(&context),
-        Some(_) => true,
-        None if edge_io_readable_path(&path) || path_targets_upstream_request(&path) => true,
-        None => tokio::fs::metadata(path.as_str()).await.is_ok(),
-    };
+    let exists = tokio::fs::metadata(path.as_str()).await.is_ok();
     Ok(CallOutcome::Return(vec![Value::Bool(exists)]))
 }

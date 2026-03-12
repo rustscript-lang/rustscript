@@ -91,6 +91,7 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
         {
             let mut guard = vm_context.lock().expect("vm context lock poisoned");
             guard.attach_upstream_client(state.client.clone());
+            guard.attach_tls_session_cache(state.tls_session_cache.clone());
         }
         match execute_vm_with_context(
             &program,

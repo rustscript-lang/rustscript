@@ -21,6 +21,7 @@ mod transport;
 mod websocket;
 
 pub use self::http::{HttpRequestContext, ProxyVmContext, SharedProxyVmContext};
+pub(crate) use self::transport::{SharedTlsSessionCache, new_shared_tls_session_cache};
 
 pub type SharedRateLimiter = Arc<Mutex<RateLimiterStore>>;
 pub type SharedVmAsyncOps = Arc<Mutex<VmAsyncOps>>;
@@ -492,7 +493,7 @@ pub(crate) enum EdgeVirtualIoHandle {
     FileWrite { path: String, append: bool },
 }
 
-const EDGE_IO_HANDLE_DYNAMIC_BASE: i64 = 1024;
+const EDGE_IO_HANDLE_DYNAMIC_BASE: i64 = 1_i64 << 48;
 
 pub fn register_host_module(
     vm: &mut Vm,

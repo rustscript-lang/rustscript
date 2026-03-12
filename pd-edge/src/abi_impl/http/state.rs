@@ -19,8 +19,8 @@ use super::super::{
     EDGE_IO_HANDLE_DYNAMIC_BASE, EdgeVirtualIoHandle, SharedRateLimiter,
     proxy::ProxyByteStreamState,
     transport::{
-        TcpFlowState, TcpTransportDag, TlsFlowState, TlsProtocolVersion, TlsTransportDag,
-        alpn_from_http_version,
+        CachedTlsSession, SharedTlsSessionCache, TcpFlowState, TcpTransportDag, TlsFlowState,
+        TlsProtocolVersion, TlsTransportDag, alpn_from_http_version, tls_session_cache_key,
     },
     websocket::WebSocketConnectionState,
 };
@@ -414,6 +414,7 @@ pub struct ProxyVmContext {
     pub(crate) response_output: HttpResponseOutputNode,
     pub(crate) upstream_response: HttpUpstreamResponseNode,
     pub(crate) upstream_client: Option<reqwest::Client>,
+    pub(crate) tls_session_cache: Option<SharedTlsSessionCache>,
     pub(crate) upstream_latency_ms: u64,
     pub(crate) next_outbound_exchange_handle: i64,
     pub(crate) outbound_exchanges: HashMap<i64, HttpOutboundExchangeNode>,
@@ -470,6 +471,7 @@ impl ProxyVmContext {
             response_output: HttpResponseOutputNode::default(),
             upstream_response: HttpUpstreamResponseNode::NotStarted,
             upstream_client: None,
+            tls_session_cache: None,
             upstream_latency_ms: 0,
             next_outbound_exchange_handle: FIRST_DYNAMIC_EXCHANGE_HANDLE,
             outbound_exchanges: HashMap::new(),
@@ -505,6 +507,10 @@ impl ProxyVmContext {
 
     pub fn attach_upstream_client(&mut self, client: reqwest::Client) {
         self.upstream_client = Some(client);
+    }
+
+    pub(crate) fn attach_tls_session_cache(&mut self, cache: SharedTlsSessionCache) {
+        self.tls_session_cache = Some(cache);
     }
 
     fn upstream_response(&self) -> Result<HttpUpstreamResponseSnapshot, VmError> {
@@ -978,6 +984,65 @@ fn note_outbound_tls_prepared(
     Ok(())
 }
 
+fn outbound_tls_handshake_complete(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<bool, UpstreamResponseStartError> {
+    let guard = context.lock().expect("vm context lock poisoned");
+    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        return Ok(guard.tls_dag.default_upstream.handshake_complete());
+    }
+
+    let exchange = guard
+        .outbound_exchanges
+        .get(&handle)
+        .ok_or(UpstreamResponseStartError::UnknownExchangeHandle(handle))?;
+    Ok(exchange.tls_dag.handshake_complete())
+}
+
+fn cache_outbound_tls_session(
+    context: &SharedProxyVmContext,
+    handle: i64,
+    negotiated_alpn: Option<String>,
+    peer_certificate_der: Option<Vec<u8>>,
+) -> Result<(), UpstreamResponseStartError> {
+    let (cache, key, cached) = {
+        let guard = context.lock().expect("vm context lock poisoned");
+        let Some(cache) = guard.tls_session_cache.clone() else {
+            return Ok(());
+        };
+        let (target, flow) = if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+            (
+                guard.outbound_request.target.as_deref(),
+                &guard.tls_dag.default_upstream,
+            )
+        } else {
+            let exchange = guard
+                .outbound_exchanges
+                .get(&handle)
+                .ok_or(UpstreamResponseStartError::UnknownExchangeHandle(handle))?;
+            (exchange.request.target.as_deref(), &exchange.tls_dag)
+        };
+        let Some(target) = target else {
+            return Ok(());
+        };
+        let Some(key) = tls_session_cache_key(target, flow) else {
+            return Ok(());
+        };
+        let cached = CachedTlsSession {
+            negotiated_alpn,
+            peer_name: (!flow.peer_name().is_empty()).then(|| flow.peer_name().to_string()),
+            server_name: (!flow.server_name().is_empty()).then(|| flow.server_name().to_string()),
+            peer_certificate_der,
+        };
+        (cache, key, cached)
+    };
+
+    let mut guard = cache.lock().expect("tls session cache lock poisoned");
+    guard.insert(key, cached);
+    Ok(())
+}
+
 fn note_outbound_tls_failure(
     context: &SharedProxyVmContext,
     handle: i64,
@@ -1076,7 +1141,10 @@ async fn start_outbound_exchange_response(
         outbound = outbound.header(HOST, host);
     }
 
-    note_outbound_tls_prepared(context, handle)?;
+    let handshake_already_complete = outbound_tls_handshake_complete(context, handle)?;
+    if !handshake_already_complete {
+        note_outbound_tls_prepared(context, handle)?;
+    }
     let started = Instant::now();
     let upstream_response = outbound.send().await.map_err(|err| {
         let _ = note_outbound_tls_failure(context, handle);
@@ -1087,12 +1155,20 @@ async fn start_outbound_exchange_response(
     let upstream_response_version = upstream_response.version();
     let negotiated_alpn = alpn_from_http_version(upstream_response_version);
     let peer_certificate_der = response_peer_certificate_der(&upstream_response);
-    finalize_outbound_tls_handshake(
-        context,
-        handle,
-        negotiated_alpn.clone(),
-        peer_certificate_der,
-    )?;
+    if !handshake_already_complete {
+        finalize_outbound_tls_handshake(
+            context,
+            handle,
+            negotiated_alpn.clone(),
+            peer_certificate_der.clone(),
+        )?;
+        cache_outbound_tls_session(
+            context,
+            handle,
+            negotiated_alpn.clone(),
+            peer_certificate_der,
+        )?;
+    }
     mark_outbound_tcp_connected(context, handle)?;
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let snapshot = HttpUpstreamResponseSnapshot {

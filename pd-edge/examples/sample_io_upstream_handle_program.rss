@@ -1,0 +1,29 @@
+use http;
+use io;
+use tcp;
+
+let target = http::request::get_header("x-upstream-target");
+
+if target == "" {
+    http::response::set_status(400);
+    http::response::set_body("missing x-upstream-target");
+} else {
+    let downstream = tcp::stream::downstream();
+    let upstream = http::exchange::default_upstream();
+
+    // Configure the default outbound exchange with the same method as the downstream request.
+    http::exchange::set_target(upstream, target);
+    http::exchange::set_method(upstream, http::request::get_method());
+
+    // `io::read_all(0)` consumes the downstream request body.
+    let staged = io::read_all(downstream);
+
+    // `io::write(1, ...)` stages bytes into the default upstream request body.
+    io::write(upstream, staged + "|via-io-handle");
+
+    // Reading from the same upstream handle advances the outbound exchange and returns the response.
+    http::response::set_status(http::upstream::response::get_status());
+    http::response::set_header("x-io-upstream-handles", "true");
+    http::response::set_header("x-first-line", io::read_line(upstream));
+    http::response::set_body(io::read_all(upstream));
+}

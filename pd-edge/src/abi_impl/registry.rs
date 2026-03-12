@@ -103,13 +103,24 @@ fn cached_registry_for_scope_mask(scope_mask_bits: u8) -> HostFunctionRegistry {
         .clone()
 }
 
+fn apply_cached_builtin_overrides(vm: &mut Vm, scopes: &[EdgeHostScope]) {
+    if scopes
+        .iter()
+        .any(|scope| matches!(scope, EdgeHostScope::Io))
+    {
+        bind_host_scopes_direct(vm, &[EdgeHostScope::Io]);
+    }
+}
+
 pub(crate) fn bind_host_scopes(vm: &mut Vm, scopes: &[EdgeHostScope]) -> Result<(), VmError> {
     let scope_mask_bits = scopes_mask(scopes);
     if scope_mask_bits == 0 {
         return Ok(());
     }
     if vm.bound_function_count() == 0 && !vm.program().imports.is_empty() {
-        return cached_registry_for_scope_mask(scope_mask_bits).bind_vm_cached(vm);
+        cached_registry_for_scope_mask(scope_mask_bits).bind_vm_cached(vm)?;
+        apply_cached_builtin_overrides(vm, scopes);
+        return Ok(());
     }
     if vm.bound_function_count() == 0 {
         for function in EDGE_ABI_FUNCTIONS {

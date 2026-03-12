@@ -14,7 +14,9 @@ use vm::{Program, decode_program, validate_program};
 
 use crate::{
     HOST_FUNCTION_COUNT,
-    abi_impl::{RateLimiterStore, SharedRateLimiter},
+    abi_impl::{
+        RateLimiterStore, SharedRateLimiter, SharedTlsSessionCache, new_shared_tls_session_cache,
+    },
     control_plane_rpc::EdgeTrafficSample,
     debug_session::{SharedDebugSession, debug_session_status, new_debug_session_store},
     logging::category_program,
@@ -97,6 +99,7 @@ pub struct SharedState {
     pub active_program: Arc<RwLock<Option<Arc<LoadedProgram>>>>,
     pub max_program_bytes: usize,
     pub client: reqwest::Client,
+    pub(crate) tls_session_cache: SharedTlsSessionCache,
     pub rate_limiter: SharedRateLimiter,
     pub debug_session: SharedDebugSession,
     pub vm_execution: VmExecutionConfig,
@@ -155,6 +158,7 @@ impl SharedState {
                 .tls_info(true)
                 .build()
                 .expect("default upstream client should build"),
+            tls_session_cache: new_shared_tls_session_cache(),
             rate_limiter: Arc::new(std::sync::Mutex::new(RateLimiterStore::new())),
             debug_session: new_debug_session_store(),
             vm_execution: VmExecutionConfig::default(),

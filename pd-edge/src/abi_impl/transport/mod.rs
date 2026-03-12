@@ -8,8 +8,10 @@ mod tcp;
 mod tls;
 
 pub(crate) use state::{
-    TcpFlowState, TcpStreamRef, TcpTransportDag, TlsFlowState, TlsProtocolVersion, TlsSessionRef,
-    TlsTransportDag, alpn_from_http_version, decode_tcp_stream_handle, decode_tls_session_handle,
+    CachedTlsSession, SharedTlsSessionCache, TcpFlowState, TcpStreamRef, TcpTransportDag,
+    TlsFlowState, TlsProtocolVersion, TlsSessionRef, TlsTransportDag, alpn_from_http_version,
+    decode_tcp_stream_handle, decode_tls_session_handle, new_shared_tls_session_cache,
+    tls_session_cache_key,
 };
 
 pub(super) fn register_transport_extensions(

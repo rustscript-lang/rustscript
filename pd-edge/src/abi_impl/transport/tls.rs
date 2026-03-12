@@ -12,6 +12,7 @@ use super::super::http::{
 use super::super::websocket::{
     ensure_outbound_websocket_connection_open, websocket_connection_mode,
 };
+use super::state::tls_session_cache_key;
 use super::state::{TlsFlowState, TlsProtocolVersion, TlsSessionRef, decode_tls_session_handle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +50,61 @@ fn session_flow(context: &SharedProxyVmContext, session: TlsSessionHandle) -> Tl
         }
         TlsSessionHandle::OutboundExchange(_) => unreachable!("handled above"),
     }
+}
+
+fn apply_cached_session(
+    context: &SharedProxyVmContext,
+    session: TlsSessionHandle,
+) -> Result<bool, VmError> {
+    let (cache, key) = {
+        let guard = context.lock().expect("vm context lock poisoned");
+        let Some(cache) = guard.tls_session_cache.clone() else {
+            return Ok(false);
+        };
+        let (target, flow) = match session {
+            TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => return Ok(false),
+            TlsSessionHandle::Reserved(TlsSessionRef::DefaultUpstream) => (
+                guard.outbound_request.target.as_deref(),
+                &guard.tls_dag.default_upstream,
+            ),
+            TlsSessionHandle::OutboundExchange(handle) => {
+                let Some(exchange) = guard.outbound_exchanges.get(&handle) else {
+                    return Ok(false);
+                };
+                (exchange.request.target.as_deref(), &exchange.tls_dag)
+            }
+        };
+        let Some(target) = target else {
+            return Ok(false);
+        };
+        let Some(key) = tls_session_cache_key(target, flow) else {
+            return Ok(false);
+        };
+        (cache, key)
+    };
+
+    let cached = {
+        let guard = cache.lock().expect("tls session cache lock poisoned");
+        guard.get(&key).cloned()
+    };
+    let Some(cached) = cached else {
+        return Ok(false);
+    };
+
+    let mut guard = context.lock().expect("vm context lock poisoned");
+    match session {
+        TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => return Ok(false),
+        TlsSessionHandle::Reserved(TlsSessionRef::DefaultUpstream) => {
+            guard.tls_dag.default_upstream.mark_session_reused(&cached);
+        }
+        TlsSessionHandle::OutboundExchange(handle) => {
+            let Some(exchange) = guard.outbound_exchanges.get_mut(&handle) else {
+                return Ok(false);
+            };
+            exchange.tls_dag.mark_session_reused(&cached);
+        }
+    }
+    Ok(true)
 }
 
 fn with_configurable_outbound_session_mut<T>(
@@ -161,14 +217,14 @@ async fn session_handshake(
     if !flow.is_present() {
         return Ok(CallOutcome::Return(vec![Value::Bool(false)]));
     }
+    if flow.handshake_complete() {
+        return Ok(CallOutcome::Return(vec![Value::Bool(true)]));
+    }
+    if apply_cached_session(&context, session)? {
+        return Ok(CallOutcome::Return(vec![Value::Bool(true)]));
+    }
 
     match session {
-        TlsSessionHandle::Reserved(TlsSessionRef::Downstream) if !flow.alpn().is_empty() => {
-            return Ok(CallOutcome::Return(vec![Value::Bool(true)]));
-        }
-        TlsSessionHandle::Reserved(TlsSessionRef::DefaultUpstream) if !flow.alpn().is_empty() => {
-            return Ok(CallOutcome::Return(vec![Value::Bool(true)]));
-        }
         TlsSessionHandle::Reserved(TlsSessionRef::DefaultUpstream) => {
             if websocket_connection_mode(&context, TlsSessionRef::DefaultUpstream.handle()) {
                 ensure_outbound_websocket_connection_open(
@@ -179,9 +235,6 @@ async fn session_handshake(
             } else {
                 ensure_upstream_response_started(&context).await?;
             }
-        }
-        TlsSessionHandle::OutboundExchange(handle) if !flow.alpn().is_empty() => {
-            return Ok(CallOutcome::Return(vec![Value::Bool(true)]));
         }
         TlsSessionHandle::OutboundExchange(handle) => {
             if websocket_connection_mode(&context, handle) {
