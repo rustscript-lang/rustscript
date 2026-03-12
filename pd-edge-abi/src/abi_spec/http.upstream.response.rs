@@ -28,6 +28,11 @@ fn http_upstream_response_body_next_chunk(max_bytes: i64) -> String {
     unreachable!("abi declaration only")
 }
 
+#[pd_host_function(name = "http::upstream::response::body::next_line")]
+fn http_upstream_response_body_next_line() -> String {
+    unreachable!("abi declaration only")
+}
+
 #[pd_host_function(name = "http::upstream::response::body::eof")]
 fn http_upstream_response_body_eof() -> bool {
     unreachable!("abi declaration only")
