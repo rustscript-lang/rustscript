@@ -1,6 +1,9 @@
 use std::{env, net::SocketAddr};
 
-use edge::{init_logging, sample_echo::{SampleEchoServerConfig, spawn_sample_echo_server}};
+use edge::{
+    init_logging,
+    sample_echo::{SampleEchoServerConfig, spawn_sample_echo_server},
+};
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -56,7 +59,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(addr) = server.addresses.websocket_tls {
         info!("secure websocket echo listening on wss://{}", addr);
     } else {
-        warn!("secure websocket echo disabled in this build; enable the `websocket` and `tls` features");
+        warn!(
+            "secure websocket echo disabled in this build; enable the `websocket` and `tls` features"
+        );
     }
 
     if let Some(addr) = server.addresses.webrtc {
@@ -138,19 +143,24 @@ where
             "-h" | "--help" => return Ok(CliAction::Help),
             "-V" | "--version" => return Ok(CliAction::Version),
             "--tcp-addr" => {
-                cli.tcp_addr = parse_socket_addr("--tcp-addr", &next_arg_value("--tcp-addr", &mut args)?)?;
+                cli.tcp_addr =
+                    parse_socket_addr("--tcp-addr", &next_arg_value("--tcp-addr", &mut args)?)?;
             }
             "--udp-addr" => {
-                cli.udp_addr = parse_socket_addr("--udp-addr", &next_arg_value("--udp-addr", &mut args)?)?;
+                cli.udp_addr =
+                    parse_socket_addr("--udp-addr", &next_arg_value("--udp-addr", &mut args)?)?;
             }
             "--tls-addr" => {
-                cli.tls_addr = parse_socket_addr("--tls-addr", &next_arg_value("--tls-addr", &mut args)?)?;
+                cli.tls_addr =
+                    parse_socket_addr("--tls-addr", &next_arg_value("--tls-addr", &mut args)?)?;
             }
             "--http-addr" => {
-                cli.http_addr = parse_socket_addr("--http-addr", &next_arg_value("--http-addr", &mut args)?)?;
+                cli.http_addr =
+                    parse_socket_addr("--http-addr", &next_arg_value("--http-addr", &mut args)?)?;
             }
             "--https-addr" => {
-                cli.https_addr = parse_socket_addr("--https-addr", &next_arg_value("--https-addr", &mut args)?)?;
+                cli.https_addr =
+                    parse_socket_addr("--https-addr", &next_arg_value("--https-addr", &mut args)?)?;
             }
             "--websocket-addr" | "--ws-addr" => {
                 let flag = if arg == "--websocket-addr" {
@@ -166,11 +176,14 @@ where
                 } else {
                     "--wss-addr"
                 };
-                cli.websocket_tls_addr = parse_socket_addr(flag, &next_arg_value(flag, &mut args)?)?;
+                cli.websocket_tls_addr =
+                    parse_socket_addr(flag, &next_arg_value(flag, &mut args)?)?;
             }
             "--webrtc-addr" => {
-                cli.webrtc_addr =
-                    parse_socket_addr("--webrtc-addr", &next_arg_value("--webrtc-addr", &mut args)?)?;
+                cli.webrtc_addr = parse_socket_addr(
+                    "--webrtc-addr",
+                    &next_arg_value("--webrtc-addr", &mut args)?,
+                )?;
             }
             _ => return Err(format!("unknown argument: {arg}")),
         }
@@ -274,11 +287,26 @@ mod tests {
         let CliAction::Run(cli) = action else {
             panic!("expected run action");
         };
-        assert_eq!(cli.tcp_addr, "127.0.0.1:9101".parse::<SocketAddr>().expect("valid addr"));
-        assert_eq!(cli.udp_addr, "127.0.0.1:9102".parse::<SocketAddr>().expect("valid addr"));
-        assert_eq!(cli.tls_addr, "127.0.0.1:9103".parse::<SocketAddr>().expect("valid addr"));
-        assert_eq!(cli.http_addr, "127.0.0.1:9104".parse::<SocketAddr>().expect("valid addr"));
-        assert_eq!(cli.https_addr, "127.0.0.1:9105".parse::<SocketAddr>().expect("valid addr"));
+        assert_eq!(
+            cli.tcp_addr,
+            "127.0.0.1:9101".parse::<SocketAddr>().expect("valid addr")
+        );
+        assert_eq!(
+            cli.udp_addr,
+            "127.0.0.1:9102".parse::<SocketAddr>().expect("valid addr")
+        );
+        assert_eq!(
+            cli.tls_addr,
+            "127.0.0.1:9103".parse::<SocketAddr>().expect("valid addr")
+        );
+        assert_eq!(
+            cli.http_addr,
+            "127.0.0.1:9104".parse::<SocketAddr>().expect("valid addr")
+        );
+        assert_eq!(
+            cli.https_addr,
+            "127.0.0.1:9105".parse::<SocketAddr>().expect("valid addr")
+        );
         assert_eq!(
             cli.websocket_addr,
             "127.0.0.1:9106".parse::<SocketAddr>().expect("valid addr")
@@ -295,8 +323,7 @@ mod tests {
 
     #[test]
     fn parse_cli_args_from_rejects_unknown_argument() {
-        let err =
-            parse_cli_args_from(["--nope".to_string()]).expect_err("unknown arg should fail");
+        let err = parse_cli_args_from(["--nope".to_string()]).expect_err("unknown arg should fail");
         assert!(err.contains("unknown argument"));
     }
 

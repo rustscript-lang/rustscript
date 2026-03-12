@@ -1,11 +1,6 @@
-use std::{
-    convert::Infallible,
-    io,
-    net::SocketAddr,
-    sync::Arc,
-};
 #[cfg(feature = "webrtc")]
 use std::{collections::HashMap, sync::Mutex};
+use std::{convert::Infallible, io, net::SocketAddr, sync::Arc};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -14,8 +9,24 @@ use tokio::{
 };
 use tracing::warn;
 
+#[cfg(feature = "webrtc")]
+use ::webrtc::{
+    api::{
+        APIBuilder, interceptor_registry::register_default_interceptors, media_engine::MediaEngine,
+        setting_engine::SettingEngine,
+    },
+    data_channel::{RTCDataChannel, data_channel_message::DataChannelMessage},
+    interceptor::registry::Registry,
+    peer_connection::{
+        RTCPeerConnection, configuration::RTCConfiguration,
+        peer_connection_state::RTCPeerConnectionState,
+        sdp::session_description::RTCSessionDescription,
+    },
+};
 #[cfg(feature = "http")]
 use axum::body::Bytes;
+#[cfg(feature = "websocket")]
+use futures_util::{SinkExt, StreamExt};
 #[cfg(feature = "http")]
 use http_body_util::{BodyExt, Full};
 #[cfg(feature = "http")]
@@ -47,22 +58,6 @@ use tokio_tungstenite::{
         http::HeaderValue as WsHeaderValue,
     },
 };
-#[cfg(feature = "websocket")]
-use futures_util::{SinkExt, StreamExt};
-#[cfg(feature = "webrtc")]
-use ::webrtc::{
-    api::{
-        APIBuilder, interceptor_registry::register_default_interceptors,
-        media_engine::MediaEngine, setting_engine::SettingEngine,
-    },
-    data_channel::{RTCDataChannel, data_channel_message::DataChannelMessage},
-    interceptor::registry::Registry,
-    peer_connection::{
-        RTCPeerConnection, configuration::RTCConfiguration,
-        peer_connection_state::RTCPeerConnectionState,
-        sdp::session_description::RTCSessionDescription,
-    },
-};
 #[cfg(feature = "webrtc")]
 use uuid::Uuid;
 
@@ -87,7 +82,9 @@ impl Default for SampleEchoServerConfig {
             http_addr: "127.0.0.1:7004".parse().expect("valid http addr"),
             https_addr: "127.0.0.1:7005".parse().expect("valid https addr"),
             websocket_addr: "127.0.0.1:7006".parse().expect("valid websocket addr"),
-            websocket_tls_addr: "127.0.0.1:7007".parse().expect("valid secure websocket addr"),
+            websocket_tls_addr: "127.0.0.1:7007"
+                .parse()
+                .expect("valid secure websocket addr"),
             webrtc_addr: "127.0.0.1:7008".parse().expect("valid webrtc addr"),
         }
     }
@@ -118,7 +115,9 @@ impl Drop for SampleEchoServer {
     }
 }
 
-pub async fn spawn_sample_echo_server(config: SampleEchoServerConfig) -> io::Result<SampleEchoServer> {
+pub async fn spawn_sample_echo_server(
+    config: SampleEchoServerConfig,
+) -> io::Result<SampleEchoServer> {
     let mut tasks = Vec::new();
 
     let (tcp, tcp_task) = spawn_tcp_echo_server(config.tcp_addr).await?;
@@ -148,8 +147,7 @@ pub async fn spawn_sample_echo_server(config: SampleEchoServerConfig) -> io::Res
     tasks.push(https_task);
 
     #[cfg(feature = "websocket")]
-    let (websocket, websocket_task) =
-        spawn_websocket_echo_server(config.websocket_addr).await?;
+    let (websocket, websocket_task) = spawn_websocket_echo_server(config.websocket_addr).await?;
     #[cfg(feature = "websocket")]
     tasks.push(websocket_task);
 
@@ -268,7 +266,8 @@ pub async fn spawn_http_echo_server(addr: SocketAddr) -> io::Result<(SocketAddr,
                 Ok((stream, _)) => {
                     tokio::spawn(async move {
                         let io = TokioIo::new(stream);
-                        let service = service_fn(|request| handle_http_echo_request("http", request));
+                        let service =
+                            service_fn(|request| handle_http_echo_request("http", request));
                         if let Err(err) = http1::Builder::new().serve_connection(io, service).await
                         {
                             warn!("sample http echo connection failed: {err}");
@@ -292,9 +291,7 @@ pub async fn spawn_tls_echo_server(addr: SocketAddr) -> io::Result<(SocketAddr, 
 }
 
 #[cfg(feature = "tls")]
-pub async fn spawn_https_echo_server(
-    addr: SocketAddr,
-) -> io::Result<(SocketAddr, JoinHandle<()>)> {
+pub async fn spawn_https_echo_server(addr: SocketAddr) -> io::Result<(SocketAddr, JoinHandle<()>)> {
     let tls_config = generate_self_signed_tls_server_config()?;
     spawn_https_echo_server_with_config(addr, tls_config).await
 }
@@ -496,11 +493,7 @@ pub async fn spawn_webrtc_echo_server(
 type EchoResponse = Response<Full<Bytes>>;
 
 #[cfg(feature = "http")]
-fn build_echo_response(
-    status: StatusCode,
-    protocol: &'static str,
-    body: Bytes,
-) -> EchoResponse {
+fn build_echo_response(status: StatusCode, protocol: &'static str, body: Bytes) -> EchoResponse {
     let mut response = Response::new(Full::new(body));
     *response.status_mut() = status;
     response
@@ -569,11 +562,11 @@ fn ensure_rustls_provider() {
 #[cfg(feature = "tls")]
 fn generate_self_signed_tls_server_config() -> io::Result<Arc<ServerConfig>> {
     ensure_rustls_provider();
-    let certificate = generate_simple_self_signed(vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-    ])
-    .map_err(|err| io::Error::other(format!("failed to generate self-signed cert: {err}")))?;
+    let certificate =
+        generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .map_err(|err| {
+                io::Error::other(format!("failed to generate self-signed cert: {err}"))
+            })?;
     let certificate_der = certificate
         .serialize_der()
         .map_err(|err| io::Error::other(format!("failed to serialize cert der: {err}")))?;
@@ -611,7 +604,9 @@ fn negotiate_chat_subprotocol(
 }
 
 #[cfg(feature = "websocket")]
-async fn run_websocket_echo_session<S>(stream: S) -> Result<(), tokio_tungstenite::tungstenite::Error>
+async fn run_websocket_echo_session<S>(
+    stream: S,
+) -> Result<(), tokio_tungstenite::tungstenite::Error>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
