@@ -1368,6 +1368,69 @@ async fn same_vm_program_handles_downstream_http11_and_http2_requests() {
     );
 }
 
+#[cfg(feature = "http2")]
+#[tokio::test]
+async fn data_plane_accepts_cleartext_http2_prior_knowledge_requests() {
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+
+    let source = r#"
+        use http;
+
+        http::response::set_header("x-request-version", http::request::get_http_version());
+        http::response::set_body(http::request::get_body());
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let stream = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("http2 client should connect");
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, connection) =
+        hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+            .handshake(io)
+            .await
+            .expect("http2 client handshake should succeed");
+    let connection_handle = tokio::spawn(async move {
+        connection
+            .await
+            .expect("http2 client connection should run");
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("http://{data_addr}/h2c"))
+        .version(axum::http::Version::HTTP_2)
+        .header("host", format!("{data_addr}"))
+        .body(http_body_util::Full::new(axum::body::Bytes::from_static(
+            b"h2c-body",
+        )))
+        .expect("http2 request should build");
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("http2 request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-request-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    let body = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .expect("http2 response body should collect")
+        .to_bytes();
+    assert_eq!(body.as_ref(), b"h2c-body");
+
+    connection_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
 #[tokio::test]
 async fn uploaded_program_with_locals_executes_successfully() {
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
