@@ -17,11 +17,9 @@ async fn set_response_header(
     value: String,
 ) -> Result<CallOutcome, VmError> {
     let (header_name, header_value) = parse_header(name, value)?;
-    let mut downstream = context.lock_downstream();
-    downstream
-        .response_output
-        .headers
-        .insert(header_name, header_value);
+    context.with_downstream_response_mut(|response| {
+        response.headers.insert(header_name, header_value);
+    });
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -33,8 +31,9 @@ async fn remove_response_header(
     name: String,
 ) -> Result<CallOutcome, VmError> {
     let header_name = parse_header_name(name)?;
-    let mut downstream = context.lock_downstream();
-    downstream.response_output.headers.remove(header_name);
+    context.with_downstream_response_mut(|response| {
+        response.headers.remove(header_name);
+    });
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -45,8 +44,9 @@ async fn set_response_body(
     context: SharedProxyVmContext,
     body: String,
 ) -> Result<CallOutcome, VmError> {
-    let mut downstream = context.lock_downstream();
-    downstream.response_output.body = Some(body.into_bytes());
+    context.with_downstream_response_mut(|response| {
+        response.body = Some(body.into_bytes());
+    });
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -62,8 +62,9 @@ async fn set_response_status(
             "status code must be in range 100..=599, got '{status}'",
         )));
     }
-    let mut downstream = context.lock_downstream();
-    downstream.response_output.status = Some(status as u16);
+    context.with_downstream_response_mut(|response| {
+        response.status = Some(status as u16);
+    });
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -73,8 +74,7 @@ async fn get_response_status(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    let downstream = context.lock_downstream();
-    let status = downstream.response_output.status.unwrap_or(0);
+    let status = context.with_downstream_response(|response| response.status.unwrap_or(0));
     Ok(CallOutcome::Return(vec![Value::Int(status as i64)]))
 }
 
@@ -84,15 +84,9 @@ async fn get_response_body(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    let downstream = context.lock_downstream();
-    let value = String::from_utf8_lossy(
-        downstream
-            .response_output
-            .body
-            .as_deref()
-            .unwrap_or_default(),
-    )
-    .into_owned();
+    let value = context.with_downstream_response(|response| {
+        String::from_utf8_lossy(response.body.as_deref().unwrap_or_default()).into_owned()
+    });
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 
@@ -105,13 +99,14 @@ async fn get_response_header(
 ) -> Result<CallOutcome, VmError> {
     let header_name = HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
-    let downstream = context.lock_downstream();
-    let value = downstream
-        .response_output
-        .headers
-        .get(&header_name)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
+    let value = context.with_downstream_response(|response| {
+        response
+            .headers
+            .get(&header_name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    });
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 
@@ -121,9 +116,8 @@ async fn get_response_headers(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    let downstream = context.lock_downstream();
     Ok(CallOutcome::Return(vec![headers_to_value_map(
-        &downstream.response_output.headers,
+        &context.with_downstream_response(|response| response.headers.clone()),
     )]))
 }
 
@@ -136,11 +130,9 @@ async fn add_response_header(
     value: String,
 ) -> Result<CallOutcome, VmError> {
     let (header_name, header_value) = parse_header(name, value)?;
-    let mut downstream = context.lock_downstream();
-    downstream
-        .response_output
-        .headers
-        .append(header_name, header_value);
+    context.with_downstream_response_mut(|response| {
+        response.headers.append(header_name, header_value);
+    });
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -152,8 +144,9 @@ async fn clear_response_header(
     name: String,
 ) -> Result<CallOutcome, VmError> {
     let header_name = parse_header_name(name)?;
-    let mut downstream = context.lock_downstream();
-    downstream.response_output.headers.remove(header_name);
+    context.with_downstream_response_mut(|response| {
+        response.headers.remove(header_name);
+    });
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -165,15 +158,13 @@ async fn set_response_headers(
     headers: VmMap,
 ) -> Result<CallOutcome, VmError> {
     let headers = parse_headers_map(headers)?;
-    let mut downstream = context.lock_downstream();
-    for (name, values) in headers {
-        downstream.response_output.headers.remove(name.clone());
-        for value in values {
-            downstream
-                .response_output
-                .headers
-                .append(name.clone(), value);
+    context.with_downstream_response_mut(|response| {
+        for (name, values) in headers {
+            response.headers.remove(name.clone());
+            for value in values {
+                response.headers.append(name.clone(), value);
+            }
         }
-    }
+    });
     Ok(CallOutcome::Return(vec![]))
 }

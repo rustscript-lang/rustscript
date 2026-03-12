@@ -947,6 +947,65 @@ impl ProxyVmContext {
         &self.services
     }
 
+    pub(crate) fn with_default_upstream_exchange<T>(
+        &self,
+        read: impl FnOnce(&HttpOutboundExchangeState) -> T,
+    ) -> T {
+        let exchanges = self.lock_exchanges();
+        let exchange = exchanges
+            .exchanges
+            .get(&DEFAULT_UPSTREAM_EXCHANGE_HANDLE)
+            .expect("default upstream exchange should exist");
+        read(exchange)
+    }
+
+    pub(crate) fn with_default_upstream_exchange_mut<T>(
+        &self,
+        mutate: impl FnOnce(&mut HttpOutboundExchangeState) -> T,
+    ) -> T {
+        let mut exchanges = self.lock_exchanges();
+        let exchange = exchanges
+            .exchanges
+            .get_mut(&DEFAULT_UPSTREAM_EXCHANGE_HANDLE)
+            .expect("default upstream exchange should exist");
+        mutate(exchange)
+    }
+
+    pub(crate) fn with_default_upstream_request_mut<T>(
+        &self,
+        mutate: impl FnOnce(&mut HttpOutboundRequestNode) -> T,
+    ) -> T {
+        self.with_default_upstream_exchange_mut(|exchange| mutate(&mut exchange.request))
+    }
+
+    pub(crate) fn with_downstream_response<T>(
+        &self,
+        read: impl FnOnce(&HttpResponseOutputNode) -> T,
+    ) -> T {
+        let downstream = self.lock_downstream();
+        read(&downstream.response_output)
+    }
+
+    pub(crate) fn with_downstream_response_mut<T>(
+        &self,
+        mutate: impl FnOnce(&mut HttpResponseOutputNode) -> T,
+    ) -> T {
+        let mut downstream = self.lock_downstream();
+        mutate(&mut downstream.response_output)
+    }
+
+    pub(crate) fn downstream_websocket(&self) -> WebSocketConnectionState {
+        self.lock_downstream().downstream_websocket.clone()
+    }
+
+    pub(crate) fn with_downstream_websocket_mut<T>(
+        &self,
+        mutate: impl FnOnce(&mut WebSocketConnectionState) -> T,
+    ) -> T {
+        let mut downstream = self.lock_downstream();
+        mutate(&mut downstream.downstream_websocket)
+    }
+
     pub(crate) fn lock_downstream(&self) -> MutexGuard<'_, DownstreamState> {
         self.downstream
             .lock()
