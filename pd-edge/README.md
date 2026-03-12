@@ -399,12 +399,14 @@ Artifacts written by these runs:
 Current state:
 
 - HTTP is implemented today as an explicit graph in [`pd-edge/src/abi_impl/http/state.rs`](src/abi_impl/http/state.rs).
-- HTTP/2 support is currently an upstream carrier feature under the generic HTTP exchange DAG. When feature `http2` is enabled, outbound exchanges can negotiate `h2` and multiplex through the shared upstream client while VM code stays on `http::exchange::*`.
+- Carrier-specific internals now split explicitly into [`pd-edge/src/abi_impl/http1/mod.rs`](src/abi_impl/http1/mod.rs) and [`pd-edge/src/abi_impl/http2/mod.rs`](src/abi_impl/http2/mod.rs). The generic exchange DAG remains in [`pd-edge/src/abi_impl/http/state.rs`](src/abi_impl/http/state.rs).
+- HTTP/2 support now has explicit runtime-owned carrier state under the generic HTTP exchange DAG. When feature `http2` is enabled, outbound exchanges can negotiate `h2` through a shared upstream session pool, and the data-plane server also tracks downstream HTTP/2 sessions outside per-request VM contexts while VM code stays on `http::exchange::*`.
 - TCP, TLS, and UDP transport state live in [`pd-edge/src/abi_impl/transport/state.rs`](src/abi_impl/transport/state.rs), with UDP host ABI in [`pd-edge/src/abi_impl/transport/udp.rs`](src/abi_impl/transport/udp.rs).
 - WebSocket is implemented today as an explicit child DAG over outbound HTTP-upgrade handles in [`pd-edge/src/abi_impl/websocket/state.rs`](src/abi_impl/websocket/state.rs).
 - WebRTC is implemented today as a request-scoped peer-connection/data-channel DAG in [`pd-edge/src/abi_impl/webrtc/mod.rs`](src/abi_impl/webrtc/mod.rs).
 - Full cross-protocol graph: [`pd-edge/docs/full-dag.md`](docs/full-dag.md).
 - `http`, `http2`, `tls`, `websocket`, and `webrtc` are feature-gated DAG families. The default build enables `http`, `tls`, and `websocket`.
+- `SharedState` now carries both a shared upstream HTTP session pool and a downstream HTTP/2 session store so carrier-specific state is not owned solely by per-request `ProxyVmContext`.
 - TCP, UDP, TLS, outbound HTTP exchanges, WebSocket connections, and WebRTC connections are exposed to programs through handle-based host calls:
   - `tcp::stream::downstream()` returns reserved socket handle `0`
   - `tcp::stream::default_upstream()` returns reserved socket handle `1`
@@ -430,7 +432,7 @@ Current state:
 - Directional `http::upstream::*` APIs remain as aliases over handle `1`.
 - Current runtime boundary:
   - generic `http::exchange::*` is the stable VM-facing request/response surface
-  - feature `http2` currently adds upstream carrier selection and multiplex over shared connections; it does not yet expose a VM-visible `http2::session::*` namespace
+  - feature `http2` currently adds explicit upstream session pooling plus downstream session tracking under the generic HTTP layer; it does not yet expose a VM-visible `http2::session::*` namespace
   - outbound UDP sockets are executable today
   - downstream UDP handle `0` is reserved but inactive in the current one-shot HTTP runtime
   - outbound WebSocket connections are executable today
@@ -558,31 +560,33 @@ Rules:
 - With feature `http2`, outbound HTTPS exchanges can negotiate `h2` and dynamic exchanges may share one upstream connection when the client path permits multiplex.
 - `response.output` starts empty and is populated by VM host calls for local response construction.
 - Each `exchange[n].response` starts as `NotStarted` and becomes `Ready` only when the DAG actually needs response data for that handle.
-- A full VM-visible `http2 session -> stream -> http exchange` DAG is still future work. Current HTTP/2 support is upstream-only carrier selection under the generic exchange layer.
+- What exists today:
+  - internal `http2.session.*` and `http2.stream.*` goals drive attachment, request commitment, response-head readiness, response-body readiness, close, and reset progression
+  - explicit stream carrier refs are attached to upstream exchanges and real downstream HTTP/2 requests
+  - upstream HTTP/2 session reuse and multiplex over the generic exchange ABI
+  - downstream HTTP/2 request admission plus explicit session or stream frontier tracking in the data plane
+  - GOAWAY and reset are modeled as session or stream frontier transitions rather than opaque connection failure flags
+- What is still intentionally not exposed yet:
+  - a VM-visible `http2::session::*` namespace
+  - full connection-scoped downstream VM hosting for long-lived multi-stream sessions
+- VM execution is not itself a DAG goal. Host calls read or mutate these nodes and may force progression, but execution is runtime control flow rather than a protocol frontier.
 
 ```mermaid
 flowchart TD
     A["http ingress admitted"] --> B["request head ready"]
     A --> C["request body unread stream"]
-    B --> D["VM execution"]
-    C -.-> D
-    D --> E["exchange n request draft"]
-    D --> F["response output draft"]
-    D --> G{"exchange n response ready"}
-    E --> G
-    G -->|no| H["host call or resolver starts exchange n"]
-    C -.-> H
-    H --> I["exchange n response stream ready"]
-    G -->|yes| I
-    I --> D
-    D --> J["graph resolver after VM halt"]
-    E --> J
-    F --> J
-    I --> J
-    J -->|response output| K["build client response from response output"]
-    J -->|default exchange| L["start exchange 1 if needed"]
-    K --> M["return client response"]
-    L --> M
+    B --> D["exchange 1 request draft"]
+    B --> E["exchange n allocated"]
+    E --> F["exchange n request draft"]
+    B --> G["response output draft"]
+    C -. request body may feed .-> D
+    C -. request body may feed .-> F
+    C -. request body may feed .-> G
+    D --> H["exchange 1 response ready"]
+    F --> I["exchange n response ready"]
+    H --> J["client response committed"]
+    G --> J
+    I -. response data may be copied into .-> G
 ```
 
 ### WebSocket DAG
@@ -688,6 +692,18 @@ In that model, TLS session reuse becomes a normal transition set:
 
 The caller asks for the node, not the path.
 
+HTTP/2 now follows the same rule internally:
+
+- `advance(http.exchange.response_ready)` on an HTTP/2-carried exchange may satisfy itself through
+  - `advance(http2.session.open)`
+  - `advance(http2.stream.attached)`
+  - `advance(http2.stream.request_committed)`
+  - `advance(http2.stream.response_head_ready)`
+- `advance(http.exchange.body.next_chunk)` may satisfy itself through `advance(http2.stream.response_body_ready)`
+- the generic exchange state stores explicit `HttpCarrierRef::UpstreamHttp2Stream { .. }` and `HttpCarrierRef::DownstreamHttp2Stream { .. }` attachments when those carriers exist
+
+This is currently an internal runtime model. VM code still talks to the generic `http::exchange::*` surface rather than a separate `http2::*` ABI.
+
 ### Downstream And Upstream As Independent DAG Instances
 
 The clean model is to treat downstream and upstream as separate DAG instances with explicit connection points.
@@ -696,7 +712,8 @@ The clean model is to treat downstream and upstream as separate DAG instances wi
 - upstream TCP/TLS/HTTP describe bytes and messages going from the VM toward the origin
 - upstream UDP sockets and upstream WebRTC connections are sibling DAG families connected through VM host calls rather than attached to the HTTP byte-stream chain
 - downstream UDP and downstream WebRTC handles currently exist only as reserved placeholders in the one-shot HTTP runtime
-- the VM and graph resolver connect these DAGs, but they do not collapse them into one giant implicit state machine
+- runtime orchestration connects these DAG instances, but that control flow is not itself a DAG edge or goal
+- [`pd-edge/docs/full-dag.md`](docs/full-dag.md) now shows those two views as separate downstream and upstream/exchange graphs rather than one merged graph
 
 ```mermaid
 flowchart LR
@@ -707,10 +724,6 @@ flowchart LR
         D1 --> D2 --> D3
     end
 
-    subgraph Control["Control"]
-        V["VM host calls and graph resolver"]
-    end
-
     subgraph Upstream["Upstream"]
         U3["http upstream request and response"]
         U2["tls upstream"]
@@ -719,15 +732,6 @@ flowchart LR
         UW["webrtc upstream connections"]
         U3 --> U2 --> U1
     end
-
-    D3 --> V
-    V --> U3
-    U3 --> V
-    V --> UU
-    UU --> V
-    V --> UW
-    UW --> V
-    V --> D3
 ```
 
 This gives the flexibility target:
@@ -746,7 +750,7 @@ Node ownership in current code:
 - HTTP host-call entrypoints that mutate or read nodes: [`pd-edge/src/abi_impl/http/`](src/abi_impl/http/)
 - WebSocket nodes and frame IO: [`pd-edge/src/abi_impl/websocket/`](src/abi_impl/websocket/)
 - WebRTC nodes, signaling state, and data-channel IO: [`pd-edge/src/abi_impl/webrtc/`](src/abi_impl/webrtc/)
-- data-plane orchestration as black-box VM execution plus graph resolution: [`pd-edge/src/runtime/http_plane/proxy_path.rs`](src/runtime/http_plane/proxy_path.rs)
+- data-plane orchestration and exchange resolution: [`pd-edge/src/runtime/http_plane/proxy_path.rs`](src/runtime/http_plane/proxy_path.rs)
 
 ## ABI Source of Truth
 

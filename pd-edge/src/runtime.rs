@@ -15,7 +15,13 @@ use vm::{Program, decode_program, validate_program};
 use crate::{
     HOST_FUNCTION_COUNT,
     abi_impl::{
-        RateLimiterStore, SharedRateLimiter, SharedTlsSessionCache, new_shared_tls_session_cache,
+        RateLimiterStore, SharedHttpDownstreamSessions, SharedHttpUpstreamSessions,
+        SharedRateLimiter, SharedTlsSessionCache, new_shared_http_downstream_sessions,
+        new_shared_http_upstream_sessions, new_shared_tls_session_cache,
+    },
+    cache::{
+        DEFAULT_DOWNSTREAM_HTTP2_SESSION_STORE_CAPACITY, DEFAULT_TLS_SESSION_REUSE_STORE_CAPACITY,
+        DEFAULT_UPSTREAM_HTTP_REUSE_STORE_CAPACITY,
     },
     control_plane_rpc::EdgeTrafficSample,
     debug_session::{SharedDebugSession, debug_session_status, new_debug_session_store},
@@ -28,7 +34,7 @@ mod vm_runner;
 const MAX_LATENCY_SAMPLES: usize = 4096;
 pub const VM_EPOCH_TICK_INTERVAL_MS: u64 = 1;
 
-pub use http_plane::{build_admin_app, build_http_proxy_app};
+pub use http_plane::{build_admin_app, build_http_proxy_app, serve_http_proxy};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum VmExecutionMode {
@@ -94,12 +100,31 @@ impl Default for VmExecutionConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeStoreLimits {
+    pub tls_session_reuse_entries: usize,
+    pub upstream_http_reuse_entries: usize,
+    pub downstream_http2_session_entries: usize,
+}
+
+impl Default for RuntimeStoreLimits {
+    fn default() -> Self {
+        Self {
+            tls_session_reuse_entries: DEFAULT_TLS_SESSION_REUSE_STORE_CAPACITY,
+            upstream_http_reuse_entries: DEFAULT_UPSTREAM_HTTP_REUSE_STORE_CAPACITY,
+            downstream_http2_session_entries: DEFAULT_DOWNSTREAM_HTTP2_SESSION_STORE_CAPACITY,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SharedState {
     pub active_program: Arc<RwLock<Option<Arc<LoadedProgram>>>>,
     pub max_program_bytes: usize,
     pub client: reqwest::Client,
     pub(crate) tls_session_cache: SharedTlsSessionCache,
+    pub(crate) upstream_http_sessions: SharedHttpUpstreamSessions,
+    pub(crate) downstream_http2_sessions: SharedHttpDownstreamSessions,
     pub rate_limiter: SharedRateLimiter,
     pub debug_session: SharedDebugSession,
     pub vm_execution: VmExecutionConfig,
@@ -151,6 +176,13 @@ pub struct ProgramApplyReport {
 
 impl SharedState {
     pub fn new(max_program_bytes: usize) -> Self {
+        Self::new_with_store_limits(max_program_bytes, RuntimeStoreLimits::default())
+    }
+
+    pub fn new_with_store_limits(
+        max_program_bytes: usize,
+        store_limits: RuntimeStoreLimits,
+    ) -> Self {
         Self {
             active_program: Arc::new(RwLock::new(None)),
             max_program_bytes,
@@ -158,7 +190,13 @@ impl SharedState {
                 .tls_info(true)
                 .build()
                 .expect("default upstream client should build"),
-            tls_session_cache: new_shared_tls_session_cache(),
+            tls_session_cache: new_shared_tls_session_cache(store_limits.tls_session_reuse_entries),
+            upstream_http_sessions: new_shared_http_upstream_sessions(
+                store_limits.upstream_http_reuse_entries,
+            ),
+            downstream_http2_sessions: new_shared_http_downstream_sessions(
+                store_limits.downstream_http2_session_entries,
+            ),
             rate_limiter: Arc::new(std::sync::Mutex::new(RateLimiterStore::new())),
             debug_session: new_debug_session_store(),
             vm_execution: VmExecutionConfig::default(),
@@ -566,5 +604,76 @@ pub async fn apply_program_from_bytes(state: &SharedState, bytes: &[u8]) -> Prog
         code_bytes: Some(code_len),
         local_count: Some(local_count),
         message: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RuntimeStoreLimits, SharedState};
+
+    #[test]
+    fn shared_state_uses_default_store_limits() {
+        let state = SharedState::new(1024);
+
+        let tls_capacity = state
+            .tls_session_cache
+            .lock()
+            .expect("tls session cache lock poisoned")
+            .capacity();
+        let upstream_capacity = state
+            .upstream_http_sessions
+            .lock()
+            .expect("http upstream session store lock poisoned")
+            .capacity();
+        let downstream_capacity = state
+            .downstream_http2_sessions
+            .lock()
+            .expect("http downstream session store lock poisoned")
+            .capacity();
+
+        let defaults = RuntimeStoreLimits::default();
+        assert_eq!(tls_capacity, defaults.tls_session_reuse_entries);
+        assert_eq!(upstream_capacity, defaults.upstream_http_reuse_entries);
+        assert_eq!(
+            downstream_capacity,
+            defaults.downstream_http2_session_entries
+        );
+    }
+
+    #[test]
+    fn shared_state_accepts_custom_store_limits() {
+        let state = SharedState::new_with_store_limits(
+            1024,
+            RuntimeStoreLimits {
+                tls_session_reuse_entries: 8,
+                upstream_http_reuse_entries: 16,
+                downstream_http2_session_entries: 4,
+            },
+        );
+
+        assert_eq!(
+            state
+                .tls_session_cache
+                .lock()
+                .expect("tls session cache lock poisoned")
+                .capacity(),
+            8
+        );
+        assert_eq!(
+            state
+                .upstream_http_sessions
+                .lock()
+                .expect("http upstream session store lock poisoned")
+                .capacity(),
+            16
+        );
+        assert_eq!(
+            state
+                .downstream_http2_sessions
+                .lock()
+                .expect("http downstream session store lock poisoned")
+                .capacity(),
+            4
+        );
     }
 }

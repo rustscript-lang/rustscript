@@ -1,13 +1,14 @@
 #![cfg_attr(not(feature = "tls"), allow(dead_code))]
 
 use std::{
-    collections::HashMap,
     hash::{Hash, Hasher},
     sync::{Arc, Mutex},
 };
 
 use axum::http::Version;
 use url::Url;
+
+use crate::cache::BoundedLruStore;
 
 pub(crate) const TCP_STREAM_DOWNSTREAM: i64 = 0;
 pub(crate) const TCP_STREAM_DEFAULT_UPSTREAM: i64 = 1;
@@ -332,11 +333,12 @@ pub(crate) struct CachedTlsSession {
     pub(crate) peer_certificate_der: Option<Vec<u8>>,
 }
 
-pub(crate) type SharedTlsSessionCache = Arc<Mutex<HashMap<TlsSessionCacheKey, CachedTlsSession>>>;
+pub(crate) type SharedTlsSessionCache =
+    Arc<Mutex<BoundedLruStore<TlsSessionCacheKey, CachedTlsSession>>>;
 pub(crate) type SharedUdpSocketIo = Arc<tokio::sync::Mutex<tokio::net::UdpSocket>>;
 
-pub(crate) fn new_shared_tls_session_cache() -> SharedTlsSessionCache {
-    Arc::new(Mutex::new(HashMap::new()))
+pub(crate) fn new_shared_tls_session_cache(capacity: usize) -> SharedTlsSessionCache {
+    Arc::new(Mutex::new(BoundedLruStore::new(capacity)))
 }
 
 impl TlsProtocolVersion {

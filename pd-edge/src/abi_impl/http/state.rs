@@ -18,7 +18,8 @@ use url::Url;
 use vm::VmError;
 
 use super::super::{
-    EDGE_IO_HANDLE_DYNAMIC_BASE, EdgeVirtualIoHandle, SharedRateLimiter,
+    EDGE_IO_HANDLE_DYNAMIC_BASE, EdgeVirtualIoHandle, SharedHttpUpstreamSessions,
+    SharedRateLimiter,
     proxy::ProxyByteStreamState,
     transport::{
         CachedTlsSession, SharedTlsSessionCache, SharedUdpSocketIo, TcpFlowState, TcpTransportDag,
@@ -29,6 +30,7 @@ use super::super::{
 };
 #[cfg(feature = "webrtc")]
 use crate::abi_impl::webrtc::WebRtcConnectionState;
+use crate::abi_impl::{http1, http2};
 
 #[derive(Debug)]
 pub struct HttpRequestContext {
@@ -217,11 +219,24 @@ impl HttpCarrierKind {
             Self::Http2 => "http2",
         }
     }
+}
 
-    pub(crate) fn from_version(version: Version) -> Self {
-        match version {
-            Version::HTTP_2 => Self::Http2,
-            _ => Self::Http1,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HttpCarrierRef {
+    DownstreamHttp1,
+    DownstreamHttp2Stream(http2::Http2StreamRef),
+    Http1DefaultUpstream,
+    Http1DynamicExchange(i64),
+    UpstreamHttp2Stream(http2::Http2StreamRef),
+}
+
+impl HttpCarrierRef {
+    fn kind(&self) -> HttpCarrierKind {
+        match self {
+            Self::DownstreamHttp1 | Self::Http1DefaultUpstream | Self::Http1DynamicExchange(_) => {
+                HttpCarrierKind::Http1
+            }
+            Self::DownstreamHttp2Stream(_) | Self::UpstreamHttp2Stream(_) => HttpCarrierKind::Http2,
         }
     }
 }
@@ -231,6 +246,7 @@ pub(crate) struct HttpExchangeTransportState {
     pub(crate) tcp_flow: TcpFlowState,
     pub(crate) tls_flow: TlsFlowState,
     pub(crate) carrier_kind: HttpCarrierKind,
+    pub(crate) carrier_ref: Option<HttpCarrierRef>,
     pub(crate) http_version: Option<String>,
 }
 
@@ -239,15 +255,26 @@ impl HttpExchangeTransportState {
         self.tcp_flow.note_write();
     }
 
-    fn mark_response_ready(&mut self, version: Version) {
+    fn mark_response_ready(&mut self, version: Version, carrier_ref: HttpCarrierRef) {
         self.tcp_flow.mark_connected();
-        self.carrier_kind = HttpCarrierKind::from_version(version);
+        self.carrier_kind = carrier_ref.kind();
+        self.carrier_ref = Some(carrier_ref);
         self.http_version = Some(http_version_label(version).to_string());
     }
 }
 
+#[cfg_attr(not(feature = "http2"), allow(dead_code))]
+enum UpstreamResponseSource {
+    Reqwest(reqwest::Response),
+    #[cfg_attr(not(feature = "http2"), allow(dead_code))]
+    Hyper(hyper::body::Incoming),
+    Exhausted,
+}
+
 struct UpstreamResponseBodyState {
-    response: Option<reqwest::Response>,
+    source: UpstreamResponseSource,
+    http2_tracker: Option<http2::Http2ResponseBodyTracker>,
+    body_started: bool,
     buffered: Vec<u8>,
     read_offset: usize,
     eof: bool,
@@ -264,9 +291,26 @@ impl std::fmt::Debug for UpstreamResponseBodyState {
 }
 
 impl UpstreamResponseBodyState {
-    fn new(response: reqwest::Response) -> Self {
+    fn from_reqwest(response: reqwest::Response) -> Self {
         Self {
-            response: Some(response),
+            source: UpstreamResponseSource::Reqwest(response),
+            http2_tracker: None,
+            body_started: false,
+            buffered: Vec::new(),
+            read_offset: 0,
+            eof: false,
+        }
+    }
+
+    #[cfg_attr(not(feature = "http2"), allow(dead_code))]
+    fn from_hyper(
+        body: hyper::body::Incoming,
+        http2_tracker: Option<http2::Http2ResponseBodyTracker>,
+    ) -> Self {
+        Self {
+            source: UpstreamResponseSource::Hyper(body),
+            http2_tracker,
+            body_started: false,
             buffered: Vec::new(),
             read_offset: 0,
             eof: false,
@@ -277,25 +321,63 @@ impl UpstreamResponseBodyState {
         if self.eof {
             return Ok(());
         }
-        let Some(response) = self.response.as_mut() else {
-            self.eof = true;
-            return Ok(());
-        };
-
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                if !chunk.is_empty() {
-                    self.buffered.extend_from_slice(&chunk);
+        match &mut self.source {
+            UpstreamResponseSource::Reqwest(response) => match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if !chunk.is_empty() {
+                        self.buffered.extend_from_slice(&chunk);
+                    }
                 }
-            }
-            Ok(None) => {
+                Ok(None) => {
+                    self.eof = true;
+                    self.source = UpstreamResponseSource::Exhausted;
+                }
+                Err(err) => {
+                    return Err(VmError::HostError(format!(
+                        "failed to read upstream response chunk: {err}",
+                    )));
+                }
+            },
+            UpstreamResponseSource::Hyper(body) => match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Ok(chunk) = frame.into_data()
+                        && !chunk.is_empty()
+                    {
+                        if !self.body_started {
+                            if let Some(tracker) = &self.http2_tracker {
+                                tracker.note_response_body_ready();
+                            }
+                            self.body_started = true;
+                        }
+                        self.buffered.extend_from_slice(&chunk);
+                    }
+                }
+                Some(Err(err)) => {
+                    let observed = http2::classify_http2_error(&err);
+                    if let Some(tracker) = &self.http2_tracker {
+                        tracker.note_body_error(&observed);
+                    }
+                    return Err(VmError::HostError(format!(
+                        "failed to read upstream response frame: {}",
+                        observed.message,
+                    )));
+                }
+                None => {
+                    if !self.body_started {
+                        if let Some(tracker) = &self.http2_tracker {
+                            tracker.note_response_body_ready();
+                        }
+                        self.body_started = true;
+                    }
+                    if let Some(tracker) = &self.http2_tracker {
+                        tracker.note_body_eof();
+                    }
+                    self.eof = true;
+                    self.source = UpstreamResponseSource::Exhausted;
+                }
+            },
+            UpstreamResponseSource::Exhausted => {
                 self.eof = true;
-                self.response = None;
-            }
-            Err(err) => {
-                return Err(VmError::HostError(format!(
-                    "failed to read upstream response chunk: {err}",
-                )));
             }
         }
         Ok(())
@@ -381,6 +463,7 @@ pub(crate) struct HttpUpstreamResponseSnapshot {
     pub(crate) headers: HeaderMap,
     pub(crate) http_version: String,
     pub(crate) carrier_kind: HttpCarrierKind,
+    pub(crate) carrier_ref: HttpCarrierRef,
     body: SharedUpstreamResponseBody,
 }
 
@@ -391,6 +474,7 @@ impl std::fmt::Debug for HttpUpstreamResponseSnapshot {
             .field("headers", &self.headers)
             .field("http_version", &self.http_version)
             .field("carrier_kind", &self.carrier_kind.as_str())
+            .field("carrier_ref", &self.carrier_ref)
             .finish()
     }
 }
@@ -448,6 +532,7 @@ impl HttpOutboundExchangeState {
         headers: HeaderMap,
         http_version: String,
         carrier_kind: HttpCarrierKind,
+        carrier_ref: HttpCarrierRef,
         body: SharedUpstreamResponseBody,
         latency_ms: u64,
     ) {
@@ -456,6 +541,7 @@ impl HttpOutboundExchangeState {
             headers,
             http_version,
             carrier_kind,
+            carrier_ref,
             body,
         });
         self.upstream_latency_ms = latency_ms;
@@ -474,8 +560,11 @@ pub struct ProxyVmContext {
     pub(crate) outbound_request: HttpOutboundRequestNode,
     pub(crate) response_output: HttpResponseOutputNode,
     pub(crate) upstream_response: HttpUpstreamResponseNode,
+    pub(crate) downstream_carrier_ref: Option<HttpCarrierRef>,
+    pub(crate) upstream_carrier_ref: Option<HttpCarrierRef>,
     pub(crate) upstream_client: Option<reqwest::Client>,
     pub(crate) tls_session_cache: Option<SharedTlsSessionCache>,
+    pub(crate) upstream_http_sessions: Option<SharedHttpUpstreamSessions>,
     pub(crate) upstream_latency_ms: u64,
     pub(crate) next_outbound_exchange_handle: i64,
     pub(crate) outbound_exchanges: HashMap<i64, HttpOutboundExchangeState>,
@@ -542,8 +631,11 @@ impl ProxyVmContext {
             default_upstream_websocket: WebSocketConnectionState::default(),
             response_output: HttpResponseOutputNode::default(),
             upstream_response: HttpUpstreamResponseNode::NotStarted,
+            downstream_carrier_ref: Some(HttpCarrierRef::DownstreamHttp1),
+            upstream_carrier_ref: None,
             upstream_client: None,
             tls_session_cache: None,
+            upstream_http_sessions: None,
             upstream_latency_ms: 0,
             next_outbound_exchange_handle: FIRST_DYNAMIC_EXCHANGE_HANDLE,
             outbound_exchanges: HashMap::new(),
@@ -596,6 +688,10 @@ impl ProxyVmContext {
         self.tls_session_cache = Some(cache);
     }
 
+    pub(crate) fn attach_upstream_http_sessions(&mut self, sessions: SharedHttpUpstreamSessions) {
+        self.upstream_http_sessions = Some(sessions);
+    }
+
     fn upstream_response(&self) -> Result<HttpUpstreamResponseSnapshot, VmError> {
         match &self.upstream_response {
             HttpUpstreamResponseNode::Ready(snapshot) => Ok(snapshot.clone()),
@@ -615,17 +711,32 @@ impl ProxyVmContext {
         headers: HeaderMap,
         http_version: String,
         carrier_kind: HttpCarrierKind,
+        carrier_ref: HttpCarrierRef,
         body: SharedUpstreamResponseBody,
         latency_ms: u64,
     ) {
+        self.upstream_carrier_ref = Some(carrier_ref.clone());
         self.upstream_response = HttpUpstreamResponseNode::Ready(HttpUpstreamResponseSnapshot {
             status,
             headers,
             http_version,
             carrier_kind,
+            carrier_ref,
             body,
         });
         self.upstream_latency_ms = latency_ms;
+    }
+
+    pub(crate) fn attach_downstream_http2_stream(
+        &mut self,
+        attachment: &http2::Http2DownstreamStreamAttachment,
+    ) {
+        self.downstream_carrier_ref = Some(HttpCarrierRef::DownstreamHttp2Stream(
+            http2::Http2StreamRef {
+                session_id: attachment.session_id,
+                stream_id: attachment.stream_id,
+            },
+        ));
     }
 }
 
@@ -828,12 +939,24 @@ impl UpstreamResponseStartError {
 #[derive(Clone, Debug)]
 struct PreparedUpstreamRequest {
     client: reqwest::Client,
+    http_sessions: Option<SharedHttpUpstreamSessions>,
+    http2_mode: http2::Http2UpstreamMode,
     tls_flow: TlsFlowState,
     method: Method,
     path: String,
     query: String,
     headers: HeaderMap,
     target: String,
+}
+
+struct StartedUpstreamResponse {
+    status: u16,
+    headers: HeaderMap,
+    version: Version,
+    carrier_ref: HttpCarrierRef,
+    negotiated_alpn: Option<String>,
+    peer_certificate_der: Option<Vec<u8>>,
+    body: SharedUpstreamResponseBody,
 }
 
 #[derive(Debug)]
@@ -902,13 +1025,10 @@ pub(crate) fn build_upstream_url(
 }
 
 pub(crate) fn http_version_label(version: Version) -> &'static str {
-    match version {
-        Version::HTTP_09 => "0.9",
-        Version::HTTP_10 => "1.0",
-        Version::HTTP_11 => "1.1",
-        Version::HTTP_2 => "2",
-        Version::HTTP_3 => "3",
-        _ => "1.1",
+    if http2::supports_response_version(version) {
+        http2::response_version_label()
+    } else {
+        http1::response_version_label(version)
     }
 }
 
@@ -926,6 +1046,21 @@ pub(crate) fn is_hop_by_hop_header(name: &HeaderName) -> bool {
     )
 }
 
+fn filtered_upstream_headers(headers: &HeaderMap, host_header: Option<&str>) -> HeaderMap {
+    let mut filtered = HeaderMap::new();
+    for (name, value) in headers {
+        if name != HOST && name != CONTENT_LENGTH && !is_hop_by_hop_header(name) {
+            filtered.insert(name.clone(), value.clone());
+        }
+    }
+    if let Some(host) = host_header
+        && let Ok(value) = HeaderValue::from_str(host)
+    {
+        filtered.insert(HOST, value);
+    }
+    filtered
+}
+
 fn prepared_upstream_request(
     context: &SharedProxyVmContext,
 ) -> Result<PreparedUpstreamRequest, UpstreamResponseStartError> {
@@ -935,21 +1070,25 @@ fn prepared_upstream_request(
             "default upstream exchange is already owned by the websocket DAG".to_string(),
         ));
     }
+    let target = guard
+        .outbound_request
+        .target
+        .clone()
+        .ok_or(UpstreamResponseStartError::MissingTarget)?;
+    let tls_flow = guard.tls_dag.default_upstream.clone();
     Ok(PreparedUpstreamRequest {
         client: guard
             .upstream_client
             .clone()
             .ok_or(UpstreamResponseStartError::MissingClient)?,
-        tls_flow: guard.tls_dag.default_upstream.clone(),
+        http_sessions: guard.upstream_http_sessions.clone(),
+        http2_mode: http2::select_upstream_mode(&target, &tls_flow),
+        tls_flow,
         method: guard.outbound_request.method.clone(),
         path: guard.outbound_request.path.clone(),
         query: guard.outbound_request.query.clone(),
         headers: guard.outbound_request.headers.clone(),
-        target: guard
-            .outbound_request
-            .target
-            .clone()
-            .ok_or(UpstreamResponseStartError::MissingTarget)?,
+        target,
     })
 }
 
@@ -985,21 +1124,25 @@ fn prepared_outbound_exchange_request(
             "outbound exchange handle {handle} is already owned by the websocket DAG",
         )));
     }
+    let target = exchange
+        .request
+        .target
+        .clone()
+        .ok_or(UpstreamResponseStartError::MissingTarget)?;
+    let tls_flow = exchange.transport.tls_flow.clone();
     Ok(PreparedUpstreamRequest {
         client: guard
             .upstream_client
             .clone()
             .ok_or(UpstreamResponseStartError::MissingClient)?,
-        tls_flow: exchange.transport.tls_flow.clone(),
+        http_sessions: guard.upstream_http_sessions.clone(),
+        http2_mode: http2::select_upstream_mode(&target, &tls_flow),
+        tls_flow,
         method: exchange.request.method.clone(),
         path: exchange.request.path.clone(),
         query: exchange.request.query.clone(),
         headers: exchange.request.headers.clone(),
-        target: exchange
-            .request
-            .target
-            .clone()
-            .ok_or(UpstreamResponseStartError::MissingTarget)?,
+        target,
     })
 }
 
@@ -1031,7 +1174,11 @@ fn reqwest_tls_version(version: TlsProtocolVersion) -> reqwest::tls::Version {
 fn configured_upstream_client(
     prepared: &PreparedUpstreamRequest,
 ) -> Result<reqwest::Client, UpstreamResponseStartError> {
-    if !prepared.tls_flow.is_present() || !prepared.tls_flow.requires_custom_client() {
+    if !matches!(
+        prepared.http2_mode,
+        http2::Http2UpstreamMode::PriorKnowledge
+    ) && (!prepared.tls_flow.is_present() || !prepared.tls_flow.requires_custom_client())
+    {
         return Ok(prepared.client.clone());
     }
 
@@ -1048,6 +1195,7 @@ fn configured_upstream_client(
     }
 
     let mut builder = reqwest::Client::builder().tls_info(true);
+    builder = http2::configure_reqwest_builder(builder, prepared.http2_mode);
     if !prepared.tls_flow.verify_peer() {
         builder = builder.danger_accept_invalid_certs(true);
     }
@@ -1126,6 +1274,85 @@ fn with_outbound_tls_flow_mut<T>(
         .get_mut(&handle)
         .ok_or(UpstreamResponseStartError::UnknownExchangeHandle(handle))?;
     Ok(mutate(&mut exchange.transport.tls_flow))
+}
+
+async fn start_upstream_response_via_reqwest(
+    handle: i64,
+    prepared: &PreparedUpstreamRequest,
+    upstream_url: &str,
+    headers: &HeaderMap,
+    request_body: Vec<u8>,
+) -> Result<StartedUpstreamResponse, UpstreamResponseStartError> {
+    let client = configured_upstream_client(prepared)?;
+    let mut outbound = client
+        .request(prepared.method.clone(), upstream_url)
+        .body(request_body);
+    for (name, value) in headers {
+        outbound = outbound.header(name, value);
+    }
+
+    let upstream_response = outbound.send().await.map_err(|err| {
+        UpstreamResponseStartError::UpstreamRequest(format!(
+            "outbound request to {upstream_url} failed while evaluating host call: {err}",
+        ))
+    })?;
+    let version = upstream_response.version();
+    Ok(StartedUpstreamResponse {
+        status: upstream_response.status().as_u16(),
+        headers: upstream_response.headers().clone(),
+        version,
+        carrier_ref: if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+            HttpCarrierRef::Http1DefaultUpstream
+        } else {
+            HttpCarrierRef::Http1DynamicExchange(handle)
+        },
+        negotiated_alpn: alpn_from_http_version(version),
+        peer_certificate_der: response_peer_certificate_der(&upstream_response),
+        body: Arc::new(tokio::sync::Mutex::new(
+            UpstreamResponseBodyState::from_reqwest(upstream_response),
+        )),
+    })
+}
+
+#[cfg(feature = "http2")]
+async fn start_upstream_response_via_http2(
+    handle: i64,
+    prepared: &PreparedUpstreamRequest,
+    upstream_url: &str,
+    headers: HeaderMap,
+    request_body: Vec<u8>,
+) -> Result<StartedUpstreamResponse, http2::Http2RequestError> {
+    let sessions = prepared
+        .http_sessions
+        .as_ref()
+        .expect("explicit http2 transport requires shared sessions");
+    let started = http2::send_request(
+        sessions,
+        handle,
+        &prepared.target,
+        upstream_url,
+        prepared.http2_mode,
+        &prepared.tls_flow,
+        prepared.method.clone(),
+        headers,
+        request_body,
+    )
+    .await?;
+    let version = started.response.version();
+    Ok(StartedUpstreamResponse {
+        status: started.response.status().as_u16(),
+        headers: started.response.headers().clone(),
+        version,
+        carrier_ref: HttpCarrierRef::UpstreamHttp2Stream(started.stream_ref),
+        negotiated_alpn: started.negotiated_alpn,
+        peer_certificate_der: started.peer_certificate_der,
+        body: Arc::new(tokio::sync::Mutex::new(
+            UpstreamResponseBodyState::from_hyper(
+                started.response.into_body(),
+                Some(started.body_tracker),
+            ),
+        )),
+    })
 }
 
 fn note_outbound_tls_prepared(
@@ -1285,60 +1512,103 @@ async fn start_outbound_exchange_response(
         })?;
     let (upstream_url, host_header) =
         build_upstream_url(&prepared.target, &prepared.path, &prepared.query);
-    let client = configured_upstream_client(&prepared)?;
-
-    let mut outbound = client
-        .request(prepared.method.clone(), upstream_url)
-        .body(request_body);
-    for (name, value) in &prepared.headers {
-        if name != HOST && name != CONTENT_LENGTH && !is_hop_by_hop_header(name) {
-            outbound = outbound.header(name, value);
-        }
-    }
-    if let Some(host) = host_header {
-        outbound = outbound.header(HOST, host);
-    }
+    let outbound_headers = filtered_upstream_headers(&prepared.headers, host_header.as_deref());
 
     let handshake_already_complete = outbound_tls_handshake_complete(context, handle)?;
     if !handshake_already_complete {
         note_outbound_tls_prepared(context, handle)?;
     }
     let started = Instant::now();
-    let upstream_response = outbound.send().await.map_err(|err| {
-        let _ = note_outbound_tls_failure(context, handle);
-        UpstreamResponseStartError::UpstreamRequest(format!(
-            "outbound exchange {handle} failed while evaluating host call: {err}",
-        ))
-    })?;
-    let upstream_response_version = upstream_response.version();
-    let negotiated_alpn = alpn_from_http_version(upstream_response_version);
-    let peer_certificate_der = response_peer_certificate_der(&upstream_response);
+    let upstream_response = if http2::should_use_explicit_upstream_transport(
+        prepared.http2_mode,
+        prepared.http_sessions.as_ref(),
+    ) {
+        #[cfg(feature = "http2")]
+        {
+            match start_upstream_response_via_http2(
+                handle,
+                &prepared,
+                &upstream_url,
+                outbound_headers.clone(),
+                request_body.clone(),
+            )
+            .await
+            {
+                Ok(started) => started,
+                Err(http2::Http2RequestError::FallbackToHttp1 { .. }) => {
+                    match start_upstream_response_via_reqwest(
+                        handle,
+                        &prepared,
+                        &upstream_url,
+                        &outbound_headers,
+                        request_body,
+                    )
+                    .await
+                    {
+                        Ok(started) => started,
+                        Err(err) => {
+                            let _ = note_outbound_tls_failure(context, handle);
+                            return Err(err);
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = note_outbound_tls_failure(context, handle);
+                    return Err(UpstreamResponseStartError::UpstreamRequest(format!(
+                        "outbound exchange {handle} failed while evaluating host call: {}",
+                        err.into_message(),
+                    )));
+                }
+            }
+        }
+        #[cfg(not(feature = "http2"))]
+        {
+            unreachable!("explicit http2 transport requires the http2 feature");
+        }
+    } else {
+        match start_upstream_response_via_reqwest(
+            handle,
+            &prepared,
+            &upstream_url,
+            &outbound_headers,
+            request_body,
+        )
+        .await
+        {
+            Ok(started) => started,
+            Err(err) => {
+                let _ = note_outbound_tls_failure(context, handle);
+                return Err(err);
+            }
+        }
+    };
+    let upstream_response_version = upstream_response.version;
+    let negotiated_alpn = upstream_response.negotiated_alpn.clone();
     if !handshake_already_complete {
         finalize_outbound_tls_handshake(
             context,
             handle,
             negotiated_alpn.clone(),
-            peer_certificate_der.clone(),
+            upstream_response.peer_certificate_der.clone(),
         )?;
         cache_outbound_tls_session(
             context,
             handle,
             negotiated_alpn.clone(),
-            peer_certificate_der,
+            upstream_response.peer_certificate_der.clone(),
         )?;
     }
     mark_outbound_tcp_connected(context, handle)?;
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let response_http_version = http_version_label(upstream_response_version).to_string();
-    let response_carrier_kind = HttpCarrierKind::from_version(upstream_response_version);
+    let response_carrier_kind = upstream_response.carrier_ref.kind();
     let snapshot = HttpUpstreamResponseSnapshot {
-        status: upstream_response.status().as_u16(),
-        headers: upstream_response.headers().clone(),
+        status: upstream_response.status,
+        headers: upstream_response.headers.clone(),
         http_version: response_http_version.clone(),
         carrier_kind: response_carrier_kind,
-        body: Arc::new(tokio::sync::Mutex::new(UpstreamResponseBodyState::new(
-            upstream_response,
-        ))),
+        carrier_ref: upstream_response.carrier_ref.clone(),
+        body: upstream_response.body.clone(),
     };
 
     let mut guard = context.lock().expect("vm context lock poisoned");
@@ -1351,6 +1621,7 @@ async fn start_outbound_exchange_response(
             snapshot.headers.clone(),
             snapshot.http_version.clone(),
             snapshot.carrier_kind,
+            snapshot.carrier_ref.clone(),
             snapshot.body.clone(),
             latency_ms,
         );
@@ -1369,12 +1640,13 @@ async fn start_outbound_exchange_response(
         snapshot.headers.clone(),
         snapshot.http_version.clone(),
         snapshot.carrier_kind,
+        snapshot.carrier_ref.clone(),
         snapshot.body.clone(),
         latency_ms,
     );
     exchange
         .transport
-        .mark_response_ready(upstream_response_version);
+        .mark_response_ready(upstream_response_version, snapshot.carrier_ref.clone());
     Ok(snapshot)
 }
 
@@ -1696,11 +1968,12 @@ mod tests {
     };
 
     use super::{
-        ProxyVmContext, SharedProxyVmContext, allocate_outbound_exchange_handle,
-        append_outbound_exchange_body, ensure_outbound_exchange_response_started,
-        outbound_exchange_exists,
+        HttpCarrierRef, HttpExchangeTransportState, ProxyVmContext, SharedProxyVmContext,
+        allocate_outbound_exchange_handle, append_outbound_exchange_body,
+        ensure_outbound_exchange_response_started, outbound_exchange_exists,
     };
     use crate::abi_impl::RateLimiterStore;
+    use crate::abi_impl::http2::{Http2DownstreamStreamAttachment, Http2StreamRef};
 
     fn test_context() -> SharedProxyVmContext {
         Arc::new(Mutex::new(ProxyVmContext::from_request_headers(
@@ -1757,6 +2030,45 @@ mod tests {
         assert_eq!(guard.outbound_exchanges[&second].request.target, None);
         assert!(!guard.outbound_exchanges[&first].response_ready());
         assert!(!guard.outbound_exchanges[&second].response_ready());
+    }
+
+    #[test]
+    fn downstream_http2_attachment_updates_explicit_carrier_ref() {
+        let mut context = ProxyVmContext::from_request_headers(
+            HeaderMap::new(),
+            Arc::new(Mutex::new(RateLimiterStore::new())),
+        );
+        assert_eq!(
+            context.downstream_carrier_ref,
+            Some(HttpCarrierRef::DownstreamHttp1)
+        );
+
+        context.attach_downstream_http2_stream(&Http2DownstreamStreamAttachment {
+            session_id: 41,
+            stream_id: 9,
+        });
+
+        assert_eq!(
+            context.downstream_carrier_ref,
+            Some(HttpCarrierRef::DownstreamHttp2Stream(Http2StreamRef {
+                session_id: 41,
+                stream_id: 9,
+            }))
+        );
+    }
+
+    #[test]
+    fn exchange_transport_records_http2_stream_carrier_ref() {
+        let mut transport = HttpExchangeTransportState::default();
+        let carrier_ref = HttpCarrierRef::UpstreamHttp2Stream(Http2StreamRef {
+            session_id: 12,
+            stream_id: 7,
+        });
+
+        transport.mark_response_ready(axum::http::Version::HTTP_2, carrier_ref.clone());
+
+        assert_eq!(transport.carrier_ref, Some(carrier_ref));
+        assert_eq!(transport.http_version.as_deref(), Some("2"));
     }
 
     #[tokio::test(flavor = "current_thread")]

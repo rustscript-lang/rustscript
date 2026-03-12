@@ -13,6 +13,8 @@ use tokio::sync::oneshot;
 use vm::{CallOutcome, HostAsyncBridge, HostFunction, HostOpId, Value, Vm, VmError};
 
 pub(crate) mod http;
+mod http1;
+mod http2;
 mod io;
 mod proxy;
 mod registry;
@@ -23,6 +25,13 @@ mod webrtc;
 mod websocket;
 
 pub use self::http::{HttpRequestContext, ProxyVmContext, SharedProxyVmContext};
+#[cfg(test)]
+pub(crate) use self::http2::Http2SessionFrontier;
+pub(crate) use self::http2::{
+    DownstreamHttp2ConnectionTracker, Http2DownstreamStreamAttachment,
+    SharedHttpDownstreamSessions, SharedHttpUpstreamSessions, new_shared_http_downstream_sessions,
+    new_shared_http_upstream_sessions,
+};
 pub(crate) use self::transport::{SharedTlsSessionCache, new_shared_tls_session_cache};
 
 pub type SharedRateLimiter = Arc<Mutex<RateLimiterStore>>;

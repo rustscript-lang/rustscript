@@ -8,6 +8,13 @@ use axum::{
     middleware,
     routing::any,
 };
+use hyper::body::Incoming;
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder as AutoBuilder,
+};
+use tokio::net::TcpListener;
+use tower::ServiceExt;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -16,7 +23,10 @@ use super::super::vm_runner::{VmDebugInvocation, VmExecutionError, execute_vm_wi
 use super::shared::access_log_middleware;
 use crate::{
     abi_impl::http::resolve_http_graph_response,
-    abi_impl::{HttpRequestContext, ProxyVmContext, register_http_plane_host_module},
+    abi_impl::{
+        DownstreamHttp2ConnectionTracker, Http2DownstreamStreamAttachment, HttpRequestContext,
+        ProxyVmContext, register_http_plane_host_module,
+    },
     debug_session::{request_uses_blocking_debugger, request_will_attach_debugger},
     logging::category_program,
 };
@@ -26,6 +36,52 @@ pub fn build_http_proxy_app(state: SharedState) -> Router {
         .fallback(any(data_plane_handler))
         .layer(middleware::from_fn(access_log_middleware))
         .with_state(state)
+}
+
+pub async fn serve_http_proxy(listener: TcpListener, state: SharedState) -> std::io::Result<()> {
+    let app = build_http_proxy_app(state.clone());
+    loop {
+        let (stream, peer_addr) = listener.accept().await?;
+        let app = app.clone();
+        let tracker = DownstreamHttp2ConnectionTracker::new(
+            state.downstream_http2_sessions.clone(),
+            peer_addr.to_string(),
+        );
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let connection_tracker = tracker.clone();
+            let service = hyper::service::service_fn(move |request: hyper::Request<Incoming>| {
+                let app = app.clone();
+                let tracker = connection_tracker.clone();
+                async move {
+                    let version = request.version();
+                    let path = request.uri().path().to_string();
+                    let attachment = tracker.observe_request(version, &path);
+                    let mut request = request;
+                    if let Some(ref attachment) = attachment {
+                        request.extensions_mut().insert(attachment.clone());
+                    }
+                    let request = request.map(Body::new);
+                    let response = app.oneshot(request).await;
+                    if response.is_ok() {
+                        tracker.note_response_head(attachment.as_ref());
+                        tracker.finish_request(attachment.as_ref(), None);
+                    } else {
+                        tracker.finish_request(
+                            attachment.as_ref(),
+                            Some("data plane request handling failed".to_string()),
+                        );
+                    }
+                    response
+                }
+            });
+
+            let result = AutoBuilder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
+            tracker.finish_connection(result.err().map(|err| err.to_string()));
+        });
+    }
 }
 
 async fn data_plane_handler(State(state): State<SharedState>, request: Request) -> Response<Body> {
@@ -49,7 +105,10 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
     };
 
     let (parts, body) = request.into_parts();
-
+    let downstream_http2_attachment = parts
+        .extensions
+        .get::<Http2DownstreamStreamAttachment>()
+        .cloned();
     let vm_context = {
         let uri = parts.uri.clone();
         let request_headers = parts.headers.clone();
@@ -92,6 +151,10 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
             let mut guard = vm_context.lock().expect("vm context lock poisoned");
             guard.attach_upstream_client(state.client.clone());
             guard.attach_tls_session_cache(state.tls_session_cache.clone());
+            guard.attach_upstream_http_sessions(state.upstream_http_sessions.clone());
+            if let Some(attachment) = &downstream_http2_attachment {
+                guard.attach_downstream_http2_stream(attachment);
+            }
         }
         match execute_vm_with_context(
             &program,
@@ -242,4 +305,129 @@ fn text_response(status: StatusCode, text: &str) -> Response<Body> {
     let mut response = Response::new(Body::from(text.to_string()));
     *response.status_mut() = status;
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::Version;
+    use http_body_util::{BodyExt, Full};
+    use vm::{compile_source, encode_program};
+
+    use super::*;
+    use crate::abi_impl::Http2SessionFrontier;
+    use crate::runtime::apply_program_from_bytes;
+
+    #[cfg(feature = "http2")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn downstream_http2_session_store_tracks_streams_outside_vm_context() {
+        let state = SharedState::new(1024 * 1024);
+        let source = r#"
+            use http;
+            use runtime;
+
+            runtime::sleep(50);
+            http::response::set_body(http::request::get_path());
+        "#;
+        let compiled = compile_source(source).expect("source should compile");
+        let program = encode_program(&compiled.program).expect("program should encode");
+        let report = apply_program_from_bytes(&state, &program).await;
+        assert!(report.applied, "program should apply");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have addr");
+        let server = tokio::spawn(serve_http_proxy(listener, state.clone()));
+
+        let stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("http2 client should connect");
+        let io = TokioIo::new(stream);
+        let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(io)
+            .await
+            .expect("http2 client handshake should succeed");
+        let connection_task = tokio::spawn(async move {
+            connection
+                .await
+                .expect("http2 client connection should run");
+        });
+
+        let first_request = {
+            let mut sender = sender.clone();
+            tokio::spawn(async move {
+                sender
+                    .send_request(
+                        hyper::Request::builder()
+                            .method("GET")
+                            .uri(format!("http://{addr}/slow-a"))
+                            .version(Version::HTTP_2)
+                            .header("host", format!("{addr}"))
+                            .body(Full::new(axum::body::Bytes::new()))
+                            .expect("first request should build"),
+                    )
+                    .await
+                    .expect("first request should complete")
+            })
+        };
+        let second_request = {
+            let mut sender = sender.clone();
+            tokio::spawn(async move {
+                sender
+                    .send_request(
+                        hyper::Request::builder()
+                            .method("GET")
+                            .uri(format!("http://{addr}/slow-b"))
+                            .version(Version::HTTP_2)
+                            .header("host", format!("{addr}"))
+                            .body(Full::new(axum::body::Bytes::new()))
+                            .expect("second request should build"),
+                    )
+                    .await
+                    .expect("second request should complete")
+            })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let snapshot = {
+            let guard = state
+                .downstream_http2_sessions
+                .lock()
+                .expect("http downstream session store lock poisoned");
+            assert_eq!(guard.len(), 1, "one downstream h2 session should exist");
+            guard
+                .snapshot_values()
+                .into_iter()
+                .next()
+                .expect("session should exist")
+        };
+        assert_eq!(snapshot.frontier, Http2SessionFrontier::Open);
+        assert_eq!(snapshot.total_streams, 2);
+        assert_eq!(snapshot.active_streams, 2);
+        assert_eq!(snapshot.streams.len(), 2);
+
+        let first_response = first_request.await.expect("first join should succeed");
+        let second_response = second_request.await.expect("second join should succeed");
+        assert_eq!(
+            BodyExt::collect(first_response.into_body())
+                .await
+                .expect("first body should collect")
+                .to_bytes()
+                .as_ref(),
+            b"/slow-a"
+        );
+        assert_eq!(
+            BodyExt::collect(second_response.into_body())
+                .await
+                .expect("second body should collect")
+                .to_bytes()
+                .as_ref(),
+            b"/slow-b"
+        );
+
+        drop(sender);
+        connection_task.abort();
+        server.abort();
+    }
 }

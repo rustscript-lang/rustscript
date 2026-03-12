@@ -11,7 +11,7 @@ name = "edge"
 [features]
 default = ["http", "tls", "websocket"]
 http = ["vm/http", "edge_abi/http"]
-http2 = ["http", "vm/http2", "edge_abi/http2", "reqwest/http2"]
+http2 = ["http", "vm/http2", "edge_abi/http2", "reqwest/http2", "dep:h2", "dep:tokio-rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
 tls = ["http", "vm/tls", "edge_abi/tls", "dep:tokio-rustls", "dep:rcgen"]
 websocket = ["http", "vm/websocket", "edge_abi/websocket", "dep:tokio-tungstenite"]
 webrtc = ["http", "vm/webrtc", "edge_abi/webrtc", "dep:webrtc", "dep:rustls"]
@@ -34,7 +34,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio = { version = "1", features = ["full"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "http2", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "http1", "http2"] }
+h2 = { version = "0.4", optional = true }
 futures-util = "0.3"
 pd-edge-host-function = { path = "./pd-edge-host-function" }
 linkme = "0.3"
@@ -50,14 +51,14 @@ base64 = "0.22"
 rand = "0.8"
 uuid = { version = "1", features = ["v4"] }
 url = "2"
+tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"], optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 rcgen = { version = "0.12", optional = true }
 webrtc = { version = "0.17", optional = true }
 rustls = { version = "0.23", optional = true }
+webpki-roots = { version = "1", optional = true }
+rustls-pemfile = { version = "2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Console"] }
-
-[dev-dependencies]
-tower = { version = "0.5", features = ["util"] }

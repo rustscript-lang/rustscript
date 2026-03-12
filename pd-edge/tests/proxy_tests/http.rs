@@ -998,20 +998,18 @@ async fn upstream_http2_response_version_is_exposed_to_vm_programs() {
     let (upstream_addr, _connection_count, upstream_handle) =
         spawn_https_http2_multiplex_upstream().await;
 
-    let mut state = SharedState::new(1024 * 1024);
-    state.client = reqwest::Client::builder()
-        .tls_info(true)
-        .danger_accept_invalid_certs(true)
-        .build()
-        .expect("http2 tls test client should build");
-    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy_with_state(state).await;
+    let (data_addr, admin_addr, data_handle, admin_handle) =
+        spawn_proxy_with_state(SharedState::new(1024 * 1024)).await;
     let client = reqwest::Client::new();
 
     let source = format!(
         r#"
         use http;
+        use tls;
 
         http::upstream::request::set_target("https://localhost:{}/fast");
+        let session = tls::session::from_socket(http::exchange::default_upstream());
+        tls::session::set_verify(session, false);
         http::response::set_header(
             "x-upstream-version",
             http::upstream::response::get_http_version()
@@ -1047,30 +1045,222 @@ async fn upstream_http2_response_version_is_exposed_to_vm_programs() {
     admin_handle.abort();
 }
 
+#[cfg(feature = "http2")]
+#[tokio::test]
+async fn sample_downstream_http2_program_handles_cleartext_h2_requests() {
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_downstream_http2_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let stream = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("http2 client should connect");
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, connection) =
+        hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+            .handshake(io)
+            .await
+            .expect("http2 client handshake should succeed");
+    let connection_handle = tokio::spawn(async move {
+        connection
+            .await
+            .expect("http2 client connection should run");
+    });
+
+    let host = data_addr.to_string();
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("http://{data_addr}/downstream-sample?mode=http2"))
+        .version(axum::http::Version::HTTP_2)
+        .header("host", &host)
+        .body(http_body_util::Full::new(axum::body::Bytes::from_static(
+            b"payload-2",
+        )))
+        .expect("http2 request should build");
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("http2 request should complete");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-request-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-request-method")
+            .and_then(|value| value.to_str().ok()),
+        Some("POST")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-request-host")
+            .and_then(|value| value.to_str().ok()),
+        Some(host.as_str())
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-request-carrier")
+            .and_then(|value| value.to_str().ok()),
+        Some("http2")
+    );
+    let body = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .expect("http2 response body should collect")
+        .to_bytes();
+    assert_eq!(body.as_ref(), b"h2:/downstream-sample?mode=http2|payload-2");
+
+    connection_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[cfg(all(feature = "tls", feature = "http2"))]
+#[tokio::test]
+async fn sample_upstream_http2_program_demonstrates_multiplex_and_reuse() {
+    let (upstream_addr, connection_count, upstream_handle) =
+        spawn_https_http2_sample_upstream().await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) =
+        spawn_proxy_with_state(SharedState::new(1024 * 1024)).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_upstream_http2_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/upstream-http2-sample"))
+        .header(
+            "x-h2-origin",
+            format!("https://localhost:{}", upstream_addr.port()),
+        )
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-multiplex-fast-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-multiplex-slow-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-multiplex-fast-alpn")
+            .and_then(|value| value.to_str().ok()),
+        Some("h2")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-multiplex-slow-alpn")
+            .and_then(|value| value.to_str().ok()),
+        Some("h2")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-multiplex-fast-eof")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-multiplex-slow-eof")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-reuse-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-reuse-alpn")
+            .and_then(|value| value.to_str().ok()),
+        Some("h2")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-reuse-eof")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-sample-pattern")
+            .and_then(|value| value.to_str().ok()),
+        Some("two-requests-multiplex-then-reuse")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "multiplex:PUT|/fast|fast-request|beta|POST|/slow|slow-request|alpha;reuse:PATCH|/reuse|reuse-request|gamma"
+    );
+    assert_eq!(
+        connection_count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "sample should multiplex and reuse one upstream http2 connection",
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
 #[cfg(all(feature = "tls", feature = "http2"))]
 #[tokio::test]
 async fn dynamic_exchanges_can_multiplex_over_single_http2_connection() {
     let (upstream_addr, connection_count, upstream_handle) =
         spawn_https_http2_multiplex_upstream().await;
 
-    let mut state = SharedState::new(1024 * 1024);
-    state.client = reqwest::Client::builder()
-        .tls_info(true)
-        .danger_accept_invalid_certs(true)
-        .build()
-        .expect("http2 multiplex client should build");
-    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy_with_state(state).await;
+    let (data_addr, admin_addr, data_handle, admin_handle) =
+        spawn_proxy_with_state(SharedState::new(1024 * 1024)).await;
     let client = reqwest::Client::new();
 
     let source = format!(
         r#"
         use http;
+        use tls;
 
         let first = http::exchange::new();
         let second = http::exchange::new();
 
         http::exchange::set_target(first, "https://localhost:{}/slow");
         http::exchange::set_target(second, "https://localhost:{}/fast");
+        tls::session::set_verify(tls::session::from_socket(first), false);
+        tls::session::set_verify(tls::session::from_socket(second), false);
 
         http::exchange::send(first);
         http::response::set_header("x-first-version", http::exchange::get_http_version(first));
@@ -1126,24 +1316,22 @@ async fn dynamic_exchange_body_chunks_can_be_read_independently_over_http2() {
     let (upstream_addr, connection_count, upstream_handle) =
         spawn_https_http2_multiplex_upstream().await;
 
-    let mut state = SharedState::new(1024 * 1024);
-    state.client = reqwest::Client::builder()
-        .tls_info(true)
-        .danger_accept_invalid_certs(true)
-        .build()
-        .expect("http2 chunk test client should build");
-    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy_with_state(state).await;
+    let (data_addr, admin_addr, data_handle, admin_handle) =
+        spawn_proxy_with_state(SharedState::new(1024 * 1024)).await;
     let client = reqwest::Client::new();
 
     let source = format!(
         r#"
         use http;
+        use tls;
 
         let slow = http::exchange::new();
         let fast = http::exchange::new();
 
         http::exchange::set_target(slow, "https://localhost:{}/slow");
         http::exchange::set_target(fast, "https://localhost:{}/fast");
+        tls::session::set_verify(tls::session::from_socket(slow), false);
+        tls::session::set_verify(tls::session::from_socket(fast), false);
 
         http::exchange::send(slow);
         http::exchange::send(fast);

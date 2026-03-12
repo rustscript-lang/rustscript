@@ -366,13 +366,8 @@ async fn tls_session_accepts_h2_alpn_policy_when_http2_is_negotiated() {
 async fn http2_capable_client_falls_back_to_http11_when_h2_is_unavailable() {
     let (upstream_addr, upstream_handle) = spawn_https_echo_upstream().await;
 
-    let mut state = SharedState::new(1024 * 1024);
-    state.client = reqwest::Client::builder()
-        .tls_info(true)
-        .danger_accept_invalid_certs(true)
-        .build()
-        .expect("http2 fallback test client should build");
-    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy_with_state(state).await;
+    let (data_addr, admin_addr, data_handle, admin_handle) =
+        spawn_proxy_with_state(SharedState::new(1024 * 1024)).await;
     let client = reqwest::Client::new();
 
     let source = format!(
@@ -384,6 +379,7 @@ async fn http2_capable_client_falls_back_to_http11_when_h2_is_unavailable() {
         http::upstream::request::set_body("fallback-body");
 
         let session = tls::session::from_socket(http::exchange::default_upstream());
+        tls::session::set_verify(session, false);
         http::response::set_header(
             "x-version",
             http::upstream::response::get_http_version()

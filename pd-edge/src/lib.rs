@@ -1,5 +1,6 @@
 mod abi_impl;
 mod active_control_plane;
+mod cache;
 mod compile;
 mod control_plane_rpc;
 mod debug_session;
@@ -33,7 +34,7 @@ pub use debug_session::{
 };
 pub use logging::init as init_logging;
 pub use runtime::{
-    HealthStatus, ProgramApplyReport, SharedState, TelemetrySnapshot, VM_EPOCH_TICK_INTERVAL_MS,
-    VmExecutionConfig, VmExecutionMode, VmInterruptConfig, apply_program_from_bytes,
-    build_admin_app, build_http_proxy_app,
+    HealthStatus, ProgramApplyReport, RuntimeStoreLimits, SharedState, TelemetrySnapshot,
+    VM_EPOCH_TICK_INTERVAL_MS, VmExecutionConfig, VmExecutionMode, VmInterruptConfig,
+    apply_program_from_bytes, build_admin_app, build_http_proxy_app, serve_http_proxy,
 };

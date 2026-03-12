@@ -11,6 +11,8 @@ mod tcp;
 mod tls;
 mod udp;
 
+#[cfg(feature = "http2")]
+pub(crate) use state::TlsSessionCacheKey;
 pub(crate) use state::{
     CachedTlsSession, SharedTlsSessionCache, SharedUdpSocketIo, TcpFlowState, TcpStreamRef,
     TcpTransportDag, TlsFlowState, TlsProtocolVersion, TlsSessionRef, TlsTransportDag,

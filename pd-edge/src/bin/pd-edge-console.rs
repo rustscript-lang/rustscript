@@ -8,10 +8,11 @@ use std::{
 
 use axum::http::HeaderMap;
 use edge::{
-    ActiveControlPlaneConfig, ProxyVmContext, SharedProxyVmContext, SharedState, SharedVmAsyncOps,
-    VM_EPOCH_TICK_INTERVAL_MS, VmAsyncOpBridge, VmExecutionConfig, VmExecutionMode,
-    VmInterruptConfig, apply_program_from_bytes, compile_edge_source_file, enter_edge_host_context,
-    init_logging, new_shared_vm_async_ops, register_host_module, spawn_active_control_plane_client,
+    ActiveControlPlaneConfig, ProxyVmContext, RuntimeStoreLimits, SharedProxyVmContext,
+    SharedState, SharedVmAsyncOps, VM_EPOCH_TICK_INTERVAL_MS, VmAsyncOpBridge, VmExecutionConfig,
+    VmExecutionMode, VmInterruptConfig, apply_program_from_bytes, compile_edge_source_file,
+    enter_edge_host_context, init_logging, new_shared_vm_async_ops, register_host_module,
+    spawn_active_control_plane_client,
 };
 use tokio::{
     runtime::Handle,
@@ -52,7 +53,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         interrupt: cli.vm_interrupt_config()?,
         execution_mode: VmExecutionMode::Async,
     };
-    let state = SharedState::new(max_program_bytes).with_vm_execution_config(vm_execution);
+    let store_limits = cli.runtime_store_limits();
+    let state = SharedState::new_with_store_limits(max_program_bytes, store_limits)
+        .with_vm_execution_config(vm_execution);
     match vm_execution.interrupt {
         VmInterruptConfig::None => {}
         VmInterruptConfig::Fuel {
@@ -118,6 +121,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct CliArgs {
     program_path: Option<PathBuf>,
     max_program_bytes: Option<usize>,
+    tls_session_reuse_entries: Option<usize>,
+    upstream_http_reuse_entries: Option<usize>,
+    downstream_http2_session_entries: Option<usize>,
     vm_fuel: Option<u64>,
     vm_fuel_check_interval: Option<u32>,
     vm_epoch_deadline: Option<u64>,
@@ -163,6 +169,29 @@ where
                         .parse::<usize>()
                         .map_err(|_| format!("invalid --max-program-bytes: {value}"))?,
                 );
+            }
+            "--tls-session-reuse-entries" => {
+                let value = next_arg_value("--tls-session-reuse-entries", &mut args)?;
+                cli.tls_session_reuse_entries = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid --tls-session-reuse-entries: {value}"))?,
+                );
+            }
+            "--upstream-http-reuse-entries" => {
+                let value = next_arg_value("--upstream-http-reuse-entries", &mut args)?;
+                cli.upstream_http_reuse_entries = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid --upstream-http-reuse-entries: {value}"))?,
+                );
+            }
+            "--downstream-http2-session-entries" => {
+                let value = next_arg_value("--downstream-http2-session-entries", &mut args)?;
+                cli.downstream_http2_session_entries =
+                    Some(value.parse::<usize>().map_err(|_| {
+                        format!("invalid --downstream-http2-session-entries: {value}")
+                    })?);
             }
             "--vm-fuel" => {
                 let value = next_arg_value("--vm-fuel", &mut args)?;
@@ -268,33 +297,56 @@ fn next_arg_value(
 }
 
 fn print_cli_help() {
-    eprintln!(concat!(
-        "Usage: pd-edge-console [options]\n\n",
-        "Options:\n",
-        "  --program <PATH>                          Optional local program source/.vmbc to load at startup\n",
-        "  --max-program-bytes <BYTES>               Max upload/program size in bytes (default: 1048576)\n",
-        "  --vm-fuel <UNITS>                         Enable cooperative VM fuel slices per run\n",
-        "  --vm-fuel-check-interval <OPS>            Fuel check interval when --vm-fuel is enabled (default: 1)\n",
-        "  --vm-epoch-deadline <TICKS>               Enable cooperative VM epoch slices per run (1 tick = 1ms wall clock)\n",
-        "  --vm-epoch-check-interval <OPS>           Epoch check interval when --vm-epoch-deadline is enabled (default: 1)\n",
-        "  --control-plane-url <URL>                 Enable active control-plane RPC client\n",
-        "  --edge-id <UUID>                          Explicit edge UUID used by active control-plane client\n",
-        "  --edge-name <NAME>                        Friendly edge name (default: hostname)\n",
-        "  --edge-id-path <PATH>                     Edge UUID file path (default .pd-edge/edge-id)\n",
-        "  --control-plane-poll-interval-ms <MS>     Poll interval for active control-plane client\n",
-        "  --control-plane-rpc-timeout-ms <MS>       RPC timeout for active control-plane client\n",
-        "  -V, --version                             Show version with git metadata\n",
-        "  -h, --help                                Show this help\n\n",
-        "Console commands:\n",
-        "  .help                                     Show console commands\n",
-        "  .status                                   Show whether a program is loaded\n",
-        "  .load <PATH>                              Load source or .vmbc program from local path\n",
-        "  .run                                      Run currently loaded program once\n",
-        "  .quit                                     Exit console\n",
-    ));
+    let defaults = RuntimeStoreLimits::default();
+    eprintln!(
+        concat!(
+            "Usage: pd-edge-console [options]\n\n",
+            "Options:\n",
+            "  --program <PATH>                          Optional local program source/.vmbc to load at startup\n",
+            "  --max-program-bytes <BYTES>               Max upload/program size in bytes (default: 1048576)\n",
+            "  --tls-session-reuse-entries <N>           TLS session reuse store cap (default: {})\n",
+            "  --upstream-http-reuse-entries <N>         Upstream HTTP reuse store cap (default: {})\n",
+            "  --downstream-http2-session-entries <N>    Downstream HTTP/2 session tracking cap (default: {})\n",
+            "  --vm-fuel <UNITS>                         Enable cooperative VM fuel slices per run\n",
+            "  --vm-fuel-check-interval <OPS>            Fuel check interval when --vm-fuel is enabled (default: 1)\n",
+            "  --vm-epoch-deadline <TICKS>               Enable cooperative VM epoch slices per run (1 tick = 1ms wall clock)\n",
+            "  --vm-epoch-check-interval <OPS>           Epoch check interval when --vm-epoch-deadline is enabled (default: 1)\n",
+            "  --control-plane-url <URL>                 Enable active control-plane RPC client\n",
+            "  --edge-id <UUID>                          Explicit edge UUID used by active control-plane client\n",
+            "  --edge-name <NAME>                        Friendly edge name (default: hostname)\n",
+            "  --edge-id-path <PATH>                     Edge UUID file path (default .pd-edge/edge-id)\n",
+            "  --control-plane-poll-interval-ms <MS>     Poll interval for active control-plane client\n",
+            "  --control-plane-rpc-timeout-ms <MS>       RPC timeout for active control-plane client\n",
+            "  -V, --version                             Show version with git metadata\n",
+            "  -h, --help                                Show this help\n\n",
+            "Console commands:\n",
+            "  .help                                     Show console commands\n",
+            "  .status                                   Show whether a program is loaded\n",
+            "  .load <PATH>                              Load source or .vmbc program from local path\n",
+            "  .run                                      Run currently loaded program once\n",
+            "  .quit                                     Exit console\n",
+        ),
+        defaults.tls_session_reuse_entries,
+        defaults.upstream_http_reuse_entries,
+        defaults.downstream_http2_session_entries,
+    );
 }
 
 impl CliArgs {
+    fn runtime_store_limits(&self) -> RuntimeStoreLimits {
+        let mut limits = RuntimeStoreLimits::default();
+        if let Some(value) = self.tls_session_reuse_entries {
+            limits.tls_session_reuse_entries = value;
+        }
+        if let Some(value) = self.upstream_http_reuse_entries {
+            limits.upstream_http_reuse_entries = value;
+        }
+        if let Some(value) = self.downstream_http2_session_entries {
+            limits.downstream_http2_session_entries = value;
+        }
+        limits
+    }
+
     fn vm_interrupt_config(&self) -> Result<VmInterruptConfig, Box<dyn std::error::Error>> {
         if let Some(fuel_per_yield) = self.vm_fuel {
             return Ok(VmInterruptConfig::Fuel {
@@ -874,6 +926,12 @@ mod tests {
             "examples/demo.rss".to_string(),
             "--max-program-bytes".to_string(),
             "4096".to_string(),
+            "--tls-session-reuse-entries".to_string(),
+            "12".to_string(),
+            "--upstream-http-reuse-entries".to_string(),
+            "18".to_string(),
+            "--downstream-http2-session-entries".to_string(),
+            "0".to_string(),
             "--control-plane-url".to_string(),
             "http://127.0.0.1:9100".to_string(),
             "--edge-id".to_string(),
@@ -897,6 +955,9 @@ mod tests {
             CliArgs {
                 program_path: Some(PathBuf::from("examples/demo.rss")),
                 max_program_bytes: Some(4096),
+                tls_session_reuse_entries: Some(12),
+                upstream_http_reuse_entries: Some(18),
+                downstream_http2_session_entries: Some(0),
                 vm_fuel: None,
                 vm_fuel_check_interval: None,
                 vm_epoch_deadline: None,
@@ -943,6 +1004,24 @@ mod tests {
         };
         assert_eq!(cli.vm_epoch_deadline, Some(2));
         assert_eq!(cli.vm_epoch_check_interval, Some(6));
+    }
+
+    #[test]
+    fn runtime_store_limits_uses_defaults_and_overrides() {
+        let cli = CliArgs {
+            tls_session_reuse_entries: Some(4),
+            downstream_http2_session_entries: Some(0),
+            ..CliArgs::default()
+        };
+
+        let limits = cli.runtime_store_limits();
+
+        assert_eq!(limits.tls_session_reuse_entries, 4);
+        assert_eq!(
+            limits.upstream_http_reuse_entries,
+            RuntimeStoreLimits::default().upstream_http_reuse_entries
+        );
+        assert_eq!(limits.downstream_http2_session_entries, 0);
     }
 
     #[test]

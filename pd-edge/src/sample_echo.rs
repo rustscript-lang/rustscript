@@ -1,6 +1,10 @@
+#[cfg(feature = "http")]
+use std::convert::Infallible;
+#[cfg(any(feature = "tls", feature = "webrtc"))]
+use std::sync::Arc;
 #[cfg(feature = "webrtc")]
 use std::{collections::HashMap, sync::Mutex};
-use std::{convert::Infallible, io, net::SocketAddr, sync::Arc};
+use std::{io, net::SocketAddr};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

@@ -22,7 +22,7 @@ pub(crate) use edge::{
     FN_HTTP_UPSTREAM_REQUEST_SET_TARGET, ProxyVmContext, RateLimiterStore, SharedState,
     VmAsyncOpBridge, build_admin_app, build_http_proxy_app, compile_edge_source_file,
     enter_edge_host_context, new_shared_vm_async_ops, register_http_plane_host_module,
-    spawn_active_control_plane_client,
+    serve_http_proxy, spawn_active_control_plane_client,
 };
 #[cfg(feature = "websocket")]
 pub(crate) use futures_util::{SinkExt, StreamExt};
@@ -79,7 +79,20 @@ pub(crate) async fn spawn_proxy(
 pub(crate) async fn spawn_proxy_with_state(
     state: SharedState,
 ) -> (SocketAddr, SocketAddr, JoinHandle<()>, JoinHandle<()>) {
-    let (data_addr, data_handle) = spawn_server(build_http_proxy_app(state.clone())).await;
+    let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let data_addr = data_listener
+        .local_addr()
+        .expect("listener should have addr");
+    let data_handle = tokio::spawn({
+        let state = state.clone();
+        async move {
+            serve_http_proxy(data_listener, state)
+                .await
+                .expect("data plane server should run");
+        }
+    });
     let (admin_addr, admin_handle) = spawn_server(build_admin_app(state)).await;
     (data_addr, admin_addr, data_handle, admin_handle)
 }
@@ -331,6 +344,28 @@ fn boxed_http2_delayed_body(
 }
 
 #[cfg(all(feature = "tls", feature = "http2"))]
+fn boxed_http2_full_body_owned(
+    text: String,
+) -> http_body_util::combinators::BoxBody<axum::body::Bytes, std::convert::Infallible> {
+    http_body_util::BodyExt::boxed(http_body_util::Full::new(axum::body::Bytes::from(text)))
+}
+
+#[cfg(all(feature = "tls", feature = "http2"))]
+fn boxed_http2_delayed_body_owned(
+    text: String,
+    delay: Duration,
+) -> http_body_util::combinators::BoxBody<axum::body::Bytes, std::convert::Infallible> {
+    let bytes = axum::body::Bytes::from(text.into_bytes());
+    let body = http_body_util::StreamBody::new(futures_util::stream::once(async move {
+        tokio::time::sleep(delay).await;
+        Ok::<hyper::body::Frame<axum::body::Bytes>, std::convert::Infallible>(
+            hyper::body::Frame::data(bytes),
+        )
+    }));
+    http_body_util::BodyExt::boxed(body)
+}
+
+#[cfg(all(feature = "tls", feature = "http2"))]
 pub(crate) async fn spawn_https_http2_multiplex_upstream() -> (
     SocketAddr,
     Arc<std::sync::atomic::AtomicUsize>,
@@ -391,6 +426,87 @@ pub(crate) async fn spawn_https_http2_multiplex_upstream() -> (
                     );
                     if let Err(err) = builder.serve_connection(io, service).await {
                         panic!("http2 upstream connection should serve: {err}");
+                    }
+                });
+            }
+        }
+    });
+    (addr, connection_count, handle)
+}
+
+#[cfg(all(feature = "tls", feature = "http2"))]
+pub(crate) async fn spawn_https_http2_sample_upstream() -> (
+    SocketAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    JoinHandle<()>,
+) {
+    ensure_rustls_provider();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("certificate should generate");
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(
+                cert.serialize_der().expect("certificate should serialize"),
+            )],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.serialize_private_key_der())),
+        )
+        .expect("server config should build");
+    server_config.alpn_protocols = vec![b"h2".to_vec()];
+
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener should have addr");
+    let connection_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handle = tokio::spawn({
+        let connection_count = Arc::clone(&connection_count);
+        async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                connection_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let tls_stream = acceptor
+                        .accept(stream)
+                        .await
+                        .expect("http2 tls accept should succeed");
+                    let service = hyper::service::service_fn(
+                        |request: hyper::Request<hyper::body::Incoming>| async move {
+                            let (parts, body) = request.into_parts();
+                            let path = parts.uri.path().to_string();
+                            let method = parts.method.to_string();
+                            let tag = parts
+                                .headers
+                                .get("x-demo-request")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let body = http_body_util::BodyExt::collect(body)
+                                .await
+                                .expect("sample http2 request body should collect")
+                                .to_bytes();
+                            let payload =
+                                format!("{method}|{path}|{tag}|{}", String::from_utf8_lossy(&body));
+                            let body = if path == "/slow" {
+                                boxed_http2_delayed_body_owned(payload, Duration::from_millis(75))
+                            } else {
+                                boxed_http2_full_body_owned(payload)
+                            };
+                            let mut response = hyper::Response::new(body);
+                            response
+                                .headers_mut()
+                                .insert("x-upstream-http-version", HeaderValue::from_static("2"));
+                            Ok::<_, std::convert::Infallible>(response)
+                        },
+                    );
+                    let io = hyper_util::rt::TokioIo::new(tls_stream);
+                    let builder = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    );
+                    if let Err(err) = builder.serve_connection(io, service).await {
+                        panic!("http2 sample upstream connection should serve: {err}");
                     }
                 });
             }
@@ -483,10 +599,21 @@ pub(crate) async fn spawn_tls_echo_server(
                 let mut expected_body_len = None;
 
                 loop {
-                    let read = stream
-                        .read(&mut buffer)
-                        .await
-                        .expect("request read should succeed");
+                    let read = match stream.read(&mut buffer).await {
+                        Ok(read) => read,
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::UnexpectedEof
+                            ) =>
+                        {
+                            break;
+                        }
+                        Err(err) => panic!("request read should succeed: {err}"),
+                    };
                     if read == 0 {
                         break;
                     }
@@ -537,8 +664,29 @@ pub(crate) async fn spawn_tls_echo_server(
                 stream
                     .write_all(response.as_bytes())
                     .await
-                    .expect("response should write");
-                stream.flush().await.expect("response should flush");
+                    .unwrap_or_else(|err| {
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::UnexpectedEof
+                        ) {
+                            return;
+                        }
+                        panic!("response should write: {err}");
+                    });
+                if let Err(err) = stream.flush().await
+                    && !matches!(
+                        err.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::UnexpectedEof
+                    )
+                {
+                    panic!("response should flush: {err}");
+                }
                 let _ = stream.shutdown().await;
             });
         }

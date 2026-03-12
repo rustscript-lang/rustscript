@@ -87,7 +87,7 @@ fn apply_cached_session(
     };
 
     let cached = {
-        let guard = cache.lock().expect("tls session cache lock poisoned");
+        let mut guard = cache.lock().expect("tls session cache lock poisoned");
         guard.get(&key).cloned()
     };
     let Some(cached) = cached else {

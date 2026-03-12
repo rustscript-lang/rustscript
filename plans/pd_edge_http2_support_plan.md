@@ -25,7 +25,7 @@ That gives the three properties this effort needs:
 - Add real multiplexing so multiple exchanges can share one HTTP/2 session.
 - Allow HTTP/2 to attach to TLS plaintext after ALPN `h2` or directly to TCP for cleartext prior-knowledge `h2c`.
 - Make downgrade or alternate realization explicit: a generic `http` exchange may be carried by `http1` or `http2`.
-- Keep the design consistent with the current DAG model in [pd-edge/README.md](d:/Workspace/project-d/pd-edge/README.md).
+- Keep the design consistent with the current DAG model in [pd-edge/README.md](pd-edge/README.md).
 
 ## Non-Goals For The First Milestone
 
@@ -37,18 +37,23 @@ That gives the three properties this effort needs:
 
 ## Current State
 
-Today the code has a generic-looking `http::exchange::*` ABI in [pd-edge-abi/src/abi_spec/http.exchange.rs](d:/Workspace/project-d/pd-edge-abi/src/abi_spec/http.exchange.rs), but the runtime model underneath it is still effectively HTTP/1.x shaped:
+The code now has a generic `http::exchange::*` ABI in [pd-edge-abi/src/abi_spec/http.exchange.rs](pd-edge-abi/src/abi_spec/http.exchange.rs) backed by an explicit internal split between generic HTTP exchange state in [pd-edge/src/abi_impl/http/state.rs](pd-edge/src/abi_impl/http/state.rs) and carrier-specific policy in [pd-edge/src/abi_impl/http1/mod.rs](pd-edge/src/abi_impl/http1/mod.rs) and [pd-edge/src/abi_impl/http2/mod.rs](pd-edge/src/abi_impl/http2/mod.rs).
 
-- `ProxyVmContext` in [pd-edge/src/abi_impl/http/state.rs](d:/Workspace/project-d/pd-edge/src/abi_impl/http/state.rs) stores per-exchange `tcp_dag`, `tls_dag`, and `websocket_dag`.
-- Dynamic exchanges are isolated from each other, but they are not multiplexed. Each exchange starts its own upstream request path.
-- Upstream HTTP execution currently goes through `reqwest::Client`, which hides session structure and does not expose a reusable HTTP/2 session DAG.
-- Downstream request handling in [pd-edge/src/runtime/http_plane/proxy_path.rs](d:/Workspace/project-d/pd-edge/src/runtime/http_plane/proxy_path.rs) builds one `ProxyVmContext` per incoming request.
+Implemented today:
 
-This means:
+- upstream HTTP/2 session reuse and multiplex over the generic exchange ABI
+- downstream HTTP/2 session tracking outside per-request `ProxyVmContext`
+- declared internal `Http2SessionGoal` and `Http2StreamGoal` advancement paths
+- explicit stream carrier refs attached to upstream exchanges and to real downstream HTTP/2 requests
+- GOAWAY and stream reset modeled as session or stream frontier transitions
 
-- the ABI can talk about many exchanges, but the transport layer does not have a shared HTTP/2 session under them
-- ALPN `h2` can be observed in TLS state today, but no explicit HTTP/2 DAG exists after that point
-- the current `http` module mixes generic exchange semantics with HTTP/1-style connection assumptions
+Still intentionally missing:
+
+- a VM-visible `http2::session::*` namespace
+- full connection-scoped downstream VM hosting for long-lived multi-stream sessions
+- every possible HTTP/2 frame primitive or policy surface
+
+So the current answer to "do we already have an HTTP/2 DAG?" is: yes, internally, at the carrier/session/stream layer. The VM-facing surface remains the generic `http::exchange::*` API.
 
 ## Recommended End State
 
@@ -97,6 +102,116 @@ Important ownership rule:
 - HTTP/2 session owns frame parsing, flow control, and stream ID allocation
 - generic `http` exchange owns request and response semantics for one logical message
 
+### 2A. Express HTTP/2 in the goal or advance model
+
+HTTP/2 should not be implemented as a pile of direct helper calls such as "open session", "allocate stream", or "send request". It should publish goals just like the other DAG families.
+
+Recommended internal goals:
+
+- `http2.session.attached`
+- `http2.session.open`
+- `http2.session.draining`
+- `http2.stream.attached`
+- `http2.stream.request_committed`
+- `http2.stream.response_head_ready`
+- `http2.stream.response_body_ready`
+- `http2.stream.closed`
+- `http2.stream.reset`
+
+Recommended detach goals:
+
+- `http.exchange.request_ready`
+- `http.exchange.response_ready`
+
+Meaning:
+
+- asking for `http.exchange.response_ready` on an exchange carried by HTTP/2 is allowed to transitively advance:
+  - `http2.session.open`
+  - `http2.stream.attached`
+  - `http2.stream.request_committed`
+  - `http2.stream.response_head_ready`
+- asking for `http.exchange.body.next_chunk` is allowed to transitively advance `http2.stream.response_body_ready`
+- asking for `http.exchange.send` on a dynamic outbound exchange is allowed to attach the exchange either to an `http1` carrier or to an `http2` stream, depending on carrier policy
+
+This is the core architectural requirement: callers request the exported HTTP exchange goal, while the runtime chooses and advances the underlying carrier DAG.
+
+### 2B. Define the HTTP/2 session DAG frontier
+
+Recommended session nodes:
+
+- `session candidate`
+- `session attachable`
+- `session preface sent or received`
+- `peer settings received`
+- `session open`
+- `session draining`
+- `session closed`
+- `session failed`
+
+Recommended exported capabilities:
+
+- `stream attach allowed`
+- `response frames readable`
+- `goaway observed`
+
+Legal advance paths to `http2.session.open`:
+
+- cleartext prior-knowledge path
+  - `tcp.connected`
+  - client preface sent
+  - settings exchanged
+  - `session open`
+- TLS ALPN path
+  - `tls.plaintext ready`
+  - `negotiated_alpn = h2`
+  - settings exchanged
+  - `session open`
+- session reuse path
+  - existing pooled session is already at `session open`
+  - `advance(http2.session.open)` is idempotently satisfied by reuse
+
+This mirrors the TLS reuse model already described in the DAG docs: the goal stays the same even when the chosen forward path differs.
+
+### 2C. Define the HTTP/2 stream DAG frontier
+
+Recommended stream nodes:
+
+- `stream reserved`
+- `stream attached to exchange`
+- `request headers sent`
+- `request body open`
+- `request closed`
+- `response head ready`
+- `response body open`
+- `half closed local`
+- `half closed remote`
+- `stream closed`
+- `stream reset`
+
+Recommended exported capabilities:
+
+- `http exchange request carrier attached`
+- `http exchange response head readable`
+- `http exchange response body readable`
+
+Important rule:
+
+- once an exchange is attached to an HTTP/2 stream, fallback to HTTP/1.1 is no longer legal for that exchange
+- fallback from HTTP/2 to HTTP/1.1 must happen before `http2.stream.attached` is published
+
+### 2D. Define the detach chain explicitly
+
+The runtime should model these detach edges:
+
+- `tcp.connected -> http2.session.attachable`
+- `tls.plaintext ready + negotiated_alpn=h2 -> http2.session.attachable`
+- `http2.session.open -> stream attach allowed`
+- `http2.stream.attached -> http.exchange.request_ready`
+- `http2.stream.response_head_ready -> http.exchange.response_ready`
+- `http2.stream.response_body_open -> http.exchange.body stream`
+
+This makes HTTP/2 a real sibling carrier to HTTP/1.1 rather than an implementation detail hidden under the generic HTTP exchange layer.
+
 ### 3. Keep `http::exchange::*` as the primary VM ABI
 
 The current `http::exchange::*` surface is already close to the right semantic abstraction.
@@ -119,7 +234,7 @@ The first milestone should avoid overcommitting to a large `http2::*` ABI until 
 
 ### A. Split `HttpOutboundExchangeNode`
 
-`HttpOutboundExchangeNode` in [pd-edge/src/abi_impl/http/state.rs](d:/Workspace/project-d/pd-edge/src/abi_impl/http/state.rs) should stop owning its own transport DAGs directly.
+`HttpOutboundExchangeNode` in [pd-edge/src/abi_impl/http/state.rs](pd-edge/src/abi_impl/http/state.rs) should stop owning its own transport DAGs directly.
 
 Replace the current per-exchange ownership with:
 
@@ -136,9 +251,11 @@ Replace the current per-exchange ownership with:
 
 This is the core change needed to make one HTTP/2 session carry many exchanges.
 
+The key missing piece today is that `HttpCarrierRef::Http2Stream { session_handle, stream_id }` is only implicit. It must become explicit in the exchange state so the generic exchange DAG can ask its carrier to satisfy goals instead of hardcoding HTTP/2 request startup inline.
+
 ### B. Add shared upstream HTTP session state
 
-`SharedState` in [pd-edge/src/runtime.rs](d:/Workspace/project-d/pd-edge/src/runtime.rs) currently shares a `reqwest::Client` and the TLS session cache across requests.
+`SharedState` in [pd-edge/src/runtime.rs](pd-edge/src/runtime.rs) currently shares a `reqwest::Client` and the TLS session cache across requests.
 
 HTTP/2 needs a new shared upstream session manager, for example:
 
@@ -156,6 +273,26 @@ The HTTP/2 manager should:
 - allocate stream IDs
 - track session health and GOAWAY state
 - know when a new session must be created instead of reusing an old one
+
+Recommended state split:
+
+```rust
+struct Http2SessionState {
+    frontier: Http2SessionFrontier,
+    peer_settings: ...,
+    goaway: Option<Http2GoawayState>,
+    streams: HashMap<u32, Http2StreamState>,
+    next_local_stream_id: u32,
+}
+
+struct Http2StreamState {
+    frontier: Http2StreamFrontier,
+    exchange_handle: i64,
+    reset: Option<Http2ResetState>,
+}
+```
+
+The important point is that frontier state must be stored in terms of DAG nodes and exported capabilities, not just ad hoc booleans.
 
 Recommended session-pool key inputs:
 
@@ -186,7 +323,7 @@ Without that, multiplex will remain accidental or opaque rather than explicit.
 
 ### D. Introduce `http1` and `http2` internal modules
 
-Recommended new modules under [pd-edge/src/abi_impl/](d:/Workspace/project-d/pd-edge/src/abi_impl/):
+Recommended new modules under [pd-edge/src/abi_impl/](pd-edge/src/abi_impl/):
 
 - `http/`
   - generic exchange state and version-agnostic helpers
@@ -197,8 +334,8 @@ Recommended new modules under [pd-edge/src/abi_impl/](d:/Workspace/project-d/pd-
 
 This should be accompanied by documentation updates in:
 
-- [pd-edge/README.md](d:/Workspace/project-d/pd-edge/README.md)
-- [pd-edge/docs/full-dag.md](d:/Workspace/project-d/pd-edge/docs/full-dag.md)
+- [pd-edge/README.md](pd-edge/README.md)
+- [pd-edge/docs/full-dag.md](pd-edge/docs/full-dag.md)
 
 ## Downstream And Upstream Strategy
 
@@ -214,7 +351,7 @@ Reason:
 
 ### Downstream second
 
-The current downstream runtime creates one `ProxyVmContext` per request in [pd-edge/src/runtime/http_plane/proxy_path.rs](d:/Workspace/project-d/pd-edge/src/runtime/http_plane/proxy_path.rs).
+The current downstream runtime creates one `ProxyVmContext` per request in [pd-edge/src/runtime/http_plane/proxy_path.rs](pd-edge/src/runtime/http_plane/proxy_path.rs).
 
 That is compatible with individual HTTP/2 streams as long as the server stack does the demultiplexing first, but it is not enough to represent a visible downstream HTTP/2 session DAG with shared settings, stream IDs, resets, and GOAWAY.
 
@@ -222,6 +359,13 @@ Recommended downstream rollout:
 
 - Phase 1: downstream HTTP/2 requests can enter the runtime as generic HTTP requests, with version metadata preserved
 - Phase 2: add an explicit downstream HTTP/2 session store so the DAG model can represent the client-side session, not just isolated requests
+
+For the full DAG end state, downstream needs the same goal model as upstream:
+
+- one connection-scoped HTTP/2 session DAG outside `ProxyVmContext`
+- one stream DAG per downstream request
+- per-request `ProxyVmContext` attaches to `HttpCarrierRef::Http2Stream { session_id, stream_id }`
+- GOAWAY and stream-reset events update the session and stream frontiers without corrupting unrelated requests
 
 ## Detach Semantics
 
@@ -342,14 +486,17 @@ Exit criteria:
 - Add a downstream HTTP/2 session store outside per-request `ProxyVmContext`
 - Represent GOAWAY, stream resets, and shared session state explicitly
 - Decide whether any session introspection should become VM-visible
+- Replace coarse downstream lifecycle tracking with real session and stream frontier tracking
+- Attach each downstream request context to an explicit HTTP/2 stream carrier ref
 
 Exit criteria:
 
 - docs and runtime both model downstream HTTP/2 as a real session, not just opaque server behavior
+- the runtime can satisfy `http.exchange.*` goals by advancing either an HTTP/1 or HTTP/2 carrier without special-case request startup code
 
 ## Test Plan
 
-Add or expand tests in [pd-edge/tests/proxy_tests/http.rs](d:/Workspace/project-d/pd-edge/tests/proxy_tests/http.rs) and related support code for:
+Add or expand tests in [pd-edge/tests/proxy_tests/http.rs](pd-edge/tests/proxy_tests/http.rs) and related support code for:
 
 - upstream exchange works over negotiated HTTP/2
 - two dynamic exchanges multiplex over one upstream HTTP/2 session

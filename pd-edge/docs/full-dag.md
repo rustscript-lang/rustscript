@@ -1,6 +1,9 @@
-# Full DAG Graph
+# Full DAG Graphs
 
-This page collects the currently supported protocol DAGs into one conceptual graph.
+This page separates the currently supported protocol model into two conceptual graphs:
+
+- downstream DAGs on the client-facing side
+- upstream and exchange DAGs that the runtime may allocate or advance while serving a request
 
 Notes:
 
@@ -8,11 +11,15 @@ Notes:
 - `exchange n` represents additional outbound exchanges allocated with `http::exchange::new()`.
 - `udp socket 1` is the reserved default upstream UDP handle; `udp socket n` represents additional outbound sockets allocated with `udp::socket::new()`.
 - `webrtc connection 1` is the reserved default upstream WebRTC handle; `webrtc connection n` represents additional outbound connections allocated with `webrtc::connection::new()`.
-- The graph shows the union of currently supported DAG families. `http`, `http2`, `tls`, `websocket`, and `webrtc` are feature-gated; the default build enables `http`, `tls`, and `websocket`.
-- Current HTTP/2 support is upstream-only and lives under the generic HTTP exchange layer. The VM still uses `http::exchange::*`; feature `http2` currently selects an `h2` carrier and permits multiplexed upstream reuse rather than exposing a public `http2::session::*` ABI.
-- The proxy layer is a capability layer, not a protocol DAG. It connects exported byte streams from TCP, TLS plaintext, HTTP bodies, and WebSocket binary adapters.
+- These graphs show the union of currently supported DAG families. `http`, `http2`, `tls`, `websocket`, and `webrtc` are feature-gated; the default build enables `http`, `tls`, and `websocket`.
+- Current HTTP/2 support lives under the generic HTTP exchange layer. The VM still uses `http::exchange::*`; feature `http2` owns upstream `h2` session reuse explicitly and tracks downstream HTTP/2 sessions in the data-plane server.
+- HTTP/2 now has declared internal `session` and `stream` goals, explicit stream carrier refs attached to exchanges, and GOAWAY/reset frontier tracking. It is still an internal carrier DAG rather than a separate VM-visible `http2::*` ABI.
+- Internally, carrier-specific policy is now split into `src/abi_impl/http1/` and `src/abi_impl/http2/`, while the generic exchange state remains under `src/abi_impl/http/`.
+- VM host calls, request execution, graph resolution, and proxy byte-stream wiring are runtime control layers, not protocol goals. They are intentionally omitted from the graphs below.
 - UDP datagrams and WebRTC data-channel messages do not currently flow through `proxy::pipe` or `proxy::tunnel`; they remain sibling message-oriented DAGs.
-- The graph is intentionally conceptual. It shows ingress and egress connections between DAGs, not every internal transition implemented by each subsystem.
+- These graphs are intentionally conceptual. They show ingress and egress connections between DAGs, not every internal transition implemented by each subsystem.
+
+## Downstream Graph
 
 ```mermaid
 flowchart LR
@@ -69,20 +76,16 @@ flowchart LR
         DWR0 --> DWR1
     end
 
-    subgraph VM["VM And Resolver"]
-        VM0["VM host calls"]
-        VM1["graph resolver after VM halt"]
-        VM0 --> VM1
-    end
+    DT1 --> DTL0
+    DT1 --> DH0
+    DTL2 --> DH0
+    DH1 --> DW0
+```
 
-    subgraph PX["Proxy Byte Stream Layer"]
-        PX0["exported byte stream handles"]
-        PX1["proxy pipe"]
-        PX2["proxy tunnel"]
-        PX0 --> PX1
-        PX0 --> PX2
-    end
+## Upstream And Exchange Graph
 
+```mermaid
+flowchart LR
     subgraph US_TCP["Upstream TCP DAG"]
         UT0["dial pending"]
         UT1["upstream connected"]
@@ -193,29 +196,6 @@ flowchart LR
         R6 --> R7
     end
 
-    DT1 --> DTL0
-    DT1 --> DH0
-    DTL2 --> DH0
-    DH1 --> DW0
-
-    DH1 --> VM0
-    DH2 --> VM0
-    VM0 --> DH3
-    VM1 --> DH4
-
-    VM0 --> U1A
-    VM0 --> UN0
-    VM0 --> UU0
-    VM0 --> R0
-    U1D --> VM0
-    U1E --> VM0
-    UN4 --> VM0
-    UN5 --> VM0
-    UU4 --> VM0
-    UU5 --> VM0
-    R5 --> VM0
-    R6 --> VM0
-
     UT1 --> UTL0
     UT1 --> U1A
     UT1 --> UN1
@@ -228,21 +208,4 @@ flowchart LR
     U1A --> W0
     UN1 --> W0
     R0 -. signaling outside current DAG .-> R1
-
-    DT2 --> PX0
-    DT3 --> PX0
-    DTL2 --> PX0
-    DH2 --> PX0
-    DH3 --> PX0
-    UT1 --> PX0
-    UTL2 --> PX0
-    U1B --> PX0
-    U1E --> PX0
-    UN2 --> PX0
-    UN5 --> PX0
-    W2 --> PX0
-    VM0 --> PX1
-    VM0 --> PX2
-    PX1 --> VM0
-    PX2 --> VM0
 ```
