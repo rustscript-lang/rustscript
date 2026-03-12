@@ -15,6 +15,9 @@ mod support;
 mod tls;
 #[path = "proxy_tests/transport.rs"]
 mod transport;
+#[cfg(feature = "webrtc")]
+#[path = "proxy_tests/webrtc.rs"]
+mod webrtc;
 #[cfg(feature = "websocket")]
 #[path = "proxy_tests/websocket.rs"]
 mod websocket;
