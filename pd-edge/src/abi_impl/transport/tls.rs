@@ -86,13 +86,8 @@ fn apply_cached_session(
         let (target, flow) = match session {
             TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => return Ok(false),
             TlsSessionHandle::Reserved(TlsSessionRef::DefaultUpstream) => {
-                let target = {
-                    let exchanges = context.lock_exchanges();
-                    exchanges
-                        .exchanges
-                        .get(&super::super::http::default_upstream_exchange_handle())
-                        .and_then(|exchange| exchange.request.target.clone())
-                };
+                let target = context
+                    .with_default_upstream_exchange(|exchange| exchange.request.target.clone());
                 let flow = {
                     let transport = context.lock_transport();
                     transport.tls_dag.default_upstream.clone()
