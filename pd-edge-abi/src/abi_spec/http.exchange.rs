@@ -43,6 +43,17 @@ fn http_exchange_set_target(exchange: i64, target: &str) {
     unreachable!("abi declaration only")
 }
 
+#[pd_host_function(name = "http::exchange::attach_tcp")]
+fn http_exchange_attach_tcp(exchange: i64, stream: i64) {
+    unreachable!("abi declaration only")
+}
+
+#[cfg(feature = "tls")]
+#[pd_host_function(name = "http::exchange::attach_tls_plaintext")]
+fn http_exchange_attach_tls_plaintext(exchange: i64, session: i64) {
+    unreachable!("abi declaration only")
+}
+
 #[pd_host_function(name = "http::exchange::set_body")]
 fn http_exchange_set_body(exchange: i64, body: &str) {
     unreachable!("abi declaration only")

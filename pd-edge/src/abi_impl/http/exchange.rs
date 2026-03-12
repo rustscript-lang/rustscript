@@ -4,8 +4,11 @@ use pd_edge_host_function::pd_edge_host_function;
 use vm::bytecode::VmMap;
 use vm::{CallOutcome, Value, Vm, VmError};
 
+#[cfg(feature = "tls")]
+use super::attach_outbound_exchange_tls_transport;
 use super::{
-    SharedProxyVmContext, allocate_outbound_exchange_handle, default_upstream_exchange_handle,
+    SharedProxyVmContext, allocate_outbound_exchange_handle,
+    attach_outbound_exchange_tcp_transport, default_upstream_exchange_handle,
     ensure_outbound_exchange_response_started, headers_to_value_map, is_valid_request_path,
     is_valid_upstream, outbound_exchange_exists, outbound_exchange_response_eof, parse_header,
     parse_header_name, parse_headers_map, read_outbound_exchange_response_all,
@@ -197,6 +200,31 @@ async fn set_exchange_target(
         tcp_flow.configure();
         tls_flow.observe_target(&upstream);
     })?;
+    Ok(CallOutcome::Return(vec![]))
+}
+
+#[pd_edge_host_function(name = http_exchange::ATTACH_TCP.name, scope = http)]
+async fn attach_exchange_tcp(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    exchange: i64,
+    stream: i64,
+) -> Result<CallOutcome, VmError> {
+    ensure_known_exchange_handle(&context, exchange)?;
+    attach_outbound_exchange_tcp_transport(&context, exchange, stream)?;
+    Ok(CallOutcome::Return(vec![]))
+}
+
+#[cfg(feature = "tls")]
+#[pd_edge_host_function(name = http_exchange::ATTACH_TLS_PLAINTEXT.name, scope = http)]
+async fn attach_exchange_tls_plaintext(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    exchange: i64,
+    session: i64,
+) -> Result<CallOutcome, VmError> {
+    ensure_known_exchange_handle(&context, exchange)?;
+    attach_outbound_exchange_tls_transport(&context, exchange, session)?;
     Ok(CallOutcome::Return(vec![]))
 }
 

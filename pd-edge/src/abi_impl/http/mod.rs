@@ -24,6 +24,8 @@ mod state;
 mod upstream;
 
 #[cfg(feature = "tls")]
+pub(crate) use state::attach_outbound_exchange_tls_transport;
+#[cfg(feature = "tls")]
 pub(crate) use state::upstream_response_available;
 #[cfg(feature = "websocket")]
 pub(crate) use state::{HttpOutboundRequestNode, build_upstream_url, is_hop_by_hop_header};
@@ -34,15 +36,16 @@ pub(crate) use state::{
     ensure_upstream_response_started, read_request_body_all,
 };
 pub(crate) use state::{
-    allocate_udp_socket_handle, append_outbound_exchange_body, append_outbound_exchange_body_bytes,
-    append_response_output_body_bytes, consume_request_body_all, default_upstream_exchange_handle,
-    default_upstream_udp_socket_handle, outbound_exchange_exists,
+    allocate_tcp_stream_handle, allocate_udp_socket_handle, append_outbound_exchange_body,
+    append_outbound_exchange_body_bytes, append_response_output_body_bytes,
+    attach_outbound_exchange_tcp_transport, consume_request_body_all,
+    default_upstream_exchange_handle, default_upstream_udp_socket_handle, outbound_exchange_exists,
     outbound_exchange_response_available, outbound_exchange_response_eof,
     outbound_exchange_tls_flow, read_outbound_exchange_response_all,
     read_outbound_exchange_response_next_chunk, read_outbound_exchange_response_next_line,
     read_request_body_next_chunk, read_request_body_next_line, read_upstream_response_all,
     read_upstream_response_next_chunk, read_upstream_response_next_line, request_body_eof,
-    resolve_http_graph_response, udp_socket_exists, upstream_response_eof,
+    resolve_http_graph_response, tcp_stream_exists, udp_socket_exists, upstream_response_eof,
 };
 #[cfg(feature = "webrtc")]
 pub(crate) use state::{
