@@ -143,6 +143,77 @@ pub(crate) async fn spawn_chunked_upstream(
     (addr, handle)
 }
 
+pub(crate) async fn spawn_connect_forward_proxy() -> (SocketAddr, JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener should have addr");
+    let handle = tokio::spawn(async move {
+        loop {
+            let (mut downstream, _) = listener.accept().await.expect("accept should succeed");
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                loop {
+                    let read = downstream
+                        .read(&mut buffer)
+                        .await
+                        .expect("proxy request should read");
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+
+                let request_text = String::from_utf8_lossy(&request);
+                let Some(first_line) = request_text.lines().next() else {
+                    return;
+                };
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let authority = parts.next().unwrap_or("");
+                if !method.eq_ignore_ascii_case("CONNECT") || authority.is_empty() {
+                    let _ = downstream
+                        .write_all(
+                            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = downstream.shutdown().await;
+                    return;
+                }
+
+                let mut upstream = match tokio::net::TcpStream::connect(authority).await {
+                    Ok(stream) => stream,
+                    Err(_) => {
+                        let _ = downstream
+                            .write_all(
+                                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                        let _ = downstream.shutdown().await;
+                        return;
+                    }
+                };
+                downstream
+                    .write_all(
+                        b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: pd-edge-test\r\n\r\n",
+                    )
+                    .await
+                    .expect("proxy connect response should write");
+                let _ = copy_bidirectional(&mut downstream, &mut upstream).await;
+                let _ = downstream.shutdown().await;
+                let _ = upstream.shutdown().await;
+            });
+        }
+    });
+    (addr, handle)
+}
+
 pub(crate) async fn run_edge_program_direct(
     program: Program,
     context: Arc<Mutex<ProxyVmContext>>,

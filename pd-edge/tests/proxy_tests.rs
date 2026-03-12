@@ -6,6 +6,9 @@ mod attach_transport;
 mod control_plane;
 #[path = "proxy_tests/debug.rs"]
 mod debug;
+#[cfg(feature = "tls")]
+#[path = "proxy_tests/forward_proxy.rs"]
+mod forward_proxy;
 #[path = "proxy_tests/http.rs"]
 mod http;
 #[path = "proxy_tests/io.rs"]
