@@ -366,6 +366,7 @@ pub(crate) enum HttpCarrierRef {
     DownstreamHttp2Stream(http2::Http2StreamRef),
     Http1DefaultUpstream,
     Http1DynamicExchange(i64),
+    #[cfg_attr(not(feature = "http2"), allow(dead_code))]
     UpstreamHttp2Stream(http2::Http2StreamRef),
 }
 

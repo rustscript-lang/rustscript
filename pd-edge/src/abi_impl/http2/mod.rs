@@ -299,7 +299,7 @@ pub(crate) fn configure_reqwest_builder(
     #[cfg(not(feature = "http2"))]
     {
         let _ = mode;
-        return builder;
+        builder
     }
 
     #[cfg(feature = "http2")]

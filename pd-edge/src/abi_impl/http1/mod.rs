@@ -15,6 +15,7 @@ pub(crate) fn response_version_label(version: Version) -> &'static str {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn session_origin(target: &str) -> Option<String> {
     let url = Url::parse(target).ok()?;
     let host = url.host_str()?.to_ascii_lowercase();

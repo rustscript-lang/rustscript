@@ -15,10 +15,11 @@ use vm::{Program, decode_program, validate_program};
 use crate::{
     HOST_FUNCTION_COUNT,
     abi_impl::{
-        http::{SharedUpstreamClientCache, new_shared_upstream_client_cache},
         RateLimiterStore, SharedHttpDownstreamSessions, SharedHttpUpstreamSessions,
-        SharedRateLimiter, SharedTlsSessionCache, new_shared_http_downstream_sessions,
-        new_shared_http_upstream_sessions, new_shared_tls_session_cache,
+        SharedRateLimiter, SharedTlsSessionCache,
+        http::{SharedUpstreamClientCache, new_shared_upstream_client_cache},
+        new_shared_http_downstream_sessions, new_shared_http_upstream_sessions,
+        new_shared_tls_session_cache,
     },
     cache::{
         DEFAULT_DOWNSTREAM_HTTP2_SESSION_STORE_CAPACITY, DEFAULT_TLS_SESSION_REUSE_STORE_CAPACITY,

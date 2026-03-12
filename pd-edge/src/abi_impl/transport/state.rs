@@ -197,11 +197,7 @@ struct SocketAddressState {
 
 impl SocketAddressState {
     fn optional_value(value: String) -> Option<String> {
-        if value.is_empty() {
-            None
-        } else {
-            Some(value)
-        }
+        if value.is_empty() { None } else { Some(value) }
     }
 
     fn set_bind_address(&mut self, address: String) {

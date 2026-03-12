@@ -39,6 +39,7 @@ where
         self.values.get(key)
     }
 
+    #[cfg_attr(not(feature = "http2"), allow(dead_code))]
     pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         if !self.values.contains_key(key) {
             return None;
@@ -59,11 +60,13 @@ where
         previous
     }
 
+    #[cfg_attr(not(feature = "http2"), allow(dead_code))]
     pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
         self.remove_from_lru(key);
         self.values.remove(key)
     }
 
+    #[cfg_attr(not(feature = "http2"), allow(dead_code))]
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
         let to_remove = self
             .values
