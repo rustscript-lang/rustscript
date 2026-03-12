@@ -1,5 +1,6 @@
 use http;
 
+// Forward requests after optionally rewriting the downstream body chunk-by-chunk.
 let upstream = http::request::get_header("x-upstream-target");
 
 if upstream == "" {
@@ -9,6 +10,7 @@ if upstream == "" {
     http::upstream::request::set_target(upstream);
 
     if http::request::get_header("Chunk-Transform") != "" {
+        // Consume the request stream incrementally and annotate each chunk before upload.
         let mut transformed = "";
         while !http::request::body::eof() {
             transformed = transformed + http::request::body::next_chunk(3) + "#";
@@ -16,10 +18,12 @@ if upstream == "" {
         http::upstream::request::set_body(transformed);
         http::response::set_header("x-request-stream", "true");
     } else {
+        // Or forward the buffered request body unchanged.
         http::upstream::request::set_body(http::request::get_body());
         http::response::set_header("x-request-stream", "false");
     }
 
+    // Mirror the upstream result after the transformed request has been sent.
     let upstream_status = http::upstream::response::get_status();
     let content_type = http::upstream::response::get_header("content-type");
     if content_type != "" {

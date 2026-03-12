@@ -1,5 +1,6 @@
 use http;
 
+// Minimal forwarding sample: send the request to x-upstream-target and mirror the response.
 let upstream = http::request::get_header("x-upstream-target");
 
 if upstream == "" {
@@ -8,6 +9,7 @@ if upstream == "" {
 } else {
     http::upstream::request::set_target(upstream);
 
+    // Accessing the response metadata/body implicitly executes the outbound exchange.
     let upstream_status = http::upstream::response::get_status();
     let content_type = http::upstream::response::get_header("content-type");
     if content_type != "" {
@@ -16,6 +18,7 @@ if upstream == "" {
     http::response::set_status(upstream_status);
 
     if http::request::get_header("Streaming") != "" {
+        // Read the response incrementally to make streaming behavior visible to the caller.
         let mut streamed = "";
         while !http::upstream::response::body::eof() {
             streamed = streamed + http::upstream::response::body::next_chunk(2) + "A";

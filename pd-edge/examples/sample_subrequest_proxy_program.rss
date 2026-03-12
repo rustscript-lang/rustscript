@@ -2,6 +2,9 @@ use http;
 use tcp;
 use tls;
 
+// Required request headers:
+// - x-primary-target: first upstream endpoint sent through the default exchange handle
+// - x-secondary-target: second upstream endpoint sent through an explicit exchange handle
 let primary_target = http::request::get_header("x-primary-target");
 let secondary_target = http::request::get_header("x-secondary-target");
 
@@ -9,12 +12,14 @@ if primary_target == "" || secondary_target == "" {
     http::response::set_status(400);
     http::response::set_body("missing x-primary-target or x-secondary-target");
 } else {
+    // Use both the default handle and a second explicit handle to demonstrate concurrent subrequests.
     let primary = http::exchange::default_upstream();
     let secondary = http::exchange::new();
 
     http::exchange::set_method(primary, "POST");
     http::exchange::set_target(primary, primary_target);
     http::exchange::set_header(primary, "x-exchange-id", "primary");
+    // Writes against the exchange handle stage the outbound request body.
     tcp::stream::write(primary, "alpha");
 
     http::exchange::set_method(secondary, "POST");
@@ -22,6 +27,7 @@ if primary_target == "" || secondary_target == "" {
     http::exchange::set_header(secondary, "x-exchange-id", "secondary");
     tcp::stream::write(secondary, "beta");
 
+    // Start the primary exchange explicitly, then inspect the secondary TLS session before reading bodies.
     http::exchange::send(primary);
 
     let secondary_tls = tls::session::from_socket(secondary);
@@ -36,6 +42,7 @@ if primary_target == "" || secondary_target == "" {
         }
     }
 
+    // Read the two responses through different APIs so both access styles stay documented.
     let mut primary_body = "";
     while !tcp::stream::eof(primary) {
         primary_body = primary_body + tcp::stream::read(primary, 3);
@@ -46,5 +53,6 @@ if primary_target == "" || secondary_target == "" {
         secondary_body = secondary_body + http::exchange::body::next_chunk(secondary, 4);
     }
 
+    // Return both bodies so tests can assert that each upstream exchange completed.
     http::response::set_body(primary_body + "|" + secondary_body);
 }

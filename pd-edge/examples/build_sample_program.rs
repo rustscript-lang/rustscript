@@ -4,6 +4,7 @@ use edge::{ABI_VERSION, HOST_FUNCTION_COUNT, compile_edge_source_file, function_
 use reqwest::StatusCode;
 use vm::{HostImport, encode_program, validate_program};
 
+// Compile an example source file, validate it against the current host ABI, then upload it.
 const SOURCE_PATH: &str = "examples/sample_proxy_program.rss";
 const CONTROL_URL: &str = "http://127.0.0.1:8081/program";
 
@@ -15,9 +16,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(source_rel);
     let compiled = compile_edge_source_file(&source_path)?;
 
+    // Fail early if the program targets stale or mismatched host imports.
     ensure_edge_abi(&compiled.program.imports)?;
     validate_program(&compiled.program, HOST_FUNCTION_COUNT)?;
 
+    // Upload the encoded program to the local control plane once validation succeeds.
     let payload = encode_program(&compiled.program)?;
     let client = reqwest::Client::new();
     let response = client
@@ -45,6 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn ensure_edge_abi(imports: &[HostImport]) -> Result<(), io::Error> {
+    // Keep upload failures actionable by checking every imported host function up front.
     for import in imports {
         let Some(abi) = function_by_name(&import.name) else {
             return Err(io::Error::other(format!(
