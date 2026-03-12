@@ -1,23 +1,36 @@
+use std::{io, io::BufReader, sync::Arc};
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use edge_abi::symbols::tls;
 use pd_edge_host_function::pd_edge_host_function;
+use tokio_rustls::{
+    TlsConnector,
+    rustls::{
+        self, ClientConfig, RootCertStore, SignatureScheme,
+        client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+        pki_types::{CertificateDer, ServerName, UnixTime},
+        version::{TLS12, TLS13},
+    },
+};
 use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::super::SharedProxyVmContext;
 use super::super::http::{
     ensure_outbound_exchange_response_started, ensure_upstream_response_started,
     outbound_exchange_exists, outbound_exchange_response_available, outbound_exchange_tls_flow,
-    upstream_response_available,
+    tcp_stream_exists, upstream_response_available,
 };
 use super::super::websocket::{
     ensure_outbound_websocket_connection_open, websocket_connection_mode,
 };
 use super::state::tls_session_cache_key;
 use super::state::{TlsFlowState, TlsProtocolVersion, TlsSessionRef, decode_tls_session_handle};
+use crate::abi_impl::http1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TlsSessionHandle {
     Reserved(TlsSessionRef),
+    Dynamic(i64),
     OutboundExchange(i64),
 }
 
@@ -28,27 +41,37 @@ fn decode_session(
     if let Some(reserved) = decode_tls_session_handle(session) {
         return Ok(TlsSessionHandle::Reserved(reserved));
     }
+    if tcp_stream_exists(context, session) {
+        return Ok(TlsSessionHandle::Dynamic(session));
+    }
     if outbound_exchange_exists(context, session) {
         return Ok(TlsSessionHandle::OutboundExchange(session));
     }
     Err(VmError::HostError(format!(
-        "invalid tls session handle {session}; reserved handles are 0 (downstream), 1 (default upstream), and allocated outbound exchange handles start at 2",
+        "invalid tls session handle {session}; use 0/1 for reserved sessions, a dynamic tcp handle from tcp::stream::new(), or an outbound exchange handle",
     )))
 }
 
 fn session_flow(context: &SharedProxyVmContext, session: TlsSessionHandle) -> TlsFlowState {
-    if let TlsSessionHandle::OutboundExchange(handle) = session {
-        return outbound_exchange_tls_flow(context, handle)
-            .expect("exchange handle should exist while tls session is in use");
-    }
-
-    let guard = context.lock().expect("vm context lock poisoned");
     match session {
-        TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => guard.tls_dag.downstream.clone(),
+        TlsSessionHandle::OutboundExchange(handle) => outbound_exchange_tls_flow(context, handle)
+            .expect("exchange handle should exist while tls session is in use"),
+        TlsSessionHandle::Dynamic(handle) => {
+            let guard = context.lock().expect("vm context lock poisoned");
+            guard
+                .dynamic_tls_sessions
+                .get(&handle)
+                .cloned()
+                .unwrap_or_else(TlsFlowState::for_dynamic_socket)
+        }
+        TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => {
+            let guard = context.lock().expect("vm context lock poisoned");
+            guard.tls_dag.downstream.clone()
+        }
         TlsSessionHandle::Reserved(TlsSessionRef::DefaultUpstream) => {
+            let guard = context.lock().expect("vm context lock poisoned");
             guard.tls_dag.default_upstream.clone()
         }
-        TlsSessionHandle::OutboundExchange(_) => unreachable!("handled above"),
     }
 }
 
@@ -67,6 +90,7 @@ fn apply_cached_session(
                 guard.outbound_request.target.as_deref(),
                 &guard.tls_dag.default_upstream,
             ),
+            TlsSessionHandle::Dynamic(_) => return Ok(false),
             TlsSessionHandle::OutboundExchange(handle) => {
                 let Some(exchange) = guard.outbound_exchanges.get(&handle) else {
                     return Ok(false);
@@ -100,6 +124,13 @@ fn apply_cached_session(
         TlsSessionHandle::Reserved(TlsSessionRef::DefaultUpstream) => {
             guard.tls_dag.default_upstream.mark_session_reused(&cached);
         }
+        TlsSessionHandle::Dynamic(handle) => {
+            let flow = guard
+                .dynamic_tls_sessions
+                .entry(handle)
+                .or_insert_with(TlsFlowState::for_dynamic_socket);
+            flow.mark_session_reused(&cached);
+        }
         TlsSessionHandle::OutboundExchange(handle) => {
             let Some(exchange) = guard.outbound_exchanges.get_mut(&handle) else {
                 return Ok(false);
@@ -129,6 +160,20 @@ fn with_configurable_outbound_session_mut<T>(
             }
             let mut guard = context.lock().expect("vm context lock poisoned");
             mutate(&mut guard.tls_dag.default_upstream)
+        }
+        TlsSessionHandle::Dynamic(handle) => {
+            let mut guard = context.lock().expect("vm context lock poisoned");
+            let io_present = guard.dynamic_tls_session_ios.contains_key(&handle);
+            let flow = guard
+                .dynamic_tls_sessions
+                .entry(handle)
+                .or_insert_with(TlsFlowState::for_dynamic_socket);
+            if flow.handshake_complete() || io_present {
+                return Err(VmError::HostError(format!(
+                    "dynamic tls session handle {handle} is read-only after the handshake completes",
+                )));
+            }
+            mutate(flow)
         }
         TlsSessionHandle::OutboundExchange(handle) => {
             if outbound_exchange_response_available(context, handle) {
@@ -184,6 +229,247 @@ fn parse_tls_version_label(label: &str) -> Result<TlsProtocolVersion, VmError> {
     }
 }
 
+fn ensure_rustls_provider() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
+fn build_root_store(flow: &TlsFlowState) -> Result<RootCertStore, VmError> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(bundle) = flow.trusted_certificate_pem() {
+        let mut reader = BufReader::new(bundle.as_bytes());
+        for certificate in rustls_pemfile::certs(&mut reader) {
+            let certificate = certificate.map_err(|err| {
+                VmError::HostError(format!("failed to parse trusted certificate bundle: {err}"))
+            })?;
+            roots.add(certificate).map_err(|err| {
+                VmError::HostError(format!(
+                    "failed to add trusted certificate to root store: {err}",
+                ))
+            })?;
+        }
+    }
+    Ok(roots)
+}
+
+fn load_client_cert_chain(
+    certificate_pem: Option<&str>,
+) -> Result<Vec<CertificateDer<'static>>, VmError> {
+    let Some(certificate_pem) = certificate_pem else {
+        return Ok(Vec::new());
+    };
+    let mut reader = BufReader::new(certificate_pem.as_bytes());
+    let chain = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, io::Error>>()
+        .map_err(|err| {
+            VmError::HostError(format!("failed to parse client certificate chain: {err}"))
+        })?;
+    if chain.is_empty() {
+        return Err(VmError::HostError(
+            "client certificate chain is empty".to_string(),
+        ));
+    }
+    Ok(chain)
+}
+
+fn load_client_private_key(
+    private_key_pem: Option<&str>,
+) -> Result<rustls::pki_types::PrivateKeyDer<'static>, VmError> {
+    let Some(private_key_pem) = private_key_pem else {
+        return Err(VmError::HostError(
+            "client private key is unavailable".to_string(),
+        ));
+    };
+    let mut reader = BufReader::new(private_key_pem.as_bytes());
+    rustls_pemfile::private_key(&mut reader)
+        .map_err(|err| VmError::HostError(format!("failed to parse client private key: {err}")))?
+        .ok_or_else(|| VmError::HostError("client private key is unavailable".to_string()))
+}
+
+fn supported_protocol_versions(
+    flow: &TlsFlowState,
+) -> Result<Vec<&'static rustls::SupportedProtocolVersion>, VmError> {
+    if matches!(
+        flow.min_version(),
+        Some(TlsProtocolVersion::Tls1_0) | Some(TlsProtocolVersion::Tls1_1)
+    ) || matches!(
+        flow.max_version(),
+        Some(TlsProtocolVersion::Tls1_0) | Some(TlsProtocolVersion::Tls1_1)
+    ) {
+        return Err(VmError::HostError(
+            "manual tls transport only supports TLS 1.2 or newer".to_string(),
+        ));
+    }
+    let min = flow.min_version().unwrap_or(TlsProtocolVersion::Tls1_2);
+    let max = flow.max_version().unwrap_or(TlsProtocolVersion::Tls1_3);
+    if min > max {
+        return Err(VmError::HostError(
+            "tls min version cannot be greater than max version".to_string(),
+        ));
+    }
+
+    let mut versions = Vec::new();
+    if min <= TlsProtocolVersion::Tls1_2 && max >= TlsProtocolVersion::Tls1_2 {
+        versions.push(&TLS12);
+    }
+    if min <= TlsProtocolVersion::Tls1_3 && max >= TlsProtocolVersion::Tls1_3 {
+        versions.push(&TLS13);
+    }
+    if versions.is_empty() {
+        return Err(VmError::HostError(
+            "tls version constraints left no supported protocol versions".to_string(),
+        ));
+    }
+    Ok(versions)
+}
+
+struct PermissiveServerCertVerifier {
+    delegate: Arc<dyn ServerCertVerifier>,
+}
+
+impl std::fmt::Debug for PermissiveServerCertVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PermissiveServerCertVerifier")
+    }
+}
+
+impl PermissiveServerCertVerifier {
+    fn new(roots: RootCertStore) -> Self {
+        let delegate = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .expect("webpki verifier should build");
+        Self { delegate }
+    }
+}
+
+impl ServerCertVerifier for PermissiveServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.delegate.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.delegate.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.delegate.supported_verify_schemes()
+    }
+}
+
+fn build_dynamic_client_config(flow: &TlsFlowState) -> Result<ClientConfig, VmError> {
+    ensure_rustls_provider();
+    let versions = supported_protocol_versions(flow)?;
+    let builder =
+        ClientConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+            .with_protocol_versions(&versions)
+            .map_err(|err| {
+                VmError::HostError(format!("failed to configure tls versions: {err}"))
+            })?;
+
+    let mut config = if flow.verify_peer() && flow.verify_hostname() {
+        match (flow.client_certificate_pem(), flow.client_private_key_pem()) {
+            (Some(_), Some(_)) => builder
+                .with_root_certificates(build_root_store(flow)?)
+                .with_client_auth_cert(
+                    load_client_cert_chain(flow.client_certificate_pem())?,
+                    load_client_private_key(flow.client_private_key_pem())?,
+                )
+                .map_err(|err| {
+                    VmError::HostError(format!(
+                        "failed to configure client certificate for tls session: {err}",
+                    ))
+                })?,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(VmError::HostError(
+                    "client certificate and private key must both be configured".to_string(),
+                ));
+            }
+            (None, None) => builder
+                .with_root_certificates(build_root_store(flow)?)
+                .with_no_client_auth(),
+        }
+    } else {
+        let verifier = Arc::new(PermissiveServerCertVerifier::new(build_root_store(flow)?));
+        let dangerous = builder
+            .dangerous()
+            .with_custom_certificate_verifier(verifier);
+        match (flow.client_certificate_pem(), flow.client_private_key_pem()) {
+            (Some(_), Some(_)) => dangerous
+                .with_client_auth_cert(
+                    load_client_cert_chain(flow.client_certificate_pem())?,
+                    load_client_private_key(flow.client_private_key_pem())?,
+                )
+                .map_err(|err| {
+                    VmError::HostError(format!(
+                        "failed to configure client certificate for tls session: {err}",
+                    ))
+                })?,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(VmError::HostError(
+                    "client certificate and private key must both be configured".to_string(),
+                ));
+            }
+            (None, None) => dangerous.with_no_client_auth(),
+        }
+    };
+
+    config.enable_sni = flow.sni_enabled();
+    config.alpn_protocols = if !flow.desired_alpn().is_empty() {
+        flow.desired_alpn()
+            .iter()
+            .map(|protocol| protocol.as_bytes().to_vec())
+            .collect()
+    } else {
+        vec![http1::ALPN_PROTOCOL.as_bytes().to_vec()]
+    };
+    Ok(config)
+}
+
+async fn take_dynamic_tcp_stream_for_tls(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<tokio::net::TcpStream, VmError> {
+    let io = {
+        let mut guard = context.lock().expect("vm context lock poisoned");
+        guard.tcp_stream_ios.remove(&handle).ok_or_else(|| {
+            VmError::HostError(format!(
+                "dynamic tcp stream handle {handle} must be connected before starting tls",
+            ))
+        })?
+    };
+
+    let mut guard = io.lock().await;
+    guard.take().ok_or_else(|| {
+        VmError::HostError(format!(
+            "dynamic tcp stream handle {handle} is already in use",
+        ))
+    })
+}
+
 #[pd_edge_host_function(name = tls::session::FROM_SOCKET.name, scope = transport)]
 async fn session_from_socket(
     _vm: &mut Vm,
@@ -193,6 +479,14 @@ async fn session_from_socket(
     let session = decode_session(&context, stream)?;
     let handle = match session {
         TlsSessionHandle::Reserved(reserved) => reserved.handle(),
+        TlsSessionHandle::Dynamic(handle) => {
+            let mut guard = context.lock().expect("vm context lock poisoned");
+            guard
+                .dynamic_tls_sessions
+                .entry(handle)
+                .or_insert_with(TlsFlowState::for_dynamic_socket);
+            handle
+        }
         TlsSessionHandle::OutboundExchange(handle) => handle,
     };
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
@@ -244,6 +538,90 @@ async fn session_handshake(
                 ensure_outbound_websocket_connection_open(&context, handle).await?;
             } else {
                 ensure_outbound_exchange_response_started(&context, handle).await?;
+            }
+        }
+        TlsSessionHandle::Dynamic(handle) => {
+            let flow = session_flow(&context, session);
+            let server_name = if flow.server_name().is_empty() {
+                return Err(VmError::HostError(format!(
+                    "dynamic tls session handle {handle} has no server name; attach it to an http exchange with a target before calling tls::session::handshake",
+                )));
+            } else {
+                flow.server_name().to_string()
+            };
+            let server_name = ServerName::try_from(server_name.clone()).map_err(|err| {
+                VmError::HostError(format!(
+                    "invalid tls server name '{server_name}' for dynamic session {handle}: {err}",
+                ))
+            })?;
+
+            {
+                let mut guard = context.lock().expect("vm context lock poisoned");
+                let flow = guard
+                    .dynamic_tls_sessions
+                    .entry(handle)
+                    .or_insert_with(TlsFlowState::for_dynamic_socket);
+                flow.note_handshake_prepared();
+                flow.note_client_hello_sent();
+            }
+
+            let tcp_stream = take_dynamic_tcp_stream_for_tls(&context, handle).await?;
+            let config = build_dynamic_client_config(&flow)?;
+            let connector = TlsConnector::from(Arc::new(config));
+            match connector.connect(server_name, tcp_stream).await {
+                Ok(tls_stream) => {
+                    let negotiated_alpn = tls_stream
+                        .get_ref()
+                        .1
+                        .alpn_protocol()
+                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+                    let peer_certificate_der = tls_stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|certs| certs.first().cloned())
+                        .map(|certificate| certificate.to_vec());
+
+                    {
+                        let mut guard = context.lock().expect("vm context lock poisoned");
+                        if let Some(flow) = guard.dynamic_tls_sessions.get_mut(&handle) {
+                            flow.note_server_hello_received();
+                            flow.note_server_certificate_received(peer_certificate_der.clone());
+                            if flow.verify_peer() && flow.verify_hostname() {
+                                flow.note_server_certificate_verified();
+                            } else {
+                                flow.note_verification_skipped();
+                            }
+                            if !flow.accepts_negotiated_alpn(negotiated_alpn.as_deref()) {
+                                flow.mark_failed();
+                                return Err(VmError::HostError(format!(
+                                    "tls ALPN mismatch: requested [{}], negotiated {}",
+                                    flow.desired_alpn().join(", "),
+                                    negotiated_alpn.as_deref().unwrap_or("none"),
+                                )));
+                            }
+                            flow.mark_handshake_complete(negotiated_alpn.clone());
+                        }
+                        if let Some(state) = guard.tcp_streams.get_mut(&handle) {
+                            state.mark_upgraded_tls();
+                        }
+                        guard
+                            .dynamic_tls_session_ios
+                            .insert(handle, Arc::new(tokio::sync::Mutex::new(Some(tls_stream))));
+                    }
+                }
+                Err(err) => {
+                    let mut guard = context.lock().expect("vm context lock poisoned");
+                    if let Some(flow) = guard.dynamic_tls_sessions.get_mut(&handle) {
+                        flow.mark_failed();
+                    }
+                    if let Some(state) = guard.tcp_streams.get_mut(&handle) {
+                        state.mark_failed(format!("tls handshake failed: {err}"));
+                    }
+                    return Err(VmError::HostError(format!(
+                        "dynamic tls handshake failed for handle {handle}: {err}",
+                    )));
+                }
             }
         }
         TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => {}

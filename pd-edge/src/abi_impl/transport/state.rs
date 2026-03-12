@@ -12,6 +12,7 @@ use crate::cache::BoundedLruStore;
 
 pub(crate) const TCP_STREAM_DOWNSTREAM: i64 = 0;
 pub(crate) const TCP_STREAM_DEFAULT_UPSTREAM: i64 = 1;
+pub(crate) const FIRST_DYNAMIC_TCP_STREAM_HANDLE: i64 = 1_i64 << 40;
 pub(crate) const UDP_SOCKET_DOWNSTREAM: i64 = 0;
 pub(crate) const UDP_SOCKET_DEFAULT_UPSTREAM: i64 = 1;
 
@@ -125,12 +126,10 @@ impl TcpFlowState {
         self.closed = false;
     }
 
-    #[cfg(test)]
     pub(crate) fn is_configured(&self) -> bool {
         self.configured
     }
 
-    #[cfg(test)]
     pub(crate) fn is_connected(&self) -> bool {
         self.connected
     }
@@ -143,6 +142,163 @@ impl TcpFlowState {
     #[cfg(test)]
     pub(crate) fn saw_write(&self) -> bool {
         self.tx_observed
+    }
+
+    pub(crate) fn phase_label(&self) -> &'static str {
+        if self.connected {
+            "connected"
+        } else if self.configured {
+            "configured"
+        } else {
+            "inactive"
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TcpSocketPhase {
+    #[default]
+    Inactive,
+    Bound,
+    Configured,
+    Connected,
+    UpgradedTls,
+    AttachedHttp,
+    Closed,
+    Failed,
+}
+
+impl TcpSocketPhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Inactive => "inactive",
+            Self::Bound => "bound",
+            Self::Configured => "configured",
+            Self::Connected => "connected",
+            Self::UpgradedTls => "upgraded-tls",
+            Self::AttachedHttp => "attached-http",
+            Self::Closed => "closed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TcpSocketState {
+    present: bool,
+    phase: TcpSocketPhase,
+    bind_address: Option<String>,
+    target: Option<String>,
+    local_address: Option<String>,
+    peer_address: Option<String>,
+    read_eof: bool,
+    failure_message: Option<String>,
+}
+
+impl TcpSocketState {
+    pub(crate) fn set_bind_address(&mut self, address: String) {
+        self.present = true;
+        self.bind_address = if address.is_empty() {
+            None
+        } else {
+            Some(address)
+        };
+        self.local_address = None;
+        self.read_eof = false;
+        self.failure_message = None;
+        if self.phase == TcpSocketPhase::Inactive {
+            self.phase = TcpSocketPhase::Bound;
+        }
+    }
+
+    pub(crate) fn set_target(&mut self, target: String) {
+        self.present = true;
+        self.target = if target.is_empty() {
+            None
+        } else {
+            Some(target)
+        };
+        self.peer_address = None;
+        self.read_eof = false;
+        self.failure_message = None;
+        self.phase = TcpSocketPhase::Configured;
+    }
+
+    pub(crate) fn mark_connected(&mut self, local_address: String, peer_address: String) {
+        self.present = true;
+        self.phase = TcpSocketPhase::Connected;
+        self.local_address = Some(local_address);
+        self.peer_address = Some(peer_address);
+        self.read_eof = false;
+        self.failure_message = None;
+    }
+
+    pub(crate) fn mark_upgraded_tls(&mut self) {
+        self.present = true;
+        self.phase = TcpSocketPhase::UpgradedTls;
+        self.read_eof = false;
+        self.failure_message = None;
+    }
+
+    pub(crate) fn mark_http_attached(&mut self) {
+        self.present = true;
+        self.phase = TcpSocketPhase::AttachedHttp;
+        self.read_eof = false;
+        self.failure_message = None;
+    }
+
+    pub(crate) fn mark_read_eof(&mut self) {
+        self.read_eof = true;
+    }
+
+    pub(crate) fn clear_read_eof(&mut self) {
+        self.read_eof = false;
+    }
+
+    pub(crate) fn mark_closed(&mut self) {
+        self.phase = TcpSocketPhase::Closed;
+    }
+
+    pub(crate) fn mark_failed(&mut self, message: impl Into<String>) {
+        self.present = true;
+        self.phase = TcpSocketPhase::Failed;
+        self.failure_message = Some(message.into());
+    }
+
+    pub(crate) fn is_present(&self) -> bool {
+        self.present
+    }
+
+    pub(crate) fn phase(&self) -> TcpSocketPhase {
+        self.phase
+    }
+
+    pub(crate) fn bind_address(&self) -> Option<&str> {
+        self.bind_address.as_deref()
+    }
+
+    pub(crate) fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
+    pub(crate) fn local_address(&self) -> &str {
+        self.local_address.as_deref().unwrap_or_default()
+    }
+
+    pub(crate) fn peer_address(&self) -> &str {
+        self.peer_address
+            .as_deref()
+            .or(self.target.as_deref())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn read_eof(&self) -> bool {
+        self.read_eof
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failure_message(&self) -> &str {
+        self.failure_message.as_deref().unwrap_or_default()
     }
 }
 
@@ -335,7 +491,11 @@ pub(crate) struct CachedTlsSession {
 
 pub(crate) type SharedTlsSessionCache =
     Arc<Mutex<BoundedLruStore<TlsSessionCacheKey, CachedTlsSession>>>;
+pub(crate) type SharedTcpStreamIo = Arc<tokio::sync::Mutex<Option<tokio::net::TcpStream>>>;
 pub(crate) type SharedUdpSocketIo = Arc<tokio::sync::Mutex<tokio::net::UdpSocket>>;
+#[cfg(feature = "tls")]
+pub(crate) type SharedTlsStreamIo =
+    Arc<tokio::sync::Mutex<Option<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>>>;
 
 pub(crate) fn new_shared_tls_session_cache(capacity: usize) -> SharedTlsSessionCache {
     Arc::new(Mutex::new(BoundedLruStore::new(capacity)))
@@ -389,6 +549,29 @@ impl TlsFlowState {
             peer_name: None,
             server_name: normalize_authority_host(host),
             alpn: alpn_from_http_version_label(http_version),
+            desired_alpn: Vec::new(),
+            verify_peer: true,
+            verify_hostname: true,
+            sni_enabled: true,
+            trusted_certificate_pem: None,
+            client_certificate_pem: None,
+            client_private_key_pem: None,
+            min_version: None,
+            max_version: None,
+            peer_certificate_der: None,
+        }
+    }
+
+    pub(crate) fn for_dynamic_socket() -> Self {
+        Self {
+            present: true,
+            handshake_complete: false,
+            plaintext_ready: false,
+            session_path: TlsSessionPath::None,
+            phase: TlsHandshakePhase::Configured,
+            peer_name: None,
+            server_name: None,
+            alpn: None,
             desired_alpn: Vec::new(),
             verify_peer: true,
             verify_hostname: true,

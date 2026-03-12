@@ -7,13 +7,13 @@ use std::{
 };
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Version,
         header::{CONTENT_LENGTH, CONTENT_TYPE, HOST},
     },
 };
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Full};
 use url::Url;
 use vm::VmError;
 
@@ -22,12 +22,15 @@ use super::super::{
     SharedRateLimiter,
     proxy::ProxyByteStreamState,
     transport::{
-        CachedTlsSession, SharedTlsSessionCache, SharedUdpSocketIo, TcpFlowState, TcpTransportDag,
+        CachedTlsSession, FIRST_DYNAMIC_TCP_STREAM_HANDLE, SharedTcpStreamIo,
+        SharedTlsSessionCache, SharedUdpSocketIo, TcpFlowState, TcpSocketState, TcpTransportDag,
         TlsFlowState, TlsProtocolVersion, TlsTransportDag, UdpSocketState, alpn_from_http_version,
         tls_session_cache_key,
     },
     websocket::WebSocketConnectionState,
 };
+#[cfg(feature = "tls")]
+use crate::abi_impl::transport::SharedTlsStreamIo;
 #[cfg(feature = "webrtc")]
 use crate::abi_impl::webrtc::WebRtcConnectionState;
 use crate::abi_impl::{http1, http2};
@@ -241,6 +244,13 @@ impl HttpCarrierRef {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttachedHttpTransport {
+    Tcp(i64),
+    #[cfg(feature = "tls")]
+    Tls(i64),
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HttpExchangeTransportState {
     pub(crate) tcp_flow: TcpFlowState,
@@ -248,6 +258,7 @@ pub(crate) struct HttpExchangeTransportState {
     pub(crate) carrier_kind: HttpCarrierKind,
     pub(crate) carrier_ref: Option<HttpCarrierRef>,
     pub(crate) http_version: Option<String>,
+    pub(crate) attached_transport: Option<AttachedHttpTransport>,
 }
 
 impl HttpExchangeTransportState {
@@ -554,9 +565,17 @@ pub struct ProxyVmContext {
     pub(crate) inbound_request_body: SharedInboundRequestBody,
     pub(crate) tcp_dag: TcpTransportDag,
     pub(crate) tls_dag: TlsTransportDag,
+    pub(crate) next_tcp_stream_handle: i64,
+    pub(crate) tcp_streams: HashMap<i64, TcpSocketState>,
+    pub(crate) tcp_stream_ios: HashMap<i64, SharedTcpStreamIo>,
+    #[cfg(feature = "tls")]
+    pub(crate) dynamic_tls_sessions: HashMap<i64, TlsFlowState>,
+    #[cfg(feature = "tls")]
+    pub(crate) dynamic_tls_session_ios: HashMap<i64, SharedTlsStreamIo>,
     #[cfg_attr(not(feature = "websocket"), allow(dead_code))]
     pub(crate) downstream_websocket: WebSocketConnectionState,
     pub(crate) default_upstream_websocket: WebSocketConnectionState,
+    pub(crate) default_upstream_attached_transport: Option<AttachedHttpTransport>,
     pub(crate) outbound_request: HttpOutboundRequestNode,
     pub(crate) response_output: HttpResponseOutputNode,
     pub(crate) upstream_response: HttpUpstreamResponseNode,
@@ -627,8 +646,16 @@ impl ProxyVmContext {
             ))),
             tcp_dag,
             tls_dag,
+            next_tcp_stream_handle: FIRST_DYNAMIC_TCP_STREAM_HANDLE,
+            tcp_streams: HashMap::new(),
+            tcp_stream_ios: HashMap::new(),
+            #[cfg(feature = "tls")]
+            dynamic_tls_sessions: HashMap::new(),
+            #[cfg(feature = "tls")]
+            dynamic_tls_session_ios: HashMap::new(),
             downstream_websocket,
             default_upstream_websocket: WebSocketConnectionState::default(),
+            default_upstream_attached_transport: None,
             response_output: HttpResponseOutputNode::default(),
             upstream_response: HttpUpstreamResponseNode::NotStarted,
             downstream_carrier_ref: Some(HttpCarrierRef::DownstreamHttp1),
@@ -780,6 +807,24 @@ pub(crate) fn outbound_exchange_exists(context: &SharedProxyVmContext, handle: i
     guard.outbound_exchanges.contains_key(&handle)
 }
 
+pub(crate) fn allocate_tcp_stream_handle(context: &SharedProxyVmContext) -> Result<i64, VmError> {
+    let mut guard = context.lock().expect("vm context lock poisoned");
+    let handle = guard.next_tcp_stream_handle;
+    if handle == i64::MAX {
+        return Err(VmError::HostError(
+            "tcp stream handle space exhausted".to_string(),
+        ));
+    }
+    guard.next_tcp_stream_handle += 1;
+    guard.tcp_streams.insert(handle, TcpSocketState::default());
+    Ok(handle)
+}
+
+pub(crate) fn tcp_stream_exists(context: &SharedProxyVmContext, handle: i64) -> bool {
+    let guard = context.lock().expect("vm context lock poisoned");
+    guard.tcp_streams.contains_key(&handle)
+}
+
 pub(crate) fn allocate_udp_socket_handle(context: &SharedProxyVmContext) -> Result<i64, VmError> {
     let mut guard = context.lock().expect("vm context lock poisoned");
     let handle = guard.next_udp_socket_handle;
@@ -799,6 +844,138 @@ pub(crate) fn udp_socket_exists(context: &SharedProxyVmContext, handle: i64) -> 
     }
     let guard = context.lock().expect("vm context lock poisoned");
     guard.udp_sockets.contains_key(&handle)
+}
+
+fn exchange_target_snapshot(guard: &ProxyVmContext, handle: i64) -> Result<String, VmError> {
+    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        return guard.outbound_request.target.clone().ok_or_else(|| {
+            VmError::HostError(
+                "http exchange target must be configured before attaching a transport".to_string(),
+            )
+        });
+    }
+
+    guard
+        .outbound_exchanges
+        .get(&handle)
+        .ok_or_else(|| VmError::HostError(format!("unknown outbound exchange handle {handle}")))?
+        .request
+        .target
+        .clone()
+        .ok_or_else(|| {
+            VmError::HostError(
+                "http exchange target must be configured before attaching a transport".to_string(),
+            )
+        })
+}
+
+pub(crate) fn attach_outbound_exchange_tcp_transport(
+    context: &SharedProxyVmContext,
+    exchange: i64,
+    stream: i64,
+) -> Result<(), VmError> {
+    let mut guard = context.lock().expect("vm context lock poisoned");
+    if exchange != DEFAULT_UPSTREAM_EXCHANGE_HANDLE
+        && !guard.outbound_exchanges.contains_key(&exchange)
+    {
+        return Err(VmError::HostError(format!(
+            "unknown outbound exchange handle {exchange}",
+        )));
+    }
+    let _target = exchange_target_snapshot(&guard, exchange)?;
+    let Some(socket) = guard.tcp_streams.get(&stream) else {
+        return Err(VmError::HostError(format!(
+            "http::exchange::attach_tcp requires a dynamic tcp stream handle, got {stream}",
+        )));
+    };
+    if socket.phase() != crate::abi_impl::transport::TcpSocketPhase::Connected {
+        return Err(VmError::HostError(format!(
+            "tcp stream handle {stream} must be connected before it can be attached to an http exchange",
+        )));
+    }
+
+    if exchange == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        if guard.upstream_response_ready() {
+            return Err(VmError::HostError(
+                "default upstream exchange is read-only after the exchange has started".to_string(),
+            ));
+        }
+        guard.default_upstream_attached_transport = Some(AttachedHttpTransport::Tcp(stream));
+        return Ok(());
+    }
+
+    let exchange_state = guard
+        .outbound_exchanges
+        .get_mut(&exchange)
+        .expect("checked exchange presence above");
+    if exchange_state.response_ready() {
+        return Err(VmError::HostError(format!(
+            "outbound exchange handle {exchange} is read-only after the exchange has started",
+        )));
+    }
+    exchange_state.transport.attached_transport = Some(AttachedHttpTransport::Tcp(stream));
+    Ok(())
+}
+
+#[cfg(feature = "tls")]
+pub(crate) fn attach_outbound_exchange_tls_transport(
+    context: &SharedProxyVmContext,
+    exchange: i64,
+    session: i64,
+) -> Result<(), VmError> {
+    let mut guard = context.lock().expect("vm context lock poisoned");
+    if exchange != DEFAULT_UPSTREAM_EXCHANGE_HANDLE
+        && !guard.outbound_exchanges.contains_key(&exchange)
+    {
+        return Err(VmError::HostError(format!(
+            "unknown outbound exchange handle {exchange}",
+        )));
+    }
+    let target = exchange_target_snapshot(&guard, exchange)?;
+    let tcp_state = guard.tcp_streams.get(&session).ok_or_else(|| {
+        VmError::HostError(format!(
+            "http::exchange::attach_tls_plaintext requires a dynamic tcp/tls handle, got {session}",
+        ))
+    })?;
+    if !matches!(
+        tcp_state.phase(),
+        crate::abi_impl::transport::TcpSocketPhase::Connected
+            | crate::abi_impl::transport::TcpSocketPhase::UpgradedTls
+    ) {
+        return Err(VmError::HostError(format!(
+            "tls session handle {session} must be connected before it can be attached to an http exchange",
+        )));
+    }
+
+    let tls_flow = guard
+        .dynamic_tls_sessions
+        .entry(session)
+        .or_insert_with(TlsFlowState::for_dynamic_socket);
+    if tls_flow.server_name().is_empty() && tls_flow.peer_name().is_empty() {
+        tls_flow.observe_target(&target);
+    }
+
+    if exchange == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        if guard.upstream_response_ready() {
+            return Err(VmError::HostError(
+                "default upstream exchange is read-only after the exchange has started".to_string(),
+            ));
+        }
+        guard.default_upstream_attached_transport = Some(AttachedHttpTransport::Tls(session));
+        return Ok(());
+    }
+
+    let exchange_state = guard
+        .outbound_exchanges
+        .get_mut(&exchange)
+        .expect("checked exchange presence above");
+    if exchange_state.response_ready() {
+        return Err(VmError::HostError(format!(
+            "outbound exchange handle {exchange} is read-only after the exchange has started",
+        )));
+    }
+    exchange_state.transport.attached_transport = Some(AttachedHttpTransport::Tls(session));
+    Ok(())
 }
 
 #[cfg(feature = "webrtc")]
@@ -942,6 +1119,7 @@ struct PreparedUpstreamRequest {
     http_sessions: Option<SharedHttpUpstreamSessions>,
     http2_mode: http2::Http2UpstreamMode,
     tls_flow: TlsFlowState,
+    attached_transport: Option<AttachedHttpTransport>,
     method: Method,
     path: String,
     query: String,
@@ -1075,7 +1253,16 @@ fn prepared_upstream_request(
         .target
         .clone()
         .ok_or(UpstreamResponseStartError::MissingTarget)?;
-    let tls_flow = guard.tls_dag.default_upstream.clone();
+    let attached_transport = guard.default_upstream_attached_transport;
+    let tls_flow = match attached_transport {
+        #[cfg(feature = "tls")]
+        Some(AttachedHttpTransport::Tls(session)) => guard
+            .dynamic_tls_sessions
+            .get(&session)
+            .cloned()
+            .unwrap_or_else(TlsFlowState::for_dynamic_socket),
+        _ => guard.tls_dag.default_upstream.clone(),
+    };
     Ok(PreparedUpstreamRequest {
         client: guard
             .upstream_client
@@ -1084,6 +1271,7 @@ fn prepared_upstream_request(
         http_sessions: guard.upstream_http_sessions.clone(),
         http2_mode: http2::select_upstream_mode(&target, &tls_flow),
         tls_flow,
+        attached_transport,
         method: guard.outbound_request.method.clone(),
         path: guard.outbound_request.path.clone(),
         query: guard.outbound_request.query.clone(),
@@ -1129,7 +1317,16 @@ fn prepared_outbound_exchange_request(
         .target
         .clone()
         .ok_or(UpstreamResponseStartError::MissingTarget)?;
-    let tls_flow = exchange.transport.tls_flow.clone();
+    let attached_transport = exchange.transport.attached_transport;
+    let tls_flow = match attached_transport {
+        #[cfg(feature = "tls")]
+        Some(AttachedHttpTransport::Tls(session)) => guard
+            .dynamic_tls_sessions
+            .get(&session)
+            .cloned()
+            .unwrap_or_else(TlsFlowState::for_dynamic_socket),
+        _ => exchange.transport.tls_flow.clone(),
+    };
     Ok(PreparedUpstreamRequest {
         client: guard
             .upstream_client
@@ -1138,6 +1335,7 @@ fn prepared_outbound_exchange_request(
         http_sessions: guard.upstream_http_sessions.clone(),
         http2_mode: http2::select_upstream_mode(&target, &tls_flow),
         tls_flow,
+        attached_transport,
         method: exchange.request.method.clone(),
         path: exchange.request.path.clone(),
         query: exchange.request.query.clone(),
@@ -1259,6 +1457,64 @@ fn response_peer_certificate_der(response: &reqwest::Response) -> Option<Vec<u8>
         .map(|bytes| bytes.to_vec())
 }
 
+async fn take_dynamic_tcp_stream_for_http(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<tokio::net::TcpStream, UpstreamResponseStartError> {
+    let io = {
+        let mut guard = context.lock().expect("vm context lock poisoned");
+        let Some(state) = guard.tcp_streams.get_mut(&handle) else {
+            return Err(UpstreamResponseStartError::Protocol(format!(
+                "dynamic tcp stream handle {handle} is unavailable for http attachment",
+            )));
+        };
+        state.mark_http_attached();
+        guard.tcp_stream_ios.remove(&handle).ok_or_else(|| {
+            UpstreamResponseStartError::Protocol(format!(
+                "dynamic tcp stream handle {handle} has no active transport",
+            ))
+        })?
+    };
+
+    let mut guard = io.lock().await;
+    guard.take().ok_or_else(|| {
+        UpstreamResponseStartError::Protocol(format!(
+            "dynamic tcp stream handle {handle} is already in use",
+        ))
+    })
+}
+
+#[cfg(feature = "tls")]
+async fn take_dynamic_tls_stream_for_http(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, UpstreamResponseStartError> {
+    let io = {
+        let mut guard = context.lock().expect("vm context lock poisoned");
+        let Some(state) = guard.tcp_streams.get_mut(&handle) else {
+            return Err(UpstreamResponseStartError::Protocol(format!(
+                "dynamic tls session handle {handle} is unavailable for http attachment",
+            )));
+        };
+        state.mark_http_attached();
+        guard
+            .dynamic_tls_session_ios
+            .remove(&handle)
+            .ok_or_else(|| {
+                UpstreamResponseStartError::Protocol(format!(
+                    "dynamic tls session handle {handle} has no active plaintext transport",
+                ))
+            })?
+    };
+
+    let mut guard = io.lock().await;
+    guard.take().ok_or_else(|| {
+        UpstreamResponseStartError::Protocol(format!(
+            "dynamic tls session handle {handle} is already in use",
+        ))
+    })
+}
+
 fn with_outbound_tls_flow_mut<T>(
     context: &SharedProxyVmContext,
     handle: i64,
@@ -1312,6 +1568,131 @@ async fn start_upstream_response_via_reqwest(
             UpstreamResponseBodyState::from_reqwest(upstream_response),
         )),
     })
+}
+
+async fn start_upstream_response_via_attached_http1<I>(
+    handle: i64,
+    prepared: &PreparedUpstreamRequest,
+    request_path: &str,
+    headers: HeaderMap,
+    request_body: Vec<u8>,
+    io: I,
+) -> Result<StartedUpstreamResponse, UpstreamResponseStartError>
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io))
+            .await
+            .map_err(|err| {
+                UpstreamResponseStartError::UpstreamRequest(format!(
+                    "failed to establish attached http/1.1 client connection: {err}",
+                ))
+            })?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let mut request = hyper::Request::builder()
+        .method(prepared.method.clone())
+        .uri(request_path)
+        .version(Version::HTTP_11)
+        .body(Full::new(Bytes::from(request_body)))
+        .map_err(|err| {
+            UpstreamResponseStartError::Protocol(format!(
+                "failed to build attached http request: {err}",
+            ))
+        })?;
+    for (name, value) in &headers {
+        request.headers_mut().insert(name, value.clone());
+    }
+
+    let response = sender.send_request(request).await.map_err(|err| {
+        UpstreamResponseStartError::UpstreamRequest(format!(
+            "attached http request failed while evaluating host call: {err}",
+        ))
+    })?;
+    let version = response.version();
+    Ok(StartedUpstreamResponse {
+        status: response.status().as_u16(),
+        headers: response.headers().clone(),
+        version,
+        carrier_ref: if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+            HttpCarrierRef::Http1DefaultUpstream
+        } else {
+            HttpCarrierRef::Http1DynamicExchange(handle)
+        },
+        negotiated_alpn: Some(http1::ALPN_PROTOCOL.to_string()),
+        peer_certificate_der: None,
+        body: Arc::new(tokio::sync::Mutex::new(
+            UpstreamResponseBodyState::from_hyper(response.into_body(), None),
+        )),
+    })
+}
+
+async fn start_upstream_response_via_attached_transport(
+    context: &SharedProxyVmContext,
+    handle: i64,
+    prepared: &PreparedUpstreamRequest,
+    headers: HeaderMap,
+    request_body: Vec<u8>,
+) -> Result<StartedUpstreamResponse, UpstreamResponseStartError> {
+    let request_path = super::request_path_with_query(&prepared.path, &prepared.query);
+    match prepared.attached_transport {
+        Some(AttachedHttpTransport::Tcp(stream)) => {
+            if Url::parse(&prepared.target)
+                .ok()
+                .map(|url| url.scheme().eq_ignore_ascii_case("https"))
+                .unwrap_or(false)
+            {
+                return Err(UpstreamResponseStartError::Protocol(
+                    "attached tcp transports cannot be used with https targets; attach a tls plaintext transport instead"
+                        .to_string(),
+                ));
+            }
+            let stream = take_dynamic_tcp_stream_for_http(context, stream).await?;
+            start_upstream_response_via_attached_http1(
+                handle,
+                prepared,
+                &request_path,
+                headers,
+                request_body,
+                stream,
+            )
+            .await
+        }
+        #[cfg(feature = "tls")]
+        Some(AttachedHttpTransport::Tls(session)) => {
+            let stream = take_dynamic_tls_stream_for_http(context, session).await?;
+            let mut started = start_upstream_response_via_attached_http1(
+                handle,
+                prepared,
+                &request_path,
+                headers,
+                request_body,
+                stream,
+            )
+            .await?;
+            started.negotiated_alpn = {
+                let guard = context.lock().expect("vm context lock poisoned");
+                guard
+                    .dynamic_tls_sessions
+                    .get(&session)
+                    .and_then(|flow| (!flow.alpn().is_empty()).then(|| flow.alpn().to_string()))
+            };
+            started.peer_certificate_der = {
+                let guard = context.lock().expect("vm context lock poisoned");
+                guard
+                    .dynamic_tls_sessions
+                    .get(&session)
+                    .and_then(|flow| flow.peer_certificate_der().map(|bytes| bytes.to_vec()))
+            };
+            Ok(started)
+        }
+        None => Err(UpstreamResponseStartError::Protocol(
+            "attached transport is unavailable".to_string(),
+        )),
+    }
 }
 
 #[cfg(feature = "http2")]
@@ -1513,6 +1894,66 @@ async fn start_outbound_exchange_response(
     let (upstream_url, host_header) =
         build_upstream_url(&prepared.target, &prepared.path, &prepared.query);
     let outbound_headers = filtered_upstream_headers(&prepared.headers, host_header.as_deref());
+
+    let is_attached_transport = prepared.attached_transport.is_some();
+    if is_attached_transport {
+        let started = Instant::now();
+        let upstream_response = start_upstream_response_via_attached_transport(
+            context,
+            handle,
+            &prepared,
+            outbound_headers,
+            request_body,
+        )
+        .await?;
+        let upstream_response_version = upstream_response.version;
+        mark_outbound_tcp_connected(context, handle)?;
+        let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let response_http_version = http_version_label(upstream_response_version).to_string();
+        let response_carrier_kind = upstream_response.carrier_ref.kind();
+        let snapshot = HttpUpstreamResponseSnapshot {
+            status: upstream_response.status,
+            headers: upstream_response.headers.clone(),
+            http_version: response_http_version.clone(),
+            carrier_kind: response_carrier_kind,
+            carrier_ref: upstream_response.carrier_ref.clone(),
+            body: upstream_response.body.clone(),
+        };
+
+        let mut guard = context.lock().expect("vm context lock poisoned");
+        if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+            guard.default_upstream_attached_transport = None;
+            guard.store_upstream_response(
+                snapshot.status,
+                snapshot.headers.clone(),
+                snapshot.http_version.clone(),
+                snapshot.carrier_kind,
+                snapshot.carrier_ref.clone(),
+                snapshot.body.clone(),
+                latency_ms,
+            );
+            return Ok(snapshot);
+        }
+
+        let exchange = guard
+            .outbound_exchanges
+            .get_mut(&handle)
+            .ok_or(UpstreamResponseStartError::UnknownExchangeHandle(handle))?;
+        exchange.transport.attached_transport = None;
+        exchange.store_response(
+            snapshot.status,
+            snapshot.headers.clone(),
+            snapshot.http_version.clone(),
+            snapshot.carrier_kind,
+            snapshot.carrier_ref.clone(),
+            snapshot.body.clone(),
+            latency_ms,
+        );
+        exchange
+            .transport
+            .mark_response_ready(upstream_response_version, snapshot.carrier_ref.clone());
+        return Ok(snapshot);
+    }
 
     let handshake_already_complete = outbound_tls_handshake_complete(context, handle)?;
     if !handshake_already_complete {

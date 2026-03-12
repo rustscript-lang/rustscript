@@ -12,7 +12,7 @@ name = "edge"
 default = ["http", "tls", "websocket"]
 http = ["vm/http", "edge_abi/http"]
 http2 = ["http", "vm/http2", "edge_abi/http2", "reqwest/http2", "dep:h2", "dep:tokio-rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
-tls = ["http", "vm/tls", "edge_abi/tls", "dep:tokio-rustls", "dep:rcgen"]
+tls = ["http", "vm/tls", "edge_abi/tls", "dep:tokio-rustls", "dep:rcgen", "dep:webpki-roots", "dep:rustls-pemfile"]
 websocket = ["http", "vm/websocket", "edge_abi/websocket", "dep:tokio-tungstenite"]
 webrtc = ["http", "vm/webrtc", "edge_abi/webrtc", "dep:webrtc", "dep:rustls"]
 

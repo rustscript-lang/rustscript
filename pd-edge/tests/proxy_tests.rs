@@ -1,5 +1,7 @@
 #![cfg(feature = "http")]
 
+#[path = "proxy_tests/attach_transport.rs"]
+mod attach_transport;
 #[path = "proxy_tests/control_plane.rs"]
 mod control_plane;
 #[path = "proxy_tests/debug.rs"]

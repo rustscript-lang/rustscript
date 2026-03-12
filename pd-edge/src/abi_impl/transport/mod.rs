@@ -11,12 +11,15 @@ mod tcp;
 mod tls;
 mod udp;
 
+#[cfg(feature = "tls")]
+pub(crate) use state::SharedTlsStreamIo;
 #[cfg(feature = "http2")]
 pub(crate) use state::TlsSessionCacheKey;
 pub(crate) use state::{
-    CachedTlsSession, SharedTlsSessionCache, SharedUdpSocketIo, TcpFlowState, TcpStreamRef,
-    TcpTransportDag, TlsFlowState, TlsProtocolVersion, TlsSessionRef, TlsTransportDag,
-    UdpSocketState, alpn_from_http_version, decode_tcp_stream_handle, decode_tls_session_handle,
+    CachedTlsSession, FIRST_DYNAMIC_TCP_STREAM_HANDLE, SharedTcpStreamIo, SharedTlsSessionCache,
+    SharedUdpSocketIo, TcpFlowState, TcpSocketPhase, TcpSocketState, TcpStreamRef, TcpTransportDag,
+    TlsFlowState, TlsProtocolVersion, TlsSessionRef, TlsTransportDag, UdpSocketState,
+    alpn_from_http_version, decode_tcp_stream_handle, decode_tls_session_handle,
     new_shared_tls_session_cache, tls_session_cache_key,
 };
 
