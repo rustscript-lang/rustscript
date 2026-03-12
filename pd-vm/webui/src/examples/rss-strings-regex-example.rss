@@ -1,0 +1,79 @@
+use stdlib::rss::strings as string;
+
+use json;
+use re;
+
+struct LogEntry {
+    level: string,
+    route: string,
+    latency_ms: string,
+    message: string
+}
+
+fn parse_log_line(line) {
+    let cleaned: string = string::trim(line);
+    let groups: [string] = re::captures(
+        "^\\[(INFO|WARN|ERROR)\\]\\s+(feed/[a-z]+)\\s+-\\s+([0-9]+)ms\\s+-\\s+(.+)$",
+        cleaned
+    );
+    assert(groups.length == 5);
+    let entry: LogEntry = {
+        level: groups[1],
+        route: groups[2],
+        latency_ms: groups[3],
+        message: groups[4]
+    };
+    entry
+}
+
+let raw_log = "[INFO] feed/world - 18ms - cache hit\n[WARN] feed/markets - 241ms - cache miss\n[ERROR] feed/culture - 502ms - bad payload id=77";
+let normalized_log: string = string::trim(raw_log);
+
+assert(string::non_empty(normalized_log));
+assert(re::match("(?m)^\\[INFO\\]", normalized_log));
+assert(re::find("feed/[a-z]+", normalized_log) == "feed/world");
+
+let lines: [string] = re::split("\\n+", normalized_log);
+let first_entry: LogEntry = parse_log_line(lines[0]);
+let warn_entry: LogEntry = parse_log_line(lines[1]);
+let error_entry: LogEntry = parse_log_line(lines[2]);
+
+let first_level: string = first_entry.level;
+let first_route: string = first_entry.route;
+let first_latency: string = first_entry.latency_ms;
+let warn_level: string = warn_entry.level;
+let warn_route: string = warn_entry.route;
+let warn_message: string = warn_entry.message;
+let error_level: string = error_entry.level;
+let error_route: string = error_entry.route;
+let error_message: string = error_entry.message;
+
+let route_parts: [string] = string::split(first_route, "/");
+assert(string::equals(route_parts[0], "feed"));
+assert(first_latency == "18");
+assert(string::contains(warn_message.copy(), "cache"));
+assert(re::match("(?i).*payload.*", error_message.copy()));
+
+let rewritten_warn: string = string::replace(warn_message, "cache", "edge-cache");
+let rewritten_route: string = re::replace("^feed/", warn_route, "rss::");
+let error_words: [string] = re::split("\\s+", error_message.copy());
+let error_word_count = error_words.length;
+let id_groups: [string] = re::captures("id=([0-9]+)", error_message);
+let error_id: string = if id_groups.length == 2 => {
+    id_groups[1]
+} else => {
+    "none"
+};
+let levels: [string] = [first_level, warn_level, error_level];
+let slow_routes: [string] = [rewritten_route, string::replace(error_route, "/", "::")];
+
+let summary = {
+    levels: levels,
+    first_section: route_parts[1],
+    slow_routes: slow_routes,
+    warn_message: rewritten_warn,
+    error_id: error_id,
+    error_word_count: error_word_count
+};
+
+print(json::encode(summary));

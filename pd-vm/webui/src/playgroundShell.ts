@@ -8,6 +8,7 @@ export interface PanelController {
 
 export interface PlaygroundUi {
   flavorSelectEl: HTMLSelectElement;
+  rssProgramSelectEl: HTMLSelectElement;
   themeControlEl: HTMLElement;
   themeSystemButtonEl: HTMLButtonElement;
   themeLightButtonEl: HTMLButtonElement;
@@ -25,7 +26,6 @@ export interface PlaygroundUi {
   lintStatusEl: HTMLSpanElement;
   sessionStatusEl: HTMLSpanElement;
   formatButtonEl: HTMLButtonElement;
-  loadSampleButtonEl: HTMLButtonElement;
   diagnosticsPanelEl: HTMLElement;
   outputPanelEl: HTMLElement;
   stackPanelEl: HTMLElement;
@@ -92,9 +92,6 @@ const ICONS: Record<string, string> = {
   stop: iconSvg('<rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor" stroke="none"></rect>'),
   format: iconSvg(
     '<line x1="7" y1="7" x2="19" y2="7"></line><line x1="10" y1="12" x2="19" y2="12"></line><line x1="7" y1="17" x2="19" y2="17"></line><path d="M4 5v4"></path><path d="M4 15v4"></path>'
-  ),
-  reset_sample: iconSvg(
-    '<path d="M3 12a9 9 0 0 1 15.5-6.36L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-15.5 6.36L3 16"></path><path d="M8 16H3v5"></path>'
   )
 };
 
@@ -230,19 +227,16 @@ export function mountPlaygroundUi(
             <div id="debug-epoch-state" class="fuel-state-line" hidden>Debug epoch: idle</div>
           </div>
           <div class="toolbar-right">
+            <div class="sample-control">
+              <label for="rss-program-select">RSS Program</label>
+              <select id="rss-program-select" aria-label="RSS program"></select>
+            </div>
             <button
               id="format-button"
               class="toolbar-action toolbar-utility-button toolbar-utility-button--icon"
               type="button"
               title="Format Document"
               aria-label="Format Document"
-            ></button>
-            <button
-              id="load-sample-button"
-              class="toolbar-action toolbar-utility-button toolbar-utility-button--icon"
-              type="button"
-              title="Reset to Sample"
-              aria-label="Reset to Sample"
             ></button>
             <div id="theme-control" class="theme-control" role="group" aria-label="theme mode" data-theme="system">
               <button id="theme-system-button" class="theme-option" type="button" title="Follow system theme" aria-label="Follow system theme"></button>
@@ -324,6 +318,7 @@ export function mountPlaygroundUi(
 
   const ui: PlaygroundUi = {
     flavorSelectEl: queryRequired("#flavor-select"),
+    rssProgramSelectEl: queryRequired("#rss-program-select"),
     themeControlEl: queryRequired("#theme-control"),
     themeSystemButtonEl: queryRequired("#theme-system-button"),
     themeLightButtonEl: queryRequired("#theme-light-button"),
@@ -341,7 +336,6 @@ export function mountPlaygroundUi(
     lintStatusEl: queryRequired("#lint-status"),
     sessionStatusEl: queryRequired("#session-status"),
     formatButtonEl: queryRequired("#format-button"),
-    loadSampleButtonEl: queryRequired("#load-sample-button"),
     diagnosticsPanelEl: queryRequired("#diagnostics"),
     outputPanelEl: queryRequired("#run-output"),
     stackPanelEl: queryRequired("#run-stack"),
@@ -380,7 +374,6 @@ export function mountPlaygroundUi(
   mountIconButton(ui.debugContinueButtonEl, "continue", "Continue");
   mountIconButton(ui.stopButtonEl, "stop", "Stop");
   mountIconButton(ui.formatButtonEl, "format", "Format Document");
-  mountIconButton(ui.loadSampleButtonEl, "reset_sample", "Reset to Sample");
 
   return ui;
 }

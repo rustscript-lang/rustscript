@@ -1,0 +1,93 @@
+use stdlib::rss::collections as collections;
+use stdlib::rss::iter as iter;
+
+use json;
+
+struct FeedConfig {
+    interval: string,
+    retries: int,
+    mode: string
+}
+
+let unique_channels: [string] =
+collections::dedup(["world", "tech", "finance", "culture", "world"]);
+let unique_channel_count = unique_channels.length;
+assert(collections::deep_compare(unique_channels.copy(), ["world", "tech", "finance", "culture"]));
+
+assert(collections::deep_compare(iter::range(unique_channel_count), [0, 1, 2, 3]));
+assert(collections::deep_compare(iter::range_step(1, 8, 2), [1, 3, 5, 7]));
+
+let scheduled_rows: [[string]] = iter::zip(
+    ["00:00", "00:05", "00:10", "00:15"],
+    ["world", "tech", "finance", "culture"]
+);
+assert(scheduled_rows.length == 4);
+assert(collections::deep_compare(scheduled_rows[0].copy(), ["00:00", "world"]));
+
+let scheduled_preview: [[string]] = iter::take(scheduled_rows.copy(), 2);
+let scheduled_preview_count = scheduled_preview.length;
+assert(scheduled_preview_count == 2);
+
+let backlog: [string] = iter::skip(["world", "tech", "finance", "culture"], 2);
+let backlog_count = backlog.length;
+assert(collections::deep_compare(backlog.copy(), ["finance", "culture"]));
+
+let slot_batches: [[string]] = iter::chunk(["00:00", "00:05", "00:10", "00:15"], 2);
+let slot_batch_count = slot_batches.length;
+assert(slot_batch_count == 2);
+
+let channel_labels: [[unknown]] = iter::enumerate(["world", "tech", "finance", "culture"]);
+assert(collections::deep_compare(iter::map(channel_labels.copy(), |row| row[0]), [0, 1, 2, 3]));
+
+let traffic_windows: [int] = [120, 95, 140, 65];
+let total_hits: int = iter::sum(traffic_windows.copy());
+assert(total_hits == 420);
+
+let hot_windows: [int] = iter::filter(traffic_windows.copy(), |value| value >= 100);
+let hot_window_count = hot_windows.length;
+assert(hot_window_count == 2);
+
+let retry_budget: int = iter::reduce([1, 2, 3, 4], 0, |acc, value| acc + value);
+assert(retry_budget == 10);
+
+let long_name_flags: [bool] =
+iter::map(["world", "tech", "finance", "culture"], |name| name.length > 4);
+assert(iter::any_true(long_name_flags.copy()));
+assert(iter::all_true([true, true]));
+
+let merged_config: FeedConfig = collections::merge(
+    {interval: "5m", retries: 2, mode: "steady"},
+    {retries: 4, mode: "burst"}
+);
+let config_mode: string = collections::get_or(merged_config.copy(), "mode", "missing");
+assert(collections::has(merged_config.copy(), "interval"));
+assert(config_mode == "burst");
+assert(collections::get_or(merged_config.copy(), "missing", "fallback") == "fallback");
+
+let config_entries: [[unknown]] = collections::entries(merged_config.copy());
+let config_values: [unknown] = collections::values(merged_config.copy());
+let config_entry_count = config_entries.length;
+let config_value_count = config_values.length;
+assert(config_entry_count == 3);
+assert(config_value_count == 3);
+
+let reversed_preview: [string] = collections::reverse(["world", "finance"]);
+let combined_names: [string] = collections::append(reversed_preview, ["archive"]);
+assert(collections::index_of(combined_names.copy(), "archive") == 2);
+assert(collections::contains(combined_names.copy(), "world"));
+assert(collections::contains(combined_names, "sports") == false);
+
+let summary = {
+    unique_channel_count: unique_channel_count,
+    scheduled_preview_count: scheduled_preview_count,
+    backlog_count: backlog_count,
+    slot_batch_count: slot_batch_count,
+    hot_window_count: hot_window_count,
+    retry_budget: retry_budget,
+    total_hits: total_hits,
+    config_mode: config_mode,
+    config_entry_count: config_entry_count,
+    config_value_count: config_value_count
+};
+
+print(json::encode(summary));
