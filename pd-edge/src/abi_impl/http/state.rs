@@ -2,6 +2,8 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
+    pin::Pin,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -65,16 +67,29 @@ pub(crate) struct HttpRequestHead {
     pub(crate) headers: HeaderMap,
 }
 
-pub(crate) struct InboundRequestBodyState {
-    body: Option<Body>,
+type BufferedByteSourceFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<BufferedByteStreamPull, VmError>> + Send + 'a>>;
+
+trait BufferedByteSource {
+    fn pull_next<'a>(&'a mut self) -> BufferedByteSourceFuture<'a>;
+}
+
+enum BufferedByteStreamPull {
+    Chunk(Bytes),
+    Skip,
+    Eof,
+}
+
+#[derive(Default)]
+struct BufferedByteStream {
     buffered: Vec<u8>,
     read_offset: usize,
     eof: bool,
 }
 
-impl std::fmt::Debug for InboundRequestBodyState {
+impl std::fmt::Debug for BufferedByteStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InboundRequestBodyState")
+        f.debug_struct("BufferedByteStream")
             .field("buffered_len", &self.buffered.len())
             .field("read_offset", &self.read_offset)
             .field("eof", &self.eof)
@@ -82,55 +97,37 @@ impl std::fmt::Debug for InboundRequestBodyState {
     }
 }
 
-impl InboundRequestBodyState {
-    fn new(body: Body) -> Self {
-        Self {
-            body: Some(body),
-            buffered: Vec::new(),
-            read_offset: 0,
-            eof: false,
-        }
-    }
-
-    async fn pull_next_frame(&mut self) -> Result<(), VmError> {
-        if self.eof {
-            return Ok(());
-        }
-        let Some(body) = self.body.as_mut() else {
-            self.eof = true;
-            return Ok(());
-        };
-
-        match body.frame().await {
-            Some(Ok(frame)) => {
-                if let Ok(chunk) = frame.into_data()
-                    && !chunk.is_empty()
-                {
+impl BufferedByteStream {
+    fn apply_pull(&mut self, pull: BufferedByteStreamPull) {
+        match pull {
+            BufferedByteStreamPull::Chunk(chunk) => {
+                if !chunk.is_empty() {
                     self.buffered.extend_from_slice(&chunk);
                 }
             }
-            Some(Err(err)) => {
-                return Err(VmError::HostError(format!(
-                    "failed to read inbound request body frame: {err}",
-                )));
-            }
-            None => {
+            BufferedByteStreamPull::Skip => {}
+            BufferedByteStreamPull::Eof => {
                 self.eof = true;
-                self.body = None;
             }
         }
-        Ok(())
     }
 
-    async fn ensure_readable_byte(&mut self) -> Result<(), VmError> {
+    async fn ensure_readable_byte<S: BufferedByteSource>(
+        &mut self,
+        source: &mut S,
+    ) -> Result<(), VmError> {
         while self.read_offset >= self.buffered.len() && !self.eof {
-            self.pull_next_frame().await?;
+            self.apply_pull(source.pull_next().await?);
         }
         Ok(())
     }
 
-    async fn read_next_chunk(&mut self, max_bytes: usize) -> Result<Vec<u8>, VmError> {
-        self.ensure_readable_byte().await?;
+    async fn read_next_chunk<S: BufferedByteSource>(
+        &mut self,
+        source: &mut S,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, VmError> {
+        self.ensure_readable_byte(source).await?;
         if self.read_offset >= self.buffered.len() {
             return Ok(Vec::new());
         }
@@ -143,7 +140,10 @@ impl InboundRequestBodyState {
         Ok(chunk)
     }
 
-    async fn read_next_line(&mut self) -> Result<Vec<u8>, VmError> {
+    async fn read_next_line<S: BufferedByteSource>(
+        &mut self,
+        source: &mut S,
+    ) -> Result<Vec<u8>, VmError> {
         loop {
             let start = self.read_offset.min(self.buffered.len());
             if start < self.buffered.len() {
@@ -165,28 +165,104 @@ impl InboundRequestBodyState {
                 return Ok(Vec::new());
             }
 
-            self.pull_next_frame().await?;
+            self.apply_pull(source.pull_next().await?);
         }
     }
 
-    async fn read_all_and_consume(&mut self) -> Result<Vec<u8>, VmError> {
-        let body = self.read_all().await?;
-        self.read_offset = self.buffered.len();
-        Ok(body)
-    }
-
-    async fn read_all(&mut self) -> Result<Vec<u8>, VmError> {
+    async fn read_all<S: BufferedByteSource>(&mut self, source: &mut S) -> Result<Vec<u8>, VmError> {
         while !self.eof {
-            self.pull_next_frame().await?;
+            self.apply_pull(source.pull_next().await?);
         }
         Ok(self.buffered.clone())
     }
 
-    async fn eof(&mut self) -> Result<bool, VmError> {
+    async fn read_all_and_consume<S: BufferedByteSource>(
+        &mut self,
+        source: &mut S,
+    ) -> Result<Vec<u8>, VmError> {
+        let body = self.read_all(source).await?;
+        self.read_offset = self.buffered.len();
+        Ok(body)
+    }
+
+    async fn eof<S: BufferedByteSource>(&mut self, source: &mut S) -> Result<bool, VmError> {
         while self.read_offset >= self.buffered.len() && !self.eof {
-            self.pull_next_frame().await?;
+            self.apply_pull(source.pull_next().await?);
         }
         Ok(self.eof && self.read_offset >= self.buffered.len())
+    }
+}
+
+struct InboundRequestBodySource {
+    body: Option<Body>,
+}
+
+impl BufferedByteSource for InboundRequestBodySource {
+    fn pull_next<'a>(&'a mut self) -> BufferedByteSourceFuture<'a> {
+        Box::pin(async move {
+            let Some(body) = self.body.as_mut() else {
+                return Ok(BufferedByteStreamPull::Eof);
+            };
+
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Ok(chunk) = frame.into_data() {
+                        Ok(BufferedByteStreamPull::Chunk(chunk))
+                    } else {
+                        Ok(BufferedByteStreamPull::Skip)
+                    }
+                }
+                Some(Err(err)) => Err(VmError::HostError(format!(
+                    "failed to read inbound request body frame: {err}",
+                ))),
+                None => {
+                    self.body = None;
+                    Ok(BufferedByteStreamPull::Eof)
+                }
+            }
+        })
+    }
+}
+
+pub(crate) struct InboundRequestBodyState {
+    source: InboundRequestBodySource,
+    stream: BufferedByteStream,
+}
+
+impl std::fmt::Debug for InboundRequestBodyState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboundRequestBodyState")
+            .field("stream", &self.stream)
+            .finish()
+    }
+}
+
+impl InboundRequestBodyState {
+    fn new(body: Body) -> Self {
+        Self {
+            source: InboundRequestBodySource { body: Some(body) },
+            stream: BufferedByteStream::default(),
+        }
+    }
+
+    async fn read_next_chunk(&mut self, max_bytes: usize) -> Result<Vec<u8>, VmError> {
+        self.stream.read_next_chunk(&mut self.source, max_bytes).await
+    }
+
+    async fn read_next_line(&mut self) -> Result<Vec<u8>, VmError> {
+        self.stream.read_next_line(&mut self.source).await
+    }
+
+    async fn read_all_and_consume(&mut self) -> Result<Vec<u8>, VmError> {
+        self.stream.read_all_and_consume(&mut self.source).await
+    }
+
+    async fn read_all(&mut self) -> Result<Vec<u8>, VmError> {
+        self.stream.read_all(&mut self.source).await
+    }
+
+    async fn eof(&mut self) -> Result<bool, VmError> {
+        self.stream.eof(&mut self.source).await
     }
 }
 
@@ -295,21 +371,82 @@ enum UpstreamResponseSource {
     Exhausted,
 }
 
-struct UpstreamResponseBodyState {
+struct UpstreamResponseBodySource {
     source: UpstreamResponseSource,
     http2_tracker: Option<http2::Http2ResponseBodyTracker>,
     body_started: bool,
-    buffered: Vec<u8>,
-    read_offset: usize,
-    eof: bool,
+}
+
+impl UpstreamResponseBodySource {
+    fn note_body_ready(&mut self) {
+        if !self.body_started {
+            if let Some(tracker) = &self.http2_tracker {
+                tracker.note_response_body_ready();
+            }
+            self.body_started = true;
+        }
+    }
+}
+
+impl BufferedByteSource for UpstreamResponseBodySource {
+    fn pull_next<'a>(&'a mut self) -> BufferedByteSourceFuture<'a> {
+        Box::pin(async move {
+            match &mut self.source {
+                UpstreamResponseSource::Reqwest(response) => match response.chunk().await {
+                    Ok(Some(chunk)) => Ok(BufferedByteStreamPull::Chunk(chunk)),
+                    Ok(None) => {
+                        self.source = UpstreamResponseSource::Exhausted;
+                        Ok(BufferedByteStreamPull::Eof)
+                    }
+                    Err(err) => Err(VmError::HostError(format!(
+                        "failed to read upstream response chunk: {err}",
+                    ))),
+                },
+                UpstreamResponseSource::Hyper(body) => match body.frame().await {
+                    Some(Ok(frame)) => {
+                        if let Ok(chunk) = frame.into_data() {
+                            if !chunk.is_empty() {
+                                self.note_body_ready();
+                            }
+                            Ok(BufferedByteStreamPull::Chunk(chunk))
+                        } else {
+                            Ok(BufferedByteStreamPull::Skip)
+                        }
+                    }
+                    Some(Err(err)) => {
+                        let observed = http2::classify_http2_error(&err);
+                        if let Some(tracker) = &self.http2_tracker {
+                            tracker.note_body_error(&observed);
+                        }
+                        Err(VmError::HostError(format!(
+                            "failed to read upstream response frame: {}",
+                            observed.message,
+                        )))
+                    }
+                    None => {
+                        self.note_body_ready();
+                        if let Some(tracker) = &self.http2_tracker {
+                            tracker.note_body_eof();
+                        }
+                        self.source = UpstreamResponseSource::Exhausted;
+                        Ok(BufferedByteStreamPull::Eof)
+                    }
+                },
+                UpstreamResponseSource::Exhausted => Ok(BufferedByteStreamPull::Eof),
+            }
+        })
+    }
+}
+
+struct UpstreamResponseBodyState {
+    source: UpstreamResponseBodySource,
+    stream: BufferedByteStream,
 }
 
 impl std::fmt::Debug for UpstreamResponseBodyState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UpstreamResponseBodyState")
-            .field("buffered_len", &self.buffered.len())
-            .field("read_offset", &self.read_offset)
-            .field("eof", &self.eof)
+            .field("stream", &self.stream)
             .finish()
     }
 }
@@ -317,12 +454,12 @@ impl std::fmt::Debug for UpstreamResponseBodyState {
 impl UpstreamResponseBodyState {
     fn from_reqwest(response: reqwest::Response) -> Self {
         Self {
-            source: UpstreamResponseSource::Reqwest(response),
-            http2_tracker: None,
-            body_started: false,
-            buffered: Vec::new(),
-            read_offset: 0,
-            eof: false,
+            source: UpstreamResponseBodySource {
+                source: UpstreamResponseSource::Reqwest(response),
+                http2_tracker: None,
+                body_started: false,
+            },
+            stream: BufferedByteStream::default(),
         }
     }
 
@@ -332,140 +469,29 @@ impl UpstreamResponseBodyState {
         http2_tracker: Option<http2::Http2ResponseBodyTracker>,
     ) -> Self {
         Self {
-            source: UpstreamResponseSource::Hyper(body),
-            http2_tracker,
-            body_started: false,
-            buffered: Vec::new(),
-            read_offset: 0,
-            eof: false,
-        }
-    }
-
-    async fn pull_next_chunk(&mut self) -> Result<(), VmError> {
-        if self.eof {
-            return Ok(());
-        }
-        match &mut self.source {
-            UpstreamResponseSource::Reqwest(response) => match response.chunk().await {
-                Ok(Some(chunk)) => {
-                    if !chunk.is_empty() {
-                        self.buffered.extend_from_slice(&chunk);
-                    }
-                }
-                Ok(None) => {
-                    self.eof = true;
-                    self.source = UpstreamResponseSource::Exhausted;
-                }
-                Err(err) => {
-                    return Err(VmError::HostError(format!(
-                        "failed to read upstream response chunk: {err}",
-                    )));
-                }
+            source: UpstreamResponseBodySource {
+                source: UpstreamResponseSource::Hyper(body),
+                http2_tracker,
+                body_started: false,
             },
-            UpstreamResponseSource::Hyper(body) => match body.frame().await {
-                Some(Ok(frame)) => {
-                    if let Ok(chunk) = frame.into_data()
-                        && !chunk.is_empty()
-                    {
-                        if !self.body_started {
-                            if let Some(tracker) = &self.http2_tracker {
-                                tracker.note_response_body_ready();
-                            }
-                            self.body_started = true;
-                        }
-                        self.buffered.extend_from_slice(&chunk);
-                    }
-                }
-                Some(Err(err)) => {
-                    let observed = http2::classify_http2_error(&err);
-                    if let Some(tracker) = &self.http2_tracker {
-                        tracker.note_body_error(&observed);
-                    }
-                    return Err(VmError::HostError(format!(
-                        "failed to read upstream response frame: {}",
-                        observed.message,
-                    )));
-                }
-                None => {
-                    if !self.body_started {
-                        if let Some(tracker) = &self.http2_tracker {
-                            tracker.note_response_body_ready();
-                        }
-                        self.body_started = true;
-                    }
-                    if let Some(tracker) = &self.http2_tracker {
-                        tracker.note_body_eof();
-                    }
-                    self.eof = true;
-                    self.source = UpstreamResponseSource::Exhausted;
-                }
-            },
-            UpstreamResponseSource::Exhausted => {
-                self.eof = true;
-            }
+            stream: BufferedByteStream::default(),
         }
-        Ok(())
-    }
-
-    async fn ensure_readable_byte(&mut self) -> Result<(), VmError> {
-        while self.read_offset >= self.buffered.len() && !self.eof {
-            self.pull_next_chunk().await?;
-        }
-        Ok(())
     }
 
     async fn read_next_chunk(&mut self, max_bytes: usize) -> Result<Vec<u8>, VmError> {
-        self.ensure_readable_byte().await?;
-        if self.read_offset >= self.buffered.len() {
-            return Ok(Vec::new());
-        }
-        let end = self
-            .read_offset
-            .saturating_add(max_bytes)
-            .min(self.buffered.len());
-        let chunk = self.buffered[self.read_offset..end].to_vec();
-        self.read_offset = end;
-        Ok(chunk)
+        self.stream.read_next_chunk(&mut self.source, max_bytes).await
     }
 
     async fn read_next_line(&mut self) -> Result<Vec<u8>, VmError> {
-        loop {
-            let start = self.read_offset.min(self.buffered.len());
-            if start < self.buffered.len() {
-                if let Some(rel_end) = self.buffered[start..]
-                    .iter()
-                    .position(|byte| *byte == b'\n')
-                {
-                    let end = start + rel_end;
-                    let line = self.buffered[start..end].to_vec();
-                    self.read_offset = end.saturating_add(1);
-                    return Ok(line);
-                }
-                if self.eof {
-                    let line = self.buffered[start..].to_vec();
-                    self.read_offset = self.buffered.len();
-                    return Ok(line);
-                }
-            } else if self.eof {
-                return Ok(Vec::new());
-            }
-
-            self.pull_next_chunk().await?;
-        }
+        self.stream.read_next_line(&mut self.source).await
     }
 
     async fn read_all(&mut self) -> Result<Vec<u8>, VmError> {
-        while !self.eof {
-            self.pull_next_chunk().await?;
-        }
-        Ok(self.buffered.clone())
+        self.stream.read_all(&mut self.source).await
     }
 
     async fn eof(&mut self) -> Result<bool, VmError> {
-        while self.read_offset >= self.buffered.len() && !self.eof {
-            self.pull_next_chunk().await?;
-        }
-        Ok(self.eof && self.read_offset >= self.buffered.len())
+        self.stream.eof(&mut self.source).await
     }
 }
 
