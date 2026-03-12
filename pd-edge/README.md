@@ -273,8 +273,9 @@ Run the built-in framework to benchmark these scenarios:
 - raw `pd-edge-http-proxy` (no program loaded)
 - proxy with a compute-only program (no host calls; baseline workload)
 - proxy with additive async HTTP host calls on top of the same workload (`get_method/get_path/get_header/get_body` + `set_header/set_body`) and explicit termination (no upstream target)
+- proxy with additive async HTTP host calls plus a real default-upstream HTTP round-trip (`set_target/set_path/set_body` + upstream `get_status/get_header/get_body`)
 
-Detailed report with charts: [`docs/HTTP_PROXY_PERF_REPORT_2026-03-11.md`](docs/HTTP_PROXY_PERF_REPORT_2026-03-11.md)
+Detailed report with charts: [`docs/HTTP_PROXY_PERF_REPORT_2026-03-13.md`](docs/HTTP_PROXY_PERF_REPORT_2026-03-13.md)
 
 Build the proxy binary once before running benchmarks so the framework does not accidentally run a stale executable:
 

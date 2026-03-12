@@ -11,10 +11,20 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use axum::{
+    Router,
+    body::{Body, to_bytes},
+    extract::Request,
+    http::{HeaderValue, Response},
+    routing::any,
+};
 use edge::HOST_FUNCTION_COUNT;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
-use tokio::{task::JoinSet, time::sleep};
+use tokio::{
+    task::{JoinHandle, JoinSet},
+    time::sleep,
+};
 use vm::{compile_source, encode_program, validate_program};
 
 const LOAD_REQUEST_BODY: &str = "edge-perf-payload";
@@ -76,11 +86,44 @@ if (acc % 2) == 0 {{
     )
 }
 
+fn host_calls_upstream_roundtrip_program_source(upstream_addr: &str) -> String {
+    format!(
+        r#"
+{BASE_WORKLOAD_SOURCE}
+
+use http;
+
+let method = http::request::get_method();
+let path = http::request::get_path();
+let client_id = http::request::get_header("x-client-id");
+let body = http::request::get_body();
+
+http::upstream::request::set_target("http://{upstream_addr}");
+http::upstream::request::set_header("x-client-id", client_id);
+http::upstream::request::set_header("x-downstream-method", method);
+http::upstream::request::set_path(path);
+http::upstream::request::set_body(body);
+
+let upstream_status = http::upstream::response::get_status();
+let echoed_client_id = http::upstream::response::get_header("x-upstream-client-id");
+let echoed_path = http::upstream::response::get_header("x-upstream-path");
+let upstream_body = http::upstream::response::get_body();
+
+http::response::set_status(upstream_status);
+http::response::set_header("x-perf-client-id", client_id);
+http::response::set_header("x-upstream-client-id", echoed_client_id);
+http::response::set_header("x-upstream-path", echoed_path);
+http::response::set_body(upstream_body);
+"#
+    )
+}
+
 #[derive(Clone, Copy)]
 enum ProgramVariant {
     None,
     NoHostCallsBase,
     HostCallsAdditive,
+    HostCallsUpstreamRoundTrip,
 }
 
 #[derive(Clone, Copy)]
@@ -91,7 +134,7 @@ struct Scenario {
     program_variant: ProgramVariant,
 }
 
-const SCENARIOS: [Scenario; 3] = [
+const SCENARIOS: [Scenario; 4] = [
     Scenario {
         id: "raw_no_program",
         description: "raw pd-edge-http-proxy (no program loaded)",
@@ -110,7 +153,30 @@ const SCENARIOS: [Scenario; 3] = [
         expected_status: 200,
         program_variant: ProgramVariant::HostCallsAdditive,
     },
+    Scenario {
+        id: "host_calls_upstream_roundtrip",
+        description: "pd-edge-http-proxy with additive host calls and real upstream round-trip",
+        expected_status: 200,
+        program_variant: ProgramVariant::HostCallsUpstreamRoundTrip,
+    },
 ];
+
+struct UpstreamFixture {
+    addr: SocketAddr,
+    task: JoinHandle<()>,
+}
+
+impl UpstreamFixture {
+    fn target(&self) -> String {
+        self.addr.to_string()
+    }
+}
+
+impl Drop for UpstreamFixture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
 
 #[derive(Debug, Clone)]
 struct BenchConfig {
@@ -690,6 +756,10 @@ async fn run_scenario(
     client: &Client,
     scenario: Scenario,
 ) -> Result<ScenarioReport, Box<dyn std::error::Error>> {
+    let upstream_fixture = match scenario.program_variant {
+        ProgramVariant::HostCallsUpstreamRoundTrip => Some(spawn_upstream_echo_server().await?),
+        _ => None,
+    };
     let program_bytes = match scenario.program_variant {
         ProgramVariant::None => None,
         ProgramVariant::NoHostCallsBase => {
@@ -698,6 +768,15 @@ async fn run_scenario(
         }
         ProgramVariant::HostCallsAdditive => {
             let source = host_calls_terminate_program_source();
+            Some(compile_program_to_vmbc(&source)?)
+        }
+        ProgramVariant::HostCallsUpstreamRoundTrip => {
+            let source = host_calls_upstream_roundtrip_program_source(
+                &upstream_fixture
+                    .as_ref()
+                    .expect("upstream fixture should exist")
+                    .target(),
+            );
             Some(compile_program_to_vmbc(&source)?)
         }
     };
@@ -919,18 +998,43 @@ async fn verify_scenario_probe(
         .into());
     }
 
-    if matches!(scenario.program_variant, ProgramVariant::HostCallsAdditive) {
-        let header_value = response
-            .headers()
-            .get("x-perf-client-id")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        let body = response.text().await.unwrap_or_default();
-        if header_value != "perf-client" {
+    let verify_host_call_headers = matches!(
+        scenario.program_variant,
+        ProgramVariant::HostCallsAdditive | ProgramVariant::HostCallsUpstreamRoundTrip
+    );
+    let verify_upstream_roundtrip = matches!(
+        scenario.program_variant,
+        ProgramVariant::HostCallsUpstreamRoundTrip
+    );
+    let perf_client_id_header = response
+        .headers()
+        .get("x-perf-client-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let upstream_client_id_header = response
+        .headers()
+        .get("x-upstream-client-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let upstream_path_header = response
+        .headers()
+        .get("x-upstream-path")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = if verify_host_call_headers || verify_upstream_roundtrip {
+        response.text().await.unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    if verify_host_call_headers {
+        if perf_client_id_header != "perf-client" {
             return Err(io::Error::other(format!(
                 "host-call probe missing expected x-perf-client-id header: got '{}'",
-                header_value
+                perf_client_id_header
             ))
             .into());
         }
@@ -943,7 +1047,69 @@ async fn verify_scenario_probe(
         }
     }
 
+    if verify_upstream_roundtrip {
+        if upstream_client_id_header != "perf-client" {
+            return Err(io::Error::other(format!(
+                "upstream probe missing expected x-upstream-client-id header: got '{}'",
+                upstream_client_id_header
+            ))
+            .into());
+        }
+        if upstream_path_header != "/perf" {
+            return Err(io::Error::other(format!(
+                "upstream probe missing expected x-upstream-path header: got '{}'",
+                upstream_path_header
+            ))
+            .into());
+        }
+        if !body.contains("upstream-roundtrip|/perf|") || !body.contains(LOAD_REQUEST_BODY) {
+            return Err(io::Error::other(format!(
+                "upstream probe body missing expected round-trip markers: body='{}'",
+                body
+            ))
+            .into());
+        }
+    }
+
     Ok(())
+}
+
+async fn spawn_upstream_echo_server() -> Result<UpstreamFixture, Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let (parts, body) = request.into_parts();
+        let path = parts.uri.path().to_string();
+        let client_id = parts
+            .headers
+            .get("x-client-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = to_bytes(body, usize::MAX)
+            .await
+            .expect("upstream perf server should read body");
+        let mut response = Response::new(Body::from(format!(
+            "upstream-roundtrip|{path}|{}",
+            String::from_utf8_lossy(&body)
+        )));
+        response.headers_mut().insert(
+            "x-upstream-client-id",
+            HeaderValue::from_str(&client_id)
+                .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+        );
+        response.headers_mut().insert(
+            "x-upstream-path",
+            HeaderValue::from_str(&path).unwrap_or_else(|_| HeaderValue::from_static("/invalid")),
+        );
+        response
+    }));
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("upstream perf server should run");
+    });
+    Ok(UpstreamFixture { addr, task })
 }
 
 async fn upload_program(
@@ -1535,7 +1701,7 @@ fn print_help() {
         "  --fuel-latency-check-intervals <CSV> CSV list for check-interval sweep; must be > 0 (default starts at 1)\n",
         "  --binary <PATH>                   Explicit pd-edge-http-proxy binary path\n",
         "  --json-out <PATH>                 Write JSON report to path\n",
-        "  --scenario <ID>                   Run a single scenario id (raw_no_program | no_host_calls_program | host_calls_terminate)\n",
+        "  --scenario <ID>                   Run a single scenario id (raw_no_program | no_host_calls_program | host_calls_terminate | host_calls_upstream_roundtrip)\n",
         "  --skip-build                      Do not auto-build pd-edge-http-proxy\n",
         "  --build-release                   Auto-build release binary (default)\n",
         "  --build-debug                     Auto-build debug binary\n",
