@@ -14,6 +14,8 @@ pub(crate) use axum::{
     routing::{any, post},
 };
 pub(crate) use base64::{Engine as _, engine::general_purpose::STANDARD};
+#[cfg(feature = "tls")]
+use edge::sample_echo::spawn_https_echo_server;
 #[cfg(feature = "webrtc")]
 pub(crate) use edge::sample_echo::spawn_webrtc_echo_server;
 pub(crate) use edge::{
@@ -144,74 +146,9 @@ pub(crate) async fn spawn_chunked_upstream(
 }
 
 pub(crate) async fn spawn_connect_forward_proxy() -> (SocketAddr, JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    edge::sample_echo::spawn_connect_forward_proxy("127.0.0.1:0".parse().expect("valid addr"))
         .await
-        .expect("listener should bind");
-    let addr = listener.local_addr().expect("listener should have addr");
-    let handle = tokio::spawn(async move {
-        loop {
-            let (mut downstream, _) = listener.accept().await.expect("accept should succeed");
-            tokio::spawn(async move {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
-
-                let mut request = Vec::new();
-                let mut buffer = [0u8; 1024];
-                loop {
-                    let read = downstream
-                        .read(&mut buffer)
-                        .await
-                        .expect("proxy request should read");
-                    if read == 0 {
-                        return;
-                    }
-                    request.extend_from_slice(&buffer[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-
-                let request_text = String::from_utf8_lossy(&request);
-                let Some(first_line) = request_text.lines().next() else {
-                    return;
-                };
-                let mut parts = first_line.split_whitespace();
-                let method = parts.next().unwrap_or("");
-                let authority = parts.next().unwrap_or("");
-                if !method.eq_ignore_ascii_case("CONNECT") || authority.is_empty() {
-                    let _ = downstream
-                        .write_all(
-                            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        )
-                        .await;
-                    let _ = downstream.shutdown().await;
-                    return;
-                }
-
-                let mut upstream = match tokio::net::TcpStream::connect(authority).await {
-                    Ok(stream) => stream,
-                    Err(_) => {
-                        let _ = downstream
-                            .write_all(
-                                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                            )
-                            .await;
-                        let _ = downstream.shutdown().await;
-                        return;
-                    }
-                };
-                downstream
-                    .write_all(
-                        b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: pd-edge-test\r\n\r\n",
-                    )
-                    .await
-                    .expect("proxy connect response should write");
-                let _ = copy_bidirectional(&mut downstream, &mut upstream).await;
-                let _ = downstream.shutdown().await;
-                let _ = upstream.shutdown().await;
-            });
-        }
-    });
-    (addr, handle)
+        .expect("forward proxy should start")
 }
 
 pub(crate) async fn run_edge_program_direct(
@@ -375,19 +312,11 @@ pub(crate) async fn spawn_websocket_echo_upstream() -> (SocketAddr, JoinHandle<(
 
 #[cfg(feature = "tls")]
 pub(crate) async fn spawn_https_echo_upstream() -> (SocketAddr, JoinHandle<()>) {
-    ensure_rustls_provider();
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-        .expect("certificate should generate");
-    let server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![CertificateDer::from(
-                cert.serialize_der().expect("certificate should serialize"),
-            )],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.serialize_private_key_der())),
-        )
-        .expect("server config should build");
-    spawn_tls_echo_server(server_config, false).await
+    // Keep the baseline HTTPS fixture aligned with the sample binary so manual examples and tests
+    // do not drift on TLS or HTTP behavior.
+    spawn_https_echo_server("127.0.0.1:0".parse().expect("valid addr"))
+        .await
+        .expect("https echo should start")
 }
 
 #[cfg(all(feature = "tls", feature = "http2"))]

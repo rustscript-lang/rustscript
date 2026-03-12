@@ -56,7 +56,7 @@ Default listeners:
 
 ### `pd-edge-sample-echo-server`
 
-- Starts separate listeners for TCP, UDP, TLS, HTTP, HTTPS, WebSocket, secure WebSocket, and WebRTC signaling
+- Starts separate listeners for TCP, UDP, TLS, HTTP, HTTPS, WebSocket, secure WebSocket, WebRTC signaling, and a CONNECT forward proxy
 - Echoes request bytes, datagrams, HTTP bodies, WebSocket frames, and WebRTC data-channel messages
 - Uses a generated self-signed certificate for TLS, HTTPS, and `wss://`
 - Enables manual end-to-end testing of the feature-gated transport surfaces without uploading a VM program
@@ -112,7 +112,7 @@ Interactive commands:
 Start the multi-protocol sample server with all current listeners enabled:
 
 ```powershell
-cargo run -p pd-edge --bin pd-edge-sample-echo-server --features webrtc
+cargo run -p pd-edge --bin pd-edge-sample-echo-server --features "webrtc http2"
 ```
 
 Default listeners:
@@ -125,6 +125,14 @@ Default listeners:
 - WebSocket: `127.0.0.1:7006`
 - WSS: `127.0.0.1:7007`
 - WebRTC signaling: `http://127.0.0.1:7008/offer`
+- CONNECT forward proxy: `127.0.0.1:7009`
+
+Notes:
+
+- With feature `http2`, the HTTP listener also accepts cleartext h2c prior-knowledge requests on the same port.
+- With feature `http2`, the HTTPS listener negotiates `h2` or `http/1.1` via ALPN on the same port.
+- Without feature `http2`, the HTTP and HTTPS listeners remain HTTP/1.1 only.
+- The forward proxy listener accepts `CONNECT` and then tunnels raw TCP bytes, which makes it usable with `examples/sample_forward_proxy_program.rss`.
 
 ## HTTP Proxy Admin API
 
@@ -209,6 +217,7 @@ Usage: pd-edge-sample-echo-server [options]
 --websocket-addr, --ws-addr <ADDR>       WebSocket echo listen address (default: 127.0.0.1:7006)
 --websocket-tls-addr, --wss-addr <ADDR>  Secure WebSocket echo listen address (default: 127.0.0.1:7007)
 --webrtc-addr <ADDR>                     WebRTC signaling listen address (default: 127.0.0.1:7008)
+--forward-proxy-addr <ADDR>              CONNECT forward proxy listen address (default: 127.0.0.1:7009)
 -V, --version
 -h, --help
 ```
@@ -216,6 +225,10 @@ Usage: pd-edge-sample-echo-server [options]
 Notes:
 
 - TLS, HTTPS, and WSS listeners use a generated self-signed certificate.
+- With feature `http2`, the HTTP listener also accepts cleartext h2c prior knowledge.
+- With feature `http2`, the HTTPS listener negotiates h2 or HTTP/1.1 via ALPN.
+- Without feature `http2`, the HTTP and HTTPS listeners serve HTTP/1.1 only.
+- The forward proxy listener accepts `CONNECT` and then tunnels raw TCP bytes.
 - The WebRTC listener accepts `POST /offer` and returns an SDP answer for a data-channel echo peer.
 - Feature-gated listeners are only enabled when their crate feature is compiled in.
 

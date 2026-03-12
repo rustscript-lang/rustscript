@@ -33,16 +33,19 @@ use axum::body::Bytes;
 use futures_util::{SinkExt, StreamExt};
 #[cfg(feature = "http")]
 use http_body_util::{BodyExt, Full};
+#[cfg(all(feature = "http", not(feature = "http2")))]
+use hyper::server::conn::http1;
 #[cfg(feature = "http")]
 use hyper::{
     Request, Response, StatusCode,
     body::Incoming,
     header::{CONTENT_TYPE, HeaderValue},
-    server::conn::http1,
     service::service_fn,
 };
 #[cfg(feature = "http")]
 use hyper_util::rt::TokioIo;
+#[cfg(all(feature = "http", feature = "http2"))]
+use hyper_util::{rt::TokioExecutor, server::conn::auto::Builder as AutoBuilder};
 #[cfg(feature = "tls")]
 use rcgen::generate_simple_self_signed;
 #[cfg(feature = "tls")]
@@ -75,6 +78,7 @@ pub struct SampleEchoServerConfig {
     pub websocket_addr: SocketAddr,
     pub websocket_tls_addr: SocketAddr,
     pub webrtc_addr: SocketAddr,
+    pub forward_proxy_addr: SocketAddr,
 }
 
 impl Default for SampleEchoServerConfig {
@@ -90,6 +94,7 @@ impl Default for SampleEchoServerConfig {
                 .parse()
                 .expect("valid secure websocket addr"),
             webrtc_addr: "127.0.0.1:7008".parse().expect("valid webrtc addr"),
+            forward_proxy_addr: "127.0.0.1:7009".parse().expect("valid forward proxy addr"),
         }
     }
 }
@@ -104,6 +109,7 @@ pub struct SampleEchoAddresses {
     pub websocket: Option<SocketAddr>,
     pub websocket_tls: Option<SocketAddr>,
     pub webrtc: Option<SocketAddr>,
+    pub forward_proxy: SocketAddr,
 }
 
 pub struct SampleEchoServer {
@@ -136,17 +142,20 @@ pub async fn spawn_sample_echo_server(
     tasks.push(http_task);
 
     #[cfg(feature = "tls")]
-    let shared_tls_config = generate_self_signed_tls_server_config()?;
+    let shared_stream_tls_config = generate_self_signed_tls_server_config(http1_alpn_protocols())?;
+    #[cfg(feature = "tls")]
+    let shared_https_tls_config = generate_sample_https_tls_server_config()?;
 
     #[cfg(feature = "tls")]
     let (tls, tls_task) =
-        spawn_tls_echo_server_with_config(config.tls_addr, shared_tls_config.clone()).await?;
+        spawn_tls_echo_server_with_config(config.tls_addr, shared_stream_tls_config.clone())
+            .await?;
     #[cfg(feature = "tls")]
     tasks.push(tls_task);
 
     #[cfg(feature = "tls")]
     let (https, https_task) =
-        spawn_https_echo_server_with_config(config.https_addr, shared_tls_config.clone()).await?;
+        spawn_https_echo_server_with_config(config.https_addr, shared_https_tls_config).await?;
     #[cfg(feature = "tls")]
     tasks.push(https_task);
 
@@ -158,7 +167,7 @@ pub async fn spawn_sample_echo_server(
     #[cfg(all(feature = "websocket", feature = "tls"))]
     let (websocket_tls, websocket_tls_task) = spawn_secure_websocket_echo_server_with_config(
         config.websocket_tls_addr,
-        shared_tls_config,
+        shared_stream_tls_config,
     )
     .await?;
     #[cfg(all(feature = "websocket", feature = "tls"))]
@@ -168,6 +177,10 @@ pub async fn spawn_sample_echo_server(
     let (webrtc, webrtc_task) = spawn_webrtc_echo_server(config.webrtc_addr).await?;
     #[cfg(feature = "webrtc")]
     tasks.push(webrtc_task);
+
+    let (forward_proxy, forward_proxy_task) =
+        spawn_connect_forward_proxy(config.forward_proxy_addr).await?;
+    tasks.push(forward_proxy_task);
 
     Ok(SampleEchoServer {
         addresses: SampleEchoAddresses {
@@ -197,6 +210,7 @@ pub async fn spawn_sample_echo_server(
             webrtc: Some(webrtc),
             #[cfg(not(feature = "webrtc"))]
             webrtc: None,
+            forward_proxy,
         },
         tasks,
     })
@@ -260,6 +274,93 @@ pub async fn spawn_udp_echo_server(addr: SocketAddr) -> io::Result<(SocketAddr, 
     Ok((local_addr, handle))
 }
 
+pub async fn spawn_connect_forward_proxy(
+    addr: SocketAddr,
+) -> io::Result<(SocketAddr, JoinHandle<()>)> {
+    let listener = TcpListener::bind(addr).await?;
+    let local_addr = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((mut downstream, _)) => {
+                    tokio::spawn(async move {
+                        use tokio::io::copy_bidirectional;
+
+                        let mut request = Vec::new();
+                        let mut buffer = [0u8; 1024];
+                        loop {
+                            match downstream.read(&mut buffer).await {
+                                Ok(0) => return,
+                                Ok(read) => {
+                                    request.extend_from_slice(&buffer[..read]);
+                                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!("sample forward proxy request read failed: {err}");
+                                    return;
+                                }
+                            }
+                        }
+
+                        let request_text = String::from_utf8_lossy(&request);
+                        let Some(first_line) = request_text.lines().next() else {
+                            return;
+                        };
+                        let mut parts = first_line.split_whitespace();
+                        let method = parts.next().unwrap_or("");
+                        let authority = parts.next().unwrap_or("");
+
+                        if !method.eq_ignore_ascii_case("CONNECT") || authority.is_empty() {
+                            let response = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                            if let Err(err) = downstream.write_all(response).await {
+                                warn!("sample forward proxy bad request response failed: {err}");
+                            }
+                            let _ = downstream.shutdown().await;
+                            return;
+                        }
+
+                        let mut upstream = match tokio::net::TcpStream::connect(authority).await {
+                            Ok(stream) => stream,
+                            Err(err) => {
+                                warn!("sample forward proxy upstream connect failed: {err}");
+                                let response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                if let Err(write_err) = downstream.write_all(response).await {
+                                    warn!(
+                                        "sample forward proxy bad gateway response failed: {write_err}"
+                                    );
+                                }
+                                let _ = downstream.shutdown().await;
+                                return;
+                            }
+                        };
+
+                        let response = b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: pd-edge-sample-echo-server\r\n\r\n";
+                        if let Err(err) = downstream.write_all(response).await {
+                            warn!("sample forward proxy connect response failed: {err}");
+                            let _ = downstream.shutdown().await;
+                            let _ = upstream.shutdown().await;
+                            return;
+                        }
+
+                        if let Err(err) = copy_bidirectional(&mut downstream, &mut upstream).await {
+                            warn!("sample forward proxy tunnel failed: {err}");
+                        }
+                        let _ = downstream.shutdown().await;
+                        let _ = upstream.shutdown().await;
+                    });
+                }
+                Err(err) => {
+                    warn!("sample forward proxy accept failed: {err}");
+                    break;
+                }
+            }
+        }
+    });
+    Ok((local_addr, handle))
+}
+
 #[cfg(feature = "http")]
 pub async fn spawn_http_echo_server(addr: SocketAddr) -> io::Result<(SocketAddr, JoinHandle<()>)> {
     let listener = TcpListener::bind(addr).await?;
@@ -270,12 +371,7 @@ pub async fn spawn_http_echo_server(addr: SocketAddr) -> io::Result<(SocketAddr,
                 Ok((stream, _)) => {
                     tokio::spawn(async move {
                         let io = TokioIo::new(stream);
-                        let service =
-                            service_fn(|request| handle_http_echo_request("http", request));
-                        if let Err(err) = http1::Builder::new().serve_connection(io, service).await
-                        {
-                            warn!("sample http echo connection failed: {err}");
-                        }
+                        serve_http_echo_connection(io, "http").await;
                     });
                 }
                 Err(err) => {
@@ -290,13 +386,13 @@ pub async fn spawn_http_echo_server(addr: SocketAddr) -> io::Result<(SocketAddr,
 
 #[cfg(feature = "tls")]
 pub async fn spawn_tls_echo_server(addr: SocketAddr) -> io::Result<(SocketAddr, JoinHandle<()>)> {
-    let tls_config = generate_self_signed_tls_server_config()?;
+    let tls_config = generate_self_signed_tls_server_config(http1_alpn_protocols())?;
     spawn_tls_echo_server_with_config(addr, tls_config).await
 }
 
 #[cfg(feature = "tls")]
 pub async fn spawn_https_echo_server(addr: SocketAddr) -> io::Result<(SocketAddr, JoinHandle<()>)> {
-    let tls_config = generate_self_signed_tls_server_config()?;
+    let tls_config = generate_sample_https_tls_server_config()?;
     spawn_https_echo_server_with_config(addr, tls_config).await
 }
 
@@ -371,12 +467,7 @@ async fn spawn_https_echo_server_with_config(
                             }
                         };
                         let io = TokioIo::new(tls_stream);
-                        let service =
-                            service_fn(|request| handle_http_echo_request("https", request));
-                        if let Err(err) = http1::Builder::new().serve_connection(io, service).await
-                        {
-                            warn!("sample https echo connection failed: {err}");
-                        }
+                        serve_http_echo_connection(io, "https").await;
                     });
                 }
                 Err(err) => {
@@ -419,7 +510,7 @@ pub async fn spawn_websocket_echo_server(
 pub async fn spawn_secure_websocket_echo_server(
     addr: SocketAddr,
 ) -> io::Result<(SocketAddr, JoinHandle<()>)> {
-    let tls_config = generate_self_signed_tls_server_config()?;
+    let tls_config = generate_self_signed_tls_server_config(http1_alpn_protocols())?;
     spawn_secure_websocket_echo_server_with_config(addr, tls_config).await
 }
 
@@ -494,6 +585,31 @@ pub async fn spawn_webrtc_echo_server(
 }
 
 #[cfg(feature = "http")]
+async fn serve_http_echo_connection<S>(io: TokioIo<S>, protocol: &'static str)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let service = service_fn(move |request| handle_http_echo_request(protocol, request));
+
+    #[cfg(feature = "http2")]
+    {
+        if let Err(err) = AutoBuilder::new(TokioExecutor::new())
+            .serve_connection(io, service)
+            .await
+        {
+            warn!("sample {protocol} echo connection failed: {err}");
+        }
+    }
+
+    #[cfg(not(feature = "http2"))]
+    {
+        if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+            warn!("sample {protocol} echo connection failed: {err}");
+        }
+    }
+}
+
+#[cfg(feature = "http")]
 type EchoResponse = Response<Full<Bytes>>;
 
 #[cfg(feature = "http")]
@@ -516,6 +632,7 @@ async fn handle_http_echo_request(
     request: Request<Incoming>,
 ) -> Result<EchoResponse, Infallible> {
     let method = request.method().clone();
+    let version = request.version();
     let path = request.uri().path().to_string();
     let body = match request.into_body().collect().await {
         Ok(body) => body.to_bytes(),
@@ -545,7 +662,23 @@ async fn handle_http_echo_request(
     if let Ok(value) = HeaderValue::from_str(&echoed_body.len().to_string()) {
         response.headers_mut().insert("x-echo-bytes", value);
     }
+    response.headers_mut().insert(
+        "x-echo-http-version",
+        HeaderValue::from_static(http_version_label(version)),
+    );
     Ok(response)
+}
+
+#[cfg(feature = "http")]
+fn http_version_label(version: hyper::Version) -> &'static str {
+    match version {
+        hyper::Version::HTTP_09 => "0.9",
+        hyper::Version::HTTP_10 => "1.0",
+        hyper::Version::HTTP_11 => "1.1",
+        hyper::Version::HTTP_2 => "2",
+        hyper::Version::HTTP_3 => "3",
+        _ => "unknown",
+    }
 }
 
 #[cfg(any(feature = "tls", feature = "webrtc"))]
@@ -564,7 +697,9 @@ fn ensure_rustls_provider() {
 }
 
 #[cfg(feature = "tls")]
-fn generate_self_signed_tls_server_config() -> io::Result<Arc<ServerConfig>> {
+fn generate_self_signed_tls_server_config(
+    alpn_protocols: Vec<Vec<u8>>,
+) -> io::Result<Arc<ServerConfig>> {
     ensure_rustls_provider();
     let certificate =
         generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
@@ -575,14 +710,33 @@ fn generate_self_signed_tls_server_config() -> io::Result<Arc<ServerConfig>> {
         .serialize_der()
         .map_err(|err| io::Error::other(format!("failed to serialize cert der: {err}")))?;
     let private_key_der = certificate.serialize_private_key_der();
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(
             vec![CertificateDer::from(certificate_der)],
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der)),
         )
         .map_err(|err| io::Error::other(format!("failed to build rustls config: {err}")))?;
+    config.alpn_protocols = alpn_protocols;
     Ok(Arc::new(config))
+}
+
+#[cfg(feature = "tls")]
+fn http1_alpn_protocols() -> Vec<Vec<u8>> {
+    vec![b"http/1.1".to_vec()]
+}
+
+#[cfg(feature = "tls")]
+fn generate_sample_https_tls_server_config() -> io::Result<Arc<ServerConfig>> {
+    #[cfg(feature = "http2")]
+    {
+        return generate_self_signed_tls_server_config(vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+    }
+
+    #[cfg(not(feature = "http2"))]
+    {
+        generate_self_signed_tls_server_config(http1_alpn_protocols())
+    }
 }
 
 #[cfg(feature = "websocket")]

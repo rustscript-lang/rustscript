@@ -39,12 +39,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(addr) = server.addresses.http {
+        #[cfg(feature = "http2")]
+        info!(
+            "http echo listening on http://{} (HTTP/1.1 + h2c prior knowledge)",
+            addr
+        );
+        #[cfg(not(feature = "http2"))]
         info!("http echo listening on http://{}", addr);
     } else {
         warn!("http echo disabled in this build; enable the `http` feature");
     }
 
     if let Some(addr) = server.addresses.https {
+        #[cfg(feature = "http2")]
+        info!(
+            "https echo listening on https://{} (ALPN: h2, http/1.1)",
+            addr
+        );
+        #[cfg(not(feature = "http2"))]
         info!("https echo listening on https://{}", addr);
     } else {
         warn!("https echo disabled in this build; enable the `tls` feature");
@@ -69,6 +81,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         warn!("webrtc echo disabled in this build; enable the `webrtc` feature");
     }
+    info!(
+        "forward proxy listening on {} (CONNECT tunnel)",
+        server.addresses.forward_proxy
+    );
 
     info!("sample echo server is running; press Ctrl+C to stop");
     tokio::signal::ctrl_c().await?;
@@ -87,6 +103,7 @@ struct CliArgs {
     websocket_addr: SocketAddr,
     websocket_tls_addr: SocketAddr,
     webrtc_addr: SocketAddr,
+    forward_proxy_addr: SocketAddr,
 }
 
 impl Default for CliArgs {
@@ -101,6 +118,7 @@ impl Default for CliArgs {
             websocket_addr: config.websocket_addr,
             websocket_tls_addr: config.websocket_tls_addr,
             webrtc_addr: config.webrtc_addr,
+            forward_proxy_addr: config.forward_proxy_addr,
         }
     }
 }
@@ -116,6 +134,7 @@ impl CliArgs {
             websocket_addr: self.websocket_addr,
             websocket_tls_addr: self.websocket_tls_addr,
             webrtc_addr: self.webrtc_addr,
+            forward_proxy_addr: self.forward_proxy_addr,
         }
     }
 }
@@ -185,6 +204,12 @@ where
                     &next_arg_value("--webrtc-addr", &mut args)?,
                 )?;
             }
+            "--forward-proxy-addr" => {
+                cli.forward_proxy_addr = parse_socket_addr(
+                    "--forward-proxy-addr",
+                    &next_arg_value("--forward-proxy-addr", &mut args)?,
+                )?;
+            }
             _ => return Err(format!("unknown argument: {arg}")),
         }
     }
@@ -223,10 +248,15 @@ fn print_cli_help() {
         "  --websocket-addr, --ws-addr <ADDR>       WebSocket echo listen address (default: 127.0.0.1:7006)\n",
         "  --websocket-tls-addr, --wss-addr <ADDR>  Secure WebSocket echo listen address (default: 127.0.0.1:7007)\n",
         "  --webrtc-addr <ADDR>                     WebRTC signaling listen address (default: 127.0.0.1:7008)\n",
+        "  --forward-proxy-addr <ADDR>              CONNECT forward proxy listen address (default: 127.0.0.1:7009)\n",
         "  -V, --version                            Show version with git metadata\n",
         "  -h, --help                               Show this help\n\n",
         "Notes:\n",
         "  The TLS, HTTPS, and WSS listeners use a generated self-signed certificate.\n",
+        "  With feature `http2`, the HTTP listener also accepts cleartext h2c prior knowledge.\n",
+        "  With feature `http2`, the HTTPS listener negotiates h2 or HTTP/1.1 via ALPN.\n",
+        "  Without feature `http2`, the HTTP and HTTPS listeners serve HTTP/1.1 only.\n",
+        "  The forward proxy listener accepts CONNECT and then tunnels raw TCP bytes.\n",
         "  The WebRTC listener serves signaling over HTTP POST /offer and echoes data-channel messages.\n",
         "  Feature-gated listeners are only enabled when the corresponding crate feature is compiled in.\n",
     ));
@@ -281,6 +311,8 @@ mod tests {
             "127.0.0.1:9107".to_string(),
             "--webrtc-addr".to_string(),
             "127.0.0.1:9108".to_string(),
+            "--forward-proxy-addr".to_string(),
+            "127.0.0.1:9109".to_string(),
         ])
         .expect("cli should parse");
 
@@ -318,6 +350,10 @@ mod tests {
         assert_eq!(
             cli.webrtc_addr,
             "127.0.0.1:9108".parse::<SocketAddr>().expect("valid addr")
+        );
+        assert_eq!(
+            cli.forward_proxy_addr,
+            "127.0.0.1:9109".parse::<SocketAddr>().expect("valid addr")
         );
     }
 
