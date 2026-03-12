@@ -5,6 +5,7 @@ mod control_plane_rpc;
 mod debug_session;
 mod logging;
 mod runtime;
+pub mod sample_echo;
 
 pub use edge_abi::*;
 

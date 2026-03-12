@@ -2,23 +2,27 @@
 
 `pd-edge` is the edge runtime crate for running VM programs at the edge.
 
-This crate now ships two binaries with different scopes:
+This crate now ships three binaries with different scopes:
 
 - `pd-edge-http-proxy`: full HTTP data plane runtime (proxy path + admin API + optional active control-plane client)
 - `pd-edge-console`: interactive local console runtime (stdin/stdout/stderr host APIs + optional active control-plane client)
+- `pd-edge-sample-echo-server`: local multi-protocol echo server for manual transport and host-ABI testing
 
 ## Contents
 
 - [Binary Scope](#binary-scope)
   - [pd-edge-http-proxy](#pd-edge-http-proxy)
   - [pd-edge-console](#pd-edge-console)
+  - [pd-edge-sample-echo-server](#pd-edge-sample-echo-server)
 - [Quick Start](#quick-start)
   - [HTTP Proxy Mode](#http-proxy-mode)
   - [Console Mode](#console-mode)
+  - [Sample Echo Server](#sample-echo-server)
 - [HTTP Proxy Admin API](#http-proxy-admin-api)
 - [CLI](#cli)
   - [pd-edge-http-proxy](#pd-edge-http-proxy-1)
   - [pd-edge-console](#pd-edge-console-1)
+  - [pd-edge-sample-echo-server](#pd-edge-sample-echo-server-1)
 - [Active Control-Plane RPC](#active-control-plane-rpc)
   - [Example](#example)
 - [HTTP Proxy Performance Framework](#http-proxy-performance-framework)
@@ -49,6 +53,13 @@ Default listeners:
 - Runs an interactive shell to load and execute VM programs locally
 - Supports console host APIs: `console::stdin::read_line()`, `console::stdin::read_all()`, `console::stdout::write(text)`, `console::stdout::flush()`, `console::stderr::write(text)`, `console::stderr::flush()`
 - Registers runtime host ABI (`runtime::sleep`, `rate_limit::allow`) plus the console host APIs above
+
+### `pd-edge-sample-echo-server`
+
+- Starts separate listeners for TCP, UDP, TLS, HTTP, HTTPS, WebSocket, secure WebSocket, and WebRTC signaling
+- Echoes request bytes, datagrams, HTTP bodies, WebSocket frames, and WebRTC data-channel messages
+- Uses a generated self-signed certificate for TLS, HTTPS, and `wss://`
+- Enables manual end-to-end testing of the feature-gated transport surfaces without uploading a VM program
 
 ## Quick Start
 
@@ -95,6 +106,25 @@ Interactive commands:
 - `.load <PATH>`
 - `.run`
 - `.quit`
+
+### Sample Echo Server
+
+Start the multi-protocol sample server with all current listeners enabled:
+
+```powershell
+cargo run -p pd-edge --bin pd-edge-sample-echo-server --features webrtc
+```
+
+Default listeners:
+
+- TCP: `127.0.0.1:7001`
+- UDP: `127.0.0.1:7002`
+- TLS: `127.0.0.1:7003`
+- HTTP: `127.0.0.1:7004`
+- HTTPS: `127.0.0.1:7005`
+- WebSocket: `127.0.0.1:7006`
+- WSS: `127.0.0.1:7007`
+- WebRTC signaling: `http://127.0.0.1:7008/offer`
 
 ## HTTP Proxy Admin API
 
@@ -165,6 +195,29 @@ Usage: pd-edge-console [options]
 ```
 
 The same interruption exclusivity rules apply in console mode: fuel and epoch cannot both be enabled for the same VM run.
+
+### `pd-edge-sample-echo-server`
+
+```text
+Usage: pd-edge-sample-echo-server [options]
+
+--tcp-addr <ADDR>                        TCP echo listen address (default: 127.0.0.1:7001)
+--udp-addr <ADDR>                        UDP echo listen address (default: 127.0.0.1:7002)
+--tls-addr <ADDR>                        TLS echo listen address (default: 127.0.0.1:7003)
+--http-addr <ADDR>                       HTTP echo listen address (default: 127.0.0.1:7004)
+--https-addr <ADDR>                      HTTPS echo listen address (default: 127.0.0.1:7005)
+--websocket-addr, --ws-addr <ADDR>       WebSocket echo listen address (default: 127.0.0.1:7006)
+--websocket-tls-addr, --wss-addr <ADDR>  Secure WebSocket echo listen address (default: 127.0.0.1:7007)
+--webrtc-addr <ADDR>                     WebRTC signaling listen address (default: 127.0.0.1:7008)
+-V, --version
+-h, --help
+```
+
+Notes:
+
+- TLS, HTTPS, and WSS listeners use a generated self-signed certificate.
+- The WebRTC listener accepts `POST /offer` and returns an SDP answer for a data-channel echo peer.
+- Feature-gated listeners are only enabled when their crate feature is compiled in.
 
 ## Active Control-Plane RPC
 
@@ -731,6 +784,8 @@ docker run --rm -p 8080:8080 -p 8081:8081 fffonion/pd-edge:latest
 
 - `pd-edge/src/bin/pd-edge-http-proxy.rs`: HTTP proxy binary entrypoint and CLI
 - `pd-edge/src/bin/pd-edge-console.rs`: console binary entrypoint and CLI
+- `pd-edge/src/bin/pd-edge-sample-echo-server.rs`: multi-protocol sample echo server binary and CLI
+- `pd-edge/src/sample_echo.rs`: shared TCP/UDP/TLS/HTTP/WebSocket/WebRTC sample echo server implementation
 - `pd-edge/src/runtime.rs`: shared runtime state, telemetry, program apply/load, exports
 - `pd-edge/src/runtime/http_plane/`: HTTP data/admin plane handlers
 - `pd-edge/src/abi_impl/runtime.rs`: protocol-independent runtime host ABI
