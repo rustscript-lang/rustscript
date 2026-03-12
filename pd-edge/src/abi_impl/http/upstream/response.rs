@@ -5,7 +5,8 @@ use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::super::{
     SharedProxyVmContext, ensure_upstream_response_started, headers_to_value_map,
-    read_upstream_response_all, read_upstream_response_next_chunk, upstream_response_eof,
+    read_upstream_response_all, read_upstream_response_next_chunk,
+    read_upstream_response_next_line, upstream_response_eof,
 };
 
 #[pd_edge_host_function(name = http_upstream_response::ENABLE_PROCESSING.name, scope = http)]
@@ -82,6 +83,20 @@ async fn get_upstream_response_body_chunk(
     let chunk = read_upstream_response_next_chunk(&context, max_bytes as usize).await?;
     Ok(CallOutcome::Return(vec![Value::string(
         String::from_utf8_lossy(&chunk).into_owned(),
+    )]))
+}
+
+#[pd_edge_host_function(
+    name = http_upstream_response::body::NEXT_LINE.name,
+    scope = http_extension
+)]
+async fn get_upstream_response_body_line(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    let line = read_upstream_response_next_line(&context).await?;
+    Ok(CallOutcome::Return(vec![Value::string(
+        String::from_utf8_lossy(&line).into_owned(),
     )]))
 }
 

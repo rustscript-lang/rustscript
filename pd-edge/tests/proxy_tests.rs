@@ -17,8 +17,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use edge::{
     ActiveControlPlaneConfig, CommandResultPayload, ControlPlaneCommand, EdgeCommandResult,
     EdgePollRequest, EdgePollResponse, FN_HTTP_RESPONSE_SET_BODY, FN_HTTP_RESPONSE_SET_HEADER,
-    FN_HTTP_UPSTREAM_REQUEST_SET_TARGET, SharedState, build_admin_app, build_http_proxy_app,
-    compile_edge_source_file, spawn_active_control_plane_client,
+    FN_HTTP_UPSTREAM_REQUEST_SET_TARGET, ProxyVmContext, RateLimiterStore, SharedState,
+    VmAsyncOpBridge, build_admin_app, build_http_proxy_app, compile_edge_source_file,
+    enter_edge_host_context, new_shared_vm_async_ops, register_http_plane_host_module,
+    spawn_active_control_plane_client,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::{sync::Notify, task::JoinHandle, time::timeout};
@@ -37,7 +39,7 @@ use tokio_tungstenite::{
         http::HeaderValue as WsHeaderValue,
     },
 };
-use vm::{BytecodeBuilder, Program, Value, compile_source, encode_program};
+use vm::{BytecodeBuilder, Program, Value, Vm, VmError, VmStatus, compile_source, encode_program};
 
 fn ensure_rustls_provider() {
     static INIT: std::sync::Once = std::sync::Once::new();
@@ -106,6 +108,81 @@ async fn spawn_chunked_upstream(chunks: Vec<&'static str>) -> (SocketAddr, JoinH
                         .expect("chunk should write");
                     stream.flush().await.expect("chunk flush should succeed");
                     tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                stream
+                    .write_all(b"0\r\n\r\n")
+                    .await
+                    .expect("terminator should write");
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (addr, handle)
+}
+
+async fn run_edge_program_direct(
+    program: Program,
+    context: Arc<Mutex<ProxyVmContext>>,
+) -> Result<(), VmError> {
+    let async_ops = new_shared_vm_async_ops();
+    let mut vm = Vm::new(program);
+    vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));
+    register_http_plane_host_module(&mut vm, context.clone(), async_ops.clone())?;
+
+    let mut status = {
+        let _host_context = enter_edge_host_context(context.clone(), async_ops.clone());
+        vm.run()?
+    };
+
+    loop {
+        match status {
+            VmStatus::Halted => return Ok(()),
+            VmStatus::Waiting(_op_id) => {
+                vm.await_waiting_host_op().await?;
+                let _host_context = enter_edge_host_context(context.clone(), async_ops.clone());
+                status = vm.resume()?;
+            }
+            other => {
+                return Err(VmError::HostError(format!(
+                    "unexpected vm status while running direct edge test: {other:?}",
+                )));
+            }
+        }
+    }
+}
+
+async fn spawn_sse_upstream(lines: Vec<&'static str>) -> (SocketAddr, JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener should have addr");
+    let lines = lines
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<String>>();
+    let handle = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.expect("accept should succeed");
+            let response_lines = lines.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .expect("response head should write");
+                for line in response_lines {
+                    let frame = format!("{:X}\r\n{}\r\n", line.len(), line);
+                    stream
+                        .write_all(frame.as_bytes())
+                        .await
+                        .expect("sse frame should write");
+                    stream.flush().await.expect("sse flush should succeed");
+                    tokio::time::sleep(Duration::from_millis(15)).await;
                 }
                 stream
                     .write_all(b"0\r\n\r\n")
@@ -1140,6 +1217,102 @@ async fn sample_proxy_program_streams_or_buffers_upstream_body() {
     upstream_handle.abort();
     data_handle.abort();
     admin_handle.abort();
+}
+
+#[tokio::test]
+async fn sample_sse_proxy_program_mutates_each_upstream_event_before_returning() {
+    let (upstream_addr, upstream_handle) = spawn_sse_upstream(vec![
+        "id: 1\n",
+        "data: alpha\n",
+        "\n",
+        "id: 2\n",
+        "data: beta\n",
+        "\n",
+    ])
+    .await;
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_sse_proxy_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/sse"))
+        .header(
+            "x-upstream-target",
+            format!("http://{upstream_addr}/events"),
+        )
+        .send()
+        .await
+        .expect("sse request should complete");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.text().await.expect("sse body should read");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    assert_eq!(
+        headers
+            .get("x-sse-mutated")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        body,
+        "id: 1 [mutated]\ndata: alpha [mutated]\n\nid: 2 [mutated]\ndata: beta [mutated]\n\n"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn direct_vm_can_read_upstream_response_line_by_line_via_http_body_api() {
+    let (upstream_addr, upstream_handle) =
+        spawn_sse_upstream(vec!["id: 1\n", "data: alpha\n", "\n"]).await;
+    let source = format!(
+        r#"
+        use http;
+        use tcp;
+
+        http::upstream::request::set_target("http://{upstream_addr}/events");
+        http::response::set_status(http::upstream::response::get_status());
+        let downstream = tcp::stream::downstream();
+
+        while !http::upstream::response::body::eof() {{
+            let line = http::upstream::response::body::next_line();
+            if line == "" {{
+                tcp::stream::write(downstream, "\n");
+            }} else {{
+                tcp::stream::write(downstream, line + "\n");
+            }}
+        }}
+    "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let context = Arc::new(Mutex::new(ProxyVmContext::from_request_headers(
+        axum::http::HeaderMap::new(),
+        Arc::new(Mutex::new(RateLimiterStore::new())),
+    )));
+    {
+        let mut guard = context.lock().expect("vm context lock poisoned");
+        guard.attach_upstream_client(reqwest::Client::new());
+    }
+
+    run_edge_program_direct(compiled.program, context.clone())
+        .await
+        .expect("direct vm run should succeed");
+
+    upstream_handle.abort();
 }
 
 #[tokio::test]
