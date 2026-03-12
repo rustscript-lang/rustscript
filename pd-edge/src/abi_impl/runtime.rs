@@ -6,6 +6,7 @@ use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::SharedProxyVmContext;
 
+/// Suspends execution for the requested number of milliseconds.
 #[pd_edge_host_function(name = edge_runtime::SLEEP.name, scope = runtime)]
 async fn runtime_sleep(_vm: &mut Vm, millis: i64) -> Result<CallOutcome, VmError> {
     if millis < 0 {
@@ -19,6 +20,7 @@ async fn runtime_sleep(_vm: &mut Vm, millis: i64) -> Result<CallOutcome, VmError
     Ok(CallOutcome::Return(vec![Value::Bool(true)]))
 }
 
+/// Checks whether a rate-limit bucket allows the current operation.
 #[pd_edge_host_function(name = edge_rate_limit::ALLOW.name, scope = runtime)]
 async fn rate_limit_allow(
     _vm: &mut Vm,

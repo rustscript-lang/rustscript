@@ -1,8 +1,8 @@
-use std::time::Duration;
+use std::sync::Arc;
 
 use edge_abi::symbols::proxy as proxy_symbols;
 use pd_edge_host_function::pd_edge_host_function;
-use tokio::{task::yield_now, time::sleep, try_join};
+use tokio::{sync::Notify, task::yield_now, try_join};
 use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::{
@@ -14,8 +14,6 @@ use super::{
     },
 };
 
-const BLOCKED_RETRY_DELAY: Duration = Duration::from_millis(1);
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ProxyByteStreamEndpoint {
     HttpDownstream,
@@ -23,11 +21,22 @@ pub(crate) enum ProxyByteStreamEndpoint {
     WebSocketBinary(i64),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) struct ProxyByteStreamState {
     endpoint: ProxyByteStreamEndpoint,
     write_observed: bool,
     write_closed: bool,
+    write_close_notify: Arc<Notify>,
+}
+
+impl std::fmt::Debug for ProxyByteStreamState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyByteStreamState")
+            .field("endpoint", &self.endpoint)
+            .field("write_observed", &self.write_observed)
+            .field("write_closed", &self.write_closed)
+            .finish()
+    }
 }
 
 impl ProxyByteStreamState {
@@ -36,6 +45,7 @@ impl ProxyByteStreamState {
             endpoint,
             write_observed: false,
             write_closed: false,
+            write_close_notify: Arc::new(Notify::new()),
         }
     }
 }
@@ -43,6 +53,7 @@ impl ProxyByteStreamState {
 enum ProxyReadStep {
     Data(Vec<u8>),
     Eof,
+    WaitingForWriteClose,
     Blocked,
 }
 
@@ -123,13 +134,61 @@ fn mark_proxy_stream_write_closed(
     context: &SharedProxyVmContext,
     handle: i64,
 ) -> Result<ProxyByteStreamEndpoint, VmError> {
-    let mut guard = context.lock().expect("vm context lock poisoned");
+    let (endpoint, notify) = {
+        let mut guard = context.lock().expect("vm context lock poisoned");
+        let stream = guard
+            .proxy_stream_handles
+            .get_mut(&handle)
+            .ok_or_else(|| unknown_proxy_stream_handle(handle))?;
+        if stream.write_closed {
+            (stream.endpoint.clone(), None)
+        } else {
+            stream.write_closed = true;
+            (
+                stream.endpoint.clone(),
+                Some(stream.write_close_notify.clone()),
+            )
+        }
+    };
+    if let Some(notify) = notify {
+        notify.notify_waiters();
+    }
+    Ok(endpoint)
+}
+
+fn proxy_stream_write_closed(context: &SharedProxyVmContext, handle: i64) -> Result<bool, VmError> {
+    let guard = context.lock().expect("vm context lock poisoned");
     let stream = guard
         .proxy_stream_handles
-        .get_mut(&handle)
+        .get(&handle)
         .ok_or_else(|| unknown_proxy_stream_handle(handle))?;
-    stream.write_closed = true;
-    Ok(stream.endpoint.clone())
+    Ok(stream.write_closed)
+}
+
+fn proxy_stream_write_close_notify(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<Arc<Notify>, VmError> {
+    let guard = context.lock().expect("vm context lock poisoned");
+    let stream = guard
+        .proxy_stream_handles
+        .get(&handle)
+        .ok_or_else(|| unknown_proxy_stream_handle(handle))?;
+    Ok(stream.write_close_notify.clone())
+}
+
+async fn wait_for_proxy_stream_write_close(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<(), VmError> {
+    loop {
+        let notify = proxy_stream_write_close_notify(context, handle)?;
+        let notified = notify.notified();
+        if proxy_stream_write_closed(context, handle)? {
+            return Ok(());
+        }
+        notified.await;
+    }
 }
 
 fn endpoint_from_tcp_stream(
@@ -231,7 +290,7 @@ async fn proxy_stream_read_step(
                 && stream.write_observed
                 && !stream.write_closed
             {
-                return Ok(ProxyReadStep::Blocked);
+                return Ok(ProxyReadStep::WaitingForWriteClose);
             }
             let chunk =
                 http::read_outbound_exchange_response_next_chunk(context, exchange, max_bytes)
@@ -309,8 +368,11 @@ async fn drive_pipe_direction(
                 proxy_stream_close_write(&context, destination).await?;
                 return Ok(());
             }
+            ProxyReadStep::WaitingForWriteClose => {
+                wait_for_proxy_stream_write_close(&context, source).await?;
+            }
             ProxyReadStep::Blocked => {
-                sleep(BLOCKED_RETRY_DELAY).await;
+                yield_now().await;
             }
         }
     }
@@ -556,7 +618,7 @@ mod tests {
             proxy_stream_read_step(&context, upstream, 64)
                 .await
                 .expect("read step should succeed"),
-            ProxyReadStep::Blocked
+            ProxyReadStep::WaitingForWriteClose
         ));
 
         proxy_stream_close_write(&context, upstream)
@@ -569,7 +631,7 @@ mod tests {
             ProxyReadStep::Data(chunk) => {
                 assert_eq!(String::from_utf8_lossy(&chunk), "echo:payload");
             }
-            ProxyReadStep::Eof | ProxyReadStep::Blocked => {
+            ProxyReadStep::Eof | ProxyReadStep::WaitingForWriteClose | ProxyReadStep::Blocked => {
                 panic!("expected upstream body bytes after write close")
             }
         }

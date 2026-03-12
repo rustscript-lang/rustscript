@@ -602,6 +602,7 @@ pub(super) fn register_webrtc_extensions(
     registry::register_host_scope(vm, &context, &async_ops, registry::EdgeHostScope::WebRtc);
 }
 
+/// Allocates a WebRTC connection handle.
 #[pd_edge_host_function(name = webrtc::connection::NEW.name, scope = webrtc)]
 async fn connection_new(
     _vm: &mut Vm,
@@ -611,6 +612,7 @@ async fn connection_new(
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 
+/// Returns the WebRTC connection handle for the current downstream flow.
 #[pd_edge_host_function(name = webrtc::connection::DOWNSTREAM.name, scope = webrtc)]
 async fn connection_downstream(
     _vm: &mut Vm,
@@ -621,6 +623,7 @@ async fn connection_downstream(
     )]))
 }
 
+/// Returns the default upstream handle for the WebRTC connection.
 #[pd_edge_host_function(name = webrtc::connection::DEFAULT_UPSTREAM.name, scope = webrtc)]
 async fn connection_default_upstream(
     _vm: &mut Vm,
@@ -631,6 +634,7 @@ async fn connection_default_upstream(
     )]))
 }
 
+/// Returns whether the WebRTC connection handle is present.
 #[pd_edge_host_function(name = webrtc::connection::IS_PRESENT.name, scope = webrtc)]
 async fn connection_is_present(
     _vm: &mut Vm,
@@ -644,6 +648,7 @@ async fn connection_is_present(
     Ok(CallOutcome::Return(vec![Value::Bool(present)]))
 }
 
+/// Sets the ICE server list for the WebRTC connection.
 #[pd_edge_host_function(name = webrtc::connection::SET_ICE_SERVERS.name, scope = webrtc)]
 async fn connection_set_ice_servers(
     _vm: &mut Vm,
@@ -665,6 +670,7 @@ async fn connection_set_ice_servers(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the data channel label for the WebRTC connection.
 #[pd_edge_host_function(
     name = webrtc::connection::SET_DATA_CHANNEL_LABEL.name,
     scope = webrtc
@@ -693,6 +699,7 @@ async fn connection_set_data_channel_label(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the remote session description for the WebRTC connection.
 #[pd_edge_host_function(
     name = webrtc::connection::SET_REMOTE_DESCRIPTION.name,
     scope = webrtc
@@ -718,6 +725,7 @@ async fn connection_set_remote_description(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Creates an SDP offer for the WebRTC connection.
 #[pd_edge_host_function(name = webrtc::connection::CREATE_OFFER.name, scope = webrtc)]
 async fn connection_create_offer(
     _vm: &mut Vm,
@@ -750,6 +758,7 @@ async fn connection_create_offer(
     Ok(CallOutcome::Return(vec![Value::string(json)]))
 }
 
+/// Creates an SDP answer for the WebRTC connection.
 #[pd_edge_host_function(name = webrtc::connection::CREATE_ANSWER.name, scope = webrtc)]
 async fn connection_create_answer(
     _vm: &mut Vm,
@@ -781,6 +790,7 @@ async fn connection_create_answer(
     Ok(CallOutcome::Return(vec![Value::string(json)]))
 }
 
+/// Attempts to connect the WebRTC connection.
 #[pd_edge_host_function(name = webrtc::connection::CONNECT.name, scope = webrtc)]
 async fn connection_connect(
     _vm: &mut Vm,
@@ -800,6 +810,7 @@ async fn connection_connect(
     Ok(CallOutcome::Return(vec![Value::Bool(open)]))
 }
 
+/// Returns the current phase for the WebRTC connection.
 #[pd_edge_host_function(name = webrtc::connection::GET_PHASE.name, scope = webrtc)]
 async fn connection_get_phase(
     _vm: &mut Vm,
@@ -817,6 +828,7 @@ async fn connection_get_phase(
     Ok(CallOutcome::Return(vec![Value::string(phase.as_str())]))
 }
 
+/// Sends a text message over the WebRTC connection.
 #[pd_edge_host_function(name = webrtc::connection::SEND_TEXT.name, scope = webrtc)]
 async fn connection_send_text(
     _vm: &mut Vm,
@@ -837,6 +849,7 @@ async fn connection_send_text(
     Ok(CallOutcome::Return(vec![Value::Int(sent as i64)]))
 }
 
+/// Reads a text message from the WebRTC connection.
 #[pd_edge_host_function(name = webrtc::connection::READ_TEXT.name, scope = webrtc)]
 async fn connection_read_text(
     _vm: &mut Vm,
@@ -858,6 +871,7 @@ async fn connection_read_text(
     Ok(CallOutcome::Return(vec![Value::string(text)]))
 }
 
+/// Sends a base64-encoded binary message over the WebRTC connection.
 #[pd_edge_host_function(
     name = webrtc::connection::SEND_BINARY_BASE64.name,
     scope = webrtc
@@ -888,6 +902,7 @@ async fn connection_send_binary_base64(
     Ok(CallOutcome::Return(vec![Value::Int(sent as i64)]))
 }
 
+/// Reads a base64-encoded binary message from the WebRTC connection.
 #[pd_edge_host_function(
     name = webrtc::connection::READ_BINARY_BASE64.name,
     scope = webrtc
@@ -911,6 +926,7 @@ async fn connection_read_binary_base64(
     Ok(CallOutcome::Return(vec![Value::string(payload)]))
 }
 
+/// Returns whether the WebRTC connection has reached EOF.
 #[pd_edge_host_function(name = webrtc::connection::EOF.name, scope = webrtc)]
 async fn connection_eof(
     _vm: &mut Vm,
@@ -927,6 +943,7 @@ async fn connection_eof(
     Ok(CallOutcome::Return(vec![Value::Bool(eof)]))
 }
 
+/// Closes the WebRTC connection.
 #[pd_edge_host_function(name = webrtc::connection::CLOSE.name, scope = webrtc)]
 async fn connection_close(
     _vm: &mut Vm,

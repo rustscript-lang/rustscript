@@ -342,6 +342,7 @@ fn append_downstream_response(context: &SharedProxyVmContext, text: &str) {
     append_response_output_body_bytes(context, text.as_bytes());
 }
 
+/// Returns the TCP stream handle for the current downstream flow.
 #[pd_edge_host_function(name = tcp::stream::DOWNSTREAM.name, scope = transport)]
 async fn stream_downstream(
     _vm: &mut Vm,
@@ -352,6 +353,7 @@ async fn stream_downstream(
     )]))
 }
 
+/// Returns the default upstream handle for the TCP stream.
 #[pd_edge_host_function(name = tcp::stream::DEFAULT_UPSTREAM.name, scope = transport)]
 async fn stream_default_upstream(
     _vm: &mut Vm,
@@ -362,12 +364,14 @@ async fn stream_default_upstream(
     )]))
 }
 
+/// Allocates a TCP stream handle.
 #[pd_edge_host_function(name = tcp::stream::NEW.name, scope = transport)]
 async fn stream_new(_vm: &mut Vm, context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
     let handle = allocate_tcp_stream_handle(&context)?;
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 
+/// Returns whether the TCP stream handle is present.
 #[pd_edge_host_function(name = tcp::stream::IS_PRESENT.name, scope = transport)]
 async fn stream_is_present(
     _vm: &mut Vm,
@@ -383,6 +387,7 @@ async fn stream_is_present(
     Ok(CallOutcome::Return(vec![Value::Bool(present)]))
 }
 
+/// Binds the TCP stream to a local address.
 #[pd_edge_host_function(name = tcp::stream::BIND.name, scope = transport)]
 async fn stream_bind(
     _vm: &mut Vm,
@@ -398,6 +403,7 @@ async fn stream_bind(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the target endpoint for the TCP stream.
 #[pd_edge_host_function(name = tcp::stream::SET_TARGET.name, scope = transport)]
 async fn stream_set_target(
     _vm: &mut Vm,
@@ -414,6 +420,7 @@ async fn stream_set_target(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Attempts to connect the TCP stream.
 #[pd_edge_host_function(name = tcp::stream::CONNECT.name, scope = transport)]
 async fn stream_connect(
     _vm: &mut Vm,
@@ -424,6 +431,7 @@ async fn stream_connect(
     Ok(CallOutcome::Return(vec![Value::Bool(true)]))
 }
 
+/// Reports the current lifecycle phase for a TCP stream handle.
 #[pd_edge_host_function(name = tcp::stream::GET_PHASE.name, scope = transport)]
 async fn stream_get_phase(
     _vm: &mut Vm,
@@ -451,6 +459,7 @@ async fn stream_get_phase(
     Ok(CallOutcome::Return(vec![Value::string(phase)]))
 }
 
+/// Returns the local address for the TCP stream.
 #[pd_edge_host_function(name = tcp::stream::GET_LOCAL_ADDR.name, scope = transport)]
 async fn stream_get_local_addr(
     _vm: &mut Vm,
@@ -466,6 +475,7 @@ async fn stream_get_local_addr(
     Ok(CallOutcome::Return(vec![Value::string(local_addr)]))
 }
 
+/// Returns the peer address for the TCP stream.
 #[pd_edge_host_function(name = tcp::stream::GET_PEER_ADDR.name, scope = transport)]
 async fn stream_get_peer_addr(
     _vm: &mut Vm,
@@ -493,6 +503,7 @@ async fn stream_get_peer_addr(
     Ok(CallOutcome::Return(vec![Value::string(peer_addr)]))
 }
 
+/// Reads text from the TCP stream.
 #[pd_edge_host_function(name = tcp::stream::READ.name, scope = transport)]
 async fn stream_read(
     _vm: &mut Vm,
@@ -542,6 +553,7 @@ async fn stream_read(
     )]))
 }
 
+/// Writes text to the TCP stream.
 #[pd_edge_host_function(name = tcp::stream::WRITE.name, scope = transport)]
 async fn stream_write(
     _vm: &mut Vm,
@@ -583,6 +595,7 @@ async fn stream_write(
     Ok(CallOutcome::Return(vec![Value::Int(text.len() as i64)]))
 }
 
+/// Returns whether the TCP stream has reached EOF.
 #[pd_edge_host_function(name = tcp::stream::EOF.name, scope = transport)]
 async fn stream_eof(
     _vm: &mut Vm,
@@ -605,6 +618,7 @@ async fn stream_eof(
     Ok(CallOutcome::Return(vec![Value::Bool(eof)]))
 }
 
+/// Closes the TCP stream.
 #[pd_edge_host_function(name = tcp::stream::CLOSE.name, scope = transport)]
 async fn stream_close(
     _vm: &mut Vm,

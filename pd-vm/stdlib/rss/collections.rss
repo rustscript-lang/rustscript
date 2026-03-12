@@ -1,8 +1,11 @@
 // Collection helpers implemented in pure RustScript.
+
+// Concatenates two arrays into a new array.
 pub fn append(lhs, rhs) {
     lhs + rhs;
 }
 
+// Returns the first index of a value in an array, or -1 when it is absent.
 pub fn index_of(values, needle) {
     let mut found =-1;
     for (let mut find_index = 0; find_index < values.length; find_index = find_index + 1) {
@@ -14,10 +17,12 @@ pub fn index_of(values, needle) {
     found;
 }
 
+// Returns whether an array contains a value.
 pub fn contains(values, needle) {
     index_of(values, needle) >-1;
 }
 
+// Returns a reversed copy of an array.
 pub fn reverse(values) {
     let mut out = [];
     for (
@@ -30,6 +35,7 @@ pub fn reverse(values) {
     out;
 }
 
+// Returns an array with duplicate values removed.
 pub fn dedup(values) {
     let mut out = [];
     for (let mut dedup_index = 0; dedup_index < values.length; dedup_index = dedup_index + 1) {
@@ -41,10 +47,12 @@ pub fn dedup(values) {
     out;
 }
 
+// Returns whether a map contains a key.
 pub fn has(map, key) {
     map.has(key)
 }
 
+// Returns a map value or a fallback when the key is absent.
 pub fn get_or(map, key, fallback) {
     let out = if has(map, key) => {
         map[key]
@@ -54,6 +62,7 @@ pub fn get_or(map, key, fallback) {
     out;
 }
 
+// Returns the values from a map as an array.
 pub fn values(map) {
     let keys =(&map).keys;
     let mut out = [];
@@ -64,6 +73,7 @@ pub fn values(map) {
     out;
 }
 
+// Returns the [key, value] pairs from a map as an array.
 pub fn entries(map) {
     let keys =(&map).keys;
     let mut out = [];
@@ -74,6 +84,7 @@ pub fn entries(map) {
     out;
 }
 
+// Merges two maps, preferring values from rhs for duplicate keys.
 pub fn merge(lhs, rhs) {
     let mut out = {};
 
@@ -91,6 +102,7 @@ pub fn merge(lhs, rhs) {
     out;
 }
 
+// Deeply compares arrays, maps, and scalar values.
 pub fn deep_compare(lhs, rhs) {
     let mut left_pending = [lhs];
     let mut right_pending = [rhs];

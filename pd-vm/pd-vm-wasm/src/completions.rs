@@ -31,6 +31,7 @@ pub struct CompletionCatalog {
 struct ParsedFunction {
     name: String,
     params: Vec<String>,
+    docs: String,
 }
 
 pub fn build_completion_catalog() -> CompletionCatalog {
@@ -357,13 +358,7 @@ fn add_edge_host_function_entries(
             .find(|namespace| namespace.root == root)
             .map(|namespace| namespace.docs)
             .unwrap_or("pd-edge host namespace.");
-        let docs = format!(
-            "pd-edge host function from ABI index {} with arity {}.",
-            function.index, function.arity
-        );
-        let namespace_docs = format!(
-            "{namespace_doc_prefix} {docs} Namespace-export form (after importing `{root}`) is also available."
-        );
+        let namespace_docs = edge_function_docs(function.docs, namespace_doc_prefix, root);
 
         push_unique(
             rustscript,
@@ -430,6 +425,15 @@ fn add_edge_host_function_entries(
             },
         );
     }
+}
+
+fn edge_function_docs(function_docs: &str, namespace_docs: &str, root: &str) -> String {
+    let import_note =
+        format!("Namespace-export form (after importing `{root}`) is also available.");
+    if function_docs.trim().is_empty() {
+        return format!("{namespace_docs} {import_note}");
+    }
+    format!("{function_docs}\n\n{import_note}")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -753,7 +757,7 @@ fn add_stdlib_entries(
 
         for function in functions {
             let signature = function_signature(&function.name, &function.params);
-            let docs = format!("Embedded stdlib function from `{spec}`.");
+            let docs = function.docs;
 
             push_unique(
                 rustscript,
@@ -941,7 +945,8 @@ fn module_alias(module_name: &str) -> &str {
 
 fn parse_pub_functions(source: &str) -> Vec<ParsedFunction> {
     let mut out = Vec::new();
-    for line in source.lines() {
+    let lines = source.lines().collect::<Vec<_>>();
+    for (index, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
         let Some(rest) = trimmed.strip_prefix("pub fn ") else {
             continue;
@@ -967,10 +972,36 @@ fn parse_pub_functions(source: &str) -> Vec<ParsedFunction> {
         out.push(ParsedFunction {
             name: name.to_string(),
             params,
+            docs: leading_line_comments(&lines, index),
         });
     }
     out.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
     out
+}
+
+fn leading_line_comments(lines: &[&str], line_index: usize) -> String {
+    let mut docs = Vec::new();
+    let mut cursor = line_index;
+    while cursor > 0 {
+        cursor -= 1;
+        let trimmed = lines[cursor].trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        let Some(comment) = line_comment_text(trimmed) else {
+            break;
+        };
+        docs.push(comment.to_string());
+    }
+    docs.reverse();
+    docs.join("\n")
+}
+
+fn line_comment_text(line: &str) -> Option<&str> {
+    if let Some(rest) = line.strip_prefix("///") {
+        return Some(rest.trim());
+    }
+    line.strip_prefix("//").map(str::trim)
 }
 
 fn push_unique(entries: &mut Vec<CompletionEntry>, entry: CompletionEntry) {
@@ -989,19 +1020,29 @@ mod tests {
     use edge_abi::{FUNCTIONS as EDGE_HOST_FUNCTIONS, host_namespace_specs};
     use vm::{CallableParam, CallableParamType, CallableSignature};
 
+    use crate::stdlib::embedded_stdlib_modules;
+
     #[test]
-    fn parse_pub_functions_extracts_public_signatures() {
+    fn parse_pub_functions_extracts_public_signatures_and_docs() {
         let source = r#"
             fn local_only() {}
+            // Trims leading and trailing whitespace.
             pub fn trim(value) {}
+            // Replaces each matching segment.
+            // Keeps the original string when no match exists.
             pub fn replace(value, needle, replacement) {}
         "#;
         let functions = parse_pub_functions(source);
         assert_eq!(functions.len(), 2);
         assert_eq!(functions[0].name, "replace");
         assert_eq!(functions[0].params, vec!["value", "needle", "replacement"]);
+        assert_eq!(
+            functions[0].docs,
+            "Replaces each matching segment.\nKeeps the original string when no match exists."
+        );
         assert_eq!(functions[1].name, "trim");
         assert_eq!(functions[1].params, vec!["value"]);
+        assert_eq!(functions[1].docs, "Trims leading and trailing whitespace.");
     }
 
     #[test]
@@ -1089,6 +1130,20 @@ mod tests {
                 .any(|entry| entry.label == "math::sqrt"),
             "expected RustScript builtin completion for math::sqrt",
         );
+    }
+
+    #[test]
+    fn embedded_stdlib_public_functions_have_docs() {
+        for (spec, source) in embedded_stdlib_modules() {
+            for function in parse_pub_functions(source) {
+                assert!(
+                    !function.docs.trim().is_empty(),
+                    "expected stdlib docs for {}:{}",
+                    spec,
+                    function.name
+                );
+            }
+        }
     }
 
     #[test]
@@ -1235,5 +1290,56 @@ mod tests {
                 namespace.root,
             );
         }
+    }
+
+    #[test]
+    fn completion_catalog_uses_edge_function_docs() {
+        let catalog = build_completion_catalog();
+        let entry = catalog
+            .rustscript
+            .iter()
+            .find(|entry| entry.label == "runtime::sleep")
+            .expect("runtime::sleep completion should exist");
+        assert!(
+            entry
+                .documentation
+                .contains("Suspends execution for the requested number of milliseconds."),
+            "expected edge ABI docs in completion hover, got {:?}",
+            entry.documentation
+        );
+    }
+
+    #[test]
+    fn completion_catalog_uses_edge_impl_doc_comments() {
+        let catalog = build_completion_catalog();
+        let entry = catalog
+            .rustscript
+            .iter()
+            .find(|entry| entry.label == "tcp::stream::get_phase")
+            .expect("tcp::stream::get_phase completion should exist");
+        assert!(
+            entry
+                .documentation
+                .contains("Reports the current lifecycle phase for a TCP stream handle."),
+            "expected edge impl docs in completion hover, got {:?}",
+            entry.documentation
+        );
+    }
+
+    #[test]
+    fn completion_catalog_uses_stdlib_doc_comments() {
+        let catalog = build_completion_catalog();
+        let entry = catalog
+            .rustscript
+            .iter()
+            .find(|entry| entry.label == "string::trim")
+            .expect("string::trim completion should exist");
+        assert!(
+            entry
+                .documentation
+                .contains("Trims leading and trailing ASCII whitespace from a string."),
+            "expected stdlib docs in completion hover, got {:?}",
+            entry.documentation
+        );
     }
 }

@@ -4,6 +4,7 @@ use super::VmArray;
 use crate::vm::{Value, VmError, VmResult};
 use pd_host_function::pd_host_function;
 
+/// Returns whether a regular expression matches the input text.
 #[pd_host_function(name = "re::match")]
 pub(super) fn builtin_re_match(pattern: &str, text: &str) -> VmResult<bool> {
     let regex = Regex::new(pattern)
@@ -11,6 +12,7 @@ pub(super) fn builtin_re_match(pattern: &str, text: &str) -> VmResult<bool> {
     Ok(regex.is_match(text))
 }
 
+/// Returns the first substring matched by a regular expression.
 #[pd_host_function(name = "re::find")]
 pub(super) fn builtin_re_find(pattern: &str, text: &str) -> VmResult<Option<String>> {
     let regex = Regex::new(pattern)
@@ -18,6 +20,7 @@ pub(super) fn builtin_re_find(pattern: &str, text: &str) -> VmResult<Option<Stri
     Ok(regex.find(text).map(|matched| matched.as_str().to_string()))
 }
 
+/// Replaces all regular-expression matches in a string.
 #[pd_host_function(name = "re::replace")]
 pub(super) fn builtin_re_replace(pattern: &str, text: &str, replacement: &str) -> VmResult<String> {
     let regex = Regex::new(pattern)
@@ -25,6 +28,7 @@ pub(super) fn builtin_re_replace(pattern: &str, text: &str, replacement: &str) -
     Ok(regex.replace_all(text, replacement).into_owned())
 }
 
+/// Splits a string on regular-expression matches.
 #[pd_host_function(name = "re::split")]
 pub(super) fn builtin_re_split(pattern: &str, text: &str) -> VmResult<VmArray> {
     let regex = Regex::new(pattern)
@@ -35,6 +39,7 @@ pub(super) fn builtin_re_split(pattern: &str, text: &str) -> VmResult<VmArray> {
         .collect::<Vec<_>>())
 }
 
+/// Returns the capture groups produced by the first regular-expression match.
 #[pd_host_function(name = "re::captures")]
 pub(super) fn builtin_re_captures(pattern: &str, text: &str) -> VmResult<VmArray> {
     let regex = Regex::new(pattern)

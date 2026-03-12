@@ -9,6 +9,7 @@ use super::super::{
     read_upstream_response_next_line, upstream_response_eof,
 };
 
+/// Enables buffered inspection for the upstream HTTP response.
 #[pd_edge_host_function(name = http_upstream_response::ENABLE_PROCESSING.name, scope = http)]
 async fn enable_upstream_response_processing(
     _vm: &mut Vm,
@@ -17,6 +18,7 @@ async fn enable_upstream_response_processing(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Returns the status code for the upstream HTTP response.
 #[pd_edge_host_function(name = http_upstream_response::GET_STATUS.name, scope = http)]
 async fn get_upstream_response_status(
     _vm: &mut Vm,
@@ -28,6 +30,7 @@ async fn get_upstream_response_status(
     )]))
 }
 
+/// Returns the first value for a header on the upstream HTTP response.
 #[pd_edge_host_function(name = http_upstream_response::GET_HEADER.name, scope = http)]
 async fn get_upstream_response_header(
     _vm: &mut Vm,
@@ -45,6 +48,7 @@ async fn get_upstream_response_header(
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 
+/// Returns all headers on the upstream HTTP response as a map.
 #[pd_edge_host_function(name = http_upstream_response::GET_HEADERS.name, scope = http)]
 async fn get_upstream_response_headers(
     _vm: &mut Vm,
@@ -56,6 +60,7 @@ async fn get_upstream_response_headers(
     )]))
 }
 
+/// Returns the full body for the upstream HTTP response as text.
 #[pd_edge_host_function(name = http_upstream_response::GET_BODY.name, scope = http)]
 async fn get_upstream_response_body(
     _vm: &mut Vm,
@@ -66,6 +71,7 @@ async fn get_upstream_response_body(
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 
+/// Returns the HTTP version for the upstream HTTP response.
 #[pd_edge_host_function(name = http_upstream_response::GET_HTTP_VERSION.name, scope = http)]
 async fn get_upstream_response_http_version(
     _vm: &mut Vm,
@@ -77,6 +83,7 @@ async fn get_upstream_response_http_version(
     )]))
 }
 
+/// Reads the next body chunk from the upstream HTTP response.
 #[pd_edge_host_function(
     name = http_upstream_response::body::NEXT_CHUNK.name,
     scope = http_extension
@@ -97,6 +104,7 @@ async fn get_upstream_response_body_chunk(
     )]))
 }
 
+/// Reads the next body line from the upstream HTTP response.
 #[pd_edge_host_function(
     name = http_upstream_response::body::NEXT_LINE.name,
     scope = http_extension
@@ -111,6 +119,7 @@ async fn get_upstream_response_body_line(
     )]))
 }
 
+/// Returns whether the body stream for the upstream HTTP response is exhausted.
 #[pd_edge_host_function(name = http_upstream_response::body::EOF.name, scope = http_extension)]
 async fn get_upstream_response_body_eof(
     _vm: &mut Vm,

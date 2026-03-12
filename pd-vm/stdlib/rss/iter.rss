@@ -1,4 +1,6 @@
 // Iteration helpers implemented in pure RustScript.
+
+// Returns an array of numbers from start to stop using the given step.
 pub fn range_step(start, stop, step) {
     let mut out = [];
     if step != 0 {
@@ -15,10 +17,12 @@ pub fn range_step(start, stop, step) {
     out;
 }
 
+// Returns an array of numbers from 0 up to stop.
 pub fn range(stop) {
     range_step(0, stop, 1);
 }
 
+// Returns [index, value] pairs for an array.
 pub fn enumerate(values) {
     let mut out = [];
     for (let mut index = 0; index < values.length; index = index + 1) {
@@ -27,6 +31,7 @@ pub fn enumerate(values) {
     out;
 }
 
+// Zips two arrays into [lhs, rhs] pairs up to the shorter length.
 pub fn zip(lhs, rhs) {
     let mut out = [];
     let mut limit = lhs.length;
@@ -39,6 +44,7 @@ pub fn zip(lhs, rhs) {
     out;
 }
 
+// Returns the first count values from an array.
 pub fn take(values, count) {
     let out = if count > 0 => {
         values[0:count]
@@ -48,6 +54,7 @@ pub fn take(values, count) {
     out;
 }
 
+// Returns an array without the first count values.
 pub fn skip(values, count) {
     let start = if count > 0 => {
         count
@@ -62,6 +69,7 @@ pub fn skip(values, count) {
     values[bounded_start:values.length];
 }
 
+// Splits an array into fixed-size chunks.
 pub fn chunk(values, size) {
     let mut out = [];
     if size > 0 {
@@ -77,6 +85,7 @@ pub fn chunk(values, size) {
     out;
 }
 
+// Returns the sum of numeric values.
 pub fn sum(values) {
     let mut out = 0;
     for (let mut index = 0; index < values.length; index = index + 1) {
@@ -85,6 +94,7 @@ pub fn sum(values) {
     out;
 }
 
+// Returns whether any value in an array is truthy.
 pub fn any_true(values) {
     let mut out = false;
     for (let mut index = 0; index < values.length; index = index + 1) {
@@ -96,6 +106,7 @@ pub fn any_true(values) {
     out;
 }
 
+// Returns whether every value in an array is truthy.
 pub fn all_true(values) {
     let mut out = true;
     for (let mut index = 0; index < values.length; index = index + 1) {
@@ -107,6 +118,7 @@ pub fn all_true(values) {
     out;
 }
 
+// Applies a function to each value in an array.
 pub fn map(values, func) {
     let mut out = [];
     for (let mut index = 0; index < values.length; index = index + 1) {
@@ -115,6 +127,7 @@ pub fn map(values, func) {
     out;
 }
 
+// Returns the values for which pred(value) is true.
 pub fn filter(values, pred) {
     let mut out = [];
     for (let mut index = 0; index < values.length; index = index + 1) {
@@ -126,6 +139,7 @@ pub fn filter(values, pred) {
     out;
 }
 
+// Reduces an array by applying func(acc, value) from left to right.
 pub fn reduce(values, init, func) {
     let mut acc = init;
     for (let mut index = 0; index < values.length; index = index + 1) {
@@ -134,6 +148,7 @@ pub fn reduce(values, init, func) {
     acc;
 }
 
+// Calls a function for each value in an array and returns null.
 pub fn each(values, func) {
     for (let mut index = 0; index < values.length; index = index + 1) {
         let each_result = func(values[index]);

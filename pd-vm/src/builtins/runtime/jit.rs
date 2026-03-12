@@ -16,6 +16,7 @@ fn config_as_map(vm: &Vm) -> VmMap {
     ])
 }
 
+/// Sets the JIT runtime configuration from a map.
 #[pd_host_function(name = "jit::set_config")]
 pub(super) fn builtin_jit_set_config(
     vm: &mut Vm,
@@ -31,11 +32,13 @@ pub(super) fn builtin_jit_set_config(
     Ok(config_as_map(vm))
 }
 
+/// Returns the current JIT runtime configuration as a map.
 #[pd_host_function(name = "jit::get_config")]
 pub(super) fn builtin_jit_get_config(vm: &mut Vm) -> VmResult<VmMap> {
     Ok(config_as_map(vm))
 }
 
+/// Enables or disables the JIT at runtime.
 #[pd_host_function(name = "jit::set_enabled")]
 pub(super) fn builtin_jit_set_enabled(vm: &mut Vm, enabled: bool) -> VmResult<bool> {
     let mut config = *vm.jit_config();
@@ -44,11 +47,13 @@ pub(super) fn builtin_jit_set_enabled(vm: &mut Vm, enabled: bool) -> VmResult<bo
     Ok(enabled)
 }
 
+/// Returns whether the JIT is enabled at runtime.
 #[pd_host_function(name = "jit::get_enabled")]
 pub(super) fn builtin_jit_get_enabled(vm: &mut Vm) -> VmResult<bool> {
     Ok(vm.jit_config().enabled)
 }
 
+/// Sets the loop-hotness threshold used by the JIT.
 #[pd_host_function(name = "jit::set_hot_loop_threshold")]
 pub(super) fn builtin_jit_set_hot_loop_threshold(
     vm: &mut Vm,
@@ -60,11 +65,13 @@ pub(super) fn builtin_jit_set_hot_loop_threshold(
     Ok(hot_loop_threshold)
 }
 
+/// Returns the loop-hotness threshold used by the JIT.
 #[pd_host_function(name = "jit::get_hot_loop_threshold")]
 pub(super) fn builtin_jit_get_hot_loop_threshold(vm: &mut Vm) -> VmResult<u32> {
     Ok(vm.jit_config().hot_loop_threshold)
 }
 
+/// Sets the maximum trace length used by the JIT.
 #[pd_host_function(name = "jit::set_max_trace_len")]
 pub(super) fn builtin_jit_set_max_trace_len(vm: &mut Vm, max_trace_len: usize) -> VmResult<usize> {
     let mut config = *vm.jit_config();
@@ -73,6 +80,7 @@ pub(super) fn builtin_jit_set_max_trace_len(vm: &mut Vm, max_trace_len: usize) -
     Ok(max_trace_len)
 }
 
+/// Returns the maximum trace length used by the JIT.
 #[pd_host_function(name = "jit::get_max_trace_len")]
 pub(super) fn builtin_jit_get_max_trace_len(vm: &mut Vm) -> VmResult<usize> {
     Ok(vm.jit_config().max_trace_len)

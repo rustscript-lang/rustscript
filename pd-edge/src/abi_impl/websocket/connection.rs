@@ -567,6 +567,7 @@ pub(crate) async fn close_websocket_binary_stream(
     Ok(())
 }
 
+/// Allocates a WebSocket connection handle.
 #[pd_edge_host_function(name = websocket::connection::NEW.name, scope = websocket)]
 async fn connection_new(
     _vm: &mut Vm,
@@ -576,6 +577,7 @@ async fn connection_new(
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 
+/// Returns the WebSocket connection handle for the current downstream flow.
 #[pd_edge_host_function(name = websocket::connection::DOWNSTREAM.name, scope = websocket)]
 async fn connection_downstream(
     _vm: &mut Vm,
@@ -586,6 +588,7 @@ async fn connection_downstream(
     )]))
 }
 
+/// Returns the default upstream handle for the WebSocket connection.
 #[pd_edge_host_function(name = websocket::connection::DEFAULT_UPSTREAM.name, scope = websocket)]
 async fn connection_default_upstream(
     _vm: &mut Vm,
@@ -596,6 +599,7 @@ async fn connection_default_upstream(
     )]))
 }
 
+/// Returns whether the WebSocket connection handle is present.
 #[pd_edge_host_function(name = websocket::connection::IS_PRESENT.name, scope = websocket)]
 async fn connection_is_present(
     _vm: &mut Vm,
@@ -606,6 +610,7 @@ async fn connection_is_present(
     Ok(CallOutcome::Return(vec![Value::Bool(state.is_present())]))
 }
 
+/// Sets the target endpoint for the WebSocket connection.
 #[pd_edge_host_function(name = websocket::connection::SET_TARGET.name, scope = websocket)]
 async fn connection_set_target(
     _vm: &mut Vm,
@@ -627,6 +632,7 @@ async fn connection_set_target(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets a header on the WebSocket connection.
 #[pd_edge_host_function(name = websocket::connection::SET_HEADER.name, scope = websocket)]
 async fn connection_set_header(
     _vm: &mut Vm,
@@ -644,6 +650,7 @@ async fn connection_set_header(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the preferred subprotocol list for the WebSocket connection.
 #[pd_edge_host_function(name = websocket::connection::SET_SUBPROTOCOLS.name, scope = websocket)]
 async fn connection_set_subprotocols(
     _vm: &mut Vm,
@@ -667,6 +674,7 @@ async fn connection_set_subprotocols(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Attempts to connect the WebSocket connection.
 #[pd_edge_host_function(name = websocket::connection::CONNECT.name, scope = websocket)]
 async fn connection_connect(
     _vm: &mut Vm,
@@ -677,6 +685,7 @@ async fn connection_connect(
     Ok(CallOutcome::Return(vec![Value::Bool(true)]))
 }
 
+/// Returns the current phase for the WebSocket connection.
 #[pd_edge_host_function(name = websocket::connection::GET_PHASE.name, scope = websocket)]
 async fn connection_get_phase(
     _vm: &mut Vm,
@@ -690,6 +699,7 @@ async fn connection_get_phase(
     )]))
 }
 
+/// Returns the negotiated subprotocol for the WebSocket connection.
 #[pd_edge_host_function(name = websocket::connection::GET_SUBPROTOCOL.name, scope = websocket)]
 async fn connection_get_subprotocol(
     _vm: &mut Vm,
@@ -702,6 +712,7 @@ async fn connection_get_subprotocol(
     )]))
 }
 
+/// Sends a text message over the WebSocket connection.
 #[pd_edge_host_function(name = websocket::connection::SEND_TEXT.name, scope = websocket)]
 async fn connection_send_text(
     _vm: &mut Vm,
@@ -716,6 +727,7 @@ async fn connection_send_text(
     Ok(CallOutcome::Return(vec![Value::Int(sent as i64)]))
 }
 
+/// Reads a text message from the WebSocket connection.
 #[pd_edge_host_function(name = websocket::connection::READ_TEXT.name, scope = websocket)]
 async fn connection_read_text(
     _vm: &mut Vm,
@@ -731,6 +743,7 @@ async fn connection_read_text(
     Ok(CallOutcome::Return(vec![Value::string(text)]))
 }
 
+/// Sends a base64-encoded binary message over the WebSocket connection.
 #[pd_edge_host_function(
     name = websocket::connection::SEND_BINARY_BASE64.name,
     scope = websocket
@@ -748,6 +761,7 @@ async fn connection_send_binary_base64(
     Ok(CallOutcome::Return(vec![Value::Int(sent as i64)]))
 }
 
+/// Reads a base64-encoded binary message from the WebSocket connection.
 #[pd_edge_host_function(
     name = websocket::connection::READ_BINARY_BASE64.name,
     scope = websocket
@@ -766,6 +780,7 @@ async fn connection_read_binary_base64(
     Ok(CallOutcome::Return(vec![Value::string(payload)]))
 }
 
+/// Returns whether the WebSocket connection has reached EOF.
 #[pd_edge_host_function(name = websocket::connection::EOF.name, scope = websocket)]
 async fn connection_eof(
     _vm: &mut Vm,
@@ -777,6 +792,7 @@ async fn connection_eof(
     Ok(CallOutcome::Return(vec![Value::Bool(eof)]))
 }
 
+/// Closes the WebSocket connection.
 #[pd_edge_host_function(name = websocket::connection::CLOSE.name, scope = websocket)]
 async fn connection_close(
     _vm: &mut Vm,

@@ -25,6 +25,7 @@ pub(super) fn poll_builtin_io_op(
 
 pub(super) fn close_all_handles(_vm: &mut Vm) {}
 
+/// Opens a file handle for runtime I/O.
 #[pd_host_function(name = "io::open")]
 pub(super) fn builtin_io_open(
     _vm: &mut Vm,
@@ -36,6 +37,7 @@ pub(super) fn builtin_io_open(
     ))
 }
 
+/// Starts a child process and returns a process-backed handle.
 #[pd_host_function(name = "io::popen")]
 pub(super) fn builtin_io_popen(
     _vm: &mut Vm,
@@ -47,6 +49,7 @@ pub(super) fn builtin_io_popen(
     ))
 }
 
+/// Reads all remaining text from an I/O handle.
 #[pd_host_function(name = "io::read_all")]
 pub(super) fn builtin_io_read_all(
     _vm: &mut Vm,
@@ -57,6 +60,7 @@ pub(super) fn builtin_io_read_all(
     ))
 }
 
+/// Reads a single line of text from an I/O handle.
 #[pd_host_function(name = "io::read_line")]
 pub(super) fn builtin_io_read_line(
     _vm: &mut Vm,
@@ -67,6 +71,7 @@ pub(super) fn builtin_io_read_line(
     ))
 }
 
+/// Writes text to an I/O handle.
 #[pd_host_function(name = "io::write")]
 pub(super) fn builtin_io_write(
     _vm: &mut Vm,
@@ -78,6 +83,7 @@ pub(super) fn builtin_io_write(
     ))
 }
 
+/// Flushes buffered output for an I/O handle.
 #[pd_host_function(name = "io::flush")]
 pub(super) fn builtin_io_flush(_vm: &mut Vm, _handle_id: i64) -> VmResult<BuiltinResult<bool>> {
     Err(VmError::HostError(
@@ -85,6 +91,7 @@ pub(super) fn builtin_io_flush(_vm: &mut Vm, _handle_id: i64) -> VmResult<Builti
     ))
 }
 
+/// Closes an I/O handle.
 #[pd_host_function(name = "io::close")]
 pub(super) fn builtin_io_close(_vm: &mut Vm, _handle_id: i64) -> VmResult<BuiltinResult<bool>> {
     Err(VmError::HostError(
@@ -92,6 +99,7 @@ pub(super) fn builtin_io_close(_vm: &mut Vm, _handle_id: i64) -> VmResult<Builti
     ))
 }
 
+/// Returns whether a file system path exists.
 #[pd_host_function(name = "io::exists")]
 pub(super) fn builtin_io_exists(_vm: &mut Vm, _path: &str) -> VmResult<BuiltinResult<bool>> {
     Err(VmError::HostError(

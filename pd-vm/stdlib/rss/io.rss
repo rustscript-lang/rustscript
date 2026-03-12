@@ -1,6 +1,7 @@
 // I/O wrappers implemented in pure RustScript.
 use io;
 
+// Reads an entire file into a string.
 pub fn read_text(path) {
     let handle = io::open(path, "r");
     let out = io::read_all(handle);
@@ -8,6 +9,7 @@ pub fn read_text(path) {
     out;
 }
 
+// Writes text to a file, replacing any existing contents.
 pub fn write_text(path, text) {
     let handle = io::open(path, "w");
     let written = io::write(handle, text);
@@ -16,6 +18,7 @@ pub fn write_text(path, text) {
     written;
 }
 
+// Appends text to the end of a file.
 pub fn append_text(path, text) {
     let handle = io::open(path, "a");
     let written = io::write(handle, text);
@@ -24,6 +27,7 @@ pub fn append_text(path, text) {
     written;
 }
 
+// Reads a file and splits it into newline-delimited lines.
 pub fn read_lines(path) {
     let text = read_text(path);
     let mut lines = [];
