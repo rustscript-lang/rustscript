@@ -17,10 +17,55 @@ async fn sample_websocket_proxy_program_round_trips_text_frames() {
         .get(format!("http://{data_addr}/ws"))
         .header("x-ws-target", format!("ws://{upstream_addr}/echo"))
         .header("x-ws-message", "hello")
+        .header("x-ws-subprotocols", "superchat, chat")
+        .header("x-ws-header-name", "x-client-tag")
+        .header("x-ws-header-value", "sample")
         .send()
         .await
         .expect("request should complete");
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-downstream-ws-present")
+            .and_then(|value| value.to_str().ok()),
+        Some("false")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-handle")
+            .and_then(|value| value.to_str().ok()),
+        Some("new")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-present-before-configure")
+            .and_then(|value| value.to_str().ok()),
+        Some("false")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-present-after-configure")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-phase-before-connect")
+            .and_then(|value| value.to_str().ok()),
+        Some("upgrade-prepared")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-phase-after-connect")
+            .and_then(|value| value.to_str().ok()),
+        Some("open")
+    );
     assert_eq!(
         response
             .headers()
@@ -31,14 +76,163 @@ async fn sample_websocket_proxy_program_round_trips_text_frames() {
     assert_eq!(
         response
             .headers()
+            .get("x-ws-phase-after-close")
+            .and_then(|value| value.to_str().ok()),
+        Some("closed")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-eof-before-close")
+            .and_then(|value| value.to_str().ok()),
+        Some("false")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-eof-after-close")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response
+            .headers()
             .get("x-ws-protocol")
             .and_then(|value| value.to_str().ok()),
         Some("chat")
     );
     assert_eq!(
-        response.text().await.expect("body should read"),
-        "echo:hello"
+        response
+            .headers()
+            .get("x-ws-requested-subprotocols")
+            .and_then(|value| value.to_str().ok()),
+        Some("superchat, chat")
     );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-custom-header")
+            .and_then(|value| value.to_str().ok()),
+        Some("x-client-tag")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-mode")
+            .and_then(|value| value.to_str().ok()),
+        Some("text")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "echo:hello|tag:sample"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn sample_websocket_proxy_program_round_trips_binary_frames_with_default_handle() {
+    let (upstream_addr, upstream_handle) = spawn_websocket_echo_upstream().await;
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_websocket_proxy_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let payload = STANDARD.encode(b"bin-payload");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/ws-binary-sample"))
+        .header("x-ws-target", format!("ws://{upstream_addr}/binary"))
+        .header("x-ws-binary-base64", &payload)
+        .header("x-ws-handle", "default")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-downstream-ws-present")
+            .and_then(|value| value.to_str().ok()),
+        Some("false")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-handle")
+            .and_then(|value| value.to_str().ok()),
+        Some("default-upstream")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-present-before-configure")
+            .and_then(|value| value.to_str().ok()),
+        Some("false")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-present-after-configure")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-phase-before-connect")
+            .and_then(|value| value.to_str().ok()),
+        Some("upgrade-prepared")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-phase-after-connect")
+            .and_then(|value| value.to_str().ok()),
+        Some("open")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-phase")
+            .and_then(|value| value.to_str().ok()),
+        Some("closed")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-eof-before-close")
+            .and_then(|value| value.to_str().ok()),
+        Some("false")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-eof-after-close")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-protocol")
+            .and_then(|value| value.to_str().ok()),
+        Some("chat")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ws-mode")
+            .and_then(|value| value.to_str().ok()),
+        Some("binary")
+    );
+    assert_eq!(response.text().await.expect("body should read"), payload);
 
     upstream_handle.abort();
     data_handle.abort();

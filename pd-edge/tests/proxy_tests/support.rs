@@ -22,8 +22,10 @@ pub(crate) use edge::{
     enter_edge_host_context, new_shared_vm_async_ops, register_http_plane_host_module,
     spawn_active_control_plane_client,
 };
+#[cfg(feature = "websocket")]
 pub(crate) use futures_util::{SinkExt, StreamExt};
 pub(crate) use tokio::{sync::Notify, task::JoinHandle, time::timeout};
+#[cfg(feature = "tls")]
 pub(crate) use tokio_rustls::{
     TlsAcceptor,
     rustls::{
@@ -31,6 +33,7 @@ pub(crate) use tokio_rustls::{
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     },
 };
+#[cfg(feature = "websocket")]
 pub(crate) use tokio_tungstenite::{
     accept_hdr_async,
     tungstenite::{
@@ -43,6 +46,7 @@ pub(crate) use vm::{
     BytecodeBuilder, Program, Value, Vm, VmError, VmStatus, compile_source, encode_program,
 };
 
+#[cfg(feature = "tls")]
 pub(crate) fn ensure_rustls_provider() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
@@ -199,6 +203,7 @@ pub(crate) async fn spawn_sse_upstream(lines: Vec<&'static str>) -> (SocketAddr,
     (addr, handle)
 }
 
+#[cfg(feature = "websocket")]
 pub(crate) async fn spawn_websocket_echo_upstream() -> (SocketAddr, JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -208,12 +213,22 @@ pub(crate) async fn spawn_websocket_echo_upstream() -> (SocketAddr, JoinHandle<(
         loop {
             let (stream, _) = listener.accept().await.expect("accept should succeed");
             tokio::spawn(async move {
-                let callback = |request: &WsRequest, mut response: WsResponse| {
+                let observed_client_tag = Arc::new(Mutex::new(None::<String>));
+                let observed_client_tag_for_callback = Arc::clone(&observed_client_tag);
+                let callback = move |request: &WsRequest, mut response: WsResponse| {
                     let requested = request
                         .headers()
                         .get("sec-websocket-protocol")
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or("");
+                    let client_tag = request
+                        .headers()
+                        .get("x-client-tag")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    *observed_client_tag_for_callback
+                        .lock()
+                        .expect("websocket client tag lock should not poison") = client_tag;
                     if requested
                         .split(',')
                         .map(str::trim)
@@ -229,11 +244,20 @@ pub(crate) async fn spawn_websocket_echo_upstream() -> (SocketAddr, JoinHandle<(
                 let mut websocket = accept_hdr_async(stream, callback)
                     .await
                     .expect("websocket accept should succeed");
+                let client_tag = observed_client_tag
+                    .lock()
+                    .expect("websocket client tag lock should not poison")
+                    .clone();
                 while let Some(message) = websocket.next().await {
                     match message.expect("websocket message should decode") {
                         Message::Text(text) => {
+                            let mut reply = format!("echo:{text}");
+                            if let Some(tag) = client_tag.as_deref() {
+                                reply.push_str("|tag:");
+                                reply.push_str(tag);
+                            }
                             websocket
-                                .send(Message::Text(format!("echo:{text}").into()))
+                                .send(Message::Text(reply.into()))
                                 .await
                                 .expect("text reply should send");
                         }
@@ -263,6 +287,7 @@ pub(crate) async fn spawn_websocket_echo_upstream() -> (SocketAddr, JoinHandle<(
     (addr, handle)
 }
 
+#[cfg(feature = "tls")]
 pub(crate) async fn spawn_https_echo_upstream() -> (SocketAddr, JoinHandle<()>) {
     ensure_rustls_provider();
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
@@ -279,6 +304,7 @@ pub(crate) async fn spawn_https_echo_upstream() -> (SocketAddr, JoinHandle<()>) 
     spawn_tls_echo_server(server_config, false).await
 }
 
+#[cfg(feature = "tls")]
 #[derive(Clone)]
 pub(crate) struct TlsTestMaterials {
     pub(crate) ca_pem: String,
@@ -289,10 +315,12 @@ pub(crate) struct TlsTestMaterials {
     pub(crate) client_key_pem: String,
 }
 
+#[cfg(feature = "tls")]
 pub(crate) fn source_string_literal(value: &str) -> String {
     serde_json::to_string(value).expect("source literal should serialize")
 }
 
+#[cfg(feature = "tls")]
 pub(crate) fn build_ca_signed_tls_materials() -> TlsTestMaterials {
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new());
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -327,6 +355,7 @@ pub(crate) fn build_ca_signed_tls_materials() -> TlsTestMaterials {
     }
 }
 
+#[cfg(feature = "tls")]
 pub(crate) async fn spawn_tls_echo_server(
     mut server_config: rustls::ServerConfig,
     require_client_certificate: bool,
@@ -422,6 +451,7 @@ pub(crate) async fn spawn_tls_echo_server(
     (addr, handle)
 }
 
+#[cfg(feature = "tls")]
 pub(crate) async fn spawn_ca_signed_https_echo_upstream(
     materials: &TlsTestMaterials,
     require_client_certificate: bool,
