@@ -2,6 +2,8 @@
 
 This rerun follows the same benchmark workflow as `HTTP_PROXY_PERF_REPORT_2026-03-11.md`, executed serially with an explicit timeout on each command. Harness A now includes `host_calls_upstream_roundtrip` so the standard comparison covers the real default-upstream HTTP path touched by recent upstream-path work.
 
+The Harness A table and charts below were refreshed from a second clean serial rerun using the built perf example binary. The first March 13 sample overstated a raw-path regression; the refreshed numbers below are the ones to use for comparison. The fuel sweeps and Harness B sections are unchanged.
+
 Data sources:
 
 - `target/http_proxy_perf_mode_async_2026-03-13.json`
@@ -22,27 +24,27 @@ Config:
 
 | Scenario | Async RPS | Async p50 (ms) | Async p95 (ms) | Async p99 (ms) | Threading RPS | Threading p50 (ms) | Threading p95 (ms) | Threading p99 (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `raw_no_program` | 88,849.47 | 1.375 | 2.266 | 2.775 | 101,270.18 | 1.207 | 1.987 | 2.377 |
-| `no_host_calls_program` | 29,716.91 | 4.077 | 7.516 | 9.457 | 31,988.47 | 3.480 | 8.140 | 12.080 |
-| `host_calls_terminate` | 37,686.25 | 3.322 | 5.563 | 6.948 | 36,144.57 | 3.189 | 6.805 | 10.604 |
-| `host_calls_upstream_roundtrip` | 26,646.39 | 4.680 | 6.975 | 8.247 | 27,599.50 | 4.332 | 7.534 | 10.382 |
+| `raw_no_program` | 101,123.06 | 1.211 | 2.000 | 2.419 | 101,584.29 | 1.196 | 2.017 | 2.453 |
+| `no_host_calls_program` | 31,281.59 | 3.968 | 7.109 | 8.688 | 30,348.21 | 3.446 | 9.130 | 23.218 |
+| `host_calls_terminate` | 37,303.62 | 3.304 | 5.978 | 7.460 | 36,570.45 | 3.079 | 6.825 | 11.663 |
+| `host_calls_upstream_roundtrip` | 26,504.20 | 4.734 | 7.015 | 8.195 | 27,113.85 | 4.349 | 8.010 | 11.718 |
 
 ```mermaid
 xychart-beta
     title "Harness A Throughput (RPS, higher is better)"
     x-axis ["raw_no_program", "no_host_calls_program", "host_calls_terminate", "host_calls_upstream_roundtrip"]
     y-axis "RPS" 0 --> 105000
-    bar "async" [88849, 29717, 37686, 26646]
-    bar "threading" [101270, 31988, 36145, 27600]
+    bar "async" [101123, 31282, 37304, 26504]
+    bar "threading" [101584, 30348, 36570, 27114]
 ```
 
 ```mermaid
 xychart-beta
     title "Harness A Tail Latency p99 (ms, lower is better)"
     x-axis ["raw_no_program", "no_host_calls_program", "host_calls_terminate", "host_calls_upstream_roundtrip"]
-    y-axis "p99 ms" 0 --> 13
-    bar "async" [2.775, 9.457, 6.948, 8.247]
-    bar "threading" [2.377, 12.080, 10.604, 10.382]
+    y-axis "p99 ms" 0 --> 25
+    bar "async" [2.419, 8.688, 7.460, 8.195]
+    bar "threading" [2.453, 23.218, 11.663, 11.718]
 ```
 
 ## 2) Proxy Fuel and Check-Interval Sweeps (Harness A)
@@ -153,8 +155,11 @@ xychart-beta
 ## 4) Short Interpretation
 
 - `host_calls_upstream_roundtrip` is new in Harness A. It was added because recent upstream-path work is not visible in the terminate-only scenario.
-- `threading` still leads the raw no-program path on throughput and also edges out `async` on throughput for `no_host_calls_program` and `host_calls_upstream_roundtrip`, but `async` keeps lower p99 on every VM-mediated scenario in this run.
-- On the new upstream round-trip case, `threading` is only slightly ahead on throughput (`27,599.50` vs `26,646.39` RPS), while `async` keeps a meaningfully lower p99 (`8.247 ms` vs `10.382 ms`).
+- The refreshed serial rerun removes the apparent broad raw-path regression from the first March 13 sample. `raw_no_program` is effectively flat relative to March 11 (`101,123.06` async vs `98,940.92`, `101,584.29` threading vs `104,750.71`).
+- The regression remains in program-loaded scenarios even without the real upstream path. `no_host_calls_program` fell to `31,281.59` async and `30,348.21` threading, and `host_calls_terminate` fell to `37,303.62` async and `36,570.45` threading.
+- That points to VM or program-loaded request overhead rather than the raw HTTP proxy path. The new upstream round-trip case should be treated as extra coverage, not the cause of the drop.
+- On the new upstream round-trip case, `threading` is only slightly ahead on throughput (`27,113.85` vs `26,504.20` RPS), while `async` keeps a meaningfully lower p99 (`8.195 ms` vs `11.718 ms`).
+- The threading `no_host_calls_program` p99 (`23.218 ms`) is noticeably spikier than the other VM-mediated cases in this sample, so repeated runs still matter for tail-latency comparisons.
 - The terminate-only host-call scenario remains materially cheaper than the real upstream round-trip in both modes, so the new case is worth keeping as separate coverage.
 - In the async proxy sweep, `fuel=50000` with interval `4` produced the best combined p99/throughput result in this sample. In the threading sweep, interval `64` improved throughput most, but not tail latency.
 - In the VM-only fuel test, the no-fuel baseline improved again to `14,899 us`, but once fuel is enabled the steady-state cost still settles at roughly `2x` latency.
