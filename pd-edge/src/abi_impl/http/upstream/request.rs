@@ -6,8 +6,8 @@ use vm::{CallOutcome, Vm, VmError};
 
 use super::super::super::transport::configure_upstream_transport_for_target;
 use super::super::{
-    SharedProxyVmContext, default_upstream_exchange_handle, is_valid_request_path,
-    is_valid_upstream, parse_header, parse_header_name, parse_headers_map, serialize_query_pairs,
+    SharedProxyVmContext, is_valid_request_path, is_valid_upstream, parse_header,
+    parse_header_name, parse_headers_map, serialize_query_pairs,
 };
 
 async fn apply_upstream_query(
@@ -20,13 +20,9 @@ async fn apply_upstream_query(
             "query must not contain whitespace or '#', got '{raw_query}'",
         )));
     }
-    let mut exchanges = context.lock_exchanges();
-    exchanges
-        .exchanges
-        .get_mut(&default_upstream_exchange_handle())
-        .expect("default upstream exchange should exist")
-        .request
-        .query = query.to_string();
+    context.with_default_upstream_request_mut(|request| {
+        request.query = query.to_string();
+    });
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -39,14 +35,9 @@ async fn set_upstream_request_header(
     value: String,
 ) -> Result<CallOutcome, VmError> {
     let (header_name, header_value) = parse_header(name, value)?;
-    let mut exchanges = context.lock_exchanges();
-    exchanges
-        .exchanges
-        .get_mut(&default_upstream_exchange_handle())
-        .expect("default upstream exchange should exist")
-        .request
-        .headers
-        .insert(header_name, header_value);
+    context.with_default_upstream_request_mut(|request| {
+        request.headers.insert(header_name, header_value);
+    });
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -58,14 +49,9 @@ async fn remove_upstream_request_header(
     name: String,
 ) -> Result<CallOutcome, VmError> {
     let header_name = parse_header_name(name)?;
-    let mut exchanges = context.lock_exchanges();
-    exchanges
-        .exchanges
-        .get_mut(&default_upstream_exchange_handle())
-        .expect("default upstream exchange should exist")
-        .request
-        .headers
-        .remove(header_name);
+    context.with_default_upstream_request_mut(|request| {
+        request.headers.remove(header_name);
+    });
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -78,13 +64,9 @@ async fn set_upstream_request_method(
 ) -> Result<CallOutcome, VmError> {
     let parsed = Method::from_bytes(method.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid http method '{method}'")))?;
-    let mut exchanges = context.lock_exchanges();
-    exchanges
-        .exchanges
-        .get_mut(&default_upstream_exchange_handle())
-        .expect("default upstream exchange should exist")
-        .request
-        .method = parsed;
+    context.with_default_upstream_request_mut(|request| {
+        request.method = parsed;
+    });
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -100,13 +82,9 @@ async fn set_upstream_request_path(
             "path must start with '/' and must not contain whitespace, '?', or '#', got '{path}'",
         )));
     }
-    let mut exchanges = context.lock_exchanges();
-    exchanges
-        .exchanges
-        .get_mut(&default_upstream_exchange_handle())
-        .expect("default upstream exchange should exist")
-        .request
-        .path = path;
+    context.with_default_upstream_request_mut(|request| {
+        request.path = path;
+    });
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -133,15 +111,9 @@ async fn set_upstream_request_target(
         )));
     }
     let target = upstream.clone();
-    {
-        let mut exchanges = context.lock_exchanges();
-        exchanges
-            .exchanges
-            .get_mut(&default_upstream_exchange_handle())
-            .expect("default upstream exchange should exist")
-            .request
-            .target = Some(upstream);
-    }
+    context.with_default_upstream_request_mut(|request| {
+        request.target = Some(upstream);
+    });
     configure_upstream_transport_for_target(&context, &target);
     Ok(CallOutcome::Return(vec![]))
 }
@@ -153,13 +125,9 @@ async fn set_upstream_request_body(
     context: SharedProxyVmContext,
     body: String,
 ) -> Result<CallOutcome, VmError> {
-    let mut exchanges = context.lock_exchanges();
-    exchanges
-        .exchanges
-        .get_mut(&default_upstream_exchange_handle())
-        .expect("default upstream exchange should exist")
-        .request
-        .body_override = Some(body.into_bytes());
+    context.with_default_upstream_request_mut(|request| {
+        request.body_override = Some(body.into_bytes());
+    });
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -172,14 +140,9 @@ async fn add_upstream_request_header(
     value: String,
 ) -> Result<CallOutcome, VmError> {
     let (header_name, header_value) = parse_header(name, value)?;
-    let mut exchanges = context.lock_exchanges();
-    exchanges
-        .exchanges
-        .get_mut(&default_upstream_exchange_handle())
-        .expect("default upstream exchange should exist")
-        .request
-        .headers
-        .append(header_name, header_value);
+    context.with_default_upstream_request_mut(|request| {
+        request.headers.append(header_name, header_value);
+    });
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -191,14 +154,9 @@ async fn clear_upstream_request_header(
     name: String,
 ) -> Result<CallOutcome, VmError> {
     let header_name = parse_header_name(name)?;
-    let mut exchanges = context.lock_exchanges();
-    exchanges
-        .exchanges
-        .get_mut(&default_upstream_exchange_handle())
-        .expect("default upstream exchange should exist")
-        .request
-        .headers
-        .remove(header_name);
+    context.with_default_upstream_request_mut(|request| {
+        request.headers.remove(header_name);
+    });
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -210,18 +168,14 @@ async fn set_upstream_request_headers(
     headers: VmMap,
 ) -> Result<CallOutcome, VmError> {
     let headers = parse_headers_map(headers)?;
-    let mut exchanges = context.lock_exchanges();
-    let request = &mut exchanges
-        .exchanges
-        .get_mut(&default_upstream_exchange_handle())
-        .expect("default upstream exchange should exist")
-        .request;
-    for (name, values) in headers {
-        request.headers.remove(name.clone());
-        for value in values {
-            request.headers.append(name.clone(), value);
+    context.with_default_upstream_request_mut(|request| {
+        for (name, values) in headers {
+            request.headers.remove(name.clone());
+            for value in values {
+                request.headers.append(name.clone(), value);
+            }
         }
-    }
+    });
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -243,17 +197,13 @@ async fn set_upstream_request_query_arg(
     key: String,
     value: String,
 ) -> Result<CallOutcome, VmError> {
-    let mut exchanges = context.lock_exchanges();
-    let request = &mut exchanges
-        .exchanges
-        .get_mut(&default_upstream_exchange_handle())
-        .expect("default upstream exchange should exist")
-        .request;
-    let mut pairs = url::form_urlencoded::parse(request.query.as_bytes())
-        .map(|(name, value)| (name.into_owned(), value.into_owned()))
-        .collect::<Vec<_>>();
-    pairs.retain(|(name, _)| name != &key);
-    pairs.push((key, value));
-    request.query = serialize_query_pairs(pairs);
+    context.with_default_upstream_request_mut(|request| {
+        let mut pairs = url::form_urlencoded::parse(request.query.as_bytes())
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        pairs.retain(|(name, _)| name != &key);
+        pairs.push((key, value));
+        request.query = serialize_query_pairs(pairs);
+    });
     Ok(CallOutcome::Return(vec![]))
 }

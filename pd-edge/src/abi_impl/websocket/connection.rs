@@ -179,14 +179,10 @@ fn connection_state(
     connection: WebSocketHandle,
 ) -> WebSocketConnectionState {
     match connection {
-        WebSocketHandle::Downstream => context.lock_downstream().downstream_websocket.clone(),
-        WebSocketHandle::DefaultUpstream => context
-            .lock_exchanges()
-            .exchanges
-            .get(&default_upstream_exchange_handle())
-            .expect("exchange handle should exist while websocket is in use")
-            .websocket_dag
-            .clone(),
+        WebSocketHandle::Downstream => context.downstream_websocket(),
+        WebSocketHandle::DefaultUpstream => {
+            context.with_default_upstream_exchange(|exchange| exchange.websocket_dag.clone())
+        }
         WebSocketHandle::OutboundExchange(handle) => context
             .lock_exchanges()
             .exchanges
@@ -307,13 +303,9 @@ fn store_connected_websocket(
                     .mark_handshake_complete(Some("http/1.1".to_string()));
             }
         }
-        context
-            .lock_exchanges()
-            .exchanges
-            .get_mut(&connection)
-            .expect("default upstream exchange should exist")
-            .websocket_dag
-            .mark_open(io, negotiated_subprotocol);
+        context.with_default_upstream_exchange_mut(|exchange| {
+            exchange.websocket_dag.mark_open(io, negotiated_subprotocol);
+        });
         return Ok(());
     }
 
@@ -354,13 +346,9 @@ fn store_failed_websocket(
         if transport.tls_dag.default_upstream.is_present() {
             transport.tls_dag.default_upstream.mark_failed();
         }
-        context
-            .lock_exchanges()
-            .exchanges
-            .get_mut(&connection)
-            .expect("default upstream exchange should exist")
-            .websocket_dag
-            .mark_failed(message);
+        context.with_default_upstream_exchange_mut(|exchange| {
+            exchange.websocket_dag.mark_failed(message);
+        });
         return Ok(());
     }
     let mut exchanges = context.lock_exchanges();
@@ -421,10 +409,7 @@ fn refresh_connection_close_state(context: &SharedProxyVmContext, connection: i6
                 exchange.websocket_dag.refresh_close_state();
             }
         }
-        0 => context
-            .lock_downstream()
-            .downstream_websocket
-            .refresh_close_state(),
+        0 => context.with_downstream_websocket_mut(|websocket| websocket.refresh_close_state()),
         handle => {
             if let Some(exchange) = context.lock_exchanges().exchanges.get_mut(&handle) {
                 exchange.websocket_dag.refresh_close_state();
@@ -578,10 +563,7 @@ pub(crate) async fn close_websocket_binary_stream(
                 .expect("default upstream exchange should exist")
                 .websocket_dag
                 .note_closing(),
-            0 => context
-                .lock_downstream()
-                .downstream_websocket
-                .note_closing(),
+            0 => context.with_downstream_websocket_mut(|websocket| websocket.note_closing()),
             handle => {
                 if let Some(exchange) = exchanges.exchanges.get_mut(&handle) {
                     exchange.websocket_dag.note_closing();
@@ -596,17 +578,12 @@ pub(crate) async fn close_websocket_binary_stream(
     let close_code = io.close_code();
     drop(io);
     match connection {
-        1 => context
-            .lock_exchanges()
-            .exchanges
-            .get_mut(&connection)
-            .expect("default upstream exchange should exist")
-            .websocket_dag
-            .mark_closed(close_code, close_reason),
-        0 => context
-            .lock_downstream()
-            .downstream_websocket
-            .mark_closed(close_code, close_reason),
+        1 => context.with_default_upstream_exchange_mut(|exchange| {
+            exchange.websocket_dag.mark_closed(close_code, close_reason);
+        }),
+        0 => context.with_downstream_websocket_mut(|websocket| {
+            websocket.mark_closed(close_code, close_reason);
+        }),
         handle => {
             if let Some(exchange) = context.lock_exchanges().exchanges.get_mut(&handle) {
                 exchange.websocket_dag.mark_closed(close_code, close_reason);
@@ -866,10 +843,7 @@ async fn connection_close(
                 .expect("default upstream exchange should exist")
                 .websocket_dag
                 .note_closing(),
-            0 => context
-                .lock_downstream()
-                .downstream_websocket
-                .note_closing(),
+            0 => context.with_downstream_websocket_mut(|websocket| websocket.note_closing()),
             handle => {
                 if let Some(exchange) = exchanges.exchanges.get_mut(&handle) {
                     exchange.websocket_dag.note_closing();
@@ -883,17 +857,12 @@ async fn connection_close(
     let close_code = io.close_code();
     drop(io);
     match connection {
-        1 => context
-            .lock_exchanges()
-            .exchanges
-            .get_mut(&connection)
-            .expect("default upstream exchange should exist")
-            .websocket_dag
-            .mark_closed(close_code, close_reason),
-        0 => context
-            .lock_downstream()
-            .downstream_websocket
-            .mark_closed(close_code, close_reason),
+        1 => context.with_default_upstream_exchange_mut(|exchange| {
+            exchange.websocket_dag.mark_closed(close_code, close_reason);
+        }),
+        0 => context.with_downstream_websocket_mut(|websocket| {
+            websocket.mark_closed(close_code, close_reason);
+        }),
         handle => {
             if let Some(exchange) = context.lock_exchanges().exchanges.get_mut(&handle) {
                 exchange.websocket_dag.mark_closed(close_code, close_reason);
