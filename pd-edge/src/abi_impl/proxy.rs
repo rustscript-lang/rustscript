@@ -323,15 +323,14 @@ async fn drive_pipe(
     max_bytes: usize,
 ) -> Result<String, VmError> {
     let source_state = proxy_stream_state(&context, source)?;
-    if let ProxyByteStreamEndpoint::HttpExchange(exchange) = source_state.endpoint {
-        if !http::outbound_exchange_response_available(&context, exchange)
-            && source_state.write_observed
-            && !source_state.write_closed
-        {
-            return Err(VmError::HostError(format!(
-                "proxy byte-stream handle {source} cannot be piped yet because its read side is waiting for its write side to close; use proxy::tunnel or finish writing before piping from it",
-            )));
-        }
+    if let ProxyByteStreamEndpoint::HttpExchange(exchange) = source_state.endpoint
+        && !http::outbound_exchange_response_available(&context, exchange)
+        && source_state.write_observed
+        && !source_state.write_closed
+    {
+        return Err(VmError::HostError(format!(
+            "proxy byte-stream handle {source} cannot be piped yet because its read side is waiting for its write side to close; use proxy::tunnel or finish writing before piping from it",
+        )));
     }
     drive_pipe_direction(context, source, destination, max_bytes).await?;
     Ok("eof".to_string())

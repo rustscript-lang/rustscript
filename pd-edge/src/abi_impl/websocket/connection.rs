@@ -355,7 +355,7 @@ fn websocket_io(
     context: &SharedProxyVmContext,
     connection: i64,
 ) -> Result<SharedWebSocketIo, VmError> {
-    let state = connection_state(&context, decode_connection(context, connection)?);
+    let state = connection_state(context, decode_connection(context, connection)?);
     state.io().ok_or_else(|| {
         VmError::HostError(format!(
             "websocket connection handle {connection} is not open",
