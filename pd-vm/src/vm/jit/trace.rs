@@ -552,7 +552,7 @@ impl TraceJitEngine {
     pub fn snapshot(&self) -> JitSnapshot {
         JitSnapshot {
             arch: std::env::consts::ARCH,
-            config: self.config.clone(),
+            config: self.config,
             traces: self.traces.clone(),
             attempts: self.attempts.clone(),
             nyi_reference: nyi_reference(),

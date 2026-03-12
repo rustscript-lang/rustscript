@@ -85,7 +85,7 @@ impl Vm {
             self.ensure_program_cache_key();
             let required_max_trace_len = self.program.code.len().max(1);
             if self.jit_config().max_trace_len < required_max_trace_len {
-                let mut config = self.jit_config().clone();
+                let mut config = *self.jit_config();
                 config.max_trace_len = required_max_trace_len;
                 self.set_jit_config(config);
             } else {
