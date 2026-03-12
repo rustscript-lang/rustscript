@@ -70,7 +70,7 @@ pub struct HostNamespaceSpec {
     pub docs: &'static str,
 }
 
-pub const ABI_VERSION: u16 = 10;
+pub const ABI_VERSION: u16 = 16;
 
 #[allow(dead_code, unused_variables)]
 mod callable_specs {
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn abi_json_contains_declared_functions() {
         let manifest = abi_json();
-        assert!(manifest.contains("\"abi_version\": 10"));
+        assert!(manifest.contains("\"abi_version\": 16"));
         for function in FUNCTIONS {
             assert!(manifest.contains(function.name));
             assert!(manifest.contains(function.return_type.as_str()));

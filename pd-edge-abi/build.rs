@@ -354,7 +354,7 @@ fn render_abi_rust(functions: &[AbiFunctionDecl], namespaces: &[NamespaceDecl]) 
 fn render_abi_json(functions: &[AbiFunctionDecl]) -> String {
     let mut out = String::new();
     out.push_str("{\n");
-    out.push_str("  \"abi_version\": 10,\n");
+    out.push_str("  \"abi_version\": 16,\n");
     out.push_str("  \"functions\": [\n");
     for (index, function) in functions.iter().enumerate() {
         let suffix = if index + 1 == functions.len() {

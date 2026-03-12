@@ -1,5 +1,10 @@
 include!("http.request.rs");
 include!("http.response.rs");
+include!("http.exchange.rs");
 include!("http.upstream.request.rs");
 include!("http.upstream.response.rs");
 include!("runtime.rs");
+include!("tcp.rs");
+include!("tls.rs");
+include!("websocket.rs");
+include!("proxy.rs");
