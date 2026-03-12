@@ -320,7 +320,7 @@ fn connection_state(
     context: &SharedProxyVmContext,
     connection: WebRtcHandle,
 ) -> WebRtcConnectionState {
-    let guard = context.lock().expect("vm context lock poisoned");
+    let guard = context.lock_webrtc();
     match connection {
         WebRtcHandle::Downstream => WebRtcConnectionState::default(),
         WebRtcHandle::DefaultUpstream => guard.default_upstream_webrtc.clone(),
@@ -338,7 +338,7 @@ fn with_connection_state_mut<T>(
     mutate: impl FnOnce(&mut WebRtcConnectionState) -> Result<T, VmError>,
 ) -> Result<T, VmError> {
     let handle = decode_connection(context, connection)?;
-    let mut guard = context.lock().expect("vm context lock poisoned");
+    let mut guard = context.lock_webrtc();
     match handle {
         WebRtcHandle::Downstream => Err(webrtc_connection_operation_on_downstream()),
         WebRtcHandle::DefaultUpstream => mutate(&mut guard.default_upstream_webrtc),

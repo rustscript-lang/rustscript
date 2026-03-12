@@ -86,7 +86,7 @@ fn allocate_proxy_stream_handle(
     context: &SharedProxyVmContext,
     endpoint: ProxyByteStreamEndpoint,
 ) -> Result<i64, VmError> {
-    let mut guard = context.lock().expect("vm context lock poisoned");
+    let mut guard = context.lock_proxy();
     let handle = guard.next_proxy_stream_handle;
     if handle == i64::MAX {
         return Err(VmError::HostError(
@@ -104,7 +104,7 @@ fn proxy_stream_state(
     context: &SharedProxyVmContext,
     handle: i64,
 ) -> Result<ProxyByteStreamState, VmError> {
-    let guard = context.lock().expect("vm context lock poisoned");
+    let guard = context.lock_proxy();
     guard
         .proxy_stream_handles
         .get(&handle)
@@ -116,7 +116,7 @@ fn prepare_proxy_stream_write(
     context: &SharedProxyVmContext,
     handle: i64,
 ) -> Result<ProxyByteStreamEndpoint, VmError> {
-    let mut guard = context.lock().expect("vm context lock poisoned");
+    let mut guard = context.lock_proxy();
     let stream = guard
         .proxy_stream_handles
         .get_mut(&handle)
@@ -135,7 +135,7 @@ fn mark_proxy_stream_write_closed(
     handle: i64,
 ) -> Result<ProxyByteStreamEndpoint, VmError> {
     let (endpoint, notify) = {
-        let mut guard = context.lock().expect("vm context lock poisoned");
+        let mut guard = context.lock_proxy();
         let stream = guard
             .proxy_stream_handles
             .get_mut(&handle)
@@ -157,7 +157,7 @@ fn mark_proxy_stream_write_closed(
 }
 
 fn proxy_stream_write_closed(context: &SharedProxyVmContext, handle: i64) -> Result<bool, VmError> {
-    let guard = context.lock().expect("vm context lock poisoned");
+    let guard = context.lock_proxy();
     let stream = guard
         .proxy_stream_handles
         .get(&handle)
@@ -169,7 +169,7 @@ fn proxy_stream_write_close_notify(
     context: &SharedProxyVmContext,
     handle: i64,
 ) -> Result<Arc<Notify>, VmError> {
-    let guard = context.lock().expect("vm context lock poisoned");
+    let guard = context.lock_proxy();
     let stream = guard
         .proxy_stream_handles
         .get(&handle)
@@ -217,7 +217,7 @@ fn tls_present_for_endpoint(
 ) -> Result<bool, VmError> {
     match endpoint {
         ProxyByteStreamEndpoint::HttpDownstream => {
-            let guard = context.lock().expect("vm context lock poisoned");
+            let guard = context.lock_transport();
             Ok(guard.tls_dag.downstream.is_present())
         }
         ProxyByteStreamEndpoint::HttpExchange(handle) => {
@@ -542,7 +542,7 @@ mod tests {
     };
 
     fn test_context(body: &str) -> SharedProxyVmContext {
-        Arc::new(Mutex::new(ProxyVmContext::from_http_request(
+        Arc::new(ProxyVmContext::from_http_request(
             HttpRequestContext {
                 request_id: "req-1".to_string(),
                 method: axum::http::Method::POST,
@@ -557,7 +557,7 @@ mod tests {
                 headers: HeaderMap::new(),
             },
             Arc::new(Mutex::new(RateLimiterStore::new())),
-        )))
+        ))
     }
 
     async fn spawn_server(app: Router) -> SocketAddr {
@@ -571,12 +571,25 @@ mod tests {
         addr
     }
 
-    fn configure_default_upstream(context: &SharedProxyVmContext, target: String, client: Client) {
-        let mut guard = context.lock().expect("vm context lock poisoned");
-        guard.attach_upstream_client(client);
-        guard.outbound_request.target = Some(target.clone());
-        guard.tcp_dag.default_upstream.configure();
-        guard.tls_dag.default_upstream.observe_target(&target);
+    fn configure_default_upstream(
+        context: &mut SharedProxyVmContext,
+        target: String,
+        client: Client,
+    ) {
+        let context = Arc::get_mut(context).expect("context should be uniquely owned");
+        context.attach_upstream_client(client);
+        {
+            let mut exchanges = context.lock_exchanges();
+            exchanges
+                .exchanges
+                .get_mut(&edge_http::default_upstream_exchange_handle())
+                .expect("default upstream exchange should exist")
+                .request
+                .target = Some(target.clone());
+        }
+        let mut transport = context.lock_transport();
+        transport.tcp_dag.default_upstream.configure();
+        transport.tls_dag.default_upstream.observe_target(&target);
     }
 
     #[test]
@@ -606,9 +619,9 @@ mod tests {
         )))
         .await;
 
-        let context = test_context("");
+        let mut context = test_context("");
         configure_default_upstream(
-            &context,
+            &mut context,
             format!("http://{upstream_addr}/echo"),
             Client::new(),
         );
@@ -657,9 +670,9 @@ mod tests {
         )))
         .await;
 
-        let context = test_context("abcdefgh");
+        let mut context = test_context("abcdefgh");
         configure_default_upstream(
-            &context,
+            &mut context,
             format!("http://{upstream_addr}/echo"),
             Client::new(),
         );
@@ -678,7 +691,7 @@ mod tests {
             .expect("tunnel should succeed");
         assert_eq!(status, "closed");
 
-        let guard = context.lock().expect("vm context lock poisoned");
+        let guard = context.lock_downstream();
         assert_eq!(
             guard.response_output.body.as_deref(),
             Some("echo:abcdefgh".as_bytes())
@@ -697,17 +710,17 @@ mod tests {
         )))
         .await;
 
-        let context = test_context("");
+        let mut context = test_context("");
         {
-            let mut guard = context.lock().expect("vm context lock poisoned");
-            guard.attach_upstream_client(Client::new());
+            let context = Arc::get_mut(&mut context).expect("context should be uniquely owned");
+            context.attach_upstream_client(Client::new());
         }
         let exchange = edge_http::allocate_outbound_exchange_handle(&context)
             .expect("exchange should allocate");
         {
-            let mut guard = context.lock().expect("vm context lock poisoned");
+            let mut guard = context.lock_exchanges();
             let exchange_state = guard
-                .outbound_exchanges
+                .exchanges
                 .get_mut(&exchange)
                 .expect("exchange should exist");
             exchange_state.request.target = Some(format!("http://{upstream_addr}/dyn"));
@@ -731,7 +744,7 @@ mod tests {
             .expect("pipe should succeed");
         assert_eq!(status, "eof");
 
-        let guard = context.lock().expect("vm context lock poisoned");
+        let guard = context.lock_downstream();
         assert_eq!(
             guard.response_output.body.as_deref(),
             Some("dyn:payload".as_bytes())

@@ -141,25 +141,29 @@ fn with_outbound_connection_mut<T>(
         &mut WebSocketConnectionState,
     ) -> T,
 ) -> Result<T, VmError> {
-    let mut guard = context.lock().expect("vm context lock poisoned");
     if connection == default_upstream_exchange_handle() {
-        let crate::abi_impl::ProxyVmContext {
-            outbound_request,
-            tcp_dag,
-            tls_dag,
-            default_upstream_websocket,
-            ..
-        } = &mut *guard;
-        return Ok(mutate(
-            outbound_request,
-            &mut tcp_dag.default_upstream,
-            &mut tls_dag.default_upstream,
-            default_upstream_websocket,
-        ));
+        let mut exchanges = context.lock_exchanges();
+        let exchange = exchanges
+            .exchanges
+            .get_mut(&connection)
+            .ok_or_else(|| VmError::HostError(format!("unknown websocket handle {connection}")))?;
+        let mut transport = context.lock_transport();
+        let mut tcp_flow = transport.tcp_dag.default_upstream.clone();
+        let mut tls_flow = transport.tls_dag.default_upstream.clone();
+        let result = mutate(
+            &mut exchange.request,
+            &mut tcp_flow,
+            &mut tls_flow,
+            &mut exchange.websocket_dag,
+        );
+        transport.tcp_dag.default_upstream = tcp_flow;
+        transport.tls_dag.default_upstream = tls_flow;
+        return Ok(result);
     }
 
-    let exchange = guard
-        .outbound_exchanges
+    let mut exchanges = context.lock_exchanges();
+    let exchange = exchanges
+        .exchanges
         .get_mut(&connection)
         .ok_or_else(|| VmError::HostError(format!("unknown websocket handle {connection}")))?;
     Ok(mutate(
@@ -174,12 +178,18 @@ fn connection_state(
     context: &SharedProxyVmContext,
     connection: WebSocketHandle,
 ) -> WebSocketConnectionState {
-    let guard = context.lock().expect("vm context lock poisoned");
     match connection {
-        WebSocketHandle::Downstream => guard.downstream_websocket.clone(),
-        WebSocketHandle::DefaultUpstream => guard.default_upstream_websocket.clone(),
-        WebSocketHandle::OutboundExchange(handle) => guard
-            .outbound_exchanges
+        WebSocketHandle::Downstream => context.lock_downstream().downstream_websocket.clone(),
+        WebSocketHandle::DefaultUpstream => context
+            .lock_exchanges()
+            .exchanges
+            .get(&default_upstream_exchange_handle())
+            .expect("exchange handle should exist while websocket is in use")
+            .websocket_dag
+            .clone(),
+        WebSocketHandle::OutboundExchange(handle) => context
+            .lock_exchanges()
+            .exchanges
             .get(&handle)
             .expect("exchange handle should exist while websocket is in use")
             .websocket_dag
@@ -227,16 +237,20 @@ fn prepared_outbound_websocket(
     context: &SharedProxyVmContext,
     connection: i64,
 ) -> Result<PreparedOutboundWebSocket, VmError> {
-    let guard = context.lock().expect("vm context lock poisoned");
     let (request, tls_flow, websocket) = if connection == default_upstream_exchange_handle() {
-        (
-            guard.outbound_request.clone(),
-            guard.tls_dag.default_upstream.clone(),
-            guard.default_upstream_websocket.clone(),
-        )
+        let request = {
+            let exchanges = context.lock_exchanges();
+            let exchange = exchanges.exchanges.get(&connection).ok_or_else(|| {
+                VmError::HostError(format!("unknown websocket handle {connection}"))
+            })?;
+            (exchange.request.clone(), exchange.websocket_dag.clone())
+        };
+        let tls_flow = context.lock_transport().tls_dag.default_upstream.clone();
+        (request.0, tls_flow, request.1)
     } else {
-        let exchange = guard
-            .outbound_exchanges
+        let exchanges = context.lock_exchanges();
+        let exchange = exchanges
+            .exchanges
             .get(&connection)
             .ok_or_else(|| VmError::HostError(format!("unknown websocket handle {connection}")))?;
         (
@@ -268,34 +282,44 @@ fn store_connected_websocket(
     io: SharedWebSocketIo,
     negotiated_subprotocol: Option<String>,
 ) -> Result<(), VmError> {
-    let mut guard = context.lock().expect("vm context lock poisoned");
     if connection == default_upstream_exchange_handle() {
-        guard.tcp_dag.default_upstream.mark_connected();
-        if guard.tls_dag.default_upstream.is_present() {
-            guard.tls_dag.default_upstream.note_handshake_prepared();
-            guard.tls_dag.default_upstream.note_client_hello_sent();
-            guard.tls_dag.default_upstream.note_server_hello_received();
-            guard
-                .tls_dag
-                .default_upstream
-                .note_server_certificate_received(None);
-            guard
-                .tls_dag
-                .default_upstream
-                .note_server_certificate_verified();
-            guard
-                .tls_dag
-                .default_upstream
-                .mark_handshake_complete(Some("http/1.1".to_string()));
+        {
+            let mut transport = context.lock_transport();
+            transport.tcp_dag.default_upstream.mark_connected();
+            if transport.tls_dag.default_upstream.is_present() {
+                transport.tls_dag.default_upstream.note_handshake_prepared();
+                transport.tls_dag.default_upstream.note_client_hello_sent();
+                transport
+                    .tls_dag
+                    .default_upstream
+                    .note_server_hello_received();
+                transport
+                    .tls_dag
+                    .default_upstream
+                    .note_server_certificate_received(None);
+                transport
+                    .tls_dag
+                    .default_upstream
+                    .note_server_certificate_verified();
+                transport
+                    .tls_dag
+                    .default_upstream
+                    .mark_handshake_complete(Some("http/1.1".to_string()));
+            }
         }
-        guard
-            .default_upstream_websocket
+        context
+            .lock_exchanges()
+            .exchanges
+            .get_mut(&connection)
+            .expect("default upstream exchange should exist")
+            .websocket_dag
             .mark_open(io, negotiated_subprotocol);
         return Ok(());
     }
 
-    let exchange = guard
-        .outbound_exchanges
+    let mut exchanges = context.lock_exchanges();
+    let exchange = exchanges
+        .exchanges
         .get_mut(&connection)
         .ok_or_else(|| VmError::HostError(format!("unknown websocket handle {connection}")))?;
     exchange.transport.tcp_flow.mark_connected();
@@ -325,16 +349,23 @@ fn store_failed_websocket(
     connection: i64,
     message: String,
 ) -> Result<(), VmError> {
-    let mut guard = context.lock().expect("vm context lock poisoned");
     if connection == default_upstream_exchange_handle() {
-        if guard.tls_dag.default_upstream.is_present() {
-            guard.tls_dag.default_upstream.mark_failed();
+        let mut transport = context.lock_transport();
+        if transport.tls_dag.default_upstream.is_present() {
+            transport.tls_dag.default_upstream.mark_failed();
         }
-        guard.default_upstream_websocket.mark_failed(message);
+        context
+            .lock_exchanges()
+            .exchanges
+            .get_mut(&connection)
+            .expect("default upstream exchange should exist")
+            .websocket_dag
+            .mark_failed(message);
         return Ok(());
     }
-    let exchange = guard
-        .outbound_exchanges
+    let mut exchanges = context.lock_exchanges();
+    let exchange = exchanges
+        .exchanges
         .get_mut(&connection)
         .ok_or_else(|| VmError::HostError(format!("unknown websocket handle {connection}")))?;
     if exchange.transport.tls_flow.is_present() {
@@ -384,12 +415,18 @@ pub(crate) fn websocket_connection_mode(context: &SharedProxyVmContext, connecti
 }
 
 fn refresh_connection_close_state(context: &SharedProxyVmContext, connection: i64) {
-    let mut state = context.lock().expect("vm context lock poisoned");
     match connection {
-        1 => state.default_upstream_websocket.refresh_close_state(),
-        0 => state.downstream_websocket.refresh_close_state(),
+        1 => {
+            if let Some(exchange) = context.lock_exchanges().exchanges.get_mut(&connection) {
+                exchange.websocket_dag.refresh_close_state();
+            }
+        }
+        0 => context
+            .lock_downstream()
+            .downstream_websocket
+            .refresh_close_state(),
         handle => {
-            if let Some(exchange) = state.outbound_exchanges.get_mut(&handle) {
+            if let Some(exchange) = context.lock_exchanges().exchanges.get_mut(&handle) {
                 exchange.websocket_dag.refresh_close_state();
             }
         }
@@ -533,12 +570,20 @@ pub(crate) async fn close_websocket_binary_stream(
     }
     ensure_outbound_websocket_connection_open(context, connection).await?;
     {
-        let mut state = context.lock().expect("vm context lock poisoned");
+        let mut exchanges = context.lock_exchanges();
         match connection {
-            1 => state.default_upstream_websocket.note_closing(),
-            0 => state.downstream_websocket.note_closing(),
+            1 => exchanges
+                .exchanges
+                .get_mut(&connection)
+                .expect("default upstream exchange should exist")
+                .websocket_dag
+                .note_closing(),
+            0 => context
+                .lock_downstream()
+                .downstream_websocket
+                .note_closing(),
             handle => {
-                if let Some(exchange) = state.outbound_exchanges.get_mut(&handle) {
+                if let Some(exchange) = exchanges.exchanges.get_mut(&handle) {
                     exchange.websocket_dag.note_closing();
                 }
             }
@@ -550,16 +595,20 @@ pub(crate) async fn close_websocket_binary_stream(
     let close_reason = io.close_reason().map(str::to_string);
     let close_code = io.close_code();
     drop(io);
-    let mut state = context.lock().expect("vm context lock poisoned");
     match connection {
-        1 => state
-            .default_upstream_websocket
+        1 => context
+            .lock_exchanges()
+            .exchanges
+            .get_mut(&connection)
+            .expect("default upstream exchange should exist")
+            .websocket_dag
             .mark_closed(close_code, close_reason),
-        0 => state
+        0 => context
+            .lock_downstream()
             .downstream_websocket
             .mark_closed(close_code, close_reason),
         handle => {
-            if let Some(exchange) = state.outbound_exchanges.get_mut(&handle) {
+            if let Some(exchange) = context.lock_exchanges().exchanges.get_mut(&handle) {
                 exchange.websocket_dag.mark_closed(close_code, close_reason);
             }
         }
@@ -809,12 +858,20 @@ async fn connection_close(
     })?;
     let io = websocket_io(&context, connection)?;
     {
-        let mut state = context.lock().expect("vm context lock poisoned");
+        let mut exchanges = context.lock_exchanges();
         match connection {
-            1 => state.default_upstream_websocket.note_closing(),
-            0 => state.downstream_websocket.note_closing(),
+            1 => exchanges
+                .exchanges
+                .get_mut(&connection)
+                .expect("default upstream exchange should exist")
+                .websocket_dag
+                .note_closing(),
+            0 => context
+                .lock_downstream()
+                .downstream_websocket
+                .note_closing(),
             handle => {
-                if let Some(exchange) = state.outbound_exchanges.get_mut(&handle) {
+                if let Some(exchange) = exchanges.exchanges.get_mut(&handle) {
                     exchange.websocket_dag.note_closing();
                 }
             }
@@ -825,16 +882,20 @@ async fn connection_close(
     let close_reason = io.close_reason().map(str::to_string);
     let close_code = io.close_code();
     drop(io);
-    let mut state = context.lock().expect("vm context lock poisoned");
     match connection {
-        1 => state
-            .default_upstream_websocket
+        1 => context
+            .lock_exchanges()
+            .exchanges
+            .get_mut(&connection)
+            .expect("default upstream exchange should exist")
+            .websocket_dag
             .mark_closed(close_code, close_reason),
-        0 => state
+        0 => context
+            .lock_downstream()
             .downstream_websocket
             .mark_closed(close_code, close_reason),
         handle => {
-            if let Some(exchange) = state.outbound_exchanges.get_mut(&handle) {
+            if let Some(exchange) = context.lock_exchanges().exchanges.get_mut(&handle) {
                 exchange.websocket_dag.mark_closed(close_code, close_reason);
             }
         }

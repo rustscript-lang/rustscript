@@ -540,10 +540,10 @@ async fn run_loaded_program_once(state: &SharedState) -> Result<(), Box<dyn std:
         return Err("no program loaded".into());
     };
 
-    let context: SharedProxyVmContext = Arc::new(Mutex::new(ProxyVmContext::from_request_headers(
+    let context: SharedProxyVmContext = Arc::new(ProxyVmContext::from_request_headers(
         HeaderMap::new(),
         state.rate_limiter.clone(),
-    )));
+    ));
     let async_ops = new_shared_vm_async_ops();
     let mut vm = Vm::new_shared(loaded.program.clone());
     vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));

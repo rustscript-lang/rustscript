@@ -143,20 +143,16 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
             request_path,
             request_id,
         };
-        let vm_context = Arc::new(std::sync::Mutex::new(ProxyVmContext::from_http_request(
-            vm_request,
-            state.rate_limiter.clone(),
-        )));
-        {
-            let mut guard = vm_context.lock().expect("vm context lock poisoned");
-            guard.attach_upstream_client(state.client.clone());
-            guard.attach_upstream_client_cache(state.upstream_client_cache.clone());
-            guard.attach_tls_session_cache(state.tls_session_cache.clone());
-            guard.attach_upstream_http_sessions(state.upstream_http_sessions.clone());
-            if let Some(attachment) = &downstream_http2_attachment {
-                guard.attach_downstream_http2_stream(attachment);
-            }
+        let mut vm_context =
+            ProxyVmContext::from_http_request(vm_request, state.rate_limiter.clone());
+        vm_context.attach_upstream_client(state.client.clone());
+        vm_context.attach_upstream_client_cache(state.upstream_client_cache.clone());
+        vm_context.attach_tls_session_cache(state.tls_session_cache.clone());
+        vm_context.attach_upstream_http_sessions(state.upstream_http_sessions.clone());
+        if let Some(attachment) = &downstream_http2_attachment {
+            vm_context.attach_downstream_http2_stream(attachment);
         }
+        let vm_context = Arc::new(vm_context);
         match execute_vm_with_context(
             &program,
             vm_context.clone(),
@@ -310,12 +306,18 @@ fn text_response(status: StatusCode, text: &str) -> Response<Body> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "http2")]
     use axum::http::Version;
+    #[cfg(feature = "http2")]
     use http_body_util::{BodyExt, Full};
+    #[cfg(feature = "http2")]
     use vm::{compile_source, encode_program};
 
+    #[cfg(feature = "http2")]
     use super::*;
+    #[cfg(feature = "http2")]
     use crate::abi_impl::Http2SessionFrontier;
+    #[cfg(feature = "http2")]
     use crate::runtime::apply_program_from_bytes;
 
     #[cfg(feature = "http2")]

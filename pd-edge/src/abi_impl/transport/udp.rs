@@ -93,7 +93,7 @@ fn normalize_udp_target(value: &str) -> Result<String, VmError> {
 }
 
 fn socket_state(context: &SharedProxyVmContext, socket: UdpSocketHandle) -> UdpSocketState {
-    let guard = context.lock().expect("vm context lock poisoned");
+    let guard = context.lock_transport();
     match socket {
         UdpSocketHandle::Downstream => UdpSocketState::default(),
         UdpSocketHandle::DefaultUpstream => guard.default_upstream_udp_socket.clone(),
@@ -111,16 +111,14 @@ fn with_mutable_udp_socket_state<T>(
     mutate: impl FnOnce(&mut UdpSocketState, &mut Option<SharedUdpSocketIo>) -> Result<T, VmError>,
 ) -> Result<T, VmError> {
     let handle = decode_socket(context, socket)?;
-    let mut guard = context.lock().expect("vm context lock poisoned");
+    let mut guard = context.lock_transport();
     match handle {
         UdpSocketHandle::Downstream => Err(udp_socket_operation_on_downstream()),
         UdpSocketHandle::DefaultUpstream => {
-            let crate::abi_impl::ProxyVmContext {
-                default_upstream_udp_socket,
-                default_upstream_udp_io,
-                ..
-            } = &mut *guard;
-            mutate(default_upstream_udp_socket, default_upstream_udp_io)
+            let mut io_slot = guard.default_upstream_udp_io.take();
+            let result = mutate(&mut guard.default_upstream_udp_socket, &mut io_slot);
+            guard.default_upstream_udp_io = io_slot;
+            result
         }
         UdpSocketHandle::Dynamic(handle) => {
             let mut io_slot = guard.udp_socket_ios.remove(&handle);
@@ -140,7 +138,7 @@ fn with_mutable_udp_socket_state<T>(
 }
 
 fn clear_udp_socket_io(context: &SharedProxyVmContext, socket: UdpSocketHandle) {
-    let mut guard = context.lock().expect("vm context lock poisoned");
+    let mut guard = context.lock_transport();
     match socket {
         UdpSocketHandle::Downstream => {}
         UdpSocketHandle::DefaultUpstream => {
@@ -156,7 +154,7 @@ fn active_udp_socket_io(
     context: &SharedProxyVmContext,
     socket: UdpSocketHandle,
 ) -> Option<SharedUdpSocketIo> {
-    let guard = context.lock().expect("vm context lock poisoned");
+    let guard = context.lock_transport();
     match socket {
         UdpSocketHandle::Downstream => None,
         UdpSocketHandle::DefaultUpstream => guard.default_upstream_udp_io.clone(),
@@ -171,7 +169,7 @@ fn store_connected_udp_socket(
     local_addr: String,
     peer_addr: String,
 ) {
-    let mut guard = context.lock().expect("vm context lock poisoned");
+    let mut guard = context.lock_transport();
     match socket {
         UdpSocketHandle::Downstream => {}
         UdpSocketHandle::DefaultUpstream => {
@@ -195,7 +193,7 @@ fn store_failed_udp_socket(
     message: impl Into<String>,
 ) {
     let message = message.into();
-    let mut guard = context.lock().expect("vm context lock poisoned");
+    let mut guard = context.lock_transport();
     match socket {
         UdpSocketHandle::Downstream => {}
         UdpSocketHandle::DefaultUpstream => {
