@@ -11,6 +11,7 @@ fn trim_trailing_separators(path) {
     (&path)[0:end];
 }
 
+// Replaces backslashes with forward slashes in a path.
 pub fn normalize_sep(path) {
     let mut out = "";
     for (let mut index = 0; index <(&path).length; index = index + 1) {
@@ -25,6 +26,7 @@ pub fn normalize_sep(path) {
     out;
 }
 
+// Joins two path segments with a single separator.
 pub fn join(lhs, rhs) {
     let left = normalize_sep(lhs);
     let right = normalize_sep(rhs);
@@ -46,6 +48,7 @@ pub fn join(lhs, rhs) {
     out;
 }
 
+// Returns the final path segment.
 pub fn basename(path) {
     let normalized = trim_trailing_separators(normalize_sep(path));
     let mut start = 0;
@@ -60,6 +63,7 @@ pub fn basename(path) {
     (&normalized)[start:(&normalized).length];
 }
 
+// Returns the parent directory portion of a path.
 pub fn dirname(path) {
     let normalized = trim_trailing_separators(normalize_sep(path));
     let mut cut =-1;
@@ -81,6 +85,7 @@ pub fn dirname(path) {
     out;
 }
 
+// Returns the file extension of a path.
 pub fn extname(path) {
     let name = basename(path);
     let mut dot =-1;

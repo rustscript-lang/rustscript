@@ -84,12 +84,14 @@ fn apply_exchange_query(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Allocates an outbound HTTP exchange handle.
 #[pd_edge_host_function(name = http_exchange::NEW.name, scope = http)]
 async fn new_exchange(_vm: &mut Vm, context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
     let handle = allocate_outbound_exchange_handle(&context)?;
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 
+/// Returns the default upstream handle for the outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::DEFAULT_UPSTREAM.name, scope = http)]
 async fn default_upstream_exchange(
     _vm: &mut Vm,
@@ -100,6 +102,7 @@ async fn default_upstream_exchange(
     )]))
 }
 
+/// Sends the outbound HTTP exchange and starts its response stream.
 #[pd_edge_host_function(name = http_exchange::SEND.name, scope = http)]
 async fn send_exchange(
     _vm: &mut Vm,
@@ -111,6 +114,7 @@ async fn send_exchange(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets a header on the outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::SET_HEADER.name, scope = http)]
 async fn set_exchange_header(
     _vm: &mut Vm,
@@ -126,6 +130,7 @@ async fn set_exchange_header(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Removes a header from the outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::REMOVE_HEADER.name, scope = http)]
 async fn remove_exchange_header(
     _vm: &mut Vm,
@@ -140,6 +145,7 @@ async fn remove_exchange_header(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the HTTP method on the outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::SET_METHOD.name, scope = http)]
 async fn set_exchange_method(
     _vm: &mut Vm,
@@ -155,6 +161,7 @@ async fn set_exchange_method(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the request path on the outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::SET_PATH.name, scope = http)]
 async fn set_exchange_path(
     _vm: &mut Vm,
@@ -173,6 +180,7 @@ async fn set_exchange_path(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the decoded query string on the outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::SET_QUERY.name, scope = http)]
 async fn set_exchange_query(
     _vm: &mut Vm,
@@ -183,6 +191,7 @@ async fn set_exchange_query(
     apply_exchange_query(&context, exchange, query)
 }
 
+/// Sets the target endpoint for the outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::SET_TARGET.name, scope = http)]
 async fn set_exchange_target(
     _vm: &mut Vm,
@@ -203,6 +212,7 @@ async fn set_exchange_target(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Attaches a TCP stream as the transport for an outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::ATTACH_TCP.name, scope = http)]
 async fn attach_exchange_tcp(
     _vm: &mut Vm,
@@ -216,6 +226,7 @@ async fn attach_exchange_tcp(
 }
 
 #[cfg(feature = "tls")]
+/// Attaches a TLS plaintext session as the transport for an outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::ATTACH_TLS_PLAINTEXT.name, scope = http)]
 async fn attach_exchange_tls_plaintext(
     _vm: &mut Vm,
@@ -228,6 +239,7 @@ async fn attach_exchange_tls_plaintext(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the body for the outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::SET_BODY.name, scope = http)]
 async fn set_exchange_body(
     _vm: &mut Vm,
@@ -241,6 +253,7 @@ async fn set_exchange_body(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Adds a header value to the outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::ADD_HEADER.name, scope = http)]
 async fn add_exchange_header(
     _vm: &mut Vm,
@@ -256,6 +269,7 @@ async fn add_exchange_header(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Clears all values for a header on the outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::CLEAR_HEADER.name, scope = http)]
 async fn clear_exchange_header(
     _vm: &mut Vm,
@@ -270,6 +284,7 @@ async fn clear_exchange_header(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Replaces the headers on the outbound HTTP exchange with the provided map.
 #[pd_edge_host_function(name = http_exchange::SET_HEADERS.name, scope = http)]
 async fn set_exchange_headers(
     _vm: &mut Vm,
@@ -289,6 +304,7 @@ async fn set_exchange_headers(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the raw query string on the outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::SET_RAW_QUERY.name, scope = http)]
 async fn set_exchange_raw_query(
     _vm: &mut Vm,
@@ -299,6 +315,7 @@ async fn set_exchange_raw_query(
     apply_exchange_query(&context, exchange, raw_query)
 }
 
+/// Sets a query parameter on the outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::SET_QUERY_ARG.name, scope = http)]
 async fn set_exchange_query_arg(
     _vm: &mut Vm,
@@ -318,6 +335,7 @@ async fn set_exchange_query_arg(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Returns the status code for the outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::GET_STATUS.name, scope = http)]
 async fn get_exchange_status(
     _vm: &mut Vm,
@@ -330,6 +348,7 @@ async fn get_exchange_status(
     )]))
 }
 
+/// Returns the first value for a header on the outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::GET_HEADER.name, scope = http)]
 async fn get_exchange_header(
     _vm: &mut Vm,
@@ -348,6 +367,7 @@ async fn get_exchange_header(
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 
+/// Returns all headers on the outbound HTTP exchange as a map.
 #[pd_edge_host_function(name = http_exchange::GET_HEADERS.name, scope = http)]
 async fn get_exchange_headers(
     _vm: &mut Vm,
@@ -360,6 +380,7 @@ async fn get_exchange_headers(
     )]))
 }
 
+/// Returns the full body for the outbound HTTP exchange as text.
 #[pd_edge_host_function(name = http_exchange::GET_BODY.name, scope = http)]
 async fn get_exchange_body(
     _vm: &mut Vm,
@@ -372,6 +393,7 @@ async fn get_exchange_body(
     )]))
 }
 
+/// Returns the HTTP version for the outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::GET_HTTP_VERSION.name, scope = http)]
 async fn get_exchange_http_version(
     _vm: &mut Vm,
@@ -384,6 +406,7 @@ async fn get_exchange_http_version(
     )]))
 }
 
+/// Reads the next body chunk from the outbound HTTP exchange.
 #[pd_edge_host_function(
     name = http_exchange::body::NEXT_CHUNK.name,
     scope = http_extension
@@ -406,6 +429,7 @@ async fn get_exchange_body_next_chunk(
     )]))
 }
 
+/// Returns whether the body stream for the outbound HTTP exchange is exhausted.
 #[pd_edge_host_function(name = http_exchange::body::EOF.name, scope = http_extension)]
 async fn get_exchange_body_eof(
     _vm: &mut Vm,

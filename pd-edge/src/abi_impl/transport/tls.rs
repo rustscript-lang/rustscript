@@ -470,6 +470,7 @@ async fn take_dynamic_tcp_stream_for_tls(
     })
 }
 
+/// Creates a TLS session handle from a connected TCP stream.
 #[pd_edge_host_function(name = tls::session::FROM_SOCKET.name, scope = transport)]
 async fn session_from_socket(
     _vm: &mut Vm,
@@ -492,6 +493,7 @@ async fn session_from_socket(
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 
+/// Returns whether the TLS session handle is present.
 #[pd_edge_host_function(name = tls::session::IS_PRESENT.name, scope = transport)]
 async fn session_is_present(
     _vm: &mut Vm,
@@ -503,6 +505,7 @@ async fn session_is_present(
     )]))
 }
 
+/// Runs the TLS handshake for the TLS session.
 #[pd_edge_host_function(name = tls::session::HANDSHAKE.name, scope = transport)]
 async fn session_handshake(
     _vm: &mut Vm,
@@ -630,6 +633,7 @@ async fn session_handshake(
     Ok(CallOutcome::Return(vec![Value::Bool(ready)]))
 }
 
+/// Sets the ALPN protocol list for the TLS session.
 #[pd_edge_host_function(name = tls::session::SET_ALPN.name, scope = transport)]
 async fn session_set_alpn(
     _vm: &mut Vm,
@@ -645,6 +649,7 @@ async fn session_set_alpn(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Enables or disables certificate verification for the TLS session.
 #[pd_edge_host_function(name = tls::session::SET_VERIFY.name, scope = transport)]
 async fn session_set_verify(
     _vm: &mut Vm,
@@ -659,6 +664,7 @@ async fn session_set_verify(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Enables or disables hostname verification for the TLS session.
 #[pd_edge_host_function(name = tls::session::SET_VERIFY_HOSTNAME.name, scope = transport)]
 async fn session_set_verify_hostname(
     _vm: &mut Vm,
@@ -673,6 +679,7 @@ async fn session_set_verify_hostname(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets a trusted CA certificate for the TLS session.
 #[pd_edge_host_function(name = tls::session::SET_TRUSTED_CERTIFICATE.name, scope = transport)]
 async fn session_set_trusted_certificate(
     _vm: &mut Vm,
@@ -687,6 +694,7 @@ async fn session_set_trusted_certificate(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the client certificate for the TLS session.
 #[pd_edge_host_function(name = tls::session::SET_CERTIFICATE.name, scope = transport)]
 async fn session_set_certificate(
     _vm: &mut Vm,
@@ -701,6 +709,7 @@ async fn session_set_certificate(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the client private key for the TLS session.
 #[pd_edge_host_function(name = tls::session::SET_PRIVATE_KEY.name, scope = transport)]
 async fn session_set_private_key(
     _vm: &mut Vm,
@@ -715,6 +724,7 @@ async fn session_set_private_key(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the SNI host name for the TLS session.
 #[pd_edge_host_function(name = tls::session::SET_SNI.name, scope = transport)]
 async fn session_set_sni(
     _vm: &mut Vm,
@@ -729,6 +739,7 @@ async fn session_set_sni(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the minimum TLS version for the TLS session.
 #[pd_edge_host_function(name = tls::session::SET_MIN_VERSION.name, scope = transport)]
 async fn session_set_min_version(
     _vm: &mut Vm,
@@ -744,6 +755,7 @@ async fn session_set_min_version(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the maximum TLS version for the TLS session.
 #[pd_edge_host_function(name = tls::session::SET_MAX_VERSION.name, scope = transport)]
 async fn session_set_max_version(
     _vm: &mut Vm,
@@ -759,6 +771,7 @@ async fn session_set_max_version(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Returns the peer certificate name for the TLS session.
 #[pd_edge_host_function(name = tls::session::GET_PEER_NAME.name, scope = transport)]
 async fn session_get_peer_name(
     _vm: &mut Vm,
@@ -772,6 +785,7 @@ async fn session_get_peer_name(
     )]))
 }
 
+/// Returns the configured server name for the TLS session.
 #[pd_edge_host_function(name = tls::session::GET_SERVER_NAME.name, scope = transport)]
 async fn session_get_server_name(
     _vm: &mut Vm,
@@ -785,6 +799,7 @@ async fn session_get_server_name(
     )]))
 }
 
+/// Returns the negotiated ALPN protocol for the TLS session.
 #[pd_edge_host_function(name = tls::session::GET_ALPN.name, scope = transport)]
 async fn session_get_alpn(
     _vm: &mut Vm,
@@ -798,6 +813,7 @@ async fn session_get_alpn(
     )]))
 }
 
+/// Returns the current phase for the TLS session.
 #[pd_edge_host_function(name = tls::session::GET_PHASE.name, scope = transport)]
 async fn session_get_phase(
     _vm: &mut Vm,
@@ -811,6 +827,7 @@ async fn session_get_phase(
     )]))
 }
 
+/// Returns the peer certificate for the TLS session.
 #[pd_edge_host_function(name = tls::session::GET_PEER_CERTIFICATE.name, scope = transport)]
 async fn session_get_peer_certificate(
     _vm: &mut Vm,
@@ -824,6 +841,7 @@ async fn session_get_peer_certificate(
     Ok(CallOutcome::Return(vec![Value::string(encoded)]))
 }
 
+/// Returns whether the TLS session reused a previous TLS session.
 #[pd_edge_host_function(name = tls::session::IS_SESSION_REUSED.name, scope = transport)]
 async fn session_is_session_reused(
     _vm: &mut Vm,

@@ -12,6 +12,7 @@ struct AbiFunctionDecl {
     param_names: Vec<String>,
     param_types: Vec<String>,
     return_type: String,
+    docs: String,
 }
 
 #[derive(Clone, Debug)]
@@ -32,6 +33,7 @@ fn main() {
     let functions_list = spec_dir.join("functions.rs");
     let namespace_list = spec_dir.join("namespaces.rs");
     let enabled_features = enabled_feature_flags();
+    let edge_impl_docs = parse_edge_host_impl_docs(&manifest_dir, &enabled_features);
 
     println!("cargo:rerun-if-changed={}", functions_list.display());
     println!("cargo:rerun-if-changed={}", namespace_list.display());
@@ -42,7 +44,7 @@ fn main() {
         .flat_map(|relative| {
             let path = spec_dir.join(relative);
             println!("cargo:rerun-if-changed={}", path.display());
-            parse_function_file(&path)
+            parse_function_file(&path, &edge_impl_docs)
         })
         .collect::<Vec<_>>();
 
@@ -103,7 +105,10 @@ fn parse_include_order(path: &Path, enabled_features: &BTreeSet<String>) -> Vec<
     files
 }
 
-fn parse_function_file(path: &Path) -> Vec<AbiFunctionDecl> {
+fn parse_function_file(
+    path: &Path,
+    edge_impl_docs: &BTreeMap<String, String>,
+) -> Vec<AbiFunctionDecl> {
     let source = fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
     let parsed = syn::parse_file(&source)
@@ -111,11 +116,14 @@ fn parse_function_file(path: &Path) -> Vec<AbiFunctionDecl> {
     parsed
         .items
         .iter()
-        .filter_map(parse_function_decl)
+        .filter_map(|item| parse_function_decl(item, edge_impl_docs))
         .collect()
 }
 
-fn parse_function_decl(item: &Item) -> Option<AbiFunctionDecl> {
+fn parse_function_decl(
+    item: &Item,
+    edge_impl_docs: &BTreeMap<String, String>,
+) -> Option<AbiFunctionDecl> {
     let Item::Fn(function) = item else {
         return None;
     };
@@ -137,6 +145,15 @@ fn parse_function_decl(item: &Item) -> Option<AbiFunctionDecl> {
         param_names.push(ident.ident.to_string());
         param_types.push(type_label(&pat_type.ty));
     }
+    let docs = edge_impl_docs
+        .get(&name)
+        .filter(|docs| !docs.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "edge ABI function '{name}' is missing /// doc comments on its #[pd_edge_host_function] implementation"
+            )
+        });
 
     Some(AbiFunctionDecl {
         name,
@@ -146,7 +163,96 @@ fn parse_function_decl(item: &Item) -> Option<AbiFunctionDecl> {
             ReturnType::Default => "Null".to_string(),
             ReturnType::Type(_, ty) => type_label(ty),
         },
+        docs,
     })
+}
+
+fn parse_edge_host_impl_docs(
+    manifest_dir: &Path,
+    enabled_features: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let Some(repo_root) = manifest_dir.parent() else {
+        return BTreeMap::new();
+    };
+    let impl_dir = repo_root.join("pd-edge").join("src").join("abi_impl");
+    if !impl_dir.exists() {
+        return BTreeMap::new();
+    }
+
+    let mut files = Vec::new();
+    collect_rs_files(&impl_dir, &mut files);
+
+    let mut docs_by_name = BTreeMap::new();
+    for path in files {
+        println!("cargo:rerun-if-changed={}", path.display());
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        let parsed = syn::parse_file(&source)
+            .unwrap_or_else(|err| panic!("failed to parse {}: {err}", path.display()));
+        collect_edge_impl_docs_from_items(&parsed.items, enabled_features, &mut docs_by_name);
+    }
+    docs_by_name
+}
+
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let mut entries = fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", dir.display()))
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+fn collect_edge_impl_docs_from_items(
+    items: &[Item],
+    enabled_features: &BTreeSet<String>,
+    docs_by_name: &mut BTreeMap<String, String>,
+) {
+    for item in items {
+        match item {
+            Item::Fn(function) => {
+                if !edge_impl_cfg_matches(&function.attrs, enabled_features) {
+                    continue;
+                }
+                let Some(name) = pd_edge_host_function_name(&function.attrs) else {
+                    continue;
+                };
+                let docs = doc_string(&function.attrs);
+                if docs.trim().is_empty() {
+                    continue;
+                }
+                match docs_by_name.get(&name) {
+                    Some(existing) if existing == &docs => {}
+                    Some(existing) => {
+                        panic!(
+                            "duplicate pd_edge_host_function docs for '{name}': {:?} vs {:?}",
+                            existing, docs
+                        );
+                    }
+                    None => {
+                        docs_by_name.insert(name, docs);
+                    }
+                }
+            }
+            Item::Mod(item_mod) => {
+                if !edge_impl_cfg_matches(&item_mod.attrs, enabled_features) {
+                    continue;
+                }
+                if let Some((_, items)) = &item_mod.content {
+                    collect_edge_impl_docs_from_items(items, enabled_features, docs_by_name);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn pd_host_function_name(attrs: &[syn::Attribute]) -> Option<String> {
@@ -176,6 +282,120 @@ fn pd_host_function_name(attrs: &[syn::Attribute]) -> Option<String> {
         }
         _ => panic!("callable name must be a string literal"),
     }
+}
+
+fn pd_edge_host_function_name(attrs: &[syn::Attribute]) -> Option<String> {
+    let attr = attrs
+        .iter()
+        .find(|attr| attr.path().is_ident("pd_edge_host_function"))?;
+    let Meta::List(list) = &attr.meta else {
+        panic!("#[pd_edge_host_function] must use name = ..., scope = ...");
+    };
+    let args = list
+        .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+        .unwrap_or_else(|err| panic!("failed to parse #[pd_edge_host_function(...)] args: {err}"));
+    let name_value = args
+        .iter()
+        .find_map(|meta| match meta {
+            Meta::NameValue(name_value) if name_value.path.is_ident("name") => Some(name_value),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("#[pd_edge_host_function] requires name = ..."));
+    Some(edge_host_name_expr(&name_value.value))
+}
+
+fn edge_host_name_expr(value: &syn::Expr) -> String {
+    match value {
+        syn::Expr::Lit(expr_lit) => match &expr_lit.lit {
+            syn::Lit::Str(value) => value.value(),
+            _ => panic!("edge host callable name must be a string literal or <path>.name"),
+        },
+        syn::Expr::Field(field) => {
+            let syn::Member::Named(member) = &field.member else {
+                panic!("edge host callable name must use .name");
+            };
+            if member != "name" {
+                panic!("edge host callable name must use .name");
+            }
+            let syn::Expr::Path(path) = field.base.as_ref() else {
+                panic!("edge host callable name must use a path ending in .name");
+            };
+            canonicalize_edge_host_path(&path.path)
+        }
+        syn::Expr::Path(path) => canonicalize_edge_host_path(&path.path),
+        _ => panic!("edge host callable name must be a string literal or <path>.name"),
+    }
+}
+
+fn canonicalize_edge_host_path(path: &syn::Path) -> String {
+    let segments = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>();
+    let Some((first, rest)) = segments.split_first() else {
+        panic!("edge host callable path must not be empty");
+    };
+
+    let mut canonical = match first.as_str() {
+        "edge_runtime" => vec!["runtime".to_string()],
+        "edge_rate_limit" => vec!["rate_limit".to_string()],
+        "http_request" => vec!["http".to_string(), "request".to_string()],
+        "http_response" => vec!["http".to_string(), "response".to_string()],
+        "http_exchange" => vec!["http".to_string(), "exchange".to_string()],
+        "http_upstream_request" => {
+            vec![
+                "http".to_string(),
+                "upstream".to_string(),
+                "request".to_string(),
+            ]
+        }
+        "http_upstream_response" => {
+            vec![
+                "http".to_string(),
+                "upstream".to_string(),
+                "response".to_string(),
+            ]
+        }
+        "proxy_symbols" => vec!["proxy".to_string()],
+        other => vec![other.to_string()],
+    };
+
+    canonical.extend(rest.iter().map(|segment| {
+        if segment
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        {
+            segment.to_ascii_lowercase()
+        } else {
+            segment.to_string()
+        }
+    }));
+
+    canonical.join("::")
+}
+
+fn doc_string(attrs: &[Attribute]) -> String {
+    attrs
+        .iter()
+        .filter_map(|attr| {
+            if !attr.path().is_ident("doc") {
+                return None;
+            }
+            match &attr.meta {
+                Meta::NameValue(name_value) => match &name_value.value {
+                    syn::Expr::Lit(expr_lit) => match &expr_lit.lit {
+                        syn::Lit::Str(value) => Some(value.value().trim().to_string()),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            }
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn type_label(ty: &Type) -> String {
@@ -281,6 +501,15 @@ fn cfg_matches(attrs: &[Attribute], enabled_features: &BTreeSet<String>) -> bool
     })
 }
 
+fn edge_impl_cfg_matches(attrs: &[Attribute], enabled_features: &BTreeSet<String>) -> bool {
+    attrs.iter().all(|attr| match &attr.meta {
+        Meta::List(list) if attr.path().is_ident("cfg") => {
+            eval_edge_impl_cfg_meta_list(list, enabled_features)
+        }
+        _ => true,
+    })
+}
+
 fn eval_cfg_meta_list(list: &syn::MetaList, enabled_features: &BTreeSet<String>) -> bool {
     let nested = list
         .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
@@ -289,6 +518,21 @@ fn eval_cfg_meta_list(list: &syn::MetaList, enabled_features: &BTreeSet<String>)
         panic!("#[cfg(...)] on ABI specs must contain exactly one top-level expression");
     }
     eval_cfg_meta(
+        nested
+            .first()
+            .expect("checked nested cfg expression length above"),
+        enabled_features,
+    )
+}
+
+fn eval_edge_impl_cfg_meta_list(list: &syn::MetaList, enabled_features: &BTreeSet<String>) -> bool {
+    let nested = list
+        .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+        .unwrap_or_else(|err| panic!("failed to parse #[cfg(...)] args: {err}"));
+    if nested.len() != 1 {
+        panic!("#[cfg(...)] on edge impl docs must contain exactly one top-level expression");
+    }
+    eval_edge_impl_cfg_meta(
         nested
             .first()
             .expect("checked nested cfg expression length above"),
@@ -336,6 +580,51 @@ fn eval_cfg_meta(meta: &Meta, enabled_features: &BTreeSet<String>) -> bool {
             )
         }
         _ => panic!("unsupported cfg expression in ABI specs"),
+    }
+}
+
+fn eval_edge_impl_cfg_meta(meta: &Meta, enabled_features: &BTreeSet<String>) -> bool {
+    match meta {
+        Meta::NameValue(name_value) if name_value.path.is_ident("feature") => {
+            match &name_value.value {
+                syn::Expr::Lit(expr_lit) => match &expr_lit.lit {
+                    syn::Lit::Str(value) => {
+                        enabled_features.contains(&value.value().to_ascii_uppercase())
+                    }
+                    _ => panic!("cfg(feature = ...) must use a string literal"),
+                },
+                _ => panic!("cfg(feature = ...) must use a string literal"),
+            }
+        }
+        Meta::Path(path) if path.is_ident("test") => false,
+        Meta::NameValue(name_value) if name_value.path.is_ident("target_arch") => true,
+        Meta::List(list) if list.path.is_ident("all") => list
+            .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+            .unwrap_or_else(|err| panic!("failed to parse cfg(all(...)) args: {err}"))
+            .iter()
+            .all(|meta| eval_edge_impl_cfg_meta(meta, enabled_features)),
+        Meta::List(list) if list.path.is_ident("any") => list
+            .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+            .unwrap_or_else(|err| panic!("failed to parse cfg(any(...)) args: {err}"))
+            .iter()
+            .any(|meta| eval_edge_impl_cfg_meta(meta, enabled_features)),
+        Meta::List(list) if list.path.is_ident("not") => {
+            let nested = list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
+                )
+                .unwrap_or_else(|err| panic!("failed to parse cfg(not(...)) args: {err}"));
+            if nested.len() != 1 {
+                panic!("cfg(not(...)) must contain exactly one expression");
+            }
+            !eval_edge_impl_cfg_meta(
+                nested
+                    .first()
+                    .expect("checked nested cfg expression length above"),
+                enabled_features,
+            )
+        }
+        _ => true,
     }
 }
 
@@ -403,14 +692,15 @@ fn render_abi_rust(functions: &[AbiFunctionDecl], namespaces: &[NamespaceDecl]) 
         .unwrap();
         writeln!(
             &mut out,
-            "pub const {}: AbiFunction = AbiFunction {{ index: {}, name: {:?}, arity: {}, param_names: &{}_PARAM_NAMES, param_types: &{}_PARAM_TYPES, return_type: AbiValueType::{} }};",
+            "pub const {}: AbiFunction = AbiFunction {{ index: {}, name: {:?}, arity: {}, param_names: &{}_PARAM_NAMES, param_types: &{}_PARAM_TYPES, return_type: AbiValueType::{}, docs: {:?} }};",
             abi_const_name(function),
             fn_const_name(function),
             function.name,
             function.param_names.len(),
             abi_const_name(function),
             abi_const_name(function),
-            function.return_type
+            function.return_type,
+            function.docs
         )
         .unwrap();
     }
@@ -485,11 +775,12 @@ fn render_abi_json(functions: &[AbiFunctionDecl]) -> String {
             .join(", ");
         writeln!(
             &mut out,
-            "    {{ \"index\": {index}, \"name\": {:?}, \"arity\": {}, \"params\": [{}], \"return_type\": {:?} }}{suffix}",
+            "    {{ \"index\": {index}, \"name\": {:?}, \"arity\": {}, \"params\": [{}], \"return_type\": {:?}, \"docs\": {:?} }}{suffix}",
             function.name,
             function.param_names.len(),
             params,
-            function.return_type.to_ascii_lowercase()
+            function.return_type.to_ascii_lowercase(),
+            function.docs
         )
         .unwrap();
     }

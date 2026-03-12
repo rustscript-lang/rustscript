@@ -62,6 +62,7 @@ pub struct AbiFunction {
     pub param_names: &'static [&'static str],
     pub param_types: &'static [AbiParamType],
     pub return_type: AbiValueType,
+    pub docs: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +137,7 @@ mod tests {
         for function in FUNCTIONS {
             assert!(manifest.contains(function.name));
             assert!(manifest.contains(function.return_type.as_str()));
+            assert!(manifest.contains(function.docs));
             for name in function.param_names {
                 assert!(manifest.contains(name));
             }
@@ -143,5 +145,24 @@ mod tests {
                 assert!(manifest.contains(param.as_str()));
             }
         }
+    }
+
+    #[test]
+    fn runtime_sleep_docs_are_available() {
+        let function = function_by_name("runtime::sleep").expect("runtime::sleep should exist");
+        assert!(
+            !function.docs.trim().is_empty(),
+            "expected runtime::sleep docs to be populated"
+        );
+    }
+
+    #[test]
+    fn tcp_stream_get_phase_docs_follow_edge_impl_comments() {
+        let function = function_by_name("tcp::stream::get_phase")
+            .expect("tcp::stream::get_phase should exist");
+        assert_eq!(
+            function.docs,
+            "Reports the current lifecycle phase for a TCP stream handle."
+        );
     }
 }

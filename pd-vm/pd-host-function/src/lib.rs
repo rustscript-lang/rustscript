@@ -19,6 +19,7 @@ fn expand_pd_host_function(
     mut item: ItemFn,
 ) -> Result<proc_macro2::TokenStream, Error> {
     parse_name_arg(&attr)?;
+    let docs = doc_string(&item.attrs);
     for input in &item.sig.inputs {
         validate_param(input)?;
     }
@@ -26,6 +27,12 @@ fn expand_pd_host_function(
 
     if is_abi_declaration_only(&item) {
         return Ok(quote!(#item));
+    }
+    if docs.trim().is_empty() {
+        return Err(Error::new_spanned(
+            &item.sig.ident,
+            "#[pd_host_function] requires /// doc comments",
+        ));
     }
 
     let (wrapper_name, impl_name) = wrapper_and_impl_names(&item.sig.ident);
@@ -68,6 +75,29 @@ fn parse_name_arg(args: &Punctuated<Meta, Token![,]>) -> Result<LitStr, Error> {
             "callable name must be a string literal",
         )),
     }
+}
+
+fn doc_string(attrs: &[syn::Attribute]) -> String {
+    attrs
+        .iter()
+        .filter_map(|attr| {
+            if !attr.path().is_ident("doc") {
+                return None;
+            }
+            match &attr.meta {
+                Meta::NameValue(name_value) => match &name_value.value {
+                    syn::Expr::Lit(expr_lit) => match &expr_lit.lit {
+                        syn::Lit::Str(value) => Some(value.value().trim().to_string()),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            }
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn validate_param(arg: &FnArg) -> Result<(), Error> {

@@ -8,6 +8,7 @@ use super::{
     SharedProxyVmContext, headers_to_value_map, parse_header, parse_header_name, parse_headers_map,
 };
 
+/// Sets a header on the downstream HTTP response.
 #[pd_edge_host_function(name = http_response::SET_HEADER.name, scope = http)]
 async fn set_response_header(
     _vm: &mut Vm,
@@ -24,6 +25,7 @@ async fn set_response_header(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Removes a header from the downstream HTTP response.
 #[pd_edge_host_function(name = http_response::REMOVE_HEADER.name, scope = http)]
 async fn remove_response_header(
     _vm: &mut Vm,
@@ -36,6 +38,7 @@ async fn remove_response_header(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the body for the downstream HTTP response.
 #[pd_edge_host_function(name = http_response::SET_BODY.name, scope = http)]
 async fn set_response_body(
     _vm: &mut Vm,
@@ -47,6 +50,7 @@ async fn set_response_body(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the status code on the downstream HTTP response.
 #[pd_edge_host_function(name = http_response::SET_STATUS.name, scope = http)]
 async fn set_response_status(
     _vm: &mut Vm,
@@ -63,6 +67,7 @@ async fn set_response_status(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Returns the status code for the downstream HTTP response.
 #[pd_edge_host_function(name = http_response::GET_STATUS.name, scope = http)]
 async fn get_response_status(
     _vm: &mut Vm,
@@ -73,6 +78,7 @@ async fn get_response_status(
     Ok(CallOutcome::Return(vec![Value::Int(status as i64)]))
 }
 
+/// Returns the full body for the downstream HTTP response as text.
 #[pd_edge_host_function(name = http_response::GET_BODY.name, scope = http)]
 async fn get_response_body(
     _vm: &mut Vm,
@@ -85,6 +91,7 @@ async fn get_response_body(
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 
+/// Returns the first value for a header on the downstream HTTP response.
 #[pd_edge_host_function(name = http_response::GET_HEADER.name, scope = http)]
 async fn get_response_header(
     _vm: &mut Vm,
@@ -103,6 +110,7 @@ async fn get_response_header(
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 
+/// Returns all headers on the downstream HTTP response as a map.
 #[pd_edge_host_function(name = http_response::GET_HEADERS.name, scope = http)]
 async fn get_response_headers(
     _vm: &mut Vm,
@@ -114,6 +122,7 @@ async fn get_response_headers(
     )]))
 }
 
+/// Adds a header value to the downstream HTTP response.
 #[pd_edge_host_function(name = http_response::ADD_HEADER.name, scope = http)]
 async fn add_response_header(
     _vm: &mut Vm,
@@ -130,6 +139,7 @@ async fn add_response_header(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Clears all values for a header on the downstream HTTP response.
 #[pd_edge_host_function(name = http_response::CLEAR_HEADER.name, scope = http)]
 async fn clear_response_header(
     _vm: &mut Vm,
@@ -142,6 +152,7 @@ async fn clear_response_header(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Replaces the headers on the downstream HTTP response with the provided map.
 #[pd_edge_host_function(name = http_response::SET_HEADERS.name, scope = http)]
 async fn set_response_headers(
     _vm: &mut Vm,

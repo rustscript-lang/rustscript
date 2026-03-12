@@ -169,31 +169,37 @@ fn entry_report(cache, id) {
     out
 }
 
+// Creates an LRU cache with the given capacity.
 pub fn new(raw_capacity) {
     let limit = normalized_capacity(raw_capacity);
     make_cache(limit, 0, 1, 0, 0, {}, {})
 }
 
+// Returns the cache capacity.
 pub fn capacity(cache) {
     let state: LruCacheState = cache;
     normalized_capacity(state.capacity)
 }
 
+// Returns the number of cached entries.
 pub fn len(cache) {
     let state: LruCacheState = cache;
     state.size
 }
 
+// Returns whether the cache is empty.
 pub fn is_empty(cache) {
     len(cache) == 0
 }
 
+// Returns whether the cache contains a key.
 pub fn has(cache, key) {
     let state: LruCacheState = cache;
     let lookup = state.lookup;
     lookup.has(key)
 }
 
+// Returns the cached value without updating recency.
 pub fn peek(cache, key) {
     let state: LruCacheState = cache;
     let lookup = state.lookup;
@@ -207,6 +213,7 @@ pub fn peek(cache, key) {
     out
 }
 
+// Returns the cached value and promotes it to the most recently used position.
 pub fn get(cache, key) {
     let state: LruCacheState = cache;
     let limit = normalized_capacity(state.capacity);
@@ -254,6 +261,7 @@ pub fn get(cache, key) {
     out
 }
 
+// Inserts or updates a cache entry and returns the next cache state.
 pub fn put(cache, key, value) {
     let state: LruCacheState = cache;
     let limit = normalized_capacity(state.capacity);
@@ -328,6 +336,7 @@ pub fn put(cache, key, value) {
     out
 }
 
+// Promotes a key to the most recently used position if it exists.
 pub fn touch(cache, key) {
     let state: LruCacheState = cache;
     let limit = normalized_capacity(state.capacity);
@@ -368,6 +377,7 @@ pub fn touch(cache, key) {
     out
 }
 
+// Removes a cache entry by key.
 pub fn remove(cache, key) {
     let state: LruCacheState = cache;
     let limit = normalized_capacity(state.capacity);
@@ -401,11 +411,13 @@ pub fn remove(cache, key) {
     out
 }
 
+// Removes all entries from the cache.
 pub fn clear(cache) {
     let state: LruCacheState = cache;
     make_cache(normalized_capacity(state.capacity), 0, 1, 0, 0, {}, {})
 }
 
+// Returns cache keys from oldest to newest.
 pub fn keys(cache) {
     let state: LruCacheState = cache;
     let nodes = state.nodes;
@@ -420,6 +432,7 @@ pub fn keys(cache) {
     out
 }
 
+// Returns cache values from oldest to newest.
 pub fn values(cache) {
     let state: LruCacheState = cache;
     let nodes = state.nodes;
@@ -434,6 +447,7 @@ pub fn values(cache) {
     out
 }
 
+// Returns cache entries as [key, value] pairs from oldest to newest.
 pub fn entries(cache) {
     let state: LruCacheState = cache;
     let nodes = state.nodes;
@@ -448,11 +462,13 @@ pub fn entries(cache) {
     out
 }
 
+// Returns the oldest cache entry report.
 pub fn oldest(cache) {
     let state: LruCacheState = cache;
     entry_report(state, state.head)
 }
 
+// Returns the newest cache entry report.
 pub fn newest(cache) {
     let state: LruCacheState = cache;
     entry_report(state, state.tail)

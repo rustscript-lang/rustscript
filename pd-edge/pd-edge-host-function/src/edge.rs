@@ -9,6 +9,13 @@ pub(crate) fn expand_pd_edge_host_function(
     mut item: ItemFn,
 ) -> Result<proc_macro2::TokenStream, Error> {
     let edge_attr = parse_edge_host_attr(&attr)?;
+    let docs = doc_string(&item.attrs);
+    if docs.trim().is_empty() {
+        return Err(Error::new_spanned(
+            &item.sig.ident,
+            "#[pd_edge_host_function] requires /// doc comments",
+        ));
+    }
     if edge_attr.scope.is_some() && !edge_attr.bind_params.is_empty() {
         return Err(Error::new_spanned(
             &item.sig.ident,
@@ -30,13 +37,36 @@ pub(crate) fn expand_pd_edge_host_function(
     let wrapper = generate_edge_host_binder(&item, &wrapper_name, &edge_attr)?;
     let static_wrapper =
         generate_scoped_edge_host_static_wrapper(&item, &wrapper_name, &edge_attr)?;
-    let registration = generate_edge_host_registration(&item, &wrapper_name, &edge_attr)?;
+    let registration = generate_edge_host_registration(&item, &wrapper_name, &edge_attr, &docs)?;
     Ok(quote! {
         #item
         #wrapper
         #static_wrapper
         #registration
     })
+}
+
+fn doc_string(attrs: &[syn::Attribute]) -> String {
+    attrs
+        .iter()
+        .filter_map(|attr| {
+            if !attr.path().is_ident("doc") {
+                return None;
+            }
+            match &attr.meta {
+                Meta::NameValue(name_value) => match &name_value.value {
+                    syn::Expr::Lit(expr_lit) => match &expr_lit.lit {
+                        syn::Lit::Str(value) => Some(value.value().trim().to_string()),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            }
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 struct EdgeHostAttr {
@@ -555,6 +585,7 @@ fn generate_edge_host_registration(
     item: &ItemFn,
     wrapper_name: &syn::Ident,
     attr: &EdgeHostAttr,
+    docs: &str,
 ) -> Result<proc_macro2::TokenStream, Error> {
     let Some(scope) = attr.scope else {
         return Ok(quote!());
@@ -596,6 +627,7 @@ fn generate_edge_host_registration(
         )
     })?;
     let name_expr = &attr.name;
+    let docs = docs.to_string();
 
     Ok(quote! {
         #[::linkme::distributed_slice(crate::abi_impl::registry::PD_EDGE_HOST_FUNCTIONS)]
@@ -605,6 +637,7 @@ fn generate_edge_host_registration(
                 scope: #scope_tokens,
                 name: #name_expr,
                 arity: #arity,
+                docs: #docs,
                 function: #function_kind,
             };
     })

@@ -642,12 +642,14 @@ mod tests {
     #[cfg(feature = "http")]
     use edge_abi::symbols::http::{request as http_request, response as http_response};
     use edge_abi::symbols::runtime as edge_runtime;
+    use edge_abi::symbols::tcp;
     #[cfg(feature = "http")]
     use pd_edge_host_function::pd_edge_host_function;
     #[cfg(feature = "http")]
     use vm::{BytecodeBuilder, CallOutcome, VmError, VmStatus};
     use vm::{HostImport, OpCode, Program, ValueType, Vm};
 
+    use super::registry::PD_EDGE_HOST_FUNCTIONS;
     use super::{
         ProxyVmContext, RateLimiterStore, SharedProxyVmContext, new_shared_vm_async_ops,
         register_host_module,
@@ -674,6 +676,7 @@ mod tests {
     }
 
     #[cfg(feature = "http")]
+    /// Yields a pending TLS test operation.
     #[pd_edge_host_function(name = "test::yield_pending_tls", scope = http_extension)]
     async fn yield_pending_tls(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
         tokio::task::yield_now().await;
@@ -706,6 +709,30 @@ mod tests {
         register_host_module(&mut second, test_context(), new_shared_vm_async_ops())
             .expect("second runtime vm should reuse cached plan");
         assert_eq!(second.bound_function_count(), 1);
+    }
+
+    #[test]
+    fn edge_registration_docs_are_available() {
+        let entry = PD_EDGE_HOST_FUNCTIONS
+            .iter()
+            .find(|entry| entry.name == edge_runtime::SLEEP.name)
+            .expect("runtime::sleep registration should exist");
+        assert!(
+            !entry.docs.trim().is_empty(),
+            "expected runtime::sleep edge registration docs to be populated"
+        );
+    }
+
+    #[test]
+    fn edge_registration_uses_function_doc_comments() {
+        let entry = PD_EDGE_HOST_FUNCTIONS
+            .iter()
+            .find(|entry| entry.name == tcp::stream::GET_PHASE.name)
+            .expect("tcp::stream::get_phase registration should exist");
+        assert_eq!(
+            entry.docs,
+            "Reports the current lifecycle phase for a TCP stream handle."
+        );
     }
 
     #[cfg(feature = "http")]

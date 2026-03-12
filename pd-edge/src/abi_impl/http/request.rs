@@ -45,6 +45,7 @@ async fn request_field_outcome(
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 
+/// Returns the current downstream request id.
 #[pd_edge_host_function(name = http_request::GET_ID.name, scope = http)]
 async fn get_request_id(
     _vm: &mut Vm,
@@ -53,6 +54,7 @@ async fn get_request_id(
     request_field_outcome(context, RequestField::Id).await
 }
 
+/// Returns the HTTP method for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_METHOD.name, scope = http)]
 async fn get_request_method(
     _vm: &mut Vm,
@@ -61,6 +63,7 @@ async fn get_request_method(
     request_field_outcome(context, RequestField::Method).await
 }
 
+/// Returns the request path for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_PATH.name, scope = http)]
 async fn get_request_path(
     _vm: &mut Vm,
@@ -69,6 +72,7 @@ async fn get_request_path(
     request_field_outcome(context, RequestField::Path).await
 }
 
+/// Returns the decoded query string for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_QUERY.name, scope = http)]
 async fn get_request_query(
     _vm: &mut Vm,
@@ -77,6 +81,7 @@ async fn get_request_query(
     request_field_outcome(context, RequestField::Query).await
 }
 
+/// Returns the URL scheme for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_SCHEME.name, scope = http)]
 async fn get_request_scheme(
     _vm: &mut Vm,
@@ -85,6 +90,7 @@ async fn get_request_scheme(
     request_field_outcome(context, RequestField::Scheme).await
 }
 
+/// Returns the host name for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_HOST.name, scope = http)]
 async fn get_request_host(
     _vm: &mut Vm,
@@ -93,6 +99,7 @@ async fn get_request_host(
     request_field_outcome(context, RequestField::Host).await
 }
 
+/// Returns the downstream client IP address.
 #[pd_edge_host_function(name = http_request::GET_CLIENT_IP.name, scope = http)]
 async fn get_request_client_ip(
     _vm: &mut Vm,
@@ -101,6 +108,7 @@ async fn get_request_client_ip(
     request_field_outcome(context, RequestField::ClientIp).await
 }
 
+/// Returns the request path and query string for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_PATH_WITH_QUERY.name, scope = http)]
 async fn get_request_path_with_query(
     _vm: &mut Vm,
@@ -109,6 +117,7 @@ async fn get_request_path_with_query(
     request_field_outcome(context, RequestField::PathWithQuery).await
 }
 
+/// Returns the raw query string for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_RAW_QUERY.name, scope = http)]
 async fn get_request_raw_query(
     _vm: &mut Vm,
@@ -117,6 +126,7 @@ async fn get_request_raw_query(
     request_field_outcome(context, RequestField::RawQuery).await
 }
 
+/// Returns the HTTP version for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_HTTP_VERSION.name, scope = http)]
 async fn get_request_http_version(
     _vm: &mut Vm,
@@ -125,6 +135,7 @@ async fn get_request_http_version(
     request_field_outcome(context, RequestField::HttpVersion).await
 }
 
+/// Returns the first value for a header on the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_HEADER.name, scope = http)]
 async fn get_request_header(
     _vm: &mut Vm,
@@ -143,6 +154,7 @@ async fn get_request_header(
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 
+/// Returns all headers on the downstream HTTP request as a map.
 #[pd_edge_host_function(name = http_request::GET_HEADERS.name, scope = http)]
 async fn get_request_headers(
     _vm: &mut Vm,
@@ -154,6 +166,7 @@ async fn get_request_headers(
     )]))
 }
 
+/// Returns a query parameter from the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_QUERY_ARG.name, scope = http)]
 async fn get_request_query_arg(
     _vm: &mut Vm,
@@ -173,6 +186,7 @@ async fn get_request_query_arg(
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 
+/// Returns all query parameters from the downstream HTTP request as a map.
 #[pd_edge_host_function(name = http_request::GET_QUERY_ARGS.name, scope = http)]
 async fn get_request_query_args(
     _vm: &mut Vm,
@@ -184,6 +198,7 @@ async fn get_request_query_args(
     )]))
 }
 
+/// Returns the full body for the downstream HTTP request as text.
 #[pd_edge_host_function(name = http_request::GET_BODY.name, scope = http)]
 async fn get_request_body(
     _vm: &mut Vm,
@@ -195,6 +210,7 @@ async fn get_request_body(
     )]))
 }
 
+/// Reads the next body chunk from the downstream HTTP request.
 #[pd_edge_host_function(name = "http::request::body::next_chunk", scope = http_extension)]
 async fn get_request_body_chunk(
     _vm: &mut Vm,
@@ -212,6 +228,7 @@ async fn get_request_body_chunk(
     )]))
 }
 
+/// Returns whether the body stream for the downstream HTTP request is exhausted.
 #[pd_edge_host_function(name = "http::request::body::eof", scope = http_extension)]
 async fn get_request_body_eof(
     _vm: &mut Vm,
@@ -221,6 +238,7 @@ async fn get_request_body_eof(
     Ok(CallOutcome::Return(vec![Value::Bool(eof)]))
 }
 
+/// Returns the local destination port for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_PORT.name, scope = http)]
 async fn get_request_port(
     _vm: &mut Vm,

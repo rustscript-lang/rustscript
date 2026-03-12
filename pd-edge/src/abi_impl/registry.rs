@@ -30,6 +30,8 @@ pub(crate) struct EdgeHostRegistration {
     pub scope: EdgeHostScope,
     pub name: &'static str,
     pub arity: u8,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub docs: &'static str,
     pub function: EdgeHostRegistrationFunction,
 }
 

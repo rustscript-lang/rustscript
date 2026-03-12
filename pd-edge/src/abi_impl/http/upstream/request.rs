@@ -25,6 +25,7 @@ async fn apply_upstream_query(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets a header on the upstream HTTP request.
 #[pd_edge_host_function(name = http_upstream_request::SET_HEADER.name, scope = http)]
 async fn set_upstream_request_header(
     _vm: &mut Vm,
@@ -41,6 +42,7 @@ async fn set_upstream_request_header(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Removes a header from the upstream HTTP request.
 #[pd_edge_host_function(name = http_upstream_request::REMOVE_HEADER.name, scope = http)]
 async fn remove_upstream_request_header(
     _vm: &mut Vm,
@@ -53,6 +55,7 @@ async fn remove_upstream_request_header(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the HTTP method on the upstream HTTP request.
 #[pd_edge_host_function(name = http_upstream_request::SET_METHOD.name, scope = http)]
 async fn set_upstream_request_method(
     _vm: &mut Vm,
@@ -66,6 +69,7 @@ async fn set_upstream_request_method(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the request path on the upstream HTTP request.
 #[pd_edge_host_function(name = http_upstream_request::SET_PATH.name, scope = http)]
 async fn set_upstream_request_path(
     _vm: &mut Vm,
@@ -82,6 +86,7 @@ async fn set_upstream_request_path(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the decoded query string on the upstream HTTP request.
 #[pd_edge_host_function(name = http_upstream_request::SET_QUERY.name, scope = http)]
 async fn set_upstream_request_query(
     _vm: &mut Vm,
@@ -91,6 +96,7 @@ async fn set_upstream_request_query(
     apply_upstream_query(context, raw_query).await
 }
 
+/// Sets the target endpoint for the upstream HTTP request.
 #[pd_edge_host_function(name = http_upstream_request::SET_TARGET.name, scope = http)]
 async fn set_upstream_request_target(
     _vm: &mut Vm,
@@ -113,6 +119,7 @@ async fn set_upstream_request_target(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the body for the upstream HTTP request.
 #[pd_edge_host_function(name = http_upstream_request::SET_BODY.name, scope = http)]
 async fn set_upstream_request_body(
     _vm: &mut Vm,
@@ -124,6 +131,7 @@ async fn set_upstream_request_body(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Adds a header value to the upstream HTTP request.
 #[pd_edge_host_function(name = http_upstream_request::ADD_HEADER.name, scope = http)]
 async fn add_upstream_request_header(
     _vm: &mut Vm,
@@ -140,6 +148,7 @@ async fn add_upstream_request_header(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Clears all values for a header on the upstream HTTP request.
 #[pd_edge_host_function(name = http_upstream_request::CLEAR_HEADER.name, scope = http)]
 async fn clear_upstream_request_header(
     _vm: &mut Vm,
@@ -152,6 +161,7 @@ async fn clear_upstream_request_header(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Replaces the headers on the upstream HTTP request with the provided map.
 #[pd_edge_host_function(name = http_upstream_request::SET_HEADERS.name, scope = http)]
 async fn set_upstream_request_headers(
     _vm: &mut Vm,
@@ -169,6 +179,7 @@ async fn set_upstream_request_headers(
     Ok(CallOutcome::Return(vec![]))
 }
 
+/// Sets the raw query string on the upstream HTTP request.
 #[pd_edge_host_function(name = http_upstream_request::SET_RAW_QUERY.name, scope = http)]
 async fn set_upstream_request_raw_query(
     _vm: &mut Vm,
@@ -178,6 +189,7 @@ async fn set_upstream_request_raw_query(
     apply_upstream_query(context, raw_query).await
 }
 
+/// Sets a query parameter on the upstream HTTP request.
 #[pd_edge_host_function(name = http_upstream_request::SET_QUERY_ARG.name, scope = http)]
 async fn set_upstream_request_query_arg(
     _vm: &mut Vm,

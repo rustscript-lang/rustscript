@@ -10,10 +10,12 @@ fn index_of(values, needle) {
     out;
 }
 
+// Returns whether a set array contains a value.
 pub fn has(values, needle) {
     index_of(values, needle) >-1;
 }
 
+// Returns a de-duplicated set array preserving insertion order.
 pub fn from(values) {
     let mut out = [];
     for (let mut index = 0; index < values.length; index = index + 1) {
@@ -25,6 +27,7 @@ pub fn from(values) {
     out;
 }
 
+// Returns a set array with a value inserted.
 pub fn add(values, needle) {
     let mut out = from(values);
     if has(out, needle) == false {
@@ -33,6 +36,7 @@ pub fn add(values, needle) {
     out;
 }
 
+// Returns a set array with a value removed.
 pub fn remove(values, needle) {
     let mut out = [];
     for (let mut index = 0; index < values.length; index = index + 1) {
@@ -44,6 +48,7 @@ pub fn remove(values, needle) {
     out;
 }
 
+// Returns the union of two set arrays.
 pub fn union(lhs, rhs) {
     let mut out = from(lhs);
     for (let mut index = 0; index < rhs.length; index = index + 1) {
@@ -55,6 +60,7 @@ pub fn union(lhs, rhs) {
     out;
 }
 
+// Returns the intersection of two set arrays.
 pub fn intersect(lhs, rhs) {
     let left = from(lhs);
     let right = from(rhs);
@@ -68,6 +74,7 @@ pub fn intersect(lhs, rhs) {
     out;
 }
 
+// Returns the values in lhs that are not in rhs.
 pub fn difference(lhs, rhs) {
     let left = from(lhs);
     let right = from(rhs);
@@ -81,6 +88,7 @@ pub fn difference(lhs, rhs) {
     out;
 }
 
+// Returns whether lhs is a subset of rhs.
 pub fn is_subset(lhs, rhs) {
     let left = from(lhs);
     let right = from(rhs);
@@ -94,6 +102,7 @@ pub fn is_subset(lhs, rhs) {
     out;
 }
 
+// Returns whether two set arrays contain the same values.
 pub fn equals(lhs, rhs) {
     is_subset(lhs, rhs) && is_subset(rhs, lhs);
 }

@@ -9,18 +9,22 @@ fn is_whitespace(ch) {
     };
 }
 
+// Returns whether two strings are equal.
 pub fn equals(lhs, rhs) {
     lhs == rhs;
 }
 
+// Returns whether a string is empty.
 pub fn is_empty(value) {
     value.length == 0;
 }
 
+// Returns whether a string is not empty.
 pub fn non_empty(value) {
     !is_empty(value);
 }
 
+// Returns whether a string contains a substring.
 pub fn contains(haystack, needle) {
     let haystack_len = haystack.length;
     let needle_len = needle.length;
@@ -40,6 +44,7 @@ pub fn contains(haystack, needle) {
     out;
 }
 
+// Splits a string on a separator.
 pub fn split(value, separator) {
     let value_len = value.length;
     let separator_len = separator.length;
@@ -69,6 +74,7 @@ pub fn split(value, separator) {
     out;
 }
 
+// Trims leading and trailing ASCII whitespace from a string.
 pub fn trim(value) {
     let trim_len = value.length;
     let mut trim_start = 0;
@@ -91,6 +97,7 @@ pub fn trim(value) {
     value[trim_start:trim_end];
 }
 
+// Replaces all matching substrings in a string.
 pub fn replace(value, needle, replacement) {
     let value_len = value.length;
     let needle_len = needle.length;

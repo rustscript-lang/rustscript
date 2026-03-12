@@ -103,6 +103,7 @@ fn is_valid_base(base) {
     base >= 2 && base <= 36;
 }
 
+// Returns whether a string is a valid integer literal for the given base.
 pub fn is_int_literal_base(value, base) {
     let text = trim(value);
     let text_len =(&text).length;
@@ -131,10 +132,12 @@ pub fn is_int_literal_base(value, base) {
     out;
 }
 
+// Returns whether a string is a base-10 integer literal.
 pub fn is_int_literal(value) {
     is_int_literal_base(value, 10);
 }
 
+// Parses an integer literal for the given base and returns null on failure.
 pub fn try_parse_int_base(value, base) {
     let text = trim(value);
     let mut out = null;
@@ -158,10 +161,12 @@ pub fn try_parse_int_base(value, base) {
     out;
 }
 
+// Parses a base-10 integer literal and returns null on failure.
 pub fn try_parse_int(value) {
     try_parse_int_base(value, 10);
 }
 
+// Parses an integer literal for the given base or returns a fallback.
 pub fn parse_int_base_or(value, base, fallback) {
     let out = try_parse_int_base(value, base);
     match type(out) {
@@ -170,6 +175,7 @@ pub fn parse_int_base_or(value, base, fallback) {
     };
 }
 
+// Parses a base-10 integer literal or returns a fallback.
 pub fn parse_int_or(value, fallback) {
     let out = try_parse_int(value);
     match type(out) {
@@ -178,11 +184,13 @@ pub fn parse_int_or(value, fallback) {
     };
 }
 
+// Returns whether a string is a boolean literal.
 pub fn is_bool_literal(value) {
     let text = trim(value);
     text == "true" || text == "false";
 }
 
+// Parses a boolean literal and returns null on failure.
 pub fn try_parse_bool(value) {
     let text = trim(value);
     match text {
@@ -192,6 +200,7 @@ pub fn try_parse_bool(value) {
     };
 }
 
+// Parses a boolean literal or returns a fallback.
 pub fn parse_bool_or(value, fallback) {
     let out = try_parse_bool(value);
     match type(out) {

@@ -199,6 +199,7 @@ fn parse_source_file(path: &Path, spec: &SourceSpec, _order_offset: usize) -> Ve
         };
         let params = parse_callable_params(function);
         let rust_ident = function.sig.ident.to_string();
+        let docs = callable_docs(&name, &function.attrs);
         let wrapper = match spec.category {
             SourceCategory::MetadataOnlyBuiltin => None,
             _ => Some(generated_wrapper_decl(function)),
@@ -207,7 +208,7 @@ fn parse_source_file(path: &Path, spec: &SourceSpec, _order_offset: usize) -> Ve
             rust_ident,
             module: spec.module.clone(),
             name,
-            docs: doc_string(&function.attrs),
+            docs,
             params,
             return_label: return_type_label(&function.sig.output),
             static_return_type: static_return_type_label(&function.sig.output),
@@ -1592,6 +1593,14 @@ fn doc_string(attrs: &[Attribute]) -> String {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn callable_docs(name: &str, attrs: &[Attribute]) -> String {
+    let docs = doc_string(attrs);
+    if docs.is_empty() {
+        panic!("callable '{name}' is missing /// doc comments");
+    }
+    docs
 }
 
 fn return_type_label(output: &ReturnType) -> String {

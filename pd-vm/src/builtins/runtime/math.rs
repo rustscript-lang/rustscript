@@ -38,151 +38,181 @@ fn binary_float_number(
     float_op(left.as_f64(), right.as_f64())
 }
 
+/// Returns the constant pi.
 #[pd_host_function(name = "math::pi")]
 pub(super) fn builtin_math_pi_impl() -> f64 {
     PI
 }
 
+/// Returns the constant tau.
 #[pd_host_function(name = "math::tau")]
 pub(super) fn builtin_math_tau_impl() -> f64 {
     TAU
 }
 
+/// Returns Euler's number.
 #[pd_host_function(name = "math::e")]
 pub(super) fn builtin_math_e_impl() -> f64 {
     E
 }
 
+/// Returns the machine epsilon for floating-point comparisons.
 #[pd_host_function(name = "math::epsilon")]
 pub(super) fn builtin_math_epsilon_impl() -> f64 {
     f64::EPSILON
 }
 
+/// Returns positive infinity.
 #[pd_host_function(name = "math::inf")]
 pub(super) fn builtin_math_inf_impl() -> f64 {
     f64::INFINITY
 }
 
+/// Returns negative infinity.
 #[pd_host_function(name = "math::neg_inf")]
 pub(super) fn builtin_math_neg_inf_impl() -> f64 {
     f64::NEG_INFINITY
 }
 
+/// Returns NaN.
 #[pd_host_function(name = "math::nan")]
 pub(super) fn builtin_math_nan_impl() -> f64 {
     f64::NAN
 }
 
+/// Returns the absolute value of a number.
 #[pd_host_function(name = "math::abs")]
 pub(super) fn builtin_math_abs_impl(value: NumberValue) -> NumberValue {
     same_number(value, i64::wrapping_abs, f64::abs)
 }
 
+/// Returns the square root of a number.
 #[pd_host_function(name = "math::sqrt")]
 pub(super) fn builtin_math_sqrt_impl(value: NumberValue) -> f64 {
     float_number(value, f64::sqrt)
 }
 
+/// Returns the cube root of a number.
 #[pd_host_function(name = "math::cbrt")]
 pub(super) fn builtin_math_cbrt_impl(value: NumberValue) -> f64 {
     float_number(value, f64::cbrt)
 }
 
+/// Returns e raised to the given power.
 #[pd_host_function(name = "math::exp")]
 pub(super) fn builtin_math_exp_impl(value: NumberValue) -> f64 {
     float_number(value, f64::exp)
 }
 
+/// Returns 2 raised to the given power.
 #[pd_host_function(name = "math::exp2")]
 pub(super) fn builtin_math_exp2_impl(value: NumberValue) -> f64 {
     float_number(value, f64::exp2)
 }
 
+/// Returns the natural logarithm of a number.
 #[pd_host_function(name = "math::ln")]
 pub(super) fn builtin_math_ln_impl(value: NumberValue) -> f64 {
     float_number(value, f64::ln)
 }
 
+/// Returns the natural logarithm of one plus a number.
 #[pd_host_function(name = "math::ln_1p")]
 pub(super) fn builtin_math_ln_1p_impl(value: NumberValue) -> f64 {
     float_number(value, f64::ln_1p)
 }
 
+/// Returns the base-2 logarithm of a number.
 #[pd_host_function(name = "math::log2")]
 pub(super) fn builtin_math_log2_impl(value: NumberValue) -> f64 {
     float_number(value, f64::log2)
 }
 
+/// Returns the base-10 logarithm of a number.
 #[pd_host_function(name = "math::log10")]
 pub(super) fn builtin_math_log10_impl(value: NumberValue) -> f64 {
     float_number(value, f64::log10)
 }
 
+/// Returns the sine of an angle in radians.
 #[pd_host_function(name = "math::sin")]
 pub(super) fn builtin_math_sin_impl(value: NumberValue) -> f64 {
     float_number(value, f64::sin)
 }
 
+/// Returns the cosine of an angle in radians.
 #[pd_host_function(name = "math::cos")]
 pub(super) fn builtin_math_cos_impl(value: NumberValue) -> f64 {
     float_number(value, f64::cos)
 }
 
+/// Returns the tangent of an angle in radians.
 #[pd_host_function(name = "math::tan")]
 pub(super) fn builtin_math_tan_impl(value: NumberValue) -> f64 {
     float_number(value, f64::tan)
 }
 
+/// Returns the arcsine of a number.
 #[pd_host_function(name = "math::asin")]
 pub(super) fn builtin_math_asin_impl(value: NumberValue) -> f64 {
     float_number(value, f64::asin)
 }
 
+/// Returns the arccosine of a number.
 #[pd_host_function(name = "math::acos")]
 pub(super) fn builtin_math_acos_impl(value: NumberValue) -> f64 {
     float_number(value, f64::acos)
 }
 
+/// Returns the arctangent of a number.
 #[pd_host_function(name = "math::atan")]
 pub(super) fn builtin_math_atan_impl(value: NumberValue) -> f64 {
     float_number(value, f64::atan)
 }
 
+/// Returns the hyperbolic sine of a number.
 #[pd_host_function(name = "math::sinh")]
 pub(super) fn builtin_math_sinh_impl(value: NumberValue) -> f64 {
     float_number(value, f64::sinh)
 }
 
+/// Returns the hyperbolic cosine of a number.
 #[pd_host_function(name = "math::cosh")]
 pub(super) fn builtin_math_cosh_impl(value: NumberValue) -> f64 {
     float_number(value, f64::cosh)
 }
 
+/// Returns the hyperbolic tangent of a number.
 #[pd_host_function(name = "math::tanh")]
 pub(super) fn builtin_math_tanh_impl(value: NumberValue) -> f64 {
     float_number(value, f64::tanh)
 }
 
+/// Rounds a number down to the nearest integer value.
 #[pd_host_function(name = "math::floor")]
 pub(super) fn builtin_math_floor_impl(value: NumberValue) -> NumberValue {
     same_number(value, |value| value, f64::floor)
 }
 
+/// Rounds a number up to the nearest integer value.
 #[pd_host_function(name = "math::ceil")]
 pub(super) fn builtin_math_ceil_impl(value: NumberValue) -> NumberValue {
     same_number(value, |value| value, f64::ceil)
 }
 
+/// Rounds a number to the nearest integer value.
 #[pd_host_function(name = "math::round")]
 pub(super) fn builtin_math_round_impl(value: NumberValue) -> NumberValue {
     same_number(value, |value| value, f64::round)
 }
 
+/// Truncates the fractional part of a number.
 #[pd_host_function(name = "math::trunc")]
 pub(super) fn builtin_math_trunc_impl(value: NumberValue) -> NumberValue {
     same_number(value, |value| value, f64::trunc)
 }
 
+/// Returns the fractional part of a number.
 #[pd_host_function(name = "math::fract")]
 pub(super) fn builtin_math_fract_impl(value: NumberValue) -> f64 {
     match value {
@@ -191,46 +221,55 @@ pub(super) fn builtin_math_fract_impl(value: NumberValue) -> f64 {
     }
 }
 
+/// Returns the sign of a number.
 #[pd_host_function(name = "math::signum")]
 pub(super) fn builtin_math_signum_impl(value: NumberValue) -> NumberValue {
     same_number(value, i64::signum, f64::signum)
 }
 
+/// Converts radians to degrees.
 #[pd_host_function(name = "math::to_degrees")]
 pub(super) fn builtin_math_to_degrees_impl(value: NumberValue) -> f64 {
     float_number(value, f64::to_degrees)
 }
 
+/// Converts degrees to radians.
 #[pd_host_function(name = "math::to_radians")]
 pub(super) fn builtin_math_to_radians_impl(value: NumberValue) -> f64 {
     float_number(value, f64::to_radians)
 }
 
+/// Returns whether a number is NaN.
 #[pd_host_function(name = "math::is_nan")]
 pub(super) fn builtin_math_is_nan_impl(value: NumberValue) -> bool {
     bool_number(value, |_| false, f64::is_nan)
 }
 
+/// Returns whether a number is infinite.
 #[pd_host_function(name = "math::is_infinite")]
 pub(super) fn builtin_math_is_infinite_impl(value: NumberValue) -> bool {
     bool_number(value, |_| false, f64::is_infinite)
 }
 
+/// Returns whether a number is finite.
 #[pd_host_function(name = "math::is_finite")]
 pub(super) fn builtin_math_is_finite_impl(value: NumberValue) -> bool {
     bool_number(value, |_| true, f64::is_finite)
 }
 
+/// Returns the four-quadrant arctangent of two numbers.
 #[pd_host_function(name = "math::atan2")]
 pub(super) fn builtin_math_atan2_impl(y: NumberValue, x: NumberValue) -> f64 {
     binary_float_number(y, x, f64::atan2)
 }
 
+/// Raises a number to a floating-point power.
 #[pd_host_function(name = "math::powf")]
 pub(super) fn builtin_math_powf_impl(value: NumberValue, exponent: NumberValue) -> f64 {
     binary_float_number(value, exponent, f64::powf)
 }
 
+/// Raises a number to an integer power.
 #[pd_host_function(name = "math::powi")]
 pub(super) fn builtin_math_powi_impl(value: NumberValue, exponent: i64) -> VmResult<f64> {
     let exponent = i32::try_from(exponent)
@@ -238,16 +277,19 @@ pub(super) fn builtin_math_powi_impl(value: NumberValue, exponent: i64) -> VmRes
     Ok(value.as_f64().powi(exponent))
 }
 
+/// Returns the hypotenuse length for two numbers.
 #[pd_host_function(name = "math::hypot")]
 pub(super) fn builtin_math_hypot_impl(left: NumberValue, right: NumberValue) -> f64 {
     binary_float_number(left, right, f64::hypot)
 }
 
+/// Returns the logarithm of a number for the given base.
 #[pd_host_function(name = "math::log")]
 pub(super) fn builtin_math_log_impl(value: NumberValue, base: NumberValue) -> f64 {
     binary_float_number(value, base, f64::log)
 }
 
+/// Returns the smaller of two numbers.
 #[pd_host_function(name = "math::min")]
 pub(super) fn builtin_math_min_impl(left: NumberValue, right: NumberValue) -> NumberValue {
     match (left, right) {
@@ -256,6 +298,7 @@ pub(super) fn builtin_math_min_impl(left: NumberValue, right: NumberValue) -> Nu
     }
 }
 
+/// Returns the larger of two numbers.
 #[pd_host_function(name = "math::max")]
 pub(super) fn builtin_math_max_impl(left: NumberValue, right: NumberValue) -> NumberValue {
     match (left, right) {
@@ -264,11 +307,13 @@ pub(super) fn builtin_math_max_impl(left: NumberValue, right: NumberValue) -> Nu
     }
 }
 
+/// Returns the first number with the sign of the second number.
 #[pd_host_function(name = "math::copysign")]
 pub(super) fn builtin_math_copysign_impl(value: NumberValue, sign: NumberValue) -> f64 {
     binary_float_number(value, sign, f64::copysign)
 }
 
+/// Clamps a number to an inclusive range.
 #[pd_host_function(name = "math::clamp")]
 pub(super) fn builtin_math_clamp_impl(
     value: NumberValue,
@@ -297,6 +342,7 @@ pub(super) fn builtin_math_clamp_impl(
     }
 }
 
+/// Computes a fused multiply-add operation.
 #[pd_host_function(name = "math::mul_add")]
 pub(super) fn builtin_math_mul_add_impl(
     left: NumberValue,

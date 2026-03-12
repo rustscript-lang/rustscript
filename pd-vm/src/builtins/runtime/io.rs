@@ -81,6 +81,7 @@ pub(super) fn close_all_handles(vm: &mut Vm) {
     }
 }
 
+/// Opens a file handle for runtime I/O.
 #[pd_host_function(name = "io::open")]
 pub(super) fn builtin_io_open(vm: &mut Vm, path: &str, mode: &str) -> VmResult<BuiltinResult<i64>> {
     let reserved_id = io_reserve_handle_id(vm);
@@ -131,6 +132,7 @@ pub(super) fn builtin_io_open(vm: &mut Vm, path: &str, mode: &str) -> VmResult<B
     Ok(BuiltinResult::Pending(op_id))
 }
 
+/// Starts a child process and returns a process-backed handle.
 #[pd_host_function(name = "io::popen")]
 pub(super) fn builtin_io_popen(
     vm: &mut Vm,
@@ -188,6 +190,7 @@ pub(super) fn builtin_io_popen(
     Ok(BuiltinResult::Pending(op_id))
 }
 
+/// Reads all remaining text from an I/O handle.
 #[pd_host_function(name = "io::read_all")]
 pub(super) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinResult<String>> {
     let handle = io_take_handle(vm, handle_id)?;
@@ -228,6 +231,7 @@ pub(super) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<Built
     Ok(BuiltinResult::Pending(op_id))
 }
 
+/// Reads a single line of text from an I/O handle.
 #[pd_host_function(name = "io::read_line")]
 pub(super) fn builtin_io_read_line(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinResult<String>> {
     let handle = io_take_handle(vm, handle_id)?;
@@ -263,6 +267,7 @@ pub(super) fn builtin_io_read_line(vm: &mut Vm, handle_id: i64) -> VmResult<Buil
     Ok(BuiltinResult::Pending(op_id))
 }
 
+/// Writes text to an I/O handle.
 #[pd_host_function(name = "io::write")]
 pub(super) fn builtin_io_write(
     vm: &mut Vm,
@@ -307,6 +312,7 @@ pub(super) fn builtin_io_write(
     Ok(BuiltinResult::Pending(op_id))
 }
 
+/// Flushes buffered output for an I/O handle.
 #[pd_host_function(name = "io::flush")]
 pub(super) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinResult<bool>> {
     let handle = io_take_handle(vm, handle_id)?;
@@ -344,6 +350,7 @@ pub(super) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinR
     Ok(BuiltinResult::Pending(op_id))
 }
 
+/// Closes an I/O handle.
 #[pd_host_function(name = "io::close")]
 pub(super) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinResult<bool>> {
     let handle = io_take_handle(vm, handle_id)?;
@@ -354,6 +361,7 @@ pub(super) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinR
     Ok(BuiltinResult::Pending(op_id))
 }
 
+/// Returns whether a file system path exists.
 #[pd_host_function(name = "io::exists")]
 pub(super) fn builtin_io_exists(vm: &mut Vm, path: &str) -> VmResult<BuiltinResult<bool>> {
     let path = path.to_string();
