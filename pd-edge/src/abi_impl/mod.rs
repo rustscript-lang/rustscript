@@ -18,6 +18,8 @@ mod proxy;
 mod registry;
 mod runtime;
 mod transport;
+#[cfg(feature = "webrtc")]
+mod webrtc;
 mod websocket;
 
 pub use self::http::{HttpRequestContext, ProxyVmContext, SharedProxyVmContext};
@@ -518,6 +520,8 @@ pub fn register_http_plane_host_module(
                 registry::EdgeHostScope::Io,
                 registry::EdgeHostScope::Transport,
                 registry::EdgeHostScope::WebSocket,
+                #[cfg(feature = "webrtc")]
+                registry::EdgeHostScope::WebRtc,
                 registry::EdgeHostScope::Proxy,
             ],
         );
@@ -533,6 +537,8 @@ pub fn register_http_plane_host_module(
     http::register_http_extensions(vm, context.clone(), async_ops.clone());
     transport::register_transport_extensions(vm, context.clone(), async_ops.clone());
     websocket::register_websocket_extensions(vm, context.clone(), async_ops.clone());
+    #[cfg(feature = "webrtc")]
+    webrtc::register_webrtc_extensions(vm, context.clone(), async_ops.clone());
     proxy::register_proxy_extensions(vm, context.clone(), async_ops.clone());
     io::register_builtin_io_overrides(vm, context, async_ops)
 }
@@ -620,34 +626,45 @@ pub(crate) fn adapt_edge_args_call_outcome(outcome: CallOutcome) -> Result<CallO
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll, Wake, Waker};
+    #[cfg(feature = "http")]
+    use std::task::{Wake, Waker};
 
     use axum::http::HeaderMap;
-    use edge_abi::symbols::{
-        http::{request as http_request, response as http_response},
-        runtime as edge_runtime,
-    };
+    #[cfg(feature = "http")]
+    use edge_abi::symbols::http::{request as http_request, response as http_response};
+    use edge_abi::symbols::runtime as edge_runtime;
+    #[cfg(feature = "http")]
     use pd_edge_host_function::pd_edge_host_function;
-    use vm::{
-        BytecodeBuilder, CallOutcome, HostImport, OpCode, Program, ValueType, Vm, VmError, VmStatus,
-    };
+    #[cfg(feature = "http")]
+    use vm::{BytecodeBuilder, CallOutcome, VmError, VmStatus};
+    use vm::{HostImport, OpCode, Program, ValueType, Vm};
 
     use super::{
-        ProxyVmContext, RateLimiterStore, SharedProxyVmContext, VmAsyncOpBridge,
-        current_vm_context, enter_edge_host_context, new_shared_vm_async_ops, register_host_module,
+        ProxyVmContext, RateLimiterStore, SharedProxyVmContext, new_shared_vm_async_ops,
+        register_host_module,
+    };
+    #[cfg(feature = "http")]
+    use super::{
+        VmAsyncOpBridge, current_vm_context, enter_edge_host_context,
         register_http_plane_host_module,
     };
+    #[cfg(feature = "http")]
+    use std::task::{Context, Poll};
 
+    #[cfg(feature = "http")]
     struct TestNoopWake;
 
+    #[cfg(feature = "http")]
     impl Wake for TestNoopWake {
         fn wake(self: Arc<Self>) {}
     }
 
+    #[cfg(feature = "http")]
     fn test_waker() -> Waker {
         Waker::from(Arc::new(TestNoopWake))
     }
 
+    #[cfg(feature = "http")]
     #[pd_edge_host_function(name = "test::yield_pending_tls", scope = http_extension)]
     async fn yield_pending_tls(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
         tokio::task::yield_now().await;
@@ -682,6 +699,7 @@ mod tests {
         assert_eq!(second.bound_function_count(), 1);
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn register_http_plane_host_module_binds_cached_multi_scope_plan() {
         let imports = vec![
@@ -715,6 +733,7 @@ mod tests {
         assert_eq!(vm.bound_function_count(), 4);
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn http_response_set_body_scoped_binding_runs_under_edge_context() {
         let imports = vec![HostImport {
@@ -760,6 +779,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "http")]
     #[tokio::test(flavor = "current_thread")]
     async fn async_host_poll_does_not_leave_tls_context_installed() {
         let imports = vec![HostImport {

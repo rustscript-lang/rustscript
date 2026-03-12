@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "http"), allow(dead_code))]
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -19,11 +21,14 @@ use super::super::{
     EDGE_IO_HANDLE_DYNAMIC_BASE, EdgeVirtualIoHandle, SharedRateLimiter,
     proxy::ProxyByteStreamState,
     transport::{
-        CachedTlsSession, SharedTlsSessionCache, TcpFlowState, TcpTransportDag, TlsFlowState,
-        TlsProtocolVersion, TlsTransportDag, alpn_from_http_version, tls_session_cache_key,
+        CachedTlsSession, SharedTlsSessionCache, SharedUdpSocketIo, TcpFlowState, TcpTransportDag,
+        TlsFlowState, TlsProtocolVersion, TlsTransportDag, UdpSocketState, alpn_from_http_version,
+        tls_session_cache_key,
     },
     websocket::WebSocketConnectionState,
 };
+#[cfg(feature = "webrtc")]
+use crate::abi_impl::webrtc::WebRtcConnectionState;
 
 #[derive(Debug)]
 pub struct HttpRequestContext {
@@ -319,6 +324,12 @@ type SharedUpstreamResponseBody = Arc<tokio::sync::Mutex<UpstreamResponseBodySta
 
 pub(crate) const DEFAULT_UPSTREAM_EXCHANGE_HANDLE: i64 = 1;
 const FIRST_DYNAMIC_EXCHANGE_HANDLE: i64 = 2;
+pub(crate) const DEFAULT_UPSTREAM_UDP_SOCKET_HANDLE: i64 = 1;
+const FIRST_DYNAMIC_UDP_SOCKET_HANDLE: i64 = 2;
+#[cfg(feature = "webrtc")]
+pub(crate) const DEFAULT_UPSTREAM_WEBRTC_CONNECTION_HANDLE: i64 = 1;
+#[cfg(feature = "webrtc")]
+const FIRST_DYNAMIC_WEBRTC_CONNECTION_HANDLE: i64 = 2;
 const FIRST_PROXY_STREAM_HANDLE: i64 = 4096;
 
 #[derive(Clone)]
@@ -408,6 +419,7 @@ pub struct ProxyVmContext {
     pub(crate) inbound_request_body: SharedInboundRequestBody,
     pub(crate) tcp_dag: TcpTransportDag,
     pub(crate) tls_dag: TlsTransportDag,
+    #[cfg_attr(not(feature = "websocket"), allow(dead_code))]
     pub(crate) downstream_websocket: WebSocketConnectionState,
     pub(crate) default_upstream_websocket: WebSocketConnectionState,
     pub(crate) outbound_request: HttpOutboundRequestNode,
@@ -418,6 +430,17 @@ pub struct ProxyVmContext {
     pub(crate) upstream_latency_ms: u64,
     pub(crate) next_outbound_exchange_handle: i64,
     pub(crate) outbound_exchanges: HashMap<i64, HttpOutboundExchangeNode>,
+    pub(crate) default_upstream_udp_socket: UdpSocketState,
+    pub(crate) default_upstream_udp_io: Option<SharedUdpSocketIo>,
+    pub(crate) next_udp_socket_handle: i64,
+    pub(crate) udp_sockets: HashMap<i64, UdpSocketState>,
+    pub(crate) udp_socket_ios: HashMap<i64, SharedUdpSocketIo>,
+    #[cfg(feature = "webrtc")]
+    pub(crate) default_upstream_webrtc: WebRtcConnectionState,
+    #[cfg(feature = "webrtc")]
+    pub(crate) next_webrtc_connection_handle: i64,
+    #[cfg(feature = "webrtc")]
+    pub(crate) webrtc_connections: HashMap<i64, WebRtcConnectionState>,
     pub(crate) next_proxy_stream_handle: i64,
     pub(crate) proxy_stream_handles: HashMap<i64, ProxyByteStreamState>,
     pub(crate) rate_limiter: SharedRateLimiter,
@@ -475,6 +498,17 @@ impl ProxyVmContext {
             upstream_latency_ms: 0,
             next_outbound_exchange_handle: FIRST_DYNAMIC_EXCHANGE_HANDLE,
             outbound_exchanges: HashMap::new(),
+            default_upstream_udp_socket: UdpSocketState::default(),
+            default_upstream_udp_io: None,
+            next_udp_socket_handle: FIRST_DYNAMIC_UDP_SOCKET_HANDLE,
+            udp_sockets: HashMap::new(),
+            udp_socket_ios: HashMap::new(),
+            #[cfg(feature = "webrtc")]
+            default_upstream_webrtc: WebRtcConnectionState::default(),
+            #[cfg(feature = "webrtc")]
+            next_webrtc_connection_handle: FIRST_DYNAMIC_WEBRTC_CONNECTION_HANDLE,
+            #[cfg(feature = "webrtc")]
+            webrtc_connections: HashMap::new(),
             next_proxy_stream_handle: FIRST_PROXY_STREAM_HANDLE,
             proxy_stream_handles: HashMap::new(),
             rate_limiter,
@@ -548,6 +582,15 @@ pub(crate) fn default_upstream_exchange_handle() -> i64 {
     DEFAULT_UPSTREAM_EXCHANGE_HANDLE
 }
 
+pub(crate) fn default_upstream_udp_socket_handle() -> i64 {
+    DEFAULT_UPSTREAM_UDP_SOCKET_HANDLE
+}
+
+#[cfg(feature = "webrtc")]
+pub(crate) fn default_upstream_webrtc_connection_handle() -> i64 {
+    DEFAULT_UPSTREAM_WEBRTC_CONNECTION_HANDLE
+}
+
 pub(crate) fn allocate_outbound_exchange_handle(
     context: &SharedProxyVmContext,
 ) -> Result<i64, VmError> {
@@ -571,6 +614,54 @@ pub(crate) fn outbound_exchange_exists(context: &SharedProxyVmContext, handle: i
     }
     let guard = context.lock().expect("vm context lock poisoned");
     guard.outbound_exchanges.contains_key(&handle)
+}
+
+pub(crate) fn allocate_udp_socket_handle(context: &SharedProxyVmContext) -> Result<i64, VmError> {
+    let mut guard = context.lock().expect("vm context lock poisoned");
+    let handle = guard.next_udp_socket_handle;
+    if handle == i64::MAX {
+        return Err(VmError::HostError(
+            "udp socket handle space exhausted".to_string(),
+        ));
+    }
+    guard.next_udp_socket_handle += 1;
+    guard.udp_sockets.insert(handle, UdpSocketState::default());
+    Ok(handle)
+}
+
+pub(crate) fn udp_socket_exists(context: &SharedProxyVmContext, handle: i64) -> bool {
+    if handle == DEFAULT_UPSTREAM_UDP_SOCKET_HANDLE {
+        return true;
+    }
+    let guard = context.lock().expect("vm context lock poisoned");
+    guard.udp_sockets.contains_key(&handle)
+}
+
+#[cfg(feature = "webrtc")]
+pub(crate) fn allocate_webrtc_connection_handle(
+    context: &SharedProxyVmContext,
+) -> Result<i64, VmError> {
+    let mut guard = context.lock().expect("vm context lock poisoned");
+    let handle = guard.next_webrtc_connection_handle;
+    if handle == i64::MAX {
+        return Err(VmError::HostError(
+            "webrtc connection handle space exhausted".to_string(),
+        ));
+    }
+    guard.next_webrtc_connection_handle += 1;
+    guard
+        .webrtc_connections
+        .insert(handle, WebRtcConnectionState::default());
+    Ok(handle)
+}
+
+#[cfg(feature = "webrtc")]
+pub(crate) fn webrtc_connection_exists(context: &SharedProxyVmContext, handle: i64) -> bool {
+    if handle == DEFAULT_UPSTREAM_WEBRTC_CONNECTION_HANDLE {
+        return true;
+    }
+    let guard = context.lock().expect("vm context lock poisoned");
+    guard.webrtc_connections.contains_key(&handle)
 }
 
 pub(crate) fn outbound_exchange_tls_flow(

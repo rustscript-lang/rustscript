@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "tls"), allow(dead_code))]
+
 use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
@@ -9,6 +11,8 @@ use url::Url;
 
 pub(crate) const TCP_STREAM_DOWNSTREAM: i64 = 0;
 pub(crate) const TCP_STREAM_DEFAULT_UPSTREAM: i64 = 1;
+pub(crate) const UDP_SOCKET_DOWNSTREAM: i64 = 0;
+pub(crate) const UDP_SOCKET_DEFAULT_UPSTREAM: i64 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TcpStreamRef {
@@ -29,6 +33,29 @@ pub(crate) fn decode_tcp_stream_handle(handle: i64) -> Option<TcpStreamRef> {
     match handle {
         TCP_STREAM_DOWNSTREAM => Some(TcpStreamRef::Downstream),
         TCP_STREAM_DEFAULT_UPSTREAM => Some(TcpStreamRef::DefaultUpstream),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UdpSocketRef {
+    Downstream,
+    DefaultUpstream,
+}
+
+impl UdpSocketRef {
+    pub(crate) fn handle(self) -> i64 {
+        match self {
+            Self::Downstream => UDP_SOCKET_DOWNSTREAM,
+            Self::DefaultUpstream => UDP_SOCKET_DEFAULT_UPSTREAM,
+        }
+    }
+}
+
+pub(crate) fn decode_udp_socket_handle(handle: i64) -> Option<UdpSocketRef> {
+    match handle {
+        UDP_SOCKET_DOWNSTREAM => Some(UdpSocketRef::Downstream),
+        UDP_SOCKET_DEFAULT_UPSTREAM => Some(UdpSocketRef::DefaultUpstream),
         _ => None,
     }
 }
@@ -118,6 +145,119 @@ impl TcpFlowState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum UdpSocketPhase {
+    #[default]
+    Inactive,
+    Bound,
+    Configured,
+    Connected,
+    Closed,
+    Failed,
+}
+
+impl UdpSocketPhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Inactive => "inactive",
+            Self::Bound => "bound",
+            Self::Configured => "configured",
+            Self::Connected => "connected",
+            Self::Closed => "closed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UdpSocketState {
+    present: bool,
+    phase: UdpSocketPhase,
+    bind_address: Option<String>,
+    target: Option<String>,
+    local_address: Option<String>,
+    peer_address: Option<String>,
+    failure_message: Option<String>,
+}
+
+impl UdpSocketState {
+    pub(crate) fn set_bind_address(&mut self, address: String) {
+        self.present = true;
+        self.bind_address = if address.is_empty() {
+            None
+        } else {
+            Some(address)
+        };
+        self.local_address = None;
+        self.failure_message = None;
+        if self.phase == UdpSocketPhase::Inactive {
+            self.phase = UdpSocketPhase::Bound;
+        }
+    }
+
+    pub(crate) fn set_target(&mut self, target: String) {
+        self.present = true;
+        self.target = if target.is_empty() {
+            None
+        } else {
+            Some(target)
+        };
+        self.peer_address = None;
+        self.failure_message = None;
+        self.phase = UdpSocketPhase::Configured;
+    }
+
+    pub(crate) fn mark_connected(&mut self, local_address: String, peer_address: String) {
+        self.present = true;
+        self.phase = UdpSocketPhase::Connected;
+        self.local_address = Some(local_address);
+        self.peer_address = Some(peer_address);
+        self.failure_message = None;
+    }
+
+    pub(crate) fn mark_closed(&mut self) {
+        self.phase = UdpSocketPhase::Closed;
+    }
+
+    pub(crate) fn mark_failed(&mut self, message: impl Into<String>) {
+        self.present = true;
+        self.phase = UdpSocketPhase::Failed;
+        self.failure_message = Some(message.into());
+    }
+
+    pub(crate) fn is_present(&self) -> bool {
+        self.present
+    }
+
+    pub(crate) fn phase(&self) -> UdpSocketPhase {
+        self.phase
+    }
+
+    pub(crate) fn bind_address(&self) -> Option<&str> {
+        self.bind_address.as_deref()
+    }
+
+    pub(crate) fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
+    pub(crate) fn local_address(&self) -> &str {
+        self.local_address.as_deref().unwrap_or_default()
+    }
+
+    pub(crate) fn peer_address(&self) -> &str {
+        self.peer_address
+            .as_deref()
+            .or(self.target.as_deref())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failure_message(&self) -> &str {
+        self.failure_message.as_deref().unwrap_or_default()
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum TlsSessionPath {
     #[default]
@@ -193,6 +333,7 @@ pub(crate) struct CachedTlsSession {
 }
 
 pub(crate) type SharedTlsSessionCache = Arc<Mutex<HashMap<TlsSessionCacheKey, CachedTlsSession>>>;
+pub(crate) type SharedUdpSocketIo = Arc<tokio::sync::Mutex<tokio::net::UdpSocket>>;
 
 pub(crate) fn new_shared_tls_session_cache() -> SharedTlsSessionCache {
     Arc::new(Mutex::new(HashMap::new()))
@@ -673,8 +814,9 @@ mod tests {
     use super::{
         CachedTlsSession, TCP_STREAM_DEFAULT_UPSTREAM, TCP_STREAM_DOWNSTREAM, TlsFlowState,
         TlsHandshakePhase, TlsProtocolVersion, TlsSessionPath, TlsTransportDag,
+        UDP_SOCKET_DEFAULT_UPSTREAM, UDP_SOCKET_DOWNSTREAM, UdpSocketPhase, UdpSocketState,
         alpn_from_http_version, decode_tcp_stream_handle, decode_tls_session_handle,
-        tls_session_cache_key,
+        decode_udp_socket_handle, tls_session_cache_key,
     };
 
     #[test]
@@ -697,6 +839,47 @@ mod tests {
         );
         assert_eq!(decode_tcp_stream_handle(2), None);
         assert_eq!(decode_tls_session_handle(2), None);
+    }
+
+    #[test]
+    fn reserved_udp_socket_handles_decode_to_default_sockets() {
+        assert_eq!(
+            decode_udp_socket_handle(UDP_SOCKET_DOWNSTREAM),
+            Some(super::UdpSocketRef::Downstream)
+        );
+        assert_eq!(
+            decode_udp_socket_handle(UDP_SOCKET_DEFAULT_UPSTREAM),
+            Some(super::UdpSocketRef::DefaultUpstream)
+        );
+        assert_eq!(decode_udp_socket_handle(2), None);
+    }
+
+    #[test]
+    fn udp_socket_state_tracks_target_binding_and_failures() {
+        let mut socket = UdpSocketState::default();
+        assert_eq!(socket.phase(), UdpSocketPhase::Inactive);
+        assert!(!socket.is_present());
+
+        socket.set_bind_address("127.0.0.1:0".to_string());
+        assert!(socket.is_present());
+        assert_eq!(socket.phase(), UdpSocketPhase::Bound);
+        assert_eq!(socket.bind_address(), Some("127.0.0.1:0"));
+
+        socket.set_target("udp://127.0.0.1:9000".to_string());
+        assert_eq!(socket.phase(), UdpSocketPhase::Configured);
+        assert_eq!(socket.peer_address(), "udp://127.0.0.1:9000");
+
+        socket.mark_connected("127.0.0.1:45000".to_string(), "127.0.0.1:9000".to_string());
+        assert_eq!(socket.phase(), UdpSocketPhase::Connected);
+        assert_eq!(socket.local_address(), "127.0.0.1:45000");
+        assert_eq!(socket.peer_address(), "127.0.0.1:9000");
+
+        socket.mark_failed("boom");
+        assert_eq!(socket.phase(), UdpSocketPhase::Failed);
+        assert_eq!(socket.failure_message(), "boom");
+
+        socket.mark_closed();
+        assert_eq!(socket.phase(), UdpSocketPhase::Closed);
     }
 
     #[test]

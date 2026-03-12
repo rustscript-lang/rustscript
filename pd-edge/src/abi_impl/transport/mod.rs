@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "tls"), allow(dead_code))]
+
 use axum::http::Version;
 use vm::Vm;
 
@@ -5,13 +7,15 @@ use super::{SharedProxyVmContext, SharedVmAsyncOps, registry};
 
 mod state;
 mod tcp;
+#[cfg(feature = "tls")]
 mod tls;
+mod udp;
 
 pub(crate) use state::{
-    CachedTlsSession, SharedTlsSessionCache, TcpFlowState, TcpStreamRef, TcpTransportDag,
-    TlsFlowState, TlsProtocolVersion, TlsSessionRef, TlsTransportDag, alpn_from_http_version,
-    decode_tcp_stream_handle, decode_tls_session_handle, new_shared_tls_session_cache,
-    tls_session_cache_key,
+    CachedTlsSession, SharedTlsSessionCache, SharedUdpSocketIo, TcpFlowState, TcpStreamRef,
+    TcpTransportDag, TlsFlowState, TlsProtocolVersion, TlsSessionRef, TlsTransportDag,
+    UdpSocketState, alpn_from_http_version, decode_tcp_stream_handle, decode_tls_session_handle,
+    new_shared_tls_session_cache, tls_session_cache_key,
 };
 
 pub(super) fn register_transport_extensions(
@@ -22,6 +26,7 @@ pub(super) fn register_transport_extensions(
     registry::register_host_scope(vm, &context, &async_ops, registry::EdgeHostScope::Transport);
 }
 
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 pub(crate) fn configure_upstream_transport_for_target(
     context: &mut super::ProxyVmContext,
     target: &str,

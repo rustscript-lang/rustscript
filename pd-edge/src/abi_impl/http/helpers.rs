@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "http"), allow(dead_code))]
+
 use std::collections::BTreeMap;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};

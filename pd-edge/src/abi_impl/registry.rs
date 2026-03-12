@@ -14,6 +14,8 @@ pub(crate) enum EdgeHostScope {
     Io,
     Transport,
     WebSocket,
+    #[cfg(feature = "webrtc")]
+    WebRtc,
     Proxy,
 }
 
@@ -42,7 +44,9 @@ fn scope_mask(scope: EdgeHostScope) -> u8 {
         EdgeHostScope::Io => 1 << 3,
         EdgeHostScope::Transport => 1 << 4,
         EdgeHostScope::WebSocket => 1 << 5,
-        EdgeHostScope::Proxy => 1 << 6,
+        #[cfg(feature = "webrtc")]
+        EdgeHostScope::WebRtc => 1 << 6,
+        EdgeHostScope::Proxy => 1 << if cfg!(feature = "webrtc") { 7 } else { 6 },
     }
 }
 
