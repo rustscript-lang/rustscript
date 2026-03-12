@@ -1,0 +1,1026 @@
+use super::support::*;
+
+#[tokio::test]
+async fn no_active_program_returns_404() {
+    let (data_addr, _admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!("http://{data_addr}/anything"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn upload_valid_program_controls_subsequent_requests() {
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program = build_short_circuit_program("hello vm", None);
+
+    let upload = upload_program(&client, admin_addr, &program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.expect("body should read"), "hello vm");
+
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn short_circuit_path_returns_200_body_and_headers() {
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program = build_short_circuit_program("payload", Some(("x-vm", "short")));
+
+    let upload = upload_program(&client, admin_addr, &program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-vm")
+            .and_then(|value| value.to_str().ok()),
+        Some("short")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+    assert_eq!(response.text().await.expect("body should read"), "payload");
+
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn upstream_path_proxies_method_path_query_and_body() {
+    let upstream_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let (parts, body) = request.into_parts();
+        let body = to_bytes(body, usize::MAX)
+            .await
+            .expect("body should be readable");
+        let path_and_query = parts
+            .uri
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/");
+        let content = format!(
+            "{}|{}|{}",
+            parts.method,
+            path_and_query,
+            String::from_utf8_lossy(&body)
+        );
+        let mut response = Response::new(Body::from(content));
+        response
+            .headers_mut()
+            .insert("x-upstream", HeaderValue::from_static("yes"));
+        response
+    }));
+    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program = build_upstream_program(&upstream_addr.to_string(), None);
+
+    let upload = upload_program(&client, admin_addr, &program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .post(format!("http://{data_addr}/api/v1/items?x=1"))
+        .body("ping")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream")
+            .and_then(|value| value.to_str().ok()),
+        Some("yes")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "POST|/api/v1/items?x=1|ping"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn upstream_accepts_full_url_with_path() {
+    let upstream_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let path = request
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/");
+        Response::new(Body::from(path.to_string()))
+    }));
+    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program = build_upstream_program(&format!("http://{upstream_addr}/fixed"), None);
+
+    let upload = upload_program(&client, admin_addr, &program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/other?x=1"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.expect("body should read"), "/fixed");
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn vm_response_headers_are_applied_on_short_circuit_and_proxied_paths() {
+    let upstream_app = Router::new().fallback(any(|_request: Request<Body>| async move {
+        let mut response = Response::new(Body::from("upstream"));
+        response
+            .headers_mut()
+            .insert("x-vm", HeaderValue::from_static("from-upstream"));
+        response
+    }));
+    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+
+    let short_program = build_short_circuit_program("short", Some(("x-vm", "from-vm-short")));
+    let upload_short = upload_program(&client, admin_addr, &short_program).await;
+    assert_eq!(upload_short.status(), StatusCode::NO_CONTENT);
+    let short_response = client
+        .get(format!("http://{data_addr}/"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(
+        short_response
+            .headers()
+            .get("x-vm")
+            .and_then(|value| value.to_str().ok()),
+        Some("from-vm-short")
+    );
+
+    let proxied_program =
+        build_upstream_program(&upstream_addr.to_string(), Some(("x-vm", "from-vm-proxy")));
+    let upload_proxy = upload_program(&client, admin_addr, &proxied_program).await;
+    assert_eq!(upload_proxy.status(), StatusCode::NO_CONTENT);
+    let proxied_response = client
+        .get(format!("http://{data_addr}/"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(proxied_response.status(), StatusCode::OK);
+    assert_eq!(
+        proxied_response
+            .headers()
+            .get("x-vm")
+            .and_then(|value| value.to_str().ok()),
+        Some("from-vm-proxy")
+    );
+    assert_eq!(
+        proxied_response.text().await.expect("body should read"),
+        "upstream"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn invalid_upload_returns_400_and_keeps_previous_program() {
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+
+    let original = build_short_circuit_program("old", None);
+    let upload_ok = upload_program(&client, admin_addr, &original).await;
+    assert_eq!(upload_ok.status(), StatusCode::NO_CONTENT);
+
+    let upload_bad = client
+        .put(format!("http://{admin_addr}/program"))
+        .header("content-type", "application/octet-stream")
+        .body(vec![0u8, 1, 2, 3, 4])
+        .send()
+        .await
+        .expect("upload should complete");
+    assert_eq!(upload_bad.status(), StatusCode::BAD_REQUEST);
+
+    let response = client
+        .get(format!("http://{data_addr}/"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.expect("body should read"), "old");
+
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn in_flight_request_uses_old_program_after_swap() {
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+
+    let started_for_handler = started.clone();
+    let release_for_handler = release.clone();
+    let upstream_app = Router::new().fallback(any(move |_request: Request<Body>| {
+        let started = started_for_handler.clone();
+        let release = release_for_handler.clone();
+        async move {
+            started.notify_one();
+            release.notified().await;
+            Response::new(Body::from("old"))
+        }
+    }));
+    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+
+    let old_program = build_upstream_program(&upstream_addr.to_string(), None);
+    let upload_old = upload_program(&client, admin_addr, &old_program).await;
+    assert_eq!(upload_old.status(), StatusCode::NO_CONTENT);
+
+    let in_flight_client = client.clone();
+    let in_flight_url = format!("http://{data_addr}/slow");
+    let in_flight = tokio::spawn(async move {
+        let response = in_flight_client
+            .get(in_flight_url)
+            .send()
+            .await
+            .expect("in-flight request should complete");
+        let status = response.status();
+        let body = response.text().await.expect("in-flight body should read");
+        (status, body)
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("upstream should receive in-flight request");
+
+    let new_program = build_short_circuit_program("new", None);
+    let upload_new = upload_program(&client, admin_addr, &new_program).await;
+    assert_eq!(upload_new.status(), StatusCode::NO_CONTENT);
+
+    release.notify_waiters();
+
+    let (status, body) = in_flight.await.expect("join should succeed");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "old");
+
+    let next_response = client
+        .get(format!("http://{data_addr}/next"))
+        .send()
+        .await
+        .expect("next request should complete");
+    assert_eq!(next_response.status(), StatusCode::OK);
+    assert_eq!(next_response.text().await.expect("body should read"), "new");
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn upstream_unreachable_returns_502() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let closed_addr = listener.local_addr().expect("listener should have addr");
+    drop(listener);
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+
+    let program = build_upstream_program(&closed_addr.to_string(), None);
+    let upload = upload_program(&client, admin_addr, &program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn tiny_language_can_enforce_simple_rate_limit() {
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+
+    let source = r#"
+        use http;
+        use rate_limit;
+
+        if rate_limit::allow(http::request::get_header("x-client-id"), 2, 60) {
+            http::response::set_header("x-vm", "allowed");
+            http::response::set_body("ok");
+        } else {
+            http::response::set_header("x-vm", "rate-limited");
+            http::response::set_body("blocked");
+        }
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    for _ in 0..2 {
+        let response = client
+            .get(format!("http://{data_addr}/"))
+            .header("x-client-id", "abc")
+            .send()
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-vm")
+                .and_then(|value| value.to_str().ok()),
+            Some("allowed")
+        );
+        assert_eq!(response.text().await.expect("body should read"), "ok");
+    }
+
+    let blocked = client
+        .get(format!("http://{data_addr}/"))
+        .header("x-client-id", "abc")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(blocked.status(), StatusCode::OK);
+    assert_eq!(
+        blocked
+            .headers()
+            .get("x-vm")
+            .and_then(|value| value.to_str().ok()),
+        Some("rate-limited")
+    );
+    assert_eq!(blocked.text().await.expect("body should read"), "blocked");
+
+    let other_key = client
+        .get(format!("http://{data_addr}/"))
+        .header("x-client-id", "xyz")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(other_key.status(), StatusCode::OK);
+    assert_eq!(
+        other_key
+            .headers()
+            .get("x-vm")
+            .and_then(|value| value.to_str().ok()),
+        Some("allowed")
+    );
+
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn http_prefixed_host_abi_can_rewrite_request_and_short_circuit() {
+    let upstream_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let method = request.method().clone();
+        let path = request
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/");
+        let added = request
+            .headers()
+            .get("x-added")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        Response::new(Body::from(format!("{method}|{path}|{added}")))
+    }));
+    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+
+    let source = format!(
+        r#"
+        use http;
+        use rate_limit;
+
+        let client_id = http::request::get_header("x-client-id");
+        if rate_limit::allow(client_id, 1, 60) {{
+            http::upstream::request::set_path("/rewritten");
+            http::upstream::request::set_query("from=vm");
+            http::upstream::request::set_header("x-added", "yes");
+            http::upstream::request::set_target("{upstream_addr}");
+        }} else {{
+            http::response::set_status(429);
+            http::response::set_body("blocked");
+        }}
+    "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let first = client
+        .get(format!("http://{data_addr}/anything?x=1"))
+        .header("x-client-id", "abc")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(
+        first.text().await.expect("body should read"),
+        "GET|/rewritten?from=vm|yes"
+    );
+
+    let second = client
+        .get(format!("http://{data_addr}/anything?x=1"))
+        .header("x-client-id", "abc")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(second.text().await.expect("body should read"), "blocked");
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn http_request_body_can_be_rewritten_before_proxying() {
+    let upstream_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let (parts, body) = request.into_parts();
+        let body = to_bytes(body, usize::MAX)
+            .await
+            .expect("body should be readable");
+        let path = parts
+            .uri
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/");
+        Response::new(Body::from(format!(
+            "{}|{}",
+            path,
+            String::from_utf8_lossy(&body)
+        )))
+    }));
+    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+
+    let source = format!(
+        r#"
+        use http;
+
+        http::upstream::request::set_body("rewritten-body");
+        http::upstream::request::set_target("{upstream_addr}");
+    "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .post(format!("http://{data_addr}/payload"))
+        .body("original-body")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "/payload|rewritten-body"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn http_request_body_chunk_api_reads_in_chunks() {
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+
+    let source = r#"
+        use http;
+
+        let first = http::request::body::next_chunk(4);
+        let second = http::request::body::next_chunk(4);
+        let rest = http::request::body::next_chunk(64);
+        let done = http::request::body::eof();
+        if done {
+            http::response::set_body(first + second + rest);
+        } else {
+            http::response::set_body("body-not-finished");
+        }
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .post(format!("http://{data_addr}/chunked"))
+        .body("abcdefghij")
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "abcdefghij"
+    );
+
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn sample_proxy_program_streams_or_buffers_upstream_body() {
+    let (upstream_addr, upstream_handle) = spawn_chunked_upstream(vec!["ab", "cd", "ef"]).await;
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_proxy_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let upstream_target = format!("http://{upstream_addr}/sample");
+    let streaming = client
+        .get(format!("http://{data_addr}/proxy"))
+        .header("x-upstream-target", &upstream_target)
+        .header("Streaming", "1")
+        .send()
+        .await
+        .expect("streaming request should complete");
+    assert_eq!(streaming.status(), StatusCode::OK);
+    assert_eq!(
+        streaming
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+    assert_eq!(
+        streaming
+            .headers()
+            .get("x-stream")
+            .and_then(|value| value.to_str().ok()),
+        None
+    );
+    assert_eq!(
+        streaming.text().await.expect("streaming body should read"),
+        "abAcdAefA"
+    );
+
+    let buffered = client
+        .get(format!("http://{data_addr}/proxy"))
+        .header("x-upstream-target", &upstream_target)
+        .send()
+        .await
+        .expect("buffered request should complete");
+    assert_eq!(buffered.status(), StatusCode::OK);
+    assert_eq!(
+        buffered
+            .headers()
+            .get("x-stream")
+            .and_then(|value| value.to_str().ok()),
+        Some("false")
+    );
+    assert_eq!(
+        buffered.text().await.expect("buffered body should read"),
+        "abcdef"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn sample_request_transform_program_streams_or_buffers_downstream_request_body() {
+    let upstream_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let body = to_bytes(request.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let mut response = Response::new(Body::from(body));
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain"),
+        );
+        response
+    }));
+    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_request_transform_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let upstream_target = format!("http://{upstream_addr}/transform");
+
+    let transformed = client
+        .post(format!("http://{data_addr}/transform"))
+        .header("x-upstream-target", &upstream_target)
+        .header("Chunk-Transform", "1")
+        .body("abcdefghi")
+        .send()
+        .await
+        .expect("transformed request should complete");
+    assert_eq!(transformed.status(), StatusCode::OK);
+    assert_eq!(
+        transformed
+            .headers()
+            .get("x-request-stream")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        transformed
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+    assert_eq!(
+        transformed
+            .text()
+            .await
+            .expect("transformed body should read"),
+        "abc#def#ghi#"
+    );
+
+    let buffered = client
+        .post(format!("http://{data_addr}/transform"))
+        .header("x-upstream-target", &upstream_target)
+        .body("abcdefghi")
+        .send()
+        .await
+        .expect("buffered request should complete");
+    assert_eq!(buffered.status(), StatusCode::OK);
+    assert_eq!(
+        buffered
+            .headers()
+            .get("x-request-stream")
+            .and_then(|value| value.to_str().ok()),
+        Some("false")
+    );
+    assert_eq!(
+        buffered
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+    assert_eq!(
+        buffered.text().await.expect("buffered body should read"),
+        "abcdefghi"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn sample_sse_proxy_program_mutates_each_upstream_event_before_returning() {
+    let (upstream_addr, upstream_handle) = spawn_sse_upstream(vec![
+        "id: 1\n",
+        "data: alpha\n",
+        "\n",
+        "id: 2\n",
+        "data: beta\n",
+        "\n",
+    ])
+    .await;
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_sse_proxy_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/sse"))
+        .header(
+            "x-upstream-target",
+            format!("http://{upstream_addr}/events"),
+        )
+        .send()
+        .await
+        .expect("sse request should complete");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.text().await.expect("sse body should read");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    assert_eq!(
+        headers
+            .get("x-sse-mutated")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        body,
+        "id: 1 [mutated]\ndata: alpha [mutated]\n\nid: 2 [mutated]\ndata: beta [mutated]\n\n"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn direct_vm_can_read_upstream_response_line_by_line_via_http_body_api() {
+    let (upstream_addr, upstream_handle) =
+        spawn_sse_upstream(vec!["id: 1\n", "data: alpha\n", "\n"]).await;
+    let source = format!(
+        r#"
+        use http;
+        use tcp;
+
+        http::upstream::request::set_target("http://{upstream_addr}/events");
+        http::response::set_status(http::upstream::response::get_status());
+        let downstream = tcp::stream::downstream();
+
+        while !http::upstream::response::body::eof() {{
+            let line = http::upstream::response::body::next_line();
+            if line == "" {{
+                tcp::stream::write(downstream, "\n");
+            }} else {{
+                tcp::stream::write(downstream, line + "\n");
+            }}
+        }}
+    "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let context = Arc::new(Mutex::new(ProxyVmContext::from_request_headers(
+        axum::http::HeaderMap::new(),
+        Arc::new(Mutex::new(RateLimiterStore::new())),
+    )));
+    {
+        let mut guard = context.lock().expect("vm context lock poisoned");
+        guard.attach_upstream_client(reqwest::Client::new());
+    }
+
+    run_edge_program_direct(compiled.program, context.clone())
+        .await
+        .expect("direct vm run should succeed");
+
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn sample_subrequest_proxy_program_fans_out_across_default_and_dynamic_exchanges() {
+    let plain_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let body = to_bytes(request.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        Response::new(Body::from(format!(
+            "plain:{}",
+            String::from_utf8_lossy(&body)
+        )))
+    }));
+    let (plain_addr, plain_handle) = spawn_server(plain_app).await;
+    let (secure_addr, secure_handle) = spawn_https_echo_upstream().await;
+
+    let mut state = SharedState::new(1024 * 1024);
+    state.client = reqwest::Client::builder()
+        .tls_info(true)
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("tls test client should build");
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy_with_state(state).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_subrequest_proxy_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/fanout"))
+        .header("x-primary-target", format!("http://{plain_addr}/plain"))
+        .header(
+            "x-secondary-target",
+            format!("https://localhost:{}/secure", secure_addr.port()),
+        )
+        .send()
+        .await
+        .expect("fanout request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-secondary-peer")
+            .and_then(|value| value.to_str().ok()),
+        Some("localhost")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-secondary-alpn")
+            .and_then(|value| value.to_str().ok()),
+        Some("http/1.1")
+    );
+    assert_eq!(
+        response.text().await.expect("response body should read"),
+        "plain:alpha|beta"
+    );
+
+    plain_handle.abort();
+    secure_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn http_exchange_supports_multiple_dynamic_subrequests_in_one_vm_run() {
+    let first_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let body = to_bytes(request.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        Response::new(Body::from(format!(
+            "first:{}",
+            String::from_utf8_lossy(&body)
+        )))
+    }));
+    let second_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        let body = to_bytes(request.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        Response::new(Body::from(format!(
+            "second:{}",
+            String::from_utf8_lossy(&body)
+        )))
+    }));
+    let (first_addr, first_handle) = spawn_server(first_app).await;
+    let (second_addr, second_handle) = spawn_server(second_app).await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use tcp;
+
+        let first = http::exchange::new();
+        let second = http::exchange::new();
+        if first == second {{
+            http::response::set_status(500);
+            http::response::set_body("same-handle");
+        }} else {{
+            http::exchange::set_target(first, "http://{first_addr}/one");
+            http::exchange::set_target(second, "http://{second_addr}/two");
+            tcp::stream::write(first, "one");
+            tcp::stream::write(second, "two");
+            http::response::set_body(
+                http::exchange::get_body(first) + "|" + http::exchange::get_body(second)
+            );
+        }}
+    "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/subrequests"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "first:one|second:two"
+    );
+
+    first_handle.abort();
+    second_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn dynamic_exchange_rejects_write_after_response_has_started() {
+    let upstream_app = Router::new().fallback(any(|_request: Request<Body>| async move {
+        Response::new(Body::from("upstream"))
+    }));
+    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use tcp;
+
+        let exchange = http::exchange::new();
+        http::exchange::set_target(exchange, "{upstream_addr}");
+        http::exchange::get_status(exchange);
+        tcp::stream::write(exchange, "late");
+    "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/late-dynamic-write"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn uploaded_program_with_locals_executes_successfully() {
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+
+    let source = r#"
+        use http;
+
+        let body = "from-local";
+        http::response::set_body(body);
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    assert!(
+        compiled.program.debug.is_some(),
+        "compiled source should carry debug info"
+    );
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "from-local"
+    );
+
+    data_handle.abort();
+    admin_handle.abort();
+}
