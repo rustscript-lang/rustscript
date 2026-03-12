@@ -343,13 +343,12 @@ async fn socket_connect(
 ) -> Result<CallOutcome, VmError> {
     ensure_udp_socket_connected(&context, socket)
         .await
-        .map_err(|err| {
+        .inspect_err(|err| {
             store_failed_udp_socket(
                 &context,
                 decode_socket(&context, socket).unwrap_or(UdpSocketHandle::Downstream),
                 err.to_string(),
             );
-            err
         })?;
     Ok(CallOutcome::Return(vec![Value::Bool(true)]))
 }
@@ -402,13 +401,12 @@ async fn socket_send_text(
 ) -> Result<CallOutcome, VmError> {
     let io = ensure_udp_socket_connected(&context, socket)
         .await
-        .map_err(|err| {
+        .inspect_err(|err| {
             store_failed_udp_socket(
                 &context,
                 decode_socket(&context, socket).unwrap_or(UdpSocketHandle::Downstream),
                 err.to_string(),
             );
-            err
         })?;
     let io = io.lock().await;
     let sent = io

@@ -498,6 +498,21 @@ pub(crate) enum HttpUpstreamResponseNode {
 }
 
 #[derive(Clone, Debug)]
+struct StoredUpstreamResponse {
+    snapshot: HttpUpstreamResponseSnapshot,
+    latency_ms: u64,
+}
+
+impl StoredUpstreamResponse {
+    fn new(snapshot: HttpUpstreamResponseSnapshot, latency_ms: u64) -> Self {
+        Self {
+            snapshot,
+            latency_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct HttpOutboundExchangeState {
     pub(crate) request: HttpOutboundRequestNode,
     pub(crate) response: HttpUpstreamResponseNode,
@@ -537,25 +552,9 @@ impl HttpOutboundExchangeState {
         matches!(self.response, HttpUpstreamResponseNode::Ready(_))
     }
 
-    fn store_response(
-        &mut self,
-        status: u16,
-        headers: HeaderMap,
-        http_version: String,
-        carrier_kind: HttpCarrierKind,
-        carrier_ref: HttpCarrierRef,
-        body: SharedUpstreamResponseBody,
-        latency_ms: u64,
-    ) {
-        self.response = HttpUpstreamResponseNode::Ready(HttpUpstreamResponseSnapshot {
-            status,
-            headers,
-            http_version,
-            carrier_kind,
-            carrier_ref,
-            body,
-        });
-        self.upstream_latency_ms = latency_ms;
+    fn store_response(&mut self, response: StoredUpstreamResponse) {
+        self.response = HttpUpstreamResponseNode::Ready(response.snapshot);
+        self.upstream_latency_ms = response.latency_ms;
     }
 }
 
@@ -732,26 +731,10 @@ impl ProxyVmContext {
         matches!(self.upstream_response, HttpUpstreamResponseNode::Ready(_))
     }
 
-    fn store_upstream_response(
-        &mut self,
-        status: u16,
-        headers: HeaderMap,
-        http_version: String,
-        carrier_kind: HttpCarrierKind,
-        carrier_ref: HttpCarrierRef,
-        body: SharedUpstreamResponseBody,
-        latency_ms: u64,
-    ) {
-        self.upstream_carrier_ref = Some(carrier_ref.clone());
-        self.upstream_response = HttpUpstreamResponseNode::Ready(HttpUpstreamResponseSnapshot {
-            status,
-            headers,
-            http_version,
-            carrier_kind,
-            carrier_ref,
-            body,
-        });
-        self.upstream_latency_ms = latency_ms;
+    fn store_upstream_response(&mut self, response: StoredUpstreamResponse) {
+        self.upstream_carrier_ref = Some(response.snapshot.carrier_ref.clone());
+        self.upstream_response = HttpUpstreamResponseNode::Ready(response.snapshot);
+        self.upstream_latency_ms = response.latency_ms;
     }
 
     pub(crate) fn attach_downstream_http2_stream(
@@ -1707,17 +1690,17 @@ async fn start_upstream_response_via_http2(
         .http_sessions
         .as_ref()
         .expect("explicit http2 transport requires shared sessions");
-    let started = http2::send_request(
+    let started = http2::send_request(http2::Http2SendRequest {
         sessions,
-        handle,
-        &prepared.target,
+        exchange_handle: handle,
+        target: &prepared.target,
         upstream_url,
-        prepared.http2_mode,
-        &prepared.tls_flow,
-        prepared.method.clone(),
+        mode: prepared.http2_mode,
+        tls_flow: &prepared.tls_flow,
+        method: prepared.method.clone(),
         headers,
         request_body,
-    )
+    })
     .await?;
     let version = started.response.version();
     Ok(StartedUpstreamResponse {
@@ -1923,15 +1906,8 @@ async fn start_outbound_exchange_response(
         let mut guard = context.lock().expect("vm context lock poisoned");
         if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
             guard.default_upstream_attached_transport = None;
-            guard.store_upstream_response(
-                snapshot.status,
-                snapshot.headers.clone(),
-                snapshot.http_version.clone(),
-                snapshot.carrier_kind,
-                snapshot.carrier_ref.clone(),
-                snapshot.body.clone(),
-                latency_ms,
-            );
+            guard
+                .store_upstream_response(StoredUpstreamResponse::new(snapshot.clone(), latency_ms));
             return Ok(snapshot);
         }
 
@@ -1940,15 +1916,7 @@ async fn start_outbound_exchange_response(
             .get_mut(&handle)
             .ok_or(UpstreamResponseStartError::UnknownExchangeHandle(handle))?;
         exchange.transport.attached_transport = None;
-        exchange.store_response(
-            snapshot.status,
-            snapshot.headers.clone(),
-            snapshot.http_version.clone(),
-            snapshot.carrier_kind,
-            snapshot.carrier_ref.clone(),
-            snapshot.body.clone(),
-            latency_ms,
-        );
+        exchange.store_response(StoredUpstreamResponse::new(snapshot.clone(), latency_ms));
         exchange
             .transport
             .mark_response_ready(upstream_response_version, snapshot.carrier_ref.clone());
@@ -2057,15 +2025,7 @@ async fn start_outbound_exchange_response(
         if let Ok(existing) = guard.upstream_response() {
             return Ok(existing);
         }
-        guard.store_upstream_response(
-            snapshot.status,
-            snapshot.headers.clone(),
-            snapshot.http_version.clone(),
-            snapshot.carrier_kind,
-            snapshot.carrier_ref.clone(),
-            snapshot.body.clone(),
-            latency_ms,
-        );
+        guard.store_upstream_response(StoredUpstreamResponse::new(snapshot.clone(), latency_ms));
         return Ok(snapshot);
     }
 
@@ -2076,15 +2036,7 @@ async fn start_outbound_exchange_response(
     if let Ok(existing) = exchange.response_snapshot() {
         return Ok(existing);
     }
-    exchange.store_response(
-        snapshot.status,
-        snapshot.headers.clone(),
-        snapshot.http_version.clone(),
-        snapshot.carrier_kind,
-        snapshot.carrier_ref.clone(),
-        snapshot.body.clone(),
-        latency_ms,
-    );
+    exchange.store_response(StoredUpstreamResponse::new(snapshot.clone(), latency_ms));
     exchange
         .transport
         .mark_response_ready(upstream_response_version, snapshot.carrier_ref.clone());

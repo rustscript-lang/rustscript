@@ -702,7 +702,8 @@ mod tests {
             (Value::string("b"), Value::Int(2)),
         ]);
 
-        let array_len = builtin_len(&[array.clone()]).expect("array len should succeed");
+        let array_len =
+            builtin_len(std::slice::from_ref(&array)).expect("array len should succeed");
         let [Value::Int(array_len)] = array_len.as_slice() else {
             panic!("expected int result");
         };
@@ -714,7 +715,7 @@ mod tests {
         };
         assert_eq!(*array_count, 3);
 
-        let map_len = builtin_len(&[map.clone()]).expect("map len should succeed");
+        let map_len = builtin_len(std::slice::from_ref(&map)).expect("map len should succeed");
         let [Value::Int(map_len)] = map_len.as_slice() else {
             panic!("expected int result");
         };

@@ -826,9 +826,7 @@ impl DownstreamHttp2ConnectionTracker {
             .store
             .lock()
             .expect("http downstream session store lock poisoned");
-        let Some(session) = guard.sessions.get_mut(&self.session_id) else {
-            return None;
-        };
+        let session = guard.sessions.get_mut(&self.session_id)?;
         if session.frontier == Http2SessionFrontier::Candidate {
             session.frontier = Http2SessionFrontier::Attachable;
         }
@@ -981,17 +979,33 @@ impl DownstreamHttp2ConnectionTracker {
 }
 
 #[cfg(feature = "http2")]
+pub(crate) struct Http2SendRequest<'a> {
+    pub(crate) sessions: &'a SharedHttpUpstreamSessions,
+    pub(crate) exchange_handle: i64,
+    pub(crate) target: &'a str,
+    pub(crate) upstream_url: &'a str,
+    pub(crate) mode: Http2UpstreamMode,
+    pub(crate) tls_flow: &'a TlsFlowState,
+    pub(crate) method: Method,
+    pub(crate) headers: HeaderMap,
+    pub(crate) request_body: Vec<u8>,
+}
+
+#[cfg(feature = "http2")]
 pub(crate) async fn send_request(
-    sessions: &SharedHttpUpstreamSessions,
-    exchange_handle: i64,
-    target: &str,
-    upstream_url: &str,
-    mode: Http2UpstreamMode,
-    tls_flow: &TlsFlowState,
-    method: Method,
-    headers: HeaderMap,
-    request_body: Vec<u8>,
+    request: Http2SendRequest<'_>,
 ) -> Result<Http2StartedResponse, Http2RequestError> {
+    let Http2SendRequest {
+        sessions,
+        exchange_handle,
+        target,
+        upstream_url,
+        mode,
+        tls_flow,
+        method,
+        headers,
+        request_body,
+    } = request;
     let session = acquire_or_open_session(sessions, target, mode, tls_flow).await?;
     let mut sender = session.sender.clone();
     sender.ready().await.map_err(|err| {
@@ -1078,7 +1092,7 @@ where
                 }),
                 goaway: h2_err
                     .is_go_away()
-                    .then(|| Http2GoawayState { reason, source }),
+                    .then_some(Http2GoawayState { reason, source }),
             };
         }
         current = candidate.source();
