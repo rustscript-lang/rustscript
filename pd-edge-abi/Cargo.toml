@@ -10,6 +10,7 @@ name = "edge_abi"
 [features]
 default = ["http", "tls", "websocket"]
 http = []
+http2 = ["http"]
 tls = []
 websocket = ["http"]
 webrtc = ["http"]

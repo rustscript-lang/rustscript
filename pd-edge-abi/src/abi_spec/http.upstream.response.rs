@@ -23,6 +23,11 @@ fn http_upstream_response_get_body() -> String {
     unreachable!("abi declaration only")
 }
 
+#[pd_host_function(name = "http::upstream::response::get_http_version")]
+fn http_upstream_response_get_http_version() -> String {
+    unreachable!("abi declaration only")
+}
+
 #[pd_host_function(name = "http::upstream::response::body::next_chunk")]
 fn http_upstream_response_body_next_chunk(max_bytes: i64) -> String {
     unreachable!("abi declaration only")

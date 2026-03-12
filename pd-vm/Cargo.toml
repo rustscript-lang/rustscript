@@ -10,6 +10,7 @@ name = "vm"
 default = ["runtime", "cli", "cranelift-jit", "http", "tls", "websocket"]
 runtime = []
 http = ["edge_abi/http"]
+http2 = ["http", "edge_abi/http2"]
 tls = ["http", "edge_abi/tls"]
 websocket = ["http", "edge_abi/websocket"]
 webrtc = ["http", "edge_abi/webrtc"]

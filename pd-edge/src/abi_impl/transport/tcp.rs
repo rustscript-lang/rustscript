@@ -54,7 +54,7 @@ fn note_stream_read(context: &SharedProxyVmContext, stream: TcpStreamHandle) {
                 .outbound_exchanges
                 .get_mut(&handle)
                 .expect("exchange handle should exist while stream is in use");
-            exchange.tcp_dag.note_read();
+            exchange.transport.tcp_flow.note_read();
         }
     }
 }

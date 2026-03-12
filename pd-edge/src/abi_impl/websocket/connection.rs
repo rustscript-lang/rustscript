@@ -164,8 +164,8 @@ fn with_outbound_connection_mut<T>(
         .ok_or_else(|| VmError::HostError(format!("unknown websocket handle {connection}")))?;
     Ok(mutate(
         &mut exchange.request,
-        &mut exchange.tcp_dag,
-        &mut exchange.tls_dag,
+        &mut exchange.transport.tcp_flow,
+        &mut exchange.transport.tls_flow,
         &mut exchange.websocket_dag,
     ))
 }
@@ -241,7 +241,7 @@ fn prepared_outbound_websocket(
             .ok_or_else(|| VmError::HostError(format!("unknown websocket handle {connection}")))?;
         (
             exchange.request.clone(),
-            exchange.tls_dag.clone(),
+            exchange.transport.tls_flow.clone(),
             exchange.websocket_dag.clone(),
         )
     };
@@ -298,15 +298,22 @@ fn store_connected_websocket(
         .outbound_exchanges
         .get_mut(&connection)
         .ok_or_else(|| VmError::HostError(format!("unknown websocket handle {connection}")))?;
-    exchange.tcp_dag.mark_connected();
-    if exchange.tls_dag.is_present() {
-        exchange.tls_dag.note_handshake_prepared();
-        exchange.tls_dag.note_client_hello_sent();
-        exchange.tls_dag.note_server_hello_received();
-        exchange.tls_dag.note_server_certificate_received(None);
-        exchange.tls_dag.note_server_certificate_verified();
+    exchange.transport.tcp_flow.mark_connected();
+    if exchange.transport.tls_flow.is_present() {
+        exchange.transport.tls_flow.note_handshake_prepared();
+        exchange.transport.tls_flow.note_client_hello_sent();
+        exchange.transport.tls_flow.note_server_hello_received();
         exchange
-            .tls_dag
+            .transport
+            .tls_flow
+            .note_server_certificate_received(None);
+        exchange
+            .transport
+            .tls_flow
+            .note_server_certificate_verified();
+        exchange
+            .transport
+            .tls_flow
             .mark_handshake_complete(Some("http/1.1".to_string()));
     }
     exchange.websocket_dag.mark_open(io, negotiated_subprotocol);
@@ -330,8 +337,8 @@ fn store_failed_websocket(
         .outbound_exchanges
         .get_mut(&connection)
         .ok_or_else(|| VmError::HostError(format!("unknown websocket handle {connection}")))?;
-    if exchange.tls_dag.is_present() {
-        exchange.tls_dag.mark_failed();
+    if exchange.transport.tls_flow.is_present() {
+        exchange.transport.tls_flow.mark_failed();
     }
     exchange.websocket_dag.mark_failed(message);
     Ok(())

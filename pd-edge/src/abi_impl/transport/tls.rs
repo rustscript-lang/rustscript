@@ -71,7 +71,10 @@ fn apply_cached_session(
                 let Some(exchange) = guard.outbound_exchanges.get(&handle) else {
                     return Ok(false);
                 };
-                (exchange.request.target.as_deref(), &exchange.tls_dag)
+                (
+                    exchange.request.target.as_deref(),
+                    &exchange.transport.tls_flow,
+                )
             }
         };
         let Some(target) = target else {
@@ -101,7 +104,7 @@ fn apply_cached_session(
             let Some(exchange) = guard.outbound_exchanges.get_mut(&handle) else {
                 return Ok(false);
             };
-            exchange.tls_dag.mark_session_reused(&cached);
+            exchange.transport.tls_flow.mark_session_reused(&cached);
         }
     }
     Ok(true)
@@ -138,7 +141,7 @@ fn with_configurable_outbound_session_mut<T>(
                 .outbound_exchanges
                 .get_mut(&handle)
                 .expect("exchange handle should exist while tls session is in use");
-            mutate(&mut exchange.tls_dag)
+            mutate(&mut exchange.transport.tls_flow)
         }
     }
 }

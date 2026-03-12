@@ -14,6 +14,8 @@ pub(crate) use axum::{
     routing::{any, post},
 };
 pub(crate) use base64::{Engine as _, engine::general_purpose::STANDARD};
+#[cfg(feature = "webrtc")]
+pub(crate) use edge::sample_echo::spawn_webrtc_echo_server;
 pub(crate) use edge::{
     ActiveControlPlaneConfig, CommandResultPayload, ControlPlaneCommand, EdgeCommandResult,
     EdgePollRequest, EdgePollResponse, FN_HTTP_RESPONSE_SET_BODY, FN_HTTP_RESPONSE_SET_HEADER,
@@ -22,8 +24,6 @@ pub(crate) use edge::{
     enter_edge_host_context, new_shared_vm_async_ops, register_http_plane_host_module,
     spawn_active_control_plane_client,
 };
-#[cfg(feature = "webrtc")]
-pub(crate) use edge::sample_echo::spawn_webrtc_echo_server;
 #[cfg(feature = "websocket")]
 pub(crate) use futures_util::{SinkExt, StreamExt};
 pub(crate) use tokio::{sync::Notify, task::JoinHandle, time::timeout};
@@ -304,6 +304,99 @@ pub(crate) async fn spawn_https_echo_upstream() -> (SocketAddr, JoinHandle<()>) 
         )
         .expect("server config should build");
     spawn_tls_echo_server(server_config, false).await
+}
+
+#[cfg(all(feature = "tls", feature = "http2"))]
+fn boxed_http2_full_body(
+    text: &'static str,
+) -> http_body_util::combinators::BoxBody<axum::body::Bytes, std::convert::Infallible> {
+    http_body_util::BodyExt::boxed(http_body_util::Full::new(axum::body::Bytes::from_static(
+        text.as_bytes(),
+    )))
+}
+
+#[cfg(all(feature = "tls", feature = "http2"))]
+fn boxed_http2_delayed_body(
+    text: &'static str,
+    delay: Duration,
+) -> http_body_util::combinators::BoxBody<axum::body::Bytes, std::convert::Infallible> {
+    let bytes = axum::body::Bytes::from_static(text.as_bytes());
+    let body = http_body_util::StreamBody::new(futures_util::stream::once(async move {
+        tokio::time::sleep(delay).await;
+        Ok::<hyper::body::Frame<axum::body::Bytes>, std::convert::Infallible>(
+            hyper::body::Frame::data(bytes),
+        )
+    }));
+    http_body_util::BodyExt::boxed(body)
+}
+
+#[cfg(all(feature = "tls", feature = "http2"))]
+pub(crate) async fn spawn_https_http2_multiplex_upstream() -> (
+    SocketAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    JoinHandle<()>,
+) {
+    ensure_rustls_provider();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("certificate should generate");
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(
+                cert.serialize_der().expect("certificate should serialize"),
+            )],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.serialize_private_key_der())),
+        )
+        .expect("server config should build");
+    server_config.alpn_protocols = vec![b"h2".to_vec()];
+
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener should have addr");
+    let connection_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handle = tokio::spawn({
+        let connection_count = Arc::clone(&connection_count);
+        async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                connection_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let tls_stream = acceptor
+                        .accept(stream)
+                        .await
+                        .expect("http2 tls accept should succeed");
+                    let service = hyper::service::service_fn(
+                        |request: hyper::Request<hyper::body::Incoming>| async move {
+                            let path = request.uri().path().to_string();
+                            let body = match path.as_str() {
+                                "/slow" => {
+                                    boxed_http2_delayed_body("slow-body", Duration::from_millis(75))
+                                }
+                                "/fast" => boxed_http2_full_body("fast-body"),
+                                _ => boxed_http2_full_body("fallback-body"),
+                            };
+                            let mut response = hyper::Response::new(body);
+                            response
+                                .headers_mut()
+                                .insert("x-upstream-http-version", HeaderValue::from_static("2"));
+                            Ok::<_, std::convert::Infallible>(response)
+                        },
+                    );
+                    let io = hyper_util::rt::TokioIo::new(tls_stream);
+                    let builder = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    );
+                    if let Err(err) = builder.serve_connection(io, service).await {
+                        panic!("http2 upstream connection should serve: {err}");
+                    }
+                });
+            }
+        }
+    });
+    (addr, connection_count, handle)
 }
 
 #[cfg(feature = "tls")]

@@ -399,11 +399,12 @@ Artifacts written by these runs:
 Current state:
 
 - HTTP is implemented today as an explicit graph in [`pd-edge/src/abi_impl/http/state.rs`](src/abi_impl/http/state.rs).
+- HTTP/2 support is currently an upstream carrier feature under the generic HTTP exchange DAG. When feature `http2` is enabled, outbound exchanges can negotiate `h2` and multiplex through the shared upstream client while VM code stays on `http::exchange::*`.
 - TCP, TLS, and UDP transport state live in [`pd-edge/src/abi_impl/transport/state.rs`](src/abi_impl/transport/state.rs), with UDP host ABI in [`pd-edge/src/abi_impl/transport/udp.rs`](src/abi_impl/transport/udp.rs).
 - WebSocket is implemented today as an explicit child DAG over outbound HTTP-upgrade handles in [`pd-edge/src/abi_impl/websocket/state.rs`](src/abi_impl/websocket/state.rs).
 - WebRTC is implemented today as a request-scoped peer-connection/data-channel DAG in [`pd-edge/src/abi_impl/webrtc/mod.rs`](src/abi_impl/webrtc/mod.rs).
 - Full cross-protocol graph: [`pd-edge/docs/full-dag.md`](docs/full-dag.md).
-- `http`, `tls`, `websocket`, and `webrtc` are feature-gated DAG families. The default build enables `http`, `tls`, and `websocket`.
+- `http`, `http2`, `tls`, `websocket`, and `webrtc` are feature-gated DAG families. The default build enables `http`, `tls`, and `websocket`.
 - TCP, UDP, TLS, outbound HTTP exchanges, WebSocket connections, and WebRTC connections are exposed to programs through handle-based host calls:
   - `tcp::stream::downstream()` returns reserved socket handle `0`
   - `tcp::stream::default_upstream()` returns reserved socket handle `1`
@@ -428,6 +429,8 @@ Current state:
   - `webrtc::connection::{set_ice_servers, set_data_channel_label, set_remote_description, create_offer, create_answer, connect, send_text, read_text, send_binary_base64, read_binary_base64, eof, close, get_phase}` operate on any outbound webrtc handle
 - Directional `http::upstream::*` APIs remain as aliases over handle `1`.
 - Current runtime boundary:
+  - generic `http::exchange::*` is the stable VM-facing request/response surface
+  - feature `http2` currently adds upstream carrier selection and multiplex over shared connections; it does not yet expose a VM-visible `http2::session::*` namespace
   - outbound UDP sockets are executable today
   - downstream UDP handle `0` is reserved but inactive in the current one-shot HTTP runtime
   - outbound WebSocket connections are executable today
@@ -542,7 +545,7 @@ TLS session reuse is exactly why advancement must be generic. The system should 
 
 ### HTTP DAG
 
-HTTP is the application DAG over the plaintext stream. Today this is the most concrete part of the model and is represented in [`pd-edge/src/abi_impl/http/state.rs`](src/abi_impl/http/state.rs).
+HTTP is the application DAG over the plaintext stream. Today it is represented in [`pd-edge/src/abi_impl/http/state.rs`](src/abi_impl/http/state.rs) as the generic request/response exchange layer, while HTTP/1.1 and HTTP/2 are carrier realizations beneath it.
 
 Rules:
 
@@ -550,8 +553,12 @@ Rules:
 - `request.body` starts unread and only advances when a host call or resolver consumes bytes.
 - `exchange[1].request` starts as the default upstream draft seeded from `request.head`.
 - `exchange[2+]` are additional outbound request/response DAG instances allocated by the VM.
+- The VM-facing ABI stays generic: `http::exchange::*` and `http::upstream::*` do not hardcode HTTP/1.1 versus HTTP/2.
+- `http::exchange::get_http_version()` and `http::upstream::response::get_http_version()` expose the realized response version after the exchange starts.
+- With feature `http2`, outbound HTTPS exchanges can negotiate `h2` and dynamic exchanges may share one upstream connection when the client path permits multiplex.
 - `response.output` starts empty and is populated by VM host calls for local response construction.
 - Each `exchange[n].response` starts as `NotStarted` and becomes `Ready` only when the DAG actually needs response data for that handle.
+- A full VM-visible `http2 session -> stream -> http exchange` DAG is still future work. Current HTTP/2 support is upstream-only carrier selection under the generic exchange layer.
 
 ```mermaid
 flowchart TD

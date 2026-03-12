@@ -66,6 +66,17 @@ async fn get_upstream_response_body(
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 
+#[pd_edge_host_function(name = http_upstream_response::GET_HTTP_VERSION.name, scope = http)]
+async fn get_upstream_response_http_version(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    let upstream_response = ensure_upstream_response_started(&context).await?;
+    Ok(CallOutcome::Return(vec![Value::string(
+        upstream_response.http_version.clone(),
+    )]))
+}
+
 #[pd_edge_host_function(
     name = http_upstream_response::body::NEXT_CHUNK.name,
     scope = http_extension
