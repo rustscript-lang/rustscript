@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging()?;
     info!("{}", binary_version_text());
 
-    let server = spawn_sample_echo_server(cli.into_config()).await?;
+    let server = spawn_sample_echo_server((*cli).into_config()).await?;
     info!("tcp echo listening on {}", server.addresses.tcp);
     info!("udp echo listening on {}", server.addresses.udp);
 
@@ -122,7 +122,7 @@ impl CliArgs {
 
 #[derive(Debug, PartialEq, Eq)]
 enum CliAction {
-    Run(CliArgs),
+    Run(Box<CliArgs>),
     Help,
     Version,
 }
@@ -189,7 +189,7 @@ where
         }
     }
 
-    Ok(CliAction::Run(cli))
+    Ok(CliAction::Run(Box::new(cli)))
 }
 
 fn parse_socket_addr(flag: &str, value: &str) -> Result<SocketAddr, String> {

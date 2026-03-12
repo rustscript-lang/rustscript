@@ -268,12 +268,12 @@ async fn ensure_dynamic_tcp_stream_connected(
     })?;
     let bind_addr = state.bind_address().map(str::to_string);
 
-    let mut resolved = lookup_host(target).await.map_err(|err| {
+    let resolved = lookup_host(target).await.map_err(|err| {
         VmError::HostError(format!("failed to resolve tcp target '{target}': {err}"))
     })?;
 
     let mut last_error = None;
-    while let Some(peer_addr) = resolved.next() {
+    for peer_addr in resolved {
         let socket = if peer_addr.is_ipv4() {
             TcpSocket::new_v4()
         } else {

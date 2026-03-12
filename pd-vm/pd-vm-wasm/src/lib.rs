@@ -1068,7 +1068,7 @@ mod runtime_tests {
         )
         .expect("playground example should compile for runtime verification");
         let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
-        let mut jit_config = vm.jit_config().clone();
+        let mut jit_config = *vm.jit_config();
         jit_config.enabled = false;
         vm.set_jit_config(jit_config);
         register_fixture_functions(&mut vm, &compiled.functions);

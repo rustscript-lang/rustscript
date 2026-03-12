@@ -126,10 +126,12 @@ impl TcpFlowState {
         self.closed = false;
     }
 
+    #[cfg(test)]
     pub(crate) fn is_configured(&self) -> bool {
         self.configured
     }
 
+    #[cfg(test)]
     pub(crate) fn is_connected(&self) -> bool {
         self.connected
     }
@@ -294,11 +296,6 @@ impl TcpSocketState {
 
     pub(crate) fn read_eof(&self) -> bool {
         self.read_eof
-    }
-
-    #[cfg(test)]
-    pub(crate) fn failure_message(&self) -> &str {
-        self.failure_message.as_deref().unwrap_or_default()
     }
 }
 

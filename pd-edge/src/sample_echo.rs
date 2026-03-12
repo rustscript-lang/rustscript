@@ -586,6 +586,7 @@ fn generate_self_signed_tls_server_config() -> io::Result<Arc<ServerConfig>> {
 }
 
 #[cfg(feature = "websocket")]
+#[allow(clippy::result_large_err)]
 fn negotiate_chat_subprotocol(
     request: &WsRequest,
     mut response: WsResponse,
