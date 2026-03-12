@@ -70,7 +70,7 @@ pub struct HostNamespaceSpec {
     pub docs: &'static str,
 }
 
-pub const ABI_VERSION: u16 = 17;
+pub const ABI_VERSION: u16 = 18;
 
 #[allow(dead_code, unused_variables)]
 mod callable_specs {
@@ -79,6 +79,7 @@ mod callable_specs {
         pub struct Map;
     }
 
+    #[allow(unused_imports)]
     use self::marker::Map;
     use pd_host_function::pd_host_function;
 
@@ -131,7 +132,7 @@ mod tests {
     #[test]
     fn abi_json_contains_declared_functions() {
         let manifest = abi_json();
-        assert!(manifest.contains("\"abi_version\": 17"));
+        assert!(manifest.contains("\"abi_version\": 18"));
         for function in FUNCTIONS {
             assert!(manifest.contains(function.name));
             assert!(manifest.contains(function.return_type.as_str()));

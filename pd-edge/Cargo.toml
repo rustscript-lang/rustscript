@@ -8,6 +8,13 @@ autobins = false
 [lib]
 name = "edge"
 
+[features]
+default = ["http", "tls", "websocket"]
+http = ["vm/http", "edge_abi/http"]
+tls = ["http", "vm/tls", "edge_abi/tls"]
+websocket = ["http", "vm/websocket", "edge_abi/websocket", "dep:tokio-tungstenite"]
+webrtc = ["http", "vm/webrtc", "edge_abi/webrtc", "dep:webrtc", "dep:rustls"]
+
 [[bin]]
 name = "pd-edge-http-proxy"
 path = "src/bin/pd-edge-http-proxy.rs"
@@ -24,8 +31,8 @@ http-body-util = "0.1"
 futures-util = "0.3"
 pd-edge-host-function = { path = "./pd-edge-host-function" }
 linkme = "0.3"
-vm = { package = "pd-vm", path = "../pd-vm" }
-edge_abi = { package = "pd-edge-abi", path = "../pd-edge-abi" }
+vm = { package = "pd-vm", path = "../pd-vm", default-features = false, features = ["runtime"] }
+edge_abi = { package = "pd-edge-abi", path = "../pd-edge-abi", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
@@ -36,7 +43,9 @@ base64 = "0.22"
 rand = "0.8"
 uuid = { version = "1", features = ["v4"] }
 url = "2"
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"], optional = true }
+webrtc = { version = "0.17", optional = true }
+rustls = { version = "0.23", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Console"] }

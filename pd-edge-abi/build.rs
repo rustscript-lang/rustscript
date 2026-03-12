@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use syn::{FnArg, Item, Meta, Pat, ReturnType, Type};
+use syn::{Attribute, FnArg, Item, Meta, Pat, ReturnType, Type};
 
 #[derive(Clone, Debug)]
 struct AbiFunctionDecl {
@@ -31,11 +31,12 @@ fn main() {
     let spec_dir = manifest_dir.join("src").join("abi_spec");
     let functions_list = spec_dir.join("functions.rs");
     let namespace_list = spec_dir.join("namespaces.rs");
+    let enabled_features = enabled_feature_flags();
 
     println!("cargo:rerun-if-changed={}", functions_list.display());
     println!("cargo:rerun-if-changed={}", namespace_list.display());
 
-    let function_files = parse_include_order(&functions_list);
+    let function_files = parse_include_order(&functions_list, &enabled_features);
     let function_decls = function_files
         .iter()
         .flat_map(|relative| {
@@ -45,7 +46,7 @@ fn main() {
         })
         .collect::<Vec<_>>();
 
-    let namespace_decls = parse_namespace_file(&namespace_list);
+    let namespace_decls = parse_namespace_file(&namespace_list, &enabled_features);
     validate_namespace_roots(&function_decls, &namespace_decls);
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("missing OUT_DIR"));
@@ -64,21 +65,40 @@ fn write_generated_file(path: &Path, contents: &str) {
         .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
 }
 
-fn parse_include_order(path: &Path) -> Vec<String> {
+fn enabled_feature_flags() -> BTreeSet<String> {
+    env::vars()
+        .filter_map(|(key, _)| key.strip_prefix("CARGO_FEATURE_").map(str::to_string))
+        .collect()
+}
+
+fn parse_include_order(path: &Path, enabled_features: &BTreeSet<String>) -> Vec<String> {
     let source = fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    let parsed = syn::parse_file(&source)
+        .unwrap_or_else(|err| panic!("failed to parse {}: {err}", path.display()));
+
     let mut files = Vec::new();
-    let mut rest = source.as_str();
-    loop {
-        let Some(index) = rest.find("include!(\"") else {
-            break;
+    for item in parsed.items {
+        let Item::Macro(item_macro) = item else {
+            continue;
         };
-        rest = &rest[index + "include!(\"".len()..];
-        let end = rest
-            .find('"')
-            .unwrap_or_else(|| panic!("unterminated include! in {}", path.display()));
-        files.push(rest[..end].to_string());
-        rest = &rest[end + 1..];
+        if !cfg_matches(&item_macro.attrs, enabled_features) {
+            continue;
+        }
+        if !item_macro.mac.path.is_ident("include") {
+            continue;
+        }
+        let include_path = syn::parse2::<syn::LitStr>(item_macro.mac.tokens.clone())
+            .unwrap_or_else(|err| {
+                panic!("failed to parse include! path in {}: {err}", path.display())
+            });
+        files.push(include_path.value());
+    }
+    if files.is_empty() {
+        panic!(
+            "no abi function includes were discovered in {}",
+            path.display()
+        );
     }
     files
 }
@@ -205,29 +225,118 @@ fn type_label(ty: &Type) -> String {
     }
 }
 
-fn parse_namespace_file(path: &Path) -> Vec<NamespaceDecl> {
+fn parse_namespace_file(path: &Path, enabled_features: &BTreeSet<String>) -> Vec<NamespaceDecl> {
     let source = fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    let parsed = syn::parse_file(&source)
+        .unwrap_or_else(|err| panic!("failed to parse {}: {err}", path.display()));
+
     let mut decls = Vec::new();
-    let mut rest = source.as_str();
-    loop {
-        let Some(index) = rest.find("edge_host_namespace!(") else {
-            break;
+    for item in parsed.items {
+        let Item::Macro(item_macro) = item else {
+            continue;
         };
-        rest = &rest[index + "edge_host_namespace!(".len()..];
-        let end = find_matching_paren(rest);
-        let args = &rest[..end];
-        let (root, rest_after_root) = parse_string(args);
-        let rest_after_root = expect_comma(rest_after_root);
-        let (docs, rest_after_docs) = parse_string(rest_after_root);
-        let rest_after_docs = skip_ws(rest_after_docs);
-        if !rest_after_docs.is_empty() {
-            panic!("unexpected trailing tokens in namespace decl: {rest_after_docs}");
+        if !cfg_matches(&item_macro.attrs, enabled_features) {
+            continue;
+        }
+        if !item_macro.mac.path.is_ident("edge_host_namespace") {
+            continue;
+        }
+        let args = syn::parse::Parser::parse2(
+            syn::punctuated::Punctuated::<syn::LitStr, syn::Token![,]>::parse_terminated,
+            item_macro.mac.tokens.clone(),
+        )
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to parse namespace decl in {}: {err}",
+                path.display()
+            )
+        });
+        let mut values = args.into_iter();
+        let root = values
+            .next()
+            .unwrap_or_else(|| panic!("namespace decl in {} is missing a root", path.display()))
+            .value();
+        let docs = values
+            .next()
+            .unwrap_or_else(|| panic!("namespace decl in {} is missing docs", path.display()))
+            .value();
+        if values.next().is_some() {
+            panic!(
+                "namespace decl in {} has unexpected trailing arguments",
+                path.display()
+            );
         }
         decls.push(NamespaceDecl { root, docs });
-        rest = &rest[end + 1..];
     }
     decls
+}
+
+fn cfg_matches(attrs: &[Attribute], enabled_features: &BTreeSet<String>) -> bool {
+    attrs.iter().all(|attr| match &attr.meta {
+        Meta::List(list) if attr.path().is_ident("cfg") => {
+            eval_cfg_meta_list(list, enabled_features)
+        }
+        _ => true,
+    })
+}
+
+fn eval_cfg_meta_list(list: &syn::MetaList, enabled_features: &BTreeSet<String>) -> bool {
+    let nested = list
+        .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+        .unwrap_or_else(|err| panic!("failed to parse #[cfg(...)] args: {err}"));
+    if nested.len() != 1 {
+        panic!("#[cfg(...)] on ABI specs must contain exactly one top-level expression");
+    }
+    eval_cfg_meta(
+        nested
+            .first()
+            .expect("checked nested cfg expression length above"),
+        enabled_features,
+    )
+}
+
+fn eval_cfg_meta(meta: &Meta, enabled_features: &BTreeSet<String>) -> bool {
+    match meta {
+        Meta::NameValue(name_value) if name_value.path.is_ident("feature") => {
+            match &name_value.value {
+                syn::Expr::Lit(expr_lit) => match &expr_lit.lit {
+                    syn::Lit::Str(value) => {
+                        enabled_features.contains(&value.value().to_ascii_uppercase())
+                    }
+                    _ => panic!("cfg(feature = ...) must use a string literal"),
+                },
+                _ => panic!("cfg(feature = ...) must use a string literal"),
+            }
+        }
+        Meta::List(list) if list.path.is_ident("all") => list
+            .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+            .unwrap_or_else(|err| panic!("failed to parse cfg(all(...)) args: {err}"))
+            .iter()
+            .all(|meta| eval_cfg_meta(meta, enabled_features)),
+        Meta::List(list) if list.path.is_ident("any") => list
+            .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+            .unwrap_or_else(|err| panic!("failed to parse cfg(any(...)) args: {err}"))
+            .iter()
+            .any(|meta| eval_cfg_meta(meta, enabled_features)),
+        Meta::List(list) if list.path.is_ident("not") => {
+            let nested = list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
+                )
+                .unwrap_or_else(|err| panic!("failed to parse cfg(not(...)) args: {err}"));
+            if nested.len() != 1 {
+                panic!("cfg(not(...)) must contain exactly one expression");
+            }
+            !eval_cfg_meta(
+                nested
+                    .first()
+                    .expect("checked nested cfg expression length above"),
+                enabled_features,
+            )
+        }
+        _ => panic!("unsupported cfg expression in ABI specs"),
+    }
 }
 
 fn validate_namespace_roots(functions: &[AbiFunctionDecl], namespaces: &[NamespaceDecl]) {
@@ -354,7 +463,7 @@ fn render_abi_rust(functions: &[AbiFunctionDecl], namespaces: &[NamespaceDecl]) 
 fn render_abi_json(functions: &[AbiFunctionDecl]) -> String {
     let mut out = String::new();
     out.push_str("{\n");
-    out.push_str("  \"abi_version\": 17,\n");
+    out.push_str("  \"abi_version\": 18,\n");
     out.push_str("  \"functions\": [\n");
     for (index, function) in functions.iter().enumerate() {
         let suffix = if index + 1 == functions.len() {
@@ -451,76 +560,4 @@ fn to_shouty_snake(value: &str) -> String {
         prev_is_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
     }
     out
-}
-
-fn parse_string(source: &str) -> (String, &str) {
-    let source = skip_ws(source);
-    let mut chars = source.char_indices();
-    let Some((_, '"')) = chars.next() else {
-        panic!("expected string literal");
-    };
-    let mut value = String::new();
-    let mut escaped = false;
-    for (index, ch) in source[1..].char_indices() {
-        if escaped {
-            value.push(match ch {
-                '\\' => '\\',
-                '"' => '"',
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                other => other,
-            });
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return (value, &source[index + 2..]),
-            other => value.push(other),
-        }
-    }
-    panic!("unterminated string literal");
-}
-
-fn expect_comma(source: &str) -> &str {
-    skip_ws(source)
-        .strip_prefix(',')
-        .unwrap_or_else(|| panic!("expected comma near '{source}'"))
-}
-
-fn skip_ws(source: &str) -> &str {
-    source.trim_start_matches(char::is_whitespace)
-}
-
-fn find_matching_paren(source: &str) -> usize {
-    let mut depth = 1usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (index, ch) in source.char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            match ch {
-                '\\' => escaped = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return index;
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("unterminated macro invocation");
 }

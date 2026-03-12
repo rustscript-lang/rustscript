@@ -821,6 +821,7 @@ async fn direct_vm_can_read_upstream_response_line_by_line_via_http_body_api() {
     upstream_handle.abort();
 }
 
+#[cfg(feature = "tls")]
 #[tokio::test]
 async fn sample_subrequest_proxy_program_fans_out_across_default_and_dynamic_exchanges() {
     let plain_app = Router::new().fallback(any(|request: Request<Body>| async move {

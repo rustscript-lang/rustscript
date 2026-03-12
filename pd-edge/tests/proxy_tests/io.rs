@@ -112,6 +112,7 @@ async fn io_protocol_handles_accept_direct_integer_arguments() {
     admin_handle.abort();
 }
 
+#[cfg(feature = "tls")]
 #[tokio::test]
 async fn io_protocol_handles_accept_tls_session_handles_for_https_exchange() {
     let (upstream_addr, upstream_handle) = spawn_https_echo_upstream().await;

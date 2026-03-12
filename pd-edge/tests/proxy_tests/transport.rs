@@ -53,6 +53,7 @@ async fn sample_transport_proxy_program_streams_plain_http_body() {
     admin_handle.abort();
 }
 
+#[cfg(feature = "tls")]
 #[tokio::test]
 async fn sample_transport_proxy_program_handles_https_tls_session() {
     let (upstream_addr, upstream_handle) = spawn_https_echo_upstream().await;
@@ -174,6 +175,7 @@ async fn sample_tunnel_proxy_program_tunnels_plain_http_body() {
     admin_handle.abort();
 }
 
+#[cfg(feature = "tls")]
 #[tokio::test]
 async fn sample_tunnel_proxy_program_tunnels_https_body_via_tls_plaintext_stream() {
     let (upstream_addr, upstream_handle) = spawn_https_echo_upstream().await;
@@ -298,6 +300,7 @@ async fn proxy_pipe_forwards_dynamic_exchange_response_via_proxy_stream_handle()
     admin_handle.abort();
 }
 
+#[cfg(feature = "tls")]
 #[tokio::test]
 async fn transport_downstream_tls_session_reflects_forwarded_https_metadata() {
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
