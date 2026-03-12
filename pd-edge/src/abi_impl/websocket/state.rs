@@ -125,16 +125,15 @@ impl OutboundWebSocketIoState {
         Ok(sent)
     }
 
-    pub(crate) async fn read_text(&mut self) -> Result<Option<String>, VmError> {
+    async fn read_next_frame(&mut self) -> Result<Option<OutboundWebSocketFrame>, VmError> {
         loop {
             let next = self.stream.next().await;
             match next {
-                Some(Ok(Message::Text(text))) => return Ok(Some(text.to_string())),
-                Some(Ok(Message::Binary(_))) => {
-                    return Err(VmError::HostError(
-                        "next websocket frame is binary; call websocket::connection::read_binary_base64"
-                            .to_string(),
-                    ));
+                Some(Ok(Message::Text(text))) => {
+                    return Ok(Some(OutboundWebSocketFrame::Text(text.to_string())));
+                }
+                Some(Ok(Message::Binary(bytes))) => {
+                    return Ok(Some(OutboundWebSocketFrame::Binary(bytes.to_vec())));
                 }
                 Some(Ok(Message::Ping(payload))) => {
                     self.stream
@@ -161,84 +160,38 @@ impl OutboundWebSocketIoState {
                     return Ok(None);
                 }
             }
+        }
+    }
+
+    pub(crate) async fn read_text(&mut self) -> Result<Option<String>, VmError> {
+        match self.read_next_frame().await? {
+            Some(OutboundWebSocketFrame::Text(text)) => Ok(Some(text)),
+            Some(OutboundWebSocketFrame::Binary(_)) => Err(VmError::HostError(
+                "next websocket frame is binary; call websocket::connection::read_binary_base64"
+                    .to_string(),
+            )),
+            None => Ok(None),
         }
     }
 
     pub(crate) async fn read_binary_bytes(&mut self) -> Result<Option<Vec<u8>>, VmError> {
-        loop {
-            let next = self.stream.next().await;
-            match next {
-                Some(Ok(Message::Binary(bytes))) => return Ok(Some(bytes.to_vec())),
-                Some(Ok(Message::Text(_))) => {
-                    return Err(VmError::HostError(
-                        "next websocket frame is text; binary byte-stream mode requires binary frames"
-                            .to_string(),
-                    ));
-                }
-                Some(Ok(Message::Ping(payload))) => {
-                    self.stream
-                        .send(Message::Pong(payload))
-                        .await
-                        .map_err(|err| {
-                            VmError::HostError(format!("failed to reply to websocket ping: {err}",))
-                        })?;
-                }
-                Some(Ok(Message::Pong(_))) => {}
-                Some(Ok(Message::Close(frame))) => {
-                    self.record_close_frame(frame);
-                    return Ok(None);
-                }
-                Some(Ok(_)) => {}
-                Some(Err(err)) => {
-                    self.eof = true;
-                    return Err(VmError::HostError(format!(
-                        "failed to read websocket frame: {err}",
-                    )));
-                }
-                None => {
-                    self.eof = true;
-                    return Ok(None);
-                }
-            }
+        match self.read_next_frame().await? {
+            Some(OutboundWebSocketFrame::Binary(bytes)) => Ok(Some(bytes)),
+            Some(OutboundWebSocketFrame::Text(_)) => Err(VmError::HostError(
+                "next websocket frame is text; binary byte-stream mode requires binary frames"
+                    .to_string(),
+            )),
+            None => Ok(None),
         }
     }
 
     pub(crate) async fn read_binary_base64(&mut self) -> Result<Option<String>, VmError> {
-        loop {
-            let next = self.stream.next().await;
-            match next {
-                Some(Ok(Message::Binary(bytes))) => return Ok(Some(STANDARD.encode(bytes))),
-                Some(Ok(Message::Text(_))) => {
-                    return Err(VmError::HostError(
-                        "next websocket frame is text; call websocket::connection::read_text"
-                            .to_string(),
-                    ));
-                }
-                Some(Ok(Message::Ping(payload))) => {
-                    self.stream
-                        .send(Message::Pong(payload))
-                        .await
-                        .map_err(|err| {
-                            VmError::HostError(format!("failed to reply to websocket ping: {err}",))
-                        })?;
-                }
-                Some(Ok(Message::Pong(_))) => {}
-                Some(Ok(Message::Close(frame))) => {
-                    self.record_close_frame(frame);
-                    return Ok(None);
-                }
-                Some(Ok(_)) => {}
-                Some(Err(err)) => {
-                    self.eof = true;
-                    return Err(VmError::HostError(format!(
-                        "failed to read websocket frame: {err}",
-                    )));
-                }
-                None => {
-                    self.eof = true;
-                    return Ok(None);
-                }
-            }
+        match self.read_next_frame().await? {
+            Some(OutboundWebSocketFrame::Binary(bytes)) => Ok(Some(STANDARD.encode(bytes))),
+            Some(OutboundWebSocketFrame::Text(_)) => Err(VmError::HostError(
+                "next websocket frame is text; call websocket::connection::read_text".to_string(),
+            )),
+            None => Ok(None),
         }
     }
 
@@ -256,6 +209,11 @@ impl OutboundWebSocketIoState {
         }));
         Ok(())
     }
+}
+
+enum OutboundWebSocketFrame {
+    Text(String),
+    Binary(Vec<u8>),
 }
 
 #[derive(Clone, Debug)]
