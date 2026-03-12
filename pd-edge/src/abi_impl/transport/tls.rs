@@ -57,7 +57,7 @@ fn session_flow(context: &SharedProxyVmContext, session: TlsSessionHandle) -> Tl
         TlsSessionHandle::OutboundExchange(handle) => outbound_exchange_tls_flow(context, handle)
             .expect("exchange handle should exist while tls session is in use"),
         TlsSessionHandle::Dynamic(handle) => {
-            let guard = context.lock().expect("vm context lock poisoned");
+            let guard = context.lock_transport();
             guard
                 .dynamic_tls_sessions
                 .get(&handle)
@@ -65,11 +65,11 @@ fn session_flow(context: &SharedProxyVmContext, session: TlsSessionHandle) -> Tl
                 .unwrap_or_else(TlsFlowState::for_dynamic_socket)
         }
         TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => {
-            let guard = context.lock().expect("vm context lock poisoned");
+            let guard = context.lock_transport();
             guard.tls_dag.downstream.clone()
         }
         TlsSessionHandle::Reserved(TlsSessionRef::DefaultUpstream) => {
-            let guard = context.lock().expect("vm context lock poisoned");
+            let guard = context.lock_transport();
             guard.tls_dag.default_upstream.clone()
         }
     }
@@ -80,31 +80,41 @@ fn apply_cached_session(
     session: TlsSessionHandle,
 ) -> Result<bool, VmError> {
     let (cache, key) = {
-        let guard = context.lock().expect("vm context lock poisoned");
-        let Some(cache) = guard.tls_session_cache.clone() else {
+        let Some(cache) = context.services().tls_session_cache() else {
             return Ok(false);
         };
         let (target, flow) = match session {
             TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => return Ok(false),
-            TlsSessionHandle::Reserved(TlsSessionRef::DefaultUpstream) => (
-                guard.outbound_request.target.as_deref(),
-                &guard.tls_dag.default_upstream,
-            ),
+            TlsSessionHandle::Reserved(TlsSessionRef::DefaultUpstream) => {
+                let target = {
+                    let exchanges = context.lock_exchanges();
+                    exchanges
+                        .exchanges
+                        .get(&super::super::http::default_upstream_exchange_handle())
+                        .and_then(|exchange| exchange.request.target.clone())
+                };
+                let flow = {
+                    let transport = context.lock_transport();
+                    transport.tls_dag.default_upstream.clone()
+                };
+                (target, flow)
+            }
             TlsSessionHandle::Dynamic(_) => return Ok(false),
             TlsSessionHandle::OutboundExchange(handle) => {
-                let Some(exchange) = guard.outbound_exchanges.get(&handle) else {
+                let exchanges = context.lock_exchanges();
+                let Some(exchange) = exchanges.exchanges.get(&handle) else {
                     return Ok(false);
                 };
                 (
-                    exchange.request.target.as_deref(),
-                    &exchange.transport.tls_flow,
+                    exchange.request.target.clone(),
+                    exchange.transport.tls_flow.clone(),
                 )
             }
         };
         let Some(target) = target else {
             return Ok(false);
         };
-        let Some(key) = tls_session_cache_key(target, flow) else {
+        let Some(key) = tls_session_cache_key(&target, &flow) else {
             return Ok(false);
         };
         (cache, key)
@@ -118,13 +128,17 @@ fn apply_cached_session(
         return Ok(false);
     };
 
-    let mut guard = context.lock().expect("vm context lock poisoned");
     match session {
         TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => return Ok(false),
         TlsSessionHandle::Reserved(TlsSessionRef::DefaultUpstream) => {
-            guard.tls_dag.default_upstream.mark_session_reused(&cached);
+            context
+                .lock_transport()
+                .tls_dag
+                .default_upstream
+                .mark_session_reused(&cached);
         }
         TlsSessionHandle::Dynamic(handle) => {
+            let mut guard = context.lock_transport();
             let flow = guard
                 .dynamic_tls_sessions
                 .entry(handle)
@@ -132,7 +146,8 @@ fn apply_cached_session(
             flow.mark_session_reused(&cached);
         }
         TlsSessionHandle::OutboundExchange(handle) => {
-            let Some(exchange) = guard.outbound_exchanges.get_mut(&handle) else {
+            let mut exchanges = context.lock_exchanges();
+            let Some(exchange) = exchanges.exchanges.get_mut(&handle) else {
                 return Ok(false);
             };
             exchange.transport.tls_flow.mark_session_reused(&cached);
@@ -158,11 +173,11 @@ fn with_configurable_outbound_session_mut<T>(
                         .to_string(),
                 ));
             }
-            let mut guard = context.lock().expect("vm context lock poisoned");
+            let mut guard = context.lock_transport();
             mutate(&mut guard.tls_dag.default_upstream)
         }
         TlsSessionHandle::Dynamic(handle) => {
-            let mut guard = context.lock().expect("vm context lock poisoned");
+            let mut guard = context.lock_transport();
             let io_present = guard.dynamic_tls_session_ios.contains_key(&handle);
             let flow = guard
                 .dynamic_tls_sessions
@@ -181,9 +196,9 @@ fn with_configurable_outbound_session_mut<T>(
                     "tls session handle {handle} is read-only after the exchange has started",
                 )));
             }
-            let mut guard = context.lock().expect("vm context lock poisoned");
+            let mut guard = context.lock_exchanges();
             let exchange = guard
-                .outbound_exchanges
+                .exchanges
                 .get_mut(&handle)
                 .expect("exchange handle should exist while tls session is in use");
             mutate(&mut exchange.transport.tls_flow)
@@ -454,7 +469,7 @@ async fn take_dynamic_tcp_stream_for_tls(
     handle: i64,
 ) -> Result<tokio::net::TcpStream, VmError> {
     let io = {
-        let mut guard = context.lock().expect("vm context lock poisoned");
+        let mut guard = context.lock_transport();
         guard.tcp_stream_ios.remove(&handle).ok_or_else(|| {
             VmError::HostError(format!(
                 "dynamic tcp stream handle {handle} must be connected before starting tls",
@@ -481,7 +496,7 @@ async fn session_from_socket(
     let handle = match session {
         TlsSessionHandle::Reserved(reserved) => reserved.handle(),
         TlsSessionHandle::Dynamic(handle) => {
-            let mut guard = context.lock().expect("vm context lock poisoned");
+            let mut guard = context.lock_transport();
             guard
                 .dynamic_tls_sessions
                 .entry(handle)
@@ -559,7 +574,7 @@ async fn session_handshake(
             })?;
 
             {
-                let mut guard = context.lock().expect("vm context lock poisoned");
+                let mut guard = context.lock_transport();
                 let flow = guard
                     .dynamic_tls_sessions
                     .entry(handle)
@@ -586,7 +601,7 @@ async fn session_handshake(
                         .map(|certificate| certificate.to_vec());
 
                     {
-                        let mut guard = context.lock().expect("vm context lock poisoned");
+                        let mut guard = context.lock_transport();
                         if let Some(flow) = guard.dynamic_tls_sessions.get_mut(&handle) {
                             flow.note_server_hello_received();
                             flow.note_server_certificate_received(peer_certificate_der.clone());
@@ -614,7 +629,7 @@ async fn session_handshake(
                     }
                 }
                 Err(err) => {
-                    let mut guard = context.lock().expect("vm context lock poisoned");
+                    let mut guard = context.lock_transport();
                     if let Some(flow) = guard.dynamic_tls_sessions.get_mut(&handle) {
                         flow.mark_failed();
                     }

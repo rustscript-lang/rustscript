@@ -33,10 +33,7 @@ async fn rate_limit_allow(
         return Ok(CallOutcome::Return(vec![Value::Bool(false)]));
     }
 
-    let rate_limiter = {
-        let context = context.lock().expect("vm context lock poisoned");
-        context.rate_limiter.clone()
-    };
+    let rate_limiter = context.services().rate_limiter();
     let allowed = rate_limiter
         .lock()
         .expect("rate limiter lock poisoned")
