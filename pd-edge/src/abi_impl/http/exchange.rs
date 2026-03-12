@@ -57,8 +57,8 @@ fn with_exchange_request_mut<T>(
         .ok_or_else(|| unknown_exchange_handle(handle))?;
     Ok(mutate(
         &mut exchange.request,
-        &mut exchange.tcp_dag,
-        &mut exchange.tls_dag,
+        &mut exchange.transport.tcp_flow,
+        &mut exchange.transport.tls_flow,
     ))
 }
 
@@ -341,6 +341,18 @@ async fn get_exchange_body(
     let body = read_outbound_exchange_response_all(&context, exchange).await?;
     Ok(CallOutcome::Return(vec![Value::string(
         String::from_utf8_lossy(&body).into_owned(),
+    )]))
+}
+
+#[pd_edge_host_function(name = http_exchange::GET_HTTP_VERSION.name, scope = http)]
+async fn get_exchange_http_version(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    exchange: i64,
+) -> Result<CallOutcome, VmError> {
+    let snapshot = ensure_outbound_exchange_response_started(&context, exchange).await?;
+    Ok(CallOutcome::Return(vec![Value::string(
+        snapshot.http_version.clone(),
     )]))
 }
 

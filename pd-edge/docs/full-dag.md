@@ -8,7 +8,8 @@ Notes:
 - `exchange n` represents additional outbound exchanges allocated with `http::exchange::new()`.
 - `udp socket 1` is the reserved default upstream UDP handle; `udp socket n` represents additional outbound sockets allocated with `udp::socket::new()`.
 - `webrtc connection 1` is the reserved default upstream WebRTC handle; `webrtc connection n` represents additional outbound connections allocated with `webrtc::connection::new()`.
-- The graph shows the union of currently supported DAG families. `http`, `tls`, `websocket`, and `webrtc` are feature-gated; the default build enables `http`, `tls`, and `websocket`.
+- The graph shows the union of currently supported DAG families. `http`, `http2`, `tls`, `websocket`, and `webrtc` are feature-gated; the default build enables `http`, `tls`, and `websocket`.
+- Current HTTP/2 support is upstream-only and lives under the generic HTTP exchange layer. The VM still uses `http::exchange::*`; feature `http2` currently selects an `h2` carrier and permits multiplexed upstream reuse rather than exposing a public `http2::session::*` ABI.
 - The proxy layer is a capability layer, not a protocol DAG. It connects exported byte streams from TCP, TLS plaintext, HTTP bodies, and WebSocket binary adapters.
 - UDP datagrams and WebRTC data-channel messages do not currently flow through `proxy::pipe` or `proxy::tunnel`; they remain sibling message-oriented DAGs.
 - The graph is intentionally conceptual. It shows ingress and egress connections between DAGs, not every internal transition implemented by each subsystem.
@@ -103,6 +104,14 @@ flowchart LR
         UTL0 --> UTL1
         UTL1 --> UTL2
         UTL2 --> UTL3
+    end
+
+    subgraph US_H2["Upstream HTTP/2 Carrier DAG"]
+        UH20["http2 session candidate"]
+        UH21["http2 session open"]
+        UH22["http2 stream attached to exchange"]
+        UH20 --> UH21
+        UH21 --> UH22
     end
 
     subgraph US_UDP["Upstream UDP Datagram DAG"]
@@ -212,6 +221,9 @@ flowchart LR
     UT1 --> UN1
     UTL2 --> U1A
     UTL2 --> UN1
+    UTL2 --> UH20
+    UH22 --> U1A
+    UH22 --> UN1
 
     U1A --> W0
     UN1 --> W0

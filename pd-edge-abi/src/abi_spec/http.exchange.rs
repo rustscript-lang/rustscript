@@ -93,6 +93,11 @@ fn http_exchange_get_body(exchange: i64) -> String {
     unreachable!("abi declaration only")
 }
 
+#[pd_host_function(name = "http::exchange::get_http_version")]
+fn http_exchange_get_http_version(exchange: i64) -> String {
+    unreachable!("abi declaration only")
+}
+
 #[pd_host_function(name = "http::exchange::body::next_chunk")]
 fn http_exchange_body_next_chunk(exchange: i64, max_bytes: i64) -> String {
     unreachable!("abi declaration only")

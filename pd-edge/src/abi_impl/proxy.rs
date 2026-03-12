@@ -642,9 +642,10 @@ mod tests {
                 .expect("exchange should exist");
             exchange_state.request.target = Some(format!("http://{upstream_addr}/dyn"));
             exchange_state.request.body_override = Some(b"payload".to_vec());
-            exchange_state.tcp_dag.configure();
+            exchange_state.transport.tcp_flow.configure();
             exchange_state
-                .tls_dag
+                .transport
+                .tls_flow
                 .observe_target(&format!("http://{upstream_addr}/dyn"));
         }
 

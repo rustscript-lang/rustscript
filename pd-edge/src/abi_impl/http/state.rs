@@ -9,7 +9,7 @@ use std::{
 use axum::{
     body::Body,
     http::{
-        HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode,
+        HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Version,
         header::{CONTENT_LENGTH, CONTENT_TYPE, HOST},
     },
 };
@@ -203,6 +203,49 @@ pub(crate) struct HttpResponseOutputNode {
     pub(crate) status: Option<u16>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum HttpCarrierKind {
+    #[default]
+    Http1,
+    Http2,
+}
+
+impl HttpCarrierKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Http1 => "http1",
+            Self::Http2 => "http2",
+        }
+    }
+
+    pub(crate) fn from_version(version: Version) -> Self {
+        match version {
+            Version::HTTP_2 => Self::Http2,
+            _ => Self::Http1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HttpExchangeTransportState {
+    pub(crate) tcp_flow: TcpFlowState,
+    pub(crate) tls_flow: TlsFlowState,
+    pub(crate) carrier_kind: HttpCarrierKind,
+    pub(crate) http_version: Option<String>,
+}
+
+impl HttpExchangeTransportState {
+    fn note_write(&mut self) {
+        self.tcp_flow.note_write();
+    }
+
+    fn mark_response_ready(&mut self, version: Version) {
+        self.tcp_flow.mark_connected();
+        self.carrier_kind = HttpCarrierKind::from_version(version);
+        self.http_version = Some(http_version_label(version).to_string());
+    }
+}
+
 struct UpstreamResponseBodyState {
     response: Option<reqwest::Response>,
     buffered: Vec<u8>,
@@ -336,6 +379,8 @@ const FIRST_PROXY_STREAM_HANDLE: i64 = 4096;
 pub(crate) struct HttpUpstreamResponseSnapshot {
     pub(crate) status: u16,
     pub(crate) headers: HeaderMap,
+    pub(crate) http_version: String,
+    pub(crate) carrier_kind: HttpCarrierKind,
     body: SharedUpstreamResponseBody,
 }
 
@@ -344,6 +389,8 @@ impl std::fmt::Debug for HttpUpstreamResponseSnapshot {
         f.debug_struct("HttpUpstreamResponseSnapshot")
             .field("status", &self.status)
             .field("headers", &self.headers)
+            .field("http_version", &self.http_version)
+            .field("carrier_kind", &self.carrier_kind.as_str())
             .finish()
     }
 }
@@ -356,16 +403,15 @@ pub(crate) enum HttpUpstreamResponseNode {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct HttpOutboundExchangeNode {
+pub(crate) struct HttpOutboundExchangeState {
     pub(crate) request: HttpOutboundRequestNode,
     pub(crate) response: HttpUpstreamResponseNode,
-    pub(crate) tcp_dag: TcpFlowState,
-    pub(crate) tls_dag: TlsFlowState,
+    pub(crate) transport: HttpExchangeTransportState,
     pub(crate) websocket_dag: WebSocketConnectionState,
     pub(crate) upstream_latency_ms: u64,
 }
 
-impl HttpOutboundExchangeNode {
+impl HttpOutboundExchangeState {
     fn new() -> Self {
         Self {
             request: HttpOutboundRequestNode {
@@ -377,8 +423,7 @@ impl HttpOutboundExchangeNode {
                 target: None,
             },
             response: HttpUpstreamResponseNode::NotStarted,
-            tcp_dag: TcpFlowState::default(),
-            tls_dag: TlsFlowState::default(),
+            transport: HttpExchangeTransportState::default(),
             websocket_dag: WebSocketConnectionState::default(),
             upstream_latency_ms: 0,
         }
@@ -401,12 +446,16 @@ impl HttpOutboundExchangeNode {
         &mut self,
         status: u16,
         headers: HeaderMap,
+        http_version: String,
+        carrier_kind: HttpCarrierKind,
         body: SharedUpstreamResponseBody,
         latency_ms: u64,
     ) {
         self.response = HttpUpstreamResponseNode::Ready(HttpUpstreamResponseSnapshot {
             status,
             headers,
+            http_version,
+            carrier_kind,
             body,
         });
         self.upstream_latency_ms = latency_ms;
@@ -429,7 +478,7 @@ pub struct ProxyVmContext {
     pub(crate) tls_session_cache: Option<SharedTlsSessionCache>,
     pub(crate) upstream_latency_ms: u64,
     pub(crate) next_outbound_exchange_handle: i64,
-    pub(crate) outbound_exchanges: HashMap<i64, HttpOutboundExchangeNode>,
+    pub(crate) outbound_exchanges: HashMap<i64, HttpOutboundExchangeState>,
     pub(crate) default_upstream_udp_socket: UdpSocketState,
     pub(crate) default_upstream_udp_io: Option<SharedUdpSocketIo>,
     pub(crate) next_udp_socket_handle: i64,
@@ -564,12 +613,16 @@ impl ProxyVmContext {
         &mut self,
         status: u16,
         headers: HeaderMap,
+        http_version: String,
+        carrier_kind: HttpCarrierKind,
         body: SharedUpstreamResponseBody,
         latency_ms: u64,
     ) {
         self.upstream_response = HttpUpstreamResponseNode::Ready(HttpUpstreamResponseSnapshot {
             status,
             headers,
+            http_version,
+            carrier_kind,
             body,
         });
         self.upstream_latency_ms = latency_ms;
@@ -604,7 +657,7 @@ pub(crate) fn allocate_outbound_exchange_handle(
     guard.next_outbound_exchange_handle += 1;
     guard
         .outbound_exchanges
-        .insert(handle, HttpOutboundExchangeNode::new());
+        .insert(handle, HttpOutboundExchangeState::new());
     Ok(handle)
 }
 
@@ -677,7 +730,7 @@ pub(crate) fn outbound_exchange_tls_flow(
     guard
         .outbound_exchanges
         .get(&handle)
-        .map(|exchange| exchange.tls_dag.clone())
+        .map(|exchange| exchange.transport.tls_flow.clone())
         .ok_or_else(|| VmError::HostError(format!("unknown outbound exchange handle {handle}")))
 }
 
@@ -721,7 +774,7 @@ pub(crate) fn append_outbound_exchange_body_bytes(
             "outbound exchange handle {handle} is read-only after the exchange has started",
         )));
     }
-    exchange.tcp_dag.note_write();
+    exchange.transport.note_write();
     exchange
         .request
         .body_override
@@ -848,6 +901,17 @@ pub(crate) fn build_upstream_url(
     (upstream_url, Some(upstream.to_string()))
 }
 
+pub(crate) fn http_version_label(version: Version) -> &'static str {
+    match version {
+        Version::HTTP_09 => "0.9",
+        Version::HTTP_10 => "1.0",
+        Version::HTTP_11 => "1.1",
+        Version::HTTP_2 => "2",
+        Version::HTTP_3 => "3",
+        _ => "1.1",
+    }
+}
+
 pub(crate) fn is_hop_by_hop_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -926,7 +990,7 @@ fn prepared_outbound_exchange_request(
             .upstream_client
             .clone()
             .ok_or(UpstreamResponseStartError::MissingClient)?,
-        tls_flow: exchange.tls_dag.clone(),
+        tls_flow: exchange.transport.tls_flow.clone(),
         method: exchange.request.method.clone(),
         path: exchange.request.path.clone(),
         query: exchange.request.query.clone(),
@@ -1061,7 +1125,7 @@ fn with_outbound_tls_flow_mut<T>(
         .outbound_exchanges
         .get_mut(&handle)
         .ok_or(UpstreamResponseStartError::UnknownExchangeHandle(handle))?;
-    Ok(mutate(&mut exchange.tls_dag))
+    Ok(mutate(&mut exchange.transport.tls_flow))
 }
 
 fn note_outbound_tls_prepared(
@@ -1088,7 +1152,7 @@ fn outbound_tls_handshake_complete(
         .outbound_exchanges
         .get(&handle)
         .ok_or(UpstreamResponseStartError::UnknownExchangeHandle(handle))?;
-    Ok(exchange.tls_dag.handshake_complete())
+    Ok(exchange.transport.tls_flow.handshake_complete())
 }
 
 fn cache_outbound_tls_session(
@@ -1112,7 +1176,10 @@ fn cache_outbound_tls_session(
                 .outbound_exchanges
                 .get(&handle)
                 .ok_or(UpstreamResponseStartError::UnknownExchangeHandle(handle))?;
-            (exchange.request.target.as_deref(), &exchange.tls_dag)
+            (
+                exchange.request.target.as_deref(),
+                &exchange.transport.tls_flow,
+            )
         };
         let Some(target) = target else {
             return Ok(());
@@ -1183,7 +1250,7 @@ fn mark_outbound_tcp_connected(
         .outbound_exchanges
         .get_mut(&handle)
         .ok_or(UpstreamResponseStartError::UnknownExchangeHandle(handle))?;
-    exchange.tcp_dag.mark_connected();
+    exchange.transport.tcp_flow.mark_connected();
     Ok(())
 }
 
@@ -1262,9 +1329,13 @@ async fn start_outbound_exchange_response(
     }
     mark_outbound_tcp_connected(context, handle)?;
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let response_http_version = http_version_label(upstream_response_version).to_string();
+    let response_carrier_kind = HttpCarrierKind::from_version(upstream_response_version);
     let snapshot = HttpUpstreamResponseSnapshot {
         status: upstream_response.status().as_u16(),
         headers: upstream_response.headers().clone(),
+        http_version: response_http_version.clone(),
+        carrier_kind: response_carrier_kind,
         body: Arc::new(tokio::sync::Mutex::new(UpstreamResponseBodyState::new(
             upstream_response,
         ))),
@@ -1278,6 +1349,8 @@ async fn start_outbound_exchange_response(
         guard.store_upstream_response(
             snapshot.status,
             snapshot.headers.clone(),
+            snapshot.http_version.clone(),
+            snapshot.carrier_kind,
             snapshot.body.clone(),
             latency_ms,
         );
@@ -1294,9 +1367,14 @@ async fn start_outbound_exchange_response(
     exchange.store_response(
         snapshot.status,
         snapshot.headers.clone(),
+        snapshot.http_version.clone(),
+        snapshot.carrier_kind,
         snapshot.body.clone(),
         latency_ms,
     );
+    exchange
+        .transport
+        .mark_response_ready(upstream_response_version);
     Ok(snapshot)
 }
 
@@ -1326,7 +1404,7 @@ pub(crate) fn outbound_exchange_response_available(
     guard
         .outbound_exchanges
         .get(&handle)
-        .map(HttpOutboundExchangeNode::response_ready)
+        .map(HttpOutboundExchangeState::response_ready)
         .unwrap_or(false)
 }
 
@@ -1712,8 +1790,11 @@ mod tests {
                 .get_mut(&first)
                 .expect("first exchange should exist");
             exchange.request.target = Some(upstream_addr.to_string());
-            exchange.tcp_dag.configure();
-            exchange.tls_dag.observe_target(&upstream_addr.to_string());
+            exchange.transport.tcp_flow.configure();
+            exchange
+                .transport
+                .tls_flow
+                .observe_target(&upstream_addr.to_string());
         }
 
         let snapshot = ensure_outbound_exchange_response_started(&context, first)
@@ -1723,11 +1804,31 @@ mod tests {
 
         let guard = context.lock().expect("vm context lock poisoned");
         assert!(guard.outbound_exchanges[&first].response_ready());
-        assert!(guard.outbound_exchanges[&first].tcp_dag.is_connected());
-        assert!(!guard.outbound_exchanges[&first].tls_dag.is_present());
+        assert!(
+            guard.outbound_exchanges[&first]
+                .transport
+                .tcp_flow
+                .is_connected()
+        );
+        assert!(
+            !guard.outbound_exchanges[&first]
+                .transport
+                .tls_flow
+                .is_present()
+        );
         assert!(!guard.outbound_exchanges[&second].response_ready());
-        assert!(!guard.outbound_exchanges[&second].tcp_dag.is_connected());
-        assert!(!guard.outbound_exchanges[&second].tls_dag.is_present());
+        assert!(
+            !guard.outbound_exchanges[&second]
+                .transport
+                .tcp_flow
+                .is_connected()
+        );
+        assert!(
+            !guard.outbound_exchanges[&second]
+                .transport
+                .tls_flow
+                .is_present()
+        );
         assert!(!guard.tcp_dag.default_upstream.is_connected());
         assert!(!guard.upstream_response_ready());
     }

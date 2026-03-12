@@ -991,6 +991,134 @@ async fn dynamic_exchange_rejects_write_after_response_has_started() {
     admin_handle.abort();
 }
 
+#[cfg(all(feature = "tls", feature = "http2"))]
+#[tokio::test]
+async fn upstream_http2_response_version_is_exposed_to_vm_programs() {
+    let (upstream_addr, _connection_count, upstream_handle) =
+        spawn_https_http2_multiplex_upstream().await;
+
+    let mut state = SharedState::new(1024 * 1024);
+    state.client = reqwest::Client::builder()
+        .tls_info(true)
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("http2 tls test client should build");
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy_with_state(state).await;
+    let client = reqwest::Client::new();
+
+    let source = format!(
+        r#"
+        use http;
+
+        http::upstream::request::set_target("https://localhost:{}/fast");
+        http::response::set_header(
+            "x-upstream-version",
+            http::upstream::response::get_http_version()
+        );
+        http::response::set_body(http::upstream::response::get_body());
+    "#,
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/http2-default"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "fast-body"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[cfg(all(feature = "tls", feature = "http2"))]
+#[tokio::test]
+async fn dynamic_exchanges_can_multiplex_over_single_http2_connection() {
+    let (upstream_addr, connection_count, upstream_handle) =
+        spawn_https_http2_multiplex_upstream().await;
+
+    let mut state = SharedState::new(1024 * 1024);
+    state.client = reqwest::Client::builder()
+        .tls_info(true)
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("http2 multiplex client should build");
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy_with_state(state).await;
+    let client = reqwest::Client::new();
+
+    let source = format!(
+        r#"
+        use http;
+
+        let first = http::exchange::new();
+        let second = http::exchange::new();
+
+        http::exchange::set_target(first, "https://localhost:{}/slow");
+        http::exchange::set_target(second, "https://localhost:{}/fast");
+
+        http::exchange::send(first);
+        http::response::set_header("x-first-version", http::exchange::get_http_version(first));
+        http::exchange::send(second);
+        http::response::set_header("x-second-version", http::exchange::get_http_version(second));
+        http::response::set_body(http::exchange::get_body(second) + "|" + http::exchange::get_body(first));
+    "#,
+        upstream_addr.port(),
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/http2-multiplex"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-first-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-second-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "fast-body|slow-body"
+    );
+    assert_eq!(
+        connection_count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "http2 exchanges should share one upstream connection",
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
 #[tokio::test]
 async fn uploaded_program_with_locals_executes_successfully() {
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;

@@ -11,6 +11,7 @@ name = "edge"
 [features]
 default = ["http", "tls", "websocket"]
 http = ["vm/http", "edge_abi/http"]
+http2 = ["http", "vm/http2", "edge_abi/http2", "reqwest/http2"]
 tls = ["http", "vm/tls", "edge_abi/tls", "dep:tokio-rustls", "dep:rcgen"]
 websocket = ["http", "vm/websocket", "edge_abi/websocket", "dep:tokio-tungstenite"]
 webrtc = ["http", "vm/webrtc", "edge_abi/webrtc", "dep:webrtc", "dep:rustls"]
@@ -32,7 +33,7 @@ axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["full"] }
 http-body-util = "0.1"
-hyper = { version = "1", features = ["http1", "server"] }
+hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 futures-util = "0.3"
 pd-edge-host-function = { path = "./pd-edge-host-function" }
