@@ -12,8 +12,7 @@ struct FeedConfig {
 let unique_channels: [string] =
 collections::dedup(["world", "tech", "finance", "culture", "world"]);
 let unique_channel_count = unique_channels.length;
-assert(collections::deep_compare(unique_channels.copy(), ["world", "tech", "finance", "culture"]));
-
+assert(collections::deep_compare(&unique_channels, ["world", "tech", "finance", "culture"]));
 assert(collections::deep_compare(iter::range(unique_channel_count), [0, 1, 2, 3]));
 assert(collections::deep_compare(iter::range_step(1, 8, 2), [1, 3, 5, 7]));
 
@@ -22,15 +21,15 @@ let scheduled_rows: [[string]] = iter::zip(
     ["world", "tech", "finance", "culture"]
 );
 assert(scheduled_rows.length == 4);
-assert(collections::deep_compare(scheduled_rows[0].copy(), ["00:00", "world"]));
+assert(collections::deep_compare(&((&scheduled_rows)[0]), ["00:00", "world"]));
 
-let scheduled_preview: [[string]] = iter::take(scheduled_rows.copy(), 2);
+let scheduled_preview: [[string]] = iter::take(&scheduled_rows, 2);
 let scheduled_preview_count = scheduled_preview.length;
 assert(scheduled_preview_count == 2);
 
 let backlog: [string] = iter::skip(["world", "tech", "finance", "culture"], 2);
 let backlog_count = backlog.length;
-assert(collections::deep_compare(backlog.copy(), ["finance", "culture"]));
+assert(collections::deep_compare(&backlog, ["finance", "culture"]));
 
 let slot_batches: [[string]] = iter::chunk(["00:00", "00:05", "00:10", "00:15"], 2);
 let slot_batch_count = slot_batches.length;
@@ -40,10 +39,10 @@ let channel_label_count = iter::enumerate(["world", "tech", "finance", "culture"
 assert(channel_label_count == unique_channel_count);
 
 let traffic_windows = [120, 95, 140, 65];
-let total_hits: int = iter::sum(traffic_windows.copy());
+let total_hits: int = iter::sum(&traffic_windows);
 assert(total_hits == 420);
 
-let hot_windows: [int] = iter::filter(traffic_windows.copy(), |value| value >= 100);
+let hot_windows: [int] = iter::filter(&traffic_windows, |value| value >= 100);
 let hot_window_count = hot_windows.length;
 assert(hot_window_count == 2);
 
@@ -52,27 +51,27 @@ assert(retry_budget == 10);
 
 let long_name_flags: [bool] =
 iter::map(["world", "tech", "finance", "culture"], |name| name.length > 4);
-assert(iter::any_true(long_name_flags.copy()));
+assert(iter::any_true(&long_name_flags));
 assert(iter::all_true([true, true]));
 
 let merged_config: FeedConfig = collections::merge(
     {interval: "5m", retries: 2, mode: "steady"},
     {retries: 4, mode: "burst"}
 );
-let config_mode: string = collections::get_or(merged_config.copy(), "mode", "missing");
-assert(collections::has(merged_config.copy(), "interval"));
+let config_mode: string = collections::get_or(&merged_config, "mode", "missing");
+assert(collections::has(&merged_config, "interval"));
 assert(config_mode == "burst");
-assert(collections::get_or(merged_config.copy(), "missing", "fallback") == "fallback");
+assert(collections::get_or(&merged_config, "missing", "fallback") == "fallback");
 
-let config_entry_count = collections::entries(merged_config.copy()).length;
-let config_value_count = collections::values(merged_config.copy()).length;
+let config_entry_count = collections::entries(&merged_config).length;
+let config_value_count = collections::values(&merged_config).length;
 assert(config_entry_count == 3);
 assert(config_value_count == 3);
 
 let reversed_preview: [string] = collections::reverse(["world", "finance"]);
 let combined_names: [string] = collections::append(reversed_preview, ["archive"]);
-assert(collections::index_of(combined_names.copy(), "archive") == 2);
-assert(collections::contains(combined_names.copy(), "world"));
+assert(collections::index_of(&combined_names, "archive") == 2);
+assert(collections::contains(&combined_names, "world"));
 assert(collections::contains(combined_names, "sports") == false);
 
 let summary = {
