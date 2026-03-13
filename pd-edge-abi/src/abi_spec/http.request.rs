@@ -77,3 +77,8 @@ fn http_request_get_http_version() -> String {
 fn http_request_get_port() -> i64 {
     unreachable!("abi declaration only")
 }
+
+#[pd_host_function(name = "http::request::handoff_downstream")]
+fn http_request_handoff_downstream() {
+    unreachable!("abi declaration only")
+}

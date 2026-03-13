@@ -24,6 +24,7 @@ use super::super::http::{
     outbound_exchange_response_available,
 };
 use super::state::{OutboundWebSocketIoState, SharedWebSocketIo, WebSocketConnectionState};
+use crate::abi_impl::transport::{DownstreamReplayTcpStream, ReplayPrefixedIo};
 
 const DOWNSTREAM_CONNECTION_HANDLE: i64 = 0;
 
@@ -429,23 +430,22 @@ fn websocket_operation_on_downstream() -> VmError {
 
 fn downstream_websocket_transport_available(context: &SharedProxyVmContext) -> bool {
     let guard = context.lock_transport();
-    guard.downstream_tcp_io.is_some()
-        || {
-            #[cfg(feature = "tls")]
-            {
-                guard.downstream_tls_io.is_some()
-            }
-            #[cfg(not(feature = "tls"))]
-            {
-                false
-            }
+    guard.downstream_tcp_io.is_some() || {
+        #[cfg(feature = "tls")]
+        {
+            guard.downstream_tls_io.is_some()
         }
+        #[cfg(not(feature = "tls"))]
+        {
+            false
+        }
+    }
 }
 
 enum DownstreamWebSocketTransport {
-    Tcp(tokio::net::TcpStream),
+    Tcp(ReplayPrefixedIo<tokio::net::TcpStream>),
     #[cfg(feature = "tls")]
-    Tls(tokio_rustls::server::TlsStream<tokio::net::TcpStream>),
+    Tls(ReplayPrefixedIo<tokio_rustls::server::TlsStream<DownstreamReplayTcpStream>>),
 }
 
 async fn take_downstream_websocket_transport(
@@ -453,9 +453,12 @@ async fn take_downstream_websocket_transport(
 ) -> Result<DownstreamWebSocketTransport, VmError> {
     #[cfg(feature = "tls")]
     {
-        let tls_io = {
+        let (tls_io, preread) = {
             let mut guard = context.lock_transport();
-            guard.downstream_tls_io.take()
+            (
+                guard.downstream_tls_io.take(),
+                std::mem::take(&mut guard.downstream_preread_buffer),
+            )
         };
         if let Some(io) = tls_io {
             let mut guard = io.lock().await;
@@ -464,18 +467,27 @@ async fn take_downstream_websocket_transport(
                     "downstream tls plaintext transport is already in use".to_string(),
                 )
             })?;
-            return Ok(DownstreamWebSocketTransport::Tls(stream));
+            return Ok(DownstreamWebSocketTransport::Tls(ReplayPrefixedIo::new(
+                preread, stream,
+            )));
         }
-        if context.lock_transport().downstream_tls_server_start.is_some() {
+        if context
+            .lock_transport()
+            .downstream_tls_server_start
+            .is_some()
+        {
             return Err(VmError::HostError(
                 "downstream websocket accept requires plaintext transport; complete tls::session::handshake first".to_string(),
             ));
         }
     }
 
-    let tcp_io = {
+    let (tcp_io, preread) = {
         let mut guard = context.lock_transport();
-        guard.downstream_tcp_io.take()
+        (
+            guard.downstream_tcp_io.take(),
+            std::mem::take(&mut guard.downstream_preread_buffer),
+        )
     };
     let Some(io) = tcp_io else {
         return Err(websocket_operation_on_downstream());
@@ -484,7 +496,9 @@ async fn take_downstream_websocket_transport(
     let stream = guard.take().ok_or_else(|| {
         VmError::HostError("downstream tcp transport is already in use".to_string())
     })?;
-    Ok(DownstreamWebSocketTransport::Tcp(stream))
+    Ok(DownstreamWebSocketTransport::Tcp(ReplayPrefixedIo::new(
+        preread, stream,
+    )))
 }
 
 fn pick_downstream_subprotocol(request: &WsRequest, configured: &[String]) -> Option<String> {
@@ -507,7 +521,10 @@ fn pick_downstream_subprotocol(request: &WsRequest, configured: &[String]) -> Op
 async fn accept_downstream_websocket(
     context: &SharedProxyVmContext,
 ) -> Result<(SharedWebSocketIo, Option<String>), VmError> {
-    let configured_protocols = context.downstream_websocket().requested_subprotocols().to_vec();
+    let configured_protocols = context
+        .downstream_websocket()
+        .requested_subprotocols()
+        .to_vec();
     let selected_protocol = Arc::new(Mutex::new(None::<String>));
 
     let io = match take_downstream_websocket_transport(context).await? {
@@ -531,9 +548,9 @@ async fn accept_downstream_websocket(
             let websocket = accept_hdr_async(stream, callback).await.map_err(|err| {
                 VmError::HostError(format!("downstream websocket accept failed: {err}"))
             })?;
-            Arc::new(tokio::sync::Mutex::new(OutboundWebSocketIoState::new_server_tcp(
-                websocket,
-            )))
+            Arc::new(tokio::sync::Mutex::new(
+                OutboundWebSocketIoState::new_server_tcp(websocket),
+            ))
         }
         #[cfg(feature = "tls")]
         DownstreamWebSocketTransport::Tls(stream) => {
@@ -556,9 +573,9 @@ async fn accept_downstream_websocket(
             let websocket = accept_hdr_async(stream, callback).await.map_err(|err| {
                 VmError::HostError(format!("downstream websocket accept failed: {err}"))
             })?;
-            Arc::new(tokio::sync::Mutex::new(OutboundWebSocketIoState::new_server_tls(
-                websocket,
-            )))
+            Arc::new(tokio::sync::Mutex::new(
+                OutboundWebSocketIoState::new_server_tls(websocket),
+            ))
         }
     };
     let negotiated_subprotocol = selected_protocol
@@ -608,7 +625,9 @@ pub(crate) async fn ensure_outbound_websocket_connection_open(
     context: &SharedProxyVmContext,
     connection: i64,
 ) -> Result<(), VmError> {
-    if connection != DOWNSTREAM_CONNECTION_HANDLE && outbound_exchange_response_available(context, connection) {
+    if connection != DOWNSTREAM_CONNECTION_HANDLE
+        && outbound_exchange_response_available(context, connection)
+    {
         return Err(VmError::HostError(format!(
             "websocket connection handle {connection} cannot enter websocket mode after the HTTP response has started",
         )));

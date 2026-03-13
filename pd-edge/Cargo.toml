@@ -21,6 +21,10 @@ name = "pd-edge-http-proxy"
 path = "src/bin/pd-edge-http-proxy.rs"
 
 [[bin]]
+name = "pd-edge-transport-proxy"
+path = "src/bin/pd-edge-transport-proxy.rs"
+
+[[bin]]
 name = "pd-edge-console"
 path = "src/bin/pd-edge-console.rs"
 

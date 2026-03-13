@@ -1654,3 +1654,163 @@ async fn uploaded_program_with_locals_executes_successfully() {
     data_handle.abort();
     admin_handle.abort();
 }
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn http_proxy_https_listener_defaults_to_http_semantics_for_http_only_programs() {
+    let (_http_addr, https_addr, admin_addr, http_handle, https_handle, admin_handle) =
+        spawn_http_https_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = r#"
+        use http;
+
+        http::response::set_body("hello over https");
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let https_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("https test client should build");
+    let response = https_client
+        .get(format!(
+            "https://localhost:{}/direct-http",
+            https_addr.port()
+        ))
+        .send()
+        .await
+        .expect("https request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().await.expect("response body should read"),
+        "hello over https"
+    );
+
+    http_handle.abort();
+    https_handle.abort();
+    admin_handle.abort();
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn http_proxy_https_listener_returns_404_for_noop_program() {
+    let (_http_addr, https_addr, admin_addr, http_handle, https_handle, admin_handle) =
+        spawn_http_https_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = r#"
+        let unused = 1;
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let https_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("https test client should build");
+    let response = https_client
+        .get(format!("https://localhost:{}/noop", https_addr.port()))
+        .send()
+        .await
+        .expect("https request should complete");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response.text().await.expect("response body should read"),
+        "not found"
+    );
+
+    http_handle.abort();
+    https_handle.abort();
+    admin_handle.abort();
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn http_proxy_https_listener_ignores_handoff_import_when_program_enters_http_directly() {
+    let (_http_addr, https_addr, admin_addr, http_handle, https_handle, admin_handle) =
+        spawn_http_https_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = r#"
+        use http;
+
+        let mode = 0;
+        if mode == 1 {
+            http::request::handoff_downstream();
+        }
+        http::response::set_body("handoff import stays on HTTP path");
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    assert!(
+        compiled
+            .program
+            .imports
+            .iter()
+            .any(|import| import.name == "http::request::handoff_downstream"),
+        "program should import handoff_downstream for regression coverage"
+    );
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let https_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("https test client should build");
+    let response = https_client
+        .get(format!(
+            "https://localhost:{}/handoff-import-direct-http",
+            https_addr.port()
+        ))
+        .send()
+        .await
+        .expect("https request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().await.expect("response body should read"),
+        "handoff import stays on HTTP path"
+    );
+
+    http_handle.abort();
+    https_handle.abort();
+    admin_handle.abort();
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn http_proxy_https_listener_explicit_handoff_uses_listener_goal_before_raw_transport() {
+    let (_http_addr, https_addr, admin_addr, http_handle, https_handle, admin_handle) =
+        spawn_http_https_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = r#"
+        use http;
+
+        if http::request::get_scheme() == "tcp" {
+            http::request::handoff_downstream();
+        }
+
+        http::response::set_body(http::request::get_scheme());
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let https_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("https test client should build");
+    let response = https_client
+        .get(format!(
+            "https://localhost:{}/listener-goal-handoff",
+            https_addr.port()
+        ))
+        .send()
+        .await
+        .expect("https request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.expect("body should read"), "https");
+
+    http_handle.abort();
+    https_handle.abort();
+    admin_handle.abort();
+}

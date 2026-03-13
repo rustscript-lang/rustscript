@@ -6,6 +6,10 @@ use vm::{CallOutcome, Value, Vm, VmError};
 use super::{
     SharedProxyVmContext, headers_to_value_map, query_to_value_map, read_request_body_all,
     read_request_body_next_chunk, request_body_eof, request_path_with_query,
+    schedule_downstream_http_handoff,
+};
+use crate::{
+    abi_impl::schedule_current_future_call, runtime::promote_transport_context_into_http_request,
 };
 
 #[derive(Clone, Copy)]
@@ -143,8 +147,8 @@ async fn get_request_header(
 ) -> Result<CallOutcome, VmError> {
     let header_name = HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
-    let value = context
-        .request_head()
+    let request_head = context.request_head();
+    let value = request_head
         .headers()
         .get(&header_name)
         .and_then(|value| value.to_str().ok())
@@ -158,8 +162,9 @@ async fn get_request_headers(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
+    let request_head = context.request_head();
     Ok(CallOutcome::Return(vec![headers_to_value_map(
-        context.request_head().headers(),
+        request_head.headers(),
     )]))
 }
 
@@ -170,7 +175,8 @@ async fn get_request_query_arg(
     context: SharedProxyVmContext,
     name: String,
 ) -> Result<CallOutcome, VmError> {
-    let value = url::form_urlencoded::parse(context.request_head().query().as_bytes())
+    let request_head = context.request_head();
+    let value = url::form_urlencoded::parse(request_head.query().as_bytes())
         .find_map(|(key, value)| {
             if key == name {
                 Some(value.into_owned())
@@ -188,8 +194,9 @@ async fn get_request_query_args(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
+    let request_head = context.request_head();
     Ok(CallOutcome::Return(vec![query_to_value_map(
-        context.request_head().query(),
+        request_head.query(),
     )]))
 }
 
@@ -239,7 +246,22 @@ async fn get_request_port(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
+    let request_head = context.request_head();
     Ok(CallOutcome::Return(vec![Value::Int(
-        context.request_head().port() as i64,
+        request_head.port() as i64
     )]))
+}
+
+/// Attaches the untouched downstream transport to the HTTP stack and resumes
+/// the current VM invocation with HTTP request semantics.
+#[pd_edge_host_function(name = http_request::HANDOFF_DOWNSTREAM.name, scope = http)]
+fn handoff_downstream_http(
+    vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    schedule_downstream_http_handoff(&context)?;
+    schedule_current_future_call(vm, async move {
+        promote_transport_context_into_http_request(context).await?;
+        Ok(vec![])
+    })
 }

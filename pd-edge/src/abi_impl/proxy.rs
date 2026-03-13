@@ -123,7 +123,8 @@ fn proxy_stream_state(
 }
 
 fn downstream_proxy_endpoint(context: &SharedProxyVmContext) -> ProxyByteStreamEndpoint {
-    if context.request_head().method() == axum::http::Method::CONNECT {
+    let request_head = context.request_head();
+    if request_head.method() == axum::http::Method::CONNECT {
         ProxyByteStreamEndpoint::DownstreamConnect
     } else if context.downstream_websocket().is_present() {
         ProxyByteStreamEndpoint::DownstreamWebSocketBinary

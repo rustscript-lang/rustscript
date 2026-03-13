@@ -11,16 +11,18 @@ mod tcp;
 mod tls;
 mod udp;
 
-#[cfg(feature = "tls")]
-pub(crate) use state::{DownstreamTlsServerStart, SharedServerTlsStreamIo, SharedTlsStreamIo};
 pub(crate) use state::TlsSessionCacheKey;
 pub(crate) use state::{
-    CachedTlsSession, FIRST_DYNAMIC_TCP_STREAM_HANDLE, SharedTcpStreamIo, SharedTlsSessionCache,
-    SharedUdpSocketIo, TcpFlowState, TcpSocketPhase, TcpSocketState, TcpStreamRef, TcpTransportDag,
-    TlsFlowState, TlsProtocolVersion, TlsSessionRef, TlsTransportDag, UdpSocketState,
-    alpn_from_http_version, decode_tcp_stream_handle, decode_tls_session_handle,
-    new_shared_tls_session_cache, tls_session_cache_key,
+    CachedTlsSession, DownstreamReplayTcpStream, FIRST_DYNAMIC_TCP_STREAM_HANDLE, ReplayPrefixedIo,
+    SharedTcpStreamIo, SharedTlsSessionCache, SharedUdpSocketIo, TcpFlowState, TcpSocketPhase,
+    TcpSocketState, TcpStreamRef, TcpTransportDag, TlsFlowState, TlsProtocolVersion, TlsSessionRef,
+    TlsTransportDag, UdpSocketState, alpn_from_http_version, decode_tcp_stream_handle,
+    decode_tls_session_handle, new_shared_tls_session_cache, tls_session_cache_key,
 };
+#[cfg(feature = "tls")]
+pub(crate) use state::{DownstreamTlsServerStart, SharedServerTlsStreamIo, SharedTlsStreamIo};
+#[cfg(feature = "tls")]
+pub(crate) use tls::build_default_self_signed_server_config;
 
 pub(super) fn register_transport_extensions(
     vm: &mut Vm,
