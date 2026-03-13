@@ -19,6 +19,7 @@ mod request;
 #[cfg(feature = "http")]
 mod response;
 mod state;
+mod version;
 
 #[cfg(feature = "websocket")]
 pub(crate) use state::DownstreamWebSocketTunnelPlan;
@@ -48,6 +49,7 @@ pub(crate) use state::{
 #[cfg(feature = "websocket")]
 pub(crate) use state::{HttpOutboundRequestNode, build_upstream_url, is_hop_by_hop_header};
 pub use state::{HttpRequestContext, ProxyVmContext, SharedProxyVmContext};
+pub(crate) use version::HttpVersionPreference;
 #[cfg(any(feature = "http", test))]
 pub(crate) use state::{
     allocate_outbound_exchange_handle, ensure_outbound_exchange_response_started,

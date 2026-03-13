@@ -593,12 +593,14 @@ fn build_scheme_optional_member_expr(
     let keys_len_expr = || {
         Expr::Call(
             BuiltinFunction::Len.call_index(),
+            Vec::new(),
             vec![Expr::Var(keys_slot)],
         )
     };
     let current_key_expr = || {
         Expr::Call(
             BuiltinFunction::Get.call_index(),
+            Vec::new(),
             vec![Expr::Var(keys_slot), Expr::Var(idx_slot)],
         )
     };
@@ -628,6 +630,7 @@ fn build_scheme_optional_member_expr(
                         declared_schema: None,
                         expr: Expr::Call(
                             BuiltinFunction::Keys.call_index(),
+                            Vec::new(),
                             vec![Expr::Var(target_slot)],
                         ),
                         line: line_u32,
@@ -688,6 +691,7 @@ fn build_scheme_optional_member_expr(
                             index: result_slot,
                             expr: Expr::Call(
                                 BuiltinFunction::Get.call_index(),
+                                Vec::new(),
                                 vec![Expr::Var(target_slot), Expr::String(member)],
                             ),
                             line: line_u32,
@@ -991,7 +995,11 @@ fn lower_scheme_direct_list_expr(
             }))
         }
         "list" | "vector" => {
-            let mut out = Expr::Call(BuiltinFunction::ArrayNew.call_index(), Vec::new());
+            let mut out = Expr::Call(
+                BuiltinFunction::ArrayNew.call_index(),
+                Vec::new(),
+                Vec::new(),
+            );
             for arg in args {
                 let Some(value) = lower_scheme_direct_expr(
                     arg,
@@ -1004,7 +1012,11 @@ fn lower_scheme_direct_list_expr(
                 else {
                     return Ok(None);
                 };
-                out = Expr::Call(BuiltinFunction::ArrayPush.call_index(), vec![out, value]);
+                out = Expr::Call(
+                    BuiltinFunction::ArrayPush.call_index(),
+                    Vec::new(),
+                    vec![out, value],
+                );
             }
             Ok(Some(out))
         }
@@ -1066,6 +1078,7 @@ fn lower_scheme_direct_list_expr(
             };
             Ok(Some(Expr::Call(
                 BuiltinFunction::Get.call_index(),
+                Vec::new(),
                 vec![container, key],
             )))
         }
@@ -1258,7 +1271,7 @@ fn lower_scheme_direct_regex_or_builtin_call(
             _ => return Ok(None),
         };
         if builtin.accepts_arity(u8::try_from(args.len()).unwrap_or(u8::MAX)) {
-            return Ok(Some(Expr::Call(builtin.call_index(), args)));
+            return Ok(Some(Expr::Call(builtin.call_index(), Vec::new(), args)));
         }
         if args.len() == usize::from(builtin.arity()) + 1 {
             let flags = args.pop().ok_or_else(|| ParseError {
@@ -1280,7 +1293,7 @@ fn lower_scheme_direct_regex_or_builtin_call(
                 ),
             })?;
             args[0] = build_scheme_regex_flags_pattern_expr(pattern, flags);
-            return Ok(Some(Expr::Call(builtin.call_index(), args)));
+            return Ok(Some(Expr::Call(builtin.call_index(), Vec::new(), args)));
         }
         return Err(ParseError {
             span: None,
@@ -1305,7 +1318,7 @@ fn lower_scheme_direct_regex_or_builtin_call(
                 ),
             });
         }
-        return Ok(Some(Expr::Call(builtin.call_index(), args)));
+        return Ok(Some(Expr::Call(builtin.call_index(), Vec::new(), args)));
     }
     Ok(None)
 }
@@ -1313,13 +1326,19 @@ fn lower_scheme_direct_regex_or_builtin_call(
 fn build_scheme_regex_flags_pattern_expr(pattern: Expr, flags: Expr) -> Expr {
     let prefix = Expr::Call(
         BuiltinFunction::Concat.call_index(),
+        Vec::new(),
         vec![Expr::String("(?".to_string()), flags],
     );
     let prefix = Expr::Call(
         BuiltinFunction::Concat.call_index(),
+        Vec::new(),
         vec![prefix, Expr::String(")".to_string())],
     );
-    Expr::Call(BuiltinFunction::Concat.call_index(), vec![prefix, pattern])
+    Expr::Call(
+        BuiltinFunction::Concat.call_index(),
+        Vec::new(),
+        vec![prefix, pattern],
+    )
 }
 fn lower_scheme_direct_hash_expr(
     args: &[SchemeForm],
@@ -1329,7 +1348,7 @@ fn lower_scheme_direct_hash_expr(
     capture_enabled: bool,
     import_context: Option<&NormalizedSchemeImportContext>,
 ) -> Result<Option<Expr>, ParseError> {
-    let mut expr = Expr::Call(BuiltinFunction::MapNew.call_index(), Vec::new());
+    let mut expr = Expr::Call(BuiltinFunction::MapNew.call_index(), Vec::new(), Vec::new());
     for entry in args {
         let Some(pair) = entry.as_list() else {
             return Ok(None);
@@ -1359,7 +1378,11 @@ fn lower_scheme_direct_hash_expr(
         else {
             return Ok(None);
         };
-        expr = Expr::Call(BuiltinFunction::Set.call_index(), vec![expr, key, value]);
+        expr = Expr::Call(
+            BuiltinFunction::Set.call_index(),
+            Vec::new(),
+            vec![expr, key, value],
+        );
     }
     Ok(Some(expr))
 }

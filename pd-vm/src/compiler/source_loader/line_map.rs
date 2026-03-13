@@ -77,7 +77,7 @@ fn remap_stmt_line_numbers(stmt: &mut Stmt, offset: u32) {
 
 fn remap_expr_line_numbers(expr: &mut Expr, offset: u32) {
     match expr {
-        Expr::Call(_, args) | Expr::LocalCall(_, args) => {
+        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => {
             for arg in args {
                 remap_expr_line_numbers(arg, offset);
             }

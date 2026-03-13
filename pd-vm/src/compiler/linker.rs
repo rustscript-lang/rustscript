@@ -5,7 +5,7 @@ use crate::builtins::BuiltinFunction;
 
 use super::{
     ParseError, SourceError, SourcePathError,
-    ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, TypeSchema},
+    ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, StructDecl},
 };
 
 pub(super) struct ParsedUnit {
@@ -33,7 +33,7 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
     let mut merged_stmts = Vec::new();
     let mut merged_stmt_sources = Vec::new();
     let mut merged_local_bindings = Vec::new();
-    let mut merged_struct_schemas = HashMap::<String, TypeSchema>::new();
+    let mut merged_struct_schemas = HashMap::<String, StructDecl>::new();
     let mut merged_unknown_type_spans = Vec::new();
     let mut merged_functions = Vec::new();
     let mut merged_function_impls = HashMap::<u16, FunctionImpl>::new();
@@ -197,6 +197,41 @@ fn remap_functions(
                     }
                 }
             }
+            if existing.type_params != func.type_params {
+                if existing.type_params.is_empty() {
+                    existing.type_params = func.type_params.clone();
+                } else if !func.type_params.is_empty() {
+                    return Err(SourcePathError::Source(SourceError::Parse(ParseError {
+                        span: None,
+                        code: None,
+                        line: 1,
+                        message: format!(
+                            "function '{}' declared with conflicting type parameters across imported modules",
+                            func.name
+                        ),
+                    })));
+                }
+            }
+            if existing.arg_schemas != func.arg_schemas {
+                if existing.arg_schemas.iter().all(Option::is_none) {
+                    existing.arg_schemas = func.arg_schemas.clone();
+                } else if !func.arg_schemas.iter().all(Option::is_none) {
+                    return Err(SourcePathError::Source(SourceError::Parse(ParseError {
+                        span: None,
+                        code: None,
+                        line: 1,
+                        message: format!(
+                            "function '{}' declared with conflicting parameter schemas across imported modules",
+                            func.name
+                        ),
+                    })));
+                }
+            }
+            if function_args_are_placeholders(&existing.args)
+                && !function_args_are_placeholders(&func.args)
+            {
+                existing.args = func.args.clone();
+            }
             existing.exported = existing.exported || func.exported;
             *existing_index
         } else {
@@ -213,6 +248,8 @@ fn remap_functions(
                 arity: func.arity,
                 index: next_index,
                 args: func.args.clone(),
+                arg_schemas: func.arg_schemas.clone(),
+                type_params: func.type_params.clone(),
                 exported: func.exported,
                 return_type: func.return_type,
             });
@@ -223,6 +260,12 @@ fn remap_functions(
     }
 
     Ok(map)
+}
+
+fn function_args_are_placeholders(args: &[String]) -> bool {
+    args.iter()
+        .enumerate()
+        .all(|(index, arg)| arg == &format!("arg{index}"))
 }
 
 fn value_type_name(ty: crate::ValueType) -> &'static str {
@@ -357,7 +400,7 @@ fn remap_expr_indices(
                 })));
             }
         }
-        Expr::Call(index, args) => {
+        Expr::Call(index, _, args) => {
             if let Some(remapped_index) = function_map.get(index).copied() {
                 *index = remapped_index;
             } else if BuiltinFunction::from_call_index(*index).is_none() {
@@ -393,7 +436,7 @@ fn remap_expr_indices(
             remap_expr_indices(value, local_base, function_map)?;
             remap_expr_indices(fallback, local_base, function_map)?;
         }
-        Expr::LocalCall(index, args) => {
+        Expr::LocalCall(index, _, args) => {
             *index = remap_local_index(*index, local_base)?;
             for arg in args {
                 remap_expr_indices(arg, local_base, function_map)?;

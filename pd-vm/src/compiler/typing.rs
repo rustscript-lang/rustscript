@@ -12,22 +12,25 @@ use self::collect::{collect_function_types, collect_stmt_types};
 use self::context::TypeContext;
 pub(crate) use self::context::bound_type_from_schema;
 use self::helpers::{
-    FunctionLegalizeEnv, build_function_names, build_host_import_return_types,
-    legalize_function_impl, legalize_stmts, validate_function_impl, validate_stmts,
+    FunctionLegalizeEnv, build_function_decl_map, build_function_names,
+    build_host_import_return_types, legalize_function_impl, legalize_stmts, validate_function_impl,
+    validate_stmts,
 };
 pub(crate) use self::state::{
     BoundType, HostCallableSignature, LocalTypeState, TypeInferenceResult,
 };
 use super::CompileError;
-use super::ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, Stmt, TypeSchema};
+use super::ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, Stmt, StructDecl, TypeSchema};
 pub(super) fn legalize_builtins_and_bind_types(mut ir: FrontendIr) -> FrontendIr {
     let function_names = build_function_names(&ir.functions);
+    let function_decls = build_function_decl_map(&ir.functions);
     let host_import_return_types =
         build_host_import_return_types(&ir.functions, &ir.function_impls);
     let host_import_signatures = build_host_import_signatures(&ir.functions, &ir.function_impls);
     let mut top_state = LocalTypeState::default();
     let mut context = TypeContext::new(
         &ir.function_impls,
+        &function_decls,
         &ir.struct_schemas,
         &function_names,
         &host_import_return_types,
@@ -42,6 +45,7 @@ pub(super) fn legalize_builtins_and_bind_types(mut ir: FrontendIr) -> FrontendIr
     let function_impls = ir.function_impls.clone();
     let legalize_env = FunctionLegalizeEnv {
         function_impls: &function_impls,
+        function_decls: &function_decls,
         function_names: &function_names,
         struct_schemas: &ir.struct_schemas,
         host_import_return_types: &host_import_return_types,
@@ -59,14 +63,17 @@ pub(super) fn legalize_builtins_and_bind_types(mut ir: FrontendIr) -> FrontendIr
 
 pub(super) fn infer_types(ir: &FrontendIr) -> TypeInferenceResult {
     let function_names = build_function_names(&ir.functions);
+    let function_decls = build_function_decl_map(&ir.functions);
     let host_import_return_types =
         build_host_import_return_types(&ir.functions, &ir.function_impls);
     let host_import_signatures = build_host_import_signatures(&ir.functions, &ir.function_impls);
     let mut local_types = vec![ValueType::Unknown; ir.locals];
+    let mut local_schema_labels = vec![None; ir.locals];
     let mut callable_slots = vec![false; ir.locals];
     let mut top_state = LocalTypeState::default();
     let mut context = TypeContext::new(
         &ir.function_impls,
+        &function_decls,
         &ir.struct_schemas,
         &function_names,
         &host_import_return_types,
@@ -77,6 +84,7 @@ pub(super) fn infer_types(ir: &FrontendIr) -> TypeInferenceResult {
         &ir.stmts,
         &mut top_state,
         &mut local_types,
+        &mut local_schema_labels,
         &mut callable_slots,
         &mut context,
     );
@@ -91,9 +99,12 @@ pub(super) fn infer_types(ir: &FrontendIr) -> TypeInferenceResult {
         collect_function_types(
             decl.index,
             function_impl,
+            decl,
             &mut local_types,
+            &mut local_schema_labels,
             &mut callable_slots,
             &ir.function_impls,
+            &function_decls,
             &function_names,
             &ir.struct_schemas,
             &host_import_return_types,
@@ -106,6 +117,7 @@ pub(super) fn infer_types(ir: &FrontendIr) -> TypeInferenceResult {
 
     TypeInferenceResult {
         local_types,
+        local_schema_labels,
         callable_slots,
     }
 }
@@ -115,12 +127,14 @@ pub(super) fn validate_if_else_type_consistency(
     require_declared_schema_for_optional_access: bool,
 ) -> Result<(), CompileError> {
     let function_names = build_function_names(&ir.functions);
+    let function_decls = build_function_decl_map(&ir.functions);
     let host_import_return_types =
         build_host_import_return_types(&ir.functions, &ir.function_impls);
     let host_import_signatures = build_host_import_signatures(&ir.functions, &ir.function_impls);
     let mut top_state = LocalTypeState::default();
     let mut context = TypeContext::new(
         &ir.function_impls,
+        &function_decls,
         &ir.struct_schemas,
         &function_names,
         &host_import_return_types,
@@ -157,13 +171,16 @@ pub(super) fn validate_if_else_type_consistency(
 
 pub(crate) fn infer_expr_type(expr: &Expr, state: &LocalTypeState) -> BoundType {
     let empty_impls: HashMap<u16, FunctionImpl> = HashMap::new();
+    let empty_function_decls: HashMap<u16, FunctionDecl> = HashMap::new();
+    let empty_struct_schemas: HashMap<String, StructDecl> = HashMap::new();
     let empty_imports: HashMap<u16, BoundType> = HashMap::new();
     let empty_signatures: HashMap<u16, HostCallableSignature> = HashMap::new();
     infer_expr_type_with_function_impls_and_imports(
         expr,
         state,
         &empty_impls,
-        &HashMap::new(),
+        &empty_function_decls,
+        &empty_struct_schemas,
         &empty_imports,
         &empty_signatures,
     )
@@ -173,13 +190,15 @@ pub(crate) fn infer_expr_type_with_function_impls_and_imports(
     expr: &Expr,
     state: &LocalTypeState,
     function_impls: &HashMap<u16, FunctionImpl>,
-    struct_schemas: &HashMap<String, TypeSchema>,
+    function_decls: &HashMap<u16, FunctionDecl>,
+    struct_schemas: &HashMap<String, StructDecl>,
     host_import_return_types: &HashMap<u16, BoundType>,
     host_import_signatures: &HashMap<u16, HostCallableSignature>,
 ) -> BoundType {
     let empty_function_names: HashMap<u16, String> = HashMap::new();
     let mut context = TypeContext::new(
         function_impls,
+        function_decls,
         struct_schemas,
         &empty_function_names,
         host_import_return_types,
@@ -193,13 +212,15 @@ pub(crate) fn infer_expr_schema_with_function_impls_and_imports(
     expr: &Expr,
     state: &LocalTypeState,
     function_impls: &HashMap<u16, FunctionImpl>,
-    struct_schemas: &HashMap<String, TypeSchema>,
+    function_decls: &HashMap<u16, FunctionDecl>,
+    struct_schemas: &HashMap<String, StructDecl>,
     host_import_return_types: &HashMap<u16, BoundType>,
     host_import_signatures: &HashMap<u16, HostCallableSignature>,
 ) -> Option<TypeSchema> {
     let empty_function_names: HashMap<u16, String> = HashMap::new();
     let mut context = TypeContext::new(
         function_impls,
+        function_decls,
         struct_schemas,
         &empty_function_names,
         host_import_return_types,
@@ -213,13 +234,15 @@ pub(crate) fn expr_is_optional_with_function_impls_and_imports(
     expr: &Expr,
     state: &LocalTypeState,
     function_impls: &HashMap<u16, FunctionImpl>,
-    struct_schemas: &HashMap<String, TypeSchema>,
+    function_decls: &HashMap<u16, FunctionDecl>,
+    struct_schemas: &HashMap<String, StructDecl>,
     host_import_return_types: &HashMap<u16, BoundType>,
     host_import_signatures: &HashMap<u16, HostCallableSignature>,
 ) -> bool {
     let empty_function_names: HashMap<u16, String> = HashMap::new();
     let mut context = TypeContext::new(
         function_impls,
+        function_decls,
         struct_schemas,
         &empty_function_names,
         host_import_return_types,
@@ -233,13 +256,15 @@ pub(crate) fn infer_optional_expr_inner_type_with_function_impls_and_imports(
     expr: &Expr,
     state: &LocalTypeState,
     function_impls: &HashMap<u16, FunctionImpl>,
-    struct_schemas: &HashMap<String, TypeSchema>,
+    function_decls: &HashMap<u16, FunctionDecl>,
+    struct_schemas: &HashMap<String, StructDecl>,
     host_import_return_types: &HashMap<u16, BoundType>,
     host_import_signatures: &HashMap<u16, HostCallableSignature>,
 ) -> BoundType {
     let empty_function_names: HashMap<u16, String> = HashMap::new();
     let mut context = TypeContext::new(
         function_impls,
+        function_decls,
         struct_schemas,
         &empty_function_names,
         host_import_return_types,
@@ -253,13 +278,15 @@ pub(crate) fn infer_optional_expr_inner_schema_with_function_impls_and_imports(
     expr: &Expr,
     state: &LocalTypeState,
     function_impls: &HashMap<u16, FunctionImpl>,
-    struct_schemas: &HashMap<String, TypeSchema>,
+    function_decls: &HashMap<u16, FunctionDecl>,
+    struct_schemas: &HashMap<String, StructDecl>,
     host_import_return_types: &HashMap<u16, BoundType>,
     host_import_signatures: &HashMap<u16, HostCallableSignature>,
 ) -> Option<TypeSchema> {
     let empty_function_names: HashMap<u16, String> = HashMap::new();
     let mut context = TypeContext::new(
         function_impls,
+        function_decls,
         struct_schemas,
         &empty_function_names,
         host_import_return_types,
@@ -273,13 +300,15 @@ pub(crate) fn apply_stmts_with_function_impls_and_imports(
     stmts: &[Stmt],
     state: &mut LocalTypeState,
     function_impls: &HashMap<u16, FunctionImpl>,
-    struct_schemas: &HashMap<String, TypeSchema>,
+    function_decls: &HashMap<u16, FunctionDecl>,
+    struct_schemas: &HashMap<String, StructDecl>,
     host_import_return_types: &HashMap<u16, BoundType>,
     host_import_signatures: &HashMap<u16, HostCallableSignature>,
 ) {
     let empty_function_names: HashMap<u16, String> = HashMap::new();
     let mut context = TypeContext::new(
         function_impls,
+        function_decls,
         struct_schemas,
         &empty_function_names,
         host_import_return_types,

@@ -352,6 +352,7 @@ where
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TypeInferenceResult {
     pub local_types: Vec<ValueType>,
+    pub local_schema_labels: Vec<Option<String>>,
     pub callable_slots: Vec<bool>,
 }
 

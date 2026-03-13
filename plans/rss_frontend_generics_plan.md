@@ -16,22 +16,23 @@ use json;
 struct MyStruct { name: string }
 struct Box<T> { value: T }
 
-fn myfn<T>() {
-  let b: T = something;
+fn myfn<T>(v: T) {
+  let b = v;
   b
 }
 
-let v = myfn::<string>();
+let v = myfn::<string>("hello");
 let boxed: Box<string> = { value: "hello" };
 let payload = json::decode::<MyStruct>(text);
 ```
 
 Desired behavior:
 
-- `fn a<T>()` and `fn a<T, U>()` parse successfully
+- `fn a<T>()`, `fn a<T, U>()`, and `fn a<T>(value: T)` parse successfully
 - `struct Box<T> { value: T }` and `Box<string>` parse successfully
-- `T` and `U` are valid type names inside generic function bodies
-- `myfn::<string>()` makes the result infer as `string`
+- `T` and `U` are valid type names inside generic function bodies and generic RSS parameter schemas
+- `let b = v` inside an instantiated generic function preserves the schema of `v`, so if `v: T` then `b` is also `T`
+- `myfn::<string>("hello")` makes the result infer as `string`
 - `Box<string>` preserves the instantiated field schema, so `.value` is known as `string`
 - `json::decode::<MyStruct>(text)` makes the result infer as schema `MyStruct`
 - generics stay compile-time only in the base version; bytecode and VM runtime remain unchanged
@@ -43,8 +44,10 @@ The base rollout is still explicit-only.
 Supported:
 
 - explicit type params on RSS functions
+- generic params in RSS parameter schema positions such as `v: T`
 - explicit type params on RSS structs
 - explicit type args on RSS function calls
+- propagation of instantiated generic schemas through local `let` bindings inside generic RSS functions
 - explicit type args in schema positions such as `Box<string>`
 - explicit type args on supported host functions
 
@@ -56,6 +59,8 @@ Not in the base rollout:
 - runtime schema-aware host execution
 - inference of missing type args from value arguments
 - inference of missing type args from expected result context
+
+Once a call site explicitly supplies type args, ordinary local inference inside that instantiated body is still in scope. For example, `let b = v` should preserve `T` when `v: T`.
 
 ## Follow-On Scope
 
@@ -91,9 +96,10 @@ The current compiler already has most of the machinery needed for compile-time-o
 
 - The parser supports declared local schemas and named struct schemas in [pd-vm/src/compiler/parser/statements.rs](../pd-vm/src/compiler/parser/statements.rs), but every non-primitive type name is currently treated as either a struct schema reference or an error.
 - Struct schemas are currently stored as `HashMap<String, TypeSchema>` in [pd-vm/src/compiler/ir.rs](../pd-vm/src/compiler/ir.rs), which is sufficient for concrete structs but not for `struct Box<T> { ... }` plus `Box<string>`.
-- Function declarations only carry `name`, `arity`, `args`, `exported`, and coarse `return_type` in [pd-vm/src/compiler/ir.rs](../pd-vm/src/compiler/ir.rs).
+- Function declarations only carry `name`, `arity`, `args`, `exported`, and coarse `return_type` in [pd-vm/src/compiler/ir.rs](../pd-vm/src/compiler/ir.rs), so parameter schema annotations such as `v: T` are not yet represented.
 - Call expressions do not carry explicit type arguments in [pd-vm/src/compiler/ir.rs](../pd-vm/src/compiler/ir.rs).
 - The analyzer already propagates call-site information into RSS function bodies in [pd-vm/src/compiler/typing/context.rs](../pd-vm/src/compiler/typing/context.rs), but its observation maps are keyed only by function index, so different generic instantiations would currently collapse together.
+- Local inference is still primarily driven by coarse bound types, so `let b = v` inside a generic instantiation needs explicit schema propagation to preserve `b` as `T` instead of only a coarse runtime category.
 - Host functions already expose coarse return types and parameter signatures through [pd-vm/src/compiler/parser/symbols.rs](../pd-vm/src/compiler/parser/symbols.rs), [pd-vm/src/compiler/typing/helpers.rs](../pd-vm/src/compiler/typing/helpers.rs), [pd-vm/src/builtins/metadata.rs](../pd-vm/src/builtins/metadata.rs), and [pd-vm/build.rs](../pd-vm/build.rs), but they do not expose generic metadata or return-schema templates.
 
 ## High-Level Design
@@ -189,6 +195,21 @@ where `GenericOwner` can represent at least:
 
 All generic-aware inference and validation should be keyed by that instance, not only by function index or bare struct name.
 
+### 5. Preserve generic schema identity across local bindings
+
+Once a generic function is instantiated, local bindings derived from other locals or parameters must carry the same instantiated schema, not only the coarse `BoundType`.
+
+This matters for flows such as:
+
+```rss
+fn myfn<T>(v: T) {
+  let b = v;
+  b
+}
+```
+
+If `v` is schema `T`, then `b` must also be tracked as `T`. Otherwise return inference, diagnostics, and hover output will collapse too early.
+
 ## Implementation Phases
 
 ## Phase 1: Parser And IR
@@ -204,7 +225,7 @@ Files:
 
 Changes:
 
-1. Extend `FunctionDecl` with `type_params: Vec<String>`.
+1. Extend `FunctionDecl` with `type_params: Vec<String>` and parameter declaration metadata that can carry optional schemas such as `v: T`.
 2. Add explicit generic struct declaration metadata in [pd-vm/src/compiler/ir.rs](../pd-vm/src/compiler/ir.rs).
 3. Extend `Expr::Call` and `Expr::LocalCall` to carry `type_args: Vec<TypeSchema>`.
 4. Parse optional generic params after the function name:
@@ -214,30 +235,37 @@ fn a<T>() {}
 fn a<T, U>() {}
 ```
 
-5. Parse optional generic params after the struct name:
+5. Parse optional declared schemas on RSS function params and allow generic params in those schema positions:
+
+```rss
+fn myfn<T>(v: T) {}
+fn pair<T, U>(left: T, right: U) {}
+```
+
+6. Parse optional generic params after the struct name:
 
 ```rss
 struct Box<T> { value: T }
 struct Pair<T, U> { left: T, right: U }
 ```
 
-6. Parse optional turbofish syntax immediately before call parentheses:
+7. Parse optional turbofish syntax immediately before call parentheses:
 
 ```rss
-myfn::<string>()
+myfn::<string>("hello")
 json::decode::<MyStruct>(text)
 ```
 
-7. Parse named type application in schema positions:
+8. Parse named type application in schema positions:
 
 ```rss
 let boxed: Box<string> = { value: "hello" };
 let pair: Pair<string, int> = { left: "x", right: 1 };
 ```
 
-8. Track active type-param names while parsing generic function bodies and generic struct bodies so `T` is accepted as a schema reference inside those scopes.
-9. Update schema-reference validation in the parser so active generic params are not rejected as unknown struct schemas.
-10. Update linker merge logic in [pd-vm/src/compiler/linker.rs](../pd-vm/src/compiler/linker.rs) so it preserves and validates generic structs and generic functions when imported modules are merged.
+9. Track active type-param names while parsing generic function bodies, generic function parameter schemas, and generic struct bodies so `T` is accepted as a schema reference inside those scopes.
+10. Update schema-reference validation in the parser so active generic params are not rejected as unknown struct schemas.
+11. Update linker merge logic in [pd-vm/src/compiler/linker.rs](../pd-vm/src/compiler/linker.rs) so it preserves and validates generic structs and generic functions when imported modules are merged.
 
 Notes:
 
@@ -269,10 +297,13 @@ Changes:
 6. Update field/index access inference so:
    - `T` does not expose fields unless it resolves to a concrete schema in the current instantiation
    - `Box<string>.value` resolves as `string`
+7. Update local-binding schema propagation so:
+   - `let b = v` copies the instantiated schema of `v`, not only its coarse bound type
+   - when `v: T`, `b` is tracked as `T` and can be returned as `T`
 
 Why this matters:
 
-- The analyzer must preserve the fact that a slot is `T`, even when its coarse runtime category is only `string`, `map`, or `unknown`.
+- The analyzer must preserve the fact that a slot is `T`, even when its coarse runtime category is only `string`, `map`, or `unknown`, and even when that slot is copied through `let b = v`.
 - The analyzer must also preserve instantiated generic struct shapes so `boxed.value` resolves correctly for `Box<string>`.
 
 ## Phase 3: RSS Function Explicit Instantiation And Return Inference
@@ -292,20 +323,20 @@ Changes:
 (function_index, type_args)
 ```
 
-2. Update `infer_function_return(...)` so it accepts explicit type args, creates a generic substitution environment, seeds the function body under that environment, and infers the return from the instantiated body.
+2. Update `infer_function_return(...)` so it accepts explicit type args, creates a generic substitution environment, seeds declared parameter schemas and the function body under that environment, and infers the return from the instantiated body.
 3. Do not rely on the existing "observed parameter types per function index" maps for generic functions. Those maps will conflate distinct instantiations.
 4. Either:
    - maintain generic observation and validation caches per instantiation, or
    - analyze generic functions on demand at each call site and cache the result by instantiation key
-5. Preserve the instantiated schema on the return value so this works:
+5. Preserve the instantiated schema on local derived bindings and on the return value so this works:
 
 ```rss
-fn myfn<T>() {
-  let b: T = something;
+fn myfn<T>(v: T) {
+  let b = v;
   b
 }
 
-let v = myfn::<string>();
+let v = myfn::<string>("hello");
 ```
 
 and `v` is inferred as `string`.
@@ -395,10 +426,11 @@ Files:
 Changes:
 
 1. Ensure generic metadata survives the parse -> legalize -> validate -> infer -> compile pipeline.
-2. Keep local type hints correct for instantiated results such as `v = myfn::<string>()`.
-3. Keep local type hints correct for instantiated generic structs such as `boxed: Box<string>`.
-4. Prefer rendering local hover and type hints as `T`, `Box<string>`, or `MyStruct` when schema knowledge exists, rather than collapsing everything to only coarse `ValueType`.
-5. Update completion and hover strings so generic RSS functions, generic RSS structs, and generic host functions display their type params.
+2. Keep local type hints correct for instantiated results such as `v = myfn::<string>("hello")`.
+3. Keep local type hints inside generic RSS functions correct for derived locals such as `let b = v`, where both locals should still render as `T` under the active instantiation.
+4. Keep local type hints correct for instantiated generic structs such as `boxed: Box<string>`.
+5. Prefer rendering local hover and type hints as `T`, `Box<string>`, or `MyStruct` when schema knowledge exists, rather than collapsing everything to only coarse `ValueType`.
+6. Update completion and hover strings so generic RSS functions, generic RSS structs, and generic host functions display their type params.
 
 This phase is not required for semantic correctness, but without it the feature will feel incomplete in the editor.
 
@@ -428,7 +460,7 @@ let p = pair("a", 1);
 
 Implications:
 
-- RSS likely needs typed function parameters such as `value: T` if inference is meant to be declarative and predictable.
+- Call-site inference should build on typed function parameters such as `value: T`; the base generic work should already parse and represent those parameter schemas in explicit-instantiation mode.
 - The analyzer needs a unification step from actual argument schemas to generic params.
 - Partial inference must define clear rules for conflicts and missing information.
 
@@ -497,6 +529,10 @@ Adding generic structs means the current plain `struct_schemas: HashMap<String, 
 
 Inferring `T` from `id("hello")` and `let s: string = make()` requires more than explicit turbofish parsing. Those follow-on phases need either typed RSS parameters, expected-type propagation, or both.
 
+### Risk 6: local copies can lose generic schema identity
+
+If local binding inference only copies coarse `BoundType`, then `let b = v` inside `fn myfn<T>(v: T)` will degrade `b` from schema `T` to only a runtime category. That would break return inference, diagnostics, and editor hints for generic locals.
+
 ## Verification Plan
 
 Add tests in:
@@ -510,6 +546,7 @@ Coverage:
 1. Parse success:
    - `fn a<T>() {}`
    - `fn a<T, U>() {}`
+   - `fn myfn<T>(v: T) { let b = v; b }`
    - `struct Box<T> { value: T }`
    - `let boxed: Box<string> = { value: "hello" };`
    - `json::decode::<Profile>(text)`
@@ -519,7 +556,8 @@ Coverage:
    - duplicate type param names
    - turbofish on non-generic RSS function
 3. RSS inference:
-   - `myfn::<string>()` returns `string`
+   - `myfn::<string>("hello")` returns `string`
+   - inside `fn myfn<T>(v: T) { let b = v; b }`, `b` is tracked as `T`
    - same generic function instantiated as `string` and `int` in the same source
 4. Generic struct schema inference:
    - `Box<string>` exposes `.value` as `string`

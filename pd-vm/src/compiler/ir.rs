@@ -15,7 +15,8 @@ pub enum TypeSchema {
     Float,
     Bool,
     String,
-    Named(String),
+    GenericParam(String),
+    Named(String, Vec<TypeSchema>),
     Array(Box<TypeSchema>),
     ArrayTuple(Vec<TypeSchema>),
     ArrayTupleRest {
@@ -55,6 +56,19 @@ impl TypeSchema {
             Some(TypeSchema::Unknown)
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionParam {
+    pub name: String,
+    pub schema: Option<TypeSchema>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructDecl {
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub body_schema: TypeSchema,
 }
 
 fn known_host_accepts_arity(name: &str, arity: u8) -> bool {
@@ -134,8 +148,8 @@ pub enum Expr {
         value_slot: LocalSlot,
         fallback: Box<Expr>,
     },
-    Call(u16, Vec<Expr>),
-    LocalCall(LocalSlot, Vec<Expr>),
+    Call(u16, Vec<TypeSchema>, Vec<Expr>),
+    LocalCall(LocalSlot, Vec<TypeSchema>, Vec<Expr>),
     Closure(ClosureExpr),
     ClosureCall(ClosureExpr, Vec<Expr>),
     Add(Box<Expr>, Box<Expr>),
@@ -274,6 +288,8 @@ pub struct FunctionDecl {
     pub arity: u8,
     pub index: u16,
     pub args: Vec<String>,
+    pub arg_schemas: Vec<Option<TypeSchema>>,
+    pub type_params: Vec<String>,
     pub exported: bool,
     pub return_type: ValueType,
 }
@@ -292,7 +308,7 @@ pub struct FrontendIr {
     pub stmts: Vec<Stmt>,
     pub locals: usize,
     pub local_bindings: Vec<(String, LocalSlot)>,
-    pub struct_schemas: HashMap<String, TypeSchema>,
+    pub struct_schemas: HashMap<String, StructDecl>,
     pub unknown_type_spans: Vec<crate::compiler::source_map::Span>,
     pub functions: Vec<FunctionDecl>,
     pub function_impls: HashMap<u16, FunctionImpl>,
@@ -412,6 +428,8 @@ impl LocalIrBuilder {
             args: (0..effective_arity)
                 .map(|slot| format!("arg{slot}"))
                 .collect(),
+            arg_schemas: vec![None; usize::from(effective_arity)],
+            type_params: Vec::new(),
             exported: false,
             return_type: ValueType::Unknown,
         });
@@ -421,7 +439,7 @@ impl LocalIrBuilder {
 
     pub(crate) fn resolve_call_expr(&mut self, name: &str, args: Vec<Expr>) -> Option<Expr> {
         if let Some(local_index) = self.locals.get(name).copied() {
-            return Some(Expr::LocalCall(local_index, args));
+            return Some(Expr::LocalCall(local_index, Vec::new(), args));
         }
         let (func_index, declared_arity) = self.function_meta.get(name).copied()?;
         let call_arity = u8::try_from(args.len()).ok()?;
@@ -441,7 +459,7 @@ impl LocalIrBuilder {
                     .insert(name.to_string(), (func_index, Some(call_arity)));
             }
         }
-        Some(Expr::Call(func_index, args))
+        Some(Expr::Call(func_index, Vec::new(), args))
     }
 
     pub(crate) fn finish(self, stmts: Vec<Stmt>) -> FrontendIr {

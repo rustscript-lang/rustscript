@@ -189,7 +189,7 @@ pub(super) fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
             value_slot,
             fallback,
         } => *value_slot == slot || expr_uses_slot(value, slot) || expr_uses_slot(fallback, slot),
-        Expr::Call(_, args) | Expr::LocalCall(_, args) => {
+        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => {
             args.iter().any(|arg| expr_uses_slot(arg, slot))
         }
         Expr::Closure(closure) => {
@@ -418,7 +418,7 @@ pub(super) fn collect_consumed_positions_from_expr(
                 out,
             );
         }
-        Expr::Call(index, args) => {
+        Expr::Call(index, _, args) => {
             for arg in args {
                 collect_consumed_positions_from_expr(
                     arg,
@@ -457,7 +457,7 @@ pub(super) fn collect_consumed_positions_from_expr(
                 }
             }
         }
-        Expr::LocalCall(_, args) => {
+        Expr::LocalCall(_, _, args) => {
             for arg in args {
                 collect_consumed_positions_from_expr(
                     arg,
