@@ -176,6 +176,7 @@ pub(super) fn parse_lua_direct_expr_top(
 pub(super) fn build_lua_unpack_get_expr(target: Expr, index: i64) -> Expr {
     Expr::Call(
         BuiltinFunction::Get.call_index(),
+        Vec::new(),
         vec![target, Expr::Int(index)],
     )
 }
@@ -262,7 +263,7 @@ fn lower_lua_callable_call(
     let unpack_arity = callee.callable_return_arity.unwrap_or(1);
     match callee.expr {
         Expr::Var(slot) => Some(LuaLoweredExpr {
-            expr: Expr::LocalCall(slot, args),
+            expr: Expr::LocalCall(slot, Vec::new(), args),
             unpack_arity,
             callable_return_arity: None,
         }),
@@ -272,7 +273,7 @@ fn lower_lua_callable_call(
             callable_return_arity: None,
         }),
         Expr::FunctionRef(index) => Some(LuaLoweredExpr {
-            expr: Expr::Call(index, args),
+            expr: Expr::Call(index, Vec::new(), args),
             unpack_arity,
             callable_return_arity: None,
         }),
@@ -389,6 +390,7 @@ pub(super) fn lower_lua_direct_expr(
             let target = lower_lua_direct_expr(*target, lowering, false)?;
             Some(LuaLoweredExpr::scalar(Expr::Call(
                 BuiltinFunction::Get.call_index(),
+                Vec::new(),
                 vec![target.expr, Expr::String(member)],
             )))
         }
@@ -402,26 +404,33 @@ pub(super) fn lower_lua_direct_expr(
             let key = lower_lua_direct_expr(*key, lowering, false)?;
             Some(LuaLoweredExpr::scalar(Expr::Call(
                 BuiltinFunction::Get.call_index(),
+                Vec::new(),
                 vec![target.expr, key.expr],
             )))
         }
         LuaDirectExpr::TableArray(values) => {
-            let mut out = Expr::Call(BuiltinFunction::ArrayNew.call_index(), Vec::new());
+            let mut out = Expr::Call(
+                BuiltinFunction::ArrayNew.call_index(),
+                Vec::new(),
+                Vec::new(),
+            );
             for value in values {
                 let value = lower_lua_direct_expr(value, lowering, false)?;
                 out = Expr::Call(
                     BuiltinFunction::ArrayPush.call_index(),
+                    Vec::new(),
                     vec![out, value.expr],
                 );
             }
             Some(LuaLoweredExpr::scalar(out))
         }
         LuaDirectExpr::TableMap(entries) => {
-            let mut out = Expr::Call(BuiltinFunction::MapNew.call_index(), Vec::new());
+            let mut out = Expr::Call(BuiltinFunction::MapNew.call_index(), Vec::new(), Vec::new());
             for (key, value) in entries {
                 let value = lower_lua_direct_expr(value, lowering, false)?;
                 out = Expr::Call(
                     BuiltinFunction::Set.call_index(),
+                    Vec::new(),
                     vec![out, Expr::String(key), value.expr],
                 );
             }
@@ -619,7 +628,7 @@ fn lower_lua_regex_or_builtin_namespace_call(
             _ => return None,
         };
         if builtin.accepts_arity(u8::try_from(args.len()).ok()?) {
-            return Some(Expr::Call(builtin.call_index(), args));
+            return Some(Expr::Call(builtin.call_index(), Vec::new(), args));
         }
         // Preserve the previous Lua frontend behavior where regex flags are
         // accepted as a third argument and rewritten into an inline pattern.
@@ -627,7 +636,7 @@ fn lower_lua_regex_or_builtin_namespace_call(
             let flags = args.pop()?;
             let pattern = args.first().cloned()?;
             args[0] = apply_lua_regex_flags_to_pattern_expr(pattern, flags);
-            return Some(Expr::Call(builtin.call_index(), args));
+            return Some(Expr::Call(builtin.call_index(), Vec::new(), args));
         }
         return None;
     }
@@ -636,19 +645,25 @@ fn lower_lua_regex_or_builtin_namespace_call(
     if !builtin.accepts_arity(u8::try_from(args.len()).ok()?) {
         return None;
     }
-    Some(Expr::Call(builtin.call_index(), args))
+    Some(Expr::Call(builtin.call_index(), Vec::new(), args))
 }
 
 fn apply_lua_regex_flags_to_pattern_expr(pattern: Expr, flags: Expr) -> Expr {
     let prefix = Expr::Call(
         BuiltinFunction::Concat.call_index(),
+        Vec::new(),
         vec![Expr::String("(?".to_string()), flags],
     );
     let prefix = Expr::Call(
         BuiltinFunction::Concat.call_index(),
+        Vec::new(),
         vec![prefix, Expr::String(")".to_string())],
     );
-    Expr::Call(BuiltinFunction::Concat.call_index(), vec![prefix, pattern])
+    Expr::Call(
+        BuiltinFunction::Concat.call_index(),
+        Vec::new(),
+        vec![prefix, pattern],
+    )
 }
 
 fn build_lua_optional_member_expr(
@@ -676,12 +691,14 @@ fn build_lua_optional_member_expr(
     let keys_len_expr = || {
         Expr::Call(
             BuiltinFunction::Len.call_index(),
+            Vec::new(),
             vec![Expr::Var(keys_slot)],
         )
     };
     let current_key_expr = || {
         Expr::Call(
             BuiltinFunction::Get.call_index(),
+            Vec::new(),
             vec![Expr::Var(keys_slot), Expr::Var(idx_slot)],
         )
     };
@@ -711,6 +728,7 @@ fn build_lua_optional_member_expr(
                         declared_schema: None,
                         expr: Expr::Call(
                             BuiltinFunction::Keys.call_index(),
+                            Vec::new(),
                             vec![Expr::Var(target_slot)],
                         ),
                         line,
@@ -771,6 +789,7 @@ fn build_lua_optional_member_expr(
                             index: result_slot,
                             expr: Expr::Call(
                                 BuiltinFunction::Get.call_index(),
+                                Vec::new(),
                                 vec![Expr::Var(target_slot), Expr::String(member)],
                             ),
                             line,

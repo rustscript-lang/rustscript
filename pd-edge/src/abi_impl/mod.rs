@@ -14,8 +14,10 @@ use vm::{CallOutcome, HostAsyncBridge, HostFunction, HostOpId, Value, Vm, VmErro
 
 pub(crate) mod http;
 mod http2;
+mod http3;
 mod io;
 mod proxy;
+mod quic;
 mod registry;
 mod runtime;
 mod transport;
@@ -31,6 +33,11 @@ pub(crate) use self::http2::{
     DownstreamHttp2ConnectionTracker, Http2DownstreamStreamAttachment,
     SharedHttpDownstreamSessions, SharedHttpUpstreamSessions, new_shared_http_downstream_sessions,
     new_shared_http_upstream_sessions,
+};
+pub(crate) use self::http3::{
+    DownstreamHttp3ConnectionTracker, Http3DownstreamStreamAttachment,
+    SharedHttp3DownstreamSessions, SharedHttp3UpstreamSessions, new_shared_http3_downstream_sessions,
+    new_shared_http3_upstream_sessions,
 };
 #[cfg(feature = "tls")]
 pub(crate) use self::transport::build_default_self_signed_server_config;

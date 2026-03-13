@@ -197,12 +197,12 @@ fn record_expr_local_debug_ranges(
             record_expr_local_debug_ranges(value, line, ranges);
             record_expr_local_debug_ranges(fallback, line, ranges);
         }
-        Expr::Call(_, args) => {
+        Expr::Call(_, _, args) => {
             for arg in args {
                 record_expr_local_debug_ranges(arg, line, ranges);
             }
         }
-        Expr::LocalCall(index, args) => {
+        Expr::LocalCall(index, _, args) => {
             note_local_use(ranges, *index, line);
             for arg in args {
                 record_expr_local_debug_ranges(arg, line, ranges);
@@ -380,6 +380,11 @@ fn compile_parsed_output_with_entry_locals(
         function_impls,
         ..
     } = parsed;
+    let function_decls = functions
+        .iter()
+        .cloned()
+        .map(|decl| (decl.index, decl))
+        .collect::<HashMap<_, _>>();
 
     let mut runtime_import_functions: Vec<FunctionDecl> = functions
         .iter()
@@ -414,6 +419,7 @@ fn compile_parsed_output_with_entry_locals(
     let mut compiler = Compiler::new();
     compiler.set_type_inference(type_info);
     compiler.set_source(source);
+    compiler.set_function_decls(function_decls);
     compiler.set_function_impls(function_impls);
     compiler.set_struct_schemas(struct_schemas);
     compiler.set_host_import_return_types(host_import_return_types);
@@ -664,6 +670,14 @@ fn collect_unknown_inferred_local_types(
         {
             continue;
         }
+        if type_info
+            .local_schema_labels
+            .get(slot_index)
+            .and_then(|label| label.as_ref())
+            .is_some_and(|label| label != "unknown")
+        {
+            continue;
+        }
         if type_info.local_types.get(slot_index) != Some(&crate::ValueType::Unknown) {
             continue;
         }
@@ -728,6 +742,14 @@ fn inferred_slot_type_name(type_info: &typing::TypeInferenceResult, slot: LocalS
         .unwrap_or(false)
     {
         return "function".to_string();
+    }
+    if let Some(label) = type_info
+        .local_schema_labels
+        .get(slot_index)
+        .and_then(|label| label.as_ref())
+        .filter(|label| label.as_str() != "unknown")
+    {
+        return label.clone();
     }
     value_type_name(
         type_info

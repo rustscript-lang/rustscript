@@ -17,8 +17,8 @@ fn observe_direct_function_call_types(
     context: &mut TypeContext<'_>,
 ) -> Result<(), CompileError> {
     let function_index = match expr {
-        Expr::Call(index, _) if context.function_impls.contains_key(index) => Some(*index),
-        Expr::LocalCall(slot, _) => match state.callable(*slot).cloned() {
+        Expr::Call(index, _, _) if context.function_impls.contains_key(index) => Some(*index),
+        Expr::LocalCall(slot, _, _) => match state.callable(*slot).cloned() {
             Some(InferredCallable::Function(index))
                 if context.function_impls.contains_key(&index) =>
             {
@@ -34,10 +34,16 @@ fn observe_direct_function_call_types(
     };
 
     let args = match expr {
-        Expr::Call(_, args) | Expr::LocalCall(_, args) => args,
+        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => args,
         _ => return Ok(()),
     };
-    context.observe_function_arg_types(function_index, args, state);
+    if context
+        .function_decls
+        .get(&function_index)
+        .is_some_and(|decl| decl.type_params.is_empty())
+    {
+        context.observe_function_arg_types(function_index, args, state);
+    }
     if let Some(detail) = context
         .function_param_conflicts
         .get(&function_index)
@@ -276,7 +282,7 @@ pub(super) fn validate_expr(
         )?,
         Expr::Var(slot) | Expr::MoveVar(slot) => state.get(*slot),
         Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => state.get(*root),
-        Expr::FunctionRef(_) | Expr::Call(_, _) | Expr::LocalCall(_, _) | Expr::Closure(_) => {
+        Expr::FunctionRef(_) | Expr::Call(..) | Expr::LocalCall(..) | Expr::Closure(_) => {
             validate_expr_children(
                 expr,
                 state,
@@ -540,7 +546,7 @@ fn validate_expr_children(
     strict_function_add_types: bool,
 ) -> Result<(), CompileError> {
     match expr {
-        Expr::Call(_, args) | Expr::LocalCall(_, args) => {
+        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => {
             for arg in args {
                 let _ = validate_expr(
                     arg,
@@ -559,11 +565,12 @@ fn validate_expr_children(
                     "call argument",
                 )?;
             }
-            if let Expr::LocalCall(slot, args) = expr
+            if let Expr::LocalCall(slot, _, args) = expr
                 && let Some(InferredCallable::Closure(closure)) = state.callable(*slot).cloned()
             {
                 validate_callable_body(
                     closure.param_slots.as_slice(),
+                    None,
                     closure.capture_copies.as_slice(),
                     &[],
                     &closure.body,
@@ -578,6 +585,7 @@ fn validate_expr_children(
         Expr::Closure(closure) => {
             validate_callable_body(
                 closure.param_slots.as_slice(),
+                None,
                 closure.capture_copies.as_slice(),
                 &[],
                 &closure.body,
@@ -609,6 +617,7 @@ fn validate_expr_children(
             }
             validate_callable_body(
                 closure.param_slots.as_slice(),
+                None,
                 closure.capture_copies.as_slice(),
                 &[],
                 &closure.body,
@@ -627,6 +636,7 @@ fn validate_expr_children(
 #[allow(clippy::too_many_arguments)]
 fn validate_callable_body(
     param_slots: &[LocalSlot],
+    param_schemas: Option<&[Option<super::super::ir::TypeSchema>]>,
     capture_copies: &[(LocalSlot, LocalSlot)],
     body_stmts: &[super::super::ir::Stmt],
     body_expr: &Expr,
@@ -636,7 +646,8 @@ fn validate_callable_body(
     source_name: Option<&str>,
     context: &mut TypeContext<'_>,
 ) -> Result<(), CompileError> {
-    let Some(mut nested) = context.build_callable_state(param_slots, capture_copies, args, state)
+    let Some(mut nested) =
+        context.build_callable_state(param_slots, param_schemas, capture_copies, args, state)
     else {
         return Ok(());
     };
@@ -666,7 +677,7 @@ fn validate_schema_access(
     source_name: Option<&str>,
     context: &mut TypeContext<'_>,
 ) -> Result<(), CompileError> {
-    let Expr::Call(index, args) = expr else {
+    let Expr::Call(index, _, args) = expr else {
         return Ok(());
     };
     if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get) || args.len() != 2 {
@@ -679,12 +690,12 @@ fn validate_schema_access(
             "member/index access",
         ));
     }
-    if !context.expr_has_declared_schema(&args[0], state) {
-        return Ok(());
-    }
     let Some(container_schema) = context.infer_expr_schema(&args[0], state) else {
         return Ok(());
     };
+    if !context.expr_has_struct_schema_source(&args[0], state) {
+        return Ok(());
+    }
     infer_access_schema(&container_schema, &args[1], context, state)
         .map(|_| ())
         .map_err(|detail| CompileError::InvalidFieldAccess {
@@ -827,7 +838,7 @@ fn extract_non_null_guard(condition: &Expr) -> Option<LocalSlot> {
 }
 
 fn extract_type_guard_side(lhs: &Expr, rhs: &Expr) -> Option<(LocalSlot, BoundType)> {
-    let Expr::Call(index, args) = lhs else {
+    let Expr::Call(index, _, args) = lhs else {
         return None;
     };
     if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::TypeOf) || args.len() != 1

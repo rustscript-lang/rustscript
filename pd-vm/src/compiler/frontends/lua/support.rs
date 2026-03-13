@@ -225,8 +225,18 @@ pub(super) fn lua_return_arity(exprs: Option<&[LuaLoweredExpr]>) -> usize {
 
 fn build_lua_packed_array_expr(values: Vec<Expr>) -> Expr {
     values.into_iter().fold(
-        Expr::Call(BuiltinFunction::ArrayNew.call_index(), Vec::new()),
-        |array, value| Expr::Call(BuiltinFunction::ArrayPush.call_index(), vec![array, value]),
+        Expr::Call(
+            BuiltinFunction::ArrayNew.call_index(),
+            Vec::new(),
+            Vec::new(),
+        ),
+        |array, value| {
+            Expr::Call(
+                BuiltinFunction::ArrayPush.call_index(),
+                Vec::new(),
+                vec![array, value],
+            )
+        },
     )
 }
 

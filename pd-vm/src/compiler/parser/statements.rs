@@ -272,12 +272,22 @@ impl Parser {
     pub(super) fn parse_struct_decl(&mut self) -> Result<Stmt, ParseError> {
         let line = self.last_line();
         let name = self.expect_ident("expected struct name after 'struct'")?;
+        let type_params = self.parse_type_params("struct", &name)?;
+        self.push_active_type_params(&type_params);
         self.expect(&TokenKind::LBrace, "expected '{' after struct name")?;
         let fields = self.parse_object_type_schema_fields()?;
+        self.pop_active_type_params();
         self.expect(&TokenKind::RBrace, "expected '}' after struct body")?;
         if self
             .struct_schemas
-            .insert(name.clone(), TypeSchema::Object(fields))
+            .insert(
+                name.clone(),
+                StructDecl {
+                    name: name.clone(),
+                    type_params,
+                    body_schema: TypeSchema::Object(fields),
+                },
+            )
             .is_some()
         {
             return Err(ParseError {
@@ -402,22 +412,38 @@ impl Parser {
     pub(super) fn parse_fn_decl(&mut self, exported: bool) -> Result<Stmt, ParseError> {
         let line = self.last_line();
         let name = self.expect_ident("expected function name after 'fn'")?;
+        let type_params = self.parse_type_params("function", &name)?;
+        self.push_active_type_params(&type_params);
         self.expect(&TokenKind::LParen, "expected '(' after function name")?;
         let mut params = Vec::new();
         if !self.check(&TokenKind::RParen) {
             loop {
                 let param = self.expect_ident("expected parameter name")?;
-                params.push(param);
+                let schema = if self.match_kind(&TokenKind::Colon) {
+                    Some(self.parse_declared_type_schema()?)
+                } else {
+                    None
+                };
+                params.push(FunctionParam {
+                    name: param,
+                    schema,
+                });
                 if self.match_kind(&TokenKind::Comma) {
                     continue;
                 }
                 break;
             }
         }
+        self.pop_active_type_params();
         self.expect(&TokenKind::RParen, "expected ')' after parameters")?;
         let return_type = self.parse_optional_declared_return_type()?;
+        let param_names = Self::function_param_names(&params);
+        let arg_schemas = params
+            .iter()
+            .map(|param| param.schema.clone())
+            .collect::<Vec<_>>();
 
-        let arity = u8::try_from(params.len()).map_err(|_| ParseError {
+        let arity = u8::try_from(param_names.len()).map_err(|_| ParseError {
             span: None,
             code: None,
             line: self.current_line(),
@@ -450,15 +476,18 @@ impl Parser {
             name: name.clone(),
             arity,
             index,
-            args: params.clone(),
+            args: param_names.clone(),
+            arg_schemas,
+            type_params: type_params.clone(),
             exported,
             return_type,
         };
         self.functions.insert(name.clone(), decl.clone());
         self.function_list.push(decl.clone());
 
+        self.push_active_type_params(&type_params);
         let has_impl = if self.match_kind(&TokenKind::Equal) {
-            let function_impl = self.parse_function_impl_expr(&params)?;
+            let function_impl = self.parse_function_impl_expr(&param_names)?;
             self.expect(
                 &TokenKind::Semicolon,
                 "expected ';' after function definition",
@@ -466,7 +495,7 @@ impl Parser {
             self.function_impls.insert(index, function_impl);
             true
         } else if self.match_kind(&TokenKind::LBrace) {
-            let function_impl = self.parse_function_impl_block(&params)?;
+            let function_impl = self.parse_function_impl_block(&param_names)?;
             self.expect(&TokenKind::RBrace, "expected '}' after function body")?;
             self.function_impls.insert(index, function_impl);
             // Optional trailing semicolon for compatibility.
@@ -479,12 +508,13 @@ impl Parser {
             )?;
             false
         };
+        self.pop_active_type_params();
 
         Ok(Stmt::FuncDecl {
             name,
             index,
             arity,
-            args: params,
+            args: param_names,
             exported,
             has_impl,
             line,
@@ -631,12 +661,42 @@ impl Parser {
                 "array" => TypeSchema::Array(Box::new(TypeSchema::Unknown)),
                 "map" => TypeSchema::Map(Box::new(TypeSchema::Unknown)),
                 other => {
-                    self.schema_reference_sites.push((
-                        other.to_string(),
-                        self.current_line(),
-                        span,
-                    ));
-                    TypeSchema::Named(other.to_string())
+                    let type_args = if self.check(&TokenKind::Less) {
+                        self.expect(&TokenKind::Less, "expected '<' before type arguments")?;
+                        let mut type_args = Vec::new();
+                        loop {
+                            type_args.push(self.parse_declared_type_schema()?);
+                            if self.match_kind(&TokenKind::Comma) {
+                                continue;
+                            }
+                            break;
+                        }
+                        self.expect(&TokenKind::Greater, "expected '>' after type arguments")?;
+                        type_args
+                    } else {
+                        Vec::new()
+                    };
+                    if self.is_active_type_param(other) {
+                        if !type_args.is_empty() {
+                            return Err(ParseError {
+                                span: Some(span),
+                                code: None,
+                                line: self.current_line(),
+                                message: format!(
+                                    "generic parameter '{other}' cannot be instantiated with type arguments"
+                                ),
+                            });
+                        }
+                        TypeSchema::GenericParam(other.to_string())
+                    } else {
+                        self.schema_reference_sites.push((
+                            other.to_string(),
+                            type_args.len(),
+                            self.current_line(),
+                            span,
+                        ));
+                        TypeSchema::Named(other.to_string(), type_args)
+                    }
                 }
             }
         };

@@ -311,7 +311,7 @@ impl AvailabilityAnalyzer {
                 self.capture_mode_for_expr(value, captured_slot, context, mode, seen);
                 self.capture_mode_for_expr(fallback, captured_slot, context, mode, seen);
             }
-            Expr::Call(_, args) | Expr::LocalCall(_, args) => {
+            Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => {
                 for arg in args {
                     self.capture_mode_for_expr(arg, captured_slot, context, mode, seen);
                 }

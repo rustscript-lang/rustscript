@@ -6,7 +6,7 @@ use crate::{Program, TypeMap, Value, ValueType};
 
 use super::ir::{
     ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, MatchTypePattern, Stmt,
-    TypeSchema,
+    StructDecl, TypeSchema,
 };
 use super::{CompileError, typing};
 
@@ -15,7 +15,8 @@ pub struct Compiler {
     next_label_id: u32,
     loop_stack: Vec<LoopContext>,
     function_impls: HashMap<u16, FunctionImpl>,
-    struct_schemas: HashMap<String, TypeSchema>,
+    function_decls: HashMap<u16, FunctionDecl>,
+    struct_schemas: HashMap<String, StructDecl>,
     host_import_return_types: HashMap<u16, typing::BoundType>,
     host_import_signatures: HashMap<u16, typing::HostCallableSignature>,
     call_index_remap: HashMap<u16, u16>,
@@ -58,6 +59,7 @@ impl Compiler {
             next_label_id: 0,
             loop_stack: Vec::new(),
             function_impls: HashMap::new(),
+            function_decls: HashMap::new(),
             struct_schemas: HashMap::new(),
             host_import_return_types: HashMap::new(),
             host_import_signatures: HashMap::new(),
@@ -99,7 +101,11 @@ impl Compiler {
         self.function_impls = function_impls;
     }
 
-    pub fn set_struct_schemas(&mut self, struct_schemas: HashMap<String, TypeSchema>) {
+    pub fn set_function_decls(&mut self, function_decls: HashMap<u16, FunctionDecl>) {
+        self.function_decls = function_decls;
+    }
+
+    pub fn set_struct_schemas(&mut self, struct_schemas: HashMap<String, StructDecl>) {
         self.struct_schemas = struct_schemas;
     }
 
@@ -246,6 +252,7 @@ impl Compiler {
                             condition,
                             iterated,
                             &self.function_impls,
+                            &self.function_decls,
                             &self.struct_schemas,
                             &self.host_import_return_types,
                             &self.host_import_signatures,
@@ -254,6 +261,7 @@ impl Compiler {
                             body,
                             iterated,
                             &self.function_impls,
+                            &self.function_decls,
                             &self.struct_schemas,
                             &self.host_import_return_types,
                             &self.host_import_signatures,
@@ -262,6 +270,7 @@ impl Compiler {
                             std::slice::from_ref(post),
                             iterated,
                             &self.function_impls,
+                            &self.function_decls,
                             &self.struct_schemas,
                             &self.host_import_return_types,
                             &self.host_import_signatures,
@@ -307,6 +316,7 @@ impl Compiler {
                             condition,
                             iterated,
                             &self.function_impls,
+                            &self.function_decls,
                             &self.struct_schemas,
                             &self.host_import_return_types,
                             &self.host_import_signatures,
@@ -315,6 +325,7 @@ impl Compiler {
                             body,
                             iterated,
                             &self.function_impls,
+                            &self.function_decls,
                             &self.struct_schemas,
                             &self.host_import_return_types,
                             &self.host_import_signatures,
@@ -402,7 +413,7 @@ impl Compiler {
             Expr::FunctionRef(_) => {
                 return Err(CompileError::CallableUsedAsValue);
             }
-            Expr::Call(index, args) => {
+            Expr::Call(index, _, args) => {
                 self.compile_function_call(*index, args)?;
             }
             Expr::Closure(_) => {
@@ -411,7 +422,7 @@ impl Compiler {
             Expr::ClosureCall(closure, args) => {
                 self.compile_inline_closure_call(closure, args)?;
             }
-            Expr::LocalCall(index, args) => {
+            Expr::LocalCall(index, _, args) => {
                 let callable = self
                     .callable_bindings
                     .get(index)
@@ -681,10 +692,12 @@ impl Compiler {
         let map_lookup = Expr::IfElse {
             condition: Box::new(Expr::Call(
                 BuiltinFunction::Has.call_index(),
+                Vec::new(),
                 vec![Expr::Var(container_slot), Expr::Var(key_slot)],
             )),
             then_expr: Box::new(Expr::Call(
                 BuiltinFunction::Get.call_index(),
+                Vec::new(),
                 vec![Expr::Var(container_slot), Expr::Var(key_slot)],
             )),
             else_expr: Box::new(Expr::Null),
@@ -693,6 +706,7 @@ impl Compiler {
             condition: Box::new(Expr::Eq(
                 Box::new(Expr::Call(
                     BuiltinFunction::TypeOf.call_index(),
+                    Vec::new(),
                     vec![Expr::Var(key_slot)],
                 )),
                 Box::new(Expr::String("int".to_string())),
@@ -708,11 +722,13 @@ impl Compiler {
                         Box::new(Expr::Var(key_slot)),
                         Box::new(Expr::Call(
                             BuiltinFunction::Len.call_index(),
+                            Vec::new(),
                             vec![Expr::Var(container_slot)],
                         )),
                     )),
                     then_expr: Box::new(Expr::Call(
                         BuiltinFunction::Get.call_index(),
+                        Vec::new(),
                         vec![Expr::Var(container_slot), Expr::Var(key_slot)],
                     )),
                     else_expr: Box::new(Expr::Null),
@@ -724,6 +740,7 @@ impl Compiler {
             condition: Box::new(Expr::Eq(
                 Box::new(Expr::Call(
                     BuiltinFunction::TypeOf.call_index(),
+                    Vec::new(),
                     vec![Expr::Var(container_slot)],
                 )),
                 Box::new(Expr::String("null".to_string())),
@@ -733,6 +750,7 @@ impl Compiler {
                 condition: Box::new(Expr::Eq(
                     Box::new(Expr::Call(
                         BuiltinFunction::TypeOf.call_index(),
+                        Vec::new(),
                         vec![Expr::Var(container_slot)],
                     )),
                     Box::new(Expr::String("map".to_string())),
@@ -742,6 +760,7 @@ impl Compiler {
                     condition: Box::new(Expr::Eq(
                         Box::new(Expr::Call(
                             BuiltinFunction::TypeOf.call_index(),
+                            Vec::new(),
                             vec![Expr::Var(container_slot)],
                         )),
                         Box::new(Expr::String("array".to_string())),
@@ -751,6 +770,7 @@ impl Compiler {
                         condition: Box::new(Expr::Eq(
                             Box::new(Expr::Call(
                                 BuiltinFunction::TypeOf.call_index(),
+                                Vec::new(),
                                 vec![Expr::Var(container_slot)],
                             )),
                             Box::new(Expr::String("string".to_string())),
@@ -777,6 +797,7 @@ impl Compiler {
             condition: Box::new(Expr::Eq(
                 Box::new(Expr::Call(
                     BuiltinFunction::TypeOf.call_index(),
+                    Vec::new(),
                     vec![Expr::Var(value_slot)],
                 )),
                 Box::new(Expr::String("null".to_string())),
@@ -1018,7 +1039,7 @@ impl Compiler {
                 self.capture_mode_for_expr(value, captured_slot, context, mode, seen);
                 self.capture_mode_for_expr(fallback, captured_slot, context, mode, seen);
             }
-            Expr::Call(_, args) | Expr::LocalCall(_, args) => {
+            Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => {
                 for arg in args {
                     self.capture_mode_for_expr(arg, captured_slot, context, mode, seen);
                 }
@@ -1163,6 +1184,7 @@ impl Compiler {
             expr,
             &self.type_state,
             &self.function_impls,
+            &self.function_decls,
             &self.struct_schemas,
             &self.host_import_return_types,
             &self.host_import_signatures,
@@ -1172,6 +1194,7 @@ impl Compiler {
                 expr,
                 &self.type_state,
                 &self.function_impls,
+                &self.function_decls,
                 &self.struct_schemas,
                 &self.host_import_return_types,
                 &self.host_import_signatures,
@@ -1194,6 +1217,7 @@ impl Compiler {
                     expr,
                     &self.type_state,
                     &self.function_impls,
+                    &self.function_decls,
                     &self.struct_schemas,
                     &self.host_import_return_types,
                     &self.host_import_signatures,
@@ -1203,6 +1227,7 @@ impl Compiler {
                     expr,
                     &self.type_state,
                     &self.function_impls,
+                    &self.function_decls,
                     &self.struct_schemas,
                     &self.host_import_return_types,
                     &self.host_import_signatures,
@@ -1453,6 +1478,7 @@ impl Compiler {
             value,
             match_entry_type_state,
             &self.function_impls,
+            &self.function_decls,
             &self.struct_schemas,
             &self.host_import_return_types,
             &self.host_import_signatures,
@@ -1461,6 +1487,7 @@ impl Compiler {
             value,
             match_entry_type_state,
             &self.function_impls,
+            &self.function_decls,
             &self.struct_schemas,
             &self.host_import_return_types,
             &self.host_import_signatures,
@@ -1477,6 +1504,7 @@ impl Compiler {
             expr,
             &self.type_state,
             &self.function_impls,
+            &self.function_decls,
             &self.struct_schemas,
             &self.host_import_return_types,
             &self.host_import_signatures,
@@ -1493,6 +1521,7 @@ impl Compiler {
             stmts,
             &mut state,
             &self.function_impls,
+            &self.function_decls,
             &self.struct_schemas,
             &self.host_import_return_types,
             &self.host_import_signatures,
@@ -1753,12 +1782,12 @@ fn collect_expr_slot_footprint(expr: &Expr, slots: &mut BTreeSet<LocalSlot>) {
             collect_expr_slot_footprint(value, slots);
             collect_expr_slot_footprint(fallback, slots);
         }
-        Expr::Call(_, args) => {
+        Expr::Call(_, _, args) => {
             for arg in args {
                 collect_expr_slot_footprint(arg, slots);
             }
         }
-        Expr::LocalCall(index, args) => {
+        Expr::LocalCall(index, _, args) => {
             slots.insert(*index);
             for arg in args {
                 collect_expr_slot_footprint(arg, slots);

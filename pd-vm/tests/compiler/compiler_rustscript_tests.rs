@@ -3066,3 +3066,154 @@ fn rustscript_positive_min_magnitude_literal_is_rejected_with_hint() {
         &["out of range", "i64::MIN"],
     );
 }
+
+#[test]
+fn rustscript_generic_runtime_cases_work() {
+    let cases = vec![
+        rustscript_runtime_case(
+            "generic passthrough functions support multiple concrete instantiations",
+            r#"
+                fn myfn<T>(v: T) {
+                    let b = v;
+                    b
+                }
+
+                let text = myfn::<string>("hello");
+                let number = myfn::<int>(41);
+                text;
+                number;
+            "#,
+            vec![Value::string("hello"), Value::Int(41)],
+        ),
+        rustscript_runtime_case(
+            "generic function returns preserve instantiated struct schemas",
+            r#"
+                struct Box<T> { value: T }
+
+                fn myfn<T>(v: T) {
+                    let b = v;
+                    b
+                }
+
+                let input: Box<string> = { value: "hello" };
+                let boxed = myfn::<Box<string>>(input);
+                boxed.value;
+            "#,
+            vec![Value::string("hello")],
+        ),
+        rustscript_runtime_case(
+            "host generic return schemas enable typed field access",
+            r#"
+                use json;
+                struct Stats { score: int }
+                struct Profile { stats: Stats }
+
+                let profile = json::decode::<Profile>("{\"stats\":{\"score\":41}}");
+                profile.stats.score + 1;
+            "#,
+            vec![Value::Int(42)],
+        ),
+    ];
+
+    run_runtime_cases(&cases);
+}
+
+#[test]
+fn rustscript_generic_parse_errors_are_reported() {
+    let cases = vec![
+        rustscript_parse_error_case(
+            "generic functions currently require explicit type arguments",
+            r#"
+                fn myfn<T>(v: T) {
+                    v
+                }
+
+                myfn("hello");
+            "#,
+            &["function 'myfn' expects 1 type arguments, got 0"],
+        ),
+        rustscript_parse_error_case(
+            "non generic functions reject explicit type arguments",
+            r#"
+                fn plain(v) {
+                    v
+                }
+
+                plain::<string>("hello");
+            "#,
+            &["function 'plain' does not accept explicit type arguments"],
+        ),
+        rustscript_parse_error_case(
+            "host generic calls validate type argument arity",
+            r#"
+                use json;
+                json::decode::<int, string>("{}");
+            "#,
+            &["function 'json::decode' expects 1 type arguments, got 2"],
+        ),
+        rustscript_parse_error_case(
+            "generic struct schemas validate type argument arity",
+            r#"
+                struct Box<T> { value: T }
+                let value: Box<string, int> = { value: "hello" };
+                value;
+            "#,
+            &["struct schema 'Box' expects 1 type arguments, got 2"],
+        ),
+        rustscript_parse_error_case(
+            "duplicate function type parameters are rejected",
+            r#"
+                fn bad<T, T>(value: T) {
+                    value
+                }
+            "#,
+            &["duplicate type parameter 'T' in function 'bad'"],
+        ),
+        rustscript_parse_error_case(
+            "duplicate struct type parameters are rejected",
+            r#"
+                struct Bad<T, T> { value: T }
+            "#,
+            &["duplicate type parameter 'T' in struct 'Bad'"],
+        ),
+    ];
+
+    for case in &cases {
+        expect_parse_error_case(case);
+    }
+}
+
+#[test]
+fn rustscript_generic_schema_errors_are_reported() {
+    let cases = vec![
+        SourceErrorCase {
+            name: "opaque generic parameters do not allow field access",
+            source: r#"
+                fn bad<T>(value: T) {
+                    value.score
+                }
+
+                bad::<int>(1);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &["cannot access fields on unresolved generic parameter 'T'"],
+        },
+        SourceErrorCase {
+            name: "generic struct instantiations enforce substituted field schemas",
+            source: r#"
+                struct Box<T> { value: T }
+
+                let boxed: Box<int> = { value: "oops" };
+                boxed.value;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &[
+                "field 'value' is declared as schema type 'int' but was assigned string",
+            ],
+        },
+    ];
+
+    run_source_error_cases(&cases);
+}

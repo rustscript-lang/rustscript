@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use vm::{
-    CompileSourceFileOptions, CompiledProgram, SourcePathError, compile_source_file_with_options,
+    CompileSourceFileOptions, CompiledProgram, SourceFlavor, SourcePathError,
+    compile_source_file_with_options, compile_source_with_flavor_and_options,
 };
 
 fn with_edge_stdlib_overrides(mut options: CompileSourceFileOptions) -> CompileSourceFileOptions {
@@ -24,6 +25,17 @@ pub fn compile_edge_source_file(
     path: impl AsRef<Path>,
 ) -> Result<CompiledProgram, SourcePathError> {
     compile_edge_source_file_with_options(path, CompileSourceFileOptions::new())
+}
+
+pub fn compile_edge_source_with_flavor(
+    source: &str,
+    flavor: SourceFlavor,
+) -> Result<CompiledProgram, SourcePathError> {
+    compile_source_with_flavor_and_options(
+        source,
+        flavor,
+        with_edge_stdlib_overrides(CompileSourceFileOptions::new()),
+    )
 }
 
 pub fn compile_edge_source_file_with_options(

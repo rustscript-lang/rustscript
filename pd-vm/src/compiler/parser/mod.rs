@@ -22,8 +22,8 @@ use self::symbols::is_virtual_host_namespace_spec;
 use super::{
     ParseError, ReplLocalBinding, STDLIB_PRINT_ARITY, STDLIB_PRINT_NAME,
     ir::{
-        AssignmentKind, ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern,
-        MatchTypePattern, Stmt, TypeSchema,
+        AssignmentKind, ClosureExpr, Expr, FunctionDecl, FunctionImpl, FunctionParam, LocalSlot,
+        MatchPattern, MatchTypePattern, Stmt, StructDecl, TypeSchema,
     },
 };
 
@@ -116,8 +116,9 @@ pub(super) struct Parser {
     next_function: u16,
     closure_scopes: Vec<HashMap<String, LocalSlot>>,
     closure_capture_contexts: Vec<ClosureCaptureContext>,
-    struct_schemas: HashMap<String, TypeSchema>,
-    schema_reference_sites: Vec<(String, usize, Span)>,
+    struct_schemas: HashMap<String, StructDecl>,
+    schema_reference_sites: Vec<(String, usize, usize, Span)>,
+    active_type_params: Vec<HashSet<String>>,
     unknown_type_spans: Vec<Span>,
     allow_implicit_externs: bool,
     allow_implicit_semicolons: bool,
@@ -169,6 +170,7 @@ impl Parser {
             closure_capture_contexts: Vec::new(),
             struct_schemas: HashMap::new(),
             schema_reference_sites: Vec::new(),
+            active_type_params: Vec::new(),
             unknown_type_spans: Vec::new(),
             allow_implicit_externs,
             allow_implicit_semicolons,
@@ -246,7 +248,7 @@ impl Parser {
         locals
     }
 
-    pub(super) fn struct_schemas(&self) -> HashMap<String, TypeSchema> {
+    pub(super) fn struct_schemas(&self) -> HashMap<String, StructDecl> {
         self.struct_schemas.clone()
     }
 
@@ -255,17 +257,104 @@ impl Parser {
     }
 
     fn validate_schema_reference_sites(&self) -> Result<(), ParseError> {
-        for (name, line, span) in &self.schema_reference_sites {
+        for (name, arg_count, line, span) in &self.schema_reference_sites {
+            let Some(decl) = self.struct_schemas.get(name) else {
+                return Err(ParseError {
+                    span: Some(*span),
+                    code: None,
+                    line: *line,
+                    message: format!("unknown struct schema '{name}'"),
+                });
+            };
+            if decl.type_params.len() != *arg_count {
+                return Err(ParseError {
+                    span: Some(*span),
+                    code: None,
+                    line: *line,
+                    message: format!(
+                        "struct schema '{name}' expects {} type arguments, got {}",
+                        decl.type_params.len(),
+                        arg_count
+                    ),
+                });
+            }
             if self.struct_schemas.contains_key(name) {
                 continue;
             }
-            return Err(ParseError {
-                span: Some(*span),
-                code: None,
-                line: *line,
-                message: format!("unknown struct schema '{name}'"),
-            });
         }
         Ok(())
+    }
+
+    fn push_active_type_params(&mut self, params: &[String]) {
+        self.active_type_params
+            .push(params.iter().cloned().collect::<HashSet<_>>());
+    }
+
+    fn pop_active_type_params(&mut self) {
+        self.active_type_params.pop();
+    }
+
+    fn is_active_type_param(&self, name: &str) -> bool {
+        self.active_type_params
+            .iter()
+            .rev()
+            .any(|params| params.contains(name))
+    }
+
+    fn parse_type_params(
+        &mut self,
+        owner: &str,
+        owner_name: &str,
+    ) -> Result<Vec<String>, ParseError> {
+        if !self.check(&TokenKind::Less) {
+            return Ok(Vec::new());
+        }
+
+        self.expect(&TokenKind::Less, "expected '<' before type parameters")?;
+        let mut params = Vec::new();
+        let mut seen = HashSet::new();
+        loop {
+            let param = self.expect_ident("expected type parameter name")?;
+            if !seen.insert(param.clone()) {
+                return Err(ParseError {
+                    span: Some(self.current_span()),
+                    code: None,
+                    line: self.current_line(),
+                    message: format!(
+                        "duplicate type parameter '{param}' in {owner} '{owner_name}'"
+                    ),
+                });
+            }
+            params.push(param);
+            if self.match_kind(&TokenKind::Comma) {
+                continue;
+            }
+            break;
+        }
+        self.expect(&TokenKind::Greater, "expected '>' after type parameters")?;
+        Ok(params)
+    }
+
+    fn parse_turbofish_type_args(&mut self) -> Result<Vec<TypeSchema>, ParseError> {
+        if !self.check_path_separator() || !self.check_kind_at(self.pos + 2, &TokenKind::Less) {
+            return Ok(Vec::new());
+        }
+
+        self.match_path_separator();
+        self.expect(&TokenKind::Less, "expected '<' after '::' in turbofish")?;
+        let mut type_args = Vec::new();
+        loop {
+            type_args.push(self.parse_declared_type_schema()?);
+            if self.match_kind(&TokenKind::Comma) {
+                continue;
+            }
+            break;
+        }
+        self.expect(&TokenKind::Greater, "expected '>' after type arguments")?;
+        Ok(type_args)
+    }
+
+    fn function_param_names(params: &[FunctionParam]) -> Vec<String> {
+        params.iter().map(|param| param.name.clone()).collect()
     }
 }

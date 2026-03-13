@@ -306,6 +306,37 @@ plus_one(2);
 }
 
 #[test]
+fn collect_inferred_local_type_hints_preserve_generic_function_schema_labels() {
+    let source = r#"
+fn myfn<T>(v: T) {
+    let b = v;
+    b
+}
+
+let text = myfn::<string>("hello");
+"#;
+
+    let hints = collect_inferred_local_type_hints(source, SourceFlavor::RustScript)
+        .expect("type hints should succeed");
+    let value = hints
+        .iter()
+        .find(|hint| hint.name == "v")
+        .expect("expected a type hint for v");
+    let binding = hints
+        .iter()
+        .find(|hint| hint.name == "b")
+        .expect("expected a type hint for b");
+    let text = hints
+        .iter()
+        .find(|hint| hint.name == "text")
+        .expect("expected a type hint for text");
+
+    assert_eq!(value.inferred_type, "T");
+    assert_eq!(binding.inferred_type, "T");
+    assert_eq!(text.inferred_type, "string");
+}
+
+#[test]
 fn collect_inferred_local_type_hints_keep_function_body_expr_visibility() {
     let source = r#"
 fn plus_one(amount) {
@@ -329,7 +360,7 @@ plus_one(2);
 }
 
 #[test]
-fn collect_inferred_local_type_hints_use_declared_schema_bound_type() {
+fn collect_inferred_local_type_hints_use_declared_schema_labels() {
     let source = r#"
 use json;
 struct Stats { score: int }
@@ -347,7 +378,47 @@ payload_decoded.stats.score;
         .find(|hint| hint.name == "payload_decoded")
         .expect("expected a type hint for payload_decoded");
 
-    assert_eq!(payload_decoded.inferred_type, "map");
+    assert_eq!(payload_decoded.inferred_type, "Profile");
     assert_eq!(payload_decoded.declared_line, Some(7));
     assert_eq!(payload_decoded.last_line, Some(8));
+}
+
+#[test]
+fn collect_inferred_local_type_hints_use_host_generic_return_schema_labels() {
+    let source = r#"
+use json;
+struct Stats { score: int }
+struct Profile { stats: Stats }
+
+let profile = json::decode::<Profile>("{\"stats\":{\"score\":41}}");
+profile.stats.score;
+"#;
+
+    let hints = collect_inferred_local_type_hints(source, SourceFlavor::RustScript)
+        .expect("type hints should succeed");
+    let profile = hints
+        .iter()
+        .find(|hint| hint.name == "profile")
+        .expect("expected a type hint for profile");
+
+    assert_eq!(profile.inferred_type, "Profile");
+    assert_eq!(profile.declared_line, Some(6));
+    assert_eq!(profile.last_line, Some(7));
+}
+
+#[test]
+fn lint_unknown_inferred_local_types_skips_generic_function_schema_locals() {
+    let source = r#"
+fn myfn<T>(v: T) {
+    let b = v;
+    b
+}
+"#;
+
+    let warnings = lint_unknown_inferred_local_types(source, SourceFlavor::RustScript)
+        .expect("lint should succeed");
+    assert!(
+        warnings.iter().all(|warning| warning.name != "b"),
+        "generic schema local should not be reported as unknown, got {warnings:?}"
+    );
 }

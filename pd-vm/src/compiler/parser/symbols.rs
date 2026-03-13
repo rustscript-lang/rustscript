@@ -195,6 +195,8 @@ impl Parser {
             arity,
             index,
             args: (0..arity).map(|idx| format!("arg{idx}")).collect(),
+            arg_schemas: vec![None; usize::from(arity)],
+            type_params: Vec::new(),
             exported: true,
             return_type: ValueType::Unknown,
         };
@@ -240,6 +242,8 @@ impl Parser {
             arity,
             index,
             args,
+            arg_schemas: vec![None; usize::from(arity)],
+            type_params: Vec::new(),
             exported: true,
             return_type: ValueType::Unknown,
         };
@@ -285,6 +289,8 @@ impl Parser {
             arity,
             index,
             args,
+            arg_schemas: vec![None; usize::from(arity)],
+            type_params: Vec::new(),
             exported: false,
             return_type: known_host_return_type(name),
         };

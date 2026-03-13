@@ -34,7 +34,7 @@ impl AvailabilityAnalyzer {
         &self,
         expr: &'a Expr,
     ) -> Option<(LocalSlot, MovedFieldKey, &'a Expr)> {
-        let Expr::Call(index, args) = expr else {
+        let Expr::Call(index, _, args) = expr else {
             return None;
         };
         if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Set) {
@@ -128,7 +128,7 @@ impl AvailabilityAnalyzer {
             self.copy_local_collection_aliases(state, *source, target);
             return;
         }
-        if let Expr::Call(index, args) = expr
+        if let Expr::Call(index, _, args) = expr
             && let Some(param_index) = self.collection_passthrough_params.get(index).copied()
             && let Some(source_expr) = args.get(param_index)
             && self.is_definitely_collection_expr(source_expr, state)
@@ -500,7 +500,7 @@ impl AvailabilityAnalyzer {
         expr: &Expr,
         state: &FlowState,
     ) -> Option<HashSet<MovedFieldKey>> {
-        let Expr::Call(index, args) = expr else {
+        let Expr::Call(index, _, args) = expr else {
             return None;
         };
         let builtin = BuiltinFunction::from_call_index(*index)?;
@@ -543,7 +543,7 @@ impl AvailabilityAnalyzer {
                 self.is_definitely_copyable_expr(lhs, state)
                     && self.is_definitely_copyable_expr(rhs, state)
             }
-            Expr::Call(index, args) => self
+            Expr::Call(index, _, args) => self
                 .extract_moved_field_access(*index, args)
                 .map(|(root_slot, field_key)| self.is_copyable_field(root_slot, &field_key, state))
                 .unwrap_or(false),
@@ -578,7 +578,7 @@ impl AvailabilityAnalyzer {
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.is_definitely_collection_expr(inner, state)
             }
-            Expr::Call(index, args) => match BuiltinFunction::from_call_index(*index) {
+            Expr::Call(index, _, args) => match BuiltinFunction::from_call_index(*index) {
                 Some(BuiltinFunction::MapNew) => args.is_empty(),
                 Some(BuiltinFunction::ArrayNew) => args.is_empty(),
                 Some(BuiltinFunction::Set) if args.len() == 3 => {

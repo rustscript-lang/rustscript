@@ -461,7 +461,7 @@ impl LivenessRewriter {
                 self.add_expr_uses(value, live);
                 self.add_expr_uses(fallback, live);
             }
-            Expr::Call(index, args) => {
+            Expr::Call(index, _, args) => {
                 for arg in args {
                     self.add_expr_uses(arg, live);
                 }
@@ -471,7 +471,7 @@ impl LivenessRewriter {
                     self.union_inplace(live, &footprint);
                 }
             }
-            Expr::LocalCall(index, args) => {
+            Expr::LocalCall(index, _, args) => {
                 self.mark_live(live, *index);
                 for arg in args {
                     self.add_expr_uses(arg, live);
@@ -735,7 +735,7 @@ impl LivenessRewriter {
             | Expr::Bool(_)
             | Expr::String(_)
             | Expr::FunctionRef(_) => {}
-            Expr::Var(index) | Expr::MoveVar(index) | Expr::LocalCall(index, _) => {
+            Expr::Var(index) | Expr::MoveVar(index) | Expr::LocalCall(index, _, _) => {
                 self.mark_live(footprint, *index);
             }
             Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
@@ -761,7 +761,7 @@ impl LivenessRewriter {
                 self.collect_expr_footprint(value, footprint, stack);
                 self.collect_expr_footprint(fallback, footprint, stack);
             }
-            Expr::Call(index, args) => {
+            Expr::Call(index, _, args) => {
                 let called = self.function_footprint(*index, stack);
                 self.union_inplace(footprint, &called);
                 for arg in args {
@@ -888,7 +888,7 @@ fn stmt_contains_local_call(stmt: &Stmt) -> bool {
 
 fn expr_contains_local_call(expr: &Expr) -> bool {
     match expr {
-        Expr::LocalCall(_, _) => true,
+        Expr::LocalCall(..) => true,
         Expr::Null
         | Expr::Int(_)
         | Expr::Float(_)
@@ -905,7 +905,7 @@ fn expr_contains_local_call(expr: &Expr) -> bool {
         Expr::OptionUnwrapOr {
             value, fallback, ..
         } => expr_contains_local_call(value) || expr_contains_local_call(fallback),
-        Expr::Call(_, args) => args.iter().any(expr_contains_local_call),
+        Expr::Call(_, _, args) => args.iter().any(expr_contains_local_call),
         Expr::Closure(closure) => expr_contains_local_call(&closure.body),
         Expr::ClosureCall(closure, args) => {
             args.iter().any(expr_contains_local_call) || expr_contains_local_call(&closure.body)
@@ -1153,7 +1153,7 @@ impl LocalSlotAllocator {
                 self.collect_expr_constraints(value, &live_during)?;
                 self.collect_expr_constraints(fallback, &live_during)?;
             }
-            Expr::Call(index, args) => {
+            Expr::Call(index, _, args) => {
                 for arg in args {
                     self.collect_expr_constraints(arg, &live_during)?;
                 }
@@ -1163,7 +1163,7 @@ impl LocalSlotAllocator {
                     self.add_cross_live_with_set(&live_during, &footprint);
                 }
             }
-            Expr::LocalCall(index, args) => {
+            Expr::LocalCall(index, _, args) => {
                 self.add_slot_live_edges(*index, &live_during);
                 for arg in args {
                     self.collect_expr_constraints(arg, &live_during)?;
@@ -1350,7 +1350,7 @@ impl LocalSlotAllocator {
             | Expr::Bool(_)
             | Expr::String(_)
             | Expr::FunctionRef(_) => {}
-            Expr::Var(index) | Expr::MoveVar(index) | Expr::LocalCall(index, _) => {
+            Expr::Var(index) | Expr::MoveVar(index) | Expr::LocalCall(index, _, _) => {
                 self.mark_set_slot(set, *index)
             }
             Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
@@ -1376,7 +1376,7 @@ impl LocalSlotAllocator {
                 self.collect_expr_footprint(value, set, stack);
                 self.collect_expr_footprint(fallback, set, stack);
             }
-            Expr::Call(index, args) => {
+            Expr::Call(index, _, args) => {
                 if self.function_impls.contains_key(index) {
                     let footprint = self.function_footprint(*index, stack);
                     for (slot, used) in footprint.iter().enumerate() {
@@ -1712,12 +1712,12 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
     match expr {
         Expr::Null | Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::String(_) => {}
         Expr::FunctionRef(_) => {}
-        Expr::Call(_, args) => {
+        Expr::Call(_, _, args) => {
             for arg in args {
                 remap_expr_slots(arg, mapping)?;
             }
         }
-        Expr::LocalCall(index, args) => {
+        Expr::LocalCall(index, _, args) => {
             *index = remap_slot(*index, mapping)?;
             for arg in args {
                 remap_expr_slots(arg, mapping)?;

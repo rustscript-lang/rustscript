@@ -183,7 +183,7 @@ impl Parser {
     pub(super) fn is_mut_borrow_target(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Var(_) => true,
-            Expr::Call(index, args) => {
+            Expr::Call(index, _, args) => {
                 if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get)
                     || args.len() != 2
                 {
@@ -210,7 +210,7 @@ impl Parser {
     pub(super) fn extract_mut_borrow_root_slot(&self, expr: &Expr) -> Option<LocalSlot> {
         match expr {
             Expr::Var(slot) => Some(*slot),
-            Expr::Call(index, args) => {
+            Expr::Call(index, _, args) => {
                 if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get)
                     || args.len() != 2
                 {
@@ -347,14 +347,22 @@ impl Parser {
                         .to_string(),
                 });
             }
-            if self.dialect.allow_namespace_path_separator() && self.match_path_separator() {
+            if self.dialect.allow_namespace_path_separator()
+                && self.check_path_separator()
+                && !self.check_kind_at(self.pos + 2, &TokenKind::Less)
+                && self.match_path_separator()
+            {
                 let mut path_segments = Vec::new();
                 path_segments
                     .push(self.expect_namespace_segment("expected function name after '::'")?);
-                while self.match_path_separator() {
+                while self.check_path_separator()
+                    && !self.check_kind_at(self.pos + 2, &TokenKind::Less)
+                {
+                    self.match_path_separator();
                     path_segments
                         .push(self.expect_namespace_segment("expected function name after '::'")?);
                 }
+                let type_args = self.parse_turbofish_type_args()?;
                 self.expect(
                     &TokenKind::LParen,
                     "expected '(' after namespaced function name",
@@ -381,7 +389,8 @@ impl Parser {
                     if let Some(builtin) =
                         resolve_builtin_namespace_call(&builtin_namespace, &builtin_member)
                     {
-                        let expr = self.build_builtin_call_expr(builtin, args)?;
+                        let expr =
+                            self.build_builtin_call_expr_with_type_args(builtin, args, type_args)?;
                         return Ok(expr);
                     }
                     return Err(ParseError {
@@ -407,58 +416,108 @@ impl Parser {
                             builtin_namespace_hint()
                         ),
                     })?;
-                let expr = self.build_host_call_expr(&host_name, args)?;
+                let expr = self.build_host_call_expr_with_type_args(&host_name, args, type_args)?;
                 return Ok(expr);
             }
 
             let mut expr = if self.dialect.allow_macro_calls() && self.match_kind(&TokenKind::Bang)
             {
                 self.parse_macro_call(&name)?
-            } else if self.match_kind(&TokenKind::LParen) {
-                let args = self.parse_call_args()?;
-                if self.has_local_binding(&name) {
-                    let local = self.get_local(&name)?;
-                    Expr::LocalCall(local, args)
-                } else if self.functions.contains_key(&name) {
-                    let builtin_alias_call = if matches!(name.as_str(), "print" | "println") {
-                        self.functions
-                            .get(&name)
-                            .map(|decl| !self.function_impls.contains_key(&decl.index))
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    };
-                    if builtin_alias_call {
-                        if let Some(expr) = self.try_build_language_builtin_call(&name, &args)? {
-                            expr
+            } else {
+                let type_args = self.parse_turbofish_type_args()?;
+                if self.match_kind(&TokenKind::LParen) {
+                    let args = self.parse_call_args()?;
+                    if self.has_local_binding(&name) {
+                        if !type_args.is_empty() {
+                            return Err(ParseError {
+                                span: None,
+                                code: None,
+                                line: self.current_line(),
+                                message: format!(
+                                    "local '{name}' does not accept explicit type arguments; generic function values are not supported"
+                                ),
+                            });
+                        }
+                        let local = self.get_local(&name)?;
+                        Expr::LocalCall(local, Vec::new(), args)
+                    } else if self.functions.contains_key(&name) {
+                        let builtin_alias_call = if matches!(name.as_str(), "print" | "println") {
+                            self.functions
+                                .get(&name)
+                                .map(|decl| !self.function_impls.contains_key(&decl.index))
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        };
+                        if builtin_alias_call {
+                            if !type_args.is_empty() {
+                                return Err(ParseError {
+                                    span: None,
+                                    code: None,
+                                    line: self.current_line(),
+                                    message: format!(
+                                        "function '{name}' does not accept explicit type arguments"
+                                    ),
+                                });
+                            }
+                            if let Some(expr) =
+                                self.try_build_language_builtin_call(&name, &args)?
+                            {
+                                expr
+                            } else {
+                                let decl = self.resolve_function_for_call(&name, args.len())?;
+                                self.validate_named_call_type_args(&decl, &type_args)?;
+                                Expr::Call(decl.index, type_args, args)
+                            }
                         } else {
                             let decl = self.resolve_function_for_call(&name, args.len())?;
-                            Expr::Call(decl.index, args)
+                            self.validate_named_call_type_args(&decl, &type_args)?;
+                            Expr::Call(decl.index, type_args, args)
                         }
+                    } else if let Some(expr) = self.try_build_language_builtin_call(&name, &args)? {
+                        if !type_args.is_empty() {
+                            return Err(ParseError {
+                                span: None,
+                                code: None,
+                                line: self.current_line(),
+                                message: format!(
+                                    "function '{name}' does not accept explicit type arguments"
+                                ),
+                            });
+                        }
+                        expr
+                    } else if let Some(host_name) = self.resolve_direct_host_call_target(&name) {
+                        self.build_host_call_expr_with_type_args(&host_name, args, type_args)?
                     } else {
                         let decl = self.resolve_function_for_call(&name, args.len())?;
-                        Expr::Call(decl.index, args)
+                        self.validate_named_call_type_args(&decl, &type_args)?;
+                        Expr::Call(decl.index, type_args, args)
                     }
-                } else if let Some(expr) = self.try_build_language_builtin_call(&name, &args)? {
-                    expr
-                } else if let Some(host_name) = self.resolve_direct_host_call_target(&name) {
-                    self.build_host_call_expr(&host_name, args)?
                 } else {
-                    let decl = self.resolve_function_for_call(&name, args.len())?;
-                    Expr::Call(decl.index, args)
+                    if !type_args.is_empty() {
+                        return Err(ParseError {
+                            span: Some(self.current_span()),
+                            code: None,
+                            line: self.current_line(),
+                            message: format!(
+                                "explicit type arguments require a direct function call; generic function values are not supported for '{name}'"
+                            ),
+                        });
+                    }
+                    if self.has_local_binding(&name) {
+                        let index = self.get_local(&name)?;
+                        Expr::Var(index)
+                    } else if let Some(decl) = self.functions.get(&name) {
+                        Expr::FunctionRef(decl.index)
+                    } else {
+                        return Err(ParseError {
+                            span: None,
+                            code: None,
+                            line: self.current_line(),
+                            message: format!("unknown local '{name}'"),
+                        });
+                    }
                 }
-            } else if self.has_local_binding(&name) {
-                let index = self.get_local(&name)?;
-                Expr::Var(index)
-            } else if let Some(decl) = self.functions.get(&name) {
-                Expr::FunctionRef(decl.index)
-            } else {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: self.current_line(),
-                    message: format!("unknown local '{name}'"),
-                });
             };
             expr = self.parse_postfix_access(expr)?;
             return Ok(expr);
@@ -1210,8 +1269,18 @@ impl Parser {
     pub(super) fn build_builtin_call_expr(
         &mut self,
         builtin: BuiltinFunction,
-        mut args: Vec<Expr>,
+        args: Vec<Expr>,
     ) -> Result<Expr, ParseError> {
+        self.build_builtin_call_expr_with_type_args(builtin, args, Vec::new())
+    }
+
+    pub(super) fn build_builtin_call_expr_with_type_args(
+        &mut self,
+        builtin: BuiltinFunction,
+        mut args: Vec<Expr>,
+        type_args: Vec<TypeSchema>,
+    ) -> Result<Expr, ParseError> {
+        self.validate_builtin_type_args(builtin, &type_args)?;
         let arity = u8::try_from(args.len()).map_err(|_| ParseError {
             span: None,
             code: None,
@@ -1222,7 +1291,7 @@ impl Parser {
             if args.len() == usize::from(builtin.arity()) + 1
                 && Self::rewrite_regex_flags_arg_into_pattern(builtin, &mut args)
             {
-                return Ok(Expr::Call(builtin.call_index(), args));
+                return Ok(Expr::Call(builtin.call_index(), type_args, args));
             }
             return Err(ParseError {
                 span: None,
@@ -1235,7 +1304,7 @@ impl Parser {
                 ),
             });
         }
-        Ok(Expr::Call(builtin.call_index(), args))
+        Ok(Expr::Call(builtin.call_index(), type_args, args))
     }
 
     pub(super) fn rewrite_regex_flags_arg_into_pattern(
@@ -1264,13 +1333,19 @@ impl Parser {
     pub(super) fn build_regex_flags_pattern_expr(pattern: Expr, flags: Expr) -> Expr {
         let prefix = Expr::Call(
             BuiltinFunction::Concat.call_index(),
+            Vec::new(),
             vec![Expr::String("(?".to_string()), flags],
         );
         let prefix = Expr::Call(
             BuiltinFunction::Concat.call_index(),
+            Vec::new(),
             vec![prefix, Expr::String(")".to_string())],
         );
-        Expr::Call(BuiltinFunction::Concat.call_index(), vec![prefix, pattern])
+        Expr::Call(
+            BuiltinFunction::Concat.call_index(),
+            Vec::new(),
+            vec![prefix, pattern],
+        )
     }
 
     pub(super) fn try_build_language_builtin_call(
@@ -1458,7 +1533,7 @@ impl Parser {
 
     pub(super) fn build_print_call_expr(&mut self, argument: Expr) -> Result<Expr, ParseError> {
         let decl = self.resolve_function_for_call(STDLIB_PRINT_NAME, 1)?;
-        Ok(Expr::Call(decl.index, vec![argument]))
+        Ok(Expr::Call(decl.index, Vec::new(), vec![argument]))
     }
 
     pub(super) fn build_to_string_expr(&mut self, value: Expr) -> Result<Expr, ParseError> {
@@ -1474,6 +1549,16 @@ impl Parser {
         host_name: &str,
         args: Vec<Expr>,
     ) -> Result<Expr, ParseError> {
+        self.build_host_call_expr_with_type_args(host_name, args, Vec::new())
+    }
+
+    pub(super) fn build_host_call_expr_with_type_args(
+        &mut self,
+        host_name: &str,
+        args: Vec<Expr>,
+        type_args: Vec<TypeSchema>,
+    ) -> Result<Expr, ParseError> {
+        self.validate_host_call_type_args(host_name, &type_args)?;
         let arity = u8::try_from(args.len()).map_err(|_| ParseError {
             span: None,
             code: None,
@@ -1481,7 +1566,117 @@ impl Parser {
             message: "function arity too large".to_string(),
         })?;
         let decl = self.define_host_function(host_name, arity)?;
-        Ok(Expr::Call(decl.index, args))
+        Ok(Expr::Call(decl.index, type_args, args))
+    }
+
+    fn validate_named_call_type_args(
+        &self,
+        decl: &FunctionDecl,
+        type_args: &[TypeSchema],
+    ) -> Result<(), ParseError> {
+        if decl.type_params.is_empty() {
+            if type_args.is_empty() {
+                return Ok(());
+            }
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: format!(
+                    "function '{}' does not accept explicit type arguments",
+                    decl.name
+                ),
+            });
+        }
+
+        if decl.type_params.len() != type_args.len() {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: format!(
+                    "function '{}' expects {} type arguments, got {}",
+                    decl.name,
+                    decl.type_params.len(),
+                    type_args.len()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_builtin_type_args(
+        &self,
+        builtin: BuiltinFunction,
+        type_args: &[TypeSchema],
+    ) -> Result<(), ParseError> {
+        self.validate_optional_call_type_arg_arity(
+            builtin_generic_type_arg_arity(builtin).display_name,
+            builtin_generic_type_arg_arity(builtin).arity,
+            type_args,
+        )
+    }
+
+    fn validate_host_call_type_args(
+        &self,
+        host_name: &str,
+        type_args: &[TypeSchema],
+    ) -> Result<(), ParseError> {
+        self.validate_optional_call_type_arg_arity(
+            host_name,
+            host_generic_type_arg_arity(host_name),
+            type_args,
+        )
+    }
+
+    fn validate_call_type_arg_arity(
+        &self,
+        callable_name: &str,
+        expected: Option<usize>,
+        type_args: &[TypeSchema],
+    ) -> Result<(), ParseError> {
+        match expected {
+            Some(expected) if expected == type_args.len() => Ok(()),
+            Some(expected) => Err(ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: format!(
+                    "function '{callable_name}' expects {expected} type arguments, got {}",
+                    type_args.len()
+                ),
+            }),
+            None if type_args.is_empty() => Ok(()),
+            None => Err(ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: format!(
+                    "function '{callable_name}' does not accept explicit type arguments"
+                ),
+            }),
+        }
+    }
+
+    fn validate_optional_call_type_arg_arity(
+        &self,
+        callable_name: &str,
+        expected: Option<usize>,
+        type_args: &[TypeSchema],
+    ) -> Result<(), ParseError> {
+        match expected {
+            Some(expected) if type_args.is_empty() || expected == type_args.len() => Ok(()),
+            Some(expected) => Err(ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: format!(
+                    "function '{callable_name}' expects {expected} type arguments, got {}",
+                    type_args.len()
+                ),
+            }),
+            None => self.validate_call_type_arg_arity(callable_name, None, type_args),
+        }
     }
 
     pub(super) fn resolve_direct_host_call_target(&self, name: &str) -> Option<String> {
@@ -1887,6 +2082,31 @@ fn match_type_pattern_from_ident(name: &str) -> Option<MatchTypePattern> {
         "String" | "string" => Some(MatchTypePattern::String),
         "Array" | "array" => Some(MatchTypePattern::Array),
         "Map" | "map" => Some(MatchTypePattern::Map),
+        _ => None,
+    }
+}
+
+struct GenericCallableTypeArgSpec {
+    display_name: &'static str,
+    arity: Option<usize>,
+}
+
+fn builtin_generic_type_arg_arity(builtin: BuiltinFunction) -> GenericCallableTypeArgSpec {
+    match builtin {
+        BuiltinFunction::JsonDecode => GenericCallableTypeArgSpec {
+            display_name: "json::decode",
+            arity: Some(1),
+        },
+        _ => GenericCallableTypeArgSpec {
+            display_name: builtin.name(),
+            arity: None,
+        },
+    }
+}
+
+fn host_generic_type_arg_arity(host_name: &str) -> Option<usize> {
+    match host_name {
+        "json::decode" => Some(1),
         _ => None,
     }
 }

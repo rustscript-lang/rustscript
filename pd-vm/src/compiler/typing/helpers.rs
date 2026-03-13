@@ -4,13 +4,14 @@ use crate::builtins::{BuiltinFunction, CallableParam, CallableParamType};
 
 use super::super::CompileError;
 use super::super::ir::{
-    AssignmentKind, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, Stmt, TypeSchema,
+    AssignmentKind, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, Stmt, StructDecl,
+    TypeSchema,
 };
 use super::collect::{
     observed_function_param_schema_slice, observed_function_param_slice,
     seed_function_capture_state, seed_function_param_state,
 };
-use super::context::{TypeContext, bound_type_from_schema};
+use super::context::{TypeContext, render_schema_label};
 use super::infer_expr_type;
 use super::state::{
     BoundType, HostCallableSignature, LocalTypeState, merge_bound_types,
@@ -22,8 +23,9 @@ use super::validate::{
 
 pub(super) struct FunctionLegalizeEnv<'a> {
     pub(super) function_impls: &'a HashMap<u16, FunctionImpl>,
+    pub(super) function_decls: &'a HashMap<u16, FunctionDecl>,
     pub(super) function_names: &'a HashMap<u16, String>,
-    pub(super) struct_schemas: &'a HashMap<String, TypeSchema>,
+    pub(super) struct_schemas: &'a HashMap<String, StructDecl>,
     pub(super) host_import_return_types: &'a HashMap<u16, BoundType>,
     pub(super) host_import_signatures: &'a HashMap<u16, HostCallableSignature>,
     pub(super) observed_function_param_types: &'a HashMap<u16, Vec<BoundType>>,
@@ -39,6 +41,7 @@ pub(super) fn legalize_function_impl(
     let mut state = LocalTypeState::default();
     let mut context = TypeContext::new(
         env.function_impls,
+        env.function_decls,
         env.struct_schemas,
         env.function_names,
         env.host_import_return_types,
@@ -48,6 +51,9 @@ pub(super) fn legalize_function_impl(
     seed_function_param_state(
         &mut state,
         &function_impl.param_slots,
+        env.function_decls
+            .get(&function_index)
+            .map(|decl| decl.arg_schemas.as_slice()),
         observed_function_param_slice(env.observed_function_param_types, function_index),
         observed_function_param_schema_slice(env.observed_function_param_schemas, function_index),
     );
@@ -86,6 +92,10 @@ pub(super) fn validate_function_impl(
     seed_function_param_state(
         &mut state,
         &function_impl.param_slots,
+        context
+            .function_decls
+            .get(&function_index)
+            .map(|decl| decl.arg_schemas.as_slice()),
         observed_function_param_slice(&context.observed_function_param_types, function_index),
         observed_function_param_schema_slice(
             &context.observed_function_param_schemas,
@@ -453,14 +463,14 @@ fn validate_declared_local_schema(
     schema: Option<&TypeSchema>,
     actual: BoundType,
     actual_schema: Option<&TypeSchema>,
-    context: &TypeContext<'_>,
+    context: &mut TypeContext<'_>,
     line: Option<u32>,
     source_name: Option<&str>,
 ) -> Result<(), CompileError> {
     let Some(schema) = schema else {
         return Ok(());
     };
-    let expected = bound_type_from_schema(schema);
+    let expected = context.bound_type_for_schema(schema);
     if actual == BoundType::Unknown
         || actual == BoundType::Null
         || actual == expected
@@ -553,7 +563,7 @@ fn inferred_expr_assignment_schema(
 fn find_declared_schema_mismatch(
     expected: &TypeSchema,
     actual: &TypeSchema,
-    context: &TypeContext<'_>,
+    context: &mut TypeContext<'_>,
     path: String,
 ) -> Option<String> {
     let mut recursive_named = HashSet::new();
@@ -570,17 +580,18 @@ fn find_declared_schema_mismatch(
 fn find_declared_schema_mismatch_with_recursion(
     expected: &TypeSchema,
     actual: &TypeSchema,
-    context: &TypeContext<'_>,
+    context: &mut TypeContext<'_>,
     path: String,
     recursive_named: &mut HashSet<String>,
     allow_partial_object: bool,
 ) -> Option<String> {
     let expected = match expected {
-        TypeSchema::Named(name) => {
-            let is_recursive = !recursive_named.insert(name.clone());
-            let resolved = context.resolve_struct_schema(name).unwrap_or(expected);
+        TypeSchema::Named(name, type_args) => {
+            let instance = render_schema_path_segment(name, type_args);
+            let is_recursive = !recursive_named.insert(instance.clone());
+            let resolved = context.resolve_schema(expected);
             let mismatch = find_declared_schema_mismatch_with_recursion(
-                resolved,
+                &resolved,
                 actual,
                 context,
                 path,
@@ -588,15 +599,15 @@ fn find_declared_schema_mismatch_with_recursion(
                 is_recursive,
             );
             if !is_recursive {
-                recursive_named.remove(name);
+                recursive_named.remove(&instance);
             }
             return mismatch;
         }
-        _ => context.resolve_schema(expected),
+        _ => context.substitute_schema_generics(expected),
     };
     let actual = context.resolve_schema(actual);
 
-    match (expected, actual) {
+    match (&expected, &actual) {
         (_, TypeSchema::Unknown | TypeSchema::Null) | (TypeSchema::Unknown, _) => None,
         (TypeSchema::Int, TypeSchema::Int)
         | (TypeSchema::Float, TypeSchema::Float)
@@ -615,6 +626,7 @@ fn find_declared_schema_mismatch_with_recursion(
                 allow_partial_object,
             )
         }
+        (TypeSchema::GenericParam(_), _) | (_, TypeSchema::GenericParam(_)) => None,
         (TypeSchema::Map(expected), TypeSchema::Map(actual)) => {
             find_declared_schema_mismatch_with_recursion(
                 expected,
@@ -686,8 +698,8 @@ fn find_declared_schema_mismatch_with_recursion(
         _ => Some(format!(
             "{} is declared as schema type '{}' but was assigned {}",
             schema_path_label(&path),
-            schema_type_label(expected),
-            schema_type_label(actual)
+            schema_type_label(&expected),
+            schema_type_label(&actual)
         )),
     }
 }
@@ -695,7 +707,7 @@ fn find_declared_schema_mismatch_with_recursion(
 fn find_declared_array_mismatch_with_recursion(
     expected: &TypeSchema,
     actual: &TypeSchema,
-    context: &TypeContext<'_>,
+    context: &mut TypeContext<'_>,
     path: String,
     recursive_named: &mut HashSet<String>,
     allow_partial_object: bool,
@@ -789,19 +801,23 @@ fn schema_path_label(path: &str) -> String {
     }
 }
 
-fn schema_type_label(schema: &TypeSchema) -> &'static str {
-    match schema {
-        TypeSchema::Unknown => "unknown",
-        TypeSchema::Null => "null",
-        TypeSchema::Int => "int",
-        TypeSchema::Float => "float",
-        TypeSchema::Bool => "bool",
-        TypeSchema::String => "string",
-        TypeSchema::Named(_) => "map",
-        TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
-            "array"
-        }
-        TypeSchema::Map(_) | TypeSchema::Object(_) => "map",
+fn schema_type_label(schema: &TypeSchema) -> String {
+    render_schema_label(schema)
+}
+
+fn render_schema_path_segment(name: &str, type_args: &[TypeSchema]) -> String {
+    if type_args.is_empty() {
+        name.to_string()
+    } else {
+        format!(
+            "{}<{}>",
+            name,
+            type_args
+                .iter()
+                .map(render_schema_label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
 }
 
@@ -841,7 +857,7 @@ pub(super) fn bind_expr_result_to_slot(
         };
         let ty = slot_declared_schema
             .as_ref()
-            .map(bound_type_from_schema)
+            .map(|schema| context.bound_type_for_schema(schema))
             .unwrap_or(inferred_ty);
         state.set_with_optional_schema_origin(slot, ty, schema, from_declared_schema, optional);
     }
@@ -869,6 +885,14 @@ pub(super) fn build_function_names(functions: &[FunctionDecl]) -> HashMap<u16, S
     functions
         .iter()
         .map(|decl| (decl.index, decl.name.clone()))
+        .collect()
+}
+
+pub(super) fn build_function_decl_map(functions: &[FunctionDecl]) -> HashMap<u16, FunctionDecl> {
+    functions
+        .iter()
+        .cloned()
+        .map(|decl| (decl.index, decl))
         .collect()
 }
 
@@ -1042,7 +1066,7 @@ pub(super) fn expr_contains_param_add(expr: &Expr, param_slots: &[LocalSlot]) ->
             expr_contains_param_add(value, param_slots)
                 || expr_contains_param_add(fallback, param_slots)
         }
-        Expr::Call(_, args) | Expr::LocalCall(_, args) => args
+        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => args
             .iter()
             .any(|arg| expr_contains_param_add(arg, param_slots)),
         Expr::ClosureCall(closure, args) => {
@@ -1110,7 +1134,7 @@ pub(super) fn expr_uses_param(expr: &Expr, param_slots: &[LocalSlot]) -> bool {
         Expr::OptionUnwrapOr {
             value, fallback, ..
         } => expr_uses_param(value, param_slots) || expr_uses_param(fallback, param_slots),
-        Expr::Call(_, args) | Expr::LocalCall(_, args) => {
+        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => {
             args.iter().any(|arg| expr_uses_param(arg, param_slots))
         }
         Expr::ClosureCall(closure, args) => {
@@ -1255,7 +1279,7 @@ pub(super) fn legalize_expr(
             let _ = legalize_expr(fallback, state, context);
             context.infer_expr_type(expr, state)
         }
-        Expr::FunctionRef(_) | Expr::Call(_, _) | Expr::LocalCall(_, _) | Expr::Closure(_) => {
+        Expr::FunctionRef(_) | Expr::Call(..) | Expr::LocalCall(..) | Expr::Closure(_) => {
             legalize_expr_children(expr, state, context);
             context.infer_call_like_expr_type(expr, state)
         }
@@ -1353,7 +1377,7 @@ pub(super) fn legalize_expr_children(
     context: &mut TypeContext<'_>,
 ) {
     match expr {
-        Expr::Call(index, args) => {
+        Expr::Call(index, _, args) => {
             for arg in args.iter_mut() {
                 let _ = legalize_expr(arg, state, context);
             }
@@ -1361,7 +1385,7 @@ pub(super) fn legalize_expr_children(
                 fold_builtin_call(expr, builtin, state);
             }
         }
-        Expr::LocalCall(_, args) => {
+        Expr::LocalCall(_, _, args) => {
             for arg in args.iter_mut() {
                 let _ = legalize_expr(arg, state, context);
             }
@@ -1380,7 +1404,7 @@ pub(super) fn legalize_expr_children(
 }
 
 pub(super) fn fold_builtin_call(expr: &mut Expr, builtin: BuiltinFunction, state: &LocalTypeState) {
-    let Expr::Call(_, args) = expr else {
+    let Expr::Call(_, _, args) = expr else {
         return;
     };
     match builtin {
@@ -1413,7 +1437,7 @@ pub(super) fn fold_builtin_call(expr: &mut Expr, builtin: BuiltinFunction, state
 pub(super) fn infer_static_len(expr: &Expr) -> Option<usize> {
     match expr {
         Expr::String(text) => Some(text.chars().count()),
-        Expr::Call(index, args) => {
+        Expr::Call(index, _, args) => {
             let builtin = BuiltinFunction::from_call_index(*index)?;
             match builtin {
                 BuiltinFunction::ArrayNew if args.is_empty() => Some(0),

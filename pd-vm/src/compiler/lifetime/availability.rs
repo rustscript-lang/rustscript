@@ -693,7 +693,7 @@ impl AvailabilityAnalyzer {
                 let then_state = self.analyze_expr(fallback, &value_state, line)?;
                 Ok(self.merge_states(then_state, value_state))
             }
-            Expr::Call(index, args) => {
+            Expr::Call(index, _, args) => {
                 if !self.enable_local_move_semantics {
                     if let Some(root_slot) = self.extract_collection_mutation_root(*index, args) {
                         let mut out = self.analyze_args(args, state, line)?;
@@ -731,7 +731,7 @@ impl AvailabilityAnalyzer {
                     Ok(out)
                 }
             }
-            Expr::LocalCall(index, args) => {
+            Expr::LocalCall(index, _, args) => {
                 self.require_available(*index, state, line)?;
                 self.analyze_args(args, state, line)
             }
@@ -854,7 +854,7 @@ impl AvailabilityAnalyzer {
             self.require_local_not_partially_moved(*index, state, line)?;
             return Ok(state.clone());
         }
-        if let Expr::Call(index, args) = inner
+        if let Expr::Call(index, _, args) = inner
             && let Some((root_slot, field_key)) = self.extract_moved_field_access(*index, args)
         {
             let out = self.analyze_projection_args(args, state, line)?;
@@ -1044,7 +1044,7 @@ impl AvailabilityAnalyzer {
         if !self.enable_local_move_semantics {
             return expr.clone();
         }
-        let Expr::Call(index, args) = expr else {
+        let Expr::Call(index, _, args) = expr else {
             return expr.clone();
         };
         if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get) {
