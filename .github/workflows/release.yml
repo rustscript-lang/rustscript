@@ -70,12 +70,21 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp target/release/pd-edge-http-proxy dist/pd-edge-http-proxy
-          cp target/release/pd-edge-console dist/pd-edge-console
+          shopt -s nullglob
+          pd_edge_bins=(target/release/pd-edge-*)
+          if [[ ${#pd_edge_bins[@]} -eq 0 ]]; then
+            echo "No pd-edge binaries found in target/release" >&2
+            exit 1
+          fi
+          for bin_path in "${pd_edge_bins[@]}"; do
+            if [[ -f "$bin_path" && -x "$bin_path" ]]; then
+              bin_name="$(basename "$bin_path")"
+              cp "$bin_path" "dist/$bin_name"
+              tar -czf "dist/${bin_name}-${{ github.ref_name }}-linux-x86_64.tar.gz" -C dist "$bin_name"
+            fi
+          done
           cp target/release/pd-controller dist/pd-controller
           cp target/release/pd-vm-run dist/pd-vm-run
-          tar -czf dist/pd-edge-http-proxy-${{ github.ref_name }}-linux-x86_64.tar.gz -C dist pd-edge-http-proxy
-          tar -czf dist/pd-edge-console-${{ github.ref_name }}-linux-x86_64.tar.gz -C dist pd-edge-console
           tar -czf dist/pd-controller-${{ github.ref_name }}-linux-x86_64.tar.gz -C dist pd-controller
           tar -czf dist/pd-vm-run-${{ github.ref_name }}-linux-x86_64.tar.gz -C dist pd-vm-run
 
@@ -98,8 +107,7 @@ jobs:
         with:
           name: release-binaries-${{ github.ref_name }}-linux-x86_64
           path: |
-            dist/pd-edge-http-proxy-${{ github.ref_name }}-linux-x86_64.tar.gz
-            dist/pd-edge-console-${{ github.ref_name }}-linux-x86_64.tar.gz
+            dist/pd-edge-*-${{ github.ref_name }}-linux-x86_64.tar.gz
             dist/pd-controller-${{ github.ref_name }}-linux-x86_64.tar.gz
             dist/pd-vm-run-${{ github.ref_name }}-linux-x86_64.tar.gz
             dist/rustscript-syntax-*.vsix
@@ -138,8 +146,7 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            dist/pd-edge-http-proxy-${{ github.ref_name }}-linux-x86_64.tar.gz
-            dist/pd-edge-console-${{ github.ref_name }}-linux-x86_64.tar.gz
+            dist/pd-edge-*-${{ github.ref_name }}-linux-x86_64.tar.gz
             dist/pd-controller-${{ github.ref_name }}-linux-x86_64.tar.gz
             dist/pd-vm-run-${{ github.ref_name }}-linux-x86_64.tar.gz
             dist/rustscript-syntax-*.vsix
