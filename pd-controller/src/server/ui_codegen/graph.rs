@@ -857,22 +857,22 @@ pub(super) fn flow_action_statement(
             let value = block_value(block, "value", "1");
             Ok(FlowActionStatement {
                 rustscript: format!(
-                    "vm::http::upstream::request::set_header({}, {});",
+                    "upstream_request::set_header({}, {});",
                     rust_string(name),
                     render_expr_rss(value)
                 ),
                 javascript: format!(
-                    "vm.http.upstream.request.set_header({}, {});",
+                    "upstream_request.set_header({}, {});",
                     js_string(name),
                     render_expr_js(value)
                 ),
                 lua: format!(
-                    "vm.http.upstream.request.set_header({}, {})",
+                    "upstream_request.set_header({}, {})",
                     lua_string(name),
                     render_expr_lua(value)
                 ),
                 scheme: format!(
-                    "(vm.http.upstream.request.set_header {} {})",
+                    "(upstream_request:set_header {} {})",
                     scheme_string(name),
                     render_expr_scheme(value)
                 ),
@@ -883,22 +883,22 @@ pub(super) fn flow_action_statement(
             let value = block_value(block, "value", "1");
             Ok(FlowActionStatement {
                 rustscript: format!(
-                    "vm::http::upstream::request::add_header({}, {});",
+                    "upstream_request::add_header({}, {});",
                     rust_string(name),
                     render_expr_rss(value)
                 ),
                 javascript: format!(
-                    "vm.http.upstream.request.add_header({}, {});",
+                    "upstream_request.add_header({}, {});",
                     js_string(name),
                     render_expr_js(value)
                 ),
                 lua: format!(
-                    "vm.http.upstream.request.add_header({}, {})",
+                    "upstream_request.add_header({}, {})",
                     lua_string(name),
                     render_expr_lua(value)
                 ),
                 scheme: format!(
-                    "(vm.http.upstream.request.add_header {} {})",
+                    "(upstream_request:add_header {} {})",
                     scheme_string(name),
                     render_expr_scheme(value)
                 ),
@@ -907,62 +907,32 @@ pub(super) fn flow_action_statement(
         "remove_request_header" => {
             let name = block_value(block, "name", "x-remove");
             Ok(FlowActionStatement {
-                rustscript: format!(
-                    "vm::http::upstream::request::remove_header({});",
-                    rust_string(name)
-                ),
-                javascript: format!(
-                    "vm.http.upstream.request.remove_header({});",
-                    js_string(name)
-                ),
-                lua: format!(
-                    "vm.http.upstream.request.remove_header({})",
-                    lua_string(name)
-                ),
-                scheme: format!(
-                    "(vm.http.upstream.request.remove_header {})",
-                    scheme_string(name)
-                ),
+                rustscript: format!("upstream_request::remove_header({});", rust_string(name)),
+                javascript: format!("upstream_request.remove_header({});", js_string(name)),
+                lua: format!("upstream_request.remove_header({})", lua_string(name)),
+                scheme: format!("(upstream_request:remove_header {})", scheme_string(name)),
             })
         }
         "clear_request_header" => {
             let name = block_value(block, "name", "x-remove");
             Ok(FlowActionStatement {
-                rustscript: format!(
-                    "vm::http::upstream::request::clear_header({});",
-                    rust_string(name)
-                ),
-                javascript: format!(
-                    "vm.http.upstream.request.clear_header({});",
-                    js_string(name)
-                ),
-                lua: format!(
-                    "vm.http.upstream.request.clear_header({})",
-                    lua_string(name)
-                ),
-                scheme: format!(
-                    "(vm.http.upstream.request.clear_header {})",
-                    scheme_string(name)
-                ),
+                rustscript: format!("upstream_request::clear_header({});", rust_string(name)),
+                javascript: format!("upstream_request.clear_header({});", js_string(name)),
+                lua: format!("upstream_request.clear_header({})", lua_string(name)),
+                scheme: format!("(upstream_request:clear_header {})", scheme_string(name)),
             })
         }
         "set_request_headers" => {
             let headers = block_value(block, "headers", "$request_headers");
             Ok(FlowActionStatement {
                 rustscript: format!(
-                    "vm::http::upstream::request::set_headers({});",
+                    "upstream_request::set_headers({});",
                     render_expr_rss(headers)
                 ),
-                javascript: format!(
-                    "vm.http.upstream.request.set_headers({});",
-                    render_expr_js(headers)
-                ),
-                lua: format!(
-                    "vm.http.upstream.request.set_headers({})",
-                    render_expr_lua(headers)
-                ),
+                javascript: format!("upstream_request.set_headers({});", render_expr_js(headers)),
+                lua: format!("upstream_request.set_headers({})", render_expr_lua(headers)),
                 scheme: format!(
-                    "(vm.http.upstream.request.set_headers {})",
+                    "(upstream_request:set_headers {})",
                     render_expr_scheme(headers)
                 ),
             })
@@ -970,20 +940,11 @@ pub(super) fn flow_action_statement(
         "set_request_method" => {
             let method = block_value(block, "method", "GET");
             Ok(FlowActionStatement {
-                rustscript: format!(
-                    "vm::http::upstream::request::set_method({});",
-                    render_expr_rss(method)
-                ),
-                javascript: format!(
-                    "vm.http.upstream.request.set_method({});",
-                    render_expr_js(method)
-                ),
-                lua: format!(
-                    "vm.http.upstream.request.set_method({})",
-                    render_expr_lua(method)
-                ),
+                rustscript: format!("upstream_request::set_method({});", render_expr_rss(method)),
+                javascript: format!("upstream_request.set_method({});", render_expr_js(method)),
+                lua: format!("upstream_request.set_method({})", render_expr_lua(method)),
                 scheme: format!(
-                    "(vm.http.upstream.request.set_method {})",
+                    "(upstream_request:set_method {})",
                     render_expr_scheme(method)
                 ),
             })
@@ -991,62 +952,32 @@ pub(super) fn flow_action_statement(
         "set_request_path" => {
             let path = block_value(block, "path", "/");
             Ok(FlowActionStatement {
-                rustscript: format!(
-                    "vm::http::upstream::request::set_path({});",
-                    render_expr_rss(path)
-                ),
-                javascript: format!(
-                    "vm.http.upstream.request.set_path({});",
-                    render_expr_js(path)
-                ),
-                lua: format!(
-                    "vm.http.upstream.request.set_path({})",
-                    render_expr_lua(path)
-                ),
-                scheme: format!(
-                    "(vm.http.upstream.request.set_path {})",
-                    render_expr_scheme(path)
-                ),
+                rustscript: format!("upstream_request::set_path({});", render_expr_rss(path)),
+                javascript: format!("upstream_request.set_path({});", render_expr_js(path)),
+                lua: format!("upstream_request.set_path({})", render_expr_lua(path)),
+                scheme: format!("(upstream_request:set_path {})", render_expr_scheme(path)),
             })
         }
         "set_request_query" => {
             let query = block_value(block, "query", "x=1");
             Ok(FlowActionStatement {
-                rustscript: format!(
-                    "vm::http::upstream::request::set_query({});",
-                    render_expr_rss(query)
-                ),
-                javascript: format!(
-                    "vm.http.upstream.request.set_query({});",
-                    render_expr_js(query)
-                ),
-                lua: format!(
-                    "vm.http.upstream.request.set_query({})",
-                    render_expr_lua(query)
-                ),
-                scheme: format!(
-                    "(vm.http.upstream.request.set_query {})",
-                    render_expr_scheme(query)
-                ),
+                rustscript: format!("upstream_request::set_query({});", render_expr_rss(query)),
+                javascript: format!("upstream_request.set_query({});", render_expr_js(query)),
+                lua: format!("upstream_request.set_query({})", render_expr_lua(query)),
+                scheme: format!("(upstream_request:set_query {})", render_expr_scheme(query)),
             })
         }
         "set_request_raw_query" => {
             let query = block_value(block, "query", "x=1");
             Ok(FlowActionStatement {
                 rustscript: format!(
-                    "vm::http::upstream::request::set_raw_query({});",
+                    "upstream_request::set_raw_query({});",
                     render_expr_rss(query)
                 ),
-                javascript: format!(
-                    "vm.http.upstream.request.set_raw_query({});",
-                    render_expr_js(query)
-                ),
-                lua: format!(
-                    "vm.http.upstream.request.set_raw_query({})",
-                    render_expr_lua(query)
-                ),
+                javascript: format!("upstream_request.set_raw_query({});", render_expr_js(query)),
+                lua: format!("upstream_request.set_raw_query({})", render_expr_lua(query)),
                 scheme: format!(
-                    "(vm.http.upstream.request.set_raw_query {})",
+                    "(upstream_request:set_raw_query {})",
                     render_expr_scheme(query)
                 ),
             })
@@ -1056,22 +987,22 @@ pub(super) fn flow_action_statement(
             let value = block_value(block, "value", "1");
             Ok(FlowActionStatement {
                 rustscript: format!(
-                    "vm::http::upstream::request::set_query_arg({}, {});",
+                    "upstream_request::set_query_arg({}, {});",
                     rust_string(name),
                     render_expr_rss(value)
                 ),
                 javascript: format!(
-                    "vm.http.upstream.request.set_query_arg({}, {});",
+                    "upstream_request.set_query_arg({}, {});",
                     js_string(name),
                     render_expr_js(value)
                 ),
                 lua: format!(
-                    "vm.http.upstream.request.set_query_arg({}, {})",
+                    "upstream_request.set_query_arg({}, {})",
                     lua_string(name),
                     render_expr_lua(value)
                 ),
                 scheme: format!(
-                    "(vm.http.upstream.request.set_query_arg {} {})",
+                    "(upstream_request:set_query_arg {} {})",
                     scheme_string(name),
                     render_expr_scheme(value)
                 ),
@@ -1080,22 +1011,10 @@ pub(super) fn flow_action_statement(
         "set_request_body" => {
             let value = block_value(block, "value", "payload");
             Ok(FlowActionStatement {
-                rustscript: format!(
-                    "vm::http::upstream::request::set_body({});",
-                    render_expr_rss(value)
-                ),
-                javascript: format!(
-                    "vm.http.upstream.request.set_body({});",
-                    render_expr_js(value)
-                ),
-                lua: format!(
-                    "vm.http.upstream.request.set_body({})",
-                    render_expr_lua(value)
-                ),
-                scheme: format!(
-                    "(vm.http.upstream.request.set_body {})",
-                    render_expr_scheme(value)
-                ),
+                rustscript: format!("upstream_request::set_body({});", render_expr_rss(value)),
+                javascript: format!("upstream_request.set_body({});", render_expr_js(value)),
+                lua: format!("upstream_request.set_body({})", render_expr_lua(value)),
+                scheme: format!("(upstream_request:set_body {})", render_expr_scheme(value)),
             })
         }
         "set_header" => {
@@ -1205,19 +1124,13 @@ pub(super) fn flow_action_statement(
             let upstream = block_value(block, "upstream", "127.0.0.1:8088");
             Ok(FlowActionStatement {
                 rustscript: format!(
-                    "vm::http::upstream::request::set_target({});",
+                    "upstream_request::set_target({});",
                     render_expr_rss(upstream)
                 ),
-                javascript: format!(
-                    "vm.http.upstream.request.set_target({});",
-                    render_expr_js(upstream)
-                ),
-                lua: format!(
-                    "vm.http.upstream.request.set_target({})",
-                    render_expr_lua(upstream)
-                ),
+                javascript: format!("upstream_request.set_target({});", render_expr_js(upstream)),
+                lua: format!("upstream_request.set_target({})", render_expr_lua(upstream)),
                 scheme: format!(
-                    "(vm.http.upstream.request.set_target {})",
+                    "(upstream_request:set_target {})",
                     render_expr_scheme(upstream)
                 ),
             })

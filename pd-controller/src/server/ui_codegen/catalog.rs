@@ -968,7 +968,7 @@ pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
             id: "set_request_header",
             title: "Set Upstream Request Header",
             category: "http_upstream_request",
-            description: "Set outbound request header via vm.http.upstream.request.set_header.",
+            description: "Set outbound request header via the default upstream exchange wrapper.",
             inputs: vec![
                 UiBlockInput {
                     key: "name",
@@ -998,7 +998,7 @@ pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
             id: "add_request_header",
             title: "Add Upstream Request Header",
             category: "http_upstream_request",
-            description: "Append outbound request header via vm.http.upstream.request.add_header.",
+            description: "Append outbound request header via the default upstream exchange wrapper.",
             inputs: vec![
                 UiBlockInput {
                     key: "name",
@@ -1028,7 +1028,7 @@ pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
             id: "remove_request_header",
             title: "Remove Upstream Request Header",
             category: "http_upstream_request",
-            description: "Remove outbound request header via vm.http.upstream.request.remove_header.",
+            description: "Remove outbound request header via the default upstream exchange wrapper.",
             inputs: vec![UiBlockInput {
                 key: "name",
                 label: "Header Name",
@@ -1048,7 +1048,7 @@ pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
             id: "clear_request_header",
             title: "Clear Upstream Request Header",
             category: "http_upstream_request",
-            description: "Clear outbound request header via vm.http.upstream.request.clear_header.",
+            description: "Clear outbound request header via the default upstream exchange wrapper.",
             inputs: vec![UiBlockInput {
                 key: "name",
                 label: "Header Name",
@@ -1088,7 +1088,7 @@ pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
             id: "set_request_method",
             title: "Set Upstream Request Method",
             category: "http_upstream_request",
-            description: "Set outbound request method via vm.http.upstream.request.set_method.",
+            description: "Set outbound request method via the default upstream exchange wrapper.",
             inputs: vec![UiBlockInput {
                 key: "method",
                 label: "Method",
@@ -1108,7 +1108,7 @@ pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
             id: "set_request_path",
             title: "Set Upstream Request Path",
             category: "http_upstream_request",
-            description: "Set outbound request path via vm.http.upstream.request.set_path.",
+            description: "Set outbound request path via the default upstream exchange wrapper.",
             inputs: vec![UiBlockInput {
                 key: "path",
                 label: "Path",
@@ -1128,7 +1128,7 @@ pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
             id: "set_request_query",
             title: "Set Upstream Request Query",
             category: "http_upstream_request",
-            description: "Set outbound request query via vm.http.upstream.request.set_query.",
+            description: "Set outbound request query via the default upstream exchange wrapper.",
             inputs: vec![UiBlockInput {
                 key: "query",
                 label: "Query",
@@ -1148,7 +1148,7 @@ pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
             id: "set_request_raw_query",
             title: "Set Upstream Raw Query",
             category: "http_upstream_request",
-            description: "Set outbound request raw query via vm.http.upstream.request.set_raw_query.",
+            description: "Set outbound request raw query via the default upstream exchange wrapper.",
             inputs: vec![UiBlockInput {
                 key: "query",
                 label: "Query",
@@ -1198,7 +1198,7 @@ pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
             id: "set_request_body",
             title: "Set Upstream Request Body",
             category: "http_upstream_request",
-            description: "Set outbound request body via vm.http.upstream.request.set_body.",
+            description: "Set outbound request body via the default upstream exchange wrapper.",
             inputs: vec![UiBlockInput {
                 key: "value",
                 label: "Body",
@@ -1618,7 +1618,7 @@ pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
             id: "set_upstream",
             title: "Set Upstream",
             category: "routing",
-            description: "Forward request to upstream host:port via vm.http.upstream.request.set_target.",
+            description: "Forward request to upstream host:port via the default upstream exchange wrapper.",
             inputs: vec![UiBlockInput {
                 key: "upstream",
                 label: "Upstream",

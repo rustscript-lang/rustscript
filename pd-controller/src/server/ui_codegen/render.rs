@@ -58,17 +58,50 @@ pub(super) fn ensure_host_namespace_imports(
 }
 
 fn ensure_rustscript_host_namespace_imports(lines: &mut Vec<String>) {
+    let requires_upstream_request = lines.iter().any(|line| line.contains("upstream_request::"));
+    let requires_upstream_response = lines
+        .iter()
+        .any(|line| line.contains("upstream_response::"));
     let requires_io = lines.iter().any(|line| line.contains("io::"));
     let requires_re = lines.iter().any(|line| line.contains("re::"));
     let requires_json = lines.iter().any(|line| line.contains("json::"));
     let requires_runtime = lines.iter().any(|line| line.contains("runtime::"));
     let requires_rate_limit = lines.iter().any(|line| line.contains("rate_limit::"));
 
-    if !requires_io && !requires_re && !requires_json && !requires_runtime && !requires_rate_limit {
+    if !requires_upstream_request
+        && !requires_upstream_response
+        && !requires_io
+        && !requires_re
+        && !requires_json
+        && !requires_runtime
+        && !requires_rate_limit
+    {
         return;
     }
 
     let mut insert_at = 1usize;
+    if requires_upstream_request
+        && !lines
+            .iter()
+            .any(|line| line.trim() == "use edge::http::upstream::request as upstream_request;")
+    {
+        lines.insert(
+            insert_at,
+            "use edge::http::upstream::request as upstream_request;".to_string(),
+        );
+        insert_at += 1;
+    }
+    if requires_upstream_response
+        && !lines
+            .iter()
+            .any(|line| line.trim() == "use edge::http::upstream::response as upstream_response;")
+    {
+        lines.insert(
+            insert_at,
+            "use edge::http::upstream::response as upstream_response;".to_string(),
+        );
+        insert_at += 1;
+    }
     if requires_io && !lines.iter().any(|line| line.trim() == "use io;") {
         lines.insert(insert_at, "use io;".to_string());
         insert_at += 1;
@@ -96,14 +129,43 @@ fn ensure_rustscript_host_namespace_imports(lines: &mut Vec<String>) {
 }
 
 fn ensure_javascript_host_namespace_imports(lines: &mut Vec<String>) {
+    let requires_upstream_request = lines.iter().any(|line| line.contains("upstream_request."));
+    let requires_upstream_response = lines.iter().any(|line| line.contains("upstream_response."));
     let requires_io = lines.iter().any(|line| line.contains("io."));
     let requires_re = lines.iter().any(|line| line.contains("re."));
     let requires_json = lines.iter().any(|line| line.contains("json."));
-    if !requires_io && !requires_re && !requires_json {
+    if !requires_upstream_request
+        && !requires_upstream_response
+        && !requires_io
+        && !requires_re
+        && !requires_json
+    {
         return;
     }
 
     let mut insert_at = 1usize;
+    if requires_upstream_request
+        && !lines.iter().any(|line| {
+            line.trim() == "import * as upstream_request from \"edge/http/upstream/request.rss\";"
+        })
+    {
+        lines.insert(
+            insert_at,
+            "import * as upstream_request from \"edge/http/upstream/request.rss\";".to_string(),
+        );
+        insert_at += 1;
+    }
+    if requires_upstream_response
+        && !lines.iter().any(|line| {
+            line.trim() == "import * as upstream_response from \"edge/http/upstream/response.rss\";"
+        })
+    {
+        lines.insert(
+            insert_at,
+            "import * as upstream_response from \"edge/http/upstream/response.rss\";".to_string(),
+        );
+        insert_at += 1;
+    }
     if requires_io
         && !lines
             .iter()
@@ -135,14 +197,43 @@ fn ensure_javascript_host_namespace_imports(lines: &mut Vec<String>) {
 }
 
 fn ensure_lua_host_namespace_imports(lines: &mut Vec<String>) {
+    let requires_upstream_request = lines.iter().any(|line| line.contains("upstream_request."));
+    let requires_upstream_response = lines.iter().any(|line| line.contains("upstream_response."));
     let requires_io = lines.iter().any(|line| line.contains("io."));
     let requires_re = lines.iter().any(|line| line.contains("re."));
     let requires_json = lines.iter().any(|line| line.contains("json."));
-    if !requires_io && !requires_re && !requires_json {
+    if !requires_upstream_request
+        && !requires_upstream_response
+        && !requires_io
+        && !requires_re
+        && !requires_json
+    {
         return;
     }
 
     let mut insert_at = 1usize;
+    if requires_upstream_request
+        && !lines.iter().any(|line| {
+            line.trim() == "local upstream_request = require(\"edge/http/upstream/request.rss\")"
+        })
+    {
+        lines.insert(
+            insert_at,
+            "local upstream_request = require(\"edge/http/upstream/request.rss\")".to_string(),
+        );
+        insert_at += 1;
+    }
+    if requires_upstream_response
+        && !lines.iter().any(|line| {
+            line.trim() == "local upstream_response = require(\"edge/http/upstream/response.rss\")"
+        })
+    {
+        lines.insert(
+            insert_at,
+            "local upstream_response = require(\"edge/http/upstream/response.rss\")".to_string(),
+        );
+        insert_at += 1;
+    }
     if requires_io
         && !lines
             .iter()
@@ -174,14 +265,46 @@ fn ensure_lua_host_namespace_imports(lines: &mut Vec<String>) {
 }
 
 fn ensure_scheme_host_namespace_imports(lines: &mut Vec<String>) {
+    let requires_upstream_request = lines.iter().any(|line| line.contains("(upstream_request:"));
+    let requires_upstream_response = lines
+        .iter()
+        .any(|line| line.contains("(upstream_response:"));
     let requires_io = lines.iter().any(|line| line.contains("(io."));
     let requires_re = lines.iter().any(|line| line.contains("(re."));
     let requires_json = lines.iter().any(|line| line.contains("(json."));
-    if !requires_io && !requires_re && !requires_json {
+    if !requires_upstream_request
+        && !requires_upstream_response
+        && !requires_io
+        && !requires_re
+        && !requires_json
+    {
         return;
     }
 
     let mut insert_at = 1usize;
+    if requires_upstream_request
+        && !lines.iter().any(|line| {
+            line.trim() == "(import (prefix \"edge/http/upstream/request.rss\" upstream_request:))"
+        })
+    {
+        lines.insert(
+            insert_at,
+            "(import (prefix \"edge/http/upstream/request.rss\" upstream_request:))".to_string(),
+        );
+        insert_at += 1;
+    }
+    if requires_upstream_response
+        && !lines.iter().any(|line| {
+            line.trim()
+                == "(import (prefix \"edge/http/upstream/response.rss\" upstream_response:))"
+        })
+    {
+        lines.insert(
+            insert_at,
+            "(import (prefix \"edge/http/upstream/response.rss\" upstream_response:))".to_string(),
+        );
+        insert_at += 1;
+    }
     if requires_io
         && !lines
             .iter()
@@ -453,66 +576,44 @@ pub(super) fn render_single_block(
         }
         "get_upstream_response_status" => {
             let var = sanitize_identifier(block.values.get("var"), "upstream_status");
-            rss.push(format!(
-                "let {var} = vm::http::upstream::response::get_status();"
-            ));
-            js.push(format!(
-                "let {var} = vm.http.upstream.response.get_status();"
-            ));
-            lua.push(format!(
-                "local {var} = vm.http.upstream.response.get_status()"
-            ));
-            scm.push(format!(
-                "(define {var} (vm.http.upstream.response.get_status))"
-            ));
+            rss.push(format!("let {var} = upstream_response::get_status();"));
+            js.push(format!("let {var} = upstream_response.get_status();"));
+            lua.push(format!("local {var} = upstream_response.get_status()"));
+            scm.push(format!("(define {var} (upstream_response:get_status))"));
         }
         "get_upstream_response_header" => {
             let var = sanitize_identifier(block.values.get("var"), "upstream_header");
             let header_name = block_value(block, "name", "x-upstream");
             rss.push(format!(
-                "let {var} = vm::http::upstream::response::get_header({});",
+                "let {var} = upstream_response::get_header({});",
                 rust_string(header_name)
             ));
             js.push(format!(
-                "let {var} = vm.http.upstream.response.get_header({});",
+                "let {var} = upstream_response.get_header({});",
                 js_string(header_name)
             ));
             lua.push(format!(
-                "local {var} = vm.http.upstream.response.get_header({})",
+                "local {var} = upstream_response.get_header({})",
                 lua_string(header_name)
             ));
             scm.push(format!(
-                "(define {var} (vm.http.upstream.response.get_header {}))",
+                "(define {var} (upstream_response:get_header {}))",
                 scheme_string(header_name)
             ));
         }
         "get_upstream_response_headers" => {
             let var = sanitize_identifier(block.values.get("var"), "upstream_headers");
-            rss.push(format!(
-                "let {var} = vm::http::upstream::response::get_headers();"
-            ));
-            js.push(format!(
-                "let {var} = vm.http.upstream.response.get_headers();"
-            ));
-            lua.push(format!(
-                "local {var} = vm.http.upstream.response.get_headers()"
-            ));
-            scm.push(format!(
-                "(define {var} (vm.http.upstream.response.get_headers))"
-            ));
+            rss.push(format!("let {var} = upstream_response::get_headers();"));
+            js.push(format!("let {var} = upstream_response.get_headers();"));
+            lua.push(format!("local {var} = upstream_response.get_headers()"));
+            scm.push(format!("(define {var} (upstream_response:get_headers))"));
         }
         "get_upstream_response_body" => {
             let var = sanitize_identifier(block.values.get("var"), "upstream_body");
-            rss.push(format!(
-                "let {var} = vm::http::upstream::response::get_body();"
-            ));
-            js.push(format!("let {var} = vm.http.upstream.response.get_body();"));
-            lua.push(format!(
-                "local {var} = vm.http.upstream.response.get_body()"
-            ));
-            scm.push(format!(
-                "(define {var} (vm.http.upstream.response.get_body))"
-            ));
+            rss.push(format!("let {var} = upstream_response::get_body();"));
+            js.push(format!("let {var} = upstream_response.get_body();"));
+            lua.push(format!("local {var} = upstream_response.get_body()"));
+            scm.push(format!("(define {var} (upstream_response:get_body))"));
         }
         "string_concat" => {
             let var = sanitize_identifier(block.values.get("var"), "joined_text");

@@ -753,11 +753,15 @@ async fn ui_render_set_upstream_uses_connected_identifier_expression() {
         .as_str()
         .expect("rustscript source should be a string");
     assert!(
-        rustscript.contains("vm::http::upstream::request::set_target(target_upstream);"),
+        rustscript.contains("use edge::http::upstream::request as upstream_request;"),
+        "expected upstream wrapper import in rustscript, got: {rustscript}"
+    );
+    assert!(
+        rustscript.contains("upstream_request::set_target(target_upstream);"),
         "expected set_upstream to use connected identifier in rustscript, got: {rustscript}"
     );
     assert!(
-        !rustscript.contains("vm::http::upstream::request::set_target(\"$target_upstream\");"),
+        !rustscript.contains("upstream_request::set_target(\"$target_upstream\");"),
         "set_upstream should not treat connected identifier as quoted literal, got: {rustscript}"
     );
 
@@ -831,6 +835,7 @@ async fn ui_render_new_http_blocks_generate_expected_calls() {
     let rustscript = render_json["source"]["rustscript"]
         .as_str()
         .expect("rustscript source should be a string");
+    assert!(rustscript.contains("use edge::http::upstream::request as upstream_request;"));
     assert!(rustscript.contains("use runtime;"));
     assert!(rustscript.contains("use rate_limit;"));
     assert!(rustscript.contains("let req_id = vm::http::request::get_id();"));
@@ -850,19 +855,17 @@ async fn ui_render_new_http_blocks_generate_expected_calls() {
     assert!(rustscript.contains("let req_chunk = vm::http::request::body::next_chunk(8);"));
     assert!(rustscript.contains("let req_body_done = vm::http::request::body::eof();"));
     assert!(rustscript.contains("let req_headers = vm::http::request::get_headers();"));
-    assert!(rustscript.contains("vm::http::upstream::request::set_header(\"x-added\", \"yes\");"));
-    assert!(
-        rustscript.contains("vm::http::upstream::request::add_header(\"x-added\", \"yes-2\");")
-    );
-    assert!(rustscript.contains("vm::http::upstream::request::remove_header(\"x-remove\");"));
-    assert!(rustscript.contains("vm::http::upstream::request::clear_header(\"x-clear\");"));
-    assert!(rustscript.contains("vm::http::upstream::request::set_headers(req_headers);"));
-    assert!(rustscript.contains("vm::http::upstream::request::set_method(method_next);"));
-    assert!(rustscript.contains("vm::http::upstream::request::set_path(path_next);"));
-    assert!(rustscript.contains("vm::http::upstream::request::set_query(query_next);"));
-    assert!(rustscript.contains("vm::http::upstream::request::set_raw_query(query_next);"));
-    assert!(rustscript.contains("vm::http::upstream::request::set_query_arg(\"token\", req_id);"));
-    assert!(rustscript.contains("vm::http::upstream::request::set_body(req_body);"));
+    assert!(rustscript.contains("upstream_request::set_header(\"x-added\", \"yes\");"));
+    assert!(rustscript.contains("upstream_request::add_header(\"x-added\", \"yes-2\");"));
+    assert!(rustscript.contains("upstream_request::remove_header(\"x-remove\");"));
+    assert!(rustscript.contains("upstream_request::clear_header(\"x-clear\");"));
+    assert!(rustscript.contains("upstream_request::set_headers(req_headers);"));
+    assert!(rustscript.contains("upstream_request::set_method(method_next);"));
+    assert!(rustscript.contains("upstream_request::set_path(path_next);"));
+    assert!(rustscript.contains("upstream_request::set_query(query_next);"));
+    assert!(rustscript.contains("upstream_request::set_raw_query(query_next);"));
+    assert!(rustscript.contains("upstream_request::set_query_arg(\"token\", req_id);"));
+    assert!(rustscript.contains("upstream_request::set_body(req_body);"));
     assert!(rustscript.contains("runtime::sleep(5);"));
     assert!(rustscript.contains("vm::http::response::remove_header(\"x-hidden\");"));
     assert!(rustscript.contains("vm::http::response::clear_header(\"x-clear\");"));
@@ -877,7 +880,11 @@ async fn ui_render_new_http_blocks_generate_expected_calls() {
     let javascript = render_json["source"]["javascript"]
         .as_str()
         .expect("javascript source should be a string");
-    assert!(javascript.contains("vm.http.upstream.request.set_path(path_next);"));
+    assert!(
+        javascript
+            .contains("import * as upstream_request from \"edge/http/upstream/request.rss\";")
+    );
+    assert!(javascript.contains("upstream_request.set_path(path_next);"));
     assert!(javascript.contains("vm.http.response.remove_header(\"x-hidden\");"));
 
     handle.abort();
