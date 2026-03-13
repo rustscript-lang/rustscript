@@ -32,7 +32,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 #[cfg(feature = "tls")]
 use tokio_rustls::{
-    LazyConfigAcceptor,
+    LazyConfigAcceptor, TlsAcceptor,
     rustls::{self, ServerConfig},
 };
 #[cfg(feature = "http3")]
@@ -42,10 +42,10 @@ use tracing::warn;
 use uuid::Uuid;
 use vm::VmError;
 
-use super::super::SharedState;
 #[cfg(feature = "tls")]
 use super::super::transport_plane::serve_transport_connection_with_listener_goal;
 use super::super::vm_runner::{VmDebugInvocation, VmExecutionError, execute_vm_with_context};
+use super::super::{LoadedProgram, SharedState};
 use super::shared::access_log_middleware;
 #[cfg(feature = "http3")]
 use crate::abi_impl::{
@@ -335,6 +335,59 @@ fn generate_https_proxy_tls_server_config() -> std::io::Result<std::sync::Arc<Se
     #[cfg(not(feature = "http2"))]
     let alpn_protocols = vec![b"http/1.1".to_vec()];
     build_default_self_signed_server_config(alpn_protocols)
+}
+
+#[cfg(feature = "tls")]
+fn https_listener_needs_transport_handoff(program: Option<&LoadedProgram>) -> bool {
+    let Some(program) = program else {
+        return false;
+    };
+
+    let mut imports_attach_transport = false;
+    let mut imports_downstream_tcp = false;
+    let mut imports_transport_prelude = false;
+
+    for import in &program.program.imports {
+        match import.name.as_str() {
+            "http::downstream::attach_transport" => imports_attach_transport = true,
+            "tcp::stream::downstream" => imports_downstream_tcp = true,
+            "tcp::stream::peek" | "tls::session::handshake" => {
+                imports_transport_prelude = true;
+            }
+            _ => {}
+        }
+    }
+
+    imports_transport_prelude || (imports_attach_transport && imports_downstream_tcp)
+}
+
+#[cfg(feature = "tls")]
+async fn serve_https_http_connection(
+    app: Router,
+    state: SharedState,
+    stream: tokio::net::TcpStream,
+    peer_addr: SocketAddr,
+    local_addr: SocketAddr,
+    tls_server_config: Arc<ServerConfig>,
+) {
+    let acceptor = TlsAcceptor::from(tls_server_config);
+    match acceptor.accept(stream).await {
+        Ok(tls_stream) => {
+            let connection_metadata = DownstreamConnectionMetadata {
+                local_addr,
+                peer_addr,
+                secure: true,
+            };
+            serve_http_connection(app, state, tls_stream, peer_addr, Some(connection_metadata))
+                .await;
+        }
+        Err(err) => {
+            warn!(
+                "{} downstream https accept failed: {err}",
+                category_program()
+            );
+        }
+    }
 }
 
 struct CapturedPromotedHttpRequest {
@@ -728,34 +781,53 @@ pub async fn serve_http_proxy(listener: TcpListener, state: SharedState) -> std:
 
     #[cfg(feature = "http2")]
     {
-    let app = build_http_proxy_app(state.clone());
-    loop {
-        let (stream, peer_addr) = listener.accept().await?;
-        let app = app.clone();
-        let state = state.clone();
-        tokio::spawn(async move {
-            serve_http_connection(app, state, stream, peer_addr, None).await;
-        });
-    }
+        let app = build_http_proxy_app(state.clone());
+        loop {
+            let (stream, peer_addr) = listener.accept().await?;
+            let app = app.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                serve_http_connection(app, state, stream, peer_addr, None).await;
+            });
+        }
     }
 }
 
 #[cfg(feature = "tls")]
 pub async fn serve_https_proxy(listener: TcpListener, state: SharedState) -> std::io::Result<()> {
     let tls_server_config = generate_https_proxy_tls_server_config()?;
+    let app = build_http_proxy_app(state.clone());
+    let local_addr = listener.local_addr()?;
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         let state = state.clone();
         let tls_server_config = tls_server_config.clone();
+        let app = app.clone();
+        let use_transport_handoff = {
+            let guard = state.active_program.read().await;
+            https_listener_needs_transport_handoff(guard.as_deref())
+        };
         tokio::spawn(async move {
-            serve_transport_connection_with_listener_goal(
-                stream,
-                peer_addr,
-                state,
-                DownstreamHttpListenerGoal::Https,
-                Some(tls_server_config),
-            )
-            .await;
+            if use_transport_handoff {
+                serve_transport_connection_with_listener_goal(
+                    stream,
+                    peer_addr,
+                    state,
+                    DownstreamHttpListenerGoal::Https,
+                    Some(tls_server_config),
+                )
+                .await;
+            } else {
+                serve_https_http_connection(
+                    app,
+                    state,
+                    stream,
+                    peer_addr,
+                    local_addr,
+                    tls_server_config,
+                )
+                .await;
+            }
         });
     }
 }

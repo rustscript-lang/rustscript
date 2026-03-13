@@ -1,6 +1,66 @@
 use super::support::*;
 use tower::ServiceExt;
 
+#[cfg(feature = "tls")]
+struct PermissiveTestServerCertVerifier {
+    delegate: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+}
+
+#[cfg(feature = "tls")]
+impl std::fmt::Debug for PermissiveTestServerCertVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PermissiveTestServerCertVerifier")
+    }
+}
+
+#[cfg(feature = "tls")]
+impl PermissiveTestServerCertVerifier {
+    fn new() -> Self {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let delegate = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .expect("webpki verifier should build");
+        Self { delegate }
+    }
+}
+
+#[cfg(feature = "tls")]
+impl rustls::client::danger::ServerCertVerifier for PermissiveTestServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.delegate.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.delegate.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.delegate.supported_verify_schemes()
+    }
+}
+
 #[tokio::test]
 async fn no_active_program_returns_404() {
     let (data_addr, _admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
@@ -2239,6 +2299,137 @@ async fn http_proxy_https_listener_returns_404_for_noop_program() {
         "not found"
     );
 
+    http_handle.abort();
+    https_handle.abort();
+    admin_handle.abort();
+}
+
+#[cfg(all(feature = "tls", feature = "http2"))]
+#[tokio::test]
+async fn http_proxy_https_listener_reuses_http2_connections_for_tls_upstream_programs() {
+    use http_body_util::{BodyExt, Full};
+    use hyper::Request;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    ensure_rustls_provider();
+
+    let (upstream_addr, connection_count, upstream_handle) =
+        spawn_https_http2_sample_upstream().await;
+    let (_http_addr, https_addr, admin_addr, http_handle, https_handle, admin_handle) =
+        spawn_http_https_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use tls;
+
+        let upstream = http::exchange::default_upstream();
+        http::exchange::set_target(upstream, "https://127.0.0.1:{}");
+        http::exchange::set_method(upstream, http::request::get_method());
+        http::exchange::set_path(upstream, http::request::get_path());
+        http::exchange::set_body(upstream, http::request::get_body());
+        http::exchange::set_header(upstream, "x-demo-request", http::request::get_path());
+
+        let session = tls::session::from_socket(upstream);
+        tls::session::set_verify(session, false);
+        tls::session::set_alpn(session, "h2,http/1.1");
+        http::exchange::set_version(upstream, "2");
+
+        http::response::set_header("x-downstream-version", http::request::get_http_version());
+        http::response::set_header("x-upstream-version", http::exchange::get_http_version(upstream));
+        http::response::set_body(http::exchange::get_body(upstream));
+    "#,
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let mut config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PermissiveTestServerCertVerifier::new()))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+
+    let stream = tokio::net::TcpStream::connect(https_addr)
+        .await
+        .expect("https listener should accept http2 tls clients");
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .expect("server name should parse")
+        .to_owned();
+    let tls_stream = connector
+        .connect(server_name, stream)
+        .await
+        .expect("https h2 tls handshake should succeed");
+    assert_eq!(
+        tls_stream
+            .get_ref()
+            .1
+            .alpn_protocol()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
+        Some("h2".to_string())
+    );
+
+    let (mut sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake(TokioIo::new(tls_stream))
+        .await
+        .expect("http2 client handshake should succeed");
+    let connection_handle = tokio::spawn(async move {
+        connection
+            .await
+            .expect("http2 client connection should run");
+    });
+
+    for (path, body) in [("/perf-one", "one"), ("/perf-two", "two")] {
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("https://localhost:{}{path}", https_addr.port()))
+                    .version(axum::http::Version::HTTP_2)
+                    .header("host", format!("localhost:{}", https_addr.port()))
+                    .body(Full::new(axum::body::Bytes::from(body.to_string())))
+                    .expect("http2 request should build"),
+            )
+            .await
+            .expect("http2 request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.version(), axum::http::Version::HTTP_2);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-downstream-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("2")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-upstream-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("2")
+        );
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("http2 response body should collect")
+            .to_bytes();
+        assert_eq!(
+            body_bytes.as_ref(),
+            format!("POST|{path}|{path}|{body}").as_bytes()
+        );
+    }
+
+    assert_eq!(
+        connection_count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "two proxied https+h2 requests should reuse one upstream http2 connection",
+    );
+
+    connection_handle.abort();
+    upstream_handle.abort();
     http_handle.abort();
     https_handle.abort();
     admin_handle.abort();
