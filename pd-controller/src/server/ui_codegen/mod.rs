@@ -1,8 +1,18 @@
 use super::*;
 
+mod abi_blocks;
+mod abi_render;
 mod catalog;
 mod graph;
 mod render;
+
+#[derive(Clone, Debug)]
+pub(super) struct FlowActionStatement {
+    pub(super) rustscript: String,
+    pub(super) javascript: String,
+    pub(super) lua: String,
+    pub(super) scheme: String,
+}
 
 pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
     catalog::ui_block_catalog()

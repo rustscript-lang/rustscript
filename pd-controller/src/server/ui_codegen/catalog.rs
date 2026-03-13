@@ -1,7 +1,8 @@
+use super::abi_blocks::additional_abi_blocks;
 use super::*;
 
 pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
-    vec![
+    let mut blocks = vec![
         UiBlockDefinition {
             id: "const_string",
             title: "Const String",
@@ -1689,5 +1690,7 @@ pub(super) fn ui_block_catalog() -> Vec<UiBlockDefinition> {
             ],
             accepts_flow: true,
         },
-    ]
+    ];
+    blocks.extend(additional_abi_blocks());
+    blocks
 }

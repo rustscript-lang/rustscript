@@ -1,3 +1,4 @@
+use super::abi_render::{is_additional_flow_block, render_additional_value_block};
 use super::graph::flow_action_statement;
 use super::*;
 
@@ -58,6 +59,7 @@ pub(super) fn ensure_host_namespace_imports(
 }
 
 fn ensure_rustscript_host_namespace_imports(lines: &mut Vec<String>) {
+    let requires_upstream = lines.iter().any(|line| line.contains("upstream::"));
     let requires_upstream_request = lines.iter().any(|line| line.contains("upstream_request::"));
     let requires_upstream_response = lines
         .iter()
@@ -68,7 +70,8 @@ fn ensure_rustscript_host_namespace_imports(lines: &mut Vec<String>) {
     let requires_runtime = lines.iter().any(|line| line.contains("runtime::"));
     let requires_rate_limit = lines.iter().any(|line| line.contains("rate_limit::"));
 
-    if !requires_upstream_request
+    if !requires_upstream
+        && !requires_upstream_request
         && !requires_upstream_response
         && !requires_io
         && !requires_re
@@ -80,6 +83,17 @@ fn ensure_rustscript_host_namespace_imports(lines: &mut Vec<String>) {
     }
 
     let mut insert_at = 1usize;
+    if requires_upstream
+        && !lines
+            .iter()
+            .any(|line| line.trim() == "use edge::http::upstream as upstream;")
+    {
+        lines.insert(
+            insert_at,
+            "use edge::http::upstream as upstream;".to_string(),
+        );
+        insert_at += 1;
+    }
     if requires_upstream_request
         && !lines
             .iter()
@@ -129,12 +143,14 @@ fn ensure_rustscript_host_namespace_imports(lines: &mut Vec<String>) {
 }
 
 fn ensure_javascript_host_namespace_imports(lines: &mut Vec<String>) {
+    let requires_upstream = lines.iter().any(|line| line.contains("upstream."));
     let requires_upstream_request = lines.iter().any(|line| line.contains("upstream_request."));
     let requires_upstream_response = lines.iter().any(|line| line.contains("upstream_response."));
     let requires_io = lines.iter().any(|line| line.contains("io."));
     let requires_re = lines.iter().any(|line| line.contains("re."));
     let requires_json = lines.iter().any(|line| line.contains("json."));
-    if !requires_upstream_request
+    if !requires_upstream
+        && !requires_upstream_request
         && !requires_upstream_response
         && !requires_io
         && !requires_re
@@ -144,6 +160,17 @@ fn ensure_javascript_host_namespace_imports(lines: &mut Vec<String>) {
     }
 
     let mut insert_at = 1usize;
+    if requires_upstream
+        && !lines
+            .iter()
+            .any(|line| line.trim() == "import * as upstream from \"edge/http/upstream.rss\";")
+    {
+        lines.insert(
+            insert_at,
+            "import * as upstream from \"edge/http/upstream.rss\";".to_string(),
+        );
+        insert_at += 1;
+    }
     if requires_upstream_request
         && !lines.iter().any(|line| {
             line.trim() == "import * as upstream_request from \"edge/http/upstream/request.rss\";"
@@ -197,12 +224,14 @@ fn ensure_javascript_host_namespace_imports(lines: &mut Vec<String>) {
 }
 
 fn ensure_lua_host_namespace_imports(lines: &mut Vec<String>) {
+    let requires_upstream = lines.iter().any(|line| line.contains("upstream."));
     let requires_upstream_request = lines.iter().any(|line| line.contains("upstream_request."));
     let requires_upstream_response = lines.iter().any(|line| line.contains("upstream_response."));
     let requires_io = lines.iter().any(|line| line.contains("io."));
     let requires_re = lines.iter().any(|line| line.contains("re."));
     let requires_json = lines.iter().any(|line| line.contains("json."));
-    if !requires_upstream_request
+    if !requires_upstream
+        && !requires_upstream_request
         && !requires_upstream_response
         && !requires_io
         && !requires_re
@@ -212,6 +241,17 @@ fn ensure_lua_host_namespace_imports(lines: &mut Vec<String>) {
     }
 
     let mut insert_at = 1usize;
+    if requires_upstream
+        && !lines
+            .iter()
+            .any(|line| line.trim() == "local upstream = require(\"edge/http/upstream.rss\")")
+    {
+        lines.insert(
+            insert_at,
+            "local upstream = require(\"edge/http/upstream.rss\")".to_string(),
+        );
+        insert_at += 1;
+    }
     if requires_upstream_request
         && !lines.iter().any(|line| {
             line.trim() == "local upstream_request = require(\"edge/http/upstream/request.rss\")"
@@ -265,6 +305,7 @@ fn ensure_lua_host_namespace_imports(lines: &mut Vec<String>) {
 }
 
 fn ensure_scheme_host_namespace_imports(lines: &mut Vec<String>) {
+    let requires_upstream = lines.iter().any(|line| line.contains("(upstream:"));
     let requires_upstream_request = lines.iter().any(|line| line.contains("(upstream_request:"));
     let requires_upstream_response = lines
         .iter()
@@ -272,7 +313,8 @@ fn ensure_scheme_host_namespace_imports(lines: &mut Vec<String>) {
     let requires_io = lines.iter().any(|line| line.contains("(io."));
     let requires_re = lines.iter().any(|line| line.contains("(re."));
     let requires_json = lines.iter().any(|line| line.contains("(json."));
-    if !requires_upstream_request
+    if !requires_upstream
+        && !requires_upstream_request
         && !requires_upstream_response
         && !requires_io
         && !requires_re
@@ -282,6 +324,17 @@ fn ensure_scheme_host_namespace_imports(lines: &mut Vec<String>) {
     }
 
     let mut insert_at = 1usize;
+    if requires_upstream
+        && !lines
+            .iter()
+            .any(|line| line.trim() == "(import (prefix \"edge/http/upstream.rss\" upstream:))")
+    {
+        lines.insert(
+            insert_at,
+            "(import (prefix \"edge/http/upstream.rss\" upstream:))".to_string(),
+        );
+        insert_at += 1;
+    }
     if requires_upstream_request
         && !lines.iter().any(|line| {
             line.trim() == "(import (prefix \"edge/http/upstream/request.rss\" upstream_request:))"
@@ -345,6 +398,17 @@ pub(super) fn render_single_block(
     lua: &mut Vec<String>,
     scm: &mut Vec<String>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if render_additional_value_block(block, rss, js, lua, scm)? {
+        return Ok(());
+    }
+    if is_additional_flow_block(&block.block_id) {
+        let action = flow_action_statement(block)?;
+        rss.push(action.rustscript);
+        js.push(action.javascript);
+        lua.push(action.lua);
+        scm.push(action.scheme);
+        return Ok(());
+    }
     match block.block_id.as_str() {
         "const_string" => {
             let var = sanitize_identifier(block.values.get("var"), "text_value");
@@ -1207,6 +1271,25 @@ pub(super) fn render_number_expr(raw: &str, fallback: &str) -> String {
         trimmed.to_string()
     } else {
         fallback.to_string()
+    }
+}
+
+pub(super) fn render_bool_expr(
+    raw: &str,
+    fallback: &str,
+    true_literal: &str,
+    false_literal: &str,
+) -> String {
+    if let Some(expr) = raw.strip_prefix('$') {
+        return sanitize_identifier(Some(&expr.to_string()), "value");
+    }
+    match raw.trim() {
+        "true" => true_literal.to_string(),
+        "false" => false_literal.to_string(),
+        _ => match fallback.trim() {
+            "false" => false_literal.to_string(),
+            _ => true_literal.to_string(),
+        },
     }
 }
 

@@ -1,3 +1,7 @@
+use super::abi_render::{
+    additional_flow_action_statement, is_additional_flow_block, is_additional_mixed_flow_block,
+    is_additional_pure_value_block,
+};
 use super::catalog::ui_block_catalog;
 use super::render::*;
 use super::*;
@@ -303,7 +307,7 @@ fn render_sources_with_flow(
     }
 
     for node in &graph.ordered_nodes {
-        if is_value_block(&node.block.block_id) {
+        if should_render_before_flow(node, graph) {
             render_single_block(
                 &node.block,
                 &mut rss_lines,
@@ -315,7 +319,7 @@ fn render_sources_with_flow(
     }
 
     for node in &graph.ordered_nodes {
-        if is_value_block(&node.block.block_id) {
+        if should_render_before_flow(node, graph) {
             continue;
         }
         if !is_flow_block(&node.block.block_id) {
@@ -330,7 +334,7 @@ fn render_sources_with_flow(
         .ordered_nodes
         .iter()
         .filter(|node| {
-            !is_value_block(&node.block.block_id)
+            !should_render_before_flow(node, graph)
                 && graph
                     .flow_incoming_count
                     .get(&node.id)
@@ -366,6 +370,25 @@ fn render_sources_with_flow(
         lua: join_lines(&lua_lines),
         scheme: join_lines(&scm_lines),
     })
+}
+
+fn should_render_before_flow(node: &ResolvedUiNode, graph: &ResolvedUiGraph) -> bool {
+    is_value_block(&node.block.block_id)
+        || (is_mixed_flow_block(&node.block.block_id) && !node_has_flow_connection(node, graph))
+}
+
+fn node_has_flow_connection(node: &ResolvedUiNode, graph: &ResolvedUiGraph) -> bool {
+    graph
+        .flow_incoming_count
+        .get(&node.id)
+        .copied()
+        .unwrap_or(0)
+        > 0
+        || graph
+            .flow_outgoing
+            .get(&node.id)
+            .map(|edges| !edges.is_empty())
+            .unwrap_or(false)
 }
 
 fn is_value_block(block_id: &str) -> bool {
@@ -415,7 +438,11 @@ fn is_value_block(block_id: &str) -> bool {
             | "json_encode"
             | "json_decode"
             | "rate_limit_allow"
-    )
+    ) || is_additional_pure_value_block(block_id)
+}
+
+fn is_mixed_flow_block(block_id: &str) -> bool {
+    is_additional_mixed_flow_block(block_id)
 }
 
 fn is_flow_block(block_id: &str) -> bool {
@@ -439,7 +466,7 @@ fn is_flow_block(block_id: &str) -> bool {
             | "rate_limit_if_else"
             | "if"
             | "loop"
-    )
+    ) || is_additional_flow_block(block_id)
 }
 
 #[derive(Default)]
@@ -497,6 +524,31 @@ fn render_flow_node(
         | "set_response_status"
         | "set_upstream"
         | "runtime_sleep" => {
+            let mut statements = FlowStatements::default();
+            let action = flow_action_statement(block)?;
+            statements
+                .rustscript
+                .push(indent_line(indent, action.rustscript));
+            statements
+                .javascript
+                .push(indent_line(indent, action.javascript));
+            statements.lua.push(indent_line(indent, action.lua));
+            statements.scheme.push(action.scheme);
+
+            if let Some(next_target) = next_flow_target(node_id, graph)? {
+                statements.extend(render_flow_node(
+                    &next_target,
+                    graph,
+                    node_map,
+                    rendered,
+                    visiting,
+                    indent,
+                )?);
+            }
+
+            Ok(statements)
+        }
+        other if is_additional_flow_block(other) => {
             let mut statements = FlowStatements::default();
             let action = flow_action_statement(block)?;
             statements
@@ -829,14 +881,6 @@ fn optional_flow_target(node_id: &str, graph: &ResolvedUiGraph, output: &str) ->
     })
 }
 
-#[derive(Clone, Debug)]
-pub(super) struct FlowActionStatement {
-    pub(super) rustscript: String,
-    pub(super) javascript: String,
-    pub(super) lua: String,
-    pub(super) scheme: String,
-}
-
 pub(super) fn flow_action_statement(
     block: &UiBlockInstance,
 ) -> Result<FlowActionStatement, (StatusCode, Json<ErrorResponse>)> {
@@ -1070,9 +1114,15 @@ pub(super) fn flow_action_statement(
                 scheme: format!("(vm.runtime.sleep {millis})"),
             })
         }
-        other => Err(bad_request(&format!(
-            "unsupported flow action block '{}'",
-            other
-        ))),
+        other => {
+            if let Some(result) = additional_flow_action_statement(block) {
+                result
+            } else {
+                Err(bad_request(&format!(
+                    "unsupported flow action block '{}'",
+                    other
+                )))
+            }
+        }
     }
 }

@@ -134,6 +134,55 @@ async fn ui_blocks_and_deploy_endpoints_work() {
             .iter()
             .any(|item| item["id"].as_str() == Some("get_response_headers"))
     );
+    assert!(
+        blocks_json["blocks"]
+            .as_array()
+            .expect("blocks should be an array")
+            .iter()
+            .any(|item| item["id"].as_str() == Some("http_exchange_new"))
+    );
+    assert!(
+        blocks_json["blocks"]
+            .as_array()
+            .expect("blocks should be an array")
+            .iter()
+            .any(|item| item["id"].as_str() == Some("tcp_stream_new"))
+    );
+    assert!(
+        blocks_json["blocks"]
+            .as_array()
+            .expect("blocks should be an array")
+            .iter()
+            .any(|item| item["id"].as_str() == Some("tls_session_from_socket"))
+    );
+    assert!(
+        blocks_json["blocks"]
+            .as_array()
+            .expect("blocks should be an array")
+            .iter()
+            .any(|item| item["id"].as_str() == Some("websocket_connection_new"))
+    );
+    assert!(
+        blocks_json["blocks"]
+            .as_array()
+            .expect("blocks should be an array")
+            .iter()
+            .any(|item| item["id"].as_str() == Some("webrtc_connection_new"))
+    );
+    assert!(
+        blocks_json["blocks"]
+            .as_array()
+            .expect("blocks should be an array")
+            .iter()
+            .any(|item| item["id"].as_str() == Some("udp_socket_new"))
+    );
+    assert!(
+        blocks_json["blocks"]
+            .as_array()
+            .expect("blocks should be an array")
+            .iter()
+            .any(|item| item["id"].as_str() == Some("proxy_stream_exchange"))
+    );
     let blocks = blocks_json["blocks"]
         .as_array()
         .expect("blocks should be an array");
@@ -214,6 +263,24 @@ async fn ui_blocks_and_deploy_endpoints_work() {
         json_encode["category"].as_str(),
         Some("json"),
         "json_encode should be json scoped"
+    );
+    let http_exchange_new = blocks
+        .iter()
+        .find(|item| item["id"].as_str() == Some("http_exchange_new"))
+        .expect("http_exchange_new block should exist");
+    assert_eq!(
+        http_exchange_new["category"].as_str(),
+        Some("http_exchange"),
+        "http_exchange_new should be exchange scoped"
+    );
+    let tcp_stream_new = blocks
+        .iter()
+        .find(|item| item["id"].as_str() == Some("tcp_stream_new"))
+        .expect("tcp_stream_new block should exist");
+    assert_eq!(
+        tcp_stream_new["category"].as_str(),
+        Some("tcp_stream"),
+        "tcp_stream_new should be tcp scoped"
     );
 
     let deploy = client
@@ -361,6 +428,52 @@ async fn ui_deploy_compiles_graph_code_for_all_flavors() {
 
     handle.abort();
 }
+
+#[tokio::test]
+async fn ui_deploy_compiles_edge_stdlib_wrapper_blocks() {
+    let (addr, handle, _state) = spawn_controller(ControllerConfig::default()).await;
+    let client = reqwest::Client::new();
+
+    let deploy = client
+        .post(format!("http://{addr}/v1/ui/deploy"))
+        .json(&serde_json::json!({
+            "edge_id": "dp-ui-stdlib-wrapper",
+            "flavor": "rustscript",
+            "blocks": [
+                {
+                    "block_id": "set_upstream",
+                    "values": {
+                        "upstream": "127.0.0.1:8088"
+                    }
+                },
+                {
+                    "block_id": "http_upstream_as_stream",
+                    "values": {
+                        "var": "upstream_stream"
+                    }
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("deploy request should complete");
+
+    assert_eq!(deploy.status(), reqwest::StatusCode::ACCEPTED);
+    let payload = deploy
+        .json::<serde_json::Value>()
+        .await
+        .expect("deploy payload should decode");
+    let rustscript = payload["source"]["rustscript"]
+        .as_str()
+        .expect("rustscript source should be present");
+    assert!(rustscript.contains("use edge::http::upstream as upstream;"));
+    assert!(rustscript.contains("use edge::http::upstream::request as upstream_request;"));
+    assert!(rustscript.contains("upstream_request::set_target(\"127.0.0.1:8088\");"));
+    assert!(rustscript.contains("let upstream_stream = upstream::as_stream();"));
+
+    handle.abort();
+}
+
 #[tokio::test]
 async fn ui_render_extended_value_blocks_work_with_flow_graph() {
     let (addr, handle, _state) = spawn_controller(ControllerConfig::default()).await;
@@ -955,6 +1068,146 @@ async fn ui_render_json_blocks_generate_expected_calls() {
     assert!(scheme.contains("(require (prefix-in json. \"json\"))"));
     assert!(scheme.contains("(define payload (json.decode payload_json))"));
     assert!(scheme.contains("(define payload_json_out (json.encode payload))"));
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn ui_render_extended_abi_blocks_generate_expected_calls() {
+    let (addr, handle, _state) = spawn_controller(ControllerConfig::default()).await;
+    let client = reqwest::Client::new();
+
+    let render = client
+        .post(format!("http://{addr}/v1/ui/render"))
+        .json(&serde_json::json!({
+            "blocks": [
+                { "block_id": "http_exchange_new", "values": { "var": "exchange" } },
+                { "block_id": "http_exchange_set_target", "values": { "exchange": "$exchange", "target": "127.0.0.1:8080" } },
+                { "block_id": "http_exchange_send", "values": { "exchange": "$exchange" } },
+                { "block_id": "http_exchange_get_status", "values": { "var": "exchange_status", "exchange": "$exchange" } },
+                { "block_id": "tcp_stream_new", "values": { "var": "stream" } },
+                { "block_id": "tcp_stream_set_target", "values": { "stream": "$stream", "target": "127.0.0.1:9000" } },
+                { "block_id": "tcp_stream_connect", "values": { "var": "connected", "stream": "$stream" } },
+                { "block_id": "tls_session_from_socket", "values": { "var": "session", "stream": "$stream" } },
+                { "block_id": "tls_session_set_verify", "values": { "session": "$session", "verify": "false" } },
+                { "block_id": "websocket_connection_new", "values": { "var": "ws" } },
+                { "block_id": "websocket_connection_set_target", "values": { "connection": "$ws", "target": "ws://127.0.0.1:8081" } },
+                { "block_id": "webrtc_connection_new", "values": { "var": "rtc" } },
+                { "block_id": "udp_socket_new", "values": { "var": "udp" } },
+                { "block_id": "proxy_stream_exchange", "values": { "var": "proxy_exchange", "exchange": "$exchange" } },
+                { "block_id": "http_upstream_as_stream", "values": { "var": "upstream_proxy" } },
+                { "block_id": "read_upstream_response_all", "values": { "var": "upstream_all" } }
+            ]
+        }))
+        .send()
+        .await
+        .expect("render request should complete");
+
+    assert_eq!(render.status(), reqwest::StatusCode::OK);
+    let render_json = render
+        .json::<serde_json::Value>()
+        .await
+        .expect("render payload should decode");
+
+    let rustscript = render_json["source"]["rustscript"]
+        .as_str()
+        .expect("rustscript source should be a string");
+    assert!(rustscript.contains("use edge::http::upstream as upstream;"));
+    assert!(rustscript.contains("use edge::http::upstream::response as upstream_response;"));
+    assert!(rustscript.contains("let exchange = vm::http::exchange::new();"));
+    assert!(rustscript.contains("vm::http::exchange::set_target(exchange, \"127.0.0.1:8080\");"));
+    assert!(rustscript.contains("vm::http::exchange::send(exchange);"));
+    assert!(rustscript.contains("let exchange_status = vm::http::exchange::get_status(exchange);"));
+    assert!(rustscript.contains("let stream = vm::tcp::stream::new();"));
+    assert!(rustscript.contains("vm::tcp::stream::set_target(stream, \"127.0.0.1:9000\");"));
+    assert!(rustscript.contains("let connected = vm::tcp::stream::connect(stream);"));
+    assert!(rustscript.contains("let session = vm::tls::session::from_socket(stream);"));
+    assert!(rustscript.contains("vm::tls::session::set_verify(session, false);"));
+    assert!(rustscript.contains("let ws = vm::websocket::connection::new();"));
+    assert!(
+        rustscript.contains("vm::websocket::connection::set_target(ws, \"ws://127.0.0.1:8081\");")
+    );
+    assert!(rustscript.contains("let rtc = vm::webrtc::connection::new();"));
+    assert!(rustscript.contains("let udp = vm::udp::socket::new();"));
+    assert!(rustscript.contains("let proxy_exchange = vm::proxy::stream::exchange(exchange);"));
+    assert!(rustscript.contains("let upstream_proxy = upstream::as_stream();"));
+    assert!(rustscript.contains("let upstream_all = upstream_response::read_all();"));
+    if let Err(err) = edge::compile_edge_source_with_flavor(rustscript, SourceFlavor::RustScript) {
+        panic!("expected rustscript ABI render to compile, got: {err}\nsource:\n{rustscript}");
+    }
+
+    let javascript = render_json["source"]["javascript"]
+        .as_str()
+        .expect("javascript source should be a string");
+    assert!(javascript.contains("import * as upstream from \"edge/http/upstream.rss\";"));
+    assert!(
+        javascript
+            .contains("import * as upstream_response from \"edge/http/upstream/response.rss\";")
+    );
+    assert!(javascript.contains("let exchange = vm.http.exchange.new();"));
+    assert!(javascript.contains("let upstream_proxy = upstream.as_stream();"));
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn ui_render_extended_abi_flow_blocks_work_with_graph() {
+    let (addr, handle, _state) = spawn_controller(ControllerConfig::default()).await;
+    let client = reqwest::Client::new();
+
+    let render = client
+        .post(format!("http://{addr}/v1/ui/render"))
+        .json(&serde_json::json!({
+            "nodes": [
+                { "id": "n1", "block_id": "tcp_stream_new", "values": { "var": "stream" } },
+                { "id": "n2", "block_id": "tcp_stream_set_target", "values": { "stream": "1", "target": "127.0.0.1:9000" } },
+                { "id": "n3", "block_id": "tcp_stream_connect", "values": { "var": "connected", "stream": "1" } },
+                { "id": "n4", "block_id": "set_response_status", "values": { "status": "204" } }
+            ],
+            "edges": [
+                { "source": "n1", "source_output": "value", "target": "n2", "target_input": "stream" },
+                { "source": "n1", "source_output": "value", "target": "n3", "target_input": "stream" },
+                { "source": "n2", "source_output": "next", "target": "n3", "target_input": "__flow" },
+                { "source": "n3", "source_output": "next", "target": "n4", "target_input": "__flow" }
+            ]
+        }))
+        .send()
+        .await
+        .expect("render request should complete");
+
+    assert_eq!(render.status(), reqwest::StatusCode::OK);
+    let render_json = render
+        .json::<serde_json::Value>()
+        .await
+        .expect("render payload should decode");
+    let rustscript = render_json["source"]["rustscript"]
+        .as_str()
+        .expect("rustscript source should be a string");
+    let stream_pos = rustscript
+        .find("let stream = vm::tcp::stream::new();")
+        .expect("stream constructor should be rendered");
+    let target_pos = rustscript
+        .find("vm::tcp::stream::set_target(stream, \"127.0.0.1:9000\");")
+        .expect("set_target should be rendered");
+    let connect_pos = rustscript
+        .find("let connected = vm::tcp::stream::connect(stream);")
+        .expect("connect should be rendered");
+    let status_pos = rustscript
+        .find("vm::http::response::set_status(204);")
+        .expect("status action should be rendered");
+
+    assert!(
+        stream_pos < target_pos,
+        "stream should be created before target set: {rustscript}"
+    );
+    assert!(
+        target_pos < connect_pos,
+        "target should be set before connect: {rustscript}"
+    );
+    assert!(
+        connect_pos < status_pos,
+        "connect should occur before final action: {rustscript}"
+    );
 
     handle.abort();
 }

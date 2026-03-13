@@ -145,7 +145,7 @@ pub(super) async fn ui_deploy_handler(
     let source = render_ui_sources(&request.blocks, &request.nodes, &request.edges)?;
     let (flavor, flavor_label) = parse_ui_flavor(request.flavor.as_deref())?;
     let source_text = source_for_flavor(&source, flavor);
-    let compiled = compile_source_with_flavor(&source_text, flavor)
+    let compiled = compile_edge_source_with_flavor(&source_text, flavor)
         .map_err(|err| bad_request(&format!("source compile failed: {err}")))?;
     let program_bytes = encode_program(&compiled.program)
         .map_err(|err| bad_request(&format!("bytecode encode failed: {err}")))?;
@@ -1289,7 +1289,7 @@ pub(super) async fn enqueue_apply_program_version_handler(
 
     let (parsed_flavor, _) = parse_ui_flavor(Some(flavor.as_str()))?;
     let source_text = source_for_flavor(&source, parsed_flavor);
-    let compiled = compile_source_with_flavor(&source_text, parsed_flavor)
+    let compiled = compile_edge_source_with_flavor(&source_text, parsed_flavor)
         .map_err(|err| bad_request(&format!("source compile failed: {err}")))?;
     let program_bytes = encode_program(&compiled.program)
         .map_err(|err| bad_request(&format!("bytecode encode failed: {err}")))?;

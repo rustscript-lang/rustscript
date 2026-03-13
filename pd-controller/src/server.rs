@@ -25,6 +25,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use edge::{
     CommandResultPayload, ControlPlaneCommand, DebugSessionMode, EdgeCommandResult,
     EdgePollRequest, EdgePollResponse, EdgeTrafficSample, RemoteDebugCommand, TelemetrySnapshot,
+    compile_edge_source_with_flavor,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -34,8 +35,7 @@ use tokio::{
 use tracing::{info, warn};
 use uuid::Uuid;
 use vm::{
-    SourceFlavor, VmRecording, VmRecordingReplayState, compile_source_with_flavor, encode_program,
-    run_recording_replay_command,
+    SourceFlavor, VmRecording, VmRecordingReplayState, encode_program, run_recording_replay_command,
 };
 
 const MAX_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
