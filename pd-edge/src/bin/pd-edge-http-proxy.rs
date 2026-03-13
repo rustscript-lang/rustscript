@@ -139,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if let Some(listener) = &https_listener {
         info!(
-            "proxy/data-plane listening on https://{} (HTTPS listener starts in transport mode and auto-promotes to HTTP unless the VM consumes raw downstream transport)",
+            "proxy/data-plane listening on https://{} (standard HTTP programs terminate TLS directly; downstream transport-prelude programs still use the transport handoff path)",
             listener.local_addr()?
         );
     }
@@ -443,7 +443,7 @@ fn print_cli_help() {
             "Options:\n",
             "  --proxy-addr <ADDR>                       Proxy/data-plane listen address (default: 0.0.0.0:8080)\n",
             "  --data-addr <ADDR>                        Alias for --proxy-addr\n",
-            "  --https-addr <ADDR>                       Optional HTTPS/TLS listen address; starts in transport mode and auto-promotes to HTTP unless the VM consumes raw downstream transport\n",
+            "  --https-addr <ADDR>                       Optional HTTPS/TLS listen address; standard HTTP programs terminate TLS directly, while downstream transport-prelude programs still use the transport handoff path\n",
             "  --http3-addr <ADDR>                       Optional HTTP/3 over UDP listen address\n",
             "  --admin-addr <ADDR>                       Admin endpoint listen address (default: 127.0.0.1:8081)\n",
             "  --max-program-bytes <BYTES>               Max upload/program size in bytes (default: 1048576)\n",
