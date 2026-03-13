@@ -180,3 +180,67 @@ fn compile_edge_source_file_with_options_can_override_runtime_module() {
     let _ = std::fs::remove_file(override_module);
     let _ = std::fs::remove_dir(root);
 }
+
+#[test]
+fn compile_edge_source_file_supports_embedded_edge_upstream_wrapper_modules() {
+    let root = unique_temp_root("edge_upstream_wrappers");
+    let main_path = root.join("main.rss");
+    std::fs::write(
+        &main_path,
+        r#"
+        use edge::http::upstream as upstream;
+        use edge::http::upstream::request as upstream_request;
+        use edge::http::upstream::response as upstream_response;
+
+        upstream_request::set_target("http://example.test");
+        upstream_request::set_header("accept", "text/plain");
+        let proxy_handle = upstream::as_stream();
+        let status = upstream_response::get_status();
+        let line = upstream_response::read_line();
+        let chunk = upstream_response::next_chunk(8);
+        let done = upstream_response::eof();
+
+        [proxy_handle, status, line, chunk, done];
+    "#,
+    )
+    .expect("main source should write");
+
+    let compiled = compile_edge_source_file(&main_path).expect("compile should succeed");
+    let import_names = compiled
+        .program
+        .imports
+        .iter()
+        .map(|import| import.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        import_names.contains(&"http::exchange::default_upstream"),
+        "wrapper should import the canonical default exchange handle"
+    );
+    assert!(
+        import_names.contains(&"http::exchange::set_target"),
+        "wrapper should import canonical exchange setters"
+    );
+    assert!(
+        import_names.contains(&"http::exchange::get_status"),
+        "wrapper should import canonical exchange response getters"
+    );
+    assert!(
+        import_names.contains(&"proxy::stream::exchange"),
+        "wrapper should build proxy streams from explicit exchanges"
+    );
+    assert!(
+        import_names.contains(&"http::exchange::body::next_chunk"),
+        "wrapper should import canonical exchange body streaming calls"
+    );
+    assert!(
+        !import_names
+            .iter()
+            .any(|name| name.starts_with("http::upstream::")
+                || *name == "proxy::stream::default_upstream"),
+        "wrapper modules should not reintroduce removed alias host calls"
+    );
+
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_dir(root);
+}

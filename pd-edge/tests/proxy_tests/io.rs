@@ -81,7 +81,7 @@ async fn io_protocol_handles_accept_direct_integer_arguments() {
         http::exchange::set_target(upstream, "http://{upstream_addr}/literal");
         http::exchange::set_method(upstream, "POST");
         io::write(1, "direct-int-body");
-        http::response::set_status(http::upstream::response::get_status());
+        http::response::set_status(http::exchange::get_status(upstream));
         http::response::set_header("x-first-line", io::read_line(1));
         http::response::set_body(io::read_all(1));
     "#
@@ -132,7 +132,7 @@ async fn io_protocol_handles_accept_tls_session_handles_for_https_exchange() {
         tls::session::set_verify(session, false);
 
         io::write(session, "tls-direct-body");
-        http::response::set_status(http::upstream::response::get_status());
+        http::response::set_status(http::exchange::get_status(upstream));
         http::response::set_header("x-first-line", io::read_line(session));
         http::response::set_body(io::read_all(session));
     "#,

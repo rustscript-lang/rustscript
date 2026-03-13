@@ -836,19 +836,6 @@ async fn stream_downstream(
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 
-/// Returns the default upstream handle for the proxy byte stream.
-#[pd_edge_host_function(name = proxy_symbols::stream::DEFAULT_UPSTREAM.name, scope = proxy)]
-async fn stream_default_upstream(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    let handle = allocate_proxy_stream_handle(
-        &context,
-        ProxyByteStreamEndpoint::HttpExchange(http::default_upstream_exchange_handle()),
-    )?;
-    Ok(CallOutcome::Return(vec![Value::Int(handle)]))
-}
-
 /// Wraps an outbound HTTP exchange as a proxy byte stream.
 #[pd_edge_host_function(name = proxy_symbols::stream::EXCHANGE.name, scope = proxy)]
 async fn stream_exchange(

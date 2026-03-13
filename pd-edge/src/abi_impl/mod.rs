@@ -679,7 +679,7 @@ mod tests {
     use vm::{BytecodeBuilder, CallOutcome, VmError, VmStatus};
     use vm::{HostImport, OpCode, Program, ValueType, Vm};
 
-    use super::registry::PD_EDGE_HOST_FUNCTIONS;
+    use super::registry::{EdgeHostScope, PD_EDGE_HOST_FUNCTIONS};
     use super::{
         ProxyVmContext, RateLimiterStore, SharedProxyVmContext, new_shared_vm_async_ops,
         register_host_module,
@@ -793,13 +793,18 @@ mod tests {
                 return_type: ValueType::Unknown,
             },
         ];
+        let import_count = imports.len();
         let program =
             Program::with_imports_and_debug(vec![], vec![OpCode::Ret as u8], imports, None);
         let mut vm = Vm::new(program);
         register_http_plane_host_module(&mut vm, test_context(), new_shared_vm_async_ops())
             .expect("http plane vm should bind all cached scopes");
 
-        assert_eq!(vm.bound_function_count(), 4);
+        let io_scope_bindings = PD_EDGE_HOST_FUNCTIONS
+            .iter()
+            .filter(|entry| entry.scope == EdgeHostScope::Io)
+            .count();
+        assert_eq!(vm.bound_function_count(), import_count + io_scope_bindings);
     }
 
     #[cfg(feature = "http")]

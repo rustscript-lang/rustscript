@@ -10,11 +10,12 @@ if upstream == "" {
     runtime::exit();
 }
 
-http::upstream::request::set_target(upstream);
+let exchange = http::exchange::default_upstream();
+http::exchange::set_target(exchange, upstream);
 
 // Accessing the response metadata/body implicitly executes the outbound exchange.
-let upstream_status = http::upstream::response::get_status();
-let content_type = http::upstream::response::get_header("content-type");
+let upstream_status = http::exchange::get_status(exchange);
+let content_type = http::exchange::get_header(exchange, "content-type");
 if content_type != "" {
     http::response::set_header("content-type", content_type);
 }
@@ -23,11 +24,11 @@ http::response::set_status(upstream_status);
 if http::request::get_header("Streaming") != "" {
     // Read the response incrementally to make streaming behavior visible to the caller.
     let mut streamed = "";
-    while !http::upstream::response::body::eof() {
-        streamed = streamed + http::upstream::response::body::next_chunk(2) + "A";
+    while !http::exchange::body::eof(exchange) {
+        streamed = streamed + http::exchange::body::next_chunk(exchange, 2) + "A";
     }
     http::response::set_body(streamed);
 } else {
     http::response::set_header("x-stream", "false");
-    http::response::set_body(http::upstream::response::get_body());
+    http::response::set_body(http::exchange::get_body(exchange));
 }

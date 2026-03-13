@@ -3,11 +3,6 @@ fn proxy_stream_downstream() -> i64 {
     unreachable!("abi declaration only")
 }
 
-#[pd_host_function(name = "proxy::stream::default_upstream")]
-fn proxy_stream_default_upstream() -> i64 {
-    unreachable!("abi declaration only")
-}
-
 #[pd_host_function(name = "proxy::stream::exchange")]
 fn proxy_stream_exchange(exchange: i64) -> i64 {
     unreachable!("abi declaration only")

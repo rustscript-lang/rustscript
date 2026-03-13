@@ -32,7 +32,7 @@ pub(super) fn register_transport_extensions(
     registry::register_host_scope(vm, &context, &async_ops, registry::EdgeHostScope::Transport);
 }
 
-#[cfg_attr(not(feature = "http"), allow(dead_code))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn configure_upstream_transport_for_target(
     context: &super::ProxyVmContext,
     target: &str,

@@ -1,0 +1,59 @@
+// Convenience wrappers over the default outbound HTTP exchange request.
+use http;
+
+fn upstream_request_default_exchange() {
+    http::exchange::default_upstream()
+}
+
+pub fn set_header(name, value) {
+    http::exchange::set_header(upstream_request_default_exchange(), name, value)
+}
+
+pub fn set_method(method) {
+    http::exchange::set_method(upstream_request_default_exchange(), method)
+}
+
+pub fn set_path(path) {
+    http::exchange::set_path(upstream_request_default_exchange(), path)
+}
+
+pub fn set_query(query) {
+    http::exchange::set_query(upstream_request_default_exchange(), query)
+}
+
+pub fn set_target(target) {
+    http::exchange::set_target(upstream_request_default_exchange(), target)
+}
+
+pub fn set_body(body) {
+    http::exchange::set_body(upstream_request_default_exchange(), body)
+}
+
+pub fn add_header(name, value) {
+    http::exchange::add_header(upstream_request_default_exchange(), name, value)
+}
+
+pub fn remove_header(name) {
+    http::exchange::clear_header(upstream_request_default_exchange(), name)
+}
+
+pub fn clear_header(name) {
+    http::exchange::clear_header(upstream_request_default_exchange(), name)
+}
+
+pub fn set_headers(headers) {
+    let keys = headers.keys;
+    for (let mut index = 0; index < keys.length; index = index + 1) {
+        let key = keys[index].copy();
+        set_header(key, headers[key]);
+    }
+    headers
+}
+
+pub fn set_raw_query(query) {
+    set_query(query)
+}
+
+pub fn set_query_arg(name, value) {
+    http::exchange::set_query_arg(upstream_request_default_exchange(), name, value)
+}

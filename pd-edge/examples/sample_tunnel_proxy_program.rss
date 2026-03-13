@@ -13,12 +13,16 @@ if target == "" {
 }
 
 // Bind the default outbound exchange to the requested target.
-http::upstream::request::set_target(target);
+let exchange = http::exchange::default_upstream();
+http::exchange::set_target(exchange, target);
 
 // Export the downstream side as a byte-stream endpoint.
 let downstream = proxy::stream::downstream();
 let upstream_socket = tcp::stream::default_upstream();
 let upstream_tls = tls::session::from_socket(upstream_socket);
+if tls::session::is_present(upstream_tls) {
+    tls::session::set_verify(upstream_tls, false);
+}
 
 let mut status = "";
 if tls::session::is_present(upstream_tls) {
@@ -27,19 +31,19 @@ if tls::session::is_present(upstream_tls) {
     status = proxy::bridge(downstream, upstream, 4);
 } else {
     // Plain HTTP can bridge directly against the default upstream exchange stream.
-    let upstream = proxy::stream::default_upstream();
+    let upstream = proxy::stream::exchange(exchange);
     status = proxy::bridge(downstream, upstream, 4);
 }
 
 http::response::set_header("x-proxy-status", status);
 
 // After the tunnel completes, mirror response metadata that the exchange produced.
-let upstream_status = http::upstream::response::get_status();
+let upstream_status = http::exchange::get_status(exchange);
 if upstream_status != 0 {
     http::response::set_status(upstream_status);
 }
 
-let content_type = http::upstream::response::get_header("content-type");
+let content_type = http::exchange::get_header(exchange, "content-type");
 if content_type != "" {
     http::response::set_header("content-type", content_type);
 }

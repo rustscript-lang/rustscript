@@ -1335,7 +1335,8 @@ async fn transport_default_upstream_socket_accepts_multiple_writes_before_exchan
         use http;
         use tcp;
 
-        http::upstream::request::set_target("{upstream_addr}");
+        let upstream_exchange = http::exchange::default_upstream();
+        http::exchange::set_target(upstream_exchange, "{upstream_addr}");
         let downstream = tcp::stream::downstream();
         let upstream = tcp::stream::default_upstream();
         while !tcp::stream::eof(downstream) {{
@@ -1344,7 +1345,7 @@ async fn transport_default_upstream_socket_accepts_multiple_writes_before_exchan
                 tcp::stream::write(upstream, chunk);
             }}
         }}
-        http::response::set_body(http::upstream::response::get_body());
+        http::response::set_body(http::exchange::get_body(upstream_exchange));
     "#
     );
     let compiled = compile_source(&source).expect("source should compile");
@@ -1382,9 +1383,10 @@ async fn transport_default_upstream_socket_rejects_write_after_response_has_star
         use http;
         use tcp;
 
-        http::upstream::request::set_target("{upstream_addr}");
+        let upstream_exchange = http::exchange::default_upstream();
+        http::exchange::set_target(upstream_exchange, "{upstream_addr}");
         let upstream = tcp::stream::default_upstream();
-        http::upstream::response::get_status();
+        http::exchange::get_status(upstream_exchange);
         tcp::stream::write(upstream, "late");
     "#
     );

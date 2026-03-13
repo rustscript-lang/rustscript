@@ -368,7 +368,8 @@ Current state:
   - `webrtc::connection::default_upstream()` returns reserved webrtc handle `1`
   - `webrtc::connection::new()` allocates independent outbound webrtc handles starting at `2`
   - `webrtc::connection::{set_ice_servers, set_data_channel_label, set_remote_description, create_offer, create_answer, connect, send_text, read_text, send_binary_base64, read_binary_base64, eof, close, get_phase}` operate on any outbound webrtc handle
-- Directional `http::upstream::*` APIs remain as aliases over handle `1`.
+- The canonical upstream HTTP ABI is handle-based: use `http::exchange::default_upstream()` and `http::exchange::*`.
+- `compile_edge_source_file(...)` also embeds convenience wrappers under `edge::http::upstream::{request,response}` and `edge::http::upstream::as_stream()`.
 - Current runtime boundary:
   - generic `http::exchange::*` is the stable VM-facing request/response surface
   - feature `http2` currently adds explicit upstream session pooling plus downstream session tracking under the generic HTTP layer; it does not yet expose a VM-visible `http2::session::*` namespace
@@ -496,8 +497,8 @@ Rules:
 - `request.body` starts unread and only advances when a host call or resolver consumes bytes.
 - `exchange[1].request` starts as the default upstream draft seeded from `request.head`.
 - `exchange[2+]` are additional outbound request/response DAG instances allocated by the VM.
-- The VM-facing ABI stays generic: `http::exchange::*` and `http::upstream::*` do not hardcode HTTP/1.1 versus HTTP/2.
-- `http::exchange::get_http_version()` and `http::upstream::response::get_http_version()` expose the realized response version after the exchange starts.
+- The VM-facing ABI stays generic: `http::exchange::*` does not hardcode HTTP/1.1 versus HTTP/2.
+- `http::exchange::get_http_version()` exposes the realized response version after the exchange starts.
 - With feature `http2`, outbound HTTPS exchanges can negotiate `h2` and dynamic exchanges may share one upstream connection when the client path permits multiplex.
 - `response.output` starts empty and is populated by VM host calls for local response construction.
 - Each `exchange[n].response` starts as `NotStarted` and becomes `Ready` only when the DAG actually needs response data for that handle.
