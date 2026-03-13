@@ -3,6 +3,11 @@ use proxy;
 use tcp;
 use tls;
 
+// HTTP-runtime sample that proxies via transport-style upstream handles.
+//
+// This is distinct from:
+// - sample_proxy_program.rss: pure HTTP request/response APIs
+// - sample_tunnel_proxy_program.rss: raw downstream<->upstream byte tunnel
 let target = http::request::get_header("x-upstream-target");
 
 if target == "" {

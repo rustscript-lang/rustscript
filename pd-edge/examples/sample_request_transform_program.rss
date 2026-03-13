@@ -1,4 +1,5 @@
 use http;
+use runtime;
 
 // Forward requests after optionally rewriting the downstream body chunk-by-chunk.
 let upstream = http::request::get_header("x-upstream-target");
@@ -6,29 +7,30 @@ let upstream = http::request::get_header("x-upstream-target");
 if upstream == "" {
     http::response::set_status(400);
     http::response::set_body("missing x-upstream-target");
-} else {
-    http::upstream::request::set_target(upstream);
-
-    if http::request::get_header("Chunk-Transform") != "" {
-        // Consume the request stream incrementally and annotate each chunk before upload.
-        let mut transformed = "";
-        while !http::request::body::eof() {
-            transformed = transformed + http::request::body::next_chunk(3) + "#";
-        }
-        http::upstream::request::set_body(transformed);
-        http::response::set_header("x-request-stream", "true");
-    } else {
-        // Or forward the buffered request body unchanged.
-        http::upstream::request::set_body(http::request::get_body());
-        http::response::set_header("x-request-stream", "false");
-    }
-
-    // Mirror the upstream result after the transformed request has been sent.
-    let upstream_status = http::upstream::response::get_status();
-    let content_type = http::upstream::response::get_header("content-type");
-    if content_type != "" {
-        http::response::set_header("content-type", content_type);
-    }
-    http::response::set_status(upstream_status);
-    http::response::set_body(http::upstream::response::get_body());
+    runtime::exit();
 }
+
+http::upstream::request::set_target(upstream);
+
+if http::request::get_header("Chunk-Transform") != "" {
+    // Consume the request stream incrementally and annotate each chunk before upload.
+    let mut transformed = "";
+    while !http::request::body::eof() {
+        transformed = transformed + http::request::body::next_chunk(3) + "#";
+    }
+    http::upstream::request::set_body(transformed);
+    http::response::set_header("x-request-stream", "true");
+} else {
+    // Or forward the buffered request body unchanged.
+    http::upstream::request::set_body(http::request::get_body());
+    http::response::set_header("x-request-stream", "false");
+}
+
+// Mirror the upstream result after the transformed request has been sent.
+let upstream_status = http::upstream::response::get_status();
+let content_type = http::upstream::response::get_header("content-type");
+if content_type != "" {
+    http::response::set_header("content-type", content_type);
+}
+http::response::set_status(upstream_status);
+http::response::set_body(http::upstream::response::get_body());
