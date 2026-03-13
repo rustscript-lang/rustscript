@@ -101,6 +101,18 @@ mod tests {
     }
 
     #[test]
+    fn adds_space_before_prefix_borrows_and_negation() {
+        let input = "let neg=-1;\nlet borrow=&mut value;\nconsume(a,&b,neg);\n";
+        let formatted = format_source_with_flavor(input, SourceFlavor::RustScript)
+            .expect("formatting should succeed");
+
+        assert_eq!(
+            formatted,
+            "let neg = -1;\nlet borrow = &mut value;\nconsume(a, &b, neg);\n"
+        );
+    }
+
+    #[test]
     fn keeps_namespace_keyword_calls_tight_to_open_paren() {
         let input = "let regex_ok = re::match (\"(?i)^rustscript$\", \"RUSTSCRIPT\");\n";
         let formatted = format_source_with_flavor(input, SourceFlavor::RustScript)
@@ -109,6 +121,40 @@ mod tests {
         assert_eq!(
             formatted,
             "let regex_ok = re::match(\"(?i)^rustscript$\", \"RUSTSCRIPT\");\n"
+        );
+    }
+
+    #[test]
+    fn folds_long_comma_delimited_groups() {
+        let input = concat!(
+            "fn borrow_with_really_long_parameter_names(first_parameter, &second_parameter, third_parameter, fourth_parameter, fifth_parameter, sixth_parameter) {\n",
+            "    call_with_really_long_parameter_names(first_parameter, &second_parameter, third_parameter, fourth_parameter, fifth_parameter, sixth_parameter)\n",
+            "}\n"
+        );
+        let formatted = format_source_with_flavor(input, SourceFlavor::RustScript)
+            .expect("formatting should succeed");
+
+        assert_eq!(
+            formatted,
+            concat!(
+                "fn borrow_with_really_long_parameter_names(\n",
+                "    first_parameter,\n",
+                "    &second_parameter,\n",
+                "    third_parameter,\n",
+                "    fourth_parameter,\n",
+                "    fifth_parameter,\n",
+                "    sixth_parameter\n",
+                ") {\n",
+                "    call_with_really_long_parameter_names(\n",
+                "        first_parameter,\n",
+                "        &second_parameter,\n",
+                "        third_parameter,\n",
+                "        fourth_parameter,\n",
+                "        fifth_parameter,\n",
+                "        sixth_parameter\n",
+                "    )\n",
+                "}\n"
+            )
         );
     }
 }
