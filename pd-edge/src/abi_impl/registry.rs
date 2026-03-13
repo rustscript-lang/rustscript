@@ -123,15 +123,10 @@ pub(crate) fn bind_host_scopes(vm: &mut Vm, scopes: &[EdgeHostScope]) -> Result<
     if scope_mask_bits == 0 {
         return Ok(());
     }
-    if vm.bound_function_count() == 0 && !vm.program().imports.is_empty() {
+    if vm.bound_function_count() == 0 {
         cached_registry_for_scope_mask(scope_mask_bits).bind_vm_cached(vm)?;
         apply_cached_builtin_overrides(vm, scopes);
         return Ok(());
-    }
-    if vm.bound_function_count() == 0 {
-        for function in EDGE_ABI_FUNCTIONS {
-            vm.bind_static_function(function.name, super::unbound_edge_abi_function);
-        }
     }
     bind_host_scopes_direct(vm, scopes);
     Ok(())
