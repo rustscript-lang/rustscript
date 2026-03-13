@@ -1,5 +1,3 @@
-#![cfg(feature = "http3")]
-
 use std::{sync::Arc, time::Duration};
 
 use axum::body::Bytes;

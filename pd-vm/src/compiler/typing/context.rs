@@ -34,6 +34,14 @@ pub(super) struct TypeContext<'a> {
     pub(super) function_param_conflicts: HashMap<u16, String>,
 }
 
+struct CallableBody<'a> {
+    param_slots: &'a [LocalSlot],
+    param_schemas: Option<&'a [Option<TypeSchema>]>,
+    capture_copies: &'a [(LocalSlot, LocalSlot)],
+    body_stmts: &'a [Stmt],
+    body_expr: &'a Expr,
+}
+
 impl<'a> TypeContext<'a> {
     pub(super) fn new(
         function_impls: &'a HashMap<u16, FunctionImpl>,
@@ -969,15 +977,13 @@ impl<'a> TypeContext<'a> {
         args: &[Expr],
         caller_state: &LocalTypeState,
     ) -> Option<TypeSchema> {
-        let Some(nested) = self.build_callable_state(
+        let nested = self.build_callable_state(
             &closure.param_slots,
             None,
             &closure.capture_copies,
             Some(args),
             caller_state,
-        ) else {
-            return None;
-        };
+        )?;
         self.infer_expr_schema(&closure.body, &nested)
     }
 
@@ -1157,11 +1163,13 @@ impl<'a> TypeContext<'a> {
             self.push_generic_bindings(&function_decl.type_params, type_args);
         }
         let result = self.infer_callable_body(
-            &function_impl.param_slots,
-            Some(&function_decl.arg_schemas),
-            &function_impl.capture_copies,
-            &function_impl.body_stmts,
-            &function_impl.body_expr,
+            CallableBody {
+                param_slots: &function_impl.param_slots,
+                param_schemas: Some(&function_decl.arg_schemas),
+                capture_copies: &function_impl.capture_copies,
+                body_stmts: &function_impl.body_stmts,
+                body_expr: &function_impl.body_expr,
+            },
             args,
             caller_state,
         );
@@ -1196,11 +1204,13 @@ impl<'a> TypeContext<'a> {
             self.push_generic_bindings(&function_decl.type_params, type_args);
         }
         let result = self.infer_callable_body_schema(
-            &function_impl.param_slots,
-            Some(&function_decl.arg_schemas),
-            &function_impl.capture_copies,
-            &function_impl.body_stmts,
-            &function_impl.body_expr,
+            CallableBody {
+                param_slots: &function_impl.param_slots,
+                param_schemas: Some(&function_decl.arg_schemas),
+                capture_copies: &function_impl.capture_copies,
+                body_stmts: &function_impl.body_stmts,
+                body_expr: &function_impl.body_expr,
+            },
             args,
             caller_state,
         );
@@ -1218,60 +1228,52 @@ impl<'a> TypeContext<'a> {
         caller_state: &LocalTypeState,
     ) -> BoundType {
         self.infer_callable_body(
-            &closure.param_slots,
-            None,
-            &closure.capture_copies,
-            &[],
-            &closure.body,
+            CallableBody {
+                param_slots: &closure.param_slots,
+                param_schemas: None,
+                capture_copies: &closure.capture_copies,
+                body_stmts: &[],
+                body_expr: &closure.body,
+            },
             args,
             caller_state,
         )
     }
 
-    pub(super) fn infer_callable_body(
+    fn infer_callable_body(
         &mut self,
-        param_slots: &[LocalSlot],
-        param_schemas: Option<&[Option<TypeSchema>]>,
-        capture_copies: &[(LocalSlot, LocalSlot)],
-        body_stmts: &[Stmt],
-        body_expr: &Expr,
+        callable: CallableBody<'_>,
         args: &[Expr],
         caller_state: &LocalTypeState,
     ) -> BoundType {
         let Some(mut nested) = self.build_callable_state(
-            param_slots,
-            param_schemas,
-            capture_copies,
+            callable.param_slots,
+            callable.param_schemas,
+            callable.capture_copies,
             Some(args),
             caller_state,
         ) else {
             return BoundType::Unknown;
         };
-        self.apply_stmts(body_stmts, &mut nested);
-        self.infer_expr_type(body_expr, &nested)
+        self.apply_stmts(callable.body_stmts, &mut nested);
+        self.infer_expr_type(callable.body_expr, &nested)
     }
 
-    pub(super) fn infer_callable_body_schema(
+    fn infer_callable_body_schema(
         &mut self,
-        param_slots: &[LocalSlot],
-        param_schemas: Option<&[Option<TypeSchema>]>,
-        capture_copies: &[(LocalSlot, LocalSlot)],
-        body_stmts: &[Stmt],
-        body_expr: &Expr,
+        callable: CallableBody<'_>,
         args: &[Expr],
         caller_state: &LocalTypeState,
     ) -> Option<TypeSchema> {
-        let Some(mut nested) = self.build_callable_state(
-            param_slots,
-            param_schemas,
-            capture_copies,
+        let mut nested = self.build_callable_state(
+            callable.param_slots,
+            callable.param_schemas,
+            callable.capture_copies,
             Some(args),
             caller_state,
-        ) else {
-            return None;
-        };
-        self.apply_stmts(body_stmts, &mut nested);
-        self.infer_expr_schema(body_expr, &nested)
+        )?;
+        self.apply_stmts(callable.body_stmts, &mut nested);
+        self.infer_expr_schema(callable.body_expr, &nested)
             .map(|schema| self.resolve_schema(&schema))
     }
 
