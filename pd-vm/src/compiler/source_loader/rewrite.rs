@@ -8,7 +8,7 @@ use super::imports::{
     host_namespace_root_from_spec, is_builtin_host_namespace_spec, is_module_specifier,
     is_valid_ident, is_virtual_host_namespace_spec, resolve_module_path,
 };
-use super::model::{ImportClause, ImportRewriteResult, ModuleImport};
+use super::model::{ExportedFunctionSignature, ImportClause, ImportRewriteResult, ModuleImport};
 
 struct ImportCallResolution {
     alias_calls: HashMap<String, String>,
@@ -19,15 +19,17 @@ struct ImportCallResolution {
 pub(super) fn build_scheme_import_context(
     path: &Path,
     imports: &[ModuleImport],
-    module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
+    module_exports: &HashMap<PathBuf, HashMap<String, ExportedFunctionSignature>>,
     options: &CompileSourceFileOptions,
 ) -> Result<SchemeImportContext, SourcePathError> {
     let resolution =
         resolve_import_call_paths(SourceFlavor::Scheme, path, imports, module_exports, options)?;
 
     let mut declared_functions = HashMap::<String, Option<u8>>::new();
-    for (name, arity) in collect_imported_module_functions(path, imports, module_exports, options)?
+    for (name, signature) in
+        collect_imported_module_functions(path, imports, module_exports, options)?
     {
+        let arity = signature.arity;
         declared_functions
             .entry(name)
             .and_modify(|existing| {
@@ -55,7 +57,7 @@ fn resolve_import_call_paths(
     flavor: SourceFlavor,
     path: &Path,
     imports: &[ModuleImport],
-    module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
+    module_exports: &HashMap<PathBuf, HashMap<String, ExportedFunctionSignature>>,
     options: &CompileSourceFileOptions,
 ) -> Result<ImportCallResolution, SourcePathError> {
     let mut alias_calls = HashMap::<String, String>::new();
@@ -191,7 +193,7 @@ pub(super) fn rewrite_imported_call_sites(
     flavor: SourceFlavor,
     path: &Path,
     imports: &[ModuleImport],
-    module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
+    module_exports: &HashMap<PathBuf, HashMap<String, ExportedFunctionSignature>>,
     options: &CompileSourceFileOptions,
 ) -> Result<ImportRewriteResult, SourcePathError> {
     let resolution = resolve_import_call_paths(flavor, path, imports, module_exports, options)?;
@@ -751,7 +753,9 @@ mod tests {
 
     use super::*;
     use crate::compiler::CompileSourceFileOptions;
-    use crate::compiler::source_loader::model::{ImportClause, ModuleImport, NamedImport};
+    use crate::compiler::source_loader::model::{
+        ExportedFunctionSignature, ImportClause, ModuleImport, NamedImport,
+    };
 
     #[test]
     fn rustscript_namespace_import_calls_rewrite_to_direct_calls() {
@@ -775,10 +779,26 @@ is_empty("");
                 line: 2,
             },
         ];
-        let mut module_exports = HashMap::<PathBuf, HashMap<String, u8>>::new();
+        let mut module_exports =
+            HashMap::<PathBuf, HashMap<String, ExportedFunctionSignature>>::new();
         module_exports.insert(
             PathBuf::from("tests").join("strings.rss"),
-            HashMap::from([("is_empty".to_string(), 1), ("non_empty".to_string(), 1)]),
+            HashMap::from([
+                (
+                    "is_empty".to_string(),
+                    ExportedFunctionSignature {
+                        arity: 1,
+                        type_params: Vec::new(),
+                    },
+                ),
+                (
+                    "non_empty".to_string(),
+                    ExportedFunctionSignature {
+                        arity: 1,
+                        type_params: Vec::new(),
+                    },
+                ),
+            ]),
         );
 
         let rewritten = rewrite_imported_call_sites(
@@ -810,10 +830,17 @@ is_empty("");
             clause: ImportClause::AllPublic,
             line: 1,
         }];
-        let mut module_exports = HashMap::<PathBuf, HashMap<String, u8>>::new();
+        let mut module_exports =
+            HashMap::<PathBuf, HashMap<String, ExportedFunctionSignature>>::new();
         module_exports.insert(
             PathBuf::from("tests").join("runtime.rss"),
-            HashMap::from([("sleep".to_string(), 1)]),
+            HashMap::from([(
+                "sleep".to_string(),
+                ExportedFunctionSignature {
+                    arity: 1,
+                    type_params: Vec::new(),
+                },
+            )]),
         );
 
         let rewritten = rewrite_imported_call_sites(

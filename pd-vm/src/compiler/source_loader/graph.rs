@@ -12,7 +12,7 @@ use super::imports::{
     parse_module_imports, resolve_module_path, should_treat_missing_module_as_host_namespace,
     strip_import_directives,
 };
-use super::model::{ImportClause, ModuleCollectState, ModuleImport};
+use super::model::{ExportedFunctionSignature, ImportClause, ModuleCollectState, ModuleImport};
 
 pub(super) fn collect_module_units(
     path: &Path,
@@ -83,7 +83,15 @@ pub(super) fn collect_module_units(
             .functions
             .iter()
             .filter(|func| func.exported)
-            .map(|func| (func.name.clone(), func.arity))
+            .map(|func| {
+                (
+                    func.name.clone(),
+                    ExportedFunctionSignature {
+                        arity: func.arity,
+                        type_params: func.type_params.clone(),
+                    },
+                )
+            })
             .collect::<HashMap<_, _>>();
         state.units.push(ParsedUnit {
             parsed,
@@ -109,17 +117,22 @@ fn module_source_override<'a>(
 pub(super) fn build_rustscript_import_prelude(
     path: &Path,
     imports: &[ModuleImport],
-    module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
+    module_exports: &HashMap<PathBuf, HashMap<String, ExportedFunctionSignature>>,
     options: &CompileSourceFileOptions,
 ) -> Result<String, SourcePathError> {
     let declared = collect_imported_module_functions(path, imports, module_exports, options)?;
     let mut prelude = String::new();
-    for (name, arity) in declared {
-        let args = (0..arity)
+    for (name, signature) in declared {
+        let type_params = if signature.type_params.is_empty() {
+            String::new()
+        } else {
+            format!("<{}>", signature.type_params.join(", "))
+        };
+        let args = (0..signature.arity)
             .map(|idx| format!("arg{idx}"))
             .collect::<Vec<_>>()
             .join(", ");
-        prelude.push_str(&format!("pub fn {name}({args});\n"));
+        prelude.push_str(&format!("pub fn {name}{type_params}({args});\n"));
     }
     Ok(prelude)
 }
@@ -127,10 +140,10 @@ pub(super) fn build_rustscript_import_prelude(
 pub(super) fn collect_imported_module_functions(
     path: &Path,
     imports: &[ModuleImport],
-    module_exports: &HashMap<PathBuf, HashMap<String, u8>>,
+    module_exports: &HashMap<PathBuf, HashMap<String, ExportedFunctionSignature>>,
     options: &CompileSourceFileOptions,
-) -> Result<Vec<(String, u8)>, SourcePathError> {
-    let mut imported_functions = HashMap::<String, u8>::new();
+) -> Result<Vec<(String, ExportedFunctionSignature)>, SourcePathError> {
+    let mut imported_functions = HashMap::<String, ExportedFunctionSignature>::new();
 
     for import in imports {
         if is_builtin_host_namespace_spec(&import.spec) {
@@ -154,16 +167,19 @@ pub(super) fn collect_imported_module_functions(
 
         match &import.clause {
             ImportClause::AllPublic | ImportClause::Namespace(_) | ImportClause::Prefix(_) => {
-                for (name, arity) in exports {
-                    imported_functions
-                        .entry(name.clone())
-                        .and_modify(|existing| *existing = (*existing).max(*arity))
-                        .or_insert(*arity);
+                for (name, signature) in exports {
+                    merge_imported_function_signature(
+                        &mut imported_functions,
+                        name,
+                        signature,
+                        path,
+                        import.line,
+                    )?;
                 }
             }
             ImportClause::Named(named) => {
                 for binding in named {
-                    let arity = exports.get(&binding.imported).copied().ok_or_else(|| {
+                    let signature = exports.get(&binding.imported).cloned().ok_or_else(|| {
                         SourcePathError::InvalidImportSyntax {
                             path: path.to_path_buf(),
                             line: import.line,
@@ -173,10 +189,13 @@ pub(super) fn collect_imported_module_functions(
                             ),
                         }
                     })?;
-                    imported_functions
-                        .entry(binding.imported.clone())
-                        .and_modify(|existing| *existing = (*existing).max(arity))
-                        .or_insert(arity);
+                    merge_imported_function_signature(
+                        &mut imported_functions,
+                        &binding.imported,
+                        &signature,
+                        path,
+                        import.line,
+                    )?;
                 }
             }
         }
@@ -185,4 +204,33 @@ pub(super) fn collect_imported_module_functions(
     let mut declared = imported_functions.into_iter().collect::<Vec<_>>();
     declared.sort_by(|(lhs_name, _), (rhs_name, _)| lhs_name.cmp(rhs_name));
     Ok(declared)
+}
+
+fn merge_imported_function_signature(
+    imported_functions: &mut HashMap<String, ExportedFunctionSignature>,
+    name: &str,
+    signature: &ExportedFunctionSignature,
+    path: &Path,
+    line: usize,
+) -> Result<(), SourcePathError> {
+    if let Some(existing) = imported_functions.get_mut(name) {
+        existing.arity = existing.arity.max(signature.arity);
+        if existing.type_params != signature.type_params {
+            if existing.type_params.is_empty() {
+                existing.type_params = signature.type_params.clone();
+            } else if !signature.type_params.is_empty() {
+                return Err(SourcePathError::InvalidImportSyntax {
+                    path: path.to_path_buf(),
+                    line,
+                    message: format!(
+                        "function '{name}' declared with conflicting type parameters across imported modules"
+                    ),
+                });
+            }
+        }
+        return Ok(());
+    }
+
+    imported_functions.insert(name.to_string(), signature.clone());
+    Ok(())
 }

@@ -114,6 +114,51 @@ fn compile_source_file_rustscript_named_import_is_selective() {
 }
 
 #[test]
+fn compile_source_file_rustscript_named_import_preserves_generic_function_type_params() {
+    let root = temp_module_root("vm_rustscript_generic_named_import_test");
+
+    let module_path = root.join("module.rss");
+    write_source(
+        &module_path,
+        r#"
+        struct Box<T> { value: T }
+
+        pub fn wrap<T>(value: T) {
+            let copied = value;
+            let out: Box<T> = { value: copied };
+            out
+        }
+    "#,
+        "module source",
+    );
+
+    let main_path = root.join("main.rss");
+    write_source(
+        &main_path,
+        r#"
+        use module::{wrap};
+
+        let wrapped = wrap::<string>("hello");
+        wrapped.value.length + 1;
+    "#,
+        "main source",
+    );
+
+    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    assert!(
+        compiled.functions.is_empty(),
+        "generic imported RustScript functions should inline without host imports"
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(6)]);
+
+    remove_module_root(&root);
+}
+
+#[test]
 fn compile_source_file_rustscript_module_exports_only_pub_functions() {
     let root = temp_module_root("vm_rustscript_pub_export_test");
 

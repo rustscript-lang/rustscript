@@ -124,7 +124,13 @@ impl<'a> TypeContext<'a> {
                 let bound = self.resolve_generic_binding(name).cloned();
                 bound.map_or_else(
                     || schema.clone(),
-                    |bound| self.resolve_schema_with_seen(&bound, seen),
+                    |bound| {
+                        if bound == *schema {
+                            schema.clone()
+                        } else {
+                            self.resolve_schema_with_seen(&bound, seen)
+                        }
+                    },
                 )
             }
             TypeSchema::Named(name, type_args) => {
@@ -277,7 +283,9 @@ impl<'a> TypeContext<'a> {
                         Some(TypeSchema::Named(_, _) | TypeSchema::GenericParam(_))
                     )
             }
-            Expr::OptionalGet { container, .. } => self.expr_has_struct_schema_source(container, state),
+            Expr::OptionalGet { container, .. } => {
+                self.expr_has_struct_schema_source(container, state)
+            }
             Expr::OptionUnwrapOr { value, .. } => self.expr_has_struct_schema_source(value, state),
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.expr_has_struct_schema_source(inner, state)
