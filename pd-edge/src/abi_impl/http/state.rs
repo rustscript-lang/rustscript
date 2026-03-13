@@ -407,7 +407,7 @@ pub(crate) enum DownstreamConnectTunnelTarget {
     #[cfg(feature = "tls")]
     Tls {
         handle: i64,
-        stream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+        stream: Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
     },
 }
 
@@ -507,7 +507,8 @@ impl DownstreamConnectTunnelPlan {
                 }
             }
             #[cfg(feature = "tls")]
-            DownstreamConnectTunnelTarget::Tls { handle, mut stream } => {
+            DownstreamConnectTunnelTarget::Tls { handle, stream } => {
+                let mut stream = *stream;
                 match copy_bidirectional(&mut downstream, &mut stream).await {
                     Ok(_) => {
                         Self::mark_closed(&context, handle, true);
@@ -662,7 +663,7 @@ impl DownstreamWebSocketTunnelPlan {
 
 #[derive(Debug)]
 pub(crate) enum DownstreamPostResponsePlan {
-    ConnectTunnel(DownstreamConnectTunnelPlan),
+    ConnectTunnel(Box<DownstreamConnectTunnelPlan>),
     #[cfg(feature = "websocket")]
     WebSocketTunnel(DownstreamWebSocketTunnelPlan),
 }
@@ -1939,8 +1940,12 @@ pub(crate) enum PromotedDownstreamTransport {
     Tcp(ReplayPrefixedIo<tokio::net::TcpStream>),
     #[cfg(feature = "tls")]
     Tls(
-        ReplayPrefixedIo<
-            tokio_rustls::server::TlsStream<crate::abi_impl::transport::DownstreamReplayTcpStream>,
+        Box<
+            ReplayPrefixedIo<
+                tokio_rustls::server::TlsStream<
+                    crate::abi_impl::transport::DownstreamReplayTcpStream,
+                >,
+            >,
         >,
     ),
 }
@@ -1979,8 +1984,8 @@ pub(crate) async fn take_promoted_downstream_transport(
         let stream = guard.take().ok_or_else(|| {
             VmError::HostError("downstream tls plaintext transport is already in use".to_string())
         })?;
-        return Ok(PromotedDownstreamTransport::Tls(ReplayPrefixedIo::new(
-            preread, stream,
+        return Ok(PromotedDownstreamTransport::Tls(Box::new(
+            ReplayPrefixedIo::new(preread, stream),
         )));
     }
 

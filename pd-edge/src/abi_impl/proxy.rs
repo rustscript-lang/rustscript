@@ -642,7 +642,10 @@ async fn take_dynamic_tls_connect_target(
             "dynamic tls session handle {handle} is already in use",
         ))
     })?;
-    Ok(http::DownstreamConnectTunnelTarget::Tls { handle, stream })
+    Ok(http::DownstreamConnectTunnelTarget::Tls {
+        handle,
+        stream: Box::new(stream),
+    })
 }
 
 async fn schedule_downstream_connect_tunnel(
@@ -698,9 +701,9 @@ async fn schedule_downstream_connect_tunnel(
                 .to_string(),
         )
     })?;
-    let plan = http::DownstreamPostResponsePlan::ConnectTunnel(
+    let plan = http::DownstreamPostResponsePlan::ConnectTunnel(Box::new(
         http::DownstreamConnectTunnelPlan::new(context.clone(), upgrade, target),
-    );
+    ));
     context.schedule_downstream_post_response_plan(plan)?;
     Ok(Some("upgraded".to_string()))
 }

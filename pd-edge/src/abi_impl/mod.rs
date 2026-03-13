@@ -708,7 +708,10 @@ mod tests {
     #[cfg(feature = "http")]
     /// Yields a pending TLS test operation.
     #[pd_edge_host_function(name = "test::yield_pending_tls", scope = http_extension)]
-    async fn yield_pending_tls(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
+    async fn yield_pending_tls(
+        _vm: &mut Vm,
+        _context: SharedProxyVmContext,
+    ) -> Result<CallOutcome, VmError> {
         tokio::task::yield_now().await;
         Ok(CallOutcome::Return(vec![]))
     }
