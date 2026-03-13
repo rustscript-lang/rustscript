@@ -212,7 +212,7 @@
       "patterns": [
         {
           "name": "meta.struct.declaration.rss",
-          "begin": "\\b(struct)(\\s+)([A-Za-z_][A-Za-z0-9_]*)(\\s*)(\\{)",
+          "begin": "\\b(struct)(\\s+)([A-Za-z_][A-Za-z0-9_]*)(\\s*)(<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)?(\\s*)(\\{)",
           "beginCaptures": {
             "1": {
               "name": "storage.type.rss"
@@ -221,6 +221,9 @@
               "name": "entity.name.type.rss"
             },
             "5": {
+              "name": "support.type.rss"
+            },
+            "7": {
               "name": "punctuation.section.block.begin.rss"
             }
           },
@@ -255,13 +258,16 @@
       "patterns": [
         {
           "name": "meta.struct.field.rss",
-          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(\\s*)(:)",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(\\s*)(:)(\\s*)((?:[A-Za-z_][A-Za-z0-9_]*(?:\\s*<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)?|\\[[^\\]\\n]+\\]))(?=\\s*(?:,|\\}))",
           "captures": {
             "1": {
               "name": "variable.other.member.rss"
             },
             "3": {
               "name": "punctuation.separator.type.rss"
+            },
+            "5": {
+              "name": "support.type.rss"
             }
           }
         }
@@ -271,7 +277,7 @@
       "patterns": [
         {
           "name": "meta.type.annotation.rss",
-          "match": "(:)(\\s*)([A-Za-z_][A-Za-z0-9_]*)",
+          "match": "(:)(\\s*)((?:[A-Za-z_][A-Za-z0-9_]*(?:\\s*<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)?|\\[[^\\]\\n]+\\]))",
           "captures": {
             "1": {
               "name": "punctuation.separator.type.rss"
@@ -283,7 +289,7 @@
         },
         {
           "name": "meta.type.annotation.array.rss",
-          "match": "(\\[)(\\s*)([A-Za-z_][A-Za-z0-9_]*)(\\s*)(\\])",
+          "match": "(\\[)(\\s*)((?:[A-Za-z_][A-Za-z0-9_]*(?:\\s*<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)?|[^\\]\\n]+))(\\s*)(\\])",
           "captures": {
             "1": {
               "name": "punctuation.section.brackets.begin.rss"
@@ -298,7 +304,7 @@
         },
         {
           "name": "meta.return.type.rss",
-          "match": "(->)(\\s*)([A-Za-z_][A-Za-z0-9_]*)",
+          "match": "(->)(\\s*)((?:[A-Za-z_][A-Za-z0-9_]*(?:\\s*<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)?|\\[[^\\]\\n]+\\]))",
           "captures": {
             "1": {
               "name": "keyword.operator.rss"
@@ -326,7 +332,7 @@
       "patterns": [
         {
           "name": "meta.function.declaration.rss",
-          "match": "\\b(pub)(\\s+)(fn)(\\s+)([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "match": "\\b(pub)(\\s+)(fn)(\\s+)([A-Za-z_][A-Za-z0-9_]*)(\\s*)(<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)?\\s*(?=\\()",
           "captures": {
             "1": {
               "name": "storage.modifier.rss"
@@ -336,18 +342,24 @@
             },
             "5": {
               "name": "entity.name.function.rss"
+            },
+            "7": {
+              "name": "support.type.rss"
             }
           }
         },
         {
           "name": "meta.function.declaration.rss",
-          "match": "\\b(fn)(\\s+)([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "match": "\\b(fn)(\\s+)([A-Za-z_][A-Za-z0-9_]*)(\\s*)(<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)?\\s*(?=\\()",
           "captures": {
             "1": {
               "name": "storage.type.function.rss"
             },
             "3": {
               "name": "entity.name.function.rss"
+            },
+            "5": {
+              "name": "support.type.rss"
             }
           }
         }
@@ -357,12 +369,48 @@
       "patterns": [
         {
           "name": "entity.name.function.rss",
+          "match": "\\b(?!pub\\b|struct\\b|fn\\b|let\\b|mut\\b|for\\b|if\\b|else\\b|match\\b|while\\b|break\\b|continue\\b|use\\b|as\\b|true\\b|false\\b|null\\b)([A-Za-z_][A-Za-z0-9_]*)(\\s*)(::)(\\s*)(<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)(?=\\s*\\()",
+          "captures": {
+            "1": {
+              "name": "entity.name.function.rss"
+            },
+            "3": {
+              "name": "punctuation.accessor.rss"
+            },
+            "5": {
+              "name": "support.type.rss"
+            }
+          }
+        },
+        {
+          "name": "entity.name.function.rss",
           "match": "\\b(?!pub\\b|struct\\b|fn\\b|let\\b|mut\\b|for\\b|if\\b|else\\b|match\\b|while\\b|break\\b|continue\\b|use\\b|as\\b|true\\b|false\\b|null\\b)([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()"
         }
       ]
     },
     "namespace-call": {
       "patterns": [
+        {
+          "name": "meta.namespace.call.rss",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(\\s*)(::)(\\s*)([A-Za-z_][A-Za-z0-9_]*(?:(?:\\s*::\\s*)[A-Za-z_][A-Za-z0-9_]*)*)(\\s*)(::)(\\s*)(<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)(?=\\s*\\()",
+          "captures": {
+            "1": {
+              "name": "entity.name.namespace.rss"
+            },
+            "3": {
+              "name": "punctuation.accessor.rss"
+            },
+            "5": {
+              "name": "entity.name.function.rss"
+            },
+            "7": {
+              "name": "punctuation.accessor.rss"
+            },
+            "9": {
+              "name": "support.type.rss"
+            }
+          }
+        },
         {
           "name": "meta.namespace.call.rss",
           "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(\\s*)(::)(\\s*)([A-Za-z_][A-Za-z0-9_]*(?:(?:\\s*::\\s*)[A-Za-z_][A-Za-z0-9_]*)*)(?=\\s*\\()",
