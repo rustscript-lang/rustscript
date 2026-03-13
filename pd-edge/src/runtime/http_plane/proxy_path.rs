@@ -58,9 +58,11 @@ pub async fn serve_http_proxy(listener: TcpListener, state: SharedState) -> std:
                     let path = request.uri().path().to_string();
                     let attachment = tracker.observe_request(version, &path);
                     let mut request = request;
+                    let on_upgrade = hyper::upgrade::on(&mut request);
                     if let Some(ref attachment) = attachment {
                         request.extensions_mut().insert(attachment.clone());
                     }
+                    request.extensions_mut().insert(on_upgrade);
                     let request = request.map(Body::new);
                     let response = app.oneshot(request).await;
                     if response.is_ok() {
@@ -77,7 +79,7 @@ pub async fn serve_http_proxy(listener: TcpListener, state: SharedState) -> std:
             });
 
             let result = AutoBuilder::new(TokioExecutor::new())
-                .serve_connection(io, service)
+                .serve_connection_with_upgrades(io, service)
                 .await;
             tracker.finish_connection(result.err().map(|err| err.to_string()));
         });
@@ -104,11 +106,12 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
         );
     };
 
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
     let downstream_http2_attachment = parts
         .extensions
         .get::<Http2DownstreamStreamAttachment>()
         .cloned();
+    let downstream_http1_upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
     let vm_context = {
         let uri = parts.uri.clone();
         let request_headers = parts.headers.clone();
@@ -152,6 +155,9 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
         if let Some(attachment) = &downstream_http2_attachment {
             vm_context.attach_downstream_http2_stream(attachment);
         }
+        if let Some(upgrade) = downstream_http1_upgrade {
+            vm_context.attach_downstream_http1_upgrade(upgrade);
+        }
         let vm_context = Arc::new(vm_context);
         match execute_vm_with_context(
             &program,
@@ -193,12 +199,22 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
     };
 
     let resolved = resolve_http_graph_response(&vm_context).await;
-    finalize_data_plane_response(
-        &state,
-        started,
-        resolved.response,
-        resolved.upstream_latency_ms,
-    )
+    let crate::abi_impl::http::ResolvedHttpGraphResponse {
+        response,
+        upstream_latency_ms,
+        post_response_plan,
+    } = resolved;
+    if let Some(plan) = post_response_plan {
+        tokio::spawn(async move {
+            if let Err(err) = plan.run().await {
+                warn!(
+                    "{} downstream post-response transport failed: {err}",
+                    category_program()
+                );
+            }
+        });
+    }
+    finalize_data_plane_response(&state, started, response, upstream_latency_ms)
 }
 
 fn finalize_data_plane_response(

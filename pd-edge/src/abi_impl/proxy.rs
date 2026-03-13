@@ -2,22 +2,32 @@ use std::sync::Arc;
 
 use edge_abi::symbols::proxy as proxy_symbols;
 use pd_edge_host_function::pd_edge_host_function;
-use tokio::{sync::Notify, task::yield_now, try_join};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::Notify,
+    task::yield_now,
+    try_join,
+};
 use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::{
     SharedProxyVmContext, SharedVmAsyncOps, http, registry,
     transport::{TcpStreamRef, TlsSessionRef, decode_tcp_stream_handle, decode_tls_session_handle},
     websocket::{
-        close_websocket_binary_stream, read_websocket_binary_bytes,
-        validate_outbound_websocket_binary_connection, write_websocket_binary_bytes,
+        close_websocket_binary_stream, ensure_outbound_websocket_connection_open,
+        read_websocket_binary_bytes, validate_outbound_websocket_binary_connection,
+        websocket_negotiated_subprotocol, write_websocket_binary_bytes,
     },
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ProxyByteStreamEndpoint {
     HttpDownstream,
+    DownstreamConnect,
+    DownstreamWebSocketBinary,
     HttpExchange(i64),
+    DynamicTcp(i64),
+    DynamicTls(i64),
     WebSocketBinary(i64),
 }
 
@@ -112,6 +122,83 @@ fn proxy_stream_state(
         .ok_or_else(|| unknown_proxy_stream_handle(handle))
 }
 
+fn downstream_proxy_endpoint(context: &SharedProxyVmContext) -> ProxyByteStreamEndpoint {
+    if context.request_head().method() == axum::http::Method::CONNECT {
+        ProxyByteStreamEndpoint::DownstreamConnect
+    } else if context.downstream_websocket().is_present() {
+        ProxyByteStreamEndpoint::DownstreamWebSocketBinary
+    } else {
+        ProxyByteStreamEndpoint::HttpDownstream
+    }
+}
+
+fn dynamic_tcp_proxy_io(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<super::transport::SharedTcpStreamIo, VmError> {
+    context
+        .lock_transport()
+        .tcp_stream_ios
+        .get(&handle)
+        .cloned()
+        .ok_or_else(|| {
+            VmError::HostError(format!(
+                "dynamic tcp stream handle {handle} has no active transport",
+            ))
+        })
+}
+
+#[cfg(feature = "tls")]
+fn dynamic_tls_proxy_io(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<super::transport::SharedTlsStreamIo, VmError> {
+    context
+        .lock_transport()
+        .dynamic_tls_session_ios
+        .get(&handle)
+        .cloned()
+        .ok_or_else(|| {
+            VmError::HostError(format!(
+                "dynamic tls session handle {handle} has no active plaintext transport",
+            ))
+        })
+}
+
+fn mark_dynamic_tcp_proxy_read_eof(context: &SharedProxyVmContext, handle: i64) {
+    let mut guard = context.lock_transport();
+    if let Some(state) = guard.tcp_streams.get_mut(&handle) {
+        state.mark_read_eof();
+    }
+}
+
+fn clear_dynamic_tcp_proxy_read_eof(context: &SharedProxyVmContext, handle: i64) {
+    let mut guard = context.lock_transport();
+    if let Some(state) = guard.tcp_streams.get_mut(&handle) {
+        state.clear_read_eof();
+    }
+}
+
+fn mark_dynamic_tcp_proxy_failed(context: &SharedProxyVmContext, handle: i64, message: &str) {
+    let mut guard = context.lock_transport();
+    if let Some(state) = guard.tcp_streams.get_mut(&handle) {
+        state.mark_failed(message.to_string());
+    }
+    guard.tcp_stream_ios.remove(&handle);
+}
+
+#[cfg(feature = "tls")]
+fn mark_dynamic_tls_proxy_failed(context: &SharedProxyVmContext, handle: i64, message: &str) {
+    let mut guard = context.lock_transport();
+    if let Some(state) = guard.tcp_streams.get_mut(&handle) {
+        state.mark_failed(message.to_string());
+    }
+    if let Some(flow) = guard.dynamic_tls_sessions.get_mut(&handle) {
+        flow.mark_failed();
+    }
+    guard.dynamic_tls_session_ios.remove(&handle);
+}
+
 fn prepare_proxy_stream_write(
     context: &SharedProxyVmContext,
     handle: i64,
@@ -197,17 +284,20 @@ fn endpoint_from_tcp_stream(
 ) -> Result<ProxyByteStreamEndpoint, VmError> {
     if let Some(stream_ref) = decode_tcp_stream_handle(stream) {
         return Ok(match stream_ref {
-            TcpStreamRef::Downstream => ProxyByteStreamEndpoint::HttpDownstream,
+            TcpStreamRef::Downstream => downstream_proxy_endpoint(context),
             TcpStreamRef::DefaultUpstream => {
                 ProxyByteStreamEndpoint::HttpExchange(http::default_upstream_exchange_handle())
             }
         });
     }
+    if http::tcp_stream_exists(context, stream) {
+        return Ok(ProxyByteStreamEndpoint::DynamicTcp(stream));
+    }
     if http::outbound_exchange_exists(context, stream) {
         return Ok(ProxyByteStreamEndpoint::HttpExchange(stream));
     }
     Err(VmError::HostError(format!(
-        "invalid tcp stream handle {stream}; expected 0 (downstream), 1 (default upstream), or an allocated outbound exchange handle",
+        "invalid tcp stream handle {stream}; expected 0 (downstream), 1 (default upstream), a connected dynamic tcp handle, or an allocated outbound exchange handle",
     )))
 }
 
@@ -220,9 +310,26 @@ fn tls_present_for_endpoint(
             let guard = context.lock_transport();
             Ok(guard.tls_dag.downstream.is_present())
         }
+        ProxyByteStreamEndpoint::DownstreamConnect => {
+            let guard = context.lock_transport();
+            Ok(guard.tls_dag.downstream.is_present())
+        }
+        ProxyByteStreamEndpoint::DownstreamWebSocketBinary => Ok(false),
         ProxyByteStreamEndpoint::HttpExchange(handle) => {
             Ok(http::outbound_exchange_tls_flow(context, *handle)?.is_present())
         }
+        ProxyByteStreamEndpoint::DynamicTcp(_) => Ok(false),
+        ProxyByteStreamEndpoint::DynamicTls(handle) => context
+            .lock_transport()
+            .dynamic_tls_sessions
+            .get(handle)
+            .cloned()
+            .map(|flow| flow.is_present())
+            .ok_or_else(|| {
+                VmError::HostError(format!(
+                    "dynamic tls session handle {handle} is unavailable for proxy transport",
+                ))
+            }),
         ProxyByteStreamEndpoint::WebSocketBinary(_) => Ok(false),
     }
 }
@@ -233,16 +340,18 @@ fn endpoint_from_tls_plaintext(
 ) -> Result<ProxyByteStreamEndpoint, VmError> {
     let endpoint = if let Some(session_ref) = decode_tls_session_handle(session) {
         match session_ref {
-            TlsSessionRef::Downstream => ProxyByteStreamEndpoint::HttpDownstream,
+            TlsSessionRef::Downstream => downstream_proxy_endpoint(context),
             TlsSessionRef::DefaultUpstream => {
                 ProxyByteStreamEndpoint::HttpExchange(http::default_upstream_exchange_handle())
             }
         }
+    } else if http::tcp_stream_exists(context, session) {
+        ProxyByteStreamEndpoint::DynamicTls(session)
     } else if http::outbound_exchange_exists(context, session) {
         ProxyByteStreamEndpoint::HttpExchange(session)
     } else {
         return Err(VmError::HostError(format!(
-            "invalid tls session handle {session}; expected 0 (downstream), 1 (default upstream), or an allocated outbound exchange handle",
+            "invalid tls session handle {session}; expected 0 (downstream), 1 (default upstream), a connected dynamic tls handle, or an allocated outbound exchange handle",
         )));
     };
 
@@ -285,6 +394,12 @@ async fn proxy_stream_read_step(
                 Ok(ProxyReadStep::Data(chunk))
             }
         }
+        ProxyByteStreamEndpoint::DownstreamConnect => Err(VmError::HostError(
+            "downstream connect tunnels are only available through proxy::tunnel".to_string(),
+        )),
+        ProxyByteStreamEndpoint::DownstreamWebSocketBinary => Err(VmError::HostError(
+            "downstream websocket tunnels are only available through proxy::tunnel".to_string(),
+        )),
         ProxyByteStreamEndpoint::HttpExchange(exchange) => {
             if !http::outbound_exchange_response_available(context, exchange)
                 && stream.write_observed
@@ -303,6 +418,52 @@ async fn proxy_stream_read_step(
                 }
             } else {
                 Ok(ProxyReadStep::Data(chunk))
+            }
+        }
+        ProxyByteStreamEndpoint::DynamicTcp(dynamic) => {
+            let io = dynamic_tcp_proxy_io(context, dynamic)?;
+            let mut guard = io.lock().await;
+            let stream = guard.as_mut().ok_or_else(|| {
+                VmError::HostError(format!(
+                    "dynamic tcp stream handle {dynamic} has no active transport",
+                ))
+            })?;
+            let mut buffer = vec![0u8; max_bytes];
+            let read = stream.read(&mut buffer).await.map_err(|err| {
+                let message = format!("proxy tcp read failed: {err}");
+                mark_dynamic_tcp_proxy_failed(context, dynamic, &message);
+                VmError::HostError(message)
+            })?;
+            if read == 0 {
+                mark_dynamic_tcp_proxy_read_eof(context, dynamic);
+                Ok(ProxyReadStep::Eof)
+            } else {
+                clear_dynamic_tcp_proxy_read_eof(context, dynamic);
+                buffer.truncate(read);
+                Ok(ProxyReadStep::Data(buffer))
+            }
+        }
+        ProxyByteStreamEndpoint::DynamicTls(dynamic) => {
+            let io = dynamic_tls_proxy_io(context, dynamic)?;
+            let mut guard = io.lock().await;
+            let stream = guard.as_mut().ok_or_else(|| {
+                VmError::HostError(format!(
+                    "dynamic tls session handle {dynamic} has no active plaintext transport",
+                ))
+            })?;
+            let mut buffer = vec![0u8; max_bytes];
+            let read = stream.read(&mut buffer).await.map_err(|err| {
+                let message = format!("proxy tls plaintext read failed: {err}");
+                mark_dynamic_tls_proxy_failed(context, dynamic, &message);
+                VmError::HostError(message)
+            })?;
+            if read == 0 {
+                mark_dynamic_tcp_proxy_read_eof(context, dynamic);
+                Ok(ProxyReadStep::Eof)
+            } else {
+                clear_dynamic_tcp_proxy_read_eof(context, dynamic);
+                buffer.truncate(read);
+                Ok(ProxyReadStep::Data(buffer))
             }
         }
         ProxyByteStreamEndpoint::WebSocketBinary(connection) => {
@@ -328,8 +489,56 @@ async fn proxy_stream_write_bytes(
             http::append_response_output_body_bytes(context, bytes);
             Ok(())
         }
+        ProxyByteStreamEndpoint::DownstreamConnect => Err(VmError::HostError(
+            "downstream connect tunnels are only available through proxy::tunnel".to_string(),
+        )),
+        ProxyByteStreamEndpoint::DownstreamWebSocketBinary => Err(VmError::HostError(
+            "downstream websocket tunnels are only available through proxy::tunnel".to_string(),
+        )),
         ProxyByteStreamEndpoint::HttpExchange(exchange) => {
             http::append_outbound_exchange_body_bytes(context, exchange, bytes)
+        }
+        ProxyByteStreamEndpoint::DynamicTcp(dynamic) => {
+            let io = dynamic_tcp_proxy_io(context, dynamic)?;
+            let mut guard = io.lock().await;
+            let stream = guard.as_mut().ok_or_else(|| {
+                VmError::HostError(format!(
+                    "dynamic tcp stream handle {dynamic} has no active transport",
+                ))
+            })?;
+            stream.write_all(bytes).await.map_err(|err| {
+                let message = format!("proxy tcp write failed: {err}");
+                mark_dynamic_tcp_proxy_failed(context, dynamic, &message);
+                VmError::HostError(message)
+            })?;
+            stream.flush().await.map_err(|err| {
+                let message = format!("proxy tcp flush failed: {err}");
+                mark_dynamic_tcp_proxy_failed(context, dynamic, &message);
+                VmError::HostError(message)
+            })?;
+            clear_dynamic_tcp_proxy_read_eof(context, dynamic);
+            Ok(())
+        }
+        ProxyByteStreamEndpoint::DynamicTls(dynamic) => {
+            let io = dynamic_tls_proxy_io(context, dynamic)?;
+            let mut guard = io.lock().await;
+            let stream = guard.as_mut().ok_or_else(|| {
+                VmError::HostError(format!(
+                    "dynamic tls session handle {dynamic} has no active plaintext transport",
+                ))
+            })?;
+            stream.write_all(bytes).await.map_err(|err| {
+                let message = format!("proxy tls plaintext write failed: {err}");
+                mark_dynamic_tls_proxy_failed(context, dynamic, &message);
+                VmError::HostError(message)
+            })?;
+            stream.flush().await.map_err(|err| {
+                let message = format!("proxy tls plaintext flush failed: {err}");
+                mark_dynamic_tls_proxy_failed(context, dynamic, &message);
+                VmError::HostError(message)
+            })?;
+            clear_dynamic_tcp_proxy_read_eof(context, dynamic);
+            Ok(())
         }
         ProxyByteStreamEndpoint::WebSocketBinary(connection) => {
             write_websocket_binary_bytes(context, connection, bytes).await?;
@@ -343,10 +552,206 @@ async fn proxy_stream_close_write(
     handle: i64,
 ) -> Result<(), VmError> {
     let endpoint = mark_proxy_stream_write_closed(context, handle)?;
-    if let ProxyByteStreamEndpoint::WebSocketBinary(connection) = endpoint {
-        close_websocket_binary_stream(context, connection).await?;
+    match endpoint {
+        ProxyByteStreamEndpoint::DynamicTcp(dynamic) => {
+            let io = dynamic_tcp_proxy_io(context, dynamic)?;
+            let mut guard = io.lock().await;
+            if let Some(stream) = guard.as_mut() {
+                stream.shutdown().await.map_err(|err| {
+                    let message = format!("proxy tcp shutdown failed: {err}");
+                    mark_dynamic_tcp_proxy_failed(context, dynamic, &message);
+                    VmError::HostError(message)
+                })?;
+            }
+        }
+        ProxyByteStreamEndpoint::DynamicTls(dynamic) => {
+            let io = dynamic_tls_proxy_io(context, dynamic)?;
+            let mut guard = io.lock().await;
+            if let Some(stream) = guard.as_mut() {
+                stream.shutdown().await.map_err(|err| {
+                    let message = format!("proxy tls plaintext shutdown failed: {err}");
+                    mark_dynamic_tls_proxy_failed(context, dynamic, &message);
+                    VmError::HostError(message)
+                })?;
+            }
+        }
+        ProxyByteStreamEndpoint::WebSocketBinary(connection) => {
+            close_websocket_binary_stream(context, connection).await?;
+        }
+        ProxyByteStreamEndpoint::HttpDownstream
+        | ProxyByteStreamEndpoint::DownstreamConnect
+        | ProxyByteStreamEndpoint::DownstreamWebSocketBinary
+        | ProxyByteStreamEndpoint::HttpExchange(_) => {}
     }
     Ok(())
+}
+
+async fn take_dynamic_tcp_connect_target(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<http::DownstreamConnectTunnelTarget, VmError> {
+    let io = {
+        let mut guard = context.lock_transport();
+        let state = guard.tcp_streams.get_mut(&handle).ok_or_else(|| {
+            VmError::HostError(format!(
+                "dynamic tcp stream handle {handle} is unavailable for proxy tunnel attachment",
+            ))
+        })?;
+        state.mark_proxy_attached();
+        guard.tcp_stream_ios.remove(&handle).ok_or_else(|| {
+            VmError::HostError(format!(
+                "dynamic tcp stream handle {handle} has no active transport",
+            ))
+        })?
+    };
+    let mut guard = io.lock().await;
+    let stream = guard.take().ok_or_else(|| {
+        VmError::HostError(format!(
+            "dynamic tcp stream handle {handle} is already in use",
+        ))
+    })?;
+    Ok(http::DownstreamConnectTunnelTarget::Tcp { handle, stream })
+}
+
+#[cfg(feature = "tls")]
+async fn take_dynamic_tls_connect_target(
+    context: &SharedProxyVmContext,
+    handle: i64,
+) -> Result<http::DownstreamConnectTunnelTarget, VmError> {
+    let io = {
+        let mut guard = context.lock_transport();
+        let state = guard.tcp_streams.get_mut(&handle).ok_or_else(|| {
+            VmError::HostError(format!(
+                "dynamic tls session handle {handle} is unavailable for proxy tunnel attachment",
+            ))
+        })?;
+        state.mark_proxy_attached();
+        guard
+            .dynamic_tls_session_ios
+            .remove(&handle)
+            .ok_or_else(|| {
+                VmError::HostError(format!(
+                    "dynamic tls session handle {handle} has no active plaintext transport",
+                ))
+            })?
+    };
+    let mut guard = io.lock().await;
+    let stream = guard.take().ok_or_else(|| {
+        VmError::HostError(format!(
+            "dynamic tls session handle {handle} is already in use",
+        ))
+    })?;
+    Ok(http::DownstreamConnectTunnelTarget::Tls { handle, stream })
+}
+
+async fn schedule_downstream_connect_tunnel(
+    context: &SharedProxyVmContext,
+    left: i64,
+    right: i64,
+) -> Result<Option<String>, VmError> {
+    let left_endpoint = proxy_stream_state(context, left)?.endpoint;
+    let right_endpoint = proxy_stream_state(context, right)?.endpoint;
+
+    let target = match (&left_endpoint, &right_endpoint) {
+        (
+            ProxyByteStreamEndpoint::DownstreamConnect,
+            ProxyByteStreamEndpoint::DynamicTcp(handle),
+        )
+        | (
+            ProxyByteStreamEndpoint::DynamicTcp(handle),
+            ProxyByteStreamEndpoint::DownstreamConnect,
+        ) => Some(take_dynamic_tcp_connect_target(context, *handle).await?),
+        (
+            ProxyByteStreamEndpoint::DownstreamConnect,
+            ProxyByteStreamEndpoint::DynamicTls(handle),
+        )
+        | (
+            ProxyByteStreamEndpoint::DynamicTls(handle),
+            ProxyByteStreamEndpoint::DownstreamConnect,
+        ) => {
+            #[cfg(feature = "tls")]
+            {
+                Some(take_dynamic_tls_connect_target(context, *handle).await?)
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                let _ = handle;
+                None
+            }
+        }
+        (ProxyByteStreamEndpoint::DownstreamConnect, _)
+        | (_, ProxyByteStreamEndpoint::DownstreamConnect) => {
+            return Err(VmError::HostError(
+                "downstream connect tunnels currently require a connected dynamic tcp::stream or tls::session peer wrapped with proxy::stream::from_tcp/from_tls_plaintext".to_string(),
+            ));
+        }
+        _ => None,
+    };
+
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let upgrade = context.downstream_http1_upgrade().ok_or_else(|| {
+        VmError::HostError(
+            "downstream connect tunnel requires an upgrade-capable HTTP/1.1 downstream connection"
+                .to_string(),
+        )
+    })?;
+    let plan = http::DownstreamPostResponsePlan::ConnectTunnel(
+        http::DownstreamConnectTunnelPlan::new(context.clone(), upgrade, target),
+    );
+    context.schedule_downstream_post_response_plan(plan)?;
+    Ok(Some("upgraded".to_string()))
+}
+
+async fn schedule_downstream_websocket_tunnel(
+    context: &SharedProxyVmContext,
+    left: i64,
+    right: i64,
+) -> Result<Option<String>, VmError> {
+    let left_endpoint = proxy_stream_state(context, left)?.endpoint;
+    let right_endpoint = proxy_stream_state(context, right)?.endpoint;
+
+    let connection = match (&left_endpoint, &right_endpoint) {
+        (
+            ProxyByteStreamEndpoint::DownstreamWebSocketBinary,
+            ProxyByteStreamEndpoint::WebSocketBinary(connection),
+        )
+        | (
+            ProxyByteStreamEndpoint::WebSocketBinary(connection),
+            ProxyByteStreamEndpoint::DownstreamWebSocketBinary,
+        ) => Some(*connection),
+        (ProxyByteStreamEndpoint::DownstreamWebSocketBinary, _)
+        | (_, ProxyByteStreamEndpoint::DownstreamWebSocketBinary) => {
+            return Err(VmError::HostError(
+                "downstream websocket tunnels currently require a websocket connection wrapped with proxy::stream::from_websocket_binary".to_string(),
+            ));
+        }
+        _ => None,
+    };
+
+    let Some(connection) = connection else {
+        return Ok(None);
+    };
+    ensure_outbound_websocket_connection_open(context, connection).await?;
+    let selected_subprotocol = websocket_negotiated_subprotocol(context, connection)?;
+    context.with_downstream_websocket_mut(|websocket| websocket.note_handshake_started());
+    let upgrade = context.downstream_http1_upgrade().ok_or_else(|| {
+        VmError::HostError(
+            "downstream websocket tunnel requires an upgrade-capable HTTP/1.1 downstream connection"
+                .to_string(),
+        )
+    })?;
+    let plan = http::DownstreamPostResponsePlan::WebSocketTunnel(
+        http::DownstreamWebSocketTunnelPlan::new(
+            context.clone(),
+            upgrade,
+            connection,
+            selected_subprotocol,
+        ),
+    );
+    context.schedule_downstream_post_response_plan(plan)?;
+    Ok(Some("upgraded".to_string()))
 }
 
 async fn drive_pipe_direction(
@@ -404,6 +809,12 @@ async fn drive_tunnel(
     right: i64,
     max_bytes: usize,
 ) -> Result<String, VmError> {
+    if let Some(status) = schedule_downstream_connect_tunnel(&context, left, right).await? {
+        return Ok(status);
+    }
+    if let Some(status) = schedule_downstream_websocket_tunnel(&context, left, right).await? {
+        return Ok(status);
+    }
     try_join!(
         drive_pipe_direction(context.clone(), left, right, max_bytes),
         drive_pipe_direction(context, right, left, max_bytes)
@@ -417,7 +828,7 @@ async fn stream_downstream(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    let handle = allocate_proxy_stream_handle(&context, ProxyByteStreamEndpoint::HttpDownstream)?;
+    let handle = allocate_proxy_stream_handle(&context, downstream_proxy_endpoint(&context))?;
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 

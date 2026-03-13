@@ -190,13 +190,14 @@ async fn direct_vm_io_protocol_handles_accept_direct_integer_arguments() {
     "#
     );
     let compiled = compile_source(&source).expect("source should compile");
-    let context = Arc::new(Mutex::new(ProxyVmContext::from_request_headers(
+    let mut context = Arc::new(ProxyVmContext::from_request_headers(
         axum::http::HeaderMap::new(),
         Arc::new(Mutex::new(RateLimiterStore::new())),
-    )));
+    ));
     {
-        let mut guard = context.lock().expect("vm context lock poisoned");
-        guard.attach_upstream_client(reqwest::Client::new());
+        Arc::get_mut(&mut context)
+            .expect("vm context should be uniquely owned")
+            .attach_upstream_client(reqwest::Client::new());
     }
 
     run_edge_program_direct(compiled.program, context.clone())
@@ -214,10 +215,10 @@ async fn io_open_no_longer_treats_virtual_protocol_paths_as_builtin_handles() {
         io::open("request.body", "r");
     "#;
     let compiled = compile_source(source).expect("source should compile");
-    let context = Arc::new(Mutex::new(ProxyVmContext::from_request_headers(
+    let context = Arc::new(ProxyVmContext::from_request_headers(
         axum::http::HeaderMap::new(),
         Arc::new(Mutex::new(RateLimiterStore::new())),
-    )));
+    ));
 
     let error = run_edge_program_direct(compiled.program, context.clone())
         .await

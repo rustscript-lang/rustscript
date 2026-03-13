@@ -806,13 +806,14 @@ async fn direct_vm_can_read_upstream_response_line_by_line_via_http_body_api() {
     "#
     );
     let compiled = compile_source(&source).expect("source should compile");
-    let context = Arc::new(Mutex::new(ProxyVmContext::from_request_headers(
+    let mut context = Arc::new(ProxyVmContext::from_request_headers(
         axum::http::HeaderMap::new(),
         Arc::new(Mutex::new(RateLimiterStore::new())),
-    )));
+    ));
     {
-        let mut guard = context.lock().expect("vm context lock poisoned");
-        guard.attach_upstream_client(reqwest::Client::new());
+        Arc::get_mut(&mut context)
+            .expect("vm context should be uniquely owned")
+            .attach_upstream_client(reqwest::Client::new());
     }
 
     run_edge_program_direct(compiled.program, context.clone())

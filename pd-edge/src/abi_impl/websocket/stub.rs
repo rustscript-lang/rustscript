@@ -79,6 +79,13 @@ pub(crate) fn websocket_connection_mode(_context: &SharedProxyVmContext, _connec
     false
 }
 
+pub(crate) fn websocket_negotiated_subprotocol(
+    _context: &SharedProxyVmContext,
+    _connection: i64,
+) -> Result<Option<String>, VmError> {
+    Err(websocket_disabled())
+}
+
 pub(crate) fn validate_outbound_websocket_binary_connection(
     _context: &SharedProxyVmContext,
     _connection: i64,

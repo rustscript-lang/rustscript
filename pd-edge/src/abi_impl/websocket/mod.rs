@@ -13,20 +13,19 @@ mod stub;
 
 #[cfg(feature = "websocket")]
 pub(crate) use connection::{
-    close_websocket_binary_stream, read_websocket_binary_bytes,
-    validate_outbound_websocket_binary_connection, write_websocket_binary_bytes,
+    close_websocket_binary_stream, ensure_outbound_websocket_connection_open,
+    read_websocket_binary_bytes, validate_outbound_websocket_binary_connection,
+    websocket_connection_mode, websocket_negotiated_subprotocol, write_websocket_binary_bytes,
 };
-#[cfg(all(feature = "websocket", feature = "tls"))]
-pub(crate) use connection::{ensure_outbound_websocket_connection_open, websocket_connection_mode};
 #[cfg(feature = "websocket")]
 pub(crate) use state::WebSocketConnectionState;
 #[cfg(not(feature = "websocket"))]
 pub(crate) use stub::{
-    WebSocketConnectionState, close_websocket_binary_stream, read_websocket_binary_bytes,
-    validate_outbound_websocket_binary_connection, write_websocket_binary_bytes,
+    WebSocketConnectionState, close_websocket_binary_stream,
+    ensure_outbound_websocket_connection_open, read_websocket_binary_bytes,
+    validate_outbound_websocket_binary_connection, websocket_connection_mode,
+    websocket_negotiated_subprotocol, write_websocket_binary_bytes,
 };
-#[cfg(all(not(feature = "websocket"), feature = "tls"))]
-pub(crate) use stub::{ensure_outbound_websocket_connection_open, websocket_connection_mode};
 
 #[cfg(feature = "websocket")]
 pub(super) fn register_websocket_extensions(
