@@ -33,25 +33,8 @@ pub fn add_header(name, value) {
     http::exchange::add_header(upstream_request_default_exchange(), name, value)
 }
 
-pub fn remove_header(name) {
-    http::exchange::clear_header(upstream_request_default_exchange(), name)
-}
-
 pub fn clear_header(name) {
     http::exchange::clear_header(upstream_request_default_exchange(), name)
-}
-
-pub fn set_headers(headers) {
-    let keys = headers.keys;
-    for (let mut index = 0; index < keys.length; index = index + 1) {
-        let key = keys[index].copy();
-        set_header(key, headers[key]);
-    }
-    headers
-}
-
-pub fn set_raw_query(query) {
-    set_query(query)
 }
 
 pub fn set_query_arg(name, value) {
