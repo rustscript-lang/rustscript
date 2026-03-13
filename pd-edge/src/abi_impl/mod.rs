@@ -13,7 +13,6 @@ use tokio::sync::oneshot;
 use vm::{CallOutcome, HostAsyncBridge, HostFunction, HostOpId, Value, Vm, VmError};
 
 pub(crate) mod http;
-mod http1;
 mod http2;
 mod io;
 mod proxy;

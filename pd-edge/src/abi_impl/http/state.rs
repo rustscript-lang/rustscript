@@ -41,13 +41,14 @@ use super::super::{
     SharedRateLimiter,
     proxy::ProxyByteStreamState,
     transport::{
-        CachedTlsSession, FIRST_DYNAMIC_TCP_STREAM_HANDLE, ReplayPrefixedIo, SharedTcpStreamIo,
-        SharedTlsSessionCache, SharedUdpSocketIo, TcpFlowState, TcpSocketState, TcpTransportDag,
-        TlsFlowState, TlsProtocolVersion, TlsSessionCacheKey, TlsTransportDag, UdpSocketState,
-        alpn_from_http_version, tls_session_cache_key,
+        CachedTlsSession, FIRST_DYNAMIC_TCP_STREAM_HANDLE, HTTP11_ALPN_PROTOCOL, ReplayPrefixedIo,
+        SharedTcpStreamIo, SharedTlsSessionCache, SharedUdpSocketIo, TcpFlowState, TcpSocketState,
+        TcpTransportDag, TlsFlowState, TlsProtocolVersion, TlsSessionCacheKey, TlsTransportDag,
+        UdpSocketState, alpn_from_http_version, tls_session_cache_key,
     },
     websocket::WebSocketConnectionState,
 };
+use crate::abi_impl::http2;
 #[cfg(feature = "tls")]
 use crate::abi_impl::transport::{
     DownstreamTlsServerStart, SharedServerTlsStreamIo, SharedTlsStreamIo,
@@ -58,7 +59,6 @@ use crate::abi_impl::webrtc::WebRtcConnectionState;
 use crate::abi_impl::websocket::{
     close_websocket_binary_stream, read_websocket_binary_bytes, write_websocket_binary_bytes,
 };
-use crate::abi_impl::{http1, http2};
 use crate::cache::BoundedLruStore;
 
 #[derive(Debug)]
@@ -2203,7 +2203,13 @@ pub(crate) fn http_version_label(version: Version) -> &'static str {
     if http2::supports_response_version(version) {
         http2::response_version_label()
     } else {
-        http1::response_version_label(version)
+        match version {
+            Version::HTTP_09 => "0.9",
+            Version::HTTP_10 => "1.0",
+            Version::HTTP_11 => "1.1",
+            Version::HTTP_3 => "3",
+            _ => "1.1",
+        }
     }
 }
 
@@ -2814,7 +2820,7 @@ where
             HttpCarrierRef::Http1DynamicExchange(handle)
         },
         peer_addr: None,
-        negotiated_alpn: Some(http1::ALPN_PROTOCOL.to_string()),
+        negotiated_alpn: Some(HTTP11_ALPN_PROTOCOL.to_string()),
         peer_certificate_der: None,
         body: Arc::new(tokio::sync::Mutex::new(
             UpstreamResponseBodyState::from_hyper(response.into_body(), None),

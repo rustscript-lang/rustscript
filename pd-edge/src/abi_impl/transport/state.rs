@@ -19,6 +19,7 @@ pub(crate) const TCP_STREAM_DEFAULT_UPSTREAM: i64 = 1;
 pub(crate) const FIRST_DYNAMIC_TCP_STREAM_HANDLE: i64 = 1_i64 << 40;
 pub(crate) const UDP_SOCKET_DOWNSTREAM: i64 = 0;
 pub(crate) const UDP_SOCKET_DEFAULT_UPSTREAM: i64 = 1;
+pub(crate) const HTTP11_ALPN_PROTOCOL: &str = "http/1.1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TcpStreamRef {
@@ -1186,7 +1187,7 @@ pub(crate) fn alpn_from_http_version(version: Version) -> Option<String> {
     match version {
         Version::HTTP_09 => Some("http/0.9".to_string()),
         Version::HTTP_10 => Some("http/1.0".to_string()),
-        Version::HTTP_11 => Some("http/1.1".to_string()),
+        Version::HTTP_11 => Some(HTTP11_ALPN_PROTOCOL.to_string()),
         Version::HTTP_2 => Some("h2".to_string()),
         Version::HTTP_3 => Some("h3".to_string()),
         _ => None,
@@ -1197,7 +1198,7 @@ fn alpn_from_http_version_label(version: &str) -> Option<String> {
     match version {
         "0.9" => Some("http/0.9".to_string()),
         "1.0" => Some("http/1.0".to_string()),
-        "1.1" => Some("http/1.1".to_string()),
+        "1.1" => Some(HTTP11_ALPN_PROTOCOL.to_string()),
         "2" => Some("h2".to_string()),
         "3" => Some("h3".to_string()),
         _ => None,
