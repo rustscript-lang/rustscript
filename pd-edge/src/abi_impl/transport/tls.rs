@@ -33,7 +33,7 @@ use super::state::{
     DownstreamTlsServerStart, ReplayPrefixedIo, TlsFlowState, TlsProtocolVersion, TlsSessionRef,
     decode_tls_session_handle,
 };
-use crate::abi_impl::http1;
+use crate::abi_impl::transport::HTTP11_ALPN_PROTOCOL;
 use rcgen::generate_simple_self_signed;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -528,7 +528,7 @@ fn build_dynamic_client_config(flow: &TlsFlowState) -> Result<ClientConfig, VmEr
             .map(|protocol| protocol.as_bytes().to_vec())
             .collect()
     } else {
-        vec![http1::ALPN_PROTOCOL.as_bytes().to_vec()]
+        vec![HTTP11_ALPN_PROTOCOL.as_bytes().to_vec()]
     };
     Ok(config)
 }
