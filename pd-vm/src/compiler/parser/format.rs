@@ -582,10 +582,9 @@ impl<'a> SourceFormatter<'a> {
         }
         self.write_raw("(");
         let for_head = self.prev_kind == Some(PrevKind::For);
-        let should_fold = self.should_force_multiline_group(
-            self.index,
-            ContextKind::Paren { for_head },
-        ) && !matches!(self.peek_kind_at(self.index + 1), Some(TokenKind::RParen));
+        let should_fold = self
+            .should_force_multiline_group(self.index, ContextKind::Paren { for_head })
+            && !matches!(self.peek_kind_at(self.index + 1), Some(TokenKind::RParen));
         self.contexts.push(Context {
             kind: ContextKind::Paren { for_head },
             indented: should_fold,
@@ -882,15 +881,13 @@ impl<'a> SourceFormatter<'a> {
             Some(Context {
                 kind: ContextKind::Paren { .. },
                 indented: true,
+            }) | Some(Context {
+                kind: ContextKind::Bracket,
+                indented: true,
+            }) | Some(Context {
+                kind: ContextKind::Brace(BraceKind::Collection),
+                indented: true,
             })
-                | Some(Context {
-                    kind: ContextKind::Bracket,
-                    indented: true,
-                })
-                | Some(Context {
-                    kind: ContextKind::Brace(BraceKind::Collection),
-                    indented: true,
-                })
         )
     }
 
@@ -1069,10 +1066,9 @@ impl<'a> SourceFormatter<'a> {
     }
 
     fn should_force_multiline_group(&self, open_index: usize, root_kind: ContextKind) -> bool {
-        let Some((close_index, comma_count)) = self.find_group_close_and_top_level_commas(
-            open_index,
-            root_kind,
-        ) else {
+        let Some((close_index, comma_count)) =
+            self.find_group_close_and_top_level_commas(open_index, root_kind)
+        else {
             return false;
         };
         if comma_count == 0 {
@@ -1168,7 +1164,11 @@ impl<'a> SourceFormatter<'a> {
     }
 
     fn current_line_len_with_pending_prefix(&self) -> usize {
-        let mut len = if self.pending_newlines > 0 { 0 } else { self.line_len };
+        let mut len = if self.pending_newlines > 0 {
+            0
+        } else {
+            self.line_len
+        };
         if self.pending_newlines > 0 || self.line_start {
             len += self.indent * 4;
         }
