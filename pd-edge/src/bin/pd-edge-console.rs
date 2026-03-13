@@ -10,9 +10,10 @@ use axum::http::HeaderMap;
 use edge::{
     ActiveControlPlaneConfig, ProxyVmContext, RuntimeStoreLimits, SharedProxyVmContext,
     SharedState, SharedVmAsyncOps, VM_EPOCH_TICK_INTERVAL_MS, VmAsyncOpBridge, VmExecutionConfig,
-    VmExecutionMode, VmInterruptConfig, apply_program_from_bytes, binary_version_report,
-    binary_version_text, compile_edge_source_file, enabled_feature_line, enter_edge_host_context,
-    init_logging, new_shared_vm_async_ops, register_host_module, spawn_active_control_plane_client,
+    VmExecutionMode, VmInterruptConfig, apply_program_from_bytes,
+    attach_http_plane_runtime_services, binary_version_report, binary_version_text,
+    compile_edge_source_file, enabled_feature_line, enter_edge_host_context, init_logging,
+    new_shared_vm_async_ops, register_http_plane_host_module, spawn_active_control_plane_client,
 };
 use tokio::{
     runtime::Handle,
@@ -115,12 +116,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         load_program_from_path(&state, program_path).await?;
     }
 
-    run_console_loop(&state).await
+    let program_args = Arc::new(cli.program_args.clone());
+    if cli.run_program {
+        let _ = run_loaded_program_once(&state, program_args).await?;
+        return Ok(());
+    }
+
+    run_console_loop(&state, program_args).await
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CliArgs {
     program_path: Option<PathBuf>,
+    run_program: bool,
+    program_args: Vec<String>,
     max_program_bytes: Option<usize>,
     tls_session_reuse_entries: Option<usize>,
     upstream_http_reuse_entries: Option<usize>,
@@ -159,11 +168,18 @@ where
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--" => {
+                cli.program_args.extend(args);
+                break;
+            }
             "-h" | "--help" => return Ok(CliAction::Help),
             "-V" | "--version" => return Ok(CliAction::Version),
             "--program" => {
                 let value = next_arg_value("--program", &mut args)?;
                 cli.program_path = Some(PathBuf::from(value));
+            }
+            "--run" => {
+                cli.run_program = true;
             }
             "--max-program-bytes" => {
                 let value = next_arg_value("--max-program-bytes", &mut args)?;
@@ -297,6 +313,9 @@ where
     if cli.vm_epoch_check_interval.is_some() && cli.vm_epoch_deadline.is_none() {
         return Err("--vm-epoch-check-interval requires --vm-epoch-deadline".to_string());
     }
+    if cli.run_program && cli.program_path.is_none() {
+        return Err("--run requires --program".to_string());
+    }
 
     Ok(CliAction::Run(Box::new(cli)))
 }
@@ -321,6 +340,7 @@ fn print_cli_help() {
             "Usage: pd-edge-console [options]\n\n",
             "Options:\n",
             "  --program <PATH>                          Optional local program source/.vmbc to load at startup\n",
+            "  --run                                     Load and execute --program once, then exit\n",
             "  --max-program-bytes <BYTES>               Max upload/program size in bytes (default: 1048576)\n",
             "  --tls-session-reuse-entries <N>           TLS session reuse store cap (default: {})\n",
             "  --upstream-http-reuse-entries <N>         Upstream HTTP reuse store cap (default: {})\n",
@@ -337,13 +357,14 @@ fn print_cli_help() {
             "  --edge-id-path <PATH>                     Edge UUID file path (default .pd-edge/edge-id)\n",
             "  --control-plane-poll-interval-ms <MS>     Poll interval for active control-plane client\n",
             "  --control-plane-rpc-timeout-ms <MS>       RPC timeout for active control-plane client\n",
+            "  -- <ARG>...                               Arguments exposed to the loaded program via console::args::*\n",
             "  -V, --version                             Show version, git metadata, and enabled features\n",
             "  -h, --help                                Show this help\n\n",
             "Console commands:\n",
             "  .help                                     Show console commands\n",
             "  .status                                   Show whether a program is loaded\n",
             "  .load <PATH>                              Load source or .vmbc program from local path\n",
-            "  .run                                      Run currently loaded program once\n",
+            "  .run                                      Run currently loaded program once using startup args\n",
             "  .quit                                     Exit console\n",
         ),
         defaults.tls_session_reuse_entries,
@@ -392,7 +413,10 @@ impl CliArgs {
     }
 }
 
-async fn run_console_loop(state: &SharedState) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_console_loop(
+    state: &SharedState,
+    program_args: Arc<Vec<String>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("pd-edge-console interactive mode");
     println!("commands: .help, .status, .load <path>, .run, .quit");
 
@@ -418,7 +442,7 @@ async fn run_console_loop(state: &SharedState) -> Result<(), Box<dyn std::error:
         if input == ".help" {
             println!("commands: .help, .status, .load <path>, .run, .quit");
             println!(
-                "host APIs: console::stdin::read_line/read_all, console::stdout::write/flush, console::stderr::write/flush"
+                "host APIs: console::stdin::read_line/read_all, console::stdout::write/flush, console::stderr::write/flush, console::args::count/get"
             );
             continue;
         }
@@ -438,7 +462,7 @@ async fn run_console_loop(state: &SharedState) -> Result<(), Box<dyn std::error:
             continue;
         }
         if input == ".run" {
-            if let Err(err) = run_loaded_program_once(state).await {
+            if let Err(err) = run_loaded_program_once(state, program_args.clone()).await {
                 eprintln!("error: {err}");
             }
             continue;
@@ -507,13 +531,19 @@ fn resolve_program_path(path: &Path) -> Result<PathBuf, Box<dyn std::error::Erro
 struct ConsoleVmStoreData {
     vm_context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
+    program_args: Arc<Vec<String>>,
 }
 
 impl ConsoleVmStoreData {
-    fn new(vm_context: SharedProxyVmContext, async_ops: SharedVmAsyncOps) -> Self {
+    fn new(
+        vm_context: SharedProxyVmContext,
+        async_ops: SharedVmAsyncOps,
+        program_args: Arc<Vec<String>>,
+    ) -> Self {
         Self {
             vm_context,
             async_ops,
+            program_args,
         }
     }
 }
@@ -545,7 +575,10 @@ impl Drop for EpochInterruptionDriver {
     }
 }
 
-async fn run_loaded_program_once(state: &SharedState) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_loaded_program_once(
+    state: &SharedState,
+    program_args: Arc<Vec<String>>,
+) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
     let loaded = {
         let guard = state.active_program.read().await;
         guard.clone()
@@ -554,14 +587,17 @@ async fn run_loaded_program_once(state: &SharedState) -> Result<(), Box<dyn std:
         return Err("no program loaded".into());
     };
 
-    let context: SharedProxyVmContext = Arc::new(ProxyVmContext::from_request_headers(
-        HeaderMap::new(),
-        state.rate_limiter.clone(),
-    ));
+    let mut context =
+        ProxyVmContext::from_request_headers(HeaderMap::new(), state.rate_limiter.clone());
+    attach_http_plane_runtime_services(state, &mut context);
+    let context: SharedProxyVmContext = Arc::new(context);
     let async_ops = new_shared_vm_async_ops();
     let mut vm = Vm::new_shared(loaded.program.clone());
     vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));
-    let mut store = Store::new(vm, ConsoleVmStoreData::new(context, async_ops));
+    let mut store = Store::new(
+        vm,
+        ConsoleVmStoreData::new(context, async_ops, program_args),
+    );
     let epoch_driver = match state.vm_execution.interrupt {
         VmInterruptConfig::None => None,
         VmInterruptConfig::Fuel {
@@ -586,8 +622,9 @@ async fn run_loaded_program_once(state: &SharedState) -> Result<(), Box<dyn std:
 
     let vm_context = store.data().vm_context.clone();
     let async_ops = store.data().async_ops.clone();
-    register_host_module(store.vm_mut(), vm_context, async_ops.clone())?;
-    register_console_host_module(store.vm_mut(), async_ops)?;
+    let program_args = store.data().program_args.clone();
+    register_console_host_module(store.vm_mut(), async_ops.clone(), program_args)?;
+    register_http_plane_host_module(store.vm_mut(), vm_context, async_ops)?;
 
     loop {
         if let Some((ticks_per_slice, _driver)) = &epoch_driver {
@@ -602,8 +639,9 @@ async fn run_loaded_program_once(state: &SharedState) -> Result<(), Box<dyn std:
         };
         match status {
             Ok(VmStatus::Halted) => {
-                println!("vm halted; stack={:?}", store.vm().stack());
-                break;
+                let stack = store.vm().stack().to_vec();
+                println!("vm halted; stack={:?}", stack);
+                return Ok(stack);
             }
             Ok(VmStatus::Yielded) => {
                 if let VmInterruptConfig::Fuel { fuel_per_yield, .. } = state.vm_execution.interrupt
@@ -622,11 +660,14 @@ async fn run_loaded_program_once(state: &SharedState) -> Result<(), Box<dyn std:
             }
         }
     }
-
-    Ok(())
 }
 
-fn register_console_host_module(vm: &mut Vm, async_ops: SharedVmAsyncOps) -> Result<(), VmError> {
+fn register_console_host_module(
+    vm: &mut Vm,
+    async_ops: SharedVmAsyncOps,
+    program_args: Arc<Vec<String>>,
+) -> Result<(), VmError> {
+    ensure_console_edge_abi_host_slots(vm)?;
     vm.bind_function(
         "console::stdin::read_line",
         Box::new(ConsoleStdinReadLineFunction::new(async_ops.clone())),
@@ -651,7 +692,45 @@ fn register_console_host_module(vm: &mut Vm, async_ops: SharedVmAsyncOps) -> Res
         "console::stderr::flush",
         Box::new(ConsoleStderrFlushFunction::new(async_ops)),
     );
+    vm.bind_function(
+        "console::args::count",
+        Box::new(ConsoleArgsCountFunction::new(program_args.clone())),
+    );
+    vm.bind_function(
+        "console::args::get",
+        Box::new(ConsoleArgsGetFunction::new(program_args)),
+    );
     Ok(())
+}
+
+fn ensure_console_edge_abi_host_slots(vm: &mut Vm) -> Result<(), VmError> {
+    if edge_abi::FUNCTIONS
+        .iter()
+        .all(|function| vm.has_bound_function(function.name))
+    {
+        return Ok(());
+    }
+
+    if vm.bound_function_count() != 0 {
+        return Err(VmError::HostError(
+            "edge ABI host slots must be initialized before registering console host functions"
+                .to_string(),
+        ));
+    }
+
+    for function in edge_abi::FUNCTIONS {
+        vm.bind_static_function(function.name, unbound_console_edge_abi_function);
+    }
+    Ok(())
+}
+
+fn unbound_console_edge_abi_function(
+    _vm: &mut Vm,
+    _args: &[Value],
+) -> Result<CallOutcome, VmError> {
+    Err(VmError::HostError(
+        "edge ABI host function is not bound in pd-edge-console".to_string(),
+    ))
 }
 
 struct ConsoleStdinReadLineFunction {
@@ -822,6 +901,53 @@ impl HostFunction for ConsoleStderrFlushFunction {
     }
 }
 
+struct ConsoleArgsCountFunction {
+    program_args: Arc<Vec<String>>,
+}
+
+impl ConsoleArgsCountFunction {
+    fn new(program_args: Arc<Vec<String>>) -> Self {
+        Self { program_args }
+    }
+}
+
+impl HostFunction for ConsoleArgsCountFunction {
+    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
+        expect_arg_count(args, 0)?;
+        Ok(CallOutcome::Return(vec![Value::Int(
+            self.program_args.len() as i64,
+        )]))
+    }
+}
+
+struct ConsoleArgsGetFunction {
+    program_args: Arc<Vec<String>>,
+}
+
+impl ConsoleArgsGetFunction {
+    fn new(program_args: Arc<Vec<String>>) -> Self {
+        Self { program_args }
+    }
+}
+
+impl HostFunction for ConsoleArgsGetFunction {
+    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
+        expect_arg_count(args, 1)?;
+        let index = expect_int(args, 0)?;
+        if index < 0 {
+            return Err(VmError::HostError(format!(
+                "console::args::get expects a non-negative index, got {index}",
+            )));
+        }
+        let value = self
+            .program_args
+            .get(index as usize)
+            .cloned()
+            .unwrap_or_default();
+        Ok(CallOutcome::Return(vec![Value::string(value)]))
+    }
+}
+
 fn schedule_future_call<F>(
     _vm: &mut Vm,
     async_ops: &SharedVmAsyncOps,
@@ -850,6 +976,13 @@ fn expect_string(args: &[Value], index: usize) -> Result<String, VmError> {
     match args.get(index) {
         Some(Value::String(value)) => Ok(value.to_string()),
         _ => Err(VmError::TypeMismatch("string")),
+    }
+}
+
+fn expect_int(args: &[Value], index: usize) -> Result<i64, VmError> {
+    match args.get(index) {
+        Some(Value::Int(value)) => Ok(*value),
+        _ => Err(VmError::TypeMismatch("int")),
     }
 }
 
@@ -968,6 +1101,8 @@ mod tests {
             *cli,
             CliArgs {
                 program_path: Some(PathBuf::from("examples/demo.rss")),
+                run_program: false,
+                program_args: vec![],
                 max_program_bytes: Some(4096),
                 tls_session_reuse_entries: Some(12),
                 upstream_http_reuse_entries: Some(18),
@@ -985,6 +1120,39 @@ mod tests {
                 control_plane_poll_interval_ms: Some(120),
                 control_plane_rpc_timeout_ms: Some(3400),
             }
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_from_parses_run_with_program_args() {
+        let action = parse_cli_args_from([
+            "--program".to_string(),
+            "examples/http3-client.rss".to_string(),
+            "--run".to_string(),
+            "--".to_string(),
+            "https://127.0.0.1:4443".to_string(),
+            "POST".to_string(),
+            "-".to_string(),
+            "false".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        let CliAction::Run(cli) = action else {
+            panic!("expected run action");
+        };
+        assert_eq!(
+            cli.program_path,
+            Some(PathBuf::from("examples/http3-client.rss"))
+        );
+        assert!(cli.run_program);
+        assert_eq!(
+            cli.program_args,
+            vec![
+                "https://127.0.0.1:4443".to_string(),
+                "POST".to_string(),
+                "-".to_string(),
+                "false".to_string(),
+            ]
         );
     }
 
@@ -1077,6 +1245,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_cli_args_from_rejects_run_without_program() {
+        let err = parse_cli_args_from(["--run".to_string()])
+            .expect_err("--run without --program should fail");
+        assert!(err.contains("--run requires --program"));
+    }
+
+    #[test]
     fn resolve_edge_id_explicit_value_is_persisted() {
         let dir = temp_test_dir("pd-edge-console-explicit-id");
         let path = dir.join("edge-id");
@@ -1124,5 +1299,74 @@ mod tests {
         let resolved = resolve_program_path(relative.as_path()).expect("path should resolve");
         assert_eq!(resolved, absolute);
         let _ = fs::remove_file(absolute);
+    }
+
+    #[tokio::test]
+    async fn run_loaded_program_once_exposes_console_args() {
+        let dir = temp_test_dir("pd-edge-console-program-args");
+        let program_path = dir.join("program.rss");
+        fs::write(
+            &program_path,
+            r#"
+            use console;
+
+            let arg0 = console::args::get(0);
+            let arg1 = console::args::get(1);
+            let arg2 = console::args::get(2);
+
+            console::args::count() + arg0.length + arg1.length + arg2.length;
+        "#,
+        )
+        .expect("program source should be written");
+
+        let state = SharedState::new(1024 * 1024).with_vm_execution_config(VmExecutionConfig {
+            interrupt: VmInterruptConfig::None,
+            execution_mode: VmExecutionMode::Async,
+        });
+        load_program_from_path(&state, &program_path)
+            .await
+            .expect("program should load");
+
+        let stack =
+            run_loaded_program_once(&state, Arc::new(vec!["abc".to_string(), "de".to_string()]))
+                .await
+                .expect("program should run");
+
+        assert_eq!(stack, vec![Value::Int(7)]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn run_loaded_program_once_rejects_negative_console_arg_index() {
+        let dir = temp_test_dir("pd-edge-console-program-args-negative");
+        let program_path = dir.join("program.rss");
+        fs::write(
+            &program_path,
+            r#"
+            use console;
+
+            console::args::get(-1);
+        "#,
+        )
+        .expect("program source should be written");
+
+        let state = SharedState::new(1024 * 1024).with_vm_execution_config(VmExecutionConfig {
+            interrupt: VmInterruptConfig::None,
+            execution_mode: VmExecutionMode::Async,
+        });
+        load_program_from_path(&state, &program_path)
+            .await
+            .expect("program should load");
+
+        let err = run_loaded_program_once(&state, Arc::new(vec![]))
+            .await
+            .expect_err("negative argv index should fail");
+        assert!(
+            err.to_string()
+                .contains("console::args::get expects a non-negative index"),
+            "unexpected error: {err}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

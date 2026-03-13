@@ -67,6 +67,8 @@ async fn sample_upstream_transport_proxy_program_streams_plain_http_body() {
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("transport")
+        .join("upstream")
         .join("sample_upstream_transport_proxy_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 
@@ -127,6 +129,8 @@ async fn sample_upstream_transport_proxy_program_handles_https_tls_session() {
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("transport")
+        .join("upstream")
         .join("sample_upstream_transport_proxy_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 
@@ -192,6 +196,8 @@ async fn sample_transport_tls_handshake_program_echoes_plaintext_after_tls_hands
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("transport")
+        .join("tls")
         .join("sample_transport_tls_handshake_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 
@@ -355,6 +361,8 @@ async fn transport_downstream_http_handoff_promotes_plain_connection_into_http11
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("transport")
+        .join("handoff")
         .join("sample_transport_http_handoff_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
@@ -401,6 +409,8 @@ async fn transport_downstream_http_handoff_promotes_plain_connection_into_http2_
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("transport")
+        .join("handoff")
         .join("sample_transport_http_handoff_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
@@ -475,6 +485,8 @@ async fn transport_downstream_http_handoff_promotes_tls_plaintext_into_https_run
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("transport")
+        .join("handoff")
         .join("sample_transport_http_handoff_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
@@ -561,6 +573,8 @@ async fn sample_http_proxy_tls_prelude_program_serves_http_and_https_listeners()
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("http")
+        .join("proxy")
         .join("sample_http_proxy_tls_prelude_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
@@ -687,6 +701,8 @@ async fn sample_tunnel_proxy_program_tunnels_plain_http_body() {
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("proxy")
+        .join("tunnel")
         .join("sample_tunnel_proxy_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 
@@ -862,6 +878,8 @@ async fn sample_tunnel_proxy_program_tunnels_https_body_via_tls_plaintext_stream
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("proxy")
+        .join("tunnel")
         .join("sample_tunnel_proxy_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 

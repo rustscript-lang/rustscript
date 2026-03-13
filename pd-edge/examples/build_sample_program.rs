@@ -5,7 +5,7 @@ use reqwest::StatusCode;
 use vm::{HostImport, encode_program, validate_program};
 
 // Compile an example source file, validate it against the current host ABI, then upload it.
-const SOURCE_PATH: &str = "examples/sample_proxy_program.rss";
+const SOURCE_PATH: &str = "examples/http/proxy/sample_proxy_program.rss";
 const CONTROL_URL: &str = "http://127.0.0.1:8081/program";
 
 #[tokio::main]

@@ -10,6 +10,8 @@ async fn sample_webrtc_proxy_program_round_trips_text_messages() {
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("webrtc")
+        .join("proxy")
         .join("sample_webrtc_proxy_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 
@@ -143,6 +145,8 @@ async fn sample_webrtc_proxy_program_round_trips_binary_messages_with_default_ha
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("webrtc")
+        .join("proxy")
         .join("sample_webrtc_proxy_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
     let payload = STANDARD.encode(b"webrtc-bin");

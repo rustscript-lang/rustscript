@@ -10,6 +10,8 @@ async fn sample_forward_proxy_program_tunnels_https_request_through_connect_prox
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("proxy")
+        .join("forward")
         .join("sample_forward_proxy_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 

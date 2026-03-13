@@ -97,6 +97,85 @@ fn compile_edge_source_file_supports_rate_limit_namespace_host_import() {
 }
 
 #[test]
+fn compile_edge_source_file_supports_console_namespace_host_import() {
+    let root = unique_temp_root("console_namespace");
+    let main_path = root.join("main.rss");
+    std::fs::write(
+        &main_path,
+        r#"
+        use console;
+        let arg0 = console::args::get(0);
+        console::args::count() + arg0.length + console::stdout::write("ok");
+    "#,
+    )
+    .expect("main source should write");
+
+    let compiled = compile_edge_source_file(&main_path).expect("compile should succeed");
+    assert!(
+        compiled
+            .program
+            .imports
+            .iter()
+            .any(|import| import.name == "console::args::count"),
+        "console namespace should map args::count to a host import"
+    );
+    assert!(
+        compiled
+            .program
+            .imports
+            .iter()
+            .any(|import| import.name == "console::args::get"),
+        "console namespace should map args::get to a host import"
+    );
+    assert!(
+        compiled
+            .program
+            .imports
+            .iter()
+            .any(|import| import.name == "console::stdout::write"),
+        "console namespace should map stdout::write to a host import"
+    );
+
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_dir(root);
+}
+
+#[test]
+fn compile_edge_source_file_supports_console_http3_client_example() {
+    let program_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/console/sample_console_http3_client.rss");
+
+    let compiled = compile_edge_source_file(&program_path).expect("example should compile");
+    let import_names = compiled
+        .program
+        .imports
+        .iter()
+        .map(|import| import.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        import_names.contains(&"console::args::count"),
+        "console sample should import argv count"
+    );
+    assert!(
+        import_names.contains(&"console::stdin::read_all"),
+        "console sample should import stdin read_all for body streaming"
+    );
+    assert!(
+        import_names.contains(&"runtime::exit"),
+        "console sample should import runtime::exit for usage handling"
+    );
+    assert!(
+        import_names.contains(&"http::exchange::send"),
+        "console sample should send an outbound exchange"
+    );
+    assert!(
+        import_names.contains(&"tls::session::from_socket"),
+        "console sample should create a TLS session from the exchange"
+    );
+}
+
+#[test]
 fn compile_edge_source_file_prefers_local_module_over_host_namespace_fallback() {
     let root = unique_temp_root("runtime_local_module");
 
