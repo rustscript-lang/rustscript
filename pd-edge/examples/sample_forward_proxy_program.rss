@@ -1,4 +1,5 @@
 use http;
+use runtime;
 use tcp;
 use tls;
 
@@ -14,70 +15,73 @@ let upstream_target = http::request::get_header("x-upstream-target");
 if forward_proxy == "" || connect_authority == "" || upstream_target == "" {
     http::response::set_status(400);
     http::response::set_body("missing x-forward-proxy-target, x-connect-authority, or x-upstream-target");
-} else {
-    // Open a raw TCP socket to the intermediary proxy first.
-    let proxy_socket = tcp::stream::new();
-    tcp::stream::set_target(proxy_socket, forward_proxy);
-
-    if !tcp::stream::connect(proxy_socket) {
-        http::response::set_status(502);
-        http::response::set_body("failed to connect to forward proxy");
-    } else {
-        // Establish a CONNECT tunnel manually so the sample can reuse that socket for TLS.
-        let connect_request =
-            "CONNECT " + connect_authority + " HTTP/1.1\r\n" +
-            "Host: " + connect_authority + "\r\n" +
-            "Connection: keep-alive\r\n\r\n";
-        tcp::stream::write(proxy_socket, connect_request);
-
-        let connect_response = tcp::stream::read(proxy_socket, 256);
-        if connect_response == "" {
-            http::response::set_status(502);
-            http::response::set_body("forward proxy did not acknowledge CONNECT");
-        } else {
-            // Bind the real outbound HTTP exchange onto the tunneled socket.
-            let upstream = http::exchange::default_upstream();
-            http::exchange::set_target(upstream, upstream_target);
-            http::upstream::request::set_method(http::request::get_method());
-            http::upstream::request::set_body(http::request::get_body());
-
-            let request_content_type = http::request::get_header("content-type");
-            if request_content_type != "" {
-                http::upstream::request::set_header("content-type", request_content_type);
-            }
-
-            let session = tls::session::from_socket(proxy_socket);
-            http::exchange::attach_tls_plaintext(upstream, session);
-            // Tests can opt out of verification when the upstream uses local certificates.
-            if http::request::get_header("x-insecure-upstream") != "" {
-                tls::session::set_verify(session, false);
-                tls::session::set_verify_hostname(session, false);
-            }
-
-            if !tls::session::handshake(session) {
-                http::response::set_status(502);
-                http::response::set_body("failed to establish upstream tls over forward proxy tunnel");
-            } else {
-                // Reading the upstream response now drives the request across the CONNECT tunnel.
-                let upstream_status = http::upstream::response::get_status();
-                http::response::set_status(upstream_status);
-                http::response::set_header("x-forward-proxy-phase", tcp::stream::get_phase(proxy_socket));
-
-                // Surface a few transport details so callers can confirm the proxied TLS path.
-                let alpn = tls::session::get_alpn(session);
-                if alpn != "" {
-                    http::response::set_header("x-upstream-alpn", alpn);
-                }
-                let peer_name = tls::session::get_peer_name(session);
-                if peer_name != "" {
-                    http::response::set_header("x-upstream-peer", peer_name);
-                }
-                let content_type = http::upstream::response::get_header("content-type");
-                if content_type != "" {
-                    http::response::set_header("content-type", content_type);
-                }
-                http::response::set_body(http::upstream::response::get_body());
-            }
-        }
-    }
+    runtime::exit();
 }
+
+// Open a raw TCP socket to the intermediary proxy first.
+let proxy_socket = tcp::stream::new();
+tcp::stream::set_target(proxy_socket, forward_proxy);
+
+if !tcp::stream::connect(proxy_socket) {
+    http::response::set_status(502);
+    http::response::set_body("failed to connect to forward proxy");
+    runtime::exit();
+}
+
+// Establish a CONNECT tunnel manually so the sample can reuse that socket for TLS.
+let connect_request_line = "CONNECT " + connect_authority + " HTTP/1.1\r\n";
+let host_header = "Host: " + connect_authority + "\r\n";
+let connect_request = connect_request_line + host_header + "Connection: keep-alive\r\n\r\n";
+tcp::stream::write(proxy_socket, connect_request);
+
+let connect_response = tcp::stream::read(proxy_socket, 256);
+if connect_response == "" {
+    http::response::set_status(502);
+    http::response::set_body("forward proxy did not acknowledge CONNECT");
+    runtime::exit();
+}
+
+// Bind the real outbound HTTP exchange onto the tunneled socket.
+let upstream = http::exchange::default_upstream();
+http::exchange::set_target(upstream, upstream_target);
+http::upstream::request::set_method(http::request::get_method());
+http::upstream::request::set_body(http::request::get_body());
+
+let request_content_type = http::request::get_header("content-type");
+if request_content_type != "" {
+    http::upstream::request::set_header("content-type", request_content_type);
+}
+
+let session = tls::session::from_socket(proxy_socket);
+http::exchange::attach_tls_plaintext(upstream, session);
+// Tests can opt out of verification when the upstream uses local certificates.
+if http::request::get_header("x-insecure-upstream") != "" {
+    tls::session::set_verify(session, false);
+    tls::session::set_verify_hostname(session, false);
+}
+
+if !tls::session::handshake(session) {
+    http::response::set_status(502);
+    http::response::set_body("failed to establish upstream tls over forward proxy tunnel");
+    runtime::exit();
+}
+
+// Reading the upstream response now drives the request across the CONNECT tunnel.
+let upstream_status = http::upstream::response::get_status();
+http::response::set_status(upstream_status);
+http::response::set_header("x-forward-proxy-phase", tcp::stream::get_phase(proxy_socket));
+
+// Surface a few transport details so callers can confirm the proxied TLS path.
+let alpn = tls::session::get_alpn(session);
+if alpn != "" {
+    http::response::set_header("x-upstream-alpn", alpn);
+}
+let peer_name = tls::session::get_peer_name(session);
+if peer_name != "" {
+    http::response::set_header("x-upstream-peer", peer_name);
+}
+let content_type = http::upstream::response::get_header("content-type");
+if content_type != "" {
+    http::response::set_header("content-type", content_type);
+}
+http::response::set_body(http::upstream::response::get_body());

@@ -1,4 +1,5 @@
 use http;
+use runtime;
 use tcp;
 
 let target = http::request::get_header("x-upstream-target");
@@ -6,38 +7,39 @@ let target = http::request::get_header("x-upstream-target");
 if target == "" {
     http::response::set_status(400);
     http::response::set_body("missing x-upstream-target");
-} else {
-    // Start the upstream exchange and mirror the SSE response head.
-    http::upstream::request::set_target(target);
-    http::upstream::response::enable_processing();
+    runtime::exit();
+}
 
-    let status = http::upstream::response::get_status();
-    http::response::set_status(status);
+// Start the upstream exchange and mirror the SSE response head.
+http::upstream::request::set_target(target);
+http::upstream::response::enable_processing();
 
-    let content_type = http::upstream::response::get_header("content-type");
-    if content_type != "" {
-        http::response::set_header("content-type", content_type);
-    }
-    http::response::set_header("x-sse-mutated", "true");
+let status = http::upstream::response::get_status();
+http::response::set_status(status);
 
-    // Read the upstream SSE stream line-by-line so event boundaries stay visible.
-    let downstream = tcp::stream::downstream();
+let content_type = http::upstream::response::get_header("content-type");
+if content_type != "" {
+    http::response::set_header("content-type", content_type);
+}
+http::response::set_header("x-sse-mutated", "true");
 
-    let mut event = "";
+// Read the upstream SSE stream line-by-line so event boundaries stay visible.
+let downstream = tcp::stream::downstream();
 
-    while !http::upstream::response::body::eof() {
-        let line = http::upstream::response::body::next_line();
-        if line == "" {
-            if event != "" {
-                tcp::stream::write(downstream, event + "\n");
-                event = "";
-            }
-        } else {
-            event = event + line + " [mutated]\n";
+let mut event = "";
+
+while !http::upstream::response::body::eof() {
+    let line = http::upstream::response::body::next_line();
+    if line == "" {
+        if event != "" {
+            tcp::stream::write(downstream, event + "\n");
+            event = "";
         }
+    } else {
+        event = event + line + " [mutated]\n";
     }
+}
 
-    if event != "" {
-        tcp::stream::write(downstream, event + "\n");
-    }
+if event != "" {
+    tcp::stream::write(downstream, event + "\n");
 }

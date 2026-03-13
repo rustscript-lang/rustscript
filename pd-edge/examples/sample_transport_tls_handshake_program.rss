@@ -1,0 +1,46 @@
+use tcp;
+use tls;
+
+// Run this under pd-edge-transport-proxy.
+//
+// The client must initiate TLS first. This sample inspects SNI before the
+// server-side handshake completes, rejects unexpected names, and then echoes
+// plaintext after TLS is established.
+let downstream = tcp::stream::downstream();
+let session = tls::session::from_socket(downstream);
+
+if !tls::session::is_present(session) {
+    tcp::stream::close(downstream);
+} else {
+    let server_name = tls::session::get_server_name(session);
+
+    // Reject anything except the expected SNI before the handshake finishes.
+    if server_name != "edge.example.test" {
+        tcp::stream::close(downstream);
+    } else {
+        // Negotiate a custom ALPN marker so clients can verify the handshake path.
+        tls::session::set_alpn(session, "echo/1");
+
+        // Optional: pin a specific identity instead of the generated self-signed certificate.
+        // tls::session::set_certificate(session, "... PEM certificate chain ...");
+        // tls::session::set_private_key(session, "... PEM private key ...");
+
+        if tls::session::handshake(session) {
+            let banner =
+                "accepted sni=" + server_name +
+                " alpn=" + tls::session::get_alpn(session) + "\n";
+            tcp::stream::write(downstream, banner);
+
+            while !tcp::stream::eof(downstream) {
+                let chunk = tcp::stream::read(downstream, 1024);
+                if chunk != "" {
+                    tcp::stream::write(downstream, chunk);
+                }
+            }
+
+            tcp::stream::close(downstream);
+        } else {
+            tcp::stream::close(downstream);
+        }
+    }
+}
