@@ -83,7 +83,7 @@ cargo run -p pd-edge --example build_sample_program
 curl -i "http://127.0.0.1:8080/anything" -H "x-client-id: demo-client"
 ```
 
-The sample program in `examples/sample_proxy_program.*` uses `rate_limit::allow` and writes response headers/body via `http::response::*`.
+The sample program in `examples/http/proxy/sample_proxy_program.*` uses `rate_limit::allow` and writes response headers/body via `http::response::*`.
 
 ### Console Mode
 
@@ -132,7 +132,7 @@ Notes:
 - With feature `http2`, the HTTP listener also accepts cleartext h2c prior-knowledge requests on the same port.
 - With feature `http2`, the HTTPS listener negotiates `h2` or `http/1.1` via ALPN on the same port.
 - Without feature `http2`, the HTTP and HTTPS listeners remain HTTP/1.1 only.
-- The forward proxy listener accepts `CONNECT` and then tunnels raw TCP bytes, which makes it usable with `examples/sample_forward_proxy_program.rss`.
+- The forward proxy listener accepts `CONNECT` and then tunnels raw TCP bytes, which makes it usable with `examples/proxy/forward/sample_forward_proxy_program.rss`.
 
 ## HTTP Proxy Admin API
 
@@ -764,6 +764,7 @@ docker run --rm -p 8080:8080 -p 8081:8081 fffonion/pd-edge:latest
 
 ## Codebase Layout
 
+- `pd-edge/examples/README.md`: categorized sample program index for console, HTTP, transport, proxy, WebSocket, and WebRTC examples
 - `pd-edge/src/bin/pd-edge-http-proxy.rs`: HTTP proxy binary entrypoint and CLI
 - `pd-edge/src/bin/pd-edge-console.rs`: console binary entrypoint and CLI
 - `pd-edge/src/bin/pd-edge-sample-echo-server.rs`: multi-protocol sample echo server binary and CLI

@@ -15,9 +15,9 @@ use vm::{Program, decode_program, validate_program};
 use crate::{
     HOST_FUNCTION_COUNT,
     abi_impl::{
-        RateLimiterStore, SharedHttp3DownstreamSessions, SharedHttp3UpstreamSessions,
-        SharedHttpDownstreamSessions, SharedHttpUpstreamSessions, SharedRateLimiter,
-        SharedTlsSessionCache,
+        ProxyVmContext, RateLimiterStore, SharedHttp3DownstreamSessions,
+        SharedHttp3UpstreamSessions, SharedHttpDownstreamSessions, SharedHttpUpstreamSessions,
+        SharedRateLimiter, SharedTlsSessionCache,
         http::{SharedUpstreamClientCache, new_shared_upstream_client_cache},
         new_shared_http_downstream_sessions, new_shared_http_upstream_sessions,
         new_shared_http3_downstream_sessions, new_shared_http3_upstream_sessions,
@@ -442,6 +442,16 @@ impl SharedState {
             telemetry.control_rpc_results_error_total,
         )
     }
+}
+
+pub fn attach_http_plane_runtime_services(state: &SharedState, vm_context: &mut ProxyVmContext) {
+    vm_context.attach_upstream_client(state.client.clone());
+    vm_context.attach_upstream_client_cache(state.upstream_client_cache.clone());
+    vm_context.attach_tls_session_cache(state.tls_session_cache.clone());
+    vm_context.attach_upstream_http_sessions(state.upstream_http_sessions.clone());
+    vm_context.attach_upstream_http3_sessions(state.upstream_http3_sessions.clone());
+    vm_context.attach_downstream_http_sessions(state.downstream_http2_sessions.clone());
+    vm_context.attach_downstream_http3_sessions(state.downstream_http3_sessions.clone());
 }
 
 struct RuntimeMetrics {

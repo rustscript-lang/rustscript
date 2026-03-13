@@ -46,6 +46,6 @@ pub use runtime::serve_http3_proxy;
 pub use runtime::{
     HealthStatus, ProgramApplyReport, RuntimeStoreLimits, SharedState, TelemetrySnapshot,
     VM_EPOCH_TICK_INTERVAL_MS, VmExecutionConfig, VmExecutionMode, VmInterruptConfig,
-    apply_program_from_bytes, build_admin_app, build_http_proxy_app, serve_http_proxy,
-    serve_https_proxy, serve_transport_proxy,
+    apply_program_from_bytes, attach_http_plane_runtime_services, build_admin_app,
+    build_http_proxy_app, serve_http_proxy, serve_https_proxy, serve_transport_proxy,
 };

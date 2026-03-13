@@ -8,6 +8,8 @@ async fn sample_websocket_proxy_program_round_trips_text_frames() {
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("websocket")
+        .join("proxy")
         .join("sample_websocket_proxy_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 
@@ -140,6 +142,8 @@ async fn sample_websocket_proxy_program_round_trips_binary_frames_with_default_h
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("websocket")
+        .join("proxy")
         .join("sample_websocket_proxy_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
     let payload = STANDARD.encode(b"bin-payload");
@@ -510,6 +514,8 @@ async fn sample_transport_websocket_sse_bridge_program_forwards_events_as_text_f
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("websocket")
+        .join("bridge")
         .join("sample_transport_websocket_sse_bridge_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 

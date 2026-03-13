@@ -581,6 +581,8 @@ async fn sample_proxy_program_streams_or_buffers_upstream_body() {
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("http")
+        .join("proxy")
         .join("sample_proxy_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 
@@ -657,6 +659,8 @@ async fn sample_request_transform_program_streams_or_buffers_downstream_request_
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("http")
+        .join("proxy")
         .join("sample_request_transform_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 
@@ -743,6 +747,8 @@ async fn sample_sse_proxy_program_mutates_each_upstream_event_before_returning()
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("http")
+        .join("proxy")
         .join("sample_sse_proxy_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 
@@ -852,6 +858,8 @@ async fn sample_subrequest_proxy_program_fans_out_across_default_and_dynamic_exc
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("http")
+        .join("proxy")
         .join("sample_subrequest_proxy_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 
@@ -1124,6 +1132,8 @@ async fn sample_downstream_http2_program_handles_cleartext_h2_requests() {
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("http")
+        .join("downstream")
         .join("sample_downstream_http2_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 
@@ -1206,6 +1216,8 @@ async fn sample_downstream_http3_program_handles_http3_requests() {
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("http")
+        .join("downstream")
         .join("sample_downstream_http3_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 
@@ -1272,6 +1284,8 @@ async fn sample_upstream_http2_program_demonstrates_multiplex_and_reuse() {
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("http")
+        .join("upstream")
         .join("sample_upstream_http2_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 
@@ -1384,6 +1398,8 @@ async fn sample_upstream_http3_program_demonstrates_multiplex_and_reuse() {
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("http")
+        .join("upstream")
         .join("sample_upstream_http3_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 

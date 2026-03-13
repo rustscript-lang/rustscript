@@ -145,13 +145,15 @@ fn parse_function_decl(
         param_names.push(ident.ident.to_string());
         param_types.push(type_label(&pat_type.ty));
     }
+    let spec_docs = doc_string(&function.attrs);
     let docs = edge_impl_docs
         .get(&name)
         .filter(|docs| !docs.trim().is_empty())
         .cloned()
+        .or_else(|| (!spec_docs.trim().is_empty()).then_some(spec_docs))
         .unwrap_or_else(|| {
             panic!(
-                "edge ABI function '{name}' is missing /// doc comments on its #[pd_edge_host_function] implementation"
+                "edge ABI function '{name}' is missing /// doc comments on its #[pd_edge_host_function] implementation or ABI spec declaration"
             )
         });
 
@@ -753,7 +755,7 @@ fn render_abi_rust(functions: &[AbiFunctionDecl], namespaces: &[NamespaceDecl]) 
 fn render_abi_json(functions: &[AbiFunctionDecl]) -> String {
     let mut out = String::new();
     out.push_str("{\n");
-    out.push_str("  \"abi_version\": 20,\n");
+    out.push_str("  \"abi_version\": 21,\n");
     out.push_str("  \"functions\": [\n");
     for (index, function) in functions.iter().enumerate() {
         let suffix = if index + 1 == functions.len() {

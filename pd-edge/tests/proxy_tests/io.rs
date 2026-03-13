@@ -19,6 +19,8 @@ async fn sample_io_upstream_handle_program_uses_tcp_and_http_handles_with_io() {
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join("transport")
+        .join("io")
         .join("sample_io_upstream_handle_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 
