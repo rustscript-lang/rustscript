@@ -6,10 +6,6 @@ include!("http.downstream.rs");
 include!("http.response.rs");
 #[cfg(feature = "http")]
 include!("http.exchange.rs");
-#[cfg(feature = "http")]
-include!("http.upstream.request.rs");
-#[cfg(feature = "http")]
-include!("http.upstream.response.rs");
 include!("runtime.rs");
 include!("tcp.rs");
 include!("udp.rs");

@@ -31,11 +31,11 @@ fn remove_module_root(root: &Path) {
 fn compile_source_file_module_override_path_redirects_import_spec() {
     let root = temp_module_root("vm_rustscript_module_override_test");
 
-    let override_module_path = root.join("edge_io_async_override.rss");
+    let override_module_path = root.join("edge_http_upstream_override.rss");
     write_source(
         &override_module_path,
         r#"
-        pub fn request_body_read() {
+        pub fn as_stream() {
             "override-body";
         }
     "#,
@@ -46,14 +46,14 @@ fn compile_source_file_module_override_path_redirects_import_spec() {
     write_source(
         &main_path,
         r#"
-        use edge::io_async as edge_io;
-        edge_io::request_body_read();
+        use edge::http::upstream as upstream;
+        upstream::as_stream();
     "#,
         "main source",
     );
 
     let options = CompileSourceFileOptions::new()
-        .with_module_override_path("edge/io_async.rss", &override_module_path);
+        .with_module_override_path("edge/http/upstream.rss", &override_module_path);
     let compiled =
         compile_source_file_with_options(&main_path, options).expect("compile should succeed");
     assert!(

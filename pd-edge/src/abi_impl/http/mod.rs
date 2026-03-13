@@ -19,8 +19,6 @@ mod request;
 #[cfg(feature = "http")]
 mod response;
 mod state;
-#[cfg(feature = "http")]
-mod upstream;
 
 #[cfg(feature = "websocket")]
 pub(crate) use state::DownstreamWebSocketTunnelPlan;

@@ -217,7 +217,15 @@ impl Http2DownstreamSessionStore {
 #[cfg(test)]
 impl Http2SessionStore {
     pub(crate) fn capacity(&self) -> usize {
-        self.sessions.capacity()
+        #[cfg(feature = "http2")]
+        {
+            self.sessions.capacity()
+        }
+
+        #[cfg(not(feature = "http2"))]
+        {
+            0
+        }
     }
 }
 
@@ -1706,7 +1714,7 @@ impl ServerCertVerifier for PermissiveServerCertVerifier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "http2"))]
 mod tests {
     use std::collections::HashMap;
 

@@ -646,7 +646,14 @@ mod tests {
 
         let defaults = RuntimeStoreLimits::default();
         assert_eq!(tls_capacity, defaults.tls_session_reuse_entries);
-        assert_eq!(upstream_capacity, defaults.upstream_http_reuse_entries);
+        assert_eq!(
+            upstream_capacity,
+            if cfg!(feature = "http2") {
+                defaults.upstream_http_reuse_entries
+            } else {
+                0
+            }
+        );
         assert_eq!(
             downstream_capacity,
             defaults.downstream_http2_session_entries
@@ -678,7 +685,7 @@ mod tests {
                 .lock()
                 .expect("http upstream session store lock poisoned")
                 .capacity(),
-            16
+            if cfg!(feature = "http2") { 16 } else { 0 }
         );
         assert_eq!(
             state

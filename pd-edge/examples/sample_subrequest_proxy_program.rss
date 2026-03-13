@@ -34,6 +34,9 @@ tcp::stream::write(secondary, "beta");
 http::exchange::send(primary);
 
 let secondary_tls = tls::session::from_socket(secondary);
+if tls::session::is_present(secondary_tls) {
+    tls::session::set_verify(secondary_tls, false);
+}
 if tls::session::is_present(secondary_tls) && tls::session::handshake(secondary_tls) {
     let peer_name = tls::session::get_peer_name(secondary_tls);
     if peer_name != "" {

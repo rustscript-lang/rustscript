@@ -98,16 +98,17 @@ let path = http::request::get_path();
 let client_id = http::request::get_header("x-client-id");
 let body = http::request::get_body();
 
-http::upstream::request::set_target("http://{upstream_addr}");
-http::upstream::request::set_header("x-client-id", client_id);
-http::upstream::request::set_header("x-downstream-method", method);
-http::upstream::request::set_path(path);
-http::upstream::request::set_body(body);
+let upstream = http::exchange::default_upstream();
+http::exchange::set_target(upstream, "http://{upstream_addr}");
+http::exchange::set_header(upstream, "x-client-id", client_id);
+http::exchange::set_header(upstream, "x-downstream-method", method);
+http::exchange::set_path(upstream, path);
+http::exchange::set_body(upstream, body);
 
-let upstream_status = http::upstream::response::get_status();
-let echoed_client_id = http::upstream::response::get_header("x-upstream-client-id");
-let echoed_path = http::upstream::response::get_header("x-upstream-path");
-let upstream_body = http::upstream::response::get_body();
+let upstream_status = http::exchange::get_status(upstream);
+let echoed_client_id = http::exchange::get_header(upstream, "x-upstream-client-id");
+let echoed_path = http::exchange::get_header(upstream, "x-upstream-path");
+let upstream_body = http::exchange::get_body(upstream);
 
 http::response::set_status(upstream_status);
 http::response::set_header("x-perf-client-id", client_id);

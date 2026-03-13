@@ -1,0 +1,7 @@
+// Convenience wrappers over the default outbound HTTP exchange.
+use http;
+use proxy;
+
+pub fn as_stream() {
+    proxy::stream::exchange(http::exchange::default_upstream())
+}

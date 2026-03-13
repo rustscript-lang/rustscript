@@ -137,7 +137,7 @@ mod tests {
         for function in FUNCTIONS {
             assert!(manifest.contains(function.name));
             assert!(manifest.contains(function.return_type.as_str()));
-            assert!(manifest.contains(function.docs));
+            assert!(manifest.contains(&format!("{:?}", function.docs)));
             for name in function.param_names {
                 assert!(manifest.contains(name));
             }

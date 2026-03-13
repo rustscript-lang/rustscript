@@ -1,4 +1,5 @@
 use http;
+use io;
 use runtime;
 use tcp;
 
@@ -11,12 +12,13 @@ if target == "" {
 }
 
 // Start the upstream exchange and mirror the SSE response head.
-http::upstream::request::set_target(target);
+let upstream = http::exchange::default_upstream();
+http::exchange::set_target(upstream, target);
 
-let status = http::upstream::response::get_status();
+let status = http::exchange::get_status(upstream);
 http::response::set_status(status);
 
-let content_type = http::upstream::response::get_header("content-type");
+let content_type = http::exchange::get_header(upstream, "content-type");
 if content_type != "" {
     http::response::set_header("content-type", content_type);
 }
@@ -27,8 +29,8 @@ let downstream = tcp::stream::downstream();
 
 let mut event = "";
 
-while !http::upstream::response::body::eof() {
-    let line = http::upstream::response::body::next_line();
+while !http::exchange::body::eof(upstream) {
+    let line = io::read_line(upstream);
     if line == "" {
         if event != "" {
             tcp::stream::write(downstream, event + "\n");

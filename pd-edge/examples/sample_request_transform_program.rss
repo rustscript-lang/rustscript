@@ -10,7 +10,8 @@ if upstream == "" {
     runtime::exit();
 }
 
-http::upstream::request::set_target(upstream);
+let exchange = http::exchange::default_upstream();
+http::exchange::set_target(exchange, upstream);
 
 if http::request::get_header("Chunk-Transform") != "" {
     // Consume the request stream incrementally and annotate each chunk before upload.
@@ -18,19 +19,19 @@ if http::request::get_header("Chunk-Transform") != "" {
     while !http::request::body::eof() {
         transformed = transformed + http::request::body::next_chunk(3) + "#";
     }
-    http::upstream::request::set_body(transformed);
+    http::exchange::set_body(exchange, transformed);
     http::response::set_header("x-request-stream", "true");
 } else {
     // Or forward the buffered request body unchanged.
-    http::upstream::request::set_body(http::request::get_body());
+    http::exchange::set_body(exchange, http::request::get_body());
     http::response::set_header("x-request-stream", "false");
 }
 
 // Mirror the upstream result after the transformed request has been sent.
-let upstream_status = http::upstream::response::get_status();
-let content_type = http::upstream::response::get_header("content-type");
+let upstream_status = http::exchange::get_status(exchange);
+let content_type = http::exchange::get_header(exchange, "content-type");
 if content_type != "" {
     http::response::set_header("content-type", content_type);
 }
 http::response::set_status(upstream_status);
-http::response::set_body(http::upstream::response::get_body());
+http::response::set_body(http::exchange::get_body(exchange));

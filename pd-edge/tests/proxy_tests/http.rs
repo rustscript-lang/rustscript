@@ -442,10 +442,11 @@ async fn http_prefixed_host_abi_can_rewrite_request_and_short_circuit() {
 
         let client_id = http::request::get_header("x-client-id");
         if rate_limit::allow(client_id, 1, 60) {{
-            http::upstream::request::set_path("/rewritten");
-            http::upstream::request::set_query("from=vm");
-            http::upstream::request::set_header("x-added", "yes");
-            http::upstream::request::set_target("{upstream_addr}");
+            let upstream = http::exchange::default_upstream();
+            http::exchange::set_path(upstream, "/rewritten");
+            http::exchange::set_query(upstream, "from=vm");
+            http::exchange::set_header(upstream, "x-added", "yes");
+            http::exchange::set_target(upstream, "{upstream_addr}");
         }} else {{
             http::response::set_status(429);
             http::response::set_body("blocked");
@@ -509,8 +510,9 @@ async fn http_request_body_can_be_rewritten_before_proxying() {
         r#"
         use http;
 
-        http::upstream::request::set_body("rewritten-body");
-        http::upstream::request::set_target("{upstream_addr}");
+        let upstream = http::exchange::default_upstream();
+        http::exchange::set_body(upstream, "rewritten-body");
+        http::exchange::set_target(upstream, "{upstream_addr}");
     "#
     );
     let compiled = compile_source(&source).expect("source should compile");
@@ -783,20 +785,22 @@ async fn sample_sse_proxy_program_mutates_each_upstream_event_before_returning()
 }
 
 #[tokio::test]
-async fn direct_vm_can_read_upstream_response_line_by_line_via_http_body_api() {
+async fn direct_vm_can_read_upstream_response_line_by_line_via_io_handle_api() {
     let (upstream_addr, upstream_handle) =
         spawn_sse_upstream(vec!["id: 1\n", "data: alpha\n", "\n"]).await;
     let source = format!(
         r#"
         use http;
+        use io;
         use tcp;
 
-        http::upstream::request::set_target("http://{upstream_addr}/events");
-        http::response::set_status(http::upstream::response::get_status());
+        let upstream = http::exchange::default_upstream();
+        http::exchange::set_target(upstream, "http://{upstream_addr}/events");
+        http::response::set_status(http::exchange::get_status(upstream));
         let downstream = tcp::stream::downstream();
 
-        while !http::upstream::response::body::eof() {{
-            let line = http::upstream::response::body::next_line();
+        while !http::exchange::body::eof(upstream) {{
+            let line = io::read_line(upstream);
             if line == "" {{
                 tcp::stream::write(downstream, "\n");
             }} else {{
@@ -1008,14 +1012,15 @@ async fn upstream_http2_response_version_is_exposed_to_vm_programs() {
         use http;
         use tls;
 
-        http::upstream::request::set_target("https://localhost:{}/fast");
-        let session = tls::session::from_socket(http::exchange::default_upstream());
+        let upstream = http::exchange::default_upstream();
+        http::exchange::set_target(upstream, "https://localhost:{}/fast");
+        let session = tls::session::from_socket(upstream);
         tls::session::set_verify(session, false);
         http::response::set_header(
             "x-upstream-version",
-            http::upstream::response::get_http_version()
+            http::exchange::get_http_version(upstream)
         );
-        http::response::set_body(http::upstream::response::get_body());
+        http::response::set_body(http::exchange::get_body(upstream));
     "#,
         upstream_addr.port()
     );

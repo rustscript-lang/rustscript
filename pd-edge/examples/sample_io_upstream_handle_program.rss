@@ -25,7 +25,7 @@ let staged = io::read_all(downstream);
 io::write(upstream, staged + "|via-io-handle");
 
 // Reading from the same upstream handle advances the outbound exchange and returns the response.
-http::response::set_status(http::upstream::response::get_status());
+http::response::set_status(http::exchange::get_status(upstream));
 http::response::set_header("x-io-upstream-handles", "true");
 http::response::set_header("x-first-line", io::read_line(upstream));
 http::response::set_body(io::read_all(upstream));

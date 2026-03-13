@@ -1,0 +1,47 @@
+// Convenience wrappers over the default outbound HTTP exchange response.
+use http;
+use io;
+
+fn upstream_response_default_exchange() {
+    http::exchange::default_upstream()
+}
+
+pub fn get_status() {
+    http::exchange::get_status(upstream_response_default_exchange())
+}
+
+pub fn get_header(name) {
+    http::exchange::get_header(upstream_response_default_exchange(), name)
+}
+
+pub fn get_headers() {
+    http::exchange::get_headers(upstream_response_default_exchange())
+}
+
+pub fn get_body() {
+    http::exchange::get_body(upstream_response_default_exchange())
+}
+
+pub fn get_http_version() {
+    http::exchange::get_http_version(upstream_response_default_exchange())
+}
+
+pub fn next_chunk(max_bytes) {
+    http::exchange::body::next_chunk(upstream_response_default_exchange(), max_bytes)
+}
+
+pub fn next_line() {
+    io::read_line(upstream_response_default_exchange())
+}
+
+pub fn eof() {
+    http::exchange::body::eof(upstream_response_default_exchange())
+}
+
+pub fn read_all() {
+    io::read_all(upstream_response_default_exchange())
+}
+
+pub fn read_line() {
+    io::read_line(upstream_response_default_exchange())
+}

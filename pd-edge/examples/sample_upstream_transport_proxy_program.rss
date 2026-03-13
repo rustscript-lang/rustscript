@@ -15,14 +15,18 @@ if target == "" {
     http::response::set_body("missing x-upstream-target");
 } else {
     // Configure the default outbound exchange first.
-    http::upstream::request::set_target(target);
+    let exchange = http::exchange::default_upstream();
+    http::exchange::set_target(exchange, target);
 
     let upstream = tcp::stream::default_upstream();
     let upstream_tls = tls::session::from_socket(upstream);
+    if tls::session::is_present(upstream_tls) {
+        tls::session::set_verify(upstream_tls, false);
+    }
 
     // Stage the downstream request body into the pending upstream request body.
     let request_body = proxy::stream::downstream();
-    let upstream_request = proxy::stream::default_upstream();
+    let upstream_request = proxy::stream::exchange(exchange);
     let upload_status = proxy::pipe(request_body, upstream_request, 8);
     http::response::set_header("x-upload-pipe", upload_status);
 
@@ -38,8 +42,8 @@ if target == "" {
         }
     }
 
-    let status = http::upstream::response::get_status();
-    let content_type = http::upstream::response::get_header("content-type");
+    let status = http::exchange::get_status(exchange);
+    let content_type = http::exchange::get_header(exchange, "content-type");
     if content_type != "" {
         http::response::set_header("content-type", content_type);
     }

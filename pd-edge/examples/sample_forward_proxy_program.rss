@@ -44,12 +44,12 @@ if connect_response == "" {
 // Bind the real outbound HTTP exchange onto the tunneled socket.
 let upstream = http::exchange::default_upstream();
 http::exchange::set_target(upstream, upstream_target);
-http::upstream::request::set_method(http::request::get_method());
-http::upstream::request::set_body(http::request::get_body());
+http::exchange::set_method(upstream, http::request::get_method());
+http::exchange::set_body(upstream, http::request::get_body());
 
 let request_content_type = http::request::get_header("content-type");
 if request_content_type != "" {
-    http::upstream::request::set_header("content-type", request_content_type);
+    http::exchange::set_header(upstream, "content-type", request_content_type);
 }
 
 let session = tls::session::from_socket(proxy_socket);
@@ -67,7 +67,7 @@ if !tls::session::handshake(session) {
 }
 
 // Reading the upstream response now drives the request across the CONNECT tunnel.
-let upstream_status = http::upstream::response::get_status();
+let upstream_status = http::exchange::get_status(upstream);
 http::response::set_status(upstream_status);
 http::response::set_header("x-forward-proxy-phase", tcp::stream::get_phase(proxy_socket));
 
@@ -80,8 +80,8 @@ let peer_name = tls::session::get_peer_name(session);
 if peer_name != "" {
     http::response::set_header("x-upstream-peer", peer_name);
 }
-let content_type = http::upstream::response::get_header("content-type");
+let content_type = http::exchange::get_header(upstream, "content-type");
 if content_type != "" {
     http::response::set_header("content-type", content_type);
 }
-http::response::set_body(http::upstream::response::get_body());
+http::response::set_body(http::exchange::get_body(upstream));

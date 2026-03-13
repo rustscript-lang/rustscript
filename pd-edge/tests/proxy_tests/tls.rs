@@ -375,17 +375,18 @@ async fn http2_capable_client_falls_back_to_http11_when_h2_is_unavailable() {
         use http;
         use tls;
 
-        http::upstream::request::set_target("https://localhost:{}/echo");
-        http::upstream::request::set_body("fallback-body");
+        let upstream = http::exchange::default_upstream();
+        http::exchange::set_target(upstream, "https://localhost:{}/echo");
+        http::exchange::set_body(upstream, "fallback-body");
 
         let session = tls::session::from_socket(http::exchange::default_upstream());
         tls::session::set_verify(session, false);
         http::response::set_header(
             "x-version",
-            http::upstream::response::get_http_version()
+            http::exchange::get_http_version(upstream)
         );
         http::response::set_header("x-alpn", tls::session::get_alpn(session));
-        http::response::set_body(http::upstream::response::get_body());
+        http::response::set_body(http::exchange::get_body(upstream));
     "#,
         upstream_addr.port()
     );

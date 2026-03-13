@@ -1,4 +1,5 @@
 use http;
+use io;
 use websocket;
 
 // Run this under pd-edge-transport-proxy.
@@ -18,13 +19,14 @@ if target == "" {
     websocket::connection::send_text(downstream, "error: missing upstream SSE target");
     websocket::connection::close(downstream, 1008, "missing-target");
 } else {
-    http::upstream::request::set_target(target);
-    http::upstream::request::set_header("accept", "text/event-stream");
+    let upstream = http::exchange::default_upstream();
+    http::exchange::set_target(upstream, target);
+    http::exchange::set_header(upstream, "accept", "text/event-stream");
 
     let mut event = "";
 
-    while !http::upstream::response::body::eof() && !websocket::connection::eof(downstream) {
-        let line = http::upstream::response::body::next_line();
+    while !http::exchange::body::eof(upstream) && !websocket::connection::eof(downstream) {
+        let line = io::read_line(upstream);
         if line == "" {
             if event != "" {
                 websocket::connection::send_text(downstream, event);

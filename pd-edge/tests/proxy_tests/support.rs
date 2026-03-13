@@ -14,17 +14,15 @@ pub(crate) use axum::{
     routing::{any, post},
 };
 pub(crate) use base64::{Engine as _, engine::general_purpose::STANDARD};
-#[cfg(feature = "tls")]
-use edge::sample_echo::spawn_https_echo_server;
 #[cfg(feature = "webrtc")]
 pub(crate) use edge::sample_echo::spawn_webrtc_echo_server;
 pub(crate) use edge::{
     ActiveControlPlaneConfig, CommandResultPayload, ControlPlaneCommand, EdgeCommandResult,
     EdgePollRequest, EdgePollResponse, FN_HTTP_RESPONSE_SET_BODY, FN_HTTP_RESPONSE_SET_HEADER,
-    FN_HTTP_UPSTREAM_REQUEST_SET_TARGET, ProxyVmContext, RateLimiterStore, SharedState,
-    VmAsyncOpBridge, build_admin_app, build_http_proxy_app, compile_edge_source_file,
-    enter_edge_host_context, new_shared_vm_async_ops, register_http_plane_host_module,
-    serve_http_proxy, serve_https_proxy, serve_transport_proxy, spawn_active_control_plane_client,
+    ProxyVmContext, RateLimiterStore, SharedState, VmAsyncOpBridge, build_admin_app,
+    build_http_proxy_app, compile_edge_source_file, enter_edge_host_context, function_by_name,
+    new_shared_vm_async_ops, register_http_plane_host_module, serve_http_proxy, serve_https_proxy,
+    serve_transport_proxy, spawn_active_control_plane_client,
 };
 #[cfg(feature = "websocket")]
 pub(crate) use futures_util::{SinkExt, StreamExt};
@@ -395,11 +393,95 @@ pub(crate) async fn spawn_websocket_echo_upstream() -> (SocketAddr, JoinHandle<(
 
 #[cfg(feature = "tls")]
 pub(crate) async fn spawn_https_echo_upstream() -> (SocketAddr, JoinHandle<()>) {
-    // Keep the baseline HTTPS fixture aligned with the sample binary so manual examples and tests
-    // do not drift on TLS or HTTP behavior.
-    spawn_https_echo_server("127.0.0.1:0".parse().expect("valid addr"))
+    ensure_rustls_provider();
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("certificate should generate");
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(
+                cert.serialize_der().expect("certificate should serialize"),
+            )],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.serialize_private_key_der())),
+        )
+        .expect("server config should build");
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("https echo should start")
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener should have addr");
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls_stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let io = hyper_util::rt::TokioIo::new(tls_stream);
+                let service = hyper::service::service_fn(
+                    |request: hyper::Request<hyper::body::Incoming>| async move {
+                        let method = request.method().clone();
+                        let version = request.version();
+                        let path = request.uri().path().to_string();
+                        let body = http_body_util::BodyExt::collect(request.into_body())
+                            .await
+                            .expect("https echo request body should collect")
+                            .to_bytes();
+                        let echoed_body = if body.is_empty() {
+                            axum::body::Bytes::from(format!("echo:https:{}:{path}", method))
+                        } else {
+                            body
+                        };
+
+                        let mut response =
+                            hyper::Response::new(http_body_util::Full::new(echoed_body.clone()));
+                        *response.status_mut() = hyper::StatusCode::OK;
+                        response.headers_mut().insert(
+                            hyper::header::CONTENT_TYPE,
+                            HeaderValue::from_static("text/plain; charset=utf-8"),
+                        );
+                        response
+                            .headers_mut()
+                            .insert("x-echo-protocol", HeaderValue::from_static("https"));
+                        response.headers_mut().insert(
+                            "x-echo-method",
+                            HeaderValue::from_str(method.as_str())
+                                .expect("method header should serialize"),
+                        );
+                        response.headers_mut().insert(
+                            "x-echo-path",
+                            HeaderValue::from_str(&path).expect("path header should serialize"),
+                        );
+                        response.headers_mut().insert(
+                            "x-echo-bytes",
+                            HeaderValue::from_str(&echoed_body.len().to_string())
+                                .expect("byte count should serialize"),
+                        );
+                        response.headers_mut().insert(
+                            "x-echo-http-version",
+                            HeaderValue::from_static(match version {
+                                hyper::Version::HTTP_09 => "0.9",
+                                hyper::Version::HTTP_10 => "1.0",
+                                hyper::Version::HTTP_11 => "1.1",
+                                hyper::Version::HTTP_2 => "2",
+                                hyper::Version::HTTP_3 => "3",
+                                _ => "unknown",
+                            }),
+                        );
+                        Ok::<_, std::convert::Infallible>(response)
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service)
+                    .await;
+            });
+        }
+    });
+    (addr, handle)
 }
 
 #[cfg(all(feature = "tls", feature = "http2"))]
@@ -833,10 +915,18 @@ pub(crate) fn build_upstream_program(upstream: &str, header: Option<(&str, &str)
     let mut constants = Vec::new();
     let mut bc = BytecodeBuilder::new();
 
+    let exchange_index = constants.len() as u32;
+    constants.push(Value::Int(1));
     let upstream_index = constants.len() as u32;
     constants.push(Value::string(upstream));
+    bc.ldc(exchange_index);
     bc.ldc(upstream_index);
-    bc.call(FN_HTTP_UPSTREAM_REQUEST_SET_TARGET, 1);
+    bc.call(
+        function_by_name("http::exchange::set_target")
+            .expect("http::exchange::set_target should exist")
+            .index,
+        2,
+    );
 
     if let Some((name, value)) = header {
         let name_index = constants.len() as u32;

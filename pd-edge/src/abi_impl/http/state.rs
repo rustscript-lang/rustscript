@@ -1511,13 +1511,6 @@ impl ProxyVmContext {
         mutate(exchange)
     }
 
-    pub(crate) fn with_default_upstream_request_mut<T>(
-        &self,
-        mutate: impl FnOnce(&mut HttpOutboundRequestNode) -> T,
-    ) -> T {
-        self.with_default_upstream_exchange_mut(|exchange| mutate(&mut exchange.request))
-    }
-
     pub(crate) fn with_downstream_response<T>(
         &self,
         read: impl FnOnce(&HttpResponseOutputNode) -> T,
@@ -2093,7 +2086,7 @@ impl UpstreamResponseStartError {
                 VmError::HostError(format!("unknown outbound exchange handle {handle}"))
             }
             Self::MissingTarget => VmError::HostError(
-                "upstream target is unavailable before http::upstream::request::set_target"
+                "upstream target is unavailable before configuring the default upstream exchange target"
                     .to_string(),
             ),
             Self::MissingClient => VmError::HostError(
