@@ -4,11 +4,12 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use edge_abi::symbols::tls;
 use pd_edge_host_function::pd_edge_host_function;
 use tokio_rustls::{
-    TlsConnector,
+    LazyConfigAcceptor, TlsConnector,
     rustls::{
-        self, ClientConfig, RootCertStore, SignatureScheme,
+        self, ClientConfig, RootCertStore, ServerConfig, SignatureScheme,
         client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-        pki_types::{CertificateDer, ServerName, UnixTime},
+        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
+        server::WebPkiClientVerifier,
         version::{TLS12, TLS13},
     },
 };
@@ -24,8 +25,12 @@ use super::super::websocket::{
     ensure_outbound_websocket_connection_open, websocket_connection_mode,
 };
 use super::state::tls_session_cache_key;
-use super::state::{TlsFlowState, TlsProtocolVersion, TlsSessionRef, decode_tls_session_handle};
+use super::state::{
+    DownstreamTlsServerStart, TlsFlowState, TlsProtocolVersion, TlsSessionRef,
+    decode_tls_session_handle,
+};
 use crate::abi_impl::http1;
+use rcgen::generate_simple_self_signed;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TlsSessionHandle {
@@ -151,16 +156,23 @@ fn apply_cached_session(
     Ok(true)
 }
 
-fn with_configurable_outbound_session_mut<T>(
+fn with_configurable_session_mut<T>(
     context: &SharedProxyVmContext,
     session: i64,
     mutate: impl FnOnce(&mut TlsFlowState) -> Result<T, VmError>,
 ) -> Result<T, VmError> {
     let session = decode_session(context, session)?;
     match session {
-        TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => Err(VmError::HostError(
-            "downstream tls session is read-only".to_string(),
-        )),
+        TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => {
+            if !downstream_tls_session_is_configurable(context) {
+                return Err(VmError::HostError(
+                    "downstream tls session is read-only in the current runtime state"
+                        .to_string(),
+                ));
+            }
+            let mut guard = context.lock_transport();
+            mutate(&mut guard.tls_dag.downstream)
+        }
         TlsSessionHandle::Reserved(TlsSessionRef::DefaultUpstream) => {
             if upstream_response_available(context) {
                 return Err(VmError::HostError(
@@ -459,6 +471,93 @@ fn build_dynamic_client_config(flow: &TlsFlowState) -> Result<ClientConfig, VmEr
     Ok(config)
 }
 
+fn build_downstream_server_identity(
+    flow: &TlsFlowState,
+) -> Result<
+    (
+        Vec<CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    VmError,
+> {
+    match (flow.client_certificate_pem(), flow.client_private_key_pem()) {
+        (Some(_), Some(_)) => Ok((
+            load_client_cert_chain(flow.client_certificate_pem())?,
+            load_client_private_key(flow.client_private_key_pem())?,
+        )),
+        (Some(_), None) | (None, Some(_)) => Err(VmError::HostError(
+            "downstream tls handshake requires both certificate and private key when either is configured".to_string(),
+        )),
+        (None, None) => {
+            let mut names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+            if !flow.server_name().is_empty() && !names.iter().any(|name| name == flow.server_name()) {
+                names.insert(0, flow.server_name().to_string());
+            }
+            let certificate = generate_simple_self_signed(names).map_err(|err| {
+                VmError::HostError(format!(
+                    "failed to generate downstream self-signed certificate: {err}",
+                ))
+            })?;
+            let certificate_der = certificate.serialize_der().map_err(|err| {
+                VmError::HostError(format!(
+                    "failed to serialize downstream certificate: {err}",
+                ))
+            })?;
+            Ok((
+                vec![CertificateDer::from(certificate_der)],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    certificate.serialize_private_key_der(),
+                )),
+            ))
+        }
+    }
+}
+
+fn build_downstream_server_config(flow: &TlsFlowState) -> Result<ServerConfig, VmError> {
+    ensure_rustls_provider();
+    let versions = supported_protocol_versions(flow)?;
+    let builder =
+        ServerConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+            .with_protocol_versions(&versions)
+            .map_err(|err| {
+                VmError::HostError(format!("failed to configure tls versions: {err}"))
+            })?;
+
+    let builder = if flow.verify_peer() && flow.trusted_certificate_pem().is_some() {
+        let verifier = WebPkiClientVerifier::builder(build_root_store(flow)?.into())
+            .build()
+            .map_err(|err| {
+                VmError::HostError(format!(
+                    "failed to configure downstream client certificate verifier: {err}",
+                ))
+            })?;
+        builder.with_client_cert_verifier(verifier)
+    } else {
+        builder.with_no_client_auth()
+    };
+
+    let (certificate_chain, private_key) = build_downstream_server_identity(flow)?;
+    let mut config = builder
+        .with_single_cert(certificate_chain, private_key)
+        .map_err(|err| {
+            VmError::HostError(format!(
+                "failed to configure downstream tls server certificate: {err}",
+            ))
+        })?;
+    config.alpn_protocols = flow
+        .desired_alpn()
+        .iter()
+        .map(|protocol| protocol.as_bytes().to_vec())
+        .collect();
+    Ok(config)
+}
+
+fn downstream_tls_session_is_configurable(context: &SharedProxyVmContext) -> bool {
+    let guard = context.lock_transport();
+    (guard.downstream_tcp_io.is_some() || guard.downstream_tls_server_start.is_some())
+        && !guard.tls_dag.downstream.handshake_complete()
+}
+
 async fn take_dynamic_tcp_stream_for_tls(
     context: &SharedProxyVmContext,
     handle: i64,
@@ -489,13 +588,72 @@ async fn session_from_socket(
 ) -> Result<CallOutcome, VmError> {
     let session = decode_session(&context, stream)?;
     let handle = match session {
+        TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => {
+            let pending_or_open = {
+                let guard = context.lock_transport();
+                guard.downstream_tls_server_start.is_some() || guard.downstream_tls_io.is_some()
+            };
+            if pending_or_open {
+                TlsSessionRef::Downstream.handle()
+            } else {
+                let raw_io = {
+                    let mut guard = context.lock_transport();
+                    guard.downstream_tcp_io.take().ok_or_else(|| {
+                        VmError::HostError(
+                            "downstream tls session requires an attached downstream tcp transport"
+                                .to_string(),
+                        )
+                    })?
+                };
+                let tcp_stream = {
+                    let mut guard = raw_io.lock().await;
+                    guard.take().ok_or_else(|| {
+                        VmError::HostError(
+                            "downstream tcp transport is already in use".to_string(),
+                        )
+                    })?
+                };
+                let mut acceptor =
+                    Box::pin(LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tcp_stream));
+                match acceptor.as_mut().await {
+                    Ok(start) => {
+                        let start = DownstreamTlsServerStart::new(start);
+                        let server_name = start.client_hello_server_name();
+                        let mut guard = context.lock_transport();
+                        guard.tls_dag.downstream.observe_downstream_client_hello(server_name);
+                        guard.downstream_tls_server_start = Some(start);
+                        TlsSessionRef::Downstream.handle()
+                    }
+                    Err(err) => {
+                        if let Some(stream) = acceptor.as_mut().get_mut().take_io() {
+                            {
+                                let mut raw_guard = raw_io.lock().await;
+                                *raw_guard = Some(stream);
+                            }
+                            let mut guard = context.lock_transport();
+                            guard.downstream_tcp_io = Some(raw_io);
+                        }
+                        return Err(VmError::HostError(format!(
+                            "failed to observe downstream tls client hello: {err}",
+                        )));
+                    }
+                }
+            }
+        }
         TlsSessionHandle::Reserved(reserved) => reserved.handle(),
         TlsSessionHandle::Dynamic(handle) => {
             let mut guard = context.lock_transport();
-            guard
+            let target = guard
+                .tcp_streams
+                .get(&handle)
+                .and_then(|state| state.target().map(str::to_string));
+            let flow = guard
                 .dynamic_tls_sessions
                 .entry(handle)
                 .or_insert_with(TlsFlowState::for_dynamic_socket);
+            if let Some(target) = target {
+                flow.observe_socket_target(&target);
+            }
             handle
         }
         TlsSessionHandle::OutboundExchange(handle) => handle,
@@ -637,7 +795,66 @@ async fn session_handshake(
                 }
             }
         }
-        TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => {}
+        TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => {
+            let start = {
+                let mut guard = context.lock_transport();
+                guard.downstream_tls_server_start.take().ok_or_else(|| {
+                    VmError::HostError(
+                        "downstream tls session has no pending client hello; call tls::session::from_socket on the downstream tcp stream first".to_string(),
+                    )
+                })?
+            };
+            let flow = session_flow(&context, session);
+            let config = build_downstream_server_config(&flow)?;
+            match start.into_inner().into_stream(Arc::new(config)).await {
+                Ok(tls_stream) => {
+                    let negotiated_alpn = tls_stream
+                        .get_ref()
+                        .1
+                        .alpn_protocol()
+                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+                    let peer_certificate_der = tls_stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|certs| certs.first().cloned())
+                        .map(|certificate| certificate.to_vec());
+
+                    let mut guard = context.lock_transport();
+                    guard.tcp_dag.downstream.mark_connected();
+                    guard.downstream_read_eof = false;
+                    let flow = &mut guard.tls_dag.downstream;
+                    flow.note_server_hello_received();
+                    flow.note_server_certificate_received(peer_certificate_der.clone());
+                    if flow.verify_peer() && flow.trusted_certificate_pem().is_some() {
+                        flow.note_server_certificate_verified();
+                    } else {
+                        flow.note_verification_skipped();
+                    }
+                    if !flow.accepts_negotiated_alpn(negotiated_alpn.as_deref()) {
+                        flow.mark_failed();
+                        return Err(VmError::HostError(format!(
+                            "downstream tls ALPN mismatch: requested [{}], negotiated {}",
+                            flow.desired_alpn().join(", "),
+                            negotiated_alpn.as_deref().unwrap_or("none"),
+                        )));
+                    }
+                    flow.mark_handshake_complete(negotiated_alpn);
+                    guard.downstream_tls_io =
+                        Some(Arc::new(tokio::sync::Mutex::new(Some(tls_stream))));
+                }
+                Err(err) => {
+                    let mut guard = context.lock_transport();
+                    guard.tcp_dag.downstream.mark_failed(format!(
+                        "downstream tls handshake failed: {err}",
+                    ));
+                    guard.tls_dag.downstream.mark_failed();
+                    return Err(VmError::HostError(format!(
+                        "downstream tls handshake failed: {err}",
+                    )));
+                }
+            }
+        }
     }
     let ready = session_flow(&context, session).handshake_complete();
     Ok(CallOutcome::Return(vec![Value::Bool(ready)]))
@@ -652,7 +869,7 @@ async fn session_set_alpn(
     protocols: String,
 ) -> Result<CallOutcome, VmError> {
     let protocols = parse_alpn_list(&protocols)?;
-    with_configurable_outbound_session_mut(&context, session, |flow| {
+    with_configurable_session_mut(&context, session, |flow| {
         flow.set_desired_alpn(protocols);
         Ok(())
     })?;
@@ -667,7 +884,7 @@ async fn session_set_verify(
     session: i64,
     verify: bool,
 ) -> Result<CallOutcome, VmError> {
-    with_configurable_outbound_session_mut(&context, session, |flow| {
+    with_configurable_session_mut(&context, session, |flow| {
         flow.set_verify_peer(verify);
         Ok(())
     })?;
@@ -682,7 +899,7 @@ async fn session_set_verify_hostname(
     session: i64,
     verify: bool,
 ) -> Result<CallOutcome, VmError> {
-    with_configurable_outbound_session_mut(&context, session, |flow| {
+    with_configurable_session_mut(&context, session, |flow| {
         flow.set_verify_hostname(verify);
         Ok(())
     })?;
@@ -697,7 +914,7 @@ async fn session_set_trusted_certificate(
     session: i64,
     certificate_pem: String,
 ) -> Result<CallOutcome, VmError> {
-    with_configurable_outbound_session_mut(&context, session, |flow| {
+    with_configurable_session_mut(&context, session, |flow| {
         flow.set_trusted_certificate_pem(certificate_pem);
         Ok(())
     })?;
@@ -712,7 +929,7 @@ async fn session_set_certificate(
     session: i64,
     certificate_pem: String,
 ) -> Result<CallOutcome, VmError> {
-    with_configurable_outbound_session_mut(&context, session, |flow| {
+    with_configurable_session_mut(&context, session, |flow| {
         flow.set_client_certificate_pem(certificate_pem);
         Ok(())
     })?;
@@ -727,7 +944,7 @@ async fn session_set_private_key(
     session: i64,
     private_key_pem: String,
 ) -> Result<CallOutcome, VmError> {
-    with_configurable_outbound_session_mut(&context, session, |flow| {
+    with_configurable_session_mut(&context, session, |flow| {
         flow.set_client_private_key_pem(private_key_pem);
         Ok(())
     })?;
@@ -742,7 +959,7 @@ async fn session_set_sni(
     session: i64,
     enabled: bool,
 ) -> Result<CallOutcome, VmError> {
-    with_configurable_outbound_session_mut(&context, session, |flow| {
+    with_configurable_session_mut(&context, session, |flow| {
         flow.set_sni_enabled(enabled);
         Ok(())
     })?;
@@ -758,7 +975,7 @@ async fn session_set_min_version(
     version: String,
 ) -> Result<CallOutcome, VmError> {
     let version = parse_tls_version_label(&version)?;
-    with_configurable_outbound_session_mut(&context, session, |flow| {
+    with_configurable_session_mut(&context, session, |flow| {
         flow.set_min_version(Some(version));
         Ok(())
     })?;
@@ -774,7 +991,7 @@ async fn session_set_max_version(
     version: String,
 ) -> Result<CallOutcome, VmError> {
     let version = parse_tls_version_label(&version)?;
-    with_configurable_outbound_session_mut(&context, session, |flow| {
+    with_configurable_session_mut(&context, session, |flow| {
         flow.set_max_version(Some(version));
         Ok(())
     })?;

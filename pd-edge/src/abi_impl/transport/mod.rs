@@ -12,7 +12,7 @@ mod tls;
 mod udp;
 
 #[cfg(feature = "tls")]
-pub(crate) use state::SharedTlsStreamIo;
+pub(crate) use state::{DownstreamTlsServerStart, SharedServerTlsStreamIo, SharedTlsStreamIo};
 pub(crate) use state::TlsSessionCacheKey;
 pub(crate) use state::{
     CachedTlsSession, FIRST_DYNAMIC_TCP_STREAM_HANDLE, SharedTcpStreamIo, SharedTlsSessionCache,

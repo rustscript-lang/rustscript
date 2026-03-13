@@ -19,6 +19,8 @@ use super::super::http::{
 use super::state::{
     SharedTcpStreamIo, TcpSocketPhase, TcpSocketState, TcpStreamRef, decode_tcp_stream_handle,
 };
+#[cfg(feature = "tls")]
+use crate::abi_impl::transport::SharedServerTlsStreamIo;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TcpStreamHandle {
@@ -61,7 +63,9 @@ fn normalize_tcp_target(value: &str) -> Result<String, VmError> {
             "tcp target must be host:port or tcp://host:port, got '{value}'",
         )));
     }
-    if let Ok(url) = Url::parse(value) {
+    if value.contains("://")
+        && let Ok(url) = Url::parse(value)
+    {
         if !url.scheme().eq_ignore_ascii_case("tcp") {
             return Err(VmError::HostError(format!(
                 "tcp target scheme must be tcp, got '{}'",
@@ -141,6 +145,155 @@ fn dynamic_tcp_socket_state(
         .get(&handle)
         .cloned()
         .ok_or_else(|| VmError::HostError(format!("unknown dynamic tcp stream handle {handle}")))
+}
+
+fn active_downstream_tcp_io(context: &SharedProxyVmContext) -> Option<SharedTcpStreamIo> {
+    let guard = context.lock_transport();
+    guard.downstream_tcp_io.clone()
+}
+
+#[cfg(feature = "tls")]
+fn active_downstream_tls_io(context: &SharedProxyVmContext) -> Option<SharedServerTlsStreamIo> {
+    let guard = context.lock_transport();
+    guard.downstream_tls_io.clone()
+}
+
+#[cfg(feature = "tls")]
+fn downstream_tls_handshake_pending(context: &SharedProxyVmContext) -> bool {
+    context.lock_transport().downstream_tls_server_start.is_some()
+}
+
+fn downstream_attached_local_addr(context: &SharedProxyVmContext) -> String {
+    context
+        .lock_transport()
+        .downstream_local_addr
+        .clone()
+        .unwrap_or_default()
+}
+
+fn downstream_attached_peer_addr(context: &SharedProxyVmContext) -> String {
+    context
+        .lock_transport()
+        .downstream_peer_addr
+        .clone()
+        .unwrap_or_default()
+}
+
+fn mark_attached_downstream_read_eof(context: &SharedProxyVmContext) {
+    let mut guard = context.lock_transport();
+    guard.downstream_read_eof = true;
+}
+
+fn clear_attached_downstream_read_eof(context: &SharedProxyVmContext) {
+    let mut guard = context.lock_transport();
+    guard.downstream_read_eof = false;
+}
+
+fn attached_downstream_eof(context: &SharedProxyVmContext) -> bool {
+    context.lock_transport().downstream_read_eof
+}
+
+fn mark_attached_downstream_failed(context: &SharedProxyVmContext, message: impl Into<String>) {
+    let message = message.into();
+    let mut guard = context.lock_transport();
+    guard.tcp_dag.downstream.mark_failed(message);
+    #[cfg(feature = "tls")]
+    {
+        if guard.tls_dag.downstream.is_present() || guard.downstream_tls_server_start.is_some() {
+            guard.tls_dag.downstream.mark_failed();
+        }
+        guard.downstream_tls_server_start = None;
+        guard.downstream_tls_io = None;
+    }
+    guard.downstream_tcp_io = None;
+}
+
+async fn read_attached_downstream_tcp(
+    context: &SharedProxyVmContext,
+    io: SharedTcpStreamIo,
+    max_bytes: usize,
+) -> Result<Vec<u8>, VmError> {
+    let mut guard = io.lock().await;
+    let stream_io = guard.as_mut().ok_or_else(|| {
+        VmError::HostError("downstream tcp transport is unavailable".to_string())
+    })?;
+    let mut buffer = vec![0u8; max_bytes];
+    let read = stream_io
+        .read(&mut buffer)
+        .await
+        .map_err(|err| VmError::HostError(format!("downstream tcp read failed: {err}")))?;
+    if read == 0 {
+        mark_attached_downstream_read_eof(context);
+        Ok(Vec::new())
+    } else {
+        clear_attached_downstream_read_eof(context);
+        buffer.truncate(read);
+        Ok(buffer)
+    }
+}
+
+#[cfg(feature = "tls")]
+async fn read_attached_downstream_tls(
+    context: &SharedProxyVmContext,
+    io: SharedServerTlsStreamIo,
+    max_bytes: usize,
+) -> Result<Vec<u8>, VmError> {
+    let mut guard = io.lock().await;
+    let stream_io = guard.as_mut().ok_or_else(|| {
+        VmError::HostError("downstream tls plaintext transport is unavailable".to_string())
+    })?;
+    let mut buffer = vec![0u8; max_bytes];
+    let read = stream_io
+        .read(&mut buffer)
+        .await
+        .map_err(|err| VmError::HostError(format!("downstream tls read failed: {err}")))?;
+    if read == 0 {
+        mark_attached_downstream_read_eof(context);
+        Ok(Vec::new())
+    } else {
+        clear_attached_downstream_read_eof(context);
+        buffer.truncate(read);
+        Ok(buffer)
+    }
+}
+
+async fn write_attached_downstream_tcp(
+    io: SharedTcpStreamIo,
+    bytes: &[u8],
+) -> Result<(), VmError> {
+    let mut guard = io.lock().await;
+    let stream_io = guard.as_mut().ok_or_else(|| {
+        VmError::HostError("downstream tcp transport is unavailable".to_string())
+    })?;
+    stream_io
+        .write_all(bytes)
+        .await
+        .map_err(|err| VmError::HostError(format!("downstream tcp write failed: {err}")))?;
+    stream_io
+        .flush()
+        .await
+        .map_err(|err| VmError::HostError(format!("downstream tcp flush failed: {err}")))?;
+    Ok(())
+}
+
+#[cfg(feature = "tls")]
+async fn write_attached_downstream_tls(
+    io: SharedServerTlsStreamIo,
+    bytes: &[u8],
+) -> Result<(), VmError> {
+    let mut guard = io.lock().await;
+    let stream_io = guard.as_mut().ok_or_else(|| {
+        VmError::HostError("downstream tls plaintext transport is unavailable".to_string())
+    })?;
+    stream_io
+        .write_all(bytes)
+        .await
+        .map_err(|err| VmError::HostError(format!("downstream tls write failed: {err}")))?;
+    stream_io
+        .flush()
+        .await
+        .map_err(|err| VmError::HostError(format!("downstream tls flush failed: {err}")))?;
+    Ok(())
 }
 
 fn store_connected_dynamic_tcp_stream(
@@ -249,6 +402,11 @@ async fn ensure_dynamic_tcp_stream_connected(
         TcpSocketPhase::AttachedHttp => {
             return Err(VmError::HostError(format!(
                 "dynamic tcp stream handle {handle} is already attached to an http exchange",
+            )));
+        }
+        TcpSocketPhase::AttachedProxy => {
+            return Err(VmError::HostError(format!(
+                "dynamic tcp stream handle {handle} is already attached to a proxy tunnel",
             )));
         }
         TcpSocketPhase::Closed => {
@@ -445,7 +603,10 @@ async fn stream_get_phase(
     stream: i64,
 ) -> Result<CallOutcome, VmError> {
     let phase = match decode_stream(&context, stream)? {
-        TcpStreamHandle::Reserved(TcpStreamRef::Downstream) => "connected",
+        TcpStreamHandle::Reserved(TcpStreamRef::Downstream) => {
+            let guard = context.lock_transport();
+            tcp_flow_phase_label(&guard.tcp_dag.downstream)
+        }
         TcpStreamHandle::Reserved(TcpStreamRef::DefaultUpstream) => {
             let guard = context.lock_transport();
             tcp_flow_phase_label(&guard.tcp_dag.default_upstream)
@@ -473,9 +634,14 @@ async fn stream_get_local_addr(
     stream: i64,
 ) -> Result<CallOutcome, VmError> {
     let local_addr = match decode_stream(&context, stream)? {
-        TcpStreamHandle::Dynamic(handle) => dynamic_tcp_socket_state(&context, handle)?
-            .local_address()
-            .to_string(),
+        TcpStreamHandle::Reserved(TcpStreamRef::Downstream) => {
+            downstream_attached_local_addr(&context)
+        }
+        TcpStreamHandle::Dynamic(handle) => {
+            dynamic_tcp_socket_state(&context, handle)?
+                .local_address()
+                .to_string()
+        }
         _ => String::new(),
     };
     Ok(CallOutcome::Return(vec![Value::string(local_addr)]))
@@ -489,7 +655,9 @@ async fn stream_get_peer_addr(
     stream: i64,
 ) -> Result<CallOutcome, VmError> {
     let peer_addr = match decode_stream(&context, stream)? {
-        TcpStreamHandle::Reserved(TcpStreamRef::Downstream) => String::new(),
+        TcpStreamHandle::Reserved(TcpStreamRef::Downstream) => {
+            downstream_attached_peer_addr(&context)
+        }
         TcpStreamHandle::Reserved(TcpStreamRef::DefaultUpstream) => {
             let guard = context.lock_transport();
             guard.tls_dag.default_upstream.peer_name().to_string()
@@ -523,7 +691,42 @@ async fn stream_read(
 
     let chunk = match stream {
         TcpStreamHandle::Reserved(TcpStreamRef::Downstream) => {
-            read_request_body_next_chunk(&context, max_bytes).await?
+            #[cfg(feature = "tls")]
+            if let Some(io) = active_downstream_tls_io(&context) {
+                match read_attached_downstream_tls(&context, io, max_bytes).await {
+                    Ok(chunk) => chunk,
+                    Err(err) => {
+                        mark_attached_downstream_failed(&context, err.to_string());
+                        return Err(err);
+                    }
+                }
+            } else if let Some(io) = active_downstream_tcp_io(&context) {
+                match read_attached_downstream_tcp(&context, io, max_bytes).await {
+                    Ok(chunk) => chunk,
+                    Err(err) => {
+                        mark_attached_downstream_failed(&context, err.to_string());
+                        return Err(err);
+                    }
+                }
+            } else if downstream_tls_handshake_pending(&context) {
+                return Err(VmError::HostError(
+                    "downstream tcp stream is pending tls handshake; call tls::session::handshake or close the stream".to_string(),
+                ));
+            } else {
+                read_request_body_next_chunk(&context, max_bytes).await?
+            }
+            #[cfg(not(feature = "tls"))]
+            if let Some(io) = active_downstream_tcp_io(&context) {
+                match read_attached_downstream_tcp(&context, io, max_bytes).await {
+                    Ok(chunk) => chunk,
+                    Err(err) => {
+                        mark_attached_downstream_failed(&context, err.to_string());
+                        return Err(err);
+                    }
+                }
+            } else {
+                read_request_body_next_chunk(&context, max_bytes).await?
+            }
         }
         TcpStreamHandle::Reserved(TcpStreamRef::DefaultUpstream) => {
             read_upstream_response_next_chunk(&context, max_bytes).await?
@@ -571,7 +774,36 @@ async fn stream_write(
     note_stream_write(&context, stream_handle);
     match stream_handle {
         TcpStreamHandle::Reserved(TcpStreamRef::Downstream) => {
-            append_downstream_response(&context, &text)
+            #[cfg(feature = "tls")]
+            if let Some(io) = active_downstream_tls_io(&context) {
+                if let Err(err) = write_attached_downstream_tls(io, text.as_bytes()).await
+                {
+                    mark_attached_downstream_failed(&context, err.to_string());
+                    return Err(err);
+                }
+            } else if let Some(io) = active_downstream_tcp_io(&context) {
+                if let Err(err) = write_attached_downstream_tcp(io, text.as_bytes()).await
+                {
+                    mark_attached_downstream_failed(&context, err.to_string());
+                    return Err(err);
+                }
+            } else if downstream_tls_handshake_pending(&context) {
+                return Err(VmError::HostError(
+                    "downstream tcp stream is pending tls handshake; call tls::session::handshake before writing plaintext".to_string(),
+                ));
+            } else {
+                append_downstream_response(&context, &text)
+            }
+            #[cfg(not(feature = "tls"))]
+            if let Some(io) = active_downstream_tcp_io(&context) {
+                if let Err(err) = write_attached_downstream_tcp(io, text.as_bytes()).await
+                {
+                    mark_attached_downstream_failed(&context, err.to_string());
+                    return Err(err);
+                }
+            } else {
+                append_downstream_response(&context, &text)
+            }
         }
         TcpStreamHandle::Reserved(TcpStreamRef::DefaultUpstream) => {
             append_outbound_exchange_body(&context, TcpStreamRef::DefaultUpstream.handle(), &text)?
@@ -609,7 +841,25 @@ async fn stream_eof(
     stream: i64,
 ) -> Result<CallOutcome, VmError> {
     let eof = match decode_stream(&context, stream)? {
-        TcpStreamHandle::Reserved(TcpStreamRef::Downstream) => request_body_eof(&context).await?,
+        TcpStreamHandle::Reserved(TcpStreamRef::Downstream) => {
+            if active_downstream_tcp_io(&context).is_some()
+                || {
+                    #[cfg(feature = "tls")]
+                    {
+                        active_downstream_tls_io(&context).is_some()
+                            || downstream_tls_handshake_pending(&context)
+                    }
+                    #[cfg(not(feature = "tls"))]
+                    {
+                        false
+                    }
+                }
+            {
+                attached_downstream_eof(&context)
+            } else {
+                request_body_eof(&context).await?
+            }
+        }
         TcpStreamHandle::Reserved(TcpStreamRef::DefaultUpstream) => {
             upstream_response_eof(&context).await?
         }
@@ -631,10 +881,56 @@ async fn stream_close(
     context: SharedProxyVmContext,
     stream: i64,
 ) -> Result<CallOutcome, VmError> {
-    with_mutable_dynamic_tcp_socket_state(&context, stream, |state, io| {
-        *io = None;
-        state.mark_closed();
-        Ok(())
-    })?;
+    match decode_stream(&context, stream)? {
+        TcpStreamHandle::Reserved(TcpStreamRef::Downstream) => {
+            #[cfg(feature = "tls")]
+            let (tcp_io, tls_io) = {
+                let mut guard = context.lock_transport();
+                let tcp_io = guard.downstream_tcp_io.take();
+                let tls_io = guard.downstream_tls_io.take();
+                guard.downstream_tls_server_start = None;
+                if guard.tls_dag.downstream.is_present() {
+                    guard.tls_dag.downstream.mark_closed();
+                }
+                guard.downstream_read_eof = true;
+                guard.tcp_dag.downstream.mark_closed();
+                (tcp_io, tls_io)
+            };
+            #[cfg(not(feature = "tls"))]
+            let tcp_io = {
+                let mut guard = context.lock_transport();
+                let tcp_io = guard.downstream_tcp_io.take();
+                guard.downstream_read_eof = true;
+                guard.tcp_dag.downstream.mark_closed();
+                tcp_io
+            };
+            #[cfg(feature = "tls")]
+            {
+                if let Some(io) = tls_io {
+                    let mut guard = io.lock().await;
+                    if let Some(mut stream_io) = guard.take() {
+                        let _ = stream_io.shutdown().await;
+                    }
+                }
+            }
+            if let Some(io) = tcp_io {
+                let mut guard = io.lock().await;
+                if let Some(mut stream_io) = guard.take() {
+                    let _ = stream_io.shutdown().await;
+                }
+            }
+        }
+        TcpStreamHandle::Reserved(_) => {
+            return Err(mutable_dynamic_tcp_stream_only());
+        }
+        TcpStreamHandle::Dynamic(_) => {
+            with_mutable_dynamic_tcp_socket_state(&context, stream, |state, io| {
+                *io = None;
+                state.mark_closed();
+                Ok(())
+            })?;
+        }
+        TcpStreamHandle::OutboundExchange(_) => return Err(mutable_dynamic_tcp_stream_only()),
+    }
     Ok(CallOutcome::Return(vec![]))
 }

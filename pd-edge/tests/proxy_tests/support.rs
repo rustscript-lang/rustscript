@@ -24,7 +24,7 @@ pub(crate) use edge::{
     FN_HTTP_UPSTREAM_REQUEST_SET_TARGET, ProxyVmContext, RateLimiterStore, SharedState,
     VmAsyncOpBridge, build_admin_app, build_http_proxy_app, compile_edge_source_file,
     enter_edge_host_context, new_shared_vm_async_ops, register_http_plane_host_module,
-    serve_http_proxy, spawn_active_control_plane_client,
+    serve_http_proxy, serve_transport_proxy, spawn_active_control_plane_client,
 };
 #[cfg(feature = "websocket")]
 pub(crate) use futures_util::{SinkExt, StreamExt};
@@ -99,6 +99,28 @@ pub(crate) async fn spawn_proxy_with_state(
     (data_addr, admin_addr, data_handle, admin_handle)
 }
 
+pub(crate) async fn spawn_transport_proxy(
+    max_program_bytes: usize,
+) -> (SocketAddr, SocketAddr, JoinHandle<()>, JoinHandle<()>) {
+    let state = SharedState::new(max_program_bytes);
+    let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let data_addr = data_listener
+        .local_addr()
+        .expect("listener should have addr");
+    let data_handle = tokio::spawn({
+        let state = state.clone();
+        async move {
+            serve_transport_proxy(data_listener, state)
+                .await
+                .expect("transport plane server should run");
+        }
+    });
+    let (admin_addr, admin_handle) = spawn_server(build_admin_app(state)).await;
+    (data_addr, admin_addr, data_handle, admin_handle)
+}
+
 pub(crate) async fn spawn_chunked_upstream(
     chunks: Vec<&'static str>,
 ) -> (SocketAddr, JoinHandle<()>) {
@@ -153,7 +175,7 @@ pub(crate) async fn spawn_connect_forward_proxy() -> (SocketAddr, JoinHandle<()>
 
 pub(crate) async fn run_edge_program_direct(
     program: Program,
-    context: Arc<Mutex<ProxyVmContext>>,
+    context: Arc<ProxyVmContext>,
 ) -> Result<(), VmError> {
     let async_ops = new_shared_vm_async_ops();
     let mut vm = Vm::new(program);

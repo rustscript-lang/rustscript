@@ -85,55 +85,86 @@ pub(crate) fn decode_tls_session_handle(handle: i64) -> Option<TlsSessionRef> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TcpFlowPhase {
+    #[default]
+    Inactive,
+    Configured,
+    Connected,
+    Closed,
+    Failed,
+}
+
+impl TcpFlowPhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Inactive => "inactive",
+            Self::Configured => "configured",
+            Self::Connected => "connected",
+            Self::Closed => "closed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TcpFlowState {
-    configured: bool,
-    connected: bool,
+    phase: TcpFlowPhase,
     rx_observed: bool,
     tx_observed: bool,
-    closed: bool,
+    failure_message: Option<String>,
 }
 
 impl TcpFlowState {
     pub(crate) fn downstream_ready() -> Self {
         Self {
-            configured: true,
-            connected: true,
+            phase: TcpFlowPhase::Connected,
             rx_observed: false,
             tx_observed: false,
-            closed: false,
+            failure_message: None,
         }
     }
 
     pub(crate) fn configure(&mut self) {
-        self.configured = true;
-        self.closed = false;
+        self.phase = TcpFlowPhase::Configured;
+        self.failure_message = None;
     }
 
     pub(crate) fn note_read(&mut self) {
         self.rx_observed = true;
-        self.closed = false;
     }
 
     pub(crate) fn note_write(&mut self) {
         self.tx_observed = true;
-        self.closed = false;
     }
 
     pub(crate) fn mark_connected(&mut self) {
-        self.configured = true;
-        self.connected = true;
-        self.closed = false;
+        self.phase = TcpFlowPhase::Connected;
+        self.failure_message = None;
+    }
+
+    pub(crate) fn mark_closed(&mut self) {
+        if self.phase != TcpFlowPhase::Failed {
+            self.phase = TcpFlowPhase::Closed;
+        }
+    }
+
+    pub(crate) fn mark_failed(&mut self, message: impl Into<String>) {
+        self.phase = TcpFlowPhase::Failed;
+        self.failure_message = Some(message.into());
     }
 
     #[cfg(test)]
     pub(crate) fn is_configured(&self) -> bool {
-        self.configured
+        matches!(
+            self.phase,
+            TcpFlowPhase::Configured | TcpFlowPhase::Connected
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn is_connected(&self) -> bool {
-        self.connected
+        self.phase == TcpFlowPhase::Connected
     }
 
     #[cfg(test)]
@@ -147,13 +178,12 @@ impl TcpFlowState {
     }
 
     pub(crate) fn phase_label(&self) -> &'static str {
-        if self.connected {
-            "connected"
-        } else if self.configured {
-            "configured"
-        } else {
-            "inactive"
-        }
+        self.phase.as_str()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failure_message(&self) -> &str {
+        self.failure_message.as_deref().unwrap_or_default()
     }
 }
 
@@ -166,6 +196,7 @@ pub(crate) enum TcpSocketPhase {
     Connected,
     UpgradedTls,
     AttachedHttp,
+    AttachedProxy,
     Closed,
     Failed,
 }
@@ -179,6 +210,7 @@ impl TcpSocketPhase {
             Self::Connected => "connected",
             Self::UpgradedTls => "upgraded-tls",
             Self::AttachedHttp => "attached-http",
+            Self::AttachedProxy => "attached-proxy",
             Self::Closed => "closed",
             Self::Failed => "failed",
         }
@@ -197,11 +229,7 @@ struct SocketAddressState {
 
 impl SocketAddressState {
     fn optional_value(value: String) -> Option<String> {
-        if value.is_empty() {
-            None
-        } else {
-            Some(value)
-        }
+        if value.is_empty() { None } else { Some(value) }
     }
 
     fn set_bind_address(&mut self, address: String) {
@@ -306,6 +334,13 @@ impl TcpSocketState {
         self.core.mark_present();
         self.core.clear_failure();
         self.phase = TcpSocketPhase::AttachedHttp;
+        self.read_eof = false;
+    }
+
+    pub(crate) fn mark_proxy_attached(&mut self) {
+        self.core.mark_present();
+        self.core.clear_failure();
+        self.phase = TcpSocketPhase::AttachedProxy;
         self.read_eof = false;
     }
 
@@ -457,6 +492,7 @@ pub(crate) enum TlsHandshakePhase {
     #[default]
     None,
     Configured,
+    ClientHelloReceived,
     ClientHelloPrepared,
     ClientHelloSent,
     ServerHelloReceived,
@@ -464,6 +500,7 @@ pub(crate) enum TlsHandshakePhase {
     ServerCertificateVerified,
     VerificationSkipped,
     PlaintextReady,
+    Closed,
     Failed,
     OpaqueEstablished,
 }
@@ -473,6 +510,7 @@ impl TlsHandshakePhase {
         match self {
             Self::None => "none",
             Self::Configured => "configured",
+            Self::ClientHelloReceived => "client-hello-received",
             Self::ClientHelloPrepared => "client-hello-prepared",
             Self::ClientHelloSent => "client-hello-sent",
             Self::ServerHelloReceived => "server-hello-received",
@@ -480,6 +518,7 @@ impl TlsHandshakePhase {
             Self::ServerCertificateVerified => "server-certificate-verified",
             Self::VerificationSkipped => "verification-skipped",
             Self::PlaintextReady => "plaintext-ready",
+            Self::Closed => "closed",
             Self::Failed => "failed",
             Self::OpaqueEstablished => "opaque-established",
         }
@@ -523,6 +562,39 @@ pub(crate) type SharedUdpSocketIo = Arc<tokio::sync::Mutex<tokio::net::UdpSocket
 #[cfg(feature = "tls")]
 pub(crate) type SharedTlsStreamIo =
     Arc<tokio::sync::Mutex<Option<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>>>;
+#[cfg(feature = "tls")]
+pub(crate) type SharedServerTlsStreamIo =
+    Arc<tokio::sync::Mutex<Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>>>;
+
+#[cfg(feature = "tls")]
+pub(crate) struct DownstreamTlsServerStart {
+    start: tokio_rustls::StartHandshake<tokio::net::TcpStream>,
+}
+
+#[cfg(feature = "tls")]
+impl DownstreamTlsServerStart {
+    pub(crate) fn new(start: tokio_rustls::StartHandshake<tokio::net::TcpStream>) -> Self {
+        Self { start }
+    }
+
+    pub(crate) fn client_hello_server_name(&self) -> Option<String> {
+        self.start
+            .client_hello()
+            .server_name()
+            .map(str::to_string)
+    }
+
+    pub(crate) fn into_inner(self) -> tokio_rustls::StartHandshake<tokio::net::TcpStream> {
+        self.start
+    }
+}
+
+#[cfg(feature = "tls")]
+impl std::fmt::Debug for DownstreamTlsServerStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownstreamTlsServerStart").finish()
+    }
+}
 
 pub(crate) fn new_shared_tls_session_cache(capacity: usize) -> SharedTlsSessionCache {
     Arc::new(Mutex::new(BoundedLruStore::new(capacity)))
@@ -630,6 +702,38 @@ impl TlsFlowState {
         } else {
             TlsHandshakePhase::None
         };
+    }
+
+    pub(crate) fn observe_socket_target(&mut self, target: &str) {
+        self.present = upstream_target_host(target).is_some();
+        self.handshake_complete = false;
+        self.plaintext_ready = false;
+        self.session_path = TlsSessionPath::None;
+        self.peer_name = upstream_target_host(target);
+        self.server_name = if self.present && self.sni_enabled {
+            self.peer_name.clone()
+        } else {
+            None
+        };
+        self.alpn = None;
+        self.peer_certificate_der = None;
+        self.phase = if self.present {
+            TlsHandshakePhase::Configured
+        } else {
+            TlsHandshakePhase::None
+        };
+    }
+
+    pub(crate) fn observe_downstream_client_hello(&mut self, server_name: Option<String>) {
+        self.present = true;
+        self.handshake_complete = false;
+        self.plaintext_ready = false;
+        self.session_path = TlsSessionPath::None;
+        self.peer_name = None;
+        self.server_name = server_name;
+        self.alpn = None;
+        self.peer_certificate_der = None;
+        self.phase = TlsHandshakePhase::ClientHelloReceived;
     }
 
     pub(crate) fn set_desired_alpn(&mut self, protocols: Vec<String>) {
@@ -771,6 +875,17 @@ impl TlsFlowState {
         } else {
             self.server_name = None;
         }
+    }
+
+    pub(crate) fn mark_closed(&mut self) {
+        if !self.present {
+            return;
+        }
+        if self.phase == TlsHandshakePhase::Failed {
+            return;
+        }
+        self.plaintext_ready = false;
+        self.phase = TlsHandshakePhase::Closed;
     }
 
     pub(crate) fn mark_failed(&mut self) {
@@ -964,7 +1079,9 @@ fn upstream_target_uses_tls(target: &str) -> bool {
 }
 
 fn upstream_target_host(target: &str) -> Option<String> {
-    if let Ok(url) = Url::parse(target) {
+    if target.contains("://")
+        && let Ok(url) = Url::parse(target)
+    {
         return url.host_str().map(str::to_string);
     }
 
@@ -1024,8 +1141,8 @@ mod tests {
     use axum::http::Version;
 
     use super::{
-        CachedTlsSession, TCP_STREAM_DEFAULT_UPSTREAM, TCP_STREAM_DOWNSTREAM, TlsFlowState,
-        TlsHandshakePhase, TlsProtocolVersion, TlsSessionPath, TlsTransportDag,
+        CachedTlsSession, TCP_STREAM_DEFAULT_UPSTREAM, TCP_STREAM_DOWNSTREAM, TcpFlowState,
+        TlsFlowState, TlsHandshakePhase, TlsProtocolVersion, TlsSessionPath, TlsTransportDag,
         UDP_SOCKET_DEFAULT_UPSTREAM, UDP_SOCKET_DOWNSTREAM, UdpSocketPhase, UdpSocketState,
         alpn_from_http_version, decode_tcp_stream_handle, decode_tls_session_handle,
         decode_udp_socket_handle, tls_session_cache_key,
@@ -1095,6 +1212,31 @@ mod tests {
     }
 
     #[test]
+    fn tcp_flow_state_tracks_terminal_phases_without_reopening() {
+        let mut flow = TcpFlowState::downstream_ready();
+        assert!(flow.is_connected());
+        assert_eq!(flow.phase_label(), "connected");
+
+        flow.note_read();
+        flow.mark_closed();
+        assert_eq!(flow.phase_label(), "closed");
+
+        flow.note_write();
+        assert_eq!(flow.phase_label(), "closed");
+
+        flow.mark_failed("downstream boom");
+        assert_eq!(flow.phase_label(), "failed");
+        assert_eq!(flow.failure_message(), "downstream boom");
+
+        flow.note_read();
+        assert_eq!(flow.phase_label(), "failed");
+
+        flow.mark_connected();
+        assert_eq!(flow.phase_label(), "connected");
+        assert_eq!(flow.failure_message(), "");
+    }
+
+    #[test]
     fn downstream_https_tls_flow_carries_server_name_and_alpn() {
         let dag = TlsTransportDag::for_http_request("https", "api.example.com:443", "2");
         assert!(dag.downstream.is_present());
@@ -1142,6 +1284,17 @@ mod tests {
     }
 
     #[test]
+    fn observing_dynamic_socket_target_sets_tls_server_name() {
+        let mut flow = TlsFlowState::for_dynamic_socket();
+        flow.observe_socket_target("localhost:8443");
+
+        assert!(flow.is_present());
+        assert_eq!(flow.phase_label(), "configured");
+        assert_eq!(flow.peer_name(), "localhost");
+        assert_eq!(flow.server_name(), "localhost");
+    }
+
+    #[test]
     fn tls_configuration_flags_and_alpn_filters_are_tracked() {
         let mut flow = TlsFlowState::default();
         flow.observe_target("https://origin.example.net/api");
@@ -1181,6 +1334,22 @@ mod tests {
         assert_eq!(flow.phase_label(), TlsHandshakePhase::Failed.as_str());
         assert!(!flow.handshake_complete());
         assert!(!flow.plaintext_ready());
+    }
+
+    #[test]
+    fn tls_closed_phase_preserves_handshake_metadata() {
+        let mut flow =
+            TlsFlowState::for_downstream_request("https", "origin.example.net:443", "1.1");
+        assert!(flow.handshake_complete());
+        assert_eq!(flow.alpn(), "http/1.1");
+
+        flow.mark_closed();
+
+        assert_eq!(flow.phase_label(), "closed");
+        assert!(flow.handshake_complete());
+        assert!(!flow.plaintext_ready());
+        assert_eq!(flow.server_name(), "origin.example.net");
+        assert_eq!(flow.alpn(), "http/1.1");
     }
 
     #[test]

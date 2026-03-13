@@ -16,8 +16,23 @@ use axum::{
     },
 };
 use http_body_util::{BodyExt, Full};
+use hyper::upgrade::OnUpgrade;
+use hyper_util::rt::TokioIo;
+use tokio::io::copy_bidirectional;
 use url::Url;
 use vm::VmError;
+#[cfg(feature = "websocket")]
+use {
+    futures_util::{SinkExt, StreamExt},
+    tokio_tungstenite::{
+        WebSocketStream,
+        tungstenite::{
+            Message,
+            handshake::derive_accept_key,
+            protocol::{CloseFrame, Role, frame::coding::CloseCode},
+        },
+    },
+};
 
 use super::super::{
     EDGE_IO_HANDLE_DYNAMIC_BASE, EdgeVirtualIoHandle, SharedHttpUpstreamSessions,
@@ -32,9 +47,15 @@ use super::super::{
     websocket::WebSocketConnectionState,
 };
 #[cfg(feature = "tls")]
-use crate::abi_impl::transport::SharedTlsStreamIo;
+use crate::abi_impl::transport::{
+    DownstreamTlsServerStart, SharedServerTlsStreamIo, SharedTlsStreamIo,
+};
 #[cfg(feature = "webrtc")]
 use crate::abi_impl::webrtc::WebRtcConnectionState;
+#[cfg(feature = "websocket")]
+use crate::abi_impl::websocket::{
+    close_websocket_binary_stream, read_websocket_binary_bytes, write_websocket_binary_bytes,
+};
 use crate::abi_impl::{http1, http2};
 use crate::cache::BoundedLruStore;
 
@@ -311,9 +332,296 @@ impl InboundRequestBodyState {
     async fn eof(&mut self) -> Result<bool, VmError> {
         self.stream.eof(&mut self.source).await
     }
+
+    fn is_drained(&self) -> bool {
+        self.stream.eof && self.stream.read_offset >= self.stream.buffered.len()
+    }
 }
 
 type SharedInboundRequestBody = Arc<tokio::sync::Mutex<InboundRequestBodyState>>;
+#[derive(Clone)]
+pub(crate) struct DownstreamHttp1Upgrade {
+    inner: Arc<tokio::sync::Mutex<Option<OnUpgrade>>>,
+}
+
+impl std::fmt::Debug for DownstreamHttp1Upgrade {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DownstreamHttp1Upgrade")
+    }
+}
+
+impl DownstreamHttp1Upgrade {
+    fn new(upgrade: OnUpgrade) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(upgrade))),
+        }
+    }
+
+    async fn take(&self) -> Result<OnUpgrade, VmError> {
+        let mut guard = self.inner.lock().await;
+        guard.take().ok_or_else(|| {
+            VmError::HostError("downstream http/1 upgrade has already been consumed".to_string())
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum DownstreamConnectTunnelTarget {
+    Tcp {
+        handle: i64,
+        stream: tokio::net::TcpStream,
+    },
+    #[cfg(feature = "tls")]
+    Tls {
+        handle: i64,
+        stream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct DownstreamConnectTunnelPlan {
+    context: Arc<ProxyVmContext>,
+    upgrade: DownstreamHttp1Upgrade,
+    target: DownstreamConnectTunnelTarget,
+}
+
+impl DownstreamConnectTunnelPlan {
+    pub(crate) fn new(
+        context: Arc<ProxyVmContext>,
+        upgrade: DownstreamHttp1Upgrade,
+        target: DownstreamConnectTunnelTarget,
+    ) -> Self {
+        Self {
+            context,
+            upgrade,
+            target,
+        }
+    }
+
+    fn mark_closed(context: &Arc<ProxyVmContext>, handle: i64, tls_attached: bool) {
+        let mut transport = context.lock_transport();
+        transport.tcp_dag.downstream.mark_closed();
+        transport.tls_dag.downstream.mark_closed();
+        if let Some(state) = transport.tcp_streams.get_mut(&handle) {
+            state.mark_closed();
+        }
+        if tls_attached && let Some(flow) = transport.dynamic_tls_sessions.get_mut(&handle) {
+            flow.mark_closed();
+        }
+    }
+
+    fn mark_failed(context: &Arc<ProxyVmContext>, handle: i64, tls_attached: bool, message: &str) {
+        let mut transport = context.lock_transport();
+        transport
+            .tcp_dag
+            .downstream
+            .mark_failed(message.to_string());
+        transport.tls_dag.downstream.mark_failed();
+        if let Some(state) = transport.tcp_streams.get_mut(&handle) {
+            state.mark_failed(message.to_string());
+        }
+        if tls_attached && let Some(flow) = transport.dynamic_tls_sessions.get_mut(&handle) {
+            flow.mark_failed();
+        }
+    }
+
+    pub(crate) async fn run(self) -> Result<(), VmError> {
+        let Self {
+            context,
+            upgrade,
+            target,
+        } = self;
+        let upgraded = upgrade.take().await?;
+        let upgraded = upgraded.await.map_err(|err| {
+            VmError::HostError(format!("downstream connect upgrade failed: {err}"))
+        })?;
+        let mut downstream = TokioIo::new(upgraded);
+
+        match target {
+            DownstreamConnectTunnelTarget::Tcp { handle, mut stream } => {
+                match copy_bidirectional(&mut downstream, &mut stream).await {
+                    Ok(_) => {
+                        Self::mark_closed(&context, handle, false);
+                        Ok(())
+                    }
+                    Err(err) => {
+                        let message = format!("proxy connect tunnel failed: {err}");
+                        Self::mark_failed(&context, handle, false, &message);
+                        Err(VmError::HostError(message))
+                    }
+                }
+            }
+            #[cfg(feature = "tls")]
+            DownstreamConnectTunnelTarget::Tls { handle, mut stream } => {
+                match copy_bidirectional(&mut downstream, &mut stream).await {
+                    Ok(_) => {
+                        Self::mark_closed(&context, handle, true);
+                        Ok(())
+                    }
+                    Err(err) => {
+                        let message = format!("proxy connect tunnel failed: {err}");
+                        Self::mark_failed(&context, handle, true, &message);
+                        Err(VmError::HostError(message))
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "websocket")]
+#[derive(Debug)]
+pub(crate) struct DownstreamWebSocketTunnelPlan {
+    context: Arc<ProxyVmContext>,
+    upgrade: DownstreamHttp1Upgrade,
+    connection: i64,
+    selected_subprotocol: Option<String>,
+}
+
+#[cfg(feature = "websocket")]
+impl DownstreamWebSocketTunnelPlan {
+    pub(crate) fn new(
+        context: Arc<ProxyVmContext>,
+        upgrade: DownstreamHttp1Upgrade,
+        connection: i64,
+        selected_subprotocol: Option<String>,
+    ) -> Self {
+        Self {
+            context,
+            upgrade,
+            connection,
+            selected_subprotocol,
+        }
+    }
+
+    fn mark_closed(
+        context: &Arc<ProxyVmContext>,
+        close_code: Option<u16>,
+        close_reason: Option<String>,
+    ) {
+        let mut transport = context.lock_transport();
+        transport.tcp_dag.downstream.mark_closed();
+        transport.tls_dag.downstream.mark_closed();
+        drop(transport);
+        context.with_downstream_websocket_mut(|websocket| {
+            websocket.mark_closed(close_code, close_reason);
+        });
+    }
+
+    fn mark_failed(context: &Arc<ProxyVmContext>, message: &str) {
+        let mut transport = context.lock_transport();
+        transport
+            .tcp_dag
+            .downstream
+            .mark_failed(message.to_string());
+        transport.tls_dag.downstream.mark_failed();
+        drop(transport);
+        context.with_downstream_websocket_mut(|websocket| websocket.mark_failed(message));
+    }
+
+    pub(crate) async fn run(self) -> Result<(), VmError> {
+        let Self {
+            context,
+            upgrade,
+            connection,
+            selected_subprotocol: _,
+        } = self;
+        let upgraded = upgrade.take().await?;
+        let upgraded = upgraded.await.map_err(|err| {
+            let message = format!("downstream websocket upgrade failed: {err}");
+            Self::mark_failed(&context, &message);
+            VmError::HostError(message)
+        })?;
+        let websocket =
+            WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
+        let (mut downstream_write, mut downstream_read) = websocket.split();
+
+        loop {
+            tokio::select! {
+                downstream_frame = downstream_read.next() => {
+                    match downstream_frame {
+                        Some(Ok(Message::Binary(bytes))) => {
+                            write_websocket_binary_bytes(&context, connection, &bytes).await?;
+                        }
+                        Some(Ok(Message::Ping(payload))) => {
+                            downstream_write.send(Message::Pong(payload)).await.map_err(|err| {
+                                let message = format!("failed to reply to downstream websocket ping: {err}");
+                                Self::mark_failed(&context, &message);
+                                VmError::HostError(message)
+                            })?;
+                        }
+                        Some(Ok(Message::Pong(_))) => {}
+                        Some(Ok(Message::Close(frame))) => {
+                            close_websocket_binary_stream(&context, connection).await?;
+                            let close_code = frame.as_ref().map(|frame| u16::from(frame.code));
+                            let close_reason = frame.as_ref().map(|frame| frame.reason.to_string());
+                            let _ = downstream_write.send(Message::Close(frame)).await;
+                            Self::mark_closed(&context, close_code, close_reason);
+                            return Ok(());
+                        }
+                        Some(Ok(Message::Text(_))) => {
+                            let message = "downstream websocket proxy tunnel only supports binary frames".to_string();
+                            let _ = downstream_write.send(Message::Close(Some(CloseFrame {
+                                code: CloseCode::Unsupported,
+                                reason: "binary-only".into(),
+                            }))).await;
+                            Self::mark_failed(&context, &message);
+                            return Err(VmError::HostError(message));
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(err)) => {
+                            let message = format!("failed to read downstream websocket frame: {err}");
+                            Self::mark_failed(&context, &message);
+                            return Err(VmError::HostError(message));
+                        }
+                        None => {
+                            close_websocket_binary_stream(&context, connection).await?;
+                            Self::mark_closed(&context, Some(1000), Some("downstream-closed".to_string()));
+                            return Ok(());
+                        }
+                    }
+                }
+                upstream_frame = read_websocket_binary_bytes(&context, connection) => {
+                    match upstream_frame? {
+                        Some(bytes) => {
+                            downstream_write.send(Message::Binary(bytes.into())).await.map_err(|err| {
+                                let message = format!("failed to write downstream websocket frame: {err}");
+                                Self::mark_failed(&context, &message);
+                                VmError::HostError(message)
+                            })?;
+                        }
+                        None => {
+                            let _ = downstream_write.send(Message::Close(Some(CloseFrame {
+                                code: CloseCode::Normal,
+                                reason: "upstream-closed".into(),
+                            }))).await;
+                            Self::mark_closed(&context, Some(1000), Some("upstream-closed".to_string()));
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum DownstreamPostResponsePlan {
+    ConnectTunnel(DownstreamConnectTunnelPlan),
+    #[cfg(feature = "websocket")]
+    WebSocketTunnel(DownstreamWebSocketTunnelPlan),
+}
+
+impl DownstreamPostResponsePlan {
+    pub(crate) async fn run(self) -> Result<(), VmError> {
+        match self {
+            Self::ConnectTunnel(plan) => plan.run().await,
+            #[cfg(feature = "websocket")]
+            Self::WebSocketTunnel(plan) => plan.run().await,
+        }
+    }
+}
+
 pub(crate) type SharedUpstreamClientCache =
     Arc<Mutex<BoundedLruStore<UpstreamClientCacheKey, reqwest::Client>>>;
 
@@ -708,6 +1016,8 @@ pub(crate) struct DownstreamState {
     pub(crate) downstream_websocket: WebSocketConnectionState,
     pub(crate) response_output: HttpResponseOutputNode,
     pub(crate) downstream_carrier_ref: Option<HttpCarrierRef>,
+    pub(crate) downstream_http1_upgrade: Option<DownstreamHttp1Upgrade>,
+    pub(crate) post_response_plan: Option<DownstreamPostResponsePlan>,
 }
 
 impl DownstreamState {
@@ -719,6 +1029,8 @@ impl DownstreamState {
             downstream_websocket: WebSocketConnectionState::for_http_request(&request_head.headers),
             response_output: HttpResponseOutputNode::default(),
             downstream_carrier_ref: Some(HttpCarrierRef::DownstreamHttp1),
+            downstream_http1_upgrade: None,
+            post_response_plan: None,
         }
     }
 
@@ -732,6 +1044,19 @@ impl DownstreamState {
                 stream_id: attachment.stream_id,
             },
         ));
+    }
+
+    fn for_transport_connection() -> Self {
+        Self {
+            inbound_request_body: Arc::new(tokio::sync::Mutex::new(InboundRequestBodyState::new(
+                Body::empty(),
+            ))),
+            downstream_websocket: WebSocketConnectionState::default(),
+            response_output: HttpResponseOutputNode::default(),
+            downstream_carrier_ref: None,
+            downstream_http1_upgrade: None,
+            post_response_plan: None,
+        }
     }
 }
 
@@ -759,6 +1084,14 @@ impl ExchangeRegistry {
 pub(crate) struct TransportState {
     pub(crate) tcp_dag: TcpTransportDag,
     pub(crate) tls_dag: TlsTransportDag,
+    pub(crate) downstream_tcp_io: Option<SharedTcpStreamIo>,
+    pub(crate) downstream_read_eof: bool,
+    pub(crate) downstream_local_addr: Option<String>,
+    pub(crate) downstream_peer_addr: Option<String>,
+    #[cfg(feature = "tls")]
+    pub(crate) downstream_tls_server_start: Option<DownstreamTlsServerStart>,
+    #[cfg(feature = "tls")]
+    pub(crate) downstream_tls_io: Option<SharedServerTlsStreamIo>,
     pub(crate) next_tcp_stream_handle: i64,
     pub(crate) tcp_streams: HashMap<i64, TcpSocketState>,
     pub(crate) tcp_stream_ios: HashMap<i64, SharedTcpStreamIo>,
@@ -782,6 +1115,48 @@ impl TransportState {
                 request_head.host.as_str(),
                 request_head.http_version.as_str(),
             ),
+            downstream_tcp_io: None,
+            downstream_read_eof: false,
+            downstream_local_addr: None,
+            downstream_peer_addr: None,
+            #[cfg(feature = "tls")]
+            downstream_tls_server_start: None,
+            #[cfg(feature = "tls")]
+            downstream_tls_io: None,
+            next_tcp_stream_handle: FIRST_DYNAMIC_TCP_STREAM_HANDLE,
+            tcp_streams: HashMap::new(),
+            tcp_stream_ios: HashMap::new(),
+            #[cfg(feature = "tls")]
+            dynamic_tls_sessions: HashMap::new(),
+            #[cfg(feature = "tls")]
+            dynamic_tls_session_ios: HashMap::new(),
+            default_upstream_udp_socket: UdpSocketState::default(),
+            default_upstream_udp_io: None,
+            next_udp_socket_handle: FIRST_DYNAMIC_UDP_SOCKET_HANDLE,
+            udp_sockets: HashMap::new(),
+            udp_socket_ios: HashMap::new(),
+        }
+    }
+
+    fn from_downstream_tcp_stream(
+        io: SharedTcpStreamIo,
+        local_addr: String,
+        peer_addr: String,
+    ) -> Self {
+        Self {
+            tcp_dag: TcpTransportDag {
+                downstream: TcpFlowState::downstream_ready(),
+                default_upstream: TcpFlowState::default(),
+            },
+            tls_dag: TlsTransportDag::default(),
+            downstream_tcp_io: Some(io),
+            downstream_read_eof: false,
+            downstream_local_addr: Some(local_addr),
+            downstream_peer_addr: Some(peer_addr),
+            #[cfg(feature = "tls")]
+            downstream_tls_server_start: None,
+            #[cfg(feature = "tls")]
+            downstream_tls_io: None,
             next_tcp_stream_handle: FIRST_DYNAMIC_TCP_STREAM_HANDLE,
             tcp_streams: HashMap::new(),
             tcp_stream_ios: HashMap::new(),
@@ -913,6 +1288,46 @@ impl ProxyVmContext {
         )
     }
 
+    pub fn from_downstream_tcp_stream(
+        stream: tokio::net::TcpStream,
+        rate_limiter: SharedRateLimiter,
+    ) -> Result<Self, VmError> {
+        let local_addr = stream.local_addr().map_err(|err| {
+            VmError::HostError(format!("failed to read downstream local address: {err}"))
+        })?;
+        let peer_addr = stream.peer_addr().map_err(|err| {
+            VmError::HostError(format!("failed to read downstream peer address: {err}"))
+        })?;
+        let io = Arc::new(tokio::sync::Mutex::new(Some(stream)));
+        let request_head = HttpRequestHead {
+            request_id: String::new(),
+            method: Method::GET,
+            path: "/".to_string(),
+            query: String::new(),
+            http_version: String::new(),
+            port: peer_addr.port(),
+            scheme: "tcp".to_string(),
+            host: peer_addr.to_string(),
+            client_ip: peer_addr.ip().to_string(),
+            headers: HeaderMap::new(),
+        };
+        Ok(Self {
+            downstream: Mutex::new(DownstreamState::for_transport_connection()),
+            exchanges: Mutex::new(ExchangeRegistry::from_http_request(&request_head)),
+            transport: Mutex::new(TransportState::from_downstream_tcp_stream(
+                io,
+                local_addr.to_string(),
+                peer_addr.to_string(),
+            )),
+            request_head,
+            services: RuntimeServices::new(rate_limiter),
+            #[cfg(feature = "webrtc")]
+            webrtc: Mutex::new(WebRtcRegistry::default()),
+            proxy: Mutex::new(ProxyStreamRegistry::default()),
+            edge_io: Mutex::new(EdgeIoRegistry::default()),
+        })
+    }
+
     pub fn attach_upstream_client(&mut self, client: reqwest::Client) {
         self.services.upstream_client = Some(client);
     }
@@ -937,6 +1352,13 @@ impl ProxyVmContext {
             .get_mut()
             .expect("downstream state lock poisoned")
             .attach_downstream_http2_stream(attachment);
+    }
+
+    pub(crate) fn attach_downstream_http1_upgrade(&mut self, upgrade: OnUpgrade) {
+        self.downstream
+            .get_mut()
+            .expect("downstream state lock poisoned")
+            .downstream_http1_upgrade = Some(DownstreamHttp1Upgrade::new(upgrade));
     }
 
     pub(crate) fn request_head(&self) -> &HttpRequestHead {
@@ -996,6 +1418,28 @@ impl ProxyVmContext {
 
     pub(crate) fn downstream_websocket(&self) -> WebSocketConnectionState {
         self.lock_downstream().downstream_websocket.clone()
+    }
+
+    pub(crate) fn downstream_http1_upgrade(&self) -> Option<DownstreamHttp1Upgrade> {
+        self.lock_downstream().downstream_http1_upgrade.clone()
+    }
+
+    pub(crate) fn schedule_downstream_post_response_plan(
+        &self,
+        plan: DownstreamPostResponsePlan,
+    ) -> Result<(), VmError> {
+        let mut downstream = self.lock_downstream();
+        if downstream.post_response_plan.is_some() {
+            return Err(VmError::HostError(
+                "downstream post-response transport plan is already scheduled".to_string(),
+            ));
+        }
+        downstream.post_response_plan = Some(plan);
+        Ok(())
+    }
+
+    pub(crate) fn take_downstream_post_response_plan(&self) -> Option<DownstreamPostResponsePlan> {
+        self.lock_downstream().post_response_plan.take()
     }
 
     pub(crate) fn with_downstream_websocket_mut<T>(
@@ -1380,6 +1824,7 @@ struct StartedUpstreamResponse {
 pub(crate) struct ResolvedHttpGraphResponse {
     pub response: Response<Body>,
     pub upstream_latency_ms: u64,
+    pub post_response_plan: Option<DownstreamPostResponsePlan>,
 }
 
 pub async fn resolve_outbound_request_body(
@@ -2519,6 +2964,63 @@ fn response_from_output(
     response
 }
 
+fn response_from_connect_tunnel(headers: HeaderMap) -> Response<Body> {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::OK;
+    merge_headers(response.headers_mut(), &headers);
+    response.headers_mut().remove(CONTENT_TYPE);
+    response.headers_mut().remove(CONTENT_LENGTH);
+    response
+}
+
+#[cfg(feature = "websocket")]
+fn response_from_websocket_tunnel(
+    request_headers: &HeaderMap,
+    headers: HeaderMap,
+    selected_subprotocol: Option<&str>,
+) -> Result<Response<Body>, VmError> {
+    let request_key = request_headers
+        .get("sec-websocket-key")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            VmError::HostError(
+                "downstream websocket tunnel requires a valid sec-websocket-key header".to_string(),
+            )
+        })?;
+    let accept = derive_accept_key(request_key.as_bytes());
+    let accept = HeaderValue::from_str(&accept).map_err(|err| {
+        VmError::HostError(format!(
+            "failed to encode websocket accept header for downstream tunnel: {err}",
+        ))
+    })?;
+
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    merge_headers(response.headers_mut(), &headers);
+    response
+        .headers_mut()
+        .insert("connection", HeaderValue::from_static("Upgrade"));
+    response
+        .headers_mut()
+        .insert("upgrade", HeaderValue::from_static("websocket"));
+    response
+        .headers_mut()
+        .insert("sec-websocket-accept", accept);
+    if let Some(subprotocol) = selected_subprotocol {
+        let value = HeaderValue::from_str(subprotocol).map_err(|err| {
+            VmError::HostError(format!(
+                "invalid negotiated websocket subprotocol '{subprotocol}': {err}",
+            ))
+        })?;
+        response
+            .headers_mut()
+            .insert("sec-websocket-protocol", value);
+    }
+    response.headers_mut().remove(CONTENT_TYPE);
+    response.headers_mut().remove(CONTENT_LENGTH);
+    Ok(response)
+}
+
 async fn response_from_upstream_snapshot(
     snapshot: HttpUpstreamResponseSnapshot,
     response_headers: HeaderMap,
@@ -2549,6 +3051,7 @@ pub(crate) async fn resolve_http_graph_response(
         response_body,
         response_headers,
         response_status,
+        has_post_response_plan,
         has_upstream_target,
         default_upstream_websocket_mode,
         upstream_response,
@@ -2563,6 +3066,7 @@ pub(crate) async fn resolve_http_graph_response(
             downstream.response_output.body.clone(),
             downstream.response_output.headers.clone(),
             downstream.response_output.status,
+            downstream.post_response_plan.is_some(),
             default_exchange.request.target.is_some(),
             default_exchange.websocket_dag.is_websocket_mode(),
             match &default_exchange.response {
@@ -2572,10 +3076,46 @@ pub(crate) async fn resolve_http_graph_response(
         )
     };
 
+    if has_post_response_plan {
+        let plan = context
+            .take_downstream_post_response_plan()
+            .expect("downstream post-response plan should exist");
+        let response = match &plan {
+            DownstreamPostResponsePlan::ConnectTunnel(_) => {
+                Ok(response_from_connect_tunnel(response_headers))
+            }
+            #[cfg(feature = "websocket")]
+            DownstreamPostResponsePlan::WebSocketTunnel(plan) => response_from_websocket_tunnel(
+                context.request_head().headers(),
+                response_headers,
+                plan.selected_subprotocol.as_deref(),
+            ),
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(_) => {
+                return ResolvedHttpGraphResponse {
+                    response: text_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal server error",
+                    ),
+                    upstream_latency_ms: current_upstream_latency_ms(context),
+                    post_response_plan: None,
+                };
+            }
+        };
+        return ResolvedHttpGraphResponse {
+            response,
+            upstream_latency_ms: current_upstream_latency_ms(context),
+            post_response_plan: Some(plan),
+        };
+    }
+
     if let Some(body) = response_body {
         return ResolvedHttpGraphResponse {
             response: response_from_output(body, response_headers, response_status),
             upstream_latency_ms: current_upstream_latency_ms(context),
+            post_response_plan: None,
         };
     }
 
@@ -2596,12 +3136,14 @@ pub(crate) async fn resolve_http_graph_response(
                         "internal server error",
                     ),
                     upstream_latency_ms: current_upstream_latency_ms(context),
+                    post_response_plan: None,
                 };
             }
             Err(UpstreamResponseStartError::UpstreamRequest(_)) => {
                 return ResolvedHttpGraphResponse {
                     response: text_response(StatusCode::BAD_GATEWAY, "bad gateway"),
                     upstream_latency_ms: current_upstream_latency_ms(context),
+                    post_response_plan: None,
                 };
             }
         }
@@ -2613,6 +3155,7 @@ pub(crate) async fn resolve_http_graph_response(
         return ResolvedHttpGraphResponse {
             response: text_response(StatusCode::NOT_FOUND, "not found"),
             upstream_latency_ms: 0,
+            post_response_plan: None,
         };
     };
 
@@ -2620,11 +3163,84 @@ pub(crate) async fn resolve_http_graph_response(
         Ok(response) => ResolvedHttpGraphResponse {
             response,
             upstream_latency_ms: current_upstream_latency_ms(context),
+            post_response_plan: None,
         },
         Err(_) => ResolvedHttpGraphResponse {
             response: text_response(StatusCode::BAD_GATEWAY, "bad gateway"),
             upstream_latency_ms: current_upstream_latency_ms(context),
+            post_response_plan: None,
         },
+    }
+}
+
+fn mark_downstream_transport_closed(context: &SharedProxyVmContext) {
+    let mut transport = context.lock_transport();
+    transport.tcp_dag.downstream.mark_closed();
+    transport.tls_dag.downstream.mark_closed();
+}
+
+fn mark_downstream_transport_failed(context: &SharedProxyVmContext, message: &str) {
+    let mut transport = context.lock_transport();
+    transport
+        .tcp_dag
+        .downstream
+        .mark_failed(message.to_string());
+    transport.tls_dag.downstream.mark_failed();
+}
+
+fn finalize_downstream_body_all_result(
+    context: &SharedProxyVmContext,
+    result: Result<Vec<u8>, VmError>,
+) -> Result<Vec<u8>, VmError> {
+    match result {
+        Ok(bytes) => {
+            mark_downstream_transport_closed(context);
+            Ok(bytes)
+        }
+        Err(err) => {
+            let message = err.to_string();
+            mark_downstream_transport_failed(context, &message);
+            Err(err)
+        }
+    }
+}
+
+fn finalize_downstream_body_read_result(
+    context: &SharedProxyVmContext,
+    inbound: &InboundRequestBodyState,
+    result: Result<Vec<u8>, VmError>,
+) -> Result<Vec<u8>, VmError> {
+    match result {
+        Ok(bytes) => {
+            if bytes.is_empty() || inbound.is_drained() {
+                mark_downstream_transport_closed(context);
+            }
+            Ok(bytes)
+        }
+        Err(err) => {
+            let message = err.to_string();
+            mark_downstream_transport_failed(context, &message);
+            Err(err)
+        }
+    }
+}
+
+fn finalize_downstream_body_eof_result(
+    context: &SharedProxyVmContext,
+    result: Result<bool, VmError>,
+) -> Result<bool, VmError> {
+    match result {
+        Ok(eof) => {
+            if eof {
+                mark_downstream_transport_closed(context);
+            }
+            Ok(eof)
+        }
+        Err(err) => {
+            let message = err.to_string();
+            mark_downstream_transport_failed(context, &message);
+            Err(err)
+        }
     }
 }
 
@@ -2633,7 +3249,7 @@ pub(crate) async fn read_request_body_all(
 ) -> Result<Vec<u8>, VmError> {
     let body: SharedInboundRequestBody = context.lock_downstream().inbound_request_body.clone();
     let mut inbound = body.lock().await;
-    inbound.read_all().await
+    finalize_downstream_body_all_result(context, inbound.read_all().await)
 }
 
 pub(crate) async fn consume_request_body_all(
@@ -2641,7 +3257,7 @@ pub(crate) async fn consume_request_body_all(
 ) -> Result<Vec<u8>, VmError> {
     let body: SharedInboundRequestBody = context.lock_downstream().inbound_request_body.clone();
     let mut inbound = body.lock().await;
-    inbound.read_all_and_consume().await
+    finalize_downstream_body_all_result(context, inbound.read_all_and_consume().await)
 }
 
 pub(crate) async fn read_request_body_next_chunk(
@@ -2650,7 +3266,8 @@ pub(crate) async fn read_request_body_next_chunk(
 ) -> Result<Vec<u8>, VmError> {
     let body: SharedInboundRequestBody = context.lock_downstream().inbound_request_body.clone();
     let mut inbound = body.lock().await;
-    inbound.read_next_chunk(max_bytes).await
+    let result = inbound.read_next_chunk(max_bytes).await;
+    finalize_downstream_body_read_result(context, &inbound, result)
 }
 
 pub(crate) async fn read_request_body_next_line(
@@ -2658,32 +3275,35 @@ pub(crate) async fn read_request_body_next_line(
 ) -> Result<Vec<u8>, VmError> {
     let body: SharedInboundRequestBody = context.lock_downstream().inbound_request_body.clone();
     let mut inbound = body.lock().await;
-    inbound.read_next_line().await
+    let result = inbound.read_next_line().await;
+    finalize_downstream_body_read_result(context, &inbound, result)
 }
 
 pub(crate) async fn request_body_eof(context: &SharedProxyVmContext) -> Result<bool, VmError> {
     let body: SharedInboundRequestBody = context.lock_downstream().inbound_request_body.clone();
     let mut inbound = body.lock().await;
-    inbound.eof().await
+    finalize_downstream_body_eof_result(context, inbound.eof().await)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
+    use std::{io, net::SocketAddr};
 
     use axum::{
         Router,
-        body::{Body, to_bytes},
+        body::{Body, Bytes, to_bytes},
         http::{HeaderMap, Request},
         routing::any,
     };
+    use http_body_util::StreamBody;
 
     use super::{
-        HttpCarrierRef, HttpExchangeTransportState, ProxyVmContext, SharedProxyVmContext,
-        allocate_outbound_exchange_handle, append_outbound_exchange_body,
+        HttpCarrierRef, HttpExchangeTransportState, HttpRequestContext, ProxyVmContext,
+        SharedProxyVmContext, allocate_outbound_exchange_handle, append_outbound_exchange_body,
         default_upstream_exchange_handle, ensure_outbound_exchange_response_started,
-        outbound_exchange_exists,
+        outbound_exchange_exists, read_request_body_all, read_request_body_next_chunk,
+        read_request_body_next_line,
     };
     use crate::abi_impl::RateLimiterStore;
     use crate::abi_impl::http2::{Http2DownstreamStreamAttachment, Http2StreamRef};
@@ -2691,6 +3311,25 @@ mod tests {
     fn test_context() -> SharedProxyVmContext {
         Arc::new(ProxyVmContext::from_request_headers(
             HeaderMap::new(),
+            Arc::new(Mutex::new(RateLimiterStore::new())),
+        ))
+    }
+
+    fn test_context_with_request(body: Body, scheme: &str, host: &str) -> SharedProxyVmContext {
+        Arc::new(ProxyVmContext::from_http_request(
+            HttpRequestContext {
+                request_id: String::new(),
+                method: axum::http::Method::POST,
+                path: "/".to_string(),
+                query: String::new(),
+                http_version: "1.1".to_string(),
+                port: if scheme == "https" { 443 } else { 80 },
+                scheme: scheme.to_string(),
+                host: host.to_string(),
+                client_ip: String::new(),
+                body,
+                headers: HeaderMap::new(),
+            },
             Arc::new(Mutex::new(RateLimiterStore::new())),
         ))
     }
@@ -2847,5 +3486,71 @@ mod tests {
                 .is_connected()
         );
         assert!(!exchanges.exchanges[&default_upstream_exchange_handle()].response_ready());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reading_full_downstream_body_marks_transport_closed() {
+        let context =
+            test_context_with_request(Body::from("payload"), "https", "origin.example.test:443");
+
+        let body = read_request_body_all(&context)
+            .await
+            .expect("full body read should succeed");
+
+        assert_eq!(body.as_slice(), b"payload");
+
+        let transport = context.lock_transport();
+        assert_eq!(transport.tcp_dag.downstream.phase_label(), "closed");
+        assert_eq!(transport.tls_dag.downstream.phase_label(), "closed");
+        assert_eq!(
+            transport.tls_dag.downstream.server_name(),
+            "origin.example.test"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reading_last_downstream_line_marks_transport_closed() {
+        let context = test_context_with_request(Body::from("tail-without-newline"), "http", "");
+
+        let line = read_request_body_next_line(&context)
+            .await
+            .expect("line read should succeed");
+
+        assert_eq!(line.as_slice(), b"tail-without-newline");
+
+        let transport = context.lock_transport();
+        assert_eq!(transport.tcp_dag.downstream.phase_label(), "closed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn downstream_transport_marks_failed_when_request_body_read_errors() {
+        let body = Body::new(StreamBody::new(futures_util::stream::once(async {
+            Err::<hyper::body::Frame<Bytes>, io::Error>(io::Error::other("boom"))
+        })));
+        let context = test_context_with_request(body, "https", "origin.example.test:443");
+
+        let err = read_request_body_next_chunk(&context, 16)
+            .await
+            .expect_err("body read should fail");
+
+        assert!(
+            err.to_string()
+                .contains("failed to read inbound request body frame")
+        );
+
+        let transport = context.lock_transport();
+        assert_eq!(transport.tcp_dag.downstream.phase_label(), "failed");
+        assert!(
+            transport
+                .tcp_dag
+                .downstream
+                .failure_message()
+                .contains("failed to read inbound request body frame")
+        );
+        assert_eq!(transport.tls_dag.downstream.phase_label(), "failed");
+        assert_eq!(
+            transport.tls_dag.downstream.server_name(),
+            "origin.example.test"
+        );
     }
 }
