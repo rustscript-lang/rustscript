@@ -1,6 +1,8 @@
 use super::lexer::{Lexer, Token, TokenKind};
 use super::{ParseError, ParserDialect};
 
+const SOFT_MAX_LINE_WIDTH: usize = 100;
+
 pub(super) fn format_source(
     source: &str,
     dialect: &'static dyn ParserDialect,
@@ -124,6 +126,7 @@ struct SourceFormatter<'a> {
     cursor: usize,
     out: String,
     indent: usize,
+    line_len: usize,
     line_start: bool,
     pending_space: bool,
     pending_newlines: usize,
@@ -145,6 +148,7 @@ impl<'a> SourceFormatter<'a> {
             cursor: 0,
             out: String::new(),
             indent: 0,
+            line_len: 0,
             line_start: true,
             pending_space: false,
             pending_newlines: 0,
@@ -299,6 +303,8 @@ impl<'a> SourceFormatter<'a> {
                 if should_break {
                     self.pending_code_break = true;
                     self.at_stmt_start = true;
+                } else if self.current_context_breaks_after_commas() {
+                    self.request_newline(1);
                 } else if !self.next_is_closer(self.index + 1) {
                     self.request_space();
                 }
@@ -392,30 +398,22 @@ impl<'a> SourceFormatter<'a> {
                     self.request_space();
                     self.advance_to(self.index + 1);
                 } else if self.is_unary_position() {
-                    self.clear_pending_space();
-                    self.write_raw("-");
-                    self.prev_kind = Some(PrevKind::Minus);
+                    self.emit_prefix_operator("-", PrevKind::Minus, false);
                 } else {
                     self.emit_binary_operator("-", PrevKind::Minus);
                 }
             }
             TokenKind::Bang => {
-                self.write_raw("!");
-                self.prev_kind = Some(PrevKind::Bang);
+                self.emit_prefix_operator("!", PrevKind::Bang, false);
             }
             TokenKind::BangEqual => self.emit_binary_operator("!=", PrevKind::BangEq),
             TokenKind::Ampersand => {
-                self.clear_pending_space();
-                self.write_raw("&");
-                self.prev_kind = Some(PrevKind::Ampersand);
+                self.emit_prefix_operator("&", PrevKind::Ampersand, false);
             }
             TokenKind::AmpersandAmpersand => self.emit_binary_operator("&&", PrevKind::AndAnd),
             TokenKind::PipePipe => {
                 if self.is_unary_position() {
-                    self.clear_pending_space();
-                    self.write_raw("||");
-                    self.prev_kind = Some(PrevKind::PipePipe);
-                    self.request_space();
+                    self.emit_prefix_operator("||", PrevKind::PipePipe, true);
                 } else {
                     self.emit_binary_operator("||", PrevKind::OrOr);
                 }
@@ -561,6 +559,15 @@ impl<'a> SourceFormatter<'a> {
         self.at_stmt_start = false;
     }
 
+    fn emit_prefix_operator(&mut self, text: &str, kind: PrevKind, trailing_space: bool) {
+        self.write_raw(text);
+        self.prev_kind = Some(kind);
+        if trailing_space {
+            self.request_space();
+        }
+        self.at_stmt_start = false;
+    }
+
     fn emit_open_paren(&mut self) {
         let needs_space = matches!(
             self.prev_kind,
@@ -575,10 +582,18 @@ impl<'a> SourceFormatter<'a> {
         }
         self.write_raw("(");
         let for_head = self.prev_kind == Some(PrevKind::For);
+        let should_fold = self.should_force_multiline_group(
+            self.index,
+            ContextKind::Paren { for_head },
+        ) && !matches!(self.peek_kind_at(self.index + 1), Some(TokenKind::RParen));
         self.contexts.push(Context {
             kind: ContextKind::Paren { for_head },
-            indented: false,
+            indented: should_fold,
         });
+        if should_fold {
+            self.indent += 1;
+            self.request_newline(1);
+        }
         self.prev_kind = Some(PrevKind::LParen);
         self.at_stmt_start = false;
     }
@@ -588,10 +603,16 @@ impl<'a> SourceFormatter<'a> {
             self.clear_pending_space();
         }
         self.write_raw("[");
+        let should_fold = self.should_force_multiline_group(self.index, ContextKind::Bracket)
+            && !matches!(self.peek_kind_at(self.index + 1), Some(TokenKind::RBracket));
         self.contexts.push(Context {
             kind: ContextKind::Bracket,
-            indented: false,
+            indented: should_fold,
         });
+        if should_fold {
+            self.indent += 1;
+            self.request_newline(1);
+        }
         self.prev_kind = Some(PrevKind::LBracket);
         self.at_stmt_start = false;
     }
@@ -614,6 +635,9 @@ impl<'a> SourceFormatter<'a> {
             kind,
             BraceKind::Block | BraceKind::MatchBody | BraceKind::StructBody
         );
+        let should_fold = kind == BraceKind::Collection
+            && !empty
+            && self.should_force_multiline_group(self.index, ContextKind::Brace(kind));
         let mut context = Context {
             kind: ContextKind::Brace(kind),
             indented: false,
@@ -623,6 +647,10 @@ impl<'a> SourceFormatter<'a> {
             self.indent += 1;
             self.pending_code_break = true;
             self.at_stmt_start = true;
+        } else if should_fold {
+            context.indented = true;
+            self.indent += 1;
+            self.request_newline(1);
         }
         self.contexts.push(context);
         self.prev_kind = Some(PrevKind::LBrace);
@@ -848,6 +876,24 @@ impl<'a> SourceFormatter<'a> {
         )
     }
 
+    fn current_context_breaks_after_commas(&self) -> bool {
+        matches!(
+            self.contexts.last(),
+            Some(Context {
+                kind: ContextKind::Paren { .. },
+                indented: true,
+            })
+                | Some(Context {
+                    kind: ContextKind::Bracket,
+                    indented: true,
+                })
+                | Some(Context {
+                    kind: ContextKind::Brace(BraceKind::Collection),
+                    indented: true,
+                })
+        )
+    }
+
     fn previous_token_kind(&self) -> Option<&TokenKind> {
         self.index
             .checked_sub(1)
@@ -1022,6 +1068,116 @@ impl<'a> SourceFormatter<'a> {
         }
     }
 
+    fn should_force_multiline_group(&self, open_index: usize, root_kind: ContextKind) -> bool {
+        let Some((close_index, comma_count)) = self.find_group_close_and_top_level_commas(
+            open_index,
+            root_kind,
+        ) else {
+            return false;
+        };
+        if comma_count == 0 {
+            return false;
+        }
+
+        let open_span = self.tokens[open_index].span;
+        let close_span = self.tokens[close_index].span;
+        let group = &self.source[open_span.lo..close_span.hi];
+        let estimated_width = Self::normalized_inline_width(group) + comma_count;
+        self.current_line_len_with_pending_prefix() + estimated_width > SOFT_MAX_LINE_WIDTH
+    }
+
+    fn find_group_close_and_top_level_commas(
+        &self,
+        open_index: usize,
+        root_kind: ContextKind,
+    ) -> Option<(usize, usize)> {
+        let mut depths = Self::root_depths_for_kind(root_kind);
+        let root_depths = depths;
+        let mut comma_count = 0usize;
+
+        for index in open_index + 1..self.tokens.len() {
+            if depths == root_depths && matches!(self.peek_kind_at(index), Some(TokenKind::Comma)) {
+                comma_count += 1;
+            }
+
+            match self.peek_kind_at(index)? {
+                TokenKind::LParen => depths.paren += 1,
+                TokenKind::RParen => {
+                    if matches!(root_kind, ContextKind::Paren { .. }) && depths == root_depths {
+                        return Some((index, comma_count));
+                    }
+                    depths.paren = depths.paren.saturating_sub(1);
+                }
+                TokenKind::LBracket => depths.bracket += 1,
+                TokenKind::RBracket => {
+                    if matches!(root_kind, ContextKind::Bracket) && depths == root_depths {
+                        return Some((index, comma_count));
+                    }
+                    depths.bracket = depths.bracket.saturating_sub(1);
+                }
+                TokenKind::LBrace => depths.brace += 1,
+                TokenKind::RBrace => {
+                    if matches!(root_kind, ContextKind::Brace(_)) && depths == root_depths {
+                        return Some((index, comma_count));
+                    }
+                    depths.brace = depths.brace.saturating_sub(1);
+                }
+                TokenKind::Eof => return None,
+                _ => {}
+            }
+        }
+
+        None
+    }
+
+    fn root_depths_for_kind(kind: ContextKind) -> DelimiterDepths {
+        match kind {
+            ContextKind::Paren { .. } => DelimiterDepths {
+                paren: 1,
+                ..DelimiterDepths::default()
+            },
+            ContextKind::Bracket => DelimiterDepths {
+                bracket: 1,
+                ..DelimiterDepths::default()
+            },
+            ContextKind::Brace(_) => DelimiterDepths {
+                brace: 1,
+                ..DelimiterDepths::default()
+            },
+        }
+    }
+
+    fn normalized_inline_width(text: &str) -> usize {
+        let mut width = 0usize;
+        let mut pending_space = false;
+
+        for ch in text.chars() {
+            if ch.is_whitespace() {
+                pending_space = width > 0;
+                continue;
+            }
+
+            if pending_space {
+                width += 1;
+                pending_space = false;
+            }
+            width += 1;
+        }
+
+        width
+    }
+
+    fn current_line_len_with_pending_prefix(&self) -> usize {
+        let mut len = if self.pending_newlines > 0 { 0 } else { self.line_len };
+        if self.pending_newlines > 0 || self.line_start {
+            len += self.indent * 4;
+        }
+        if self.pending_space && len > 0 {
+            len += 1;
+        }
+        len
+    }
+
     fn request_space(&mut self) {
         if !self.line_start {
             self.pending_space = true;
@@ -1040,12 +1196,24 @@ impl<'a> SourceFormatter<'a> {
     fn write_raw(&mut self, text: &str) {
         self.flush_pending_prefix();
         if self.line_start {
-            self.out.push_str(&"    ".repeat(self.indent));
+            let indent = "    ".repeat(self.indent);
+            self.line_len = indent.len();
+            self.out.push_str(&indent);
             self.line_start = false;
         }
         self.out.push_str(text);
         self.pending_space = false;
-        self.line_start = text.ends_with('\n');
+        if let Some(last_newline) = text.rfind('\n') {
+            self.line_start = text.ends_with('\n');
+            self.line_len = if self.line_start {
+                0
+            } else {
+                text[last_newline + 1..].chars().count()
+            };
+        } else {
+            self.line_len += text.chars().count();
+            self.line_start = false;
+        }
     }
 
     fn flush_pending_prefix(&mut self) {
@@ -1056,15 +1224,18 @@ impl<'a> SourceFormatter<'a> {
             }
             self.pending_newlines = 0;
             self.line_start = true;
+            self.line_len = 0;
         } else if self.pending_space && !self.line_start && !self.out.ends_with(' ') {
             self.out.push(' ');
             self.pending_space = false;
+            self.line_len += 1;
         }
     }
 
     fn trim_trailing_spaces(&mut self) {
         while self.out.ends_with(' ') || self.out.ends_with('\t') {
             self.out.pop();
+            self.line_len = self.line_len.saturating_sub(1);
         }
     }
 }
