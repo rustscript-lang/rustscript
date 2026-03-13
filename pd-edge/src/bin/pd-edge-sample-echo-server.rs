@@ -1,7 +1,7 @@
 use std::{env, net::SocketAddr};
 
 use edge::{
-    init_logging,
+    binary_version_report, binary_version_text, enabled_feature_line, init_logging,
     sample_echo::{SampleEchoServerConfig, spawn_sample_echo_server},
 };
 use tracing::{info, warn};
@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Ok(CliAction::Version) => {
-            println!("{}", binary_version_text());
+            println!("{}", binary_version_report(env!("CARGO_BIN_NAME")));
             return Ok(());
         }
         Err(err) => {
@@ -26,7 +26,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     init_logging()?;
-    info!("{}", binary_version_text());
+    info!("{}", binary_version_text(env!("CARGO_BIN_NAME")));
+    info!("{}", enabled_feature_line());
 
     let server = spawn_sample_echo_server((*cli).into_config()).await?;
     info!("tcp echo listening on {}", server.addresses.tcp);
@@ -60,6 +61,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("https echo listening on https://{}", addr);
     } else {
         warn!("https echo disabled in this build; enable the `tls` feature");
+    }
+
+    if let Some(addr) = server.addresses.http3 {
+        info!(
+            "http3 echo listening on https://{} (ALPN: h3 over QUIC)",
+            addr
+        );
+    } else {
+        warn!("http3 echo disabled in this build; enable the `http3` feature");
     }
 
     if let Some(addr) = server.addresses.websocket {
@@ -100,6 +110,7 @@ struct CliArgs {
     tls_addr: SocketAddr,
     http_addr: SocketAddr,
     https_addr: SocketAddr,
+    http3_addr: SocketAddr,
     websocket_addr: SocketAddr,
     websocket_tls_addr: SocketAddr,
     webrtc_addr: SocketAddr,
@@ -115,6 +126,7 @@ impl Default for CliArgs {
             tls_addr: config.tls_addr,
             http_addr: config.http_addr,
             https_addr: config.https_addr,
+            http3_addr: config.http3_addr,
             websocket_addr: config.websocket_addr,
             websocket_tls_addr: config.websocket_tls_addr,
             webrtc_addr: config.webrtc_addr,
@@ -131,6 +143,7 @@ impl CliArgs {
             tls_addr: self.tls_addr,
             http_addr: self.http_addr,
             https_addr: self.https_addr,
+            http3_addr: self.http3_addr,
             websocket_addr: self.websocket_addr,
             websocket_tls_addr: self.websocket_tls_addr,
             webrtc_addr: self.webrtc_addr,
@@ -180,6 +193,10 @@ where
             "--https-addr" => {
                 cli.https_addr =
                     parse_socket_addr("--https-addr", &next_arg_value("--https-addr", &mut args)?)?;
+            }
+            "--http3-addr" => {
+                cli.http3_addr =
+                    parse_socket_addr("--http3-addr", &next_arg_value("--http3-addr", &mut args)?)?;
             }
             "--websocket-addr" | "--ws-addr" => {
                 let flag = if arg == "--websocket-addr" {
@@ -245,35 +262,23 @@ fn print_cli_help() {
         "  --tls-addr <ADDR>                        TLS echo listen address (default: 127.0.0.1:7003)\n",
         "  --http-addr <ADDR>                       HTTP echo listen address (default: 127.0.0.1:7004)\n",
         "  --https-addr <ADDR>                      HTTPS echo listen address (default: 127.0.0.1:7005)\n",
+        "  --http3-addr <ADDR>                      HTTP/3 echo listen address (default: 127.0.0.1:7005)\n",
         "  --websocket-addr, --ws-addr <ADDR>       WebSocket echo listen address (default: 127.0.0.1:7006)\n",
         "  --websocket-tls-addr, --wss-addr <ADDR>  Secure WebSocket echo listen address (default: 127.0.0.1:7007)\n",
         "  --webrtc-addr <ADDR>                     WebRTC signaling listen address (default: 127.0.0.1:7008)\n",
         "  --forward-proxy-addr <ADDR>              CONNECT forward proxy listen address (default: 127.0.0.1:7009)\n",
-        "  -V, --version                            Show version with git metadata\n",
+        "  -V, --version                            Show version, git metadata, and enabled features\n",
         "  -h, --help                               Show this help\n\n",
         "Notes:\n",
         "  The TLS, HTTPS, and WSS listeners use a generated self-signed certificate.\n",
         "  With feature `http2`, the HTTP listener also accepts cleartext h2c prior knowledge.\n",
         "  With feature `http2`, the HTTPS listener negotiates h2 or HTTP/1.1 via ALPN.\n",
+        "  With feature `http3`, the HTTP/3 listener speaks QUIC with ALPN `h3` on UDP.\n",
         "  Without feature `http2`, the HTTP and HTTPS listeners serve HTTP/1.1 only.\n",
         "  The forward proxy listener accepts CONNECT and then tunnels raw TCP bytes.\n",
         "  The WebRTC listener serves signaling over HTTP POST /offer and echoes data-channel messages.\n",
         "  Feature-gated listeners are only enabled when the corresponding crate feature is compiled in.\n",
     ));
-}
-
-fn binary_version_text() -> String {
-    let binary = env!("CARGO_BIN_NAME");
-    let git_tag = option_env!("PD_BUILD_GIT_TAG").unwrap_or("untagged");
-    let git_commit = option_env!("PD_BUILD_GIT_COMMIT").unwrap_or("unknown");
-    let git_dirty = option_env!("PD_BUILD_GIT_DIRTY").unwrap_or("false");
-    let dirty = matches!(git_dirty, "true" | "1" | "yes" | "dirty");
-
-    if dirty {
-        format!("{binary} {git_tag} (dirty commit: {git_commit})")
-    } else {
-        format!("{binary} {git_tag}")
-    }
 }
 
 #[cfg(test)]
@@ -305,6 +310,8 @@ mod tests {
             "127.0.0.1:9104".to_string(),
             "--https-addr".to_string(),
             "127.0.0.1:9105".to_string(),
+            "--http3-addr".to_string(),
+            "127.0.0.1:9115".to_string(),
             "--ws-addr".to_string(),
             "127.0.0.1:9106".to_string(),
             "--wss-addr".to_string(),
@@ -338,6 +345,10 @@ mod tests {
         assert_eq!(
             cli.https_addr,
             "127.0.0.1:9105".parse::<SocketAddr>().expect("valid addr")
+        );
+        assert_eq!(
+            cli.http3_addr,
+            "127.0.0.1:9115".parse::<SocketAddr>().expect("valid addr")
         );
         assert_eq!(
             cli.websocket_addr,

@@ -3,6 +3,8 @@ mod proxy_path;
 mod shared;
 
 pub use admin_api::build_admin_app;
+#[cfg(feature = "http3")]
+pub use proxy_path::serve_http3_proxy;
 pub(crate) use proxy_path::{
     auto_promote_downstream_listener_goal_into_http_request,
     maybe_auto_promote_downstream_listener_goal_into_http_request,

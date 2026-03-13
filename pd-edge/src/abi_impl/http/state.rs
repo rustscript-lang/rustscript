@@ -17,6 +17,8 @@ use axum::{
     },
 };
 use http_body_util::{BodyExt, Full};
+#[cfg(feature = "http3")]
+use hyper::body::Buf;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use tokio::io::copy_bidirectional;
@@ -37,8 +39,8 @@ use {
 };
 
 use super::super::{
-    EDGE_IO_HANDLE_DYNAMIC_BASE, EdgeVirtualIoHandle, SharedHttpUpstreamSessions,
-    SharedRateLimiter,
+    EDGE_IO_HANDLE_DYNAMIC_BASE, EdgeVirtualIoHandle, SharedHttp3UpstreamSessions,
+    SharedHttpUpstreamSessions, SharedRateLimiter,
     proxy::ProxyByteStreamState,
     transport::{
         CachedTlsSession, FIRST_DYNAMIC_TCP_STREAM_HANDLE, HTTP11_ALPN_PROTOCOL, ReplayPrefixedIo,
@@ -48,7 +50,7 @@ use super::super::{
     },
     websocket::WebSocketConnectionState,
 };
-use crate::abi_impl::http2;
+use super::version::HttpVersionPreference;
 #[cfg(feature = "tls")]
 use crate::abi_impl::transport::{
     DownstreamTlsServerStart, SharedServerTlsStreamIo, SharedTlsStreamIo,
@@ -59,6 +61,7 @@ use crate::abi_impl::webrtc::WebRtcConnectionState;
 use crate::abi_impl::websocket::{
     close_websocket_binary_stream, read_websocket_binary_bytes, write_websocket_binary_bytes,
 };
+use crate::abi_impl::{http2, http3};
 use crate::cache::BoundedLruStore;
 
 #[derive(Debug)]
@@ -699,6 +702,7 @@ pub(crate) struct HttpOutboundRequestNode {
     pub(crate) headers: HeaderMap,
     pub(crate) body_override: Option<Vec<u8>>,
     pub(crate) target: Option<String>,
+    pub(crate) version_preference: HttpVersionPreference,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -713,6 +717,7 @@ pub(crate) enum HttpCarrierKind {
     #[default]
     Http1,
     Http2,
+    Http3,
 }
 
 impl HttpCarrierKind {
@@ -720,6 +725,7 @@ impl HttpCarrierKind {
         match self {
             Self::Http1 => "http1",
             Self::Http2 => "http2",
+            Self::Http3 => "http3",
         }
     }
 }
@@ -728,9 +734,11 @@ impl HttpCarrierKind {
 pub(crate) enum HttpCarrierRef {
     DownstreamHttp1,
     DownstreamHttp2Stream(http2::Http2StreamRef),
+    DownstreamHttp3Stream(http3::Http3StreamRef),
     Http1DefaultUpstream,
     Http1DynamicExchange(i64),
     UpstreamHttp2Stream(http2::Http2StreamRef),
+    UpstreamHttp3Stream(http3::Http3StreamRef),
 }
 
 impl HttpCarrierRef {
@@ -740,6 +748,7 @@ impl HttpCarrierRef {
                 HttpCarrierKind::Http1
             }
             Self::DownstreamHttp2Stream(_) | Self::UpstreamHttp2Stream(_) => HttpCarrierKind::Http2,
+            Self::DownstreamHttp3Stream(_) | Self::UpstreamHttp3Stream(_) => HttpCarrierKind::Http3,
         }
     }
 }
@@ -768,7 +777,6 @@ impl HttpExchangeTransportState {
     }
 
     fn mark_response_ready(&mut self, version: Version, carrier_ref: HttpCarrierRef) {
-        self.tcp_flow.mark_connected();
         self.carrier_kind = carrier_ref.kind();
         self.carrier_ref = Some(carrier_ref);
         self.http_version = Some(http_version_label(version).to_string());
@@ -784,12 +792,15 @@ enum UpstreamResponseSource {
     Reqwest(reqwest::Response),
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
     Hyper(hyper::body::Incoming),
+    #[cfg(feature = "http3")]
+    Http3(h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>),
     Exhausted,
 }
 
 struct UpstreamResponseBodySource {
     source: UpstreamResponseSource,
     http2_tracker: Option<http2::Http2ResponseBodyTracker>,
+    http3_tracker: Option<http3::Http3ResponseBodyTracker>,
     body_started: bool,
 }
 
@@ -797,6 +808,9 @@ impl UpstreamResponseBodySource {
     fn note_body_ready(&mut self) {
         if !self.body_started {
             if let Some(tracker) = &self.http2_tracker {
+                tracker.note_response_body_ready();
+            }
+            if let Some(tracker) = &self.http3_tracker {
                 tracker.note_response_body_ready();
             }
             self.body_started = true;
@@ -848,6 +862,36 @@ impl BufferedByteSource for UpstreamResponseBodySource {
                         Ok(BufferedByteStreamPull::Eof)
                     }
                 },
+                #[cfg(feature = "http3")]
+                UpstreamResponseSource::Http3(request_stream) => {
+                    match request_stream.recv_data().await {
+                        Ok(Some(mut chunk)) => {
+                            let bytes = chunk.copy_to_bytes(chunk.remaining());
+                            if !bytes.is_empty() {
+                                self.note_body_ready();
+                            }
+                            Ok(BufferedByteStreamPull::Chunk(bytes))
+                        }
+                        Ok(None) => {
+                            self.note_body_ready();
+                            if let Some(tracker) = &self.http3_tracker {
+                                tracker.note_body_eof();
+                            }
+                            self.source = UpstreamResponseSource::Exhausted;
+                            Ok(BufferedByteStreamPull::Eof)
+                        }
+                        Err(err) => {
+                            let observed = http3::classify_http3_error(&err);
+                            if let Some(tracker) = &self.http3_tracker {
+                                tracker.note_body_error(&observed);
+                            }
+                            Err(VmError::HostError(format!(
+                                "failed to read upstream http3 response frame: {}",
+                                observed.message,
+                            )))
+                        }
+                    }
+                }
                 UpstreamResponseSource::Exhausted => Ok(BufferedByteStreamPull::Eof),
             }
         })
@@ -873,6 +917,7 @@ impl UpstreamResponseBodyState {
             source: UpstreamResponseBodySource {
                 source: UpstreamResponseSource::Reqwest(response),
                 http2_tracker: None,
+                http3_tracker: None,
                 body_started: false,
             },
             stream: BufferedByteStream::default(),
@@ -888,6 +933,23 @@ impl UpstreamResponseBodyState {
             source: UpstreamResponseBodySource {
                 source: UpstreamResponseSource::Hyper(body),
                 http2_tracker,
+                http3_tracker: None,
+                body_started: false,
+            },
+            stream: BufferedByteStream::default(),
+        }
+    }
+
+    #[cfg(feature = "http3")]
+    fn from_http3(
+        request_stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+        http3_tracker: Option<http3::Http3ResponseBodyTracker>,
+    ) -> Self {
+        Self {
+            source: UpstreamResponseBodySource {
+                source: UpstreamResponseSource::Http3(request_stream),
+                http2_tracker: None,
+                http3_tracker,
                 body_started: false,
             },
             stream: BufferedByteStream::default(),
@@ -988,6 +1050,7 @@ impl HttpOutboundExchangeState {
                 headers: HeaderMap::new(),
                 body_override: None,
                 target: None,
+                version_preference: HttpVersionPreference::Auto,
             },
             response: HttpUpstreamResponseNode::NotStarted,
             transport: HttpExchangeTransportState::default(),
@@ -1005,6 +1068,7 @@ impl HttpOutboundExchangeState {
                 headers: request_head.headers.clone(),
                 body_override: None,
                 target: None,
+                version_preference: HttpVersionPreference::Auto,
             },
             ..Self::new()
         }
@@ -1035,7 +1099,9 @@ pub(crate) struct RuntimeServices {
     upstream_client_cache: Option<SharedUpstreamClientCache>,
     tls_session_cache: Option<SharedTlsSessionCache>,
     upstream_http_sessions: Option<SharedHttpUpstreamSessions>,
+    upstream_http3_sessions: Option<SharedHttp3UpstreamSessions>,
     downstream_http_sessions: Option<http2::SharedHttpDownstreamSessions>,
+    downstream_http3_sessions: Option<http3::SharedHttp3DownstreamSessions>,
     #[cfg(feature = "tls")]
     downstream_tls_termination: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
     rate_limiter: SharedRateLimiter,
@@ -1048,7 +1114,9 @@ impl RuntimeServices {
             upstream_client_cache: None,
             tls_session_cache: None,
             upstream_http_sessions: None,
+            upstream_http3_sessions: None,
             downstream_http_sessions: None,
+            downstream_http3_sessions: None,
             #[cfg(feature = "tls")]
             downstream_tls_termination: None,
             rate_limiter,
@@ -1071,8 +1139,16 @@ impl RuntimeServices {
         self.upstream_http_sessions.clone()
     }
 
+    pub(crate) fn upstream_http3_sessions(&self) -> Option<SharedHttp3UpstreamSessions> {
+        self.upstream_http3_sessions.clone()
+    }
+
     pub(crate) fn downstream_http_sessions(&self) -> Option<http2::SharedHttpDownstreamSessions> {
         self.downstream_http_sessions.clone()
+    }
+
+    pub(crate) fn downstream_http3_sessions(&self) -> Option<http3::SharedHttp3DownstreamSessions> {
+        self.downstream_http3_sessions.clone()
     }
 
     #[cfg(feature = "tls")]
@@ -1120,6 +1196,18 @@ impl DownstreamState {
     ) {
         self.downstream_carrier_ref = Some(HttpCarrierRef::DownstreamHttp2Stream(
             http2::Http2StreamRef {
+                session_id: attachment.session_id,
+                stream_id: attachment.stream_id,
+            },
+        ));
+    }
+
+    fn attach_downstream_http3_stream(
+        &mut self,
+        attachment: &http3::Http3DownstreamStreamAttachment,
+    ) {
+        self.downstream_carrier_ref = Some(HttpCarrierRef::DownstreamHttp3Stream(
+            http3::Http3StreamRef {
                 session_id: attachment.session_id,
                 stream_id: attachment.stream_id,
             },
@@ -1441,11 +1529,22 @@ impl ProxyVmContext {
         self.services.upstream_http_sessions = Some(sessions);
     }
 
+    pub(crate) fn attach_upstream_http3_sessions(&mut self, sessions: SharedHttp3UpstreamSessions) {
+        self.services.upstream_http3_sessions = Some(sessions);
+    }
+
     pub(crate) fn attach_downstream_http_sessions(
         &mut self,
         sessions: http2::SharedHttpDownstreamSessions,
     ) {
         self.services.downstream_http_sessions = Some(sessions);
+    }
+
+    pub(crate) fn attach_downstream_http3_sessions(
+        &mut self,
+        sessions: http3::SharedHttp3DownstreamSessions,
+    ) {
+        self.services.downstream_http3_sessions = Some(sessions);
     }
 
     pub(crate) fn attach_downstream_http2_stream(
@@ -1456,6 +1555,16 @@ impl ProxyVmContext {
             .get_mut()
             .expect("downstream state lock poisoned")
             .attach_downstream_http2_stream(attachment);
+    }
+
+    pub(crate) fn attach_downstream_http3_stream(
+        &mut self,
+        attachment: &http3::Http3DownstreamStreamAttachment,
+    ) {
+        self.downstream
+            .get_mut()
+            .expect("downstream state lock poisoned")
+            .attach_downstream_http3_stream(attachment);
     }
 
     pub(crate) fn attach_downstream_http1_upgrade(&mut self, upgrade: OnUpgrade) {
@@ -2104,8 +2213,11 @@ impl UpstreamResponseStartError {
 struct PreparedUpstreamRequest {
     client: reqwest::Client,
     upstream_client_cache: Option<SharedUpstreamClientCache>,
-    http_sessions: Option<SharedHttpUpstreamSessions>,
+    http2_sessions: Option<SharedHttpUpstreamSessions>,
+    http3_sessions: Option<SharedHttp3UpstreamSessions>,
+    version_preference: HttpVersionPreference,
     http2_mode: http2::Http2UpstreamMode,
+    http3_mode: http3::Http3UpstreamMode,
     tls_flow: TlsFlowState,
     attached_transport: Option<AttachedHttpTransport>,
     method: Method,
@@ -2400,8 +2512,19 @@ fn prepared_upstream_request(
             .upstream_client()
             .ok_or(UpstreamResponseStartError::MissingClient)?,
         upstream_client_cache: services.upstream_client_cache(),
-        http_sessions: services.upstream_http_sessions(),
-        http2_mode: http2::select_upstream_mode(&target, &tls_flow),
+        http2_sessions: services.upstream_http_sessions(),
+        http3_sessions: services.upstream_http3_sessions(),
+        version_preference: exchange.request.version_preference,
+        http2_mode: http2::select_upstream_mode(
+            &target,
+            &tls_flow,
+            exchange.request.version_preference,
+        ),
+        http3_mode: http3::select_upstream_mode(
+            &target,
+            &tls_flow,
+            exchange.request.version_preference,
+        ),
         tls_flow,
         attached_transport,
         method: exchange.request.method.clone(),
@@ -2467,8 +2590,19 @@ fn prepared_outbound_exchange_request(
             .upstream_client()
             .ok_or(UpstreamResponseStartError::MissingClient)?,
         upstream_client_cache: services.upstream_client_cache(),
-        http_sessions: services.upstream_http_sessions(),
-        http2_mode: http2::select_upstream_mode(&target, &tls_flow),
+        http2_sessions: services.upstream_http_sessions(),
+        http3_sessions: services.upstream_http3_sessions(),
+        version_preference: exchange.request.version_preference,
+        http2_mode: http2::select_upstream_mode(
+            &target,
+            &tls_flow,
+            exchange.request.version_preference,
+        ),
+        http3_mode: http3::select_upstream_mode(
+            &target,
+            &tls_flow,
+            exchange.request.version_preference,
+        ),
         tls_flow,
         attached_transport,
         method: exchange.request.method.clone(),
@@ -2835,6 +2969,12 @@ async fn start_upstream_response_via_attached_transport(
     headers: HeaderMap,
     request_body: Vec<u8>,
 ) -> Result<StartedUpstreamResponse, UpstreamResponseStartError> {
+    if matches!(prepared.version_preference, HttpVersionPreference::Http3) {
+        return Err(UpstreamResponseStartError::Protocol(
+            "http3 cannot use an attached tcp or tls plaintext transport".to_string(),
+        ));
+    }
+
     let request_path = super::request_path_with_query(&prepared.path, &prepared.query);
     match prepared.attached_transport {
         Some(AttachedHttpTransport::Tcp(stream)) => {
@@ -2916,7 +3056,7 @@ async fn start_upstream_response_via_http2(
     request_body: Vec<u8>,
 ) -> Result<StartedUpstreamResponse, http2::Http2RequestError> {
     let sessions = prepared
-        .http_sessions
+        .http2_sessions
         .as_ref()
         .expect("explicit http2 transport requires shared sessions");
     let started = http2::send_request(http2::Http2SendRequest {
@@ -2943,6 +3083,48 @@ async fn start_upstream_response_via_http2(
         body: Arc::new(tokio::sync::Mutex::new(
             UpstreamResponseBodyState::from_hyper(
                 started.response.into_body(),
+                Some(started.body_tracker),
+            ),
+        )),
+    })
+}
+
+#[cfg(feature = "http3")]
+async fn start_upstream_response_via_http3(
+    handle: i64,
+    prepared: &PreparedUpstreamRequest,
+    upstream_url: &str,
+    headers: HeaderMap,
+    request_body: Vec<u8>,
+) -> Result<StartedUpstreamResponse, http3::Http3RequestError> {
+    let sessions = prepared
+        .http3_sessions
+        .clone()
+        .expect("explicit http3 transport requires shared sessions");
+    let started = http3::send_request(http3::Http3SendRequestOptions {
+        exchange_handle: handle,
+        target: prepared.target.clone(),
+        upstream_url: upstream_url.to_string(),
+        method: prepared.method.clone(),
+        headers,
+        request_body,
+        tls_flow: prepared.tls_flow.clone(),
+        mode: prepared.http3_mode,
+        sessions,
+    })
+    .await?;
+    let version = started.response.version();
+    Ok(StartedUpstreamResponse {
+        status: started.response.status().as_u16(),
+        headers: started.response.headers().clone(),
+        version,
+        carrier_ref: HttpCarrierRef::UpstreamHttp3Stream(started.stream_ref),
+        peer_addr: started.peer_addr,
+        negotiated_alpn: started.negotiated_alpn,
+        peer_certificate_der: started.peer_certificate_der,
+        body: Arc::new(tokio::sync::Mutex::new(
+            UpstreamResponseBodyState::from_http3(
+                started.request_stream,
                 Some(started.body_tracker),
             ),
         )),
@@ -3159,10 +3341,105 @@ async fn start_outbound_exchange_response(
         note_outbound_tls_prepared(context, handle)?;
     }
     let started = Instant::now();
-    let upstream_response = if http2::should_use_explicit_upstream_transport(
+    let use_http3 = http3::should_use_explicit_upstream_transport(
+        prepared.http3_mode,
+        prepared.http3_sessions.as_ref(),
+    );
+    let use_http2 = http2::should_use_explicit_upstream_transport(
         prepared.http2_mode,
-        prepared.http_sessions.as_ref(),
-    ) {
+        prepared.http2_sessions.as_ref(),
+    );
+    let upstream_response = if use_http3 {
+        #[cfg(feature = "http3")]
+        {
+            match start_upstream_response_via_http3(
+                handle,
+                &prepared,
+                &upstream_url,
+                outbound_headers.clone(),
+                request_body.clone(),
+            )
+            .await
+            {
+                Ok(started) => started,
+                Err(http3::Http3RequestError::FallbackToHttp2 { .. }) => {
+                    if use_http2 {
+                        #[cfg(feature = "http2")]
+                        {
+                            match start_upstream_response_via_http2(
+                                handle,
+                                &prepared,
+                                &upstream_url,
+                                outbound_headers.clone(),
+                                request_body.clone(),
+                            )
+                            .await
+                            {
+                                Ok(started) => started,
+                                Err(http2::Http2RequestError::FallbackToHttp1 { .. }) => {
+                                    match start_upstream_response_via_reqwest(
+                                        handle,
+                                        &prepared,
+                                        &upstream_url,
+                                        &outbound_headers,
+                                        request_body,
+                                    )
+                                    .await
+                                    {
+                                        Ok(started) => started,
+                                        Err(err) => {
+                                            let _ = note_outbound_tls_failure(context, handle);
+                                            return Err(err);
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    let _ = note_outbound_tls_failure(context, handle);
+                                    return Err(UpstreamResponseStartError::UpstreamRequest(
+                                        format!(
+                                            "outbound exchange {handle} failed while evaluating host call: {}",
+                                            err.into_message(),
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "http2"))]
+                        {
+                            unreachable!("explicit http2 transport requires the http2 feature");
+                        }
+                    } else {
+                        match start_upstream_response_via_reqwest(
+                            handle,
+                            &prepared,
+                            &upstream_url,
+                            &outbound_headers,
+                            request_body,
+                        )
+                        .await
+                        {
+                            Ok(started) => started,
+                            Err(err) => {
+                                let _ = note_outbound_tls_failure(context, handle);
+                                return Err(err);
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = note_outbound_tls_failure(context, handle);
+                    return Err(UpstreamResponseStartError::UpstreamRequest(format!(
+                        "outbound exchange {handle} failed while evaluating host call: {}",
+                        err.into_message(),
+                    )));
+                }
+            }
+        }
+        #[cfg(not(feature = "http3"))]
+        {
+            unreachable!("explicit http3 transport requires the http3 feature");
+        }
+    } else if use_http2 {
         #[cfg(feature = "http2")]
         {
             match start_upstream_response_via_http2(
@@ -3238,7 +3515,9 @@ async fn start_outbound_exchange_response(
             upstream_response.peer_certificate_der.clone(),
         )?;
     }
-    mark_outbound_tcp_connected(context, handle)?;
+    if !http3::supports_response_version(upstream_response_version) {
+        mark_outbound_tcp_connected(context, handle)?;
+    }
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let response_http_version = http_version_label(upstream_response_version).to_string();
     let response_carrier_kind = upstream_response.carrier_ref.kind();
@@ -3632,12 +3911,28 @@ pub(crate) async fn resolve_http_graph_response(
 }
 
 fn mark_downstream_transport_closed(context: &SharedProxyVmContext) {
+    let is_http3 = context
+        .lock_downstream()
+        .downstream_carrier_ref
+        .as_ref()
+        .is_some_and(|carrier_ref| carrier_ref.kind() == HttpCarrierKind::Http3);
+    if is_http3 {
+        return;
+    }
     let mut transport = context.lock_transport();
     transport.tcp_dag.downstream.mark_closed();
     transport.tls_dag.downstream.mark_closed();
 }
 
 fn mark_downstream_transport_failed(context: &SharedProxyVmContext, message: &str) {
+    let is_http3 = context
+        .lock_downstream()
+        .downstream_carrier_ref
+        .as_ref()
+        .is_some_and(|carrier_ref| carrier_ref.kind() == HttpCarrierKind::Http3);
+    if is_http3 {
+        return;
+    }
     let mut transport = context.lock_transport();
     transport
         .tcp_dag

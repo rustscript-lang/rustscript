@@ -49,7 +49,6 @@ pub(crate) use state::{
 #[cfg(feature = "websocket")]
 pub(crate) use state::{HttpOutboundRequestNode, build_upstream_url, is_hop_by_hop_header};
 pub use state::{HttpRequestContext, ProxyVmContext, SharedProxyVmContext};
-pub(crate) use version::HttpVersionPreference;
 #[cfg(any(feature = "http", test))]
 pub(crate) use state::{
     allocate_outbound_exchange_handle, ensure_outbound_exchange_response_started,
@@ -60,6 +59,7 @@ pub(crate) use state::{
     allocate_webrtc_connection_handle, default_upstream_webrtc_connection_handle,
     webrtc_connection_exists,
 };
+pub(crate) use version::HttpVersionPreference;
 
 #[cfg(feature = "http")]
 pub(super) fn register_http_extensions(

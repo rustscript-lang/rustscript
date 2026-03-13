@@ -11,6 +11,9 @@ mod debug;
 mod forward_proxy;
 #[path = "proxy_tests/http.rs"]
 mod http;
+#[cfg(feature = "http3")]
+#[path = "support/http3_support.rs"]
+mod http3_support;
 #[path = "proxy_tests/io.rs"]
 mod io;
 #[path = "proxy_tests/support.rs"]

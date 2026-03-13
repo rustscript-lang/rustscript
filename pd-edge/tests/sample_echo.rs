@@ -1,4 +1,8 @@
-#[cfg(feature = "http2")]
+#[cfg(feature = "http3")]
+#[path = "support/http3_support.rs"]
+mod http3_support;
+
+#[cfg(any(feature = "http2", feature = "http3"))]
 use edge::sample_echo::{SampleEchoServerConfig, spawn_sample_echo_server};
 use edge::sample_echo::{spawn_connect_forward_proxy, spawn_tcp_echo_server};
 #[cfg(feature = "http2")]
@@ -175,7 +179,60 @@ async fn sample_echo_server_https_listener_negotiates_http2_over_tls() {
     drop(server);
 }
 
-#[cfg(feature = "http2")]
+#[cfg(feature = "http3")]
+#[tokio::test]
+async fn sample_echo_server_http3_listener_serves_http3_requests() {
+    let server = spawn_sample_echo_server(zero_addr_sample_echo_config())
+        .await
+        .expect("sample echo server should start");
+    let addr = server
+        .addresses
+        .http3
+        .expect("http3 listener should be present");
+
+    let response = http3_support::send_http3_request(
+        &format!("https://127.0.0.1:{}/echo?mode=http3", addr.port()),
+        "POST",
+        &[],
+        b"quic-body",
+    )
+    .await;
+    assert_eq!(response.status, axum::http::StatusCode::OK);
+    assert_eq!(response.version, axum::http::Version::HTTP_3);
+    assert_eq!(
+        response
+            .headers
+            .get("x-echo-http-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("x-echo-protocol")
+            .and_then(|value| value.to_str().ok()),
+        Some("http3")
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("x-echo-method")
+            .and_then(|value| value.to_str().ok()),
+        Some("POST")
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("x-echo-path")
+            .and_then(|value| value.to_str().ok()),
+        Some("/echo")
+    );
+    assert_eq!(response.body.as_ref(), b"quic-body");
+
+    drop(server);
+}
+
+#[cfg(any(feature = "http2", feature = "http3"))]
 fn zero_addr_sample_echo_config() -> SampleEchoServerConfig {
     let any = "127.0.0.1:0".parse().expect("valid wildcard addr");
     SampleEchoServerConfig {
@@ -184,6 +241,7 @@ fn zero_addr_sample_echo_config() -> SampleEchoServerConfig {
         tls_addr: any,
         http_addr: any,
         https_addr: any,
+        http3_addr: any,
         websocket_addr: any,
         websocket_tls_addr: any,
         webrtc_addr: any,

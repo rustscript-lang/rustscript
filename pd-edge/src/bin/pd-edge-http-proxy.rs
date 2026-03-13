@@ -4,10 +4,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(feature = "http3")]
+use edge::serve_http3_proxy;
 use edge::{
     ActiveControlPlaneConfig, RuntimeStoreLimits, SharedState, VM_EPOCH_TICK_INTERVAL_MS,
-    VmExecutionConfig, VmExecutionMode, VmInterruptConfig, build_admin_app, init_logging,
-    serve_http_proxy, serve_https_proxy, spawn_active_control_plane_client,
+    VmExecutionConfig, VmExecutionMode, VmInterruptConfig, binary_version_report,
+    binary_version_text, build_admin_app, enabled_feature_line, init_logging, serve_http_proxy,
+    serve_https_proxy, spawn_active_control_plane_client,
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -21,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Ok(CliAction::Version) => {
-            println!("{}", binary_version_text());
+            println!("{}", binary_version_report(env!("CARGO_BIN_NAME")));
             return Ok(());
         }
         Err(err) => {
@@ -32,7 +35,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     init_logging()?;
-    info!("{}", binary_version_text());
+    info!("{}", binary_version_text(env!("CARGO_BIN_NAME")));
+    info!("{}", enabled_feature_line());
 
     let data_addr = if let Some(value) = cli.proxy_addr {
         value
@@ -115,6 +119,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
+    #[cfg(feature = "http3")]
+    let http3_listener = match cli.http3_addr {
+        Some(addr) => Some(tokio::net::UdpSocket::bind(addr).await?),
+        None => None,
+    };
+
+    #[cfg(not(feature = "http3"))]
+    if cli.http3_addr.is_some() {
+        let err = "--http3-addr requires a build with the `http3` feature".to_string();
+        eprintln!("error: {err}\n");
+        print_cli_help();
+        return Err(err.into());
+    }
 
     info!(
         "proxy/data-plane listening on http://{}",
@@ -123,6 +140,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(listener) = &https_listener {
         info!(
             "proxy/data-plane listening on https://{} (HTTPS listener starts in transport mode and auto-promotes to HTTP unless the VM consumes raw downstream transport)",
+            listener.local_addr()?
+        );
+    }
+    #[cfg(feature = "http3")]
+    if let Some(listener) = &http3_listener {
+        info!(
+            "proxy/data-plane listening on https://{} over UDP (HTTP/3)",
             listener.local_addr()?
         );
     }
@@ -139,11 +163,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::future::pending::<std::io::Result<()>>().await
         }
     };
+    let http3_server = async {
+        #[cfg(feature = "http3")]
+        {
+            if let Some(listener) = http3_listener {
+                serve_http3_proxy(listener, state.clone()).await
+            } else {
+                std::future::pending::<std::io::Result<()>>().await
+            }
+        }
+        #[cfg(not(feature = "http3"))]
+        {
+            std::future::pending::<std::io::Result<()>>().await
+        }
+    };
     let admin_server = axum::serve(admin_listener, admin_app);
 
     tokio::select! {
         result = data_server => result?,
         result = https_server => result?,
+        result = http3_server => result?,
         result = admin_server => result?,
     }
 
@@ -154,11 +193,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct CliArgs {
     proxy_addr: Option<SocketAddr>,
     https_addr: Option<SocketAddr>,
+    http3_addr: Option<SocketAddr>,
     admin_addr: Option<SocketAddr>,
     max_program_bytes: Option<usize>,
     tls_session_reuse_entries: Option<usize>,
     upstream_http_reuse_entries: Option<usize>,
     downstream_http2_session_entries: Option<usize>,
+    upstream_http3_reuse_entries: Option<usize>,
+    downstream_http3_session_entries: Option<usize>,
     vm_fuel: Option<u64>,
     vm_fuel_check_interval: Option<u32>,
     vm_epoch_deadline: Option<u64>,
@@ -218,6 +260,14 @@ where
                         .map_err(|_| format!("invalid --https-addr: {value}"))?,
                 );
             }
+            "--http3-addr" => {
+                let value = next_arg_value("--http3-addr", &mut args)?;
+                cli.http3_addr = Some(
+                    value
+                        .parse::<SocketAddr>()
+                        .map_err(|_| format!("invalid --http3-addr: {value}"))?,
+                );
+            }
             "--admin-addr" => {
                 let value = next_arg_value("--admin-addr", &mut args)?;
                 cli.admin_addr = Some(
@@ -255,6 +305,21 @@ where
                 cli.downstream_http2_session_entries =
                     Some(value.parse::<usize>().map_err(|_| {
                         format!("invalid --downstream-http2-session-entries: {value}")
+                    })?);
+            }
+            "--upstream-http3-reuse-entries" => {
+                let value = next_arg_value("--upstream-http3-reuse-entries", &mut args)?;
+                cli.upstream_http3_reuse_entries = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid --upstream-http3-reuse-entries: {value}"))?,
+                );
+            }
+            "--downstream-http3-session-entries" => {
+                let value = next_arg_value("--downstream-http3-session-entries", &mut args)?;
+                cli.downstream_http3_session_entries =
+                    Some(value.parse::<usize>().map_err(|_| {
+                        format!("invalid --downstream-http3-session-entries: {value}")
                     })?);
             }
             "--vm-fuel" => {
@@ -379,11 +444,14 @@ fn print_cli_help() {
             "  --proxy-addr <ADDR>                       Proxy/data-plane listen address (default: 0.0.0.0:8080)\n",
             "  --data-addr <ADDR>                        Alias for --proxy-addr\n",
             "  --https-addr <ADDR>                       Optional HTTPS/TLS listen address; starts in transport mode and auto-promotes to HTTP unless the VM consumes raw downstream transport\n",
+            "  --http3-addr <ADDR>                       Optional HTTP/3 over UDP listen address\n",
             "  --admin-addr <ADDR>                       Admin endpoint listen address (default: 127.0.0.1:8081)\n",
             "  --max-program-bytes <BYTES>               Max upload/program size in bytes (default: 1048576)\n",
             "  --tls-session-reuse-entries <N>           TLS session reuse store cap (default: {})\n",
             "  --upstream-http-reuse-entries <N>         Upstream HTTP reuse store cap (default: {})\n",
             "  --downstream-http2-session-entries <N>    Downstream HTTP/2 session tracking cap (default: {})\n",
+            "  --upstream-http3-reuse-entries <N>        Upstream HTTP/3 reuse store cap (default: {})\n",
+            "  --downstream-http3-session-entries <N>    Downstream HTTP/3 session tracking cap (default: {})\n",
             "  --vm-fuel <UNITS>                         Enable cooperative VM fuel slices per request\n",
             "  --vm-fuel-check-interval <OPS>            Fuel check interval when --vm-fuel is enabled (default: 1)\n",
             "  --vm-epoch-deadline <TICKS>               Enable cooperative VM epoch slices per request (1 tick = 1ms wall clock)\n",
@@ -395,12 +463,14 @@ fn print_cli_help() {
             "  --edge-id-path <PATH>                     Edge UUID file path (default .pd-edge/edge-id)\n",
             "  --control-plane-poll-interval-ms <MS>     Poll interval for active control-plane client\n",
             "  --control-plane-rpc-timeout-ms <MS>       RPC timeout for active control-plane client\n",
-            "  -V, --version                             Show version with git metadata\n",
+            "  -V, --version                             Show version, git metadata, and enabled features\n",
             "  -h, --help                                Show this help\n"
         ),
         defaults.tls_session_reuse_entries,
         defaults.upstream_http_reuse_entries,
         defaults.downstream_http2_session_entries,
+        defaults.upstream_http3_reuse_entries,
+        defaults.downstream_http3_session_entries,
     );
 }
 
@@ -415,6 +485,12 @@ impl CliArgs {
         }
         if let Some(value) = self.downstream_http2_session_entries {
             limits.downstream_http2_session_entries = value;
+        }
+        if let Some(value) = self.upstream_http3_reuse_entries {
+            limits.upstream_http3_reuse_entries = value;
+        }
+        if let Some(value) = self.downstream_http3_session_entries {
+            limits.downstream_http3_session_entries = value;
         }
         limits
     }
@@ -433,20 +509,6 @@ impl CliArgs {
             });
         }
         Ok(VmInterruptConfig::None)
-    }
-}
-
-fn binary_version_text() -> String {
-    let binary = env!("CARGO_BIN_NAME");
-    let git_tag = option_env!("PD_BUILD_GIT_TAG").unwrap_or("untagged");
-    let git_commit = option_env!("PD_BUILD_GIT_COMMIT").unwrap_or("unknown");
-    let git_dirty = option_env!("PD_BUILD_GIT_DIRTY").unwrap_or("false");
-    let dirty = matches!(git_dirty, "true" | "1" | "yes" | "dirty");
-
-    if dirty {
-        format!("{binary} {git_tag} (dirty commit: {git_commit})")
-    } else {
-        format!("{binary} {git_tag}")
     }
 }
 
@@ -576,11 +638,14 @@ mod tests {
             CliArgs {
                 proxy_addr: Some("127.0.0.1:7001".parse().expect("valid addr")),
                 https_addr: None,
+                http3_addr: None,
                 admin_addr: Some("127.0.0.1:7002".parse().expect("valid addr")),
                 max_program_bytes: Some(2048),
                 tls_session_reuse_entries: Some(16),
                 upstream_http_reuse_entries: Some(24),
                 downstream_http2_session_entries: Some(0),
+                upstream_http3_reuse_entries: None,
+                downstream_http3_session_entries: None,
                 vm_fuel: None,
                 vm_fuel_check_interval: None,
                 vm_epoch_deadline: None,
@@ -616,6 +681,26 @@ mod tests {
         assert_eq!(
             cli.https_addr,
             Some("127.0.0.1:7443".parse().expect("valid addr"))
+        );
+        assert_eq!(cli.http3_addr, None);
+    }
+
+    #[test]
+    fn parse_cli_args_from_parses_http3_addr() {
+        let action = parse_cli_args_from([
+            "--proxy-addr".to_string(),
+            "127.0.0.1:7001".to_string(),
+            "--http3-addr".to_string(),
+            "127.0.0.1:7444".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        let CliAction::Run(cli) = action else {
+            panic!("expected run action");
+        };
+        assert_eq!(
+            cli.http3_addr,
+            Some("127.0.0.1:7444".parse().expect("valid addr"))
         );
     }
 
@@ -670,6 +755,8 @@ mod tests {
         let cli = CliArgs {
             tls_session_reuse_entries: Some(8),
             upstream_http_reuse_entries: Some(0),
+            upstream_http3_reuse_entries: Some(3),
+            downstream_http3_session_entries: Some(5),
             ..CliArgs::default()
         };
 
@@ -677,6 +764,8 @@ mod tests {
 
         assert_eq!(limits.tls_session_reuse_entries, 8);
         assert_eq!(limits.upstream_http_reuse_entries, 0);
+        assert_eq!(limits.upstream_http3_reuse_entries, 3);
+        assert_eq!(limits.downstream_http3_session_entries, 5);
         assert_eq!(
             limits.downstream_http2_session_entries,
             RuntimeStoreLimits::default().downstream_http2_session_entries

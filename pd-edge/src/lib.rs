@@ -1,5 +1,6 @@
 mod abi_impl;
 mod active_control_plane;
+mod build_info;
 mod cache;
 mod compile;
 mod control_plane_rpc;
@@ -20,6 +21,10 @@ pub use abi_impl::{
 pub use active_control_plane::{
     ActiveControlPlaneConfig, run_active_control_plane_client, spawn_active_control_plane_client,
 };
+pub use build_info::{
+    binary_version_report, binary_version_text, enabled_feature_line, enabled_feature_list,
+    enabled_feature_names,
+};
 pub use compile::{
     compile_edge_source_file, compile_edge_source_file_with_options,
     compile_edge_source_with_flavor,
@@ -36,6 +41,8 @@ pub use debug_session::{
     run_vm_with_optional_debugger, start_debug_session, stop_debug_session,
 };
 pub use logging::init as init_logging;
+#[cfg(feature = "http3")]
+pub use runtime::serve_http3_proxy;
 pub use runtime::{
     HealthStatus, ProgramApplyReport, RuntimeStoreLimits, SharedState, TelemetrySnapshot,
     VM_EPOCH_TICK_INTERVAL_MS, VmExecutionConfig, VmExecutionMode, VmInterruptConfig,

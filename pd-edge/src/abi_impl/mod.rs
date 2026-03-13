@@ -36,9 +36,11 @@ pub(crate) use self::http2::{
 };
 pub(crate) use self::http3::{
     DownstreamHttp3ConnectionTracker, Http3DownstreamStreamAttachment,
-    SharedHttp3DownstreamSessions, SharedHttp3UpstreamSessions, new_shared_http3_downstream_sessions,
-    new_shared_http3_upstream_sessions,
+    SharedHttp3DownstreamSessions, SharedHttp3UpstreamSessions,
+    new_shared_http3_downstream_sessions, new_shared_http3_upstream_sessions,
 };
+#[cfg(feature = "http3")]
+pub(crate) use self::quic::build_quic_server_config;
 #[cfg(feature = "tls")]
 pub(crate) use self::transport::build_default_self_signed_server_config;
 pub(crate) use self::transport::{

@@ -6,6 +6,8 @@ pub(crate) use std::{
     time::Duration,
 };
 
+#[cfg(feature = "http3")]
+pub(crate) use crate::http3_support::send_http3_request;
 pub(crate) use axum::{
     Json, Router,
     body::{Body, to_bytes},
@@ -16,6 +18,8 @@ pub(crate) use axum::{
 pub(crate) use base64::{Engine as _, engine::general_purpose::STANDARD};
 #[cfg(feature = "webrtc")]
 pub(crate) use edge::sample_echo::spawn_webrtc_echo_server;
+#[cfg(feature = "http3")]
+pub(crate) use edge::serve_http3_proxy;
 pub(crate) use edge::{
     ActiveControlPlaneConfig, CommandResultPayload, ControlPlaneCommand, EdgeCommandResult,
     EdgePollRequest, EdgePollResponse, FN_HTTP_RESPONSE_SET_BODY, FN_HTTP_RESPONSE_SET_HEADER,
@@ -89,6 +93,36 @@ pub(crate) async fn spawn_proxy_with_state(
             serve_http_proxy(data_listener, state)
                 .await
                 .expect("data plane server should run");
+        }
+    });
+    let (admin_addr, admin_handle) = spawn_server(build_admin_app(state)).await;
+    (data_addr, admin_addr, data_handle, admin_handle)
+}
+
+#[cfg(feature = "http3")]
+pub(crate) async fn spawn_http3_proxy(
+    max_program_bytes: usize,
+) -> (SocketAddr, SocketAddr, JoinHandle<()>, JoinHandle<()>) {
+    let state = SharedState::new(max_program_bytes);
+    spawn_http3_proxy_with_state(state).await
+}
+
+#[cfg(feature = "http3")]
+pub(crate) async fn spawn_http3_proxy_with_state(
+    state: SharedState,
+) -> (SocketAddr, SocketAddr, JoinHandle<()>, JoinHandle<()>) {
+    let data_listener = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("http3 listener should bind");
+    let data_addr = data_listener
+        .local_addr()
+        .expect("http3 listener should have addr");
+    let data_handle = tokio::spawn({
+        let state = state.clone();
+        async move {
+            serve_http3_proxy(data_listener, state)
+                .await
+                .expect("http3 data plane server should run");
         }
     });
     let (admin_addr, admin_handle) = spawn_server(build_admin_app(state)).await;
@@ -528,6 +562,214 @@ fn boxed_http2_delayed_body_owned(
         )
     }));
     http_body_util::BodyExt::boxed(body)
+}
+
+#[cfg(all(feature = "tls", feature = "http3"))]
+#[derive(Clone, Copy)]
+enum Http3FixtureKind {
+    Multiplex,
+    Sample,
+}
+
+#[cfg(all(feature = "tls", feature = "http3"))]
+type Http3FixtureSendStream =
+    h3::server::RequestStream<h3_quinn::SendStream<axum::body::Bytes>, axum::body::Bytes>;
+
+#[cfg(all(feature = "tls", feature = "http3"))]
+type Http3FixtureRecvStream = h3::server::RequestStream<h3_quinn::RecvStream, axum::body::Bytes>;
+
+#[cfg(all(feature = "tls", feature = "http3"))]
+fn build_http3_upstream_server_config() -> quinn::ServerConfig {
+    ensure_rustls_provider();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("http3 upstream certificate should generate");
+    let mut server_crypto = rustls::ServerConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .expect("http3 upstream TLS versions should configure")
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![CertificateDer::from(
+            cert.serialize_der()
+                .expect("http3 upstream certificate should serialize"),
+        )],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.serialize_private_key_der())),
+    )
+    .expect("http3 upstream server config should build");
+    server_crypto.alpn_protocols = vec![b"h3".to_vec()];
+    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
+        .expect("http3 upstream QUIC config should build");
+    quinn::ServerConfig::with_crypto(Arc::new(quic_crypto))
+}
+
+#[cfg(all(feature = "tls", feature = "http3"))]
+async fn read_http3_fixture_body(mut stream: Http3FixtureRecvStream) -> axum::body::Bytes {
+    use hyper::body::Buf;
+
+    let mut body = Vec::new();
+    while let Some(mut chunk) = stream
+        .recv_data()
+        .await
+        .expect("http3 fixture request body should read")
+    {
+        body.extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref());
+    }
+    axum::body::Bytes::from(body)
+}
+
+#[cfg(all(feature = "tls", feature = "http3"))]
+async fn write_http3_fixture_response(
+    stream: &mut Http3FixtureSendStream,
+    body: axum::body::Bytes,
+    delay: Option<Duration>,
+) {
+    let response = hyper::Response::builder()
+        .status(hyper::StatusCode::OK)
+        .header("x-upstream-http-version", "3")
+        .body(())
+        .expect("http3 fixture response head should build");
+    stream
+        .send_response(response)
+        .await
+        .expect("http3 fixture response head should send");
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
+    if !body.is_empty() {
+        stream
+            .send_data(body)
+            .await
+            .expect("http3 fixture response body should send");
+    }
+    stream
+        .finish()
+        .await
+        .expect("http3 fixture response should finish");
+}
+
+#[cfg(all(feature = "tls", feature = "http3"))]
+async fn serve_http3_fixture_connection(connection: quinn::Connection, kind: Http3FixtureKind) {
+    let mut h3_conn = h3::server::builder()
+        .build(h3_quinn::Connection::new(connection))
+        .await
+        .expect("http3 fixture connection should initialize");
+
+    loop {
+        match h3_conn.accept().await {
+            Ok(Some(resolver)) => {
+                tokio::spawn(async move {
+                    let (request, stream) = resolver
+                        .resolve_request()
+                        .await
+                        .expect("http3 fixture request should resolve");
+                    let (parts, _) = request.into_parts();
+                    let path = parts.uri.path().to_string();
+                    let method = parts.method.to_string();
+                    let tag = parts
+                        .headers
+                        .get("x-demo-request")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let (mut send_stream, recv_stream) = stream.split();
+                    let request_body = read_http3_fixture_body(recv_stream).await;
+
+                    let (response_body, delay) = match kind {
+                        Http3FixtureKind::Multiplex => match path.as_str() {
+                            "/slow" => (
+                                axum::body::Bytes::from_static(b"slow-body"),
+                                Some(Duration::from_millis(75)),
+                            ),
+                            "/fast" => (axum::body::Bytes::from_static(b"fast-body"), None),
+                            _ => (axum::body::Bytes::from_static(b"fallback-body"), None),
+                        },
+                        Http3FixtureKind::Sample => {
+                            let payload = format!(
+                                "{method}|{path}|{tag}|{}",
+                                String::from_utf8_lossy(&request_body)
+                            );
+                            let delay = if path == "/slow" {
+                                Some(Duration::from_millis(75))
+                            } else {
+                                None
+                            };
+                            (axum::body::Bytes::from(payload), delay)
+                        }
+                    };
+
+                    write_http3_fixture_response(&mut send_stream, response_body, delay).await;
+                });
+            }
+            Ok(None) => break,
+            Err(err) => {
+                if err.is_h3_no_error() {
+                    break;
+                }
+                panic!("http3 fixture connection should stay healthy: {err}");
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "tls", feature = "http3"))]
+async fn spawn_https_http3_upstream_fixture(
+    kind: Http3FixtureKind,
+) -> (
+    SocketAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    JoinHandle<()>,
+) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("http3 upstream socket should bind");
+    let addr = socket
+        .local_addr()
+        .expect("http3 upstream socket should have addr");
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(build_http3_upstream_server_config()),
+        socket
+            .into_std()
+            .expect("http3 upstream socket should convert"),
+        Arc::new(quinn::TokioRuntime),
+    )
+    .expect("http3 upstream endpoint should build");
+    let connection_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handle = tokio::spawn({
+        let connection_count = Arc::clone(&connection_count);
+        async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let connection_count = Arc::clone(&connection_count);
+                tokio::spawn(async move {
+                    let connection = incoming
+                        .await
+                        .expect("http3 upstream QUIC handshake should succeed");
+                    connection_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    serve_http3_fixture_connection(connection, kind).await;
+                });
+            }
+        }
+    });
+    (addr, connection_count, handle)
+}
+
+#[cfg(all(feature = "tls", feature = "http3"))]
+pub(crate) async fn spawn_https_http3_multiplex_upstream() -> (
+    SocketAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    JoinHandle<()>,
+) {
+    spawn_https_http3_upstream_fixture(Http3FixtureKind::Multiplex).await
+}
+
+#[cfg(all(feature = "tls", feature = "http3"))]
+pub(crate) async fn spawn_https_http3_sample_upstream() -> (
+    SocketAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    JoinHandle<()>,
+) {
+    spawn_https_http3_upstream_fixture(Http3FixtureKind::Sample).await
 }
 
 #[cfg(all(feature = "tls", feature = "http2"))]

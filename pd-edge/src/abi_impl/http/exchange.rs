@@ -6,7 +6,7 @@ use vm::{CallOutcome, Value, Vm, VmError};
 #[cfg(feature = "tls")]
 use super::attach_outbound_exchange_tls_transport;
 use super::{
-    SharedProxyVmContext, allocate_outbound_exchange_handle,
+    HttpVersionPreference, SharedProxyVmContext, allocate_outbound_exchange_handle,
     attach_outbound_exchange_tcp_transport, default_upstream_exchange_handle,
     ensure_outbound_exchange_response_started, headers_to_value_map, is_valid_request_path,
     is_valid_upstream, outbound_exchange_exists, outbound_exchange_response_eof, parse_header,
@@ -82,6 +82,14 @@ fn apply_exchange_query(
         request.query = normalized_query.to_string();
     })?;
     Ok(CallOutcome::Return(vec![]))
+}
+
+fn parse_version_preference(label: &str) -> Result<HttpVersionPreference, VmError> {
+    HttpVersionPreference::parse(label).ok_or_else(|| {
+        VmError::HostError(format!(
+            "invalid http version preference '{label}'; expected auto, 1.1, 2, or 3",
+        ))
+    })
 }
 
 /// Allocates an outbound HTTP exchange handle.
@@ -174,6 +182,35 @@ async fn set_exchange_query(
     query: String,
 ) -> Result<CallOutcome, VmError> {
     apply_exchange_query(&context, exchange, query)
+}
+
+/// Sets the preferred HTTP version for the outbound HTTP exchange.
+#[pd_edge_host_function(name = http_exchange::SET_VERSION.name, scope = http)]
+async fn set_exchange_version(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    exchange: i64,
+    version: String,
+) -> Result<CallOutcome, VmError> {
+    let parsed = parse_version_preference(&version)?;
+    with_exchange_request_mut(&context, exchange, |request, _tcp_flow, _tls_flow| {
+        request.version_preference = parsed;
+    })?;
+    Ok(CallOutcome::Return(vec![]))
+}
+
+/// Returns the configured HTTP version preference for the outbound HTTP exchange.
+#[pd_edge_host_function(name = http_exchange::GET_VERSION.name, scope = http)]
+async fn get_exchange_version(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    exchange: i64,
+) -> Result<CallOutcome, VmError> {
+    let version =
+        with_exchange_request_mut(&context, exchange, |request, _tcp_flow, _tls_flow| {
+            request.version_preference.as_str().to_string()
+        })?;
+    Ok(CallOutcome::Return(vec![Value::string(version)]))
 }
 
 /// Sets the target endpoint for the outbound HTTP exchange.

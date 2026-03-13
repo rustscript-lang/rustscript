@@ -1,6 +1,6 @@
 #[cfg(feature = "http")]
 use std::convert::Infallible;
-#[cfg(any(feature = "tls", feature = "webrtc"))]
+#[cfg(any(feature = "tls", feature = "webrtc", feature = "http3"))]
 use std::sync::Arc;
 #[cfg(feature = "webrtc")]
 use std::{collections::HashMap, sync::Mutex};
@@ -33,6 +33,8 @@ use axum::body::Bytes;
 use futures_util::{SinkExt, StreamExt};
 #[cfg(feature = "http")]
 use http_body_util::{BodyExt, Full};
+#[cfg(feature = "http3")]
+use hyper::body::Buf;
 #[cfg(any(feature = "webrtc", all(feature = "http", not(feature = "http2"))))]
 use hyper::server::conn::http1;
 #[cfg(feature = "http")]
@@ -46,7 +48,7 @@ use hyper::{
 use hyper_util::rt::TokioIo;
 #[cfg(all(feature = "http", feature = "http2"))]
 use hyper_util::{rt::TokioExecutor, server::conn::auto::Builder as AutoBuilder};
-#[cfg(feature = "tls")]
+#[cfg(any(feature = "tls", feature = "http3"))]
 use rcgen::generate_simple_self_signed;
 #[cfg(feature = "tls")]
 use tokio_rustls::{
@@ -67,6 +69,15 @@ use tokio_tungstenite::{
 };
 #[cfg(feature = "webrtc")]
 use uuid::Uuid;
+#[cfg(feature = "http3")]
+use {
+    crate::abi_impl::build_quic_server_config,
+    quinn::{Endpoint, TokioRuntime},
+    rustls::pki_types::{
+        CertificateDer as QuicCertificateDer, PrivateKeyDer as QuicPrivateKeyDer,
+        PrivatePkcs8KeyDer as QuicPrivatePkcs8KeyDer,
+    },
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SampleEchoServerConfig {
@@ -75,6 +86,7 @@ pub struct SampleEchoServerConfig {
     pub tls_addr: SocketAddr,
     pub http_addr: SocketAddr,
     pub https_addr: SocketAddr,
+    pub http3_addr: SocketAddr,
     pub websocket_addr: SocketAddr,
     pub websocket_tls_addr: SocketAddr,
     pub webrtc_addr: SocketAddr,
@@ -89,6 +101,7 @@ impl Default for SampleEchoServerConfig {
             tls_addr: "127.0.0.1:7003".parse().expect("valid tls addr"),
             http_addr: "127.0.0.1:7004".parse().expect("valid http addr"),
             https_addr: "127.0.0.1:7005".parse().expect("valid https addr"),
+            http3_addr: "127.0.0.1:7005".parse().expect("valid http3 addr"),
             websocket_addr: "127.0.0.1:7006".parse().expect("valid websocket addr"),
             websocket_tls_addr: "127.0.0.1:7007"
                 .parse()
@@ -106,6 +119,7 @@ pub struct SampleEchoAddresses {
     pub tls: Option<SocketAddr>,
     pub http: Option<SocketAddr>,
     pub https: Option<SocketAddr>,
+    pub http3: Option<SocketAddr>,
     pub websocket: Option<SocketAddr>,
     pub websocket_tls: Option<SocketAddr>,
     pub webrtc: Option<SocketAddr>,
@@ -141,10 +155,17 @@ pub async fn spawn_sample_echo_server(
     #[cfg(feature = "http")]
     tasks.push(http_task);
 
+    #[cfg(any(feature = "tls", feature = "http3"))]
+    let shared_identity = generate_self_signed_tls_identity()?;
     #[cfg(feature = "tls")]
-    let shared_stream_tls_config = generate_self_signed_tls_server_config(http1_alpn_protocols())?;
+    let shared_stream_tls_config =
+        generate_tls_server_config_from_identity(&shared_identity, http1_alpn_protocols())?;
     #[cfg(feature = "tls")]
-    let shared_https_tls_config = generate_sample_https_tls_server_config()?;
+    let shared_https_tls_config =
+        generate_sample_https_tls_server_config_from_identity(&shared_identity)?;
+    #[cfg(feature = "http3")]
+    let shared_http3_quic_config =
+        generate_http3_quic_server_config_from_identity(&shared_identity)?;
 
     #[cfg(feature = "tls")]
     let (tls, tls_task) =
@@ -158,6 +179,12 @@ pub async fn spawn_sample_echo_server(
         spawn_https_echo_server_with_config(config.https_addr, shared_https_tls_config).await?;
     #[cfg(feature = "tls")]
     tasks.push(https_task);
+
+    #[cfg(feature = "http3")]
+    let (http3, http3_task) =
+        spawn_http3_echo_server_with_config(config.http3_addr, shared_http3_quic_config).await?;
+    #[cfg(feature = "http3")]
+    tasks.push(http3_task);
 
     #[cfg(feature = "websocket")]
     let (websocket, websocket_task) = spawn_websocket_echo_server(config.websocket_addr).await?;
@@ -198,6 +225,10 @@ pub async fn spawn_sample_echo_server(
             https: Some(https),
             #[cfg(not(feature = "tls"))]
             https: None,
+            #[cfg(feature = "http3")]
+            http3: Some(http3),
+            #[cfg(not(feature = "http3"))]
+            http3: None,
             #[cfg(feature = "websocket")]
             websocket: Some(websocket),
             #[cfg(not(feature = "websocket"))]
@@ -396,6 +427,13 @@ pub async fn spawn_https_echo_server(addr: SocketAddr) -> io::Result<(SocketAddr
     spawn_https_echo_server_with_config(addr, tls_config).await
 }
 
+#[cfg(feature = "http3")]
+pub async fn spawn_http3_echo_server(addr: SocketAddr) -> io::Result<(SocketAddr, JoinHandle<()>)> {
+    let identity = generate_self_signed_tls_identity()?;
+    let quic_config = generate_http3_quic_server_config_from_identity(&identity)?;
+    spawn_http3_echo_server_with_config(addr, quic_config).await
+}
+
 #[cfg(feature = "tls")]
 async fn spawn_tls_echo_server_with_config(
     addr: SocketAddr,
@@ -478,6 +516,140 @@ async fn spawn_https_echo_server_with_config(
         }
     });
     Ok((local_addr, handle))
+}
+
+#[cfg(feature = "http3")]
+type Http3EchoSendStream = h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
+
+#[cfg(feature = "http3")]
+type Http3EchoRecvStream = h3::server::RequestStream<h3_quinn::RecvStream, Bytes>;
+
+#[cfg(feature = "http3")]
+async fn spawn_http3_echo_server_with_config(
+    addr: SocketAddr,
+    quic_config: quinn::ServerConfig,
+) -> io::Result<(SocketAddr, JoinHandle<()>)> {
+    let socket = UdpSocket::bind(addr).await?;
+    let local_addr = socket.local_addr()?;
+    let endpoint = Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(quic_config),
+        socket.into_std()?,
+        Arc::new(TokioRuntime),
+    )?;
+    let handle = tokio::spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            tokio::spawn(async move {
+                match incoming.await {
+                    Ok(connection) => serve_http3_echo_connection(connection).await,
+                    Err(err) => warn!("sample http3 echo QUIC accept failed: {err}"),
+                }
+            });
+        }
+    });
+    Ok((local_addr, handle))
+}
+
+#[cfg(feature = "http3")]
+async fn serve_http3_echo_connection(connection: quinn::Connection) {
+    let mut h3_conn = match h3::server::builder()
+        .build(h3_quinn::Connection::new(connection))
+        .await
+    {
+        Ok(connection) => connection,
+        Err(err) => {
+            warn!("sample http3 echo connection setup failed: {err}");
+            return;
+        }
+    };
+
+    loop {
+        match h3_conn.accept().await {
+            Ok(Some(resolver)) => {
+                tokio::spawn(async move {
+                    let (request, stream) = match resolver.resolve_request().await {
+                        Ok(value) => value,
+                        Err(err) => {
+                            warn!("sample http3 request resolution failed: {err}");
+                            return;
+                        }
+                    };
+                    if let Err(err) = handle_http3_echo_request(request, stream).await {
+                        warn!("sample http3 echo request failed: {err}");
+                    }
+                });
+            }
+            Ok(None) => break,
+            Err(err) => {
+                if !err.is_h3_no_error() {
+                    warn!("sample http3 echo connection closed with error: {err}");
+                }
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "http3")]
+async fn handle_http3_echo_request(
+    request: Request<()>,
+    stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+) -> Result<(), String> {
+    let (parts, _) = request.into_parts();
+    let path = parts.uri.path().to_string();
+    let method = parts.method;
+    let version = parts.version;
+    let (mut send_stream, recv_stream) = stream.split();
+    let body = read_http3_request_body(recv_stream).await?;
+    let response = build_echo_response_from_parts("http3", &method, version, &path, body);
+    write_http3_echo_response(&mut send_stream, response).await
+}
+
+#[cfg(feature = "http3")]
+async fn read_http3_request_body(mut stream: Http3EchoRecvStream) -> Result<Bytes, String> {
+    let mut body = Vec::new();
+    while let Some(mut chunk) = stream
+        .recv_data()
+        .await
+        .map_err(|err| format!("failed to read sample http3 request body: {err}"))?
+    {
+        body.extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref());
+    }
+    Ok(Bytes::from(body))
+}
+
+#[cfg(feature = "http3")]
+async fn write_http3_echo_response(
+    stream: &mut Http3EchoSendStream,
+    response: EchoResponse,
+) -> Result<(), String> {
+    let (parts, body) = response.into_parts();
+    let mut head = Response::builder().status(parts.status);
+    for (name, value) in &parts.headers {
+        head = head.header(name, value);
+    }
+    let head = head
+        .body(())
+        .map_err(|err| format!("failed to build sample http3 response head: {err}"))?;
+    stream
+        .send_response(head)
+        .await
+        .map_err(|err| format!("failed to send sample http3 response head: {err}"))?;
+    let body = body
+        .collect()
+        .await
+        .map_err(|err| format!("failed to collect sample http3 response body: {err}"))?
+        .to_bytes();
+    if !body.is_empty() {
+        stream
+            .send_data(body)
+            .await
+            .map_err(|err| format!("failed to send sample http3 response body: {err}"))?;
+    }
+    stream
+        .finish()
+        .await
+        .map_err(|err| format!("failed to finish sample http3 response: {err}"))
 }
 
 #[cfg(feature = "websocket")]
@@ -627,6 +799,37 @@ fn build_echo_response(status: StatusCode, protocol: &'static str, body: Bytes) 
 }
 
 #[cfg(feature = "http")]
+fn build_echo_response_from_parts(
+    protocol: &'static str,
+    method: &hyper::Method,
+    version: hyper::Version,
+    path: &str,
+    body: Bytes,
+) -> EchoResponse {
+    let echoed_body = if body.is_empty() {
+        Bytes::from(format!("echo:{protocol}:{}:{path}", method.as_str()))
+    } else {
+        body
+    };
+
+    let mut response = build_echo_response(StatusCode::OK, protocol, echoed_body.clone());
+    if let Ok(value) = HeaderValue::from_str(method.as_str()) {
+        response.headers_mut().insert("x-echo-method", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(path) {
+        response.headers_mut().insert("x-echo-path", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&echoed_body.len().to_string()) {
+        response.headers_mut().insert("x-echo-bytes", value);
+    }
+    response.headers_mut().insert(
+        "x-echo-http-version",
+        HeaderValue::from_static(http_version_label(version)),
+    );
+    response
+}
+
+#[cfg(feature = "http")]
 async fn handle_http_echo_request(
     protocol: &'static str,
     request: Request<Incoming>,
@@ -645,28 +848,9 @@ async fn handle_http_echo_request(
             ));
         }
     };
-
-    let echoed_body = if body.is_empty() {
-        Bytes::from(format!("echo:{protocol}:{}:{path}", method.as_str()))
-    } else {
-        body
-    };
-
-    let mut response = build_echo_response(StatusCode::OK, protocol, echoed_body.clone());
-    if let Ok(value) = HeaderValue::from_str(method.as_str()) {
-        response.headers_mut().insert("x-echo-method", value);
-    }
-    if let Ok(value) = HeaderValue::from_str(&path) {
-        response.headers_mut().insert("x-echo-path", value);
-    }
-    if let Ok(value) = HeaderValue::from_str(&echoed_body.len().to_string()) {
-        response.headers_mut().insert("x-echo-bytes", value);
-    }
-    response.headers_mut().insert(
-        "x-echo-http-version",
-        HeaderValue::from_static(http_version_label(version)),
-    );
-    Ok(response)
+    Ok(build_echo_response_from_parts(
+        protocol, &method, version, &path, body,
+    ))
 }
 
 #[cfg(feature = "http")]
@@ -681,7 +865,7 @@ fn http_version_label(version: hyper::Version) -> &'static str {
     }
 }
 
-#[cfg(any(feature = "tls", feature = "webrtc"))]
+#[cfg(any(feature = "tls", feature = "webrtc", feature = "http3"))]
 fn ensure_rustls_provider() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
@@ -693,32 +877,57 @@ fn ensure_rustls_provider() {
         {
             let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
         }
+        #[cfg(all(feature = "http3", not(feature = "tls"), not(feature = "webrtc")))]
+        {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        }
     });
 }
 
-#[cfg(feature = "tls")]
-fn generate_self_signed_tls_server_config(
-    alpn_protocols: Vec<Vec<u8>>,
-) -> io::Result<Arc<ServerConfig>> {
+#[cfg(any(feature = "tls", feature = "http3"))]
+struct SelfSignedTlsIdentity {
+    certificate_der: Vec<u8>,
+    private_key_der: Vec<u8>,
+}
+
+#[cfg(any(feature = "tls", feature = "http3"))]
+fn generate_self_signed_tls_identity() -> io::Result<SelfSignedTlsIdentity> {
     ensure_rustls_provider();
     let certificate =
         generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
             .map_err(|err| {
                 io::Error::other(format!("failed to generate self-signed cert: {err}"))
             })?;
-    let certificate_der = certificate
-        .serialize_der()
-        .map_err(|err| io::Error::other(format!("failed to serialize cert der: {err}")))?;
-    let private_key_der = certificate.serialize_private_key_der();
+    Ok(SelfSignedTlsIdentity {
+        certificate_der: certificate
+            .serialize_der()
+            .map_err(|err| io::Error::other(format!("failed to serialize cert der: {err}")))?,
+        private_key_der: certificate.serialize_private_key_der(),
+    })
+}
+
+#[cfg(feature = "tls")]
+fn generate_tls_server_config_from_identity(
+    identity: &SelfSignedTlsIdentity,
+    alpn_protocols: Vec<Vec<u8>>,
+) -> io::Result<Arc<ServerConfig>> {
     let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(
-            vec![CertificateDer::from(certificate_der)],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der)),
+            vec![CertificateDer::from(identity.certificate_der.clone())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key_der.clone())),
         )
         .map_err(|err| io::Error::other(format!("failed to build rustls config: {err}")))?;
     config.alpn_protocols = alpn_protocols;
     Ok(Arc::new(config))
+}
+
+#[cfg(feature = "tls")]
+fn generate_self_signed_tls_server_config(
+    alpn_protocols: Vec<Vec<u8>>,
+) -> io::Result<Arc<ServerConfig>> {
+    let identity = generate_self_signed_tls_identity()?;
+    generate_tls_server_config_from_identity(&identity, alpn_protocols)
 }
 
 #[cfg(feature = "tls")]
@@ -728,15 +937,39 @@ fn http1_alpn_protocols() -> Vec<Vec<u8>> {
 
 #[cfg(feature = "tls")]
 fn generate_sample_https_tls_server_config() -> io::Result<Arc<ServerConfig>> {
+    let identity = generate_self_signed_tls_identity()?;
+    generate_sample_https_tls_server_config_from_identity(&identity)
+}
+
+#[cfg(feature = "tls")]
+fn generate_sample_https_tls_server_config_from_identity(
+    identity: &SelfSignedTlsIdentity,
+) -> io::Result<Arc<ServerConfig>> {
     #[cfg(feature = "http2")]
     {
-        generate_self_signed_tls_server_config(vec![b"h2".to_vec(), b"http/1.1".to_vec()])
+        generate_tls_server_config_from_identity(
+            identity,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        )
     }
 
     #[cfg(not(feature = "http2"))]
     {
-        generate_self_signed_tls_server_config(http1_alpn_protocols())
+        generate_tls_server_config_from_identity(identity, http1_alpn_protocols())
     }
+}
+
+#[cfg(feature = "http3")]
+fn generate_http3_quic_server_config_from_identity(
+    identity: &SelfSignedTlsIdentity,
+) -> io::Result<quinn::ServerConfig> {
+    build_quic_server_config(
+        vec![QuicCertificateDer::from(identity.certificate_der.clone())],
+        QuicPrivateKeyDer::Pkcs8(QuicPrivatePkcs8KeyDer::from(
+            identity.private_key_der.clone(),
+        )),
+        vec![b"h3".to_vec()],
+    )
 }
 
 #[cfg(feature = "websocket")]

@@ -15,15 +15,18 @@ use vm::{Program, decode_program, validate_program};
 use crate::{
     HOST_FUNCTION_COUNT,
     abi_impl::{
-        RateLimiterStore, SharedHttpDownstreamSessions, SharedHttpUpstreamSessions,
-        SharedRateLimiter, SharedTlsSessionCache,
+        RateLimiterStore, SharedHttp3DownstreamSessions, SharedHttp3UpstreamSessions,
+        SharedHttpDownstreamSessions, SharedHttpUpstreamSessions, SharedRateLimiter,
+        SharedTlsSessionCache,
         http::{SharedUpstreamClientCache, new_shared_upstream_client_cache},
         new_shared_http_downstream_sessions, new_shared_http_upstream_sessions,
+        new_shared_http3_downstream_sessions, new_shared_http3_upstream_sessions,
         new_shared_tls_session_cache,
     },
     cache::{
-        DEFAULT_DOWNSTREAM_HTTP2_SESSION_STORE_CAPACITY, DEFAULT_TLS_SESSION_REUSE_STORE_CAPACITY,
-        DEFAULT_UPSTREAM_HTTP_REUSE_STORE_CAPACITY,
+        DEFAULT_DOWNSTREAM_HTTP2_SESSION_STORE_CAPACITY,
+        DEFAULT_DOWNSTREAM_HTTP3_SESSION_STORE_CAPACITY, DEFAULT_TLS_SESSION_REUSE_STORE_CAPACITY,
+        DEFAULT_UPSTREAM_HTTP_REUSE_STORE_CAPACITY, DEFAULT_UPSTREAM_HTTP3_REUSE_STORE_CAPACITY,
     },
     control_plane_rpc::EdgeTrafficSample,
     debug_session::{SharedDebugSession, debug_session_status, new_debug_session_store},
@@ -37,6 +40,8 @@ mod vm_runner;
 const MAX_LATENCY_SAMPLES: usize = 4096;
 pub const VM_EPOCH_TICK_INTERVAL_MS: u64 = 1;
 
+#[cfg(feature = "http3")]
+pub use http_plane::serve_http3_proxy;
 pub(crate) use http_plane::{
     auto_promote_downstream_listener_goal_into_http_request,
     maybe_auto_promote_downstream_listener_goal_into_http_request,
@@ -114,6 +119,8 @@ pub struct RuntimeStoreLimits {
     pub tls_session_reuse_entries: usize,
     pub upstream_http_reuse_entries: usize,
     pub downstream_http2_session_entries: usize,
+    pub upstream_http3_reuse_entries: usize,
+    pub downstream_http3_session_entries: usize,
 }
 
 impl Default for RuntimeStoreLimits {
@@ -122,6 +129,8 @@ impl Default for RuntimeStoreLimits {
             tls_session_reuse_entries: DEFAULT_TLS_SESSION_REUSE_STORE_CAPACITY,
             upstream_http_reuse_entries: DEFAULT_UPSTREAM_HTTP_REUSE_STORE_CAPACITY,
             downstream_http2_session_entries: DEFAULT_DOWNSTREAM_HTTP2_SESSION_STORE_CAPACITY,
+            upstream_http3_reuse_entries: DEFAULT_UPSTREAM_HTTP3_REUSE_STORE_CAPACITY,
+            downstream_http3_session_entries: DEFAULT_DOWNSTREAM_HTTP3_SESSION_STORE_CAPACITY,
         }
     }
 }
@@ -134,7 +143,9 @@ pub struct SharedState {
     pub(crate) upstream_client_cache: SharedUpstreamClientCache,
     pub(crate) tls_session_cache: SharedTlsSessionCache,
     pub(crate) upstream_http_sessions: SharedHttpUpstreamSessions,
+    pub(crate) upstream_http3_sessions: SharedHttp3UpstreamSessions,
     pub(crate) downstream_http2_sessions: SharedHttpDownstreamSessions,
+    pub(crate) downstream_http3_sessions: SharedHttp3DownstreamSessions,
     pub rate_limiter: SharedRateLimiter,
     pub debug_session: SharedDebugSession,
     pub vm_execution: VmExecutionConfig,
@@ -207,8 +218,14 @@ impl SharedState {
             upstream_http_sessions: new_shared_http_upstream_sessions(
                 store_limits.upstream_http_reuse_entries,
             ),
+            upstream_http3_sessions: new_shared_http3_upstream_sessions(
+                store_limits.upstream_http3_reuse_entries,
+            ),
             downstream_http2_sessions: new_shared_http_downstream_sessions(
                 store_limits.downstream_http2_session_entries,
+            ),
+            downstream_http3_sessions: new_shared_http3_downstream_sessions(
+                store_limits.downstream_http3_session_entries,
             ),
             rate_limiter: Arc::new(std::sync::Mutex::new(RateLimiterStore::new())),
             debug_session: new_debug_session_store(),
@@ -643,6 +660,16 @@ mod tests {
             .lock()
             .expect("http downstream session store lock poisoned")
             .capacity();
+        let upstream_http3_capacity = state
+            .upstream_http3_sessions
+            .lock()
+            .expect("http3 upstream session store lock poisoned")
+            .capacity();
+        let downstream_http3_capacity = state
+            .downstream_http3_sessions
+            .lock()
+            .expect("http3 downstream session store lock poisoned")
+            .capacity();
 
         let defaults = RuntimeStoreLimits::default();
         assert_eq!(tls_capacity, defaults.tls_session_reuse_entries);
@@ -658,6 +685,18 @@ mod tests {
             downstream_capacity,
             defaults.downstream_http2_session_entries
         );
+        assert_eq!(
+            upstream_http3_capacity,
+            if cfg!(feature = "http3") {
+                defaults.upstream_http3_reuse_entries
+            } else {
+                0
+            }
+        );
+        assert_eq!(
+            downstream_http3_capacity,
+            defaults.downstream_http3_session_entries
+        );
     }
 
     #[test]
@@ -668,6 +707,8 @@ mod tests {
                 tls_session_reuse_entries: 8,
                 upstream_http_reuse_entries: 16,
                 downstream_http2_session_entries: 4,
+                upstream_http3_reuse_entries: 6,
+                downstream_http3_session_entries: 5,
             },
         );
 
@@ -694,6 +735,22 @@ mod tests {
                 .expect("http downstream session store lock poisoned")
                 .capacity(),
             4
+        );
+        assert_eq!(
+            state
+                .upstream_http3_sessions
+                .lock()
+                .expect("http3 upstream session store lock poisoned")
+                .capacity(),
+            if cfg!(feature = "http3") { 6 } else { 0 }
+        );
+        assert_eq!(
+            state
+                .downstream_http3_sessions
+                .lock()
+                .expect("http3 downstream session store lock poisoned")
+                .capacity(),
+            5
         );
     }
 }

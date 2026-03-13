@@ -1013,7 +1013,7 @@ async fn upstream_http2_response_version_is_exposed_to_vm_programs() {
         use tls;
 
         let upstream = http::exchange::default_upstream();
-        http::exchange::set_target(upstream, "https://localhost:{}/fast");
+        http::exchange::set_target(upstream, "https://127.0.0.1:{}/fast");
         let session = tls::session::from_socket(upstream);
         tls::session::set_verify(session, false);
         http::response::set_header(
@@ -1040,6 +1040,72 @@ async fn upstream_http2_response_version_is_exposed_to_vm_programs() {
             .get("x-upstream-version")
             .and_then(|value| value.to_str().ok()),
         Some("2")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "fast-body"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[cfg(all(feature = "tls", feature = "http3"))]
+#[tokio::test]
+async fn upstream_http3_response_version_is_exposed_to_vm_programs() {
+    let (upstream_addr, _connection_count, upstream_handle) =
+        spawn_https_http3_multiplex_upstream().await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) =
+        spawn_proxy_with_state(SharedState::new(1024 * 1024)).await;
+    let client = reqwest::Client::new();
+
+    let source = format!(
+        r#"
+        use http;
+        use tls;
+
+        let upstream = http::exchange::default_upstream();
+        http::exchange::set_target(upstream, "https://127.0.0.1:{}/fast");
+        http::exchange::set_version(upstream, "3");
+        let session = tls::session::from_socket(upstream);
+        tls::session::set_verify(session, false);
+
+        http::exchange::send(upstream);
+        let body = http::exchange::get_body(upstream);
+        http::response::set_header(
+            "x-upstream-version",
+            http::exchange::get_http_version(upstream)
+        );
+        http::response::set_header("x-upstream-alpn", tls::session::get_alpn(session));
+        http::response::set_body(body);
+    "#,
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/http3-default"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream-alpn")
+            .and_then(|value| value.to_str().ok()),
+        Some("h3")
     );
     assert_eq!(
         response.text().await.expect("body should read"),
@@ -1129,6 +1195,68 @@ async fn sample_downstream_http2_program_handles_cleartext_h2_requests() {
     assert_eq!(body.as_ref(), b"h2:/downstream-sample?mode=http2|payload-2");
 
     connection_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[cfg(feature = "http3")]
+#[tokio::test]
+async fn sample_downstream_http3_program_handles_http3_requests() {
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_http3_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_downstream_http3_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = send_http3_request(
+        &format!(
+            "https://127.0.0.1:{}/downstream-sample?mode=http3",
+            data_addr.port()
+        ),
+        "POST",
+        &[],
+        b"payload-3",
+    )
+    .await;
+    assert_eq!(response.status, axum::http::StatusCode::CREATED);
+    assert_eq!(response.version, axum::http::Version::HTTP_3);
+    assert_eq!(
+        response
+            .headers
+            .get("x-request-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("x-request-method")
+            .and_then(|value| value.to_str().ok()),
+        Some("POST")
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("x-request-host")
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("127.0.0.1:{}", data_addr.port()).as_str())
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("x-request-carrier")
+            .and_then(|value| value.to_str().ok()),
+        Some("http3")
+    );
+    assert_eq!(
+        response.body.as_ref(),
+        b"h3:/downstream-sample?mode=http3|payload-3"
+    );
+
     data_handle.abort();
     admin_handle.abort();
 }
@@ -1245,6 +1373,118 @@ async fn sample_upstream_http2_program_demonstrates_multiplex_and_reuse() {
     admin_handle.abort();
 }
 
+#[cfg(all(feature = "tls", feature = "http3"))]
+#[tokio::test]
+async fn sample_upstream_http3_program_demonstrates_multiplex_and_reuse() {
+    let (upstream_addr, connection_count, upstream_handle) =
+        spawn_https_http3_sample_upstream().await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) =
+        spawn_proxy_with_state(SharedState::new(1024 * 1024)).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_upstream_http3_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/upstream-http3-sample"))
+        .header(
+            "x-h3-origin",
+            format!("https://127.0.0.1:{}", upstream_addr.port()),
+        )
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-multiplex-fast-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-multiplex-slow-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-multiplex-fast-alpn")
+            .and_then(|value| value.to_str().ok()),
+        Some("h3")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-multiplex-slow-alpn")
+            .and_then(|value| value.to_str().ok()),
+        Some("h3")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-multiplex-fast-eof")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-multiplex-slow-eof")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-reuse-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-reuse-alpn")
+            .and_then(|value| value.to_str().ok()),
+        Some("h3")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-reuse-eof")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-sample-pattern")
+            .and_then(|value| value.to_str().ok()),
+        Some("two-requests-multiplex-then-reuse")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "multiplex:PUT|/fast|fast-request|beta|POST|/slow|slow-request|alpha;reuse:PATCH|/reuse|reuse-request|gamma"
+    );
+    assert_eq!(
+        connection_count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "sample should multiplex and reuse one upstream http3 connection",
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
 #[cfg(all(feature = "tls", feature = "http2"))]
 #[tokio::test]
 async fn dynamic_exchanges_can_multiplex_over_single_http2_connection() {
@@ -1309,6 +1549,79 @@ async fn dynamic_exchanges_can_multiplex_over_single_http2_connection() {
         connection_count.load(std::sync::atomic::Ordering::Relaxed),
         1,
         "http2 exchanges should share one upstream connection",
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[cfg(all(feature = "tls", feature = "http3"))]
+#[tokio::test]
+async fn dynamic_exchanges_can_multiplex_over_single_http3_connection() {
+    let (upstream_addr, connection_count, upstream_handle) =
+        spawn_https_http3_multiplex_upstream().await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) =
+        spawn_proxy_with_state(SharedState::new(1024 * 1024)).await;
+    let client = reqwest::Client::new();
+
+    let source = format!(
+        r#"
+        use http;
+        use tls;
+
+        let first = http::exchange::new();
+        let second = http::exchange::new();
+
+        http::exchange::set_target(first, "https://127.0.0.1:{}/slow");
+        http::exchange::set_version(first, "3");
+        http::exchange::set_target(second, "https://127.0.0.1:{}/fast");
+        http::exchange::set_version(second, "3");
+        tls::session::set_verify(tls::session::from_socket(first), false);
+        tls::session::set_verify(tls::session::from_socket(second), false);
+
+        http::exchange::send(first);
+        http::response::set_header("x-first-version", http::exchange::get_http_version(first));
+        http::exchange::send(second);
+        http::response::set_header("x-second-version", http::exchange::get_http_version(second));
+        http::response::set_body(http::exchange::get_body(second) + "|" + http::exchange::get_body(first));
+    "#,
+        upstream_addr.port(),
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/http3-multiplex"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-first-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-second-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "fast-body|slow-body"
+    );
+    assert_eq!(
+        connection_count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "http3 exchanges should share one upstream connection",
     );
 
     upstream_handle.abort();
@@ -1415,6 +1728,107 @@ async fn dynamic_exchange_body_chunks_can_be_read_independently_over_http2() {
     admin_handle.abort();
 }
 
+#[cfg(all(feature = "tls", feature = "http3"))]
+#[tokio::test]
+async fn dynamic_exchange_body_chunks_can_be_read_independently_over_http3() {
+    let (upstream_addr, connection_count, upstream_handle) =
+        spawn_https_http3_multiplex_upstream().await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) =
+        spawn_proxy_with_state(SharedState::new(1024 * 1024)).await;
+    let client = reqwest::Client::new();
+
+    let source = format!(
+        r#"
+        use http;
+        use tls;
+
+        let slow = http::exchange::new();
+        let fast = http::exchange::new();
+
+        http::exchange::set_target(slow, "https://127.0.0.1:{}/slow");
+        http::exchange::set_version(slow, "3");
+        http::exchange::set_target(fast, "https://127.0.0.1:{}/fast");
+        http::exchange::set_version(fast, "3");
+        tls::session::set_verify(tls::session::from_socket(slow), false);
+        tls::session::set_verify(tls::session::from_socket(fast), false);
+
+        http::exchange::send(slow);
+        http::exchange::send(fast);
+
+        let fast_head = http::exchange::body::next_chunk(fast, 4);
+        let slow_head = http::exchange::body::next_chunk(slow, 4);
+        let fast_tail = http::exchange::body::next_chunk(fast, 32);
+        let slow_tail = http::exchange::body::next_chunk(slow, 32);
+
+        http::response::set_header("x-fast-version", http::exchange::get_http_version(fast));
+        http::response::set_header("x-slow-version", http::exchange::get_http_version(slow));
+        http::response::set_header(
+            "x-fast-eof",
+            if http::exchange::body::eof(fast) => {{ "true" }} else => {{ "false" }}
+        );
+        http::response::set_header(
+            "x-slow-eof",
+            if http::exchange::body::eof(slow) => {{ "true" }} else => {{ "false" }}
+        );
+        http::response::set_body(fast_head + "|" + slow_head + "|" + fast_tail + "|" + slow_tail);
+    "#,
+        upstream_addr.port(),
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/http3-chunks"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-fast-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-slow-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-fast-eof")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-slow-eof")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "fast|slow|-body|-body"
+    );
+    assert_eq!(
+        connection_count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "http3 chunk reads should stay on one upstream connection",
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
 #[tokio::test]
 async fn downstream_http2_requests_expose_version_metadata_to_vm_programs() {
     let state = SharedState::new(1024 * 1024);
@@ -1458,8 +1872,46 @@ async fn downstream_http2_requests_expose_version_metadata_to_vm_programs() {
     );
 }
 
+#[cfg(feature = "http3")]
 #[tokio::test]
-async fn same_vm_program_handles_downstream_http11_and_http2_requests() {
+async fn downstream_http3_requests_expose_version_metadata_to_vm_programs() {
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_http3_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+
+    let source = r#"
+        use http;
+
+        http::response::set_header("x-request-version", http::request::get_http_version());
+        http::response::set_body("ok");
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = send_http3_request(
+        &format!("https://127.0.0.1:{}/http3-downstream", data_addr.port()),
+        "GET",
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(response.status, axum::http::StatusCode::OK);
+    assert_eq!(response.version, axum::http::Version::HTTP_3);
+    assert_eq!(
+        response
+            .headers
+            .get("x-request-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    assert_eq!(response.body.as_ref(), b"ok");
+
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn same_vm_program_handles_downstream_http11_http2_and_http3_requests() {
     let state = SharedState::new(1024 * 1024);
     let source = r#"
         use http;
@@ -1519,7 +1971,7 @@ async fn same_vm_program_handles_downstream_http11_and_http2_requests() {
         b"/same-program?mode=http11|payload-11"
     );
 
-    let http2_response = build_http_proxy_app(state)
+    let http2_response = build_http_proxy_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -1560,6 +2012,51 @@ async fn same_vm_program_handles_downstream_http11_and_http2_requests() {
             .as_ref(),
         b"/same-program?mode=http2|payload-2"
     );
+
+    #[cfg(feature = "http3")]
+    {
+        let http3_response = build_http_proxy_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/same-program?mode=http3")
+                    .version(axum::http::Version::HTTP_3)
+                    .header("host", "app.example.test")
+                    .body(Body::from("payload-3"))
+                    .expect("http3 request should build"),
+            )
+            .await
+            .expect("http3 request should complete");
+        assert_eq!(http3_response.status(), StatusCode::CREATED);
+        assert_eq!(
+            http3_response
+                .headers()
+                .get("x-request-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("3")
+        );
+        assert_eq!(
+            http3_response
+                .headers()
+                .get("x-method")
+                .and_then(|value| value.to_str().ok()),
+            Some("POST")
+        );
+        assert_eq!(
+            http3_response
+                .headers()
+                .get("x-host")
+                .and_then(|value| value.to_str().ok()),
+            Some("app.example.test")
+        );
+        assert_eq!(
+            to_bytes(http3_response.into_body(), usize::MAX)
+                .await
+                .expect("http3 body should read")
+                .as_ref(),
+            b"/same-program?mode=http3|payload-3"
+        );
+    }
 }
 
 #[cfg(feature = "http2")]

@@ -1,4 +1,7 @@
-#![cfg_attr(not(any(feature = "tls", feature = "http2")), allow(dead_code))]
+#![cfg_attr(
+    not(any(feature = "tls", feature = "http2", feature = "http3")),
+    allow(dead_code)
+)]
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -8,6 +11,8 @@ use std::{
 pub(crate) const DEFAULT_TLS_SESSION_REUSE_STORE_CAPACITY: usize = 256;
 pub(crate) const DEFAULT_UPSTREAM_HTTP_REUSE_STORE_CAPACITY: usize = 256;
 pub(crate) const DEFAULT_DOWNSTREAM_HTTP2_SESSION_STORE_CAPACITY: usize = 256;
+pub(crate) const DEFAULT_UPSTREAM_HTTP3_REUSE_STORE_CAPACITY: usize = 256;
+pub(crate) const DEFAULT_DOWNSTREAM_HTTP3_SESSION_STORE_CAPACITY: usize = 256;
 
 #[derive(Clone, Debug)]
 pub(crate) struct BoundedLruStore<K, V>

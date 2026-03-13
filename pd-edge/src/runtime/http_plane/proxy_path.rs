@@ -15,18 +15,28 @@ use axum::{
     middleware,
     routing::any,
 };
+#[cfg(feature = "http3")]
+use futures_util::stream::try_unfold;
+#[cfg(feature = "http3")]
+use http_body_util::BodyExt;
+#[cfg(feature = "http3")]
+use hyper::body::Buf;
 use hyper::body::Incoming;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as AutoBuilder,
 };
 use tokio::net::TcpListener;
+#[cfg(feature = "http3")]
+use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 #[cfg(feature = "tls")]
 use tokio_rustls::{
     LazyConfigAcceptor,
     rustls::{self, ServerConfig},
 };
+#[cfg(feature = "http3")]
+use tower::Service;
 use tower::ServiceExt;
 use tracing::warn;
 use uuid::Uuid;
@@ -37,6 +47,10 @@ use super::super::SharedState;
 use super::super::transport_plane::serve_transport_connection_with_listener_goal;
 use super::super::vm_runner::{VmDebugInvocation, VmExecutionError, execute_vm_with_context};
 use super::shared::access_log_middleware;
+#[cfg(feature = "http3")]
+use crate::abi_impl::{
+    DownstreamHttp3ConnectionTracker, Http3DownstreamStreamAttachment, build_quic_server_config,
+};
 use crate::{
     abi_impl::http::{
         DownstreamConnectionMetadata, DownstreamHttpListenerGoal, InlineDownstreamHttpResponse,
@@ -50,6 +64,12 @@ use crate::{
     },
     debug_session::{request_uses_blocking_debugger, request_will_attach_debugger},
     logging::category_program,
+};
+#[cfg(feature = "http3")]
+use {
+    axum::body::Bytes,
+    rcgen::generate_simple_self_signed,
+    rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
 };
 
 pub fn build_http_proxy_app(state: SharedState) -> Router {
@@ -112,6 +132,200 @@ async fn serve_http_connection<S>(
         .serve_connection_with_upgrades(io, service)
         .await;
     tracker.finish_connection(result.err().map(|err| err.to_string()));
+}
+
+#[cfg(feature = "http3")]
+fn generate_http3_proxy_quic_server_config() -> std::io::Result<quinn::ServerConfig> {
+    let certificate =
+        generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .map_err(|err| {
+                std::io::Error::other(format!(
+                    "failed to generate self-signed http3 proxy cert: {err}"
+                ))
+            })?;
+    let certificate_der = certificate
+        .serialize_der()
+        .map_err(|err| std::io::Error::other(format!("failed to serialize cert der: {err}")))?;
+    let private_key_der = certificate.serialize_private_key_der();
+    build_quic_server_config(
+        vec![CertificateDer::from(certificate_der)],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der)),
+        vec![b"h3".to_vec()],
+    )
+}
+
+#[cfg(feature = "http3")]
+type Http3ServerSendStream = h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
+
+#[cfg(feature = "http3")]
+type Http3ServerRecvStream = h3::server::RequestStream<h3_quinn::RecvStream, Bytes>;
+
+#[cfg(feature = "http3")]
+fn body_from_http3_request_stream(stream: Http3ServerRecvStream) -> Body {
+    Body::from_stream(try_unfold(stream, |mut stream| async move {
+        match stream.recv_data().await {
+            Ok(Some(mut chunk)) => {
+                Ok::<_, std::io::Error>(Some((chunk.copy_to_bytes(chunk.remaining()), stream)))
+            }
+            Ok(None) => Ok(None),
+            Err(err) => Err(std::io::Error::other(format!(
+                "failed to read downstream http3 request body: {err}",
+            ))),
+        }
+    }))
+}
+
+#[cfg(feature = "http3")]
+async fn write_http3_response(
+    stream: &mut Http3ServerSendStream,
+    response: Response<Body>,
+) -> Result<(), String> {
+    let (parts, mut body) = response.into_parts();
+    let mut head = axum::http::Response::builder().status(parts.status);
+    for (name, value) in &parts.headers {
+        head = head.header(name, value);
+    }
+    let head = head
+        .body(())
+        .map_err(|err| format!("failed to build downstream http3 response: {err}"))?;
+    stream
+        .send_response(head)
+        .await
+        .map_err(|err| format!("failed to send downstream http3 response head: {err}"))?;
+
+    while let Some(frame) = body.frame().await {
+        let frame =
+            frame.map_err(|err| format!("failed to read downstream response body frame: {err}"))?;
+        match frame.into_data() {
+            Ok(bytes) => {
+                if !bytes.is_empty() {
+                    stream.send_data(bytes).await.map_err(|err| {
+                        format!("failed to send downstream http3 response body: {err}")
+                    })?;
+                }
+            }
+            Err(frame) => {
+                if let Ok(trailers) = frame.into_trailers() {
+                    stream.send_trailers(trailers).await.map_err(|err| {
+                        format!("failed to send downstream http3 response trailers: {err}")
+                    })?;
+                }
+            }
+        }
+    }
+
+    stream
+        .finish()
+        .await
+        .map_err(|err| format!("failed to finalize downstream http3 response: {err}"))
+}
+
+#[cfg(feature = "http3")]
+async fn serve_http3_connection(
+    app: Router,
+    state: SharedState,
+    local_addr: SocketAddr,
+    connection: quinn::Connection,
+) {
+    let peer_addr = connection.remote_address();
+    let connection_metadata = DownstreamConnectionMetadata {
+        local_addr,
+        peer_addr,
+        secure: true,
+    };
+    let tracker = DownstreamHttp3ConnectionTracker::new(
+        state.downstream_http3_sessions.clone(),
+        peer_addr.to_string(),
+    );
+    let mut h3_conn = match h3::server::builder()
+        .build(h3_quinn::Connection::new(connection))
+        .await
+    {
+        Ok(connection) => connection,
+        Err(err) => {
+            tracker.finish_connection(Some(err.to_string()));
+            return;
+        }
+    };
+
+    loop {
+        match h3_conn.accept().await {
+            Ok(Some(resolver)) => {
+                let mut app = app.clone();
+                let tracker = tracker.clone();
+                let connection_metadata = connection_metadata.clone();
+                tokio::spawn(async move {
+                    let (request, stream) = match resolver.resolve_request().await {
+                        Ok(value) => value,
+                        Err(err) => {
+                            warn!(
+                                "{} downstream http3 request resolution failed: {err}",
+                                category_program()
+                            );
+                            return;
+                        }
+                    };
+                    let stream_id = stream.id().into_inner();
+                    let attachment = tracker.observe_request(request.uri().path(), stream_id);
+                    let (parts, _) = request.into_parts();
+                    let (mut send_stream, recv_stream) = stream.split();
+                    let mut request =
+                        Request::from_parts(parts, body_from_http3_request_stream(recv_stream));
+                    if let Some(ref attachment) = attachment {
+                        request.extensions_mut().insert(attachment.clone());
+                    }
+                    request.extensions_mut().insert(connection_metadata);
+
+                    match app.call(request).await {
+                        Ok(response) => {
+                            tracker.note_response_head(attachment.as_ref());
+                            match write_http3_response(&mut send_stream, response).await {
+                                Ok(()) => tracker.finish_request(attachment.as_ref(), None),
+                                Err(err) => {
+                                    tracker.finish_request(attachment.as_ref(), Some(err.clone()));
+                                    warn!(
+                                        "{} downstream http3 response write failed: {err}",
+                                        category_program()
+                                    );
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            let message = format!("data plane request handling failed: {err}");
+                            tracker.finish_request(attachment.as_ref(), Some(message.clone()));
+                            let _ = write_http3_response(
+                                &mut send_stream,
+                                text_response(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "internal server error",
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                });
+            }
+            Ok(None) => {
+                tracker.finish_connection(None);
+                break;
+            }
+            Err(err) => {
+                let error = if err.is_h3_no_error() {
+                    None
+                } else {
+                    Some(err.to_string())
+                };
+                tracker.finish_connection(error.clone());
+                if let Some(message) = error {
+                    warn!(
+                        "{} downstream http3 connection closed with error: {message}",
+                        category_program()
+                    );
+                }
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(feature = "tls")]
@@ -543,7 +757,37 @@ pub async fn serve_https_proxy(listener: TcpListener, state: SharedState) -> std
     super::super::transport_plane::serve_transport_proxy(listener, state).await
 }
 
-async fn data_plane_handler(State(state): State<SharedState>, request: Request) -> Response<Body> {
+#[cfg(feature = "http3")]
+pub async fn serve_http3_proxy(listener: UdpSocket, state: SharedState) -> std::io::Result<()> {
+    let local_addr = listener.local_addr()?;
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(generate_http3_proxy_quic_server_config()?),
+        listener.into_std()?,
+        Arc::new(quinn::TokioRuntime),
+    )?;
+    let app = build_http_proxy_app(state.clone());
+
+    while let Some(incoming) = endpoint.accept().await {
+        let app = app.clone();
+        let state = state.clone();
+        tokio::spawn(async move {
+            match incoming.await {
+                Ok(connection) => serve_http3_connection(app, state, local_addr, connection).await,
+                Err(err) => {
+                    warn!(
+                        "{} downstream http3 QUIC accept failed: {err}",
+                        category_program()
+                    );
+                }
+            }
+        });
+    }
+
+    Ok(())
+}
+
+async fn handle_data_plane_request(state: SharedState, request: Request) -> Response<Body> {
     let started = Instant::now();
 
     state.record_data_plane_request();
@@ -567,6 +811,11 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
     let downstream_http2_attachment = parts
         .extensions
         .get::<Http2DownstreamStreamAttachment>()
+        .cloned();
+    #[cfg(feature = "http3")]
+    let downstream_http3_attachment = parts
+        .extensions
+        .get::<Http3DownstreamStreamAttachment>()
         .cloned();
     let connection_metadata = parts
         .extensions
@@ -603,9 +852,15 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
         vm_context.attach_upstream_client_cache(state.upstream_client_cache.clone());
         vm_context.attach_tls_session_cache(state.tls_session_cache.clone());
         vm_context.attach_upstream_http_sessions(state.upstream_http_sessions.clone());
+        vm_context.attach_upstream_http3_sessions(state.upstream_http3_sessions.clone());
         vm_context.attach_downstream_http_sessions(state.downstream_http2_sessions.clone());
+        vm_context.attach_downstream_http3_sessions(state.downstream_http3_sessions.clone());
         if let Some(attachment) = &downstream_http2_attachment {
             vm_context.attach_downstream_http2_stream(attachment);
+        }
+        #[cfg(feature = "http3")]
+        if let Some(attachment) = &downstream_http3_attachment {
+            vm_context.attach_downstream_http3_stream(attachment);
         }
         if let Some(upgrade) = downstream_http1_upgrade {
             vm_context.attach_downstream_http1_upgrade(upgrade);
@@ -667,6 +922,10 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
         });
     }
     finalize_data_plane_response(&state, started, response, upstream_latency_ms)
+}
+
+async fn data_plane_handler(State(state): State<SharedState>, request: Request) -> Response<Body> {
+    handle_data_plane_request(state, request).await
 }
 
 fn finalize_data_plane_response(

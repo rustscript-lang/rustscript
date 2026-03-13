@@ -10,9 +10,9 @@ use axum::http::HeaderMap;
 use edge::{
     ActiveControlPlaneConfig, ProxyVmContext, RuntimeStoreLimits, SharedProxyVmContext,
     SharedState, SharedVmAsyncOps, VM_EPOCH_TICK_INTERVAL_MS, VmAsyncOpBridge, VmExecutionConfig,
-    VmExecutionMode, VmInterruptConfig, apply_program_from_bytes, compile_edge_source_file,
-    enter_edge_host_context, init_logging, new_shared_vm_async_ops, register_host_module,
-    spawn_active_control_plane_client,
+    VmExecutionMode, VmInterruptConfig, apply_program_from_bytes, binary_version_report,
+    binary_version_text, compile_edge_source_file, enabled_feature_line, enter_edge_host_context,
+    init_logging, new_shared_vm_async_ops, register_host_module, spawn_active_control_plane_client,
 };
 use tokio::{
     runtime::Handle,
@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Ok(CliAction::Version) => {
-            println!("{}", binary_version_text());
+            println!("{}", binary_version_report(env!("CARGO_BIN_NAME")));
             return Ok(());
         }
         Err(err) => {
@@ -46,7 +46,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     init_logging()?;
-    info!("{}", binary_version_text());
+    info!("{}", binary_version_text(env!("CARGO_BIN_NAME")));
+    info!("{}", enabled_feature_line());
 
     let max_program_bytes = cli.max_program_bytes.unwrap_or(1024 * 1024);
     let vm_execution = VmExecutionConfig {
@@ -124,6 +125,8 @@ struct CliArgs {
     tls_session_reuse_entries: Option<usize>,
     upstream_http_reuse_entries: Option<usize>,
     downstream_http2_session_entries: Option<usize>,
+    upstream_http3_reuse_entries: Option<usize>,
+    downstream_http3_session_entries: Option<usize>,
     vm_fuel: Option<u64>,
     vm_fuel_check_interval: Option<u32>,
     vm_epoch_deadline: Option<u64>,
@@ -191,6 +194,21 @@ where
                 cli.downstream_http2_session_entries =
                     Some(value.parse::<usize>().map_err(|_| {
                         format!("invalid --downstream-http2-session-entries: {value}")
+                    })?);
+            }
+            "--upstream-http3-reuse-entries" => {
+                let value = next_arg_value("--upstream-http3-reuse-entries", &mut args)?;
+                cli.upstream_http3_reuse_entries = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid --upstream-http3-reuse-entries: {value}"))?,
+                );
+            }
+            "--downstream-http3-session-entries" => {
+                let value = next_arg_value("--downstream-http3-session-entries", &mut args)?;
+                cli.downstream_http3_session_entries =
+                    Some(value.parse::<usize>().map_err(|_| {
+                        format!("invalid --downstream-http3-session-entries: {value}")
                     })?);
             }
             "--vm-fuel" => {
@@ -307,6 +325,8 @@ fn print_cli_help() {
             "  --tls-session-reuse-entries <N>           TLS session reuse store cap (default: {})\n",
             "  --upstream-http-reuse-entries <N>         Upstream HTTP reuse store cap (default: {})\n",
             "  --downstream-http2-session-entries <N>    Downstream HTTP/2 session tracking cap (default: {})\n",
+            "  --upstream-http3-reuse-entries <N>        Upstream HTTP/3 reuse store cap (default: {})\n",
+            "  --downstream-http3-session-entries <N>    Downstream HTTP/3 session tracking cap (default: {})\n",
             "  --vm-fuel <UNITS>                         Enable cooperative VM fuel slices per run\n",
             "  --vm-fuel-check-interval <OPS>            Fuel check interval when --vm-fuel is enabled (default: 1)\n",
             "  --vm-epoch-deadline <TICKS>               Enable cooperative VM epoch slices per run (1 tick = 1ms wall clock)\n",
@@ -317,7 +337,7 @@ fn print_cli_help() {
             "  --edge-id-path <PATH>                     Edge UUID file path (default .pd-edge/edge-id)\n",
             "  --control-plane-poll-interval-ms <MS>     Poll interval for active control-plane client\n",
             "  --control-plane-rpc-timeout-ms <MS>       RPC timeout for active control-plane client\n",
-            "  -V, --version                             Show version with git metadata\n",
+            "  -V, --version                             Show version, git metadata, and enabled features\n",
             "  -h, --help                                Show this help\n\n",
             "Console commands:\n",
             "  .help                                     Show console commands\n",
@@ -329,6 +349,8 @@ fn print_cli_help() {
         defaults.tls_session_reuse_entries,
         defaults.upstream_http_reuse_entries,
         defaults.downstream_http2_session_entries,
+        defaults.upstream_http3_reuse_entries,
+        defaults.downstream_http3_session_entries,
     );
 }
 
@@ -343,6 +365,12 @@ impl CliArgs {
         }
         if let Some(value) = self.downstream_http2_session_entries {
             limits.downstream_http2_session_entries = value;
+        }
+        if let Some(value) = self.upstream_http3_reuse_entries {
+            limits.upstream_http3_reuse_entries = value;
+        }
+        if let Some(value) = self.downstream_http3_session_entries {
+            limits.downstream_http3_session_entries = value;
         }
         limits
     }
@@ -361,20 +389,6 @@ impl CliArgs {
             });
         }
         Ok(VmInterruptConfig::None)
-    }
-}
-
-fn binary_version_text() -> String {
-    let binary = env!("CARGO_BIN_NAME");
-    let git_tag = option_env!("PD_BUILD_GIT_TAG").unwrap_or("untagged");
-    let git_commit = option_env!("PD_BUILD_GIT_COMMIT").unwrap_or("unknown");
-    let git_dirty = option_env!("PD_BUILD_GIT_DIRTY").unwrap_or("false");
-    let dirty = matches!(git_dirty, "true" | "1" | "yes" | "dirty");
-
-    if dirty {
-        format!("{binary} {git_tag} (dirty commit: {git_commit})")
-    } else {
-        format!("{binary} {git_tag}")
     }
 }
 
@@ -958,6 +972,8 @@ mod tests {
                 tls_session_reuse_entries: Some(12),
                 upstream_http_reuse_entries: Some(18),
                 downstream_http2_session_entries: Some(0),
+                upstream_http3_reuse_entries: None,
+                downstream_http3_session_entries: None,
                 vm_fuel: None,
                 vm_fuel_check_interval: None,
                 vm_epoch_deadline: None,
@@ -1011,6 +1027,8 @@ mod tests {
         let cli = CliArgs {
             tls_session_reuse_entries: Some(4),
             downstream_http2_session_entries: Some(0),
+            upstream_http3_reuse_entries: Some(2),
+            downstream_http3_session_entries: Some(3),
             ..CliArgs::default()
         };
 
@@ -1022,6 +1040,8 @@ mod tests {
             RuntimeStoreLimits::default().upstream_http_reuse_entries
         );
         assert_eq!(limits.downstream_http2_session_entries, 0);
+        assert_eq!(limits.upstream_http3_reuse_entries, 2);
+        assert_eq!(limits.downstream_http3_session_entries, 3);
     }
 
     #[test]
