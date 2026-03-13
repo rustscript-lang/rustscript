@@ -30,10 +30,12 @@ pub(crate) use state::attach_outbound_exchange_tls_transport;
 #[cfg(feature = "tls")]
 pub(crate) use state::upstream_response_available;
 pub(crate) use state::{
-    DownstreamConnectTunnelPlan, DownstreamConnectTunnelTarget, DownstreamPostResponsePlan,
-    ResolvedHttpGraphResponse, SharedUpstreamClientCache, allocate_tcp_stream_handle,
-    allocate_udp_socket_handle, append_outbound_exchange_body, append_outbound_exchange_body_bytes,
-    append_response_output_body_bytes, attach_outbound_exchange_tcp_transport,
+    DownstreamConnectTunnelPlan, DownstreamConnectTunnelTarget, DownstreamConnectionMetadata,
+    DownstreamHttpListenerGoal, DownstreamPostResponsePlan, InlineDownstreamHttpResponse,
+    PromotedDownstreamTransport, ResolvedHttpGraphResponse, SharedUpstreamClientCache,
+    allocate_tcp_stream_handle, allocate_udp_socket_handle, append_outbound_exchange_body,
+    append_outbound_exchange_body_bytes, append_response_output_body_bytes,
+    attach_outbound_exchange_tcp_transport, build_downstream_http_request_context,
     consume_request_body_all, default_upstream_exchange_handle, default_upstream_udp_socket_handle,
     new_shared_upstream_client_cache, outbound_exchange_exists,
     outbound_exchange_response_available, outbound_exchange_response_eof,
@@ -41,7 +43,9 @@ pub(crate) use state::{
     read_outbound_exchange_response_next_chunk, read_outbound_exchange_response_next_line,
     read_request_body_next_chunk, read_request_body_next_line, read_upstream_response_all,
     read_upstream_response_next_chunk, read_upstream_response_next_line, request_body_eof,
-    resolve_http_graph_response, tcp_stream_exists, udp_socket_exists, upstream_response_eof,
+    resolve_http_graph_response, schedule_downstream_http_handoff,
+    take_promoted_downstream_transport, tcp_stream_exists, udp_socket_exists,
+    upstream_response_eof,
 };
 #[cfg(feature = "websocket")]
 pub(crate) use state::{HttpOutboundRequestNode, build_upstream_url, is_hop_by_hop_header};

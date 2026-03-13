@@ -61,13 +61,13 @@ impl rustls::client::danger::ServerCertVerifier for PermissiveTestServerCertVeri
 }
 
 #[tokio::test]
-async fn sample_transport_proxy_program_streams_plain_http_body() {
+async fn sample_upstream_transport_proxy_program_streams_plain_http_body() {
     let (upstream_addr, upstream_handle) = spawn_chunked_upstream(vec!["ab", "cd", "ef"]).await;
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
-        .join("sample_transport_proxy_program.rss");
+        .join("sample_upstream_transport_proxy_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
@@ -115,7 +115,7 @@ async fn sample_transport_proxy_program_streams_plain_http_body() {
 
 #[cfg(feature = "tls")]
 #[tokio::test]
-async fn sample_transport_proxy_program_handles_https_tls_session() {
+async fn sample_upstream_transport_proxy_program_handles_https_tls_session() {
     let (upstream_addr, upstream_handle) = spawn_https_echo_upstream().await;
     let mut state = SharedState::new(1024 * 1024);
     state.client = reqwest::Client::builder()
@@ -127,7 +127,7 @@ async fn sample_transport_proxy_program_handles_https_tls_session() {
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
-        .join("sample_transport_proxy_program.rss");
+        .join("sample_upstream_transport_proxy_program.rss");
     let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
@@ -177,6 +177,580 @@ async fn sample_transport_proxy_program_handles_https_tls_session() {
 
     upstream_handle.abort();
     data_handle.abort();
+    admin_handle.abort();
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn sample_transport_tls_handshake_program_controls_sni_and_echoes_plaintext() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    ensure_rustls_provider();
+
+    let (data_addr, admin_addr, data_handle, admin_handle) =
+        spawn_transport_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_transport_tls_handshake_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let mut config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PermissiveTestServerCertVerifier::new()))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"echo/1".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+
+    let blocked_stream = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("transport proxy should accept blocked tls");
+    let blocked_name = rustls::pki_types::ServerName::try_from("blocked.example.test")
+        .expect("blocked name should parse")
+        .to_owned();
+    let blocked = connector.connect(blocked_name, blocked_stream).await;
+    assert!(blocked.is_err(), "unexpected SNI should not complete tls");
+
+    let allowed_stream = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("transport proxy should accept allowed tls");
+    let allowed_name = rustls::pki_types::ServerName::try_from("edge.example.test")
+        .expect("allowed name should parse")
+        .to_owned();
+    let mut allowed = connector
+        .connect(allowed_name, allowed_stream)
+        .await
+        .expect("expected SNI should complete tls");
+    assert_eq!(
+        allowed
+            .get_ref()
+            .1
+            .alpn_protocol()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
+        Some("echo/1".to_string())
+    );
+
+    let mut banner = vec![0u8; "accepted sni=edge.example.test alpn=echo/1\n".len()];
+    allowed
+        .read_exact(&mut banner)
+        .await
+        .expect("tls banner should read");
+    assert_eq!(
+        String::from_utf8(banner).expect("banner should be utf8"),
+        "accepted sni=edge.example.test alpn=echo/1\n"
+    );
+
+    allowed
+        .write_all(b"hello")
+        .await
+        .expect("tls payload should write");
+    allowed
+        .shutdown()
+        .await
+        .expect("tls write half-close should succeed");
+    let mut echoed = Vec::new();
+    allowed
+        .read_to_end(&mut echoed)
+        .await
+        .expect("tls echo should read");
+    assert_eq!(echoed, b"hello");
+
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn transport_downstream_preread_replays_into_raw_tcp_reads() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (data_addr, admin_addr, data_handle, admin_handle) =
+        spawn_transport_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = r#"
+        use tcp;
+
+        let downstream = tcp::stream::downstream();
+        let preview = tcp::stream::peek(downstream, 2);
+        let payload = tcp::stream::read(downstream, 5);
+        tcp::stream::write(downstream, preview + "|" + payload);
+        tcp::stream::close(downstream);
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let mut stream = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("transport proxy should accept raw preread connection");
+    stream
+        .write_all(b"hello")
+        .await
+        .expect("raw payload should write");
+    stream
+        .shutdown()
+        .await
+        .expect("client write half-close should succeed");
+
+    let mut echoed = Vec::new();
+    stream
+        .read_to_end(&mut echoed)
+        .await
+        .expect("raw response should read");
+    assert_eq!(echoed, b"he|hello");
+
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn transport_downstream_http_handoff_continues_same_vm_invocation() {
+    let (data_addr, admin_addr, data_handle, admin_handle) =
+        spawn_transport_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = r#"
+        use http;
+        use tcp;
+
+        http::response::set_header("x-pre-handoff", "still-here");
+
+        let downstream = tcp::stream::downstream();
+        if http::request::get_scheme() == "tcp" {
+            http::request::handoff_downstream();
+        }
+
+        if http::request::get_scheme() != "tcp" {
+            http::response::set_status(201);
+            http::response::set_body(
+                http::request::get_method() + "|" +
+                http::request::get_path_with_query() + "|" +
+                http::request::get_body()
+            );
+        }
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .post(format!("http://{data_addr}/inline"))
+        .body("payload")
+        .send()
+        .await
+        .expect("inline handoff request should complete");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-pre-handoff")
+            .and_then(|value| value.to_str().ok()),
+        Some("still-here")
+    );
+    assert_eq!(
+        response.text().await.expect("response body should read"),
+        "POST|/inline|payload"
+    );
+
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn transport_downstream_http_handoff_promotes_plain_connection_into_http11_runtime() {
+    let (data_addr, admin_addr, data_handle, admin_handle) =
+        spawn_transport_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_transport_http_handoff_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .post(format!("http://{data_addr}/promoted?mode=http1"))
+        .body("payload")
+        .send()
+        .await
+        .expect("promoted http1 request should complete");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-request-scheme")
+            .and_then(|value| value.to_str().ok()),
+        Some("http")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-request-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("1.1")
+    );
+    assert_eq!(
+        response.text().await.expect("response body should read"),
+        "POST|/promoted?mode=http1|payload"
+    );
+
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn transport_downstream_http_handoff_promotes_plain_connection_into_http2_runtime() {
+    use http_body_util::{BodyExt, Full};
+    use hyper::Request;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let (data_addr, admin_addr, data_handle, admin_handle) =
+        spawn_transport_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_transport_http_handoff_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let stream = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("transport proxy should accept promoted http2");
+    let (mut sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake(TokioIo::new(stream))
+        .await
+        .expect("http2 handshake should succeed");
+    let connection_task = tokio::spawn(async move {
+        connection.await.expect("http2 connection should run");
+    });
+
+    let response = sender
+        .send_request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("http://{data_addr}/promoted?mode=http2"))
+                .version(axum::http::Version::HTTP_2)
+                .header("host", format!("{data_addr}"))
+                .body(Full::new(axum::body::Bytes::from_static(b"h2-payload")))
+                .expect("http2 request should build"),
+        )
+        .await
+        .expect("http2 request should complete");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-request-scheme")
+            .and_then(|value| value.to_str().ok()),
+        Some("http")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-request-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("http2 body should collect")
+            .to_bytes()
+            .as_ref(),
+        b"POST|/promoted?mode=http2|h2-payload"
+    );
+
+    drop(sender);
+    connection_task.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn transport_downstream_http_handoff_promotes_tls_plaintext_into_https_runtime() {
+    use http_body_util::{BodyExt, Full};
+    use hyper::Request;
+    use hyper_util::rt::TokioIo;
+
+    ensure_rustls_provider();
+
+    let (data_addr, admin_addr, data_handle, admin_handle) =
+        spawn_transport_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_transport_http_handoff_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let mut config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PermissiveTestServerCertVerifier::new()))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+
+    let stream = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("transport proxy should accept promoted https");
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .expect("server name should parse")
+        .to_owned();
+    let tls_stream = connector
+        .connect(server_name, stream)
+        .await
+        .expect("downstream tls handshake should succeed");
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls_stream))
+        .await
+        .expect("http1 over tls handshake should succeed");
+    let connection_task = tokio::spawn(async move {
+        connection
+            .await
+            .expect("http1 over tls connection should run");
+    });
+
+    let response = sender
+        .send_request(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "https://localhost:{}/promoted?mode=https",
+                    data_addr.port()
+                ))
+                .header("host", format!("localhost:{}", data_addr.port()))
+                .body(Full::new(axum::body::Bytes::from_static(b"secure-body")))
+                .expect("https request should build"),
+        )
+        .await
+        .expect("https request should complete");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-request-scheme")
+            .and_then(|value| value.to_str().ok()),
+        Some("https")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-request-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("1.1")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-server-name")
+            .and_then(|value| value.to_str().ok()),
+        Some("localhost")
+    );
+    assert_eq!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("https body should collect")
+            .to_bytes()
+            .as_ref(),
+        b"POST|/promoted?mode=https|secure-body"
+    );
+
+    connection_task.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn sample_http_proxy_tls_prelude_program_serves_http_and_https_listeners() {
+    use http_body_util::{BodyExt, Full};
+    use hyper::Request;
+    use hyper_util::rt::TokioIo;
+
+    ensure_rustls_provider();
+
+    let (http_addr, https_addr, admin_addr, http_handle, https_handle, admin_handle) =
+        spawn_http_https_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_http_proxy_tls_prelude_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let http_response = client
+        .post(format!("http://{http_addr}/plain?mode=http"))
+        .body("plain-body")
+        .send()
+        .await
+        .expect("plain http request should complete");
+    assert_eq!(http_response.status(), StatusCode::CREATED);
+    assert_eq!(
+        http_response
+            .headers()
+            .get("x-request-scheme")
+            .and_then(|value| value.to_str().ok()),
+        Some("http")
+    );
+    assert_eq!(
+        http_response
+            .headers()
+            .get("x-server-name")
+            .and_then(|value| value.to_str().ok()),
+        None
+    );
+    assert_eq!(
+        http_response
+            .text()
+            .await
+            .expect("plain response body should read"),
+        "POST|/plain?mode=http|plain-body"
+    );
+
+    let plaintext_https_listener_response = client
+        .post(format!("http://{https_addr}/plaintext-on-https-port"))
+        .body("plaintext-body")
+        .send()
+        .await
+        .expect("plaintext http on https listener should complete");
+    assert_eq!(
+        plaintext_https_listener_response.status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        plaintext_https_listener_response
+            .headers()
+            .get("x-request-scheme")
+            .and_then(|value| value.to_str().ok()),
+        Some("http")
+    );
+    assert_eq!(
+        plaintext_https_listener_response
+            .text()
+            .await
+            .expect("plaintext https-listener body should read"),
+        "POST|/plaintext-on-https-port|plaintext-body"
+    );
+
+    let https_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("https test client should build");
+    let https_response = https_client
+        .post(format!(
+            "https://localhost:{}/secure?mode=https",
+            https_addr.port()
+        ))
+        .body("secure-body")
+        .send()
+        .await
+        .expect("https request should complete");
+    assert_eq!(https_response.status(), StatusCode::CREATED);
+    assert_eq!(
+        https_response
+            .headers()
+            .get("x-request-scheme")
+            .and_then(|value| value.to_str().ok()),
+        Some("https")
+    );
+    assert_eq!(
+        https_response
+            .headers()
+            .get("x-server-name")
+            .and_then(|value| value.to_str().ok()),
+        Some("localhost")
+    );
+    assert_eq!(
+        https_response
+            .text()
+            .await
+            .expect("https response body should read"),
+        "POST|/secure?mode=https|secure-body"
+    );
+
+    let mut bad_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PermissiveTestServerCertVerifier::new()))
+        .with_no_client_auth();
+    bad_config.alpn_protocols = vec![b"imap".to_vec()];
+    let bad_connector = tokio_rustls::TlsConnector::from(Arc::new(bad_config));
+    let bad_stream = tokio::net::TcpStream::connect(https_addr)
+        .await
+        .expect("https listener should accept mismatched alpn tls");
+    let bad_name = rustls::pki_types::ServerName::try_from("localhost")
+        .expect("server name should parse")
+        .to_owned();
+    let bad_read = timeout(
+        Duration::from_secs(1),
+        bad_connector.connect(bad_name, bad_stream),
+    )
+    .await
+    .expect("mismatched alpn connection should terminate promptly");
+    assert!(
+        bad_read.is_err(),
+        "expected alpn-mismatched tls handshake to fail, got {bad_read:?}"
+    );
+
+    let mut config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PermissiveTestServerCertVerifier::new()))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let stream = tokio::net::TcpStream::connect(https_addr)
+        .await
+        .expect("https listener should accept raw tls");
+    let server_name = rustls::pki_types::ServerName::try_from("failme.test")
+        .expect("server name should parse")
+        .to_owned();
+    let tls_stream = connector
+        .connect(server_name, stream)
+        .await
+        .expect("failme tls handshake should succeed");
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls_stream))
+        .await
+        .expect("http1 over tls handshake should succeed");
+    let connection_task = tokio::spawn(async move {
+        connection.await.expect("failme tls connection should run");
+    });
+    let failme_response = sender
+        .send_request(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "https://failme.test:{}/rejected",
+                    https_addr.port()
+                ))
+                .header("host", format!("failme.test:{}", https_addr.port()))
+                .body(Full::new(axum::body::Bytes::new()))
+                .expect("failme request should build"),
+        )
+        .await
+        .expect("failme request should complete");
+    assert_eq!(failme_response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        failme_response
+            .into_body()
+            .collect()
+            .await
+            .expect("failme response body should collect")
+            .to_bytes()
+            .as_ref(),
+        b"forbidden"
+    );
+
+    drop(sender);
+    connection_task.abort();
+    http_handle.abort();
+    https_handle.abort();
     admin_handle.abort();
 }
 
@@ -964,7 +1538,10 @@ async fn downstream_transport_proxy_exposes_raw_tcp_read_and_write() {
         .write_all(b"hello")
         .await
         .expect("payload should write");
-    stream.shutdown().await.expect("write half-close should succeed");
+    stream
+        .shutdown()
+        .await
+        .expect("write half-close should succeed");
     let mut echoed = Vec::new();
     stream
         .read_to_end(&mut echoed)
@@ -1055,6 +1632,80 @@ async fn downstream_transport_proxy_controls_tls_sni_and_handshake() {
         .await
         .expect("tls echo should read");
     assert_eq!(echoed, b"hello");
+
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn downstream_transport_proxy_reuses_default_self_signed_certificate() {
+    ensure_rustls_provider();
+
+    let (data_addr, admin_addr, data_handle, admin_handle) =
+        spawn_transport_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = r#"
+        use tcp;
+        use tls;
+
+        let downstream = tcp::stream::downstream();
+        let session = tls::session::from_socket(downstream);
+        tls::session::set_alpn(session, "echo/1");
+        if tls::session::handshake(session) {
+            tcp::stream::close(downstream);
+        }
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let mut config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PermissiveTestServerCertVerifier::new()))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"echo/1".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .expect("server name should parse")
+        .to_owned();
+
+    let first_stream = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("first tls client should connect");
+    let first = connector
+        .connect(server_name.clone(), first_stream)
+        .await
+        .expect("first tls handshake should complete");
+    let first_cert = first
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certificates| certificates.first().cloned())
+        .expect("first handshake should expose peer certificate")
+        .to_vec();
+    drop(first);
+
+    let second_stream = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("second tls client should connect");
+    let second = connector
+        .connect(server_name, second_stream)
+        .await
+        .expect("second tls handshake should complete");
+    let second_cert = second
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certificates| certificates.first().cloned())
+        .expect("second handshake should expose peer certificate")
+        .to_vec();
+
+    assert_eq!(
+        first_cert, second_cert,
+        "default downstream self-signed certificate should be reused across requests"
+    );
 
     data_handle.abort();
     admin_handle.abort();

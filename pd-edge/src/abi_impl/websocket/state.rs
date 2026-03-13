@@ -10,13 +10,15 @@ use tokio_tungstenite::{
 };
 use vm::VmError;
 
+use crate::abi_impl::transport::{DownstreamReplayTcpStream, ReplayPrefixedIo};
+
 pub(crate) type SharedWebSocketIo = Arc<tokio::sync::Mutex<OutboundWebSocketIoState>>;
 
 type ClientWebSocketStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
-type ServerTcpWebSocketStream = WebSocketStream<TcpStream>;
+type ServerTcpWebSocketStream = WebSocketStream<ReplayPrefixedIo<TcpStream>>;
 #[cfg(feature = "tls")]
 type ServerTlsWebSocketStream =
-    WebSocketStream<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>;
+    WebSocketStream<ReplayPrefixedIo<tokio_rustls::server::TlsStream<DownstreamReplayTcpStream>>>;
 
 enum RuntimeWebSocketStream {
     Client(ClientWebSocketStream),
@@ -145,7 +147,9 @@ impl OutboundWebSocketIoState {
             #[cfg(feature = "tls")]
             RuntimeWebSocketStream::ServerTls(stream) => stream.send(frame).await,
         }
-        .map_err(|err| VmError::HostError(format!("failed to send websocket binary frame: {err}")))?;
+        .map_err(|err| {
+            VmError::HostError(format!("failed to send websocket binary frame: {err}"))
+        })?;
         Ok(sent)
     }
 
@@ -158,7 +162,9 @@ impl OutboundWebSocketIoState {
             #[cfg(feature = "tls")]
             RuntimeWebSocketStream::ServerTls(stream) => stream.send(frame).await,
         }
-        .map_err(|err| VmError::HostError(format!("failed to send websocket binary frame: {err}")))?;
+        .map_err(|err| {
+            VmError::HostError(format!("failed to send websocket binary frame: {err}"))
+        })?;
         Ok(sent)
     }
 
@@ -252,9 +258,7 @@ impl OutboundWebSocketIoState {
             #[cfg(feature = "tls")]
             RuntimeWebSocketStream::ServerTls(stream) => stream.close(close_frame.clone()).await,
         }
-        .map_err(|err| {
-            VmError::HostError(format!("failed to close websocket session: {err}"))
-        })?;
+        .map_err(|err| VmError::HostError(format!("failed to close websocket session: {err}")))?;
         self.record_close_frame(close_frame);
         Ok(())
     }

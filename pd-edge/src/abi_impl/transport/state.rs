@@ -2,10 +2,14 @@
 
 use std::{
     hash::{Hash, Hasher},
+    io,
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context, Poll},
 };
 
 use axum::http::Version;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use url::Url;
 
 use crate::cache::BoundedLruStore;
@@ -136,6 +140,10 @@ impl TcpFlowState {
 
     pub(crate) fn note_write(&mut self) {
         self.tx_observed = true;
+    }
+
+    pub(crate) fn observed_io(&self) -> bool {
+        self.rx_observed || self.tx_observed
     }
 
     pub(crate) fn mark_connected(&mut self) {
@@ -562,29 +570,125 @@ pub(crate) type SharedUdpSocketIo = Arc<tokio::sync::Mutex<tokio::net::UdpSocket
 #[cfg(feature = "tls")]
 pub(crate) type SharedTlsStreamIo =
     Arc<tokio::sync::Mutex<Option<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>>>;
+
+#[derive(Default)]
+pub(crate) struct ReplayPrefixedIo<S> {
+    prefix: Vec<u8>,
+    prefix_offset: usize,
+    inner: S,
+}
+
+impl<S> ReplayPrefixedIo<S> {
+    pub(crate) fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self {
+            prefix,
+            prefix_offset: 0,
+            inner,
+        }
+    }
+
+    pub(crate) fn into_inner(self) -> S {
+        self.inner
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<u8>, S) {
+        let prefix = if self.prefix_offset >= self.prefix.len() {
+            Vec::new()
+        } else {
+            self.prefix[self.prefix_offset..].to_vec()
+        };
+        (prefix, self.inner)
+    }
+}
+
+impl<S> std::fmt::Debug for ReplayPrefixedIo<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplayPrefixedIo")
+            .field(
+                "prefix_remaining",
+                &self.prefix.len().saturating_sub(self.prefix_offset),
+            )
+            .finish()
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for ReplayPrefixedIo<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.prefix_offset < self.prefix.len() && buf.remaining() > 0 {
+            let remaining = self.prefix.len() - self.prefix_offset;
+            let to_copy = remaining.min(buf.remaining());
+            let start = self.prefix_offset;
+            let end = start + to_copy;
+            buf.put_slice(&self.prefix[start..end]);
+            self.prefix_offset = end;
+            if self.prefix_offset >= self.prefix.len() {
+                self.prefix.clear();
+                self.prefix_offset = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for ReplayPrefixedIo<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+pub(crate) type DownstreamReplayTcpStream = ReplayPrefixedIo<tokio::net::TcpStream>;
 #[cfg(feature = "tls")]
 pub(crate) type SharedServerTlsStreamIo =
-    Arc<tokio::sync::Mutex<Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>>>;
+    Arc<tokio::sync::Mutex<Option<tokio_rustls::server::TlsStream<DownstreamReplayTcpStream>>>>;
 
 #[cfg(feature = "tls")]
 pub(crate) struct DownstreamTlsServerStart {
-    start: tokio_rustls::StartHandshake<tokio::net::TcpStream>,
+    start: tokio_rustls::StartHandshake<DownstreamReplayTcpStream>,
 }
 
 #[cfg(feature = "tls")]
 impl DownstreamTlsServerStart {
-    pub(crate) fn new(start: tokio_rustls::StartHandshake<tokio::net::TcpStream>) -> Self {
+    pub(crate) fn new(start: tokio_rustls::StartHandshake<DownstreamReplayTcpStream>) -> Self {
         Self { start }
     }
 
     pub(crate) fn client_hello_server_name(&self) -> Option<String> {
-        self.start
-            .client_hello()
-            .server_name()
-            .map(str::to_string)
+        self.start.client_hello().server_name().map(str::to_string)
     }
 
-    pub(crate) fn into_inner(self) -> tokio_rustls::StartHandshake<tokio::net::TcpStream> {
+    pub(crate) fn into_inner(self) -> tokio_rustls::StartHandshake<DownstreamReplayTcpStream> {
         self.start
     }
 }

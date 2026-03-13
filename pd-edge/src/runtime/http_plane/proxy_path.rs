@@ -1,10 +1,17 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
 
 use axum::{
     Router,
     body::Body,
     extract::{Request, State},
-    http::{HeaderMap, Response, StatusCode, Uri, header::HOST},
+    http::{Response, StatusCode},
     middleware,
     routing::any,
 };
@@ -14,18 +21,32 @@ use hyper_util::{
     server::conn::auto::Builder as AutoBuilder,
 };
 use tokio::net::TcpListener;
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
+#[cfg(feature = "tls")]
+use tokio_rustls::{
+    LazyConfigAcceptor,
+    rustls::{self, ServerConfig},
+};
 use tower::ServiceExt;
 use tracing::warn;
 use uuid::Uuid;
+use vm::VmError;
 
 use super::super::SharedState;
+#[cfg(feature = "tls")]
+use super::super::transport_plane::serve_transport_connection_with_listener_goal;
 use super::super::vm_runner::{VmDebugInvocation, VmExecutionError, execute_vm_with_context};
 use super::shared::access_log_middleware;
 use crate::{
-    abi_impl::http::resolve_http_graph_response,
+    abi_impl::http::{
+        DownstreamConnectionMetadata, DownstreamHttpListenerGoal, InlineDownstreamHttpResponse,
+        PromotedDownstreamTransport, build_downstream_http_request_context,
+        resolve_http_graph_response, take_promoted_downstream_transport,
+    },
     abi_impl::{
-        DownstreamHttp2ConnectionTracker, Http2DownstreamStreamAttachment, HttpRequestContext,
-        ProxyVmContext, register_http_plane_host_module,
+        DownstreamHttp2ConnectionTracker, Http2DownstreamStreamAttachment, ProxyVmContext,
+        SharedProxyVmContext, build_default_self_signed_server_config,
+        register_http_plane_host_module,
     },
     debug_session::{request_uses_blocking_debugger, request_will_attach_debugger},
     logging::category_program,
@@ -38,52 +59,488 @@ pub fn build_http_proxy_app(state: SharedState) -> Router {
         .with_state(state)
 }
 
+async fn serve_http_connection<S>(
+    app: Router,
+    state: SharedState,
+    stream: S,
+    peer_addr: SocketAddr,
+    connection_metadata: Option<DownstreamConnectionMetadata>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let io = TokioIo::new(stream);
+    let tracker = DownstreamHttp2ConnectionTracker::new(
+        state.downstream_http2_sessions.clone(),
+        peer_addr.to_string(),
+    );
+    let service = {
+        let connection_tracker = tracker.clone();
+        hyper::service::service_fn(move |request: hyper::Request<Incoming>| {
+            let app = app.clone();
+            let tracker = connection_tracker.clone();
+            let connection_metadata = connection_metadata.clone();
+            async move {
+                let version = request.version();
+                let path = request.uri().path().to_string();
+                let attachment = tracker.observe_request(version, &path);
+                let mut request = request;
+                let on_upgrade = hyper::upgrade::on(&mut request);
+                if let Some(ref attachment) = attachment {
+                    request.extensions_mut().insert(attachment.clone());
+                }
+                if let Some(connection_metadata) = connection_metadata {
+                    request.extensions_mut().insert(connection_metadata);
+                }
+                request.extensions_mut().insert(on_upgrade);
+                let request = request.map(Body::new);
+                let response = app.oneshot(request).await;
+                if response.is_ok() {
+                    tracker.note_response_head(attachment.as_ref());
+                    tracker.finish_request(attachment.as_ref(), None);
+                } else {
+                    tracker.finish_request(
+                        attachment.as_ref(),
+                        Some("data plane request handling failed".to_string()),
+                    );
+                }
+                response
+            }
+        })
+    };
+
+    let result = AutoBuilder::new(TokioExecutor::new())
+        .serve_connection_with_upgrades(io, service)
+        .await;
+    tracker.finish_connection(result.err().map(|err| err.to_string()));
+}
+
+#[cfg(feature = "tls")]
+fn generate_https_proxy_tls_server_config() -> std::io::Result<std::sync::Arc<ServerConfig>> {
+    #[cfg(feature = "http2")]
+    let alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    #[cfg(not(feature = "http2"))]
+    let alpn_protocols = vec![b"http/1.1".to_vec()];
+    build_default_self_signed_server_config(alpn_protocols)
+}
+
+struct CapturedPromotedHttpRequest {
+    request: crate::abi_impl::HttpRequestContext,
+    http2_attachment: Option<Http2DownstreamStreamAttachment>,
+    http1_upgrade: Option<hyper::upgrade::OnUpgrade>,
+}
+
+enum DownstreamHttpAutoPromotion {
+    None,
+    Eligible(DownstreamHttpListenerGoal),
+    Blocked,
+}
+
+fn downstream_http_auto_promotion(context: &SharedProxyVmContext) -> DownstreamHttpAutoPromotion {
+    if context.lock_downstream().downstream_carrier_ref.is_some() {
+        return DownstreamHttpAutoPromotion::None;
+    }
+
+    let transport = context.lock_transport();
+    let goal = transport.downstream_listener_goal;
+    if !goal.promotes_into_http() {
+        return DownstreamHttpAutoPromotion::None;
+    }
+
+    #[cfg(feature = "tls")]
+    let tls_touched =
+        transport.downstream_tls_server_start.is_some() || transport.downstream_tls_io.is_some();
+    #[cfg(not(feature = "tls"))]
+    let tls_touched = false;
+
+    if transport.downstream_transport_accessed
+        || transport.tcp_dag.downstream.observed_io()
+        || !transport.downstream_preread_buffer.is_empty()
+        || tls_touched
+        || transport.downstream_tcp_io.is_none()
+    {
+        DownstreamHttpAutoPromotion::Blocked
+    } else {
+        DownstreamHttpAutoPromotion::Eligible(goal)
+    }
+}
+
+fn blocked_downstream_http_auto_promotion(host_name: &str) -> VmError {
+    VmError::HostError(format!(
+        "{host_name} requires http::request::handoff_downstream() after raw downstream transport or TLS prelude use",
+    ))
+}
+
+async fn promote_captured_downstream_transport_into_http_request(
+    context: SharedProxyVmContext,
+    promoted: PromotedDownstreamTransport,
+) -> Result<(), VmError> {
+    let connection_metadata = match &promoted {
+        PromotedDownstreamTransport::Tcp(_) => context.downstream_connection_metadata(false)?,
+        #[cfg(feature = "tls")]
+        PromotedDownstreamTransport::Tls(_) => context.downstream_connection_metadata(true)?,
+    };
+    let request_id = context.request_head().request_id().to_string();
+    let downstream_http_sessions = context.services().downstream_http_sessions();
+    let (captured_tx, captured_rx) =
+        oneshot::channel::<Result<CapturedPromotedHttpRequest, String>>();
+    let (response_tx, response_rx) = oneshot::channel::<InlineDownstreamHttpResponse>();
+    context.begin_inline_downstream_http_response(response_tx)?;
+
+    match promoted {
+        PromotedDownstreamTransport::Tcp(stream) => {
+            tokio::spawn(run_inline_promoted_http_connection(
+                stream,
+                connection_metadata,
+                downstream_http_sessions,
+                request_id,
+                captured_tx,
+                response_rx,
+            ));
+        }
+        #[cfg(feature = "tls")]
+        PromotedDownstreamTransport::Tls(stream) => {
+            tokio::spawn(run_inline_promoted_http_connection(
+                stream,
+                connection_metadata,
+                downstream_http_sessions,
+                request_id,
+                captured_tx,
+                response_rx,
+            ));
+        }
+    }
+
+    let captured = captured_rx.await.map_err(|_| {
+        VmError::HostError(
+            "downstream http promotion closed before a request was captured".to_string(),
+        )
+    })?;
+    let captured = captured.map_err(VmError::HostError)?;
+    context.promote_downstream_http_request(
+        captured.request,
+        captured.http2_attachment,
+        captured.http1_upgrade,
+    );
+    Ok(())
+}
+
+#[cfg(feature = "tls")]
+async fn take_goal_promoted_downstream_transport(
+    context: &SharedProxyVmContext,
+    goal: DownstreamHttpListenerGoal,
+) -> Result<PromotedDownstreamTransport, VmError> {
+    if !goal.requires_tls() {
+        return take_promoted_downstream_transport(context).await;
+    }
+
+    let server_config = context
+        .services()
+        .downstream_tls_termination()
+        .ok_or_else(|| {
+            VmError::HostError(
+                "downstream https listener is missing tls termination configuration".to_string(),
+            )
+        })?;
+    let tcp_io = {
+        let mut transport = context.lock_transport();
+        transport.downstream_tcp_io.take().ok_or_else(|| {
+            VmError::HostError(
+                "downstream HTTP promotion requires an attached downstream tcp transport"
+                    .to_string(),
+            )
+        })?
+    };
+    let tcp_stream = {
+        let mut guard = tcp_io.lock().await;
+        guard.take().ok_or_else(|| {
+            VmError::HostError("downstream tcp transport is already in use".to_string())
+        })?
+    };
+    let mut acceptor = Box::pin(LazyConfigAcceptor::new(
+        rustls::server::Acceptor::default(),
+        crate::abi_impl::ReplayPrefixedIo::new(Vec::new(), tcp_stream),
+    ));
+    let start = acceptor.as_mut().await.map_err(|err| {
+        let message = format!("downstream tls handshake failed before http attach: {err}");
+        {
+            let mut transport = context.lock_transport();
+            transport.tcp_dag.downstream.mark_failed(message.clone());
+            transport.tls_dag.downstream.mark_failed();
+        }
+        VmError::HostError(message)
+    })?;
+    let server_name = start.client_hello().server_name().map(str::to_string);
+    {
+        let mut transport = context.lock_transport();
+        transport
+            .tls_dag
+            .downstream
+            .observe_downstream_client_hello(server_name);
+    }
+
+    let tls_stream = start.into_stream(server_config).await.map_err(|err| {
+        let message = format!("downstream tls handshake failed before http attach: {err}");
+        {
+            let mut transport = context.lock_transport();
+            transport.tcp_dag.downstream.mark_failed(message.clone());
+            transport.tls_dag.downstream.mark_failed();
+        }
+        VmError::HostError(message)
+    })?;
+    let negotiated_alpn = tls_stream
+        .get_ref()
+        .1
+        .alpn_protocol()
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+    let peer_certificate_der = tls_stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first().cloned())
+        .map(|certificate| certificate.to_vec());
+
+    {
+        let mut transport = context.lock_transport();
+        transport.tcp_dag.downstream.mark_connected();
+        transport.downstream_read_eof = false;
+        let flow = &mut transport.tls_dag.downstream;
+        flow.note_server_hello_received();
+        flow.note_server_certificate_received(peer_certificate_der);
+        if flow.verify_peer() && flow.trusted_certificate_pem().is_some() {
+            flow.note_server_certificate_verified();
+        } else {
+            flow.note_verification_skipped();
+        }
+        if !flow.accepts_negotiated_alpn(negotiated_alpn.as_deref()) {
+            flow.mark_failed();
+            return Err(VmError::HostError(format!(
+                "downstream tls ALPN mismatch: requested [{}], negotiated {}",
+                flow.desired_alpn().join(", "),
+                negotiated_alpn.as_deref().unwrap_or("none"),
+            )));
+        }
+        flow.mark_handshake_complete(negotiated_alpn);
+    }
+
+    Ok(PromotedDownstreamTransport::Tls(
+        crate::abi_impl::ReplayPrefixedIo::new(Vec::new(), tls_stream),
+    ))
+}
+
+#[cfg(not(feature = "tls"))]
+async fn take_goal_promoted_downstream_transport(
+    context: &SharedProxyVmContext,
+    _goal: DownstreamHttpListenerGoal,
+) -> Result<PromotedDownstreamTransport, VmError> {
+    take_promoted_downstream_transport(context).await
+}
+
+pub(crate) async fn auto_promote_downstream_listener_goal_into_http_request(
+    context: SharedProxyVmContext,
+    host_name: &str,
+) -> Result<(), VmError> {
+    match downstream_http_auto_promotion(&context) {
+        DownstreamHttpAutoPromotion::None => Ok(()),
+        DownstreamHttpAutoPromotion::Eligible(goal) => {
+            let promoted = take_goal_promoted_downstream_transport(&context, goal).await?;
+            promote_captured_downstream_transport_into_http_request(context, promoted).await
+        }
+        DownstreamHttpAutoPromotion::Blocked => {
+            Err(blocked_downstream_http_auto_promotion(host_name))
+        }
+    }
+}
+
+pub(crate) async fn maybe_auto_promote_downstream_listener_goal_into_http_request(
+    context: &SharedProxyVmContext,
+) -> Result<bool, VmError> {
+    let DownstreamHttpAutoPromotion::Eligible(goal) = downstream_http_auto_promotion(context)
+    else {
+        return Ok(false);
+    };
+    let promoted = take_goal_promoted_downstream_transport(context, goal).await?;
+    promote_captured_downstream_transport_into_http_request(context.clone(), promoted).await?;
+    Ok(true)
+}
+
+pub(crate) async fn promote_transport_context_into_http_request(
+    context: SharedProxyVmContext,
+) -> Result<(), VmError> {
+    if let DownstreamHttpAutoPromotion::Eligible(goal) = downstream_http_auto_promotion(&context) {
+        let promoted = take_goal_promoted_downstream_transport(&context, goal).await?;
+        return promote_captured_downstream_transport_into_http_request(context, promoted).await;
+    }
+
+    let promoted = take_promoted_downstream_transport(&context).await?;
+    promote_captured_downstream_transport_into_http_request(context, promoted).await
+}
+
+async fn run_inline_promoted_http_connection<S>(
+    stream: S,
+    connection_metadata: DownstreamConnectionMetadata,
+    downstream_http_sessions: Option<crate::abi_impl::SharedHttpDownstreamSessions>,
+    request_id: String,
+    captured_tx: oneshot::Sender<Result<CapturedPromotedHttpRequest, String>>,
+    response_rx: oneshot::Receiver<InlineDownstreamHttpResponse>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let tracker = DownstreamHttp2ConnectionTracker::new(
+        downstream_http_sessions
+            .unwrap_or_else(|| crate::abi_impl::new_shared_http_downstream_sessions(1)),
+        connection_metadata.peer_addr.to_string(),
+    );
+    let capture_sender = Arc::new(Mutex::new(Some(captured_tx)));
+    let response_receiver = Arc::new(AsyncMutex::new(Some(response_rx)));
+    let request_claimed = Arc::new(AtomicBool::new(false));
+    let metadata = Some(connection_metadata.clone());
+    let service = {
+        let tracker = tracker.clone();
+        let capture_sender = capture_sender.clone();
+        let response_receiver = response_receiver.clone();
+        let request_claimed = request_claimed.clone();
+        let request_id = request_id.clone();
+        hyper::service::service_fn(move |request: hyper::Request<Incoming>| {
+            let tracker = tracker.clone();
+            let capture_sender = capture_sender.clone();
+            let response_receiver = response_receiver.clone();
+            let request_claimed = request_claimed.clone();
+            let request_id = request_id.clone();
+            let connection_metadata = metadata.clone();
+            async move {
+                if request_claimed.swap(true, Ordering::AcqRel) {
+                    return Ok::<_, std::convert::Infallible>(text_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "downstream http session already attached",
+                    ));
+                }
+
+                let version = request.version();
+                let path = request.uri().path().to_string();
+                let attachment = tracker.observe_request(version, &path);
+                let mut request = request;
+                let on_upgrade = hyper::upgrade::on(&mut request);
+                let request = request.map(Body::new);
+                let (parts, body) = request.into_parts();
+                let captured_request = CapturedPromotedHttpRequest {
+                    request: build_downstream_http_request_context(
+                        request_id,
+                        parts,
+                        body,
+                        connection_metadata.as_ref(),
+                    ),
+                    http2_attachment: attachment.clone(),
+                    http1_upgrade: (!matches!(version, axum::http::Version::HTTP_2))
+                        .then_some(on_upgrade),
+                };
+
+                if let Some(sender) = capture_sender
+                    .lock()
+                    .expect("inline http capture sender lock poisoned")
+                    .take()
+                {
+                    let _ = sender.send(Ok(captured_request));
+                }
+
+                let response_receiver = {
+                    let mut guard = response_receiver.lock().await;
+                    guard.take()
+                };
+                let Some(response_receiver) = response_receiver else {
+                    tracker.finish_request(
+                        attachment.as_ref(),
+                        Some("inline downstream http response receiver missing".to_string()),
+                    );
+                    return Ok::<_, std::convert::Infallible>(text_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal server error",
+                    ));
+                };
+                let response_result = response_receiver.await;
+
+                match response_result {
+                    Ok(resolved) => {
+                        tracker.note_response_head(attachment.as_ref());
+                        tracker.finish_request(attachment.as_ref(), None);
+                        if let Some(plan) = resolved.post_response_plan {
+                            tokio::spawn(async move {
+                                if let Err(err) = plan.run().await {
+                                    warn!(
+                                        "{} downstream post-response transport failed: {err}",
+                                        category_program()
+                                    );
+                                }
+                            });
+                        }
+                        Ok::<_, std::convert::Infallible>(resolved.response)
+                    }
+                    Err(_) => {
+                        tracker.finish_request(
+                            attachment.as_ref(),
+                            Some("inline downstream http response was dropped".to_string()),
+                        );
+                        Ok::<_, std::convert::Infallible>(text_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "internal server error",
+                        ))
+                    }
+                }
+            }
+        })
+    };
+
+    let result = AutoBuilder::new(TokioExecutor::new())
+        .serve_connection_with_upgrades(TokioIo::new(stream), service)
+        .await;
+
+    if let Err(ref err) = result
+        && let Some(sender) = capture_sender
+            .lock()
+            .expect("inline http capture sender lock poisoned")
+            .take()
+    {
+        let _ = sender.send(Err(format!(
+            "downstream http promotion failed before request capture: {err}",
+        )));
+    }
+    tracker.finish_connection(result.as_ref().err().map(|err| err.to_string()));
+}
+
 pub async fn serve_http_proxy(listener: TcpListener, state: SharedState) -> std::io::Result<()> {
     let app = build_http_proxy_app(state.clone());
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         let app = app.clone();
-        let tracker = DownstreamHttp2ConnectionTracker::new(
-            state.downstream_http2_sessions.clone(),
-            peer_addr.to_string(),
-        );
+        let state = state.clone();
         tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            let connection_tracker = tracker.clone();
-            let service = hyper::service::service_fn(move |request: hyper::Request<Incoming>| {
-                let app = app.clone();
-                let tracker = connection_tracker.clone();
-                async move {
-                    let version = request.version();
-                    let path = request.uri().path().to_string();
-                    let attachment = tracker.observe_request(version, &path);
-                    let mut request = request;
-                    let on_upgrade = hyper::upgrade::on(&mut request);
-                    if let Some(ref attachment) = attachment {
-                        request.extensions_mut().insert(attachment.clone());
-                    }
-                    request.extensions_mut().insert(on_upgrade);
-                    let request = request.map(Body::new);
-                    let response = app.oneshot(request).await;
-                    if response.is_ok() {
-                        tracker.note_response_head(attachment.as_ref());
-                        tracker.finish_request(attachment.as_ref(), None);
-                    } else {
-                        tracker.finish_request(
-                            attachment.as_ref(),
-                            Some("data plane request handling failed".to_string()),
-                        );
-                    }
-                    response
-                }
-            });
-
-            let result = AutoBuilder::new(TokioExecutor::new())
-                .serve_connection_with_upgrades(io, service)
-                .await;
-            tracker.finish_connection(result.err().map(|err| err.to_string()));
+            serve_http_connection(app, state, stream, peer_addr, None).await;
         });
     }
+}
+
+#[cfg(feature = "tls")]
+pub async fn serve_https_proxy(listener: TcpListener, state: SharedState) -> std::io::Result<()> {
+    let tls_server_config = generate_https_proxy_tls_server_config()?;
+    loop {
+        let (stream, peer_addr) = listener.accept().await?;
+        let state = state.clone();
+        let tls_server_config = tls_server_config.clone();
+        tokio::spawn(async move {
+            serve_transport_connection_with_listener_goal(
+                stream,
+                peer_addr,
+                state,
+                DownstreamHttpListenerGoal::Https,
+                Some(tls_server_config),
+            )
+            .await;
+        });
+    }
+}
+
+#[cfg(not(feature = "tls"))]
+pub async fn serve_https_proxy(listener: TcpListener, state: SharedState) -> std::io::Result<()> {
+    super::super::transport_plane::serve_transport_proxy(listener, state).await
 }
 
 async fn data_plane_handler(State(state): State<SharedState>, request: Request) -> Response<Body> {
@@ -111,26 +568,20 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
         .extensions
         .get::<Http2DownstreamStreamAttachment>()
         .cloned();
+    let connection_metadata = parts
+        .extensions
+        .get::<DownstreamConnectionMetadata>()
+        .cloned();
     let downstream_http1_upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
     let vm_context = {
-        let uri = parts.uri.clone();
-        let request_headers = parts.headers.clone();
-        let request_scheme = resolve_request_scheme(&uri, &request_headers);
         let request_id = Uuid::new_v4().to_string();
-        let request_path = uri.path().to_string();
-        let vm_request = HttpRequestContext {
-            request_id: request_id.clone(),
-            method: parts.method.clone(),
-            path: request_path.clone(),
-            query: uri.query().unwrap_or("").to_string(),
-            http_version: http_version_label(parts.version),
-            port: resolve_request_port(&uri, &request_headers, &request_scheme),
-            scheme: request_scheme,
-            host: resolve_request_host(&uri, &request_headers),
-            client_ip: resolve_request_client_ip(&request_headers),
+        let request_path = parts.uri.path().to_string();
+        let vm_request = build_downstream_http_request_context(
+            request_id.clone(),
+            parts,
             body,
-            headers: request_headers,
-        };
+            connection_metadata.as_ref(),
+        );
         let debug = VmDebugInvocation {
             attach_debugger: request_will_attach_debugger(
                 &state.debug_session,
@@ -152,6 +603,7 @@ async fn data_plane_handler(State(state): State<SharedState>, request: Request) 
         vm_context.attach_upstream_client_cache(state.upstream_client_cache.clone());
         vm_context.attach_tls_session_cache(state.tls_session_cache.clone());
         vm_context.attach_upstream_http_sessions(state.upstream_http_sessions.clone());
+        vm_context.attach_downstream_http_sessions(state.downstream_http2_sessions.clone());
         if let Some(attachment) = &downstream_http2_attachment {
             vm_context.attach_downstream_http2_stream(attachment);
         }
@@ -228,90 +680,6 @@ fn finalize_data_plane_response(
     let total_latency_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
     state.record_data_plane_latency_ms(total_latency_ms, upstream_latency_ms);
     response
-}
-
-fn resolve_request_scheme(uri: &Uri, headers: &HeaderMap) -> String {
-    if let Some(scheme) = uri.scheme_str() {
-        return scheme.to_string();
-    }
-    if let Some(forwarded) = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return forwarded.to_string();
-    }
-    "http".to_string()
-}
-
-fn resolve_request_port(uri: &Uri, headers: &HeaderMap, scheme: &str) -> u16 {
-    if let Some(port) = uri.port_u16() {
-        return port;
-    }
-    if let Some(host_header) = headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        && let Ok(authority) = host_header.parse::<axum::http::uri::Authority>()
-        && let Some(port) = authority.port_u16()
-    {
-        return port;
-    }
-    if scheme.eq_ignore_ascii_case("https") {
-        443
-    } else {
-        80
-    }
-}
-
-fn http_version_label(version: axum::http::Version) -> String {
-    match version {
-        axum::http::Version::HTTP_09 => "0.9".to_string(),
-        axum::http::Version::HTTP_10 => "1.0".to_string(),
-        axum::http::Version::HTTP_11 => "1.1".to_string(),
-        axum::http::Version::HTTP_2 => "2".to_string(),
-        axum::http::Version::HTTP_3 => "3".to_string(),
-        _ => "1.1".to_string(),
-    }
-}
-
-fn resolve_request_host(uri: &Uri, headers: &HeaderMap) -> String {
-    if let Some(host) = headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return host.to_string();
-    }
-    uri.authority()
-        .map(|authority| authority.as_str().to_string())
-        .unwrap_or_default()
-}
-
-fn resolve_request_client_ip(headers: &HeaderMap) -> String {
-    if let Some(value) = headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-    {
-        let first = value
-            .split(',')
-            .map(str::trim)
-            .find(|candidate| !candidate.is_empty())
-            .unwrap_or_default();
-        if !first.is_empty() {
-            return first.to_string();
-        }
-    }
-    headers
-        .get("x-real-ip")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_default()
 }
 
 fn text_response(status: StatusCode, text: &str) -> Response<Body> {

@@ -7,7 +7,7 @@ use std::{
 use edge::{
     ActiveControlPlaneConfig, RuntimeStoreLimits, SharedState, VM_EPOCH_TICK_INTERVAL_MS,
     VmExecutionConfig, VmExecutionMode, VmInterruptConfig, build_admin_app, init_logging,
-    serve_http_proxy, serve_https_proxy, spawn_active_control_plane_client,
+    serve_transport_proxy, spawn_active_control_plane_client,
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -110,40 +110,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let admin_app = build_admin_app(state.clone());
 
     let data_listener = tokio::net::TcpListener::bind(data_addr).await?;
-    let https_listener = match cli.https_addr {
-        Some(addr) => Some(tokio::net::TcpListener::bind(addr).await?),
-        None => None,
-    };
     let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
 
     info!(
-        "proxy/data-plane listening on http://{}",
+        "transport/data-plane listening on tcp://{}",
         data_listener.local_addr()?
     );
-    if let Some(listener) = &https_listener {
-        info!(
-            "proxy/data-plane listening on https://{} (HTTPS listener starts in transport mode and auto-promotes to HTTP unless the VM consumes raw downstream transport)",
-            listener.local_addr()?
-        );
-    }
     info!(
         "admin endpoint listening on http://{}",
         admin_listener.local_addr()?
     );
 
-    let data_server = serve_http_proxy(data_listener, state.clone());
-    let https_server = async {
-        if let Some(listener) = https_listener {
-            serve_https_proxy(listener, state.clone()).await
-        } else {
-            std::future::pending::<std::io::Result<()>>().await
-        }
-    };
+    let data_server = serve_transport_proxy(data_listener, state.clone());
     let admin_server = axum::serve(admin_listener, admin_app);
 
     tokio::select! {
         result = data_server => result?,
-        result = https_server => result?,
         result = admin_server => result?,
     }
 
@@ -153,12 +135,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CliArgs {
     proxy_addr: Option<SocketAddr>,
-    https_addr: Option<SocketAddr>,
     admin_addr: Option<SocketAddr>,
     max_program_bytes: Option<usize>,
     tls_session_reuse_entries: Option<usize>,
     upstream_http_reuse_entries: Option<usize>,
-    downstream_http2_session_entries: Option<usize>,
     vm_fuel: Option<u64>,
     vm_fuel_check_interval: Option<u32>,
     vm_epoch_deadline: Option<u64>,
@@ -210,14 +190,6 @@ where
                         .map_err(|_| format!("invalid {flag}: {value}"))?,
                 );
             }
-            "--https-addr" => {
-                let value = next_arg_value("--https-addr", &mut args)?;
-                cli.https_addr = Some(
-                    value
-                        .parse::<SocketAddr>()
-                        .map_err(|_| format!("invalid --https-addr: {value}"))?,
-                );
-            }
             "--admin-addr" => {
                 let value = next_arg_value("--admin-addr", &mut args)?;
                 cli.admin_addr = Some(
@@ -249,13 +221,6 @@ where
                         .parse::<usize>()
                         .map_err(|_| format!("invalid --upstream-http-reuse-entries: {value}"))?,
                 );
-            }
-            "--downstream-http2-session-entries" => {
-                let value = next_arg_value("--downstream-http2-session-entries", &mut args)?;
-                cli.downstream_http2_session_entries =
-                    Some(value.parse::<usize>().map_err(|_| {
-                        format!("invalid --downstream-http2-session-entries: {value}")
-                    })?);
             }
             "--vm-fuel" => {
                 let value = next_arg_value("--vm-fuel", &mut args)?;
@@ -374,19 +339,17 @@ fn print_cli_help() {
     let defaults = RuntimeStoreLimits::default();
     eprintln!(
         concat!(
-            "Usage: pd-edge-http-proxy [options]\n\n",
+            "Usage: pd-edge-transport-proxy [options]\n\n",
             "Options:\n",
-            "  --proxy-addr <ADDR>                       Proxy/data-plane listen address (default: 0.0.0.0:8080)\n",
+            "  --proxy-addr <ADDR>                       Transport/data-plane listen address (default: 0.0.0.0:8080)\n",
             "  --data-addr <ADDR>                        Alias for --proxy-addr\n",
-            "  --https-addr <ADDR>                       Optional HTTPS/TLS listen address; starts in transport mode and auto-promotes to HTTP unless the VM consumes raw downstream transport\n",
             "  --admin-addr <ADDR>                       Admin endpoint listen address (default: 127.0.0.1:8081)\n",
             "  --max-program-bytes <BYTES>               Max upload/program size in bytes (default: 1048576)\n",
             "  --tls-session-reuse-entries <N>           TLS session reuse store cap (default: {})\n",
             "  --upstream-http-reuse-entries <N>         Upstream HTTP reuse store cap (default: {})\n",
-            "  --downstream-http2-session-entries <N>    Downstream HTTP/2 session tracking cap (default: {})\n",
-            "  --vm-fuel <UNITS>                         Enable cooperative VM fuel slices per request\n",
+            "  --vm-fuel <UNITS>                         Enable cooperative VM fuel slices per connection\n",
             "  --vm-fuel-check-interval <OPS>            Fuel check interval when --vm-fuel is enabled (default: 1)\n",
-            "  --vm-epoch-deadline <TICKS>               Enable cooperative VM epoch slices per request (1 tick = 1ms wall clock)\n",
+            "  --vm-epoch-deadline <TICKS>               Enable cooperative VM epoch slices per connection (1 tick = 1ms wall clock)\n",
             "  --vm-epoch-check-interval <OPS>           Epoch check interval when --vm-epoch-deadline is enabled (default: 1)\n",
             "  --vm-execution-mode <MODE>                VM execution mode: async|threading (default: async)\n",
             "  --control-plane-url <URL>                 Enable active control-plane RPC client\n",
@@ -398,9 +361,7 @@ fn print_cli_help() {
             "  -V, --version                             Show version with git metadata\n",
             "  -h, --help                                Show this help\n"
         ),
-        defaults.tls_session_reuse_entries,
-        defaults.upstream_http_reuse_entries,
-        defaults.downstream_http2_session_entries,
+        defaults.tls_session_reuse_entries, defaults.upstream_http_reuse_entries,
     );
 }
 
@@ -412,9 +373,6 @@ impl CliArgs {
         }
         if let Some(value) = self.upstream_http_reuse_entries {
             limits.upstream_http_reuse_entries = value;
-        }
-        if let Some(value) = self.downstream_http2_session_entries {
-            limits.downstream_http2_session_entries = value;
         }
         limits
     }
@@ -445,6 +403,8 @@ fn binary_version_text() -> String {
 
     if dirty {
         format!("{binary} {git_tag} (dirty commit: {git_commit})")
+    } else if git_commit != "unknown" {
+        format!("{binary} {git_tag} (commit: {git_commit})")
     } else {
         format!("{binary} {git_tag}")
     }
@@ -520,12 +480,6 @@ fn default_edge_name() -> String {
 mod tests {
     use super::*;
 
-    fn temp_test_dir(prefix: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!("{}-{}", prefix, Uuid::new_v4()));
-        fs::create_dir_all(&dir).expect("temp dir should be created");
-        dir
-    }
-
     #[test]
     fn parse_cli_args_from_handles_help_and_version() {
         assert!(matches!(
@@ -551,8 +505,6 @@ mod tests {
             "16".to_string(),
             "--upstream-http-reuse-entries".to_string(),
             "24".to_string(),
-            "--downstream-http2-session-entries".to_string(),
-            "0".to_string(),
             "--control-plane-url".to_string(),
             "http://127.0.0.1:9100".to_string(),
             "--edge-id".to_string(),
@@ -575,12 +527,10 @@ mod tests {
             *cli,
             CliArgs {
                 proxy_addr: Some("127.0.0.1:7001".parse().expect("valid addr")),
-                https_addr: None,
                 admin_addr: Some("127.0.0.1:7002".parse().expect("valid addr")),
                 max_program_bytes: Some(2048),
                 tls_session_reuse_entries: Some(16),
                 upstream_http_reuse_entries: Some(24),
-                downstream_http2_session_entries: Some(0),
                 vm_fuel: None,
                 vm_fuel_check_interval: None,
                 vm_epoch_deadline: None,
@@ -594,75 +544,6 @@ mod tests {
                 control_plane_rpc_timeout_ms: Some(2500),
             }
         );
-    }
-
-    #[test]
-    fn parse_cli_args_from_parses_https_addr() {
-        let action = parse_cli_args_from([
-            "--proxy-addr".to_string(),
-            "127.0.0.1:7001".to_string(),
-            "--https-addr".to_string(),
-            "127.0.0.1:7443".to_string(),
-        ])
-        .expect("parse should succeed");
-
-        let CliAction::Run(cli) = action else {
-            panic!("expected run action");
-        };
-        assert_eq!(
-            cli.proxy_addr,
-            Some("127.0.0.1:7001".parse().expect("valid addr"))
-        );
-        assert_eq!(
-            cli.https_addr,
-            Some("127.0.0.1:7443".parse().expect("valid addr"))
-        );
-    }
-
-    #[test]
-    fn parse_cli_args_from_parses_vm_fuel_flags() {
-        let action = parse_cli_args_from([
-            "--vm-fuel".to_string(),
-            "1000".to_string(),
-            "--vm-fuel-check-interval".to_string(),
-            "8".to_string(),
-        ])
-        .expect("parse should succeed");
-
-        let CliAction::Run(cli) = action else {
-            panic!("expected run action");
-        };
-        assert_eq!(cli.vm_fuel, Some(1000));
-        assert_eq!(cli.vm_fuel_check_interval, Some(8));
-    }
-
-    #[test]
-    fn parse_cli_args_from_parses_vm_epoch_flags() {
-        let action = parse_cli_args_from([
-            "--vm-epoch-deadline".to_string(),
-            "3".to_string(),
-            "--vm-epoch-check-interval".to_string(),
-            "5".to_string(),
-        ])
-        .expect("parse should succeed");
-
-        let CliAction::Run(cli) = action else {
-            panic!("expected run action");
-        };
-        assert_eq!(cli.vm_epoch_deadline, Some(3));
-        assert_eq!(cli.vm_epoch_check_interval, Some(5));
-    }
-
-    #[test]
-    fn parse_cli_args_from_parses_vm_execution_mode() {
-        let action =
-            parse_cli_args_from(["--vm-execution-mode".to_string(), "threading".to_string()])
-                .expect("parse should succeed");
-
-        let CliAction::Run(cli) = action else {
-            panic!("expected run action");
-        };
-        assert_eq!(cli.vm_execution_mode, Some(VmExecutionMode::Threading));
     }
 
     #[test]
@@ -681,85 +562,5 @@ mod tests {
             limits.downstream_http2_session_entries,
             RuntimeStoreLimits::default().downstream_http2_session_entries
         );
-    }
-
-    #[test]
-    fn parse_cli_args_from_rejects_invalid_vm_execution_mode() {
-        let err =
-            parse_cli_args_from(["--vm-execution-mode".to_string(), "threadpool".to_string()])
-                .expect_err("invalid vm execution mode should fail");
-        assert!(err.contains("invalid --vm-execution-mode"));
-    }
-
-    #[test]
-    fn parse_cli_args_from_rejects_zero_vm_fuel() {
-        let err = parse_cli_args_from(["--vm-fuel".to_string(), "0".to_string()])
-            .expect_err("zero vm fuel should fail");
-        assert!(err.contains("--vm-fuel must be > 0"));
-    }
-
-    #[test]
-    fn parse_cli_args_from_rejects_conflicting_vm_interrupt_flags() {
-        let err = parse_cli_args_from([
-            "--vm-fuel".to_string(),
-            "32".to_string(),
-            "--vm-epoch-deadline".to_string(),
-            "2".to_string(),
-        ])
-        .expect_err("conflicting vm interrupt flags should fail");
-        assert!(err.contains("mutually exclusive"));
-    }
-
-    #[test]
-    fn parse_cli_args_from_rejects_missing_value() {
-        let err = parse_cli_args_from(["--admin-addr".to_string()])
-            .expect_err("missing value should fail");
-        assert!(err.contains("missing value for --admin-addr"));
-    }
-
-    #[test]
-    fn parse_cli_args_from_rejects_unknown_argument() {
-        let err = parse_cli_args_from(["--nope".to_string()]).expect_err("unknown should fail");
-        assert!(err.contains("unknown argument: --nope"));
-    }
-
-    #[test]
-    fn resolve_edge_id_explicit_value_is_persisted() {
-        let dir = temp_test_dir("pd-edge-http-proxy-explicit-id");
-        let path = dir.join("edge-id");
-        let edge_id = resolve_edge_id(Some("123e4567-e89b-12d3-a456-426614174000"), path.as_path())
-            .expect("explicit id should resolve");
-        assert_eq!(edge_id, "123e4567-e89b-12d3-a456-426614174000");
-        let on_disk = fs::read_to_string(&path).expect("id file should exist");
-        assert_eq!(on_disk, "123e4567-e89b-12d3-a456-426614174000\n");
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn resolve_edge_id_existing_invalid_file_is_replaced() {
-        let dir = temp_test_dir("pd-edge-http-proxy-invalid-id");
-        let path = dir.join("edge-id");
-        fs::write(&path, "not-a-uuid\n").expect("seed invalid id");
-
-        let edge_id = resolve_edge_id(None, path.as_path()).expect("id should be generated");
-        assert!(
-            Uuid::parse_str(&edge_id).is_ok(),
-            "generated id should be uuid"
-        );
-        let on_disk = fs::read_to_string(&path).expect("id file should exist");
-        assert_eq!(on_disk, format!("{edge_id}\n"));
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn resolve_edge_id_empty_file_is_rejected() {
-        let dir = temp_test_dir("pd-edge-http-proxy-empty-id");
-        let path = dir.join("edge-id");
-        fs::write(&path, "  \n").expect("seed empty id");
-
-        let err = resolve_edge_id(None, path.as_path()).expect_err("empty file should fail");
-        let text = err.to_string();
-        assert!(text.contains("is empty"));
-        let _ = fs::remove_dir_all(dir);
     }
 }

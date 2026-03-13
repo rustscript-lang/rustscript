@@ -24,7 +24,7 @@ pub(crate) use edge::{
     FN_HTTP_UPSTREAM_REQUEST_SET_TARGET, ProxyVmContext, RateLimiterStore, SharedState,
     VmAsyncOpBridge, build_admin_app, build_http_proxy_app, compile_edge_source_file,
     enter_edge_host_context, new_shared_vm_async_ops, register_http_plane_host_module,
-    serve_http_proxy, serve_transport_proxy, spawn_active_control_plane_client,
+    serve_http_proxy, serve_https_proxy, serve_transport_proxy, spawn_active_control_plane_client,
 };
 #[cfg(feature = "websocket")]
 pub(crate) use futures_util::{SinkExt, StreamExt};
@@ -54,9 +54,7 @@ pub(crate) use vm::{
 pub(crate) fn ensure_rustls_provider() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .expect("rustls crypto provider should install");
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
 }
 
@@ -97,6 +95,69 @@ pub(crate) async fn spawn_proxy_with_state(
     });
     let (admin_addr, admin_handle) = spawn_server(build_admin_app(state)).await;
     (data_addr, admin_addr, data_handle, admin_handle)
+}
+
+pub(crate) async fn spawn_http_https_proxy(
+    max_program_bytes: usize,
+) -> (
+    SocketAddr,
+    SocketAddr,
+    SocketAddr,
+    JoinHandle<()>,
+    JoinHandle<()>,
+    JoinHandle<()>,
+) {
+    let state = SharedState::new(max_program_bytes);
+    spawn_http_https_proxy_with_state(state).await
+}
+
+pub(crate) async fn spawn_http_https_proxy_with_state(
+    state: SharedState,
+) -> (
+    SocketAddr,
+    SocketAddr,
+    SocketAddr,
+    JoinHandle<()>,
+    JoinHandle<()>,
+    JoinHandle<()>,
+) {
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("http listener should bind");
+    let http_addr = http_listener
+        .local_addr()
+        .expect("http listener should have addr");
+    let https_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("https listener should bind");
+    let https_addr = https_listener
+        .local_addr()
+        .expect("https listener should have addr");
+    let http_handle = tokio::spawn({
+        let state = state.clone();
+        async move {
+            serve_http_proxy(http_listener, state)
+                .await
+                .expect("http data plane server should run");
+        }
+    });
+    let https_handle = tokio::spawn({
+        let state = state.clone();
+        async move {
+            serve_https_proxy(https_listener, state)
+                .await
+                .expect("https data plane server should run");
+        }
+    });
+    let (admin_addr, admin_handle) = spawn_server(build_admin_app(state)).await;
+    (
+        http_addr,
+        https_addr,
+        admin_addr,
+        http_handle,
+        https_handle,
+        admin_handle,
+    )
 }
 
 pub(crate) async fn spawn_transport_proxy(

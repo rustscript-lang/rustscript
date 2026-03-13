@@ -53,6 +53,11 @@ fn tcp_stream_read(stream: i64, max_bytes: i64) -> String {
     unreachable!("abi declaration only")
 }
 
+#[pd_host_function(name = "tcp::stream::peek")]
+fn tcp_stream_peek(stream: i64, max_bytes: i64) -> String {
+    unreachable!("abi declaration only")
+}
+
 #[pd_host_function(name = "tcp::stream::write")]
 fn tcp_stream_write(stream: i64, text: &str) -> i64 {
     unreachable!("abi declaration only")

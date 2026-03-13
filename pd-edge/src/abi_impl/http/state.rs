@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     future::Future,
+    net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex, MutexGuard},
     time::Instant,
@@ -19,6 +20,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use tokio::io::copy_bidirectional;
+use tokio::sync::oneshot;
 use url::Url;
 use vm::VmError;
 #[cfg(feature = "websocket")]
@@ -39,7 +41,7 @@ use super::super::{
     SharedRateLimiter,
     proxy::ProxyByteStreamState,
     transport::{
-        CachedTlsSession, FIRST_DYNAMIC_TCP_STREAM_HANDLE, SharedTcpStreamIo,
+        CachedTlsSession, FIRST_DYNAMIC_TCP_STREAM_HANDLE, ReplayPrefixedIo, SharedTcpStreamIo,
         SharedTlsSessionCache, SharedUdpSocketIo, TcpFlowState, TcpSocketState, TcpTransportDag,
         TlsFlowState, TlsProtocolVersion, TlsSessionCacheKey, TlsTransportDag, UdpSocketState,
         alpn_from_http_version, tls_session_cache_key,
@@ -72,6 +74,37 @@ pub struct HttpRequestContext {
     pub client_ip: String,
     pub body: Body,
     pub headers: HeaderMap,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DownstreamConnectionMetadata {
+    pub(crate) local_addr: SocketAddr,
+    pub(crate) peer_addr: SocketAddr,
+    pub(crate) secure: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DownstreamHttpListenerGoal {
+    #[default]
+    None,
+    #[cfg(feature = "tls")]
+    Https,
+}
+
+impl DownstreamHttpListenerGoal {
+    pub(crate) fn promotes_into_http(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    #[cfg(feature = "tls")]
+    pub(crate) fn requires_tls(self) -> bool {
+        matches!(self, Self::Https)
+    }
+
+    #[cfg(not(feature = "tls"))]
+    pub(crate) fn requires_tls(self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -376,6 +409,28 @@ pub(crate) enum DownstreamConnectTunnelTarget {
         handle: i64,
         stream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
     },
+}
+
+pub(crate) struct InlineDownstreamHttpResponse {
+    pub(crate) response: Response<Body>,
+    pub(crate) post_response_plan: Option<DownstreamPostResponsePlan>,
+}
+
+impl std::fmt::Debug for InlineDownstreamHttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InlineDownstreamHttpResponse")
+            .field("response_status", &self.response.status())
+            .field("has_post_response_plan", &self.post_response_plan.is_some())
+            .finish()
+    }
+}
+
+struct InlineDownstreamHttpResponseSender(oneshot::Sender<InlineDownstreamHttpResponse>);
+
+impl std::fmt::Debug for InlineDownstreamHttpResponseSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InlineDownstreamHttpResponseSender")
+    }
 }
 
 #[derive(Debug)]
@@ -974,6 +1029,9 @@ pub(crate) struct RuntimeServices {
     upstream_client_cache: Option<SharedUpstreamClientCache>,
     tls_session_cache: Option<SharedTlsSessionCache>,
     upstream_http_sessions: Option<SharedHttpUpstreamSessions>,
+    downstream_http_sessions: Option<http2::SharedHttpDownstreamSessions>,
+    #[cfg(feature = "tls")]
+    downstream_tls_termination: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
     rate_limiter: SharedRateLimiter,
 }
 
@@ -984,6 +1042,9 @@ impl RuntimeServices {
             upstream_client_cache: None,
             tls_session_cache: None,
             upstream_http_sessions: None,
+            downstream_http_sessions: None,
+            #[cfg(feature = "tls")]
+            downstream_tls_termination: None,
             rate_limiter,
         }
     }
@@ -1004,6 +1065,17 @@ impl RuntimeServices {
         self.upstream_http_sessions.clone()
     }
 
+    pub(crate) fn downstream_http_sessions(&self) -> Option<http2::SharedHttpDownstreamSessions> {
+        self.downstream_http_sessions.clone()
+    }
+
+    #[cfg(feature = "tls")]
+    pub(crate) fn downstream_tls_termination(
+        &self,
+    ) -> Option<Arc<tokio_rustls::rustls::ServerConfig>> {
+        self.downstream_tls_termination.clone()
+    }
+
     pub(crate) fn rate_limiter(&self) -> SharedRateLimiter {
         self.rate_limiter.clone()
     }
@@ -1018,6 +1090,7 @@ pub(crate) struct DownstreamState {
     pub(crate) downstream_carrier_ref: Option<HttpCarrierRef>,
     pub(crate) downstream_http1_upgrade: Option<DownstreamHttp1Upgrade>,
     pub(crate) post_response_plan: Option<DownstreamPostResponsePlan>,
+    inline_http_response_sender: Option<InlineDownstreamHttpResponseSender>,
 }
 
 impl DownstreamState {
@@ -1031,6 +1104,7 @@ impl DownstreamState {
             downstream_carrier_ref: Some(HttpCarrierRef::DownstreamHttp1),
             downstream_http1_upgrade: None,
             post_response_plan: None,
+            inline_http_response_sender: None,
         }
     }
 
@@ -1056,6 +1130,7 @@ impl DownstreamState {
             downstream_carrier_ref: None,
             downstream_http1_upgrade: None,
             post_response_plan: None,
+            inline_http_response_sender: None,
         }
     }
 }
@@ -1084,10 +1159,13 @@ impl ExchangeRegistry {
 pub(crate) struct TransportState {
     pub(crate) tcp_dag: TcpTransportDag,
     pub(crate) tls_dag: TlsTransportDag,
+    pub(crate) downstream_listener_goal: DownstreamHttpListenerGoal,
+    pub(crate) downstream_transport_accessed: bool,
     pub(crate) downstream_tcp_io: Option<SharedTcpStreamIo>,
+    pub(crate) downstream_preread_buffer: Vec<u8>,
     pub(crate) downstream_read_eof: bool,
-    pub(crate) downstream_local_addr: Option<String>,
-    pub(crate) downstream_peer_addr: Option<String>,
+    pub(crate) downstream_local_addr: Option<SocketAddr>,
+    pub(crate) downstream_peer_addr: Option<SocketAddr>,
     #[cfg(feature = "tls")]
     pub(crate) downstream_tls_server_start: Option<DownstreamTlsServerStart>,
     #[cfg(feature = "tls")]
@@ -1115,7 +1193,10 @@ impl TransportState {
                 request_head.host.as_str(),
                 request_head.http_version.as_str(),
             ),
+            downstream_listener_goal: DownstreamHttpListenerGoal::None,
+            downstream_transport_accessed: false,
             downstream_tcp_io: None,
+            downstream_preread_buffer: Vec::new(),
             downstream_read_eof: false,
             downstream_local_addr: None,
             downstream_peer_addr: None,
@@ -1140,8 +1221,8 @@ impl TransportState {
 
     fn from_downstream_tcp_stream(
         io: SharedTcpStreamIo,
-        local_addr: String,
-        peer_addr: String,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
     ) -> Self {
         Self {
             tcp_dag: TcpTransportDag {
@@ -1149,7 +1230,10 @@ impl TransportState {
                 default_upstream: TcpFlowState::default(),
             },
             tls_dag: TlsTransportDag::default(),
+            downstream_listener_goal: DownstreamHttpListenerGoal::None,
+            downstream_transport_accessed: false,
             downstream_tcp_io: Some(io),
+            downstream_preread_buffer: Vec::new(),
             downstream_read_eof: false,
             downstream_local_addr: Some(local_addr),
             downstream_peer_addr: Some(peer_addr),
@@ -1224,7 +1308,7 @@ impl Default for EdgeIoRegistry {
 
 #[derive(Debug)]
 pub struct ProxyVmContext {
-    request_head: HttpRequestHead,
+    request_head: Mutex<HttpRequestHead>,
     services: RuntimeServices,
     downstream: Mutex<DownstreamState>,
     exchanges: Mutex<ExchangeRegistry>,
@@ -1257,7 +1341,7 @@ impl ProxyVmContext {
             )),
             exchanges: Mutex::new(ExchangeRegistry::from_http_request(&request_head)),
             transport: Mutex::new(TransportState::from_http_request(&request_head)),
-            request_head,
+            request_head: Mutex::new(request_head),
             services: RuntimeServices::new(rate_limiter),
             #[cfg(feature = "webrtc")]
             webrtc: Mutex::new(WebRtcRegistry::default()),
@@ -1290,6 +1374,7 @@ impl ProxyVmContext {
 
     pub fn from_downstream_tcp_stream(
         stream: tokio::net::TcpStream,
+        request_id: String,
         rate_limiter: SharedRateLimiter,
     ) -> Result<Self, VmError> {
         let local_addr = stream.local_addr().map_err(|err| {
@@ -1300,7 +1385,7 @@ impl ProxyVmContext {
         })?;
         let io = Arc::new(tokio::sync::Mutex::new(Some(stream)));
         let request_head = HttpRequestHead {
-            request_id: String::new(),
+            request_id,
             method: Method::GET,
             path: "/".to_string(),
             query: String::new(),
@@ -1315,11 +1400,9 @@ impl ProxyVmContext {
             downstream: Mutex::new(DownstreamState::for_transport_connection()),
             exchanges: Mutex::new(ExchangeRegistry::from_http_request(&request_head)),
             transport: Mutex::new(TransportState::from_downstream_tcp_stream(
-                io,
-                local_addr.to_string(),
-                peer_addr.to_string(),
+                io, local_addr, peer_addr,
             )),
-            request_head,
+            request_head: Mutex::new(request_head),
             services: RuntimeServices::new(rate_limiter),
             #[cfg(feature = "webrtc")]
             webrtc: Mutex::new(WebRtcRegistry::default()),
@@ -1340,8 +1423,23 @@ impl ProxyVmContext {
         self.services.tls_session_cache = Some(cache);
     }
 
+    #[cfg(feature = "tls")]
+    pub(crate) fn attach_downstream_tls_termination(
+        &mut self,
+        server_config: Arc<tokio_rustls::rustls::ServerConfig>,
+    ) {
+        self.services.downstream_tls_termination = Some(server_config);
+    }
+
     pub(crate) fn attach_upstream_http_sessions(&mut self, sessions: SharedHttpUpstreamSessions) {
         self.services.upstream_http_sessions = Some(sessions);
+    }
+
+    pub(crate) fn attach_downstream_http_sessions(
+        &mut self,
+        sessions: http2::SharedHttpDownstreamSessions,
+    ) {
+        self.services.downstream_http_sessions = Some(sessions);
     }
 
     pub(crate) fn attach_downstream_http2_stream(
@@ -1361,12 +1459,26 @@ impl ProxyVmContext {
             .downstream_http1_upgrade = Some(DownstreamHttp1Upgrade::new(upgrade));
     }
 
-    pub(crate) fn request_head(&self) -> &HttpRequestHead {
-        &self.request_head
+    pub(crate) fn set_downstream_listener_goal(&mut self, goal: DownstreamHttpListenerGoal) {
+        self.transport
+            .get_mut()
+            .expect("transport state lock poisoned")
+            .downstream_listener_goal = goal;
+    }
+
+    pub(crate) fn request_head(&self) -> HttpRequestHead {
+        self.request_head
+            .lock()
+            .expect("vm request head lock poisoned")
+            .clone()
     }
 
     pub(crate) fn services(&self) -> &RuntimeServices {
         &self.services
+    }
+
+    pub(crate) fn note_downstream_transport_access(&self) {
+        self.lock_transport().downstream_transport_accessed = true;
     }
 
     pub(crate) fn with_default_upstream_exchange<T>(
@@ -1440,6 +1552,102 @@ impl ProxyVmContext {
 
     pub(crate) fn take_downstream_post_response_plan(&self) -> Option<DownstreamPostResponsePlan> {
         self.lock_downstream().post_response_plan.take()
+    }
+
+    pub(crate) fn begin_inline_downstream_http_response(
+        &self,
+        sender: oneshot::Sender<InlineDownstreamHttpResponse>,
+    ) -> Result<(), VmError> {
+        let mut downstream = self.lock_downstream();
+        if downstream.inline_http_response_sender.is_some() {
+            return Err(VmError::HostError(
+                "downstream inline http response is already attached".to_string(),
+            ));
+        }
+        downstream.inline_http_response_sender = Some(InlineDownstreamHttpResponseSender(sender));
+        Ok(())
+    }
+
+    pub(crate) fn take_inline_downstream_http_response_sender(
+        &self,
+    ) -> Option<oneshot::Sender<InlineDownstreamHttpResponse>> {
+        self.lock_downstream()
+            .inline_http_response_sender
+            .take()
+            .map(|sender| sender.0)
+    }
+
+    pub(crate) fn downstream_connection_metadata(
+        &self,
+        secure: bool,
+    ) -> Result<DownstreamConnectionMetadata, VmError> {
+        let transport = self.lock_transport();
+        let local_addr = transport.downstream_local_addr.ok_or_else(|| {
+            VmError::HostError("downstream local address is unavailable".to_string())
+        })?;
+        let peer_addr = transport.downstream_peer_addr.ok_or_else(|| {
+            VmError::HostError("downstream peer address is unavailable".to_string())
+        })?;
+        Ok(DownstreamConnectionMetadata {
+            local_addr,
+            peer_addr,
+            secure,
+        })
+    }
+
+    pub(crate) fn promote_downstream_http_request(
+        &self,
+        request: HttpRequestContext,
+        http2_attachment: Option<http2::Http2DownstreamStreamAttachment>,
+        downstream_http1_upgrade: Option<OnUpgrade>,
+    ) {
+        let request_headers = request.headers.clone();
+        let request_head = HttpRequestHead {
+            request_id: request.request_id,
+            method: request.method,
+            path: request.path,
+            query: request.query,
+            http_version: request.http_version,
+            port: request.port,
+            scheme: request.scheme,
+            host: request.host,
+            client_ip: request.client_ip,
+            headers: request_headers.clone(),
+        };
+        *self
+            .request_head
+            .lock()
+            .expect("vm request head lock poisoned") = request_head.clone();
+
+        {
+            let mut exchanges = self.lock_exchanges();
+            let default_exchange = exchanges
+                .exchanges
+                .get_mut(&DEFAULT_UPSTREAM_EXCHANGE_HANDLE)
+                .expect("default upstream exchange should exist");
+            default_exchange.request.method = request_head.method.clone();
+            default_exchange.request.path = request_head.path.clone();
+            default_exchange.request.query = request_head.query.clone();
+            default_exchange.request.headers = request_head.headers.clone();
+        }
+
+        let mut downstream = self.lock_downstream();
+        downstream.inbound_request_body = Arc::new(tokio::sync::Mutex::new(
+            InboundRequestBodyState::new(request.body),
+        ));
+        downstream.downstream_websocket =
+            WebSocketConnectionState::for_http_request(&request_headers);
+        downstream.downstream_carrier_ref =
+            http2_attachment.map_or(Some(HttpCarrierRef::DownstreamHttp1), |attachment| {
+                Some(HttpCarrierRef::DownstreamHttp2Stream(
+                    http2::Http2StreamRef {
+                        session_id: attachment.session_id,
+                        stream_id: attachment.stream_id,
+                    },
+                ))
+            });
+        downstream.downstream_http1_upgrade =
+            downstream_http1_upgrade.map(DownstreamHttp1Upgrade::new);
     }
 
     pub(crate) fn with_downstream_websocket_mut<T>(
@@ -1636,7 +1844,7 @@ pub(crate) fn attach_outbound_exchange_tls_transport(
         .dynamic_tls_sessions
         .entry(session)
         .or_insert_with(TlsFlowState::for_dynamic_socket);
-    if tls_flow.server_name().is_empty() && tls_flow.peer_name().is_empty() {
+    if !tls_flow.handshake_complete() {
         tls_flow.observe_target(&target);
     }
     drop(transport);
@@ -1695,6 +1903,100 @@ pub(crate) fn outbound_exchange_tls_flow(
         .get(&handle)
         .map(|exchange| exchange.transport.tls_flow.clone())
         .ok_or_else(|| VmError::HostError(format!("unknown outbound exchange handle {handle}")))
+}
+
+pub(crate) fn schedule_downstream_http_handoff(
+    context: &SharedProxyVmContext,
+) -> Result<(), VmError> {
+    let handoff_ready = {
+        let transport = context.lock_transport();
+        #[cfg(feature = "tls")]
+        if transport.downstream_tls_server_start.is_some() {
+            return Err(VmError::HostError(
+                "downstream HTTP handoff requires TLS plaintext; complete the downstream TLS handshake first".to_string(),
+            ));
+        }
+        #[cfg(feature = "tls")]
+        let tls_ready = transport.downstream_tls_io.is_some();
+        #[cfg(not(feature = "tls"))]
+        let tls_ready = false;
+        transport.downstream_tcp_io.is_some() || tls_ready
+    };
+    if !handoff_ready {
+        return Err(VmError::HostError(
+            "downstream HTTP handoff requires an attached raw downstream tcp or tls plaintext transport".to_string(),
+        ));
+    }
+    if context.lock_downstream().downstream_carrier_ref.is_some() {
+        return Err(VmError::HostError(
+            "downstream HTTP handoff is only available before the connection has entered HTTP request semantics".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) enum PromotedDownstreamTransport {
+    Tcp(ReplayPrefixedIo<tokio::net::TcpStream>),
+    #[cfg(feature = "tls")]
+    Tls(
+        ReplayPrefixedIo<
+            tokio_rustls::server::TlsStream<crate::abi_impl::transport::DownstreamReplayTcpStream>,
+        >,
+    ),
+}
+
+pub(crate) async fn take_promoted_downstream_transport(
+    context: &SharedProxyVmContext,
+) -> Result<PromotedDownstreamTransport, VmError> {
+    #[cfg(feature = "tls")]
+    let (tcp_io, tls_io, preread, tls_pending) = {
+        let mut transport = context.lock_transport();
+        let tcp_io = transport.downstream_tcp_io.take();
+        let tls_io = transport.downstream_tls_io.take();
+        let preread = std::mem::take(&mut transport.downstream_preread_buffer);
+        let tls_pending = transport.downstream_tls_server_start.is_some();
+        (tcp_io, tls_io, preread, tls_pending)
+    };
+    #[cfg(not(feature = "tls"))]
+    let (tcp_io, preread) = {
+        let mut transport = context.lock_transport();
+        (
+            transport.downstream_tcp_io.take(),
+            std::mem::take(&mut transport.downstream_preread_buffer),
+        )
+    };
+
+    #[cfg(feature = "tls")]
+    if tls_pending {
+        return Err(VmError::HostError(
+            "downstream HTTP handoff requires TLS plaintext; complete the downstream TLS handshake first".to_string(),
+        ));
+    }
+
+    #[cfg(feature = "tls")]
+    if let Some(io) = tls_io {
+        let mut guard = io.lock().await;
+        let stream = guard.take().ok_or_else(|| {
+            VmError::HostError("downstream tls plaintext transport is already in use".to_string())
+        })?;
+        return Ok(PromotedDownstreamTransport::Tls(ReplayPrefixedIo::new(
+            preread, stream,
+        )));
+    }
+
+    if let Some(io) = tcp_io {
+        let mut guard = io.lock().await;
+        let stream = guard.take().ok_or_else(|| {
+            VmError::HostError("downstream tcp transport is already in use".to_string())
+        })?;
+        return Ok(PromotedDownstreamTransport::Tcp(ReplayPrefixedIo::new(
+            preread, stream,
+        )));
+    }
+
+    Err(VmError::HostError(
+        "downstream HTTP handoff requires an attached raw downstream tcp or tls plaintext transport".to_string(),
+    ))
 }
 
 pub(crate) fn append_outbound_exchange_body(
@@ -1899,6 +2201,128 @@ pub(crate) fn http_version_label(version: Version) -> &'static str {
     } else {
         http1::response_version_label(version)
     }
+}
+
+pub(crate) fn build_downstream_http_request_context(
+    request_id: String,
+    parts: axum::http::request::Parts,
+    body: Body,
+    connection_metadata: Option<&DownstreamConnectionMetadata>,
+) -> HttpRequestContext {
+    let request_scheme =
+        resolve_downstream_request_scheme(&parts.uri, &parts.headers, connection_metadata);
+    HttpRequestContext {
+        request_id,
+        method: parts.method,
+        path: parts.uri.path().to_string(),
+        query: parts.uri.query().unwrap_or("").to_string(),
+        http_version: http_version_label(parts.version).to_string(),
+        port: resolve_downstream_request_port(
+            &parts.uri,
+            &parts.headers,
+            &request_scheme,
+            connection_metadata,
+        ),
+        scheme: request_scheme,
+        host: resolve_downstream_request_host(&parts.uri, &parts.headers),
+        client_ip: resolve_downstream_request_client_ip(&parts.headers, connection_metadata),
+        body,
+        headers: parts.headers,
+    }
+}
+
+fn resolve_downstream_request_scheme(
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+    connection_metadata: Option<&DownstreamConnectionMetadata>,
+) -> String {
+    if let Some(scheme) = uri.scheme_str() {
+        return scheme.to_string();
+    }
+    if let Some(forwarded) = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return forwarded.to_string();
+    }
+    if let Some(connection_metadata) = connection_metadata
+        && connection_metadata.secure
+    {
+        return "https".to_string();
+    }
+    "http".to_string()
+}
+
+fn resolve_downstream_request_port(
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+    scheme: &str,
+    connection_metadata: Option<&DownstreamConnectionMetadata>,
+) -> u16 {
+    if let Some(port) = uri.port_u16() {
+        return port;
+    }
+    if let Some(host_header) = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && let Ok(authority) = host_header.parse::<axum::http::uri::Authority>()
+        && let Some(port) = authority.port_u16()
+    {
+        return port;
+    }
+    if let Some(connection_metadata) = connection_metadata {
+        return connection_metadata.local_addr.port();
+    }
+    if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
+    }
+}
+
+fn resolve_downstream_request_host(uri: &axum::http::Uri, headers: &HeaderMap) -> String {
+    if let Some(host) = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return host.to_string();
+    }
+    uri.authority()
+        .map(|authority| authority.as_str().to_string())
+        .unwrap_or_default()
+}
+
+fn resolve_downstream_request_client_ip(
+    headers: &HeaderMap,
+    connection_metadata: Option<&DownstreamConnectionMetadata>,
+) -> String {
+    if let Some(value) = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+    {
+        let first = value
+            .split(',')
+            .map(str::trim)
+            .find(|candidate| !candidate.is_empty())
+            .unwrap_or_default();
+        if !first.is_empty() {
+            return first.to_string();
+        }
+    }
+    headers
+        .get("x-real-ip")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| connection_metadata.map(|metadata| metadata.peer_addr.ip().to_string()))
+        .unwrap_or_default()
 }
 
 pub(crate) fn is_hop_by_hop_header(name: &HeaderName) -> bool {
@@ -3080,13 +3504,14 @@ pub(crate) async fn resolve_http_graph_response(
         let plan = context
             .take_downstream_post_response_plan()
             .expect("downstream post-response plan should exist");
+        let request_head = context.request_head();
         let response = match &plan {
             DownstreamPostResponsePlan::ConnectTunnel(_) => {
                 Ok(response_from_connect_tunnel(response_headers))
             }
             #[cfg(feature = "websocket")]
             DownstreamPostResponsePlan::WebSocketTunnel(plan) => response_from_websocket_tunnel(
-                context.request_head().headers(),
+                request_head.headers(),
                 response_headers,
                 plan.selected_subprotocol.as_deref(),
             ),

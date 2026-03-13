@@ -37,7 +37,12 @@ mod vm_runner;
 const MAX_LATENCY_SAMPLES: usize = 4096;
 pub const VM_EPOCH_TICK_INTERVAL_MS: u64 = 1;
 
-pub use http_plane::{build_admin_app, build_http_proxy_app, serve_http_proxy};
+pub(crate) use http_plane::{
+    auto_promote_downstream_listener_goal_into_http_request,
+    maybe_auto_promote_downstream_listener_goal_into_http_request,
+    promote_transport_context_into_http_request,
+};
+pub use http_plane::{build_admin_app, build_http_proxy_app, serve_http_proxy, serve_https_proxy};
 pub use transport_plane::serve_transport_proxy;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]

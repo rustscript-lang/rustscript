@@ -1,4 +1,8 @@
-use std::{io, io::BufReader, sync::Arc};
+use std::{
+    io,
+    io::BufReader,
+    sync::{Arc, OnceLock},
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use edge_abi::symbols::tls;
@@ -26,7 +30,7 @@ use super::super::websocket::{
 };
 use super::state::tls_session_cache_key;
 use super::state::{
-    DownstreamTlsServerStart, TlsFlowState, TlsProtocolVersion, TlsSessionRef,
+    DownstreamTlsServerStart, ReplayPrefixedIo, TlsFlowState, TlsProtocolVersion, TlsSessionRef,
     decode_tls_session_handle,
 };
 use crate::abi_impl::http1;
@@ -44,6 +48,9 @@ fn decode_session(
     session: i64,
 ) -> Result<TlsSessionHandle, VmError> {
     if let Some(reserved) = decode_tls_session_handle(session) {
+        if matches!(reserved, TlsSessionRef::Downstream) {
+            context.note_downstream_transport_access();
+        }
         return Ok(TlsSessionHandle::Reserved(reserved));
     }
     if tcp_stream_exists(context, session) {
@@ -166,8 +173,7 @@ fn with_configurable_session_mut<T>(
         TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => {
             if !downstream_tls_session_is_configurable(context) {
                 return Err(VmError::HostError(
-                    "downstream tls session is read-only in the current runtime state"
-                        .to_string(),
+                    "downstream tls session is read-only in the current runtime state".to_string(),
                 ));
             }
             let mut guard = context.lock_transport();
@@ -256,6 +262,62 @@ fn ensure_rustls_provider() {
     INIT.call_once(|| {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
+}
+
+#[derive(Clone, Debug)]
+struct DefaultSelfSignedServerIdentity {
+    certificate_chain_der: Vec<Vec<u8>>,
+    private_key_der: Vec<u8>,
+}
+
+impl DefaultSelfSignedServerIdentity {
+    fn generate() -> Result<Self, String> {
+        let certificate =
+            generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .map_err(|err| format!("failed to generate self-signed cert: {err}"))?;
+        let certificate_der = certificate
+            .serialize_der()
+            .map_err(|err| format!("failed to serialize cert der: {err}"))?;
+        Ok(Self {
+            certificate_chain_der: vec![certificate_der],
+            private_key_der: certificate.serialize_private_key_der(),
+        })
+    }
+
+    fn certificate_chain(&self) -> Vec<CertificateDer<'static>> {
+        self.certificate_chain_der
+            .iter()
+            .cloned()
+            .map(CertificateDer::from)
+            .collect()
+    }
+
+    fn private_key(&self) -> PrivateKeyDer<'static> {
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.private_key_der.clone()))
+    }
+}
+
+fn default_self_signed_server_identity() -> Result<Arc<DefaultSelfSignedServerIdentity>, String> {
+    static IDENTITY: OnceLock<Result<Arc<DefaultSelfSignedServerIdentity>, String>> =
+        OnceLock::new();
+    IDENTITY
+        .get_or_init(|| {
+            ensure_rustls_provider();
+            DefaultSelfSignedServerIdentity::generate().map(Arc::new)
+        })
+        .clone()
+}
+
+pub(crate) fn build_default_self_signed_server_config(
+    alpn_protocols: Vec<Vec<u8>>,
+) -> io::Result<Arc<ServerConfig>> {
+    let identity = default_self_signed_server_identity().map_err(io::Error::other)?;
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(identity.certificate_chain(), identity.private_key())
+        .map_err(|err| io::Error::other(format!("failed to build rustls config: {err}")))?;
+    config.alpn_protocols = alpn_protocols;
+    Ok(Arc::new(config))
 }
 
 fn build_root_store(flow: &TlsFlowState) -> Result<RootCertStore, VmError> {
@@ -489,26 +551,11 @@ fn build_downstream_server_identity(
             "downstream tls handshake requires both certificate and private key when either is configured".to_string(),
         )),
         (None, None) => {
-            let mut names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-            if !flow.server_name().is_empty() && !names.iter().any(|name| name == flow.server_name()) {
-                names.insert(0, flow.server_name().to_string());
-            }
-            let certificate = generate_simple_self_signed(names).map_err(|err| {
-                VmError::HostError(format!(
-                    "failed to generate downstream self-signed certificate: {err}",
-                ))
-            })?;
-            let certificate_der = certificate.serialize_der().map_err(|err| {
-                VmError::HostError(format!(
-                    "failed to serialize downstream certificate: {err}",
-                ))
-            })?;
-            Ok((
-                vec![CertificateDer::from(certificate_der)],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    certificate.serialize_private_key_der(),
-                )),
-            ))
+            // Reuse one fallback identity for the lifetime of the process instead of
+            // regenerating a fresh self-signed certificate on every downstream handshake.
+            let identity =
+                default_self_signed_server_identity().map_err(VmError::HostError)?;
+            Ok((identity.certificate_chain(), identity.private_key()))
         }
     }
 }
@@ -591,47 +638,56 @@ async fn session_from_socket(
         TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => {
             let pending_or_open = {
                 let guard = context.lock_transport();
-                guard.downstream_tls_server_start.is_some() || guard.downstream_tls_io.is_some()
+                guard.downstream_tls_server_start.is_some()
+                    || guard.downstream_tls_io.is_some()
+                    || (guard.downstream_tcp_io.is_none() && guard.tls_dag.downstream.is_present())
             };
             if pending_or_open {
                 TlsSessionRef::Downstream.handle()
             } else {
-                let raw_io = {
+                let (raw_io, preread) = {
                     let mut guard = context.lock_transport();
-                    guard.downstream_tcp_io.take().ok_or_else(|| {
+                    let raw_io = guard.downstream_tcp_io.take().ok_or_else(|| {
                         VmError::HostError(
                             "downstream tls session requires an attached downstream tcp transport"
                                 .to_string(),
                         )
-                    })?
+                    })?;
+                    let preread = std::mem::take(&mut guard.downstream_preread_buffer);
+                    (raw_io, preread)
                 };
                 let tcp_stream = {
                     let mut guard = raw_io.lock().await;
                     guard.take().ok_or_else(|| {
-                        VmError::HostError(
-                            "downstream tcp transport is already in use".to_string(),
-                        )
+                        VmError::HostError("downstream tcp transport is already in use".to_string())
                     })?
                 };
-                let mut acceptor =
-                    Box::pin(LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tcp_stream));
+                let mut acceptor = Box::pin(LazyConfigAcceptor::new(
+                    rustls::server::Acceptor::default(),
+                    ReplayPrefixedIo::new(preread, tcp_stream),
+                ));
                 match acceptor.as_mut().await {
                     Ok(start) => {
                         let start = DownstreamTlsServerStart::new(start);
                         let server_name = start.client_hello_server_name();
                         let mut guard = context.lock_transport();
-                        guard.tls_dag.downstream.observe_downstream_client_hello(server_name);
+                        guard
+                            .tls_dag
+                            .downstream
+                            .observe_downstream_client_hello(server_name);
                         guard.downstream_tls_server_start = Some(start);
                         TlsSessionRef::Downstream.handle()
                     }
                     Err(err) => {
                         if let Some(stream) = acceptor.as_mut().get_mut().take_io() {
+                            let (prefix, raw_stream) = stream.into_parts();
                             {
                                 let mut raw_guard = raw_io.lock().await;
-                                *raw_guard = Some(stream);
+                                *raw_guard = Some(raw_stream);
                             }
                             let mut guard = context.lock_transport();
                             guard.downstream_tcp_io = Some(raw_io);
+                            guard.downstream_preread_buffer = prefix;
                         }
                         return Err(VmError::HostError(format!(
                             "failed to observe downstream tls client hello: {err}",
@@ -845,9 +901,10 @@ async fn session_handshake(
                 }
                 Err(err) => {
                     let mut guard = context.lock_transport();
-                    guard.tcp_dag.downstream.mark_failed(format!(
-                        "downstream tls handshake failed: {err}",
-                    ));
+                    guard
+                        .tcp_dag
+                        .downstream
+                        .mark_failed(format!("downstream tls handshake failed: {err}",));
                     guard.tls_dag.downstream.mark_failed();
                     return Err(VmError::HostError(format!(
                         "downstream tls handshake failed: {err}",

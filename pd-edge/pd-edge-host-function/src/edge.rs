@@ -23,7 +23,7 @@ pub(crate) fn expand_pd_edge_host_function(
         ));
     }
 
-    transform_async_edge_function(&mut item)?;
+    transform_async_edge_function(&mut item, &edge_attr)?;
     validate_edge_bind_names(&item, &edge_attr.bind_params)?;
     for input in &item.sig.inputs {
         validate_edge_param(input, &edge_attr.bind_params)?;
@@ -215,7 +215,54 @@ fn edge_scope_tokens(scope: EdgeHostScopeAttr) -> proc_macro2::TokenStream {
     }
 }
 
-fn transform_async_edge_function(item: &mut ItemFn) -> Result<(), Error> {
+fn find_context_param_ident(item: &ItemFn) -> Option<Ident> {
+    item.sig.inputs.iter().find_map(|input| {
+        let FnArg::Typed(pat_type) = input else {
+            return None;
+        };
+        if !is_edge_context_type(&pat_type.ty) {
+            return None;
+        }
+        match pat_type.pat.as_ref() {
+            Pat::Ident(PatIdent { ident, .. }) => Some(ident.clone()),
+            _ => None,
+        }
+    })
+}
+
+fn async_scope_prepare_stmt(
+    item: &ItemFn,
+    attr: &EdgeHostAttr,
+) -> Result<proc_macro2::TokenStream, Error> {
+    let Some(scope) = attr.scope else {
+        return Ok(quote!());
+    };
+    let requires_prepare = matches!(
+        scope,
+        EdgeHostScopeAttr::Http | EdgeHostScopeAttr::HttpExtension
+    );
+    if !requires_prepare {
+        return Ok(quote!());
+    }
+    let Some(context_ident) = find_context_param_ident(item) else {
+        return Err(Error::new_spanned(
+            &item.sig.ident,
+            "async scoped http host functions must accept SharedProxyVmContext",
+        ));
+    };
+    let scope_tokens = edge_scope_tokens(scope);
+    let name_expr = &attr.name;
+    Ok(quote! {
+        crate::abi_impl::prepare_scoped_host_call(
+            #context_ident.clone(),
+            #scope_tokens,
+            #name_expr,
+        )
+        .await?;
+    })
+}
+
+fn transform_async_edge_function(item: &mut ItemFn, attr: &EdgeHostAttr) -> Result<(), Error> {
     if item.sig.asyncness.is_none() {
         return Ok(());
     }
@@ -256,9 +303,11 @@ fn transform_async_edge_function(item: &mut ItemFn) -> Result<(), Error> {
     }
 
     let original_block = item.block.clone();
+    let prepare_stmt = async_scope_prepare_stmt(item, attr)?;
     item.sig.asyncness = None;
     *item.block = syn::parse2(quote!({
         crate::abi_impl::schedule_current_future_call(#vm_ident, async move {
+            #prepare_stmt
             let __pd_edge_outcome = (async move #original_block).await?;
             match __pd_edge_outcome {
                 ::vm::CallOutcome::Return(values) => Ok(values),

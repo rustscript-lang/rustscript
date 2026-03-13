@@ -33,7 +33,11 @@ pub(crate) use self::http2::{
     SharedHttpDownstreamSessions, SharedHttpUpstreamSessions, new_shared_http_downstream_sessions,
     new_shared_http_upstream_sessions,
 };
-pub(crate) use self::transport::{SharedTlsSessionCache, new_shared_tls_session_cache};
+#[cfg(feature = "tls")]
+pub(crate) use self::transport::build_default_self_signed_server_config;
+pub(crate) use self::transport::{
+    ReplayPrefixedIo, SharedTlsSessionCache, new_shared_tls_session_cache,
+};
 
 pub type SharedRateLimiter = Arc<Mutex<RateLimiterStore>>;
 pub type SharedVmAsyncOps = Arc<Mutex<VmAsyncOps>>;
@@ -260,6 +264,28 @@ pub(crate) fn current_async_ops() -> Result<SharedVmAsyncOps, VmError> {
                 )
             })
     })
+}
+
+pub(crate) async fn prepare_scoped_host_call(
+    context: SharedProxyVmContext,
+    scope: registry::EdgeHostScope,
+    host_name: &str,
+) -> Result<(), VmError> {
+    let requires_http_entry = matches!(
+        scope,
+        registry::EdgeHostScope::Http | registry::EdgeHostScope::HttpExtension
+    );
+    if !requires_http_entry {
+        return Ok(());
+    }
+    if host_name == edge_abi::symbols::http::request::GET_SCHEME.name
+        || host_name == edge_abi::symbols::http::request::HANDOFF_DOWNSTREAM.name
+    {
+        return Ok(());
+    }
+
+    crate::runtime::auto_promote_downstream_listener_goal_into_http_request(context, host_name)
+        .await
 }
 
 struct AsyncHostAdapter {

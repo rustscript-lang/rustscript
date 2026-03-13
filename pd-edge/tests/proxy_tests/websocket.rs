@@ -494,3 +494,83 @@ async fn downstream_transport_proxy_accepts_and_executes_websocket_frames_direct
     data_handle.abort();
     admin_handle.abort();
 }
+
+#[tokio::test]
+async fn sample_transport_websocket_sse_bridge_program_forwards_events_as_text_frames() {
+    let (upstream_addr, upstream_handle) = spawn_sse_upstream(vec![
+        "id: 1\n",
+        "data: alpha\n",
+        "\n",
+        "event: update\n",
+        "data: beta\n",
+        "\n",
+    ])
+    .await;
+    let (data_addr, admin_addr, data_handle, admin_handle) =
+        spawn_transport_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("sample_transport_websocket_sse_bridge_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let mut request = format!("ws://{data_addr}/bridge")
+        .into_client_request()
+        .expect("websocket request should build");
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_static("chat, sse-bridge"),
+    );
+    let (mut websocket, response) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("downstream websocket accept should succeed");
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(
+        response
+            .headers()
+            .get("sec-websocket-protocol")
+            .and_then(|value| value.to_str().ok()),
+        Some("sse-bridge")
+    );
+
+    websocket
+        .send(Message::Text(
+            format!("http://{upstream_addr}/events").into(),
+        ))
+        .await
+        .expect("upstream target frame should send");
+
+    let first = websocket
+        .next()
+        .await
+        .expect("websocket should yield first event")
+        .expect("first event should decode");
+    assert_eq!(
+        first.to_text().expect("first event should be text"),
+        "id: 1\ndata: alpha"
+    );
+
+    let second = websocket
+        .next()
+        .await
+        .expect("websocket should yield second event")
+        .expect("second event should decode");
+    assert_eq!(
+        second.to_text().expect("second event should be text"),
+        "event: update\ndata: beta"
+    );
+
+    let closed = websocket
+        .next()
+        .await
+        .expect("websocket should yield a close frame")
+        .expect("close frame should decode");
+    assert!(matches!(closed, Message::Close(_)));
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
