@@ -721,6 +721,13 @@ async fn run_inline_promoted_http_connection<S>(
 }
 
 pub async fn serve_http_proxy(listener: TcpListener, state: SharedState) -> std::io::Result<()> {
+    #[cfg(not(feature = "http2"))]
+    {
+        return axum::serve(listener, build_http_proxy_app(state)).await;
+    }
+
+    #[cfg(feature = "http2")]
+    {
     let app = build_http_proxy_app(state.clone());
     loop {
         let (stream, peer_addr) = listener.accept().await?;
@@ -729,6 +736,7 @@ pub async fn serve_http_proxy(listener: TcpListener, state: SharedState) -> std:
         tokio::spawn(async move {
             serve_http_connection(app, state, stream, peer_addr, None).await;
         });
+    }
     }
 }
 
