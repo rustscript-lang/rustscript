@@ -11,6 +11,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(all(feature = "http2", feature = "tls"))]
+use axum::body::Bytes;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -19,15 +21,46 @@ use axum::{
     routing::any,
 };
 use edge::HOST_FUNCTION_COUNT;
-use reqwest::{Client, StatusCode};
+#[cfg(all(feature = "http2", feature = "tls"))]
+use http_body_util::{BodyExt, Full};
+#[cfg(all(feature = "http2", feature = "tls"))]
+use hyper::{
+    Request as HyperRequest, Response as HyperResponse, body::Incoming, service::service_fn,
+};
+#[cfg(all(feature = "http2", feature = "tls"))]
+use hyper_util::rt::TokioIo;
+#[cfg(all(feature = "http2", feature = "tls"))]
+use rcgen::generate_simple_self_signed;
+use reqwest::{Client, StatusCode, Version as ReqwestVersion};
 use serde::{Deserialize, Serialize};
 use tokio::{
     task::{JoinHandle, JoinSet},
     time::sleep,
 };
+#[cfg(all(feature = "http2", feature = "tls"))]
+use tokio_rustls::{
+    TlsAcceptor,
+    rustls::{
+        ServerConfig,
+        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    },
+};
 use vm::{compile_source, encode_program, validate_program};
 
 const LOAD_REQUEST_BODY: &str = "edge-perf-payload";
+const BENCH_TLS_SESSION_REUSE_ENTRIES: usize = 128;
+const BENCH_UPSTREAM_HTTP_REUSE_ENTRIES: usize = 128;
+const BENCH_DOWNSTREAM_HTTP2_SESSION_ENTRIES: usize = 128;
+const HTTP2_TLS_FEATURE_HINT: &str =
+    "HTTP/2 benchmark scenarios require running the example with --features http2,tls";
+
+#[cfg(all(feature = "http2", feature = "tls"))]
+fn ensure_rustls_provider() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
 
 const BASE_WORKLOAD_SOURCE: &str = r#"
 let mut outer = 0;
@@ -86,96 +119,285 @@ if (acc % 2) == 0 {{
     )
 }
 
-fn host_calls_upstream_roundtrip_program_source(upstream_addr: &str) -> String {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpstreamProtocol {
+    Http1,
+    HttpsHttp2,
+}
+
+impl UpstreamProtocol {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Http1 => "1.1",
+            Self::HttpsHttp2 => "2",
+        }
+    }
+
+    fn requires_http2_tls(self) -> bool {
+        matches!(self, Self::HttpsHttp2)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DownstreamProtocol {
+    Http1,
+    HttpsHttp2,
+}
+
+impl DownstreamProtocol {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Http1 => "1.1",
+            Self::HttpsHttp2 => "2",
+        }
+    }
+
+    fn requires_http2_tls(self) -> bool {
+        matches!(self, Self::HttpsHttp2)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxyProgramFlavor {
+    HeaderTransform,
+}
+
+fn proxy_roundtrip_program_source(
+    upstream_origin: &str,
+    upstream_protocol: UpstreamProtocol,
+    flavor: ProxyProgramFlavor,
+) -> String {
+    let tls_import = if upstream_protocol.requires_http2_tls() {
+        "use tls;\n"
+    } else {
+        ""
+    };
+    let tls_prelude = if upstream_protocol.requires_http2_tls() {
+        r#"
+let session = tls::session::from_socket(upstream);
+tls::session::set_verify(session, false);
+tls::session::set_alpn(session, "h2,http/1.1");
+http::exchange::set_version(upstream, "2");
+"#
+    } else {
+        ""
+    };
+    let tls_response_headers = if upstream_protocol.requires_http2_tls() {
+        r#"
+http::response::set_header("x-upstream-alpn", tls::session::get_alpn(session));
+"#
+    } else {
+        ""
+    };
+    let extra_upstream_header = match flavor {
+        ProxyProgramFlavor::HeaderTransform => {
+            r#"http::exchange::set_header(upstream, "x-bench-program-header", "program-proxy");"#
+                .to_string()
+        }
+    };
+    let extra_response_headers = match flavor {
+        ProxyProgramFlavor::HeaderTransform => r#"
+http::response::set_header("x-bench-response-header", "program-proxy");
+http::response::set_header("x-upstream-program-header", echoed_program_header);
+"#
+        .to_string(),
+    };
     format!(
         r#"
 {BASE_WORKLOAD_SOURCE}
 
 use http;
+{tls_import}
 
 let method = http::request::get_method();
 let path = http::request::get_path();
 let client_id = http::request::get_header("x-client-id");
+let downstream_version = http::request::get_http_version();
 let body = http::request::get_body();
 
 let upstream = http::exchange::default_upstream();
-http::exchange::set_target(upstream, "http://{upstream_addr}");
-http::exchange::set_header(upstream, "x-client-id", client_id);
-http::exchange::set_header(upstream, "x-downstream-method", method);
+http::exchange::set_target(upstream, "{upstream_origin}");
+http::exchange::set_method(upstream, method);
 http::exchange::set_path(upstream, path);
+http::exchange::set_header(upstream, "x-client-id", client_id);
+http::exchange::set_header(upstream, "x-downstream-version", downstream_version);
+{extra_upstream_header}
 http::exchange::set_body(upstream, body);
+{tls_prelude}
 
 let upstream_status = http::exchange::get_status(upstream);
-let echoed_client_id = http::exchange::get_header(upstream, "x-upstream-client-id");
-let echoed_path = http::exchange::get_header(upstream, "x-upstream-path");
+let upstream_version = http::exchange::get_http_version(upstream);
+let echoed_client_id = http::exchange::get_header(upstream, "x-bench-upstream-client-id");
+let echoed_path = http::exchange::get_header(upstream, "x-bench-upstream-path");
+let echoed_program_header = http::exchange::get_header(upstream, "x-bench-upstream-program-header");
 let upstream_body = http::exchange::get_body(upstream);
 
 http::response::set_status(upstream_status);
+http::response::set_header("x-downstream-version", downstream_version);
 http::response::set_header("x-perf-client-id", client_id);
+http::response::set_header("x-upstream-version", upstream_version);
 http::response::set_header("x-upstream-client-id", echoed_client_id);
 http::response::set_header("x-upstream-path", echoed_path);
+{extra_response_headers}
+{tls_response_headers}
 http::response::set_body(upstream_body);
 "#
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProgramVariant {
     None,
     NoHostCallsBase,
     HostCallsAdditive,
-    HostCallsUpstreamRoundTrip,
+    DirectUpstream {
+        upstream: UpstreamProtocol,
+    },
+    ProxyRoundTrip {
+        flavor: ProxyProgramFlavor,
+        upstream: UpstreamProtocol,
+    },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Scenario {
     id: &'static str,
     description: &'static str,
     expected_status: u16,
     program_variant: ProgramVariant,
+    downstream_protocol: DownstreamProtocol,
 }
 
-const SCENARIOS: [Scenario; 4] = [
+impl Scenario {
+    fn upstream_protocol(self) -> Option<UpstreamProtocol> {
+        match self.program_variant {
+            ProgramVariant::DirectUpstream { upstream } => Some(upstream),
+            ProgramVariant::ProxyRoundTrip { upstream, .. } => Some(upstream),
+            _ => None,
+        }
+    }
+
+    fn uses_proxy(self) -> bool {
+        !matches!(self.program_variant, ProgramVariant::DirectUpstream { .. })
+    }
+
+    fn requires_http2_tls(self) -> bool {
+        self.downstream_protocol.requires_http2_tls()
+            || self
+                .upstream_protocol()
+                .is_some_and(UpstreamProtocol::requires_http2_tls)
+    }
+
+    fn supports_current_build(self) -> bool {
+        !self.requires_http2_tls() || cfg!(all(feature = "http2", feature = "tls"))
+    }
+
+    fn expects_header_transform(self) -> bool {
+        matches!(
+            self.program_variant,
+            ProgramVariant::ProxyRoundTrip {
+                flavor: ProxyProgramFlavor::HeaderTransform,
+                ..
+            }
+        )
+    }
+}
+
+const SCENARIOS: [Scenario; 8] = [
     Scenario {
         id: "raw_no_program",
         description: "raw pd-edge-http-proxy (no program loaded)",
         expected_status: 404,
         program_variant: ProgramVariant::None,
+        downstream_protocol: DownstreamProtocol::Http1,
     },
     Scenario {
         id: "no_host_calls_program",
         description: "pd-edge-http-proxy with no host calls (compute-only program)",
         expected_status: 404,
         program_variant: ProgramVariant::NoHostCallsBase,
+        downstream_protocol: DownstreamProtocol::Http1,
     },
     Scenario {
         id: "host_calls_terminate",
         description: "pd-edge-http-proxy with additive host calls and terminate (no upstream)",
         expected_status: 200,
         program_variant: ProgramVariant::HostCallsAdditive,
+        downstream_protocol: DownstreamProtocol::Http1,
+    },
+    Scenario {
+        id: "raw_http_upstream",
+        description: "perf client hits hardcoded plaintext HTTP upstream directly",
+        expected_status: 200,
+        program_variant: ProgramVariant::DirectUpstream {
+            upstream: UpstreamProtocol::Http1,
+        },
+        downstream_protocol: DownstreamProtocol::Http1,
     },
     Scenario {
         id: "host_calls_upstream_roundtrip",
-        description: "pd-edge-http-proxy with additive host calls and real upstream round-trip",
+        description: "pd-edge-http-proxy with program proxying to hardcoded plaintext HTTP upstream and request/response header mutations",
         expected_status: 200,
-        program_variant: ProgramVariant::HostCallsUpstreamRoundTrip,
+        program_variant: ProgramVariant::ProxyRoundTrip {
+            flavor: ProxyProgramFlavor::HeaderTransform,
+            upstream: UpstreamProtocol::Http1,
+        },
+        downstream_protocol: DownstreamProtocol::Http1,
+    },
+    Scenario {
+        id: "raw_http2_upstream",
+        description: "perf client hits hardcoded HTTPS HTTP/2 upstream directly",
+        expected_status: 200,
+        program_variant: ProgramVariant::DirectUpstream {
+            upstream: UpstreamProtocol::HttpsHttp2,
+        },
+        downstream_protocol: DownstreamProtocol::HttpsHttp2,
+    },
+    Scenario {
+        id: "host_calls_upstream_roundtrip_http2_upstream",
+        description: "pd-edge-http-proxy with program proxying to hardcoded HTTPS HTTP/2 upstream while downstream stays plaintext HTTP/1.1",
+        expected_status: 200,
+        program_variant: ProgramVariant::ProxyRoundTrip {
+            flavor: ProxyProgramFlavor::HeaderTransform,
+            upstream: UpstreamProtocol::HttpsHttp2,
+        },
+        downstream_protocol: DownstreamProtocol::Http1,
+    },
+    Scenario {
+        id: "host_calls_upstream_roundtrip_downstream_http2",
+        description: "pd-edge-http-proxy with program proxying to hardcoded plaintext HTTP upstream while downstream uses HTTPS HTTP/2",
+        expected_status: 200,
+        program_variant: ProgramVariant::ProxyRoundTrip {
+            flavor: ProxyProgramFlavor::HeaderTransform,
+            upstream: UpstreamProtocol::Http1,
+        },
+        downstream_protocol: DownstreamProtocol::HttpsHttp2,
     },
 ];
 
 struct UpstreamFixture {
-    addr: SocketAddr,
-    task: JoinHandle<()>,
+    origin: String,
+    connection_count: Option<Arc<AtomicUsize>>,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 impl UpstreamFixture {
-    fn target(&self) -> String {
-        self.addr.to_string()
+    fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    fn connection_count(&self) -> Option<usize> {
+        self.connection_count
+            .as_ref()
+            .map(|value| value.load(Ordering::Relaxed))
     }
 }
 
 impl Drop for UpstreamFixture {
     fn drop(&mut self) {
-        self.task.abort();
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 }
 
@@ -209,7 +431,7 @@ impl Default for BenchConfig {
             request_timeout_ms: 10_000,
             startup_timeout_ms: 15_000,
             memory_sample_interval_ms: 100,
-            vm_fuel: Some(50_000),
+            vm_fuel: None,
             vm_fuel_check_interval: 32,
             vm_execution_mode: VmExecutionModeArg::Async,
             fuel_latency_sweep: false,
@@ -350,6 +572,20 @@ struct TelemetrySummary {
     vm_execution_errors_total: u64,
 }
 
+#[derive(Clone)]
+struct BenchClients {
+    http: Client,
+    https: Client,
+}
+
+#[derive(Debug)]
+struct ProbeResponse {
+    status: u16,
+    version: ReqwestVersion,
+    headers: reqwest::header::HeaderMap,
+    body: String,
+}
+
 #[derive(Default)]
 struct WorkerRun {
     latencies_us: Vec<u64>,
@@ -372,6 +608,7 @@ impl ProxyProcess {
     fn spawn(
         binary_path: &Path,
         data_addr: SocketAddr,
+        https_addr: Option<SocketAddr>,
         admin_addr: SocketAddr,
         vm_fuel: Option<u64>,
         vm_fuel_check_interval: u32,
@@ -388,6 +625,12 @@ impl ProxyProcess {
         command
             .arg("--data-addr")
             .arg(data_addr.to_string())
+            .arg("--tls-session-reuse-entries")
+            .arg(BENCH_TLS_SESSION_REUSE_ENTRIES.to_string())
+            .arg("--upstream-http-reuse-entries")
+            .arg(BENCH_UPSTREAM_HTTP_REUSE_ENTRIES.to_string())
+            .arg("--downstream-http2-session-entries")
+            .arg(BENCH_DOWNSTREAM_HTTP2_SESSION_ENTRIES.to_string())
             .arg("--admin-addr")
             .arg(admin_addr.to_string())
             .arg("--vm-execution-mode")
@@ -396,6 +639,9 @@ impl ProxyProcess {
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(Stdio::inherit());
+        if let Some(https_addr) = https_addr {
+            command.arg("--https-addr").arg(https_addr.to_string());
+        }
         if let Some(fuel) = vm_fuel {
             command.arg("--vm-fuel").arg(fuel.to_string());
             command
@@ -421,6 +667,31 @@ impl ProxyProcess {
     }
 }
 
+fn build_bench_client(
+    config: &BenchConfig,
+    accept_invalid_certs: bool,
+) -> Result<Client, Box<dyn std::error::Error>> {
+    let mut builder = Client::builder()
+        .pool_max_idle_per_host(config.concurrency.max(1))
+        .tcp_nodelay(true)
+        .timeout(Duration::from_millis(config.request_timeout_ms));
+    if accept_invalid_certs {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    #[cfg(feature = "http2")]
+    {
+        builder = builder.http2_adaptive_window(true);
+    }
+    Ok(builder.build()?)
+}
+
+fn request_client_for_scenario(clients: &BenchClients, scenario: Scenario) -> &Client {
+    match scenario.downstream_protocol {
+        DownstreamProtocol::Http1 => &clients.http,
+        DownstreamProtocol::HttpsHttp2 => &clients.https,
+    }
+}
+
 impl Drop for ProxyProcess {
     fn drop(&mut self) {
         if let Ok(None) = self.child.try_wait() {
@@ -441,7 +712,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let binary_path = resolve_proxy_binary_path(&config)?;
+    let selected_scenarios = if config.fuel_latency_sweep {
+        select_sweep_scenarios(&config)?
+    } else {
+        select_scenarios(&config)?
+    };
+    let required_features = required_proxy_build_features(&selected_scenarios);
+    let binary_path = resolve_proxy_binary_path(&config, &required_features)?;
     println!("proxy binary: {}", binary_path.display());
     println!(
         "requests={}, warmup_requests={}, concurrency={}, request_timeout_ms={}, memory_sample_interval_ms={}, vm_execution_mode={}, vm_fuel={:?}, vm_fuel_check_interval={}, fuel_latency_sweep={}, fuel_latency_fuels={:?}, fuel_latency_check_intervals={:?}",
@@ -458,16 +735,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.fuel_latency_check_intervals
     );
 
-    let client = Client::builder()
-        .pool_max_idle_per_host(config.concurrency.max(1))
-        .tcp_nodelay(true)
-        .timeout(Duration::from_millis(config.request_timeout_ms))
-        .build()?;
+    let clients = BenchClients {
+        http: build_bench_client(&config, false)?,
+        https: build_bench_client(&config, true)?,
+    };
 
     if config.fuel_latency_sweep {
-        run_fuel_latency_sweep(&config, &binary_path, &client).await?;
+        run_fuel_latency_sweep(&config, &binary_path, &clients, &selected_scenarios).await?;
     } else {
-        run_standard_bench(&config, &binary_path, &client).await?;
+        run_standard_bench(&config, &binary_path, &clients, &selected_scenarios).await?;
     }
 
     Ok(())
@@ -476,10 +752,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_standard_bench(
     config: &BenchConfig,
     binary_path: &Path,
-    client: &Client,
+    clients: &BenchClients,
+    scenarios: &[Scenario],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let scenarios = select_scenarios(config)?;
-    let reports = run_case_scenarios(config, binary_path, client, &scenarios, None).await;
+    let reports = run_case_scenarios(config, binary_path, clients, scenarios, None).await;
     let report = BenchReport {
         generated_at_unix_ms: generated_at_unix_ms(),
         config: build_bench_config_report(config, binary_path),
@@ -494,9 +770,9 @@ async fn run_standard_bench(
 async fn run_fuel_latency_sweep(
     config: &BenchConfig,
     binary_path: &Path,
-    client: &Client,
+    clients: &BenchClients,
+    scenarios: &[Scenario],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let scenarios = select_sweep_scenarios(config)?;
     let fixed_interval = 1_u32;
     let fixed_fuel = config.vm_fuel.unwrap_or(50_000);
     println!(
@@ -516,7 +792,7 @@ async fn run_fuel_latency_sweep(
             fuel
         );
         let reports =
-            run_case_scenarios(&case_config, binary_path, client, &scenarios, Some(&label)).await;
+            run_case_scenarios(&case_config, binary_path, clients, scenarios, Some(&label)).await;
         fuel_sweep_cases.push(FuelSweepCaseReport {
             vm_fuel: Some(*fuel),
             vm_fuel_check_interval: fixed_interval,
@@ -532,7 +808,7 @@ async fn run_fuel_latency_sweep(
         let label =
             format!("interval sweep case vm_fuel={fixed_fuel} vm_fuel_check_interval={interval}");
         let reports =
-            run_case_scenarios(&case_config, binary_path, client, &scenarios, Some(&label)).await;
+            run_case_scenarios(&case_config, binary_path, clients, scenarios, Some(&label)).await;
         fuel_check_interval_sweep_cases.push(FuelSweepCaseReport {
             vm_fuel: Some(fixed_fuel),
             vm_fuel_check_interval: *interval,
@@ -561,7 +837,7 @@ async fn run_fuel_latency_sweep(
 async fn run_case_scenarios(
     config: &BenchConfig,
     binary_path: &Path,
-    client: &Client,
+    clients: &BenchClients,
     scenarios: &[Scenario],
     case_label: Option<&str>,
 ) -> Vec<ScenarioReport> {
@@ -573,7 +849,7 @@ async fn run_case_scenarios(
         } else {
             println!("=== {} ===", scenario.description);
         }
-        let report = match run_scenario(config, binary_path, client, *scenario).await {
+        let report = match run_scenario(config, binary_path, clients, *scenario).await {
             Ok(report) => report,
             Err(err) => scenario_error_report(*scenario, err.to_string()),
         };
@@ -590,9 +866,31 @@ fn select_scenarios(config: &BenchConfig) -> Result<Vec<Scenario>, Box<dyn std::
             .copied()
             .find(|scenario| scenario.id == filter)
             .ok_or_else(|| io::Error::other(format!("unknown --scenario: {filter}")))?;
+        if !matched.supports_current_build() {
+            return Err(io::Error::other(format!(
+                "scenario '{}' requires HTTP/2 + TLS support; {}",
+                matched.id, HTTP2_TLS_FEATURE_HINT
+            ))
+            .into());
+        }
         Ok(vec![matched])
     } else {
-        Ok(SCENARIOS.to_vec())
+        let mut selected = Vec::new();
+        let mut skipped = Vec::new();
+        for scenario in SCENARIOS {
+            if scenario.supports_current_build() {
+                selected.push(scenario);
+            } else {
+                skipped.push(scenario.id);
+            }
+        }
+        if !skipped.is_empty() {
+            println!(
+                "skipping scenarios requiring HTTP/2 + TLS support: {}",
+                skipped.join(", ")
+            );
+        }
+        Ok(selected)
     }
 }
 
@@ -633,6 +931,17 @@ fn scenario_error_report(scenario: Scenario, error: String) -> ScenarioReport {
         },
         telemetry: None,
         error: Some(error),
+    }
+}
+
+fn required_proxy_build_features(scenarios: &[Scenario]) -> Vec<&'static str> {
+    if scenarios
+        .iter()
+        .any(|scenario| scenario.requires_http2_tls())
+    {
+        vec!["http2", "tls"]
+    } else {
+        Vec::new()
     }
 }
 
@@ -754,12 +1063,13 @@ fn write_json_report<T: Serialize>(
 async fn run_scenario(
     config: &BenchConfig,
     binary_path: &Path,
-    client: &Client,
+    clients: &BenchClients,
     scenario: Scenario,
 ) -> Result<ScenarioReport, Box<dyn std::error::Error>> {
-    let upstream_fixture = match scenario.program_variant {
-        ProgramVariant::HostCallsUpstreamRoundTrip => Some(spawn_upstream_echo_server().await?),
-        _ => None,
+    let upstream_fixture = match scenario.upstream_protocol() {
+        Some(UpstreamProtocol::Http1) => Some(spawn_plain_http_upstream_fixture().await?),
+        Some(UpstreamProtocol::HttpsHttp2) => Some(spawn_https_http2_upstream_fixture().await?),
+        None => None,
     };
     let program_bytes = match scenario.program_variant {
         ProgramVariant::None => None,
@@ -771,46 +1081,84 @@ async fn run_scenario(
             let source = host_calls_terminate_program_source();
             Some(compile_program_to_vmbc(&source)?)
         }
-        ProgramVariant::HostCallsUpstreamRoundTrip => {
-            let source = host_calls_upstream_roundtrip_program_source(
-                &upstream_fixture
-                    .as_ref()
-                    .expect("upstream fixture should exist")
-                    .target(),
-            );
+        ProgramVariant::DirectUpstream { .. } => None,
+        ProgramVariant::ProxyRoundTrip { flavor, upstream } => {
+            let upstream_origin = upstream_fixture
+                .as_ref()
+                .expect("upstream fixture should exist")
+                .origin();
+            let source = match flavor {
+                ProxyProgramFlavor::HeaderTransform => {
+                    proxy_roundtrip_program_source(upstream_origin, upstream, flavor)
+                }
+            };
             Some(compile_program_to_vmbc(&source)?)
         }
     };
 
-    let data_addr = reserve_loopback_addr()?;
-    let admin_addr = reserve_loopback_addr()?;
-    let mut proxy = ProxyProcess::spawn(
-        binary_path,
-        data_addr,
-        admin_addr,
-        config.vm_fuel,
-        config.vm_fuel_check_interval,
-        config.vm_execution_mode,
-    )?;
+    let mut proxy = if scenario.uses_proxy() {
+        let data_addr = reserve_loopback_addr()?;
+        let https_addr = if scenario.downstream_protocol.requires_http2_tls() {
+            Some(reserve_loopback_addr()?)
+        } else {
+            None
+        };
+        let admin_addr = reserve_loopback_addr()?;
+        let mut proxy = ProxyProcess::spawn(
+            binary_path,
+            data_addr,
+            https_addr,
+            admin_addr,
+            config.vm_fuel,
+            config.vm_fuel_check_interval,
+            config.vm_execution_mode,
+        )?;
 
-    wait_until_proxy_ready(
-        client,
-        admin_addr,
-        Duration::from_millis(config.startup_timeout_ms),
-        &mut proxy,
+        wait_until_proxy_ready(
+            &clients.http,
+            admin_addr,
+            Duration::from_millis(config.startup_timeout_ms),
+            &mut proxy,
+        )
+        .await?;
+
+        if let Some(bytes) = program_bytes {
+            upload_program(&clients.http, admin_addr, bytes).await?;
+        }
+
+        Some((proxy, data_addr, https_addr, admin_addr))
+    } else {
+        None
+    };
+
+    let request_origin = if let Some((_, data_addr, https_addr, _)) = proxy.as_ref() {
+        match scenario.downstream_protocol {
+            DownstreamProtocol::Http1 => format!("http://{data_addr}"),
+            DownstreamProtocol::HttpsHttp2 => {
+                let https_addr = https_addr.expect("https addr should exist");
+                format!("https://127.0.0.1:{}", https_addr.port())
+            }
+        }
+    } else {
+        upstream_fixture
+            .as_ref()
+            .expect("direct-upstream scenario should have an upstream fixture")
+            .origin()
+            .to_string()
+    };
+    let request_url = format!("{request_origin}/perf");
+    let request_client = request_client_for_scenario(clients, scenario);
+    verify_scenario_probe(
+        request_client,
+        &request_origin,
+        scenario,
+        upstream_fixture.as_ref(),
     )
     .await?;
 
-    if let Some(bytes) = program_bytes {
-        upload_program(client, admin_addr, bytes).await?;
-    }
-
-    let request_url = format!("http://{data_addr}/perf?scenario={}", scenario.id);
-    verify_scenario_probe(client, &request_url, scenario).await?;
-
     if config.warmup_requests > 0 {
         let warmup = run_load(
-            client,
+            request_client,
             &request_url,
             config.warmup_requests,
             config.concurrency,
@@ -825,37 +1173,52 @@ async fn run_scenario(
         }
     }
 
-    let pid = proxy.pid();
-    let start_rss_kib = read_process_rss_kib(pid);
-    let stop_sampler = Arc::new(AtomicBool::new(false));
-    let rss_samples = Arc::new(Mutex::new(Vec::<u64>::new()));
-    let sampler_handle = spawn_memory_sampler(
-        pid,
-        Duration::from_millis(config.memory_sample_interval_ms.max(10)),
-        stop_sampler.clone(),
-        rss_samples.clone(),
-    );
+    let pid = proxy.as_mut().map(|(proxy, _, _, _)| proxy.pid());
+    let start_rss_kib = pid.and_then(read_process_rss_kib);
+    let stop_sampler = pid.map(|_| Arc::new(AtomicBool::new(false)));
+    let rss_samples = pid.map(|_| Arc::new(Mutex::new(Vec::<u64>::new())));
+    let sampler_handle = match (pid, stop_sampler.as_ref(), rss_samples.as_ref()) {
+        (Some(pid), Some(stop_sampler), Some(rss_samples)) => Some(spawn_memory_sampler(
+            pid,
+            Duration::from_millis(config.memory_sample_interval_ms.max(10)),
+            stop_sampler.clone(),
+            rss_samples.clone(),
+        )),
+        _ => None,
+    };
 
     let run = run_load(
-        client,
+        request_client,
         &request_url,
         config.requests,
         config.concurrency,
         true,
     )
     .await?;
-    stop_sampler.store(true, Ordering::Relaxed);
-    let _ = sampler_handle.await;
-    let end_rss_kib = read_process_rss_kib(pid);
+    if let Some(stop_sampler) = stop_sampler.as_ref() {
+        stop_sampler.store(true, Ordering::Relaxed);
+    }
+    if let Some(sampler_handle) = sampler_handle {
+        let _ = sampler_handle.await;
+    }
+    let end_rss_kib = pid.and_then(read_process_rss_kib);
 
-    let samples = {
-        let guard = rss_samples
-            .lock()
-            .map_err(|_| io::Error::other("memory sample lock poisoned"))?;
-        guard.clone()
+    let memory = if let Some(rss_samples) = rss_samples {
+        let samples = {
+            let guard = rss_samples
+                .lock()
+                .map_err(|_| io::Error::other("memory sample lock poisoned"))?;
+            guard.clone()
+        };
+        build_memory_stats(samples, start_rss_kib, end_rss_kib)
+    } else {
+        empty_memory_stats()
     };
-    let memory = build_memory_stats(samples, start_rss_kib, end_rss_kib);
-    let telemetry = fetch_telemetry_summary(client, admin_addr).await;
+    let telemetry = if let Some((_, _, _, admin_addr)) = proxy.as_ref() {
+        fetch_telemetry_summary(&clients.http, *admin_addr).await
+    } else {
+        None
+    };
 
     let responses_received: usize = run.status_counts.values().copied().sum();
     let unexpected_status_responses = run
@@ -959,6 +1322,18 @@ fn build_memory_stats(
     }
 }
 
+fn empty_memory_stats() -> MemoryStats {
+    MemoryStats {
+        samples: 0,
+        start_rss_mib: None,
+        end_rss_mib: None,
+        min_rss_mib: None,
+        avg_rss_mib: None,
+        max_rss_mib: None,
+        peak_rss_mib: None,
+    }
+}
+
 fn us_to_ms(value: u64) -> f64 {
     value as f64 / 1_000.0
 }
@@ -978,104 +1353,410 @@ fn compile_program_to_vmbc(source: &str) -> Result<Vec<u8>, Box<dyn std::error::
 
 async fn verify_scenario_probe(
     client: &Client,
-    url: &str,
+    request_origin: &str,
     scenario: Scenario,
+    upstream_fixture: Option<&UpstreamFixture>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let response = client
-        .post(url)
-        .header("x-client-id", "perf-client")
-        .header("content-type", "text/plain")
-        .body(LOAD_REQUEST_BODY)
-        .send()
-        .await?;
+    let response = send_probe_request(
+        client,
+        &format!("{request_origin}/perf"),
+        "perf-client",
+        LOAD_REQUEST_BODY,
+    )
+    .await?;
+    ensure_probe_status(&response, scenario, "baseline probe")?;
 
-    let status = response.status().as_u16();
-    if status != scenario.expected_status {
-        let body = response.text().await.unwrap_or_default();
-        return Err(io::Error::other(format!(
-            "probe status mismatch for {}: expected {}, got {}, body={}",
-            scenario.id, scenario.expected_status, status, body
-        ))
-        .into());
-    }
-
-    let verify_host_call_headers = matches!(
-        scenario.program_variant,
-        ProgramVariant::HostCallsAdditive | ProgramVariant::HostCallsUpstreamRoundTrip
-    );
-    let verify_upstream_roundtrip = matches!(
-        scenario.program_variant,
-        ProgramVariant::HostCallsUpstreamRoundTrip
-    );
-    let perf_client_id_header = response
-        .headers()
-        .get("x-perf-client-id")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let upstream_client_id_header = response
-        .headers()
-        .get("x-upstream-client-id")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let upstream_path_header = response
-        .headers()
-        .get("x-upstream-path")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let body = if verify_host_call_headers || verify_upstream_roundtrip {
-        response.text().await.unwrap_or_default()
-    } else {
-        String::new()
-    };
-
-    if verify_host_call_headers {
-        if perf_client_id_header != "perf-client" {
-            return Err(io::Error::other(format!(
-                "host-call probe missing expected x-perf-client-id header: got '{}'",
-                perf_client_id_header
-            ))
-            .into());
+    match scenario.program_variant {
+        ProgramVariant::None | ProgramVariant::NoHostCallsBase => {}
+        ProgramVariant::HostCallsAdditive => {
+            if probe_header(&response, "x-perf-client-id") != "perf-client" {
+                return Err(io::Error::other(format!(
+                    "host-call probe missing expected x-perf-client-id header: got '{}'",
+                    probe_header(&response, "x-perf-client-id")
+                ))
+                .into());
+            }
+            if !response.body.contains(LOAD_REQUEST_BODY) {
+                return Err(io::Error::other(format!(
+                    "host-call probe body missing request payload marker '{}': body='{}'",
+                    LOAD_REQUEST_BODY, response.body
+                ))
+                .into());
+            }
         }
-        if !body.contains(LOAD_REQUEST_BODY) {
-            return Err(io::Error::other(format!(
-                "host-call probe body missing request payload marker '{}': body='{}'",
-                LOAD_REQUEST_BODY, body
-            ))
-            .into());
+        ProgramVariant::DirectUpstream { upstream } => {
+            verify_direct_upstream_probe_response(
+                &response,
+                scenario,
+                upstream,
+                "perf-client",
+                "/perf",
+            )?;
+            if upstream.requires_http2_tls() {
+                let fixture = upstream_fixture
+                    .ok_or_else(|| io::Error::other("missing HTTP/2 upstream fixture"))?;
+                verify_http2_upstream_reuse_probe(client, request_origin, scenario, fixture)
+                    .await?;
+            }
         }
-    }
-
-    if verify_upstream_roundtrip {
-        if upstream_client_id_header != "perf-client" {
-            return Err(io::Error::other(format!(
-                "upstream probe missing expected x-upstream-client-id header: got '{}'",
-                upstream_client_id_header
-            ))
-            .into());
-        }
-        if upstream_path_header != "/perf" {
-            return Err(io::Error::other(format!(
-                "upstream probe missing expected x-upstream-path header: got '{}'",
-                upstream_path_header
-            ))
-            .into());
-        }
-        if !body.contains("upstream-roundtrip|/perf|") || !body.contains(LOAD_REQUEST_BODY) {
-            return Err(io::Error::other(format!(
-                "upstream probe body missing expected round-trip markers: body='{}'",
-                body
-            ))
-            .into());
+        ProgramVariant::ProxyRoundTrip { upstream, .. } => {
+            verify_proxy_roundtrip_probe_response(&response, scenario, "perf-client", "/perf")?;
+            if upstream.requires_http2_tls() {
+                let fixture = upstream_fixture
+                    .ok_or_else(|| io::Error::other("missing HTTP/2 upstream fixture"))?;
+                verify_http2_upstream_reuse_probe(client, request_origin, scenario, fixture)
+                    .await?;
+            }
         }
     }
 
     Ok(())
 }
 
-async fn spawn_upstream_echo_server() -> Result<UpstreamFixture, Box<dyn std::error::Error>> {
+async fn send_probe_request(
+    client: &Client,
+    url: &str,
+    client_id: &str,
+    body: &str,
+) -> Result<ProbeResponse, Box<dyn std::error::Error>> {
+    let response = client
+        .post(url)
+        .header("x-client-id", client_id)
+        .header("content-type", "text/plain")
+        .body(body.to_string())
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let version = response.version();
+    let headers = response.headers().clone();
+    let body = response.text().await.unwrap_or_default();
+    Ok(ProbeResponse {
+        status,
+        version,
+        headers,
+        body,
+    })
+}
+
+fn probe_header(response: &ProbeResponse, name: &str) -> String {
+    response
+        .headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn ensure_probe_status(
+    response: &ProbeResponse,
+    scenario: Scenario,
+    label: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if response.status != scenario.expected_status {
+        return Err(io::Error::other(format!(
+            "{label} status mismatch for {}: expected {}, got {}, body={}",
+            scenario.id, scenario.expected_status, response.status, response.body
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_proxy_roundtrip_probe_response(
+    response: &ProbeResponse,
+    scenario: Scenario,
+    expected_client_id: &str,
+    expected_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_probe_status(response, scenario, "proxy round-trip probe")?;
+    let expected_downstream_version = scenario.downstream_protocol.label();
+    let actual_downstream_version = probe_header(response, "x-downstream-version");
+    if actual_downstream_version != expected_downstream_version {
+        return Err(io::Error::other(format!(
+            "probe missing expected downstream version {}: got '{}'",
+            expected_downstream_version, actual_downstream_version
+        ))
+        .into());
+    }
+
+    let expected_response_version = match scenario.downstream_protocol {
+        DownstreamProtocol::Http1 => ReqwestVersion::HTTP_11,
+        DownstreamProtocol::HttpsHttp2 => ReqwestVersion::HTTP_2,
+    };
+    if response.version != expected_response_version {
+        return Err(io::Error::other(format!(
+            "downstream response version mismatch: expected {}, got {}",
+            downstream_version_label(expected_response_version),
+            downstream_version_label(response.version)
+        ))
+        .into());
+    }
+
+    if scenario.expects_header_transform()
+        && probe_header(response, "x-bench-response-header") != "program-proxy"
+    {
+        return Err(io::Error::other(format!(
+            "header-transform probe missing expected x-bench-response-header: got '{}'",
+            probe_header(response, "x-bench-response-header")
+        ))
+        .into());
+    }
+    if scenario.expects_header_transform()
+        && probe_header(response, "x-upstream-program-header") != "program-proxy"
+    {
+        return Err(io::Error::other(format!(
+            "header-transform probe missing expected x-upstream-program-header: got '{}'",
+            probe_header(response, "x-upstream-program-header")
+        ))
+        .into());
+    }
+    if scenario.expects_header_transform()
+        && probe_header(response, "x-perf-client-id") != expected_client_id
+    {
+        return Err(io::Error::other(format!(
+            "header-transform probe missing expected x-perf-client-id: got '{}'",
+            probe_header(response, "x-perf-client-id")
+        ))
+        .into());
+    }
+
+    let upstream_client_id = probe_header(response, "x-upstream-client-id");
+    if upstream_client_id != expected_client_id {
+        return Err(io::Error::other(format!(
+            "probe missing expected x-upstream-client-id header: got '{}'",
+            upstream_client_id
+        ))
+        .into());
+    }
+
+    let upstream_path = probe_header(response, "x-upstream-path");
+    if upstream_path != expected_path {
+        return Err(io::Error::other(format!(
+            "probe missing expected x-upstream-path header: got '{}'",
+            upstream_path
+        ))
+        .into());
+    }
+
+    let expected_upstream_version = scenario
+        .upstream_protocol()
+        .map(UpstreamProtocol::label)
+        .unwrap_or_default();
+    let upstream_version = probe_header(response, "x-upstream-version");
+    if !expected_upstream_version.is_empty() && upstream_version != expected_upstream_version {
+        return Err(io::Error::other(format!(
+            "probe missing expected x-upstream-version {}: got '{}'",
+            expected_upstream_version, upstream_version
+        ))
+        .into());
+    }
+
+    if scenario
+        .upstream_protocol()
+        .is_some_and(UpstreamProtocol::requires_http2_tls)
+        && probe_header(response, "x-upstream-alpn") != "h2"
+    {
+        return Err(io::Error::other(format!(
+            "probe missing expected x-upstream-alpn=h2: got '{}'",
+            probe_header(response, "x-upstream-alpn")
+        ))
+        .into());
+    }
+
+    if !response
+        .body
+        .contains(&format!("upstream-roundtrip|{expected_path}|"))
+        || !response.body.contains(LOAD_REQUEST_BODY)
+    {
+        return Err(io::Error::other(format!(
+            "proxy round-trip probe body missing expected markers for path {}: body='{}'",
+            expected_path, response.body
+        ))
+        .into());
+    }
+
+    Ok(())
+}
+
+fn verify_direct_upstream_probe_response(
+    response: &ProbeResponse,
+    scenario: Scenario,
+    upstream: UpstreamProtocol,
+    expected_client_id: &str,
+    expected_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_probe_status(response, scenario, "direct-upstream probe")?;
+
+    let expected_response_version = match upstream {
+        UpstreamProtocol::Http1 => ReqwestVersion::HTTP_11,
+        UpstreamProtocol::HttpsHttp2 => ReqwestVersion::HTTP_2,
+    };
+    if response.version != expected_response_version {
+        return Err(io::Error::other(format!(
+            "direct-upstream response version mismatch: expected {}, got {}",
+            downstream_version_label(expected_response_version),
+            downstream_version_label(response.version)
+        ))
+        .into());
+    }
+
+    let upstream_client_id = probe_header(response, "x-bench-upstream-client-id");
+    if upstream_client_id != expected_client_id {
+        return Err(io::Error::other(format!(
+            "direct-upstream probe missing expected x-bench-upstream-client-id: got '{}'",
+            upstream_client_id
+        ))
+        .into());
+    }
+
+    let upstream_path = probe_header(response, "x-bench-upstream-path");
+    if upstream_path != expected_path {
+        return Err(io::Error::other(format!(
+            "direct-upstream probe missing expected x-bench-upstream-path header: got '{}'",
+            upstream_path
+        ))
+        .into());
+    }
+
+    let upstream_version = probe_header(response, "x-bench-upstream-http-version");
+    if upstream_version != upstream.label() {
+        return Err(io::Error::other(format!(
+            "direct-upstream probe missing expected x-bench-upstream-http-version {}: got '{}'",
+            upstream.label(),
+            upstream_version
+        ))
+        .into());
+    }
+
+    if !response
+        .body
+        .contains(&format!("upstream-roundtrip|{expected_path}|"))
+        || !response.body.contains(LOAD_REQUEST_BODY)
+    {
+        return Err(io::Error::other(format!(
+            "direct-upstream probe body missing expected markers for path {}: body='{}'",
+            expected_path, response.body
+        ))
+        .into());
+    }
+
+    Ok(())
+}
+
+async fn verify_http2_upstream_reuse_probe(
+    client: &Client,
+    request_origin: &str,
+    scenario: Scenario,
+    upstream_fixture: &UpstreamFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let baseline_connections = upstream_fixture
+        .connection_count()
+        .ok_or_else(|| io::Error::other("missing upstream HTTP/2 connection counter"))?;
+    if baseline_connections != 1 {
+        return Err(io::Error::other(format!(
+            "expected one upstream HTTP/2 TLS connection after baseline probe, got {}",
+            baseline_connections
+        ))
+        .into());
+    }
+
+    let slow_url = format!("{request_origin}/slow");
+    let fast_url = format!("{request_origin}/fast");
+    let (slow, fast) = tokio::try_join!(
+        send_probe_request(client, &slow_url, "perf-client-slow", LOAD_REQUEST_BODY),
+        send_probe_request(client, &fast_url, "perf-client-fast", LOAD_REQUEST_BODY),
+    )?;
+
+    match scenario.program_variant {
+        ProgramVariant::DirectUpstream { upstream } => {
+            verify_direct_upstream_probe_response(
+                &slow,
+                scenario,
+                upstream,
+                "perf-client-slow",
+                "/slow",
+            )?;
+            verify_direct_upstream_probe_response(
+                &fast,
+                scenario,
+                upstream,
+                "perf-client-fast",
+                "/fast",
+            )?;
+        }
+        ProgramVariant::ProxyRoundTrip { .. } => {
+            verify_proxy_roundtrip_probe_response(&slow, scenario, "perf-client-slow", "/slow")?;
+            verify_proxy_roundtrip_probe_response(&fast, scenario, "perf-client-fast", "/fast")?;
+        }
+        _ => {
+            return Err(io::Error::other(format!(
+                "http2 reuse probe is only valid for upstream round-trip scenarios, got {}",
+                scenario.id
+            ))
+            .into());
+        }
+    }
+
+    let after_parallel = upstream_fixture
+        .connection_count()
+        .ok_or_else(|| io::Error::other("missing upstream HTTP/2 connection counter"))?;
+    if after_parallel != 1 {
+        return Err(io::Error::other(format!(
+            "expected HTTP/2 multiplexing over one upstream TLS connection, observed {} connections",
+            after_parallel
+        ))
+        .into());
+    }
+
+    let reused = send_probe_request(
+        client,
+        &format!("{request_origin}/reuse"),
+        "perf-client-reuse",
+        LOAD_REQUEST_BODY,
+    )
+    .await?;
+    match scenario.program_variant {
+        ProgramVariant::DirectUpstream { upstream } => {
+            verify_direct_upstream_probe_response(
+                &reused,
+                scenario,
+                upstream,
+                "perf-client-reuse",
+                "/reuse",
+            )?;
+        }
+        ProgramVariant::ProxyRoundTrip { .. } => {
+            verify_proxy_roundtrip_probe_response(&reused, scenario, "perf-client-reuse", "/reuse")?;
+        }
+        _ => unreachable!("unsupported scenario variant for HTTP/2 upstream reuse probe"),
+    }
+
+    let after_reuse = upstream_fixture
+        .connection_count()
+        .ok_or_else(|| io::Error::other("missing upstream HTTP/2 connection counter"))?;
+    if after_reuse != 1 {
+        return Err(io::Error::other(format!(
+            "expected HTTP/2 connection reuse over one upstream TLS connection, observed {} connections",
+            after_reuse
+        ))
+        .into());
+    }
+
+    Ok(())
+}
+
+fn downstream_version_label(version: ReqwestVersion) -> &'static str {
+    match version {
+        ReqwestVersion::HTTP_09 => "0.9",
+        ReqwestVersion::HTTP_10 => "1.0",
+        ReqwestVersion::HTTP_11 => "1.1",
+        ReqwestVersion::HTTP_2 => "2",
+        _ => "unknown",
+    }
+}
+
+async fn spawn_plain_http_upstream_fixture() -> Result<UpstreamFixture, Box<dyn std::error::Error>>
+{
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let app = Router::new().fallback(any(|request: Request<Body>| async move {
@@ -1087,6 +1768,15 @@ async fn spawn_upstream_echo_server() -> Result<UpstreamFixture, Box<dyn std::er
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_string();
+        let program_header = parts
+            .headers
+            .get("x-bench-program-header")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        if path == "/slow" {
+            sleep(Duration::from_millis(75)).await;
+        }
         let body = to_bytes(body, usize::MAX)
             .await
             .expect("upstream perf server should read body");
@@ -1095,13 +1785,22 @@ async fn spawn_upstream_echo_server() -> Result<UpstreamFixture, Box<dyn std::er
             String::from_utf8_lossy(&body)
         )));
         response.headers_mut().insert(
-            "x-upstream-client-id",
+            "x-bench-upstream-client-id",
             HeaderValue::from_str(&client_id)
                 .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
         );
         response.headers_mut().insert(
-            "x-upstream-path",
+            "x-bench-upstream-path",
             HeaderValue::from_str(&path).unwrap_or_else(|_| HeaderValue::from_static("/invalid")),
+        );
+        response.headers_mut().insert(
+            "x-bench-upstream-program-header",
+            HeaderValue::from_str(&program_header)
+                .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+        );
+        response.headers_mut().insert(
+            "x-bench-upstream-http-version",
+            HeaderValue::from_static("1.1"),
         );
         response
     }));
@@ -1110,7 +1809,120 @@ async fn spawn_upstream_echo_server() -> Result<UpstreamFixture, Box<dyn std::er
             .await
             .expect("upstream perf server should run");
     });
-    Ok(UpstreamFixture { addr, task })
+    Ok(UpstreamFixture {
+        origin: format!("http://{addr}"),
+        connection_count: None,
+        tasks: vec![task],
+    })
+}
+
+#[cfg(all(feature = "http2", feature = "tls"))]
+async fn spawn_https_http2_upstream_fixture() -> Result<UpstreamFixture, Box<dyn std::error::Error>>
+{
+    ensure_rustls_provider();
+    let cert = generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+        .map_err(|err| io::Error::other(format!("failed to generate benchmark cert: {err}")))?;
+    let mut server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(cert.serialize_der().map_err(
+                |err| io::Error::other(format!("failed to serialize benchmark cert: {err}")),
+            )?)],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.serialize_private_key_der())),
+        )
+        .map_err(|err| io::Error::other(format!("failed to build benchmark TLS config: {err}")))?;
+    server_config.alpn_protocols = vec![b"h2".to_vec()];
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let connection_count = Arc::new(AtomicUsize::new(0));
+    let task = tokio::spawn({
+        let connection_count = connection_count.clone();
+        async move {
+            loop {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("http2 upstream benchmark accept should succeed");
+                connection_count.fetch_add(1, Ordering::Relaxed);
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let tls_stream = acceptor
+                        .accept(stream)
+                        .await
+                        .expect("http2 upstream benchmark tls accept should succeed");
+                    let service = service_fn(|request: HyperRequest<Incoming>| async move {
+                        let (parts, body) = request.into_parts();
+                        let path = parts.uri.path().to_string();
+                        let client_id = parts
+                            .headers
+                            .get("x-client-id")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let program_header = parts
+                            .headers
+                            .get("x-bench-program-header")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        if path == "/slow" {
+                            sleep(Duration::from_millis(75)).await;
+                        }
+                        let body = body
+                            .collect()
+                            .await
+                            .expect("http2 upstream benchmark body should collect")
+                            .to_bytes();
+                        let mut response = HyperResponse::new(Full::new(Bytes::from(format!(
+                            "upstream-roundtrip|{path}|{}",
+                            String::from_utf8_lossy(&body)
+                        ))));
+                        response.headers_mut().insert(
+                            "x-bench-upstream-client-id",
+                            HeaderValue::from_str(&client_id)
+                                .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+                        );
+                        response.headers_mut().insert(
+                            "x-bench-upstream-path",
+                            HeaderValue::from_str(&path)
+                                .unwrap_or_else(|_| HeaderValue::from_static("/invalid")),
+                        );
+                        response.headers_mut().insert(
+                            "x-bench-upstream-program-header",
+                            HeaderValue::from_str(&program_header)
+                                .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+                        );
+                        response.headers_mut().insert(
+                            "x-bench-upstream-http-version",
+                            HeaderValue::from_static("2"),
+                        );
+                        Ok::<_, std::convert::Infallible>(response)
+                    });
+                    let io = TokioIo::new(tls_stream);
+                    let builder = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    );
+                    if let Err(err) = builder.serve_connection(io, service).await {
+                        eprintln!("http2 upstream benchmark connection ended: {err}");
+                    }
+                });
+            }
+        }
+    });
+
+    Ok(UpstreamFixture {
+        origin: format!("https://127.0.0.1:{}", addr.port()),
+        connection_count: Some(connection_count),
+        tasks: vec![task],
+    })
+}
+
+#[cfg(not(all(feature = "http2", feature = "tls")))]
+async fn spawn_https_http2_upstream_fixture() -> Result<UpstreamFixture, Box<dyn std::error::Error>>
+{
+    Err(io::Error::other(HTTP2_TLS_FEATURE_HINT).into())
 }
 
 async fn upload_program(
@@ -1324,7 +2136,10 @@ fn read_process_rss_kib(pid: u32) -> Option<u64> {
     text.split_whitespace().next()?.parse::<u64>().ok()
 }
 
-fn resolve_proxy_binary_path(config: &BenchConfig) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn resolve_proxy_binary_path(
+    config: &BenchConfig,
+    required_features: &[&str],
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(path) = &config.binary_path {
         if path.exists() {
             return Ok(path.clone());
@@ -1347,9 +2162,10 @@ fn resolve_proxy_binary_path(config: &BenchConfig) -> Result<PathBuf, Box<dyn st
         .join(profile)
         .join(proxy_binary_name());
 
-    if !binary_path.exists() {
+    let force_rebuild_for_features = !required_features.is_empty();
+    if !binary_path.exists() || (config.auto_build && force_rebuild_for_features) {
         if config.auto_build {
-            build_proxy_binary(&workspace_root, config.release_build)?;
+            build_proxy_binary(&workspace_root, config.release_build, required_features)?;
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1368,6 +2184,7 @@ fn resolve_proxy_binary_path(config: &BenchConfig) -> Result<PathBuf, Box<dyn st
 fn build_proxy_binary(
     workspace_root: &Path,
     release_build: bool,
+    required_features: &[&str],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut command = Command::new("cargo");
     command
@@ -1379,6 +2196,9 @@ fn build_proxy_binary(
         .arg("pd-edge-http-proxy");
     if release_build {
         command.arg("--release");
+    }
+    if !required_features.is_empty() {
+        command.arg("--features").arg(required_features.join(","));
     }
 
     let status = command.status()?;
@@ -1684,28 +2504,37 @@ fn env_flag(name: &str) -> bool {
 }
 
 fn print_help() {
-    eprintln!(concat!(
-        "Usage: cargo run -p pd-edge --example http_proxy_perf_framework -- [options]\n\n",
-        "Options:\n",
-        "  --requests <N>                    Measured requests per scenario (default: 10000)\n",
-        "  --warmup-requests <N>             Warmup requests per scenario (default: 1000)\n",
-        "  --concurrency <N>                 Concurrent workers (default: 64)\n",
-        "  --request-timeout-ms <MS>         Per-request timeout (default: 10000)\n",
-        "  --startup-timeout-ms <MS>         Proxy readiness timeout (default: 15000)\n",
-        "  --memory-sample-interval-ms <MS>  RSS sample interval (default: 100)\n",
-        "  --vm-fuel <UNITS>                 Enable cooperative VM fuel slices (default: 50000)\n",
-        "  --no-vm-fuel                      Disable VM fuel slices\n",
-        "  --vm-fuel-check-interval <OPS>    Fuel check interval for proxy VM (default: 32)\n",
-        "  --vm-execution-mode <MODE>        Proxy VM execution mode: async|threading (default: async)\n",
-        "  --fuel-latency-sweep              Run latency sweeps for fuel and fuel-check-interval (defaults to scenario no_host_calls_program)\n",
-        "  --fuel-latency-fuels <CSV>        CSV list for fuel sweep; must be > 0 (default starts at 1)\n",
-        "  --fuel-latency-check-intervals <CSV> CSV list for check-interval sweep; must be > 0 (default starts at 1)\n",
-        "  --binary <PATH>                   Explicit pd-edge-http-proxy binary path\n",
-        "  --json-out <PATH>                 Write JSON report to path\n",
-        "  --scenario <ID>                   Run a single scenario id (raw_no_program | no_host_calls_program | host_calls_terminate | host_calls_upstream_roundtrip)\n",
-        "  --skip-build                      Do not auto-build pd-edge-http-proxy\n",
-        "  --build-release                   Auto-build release binary (default)\n",
-        "  --build-debug                     Auto-build debug binary\n",
-        "  -h, --help                        Show help\n"
-    ));
+    let scenario_ids = SCENARIOS
+        .iter()
+        .map(|scenario| scenario.id)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    eprintln!(
+        "Usage: cargo run -p pd-edge --example http_proxy_perf_framework -- [options]\n\n\
+Options:\n\
+  --requests <N>                    Measured requests per scenario (default: 10000)\n\
+  --warmup-requests <N>             Warmup requests per scenario (default: 1000)\n\
+  --concurrency <N>                 Concurrent workers (default: 64)\n\
+  --request-timeout-ms <MS>         Per-request timeout (default: 10000)\n\
+  --startup-timeout-ms <MS>         Proxy readiness timeout (default: 15000)\n\
+  --memory-sample-interval-ms <MS>  RSS sample interval (default: 100)\n\
+  --vm-fuel <UNITS>                 Enable cooperative VM fuel slices (default: disabled)\n\
+  --no-vm-fuel                      Disable VM fuel slices\n\
+  --vm-fuel-check-interval <OPS>    Fuel check interval for proxy VM (default: 32)\n\
+  --vm-execution-mode <MODE>        Proxy VM execution mode: async|threading (default: async)\n\
+  --fuel-latency-sweep              Run latency sweeps for fuel and fuel-check-interval (defaults to scenario no_host_calls_program)\n\
+  --fuel-latency-fuels <CSV>        CSV list for fuel sweep; must be > 0 (default starts at 1)\n\
+  --fuel-latency-check-intervals <CSV> CSV list for check-interval sweep; must be > 0 (default starts at 1)\n\
+  --binary <PATH>                   Explicit pd-edge-http-proxy binary path\n\
+  --json-out <PATH>                 Write JSON report to path\n\
+  --scenario <ID>                   Run a single scenario id ({scenario_ids})\n\
+  --skip-build                      Do not auto-build pd-edge-http-proxy\n\
+  --build-release                   Auto-build release binary (default)\n\
+  --build-debug                     Auto-build debug binary\n\
+  -h, --help                        Show help\n\n\
+Notes:\n\
+  - Plain HTTP scenarios use plaintext HTTP/1.1 only.\n\
+  - HTTP/2 scenarios use HTTPS + ALPN-negotiated h2 only; h2c is not used.\n\
+  - {HTTP2_TLS_FEATURE_HINT}\n"
+    );
 }

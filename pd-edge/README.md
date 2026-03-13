@@ -26,7 +26,6 @@ This crate now ships three binaries with different scopes:
 - [Active Control-Plane RPC](#active-control-plane-rpc)
   - [Example](#example)
 - [HTTP Proxy Performance Framework](#http-proxy-performance-framework)
-  - [Latest Snapshot (2026-03-11, Local Windows x86_64 Dev Machine)](#latest-snapshot-2026-03-11-local-windows-x8664-dev-machine)
 - [Layered DAGs](#layered-dags)
 - [ABI Source of Truth](#abi-source-of-truth)
 - [Release Artifacts](#release-artifacts)
@@ -273,9 +272,15 @@ Run the built-in framework to benchmark these scenarios:
 - raw `pd-edge-http-proxy` (no program loaded)
 - proxy with a compute-only program (no host calls; baseline workload)
 - proxy with additive async HTTP host calls on top of the same workload (`get_method/get_path/get_header/get_body` + `set_header/set_body`) and explicit termination (no upstream target)
-- proxy with additive async HTTP host calls plus a real default-upstream HTTP round-trip (`set_target/set_path/set_body` + upstream `get_status/get_header/get_body`)
+- direct plaintext HTTP upstream (`raw_http_upstream`)
+- proxy with additive async HTTP host calls plus a real default-upstream plaintext HTTP round-trip (`host_calls_upstream_roundtrip`)
+- direct HTTPS HTTP/2 upstream over TLS (`raw_http2_upstream`)
+- proxy with additive async HTTP host calls plus an HTTPS HTTP/2 upstream round-trip over TLS (`host_calls_upstream_roundtrip_http2_upstream`)
+- proxy with plaintext upstream and HTTPS HTTP/2 downstream over TLS (`host_calls_upstream_roundtrip_downstream_http2`)
 
-Detailed report with charts: [`docs/HTTP_PROXY_PERF_REPORT_2026-03-13.md`](docs/HTTP_PROXY_PERF_REPORT_2026-03-13.md)
+Detailed report with charts: [`docs/HTTP_PROXY_PERF_REPORT_2026-03-14.md`](docs/HTTP_PROXY_PERF_REPORT_2026-03-14.md)
+
+Harness A standard comparisons run with VM fuel disabled by default. Pass `--vm-fuel <UNITS>` to turn it on.
 
 Build the proxy binary once before running benchmarks so the framework does not accidentally run a stale executable:
 
@@ -288,6 +293,7 @@ Standard mode comparison (same benchmark shape, different VM execution mode):
 ```bash
 cargo run -p pd-edge --example http_proxy_perf_framework --release -- \
   --vm-execution-mode async \
+  --no-vm-fuel \
   --requests 12000 \
   --warmup-requests 2000 \
   --concurrency 128 \
@@ -295,6 +301,7 @@ cargo run -p pd-edge --example http_proxy_perf_framework --release -- \
 
 cargo run -p pd-edge --example http_proxy_perf_framework --release -- \
   --vm-execution-mode threading \
+  --no-vm-fuel \
   --requests 12000 \
   --warmup-requests 2000 \
   --concurrency 128 \
@@ -308,6 +315,7 @@ cargo run -p pd-edge --example http_proxy_perf_framework --release -- \
   --vm-execution-mode async \
   --fuel-latency-sweep \
   --scenario no_host_calls_program \
+  --vm-fuel 50000 \
   --requests 3000 \
   --warmup-requests 300 \
   --concurrency 64 \
@@ -319,6 +327,7 @@ cargo run -p pd-edge --example http_proxy_perf_framework --release -- \
   --vm-execution-mode threading \
   --fuel-latency-sweep \
   --scenario no_host_calls_program \
+  --vm-fuel 50000 \
   --requests 3000 \
   --warmup-requests 300 \
   --concurrency 64 \
