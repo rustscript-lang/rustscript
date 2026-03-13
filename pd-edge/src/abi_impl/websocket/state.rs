@@ -10,8 +10,20 @@ use tokio_tungstenite::{
 };
 use vm::VmError;
 
-type RuntimeWebSocketStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub(crate) type SharedWebSocketIo = Arc<tokio::sync::Mutex<OutboundWebSocketIoState>>;
+
+type ClientWebSocketStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type ServerTcpWebSocketStream = WebSocketStream<TcpStream>;
+#[cfg(feature = "tls")]
+type ServerTlsWebSocketStream =
+    WebSocketStream<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>;
+
+enum RuntimeWebSocketStream {
+    Client(ClientWebSocketStream),
+    ServerTcp(ServerTcpWebSocketStream),
+    #[cfg(feature = "tls")]
+    ServerTls(ServerTlsWebSocketStream),
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum WebSocketPhase {
@@ -59,9 +71,28 @@ impl std::fmt::Debug for OutboundWebSocketIoState {
 }
 
 impl OutboundWebSocketIoState {
-    pub(crate) fn new(stream: RuntimeWebSocketStream) -> Self {
+    pub(crate) fn new_client(stream: ClientWebSocketStream) -> Self {
         Self {
-            stream,
+            stream: RuntimeWebSocketStream::Client(stream),
+            eof: false,
+            close_code: None,
+            close_reason: None,
+        }
+    }
+
+    pub(crate) fn new_server_tcp(stream: ServerTcpWebSocketStream) -> Self {
+        Self {
+            stream: RuntimeWebSocketStream::ServerTcp(stream),
+            eof: false,
+            close_code: None,
+            close_reason: None,
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    pub(crate) fn new_server_tls(stream: ServerTlsWebSocketStream) -> Self {
+        Self {
+            stream: RuntimeWebSocketStream::ServerTls(stream),
             eof: false,
             close_code: None,
             close_reason: None,
@@ -89,12 +120,14 @@ impl OutboundWebSocketIoState {
     }
 
     pub(crate) async fn send_text(&mut self, text: String) -> Result<usize, VmError> {
-        self.stream
-            .send(Message::Text(text.clone().into()))
-            .await
-            .map_err(|err| {
-                VmError::HostError(format!("failed to send websocket text frame: {err}"))
-            })?;
+        let frame = Message::Text(text.clone().into());
+        match &mut self.stream {
+            RuntimeWebSocketStream::Client(stream) => stream.send(frame).await,
+            RuntimeWebSocketStream::ServerTcp(stream) => stream.send(frame).await,
+            #[cfg(feature = "tls")]
+            RuntimeWebSocketStream::ServerTls(stream) => stream.send(frame).await,
+        }
+        .map_err(|err| VmError::HostError(format!("failed to send websocket text frame: {err}")))?;
         Ok(text.len())
     }
 
@@ -105,29 +138,38 @@ impl OutboundWebSocketIoState {
             ))
         })?;
         let sent = bytes.len();
-        self.stream
-            .send(Message::Binary(bytes.into()))
-            .await
-            .map_err(|err| {
-                VmError::HostError(format!("failed to send websocket binary frame: {err}"))
-            })?;
+        let frame = Message::Binary(bytes.into());
+        match &mut self.stream {
+            RuntimeWebSocketStream::Client(stream) => stream.send(frame).await,
+            RuntimeWebSocketStream::ServerTcp(stream) => stream.send(frame).await,
+            #[cfg(feature = "tls")]
+            RuntimeWebSocketStream::ServerTls(stream) => stream.send(frame).await,
+        }
+        .map_err(|err| VmError::HostError(format!("failed to send websocket binary frame: {err}")))?;
         Ok(sent)
     }
 
     pub(crate) async fn send_binary_bytes(&mut self, payload: &[u8]) -> Result<usize, VmError> {
         let sent = payload.len();
-        self.stream
-            .send(Message::Binary(payload.to_vec().into()))
-            .await
-            .map_err(|err| {
-                VmError::HostError(format!("failed to send websocket binary frame: {err}"))
-            })?;
+        let frame = Message::Binary(payload.to_vec().into());
+        match &mut self.stream {
+            RuntimeWebSocketStream::Client(stream) => stream.send(frame).await,
+            RuntimeWebSocketStream::ServerTcp(stream) => stream.send(frame).await,
+            #[cfg(feature = "tls")]
+            RuntimeWebSocketStream::ServerTls(stream) => stream.send(frame).await,
+        }
+        .map_err(|err| VmError::HostError(format!("failed to send websocket binary frame: {err}")))?;
         Ok(sent)
     }
 
     async fn read_next_frame(&mut self) -> Result<Option<OutboundWebSocketFrame>, VmError> {
         loop {
-            let next = self.stream.next().await;
+            let next = match &mut self.stream {
+                RuntimeWebSocketStream::Client(stream) => stream.next().await,
+                RuntimeWebSocketStream::ServerTcp(stream) => stream.next().await,
+                #[cfg(feature = "tls")]
+                RuntimeWebSocketStream::ServerTls(stream) => stream.next().await,
+            };
             match next {
                 Some(Ok(Message::Text(text))) => {
                     return Ok(Some(OutboundWebSocketFrame::Text(text.to_string())));
@@ -136,12 +178,16 @@ impl OutboundWebSocketIoState {
                     return Ok(Some(OutboundWebSocketFrame::Binary(bytes.to_vec())));
                 }
                 Some(Ok(Message::Ping(payload))) => {
-                    self.stream
-                        .send(Message::Pong(payload))
-                        .await
-                        .map_err(|err| {
-                            VmError::HostError(format!("failed to reply to websocket ping: {err}",))
-                        })?;
+                    let frame = Message::Pong(payload);
+                    match &mut self.stream {
+                        RuntimeWebSocketStream::Client(stream) => stream.send(frame).await,
+                        RuntimeWebSocketStream::ServerTcp(stream) => stream.send(frame).await,
+                        #[cfg(feature = "tls")]
+                        RuntimeWebSocketStream::ServerTls(stream) => stream.send(frame).await,
+                    }
+                    .map_err(|err| {
+                        VmError::HostError(format!("failed to reply to websocket ping: {err}",))
+                    })?;
                 }
                 Some(Ok(Message::Pong(_))) => {}
                 Some(Ok(Message::Close(frame))) => {
@@ -200,13 +246,16 @@ impl OutboundWebSocketIoState {
             code: CloseCode::from(code),
             reason: reason.clone().into(),
         });
-        self.stream.close(close_frame).await.map_err(|err| {
+        match &mut self.stream {
+            RuntimeWebSocketStream::Client(stream) => stream.close(close_frame.clone()).await,
+            RuntimeWebSocketStream::ServerTcp(stream) => stream.close(close_frame.clone()).await,
+            #[cfg(feature = "tls")]
+            RuntimeWebSocketStream::ServerTls(stream) => stream.close(close_frame.clone()).await,
+        }
+        .map_err(|err| {
             VmError::HostError(format!("failed to close websocket session: {err}"))
         })?;
-        self.record_close_frame(Some(CloseFrame {
-            code: CloseCode::from(code),
-            reason: reason.into(),
-        }));
+        self.record_close_frame(close_frame);
         Ok(())
     }
 }

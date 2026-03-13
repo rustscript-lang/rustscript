@@ -1,10 +1,19 @@
+use std::sync::{Arc, Mutex};
+
 use axum::http::{
     HeaderName, HeaderValue,
     header::{CONTENT_LENGTH, HOST},
 };
 use edge_abi::symbols::websocket;
 use pd_edge_host_function::pd_edge_host_function;
-use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
+use tokio_tungstenite::{
+    accept_hdr_async, connect_async,
+    tungstenite::{
+        client::IntoClientRequest,
+        handshake::server::{Request as WsRequest, Response as WsResponse},
+        http::HeaderValue as WsHeaderValue,
+    },
+};
 use url::Url;
 use vm::{CallOutcome, Value, Vm, VmError};
 
@@ -278,6 +287,15 @@ fn store_connected_websocket(
     io: SharedWebSocketIo,
     negotiated_subprotocol: Option<String>,
 ) -> Result<(), VmError> {
+    if connection == DOWNSTREAM_CONNECTION_HANDLE {
+        let mut transport = context.lock_transport();
+        transport.tcp_dag.downstream.mark_connected();
+        drop(transport);
+        context.with_downstream_websocket_mut(|websocket| {
+            websocket.mark_open(io, negotiated_subprotocol);
+        });
+        return Ok(());
+    }
     if connection == default_upstream_exchange_handle() {
         {
             let mut transport = context.lock_transport();
@@ -341,6 +359,16 @@ fn store_failed_websocket(
     connection: i64,
     message: String,
 ) -> Result<(), VmError> {
+    if connection == DOWNSTREAM_CONNECTION_HANDLE {
+        let mut transport = context.lock_transport();
+        transport.tcp_dag.downstream.mark_failed(message.clone());
+        if transport.tls_dag.downstream.is_present() {
+            transport.tls_dag.downstream.mark_failed();
+        }
+        drop(transport);
+        context.with_downstream_websocket_mut(|websocket| websocket.mark_failed(message));
+        return Ok(());
+    }
     if connection == default_upstream_exchange_handle() {
         let mut transport = context.lock_transport();
         if transport.tls_dag.default_upstream.is_present() {
@@ -367,6 +395,10 @@ fn note_websocket_handshake_started(
     context: &SharedProxyVmContext,
     connection: i64,
 ) -> Result<(), VmError> {
+    if connection == DOWNSTREAM_CONNECTION_HANDLE {
+        context.with_downstream_websocket_mut(|websocket| websocket.note_handshake_started());
+        return Ok(());
+    }
     with_outbound_connection_mut(
         context,
         connection,
@@ -395,11 +427,165 @@ fn websocket_operation_on_downstream() -> VmError {
     )
 }
 
+fn downstream_websocket_transport_available(context: &SharedProxyVmContext) -> bool {
+    let guard = context.lock_transport();
+    guard.downstream_tcp_io.is_some()
+        || {
+            #[cfg(feature = "tls")]
+            {
+                guard.downstream_tls_io.is_some()
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                false
+            }
+        }
+}
+
+enum DownstreamWebSocketTransport {
+    Tcp(tokio::net::TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(tokio_rustls::server::TlsStream<tokio::net::TcpStream>),
+}
+
+async fn take_downstream_websocket_transport(
+    context: &SharedProxyVmContext,
+) -> Result<DownstreamWebSocketTransport, VmError> {
+    #[cfg(feature = "tls")]
+    {
+        let tls_io = {
+            let mut guard = context.lock_transport();
+            guard.downstream_tls_io.take()
+        };
+        if let Some(io) = tls_io {
+            let mut guard = io.lock().await;
+            let stream = guard.take().ok_or_else(|| {
+                VmError::HostError(
+                    "downstream tls plaintext transport is already in use".to_string(),
+                )
+            })?;
+            return Ok(DownstreamWebSocketTransport::Tls(stream));
+        }
+        if context.lock_transport().downstream_tls_server_start.is_some() {
+            return Err(VmError::HostError(
+                "downstream websocket accept requires plaintext transport; complete tls::session::handshake first".to_string(),
+            ));
+        }
+    }
+
+    let tcp_io = {
+        let mut guard = context.lock_transport();
+        guard.downstream_tcp_io.take()
+    };
+    let Some(io) = tcp_io else {
+        return Err(websocket_operation_on_downstream());
+    };
+    let mut guard = io.lock().await;
+    let stream = guard.take().ok_or_else(|| {
+        VmError::HostError("downstream tcp transport is already in use".to_string())
+    })?;
+    Ok(DownstreamWebSocketTransport::Tcp(stream))
+}
+
+fn pick_downstream_subprotocol(request: &WsRequest, configured: &[String]) -> Option<String> {
+    if configured.is_empty() {
+        return None;
+    }
+    request
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .find(|protocol| configured.iter().any(|configured| configured == protocol))
+                .map(str::to_string)
+        })
+}
+
+async fn accept_downstream_websocket(
+    context: &SharedProxyVmContext,
+) -> Result<(SharedWebSocketIo, Option<String>), VmError> {
+    let configured_protocols = context.downstream_websocket().requested_subprotocols().to_vec();
+    let selected_protocol = Arc::new(Mutex::new(None::<String>));
+
+    let io = match take_downstream_websocket_transport(context).await? {
+        DownstreamWebSocketTransport::Tcp(stream) => {
+            let configured_protocols = configured_protocols.clone();
+            let selected_for_callback = Arc::clone(&selected_protocol);
+            let callback = move |request: &WsRequest, mut response: WsResponse| {
+                let selected = pick_downstream_subprotocol(request, &configured_protocols);
+                if let Some(protocol) = &selected
+                    && let Ok(value) = WsHeaderValue::from_str(protocol)
+                {
+                    response
+                        .headers_mut()
+                        .insert("sec-websocket-protocol", value);
+                }
+                *selected_for_callback
+                    .lock()
+                    .expect("downstream websocket protocol lock should not poison") = selected;
+                Ok(response)
+            };
+            let websocket = accept_hdr_async(stream, callback).await.map_err(|err| {
+                VmError::HostError(format!("downstream websocket accept failed: {err}"))
+            })?;
+            Arc::new(tokio::sync::Mutex::new(OutboundWebSocketIoState::new_server_tcp(
+                websocket,
+            )))
+        }
+        #[cfg(feature = "tls")]
+        DownstreamWebSocketTransport::Tls(stream) => {
+            let configured_protocols = configured_protocols.clone();
+            let selected_for_callback = Arc::clone(&selected_protocol);
+            let callback = move |request: &WsRequest, mut response: WsResponse| {
+                let selected = pick_downstream_subprotocol(request, &configured_protocols);
+                if let Some(protocol) = &selected
+                    && let Ok(value) = WsHeaderValue::from_str(protocol)
+                {
+                    response
+                        .headers_mut()
+                        .insert("sec-websocket-protocol", value);
+                }
+                *selected_for_callback
+                    .lock()
+                    .expect("downstream websocket protocol lock should not poison") = selected;
+                Ok(response)
+            };
+            let websocket = accept_hdr_async(stream, callback).await.map_err(|err| {
+                VmError::HostError(format!("downstream websocket accept failed: {err}"))
+            })?;
+            Arc::new(tokio::sync::Mutex::new(OutboundWebSocketIoState::new_server_tls(
+                websocket,
+            )))
+        }
+    };
+    let negotiated_subprotocol = selected_protocol
+        .lock()
+        .expect("downstream websocket protocol lock should not poison")
+        .clone();
+    Ok((io, negotiated_subprotocol))
+}
+
 pub(crate) fn websocket_connection_mode(context: &SharedProxyVmContext, connection: i64) -> bool {
     let Ok(handle) = decode_connection(context, connection) else {
         return false;
     };
     connection_state(context, handle).is_websocket_mode()
+}
+
+pub(crate) fn websocket_negotiated_subprotocol(
+    context: &SharedProxyVmContext,
+    connection: i64,
+) -> Result<Option<String>, VmError> {
+    let state = connection_state(context, decode_connection(context, connection)?);
+    let protocol = state.negotiated_subprotocol();
+    if protocol.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(protocol.to_string()))
+    }
 }
 
 fn refresh_connection_close_state(context: &SharedProxyVmContext, connection: i64) {
@@ -422,13 +608,33 @@ pub(crate) async fn ensure_outbound_websocket_connection_open(
     context: &SharedProxyVmContext,
     connection: i64,
 ) -> Result<(), VmError> {
-    if outbound_exchange_response_available(context, connection) {
+    if connection != DOWNSTREAM_CONNECTION_HANDLE && outbound_exchange_response_available(context, connection) {
         return Err(VmError::HostError(format!(
             "websocket connection handle {connection} cannot enter websocket mode after the HTTP response has started",
         )));
     }
     match decode_connection(context, connection)? {
-        WebSocketHandle::Downstream => return Err(websocket_operation_on_downstream()),
+        WebSocketHandle::Downstream => {
+            let state = connection_state(context, WebSocketHandle::Downstream);
+            if state.is_open() {
+                return Ok(());
+            }
+            if !downstream_websocket_transport_available(context) {
+                return Err(websocket_operation_on_downstream());
+            }
+            note_websocket_handshake_started(context, connection)?;
+            match accept_downstream_websocket(context).await {
+                Ok((io, negotiated_subprotocol)) => {
+                    store_connected_websocket(context, connection, io, negotiated_subprotocol)?;
+                    return Ok(());
+                }
+                Err(err) => {
+                    let message = err.to_string();
+                    let _ = store_failed_websocket(context, connection, message.clone());
+                    return Err(err);
+                }
+            }
+        }
         handle @ (WebSocketHandle::DefaultUpstream | WebSocketHandle::OutboundExchange(_)) => {
             let state = connection_state(context, handle);
             if state.is_open() {
@@ -494,9 +700,9 @@ pub(crate) async fn ensure_outbound_websocket_connection_open(
         .get("sec-websocket-protocol")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let io = std::sync::Arc::new(tokio::sync::Mutex::new(OutboundWebSocketIoState::new(
-        stream,
-    )));
+    let io = std::sync::Arc::new(tokio::sync::Mutex::new(
+        OutboundWebSocketIoState::new_client(stream),
+    ));
     store_connected_websocket(context, connection, io, negotiated_subprotocol)?;
     Ok(())
 }
@@ -506,7 +712,15 @@ pub(crate) fn validate_outbound_websocket_binary_connection(
     connection: i64,
 ) -> Result<(), VmError> {
     match decode_connection(context, connection)? {
-        WebSocketHandle::Downstream => Err(websocket_operation_on_downstream()),
+        WebSocketHandle::Downstream => {
+            if downstream_websocket_transport_available(context)
+                || context.downstream_websocket().is_open()
+            {
+                Ok(())
+            } else {
+                Err(websocket_operation_on_downstream())
+            }
+        }
         WebSocketHandle::DefaultUpstream | WebSocketHandle::OutboundExchange(_) => Ok(()),
     }
 }
@@ -632,8 +846,14 @@ async fn connection_is_present(
     context: SharedProxyVmContext,
     connection: i64,
 ) -> Result<CallOutcome, VmError> {
-    let state = connection_state(&context, decode_connection(&context, connection)?);
-    Ok(CallOutcome::Return(vec![Value::Bool(state.is_present())]))
+    let present = match decode_connection(&context, connection)? {
+        WebSocketHandle::Downstream => {
+            let state = connection_state(&context, WebSocketHandle::Downstream);
+            state.is_present() || downstream_websocket_transport_available(&context)
+        }
+        handle => connection_state(&context, handle).is_present(),
+    };
+    Ok(CallOutcome::Return(vec![Value::Bool(present)]))
 }
 
 /// Sets the target endpoint for the WebSocket connection.
@@ -686,7 +906,14 @@ async fn connection_set_subprotocols(
 ) -> Result<CallOutcome, VmError> {
     let protocols = parse_subprotocols(&protocols)?;
     match decode_connection(&context, connection)? {
-        WebSocketHandle::Downstream => return Err(websocket_operation_on_downstream()),
+        WebSocketHandle::Downstream => {
+            if !downstream_websocket_transport_available(&context) {
+                return Err(websocket_operation_on_downstream());
+            }
+            context.with_downstream_websocket_mut(|websocket| {
+                websocket.set_requested_subprotocols(protocols);
+            });
+        }
         WebSocketHandle::DefaultUpstream | WebSocketHandle::OutboundExchange(_) => {
             with_outbound_connection_mut(
                 &context,
