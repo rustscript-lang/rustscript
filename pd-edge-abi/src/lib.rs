@@ -157,6 +157,15 @@ mod tests {
     }
 
     #[test]
+    fn runtime_exit_docs_are_available() {
+        let function = function_by_name("runtime::exit").expect("runtime::exit should exist");
+        assert!(
+            !function.docs.trim().is_empty(),
+            "expected runtime::exit docs to be populated"
+        );
+    }
+
+    #[test]
     fn tcp_stream_get_phase_docs_follow_edge_impl_comments() {
         let function = function_by_name("tcp::stream::get_phase")
             .expect("tcp::stream::get_phase should exist");

@@ -262,6 +262,9 @@ fn transform_async_edge_function(item: &mut ItemFn) -> Result<(), Error> {
             let __pd_edge_outcome = (async move #original_block).await?;
             match __pd_edge_outcome {
                 ::vm::CallOutcome::Return(values) => Ok(values),
+                ::vm::CallOutcome::Halt => Err(::vm::VmError::HostError(
+                    "async edge host functions must not return Halt".to_string(),
+                )),
                 ::vm::CallOutcome::Yield => Err(::vm::VmError::HostError(
                     "async edge host functions must not return Yield".to_string(),
                 )),

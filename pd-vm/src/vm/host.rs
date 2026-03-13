@@ -10,6 +10,7 @@ pub type HostOpId = u64;
 #[derive(Debug, PartialEq)]
 pub enum CallOutcome {
     Return(Vec<Value>),
+    Halt,
     Yield,
     Pending(HostOpId),
 }
@@ -308,6 +309,7 @@ pub(super) enum VmHostFunction {
 
 pub(super) enum HostCallExecOutcome {
     Returned,
+    Halted,
     Yielded,
     Pending(HostOpId),
 }
@@ -688,6 +690,10 @@ impl Vm {
                 }
                 Ok(HostCallExecOutcome::Returned)
             }
+            crate::builtins::runtime::BuiltinCallOutcome::Halt => {
+                self.stack.truncate(arg_start);
+                Ok(HostCallExecOutcome::Halted)
+            }
             crate::builtins::runtime::BuiltinCallOutcome::Pending(op_id) => {
                 self.stack.truncate(arg_start);
                 let resume_ip = self.call_resume_ip(call_ip)?;
@@ -726,6 +732,7 @@ impl Vm {
                 }
                 Ok(HostCallExecOutcome::Returned)
             }
+            CallOutcome::Halt => Ok(HostCallExecOutcome::Halted),
             CallOutcome::Yield => {
                 for value in args {
                     self.stack.push(value);
@@ -802,6 +809,10 @@ impl Vm {
                     self.stack.push(value);
                 }
                 Ok(HostCallExecOutcome::Returned)
+            }
+            CallOutcome::Halt => {
+                self.stack.truncate(arg_start);
+                Ok(HostCallExecOutcome::Halted)
             }
             CallOutcome::Yield => {
                 if self.native_only_aot {

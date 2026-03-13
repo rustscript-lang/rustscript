@@ -20,6 +20,12 @@ async fn runtime_sleep(_vm: &mut Vm, millis: i64) -> Result<CallOutcome, VmError
     Ok(CallOutcome::Return(vec![Value::Bool(true)]))
 }
 
+/// Halts the current VM invocation immediately.
+#[pd_edge_host_function(name = edge_runtime::EXIT.name, scope = runtime)]
+fn runtime_exit(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
+    Ok(CallOutcome::Halt)
+}
+
 /// Checks whether a rate-limit bucket allows the current operation.
 #[pd_edge_host_function(name = edge_rate_limit::ALLOW.name, scope = runtime)]
 async fn rate_limit_allow(

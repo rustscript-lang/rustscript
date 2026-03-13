@@ -1638,6 +1638,7 @@ fn type_label(ty: &Type) -> String {
                 "Map" | "VmMap" => "map".to_string(),
                 "Number" | "NumberValue" => "number".to_string(),
                 "Unknown" | "UnknownValue" => "unknown".to_string(),
+                "CallOutcome" => "unknown".to_string(),
                 "Option" => {
                     let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
                         panic!("Option<T> requires one generic argument");

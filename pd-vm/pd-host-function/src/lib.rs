@@ -295,6 +295,7 @@ fn type_label(ty: &Type) -> Result<String, Error> {
                 "Map" | "VmMap" => Ok("map".to_string()),
                 "Number" | "NumberValue" => Ok("number".to_string()),
                 "Unknown" | "UnknownValue" => Ok("unknown".to_string()),
+                "CallOutcome" => Ok("unknown".to_string()),
                 "Option" => {
                     let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
                         return Err(Error::new_spanned(

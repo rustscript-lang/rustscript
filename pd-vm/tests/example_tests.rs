@@ -35,7 +35,7 @@ fn register_functions(vm: &mut Vm, functions: &[FunctionDecl]) {
             "add_one" => {
                 vm.bind_function("add_one", Box::new(AddOneFunction));
             }
-            "runtime::sleep" => {}
+            "runtime::sleep" | "runtime::exit" => {}
             other => panic!("unknown function '{other}'"),
         }
     }

@@ -295,6 +295,12 @@ pub(super) trait IntoHostCallOutcome {
     fn into_host_call_outcome(self) -> CallOutcome;
 }
 
+impl IntoHostCallOutcome for CallOutcome {
+    fn into_host_call_outcome(self) -> CallOutcome {
+        self
+    }
+}
+
 impl<T> IntoHostCallOutcome for T
 where
     T: IntoVmValue,

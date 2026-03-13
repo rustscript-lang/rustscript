@@ -43,6 +43,33 @@ fn compile_edge_source_file_supports_runtime_namespace_host_import() {
 }
 
 #[test]
+fn compile_edge_source_file_supports_runtime_exit_host_import() {
+    let root = unique_temp_root("runtime_exit_namespace");
+    let main_path = root.join("main.rss");
+    std::fs::write(
+        &main_path,
+        r#"
+        use runtime;
+        runtime::exit();
+    "#,
+    )
+    .expect("main source should write");
+
+    let compiled = compile_edge_source_file(&main_path).expect("compile should succeed");
+    assert!(
+        compiled
+            .program
+            .imports
+            .iter()
+            .any(|import| import.name == "runtime::exit"),
+        "runtime namespace should map runtime::exit to a host import"
+    );
+
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_dir(root);
+}
+
+#[test]
 fn compile_edge_source_file_supports_rate_limit_namespace_host_import() {
     let root = unique_temp_root("rate_limit_namespace");
     let main_path = root.join("main.rss");

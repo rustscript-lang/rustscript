@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use super::AnyValue;
 use super::print::format_value;
-use crate::vm::{Value, Vm, VmError, VmResult};
+use crate::vm::{CallOutcome, Value, Vm, VmError, VmResult};
 use pd_host_function::pd_host_function;
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -11,6 +11,8 @@ pub(crate) const PRINT_NAME: &str = "print";
 pub(crate) const PRINTLN_NAME: &str = "println";
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const RUNTIME_SLEEP_NAME: &str = "runtime::sleep";
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const RUNTIME_EXIT_NAME: &str = "runtime::exit";
 
 fn render_print_value(value: &Value, newline: bool) -> String {
     let mut rendered = format_value(value);
@@ -54,15 +56,24 @@ fn runtime_sleep_impl(_vm: &mut Vm, ms: i64) -> VmResult<bool> {
     Ok(true)
 }
 
+/// Halts the current VM invocation immediately.
+#[pd_host_function(name = "runtime::exit")]
+fn runtime_exit_impl(_vm: &mut Vm) -> VmResult<CallOutcome> {
+    Ok(CallOutcome::Halt)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::assembler::BytecodeBuilder;
     use crate::bytecode::{HostImport, Program};
-    use crate::vm::{HostFunctionRegistry, Value, Vm, VmStatus};
+    use crate::vm::{CallOutcome, HostFunctionRegistry, Value, Vm, VmStatus};
 
-    use super::{PRINT_NAME, PRINTLN_NAME, RUNTIME_SLEEP_NAME, runtime_sleep_impl};
+    use super::{
+        PRINT_NAME, PRINTLN_NAME, RUNTIME_EXIT_NAME, RUNTIME_SLEEP_NAME, runtime_exit_impl,
+        runtime_sleep_impl,
+    };
 
     fn host_call_program(name: &str) -> Program {
         let mut bc = BytecodeBuilder::new();
@@ -98,6 +109,23 @@ mod tests {
     #[test]
     fn runtime_sleep_name_is_stable() {
         assert_eq!(RUNTIME_SLEEP_NAME, "runtime::sleep");
+    }
+
+    #[test]
+    fn runtime_exit_name_is_stable() {
+        assert_eq!(RUNTIME_EXIT_NAME, "runtime::exit");
+    }
+
+    #[test]
+    fn runtime_exit_returns_halt_outcome() {
+        let mut vm = Vm::new(Program::new(
+            Vec::new(),
+            vec![crate::bytecode::OpCode::Ret as u8],
+        ));
+        assert_eq!(
+            runtime_exit_impl(&mut vm).expect("runtime::exit should halt"),
+            CallOutcome::Halt
+        );
     }
 
     #[test]

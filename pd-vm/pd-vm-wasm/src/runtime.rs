@@ -1348,6 +1348,7 @@ fn register_named_function(
                 Box::new(PlaygroundRuntimeSleepHostFunction::new(Arc::clone(state))),
             );
         }
+        "runtime::exit" => {}
         other => {
             return Err(format!("no host binding for function '{other}'"));
         }

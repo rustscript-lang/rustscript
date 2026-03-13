@@ -304,6 +304,26 @@ fn runtime_sleep_host_import_is_available_by_default() {
 }
 
 #[test]
+fn runtime_exit_host_import_halts_before_later_code_runs() {
+    let compiled = compile_source(
+        r#"
+        use runtime;
+        runtime::exit();
+        41;
+    "#,
+    )
+    .expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+
+    let status = vm.run().expect("vm should halt");
+    assert_eq!(status, VmStatus::Halted);
+    assert!(
+        vm.stack().is_empty(),
+        "runtime::exit should stop before later values are pushed"
+    );
+}
+
+#[test]
 fn runtime_sleep_host_import_can_be_overridden_by_host_binding() {
     struct RuntimeSleepOverride;
 
@@ -347,6 +367,27 @@ fn host_function_registry_includes_default_runtime_sleep() {
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Bool(true)]);
+}
+
+#[test]
+fn host_function_registry_includes_default_runtime_exit() {
+    let compiled = compile_source(
+        r#"
+        use runtime;
+        runtime::exit();
+        1;
+    "#,
+    )
+    .expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    let registry = HostFunctionRegistry::new();
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("registry should bind runtime::exit");
+
+    let status = vm.run().expect("vm should halt");
+    assert_eq!(status, VmStatus::Halted);
+    assert!(vm.stack().is_empty());
 }
 
 #[test]

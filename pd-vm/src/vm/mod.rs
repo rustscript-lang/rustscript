@@ -1295,6 +1295,7 @@ impl Vm {
                             return Ok(ExecOutcome::Halted);
                         }
                     }
+                    HostCallExecOutcome::Halted => return Ok(ExecOutcome::Halted),
                     HostCallExecOutcome::Yielded => {
                         self.last_yield_reason = Some(VmYieldReason::Host);
                         return Ok(ExecOutcome::Yielded);

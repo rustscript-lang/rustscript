@@ -663,6 +663,7 @@ impl Vm {
                     call_ip,
                 } => match self.execute_host_call(*index, *argc, *call_ip)? {
                     HostCallExecOutcome::Returned => {}
+                    HostCallExecOutcome::Halted => return Ok(ExecOutcome::Halted),
                     HostCallExecOutcome::Yielded => {
                         self.last_yield_reason = Some(super::super::VmYieldReason::Host);
                         return Ok(ExecOutcome::Yielded);
@@ -677,6 +678,7 @@ impl Vm {
                     call_ip,
                 } => match self.execute_host_call(*index, *argc, *call_ip)? {
                     HostCallExecOutcome::Returned => {}
+                    HostCallExecOutcome::Halted => return Ok(ExecOutcome::Halted),
                     HostCallExecOutcome::Yielded => {
                         self.last_yield_reason = Some(super::super::VmYieldReason::Host);
                         return Ok(ExecOutcome::Yielded);

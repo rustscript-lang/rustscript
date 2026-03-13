@@ -1054,7 +1054,7 @@ mod runtime_tests {
         for decl in functions {
             match decl.name.as_str() {
                 "print" => vm.bind_function("print", Box::new(TestPrintFunction)),
-                "runtime::sleep" => {}
+                "runtime::sleep" | "runtime::exit" => {}
                 other => panic!("unknown fixture host function '{other}'"),
             }
         }

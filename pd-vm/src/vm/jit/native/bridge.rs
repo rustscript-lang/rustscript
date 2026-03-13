@@ -205,6 +205,7 @@ pub(super) extern "C" fn pd_vm_cranelift_step(vm: *mut Vm, op: i64, a: i64, b: i
                     .map_err(|_| VmError::JitNative("call ip out of range".to_string()))?;
                 match vm.execute_host_call(index, argc, call_ip)? {
                     HostCallExecOutcome::Returned => Ok(STATUS_CONTINUE),
+                    HostCallExecOutcome::Halted => Ok(STATUS_HALTED),
                     HostCallExecOutcome::Yielded => Ok(STATUS_YIELDED),
                     HostCallExecOutcome::Pending(_) => Ok(STATUS_WAITING),
                 }
@@ -220,6 +221,7 @@ pub(super) extern "C" fn pd_vm_cranelift_step(vm: *mut Vm, op: i64, a: i64, b: i
                     .map_err(|_| VmError::JitNative("builtin call ip out of range".to_string()))?;
                 match vm.execute_host_call(index, argc, call_ip)? {
                     HostCallExecOutcome::Returned => Ok(STATUS_CONTINUE),
+                    HostCallExecOutcome::Halted => Ok(STATUS_HALTED),
                     HostCallExecOutcome::Yielded => Ok(STATUS_YIELDED),
                     HostCallExecOutcome::Pending(_) => Ok(STATUS_WAITING),
                 }

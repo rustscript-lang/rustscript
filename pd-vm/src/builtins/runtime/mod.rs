@@ -29,6 +29,8 @@ use typed::{
 
 pub(crate) enum BuiltinCallOutcome {
     Return(Vec<Value>),
+    #[allow(dead_code)]
+    Halt,
     Pending(HostOpId),
 }
 
@@ -106,6 +108,9 @@ mod tests {
                 values.is_empty(),
                 "successful assert should not push a null sentinel"
             ),
+            BuiltinCallOutcome::Halt => {
+                panic!("assert should not halt builtin execution");
+            }
             BuiltinCallOutcome::Pending(op_id) => {
                 panic!("assert should not yield pending host op {op_id}")
             }

@@ -277,6 +277,7 @@ impl HostFunction for AsyncHostAdapter {
     fn call(&mut self, vm: &mut Vm, args: &[Value]) -> HostCallResult {
         match self.inner.call(vm, args)? {
             CallOutcome::Return(values) => schedule_ready_call(&self.async_ops, values),
+            CallOutcome::Halt => Ok(CallOutcome::Halt),
             CallOutcome::Yield => Ok(CallOutcome::Yield),
             CallOutcome::Pending(op_id) => Ok(CallOutcome::Pending(op_id)),
         }
@@ -616,6 +617,7 @@ pub(crate) fn adapt_edge_call_outcome(
 ) -> Result<CallOutcome, VmError> {
     match outcome {
         CallOutcome::Return(values) => schedule_current_ready_call(vm, values),
+        CallOutcome::Halt => Ok(CallOutcome::Halt),
         CallOutcome::Yield => Ok(CallOutcome::Yield),
         CallOutcome::Pending(op_id) => Ok(CallOutcome::Pending(op_id)),
     }
@@ -628,6 +630,7 @@ pub(crate) fn adapt_edge_args_call_outcome(outcome: CallOutcome) -> Result<CallO
             let async_ops = current_async_ops()?;
             schedule_ready_call(&async_ops, values)
         }
+        CallOutcome::Halt => Ok(CallOutcome::Halt),
         CallOutcome::Yield => Ok(CallOutcome::Yield),
         CallOutcome::Pending(op_id) => Ok(CallOutcome::Pending(op_id)),
     }
