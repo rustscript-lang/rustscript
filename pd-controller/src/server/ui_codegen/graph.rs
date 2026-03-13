@@ -381,7 +381,6 @@ fn is_value_block(block_id: &str) -> bool {
             | "get_request_method"
             | "get_request_path"
             | "get_request_query"
-            | "get_request_raw_query"
             | "get_request_path_with_query"
             | "get_request_scheme"
             | "get_request_host"
@@ -424,20 +423,15 @@ fn is_flow_block(block_id: &str) -> bool {
         block_id,
         "set_request_header"
             | "add_request_header"
-            | "remove_request_header"
             | "clear_request_header"
-            | "set_request_headers"
             | "set_request_method"
             | "set_request_path"
             | "set_request_query"
-            | "set_request_raw_query"
             | "set_request_query_arg"
             | "set_request_body"
             | "set_header"
             | "add_response_header"
-            | "remove_response_header"
             | "clear_response_header"
-            | "set_response_headers"
             | "set_response_content"
             | "set_response_status"
             | "set_upstream"
@@ -490,20 +484,15 @@ fn render_flow_node(
     let result = match block.block_id.as_str() {
         "set_request_header"
         | "add_request_header"
-        | "remove_request_header"
         | "clear_request_header"
-        | "set_request_headers"
         | "set_request_method"
         | "set_request_path"
         | "set_request_query"
-        | "set_request_raw_query"
         | "set_request_query_arg"
         | "set_request_body"
         | "set_header"
         | "add_response_header"
-        | "remove_response_header"
         | "clear_response_header"
-        | "set_response_headers"
         | "set_response_content"
         | "set_response_status"
         | "set_upstream"
@@ -904,15 +893,6 @@ pub(super) fn flow_action_statement(
                 ),
             })
         }
-        "remove_request_header" => {
-            let name = block_value(block, "name", "x-remove");
-            Ok(FlowActionStatement {
-                rustscript: format!("upstream_request::remove_header({});", rust_string(name)),
-                javascript: format!("upstream_request.remove_header({});", js_string(name)),
-                lua: format!("upstream_request.remove_header({})", lua_string(name)),
-                scheme: format!("(upstream_request:remove_header {})", scheme_string(name)),
-            })
-        }
         "clear_request_header" => {
             let name = block_value(block, "name", "x-remove");
             Ok(FlowActionStatement {
@@ -920,21 +900,6 @@ pub(super) fn flow_action_statement(
                 javascript: format!("upstream_request.clear_header({});", js_string(name)),
                 lua: format!("upstream_request.clear_header({})", lua_string(name)),
                 scheme: format!("(upstream_request:clear_header {})", scheme_string(name)),
-            })
-        }
-        "set_request_headers" => {
-            let headers = block_value(block, "headers", "$request_headers");
-            Ok(FlowActionStatement {
-                rustscript: format!(
-                    "upstream_request::set_headers({});",
-                    render_expr_rss(headers)
-                ),
-                javascript: format!("upstream_request.set_headers({});", render_expr_js(headers)),
-                lua: format!("upstream_request.set_headers({})", render_expr_lua(headers)),
-                scheme: format!(
-                    "(upstream_request:set_headers {})",
-                    render_expr_scheme(headers)
-                ),
             })
         }
         "set_request_method" => {
@@ -965,21 +930,6 @@ pub(super) fn flow_action_statement(
                 javascript: format!("upstream_request.set_query({});", render_expr_js(query)),
                 lua: format!("upstream_request.set_query({})", render_expr_lua(query)),
                 scheme: format!("(upstream_request:set_query {})", render_expr_scheme(query)),
-            })
-        }
-        "set_request_raw_query" => {
-            let query = block_value(block, "query", "x=1");
-            Ok(FlowActionStatement {
-                rustscript: format!(
-                    "upstream_request::set_raw_query({});",
-                    render_expr_rss(query)
-                ),
-                javascript: format!("upstream_request.set_raw_query({});", render_expr_js(query)),
-                lua: format!("upstream_request.set_raw_query({})", render_expr_lua(query)),
-                scheme: format!(
-                    "(upstream_request:set_raw_query {})",
-                    render_expr_scheme(query)
-                ),
             })
         }
         "set_request_query_arg" => {
@@ -1069,15 +1019,6 @@ pub(super) fn flow_action_statement(
                 ),
             })
         }
-        "remove_response_header" => {
-            let name = block_value(block, "name", "x-remove");
-            Ok(FlowActionStatement {
-                rustscript: format!("vm::http::response::remove_header({});", rust_string(name)),
-                javascript: format!("vm.http.response.remove_header({});", js_string(name)),
-                lua: format!("vm.http.response.remove_header({})", lua_string(name)),
-                scheme: format!("(vm.http.response.remove_header {})", scheme_string(name)),
-            })
-        }
         "clear_response_header" => {
             let name = block_value(block, "name", "x-remove");
             Ok(FlowActionStatement {
@@ -1085,21 +1026,6 @@ pub(super) fn flow_action_statement(
                 javascript: format!("vm.http.response.clear_header({});", js_string(name)),
                 lua: format!("vm.http.response.clear_header({})", lua_string(name)),
                 scheme: format!("(vm.http.response.clear_header {})", scheme_string(name)),
-            })
-        }
-        "set_response_headers" => {
-            let headers = block_value(block, "headers", "$response_headers");
-            Ok(FlowActionStatement {
-                rustscript: format!(
-                    "vm::http::response::set_headers({});",
-                    render_expr_rss(headers)
-                ),
-                javascript: format!("vm.http.response.set_headers({});", render_expr_js(headers)),
-                lua: format!("vm.http.response.set_headers({})", render_expr_lua(headers)),
-                scheme: format!(
-                    "(vm.http.response.set_headers {})",
-                    render_expr_scheme(headers)
-                ),
             })
         }
         "set_response_content" => {

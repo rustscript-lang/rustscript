@@ -69,7 +69,7 @@ async fn ui_blocks_and_deploy_endpoints_work() {
             .as_array()
             .expect("blocks should be an array")
             .iter()
-            .any(|item| item["id"].as_str() == Some("remove_response_header"))
+            .any(|item| item["id"].as_str() == Some("clear_response_header"))
     );
     assert!(
         blocks_json["blocks"]
@@ -137,6 +137,21 @@ async fn ui_blocks_and_deploy_endpoints_work() {
     let blocks = blocks_json["blocks"]
         .as_array()
         .expect("blocks should be an array");
+    for removed_id in [
+        "get_request_raw_query",
+        "remove_request_header",
+        "set_request_headers",
+        "set_request_raw_query",
+        "remove_response_header",
+        "set_response_headers",
+    ] {
+        assert!(
+            !blocks
+                .iter()
+                .any(|item| item["id"].as_str() == Some(removed_id)),
+            "{removed_id} block should not exist"
+        );
+    }
     let get_header = blocks
         .iter()
         .find(|item| item["id"].as_str() == Some("get_header"))
@@ -173,14 +188,14 @@ async fn ui_blocks_and_deploy_endpoints_work() {
         Some("http_request"),
         "get_request_method should be request-http scoped"
     );
-    let remove_response_header = blocks
+    let clear_response_header = blocks
         .iter()
-        .find(|item| item["id"].as_str() == Some("remove_response_header"))
-        .expect("remove_response_header block should exist");
+        .find(|item| item["id"].as_str() == Some("clear_response_header"))
+        .expect("clear_response_header block should exist");
     assert_eq!(
-        remove_response_header["category"].as_str(),
+        clear_response_header["category"].as_str(),
         Some("http_response"),
-        "remove_response_header should be response-http scoped"
+        "clear_response_header should be response-http scoped"
     );
     let runtime_sleep = blocks
         .iter()
@@ -784,7 +799,6 @@ async fn ui_render_new_http_blocks_generate_expected_calls() {
                 { "block_id": "get_request_method", "values": { "var": "req_method" } },
                 { "block_id": "get_request_path", "values": { "var": "req_path" } },
                 { "block_id": "get_request_query", "values": { "var": "req_query" } },
-                { "block_id": "get_request_raw_query", "values": { "var": "req_raw_query" } },
                 { "block_id": "get_request_path_with_query", "values": { "var": "req_path_query" } },
                 { "block_id": "get_request_query_arg", "values": { "var": "req_token", "name": "token" } },
                 { "block_id": "get_request_query_args", "values": { "var": "req_query_args" } },
@@ -799,20 +813,16 @@ async fn ui_render_new_http_blocks_generate_expected_calls() {
                 { "block_id": "get_request_headers", "values": { "var": "req_headers" } },
                 { "block_id": "set_request_header", "values": { "name": "x-added", "value": "yes" } },
                 { "block_id": "add_request_header", "values": { "name": "x-added", "value": "yes-2" } },
-                { "block_id": "remove_request_header", "values": { "name": "x-remove" } },
                 { "block_id": "clear_request_header", "values": { "name": "x-clear" } },
-                { "block_id": "set_request_headers", "values": { "headers": "$req_headers" } },
                 { "block_id": "set_request_method", "values": { "method": "$method_next" } },
                 { "block_id": "set_request_path", "values": { "path": "$path_next" } },
                 { "block_id": "set_request_query", "values": { "query": "$query_next" } },
-                { "block_id": "set_request_raw_query", "values": { "query": "$query_next" } },
                 { "block_id": "set_request_query_arg", "values": { "name": "token", "value": "$req_id" } },
                 { "block_id": "set_request_body", "values": { "value": "$req_body" } },
+                { "block_id": "set_header", "values": { "name": "x-vm", "value": "$req_method" } },
                 { "block_id": "runtime_sleep", "values": { "millis": "5" } },
-                { "block_id": "remove_response_header", "values": { "name": "x-hidden" } },
                 { "block_id": "clear_response_header", "values": { "name": "x-clear" } },
                 { "block_id": "add_response_header", "values": { "name": "set-cookie", "value": "a=1" } },
-                { "block_id": "set_response_headers", "values": { "headers": "$req_headers" } },
                 { "block_id": "get_response_status", "values": { "var": "resp_status" } },
                 { "block_id": "get_response_header", "values": { "var": "resp_header", "name": "x-vm" } },
                 { "block_id": "get_response_headers", "values": { "var": "resp_headers" } },
@@ -842,7 +852,6 @@ async fn ui_render_new_http_blocks_generate_expected_calls() {
     assert!(rustscript.contains("let req_method = vm::http::request::get_method();"));
     assert!(rustscript.contains("let req_path = vm::http::request::get_path();"));
     assert!(rustscript.contains("let req_query = vm::http::request::get_query();"));
-    assert!(rustscript.contains("let req_raw_query = vm::http::request::get_raw_query();"));
     assert!(rustscript.contains("let req_path_query = vm::http::request::get_path_with_query();"));
     assert!(rustscript.contains("let req_token = vm::http::request::get_query_arg(\"token\");"));
     assert!(rustscript.contains("let req_query_args = vm::http::request::get_query_args();"));
@@ -857,20 +866,16 @@ async fn ui_render_new_http_blocks_generate_expected_calls() {
     assert!(rustscript.contains("let req_headers = vm::http::request::get_headers();"));
     assert!(rustscript.contains("upstream_request::set_header(\"x-added\", \"yes\");"));
     assert!(rustscript.contains("upstream_request::add_header(\"x-added\", \"yes-2\");"));
-    assert!(rustscript.contains("upstream_request::remove_header(\"x-remove\");"));
     assert!(rustscript.contains("upstream_request::clear_header(\"x-clear\");"));
-    assert!(rustscript.contains("upstream_request::set_headers(req_headers);"));
     assert!(rustscript.contains("upstream_request::set_method(method_next);"));
     assert!(rustscript.contains("upstream_request::set_path(path_next);"));
     assert!(rustscript.contains("upstream_request::set_query(query_next);"));
-    assert!(rustscript.contains("upstream_request::set_raw_query(query_next);"));
     assert!(rustscript.contains("upstream_request::set_query_arg(\"token\", req_id);"));
     assert!(rustscript.contains("upstream_request::set_body(req_body);"));
+    assert!(rustscript.contains("vm::http::response::set_header(\"x-vm\", req_method);"));
     assert!(rustscript.contains("runtime::sleep(5);"));
-    assert!(rustscript.contains("vm::http::response::remove_header(\"x-hidden\");"));
     assert!(rustscript.contains("vm::http::response::clear_header(\"x-clear\");"));
     assert!(rustscript.contains("vm::http::response::add_header(\"set-cookie\", \"a=1\");"));
-    assert!(rustscript.contains("vm::http::response::set_headers(req_headers);"));
     assert!(rustscript.contains("let resp_status = vm::http::response::get_status();"));
     assert!(rustscript.contains("let resp_header = vm::http::response::get_header(\"x-vm\");"));
     assert!(rustscript.contains("let resp_headers = vm::http::response::get_headers();"));
@@ -885,7 +890,7 @@ async fn ui_render_new_http_blocks_generate_expected_calls() {
             .contains("import * as upstream_request from \"edge/http/upstream/request.rss\";")
     );
     assert!(javascript.contains("upstream_request.set_path(path_next);"));
-    assert!(javascript.contains("vm.http.response.remove_header(\"x-hidden\");"));
+    assert!(javascript.contains("vm.http.response.clear_header(\"x-clear\");"));
 
     handle.abort();
 }

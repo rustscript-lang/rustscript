@@ -444,13 +444,6 @@ pub(super) fn render_single_block(
             lua.push(format!("local {var} = vm.http.request.get_query()"));
             scm.push(format!("(define {var} (vm.http.request.get_query))"));
         }
-        "get_request_raw_query" => {
-            let var = sanitize_identifier(block.values.get("var"), "request_raw_query");
-            rss.push(format!("let {var} = vm::http::request::get_raw_query();"));
-            js.push(format!("let {var} = vm.http.request.get_raw_query();"));
-            lua.push(format!("local {var} = vm.http.request.get_raw_query()"));
-            scm.push(format!("(define {var} (vm.http.request.get_raw_query))"));
-        }
         "get_request_path_with_query" => {
             let var = sanitize_identifier(block.values.get("var"), "request_path_with_query");
             rss.push(format!(
@@ -877,20 +870,15 @@ pub(super) fn render_single_block(
         }
         "set_request_header"
         | "add_request_header"
-        | "remove_request_header"
         | "clear_request_header"
-        | "set_request_headers"
         | "set_request_method"
         | "set_request_path"
         | "set_request_query"
-        | "set_request_raw_query"
         | "set_request_query_arg"
         | "set_request_body"
         | "set_header"
         | "add_response_header"
-        | "remove_response_header"
         | "clear_response_header"
-        | "set_response_headers"
         | "set_response_content"
         | "set_response_status"
         | "set_upstream"
