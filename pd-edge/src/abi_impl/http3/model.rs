@@ -13,7 +13,6 @@ pub(crate) struct Http3StreamRef {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Http3ControlEventSource {
-    RemotePeer,
     LocalRuntime,
     Transport,
 }
@@ -43,16 +42,6 @@ pub(crate) enum Http3SessionGoal {
     Attached,
     Open,
     Draining,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Http3StreamGoal {
-    Attached,
-    RequestCommitted,
-    ResponseHeadReady,
-    ResponseBodyReady,
-    Closed,
-    Reset,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -95,10 +84,6 @@ impl Http3StreamFrontier {
 
 pub(crate) fn supports_response_version(version: Version) -> bool {
     matches!(version, Version::HTTP_3)
-}
-
-pub(crate) fn response_version_label() -> &'static str {
-    "3"
 }
 
 pub(crate) fn select_upstream_mode(

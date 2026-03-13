@@ -44,10 +44,6 @@ impl Http3DownstreamSessionStore {
     pub(crate) fn capacity(&self) -> usize {
         self.sessions.capacity()
     }
-
-    pub(crate) fn len(&self) -> usize {
-        self.sessions.len()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,6 +1,19 @@
 use super::render::*;
 use super::*;
 
+type UiRenderError = (StatusCode, Json<ErrorResponse>);
+type UiRenderResult<T> = Result<T, UiRenderError>;
+type RenderedExprs = (String, String, String, String);
+
+macro_rules! push_value_assignment {
+    ($rss:expr, $js:expr, $lua:expr, $scm:expr, $var:expr, $rss_expr:expr, $js_expr:expr, $lua_expr:expr, $scm_expr:expr $(,)?) => {{
+        $rss.push(format!("let {} = {};", $var, $rss_expr));
+        $js.push(format!("let {} = {};", $var, $js_expr));
+        $lua.push(format!("local {} = {}", $var, $lua_expr));
+        $scm.push(format!("(define {} {})", $var, $scm_expr));
+    }};
+}
+
 pub(super) fn is_additional_pure_value_block(block_id: &str) -> bool {
     matches!(
         block_id,
@@ -173,7 +186,7 @@ fn render_additional_http_value_block(
     match block.block_id.as_str() {
         "http_exchange_new" => {
             let var = sanitize_identifier(block.values.get("var"), "exchange");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -188,7 +201,7 @@ fn render_additional_http_value_block(
         }
         "http_exchange_default_upstream" => {
             let var = sanitize_identifier(block.values.get("var"), "default_exchange");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -203,7 +216,7 @@ fn render_additional_http_value_block(
         }
         "http_upstream_as_stream" => {
             let var = sanitize_identifier(block.values.get("var"), "upstream_stream");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -218,7 +231,7 @@ fn render_additional_http_value_block(
         }
         "get_upstream_response_http_version" => {
             let var = sanitize_identifier(block.values.get("var"), "upstream_http_version");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -234,7 +247,7 @@ fn render_additional_http_value_block(
         "get_upstream_response_next_chunk" => {
             let var = sanitize_identifier(block.values.get("var"), "upstream_chunk");
             let max_bytes = render_number_expr(block_value(block, "max_bytes", "1024"), "1024");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -249,7 +262,7 @@ fn render_additional_http_value_block(
         }
         "get_upstream_response_eof" => {
             let var = sanitize_identifier(block.values.get("var"), "upstream_body_eof");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -264,7 +277,7 @@ fn render_additional_http_value_block(
         }
         "read_upstream_response_line" => {
             let var = sanitize_identifier(block.values.get("var"), "upstream_line");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -279,7 +292,7 @@ fn render_additional_http_value_block(
         }
         "read_upstream_response_all" => {
             let var = sanitize_identifier(block.values.get("var"), "upstream_all");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -306,7 +319,7 @@ fn render_additional_transport_value_block(
     match block.block_id.as_str() {
         "tcp_stream_downstream" => {
             let var = sanitize_identifier(block.values.get("var"), "downstream_stream");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -321,7 +334,7 @@ fn render_additional_transport_value_block(
         }
         "tcp_stream_default_upstream" => {
             let var = sanitize_identifier(block.values.get("var"), "default_tcp_upstream");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -336,7 +349,7 @@ fn render_additional_transport_value_block(
         }
         "tcp_stream_new" => {
             let var = sanitize_identifier(block.values.get("var"), "tcp_stream");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -352,7 +365,7 @@ fn render_additional_transport_value_block(
         "tls_session_from_socket" => {
             let var = sanitize_identifier(block.values.get("var"), "tls_session");
             let stream = render_number_expr(block_value(block, "stream", "1"), "1");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -379,7 +392,7 @@ fn render_additional_realtime_value_block(
     let handled = match block.block_id.as_str() {
         "websocket_connection_new" => {
             let var = sanitize_identifier(block.values.get("var"), "ws_conn");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -394,7 +407,7 @@ fn render_additional_realtime_value_block(
         }
         "websocket_connection_downstream" => {
             let var = sanitize_identifier(block.values.get("var"), "ws_downstream");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -409,7 +422,7 @@ fn render_additional_realtime_value_block(
         }
         "websocket_connection_default_upstream" => {
             let var = sanitize_identifier(block.values.get("var"), "ws_default_upstream");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -424,7 +437,7 @@ fn render_additional_realtime_value_block(
         }
         "webrtc_connection_new" => {
             let var = sanitize_identifier(block.values.get("var"), "webrtc_conn");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -439,7 +452,7 @@ fn render_additional_realtime_value_block(
         }
         "webrtc_connection_downstream" => {
             let var = sanitize_identifier(block.values.get("var"), "webrtc_downstream");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -454,7 +467,7 @@ fn render_additional_realtime_value_block(
         }
         "webrtc_connection_default_upstream" => {
             let var = sanitize_identifier(block.values.get("var"), "webrtc_default_upstream");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -469,7 +482,7 @@ fn render_additional_realtime_value_block(
         }
         "udp_socket_new" => {
             let var = sanitize_identifier(block.values.get("var"), "udp_socket");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -484,7 +497,7 @@ fn render_additional_realtime_value_block(
         }
         "udp_socket_downstream" => {
             let var = sanitize_identifier(block.values.get("var"), "udp_downstream");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -499,7 +512,7 @@ fn render_additional_realtime_value_block(
         }
         "udp_socket_default_upstream" => {
             let var = sanitize_identifier(block.values.get("var"), "udp_default_upstream");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -527,7 +540,7 @@ fn render_additional_proxy_value_block(
     let handled = match block.block_id.as_str() {
         "proxy_stream_downstream" => {
             let var = sanitize_identifier(block.values.get("var"), "proxy_downstream");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -543,7 +556,7 @@ fn render_additional_proxy_value_block(
         "proxy_stream_exchange" => {
             let var = sanitize_identifier(block.values.get("var"), "proxy_exchange_stream");
             let exchange = render_number_expr(block_value(block, "exchange", "1"), "1");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -559,7 +572,7 @@ fn render_additional_proxy_value_block(
         "proxy_stream_from_tcp" => {
             let var = sanitize_identifier(block.values.get("var"), "proxy_tcp_stream");
             let stream = render_number_expr(block_value(block, "stream", "1"), "1");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -575,7 +588,7 @@ fn render_additional_proxy_value_block(
         "proxy_stream_from_tls_plaintext" => {
             let var = sanitize_identifier(block.values.get("var"), "proxy_tls_stream");
             let session = render_number_expr(block_value(block, "session", "1"), "1");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -591,7 +604,7 @@ fn render_additional_proxy_value_block(
         "proxy_stream_from_websocket_binary" => {
             let var = sanitize_identifier(block.values.get("var"), "proxy_ws_stream");
             let connection = render_number_expr(block_value(block, "connection", "1"), "1");
-            push_value_assignment(
+            push_value_assignment!(
                 rss,
                 js,
                 lua,
@@ -1409,23 +1422,6 @@ fn additional_proxy_flow_action(
     }
 }
 
-fn push_value_assignment(
-    rss: &mut Vec<String>,
-    js: &mut Vec<String>,
-    lua: &mut Vec<String>,
-    scm: &mut Vec<String>,
-    var: &str,
-    rss_expr: String,
-    js_expr: String,
-    lua_expr: String,
-    scm_expr: String,
-) {
-    rss.push(format!("let {var} = {rss_expr};"));
-    js.push(format!("let {var} = {js_expr};"));
-    lua.push(format!("local {var} = {lua_expr}"));
-    scm.push(format!("(define {var} {scm_expr})"));
-}
-
 fn assignment_action(
     var: &str,
     rss_expr: String,
@@ -1473,7 +1469,7 @@ fn bool_expr_scheme(raw: &str, fallback: &str) -> String {
 
 fn render_generic_assignment_action(
     block: &UiBlockInstance,
-) -> Result<FlowActionStatement, (StatusCode, Json<ErrorResponse>)> {
+) -> UiRenderResult<FlowActionStatement> {
     let var = sanitize_identifier(block.values.get("var"), "value");
     let (rss_expr, js_expr, lua_expr, scm_expr) = generic_vm_call(block)?;
     Ok(assignment_action(
@@ -1481,9 +1477,7 @@ fn render_generic_assignment_action(
     ))
 }
 
-fn render_generic_statement_action(
-    block: &UiBlockInstance,
-) -> Result<FlowActionStatement, (StatusCode, Json<ErrorResponse>)> {
+fn render_generic_statement_action(block: &UiBlockInstance) -> UiRenderResult<FlowActionStatement> {
     let (rss_expr, js_expr, lua_expr, scm_expr) = generic_vm_call(block)?;
     Ok(statement_action(
         format!("{rss_expr};"),
@@ -1493,9 +1487,7 @@ fn render_generic_statement_action(
     ))
 }
 
-fn generic_vm_call(
-    block: &UiBlockInstance,
-) -> Result<(String, String, String, String), (StatusCode, Json<ErrorResponse>)> {
+fn generic_vm_call(block: &UiBlockInstance) -> UiRenderResult<RenderedExprs> {
     let rss_path =
         vm_rss_path(&block.block_id).ok_or_else(|| bad_request("unsupported UI ABI block"))?;
     let js_path =

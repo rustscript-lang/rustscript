@@ -793,7 +793,7 @@ enum UpstreamResponseSource {
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
     Hyper(hyper::body::Incoming),
     #[cfg(feature = "http3")]
-    Http3(h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>),
+    Http3(Box<h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>>),
     Exhausted,
 }
 
@@ -864,7 +864,7 @@ impl BufferedByteSource for UpstreamResponseBodySource {
                 },
                 #[cfg(feature = "http3")]
                 UpstreamResponseSource::Http3(request_stream) => {
-                    match request_stream.recv_data().await {
+                    match request_stream.as_mut().recv_data().await {
                         Ok(Some(mut chunk)) => {
                             let bytes = chunk.copy_to_bytes(chunk.remaining());
                             if !bytes.is_empty() {
@@ -947,7 +947,7 @@ impl UpstreamResponseBodyState {
     ) -> Self {
         Self {
             source: UpstreamResponseBodySource {
-                source: UpstreamResponseSource::Http3(request_stream),
+                source: UpstreamResponseSource::Http3(Box::new(request_stream)),
                 http2_tracker: None,
                 http3_tracker,
                 body_started: false,
@@ -1145,10 +1145,6 @@ impl RuntimeServices {
 
     pub(crate) fn downstream_http_sessions(&self) -> Option<http2::SharedHttpDownstreamSessions> {
         self.downstream_http_sessions.clone()
-    }
-
-    pub(crate) fn downstream_http3_sessions(&self) -> Option<http3::SharedHttp3DownstreamSessions> {
-        self.downstream_http3_sessions.clone()
     }
 
     #[cfg(feature = "tls")]

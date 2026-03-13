@@ -16,58 +16,6 @@ use crate::abi_impl::transport::{TlsFlowState, TlsProtocolVersion};
 
 pub(crate) const ALPN_PROTOCOL: &str = "h3";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum QuicConnectionGoal {
-    Attached,
-    HandshakeReady,
-    Open,
-    Draining,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum QuicConnectionFrontier {
-    #[default]
-    Candidate,
-    Attached,
-    HandshakeInProgress,
-    OneRttReady,
-    Open,
-    Draining,
-    Closed,
-    Failed,
-}
-
-impl QuicConnectionFrontier {
-    pub(crate) fn is_terminal(self) -> bool {
-        matches!(self, Self::Closed | Self::Failed)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum QuicStreamGoal {
-    Reserved,
-    Open,
-    Closed,
-    Reset,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum QuicStreamFrontier {
-    #[default]
-    Reserved,
-    Open,
-    HalfClosedLocal,
-    HalfClosedRemote,
-    Reset,
-    Closed,
-}
-
-impl QuicStreamFrontier {
-    pub(crate) fn is_terminal(self) -> bool {
-        matches!(self, Self::Reset | Self::Closed)
-    }
-}
-
 #[cfg(feature = "http3")]
 pub(crate) fn ensure_rustls_provider() {
     static INIT: std::sync::Once = std::sync::Once::new();

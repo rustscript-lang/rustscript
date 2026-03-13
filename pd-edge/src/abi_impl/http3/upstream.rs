@@ -103,8 +103,8 @@ type Http3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>,
 #[cfg(feature = "http3")]
 struct Http3UpstreamSession {
     session_id: u64,
-    endpoint: quinn::Endpoint,
-    connection: quinn::Connection,
+    _endpoint: quinn::Endpoint,
+    _connection: quinn::Connection,
     sender: tokio::sync::Mutex<Http3SendRequest>,
     peer_addr: String,
     negotiated_alpn: Option<String>,
@@ -244,8 +244,8 @@ impl Http3UpstreamSession {
         dag.advance_session_goal(Http3SessionGoal::Open);
         Self {
             session_id,
-            endpoint,
-            connection,
+            _endpoint: endpoint,
+            _connection: connection,
             sender: tokio::sync::Mutex::new(sender),
             peer_addr,
             negotiated_alpn,
