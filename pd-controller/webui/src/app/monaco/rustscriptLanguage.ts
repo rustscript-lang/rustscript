@@ -32,6 +32,9 @@ const FALLBACK_NUMBERS = "\\b(?:\\d+\\.\\d+|\\d+)\\b";
 const FALLBACK_OPERATORS = "=>|==|!=|&&|\\|\\||&|=|\\+|-|\\*|/|%|<|>|!|\\?";
 const IDENT = "[A-Za-z_][A-Za-z0-9_]*";
 const TYPE_IDENT = "[A-Za-z_][A-Za-z0-9_]*";
+const GENERIC_BLOCK = "<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>";
+const TYPE_EXPR = `${TYPE_IDENT}(?:\\s*${GENERIC_BLOCK})?`;
+const TYPE_ANNOTATION_EXPR = `(?:${TYPE_EXPR}|\\[[^\\]\\n]+\\])`;
 const PATH_IDENT = `(?:self|super|crate|${IDENT})`;
 const PATH = `(?:${PATH_IDENT})(?:::(?:${PATH_IDENT}))*`;
 const PATH_CALL = `${IDENT}(?:(?:\\s*::\\s*)${IDENT})*`;
@@ -88,81 +91,52 @@ export function ensureRustScriptLanguage(monaco: typeof import("monaco-editor"))
     monaco.languages.register({ id: languageId });
   }
 
-  const lineCommentPattern = beginPattern(
-    findByName("comments", "comment.line"),
-    FALLBACK_LINE_COMMENT,
-  );
-  const blockCommentBegin = beginPattern(
-    findByName("comments", "comment.block"),
-    FALLBACK_BLOCK_COMMENT_BEGIN,
-  );
-  const blockCommentEnd = endPattern(
-    findByName("comments", "comment.block"),
-    FALLBACK_BLOCK_COMMENT_END,
-  );
-  const stringBegin = beginPattern(
-    section("double-quoted-string"),
-    FALLBACK_STRING_BEGIN,
-  );
-  const stringEnd = endPattern(
-    section("double-quoted-string"),
-    FALLBACK_STRING_END,
-  );
-  const stringEscape = sectionPatternMatches("double-quoted-string")[0] ??
-    patternMatch(FALLBACK_STRING_ESCAPE, FALLBACK_STRING_ESCAPE);
+  const lineCommentPattern = beginPattern(findByName("comments", "comment.line"), FALLBACK_LINE_COMMENT);
+  const blockCommentBegin = beginPattern(findByName("comments", "comment.block"), FALLBACK_BLOCK_COMMENT_BEGIN);
+  const blockCommentEnd = endPattern(findByName("comments", "comment.block"), FALLBACK_BLOCK_COMMENT_END);
+  const stringBegin = beginPattern(section("double-quoted-string"), FALLBACK_STRING_BEGIN);
+  const stringEnd = endPattern(section("double-quoted-string"), FALLBACK_STRING_END);
+  const stringEscape =
+    sectionPatternMatches("double-quoted-string")[0] ?? patternMatch(FALLBACK_STRING_ESCAPE, FALLBACK_STRING_ESCAPE);
 
   const rootRules: Monaco.languages.IMonarchLanguageRule[] = [
     [lineCommentPattern, "comment"],
     [blockCommentBegin, "comment", "@blockComment"],
     [stringBegin, "string", "@string"],
+    [
+      new RegExp(`\\b(struct)(\\s+)(${IDENT})(\\s*)(${GENERIC_BLOCK})(\\s*)(\\{)`),
+      ["keyword", "", "type.identifier", "", "type.identifier", "", "delimiter"],
+      "@structBlock"
+    ],
     [new RegExp(`\\b(struct)(\\s+)(${IDENT})(\\s*)(\\{)`), ["keyword", "", "type.identifier", "", "delimiter"], "@structBlock"],
-    [
-      new RegExp(`\\b(use)(\\s+)(${PATH})(\\s+)(as)(\\s+)(${IDENT})\\b`),
-      ["keyword", "", "type.identifier", "", "keyword", "", "identifier"],
-    ],
-    [
-      new RegExp(`\\b(use)(\\s+)(${PATH})(\\s*)(::)(\\s*)(\\{[^}\\n]*\\}|\\*)`),
-      ["keyword", "", "type.identifier", "", "delimiter", "", "type.identifier"],
-    ],
+    [new RegExp(`\\b(use)(\\s+)(${PATH})(\\s+)(as)(\\s+)(${IDENT})\\b`), ["keyword", "", "type.identifier", "", "keyword", "", "identifier"]],
+    [new RegExp(`\\b(use)(\\s+)(${PATH})(\\s*)(::)(\\s*)(\\{[^}\\n]*\\}|\\*)`), ["keyword", "", "type.identifier", "", "delimiter", "", "type.identifier"]],
     [new RegExp(`\\b(use)(\\s+)(${PATH})\\b`), ["keyword", "", "type.identifier"]],
     [
-      new RegExp(`\\b(pub)(\\s+)(fn)(\\s+)(${IDENT})\\s*(?=\\()`),
-      ["keyword", "", "keyword", "", "function"],
-    ],
-    [new RegExp(`\\b(fn)(\\s+)(${IDENT})\\s*(?=\\()`), ["keyword", "", "function"]],
-    [
-      new RegExp(`\\b(pub)(\\s+)(fn)(\\s+)(${IDENT})(\\s*)(\\([^)]*\\))(\\s*)(->)(\\s+)(${TYPE_IDENT})\\b`),
-      ["keyword", "", "keyword", "", "function", "", "", "", "operator", "", "type.identifier"],
+      new RegExp(`\\b(pub)(\\s+)(fn)(\\s+)(${IDENT})(\\s*)(${GENERIC_BLOCK})(\\s*)(\\()`),
+      ["keyword", "", "keyword", "", "function", "", "type.identifier", "", "delimiter"],
+      "@functionSignature"
     ],
     [
-      new RegExp(`\\b(fn)(\\s+)(${IDENT})(\\s*)(\\([^)]*\\))(\\s*)(->)(\\s+)(${TYPE_IDENT})\\b`),
-      ["keyword", "", "function", "", "", "", "operator", "", "type.identifier"],
+      new RegExp(`\\b(fn)(\\s+)(${IDENT})(\\s*)(${GENERIC_BLOCK})(\\s*)(\\()`),
+      ["keyword", "", "function", "", "type.identifier", "", "delimiter"],
+      "@functionSignature"
     ],
-    [
-      new RegExp(`\\b(let)(\\s+)(mut)(\\s+)(${IDENT})(\\s*)(:)(\\s+)(${TYPE_IDENT})\\b`),
-      ["keyword", "", "keyword", "", "identifier", "", "delimiter", "", "type.identifier"],
-    ],
-    [
-      new RegExp(`\\b(let)(\\s+)(${IDENT})(\\s*)(:)(\\s+)(${TYPE_IDENT})\\b`),
-      ["keyword", "", "identifier", "", "delimiter", "", "type.identifier"],
-    ],
-    [
-      new RegExp(`\\b(let)(\\s+)(mut)(\\s+)(${IDENT})\\b`),
-      ["keyword", "", "keyword", "", "identifier"],
-    ],
+    [new RegExp(`\\b(pub)(\\s+)(fn)(\\s+)(${IDENT})(\\s*)(\\()`), ["keyword", "", "keyword", "", "function", "", "delimiter"], "@functionSignature"],
+    [new RegExp(`\\b(fn)(\\s+)(${IDENT})(\\s*)(\\()`), ["keyword", "", "function", "", "delimiter"], "@functionSignature"],
+    [new RegExp(`\\b(let)(\\s+)(mut)(\\s+)(${IDENT})(\\s*)(:)(\\s+)(${TYPE_ANNOTATION_EXPR})(?=\\s*=)`), ["keyword", "", "keyword", "", "identifier", "", "delimiter", "", "type.identifier"]],
+    [new RegExp(`\\b(let)(\\s+)(${IDENT})(\\s*)(:)(\\s+)(${TYPE_ANNOTATION_EXPR})(?=\\s*=)`), ["keyword", "", "identifier", "", "delimiter", "", "type.identifier"]],
+    [new RegExp(`\\b(let)(\\s+)(mut)(\\s+)(${IDENT})\\b`), ["keyword", "", "keyword", "", "identifier"]],
     [new RegExp(`\\b(let)(\\s+)(${IDENT})\\b`), ["keyword", "", "identifier"]],
     [
-      new RegExp(`\\b(${IDENT})(\\s*)(::)(\\s*)(${PATH_CALL})(?=\\s*\\()`),
-      ["type.identifier", "", "delimiter", "", "function"],
+      new RegExp(`\\b(${IDENT})(\\s*)(::)(\\s*)(${PATH_CALL})(\\s*)(::)(\\s*)(${GENERIC_BLOCK})(?=\\s*\\()`),
+      ["type.identifier", "", "delimiter", "", "function", "", "delimiter", "", "type.identifier"]
     ],
-    [
-      /(\?\.|\.)(\s*)([A-Za-z_][A-Za-z0-9_]*)/,
-      ["delimiter", "", "variable"],
-    ],
-    [
-      /\b(?!pub\b|struct\b|fn\b|let\b|mut\b|for\b|if\b|else\b|match\b|while\b|break\b|continue\b|use\b|as\b|true\b|false\b|null\b)([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()/,
-      "function",
-    ],
+    [new RegExp(`\\b(${IDENT})(\\s*)(::)(\\s*)(${GENERIC_BLOCK})(?=\\s*\\()`), ["function", "", "delimiter", "", "type.identifier"]],
+    [new RegExp(`\\b(${IDENT})(\\s*)(::)(\\s*)(${PATH_CALL})(?=\\s*\\()`), ["type.identifier", "", "delimiter", "", "function"]],
+    [new RegExp(`\\b(println)(\\s*)(!)(?=\\s*\\()`), ["function", "", "operator"]],
+    [/(\?\.|\.)(\s*)([A-Za-z_][A-Za-z0-9_]*)/, ["delimiter", "", "variable"]],
+    [/\b(?!pub\b|struct\b|fn\b|let\b|mut\b|for\b|if\b|else\b|match\b|while\b|break\b|continue\b|use\b|as\b|true\b|false\b|null\b)([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()/, "function"]
   ];
 
   rootRules.push([sectionMatch("booleans", "\\b(?:true|false)\\b"), "keyword"]);
@@ -181,13 +155,28 @@ export function ensureRustScriptLanguage(monaco: typeof import("monaco-editor"))
       root: rootRules,
       blockComment: [
         [blockCommentEnd, "comment", "@pop"],
-        [/./, "comment"],
+        [/./, "comment"]
       ],
       string: [
         [stringEscape, "string.escape"],
         [stringEnd, "string", "@pop"],
         [/[^\\"]+/, "string"],
-        [/./, "string"],
+        [/./, "string"]
+      ],
+      functionSignature: [
+        [lineCommentPattern, "comment"],
+        [blockCommentBegin, "comment", "@blockComment"],
+        [stringBegin, "string", "@string"],
+        [
+          new RegExp(`\\b(${IDENT})(\\s*)(:)(\\s*)(${TYPE_ANNOTATION_EXPR})(?=\\s*(?:,|\\)))`),
+          ["identifier", "", "delimiter", "", "type.identifier"]
+        ],
+        [new RegExp(`(->)(\\s*)(${TYPE_ANNOTATION_EXPR})(?=\\s*(?:\\{|=|;))`), ["operator", "", "type.identifier"]],
+        [/\{/, "delimiter", "@pop"],
+        [/=/, "operator", "@pop"],
+        [/;/, "delimiter", "@pop"],
+        [sectionMatch("punctuation", "[(){}\\[\\],;:]"), "delimiter"],
+        [sectionMatch("operators", FALLBACK_OPERATORS), "operator"]
       ],
       structBlock: [
         [lineCommentPattern, "comment"],
@@ -197,17 +186,18 @@ export function ensureRustScriptLanguage(monaco: typeof import("monaco-editor"))
         [/\}/, "delimiter", "@pop"],
         [/\[/, "delimiter"],
         [/\]/, "delimiter"],
-        [new RegExp(`\\b(${IDENT})(\\s*)(:)(\\s*)`), ["variable", "", "delimiter", ""]],
-        [/\b(?:unknown|null|int|float|bool|string|array|map)\b/, "type.identifier"],
-        [new RegExp(`\\b${TYPE_IDENT}\\b`), "type.identifier"],
-        [sectionMatch("punctuation", "[(){}\\[\\],;:]"), "delimiter"],
-      ],
-    },
+        [
+          new RegExp(`\\b(${IDENT})(\\s*)(:)(\\s*)(${TYPE_ANNOTATION_EXPR})(?=\\s*(?:,|\\}))`),
+          ["variable", "", "delimiter", "", "type.identifier"]
+        ],
+        [sectionMatch("punctuation", "[(){}\\[\\],;:]"), "delimiter"]
+      ]
+    }
   });
 
   monaco.languages.setLanguageConfiguration(
     languageId,
-    languageConfiguration as unknown as Monaco.languages.LanguageConfiguration,
+    languageConfiguration as unknown as Monaco.languages.LanguageConfiguration
   );
 
   rustScriptLanguageRegistered = true;
