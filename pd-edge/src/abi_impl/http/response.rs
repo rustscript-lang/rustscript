@@ -1,12 +1,9 @@
 use axum::http::HeaderName;
 use edge_abi::symbols::http::response as http_response;
 use pd_edge_host_function::pd_edge_host_function;
-use vm::bytecode::VmMap;
 use vm::{CallOutcome, Value, Vm, VmError};
 
-use super::{
-    SharedProxyVmContext, headers_to_value_map, parse_header, parse_header_name, parse_headers_map,
-};
+use super::{SharedProxyVmContext, headers_to_value_map, parse_header, parse_header_name};
 
 /// Sets a header on the downstream HTTP response.
 #[pd_edge_host_function(name = http_response::SET_HEADER.name, scope = http)]
@@ -19,20 +16,6 @@ async fn set_response_header(
     let (header_name, header_value) = parse_header(name, value)?;
     context.with_downstream_response_mut(|response| {
         response.headers.insert(header_name, header_value);
-    });
-    Ok(CallOutcome::Return(vec![]))
-}
-
-/// Removes a header from the downstream HTTP response.
-#[pd_edge_host_function(name = http_response::REMOVE_HEADER.name, scope = http)]
-async fn remove_response_header(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-    name: String,
-) -> Result<CallOutcome, VmError> {
-    let header_name = parse_header_name(name)?;
-    context.with_downstream_response_mut(|response| {
-        response.headers.remove(header_name);
     });
     Ok(CallOutcome::Return(vec![]))
 }
@@ -146,25 +129,6 @@ async fn clear_response_header(
     let header_name = parse_header_name(name)?;
     context.with_downstream_response_mut(|response| {
         response.headers.remove(header_name);
-    });
-    Ok(CallOutcome::Return(vec![]))
-}
-
-/// Replaces the headers on the downstream HTTP response with the provided map.
-#[pd_edge_host_function(name = http_response::SET_HEADERS.name, scope = http)]
-async fn set_response_headers(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-    headers: VmMap,
-) -> Result<CallOutcome, VmError> {
-    let headers = parse_headers_map(headers)?;
-    context.with_downstream_response_mut(|response| {
-        for (name, values) in headers {
-            response.headers.remove(name.clone());
-            for value in values {
-                response.headers.append(name.clone(), value);
-            }
-        }
     });
     Ok(CallOutcome::Return(vec![]))
 }

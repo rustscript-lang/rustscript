@@ -1,7 +1,6 @@
 use axum::http::{HeaderName, Method};
 use edge_abi::symbols::http::exchange as http_exchange;
 use pd_edge_host_function::pd_edge_host_function;
-use vm::bytecode::VmMap;
 use vm::{CallOutcome, Value, Vm, VmError};
 
 #[cfg(feature = "tls")]
@@ -11,7 +10,7 @@ use super::{
     attach_outbound_exchange_tcp_transport, default_upstream_exchange_handle,
     ensure_outbound_exchange_response_started, headers_to_value_map, is_valid_request_path,
     is_valid_upstream, outbound_exchange_exists, outbound_exchange_response_eof, parse_header,
-    parse_header_name, parse_headers_map, read_outbound_exchange_response_all,
+    parse_header_name, read_outbound_exchange_response_all,
     read_outbound_exchange_response_next_chunk, serialize_query_pairs,
 };
 
@@ -69,18 +68,18 @@ fn with_exchange_request_mut<T>(
 fn apply_exchange_query(
     context: &SharedProxyVmContext,
     handle: i64,
-    raw_query: String,
+    query: String,
 ) -> Result<CallOutcome, VmError> {
     ensure_known_exchange_handle(context, handle)?;
-    let query = raw_query.strip_prefix('?').unwrap_or(raw_query.as_str());
-    if query.contains('#') || query.chars().any(|ch| ch.is_whitespace()) {
+    let normalized_query = query.strip_prefix('?').unwrap_or(query.as_str());
+    if normalized_query.contains('#') || normalized_query.chars().any(|ch| ch.is_whitespace()) {
         return Err(VmError::HostError(format!(
-            "query must not contain whitespace or '#', got '{raw_query}'",
+            "query must not contain whitespace or '#', got '{query}'",
         )));
     }
 
     with_exchange_request_mut(context, handle, |request, _tcp_flow, _tls_flow| {
-        request.query = query.to_string();
+        request.query = normalized_query.to_string();
     })?;
     Ok(CallOutcome::Return(vec![]))
 }
@@ -127,21 +126,6 @@ async fn set_exchange_header(
     let (header_name, header_value) = parse_header(name, value)?;
     with_exchange_request_mut(&context, exchange, |request, _tcp_flow, _tls_flow| {
         request.headers.insert(header_name, header_value);
-    })?;
-    Ok(CallOutcome::Return(vec![]))
-}
-
-/// Removes a header from the outbound HTTP exchange.
-#[pd_edge_host_function(name = http_exchange::REMOVE_HEADER.name, scope = http)]
-async fn remove_exchange_header(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-    exchange: i64,
-    name: String,
-) -> Result<CallOutcome, VmError> {
-    let header_name = parse_header_name(name)?;
-    with_exchange_request_mut(&context, exchange, |request, _tcp_flow, _tls_flow| {
-        request.headers.remove(header_name);
     })?;
     Ok(CallOutcome::Return(vec![]))
 }
@@ -283,37 +267,6 @@ async fn clear_exchange_header(
         request.headers.remove(header_name);
     })?;
     Ok(CallOutcome::Return(vec![]))
-}
-
-/// Replaces the headers on the outbound HTTP exchange with the provided map.
-#[pd_edge_host_function(name = http_exchange::SET_HEADERS.name, scope = http)]
-async fn set_exchange_headers(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-    exchange: i64,
-    headers: VmMap,
-) -> Result<CallOutcome, VmError> {
-    let headers = parse_headers_map(headers)?;
-    with_exchange_request_mut(&context, exchange, |request, _tcp_flow, _tls_flow| {
-        for (name, values) in headers {
-            request.headers.remove(name.clone());
-            for value in values {
-                request.headers.append(name.clone(), value);
-            }
-        }
-    })?;
-    Ok(CallOutcome::Return(vec![]))
-}
-
-/// Sets the raw query string on the outbound HTTP exchange.
-#[pd_edge_host_function(name = http_exchange::SET_RAW_QUERY.name, scope = http)]
-async fn set_exchange_raw_query(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-    exchange: i64,
-    raw_query: String,
-) -> Result<CallOutcome, VmError> {
-    apply_exchange_query(&context, exchange, raw_query)
 }
 
 /// Sets a query parameter on the outbound HTTP exchange.

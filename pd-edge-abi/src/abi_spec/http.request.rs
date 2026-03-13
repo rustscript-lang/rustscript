@@ -58,11 +58,6 @@ fn http_request_get_path_with_query() -> String {
     unreachable!("abi declaration only")
 }
 
-#[pd_host_function(name = "http::request::get_raw_query")]
-fn http_request_get_raw_query() -> String {
-    unreachable!("abi declaration only")
-}
-
 #[pd_host_function(name = "http::request::get_body")]
 fn http_request_get_body() -> String {
     unreachable!("abi declaration only")
@@ -75,10 +70,5 @@ fn http_request_get_http_version() -> String {
 
 #[pd_host_function(name = "http::request::get_port")]
 fn http_request_get_port() -> i64 {
-    unreachable!("abi declaration only")
-}
-
-#[pd_host_function(name = "http::request::handoff_downstream")]
-fn http_request_handoff_downstream() {
     unreachable!("abi declaration only")
 }

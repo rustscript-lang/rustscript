@@ -279,7 +279,7 @@ pub(crate) async fn prepare_scoped_host_call(
         return Ok(());
     }
     if host_name == edge_abi::symbols::http::request::GET_SCHEME.name
-        || host_name == edge_abi::symbols::http::request::HANDOFF_DOWNSTREAM.name
+        || host_name == "http::downstream::attach_transport"
     {
         return Ok(());
     }

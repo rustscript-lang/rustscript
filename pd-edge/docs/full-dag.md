@@ -17,9 +17,9 @@ Notes:
 - Internally, carrier-specific policy is now split into `src/abi_impl/http1/` and `src/abi_impl/http2/`, while the generic exchange state remains under `src/abi_impl/http/`.
 - VM host calls, request execution, graph resolution, and proxy byte-stream wiring are runtime control layers, not protocol goals. They are intentionally omitted from the graphs below.
 - Downstream listener goals are shown below because they now affect which forward edges are legal. The HTTP proxy HTTPS listener begins as downstream TCP with goal `https`; a plain HTTP listener still enters directly at downstream HTTP ingress.
-- An untouched downstream HTTPS listener may auto-advance through `tcp -> tls -> http` on first HTTP-scoped host-call entry or during finalization. Once VM code uses raw downstream transport or TLS prelude state, that automatic edge is blocked and `http::request::handoff_downstream()` becomes the explicit bridge into HTTP.
+- An untouched downstream HTTPS listener may auto-advance through `tcp -> tls -> http` on first HTTP-scoped host-call entry or during finalization. Once VM code uses raw downstream transport or TLS prelude state, that automatic edge is blocked and `http::downstream::attach_transport()` becomes the explicit bridge into HTTP.
 - There is no symmetric upstream listener-goal layer. Upstream DAGs still begin from VM-selected handles, explicit targets, and connect/send/handshake demand. The adjacent upstream refinement is that TLS sessions now observe the logical target as part of the TLS session DAG, even when the underlying transport was attached first.
-- UDP datagrams and WebRTC data-channel messages do not currently flow through `proxy::pipe` or `proxy::tunnel`; they remain sibling message-oriented DAGs.
+- UDP datagrams and WebRTC data-channel messages do not currently flow through `proxy::pipe` or `proxy::bridge`; they remain sibling message-oriented DAGs.
 - These graphs are intentionally conceptual. They show ingress and egress connections between DAGs, not every internal transition implemented by each subsystem.
 
 ## Downstream Graph
@@ -96,7 +96,7 @@ flowchart LR
     DT1 -->|vm transport host call| DB0
     DTL3 --> DH0
     DTL0 -->|vm tls prelude host call| DB0
-    DB0 -. http::request::handoff_downstream required for http entry .-> DH0
+    DB0 -. http::downstream::attach_transport required for http entry .-> DH0
     DH1 --> DW0
 ```
 

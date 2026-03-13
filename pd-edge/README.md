@@ -355,8 +355,8 @@ Current state:
   - `udp::socket::new()` allocates independent outbound UDP socket handles starting at `2`
   - `udp::socket::{bind, set_target, connect, get_phase, get_local_addr, get_peer_addr, send_text, recv_text, send_binary_base64, recv_binary_base64, close}` operate on any UDP socket handle
   - `tls::session::from_socket(sock)` projects a TLS-session handle from a socket handle
-  - `tls::session::{set_alpn, set_verify, set_verify_hostname, set_trusted_certificate, set_certificate, set_private_key, set_sni, set_min_version, set_max_version}` configure the next outbound TLS handshake for that session handle
-  - `tls::session::{is_present, handshake, get_phase, get_peer_name, get_server_name, get_alpn, get_peer_certificate, is_session_reused}` read back negotiated or observed TLS state
+  - `tls::session::{set_alpn, set_verify, set_verify_hostname, set_trusted_certificate, set_client_certificate, set_client_private_key, set_server_certificate, set_server_private_key, set_sni, set_min_version, set_max_version}` configure a TLS session handle
+  - `tls::session::{is_present, handshake, get_phase, get_peer_name, get_alpn, get_peer_certificate, is_session_reused}` read back negotiated or observed TLS state
   - `http::exchange::default_upstream()` returns outbound exchange handle `1`
   - `http::exchange::new()` allocates independent outbound exchange handles starting at `2`
   - `http::exchange::{set_*, send, get_*}` operates on any outbound exchange handle
@@ -372,7 +372,7 @@ Current state:
 - Current runtime boundary:
   - generic `http::exchange::*` is the stable VM-facing request/response surface
   - feature `http2` currently adds explicit upstream session pooling plus downstream session tracking under the generic HTTP layer; it does not yet expose a VM-visible `http2::session::*` namespace
-  - downstream HTTPS listener entry is now modeled as a runtime-owned listener goal over the downstream DAG; an untouched connection may auto-advance `tcp -> tls -> http` on first HTTP-scoped host-call entry or during finalization, while raw downstream transport or TLS prelude use still requires explicit `http::request::handoff_downstream()`
+  - downstream HTTPS listener entry is now modeled as a runtime-owned listener goal over the downstream DAG; an untouched connection may auto-advance `tcp -> tls -> http` on first HTTP-scoped host-call entry or during finalization, while raw downstream transport or TLS prelude use still requires explicit `http::downstream::attach_transport()`
   - there is no symmetric upstream listener-goal edge today; upstream DAGs still begin only when the VM selects or allocates a handle and asks for connect, handshake, or send progression
   - outbound UDP sockets are executable today
   - downstream UDP handle `0` is reserved but inactive in the current one-shot HTTP runtime
@@ -381,7 +381,7 @@ Current state:
   - outbound WebRTC peer connections and data channels are executable today
   - downstream WebRTC handle `0` is reserved but inactive in the current one-shot HTTP runtime
   - `wss://` currently uses the default verifier/client configuration only; custom TLS-session overrides are rejected for websocket connects until the manual websocket TLS connector reaches parity with the HTTP client path
-  - `proxy::pipe` and `proxy::tunnel` remain byte-stream only; UDP datagrams and WebRTC message queues are not adapted into that layer today
+  - `proxy::pipe` and `proxy::bridge` remain byte-stream only; UDP datagrams and WebRTC message queues are not adapted into that layer today
 
 Core model:
 
@@ -430,7 +430,7 @@ Rules:
 - Datagram boundaries are preserved. `recv_text` and `recv_binary_base64` each consume at most one datagram.
 - The program-facing API is handle-based: `0` is the reserved downstream placeholder, `1` is the default upstream socket, and `2+` are dynamically allocated sockets.
 - In the current one-shot HTTP runtime, only outbound UDP handles execute the full DAG.
-- UDP does not currently enter the proxy byte-stream layer because `proxy::pipe` and `proxy::tunnel` are stream-oriented.
+- UDP does not currently enter the proxy byte-stream layer because `proxy::pipe` and `proxy::bridge` are stream-oriented.
 
 ```mermaid
 flowchart TD
@@ -571,7 +571,7 @@ Rules:
 - `connect` is the explicit request to wait for `webrtc.open`. `send_*` and `read_*` can also force that advancement implicitly because they require an open data channel.
 - `send_text`, `read_text`, `send_binary_base64`, and `read_binary_base64` advance message queues while preserving message boundaries.
 - Today, only outbound handles execute the full DAG. Downstream handle `0` is reserved so the ABI shape is stable, but the current one-shot HTTP runtime does not host a downstream peer connection yet.
-- WebRTC remains outside the proxy byte-stream layer today because data-channel messages are not adapted into `proxy::pipe` or `proxy::tunnel`.
+- WebRTC remains outside the proxy byte-stream layer today because data-channel messages are not adapted into `proxy::pipe` or `proxy::bridge`.
 
 ```mermaid
 flowchart TD
@@ -649,7 +649,7 @@ Downstream listener goals now use the same advancement rule:
 
 - `advance(http.request_admitted)` on an untouched downstream HTTPS listener may satisfy itself by advancing `tcp -> tls.plaintext -> http ingress` instead of relying on an import-based heuristic
 - the same goal may be forced lazily on first HTTP-scoped host-call entry or during finalization after a no-op VM run
-- once the VM has touched raw downstream transport, preread buffers, or downstream TLS prelude state, the automatic path is no longer legal and only explicit `http::request::handoff_downstream()` may cross into HTTP
+- once the VM has touched raw downstream transport, preread buffers, or downstream TLS prelude state, the automatic path is no longer legal and only explicit `http::downstream::attach_transport()` may cross into HTTP
 
 ### Downstream And Upstream As Independent DAG Instances
 
@@ -680,7 +680,7 @@ flowchart LR
         D2 -->|vm transport host call| D3
         D4 -->|plaintext exports http ingress| D5
         D4 -->|vm tls prelude host call| D3
-        D3 -. handoff_downstream required for http entry .-> D5
+        D3 -. attach_transport required for http entry .-> D5
     end
 
     subgraph Upstream["Upstream"]

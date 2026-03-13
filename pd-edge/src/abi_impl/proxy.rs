@@ -396,10 +396,10 @@ async fn proxy_stream_read_step(
             }
         }
         ProxyByteStreamEndpoint::DownstreamConnect => Err(VmError::HostError(
-            "downstream connect tunnels are only available through proxy::tunnel".to_string(),
+            "downstream connect tunnels are only available through proxy::bridge".to_string(),
         )),
         ProxyByteStreamEndpoint::DownstreamWebSocketBinary => Err(VmError::HostError(
-            "downstream websocket tunnels are only available through proxy::tunnel".to_string(),
+            "downstream websocket tunnels are only available through proxy::bridge".to_string(),
         )),
         ProxyByteStreamEndpoint::HttpExchange(exchange) => {
             if !http::outbound_exchange_response_available(context, exchange)
@@ -491,10 +491,10 @@ async fn proxy_stream_write_bytes(
             Ok(())
         }
         ProxyByteStreamEndpoint::DownstreamConnect => Err(VmError::HostError(
-            "downstream connect tunnels are only available through proxy::tunnel".to_string(),
+            "downstream connect tunnels are only available through proxy::bridge".to_string(),
         )),
         ProxyByteStreamEndpoint::DownstreamWebSocketBinary => Err(VmError::HostError(
-            "downstream websocket tunnels are only available through proxy::tunnel".to_string(),
+            "downstream websocket tunnels are only available through proxy::bridge".to_string(),
         )),
         ProxyByteStreamEndpoint::HttpExchange(exchange) => {
             http::append_outbound_exchange_body_bytes(context, exchange, bytes)
@@ -800,14 +800,14 @@ async fn drive_pipe(
         && !source_state.write_closed
     {
         return Err(VmError::HostError(format!(
-            "proxy byte-stream handle {source} cannot be piped yet because its read side is waiting for its write side to close; use proxy::tunnel or finish writing before piping from it",
+            "proxy byte-stream handle {source} cannot be piped yet because its read side is waiting for its write side to close; use proxy::bridge or finish writing before piping from it",
         )));
     }
     drive_pipe_direction(context, source, destination, max_bytes).await?;
     Ok("eof".to_string())
 }
 
-async fn drive_tunnel(
+async fn drive_bridge(
     context: SharedProxyVmContext,
     left: i64,
     right: i64,
@@ -916,9 +916,9 @@ async fn proxy_pipe(
     Ok(CallOutcome::Return(vec![Value::string(status)]))
 }
 
-/// Bidirectionally tunnels bytes between two proxy byte streams.
-#[pd_edge_host_function(name = proxy_symbols::TUNNEL.name, scope = proxy)]
-async fn proxy_tunnel(
+/// Bidirectionally bridges bytes between two proxy byte streams.
+#[pd_edge_host_function(name = "proxy::bridge", scope = proxy)]
+async fn proxy_bridge(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
     left: i64,
@@ -926,7 +926,7 @@ async fn proxy_tunnel(
     max_bytes: i64,
 ) -> Result<CallOutcome, VmError> {
     let max_bytes = decode_chunk_size(max_bytes)?;
-    let status = drive_tunnel(context, left, right, max_bytes).await?;
+    let status = drive_bridge(context, left, right, max_bytes).await?;
     Ok(CallOutcome::Return(vec![Value::string(status)]))
 }
 
@@ -946,9 +946,9 @@ mod tests {
     use reqwest::Client;
 
     use super::{
-        ProxyByteStreamEndpoint, ProxyReadStep, allocate_proxy_stream_handle, drive_pipe,
-        drive_tunnel, endpoint_from_tls_plaintext, proxy_stream_close_write,
-        proxy_stream_read_step, proxy_stream_write_bytes,
+        ProxyByteStreamEndpoint, ProxyReadStep, allocate_proxy_stream_handle, drive_bridge,
+        drive_pipe, endpoint_from_tls_plaintext, proxy_stream_close_write, proxy_stream_read_step,
+        proxy_stream_write_bytes,
     };
     use crate::abi_impl::{
         RateLimiterStore,
@@ -1101,7 +1101,7 @@ mod tests {
         )
         .expect("upstream stream should allocate");
 
-        let status = drive_tunnel(context.clone(), downstream, upstream, 3)
+        let status = drive_bridge(context.clone(), downstream, upstream, 3)
             .await
             .expect("tunnel should succeed");
         assert_eq!(status, "closed");

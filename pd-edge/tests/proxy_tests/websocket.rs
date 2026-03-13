@@ -351,7 +351,7 @@ async fn downstream_websocket_binary_tunnel_upgrades_and_relays_frames() {
             }
             let downstream = proxy::stream::downstream();
             let peer = proxy::stream::from_websocket_binary(upstream);
-            let status = proxy::tunnel(downstream, peer, 1024);
+            let status = proxy::bridge(downstream, peer, 1024);
             http::response::set_header("x-proxy-status", status);
             http::response::set_header("x-upstream-phase", websocket::connection::get_phase(upstream));
             http::response::set_header("x-upstream-protocol", websocket::connection::get_subprotocol(upstream));

@@ -22,13 +22,13 @@ let upstream_tls = tls::session::from_socket(upstream_socket);
 
 let mut status = "";
 if tls::session::is_present(upstream_tls) {
-    // Tunnel against decrypted TLS plaintext when the outbound side is HTTPS.
+    // Bridge against decrypted TLS plaintext when the outbound side is HTTPS.
     let upstream = proxy::stream::from_tls_plaintext(upstream_tls);
-    status = proxy::tunnel(downstream, upstream, 4);
+    status = proxy::bridge(downstream, upstream, 4);
 } else {
-    // Plain HTTP can tunnel directly against the default upstream exchange stream.
+    // Plain HTTP can bridge directly against the default upstream exchange stream.
     let upstream = proxy::stream::default_upstream();
-    status = proxy::tunnel(downstream, upstream, 4);
+    status = proxy::bridge(downstream, upstream, 4);
 }
 
 http::response::set_header("x-proxy-status", status);

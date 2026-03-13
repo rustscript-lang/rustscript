@@ -182,7 +182,7 @@ async fn sample_upstream_transport_proxy_program_handles_https_tls_session() {
 
 #[cfg(feature = "tls")]
 #[tokio::test]
-async fn sample_transport_tls_handshake_program_controls_sni_and_echoes_plaintext() {
+async fn sample_transport_tls_handshake_program_echoes_plaintext_after_tls_handshake() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     ensure_rustls_provider();
@@ -205,27 +205,18 @@ async fn sample_transport_tls_handshake_program_controls_sni_and_echoes_plaintex
     config.alpn_protocols = vec![b"echo/1".to_vec()];
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
 
-    let blocked_stream = tokio::net::TcpStream::connect(data_addr)
+    let stream = tokio::net::TcpStream::connect(data_addr)
         .await
-        .expect("transport proxy should accept blocked tls");
-    let blocked_name = rustls::pki_types::ServerName::try_from("blocked.example.test")
-        .expect("blocked name should parse")
+        .expect("transport proxy should accept tls");
+    let server_name = rustls::pki_types::ServerName::try_from("edge.example.test")
+        .expect("server name should parse")
         .to_owned();
-    let blocked = connector.connect(blocked_name, blocked_stream).await;
-    assert!(blocked.is_err(), "unexpected SNI should not complete tls");
-
-    let allowed_stream = tokio::net::TcpStream::connect(data_addr)
+    let mut tls_stream = connector
+        .connect(server_name, stream)
         .await
-        .expect("transport proxy should accept allowed tls");
-    let allowed_name = rustls::pki_types::ServerName::try_from("edge.example.test")
-        .expect("allowed name should parse")
-        .to_owned();
-    let mut allowed = connector
-        .connect(allowed_name, allowed_stream)
-        .await
-        .expect("expected SNI should complete tls");
+        .expect("tls handshake should complete");
     assert_eq!(
-        allowed
+        tls_stream
             .get_ref()
             .1
             .alpn_protocol()
@@ -233,26 +224,26 @@ async fn sample_transport_tls_handshake_program_controls_sni_and_echoes_plaintex
         Some("echo/1".to_string())
     );
 
-    let mut banner = vec![0u8; "accepted sni=edge.example.test alpn=echo/1\n".len()];
-    allowed
+    let mut banner = vec![0u8; "accepted alpn=echo/1\n".len()];
+    tls_stream
         .read_exact(&mut banner)
         .await
         .expect("tls banner should read");
     assert_eq!(
         String::from_utf8(banner).expect("banner should be utf8"),
-        "accepted sni=edge.example.test alpn=echo/1\n"
+        "accepted alpn=echo/1\n"
     );
 
-    allowed
+    tls_stream
         .write_all(b"hello")
         .await
         .expect("tls payload should write");
-    allowed
+    tls_stream
         .shutdown()
         .await
         .expect("tls write half-close should succeed");
     let mut echoed = Vec::new();
-    allowed
+    tls_stream
         .read_to_end(&mut echoed)
         .await
         .expect("tls echo should read");
@@ -318,7 +309,7 @@ async fn transport_downstream_http_handoff_continues_same_vm_invocation() {
 
         let downstream = tcp::stream::downstream();
         if http::request::get_scheme() == "tcp" {
-            http::request::handoff_downstream();
+            http::downstream::attach_transport();
         }
 
         if http::request::get_scheme() != "tcp" {
@@ -546,13 +537,6 @@ async fn transport_downstream_http_handoff_promotes_tls_plaintext_into_https_run
     );
     assert_eq!(
         response
-            .headers()
-            .get("x-server-name")
-            .and_then(|value| value.to_str().ok()),
-        Some("localhost")
-    );
-    assert_eq!(
-        response
             .into_body()
             .collect()
             .await
@@ -570,10 +554,6 @@ async fn transport_downstream_http_handoff_promotes_tls_plaintext_into_https_run
 #[cfg(feature = "tls")]
 #[tokio::test]
 async fn sample_http_proxy_tls_prelude_program_serves_http_and_https_listeners() {
-    use http_body_util::{BodyExt, Full};
-    use hyper::Request;
-    use hyper_util::rt::TokioIo;
-
     ensure_rustls_provider();
 
     let (http_addr, https_addr, admin_addr, http_handle, https_handle, admin_handle) =
@@ -599,13 +579,6 @@ async fn sample_http_proxy_tls_prelude_program_serves_http_and_https_listeners()
             .get("x-request-scheme")
             .and_then(|value| value.to_str().ok()),
         Some("http")
-    );
-    assert_eq!(
-        http_response
-            .headers()
-            .get("x-server-name")
-            .and_then(|value| value.to_str().ok()),
-        None
     );
     assert_eq!(
         http_response
@@ -663,13 +636,6 @@ async fn sample_http_proxy_tls_prelude_program_serves_http_and_https_listeners()
     );
     assert_eq!(
         https_response
-            .headers()
-            .get("x-server-name")
-            .and_then(|value| value.to_str().ok()),
-        Some("localhost")
-    );
-    assert_eq!(
-        https_response
             .text()
             .await
             .expect("https response body should read"),
@@ -699,56 +665,6 @@ async fn sample_http_proxy_tls_prelude_program_serves_http_and_https_listeners()
         "expected alpn-mismatched tls handshake to fail, got {bad_read:?}"
     );
 
-    let mut config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PermissiveTestServerCertVerifier::new()))
-        .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-    let stream = tokio::net::TcpStream::connect(https_addr)
-        .await
-        .expect("https listener should accept raw tls");
-    let server_name = rustls::pki_types::ServerName::try_from("failme.test")
-        .expect("server name should parse")
-        .to_owned();
-    let tls_stream = connector
-        .connect(server_name, stream)
-        .await
-        .expect("failme tls handshake should succeed");
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls_stream))
-        .await
-        .expect("http1 over tls handshake should succeed");
-    let connection_task = tokio::spawn(async move {
-        connection.await.expect("failme tls connection should run");
-    });
-    let failme_response = sender
-        .send_request(
-            Request::builder()
-                .method("GET")
-                .uri(format!(
-                    "https://failme.test:{}/rejected",
-                    https_addr.port()
-                ))
-                .header("host", format!("failme.test:{}", https_addr.port()))
-                .body(Full::new(axum::body::Bytes::new()))
-                .expect("failme request should build"),
-        )
-        .await
-        .expect("failme request should complete");
-    assert_eq!(failme_response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        failme_response
-            .into_body()
-            .collect()
-            .await
-            .expect("failme response body should collect")
-            .to_bytes()
-            .as_ref(),
-        b"forbidden"
-    );
-
-    drop(sender);
-    connection_task.abort();
     http_handle.abort();
     https_handle.abort();
     admin_handle.abort();
@@ -876,7 +792,7 @@ async fn transport_connect_tunnel_upgrades_downstream_into_dynamic_tcp() {
             } else {
                 let downstream = proxy::stream::downstream();
                 let peer = proxy::stream::from_tcp(upstream);
-                let status = proxy::tunnel(downstream, peer, 64);
+                let status = proxy::bridge(downstream, peer, 64);
                 http::response::set_header("x-proxy-status", status);
             }
         }
@@ -1092,7 +1008,7 @@ async fn transport_connect_tunnel_upgrades_downstream_into_dynamic_tls_plaintext
                 } else {
                     let downstream = proxy::stream::downstream();
                     let peer = proxy::stream::from_tls_plaintext(session);
-                    let status = proxy::tunnel(downstream, peer, 256);
+                    let status = proxy::bridge(downstream, peer, 256);
                     http::response::set_header("x-proxy-status", status);
                     http::response::set_header("x-tls-phase", tls::session::get_phase(session));
                 }
@@ -1198,7 +1114,6 @@ async fn transport_downstream_tls_session_reflects_forwarded_https_metadata() {
         let session = tls::session::from_socket(sock);
         if tls::session::is_present(session) {
             http::response::set_header("x-tls", "true");
-            http::response::set_header("x-server-name", tls::session::get_server_name(session));
             http::response::set_header("x-alpn", tls::session::get_alpn(session));
         } else {
             http::response::set_header("x-tls", "false");
@@ -1223,13 +1138,6 @@ async fn transport_downstream_tls_session_reflects_forwarded_https_metadata() {
             .get("x-tls")
             .and_then(|value| value.to_str().ok()),
         Some("true")
-    );
-    assert_eq!(
-        response
-            .headers()
-            .get("x-server-name")
-            .and_then(|value| value.to_str().ok()),
-        Some("app.example.test")
     );
     assert_eq!(
         response
@@ -1271,7 +1179,6 @@ async fn transport_dynamic_tls_session_can_handshake_against_socket_target() {
                 http::response::set_body("handshake failed");
             }} else {{
                 http::response::set_header("x-phase", tls::session::get_phase(session));
-                http::response::set_header("x-server-name", tls::session::get_server_name(session));
                 http::response::set_header("x-peer-name", tls::session::get_peer_name(session));
                 http::response::set_header("x-stream-phase", tcp::stream::get_phase(stream));
                 http::response::set_body("ok");
@@ -1296,13 +1203,6 @@ async fn transport_dynamic_tls_session_can_handshake_against_socket_target() {
             .get("x-phase")
             .and_then(|value| value.to_str().ok()),
         Some("plaintext-ready")
-    );
-    assert_eq!(
-        response
-            .headers()
-            .get("x-server-name")
-            .and_then(|value| value.to_str().ok()),
-        Some("localhost")
     );
     assert_eq!(
         response
@@ -1383,7 +1283,6 @@ async fn transport_downstream_tls_phase_closes_after_http_body_is_buffered() {
         let session = tls::session::from_socket(downstream);
         http::response::set_header("x-tcp-phase", tcp::stream::get_phase(downstream));
         http::response::set_header("x-tls-phase", tls::session::get_phase(session));
-        http::response::set_header("x-server-name", tls::session::get_server_name(session));
         http::response::set_body(body);
     "#;
     let compiled = compile_source(source).expect("source should compile");
@@ -1412,13 +1311,6 @@ async fn transport_downstream_tls_phase_closes_after_http_body_is_buffered() {
             .get("x-tls-phase")
             .and_then(|value| value.to_str().ok()),
         Some("closed")
-    );
-    assert_eq!(
-        response
-            .headers()
-            .get("x-server-name")
-            .and_then(|value| value.to_str().ok()),
-        Some("app.example.test")
     );
     assert_eq!(response.text().await.expect("body should read"), "payload");
 
@@ -1555,7 +1447,7 @@ async fn downstream_transport_proxy_exposes_raw_tcp_read_and_write() {
 
 #[cfg(feature = "tls")]
 #[tokio::test]
-async fn downstream_transport_proxy_controls_tls_sni_and_handshake() {
+async fn downstream_transport_proxy_completes_tls_handshake_and_echoes_payload() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     ensure_rustls_provider();
@@ -1569,15 +1461,11 @@ async fn downstream_transport_proxy_controls_tls_sni_and_handshake() {
 
         let downstream = tcp::stream::downstream();
         let session = tls::session::from_socket(downstream);
-        if tls::session::get_server_name(session) != "allowed.example.test" {
+        tls::session::set_alpn(session, "echo/1");
+        if tls::session::handshake(session) {
+            let body = tcp::stream::read(downstream, 5);
+            tcp::stream::write(downstream, body);
             tcp::stream::close(downstream);
-        } else {
-            tls::session::set_alpn(session, "echo/1");
-            if tls::session::handshake(session) {
-                let body = tcp::stream::read(downstream, 5);
-                tcp::stream::write(downstream, body);
-                tcp::stream::close(downstream);
-            }
         }
     "#;
     let compiled = compile_source(source).expect("source should compile");
@@ -1591,43 +1479,34 @@ async fn downstream_transport_proxy_controls_tls_sni_and_handshake() {
     config.alpn_protocols = vec![b"echo/1".to_vec()];
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
 
-    let blocked_stream = tokio::net::TcpStream::connect(data_addr)
+    let stream = tokio::net::TcpStream::connect(data_addr)
         .await
-        .expect("transport proxy should accept blocked tls");
-    let blocked_name = rustls::pki_types::ServerName::try_from("blocked.example.test")
-        .expect("blocked name should parse")
+        .expect("transport proxy should accept tls");
+    let server_name = rustls::pki_types::ServerName::try_from("allowed.example.test")
+        .expect("server name should parse")
         .to_owned();
-    let blocked = connector.connect(blocked_name, blocked_stream).await;
-    assert!(blocked.is_err(), "blocked SNI should not complete tls");
-
-    let allowed_stream = tokio::net::TcpStream::connect(data_addr)
+    let mut tls_stream = connector
+        .connect(server_name, stream)
         .await
-        .expect("transport proxy should accept allowed tls");
-    let allowed_name = rustls::pki_types::ServerName::try_from("allowed.example.test")
-        .expect("allowed name should parse")
-        .to_owned();
-    let mut allowed = connector
-        .connect(allowed_name, allowed_stream)
-        .await
-        .expect("allowed SNI should complete tls");
+        .expect("tls handshake should complete");
     assert_eq!(
-        allowed
+        tls_stream
             .get_ref()
             .1
             .alpn_protocol()
             .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
         Some("echo/1".to_string())
     );
-    allowed
+    tls_stream
         .write_all(b"hello")
         .await
         .expect("tls payload should write");
-    allowed
+    tls_stream
         .shutdown()
         .await
         .expect("tls write half-close should succeed");
     let mut echoed = Vec::new();
-    allowed
+    tls_stream
         .read_to_end(&mut echoed)
         .await
         .expect("tls echo should read");

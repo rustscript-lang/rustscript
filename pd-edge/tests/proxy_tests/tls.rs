@@ -219,8 +219,8 @@ async fn tls_session_supports_client_certificate_authentication() {
 
         let session = tls::session::from_socket(exchange);
         tls::session::set_trusted_certificate(session, {});
-        tls::session::set_certificate(session, {});
-        tls::session::set_private_key(session, {});
+        tls::session::set_client_certificate(session, {});
+        tls::session::set_client_private_key(session, {});
         tls::session::handshake(session);
 
         http::response::set_header("x-phase", tls::session::get_phase(session));

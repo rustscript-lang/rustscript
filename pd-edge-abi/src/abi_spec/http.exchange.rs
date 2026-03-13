@@ -18,11 +18,6 @@ fn http_exchange_set_header(exchange: i64, name: &str, value: &str) {
     unreachable!("abi declaration only")
 }
 
-#[pd_host_function(name = "http::exchange::remove_header")]
-fn http_exchange_remove_header(exchange: i64, name: &str) {
-    unreachable!("abi declaration only")
-}
-
 #[pd_host_function(name = "http::exchange::set_method")]
 fn http_exchange_set_method(exchange: i64, method: &str) {
     unreachable!("abi declaration only")
@@ -66,16 +61,6 @@ fn http_exchange_add_header(exchange: i64, name: &str, value: &str) {
 
 #[pd_host_function(name = "http::exchange::clear_header")]
 fn http_exchange_clear_header(exchange: i64, name: &str) {
-    unreachable!("abi declaration only")
-}
-
-#[pd_host_function(name = "http::exchange::set_headers")]
-fn http_exchange_set_headers(exchange: i64, headers: Map) {
-    unreachable!("abi declaration only")
-}
-
-#[pd_host_function(name = "http::exchange::set_raw_query")]
-fn http_exchange_set_raw_query(exchange: i64, query: &str) {
     unreachable!("abi declaration only")
 }
 

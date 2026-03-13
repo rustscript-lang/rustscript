@@ -9,15 +9,6 @@ use super::super::{
     read_upstream_response_next_line, upstream_response_eof,
 };
 
-/// Enables buffered inspection for the upstream HTTP response.
-#[pd_edge_host_function(name = http_upstream_response::ENABLE_PROCESSING.name, scope = http)]
-async fn enable_upstream_response_processing(
-    _vm: &mut Vm,
-    _context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return(vec![]))
-}
-
 /// Returns the status code for the upstream HTTP response.
 #[pd_edge_host_function(name = http_upstream_response::GET_STATUS.name, scope = http)]
 async fn get_upstream_response_status(

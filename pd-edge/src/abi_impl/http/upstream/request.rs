@@ -1,27 +1,26 @@
 use axum::http::Method;
 use edge_abi::symbols::http::upstream::request as http_upstream_request;
 use pd_edge_host_function::pd_edge_host_function;
-use vm::bytecode::VmMap;
 use vm::{CallOutcome, Vm, VmError};
 
 use super::super::super::transport::configure_upstream_transport_for_target;
 use super::super::{
     SharedProxyVmContext, is_valid_request_path, is_valid_upstream, parse_header,
-    parse_header_name, parse_headers_map, serialize_query_pairs,
+    parse_header_name, serialize_query_pairs,
 };
 
 async fn apply_upstream_query(
     context: SharedProxyVmContext,
-    raw_query: String,
+    query: String,
 ) -> Result<CallOutcome, VmError> {
-    let query = raw_query.strip_prefix('?').unwrap_or(raw_query.as_str());
-    if query.contains('#') || query.chars().any(|ch| ch.is_whitespace()) {
+    let normalized_query = query.strip_prefix('?').unwrap_or(query.as_str());
+    if normalized_query.contains('#') || normalized_query.chars().any(|ch| ch.is_whitespace()) {
         return Err(VmError::HostError(format!(
-            "query must not contain whitespace or '#', got '{raw_query}'",
+            "query must not contain whitespace or '#', got '{query}'",
         )));
     }
     context.with_default_upstream_request_mut(|request| {
-        request.query = query.to_string();
+        request.query = normalized_query.to_string();
     });
     Ok(CallOutcome::Return(vec![]))
 }
@@ -37,20 +36,6 @@ async fn set_upstream_request_header(
     let (header_name, header_value) = parse_header(name, value)?;
     context.with_default_upstream_request_mut(|request| {
         request.headers.insert(header_name, header_value);
-    });
-    Ok(CallOutcome::Return(vec![]))
-}
-
-/// Removes a header from the upstream HTTP request.
-#[pd_edge_host_function(name = http_upstream_request::REMOVE_HEADER.name, scope = http)]
-async fn remove_upstream_request_header(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-    name: String,
-) -> Result<CallOutcome, VmError> {
-    let header_name = parse_header_name(name)?;
-    context.with_default_upstream_request_mut(|request| {
-        request.headers.remove(header_name);
     });
     Ok(CallOutcome::Return(vec![]))
 }
@@ -158,35 +143,6 @@ async fn clear_upstream_request_header(
         request.headers.remove(header_name);
     });
     Ok(CallOutcome::Return(vec![]))
-}
-
-/// Replaces the headers on the upstream HTTP request with the provided map.
-#[pd_edge_host_function(name = http_upstream_request::SET_HEADERS.name, scope = http)]
-async fn set_upstream_request_headers(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-    headers: VmMap,
-) -> Result<CallOutcome, VmError> {
-    let headers = parse_headers_map(headers)?;
-    context.with_default_upstream_request_mut(|request| {
-        for (name, values) in headers {
-            request.headers.remove(name.clone());
-            for value in values {
-                request.headers.append(name.clone(), value);
-            }
-        }
-    });
-    Ok(CallOutcome::Return(vec![]))
-}
-
-/// Sets the raw query string on the upstream HTTP request.
-#[pd_edge_host_function(name = http_upstream_request::SET_RAW_QUERY.name, scope = http)]
-async fn set_upstream_request_raw_query(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-    raw_query: String,
-) -> Result<CallOutcome, VmError> {
-    apply_upstream_query(context, raw_query).await
 }
 
 /// Sets a query parameter on the upstream HTTP request.

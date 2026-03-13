@@ -1737,7 +1737,7 @@ async fn http_proxy_https_listener_ignores_handoff_import_when_program_enters_ht
 
         let mode = 0;
         if mode == 1 {
-            http::request::handoff_downstream();
+            http::downstream::attach_transport();
         }
         http::response::set_body("handoff import stays on HTTP path");
     "#;
@@ -1747,8 +1747,8 @@ async fn http_proxy_https_listener_ignores_handoff_import_when_program_enters_ht
             .program
             .imports
             .iter()
-            .any(|import| import.name == "http::request::handoff_downstream"),
-        "program should import handoff_downstream for regression coverage"
+            .any(|import| import.name == "http::downstream::attach_transport"),
+        "program should import attach_transport for regression coverage"
     );
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
@@ -1786,7 +1786,7 @@ async fn http_proxy_https_listener_explicit_handoff_uses_listener_goal_before_ra
         use http;
 
         if http::request::get_scheme() == "tcp" {
-            http::request::handoff_downstream();
+            http::downstream::attach_transport();
         }
 
         http::response::set_body(http::request::get_scheme());

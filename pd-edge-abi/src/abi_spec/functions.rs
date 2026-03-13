@@ -1,6 +1,8 @@
 #[cfg(feature = "http")]
 include!("http.request.rs");
 #[cfg(feature = "http")]
+include!("http.downstream.rs");
+#[cfg(feature = "http")]
 include!("http.response.rs");
 #[cfg(feature = "http")]
 include!("http.exchange.rs");

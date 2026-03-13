@@ -3,11 +3,6 @@ fn http_upstream_request_set_header(name: &str, value: &str) {
     unreachable!("abi declaration only")
 }
 
-#[pd_host_function(name = "http::upstream::request::remove_header")]
-fn http_upstream_request_remove_header(name: &str) {
-    unreachable!("abi declaration only")
-}
-
 #[pd_host_function(name = "http::upstream::request::set_method")]
 fn http_upstream_request_set_method(method: &str) {
     unreachable!("abi declaration only")
@@ -40,16 +35,6 @@ fn http_upstream_request_add_header(name: &str, value: &str) {
 
 #[pd_host_function(name = "http::upstream::request::clear_header")]
 fn http_upstream_request_clear_header(name: &str) {
-    unreachable!("abi declaration only")
-}
-
-#[pd_host_function(name = "http::upstream::request::set_headers")]
-fn http_upstream_request_set_headers(headers: Map) {
-    unreachable!("abi declaration only")
-}
-
-#[pd_host_function(name = "http::upstream::request::set_raw_query")]
-fn http_upstream_request_set_raw_query(query: &str) {
     unreachable!("abi declaration only")
 }
 

@@ -5,8 +5,7 @@ use vm::Vm;
 #[cfg(feature = "http")]
 use self::helpers::{
     headers_to_value_map, is_valid_request_path, is_valid_upstream, parse_header,
-    parse_header_name, parse_headers_map, query_to_value_map, request_path_with_query,
-    serialize_query_pairs,
+    parse_header_name, query_to_value_map, request_path_with_query, serialize_query_pairs,
 };
 use super::SharedVmAsyncOps;
 #[cfg(feature = "http")]
@@ -30,13 +29,14 @@ pub(crate) use state::attach_outbound_exchange_tls_transport;
 #[cfg(feature = "tls")]
 pub(crate) use state::upstream_response_available;
 pub(crate) use state::{
-    DownstreamConnectTunnelPlan, DownstreamConnectTunnelTarget, DownstreamConnectionMetadata,
-    DownstreamHttpListenerGoal, DownstreamPostResponsePlan, InlineDownstreamHttpResponse,
-    PromotedDownstreamTransport, ResolvedHttpGraphResponse, SharedUpstreamClientCache,
-    allocate_tcp_stream_handle, allocate_udp_socket_handle, append_outbound_exchange_body,
-    append_outbound_exchange_body_bytes, append_response_output_body_bytes,
-    attach_outbound_exchange_tcp_transport, build_downstream_http_request_context,
-    consume_request_body_all, default_upstream_exchange_handle, default_upstream_udp_socket_handle,
+    AttachedHttpTransport, DownstreamConnectTunnelPlan, DownstreamConnectTunnelTarget,
+    DownstreamConnectionMetadata, DownstreamHttpListenerGoal, DownstreamPostResponsePlan,
+    InlineDownstreamHttpResponse, PromotedDownstreamTransport, ResolvedHttpGraphResponse,
+    SharedUpstreamClientCache, allocate_tcp_stream_handle, allocate_udp_socket_handle,
+    append_outbound_exchange_body, append_outbound_exchange_body_bytes,
+    append_response_output_body_bytes, attach_outbound_exchange_tcp_transport,
+    build_downstream_http_request_context, consume_request_body_all,
+    default_upstream_exchange_handle, default_upstream_udp_socket_handle,
     new_shared_upstream_client_cache, outbound_exchange_exists,
     outbound_exchange_response_available, outbound_exchange_response_eof,
     outbound_exchange_tls_flow, read_outbound_exchange_response_all,
