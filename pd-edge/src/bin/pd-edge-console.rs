@@ -2,7 +2,7 @@ use std::{
     env, fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 

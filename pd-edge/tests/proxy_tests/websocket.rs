@@ -433,8 +433,7 @@ async fn downstream_transport_proxy_accepts_and_executes_websocket_frames_direct
         spawn_transport_proxy(1024 * 1024).await;
     let client = reqwest::Client::new();
     let payload = STANDARD.encode(b"transport-binary");
-    let source = format!(
-        r#"
+    let source = r#"
         use websocket;
 
         let downstream = websocket::connection::downstream();
@@ -444,7 +443,7 @@ async fn downstream_transport_proxy_accepts_and_executes_websocket_frames_direct
         websocket::connection::send_binary_base64(downstream, payload);
         websocket::connection::close(downstream, 1000, "done");
     "#
-    );
+    .to_string();
     let compiled = compile_source(&source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);

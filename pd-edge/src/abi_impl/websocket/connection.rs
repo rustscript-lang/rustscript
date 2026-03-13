@@ -445,7 +445,7 @@ fn downstream_websocket_transport_available(context: &SharedProxyVmContext) -> b
 enum DownstreamWebSocketTransport {
     Tcp(ReplayPrefixedIo<tokio::net::TcpStream>),
     #[cfg(feature = "tls")]
-    Tls(ReplayPrefixedIo<tokio_rustls::server::TlsStream<DownstreamReplayTcpStream>>),
+    Tls(Box<ReplayPrefixedIo<tokio_rustls::server::TlsStream<DownstreamReplayTcpStream>>>),
 }
 
 async fn take_downstream_websocket_transport(
@@ -467,8 +467,8 @@ async fn take_downstream_websocket_transport(
                     "downstream tls plaintext transport is already in use".to_string(),
                 )
             })?;
-            return Ok(DownstreamWebSocketTransport::Tls(ReplayPrefixedIo::new(
-                preread, stream,
+            return Ok(DownstreamWebSocketTransport::Tls(Box::new(
+                ReplayPrefixedIo::new(preread, stream),
             )));
         }
         if context
@@ -554,6 +554,7 @@ async fn accept_downstream_websocket(
         }
         #[cfg(feature = "tls")]
         DownstreamWebSocketTransport::Tls(stream) => {
+            let stream = *stream;
             let configured_protocols = configured_protocols.clone();
             let selected_for_callback = Arc::clone(&selected_protocol);
             let callback = move |request: &WsRequest, mut response: WsResponse| {

@@ -200,7 +200,7 @@ async fn promote_captured_downstream_transport_into_http_request(
         #[cfg(feature = "tls")]
         PromotedDownstreamTransport::Tls(stream) => {
             tokio::spawn(run_inline_promoted_http_connection(
-                stream,
+                *stream,
                 connection_metadata,
                 downstream_http_sessions,
                 request_id,
@@ -322,9 +322,9 @@ async fn take_goal_promoted_downstream_transport(
         flow.mark_handshake_complete(negotiated_alpn);
     }
 
-    Ok(PromotedDownstreamTransport::Tls(
+    Ok(PromotedDownstreamTransport::Tls(Box::new(
         crate::abi_impl::ReplayPrefixedIo::new(Vec::new(), tls_stream),
-    ))
+    )))
 }
 
 #[cfg(not(feature = "tls"))]

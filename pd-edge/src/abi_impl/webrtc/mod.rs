@@ -972,10 +972,10 @@ mod tests {
     use crate::abi_impl::{ProxyVmContext, RateLimiterStore};
 
     fn test_context() -> SharedProxyVmContext {
-        Arc::new(Mutex::new(ProxyVmContext::from_request_headers(
+        Arc::new(ProxyVmContext::from_request_headers(
             HeaderMap::new(),
             Arc::new(Mutex::new(RateLimiterStore::new())),
-        )))
+        ))
     }
 
     #[tokio::test(flavor = "current_thread")]

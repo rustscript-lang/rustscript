@@ -587,10 +587,6 @@ impl<S> ReplayPrefixedIo<S> {
         }
     }
 
-    pub(crate) fn into_inner(self) -> S {
-        self.inner
-    }
-
     pub(crate) fn into_parts(self) -> (Vec<u8>, S) {
         let prefix = if self.prefix_offset >= self.prefix.len() {
             Vec::new()
