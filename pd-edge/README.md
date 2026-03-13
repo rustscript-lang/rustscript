@@ -372,6 +372,8 @@ Current state:
 - Current runtime boundary:
   - generic `http::exchange::*` is the stable VM-facing request/response surface
   - feature `http2` currently adds explicit upstream session pooling plus downstream session tracking under the generic HTTP layer; it does not yet expose a VM-visible `http2::session::*` namespace
+  - downstream HTTPS listener entry is now modeled as a runtime-owned listener goal over the downstream DAG; an untouched connection may auto-advance `tcp -> tls -> http` on first HTTP-scoped host-call entry or during finalization, while raw downstream transport or TLS prelude use still requires explicit `http::request::handoff_downstream()`
+  - there is no symmetric upstream listener-goal edge today; upstream DAGs still begin only when the VM selects or allocates a handle and asks for connect, handshake, or send progression
   - outbound UDP sockets are executable today
   - downstream UDP handle `0` is reserved but inactive in the current one-shot HTTP runtime
   - outbound WebSocket connections are executable today
@@ -643,32 +645,55 @@ HTTP/2 now follows the same rule internally:
 
 This is currently an internal runtime model. VM code still talks to the generic `http::exchange::*` surface rather than a separate `http2::*` ABI.
 
+Downstream listener goals now use the same advancement rule:
+
+- `advance(http.request_admitted)` on an untouched downstream HTTPS listener may satisfy itself by advancing `tcp -> tls.plaintext -> http ingress` instead of relying on an import-based heuristic
+- the same goal may be forced lazily on first HTTP-scoped host-call entry or during finalization after a no-op VM run
+- once the VM has touched raw downstream transport, preread buffers, or downstream TLS prelude state, the automatic path is no longer legal and only explicit `http::request::handoff_downstream()` may cross into HTTP
+
 ### Downstream And Upstream As Independent DAG Instances
 
 The clean model is to treat downstream and upstream as separate DAG instances with explicit connection points.
 
-- downstream TCP/TLS/HTTP describe bytes and messages coming from the client toward the VM
-- upstream TCP/TLS/HTTP describe bytes and messages going from the VM toward the origin
+- downstream TCP/TLS/HTTP describe bytes and messages coming from the client toward the VM, and may also carry runtime-owned listener goals such as `https -> tcp -> tls -> http`
+- upstream TCP/TLS/HTTP describe bytes and messages going from the VM toward the origin, and still begin only from VM-selected handles, drafts, and targets
 - upstream UDP sockets and upstream WebRTC connections are sibling DAG families connected through VM host calls rather than attached to the HTTP byte-stream chain
 - downstream UDP and downstream WebRTC handles currently exist only as reserved placeholders in the one-shot HTTP runtime
+- downstream auto-promotion is legal only while the VM has not consumed raw downstream transport or downstream TLS prelude state; upstream has no comparable listener-goal auto-promotion path
 - runtime orchestration connects these DAG instances, but that control flow is not itself a DAG edge or goal
 - [`pd-edge/docs/full-dag.md`](docs/full-dag.md) now shows those two views as separate downstream and upstream/exchange graphs rather than one merged graph
 
 ```mermaid
 flowchart LR
     subgraph Downstream["Downstream"]
-        D1["tcp downstream"]
-        D2["tls downstream"]
-        D3["http downstream request and response"]
-        D1 --> D2 --> D3
+        D0["plain http listener"]
+        D1["transport or https listener"]
+        D2["tcp downstream"]
+        D3["vm used raw downstream transport or tls prelude"]
+        D4["tls downstream"]
+        D5["http downstream request and response"]
+        D0 --> D5
+        D1 --> D2
+        D1 -. https listener goal may auto-advance on first http call or finalization .-> D4
+        D2 -->|tls may attach| D4
+        D2 -. explicit cleartext handoff .-> D5
+        D2 -->|vm transport host call| D3
+        D4 -->|plaintext exports http ingress| D5
+        D4 -->|vm tls prelude host call| D3
+        D3 -. handoff_downstream required for http entry .-> D5
     end
 
     subgraph Upstream["Upstream"]
+        U0["vm selects default handle or allocates handle n"]
         U3["http upstream request and response"]
-        U2["tls upstream"]
+        U2["tls upstream session / target observed"]
         U1["tcp upstream"]
         UU["udp upstream sockets"]
         UW["webrtc upstream connections"]
+        U0 --> U3
+        U0 --> U2
+        U0 --> UU
+        U0 --> UW
         U3 --> U2 --> U1
     end
 ```
@@ -680,6 +705,12 @@ This gives the flexibility target:
 - you can materialize only the parts you need, late, including sibling DAGs that have no parent byte stream
 - you do not need a custom driver for every feature such as TLS session reuse, early response generation, UDP datagram I/O, or WebRTC signaling and open-state transitions
 - directional convenience APIs may remain as aliases, but the stable abstraction is the handle-based `tcp::stream::*` / `udp::socket::*` / `tls::session::*` / `http::exchange::*` / `websocket::connection::*` / `webrtc::connection::*` surface
+
+Current downstream versus upstream difference:
+
+- downstream may begin from runtime listener policy: plain HTTP can enter directly at HTTP ingress, while HTTPS starts as transport plus a goal to promote into HTTP
+- upstream has no symmetric listener policy; the VM creates demand by selecting handles, setting targets, and forcing connect, handshake, or send progression
+- downstream auto-promotion is revoked once the VM touches raw downstream transport or TLS prelude state, while upstream progression stays explicit and per-handle
 
 Node ownership in current code:
 

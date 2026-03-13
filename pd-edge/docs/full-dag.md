@@ -16,6 +16,9 @@ Notes:
 - HTTP/2 now has declared internal `session` and `stream` goals, explicit stream carrier refs attached to exchanges, and GOAWAY/reset frontier tracking. It is still an internal carrier DAG rather than a separate VM-visible `http2::*` ABI.
 - Internally, carrier-specific policy is now split into `src/abi_impl/http1/` and `src/abi_impl/http2/`, while the generic exchange state remains under `src/abi_impl/http/`.
 - VM host calls, request execution, graph resolution, and proxy byte-stream wiring are runtime control layers, not protocol goals. They are intentionally omitted from the graphs below.
+- Downstream listener goals are shown below because they now affect which forward edges are legal. The HTTP proxy HTTPS listener begins as downstream TCP with goal `https`; a plain HTTP listener still enters directly at downstream HTTP ingress.
+- An untouched downstream HTTPS listener may auto-advance through `tcp -> tls -> http` on first HTTP-scoped host-call entry or during finalization. Once VM code uses raw downstream transport or TLS prelude state, that automatic edge is blocked and `http::request::handoff_downstream()` becomes the explicit bridge into HTTP.
+- There is no symmetric upstream listener-goal layer. Upstream DAGs still begin from VM-selected handles, explicit targets, and connect/send/handshake demand. The adjacent upstream refinement is that TLS sessions now observe the logical target as part of the TLS session DAG, even when the underlying transport was attached first.
 - UDP datagrams and WebRTC data-channel messages do not currently flow through `proxy::pipe` or `proxy::tunnel`; they remain sibling message-oriented DAGs.
 - These graphs are intentionally conceptual. They show ingress and egress connections between DAGs, not every internal transition implemented by each subsystem.
 
@@ -23,13 +26,17 @@ Notes:
 
 ```mermaid
 flowchart LR
+    subgraph DS_ENTRY["Downstream Entry Modes"]
+        DE0["plain http listener admitted"]
+        DE1["transport listener accepted"]
+        DE2["https listener accepted with goal https"]
+    end
+
     subgraph DS_TCP["Downstream TCP DAG"]
-        DT0["listener pending"]
         DT1["downstream connected"]
         DT2["downstream rx bytes"]
         DT3["downstream tx bytes"]
         DT4["downstream closed"]
-        DT0 --> DT1
         DT1 --> DT2
         DT1 --> DT3
         DT2 --> DT4
@@ -38,12 +45,14 @@ flowchart LR
 
     subgraph DS_TLS["Downstream TLS DAG"]
         DTL0["tls ingress attached"]
-        DTL1["downstream handshake in progress"]
-        DTL2["downstream plaintext ready"]
-        DTL3["downstream tls closed or failed"]
+        DTL1["downstream client hello observed"]
+        DTL2["downstream handshake in progress"]
+        DTL3["downstream plaintext ready"]
+        DTL4["downstream tls closed or failed"]
         DTL0 --> DTL1
         DTL1 --> DTL2
         DTL2 --> DTL3
+        DTL3 --> DTL4
     end
 
     subgraph DS_HTTP["Downstream HTTP DAG"]
@@ -76,9 +85,18 @@ flowchart LR
         DWR0 --> DWR1
     end
 
-    DT1 --> DTL0
-    DT1 --> DH0
-    DTL2 --> DH0
+    DB0["vm used raw downstream transport or tls prelude"]
+
+    DE0 --> DH0
+    DE1 --> DT1
+    DE2 --> DT1
+    DE2 -. listener goal may auto-advance on first http host call or finalization .-> DTL0
+    DT1 -->|tls may attach| DTL0
+    DT1 -. explicit cleartext handoff .-> DH0
+    DT1 -->|vm transport host call| DB0
+    DTL3 --> DH0
+    DTL0 -->|vm tls prelude host call| DB0
+    DB0 -. http::request::handoff_downstream required for http entry .-> DH0
     DH1 --> DW0
 ```
 
@@ -86,6 +104,10 @@ flowchart LR
 
 ```mermaid
 flowchart LR
+    subgraph US_ENTRY["Upstream Entry"]
+        UE0["vm selects default handle or allocates handle n"]
+    end
+
     subgraph US_TCP["Upstream TCP DAG"]
         UT0["dial pending"]
         UT1["upstream connected"]
@@ -100,13 +122,15 @@ flowchart LR
     end
 
     subgraph US_TLS["Upstream TLS Session DAG"]
-        UTL0["tls configured"]
-        UTL1["session selected"]
-        UTL2["plaintext ready"]
-        UTL3["tls closed or failed"]
+        UTL0["tls configured or attached"]
+        UTL1["logical target observed"]
+        UTL2["session selected"]
+        UTL3["plaintext ready"]
+        UTL4["tls closed or failed"]
         UTL0 --> UTL1
         UTL1 --> UTL2
         UTL2 --> UTL3
+        UTL3 --> UTL4
     end
 
     subgraph US_H2["Upstream HTTP/2 Carrier DAG"]
@@ -196,12 +220,18 @@ flowchart LR
         R6 --> R7
     end
 
+    UE0 --> UTL0
+    UE0 --> U1A
+    UE0 --> UN0
+    UE0 --> UU0
+    UE0 --> R0
+
     UT1 --> UTL0
     UT1 --> U1A
     UT1 --> UN1
-    UTL2 --> U1A
-    UTL2 --> UN1
-    UTL2 --> UH20
+    UTL3 --> U1A
+    UTL3 --> UN1
+    UTL3 --> UH20
     UH22 --> U1A
     UH22 --> UN1
 
@@ -209,3 +239,10 @@ flowchart LR
     UN1 --> W0
     R0 -. signaling outside current DAG .-> R1
 ```
+
+## Downstream Versus Upstream
+
+- Downstream may begin from runtime listener policy: plain HTTP enters directly at HTTP ingress, while HTTPS begins as transport plus goal `https` and may auto-advance into TLS and HTTP.
+- Upstream has no symmetric listener policy. The VM creates demand by selecting handles, setting targets, and forcing connect, handshake, or send progression.
+- Downstream auto-promotion is revoked once the VM touches raw downstream transport or TLS prelude state; upstream progression remains explicit and per-handle.
+- Downstream DAG instances are tied to the already-admitted client-facing connection. Upstream DAG instances are created or reused on demand and may share carrier state such as upstream TLS or HTTP/2 sessions across exchanges.
