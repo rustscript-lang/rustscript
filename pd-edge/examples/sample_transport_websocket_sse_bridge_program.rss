@@ -20,7 +20,6 @@ if target == "" {
 } else {
     http::upstream::request::set_target(target);
     http::upstream::request::set_header("accept", "text/event-stream");
-    http::upstream::response::enable_processing();
 
     let mut event = "";
 

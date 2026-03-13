@@ -18,7 +18,6 @@ enum RequestField {
     Method,
     Path,
     Query,
-    RawQuery,
     PathWithQuery,
     HttpVersion,
     Scheme,
@@ -36,7 +35,6 @@ async fn request_field_outcome(
         RequestField::Method => request_head.method().as_str().to_string(),
         RequestField::Path => request_head.path().to_string(),
         RequestField::Query => request_head.query().to_string(),
-        RequestField::RawQuery => request_head.query().to_string(),
         RequestField::PathWithQuery => {
             request_path_with_query(request_head.path(), request_head.query())
         }
@@ -118,15 +116,6 @@ async fn get_request_path_with_query(
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
     request_field_outcome(context, RequestField::PathWithQuery).await
-}
-
-/// Returns the raw query string for the downstream HTTP request.
-#[pd_edge_host_function(name = http_request::GET_RAW_QUERY.name, scope = http)]
-async fn get_request_raw_query(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    request_field_outcome(context, RequestField::RawQuery).await
 }
 
 /// Returns the HTTP version for the downstream HTTP request.
@@ -254,8 +243,8 @@ async fn get_request_port(
 
 /// Attaches the untouched downstream transport to the HTTP stack and resumes
 /// the current VM invocation with HTTP request semantics.
-#[pd_edge_host_function(name = http_request::HANDOFF_DOWNSTREAM.name, scope = http)]
-fn handoff_downstream_http(
+#[pd_edge_host_function(name = "http::downstream::attach_transport", scope = http)]
+fn attach_downstream_transport_to_http(
     vm: &mut Vm,
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {

@@ -33,7 +33,7 @@ fn proxy_pipe(source: i64, destination: i64, max_bytes: i64) -> String {
     unreachable!("abi declaration only")
 }
 
-#[pd_host_function(name = "proxy::tunnel")]
-fn proxy_tunnel(left: i64, right: i64, max_bytes: i64) -> String {
+#[pd_host_function(name = "proxy::bridge")]
+fn proxy_bridge(left: i64, right: i64, max_bytes: i64) -> String {
     unreachable!("abi declaration only")
 }

@@ -166,7 +166,7 @@ fn downstream_http_auto_promotion(context: &SharedProxyVmContext) -> DownstreamH
 
 fn blocked_downstream_http_auto_promotion(host_name: &str) -> VmError {
     VmError::HostError(format!(
-        "{host_name} requires http::request::handoff_downstream() after raw downstream transport or TLS prelude use",
+        "{host_name} requires http::downstream::attach_transport() after raw downstream transport or TLS prelude use",
     ))
 }
 

@@ -322,6 +322,7 @@ struct Http2SessionKey {
 struct Http2UpstreamSession {
     session_id: u64,
     sender: hyper::client::conn::http2::SendRequest<Full<Bytes>>,
+    peer_addr: String,
     negotiated_alpn: Option<String>,
     peer_certificate_der: Option<Vec<u8>>,
     dag: Mutex<Http2UpstreamSessionDagState>,
@@ -342,6 +343,7 @@ pub(crate) struct Http2ResponseBodyTracker;
 #[derive(Debug)]
 pub(crate) struct Http2StartedResponse {
     pub(crate) response: Response<Incoming>,
+    pub(crate) peer_addr: Option<String>,
     pub(crate) negotiated_alpn: Option<String>,
     pub(crate) peer_certificate_der: Option<Vec<u8>>,
     pub(crate) stream_ref: Http2StreamRef,
@@ -402,6 +404,7 @@ impl Http2UpstreamSession {
     fn new(
         session_id: u64,
         sender: hyper::client::conn::http2::SendRequest<Full<Bytes>>,
+        peer_addr: String,
         negotiated_alpn: Option<String>,
         peer_certificate_der: Option<Vec<u8>>,
     ) -> Self {
@@ -418,6 +421,7 @@ impl Http2UpstreamSession {
         Self {
             session_id,
             sender,
+            peer_addr,
             negotiated_alpn,
             peer_certificate_der,
             dag: Mutex::new(dag),
@@ -1033,6 +1037,7 @@ pub(crate) async fn send_request(
 
     Ok(Http2StartedResponse {
         response,
+        peer_addr: Some(session.peer_addr.clone()),
         negotiated_alpn: session.negotiated_alpn.clone(),
         peer_certificate_der: session.peer_certificate_der.clone(),
         stream_ref,
@@ -1236,11 +1241,12 @@ async fn open_session(
 ) -> Result<Arc<Http2UpstreamSession>, Http2RequestError> {
     match mode {
         Http2UpstreamMode::AutomaticTls => {
-            let (sender, negotiated_alpn, peer_certificate_der, connection) =
+            let (sender, negotiated_alpn, peer_certificate_der, connection, peer_addr) =
                 connect_tls_http2(target, tls_flow, session_id).await?;
             let session = Arc::new(Http2UpstreamSession::new(
                 session_id,
                 sender,
+                peer_addr,
                 negotiated_alpn,
                 peer_certificate_der,
             ));
@@ -1248,8 +1254,11 @@ async fn open_session(
             Ok(session)
         }
         Http2UpstreamMode::PriorKnowledge => {
-            let (sender, connection) = connect_cleartext_http2(target, session_id).await?;
-            let session = Arc::new(Http2UpstreamSession::new(session_id, sender, None, None));
+            let (sender, peer_addr, connection) =
+                connect_cleartext_http2(target, session_id).await?;
+            let session = Arc::new(Http2UpstreamSession::new(
+                session_id, sender, peer_addr, None, None,
+            ));
             spawn_http2_connection(connection, session.clone());
             Ok(session)
         }
@@ -1266,6 +1275,7 @@ async fn connect_cleartext_http2(
 ) -> Result<
     (
         hyper::client::conn::http2::SendRequest<Full<Bytes>>,
+        String,
         hyper::client::conn::http2::Connection<TokioIo<TcpStream>, Full<Bytes>, TokioExecutor>,
     ),
     Http2RequestError,
@@ -1285,6 +1295,14 @@ async fn connect_cleartext_http2(
             "http2 session {session_id} failed to connect to {host}:{port}: {err}",
         ))
     })?;
+    let peer_addr = stream
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .map_err(|err| {
+            Http2RequestError::transport(format!(
+                "http2 session {session_id} failed to read peer addr: {err}",
+            ))
+        })?;
     let io = TokioIo::new(stream);
     let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
         .handshake(io)
@@ -1294,7 +1312,7 @@ async fn connect_cleartext_http2(
                 "http2 session {session_id} handshake failed: {err}",
             ))
         })?;
-    Ok((sender, connection))
+    Ok((sender, peer_addr, connection))
 }
 
 #[cfg(feature = "http2")]
@@ -1312,6 +1330,7 @@ async fn connect_tls_http2(
             Full<Bytes>,
             TokioExecutor,
         >,
+        String,
     ),
     Http2RequestError,
 > {
@@ -1329,17 +1348,25 @@ async fn connect_tls_http2(
             "http2 session {session_id} failed to connect to {host}:{port}: {err}",
         ))
     })?;
+    let peer_addr = stream
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .map_err(|err| {
+            Http2RequestError::transport(format!(
+                "http2 session {session_id} failed to read peer addr: {err}",
+            ))
+        })?;
 
-    let server_name = if !tls_flow.server_name().is_empty() {
-        tls_flow.server_name().to_string()
+    let peer_name = if !tls_flow.peer_name().is_empty() {
+        tls_flow.peer_name().to_string()
     } else {
         host.to_string()
     };
     let tls_config = build_tls_client_config(tls_flow)?;
     let connector = TlsConnector::from(Arc::new(tls_config));
-    let server_name = ServerName::try_from(server_name.clone()).map_err(|err| {
+    let server_name = ServerName::try_from(peer_name.clone()).map_err(|err| {
         Http2RequestError::transport(format!(
-            "http2 session {session_id} has invalid TLS server name '{server_name}': {err}",
+            "http2 session {session_id} has invalid TLS peer name '{peer_name}': {err}",
         ))
     })?;
     let tls_stream = connector
@@ -1380,7 +1407,13 @@ async fn connect_tls_http2(
                 "http2 session {session_id} handshake failed after TLS setup: {err}",
             ))
         })?;
-    Ok((sender, negotiated_alpn, peer_certificate_der, connection))
+    Ok((
+        sender,
+        negotiated_alpn,
+        peer_certificate_der,
+        connection,
+        peer_addr,
+    ))
 }
 
 #[cfg(feature = "http2")]

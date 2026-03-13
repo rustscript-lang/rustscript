@@ -726,6 +726,8 @@ pub(crate) struct TlsFlowState {
     verify_hostname: bool,
     sni_enabled: bool,
     trusted_certificate_pem: Option<String>,
+    server_certificate_pem: Option<String>,
+    server_private_key_pem: Option<String>,
     client_certificate_pem: Option<String>,
     client_private_key_pem: Option<String>,
     min_version: Option<TlsProtocolVersion>,
@@ -753,6 +755,8 @@ impl TlsFlowState {
             verify_hostname: true,
             sni_enabled: true,
             trusted_certificate_pem: None,
+            server_certificate_pem: None,
+            server_private_key_pem: None,
             client_certificate_pem: None,
             client_private_key_pem: None,
             min_version: None,
@@ -776,6 +780,8 @@ impl TlsFlowState {
             verify_hostname: true,
             sni_enabled: true,
             trusted_certificate_pem: None,
+            server_certificate_pem: None,
+            server_private_key_pem: None,
             client_certificate_pem: None,
             client_private_key_pem: None,
             min_version: None,
@@ -862,6 +868,22 @@ impl TlsFlowState {
             None
         } else {
             Some(certificate_pem)
+        };
+    }
+
+    pub(crate) fn set_server_certificate_pem(&mut self, certificate_pem: String) {
+        self.server_certificate_pem = if certificate_pem.is_empty() {
+            None
+        } else {
+            Some(certificate_pem)
+        };
+    }
+
+    pub(crate) fn set_server_private_key_pem(&mut self, private_key_pem: String) {
+        self.server_private_key_pem = if private_key_pem.is_empty() {
+            None
+        } else {
+            Some(private_key_pem)
         };
     }
 
@@ -1053,6 +1075,14 @@ impl TlsFlowState {
         self.trusted_certificate_pem.as_deref()
     }
 
+    pub(crate) fn server_certificate_pem(&self) -> Option<&str> {
+        self.server_certificate_pem.as_deref()
+    }
+
+    pub(crate) fn server_private_key_pem(&self) -> Option<&str> {
+        self.server_private_key_pem.as_deref()
+    }
+
     pub(crate) fn client_certificate_pem(&self) -> Option<&str> {
         self.client_certificate_pem.as_deref()
     }
@@ -1111,6 +1141,8 @@ impl Default for TlsFlowState {
             verify_hostname: true,
             sni_enabled: true,
             trusted_certificate_pem: None,
+            server_certificate_pem: None,
+            server_private_key_pem: None,
             client_certificate_pem: None,
             client_private_key_pem: None,
             min_version: None,

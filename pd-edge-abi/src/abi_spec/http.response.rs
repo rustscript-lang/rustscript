@@ -3,11 +3,6 @@ fn http_response_set_header(name: &str, value: &str) {
     unreachable!("abi declaration only")
 }
 
-#[pd_host_function(name = "http::response::remove_header")]
-fn http_response_remove_header(name: &str) {
-    unreachable!("abi declaration only")
-}
-
 #[pd_host_function(name = "http::response::set_body")]
 fn http_response_set_body(body: &str) {
     unreachable!("abi declaration only")
@@ -45,10 +40,5 @@ fn http_response_add_header(name: &str, value: &str) {
 
 #[pd_host_function(name = "http::response::clear_header")]
 fn http_response_clear_header(name: &str) {
-    unreachable!("abi declaration only")
-}
-
-#[pd_host_function(name = "http::response::set_headers")]
-fn http_response_set_headers(headers: Map) {
     unreachable!("abi declaration only")
 }

@@ -542,13 +542,13 @@ fn build_downstream_server_identity(
     ),
     VmError,
 > {
-    match (flow.client_certificate_pem(), flow.client_private_key_pem()) {
+    match (flow.server_certificate_pem(), flow.server_private_key_pem()) {
         (Some(_), Some(_)) => Ok((
-            load_client_cert_chain(flow.client_certificate_pem())?,
-            load_client_private_key(flow.client_private_key_pem())?,
+            load_client_cert_chain(flow.server_certificate_pem())?,
+            load_client_private_key(flow.server_private_key_pem())?,
         )),
         (Some(_), None) | (None, Some(_)) => Err(VmError::HostError(
-            "downstream tls handshake requires both certificate and private key when either is configured".to_string(),
+            "downstream tls handshake requires both server certificate and private key when either is configured".to_string(),
         )),
         (None, None) => {
             // Reuse one fallback identity for the lifetime of the process instead of
@@ -769,16 +769,16 @@ async fn session_handshake(
         }
         TlsSessionHandle::Dynamic(handle) => {
             let flow = session_flow(&context, session);
-            let server_name = if flow.server_name().is_empty() {
+            let peer_name = if flow.peer_name().is_empty() {
                 return Err(VmError::HostError(format!(
-                    "dynamic tls session handle {handle} has no server name; attach it to an http exchange with a target before calling tls::session::handshake",
+                    "dynamic tls session handle {handle} has no peer name; attach it to an http exchange with a target before calling tls::session::handshake",
                 )));
             } else {
-                flow.server_name().to_string()
+                flow.peer_name().to_string()
             };
-            let server_name = ServerName::try_from(server_name.clone()).map_err(|err| {
+            let server_name = ServerName::try_from(peer_name.clone()).map_err(|err| {
                 VmError::HostError(format!(
-                    "invalid tls server name '{server_name}' for dynamic session {handle}: {err}",
+                    "invalid tls peer name '{peer_name}' for dynamic session {handle}: {err}",
                 ))
             })?;
 
@@ -979,8 +979,8 @@ async fn session_set_trusted_certificate(
 }
 
 /// Sets the client certificate for the TLS session.
-#[pd_edge_host_function(name = tls::session::SET_CERTIFICATE.name, scope = transport)]
-async fn session_set_certificate(
+#[pd_edge_host_function(name = "tls::session::set_client_certificate", scope = transport)]
+async fn session_set_client_certificate(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
     session: i64,
@@ -994,8 +994,8 @@ async fn session_set_certificate(
 }
 
 /// Sets the client private key for the TLS session.
-#[pd_edge_host_function(name = tls::session::SET_PRIVATE_KEY.name, scope = transport)]
-async fn session_set_private_key(
+#[pd_edge_host_function(name = "tls::session::set_client_private_key", scope = transport)]
+async fn session_set_client_private_key(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
     session: i64,
@@ -1008,7 +1008,37 @@ async fn session_set_private_key(
     Ok(CallOutcome::Return(vec![]))
 }
 
-/// Sets the SNI host name for the TLS session.
+/// Sets the server certificate for the TLS session.
+#[pd_edge_host_function(name = "tls::session::set_server_certificate", scope = transport)]
+async fn session_set_server_certificate(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    session: i64,
+    certificate_pem: String,
+) -> Result<CallOutcome, VmError> {
+    with_configurable_session_mut(&context, session, |flow| {
+        flow.set_server_certificate_pem(certificate_pem);
+        Ok(())
+    })?;
+    Ok(CallOutcome::Return(vec![]))
+}
+
+/// Sets the server private key for the TLS session.
+#[pd_edge_host_function(name = "tls::session::set_server_private_key", scope = transport)]
+async fn session_set_server_private_key(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    session: i64,
+    private_key_pem: String,
+) -> Result<CallOutcome, VmError> {
+    with_configurable_session_mut(&context, session, |flow| {
+        flow.set_server_private_key_pem(private_key_pem);
+        Ok(())
+    })?;
+    Ok(CallOutcome::Return(vec![]))
+}
+
+/// Enables or disables SNI for the TLS session.
 #[pd_edge_host_function(name = tls::session::SET_SNI.name, scope = transport)]
 async fn session_set_sni(
     _vm: &mut Vm,
@@ -1065,20 +1095,6 @@ async fn session_get_peer_name(
     Ok(CallOutcome::Return(vec![Value::string(
         session_flow(&context, decode_session(&context, session)?)
             .peer_name()
-            .to_string(),
-    )]))
-}
-
-/// Returns the configured server name for the TLS session.
-#[pd_edge_host_function(name = tls::session::GET_SERVER_NAME.name, scope = transport)]
-async fn session_get_server_name(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-    session: i64,
-) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return(vec![Value::string(
-        session_flow(&context, decode_session(&context, session)?)
-            .server_name()
             .to_string(),
     )]))
 }

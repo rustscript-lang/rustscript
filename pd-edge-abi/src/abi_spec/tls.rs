@@ -33,13 +33,23 @@ fn tls_session_set_trusted_certificate(session: i64, certificate_pem: &str) {
     unreachable!("abi declaration only")
 }
 
-#[pd_host_function(name = "tls::session::set_certificate")]
-fn tls_session_set_certificate(session: i64, certificate_pem: &str) {
+#[pd_host_function(name = "tls::session::set_client_certificate")]
+fn tls_session_set_client_certificate(session: i64, certificate_pem: &str) {
     unreachable!("abi declaration only")
 }
 
-#[pd_host_function(name = "tls::session::set_private_key")]
-fn tls_session_set_private_key(session: i64, private_key_pem: &str) {
+#[pd_host_function(name = "tls::session::set_client_private_key")]
+fn tls_session_set_client_private_key(session: i64, private_key_pem: &str) {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "tls::session::set_server_certificate")]
+fn tls_session_set_server_certificate(session: i64, certificate_pem: &str) {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "tls::session::set_server_private_key")]
+fn tls_session_set_server_private_key(session: i64, private_key_pem: &str) {
     unreachable!("abi declaration only")
 }
 
@@ -60,11 +70,6 @@ fn tls_session_set_max_version(session: i64, version: &str) {
 
 #[pd_host_function(name = "tls::session::get_peer_name")]
 fn tls_session_get_peer_name(session: i64) -> String {
-    unreachable!("abi declaration only")
-}
-
-#[pd_host_function(name = "tls::session::get_server_name")]
-fn tls_session_get_server_name(session: i64) -> String {
     unreachable!("abi declaration only")
 }
 

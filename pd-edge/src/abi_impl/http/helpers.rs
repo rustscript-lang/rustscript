@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use url::Url;
-use vm::{Value, VmError, bytecode::VmMap};
+use vm::{Value, VmError};
 
 pub(super) fn parse_header_name(name: String) -> Result<HeaderName, VmError> {
     HeaderName::from_bytes(name.as_bytes())
@@ -20,57 +20,6 @@ pub(super) fn parse_header(
     let header_value = HeaderValue::from_str(&value)
         .map_err(|_| VmError::HostError(format!("invalid header value '{value}'")))?;
     Ok((header_name, header_value))
-}
-
-pub(super) fn parse_headers_map(
-    entries: VmMap,
-) -> Result<Vec<(HeaderName, Vec<HeaderValue>)>, VmError> {
-    let mut parsed = Vec::with_capacity(entries.len());
-    for (key, value) in entries {
-        let name = match key {
-            Value::String(name) => name.to_string(),
-            _ => {
-                return Err(VmError::HostError(
-                    "header map keys must be strings".to_string(),
-                ));
-            }
-        };
-        let header_name = HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
-
-        let values = match value {
-            Value::String(single) => vec![single.to_string()],
-            Value::Array(values) => {
-                let mut collected = Vec::with_capacity(values.len());
-                for value in values.iter() {
-                    match value {
-                        Value::String(item) => collected.push(item.to_string()),
-                        _ => {
-                            return Err(VmError::HostError(
-                                "header map values must be strings or arrays of strings"
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                }
-                collected
-            }
-            _ => {
-                return Err(VmError::HostError(
-                    "header map values must be strings or arrays of strings".to_string(),
-                ));
-            }
-        };
-
-        let mut header_values = Vec::with_capacity(values.len());
-        for value in values {
-            let header_value = HeaderValue::from_str(&value)
-                .map_err(|_| VmError::HostError(format!("invalid header value '{value}'")))?;
-            header_values.push(header_value);
-        }
-        parsed.push((header_name, header_values));
-    }
-    Ok(parsed)
 }
 
 pub(super) fn request_path_with_query(path: &str, query: &str) -> String {

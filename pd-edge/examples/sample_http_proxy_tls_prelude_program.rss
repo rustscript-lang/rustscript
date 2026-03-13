@@ -12,7 +12,6 @@ use tls;
 // On that path:
 // - plaintext HTTP is attached directly
 // - TLS is accepted and then attached to the HTTP stack
-// - SNI failme.test is rejected after attach, in normal HTTP response semantics
 let downstream = tcp::stream::downstream();
 
 if http::request::get_scheme() == "tcp" {
@@ -20,12 +19,12 @@ if http::request::get_scheme() == "tcp" {
     if prefix == "GET " || prefix == "POST" || prefix == "HEAD" ||
         prefix == "PUT " || prefix == "PATC" || prefix == "DELE" ||
         prefix == "OPTI" || prefix == "PRI " {
-        http::request::handoff_downstream();
+        http::downstream::attach_transport();
     } else {
         let session = tls::session::from_socket(downstream);
         tls::session::set_alpn(session, "h2,http/1.1");
         if tls::session::handshake(session) {
-            http::request::handoff_downstream();
+            http::downstream::attach_transport();
         } else {
             tcp::stream::close(downstream);
             runtime::exit();
@@ -33,20 +32,11 @@ if http::request::get_scheme() == "tcp" {
     }
 }
 
-let server_name = tls::session::get_server_name(0);
-if server_name == "failme.test" {
-    http::response::set_status(403);
-    http::response::set_body("forbidden");
-} else {
-    http::response::set_status(201);
-    http::response::set_body(
-        http::request::get_method() + "|" +
-        http::request::get_path_with_query() + "|" +
-        http::request::get_body()
-    );
-}
+http::response::set_status(201);
+http::response::set_body(
+    http::request::get_method() + "|" +
+    http::request::get_path_with_query() + "|" +
+    http::request::get_body()
+);
 http::response::set_header("x-request-scheme", http::request::get_scheme());
 http::response::set_header("x-request-version", http::request::get_http_version());
-if server_name != "" {
-    http::response::set_header("x-server-name", server_name);
-}

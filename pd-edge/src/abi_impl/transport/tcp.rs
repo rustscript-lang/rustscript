@@ -12,7 +12,7 @@ use vm::{CallOutcome, Value, Vm, VmError};
 use super::super::SharedProxyVmContext;
 use super::super::http::{
     allocate_tcp_stream_handle, append_outbound_exchange_body, append_response_output_body_bytes,
-    outbound_exchange_exists, outbound_exchange_response_eof,
+    default_upstream_exchange_handle, outbound_exchange_exists, outbound_exchange_response_eof,
     read_outbound_exchange_response_next_chunk, read_request_body_next_chunk,
     read_upstream_response_next_chunk, request_body_eof, tcp_stream_exists, upstream_response_eof,
 };
@@ -153,6 +153,31 @@ fn dynamic_tcp_socket_state(
 fn active_downstream_tcp_io(context: &SharedProxyVmContext) -> Option<SharedTcpStreamIo> {
     let guard = context.lock_transport();
     guard.downstream_tcp_io.clone()
+}
+
+fn outbound_http_peer_addr(context: &SharedProxyVmContext, handle: i64) -> Option<String> {
+    let (attached_transport, peer_addr) = {
+        let guard = context.lock_exchanges();
+        let exchange = guard.exchanges.get(&handle)?;
+        (
+            exchange.transport.attached_transport,
+            exchange.transport.peer_addr.clone(),
+        )
+    };
+    if let Some(peer_addr) = peer_addr.filter(|peer_addr| !peer_addr.is_empty()) {
+        return Some(peer_addr);
+    }
+    let stream = match attached_transport {
+        Some(super::super::http::AttachedHttpTransport::Tcp(stream))
+        | Some(super::super::http::AttachedHttpTransport::Tls(stream)) => stream,
+        None => return None,
+    };
+    let guard = context.lock_transport();
+    guard
+        .tcp_streams
+        .get(&stream)
+        .map(|state| state.peer_address().to_string())
+        .filter(|peer_addr| !peer_addr.is_empty())
 }
 
 #[cfg(feature = "tls")]
@@ -746,16 +771,11 @@ async fn stream_get_peer_addr(
             downstream_attached_peer_addr(&context)
         }
         TcpStreamHandle::Reserved(TcpStreamRef::DefaultUpstream) => {
-            let guard = context.lock_transport();
-            guard.tls_dag.default_upstream.peer_name().to_string()
+            outbound_http_peer_addr(&context, default_upstream_exchange_handle())
+                .unwrap_or_default()
         }
         TcpStreamHandle::OutboundExchange(handle) => {
-            let guard = context.lock_exchanges();
-            let exchange = guard
-                .exchanges
-                .get(&handle)
-                .expect("exchange should exist while stream handle is in use");
-            exchange.transport.tls_flow.peer_name().to_string()
+            outbound_http_peer_addr(&context, handle).unwrap_or_default()
         }
         TcpStreamHandle::Dynamic(handle) => dynamic_tcp_socket_state(&context, handle)?
             .peer_address()

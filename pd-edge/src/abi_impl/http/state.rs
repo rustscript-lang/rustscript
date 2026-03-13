@@ -758,6 +758,7 @@ pub(crate) struct HttpExchangeTransportState {
     pub(crate) carrier_kind: HttpCarrierKind,
     pub(crate) carrier_ref: Option<HttpCarrierRef>,
     pub(crate) http_version: Option<String>,
+    pub(crate) peer_addr: Option<String>,
     pub(crate) attached_transport: Option<AttachedHttpTransport>,
 }
 
@@ -771,6 +772,10 @@ impl HttpExchangeTransportState {
         self.carrier_kind = carrier_ref.kind();
         self.carrier_ref = Some(carrier_ref);
         self.http_version = Some(http_version_label(version).to_string());
+    }
+
+    fn set_peer_addr(&mut self, peer_addr: Option<String>) {
+        self.peer_addr = peer_addr;
     }
 }
 
@@ -2122,6 +2127,7 @@ struct StartedUpstreamResponse {
     headers: HeaderMap,
     version: Version,
     carrier_ref: HttpCarrierRef,
+    peer_addr: Option<String>,
     negotiated_alpn: Option<String>,
     peer_certificate_der: Option<Vec<u8>>,
     body: SharedUpstreamResponseBody,
@@ -2753,6 +2759,7 @@ async fn start_upstream_response_via_reqwest(
         } else {
             HttpCarrierRef::Http1DynamicExchange(handle)
         },
+        peer_addr: upstream_response.remote_addr().map(|addr| addr.to_string()),
         negotiated_alpn: alpn_from_http_version(version),
         peer_certificate_der: response_peer_certificate_der(&upstream_response),
         body: Arc::new(tokio::sync::Mutex::new(
@@ -2813,6 +2820,7 @@ where
         } else {
             HttpCarrierRef::Http1DynamicExchange(handle)
         },
+        peer_addr: None,
         negotiated_alpn: Some(http1::ALPN_PROTOCOL.to_string()),
         peer_certificate_der: None,
         body: Arc::new(tokio::sync::Mutex::new(
@@ -2831,6 +2839,7 @@ async fn start_upstream_response_via_attached_transport(
     let request_path = super::request_path_with_query(&prepared.path, &prepared.query);
     match prepared.attached_transport {
         Some(AttachedHttpTransport::Tcp(stream)) => {
+            let stream_handle = stream;
             if Url::parse(&prepared.target)
                 .ok()
                 .map(|url| url.scheme().eq_ignore_ascii_case("https"))
@@ -2841,8 +2850,8 @@ async fn start_upstream_response_via_attached_transport(
                         .to_string(),
                 ));
             }
-            let stream = take_dynamic_tcp_stream_for_http(context, stream).await?;
-            start_upstream_response_via_attached_http1(
+            let stream = take_dynamic_tcp_stream_for_http(context, stream_handle).await?;
+            let mut started = start_upstream_response_via_attached_http1(
                 handle,
                 prepared,
                 &request_path,
@@ -2850,7 +2859,14 @@ async fn start_upstream_response_via_attached_transport(
                 request_body,
                 stream,
             )
-            .await
+            .await?;
+            started.peer_addr = context
+                .lock_transport()
+                .tcp_streams
+                .get(&stream_handle)
+                .map(|state| state.peer_address().to_string())
+                .filter(|peer_addr| !peer_addr.is_empty());
+            Ok(started)
         }
         #[cfg(feature = "tls")]
         Some(AttachedHttpTransport::Tls(session)) => {
@@ -2878,6 +2894,12 @@ async fn start_upstream_response_via_attached_transport(
                     .get(&session)
                     .and_then(|flow| flow.peer_certificate_der().map(|bytes| bytes.to_vec()))
             };
+            started.peer_addr = context
+                .lock_transport()
+                .tcp_streams
+                .get(&session)
+                .map(|state| state.peer_address().to_string())
+                .filter(|peer_addr| !peer_addr.is_empty());
             Ok(started)
         }
         None => Err(UpstreamResponseStartError::Protocol(
@@ -2916,6 +2938,7 @@ async fn start_upstream_response_via_http2(
         headers: started.response.headers().clone(),
         version,
         carrier_ref: HttpCarrierRef::UpstreamHttp2Stream(started.stream_ref),
+        peer_addr: started.peer_addr,
         negotiated_alpn: started.negotiated_alpn,
         peer_certificate_der: started.peer_certificate_der,
         body: Arc::new(tokio::sync::Mutex::new(
@@ -3126,6 +3149,9 @@ async fn start_outbound_exchange_response(
         exchange
             .transport
             .mark_response_ready(upstream_response_version, snapshot.carrier_ref.clone());
+        exchange
+            .transport
+            .set_peer_addr(upstream_response.peer_addr);
         return Ok(snapshot);
     }
 
@@ -3238,6 +3264,9 @@ async fn start_outbound_exchange_response(
     exchange
         .transport
         .mark_response_ready(upstream_response_version, snapshot.carrier_ref.clone());
+    exchange
+        .transport
+        .set_peer_addr(upstream_response.peer_addr);
     Ok(snapshot)
 }
 

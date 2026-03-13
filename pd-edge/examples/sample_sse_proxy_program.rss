@@ -12,7 +12,6 @@ if target == "" {
 
 // Start the upstream exchange and mirror the SSE response head.
 http::upstream::request::set_target(target);
-http::upstream::response::enable_processing();
 
 let status = http::upstream::response::get_status();
 http::response::set_status(status);
