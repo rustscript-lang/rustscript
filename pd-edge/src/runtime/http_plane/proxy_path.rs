@@ -459,7 +459,8 @@ async fn promote_captured_downstream_transport_into_http_request(
         #[cfg(feature = "tls")]
         PromotedDownstreamTransport::Tls(_) => context.downstream_connection_metadata(true)?,
     };
-    let request_id = context.with_request_head(|request_head| request_head.request_id().to_string());
+    let request_id =
+        context.with_request_head(|request_head| request_head.request_id().to_string());
     let downstream_http_sessions = context.services().downstream_http_sessions();
     let (captured_tx, captured_rx) =
         oneshot::channel::<Result<CapturedPromotedHttpRequest, String>>();
@@ -939,15 +940,10 @@ async fn handle_data_plane_request(state: SharedState, request: Request) -> Resp
             request_path,
             request_id,
         };
-        let mut vm_context =
-            ProxyVmContext::from_http_request(vm_request, state.rate_limiter.clone());
-        vm_context.attach_upstream_client(state.client.clone());
-        vm_context.attach_upstream_client_cache(state.upstream_client_cache.clone());
-        vm_context.attach_tls_session_cache(state.tls_session_cache.clone());
-        vm_context.attach_upstream_http_sessions(state.upstream_http_sessions.clone());
-        vm_context.attach_upstream_http3_sessions(state.upstream_http3_sessions.clone());
-        vm_context.attach_downstream_http_sessions(state.downstream_http2_sessions.clone());
-        vm_context.attach_downstream_http3_sessions(state.downstream_http3_sessions.clone());
+        let mut vm_context = ProxyVmContext::from_http_request_with_services(
+            vm_request,
+            state.runtime_services.clone(),
+        );
         if let Some(attachment) = &downstream_http2_attachment {
             vm_context.attach_downstream_http2_stream(attachment);
         }

@@ -77,10 +77,10 @@ pub(crate) async fn serve_transport_connection_with_listener_goal(
         request_id: request_id.clone(),
     };
 
-    let vm_context = match ProxyVmContext::from_downstream_tcp_stream(
+    let vm_context = match ProxyVmContext::from_downstream_tcp_stream_with_services(
         stream,
         request_id,
-        state.rate_limiter.clone(),
+        state.runtime_services.clone(),
     ) {
         Ok(vm_context) => vm_context,
         Err(err) => {
@@ -93,13 +93,6 @@ pub(crate) async fn serve_transport_connection_with_listener_goal(
     };
     let mut vm_context = vm_context;
     vm_context.set_downstream_listener_goal(downstream_listener_goal);
-    vm_context.attach_upstream_client(state.client.clone());
-    vm_context.attach_upstream_client_cache(state.upstream_client_cache.clone());
-    vm_context.attach_tls_session_cache(state.tls_session_cache.clone());
-    vm_context.attach_upstream_http_sessions(state.upstream_http_sessions.clone());
-    vm_context.attach_upstream_http3_sessions(state.upstream_http3_sessions.clone());
-    vm_context.attach_downstream_http_sessions(state.downstream_http2_sessions.clone());
-    vm_context.attach_downstream_http3_sessions(state.downstream_http3_sessions.clone());
     #[cfg(feature = "tls")]
     if let Some(downstream_tls_termination) = downstream_tls_termination {
         vm_context.attach_downstream_tls_termination(downstream_tls_termination);

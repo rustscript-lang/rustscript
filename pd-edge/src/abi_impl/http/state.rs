@@ -1201,11 +1201,14 @@ pub(crate) struct RuntimeServices {
     upstream_http_sessions: Option<SharedHttpUpstreamSessions>,
     upstream_http3_sessions: Option<SharedHttp3UpstreamSessions>,
     downstream_http_sessions: Option<http2::SharedHttpDownstreamSessions>,
+    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     downstream_http3_sessions: Option<http3::SharedHttp3DownstreamSessions>,
     #[cfg(feature = "tls")]
     downstream_tls_termination: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
     rate_limiter: SharedRateLimiter,
 }
+
+pub(crate) type SharedRuntimeServices = Arc<RuntimeServices>;
 
 impl RuntimeServices {
     fn new(rate_limiter: SharedRateLimiter) -> Self {
@@ -1259,6 +1262,36 @@ impl RuntimeServices {
     }
 }
 
+pub(crate) fn new_shared_runtime_services(
+    rate_limiter: SharedRateLimiter,
+) -> SharedRuntimeServices {
+    Arc::new(RuntimeServices::new(rate_limiter))
+}
+
+pub(crate) fn new_shared_http_plane_runtime_services(
+    rate_limiter: SharedRateLimiter,
+    upstream_client: reqwest::Client,
+    upstream_client_cache: SharedUpstreamClientCache,
+    tls_session_cache: SharedTlsSessionCache,
+    upstream_http_sessions: SharedHttpUpstreamSessions,
+    upstream_http3_sessions: SharedHttp3UpstreamSessions,
+    downstream_http_sessions: http2::SharedHttpDownstreamSessions,
+    downstream_http3_sessions: http3::SharedHttp3DownstreamSessions,
+) -> SharedRuntimeServices {
+    Arc::new(RuntimeServices {
+        upstream_client: Some(upstream_client),
+        upstream_client_cache: Some(upstream_client_cache),
+        tls_session_cache: Some(tls_session_cache),
+        upstream_http_sessions: Some(upstream_http_sessions),
+        upstream_http3_sessions: Some(upstream_http3_sessions),
+        downstream_http_sessions: Some(downstream_http_sessions),
+        downstream_http3_sessions: Some(downstream_http3_sessions),
+        #[cfg(feature = "tls")]
+        downstream_tls_termination: None,
+        rate_limiter,
+    })
+}
+
 #[derive(Debug)]
 pub(crate) struct DownstreamState {
     pub(crate) inbound_request_body: SharedInboundRequestBody,
@@ -1298,6 +1331,7 @@ impl DownstreamState {
         ));
     }
 
+    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     fn attach_downstream_http3_stream(
         &mut self,
         attachment: &http3::Http3DownstreamStreamAttachment,
@@ -1499,7 +1533,7 @@ impl Default for EdgeIoRegistry {
 #[derive(Debug)]
 pub struct ProxyVmContext {
     request_head: Mutex<HttpRequestHead>,
-    services: RuntimeServices,
+    services: SharedRuntimeServices,
     downstream: Mutex<DownstreamState>,
     exchanges: Mutex<ExchangeRegistry>,
     transport: Mutex<TransportState>,
@@ -1511,6 +1545,13 @@ pub struct ProxyVmContext {
 
 impl ProxyVmContext {
     pub fn from_http_request(request: HttpRequestContext, rate_limiter: SharedRateLimiter) -> Self {
+        Self::from_http_request_with_services(request, new_shared_runtime_services(rate_limiter))
+    }
+
+    pub(crate) fn from_http_request_with_services(
+        request: HttpRequestContext,
+        services: SharedRuntimeServices,
+    ) -> Self {
         let request_headers = request.headers;
         let request_head = HttpRequestHead {
             request_id: request.request_id,
@@ -1532,7 +1573,7 @@ impl ProxyVmContext {
             exchanges: Mutex::new(ExchangeRegistry::from_http_request(&request_head)),
             transport: Mutex::new(TransportState::from_http_request(&request_head)),
             request_head: Mutex::new(request_head),
-            services: RuntimeServices::new(rate_limiter),
+            services,
             #[cfg(feature = "webrtc")]
             webrtc: Mutex::new(WebRtcRegistry::default()),
             proxy: Mutex::new(ProxyStreamRegistry::default()),
@@ -1544,7 +1585,17 @@ impl ProxyVmContext {
         request_headers: HeaderMap,
         rate_limiter: SharedRateLimiter,
     ) -> Self {
-        Self::from_http_request(
+        Self::from_request_headers_with_services(
+            request_headers,
+            new_shared_runtime_services(rate_limiter),
+        )
+    }
+
+    pub(crate) fn from_request_headers_with_services(
+        request_headers: HeaderMap,
+        services: SharedRuntimeServices,
+    ) -> Self {
+        Self::from_http_request_with_services(
             HttpRequestContext {
                 request_id: String::new(),
                 method: Method::GET,
@@ -1558,7 +1609,7 @@ impl ProxyVmContext {
                 body: Body::empty(),
                 headers: request_headers,
             },
-            rate_limiter,
+            services,
         )
     }
 
@@ -1566,6 +1617,18 @@ impl ProxyVmContext {
         stream: tokio::net::TcpStream,
         request_id: String,
         rate_limiter: SharedRateLimiter,
+    ) -> Result<Self, VmError> {
+        Self::from_downstream_tcp_stream_with_services(
+            stream,
+            request_id,
+            new_shared_runtime_services(rate_limiter),
+        )
+    }
+
+    pub(crate) fn from_downstream_tcp_stream_with_services(
+        stream: tokio::net::TcpStream,
+        request_id: String,
+        services: SharedRuntimeServices,
     ) -> Result<Self, VmError> {
         let local_addr = stream.local_addr().map_err(|err| {
             VmError::HostError(format!("failed to read downstream local address: {err}"))
@@ -1593,7 +1656,7 @@ impl ProxyVmContext {
                 io, local_addr, peer_addr,
             )),
             request_head: Mutex::new(request_head),
-            services: RuntimeServices::new(rate_limiter),
+            services,
             #[cfg(feature = "webrtc")]
             webrtc: Mutex::new(WebRtcRegistry::default()),
             proxy: Mutex::new(ProxyStreamRegistry::default()),
@@ -1601,16 +1664,16 @@ impl ProxyVmContext {
         })
     }
 
+    fn services_mut(&mut self) -> &mut RuntimeServices {
+        Arc::make_mut(&mut self.services)
+    }
+
+    pub(crate) fn attach_runtime_services(&mut self, services: SharedRuntimeServices) {
+        self.services = services;
+    }
+
     pub fn attach_upstream_client(&mut self, client: reqwest::Client) {
-        self.services.upstream_client = Some(client);
-    }
-
-    pub(crate) fn attach_upstream_client_cache(&mut self, cache: SharedUpstreamClientCache) {
-        self.services.upstream_client_cache = Some(cache);
-    }
-
-    pub(crate) fn attach_tls_session_cache(&mut self, cache: SharedTlsSessionCache) {
-        self.services.tls_session_cache = Some(cache);
+        self.services_mut().upstream_client = Some(client);
     }
 
     #[cfg(feature = "tls")]
@@ -1618,29 +1681,7 @@ impl ProxyVmContext {
         &mut self,
         server_config: Arc<tokio_rustls::rustls::ServerConfig>,
     ) {
-        self.services.downstream_tls_termination = Some(server_config);
-    }
-
-    pub(crate) fn attach_upstream_http_sessions(&mut self, sessions: SharedHttpUpstreamSessions) {
-        self.services.upstream_http_sessions = Some(sessions);
-    }
-
-    pub(crate) fn attach_upstream_http3_sessions(&mut self, sessions: SharedHttp3UpstreamSessions) {
-        self.services.upstream_http3_sessions = Some(sessions);
-    }
-
-    pub(crate) fn attach_downstream_http_sessions(
-        &mut self,
-        sessions: http2::SharedHttpDownstreamSessions,
-    ) {
-        self.services.downstream_http_sessions = Some(sessions);
-    }
-
-    pub(crate) fn attach_downstream_http3_sessions(
-        &mut self,
-        sessions: http3::SharedHttp3DownstreamSessions,
-    ) {
-        self.services.downstream_http3_sessions = Some(sessions);
+        self.services_mut().downstream_tls_termination = Some(server_config);
     }
 
     pub(crate) fn attach_downstream_http2_stream(
@@ -1653,6 +1694,7 @@ impl ProxyVmContext {
             .attach_downstream_http2_stream(attachment);
     }
 
+    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     pub(crate) fn attach_downstream_http3_stream(
         &mut self,
         attachment: &http3::Http3DownstreamStreamAttachment,
@@ -1686,7 +1728,7 @@ impl ProxyVmContext {
     }
 
     pub(crate) fn services(&self) -> &RuntimeServices {
-        &self.services
+        self.services.as_ref()
     }
 
     pub(crate) fn note_downstream_transport_access(&self) {
@@ -3945,15 +3987,15 @@ pub(crate) async fn resolve_http_graph_response(
                 Ok(response_from_connect_tunnel(response_headers))
             }
             #[cfg(feature = "websocket")]
-            DownstreamPostResponsePlan::WebSocketTunnel(plan) => context.with_request_head(
-                |request_head| {
+            DownstreamPostResponsePlan::WebSocketTunnel(plan) => {
+                context.with_request_head(|request_head| {
                     response_from_websocket_tunnel(
                         request_head.headers(),
                         response_headers,
                         plan.selected_subprotocol.as_deref(),
                     )
-                },
-            ),
+                })
+            }
         };
         let response = match response {
             Ok(response) => response,
@@ -4185,12 +4227,12 @@ mod tests {
 
     use super::{
         HttpCarrierRef, HttpExchangeTransportState, HttpRequestContext,
-        HttpUpstreamResponseSnapshot, ProxyVmContext, UpstreamResponseBodyState,
-        header_content_length, response_from_upstream_snapshot,
-        SharedProxyVmContext, allocate_outbound_exchange_handle, append_outbound_exchange_body,
-        default_upstream_exchange_handle, ensure_outbound_exchange_response_started,
-        outbound_exchange_exists, read_request_body_all, read_request_body_next_chunk,
-        read_request_body_next_line, resolve_http_graph_response,
+        HttpUpstreamResponseSnapshot, ProxyVmContext, SharedProxyVmContext,
+        UpstreamResponseBodyState, allocate_outbound_exchange_handle,
+        append_outbound_exchange_body, default_upstream_exchange_handle,
+        ensure_outbound_exchange_response_started, header_content_length, outbound_exchange_exists,
+        read_request_body_all, read_request_body_next_chunk, read_request_body_next_line,
+        resolve_http_graph_response, response_from_upstream_snapshot,
     };
     use crate::abi_impl::RateLimiterStore;
     use crate::abi_impl::http2::{
@@ -4494,9 +4536,12 @@ mod tests {
             exchange.transport.tls_flow.observe_target(&target);
         }
 
-        let resolved = timeout(Duration::from_millis(100), resolve_http_graph_response(&context))
-            .await
-            .expect("response resolution should not wait for the full upstream body");
+        let resolved = timeout(
+            Duration::from_millis(100),
+            resolve_http_graph_response(&context),
+        )
+        .await
+        .expect("response resolution should not wait for the full upstream body");
 
         let mut body = resolved.response.into_body();
         let first = timeout(Duration::from_millis(100), body.frame())
@@ -4509,7 +4554,9 @@ mod tests {
         assert_eq!(first.as_ref(), b"hello");
 
         assert!(
-            timeout(Duration::from_millis(50), body.frame()).await.is_err(),
+            timeout(Duration::from_millis(50), body.frame())
+                .await
+                .is_err(),
             "second upstream chunk should still be pending before release"
         );
 
@@ -4560,12 +4607,9 @@ mod tests {
             .with_no_client_auth()
             .with_single_cert(
                 vec![CertificateDer::from(
-                    cert.serialize_der()
-                        .expect("cert der should serialize"),
+                    cert.serialize_der().expect("cert der should serialize"),
                 )],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    cert.serialize_private_key_der(),
-                )),
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.serialize_private_key_der())),
             )
             .expect("server config should build");
         server_config.alpn_protocols = vec![b"h2".to_vec()];
@@ -4629,11 +4673,13 @@ mod tests {
             http_version: "2".to_string(),
             carrier_kind: carrier_ref.kind(),
             carrier_ref,
-            body: Arc::new(tokio::sync::Mutex::new(UpstreamResponseBodyState::from_hyper(
-                started.response.into_body(),
-                Some(started.body_tracker),
-                content_length,
-            ))),
+            body: Arc::new(tokio::sync::Mutex::new(
+                UpstreamResponseBodyState::from_hyper(
+                    started.response.into_body(),
+                    Some(started.body_tracker),
+                    content_length,
+                ),
+            )),
         };
 
         let response = response_from_upstream_snapshot(snapshot, HeaderMap::new(), None)

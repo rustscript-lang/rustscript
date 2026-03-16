@@ -16,9 +16,11 @@ use crate::{
     HOST_FUNCTION_COUNT,
     abi_impl::{
         ProxyVmContext, RateLimiterStore, SharedHttp3DownstreamSessions,
-        SharedHttp3UpstreamSessions, SharedHttpDownstreamSessions, SharedHttpUpstreamSessions,
-        SharedRateLimiter, SharedTlsSessionCache,
-        http::{SharedUpstreamClientCache, new_shared_upstream_client_cache},
+        SharedHttpDownstreamSessions, SharedRateLimiter,
+        http::{
+            SharedRuntimeServices, new_shared_http_plane_runtime_services,
+            new_shared_upstream_client_cache,
+        },
         new_shared_http_downstream_sessions, new_shared_http_upstream_sessions,
         new_shared_http3_downstream_sessions, new_shared_http3_upstream_sessions,
         new_shared_tls_session_cache,
@@ -45,8 +47,7 @@ pub use http_plane::serve_http3_proxy;
 pub(crate) use http_plane::{
     auto_promote_downstream_listener_goal_into_http_request,
     maybe_auto_promote_downstream_listener_goal_into_http_request,
-    promote_transport_context_into_http_request,
-    scoped_http_host_call_can_run_synchronously,
+    promote_transport_context_into_http_request, scoped_http_host_call_can_run_synchronously,
 };
 pub use http_plane::{build_admin_app, build_http_proxy_app, serve_http_proxy, serve_https_proxy};
 pub use transport_plane::serve_transport_proxy;
@@ -141,13 +142,11 @@ pub struct SharedState {
     pub active_program: Arc<RwLock<Option<Arc<LoadedProgram>>>>,
     pub max_program_bytes: usize,
     pub client: reqwest::Client,
-    pub(crate) upstream_client_cache: SharedUpstreamClientCache,
-    pub(crate) tls_session_cache: SharedTlsSessionCache,
-    pub(crate) upstream_http_sessions: SharedHttpUpstreamSessions,
-    pub(crate) upstream_http3_sessions: SharedHttp3UpstreamSessions,
     pub(crate) downstream_http2_sessions: SharedHttpDownstreamSessions,
+    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     pub(crate) downstream_http3_sessions: SharedHttp3DownstreamSessions,
     pub rate_limiter: SharedRateLimiter,
+    pub(crate) runtime_services: SharedRuntimeServices,
     pub debug_session: SharedDebugSession,
     pub vm_execution: VmExecutionConfig,
     runtime_metrics: Arc<RuntimeMetrics>,
@@ -205,30 +204,41 @@ impl SharedState {
         max_program_bytes: usize,
         store_limits: RuntimeStoreLimits,
     ) -> Self {
+        let client = reqwest::Client::builder()
+            .tls_info(true)
+            .build()
+            .expect("default upstream client should build");
+        let upstream_client_cache =
+            new_shared_upstream_client_cache(store_limits.upstream_http_reuse_entries);
+        let tls_session_cache =
+            new_shared_tls_session_cache(store_limits.tls_session_reuse_entries);
+        let upstream_http_sessions =
+            new_shared_http_upstream_sessions(store_limits.upstream_http_reuse_entries);
+        let upstream_http3_sessions =
+            new_shared_http3_upstream_sessions(store_limits.upstream_http3_reuse_entries);
+        let downstream_http2_sessions =
+            new_shared_http_downstream_sessions(store_limits.downstream_http2_session_entries);
+        let downstream_http3_sessions =
+            new_shared_http3_downstream_sessions(store_limits.downstream_http3_session_entries);
+        let rate_limiter = Arc::new(std::sync::Mutex::new(RateLimiterStore::new()));
+        let runtime_services = new_shared_http_plane_runtime_services(
+            rate_limiter.clone(),
+            client.clone(),
+            upstream_client_cache.clone(),
+            tls_session_cache.clone(),
+            upstream_http_sessions.clone(),
+            upstream_http3_sessions.clone(),
+            downstream_http2_sessions.clone(),
+            downstream_http3_sessions.clone(),
+        );
         Self {
             active_program: Arc::new(RwLock::new(None)),
             max_program_bytes,
-            client: reqwest::Client::builder()
-                .tls_info(true)
-                .build()
-                .expect("default upstream client should build"),
-            upstream_client_cache: new_shared_upstream_client_cache(
-                store_limits.upstream_http_reuse_entries,
-            ),
-            tls_session_cache: new_shared_tls_session_cache(store_limits.tls_session_reuse_entries),
-            upstream_http_sessions: new_shared_http_upstream_sessions(
-                store_limits.upstream_http_reuse_entries,
-            ),
-            upstream_http3_sessions: new_shared_http3_upstream_sessions(
-                store_limits.upstream_http3_reuse_entries,
-            ),
-            downstream_http2_sessions: new_shared_http_downstream_sessions(
-                store_limits.downstream_http2_session_entries,
-            ),
-            downstream_http3_sessions: new_shared_http3_downstream_sessions(
-                store_limits.downstream_http3_session_entries,
-            ),
-            rate_limiter: Arc::new(std::sync::Mutex::new(RateLimiterStore::new())),
+            client,
+            downstream_http2_sessions,
+            downstream_http3_sessions,
+            rate_limiter,
+            runtime_services,
             debug_session: new_debug_session_store(),
             vm_execution: VmExecutionConfig::default(),
             runtime_metrics: Arc::new(RuntimeMetrics::default()),
@@ -446,13 +456,7 @@ impl SharedState {
 }
 
 pub fn attach_http_plane_runtime_services(state: &SharedState, vm_context: &mut ProxyVmContext) {
-    vm_context.attach_upstream_client(state.client.clone());
-    vm_context.attach_upstream_client_cache(state.upstream_client_cache.clone());
-    vm_context.attach_tls_session_cache(state.tls_session_cache.clone());
-    vm_context.attach_upstream_http_sessions(state.upstream_http_sessions.clone());
-    vm_context.attach_upstream_http3_sessions(state.upstream_http3_sessions.clone());
-    vm_context.attach_downstream_http_sessions(state.downstream_http2_sessions.clone());
-    vm_context.attach_downstream_http3_sessions(state.downstream_http3_sessions.clone());
+    vm_context.attach_runtime_services(state.runtime_services.clone());
 }
 
 struct RuntimeMetrics {
@@ -655,14 +659,17 @@ mod tests {
     #[test]
     fn shared_state_uses_default_store_limits() {
         let state = SharedState::new(1024);
+        let services = state.runtime_services.as_ref();
 
-        let tls_capacity = state
-            .tls_session_cache
+        let tls_capacity = services
+            .tls_session_cache()
+            .expect("tls session cache should exist")
             .lock()
             .expect("tls session cache lock poisoned")
             .capacity();
-        let upstream_capacity = state
-            .upstream_http_sessions
+        let upstream_capacity = services
+            .upstream_http_sessions()
+            .expect("http upstream session store should exist")
             .lock()
             .expect("http upstream session store lock poisoned")
             .capacity();
@@ -671,8 +678,9 @@ mod tests {
             .lock()
             .expect("http downstream session store lock poisoned")
             .capacity();
-        let upstream_http3_capacity = state
-            .upstream_http3_sessions
+        let upstream_http3_capacity = services
+            .upstream_http3_sessions()
+            .expect("http3 upstream session store should exist")
             .lock()
             .expect("http3 upstream session store lock poisoned")
             .capacity();
@@ -723,17 +731,20 @@ mod tests {
             },
         );
 
+        let services = state.runtime_services.as_ref();
         assert_eq!(
-            state
-                .tls_session_cache
+            services
+                .tls_session_cache()
+                .expect("tls session cache should exist")
                 .lock()
                 .expect("tls session cache lock poisoned")
                 .capacity(),
             8
         );
         assert_eq!(
-            state
-                .upstream_http_sessions
+            services
+                .upstream_http_sessions()
+                .expect("http upstream session store should exist")
                 .lock()
                 .expect("http upstream session store lock poisoned")
                 .capacity(),
@@ -748,8 +759,9 @@ mod tests {
             4
         );
         assert_eq!(
-            state
-                .upstream_http3_sessions
+            services
+                .upstream_http3_sessions()
+                .expect("http3 upstream session store should exist")
                 .lock()
                 .expect("http3 upstream session store lock poisoned")
                 .capacity(),
