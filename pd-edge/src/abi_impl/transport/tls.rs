@@ -152,8 +152,7 @@ fn apply_cached_session(
             let mut guard = context.lock_transport();
             let flow = guard
                 .dynamic_tls_sessions
-                .entry(handle)
-                .or_insert_with(TlsFlowState::for_dynamic_socket);
+                .get_or_insert_with(handle, TlsFlowState::for_dynamic_socket);
             flow.mark_session_reused(&cached);
         }
         TlsSessionHandle::OutboundExchange(handle) => {
@@ -198,8 +197,7 @@ fn with_configurable_session_mut<T>(
             let io_present = guard.dynamic_tls_session_ios.contains_key(&handle);
             let flow = guard
                 .dynamic_tls_sessions
-                .entry(handle)
-                .or_insert_with(TlsFlowState::for_dynamic_socket);
+                .get_or_insert_with(handle, TlsFlowState::for_dynamic_socket);
             if flow.handshake_complete() || io_present {
                 return Err(VmError::HostError(format!(
                     "dynamic tls session handle {handle} is read-only after the handshake completes",
@@ -709,8 +707,7 @@ async fn session_from_socket(
                 .and_then(|state| state.target().map(str::to_string));
             let flow = guard
                 .dynamic_tls_sessions
-                .entry(handle)
-                .or_insert_with(TlsFlowState::for_dynamic_socket);
+                .get_or_insert_with(handle, TlsFlowState::for_dynamic_socket);
             if let Some(target) = target {
                 flow.observe_socket_target(&target);
             }
@@ -790,8 +787,7 @@ async fn session_handshake(
                 let mut guard = context.lock_transport();
                 let flow = guard
                     .dynamic_tls_sessions
-                    .entry(handle)
-                    .or_insert_with(TlsFlowState::for_dynamic_socket);
+                    .get_or_insert_with(handle, TlsFlowState::for_dynamic_socket);
                 flow.note_handshake_prepared();
                 flow.note_client_hello_sent();
             }

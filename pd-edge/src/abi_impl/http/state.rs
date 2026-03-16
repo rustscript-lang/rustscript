@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     future::Future,
+    hash::Hash,
     io,
     net::SocketAddr,
     pin::Pin,
@@ -1388,6 +1389,51 @@ impl ExchangeRegistry {
 }
 
 #[derive(Debug)]
+pub(crate) struct LazyHandleMap<K, V>(Option<HashMap<K, V>>);
+
+impl<K, V> LazyHandleMap<K, V>
+where
+    K: Eq + Hash,
+{
+    pub(crate) fn get(&self, key: &K) -> Option<&V> {
+        self.0.as_ref().and_then(|map| map.get(key))
+    }
+
+    pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.0.as_mut().and_then(|map| map.get_mut(key))
+    }
+
+    pub(crate) fn contains_key(&self, key: &K) -> bool {
+        self.0.as_ref().is_some_and(|map| map.contains_key(key))
+    }
+
+    pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
+        self.0.get_or_insert_with(HashMap::new).insert(key, value)
+    }
+
+    pub(crate) fn get_or_insert_with(
+        &mut self,
+        key: K,
+        default: impl FnOnce() -> V,
+    ) -> &mut V {
+        self.0
+            .get_or_insert_with(HashMap::new)
+            .entry(key)
+            .or_insert_with(default)
+    }
+
+    pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
+        self.0.as_mut().and_then(|map| map.remove(key))
+    }
+}
+
+impl<K, V> Default for LazyHandleMap<K, V> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct TransportState {
     pub(crate) tcp_dag: TcpTransportDag,
     pub(crate) tls_dag: TlsTransportDag,
@@ -1403,17 +1449,17 @@ pub(crate) struct TransportState {
     #[cfg(feature = "tls")]
     pub(crate) downstream_tls_io: Option<SharedServerTlsStreamIo>,
     pub(crate) next_tcp_stream_handle: i64,
-    pub(crate) tcp_streams: HashMap<i64, TcpSocketState>,
-    pub(crate) tcp_stream_ios: HashMap<i64, SharedTcpStreamIo>,
+    pub(crate) tcp_streams: LazyHandleMap<i64, TcpSocketState>,
+    pub(crate) tcp_stream_ios: LazyHandleMap<i64, SharedTcpStreamIo>,
     #[cfg(feature = "tls")]
-    pub(crate) dynamic_tls_sessions: HashMap<i64, TlsFlowState>,
+    pub(crate) dynamic_tls_sessions: LazyHandleMap<i64, TlsFlowState>,
     #[cfg(feature = "tls")]
-    pub(crate) dynamic_tls_session_ios: HashMap<i64, SharedTlsStreamIo>,
+    pub(crate) dynamic_tls_session_ios: LazyHandleMap<i64, SharedTlsStreamIo>,
     pub(crate) default_upstream_udp_socket: UdpSocketState,
     pub(crate) default_upstream_udp_io: Option<SharedUdpSocketIo>,
     pub(crate) next_udp_socket_handle: i64,
-    pub(crate) udp_sockets: HashMap<i64, UdpSocketState>,
-    pub(crate) udp_socket_ios: HashMap<i64, SharedUdpSocketIo>,
+    pub(crate) udp_sockets: LazyHandleMap<i64, UdpSocketState>,
+    pub(crate) udp_socket_ios: LazyHandleMap<i64, SharedUdpSocketIo>,
 }
 
 impl TransportState {
@@ -1437,17 +1483,17 @@ impl TransportState {
             #[cfg(feature = "tls")]
             downstream_tls_io: None,
             next_tcp_stream_handle: FIRST_DYNAMIC_TCP_STREAM_HANDLE,
-            tcp_streams: HashMap::new(),
-            tcp_stream_ios: HashMap::new(),
+            tcp_streams: LazyHandleMap::default(),
+            tcp_stream_ios: LazyHandleMap::default(),
             #[cfg(feature = "tls")]
-            dynamic_tls_sessions: HashMap::new(),
+            dynamic_tls_sessions: LazyHandleMap::default(),
             #[cfg(feature = "tls")]
-            dynamic_tls_session_ios: HashMap::new(),
+            dynamic_tls_session_ios: LazyHandleMap::default(),
             default_upstream_udp_socket: UdpSocketState::default(),
             default_upstream_udp_io: None,
             next_udp_socket_handle: FIRST_DYNAMIC_UDP_SOCKET_HANDLE,
-            udp_sockets: HashMap::new(),
-            udp_socket_ios: HashMap::new(),
+            udp_sockets: LazyHandleMap::default(),
+            udp_socket_ios: LazyHandleMap::default(),
         }
     }
 
@@ -1474,17 +1520,17 @@ impl TransportState {
             #[cfg(feature = "tls")]
             downstream_tls_io: None,
             next_tcp_stream_handle: FIRST_DYNAMIC_TCP_STREAM_HANDLE,
-            tcp_streams: HashMap::new(),
-            tcp_stream_ios: HashMap::new(),
+            tcp_streams: LazyHandleMap::default(),
+            tcp_stream_ios: LazyHandleMap::default(),
             #[cfg(feature = "tls")]
-            dynamic_tls_sessions: HashMap::new(),
+            dynamic_tls_sessions: LazyHandleMap::default(),
             #[cfg(feature = "tls")]
-            dynamic_tls_session_ios: HashMap::new(),
+            dynamic_tls_session_ios: LazyHandleMap::default(),
             default_upstream_udp_socket: UdpSocketState::default(),
             default_upstream_udp_io: None,
             next_udp_socket_handle: FIRST_DYNAMIC_UDP_SOCKET_HANDLE,
-            udp_sockets: HashMap::new(),
-            udp_socket_ios: HashMap::new(),
+            udp_sockets: LazyHandleMap::default(),
+            udp_socket_ios: LazyHandleMap::default(),
         }
     }
 }
@@ -2111,8 +2157,7 @@ pub(crate) fn attach_outbound_exchange_tls_transport(
 
     let tls_flow = transport
         .dynamic_tls_sessions
-        .entry(session)
-        .or_insert_with(TlsFlowState::for_dynamic_socket);
+        .get_or_insert_with(session, TlsFlowState::for_dynamic_socket);
     if !tls_flow.handshake_complete() {
         tls_flow.observe_target(&target);
     }
