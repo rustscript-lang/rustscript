@@ -5,7 +5,11 @@ use tracing_subscriber::EnvFilter;
 
 static ANSI_ENABLED: OnceLock<bool> = OnceLock::new();
 
-pub fn init() -> Result<(), Box<dyn std::error::Error>> {
+pub fn init(enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if !enabled {
+        return Ok(());
+    }
+
     let ansi = detect_ansi();
     // let _ = ANSI_ENABLED.set(ansi && false);
     // temporarily disable ansi

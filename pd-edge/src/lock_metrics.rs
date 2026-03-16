@@ -3,7 +3,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::{
         Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -103,6 +103,7 @@ impl LockMetricCounter {
 }
 
 static LOCK_METRICS_ENABLED: OnceLock<bool> = OnceLock::new();
+static LOCK_METRICS_DISABLED: AtomicBool = AtomicBool::new(false);
 static LOCK_METRICS: [LockMetricCounter; LockMetricKey::COUNT] = [
     LockMetricCounter::new(),
     LockMetricCounter::new(),
@@ -211,7 +212,15 @@ impl<T> Drop for ProfiledRwLockWriteGuard<'_, T> {
     }
 }
 
+pub fn disable_collection() {
+    LOCK_METRICS_DISABLED.store(true, Ordering::Relaxed);
+}
+
 pub(crate) fn enabled() -> bool {
+    if LOCK_METRICS_DISABLED.load(Ordering::Relaxed) {
+        return false;
+    }
+
     *LOCK_METRICS_ENABLED.get_or_init(|| {
         env::var("PD_EDGE_LOCK_METRICS")
             .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))

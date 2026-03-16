@@ -12,9 +12,9 @@ use edge::{
     SharedState, SharedVmAsyncOps, VM_EPOCH_TICK_INTERVAL_MS, VmAsyncOpBridge, VmExecutionConfig,
     VmExecutionMode, VmInterruptConfig, apply_program_from_bytes,
     attach_http_plane_runtime_services, binary_version_report, binary_version_text,
-    compile_edge_source_file, enabled_feature_line, enter_edge_host_context_with_console,
-    init_logging, new_shared_vm_async_ops, register_console_http_plane_host_module,
-    spawn_active_control_plane_client,
+    compile_edge_source_file, disable_lock_metrics_collection, enabled_feature_line,
+    enter_edge_host_context_with_console, init_logging, new_shared_vm_async_ops,
+    register_console_http_plane_host_module, spawn_active_control_plane_client,
 };
 use tokio::{
     runtime::Handle,
@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    init_logging()?;
+    init_logging(!cli.disable_logging)?;
     info!("{}", binary_version_text(env!("CARGO_BIN_NAME")));
     info!("{}", enabled_feature_line());
 
@@ -54,7 +54,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         execution_mode: VmExecutionMode::Async,
     };
     let store_limits = cli.runtime_store_limits();
+    if cli.disable_metrics {
+        disable_lock_metrics_collection();
+    }
     let state = SharedState::new_with_store_limits(max_program_bytes, store_limits)
+        .with_metrics_collection_enabled(!cli.disable_metrics)
         .with_vm_execution_config(vm_execution);
     match vm_execution.interrupt {
         VmInterruptConfig::None => {}
@@ -125,6 +129,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CliArgs {
+    disable_logging: bool,
+    disable_metrics: bool,
     program_path: Option<PathBuf>,
     run_program: bool,
     program_args: Vec<String>,
@@ -172,6 +178,12 @@ where
             }
             "-h" | "--help" => return Ok(CliAction::Help),
             "-V" | "--version" => return Ok(CliAction::Version),
+            "--disable-logging" => {
+                cli.disable_logging = true;
+            }
+            "--disable-metrics" => {
+                cli.disable_metrics = true;
+            }
             "--program" => {
                 let value = next_arg_value("--program", &mut args)?;
                 cli.program_path = Some(PathBuf::from(value));
@@ -337,6 +349,8 @@ fn print_cli_help() {
         concat!(
             "Usage: pd-edge-console [options]\n\n",
             "Options:\n",
+            "  --disable-logging                         Disable tracing/log output\n",
+            "  --disable-metrics                         Disable telemetry and Prometheus metric collection\n",
             "  --program <PATH>                          Optional local program source/.vmbc to load at startup\n",
             "  --run                                     Load and execute --program once, then exit\n",
             "  --max-program-bytes <BYTES>               Max upload/program size in bytes (default: 1048576)\n",
@@ -770,6 +784,8 @@ mod tests {
         assert_eq!(
             *cli,
             CliArgs {
+                disable_logging: false,
+                disable_metrics: false,
                 program_path: Some(PathBuf::from("examples/demo.rss")),
                 run_program: false,
                 program_args: vec![],
@@ -791,6 +807,21 @@ mod tests {
                 control_plane_rpc_timeout_ms: Some(3400),
             }
         );
+    }
+
+    #[test]
+    fn parse_cli_args_from_parses_disable_flags() {
+        let action = parse_cli_args_from([
+            "--disable-logging".to_string(),
+            "--disable-metrics".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        let CliAction::Run(cli) = action else {
+            panic!("expected run action");
+        };
+        assert!(cli.disable_logging);
+        assert!(cli.disable_metrics);
     }
 
     #[test]

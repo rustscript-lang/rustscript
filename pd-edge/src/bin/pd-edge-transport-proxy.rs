@@ -7,8 +7,8 @@ use std::{
 use edge::{
     ActiveControlPlaneConfig, RuntimeStoreLimits, SharedState, VM_EPOCH_TICK_INTERVAL_MS,
     VmExecutionConfig, VmExecutionMode, VmInterruptConfig, binary_version_report,
-    binary_version_text, build_admin_app, enabled_feature_line, init_logging,
-    serve_transport_proxy, spawn_active_control_plane_client,
+    binary_version_text, build_admin_app, disable_lock_metrics_collection, enabled_feature_line,
+    init_logging, serve_transport_proxy, spawn_active_control_plane_client,
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    init_logging()?;
+    init_logging(!cli.disable_logging)?;
     info!("{}", binary_version_text(env!("CARGO_BIN_NAME")));
     info!("{}", enabled_feature_line());
 
@@ -71,7 +71,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         execution_mode: cli.vm_execution_mode.unwrap_or_default(),
     };
     let store_limits = cli.runtime_store_limits();
+    if cli.disable_metrics {
+        disable_lock_metrics_collection();
+    }
     let state = SharedState::new_with_store_limits(max_program_bytes, store_limits)
+        .with_metrics_collection_enabled(!cli.disable_metrics)
         .with_vm_execution_config(vm_execution);
     info!("vm execution mode={}", vm_execution.execution_mode.as_str());
     match vm_execution.interrupt {
@@ -136,6 +140,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CliArgs {
+    disable_logging: bool,
+    disable_metrics: bool,
     proxy_addr: Option<SocketAddr>,
     admin_addr: Option<SocketAddr>,
     max_program_bytes: Option<usize>,
@@ -178,6 +184,12 @@ where
         match arg.as_str() {
             "-h" | "--help" => return Ok(CliAction::Help),
             "-V" | "--version" => return Ok(CliAction::Version),
+            "--disable-logging" => {
+                cli.disable_logging = true;
+            }
+            "--disable-metrics" => {
+                cli.disable_metrics = true;
+            }
             "--control-plane-url" => {
                 cli.control_plane_url = Some(next_arg_value("--control-plane-url", &mut args)?);
             }
@@ -360,6 +372,8 @@ fn print_cli_help() {
         concat!(
             "Usage: pd-edge-transport-proxy [options]\n\n",
             "Options:\n",
+            "  --disable-logging                         Disable tracing/log output\n",
+            "  --disable-metrics                         Disable telemetry and Prometheus metric collection\n",
             "  --proxy-addr <ADDR>                       Transport/data-plane listen address (default: 0.0.0.0:8080)\n",
             "  --data-addr <ADDR>                        Alias for --proxy-addr\n",
             "  --admin-addr <ADDR>                       Admin endpoint listen address (default: 127.0.0.1:8081)\n",
@@ -540,6 +554,8 @@ mod tests {
         assert_eq!(
             *cli,
             CliArgs {
+                disable_logging: false,
+                disable_metrics: false,
                 proxy_addr: Some("127.0.0.1:7001".parse().expect("valid addr")),
                 admin_addr: Some("127.0.0.1:7002".parse().expect("valid addr")),
                 max_program_bytes: Some(2048),
@@ -560,6 +576,21 @@ mod tests {
                 control_plane_rpc_timeout_ms: Some(2500),
             }
         );
+    }
+
+    #[test]
+    fn parse_cli_args_from_parses_disable_flags() {
+        let action = parse_cli_args_from([
+            "--disable-logging".to_string(),
+            "--disable-metrics".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        let CliAction::Run(cli) = action else {
+            panic!("expected run action");
+        };
+        assert!(cli.disable_logging);
+        assert!(cli.disable_metrics);
     }
 
     #[test]

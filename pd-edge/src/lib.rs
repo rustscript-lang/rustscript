@@ -46,6 +46,7 @@ pub use debug_session::{
     new_debug_session_store, request_will_attach_debugger, run_debug_command,
     run_vm_with_optional_debugger, start_debug_session, stop_debug_session,
 };
+pub use lock_metrics::disable_collection as disable_lock_metrics_collection;
 pub use logging::init as init_logging;
 #[cfg(feature = "http3")]
 pub use runtime::serve_http3_proxy;

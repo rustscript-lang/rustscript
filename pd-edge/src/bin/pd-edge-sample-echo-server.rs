@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    init_logging()?;
+    init_logging(!cli.disable_logging)?;
     info!("{}", binary_version_text(env!("CARGO_BIN_NAME")));
     info!("{}", enabled_feature_line());
 
@@ -105,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CliArgs {
+    disable_logging: bool,
     tcp_addr: SocketAddr,
     udp_addr: SocketAddr,
     tls_addr: SocketAddr,
@@ -121,6 +122,7 @@ impl Default for CliArgs {
     fn default() -> Self {
         let config = SampleEchoServerConfig::default();
         Self {
+            disable_logging: false,
             tcp_addr: config.tcp_addr,
             udp_addr: config.udp_addr,
             tls_addr: config.tls_addr,
@@ -174,6 +176,9 @@ where
         match arg.as_str() {
             "-h" | "--help" => return Ok(CliAction::Help),
             "-V" | "--version" => return Ok(CliAction::Version),
+            "--disable-logging" => {
+                cli.disable_logging = true;
+            }
             "--tcp-addr" => {
                 cli.tcp_addr =
                     parse_socket_addr("--tcp-addr", &next_arg_value("--tcp-addr", &mut args)?)?;
@@ -257,6 +262,7 @@ fn print_cli_help() {
     eprintln!(concat!(
         "Usage: pd-edge-sample-echo-server [options]\n\n",
         "Options:\n",
+        "  --disable-logging                         Disable tracing/log output\n",
         "  --tcp-addr <ADDR>                        TCP echo listen address (default: 127.0.0.1:7001)\n",
         "  --udp-addr <ADDR>                        UDP echo listen address (default: 127.0.0.1:7002)\n",
         "  --tls-addr <ADDR>                        TLS echo listen address (default: 127.0.0.1:7003)\n",
@@ -300,6 +306,7 @@ mod tests {
     #[test]
     fn parse_cli_args_from_parses_custom_addresses() {
         let action = parse_cli_args_from([
+            "--disable-logging".to_string(),
             "--tcp-addr".to_string(),
             "127.0.0.1:9101".to_string(),
             "--udp-addr".to_string(),
@@ -326,6 +333,7 @@ mod tests {
         let CliAction::Run(cli) = action else {
             panic!("expected run action");
         };
+        assert!(cli.disable_logging);
         assert_eq!(
             cli.tcp_addr,
             "127.0.0.1:9101".parse::<SocketAddr>().expect("valid addr")

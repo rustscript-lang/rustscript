@@ -150,6 +150,7 @@ pub struct SharedState {
     pub(crate) runtime_services: SharedRuntimeServices,
     pub debug_session: SharedDebugSession,
     pub vm_execution: VmExecutionConfig,
+    metrics_collection_enabled: bool,
     runtime_metrics: Arc<RuntimeMetrics>,
 }
 
@@ -243,6 +244,7 @@ impl SharedState {
             runtime_services,
             debug_session: new_debug_session_store(),
             vm_execution: VmExecutionConfig::default(),
+            metrics_collection_enabled: true,
             runtime_metrics: Arc::new(RuntimeMetrics::default()),
         }
     }
@@ -256,13 +258,28 @@ impl SharedState {
         self
     }
 
+    pub fn with_metrics_collection_enabled(mut self, enabled: bool) -> Self {
+        self.metrics_collection_enabled = enabled;
+        self
+    }
+
+    pub fn metrics_collection_enabled(&self) -> bool {
+        self.metrics_collection_enabled
+    }
+
     pub fn record_data_plane_request(&self) {
+        if !self.metrics_collection_enabled {
+            return;
+        }
         self.runtime_metrics
             .data_requests_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_data_plane_status(&self, status: u16) {
+        if !self.metrics_collection_enabled {
+            return;
+        }
         let metrics = &self.runtime_metrics;
         match status {
             200..=299 => {
@@ -282,47 +299,71 @@ impl SharedState {
     }
 
     pub fn record_data_plane_latency_ms(&self, total_latency_ms: u64, upstream_latency_ms: u64) {
+        if !self.metrics_collection_enabled {
+            return;
+        }
         self.runtime_metrics
             .record_latency_ms(total_latency_ms, upstream_latency_ms);
     }
 
     pub fn record_vm_execution_error(&self) {
+        if !self.metrics_collection_enabled {
+            return;
+        }
         self.runtime_metrics
             .vm_execution_errors_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_program_apply_success(&self) {
+        if !self.metrics_collection_enabled {
+            return;
+        }
         self.runtime_metrics
             .program_apply_success_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_program_apply_failure(&self) {
+        if !self.metrics_collection_enabled {
+            return;
+        }
         self.runtime_metrics
             .program_apply_failure_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_control_rpc_poll_success(&self) {
+        if !self.metrics_collection_enabled {
+            return;
+        }
         self.runtime_metrics
             .control_rpc_polls_success_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_control_rpc_poll_error(&self) {
+        if !self.metrics_collection_enabled {
+            return;
+        }
         self.runtime_metrics
             .control_rpc_polls_error_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_control_rpc_result_success(&self) {
+        if !self.metrics_collection_enabled {
+            return;
+        }
         self.runtime_metrics
             .control_rpc_results_success_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_control_rpc_result_error(&self) {
+        if !self.metrics_collection_enabled {
+            return;
+        }
         self.runtime_metrics
             .control_rpc_results_error_total
             .fetch_add(1, Ordering::Relaxed);
@@ -382,11 +423,33 @@ impl SharedState {
                 .runtime_metrics
                 .control_rpc_results_error_total
                 .load(Ordering::Relaxed),
-            lock_metrics: lock_metrics::snapshot(),
+            lock_metrics: if self.metrics_collection_enabled {
+                lock_metrics::snapshot()
+            } else {
+                vec![]
+            },
         }
     }
 
     pub fn traffic_sample(&self) -> EdgeTrafficSample {
+        if !self.metrics_collection_enabled {
+            return EdgeTrafficSample {
+                requests_total: 0,
+                status_2xx_total: 0,
+                status_3xx_total: 0,
+                status_4xx_total: 0,
+                status_5xx_total: 0,
+                latency_p50_ms: 0,
+                latency_p90_ms: 0,
+                latency_p99_ms: 0,
+                upstream_latency_p50_ms: 0,
+                upstream_latency_p90_ms: 0,
+                upstream_latency_p99_ms: 0,
+                edge_latency_p50_ms: 0,
+                edge_latency_p90_ms: 0,
+                edge_latency_p99_ms: 0,
+            };
+        }
         let latencies = self.runtime_metrics.take_latency_percentiles_ms();
         EdgeTrafficSample {
             requests_total: self
@@ -422,6 +485,9 @@ impl SharedState {
     }
 
     pub async fn metrics_text(&self) -> String {
+        if !self.metrics_collection_enabled {
+            return "# metrics collection disabled\n".to_string();
+        }
         let telemetry = self.telemetry_snapshot().await;
         let debug_active = if telemetry.debug_session_active { 1 } else { 0 };
         let debug_attached = if telemetry.debug_session_attached {
@@ -777,6 +843,44 @@ mod tests {
                 .expect("http3 downstream session store lock poisoned")
                 .capacity(),
             5
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_state_can_disable_metrics_collection() {
+        let state = SharedState::new(1024).with_metrics_collection_enabled(false);
+
+        state.record_data_plane_request();
+        state.record_data_plane_status(204);
+        state.record_data_plane_latency_ms(12, 7);
+        state.record_vm_execution_error();
+        state.record_program_apply_success();
+        state.record_program_apply_failure();
+        state.record_control_rpc_poll_success();
+        state.record_control_rpc_poll_error();
+        state.record_control_rpc_result_success();
+        state.record_control_rpc_result_error();
+
+        let telemetry = state.telemetry_snapshot().await;
+        assert_eq!(telemetry.data_requests_total, 0);
+        assert_eq!(telemetry.vm_execution_errors_total, 0);
+        assert_eq!(telemetry.program_apply_success_total, 0);
+        assert_eq!(telemetry.program_apply_failure_total, 0);
+        assert_eq!(telemetry.control_rpc_polls_success_total, 0);
+        assert_eq!(telemetry.control_rpc_polls_error_total, 0);
+        assert_eq!(telemetry.control_rpc_results_success_total, 0);
+        assert_eq!(telemetry.control_rpc_results_error_total, 0);
+        assert!(telemetry.lock_metrics.is_empty());
+
+        let traffic = state.traffic_sample();
+        assert_eq!(traffic.requests_total, 0);
+        assert_eq!(traffic.status_2xx_total, 0);
+        assert_eq!(traffic.latency_p50_ms, 0);
+        assert_eq!(traffic.edge_latency_p99_ms, 0);
+
+        assert_eq!(
+            state.metrics_text().await,
+            "# metrics collection disabled\n"
         );
     }
 }
