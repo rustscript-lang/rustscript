@@ -148,12 +148,12 @@ pub(crate) fn tune_udp_socket_buffers(socket: &std::net::UdpSocket) -> io::Resul
 #[cfg(feature = "http3")]
 fn default_quic_transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(
-        quinn::VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS).into(),
-    );
     transport
-        .stream_receive_window(quinn::VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW_BYTES).into());
-    transport.receive_window(quinn::VarInt::from_u32(QUIC_CONNECTION_RECEIVE_WINDOW_BYTES).into());
+        .max_concurrent_bidi_streams(quinn::VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS));
+    transport.stream_receive_window(quinn::VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW_BYTES));
+    transport.receive_window(quinn::VarInt::from_u32(
+        QUIC_CONNECTION_RECEIVE_WINDOW_BYTES,
+    ));
     transport.send_window(QUIC_SEND_WINDOW_BYTES);
     transport.keep_alive_interval(Some(std::time::Duration::from_millis(
         QUIC_KEEPALIVE_INTERVAL_MS,

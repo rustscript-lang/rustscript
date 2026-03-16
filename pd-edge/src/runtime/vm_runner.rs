@@ -212,11 +212,7 @@ async fn run_vm_async(
             );
             if debug.attach_debugger {
                 let vm_context = vm_store.data().vm_context.clone();
-                run_vm_with_optional_debugger(
-                    &debug_session,
-                    vm_context,
-                    vm_store.vm_mut(),
-                )
+                run_vm_with_optional_debugger(&debug_session, vm_context, vm_store.vm_mut())
             } else {
                 vm_store.run()
             }
@@ -267,11 +263,7 @@ fn run_vm_threading(
             );
             if debug.attach_debugger {
                 let vm_context = vm_store.data().vm_context.clone();
-                run_vm_with_optional_debugger(
-                    &debug_session,
-                    vm_context,
-                    vm_store.vm_mut(),
-                )
+                run_vm_with_optional_debugger(&debug_session, vm_context, vm_store.vm_mut())
             } else {
                 vm_store.run()
             }

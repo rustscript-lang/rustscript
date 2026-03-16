@@ -40,6 +40,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn get(&mut self, key: &K) -> Option<&V> {
         if !self.values.contains_key(key) {
             return None;
@@ -124,6 +125,7 @@ where
         self.values.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
@@ -139,7 +141,6 @@ pub(crate) struct ShardedRwLruStore<K, V>
 where
     K: Clone + Eq + Hash,
 {
-    capacity: usize,
     shards: Box<[RwLock<BoundedLruStore<K, V>>]>,
 }
 
@@ -158,7 +159,7 @@ where
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        Self { capacity, shards }
+        Self { shards }
     }
 
     pub(crate) fn peek_cloned(
@@ -219,7 +220,15 @@ where
 
     #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
-        self.capacity
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .read()
+                    .expect("sharded lru store lock poisoned")
+                    .capacity
+            })
+            .sum()
     }
 
     #[cfg(test)]

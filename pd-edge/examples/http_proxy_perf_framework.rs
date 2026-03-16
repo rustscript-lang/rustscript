@@ -807,17 +807,29 @@ struct ProxyProcess {
     child: Child,
 }
 
+struct ProxyProcessConfig<'a> {
+    binary_path: &'a Path,
+    data_addr: SocketAddr,
+    https_addr: Option<SocketAddr>,
+    http3_addr: Option<SocketAddr>,
+    admin_addr: SocketAddr,
+    vm_fuel: Option<u64>,
+    vm_fuel_check_interval: u32,
+    vm_execution_mode: VmExecutionModeArg,
+}
+
 impl ProxyProcess {
-    fn spawn(
-        binary_path: &Path,
-        data_addr: SocketAddr,
-        https_addr: Option<SocketAddr>,
-        http3_addr: Option<SocketAddr>,
-        admin_addr: SocketAddr,
-        vm_fuel: Option<u64>,
-        vm_fuel_check_interval: u32,
-        vm_execution_mode: VmExecutionModeArg,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    fn spawn(config: ProxyProcessConfig<'_>) -> Result<Self, Box<dyn std::error::Error>> {
+        let ProxyProcessConfig {
+            binary_path,
+            data_addr,
+            https_addr,
+            http3_addr,
+            admin_addr,
+            vm_fuel,
+            vm_fuel_check_interval,
+            vm_execution_mode,
+        } = config;
         let rust_log = env::var("PD_EDGE_PROXY_RUST_LOG").unwrap_or_else(|_| "error".to_string());
         let inherit_stdout = env_flag("PD_EDGE_PROXY_STDOUT_INHERIT");
         let mut command = Command::new(binary_path);
@@ -1599,16 +1611,16 @@ async fn run_scenario(
             None
         };
         let admin_addr = reserve_loopback_addr()?;
-        let mut proxy = ProxyProcess::spawn(
+        let mut proxy = ProxyProcess::spawn(ProxyProcessConfig {
             binary_path,
             data_addr,
             https_addr,
             http3_addr,
             admin_addr,
-            config.vm_fuel,
-            config.vm_fuel_check_interval,
-            config.vm_execution_mode,
-        )?;
+            vm_fuel: config.vm_fuel,
+            vm_fuel_check_interval: config.vm_fuel_check_interval,
+            vm_execution_mode: config.vm_execution_mode,
+        })?;
 
         wait_until_proxy_ready(
             &clients.http,
@@ -2357,7 +2369,7 @@ impl BenchmarkUpstreamResponse {
         response
     }
 
-    fn into_http3_head(&self) -> HyperResponse<()> {
+    fn to_http3_head(&self) -> HyperResponse<()> {
         let mut response = HyperResponse::builder()
             .status(HttpStatusCode::OK)
             .body(())
@@ -2518,15 +2530,15 @@ fn build_http3_bench_client_config() -> quinn::ClientConfig {
 #[cfg(feature = "http3")]
 fn build_http3_transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(
-        quinn::VarInt::from_u32(BENCH_HTTP3_MAX_CONCURRENT_BIDI_STREAMS).into(),
-    );
-    transport.stream_receive_window(
-        quinn::VarInt::from_u32(BENCH_HTTP3_STREAM_RECEIVE_WINDOW_BYTES).into(),
-    );
-    transport.receive_window(
-        quinn::VarInt::from_u32(BENCH_HTTP3_CONNECTION_RECEIVE_WINDOW_BYTES).into(),
-    );
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(
+        BENCH_HTTP3_MAX_CONCURRENT_BIDI_STREAMS,
+    ));
+    transport.stream_receive_window(quinn::VarInt::from_u32(
+        BENCH_HTTP3_STREAM_RECEIVE_WINDOW_BYTES,
+    ));
+    transport.receive_window(quinn::VarInt::from_u32(
+        BENCH_HTTP3_CONNECTION_RECEIVE_WINDOW_BYTES,
+    ));
     transport.send_window(BENCH_HTTP3_SEND_WINDOW_BYTES);
     transport.keep_alive_interval(Some(Duration::from_millis(
         BENCH_HTTP3_KEEPALIVE_INTERVAL_MS,
@@ -2687,7 +2699,7 @@ async fn write_http3_bench_response(
 ) {
     let body = response.body.clone();
     stream
-        .send_response(response.into_http3_head())
+        .send_response(response.to_http3_head())
         .await
         .expect("http3 upstream benchmark response head should send");
     if !body.is_empty() {

@@ -347,12 +347,9 @@ pub fn run_vm_with_optional_debugger(
     };
 
     if let Some(session) = session {
-        let matched = context
-            .with_request_head(|request_head| request_matches_session(
-                request_head.headers(),
-                request_head.path(),
-                &session,
-            ));
+        let matched = context.with_request_head(|request_head| {
+            request_matches_session(request_head.headers(), request_head.path(), &session)
+        });
         if !matched {
             return vm.run();
         }
