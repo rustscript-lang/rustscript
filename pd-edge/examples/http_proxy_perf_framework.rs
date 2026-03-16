@@ -177,70 +177,62 @@ fn proxy_roundtrip_program_source(
 let session = tls::session::from_socket(upstream);
 tls::session::set_verify(session, false);
 tls::session::set_alpn(session, "h2,http/1.1");
-http::exchange::set_version(upstream, "2");
 "#
     } else {
         ""
     };
-    let tls_response_headers = if upstream_protocol.requires_http2_tls() {
-        r#"
-http::response::set_header("x-upstream-alpn", tls::session::get_alpn(session));
-"#
-    } else {
-        ""
-    };
-    let extra_upstream_header = match flavor {
+    let version_preference = upstream_protocol.label();
+    let batched_upstream_headers = match flavor {
         ProxyProgramFlavor::HeaderTransform => {
-            r#"http::exchange::set_header(upstream, "x-bench-program-header", "program-proxy");"#
+            r#"["x-downstream-version", downstream_version, "x-bench-program-header", "program-proxy"]"#
                 .to_string()
         }
     };
-    let extra_response_headers = match flavor {
-        ProxyProgramFlavor::HeaderTransform => r#"
-http::response::set_header("x-bench-response-header", "program-proxy");
-http::response::set_header("x-upstream-program-header", echoed_program_header);
-"#
+    let batched_response_headers = match flavor {
+        ProxyProgramFlavor::HeaderTransform => r#"[
+    "x-downstream-version", downstream_version,
+    "x-bench-response-header", "program-proxy"
+]"#
         .to_string(),
+    };
+    let response_header_program = if upstream_protocol.requires_http2_tls() {
+        format!(
+            r#"
+let downstream = proxy::stream::downstream();
+let upstream_stream = proxy::stream::exchange(upstream);
+proxy::forward(downstream, upstream_stream);
+http::response::set_headers({batched_response_headers});
+http::response::set_header("x-upstream-alpn", tls::session::get_alpn(session));
+"#
+        )
+    } else {
+        format!(
+            r#"
+let downstream = proxy::stream::downstream();
+let upstream_stream = proxy::stream::exchange(upstream);
+proxy::forward(downstream, upstream_stream);
+http::response::set_headers({batched_response_headers});
+"#
+        )
     };
     format!(
         r#"
 {BASE_WORKLOAD_SOURCE}
 
 use http;
+use proxy;
 {tls_import}
 
-let method = http::request::get_method();
-let path = http::request::get_path();
-let client_id = http::request::get_header("x-client-id");
 let downstream_version = http::request::get_http_version();
-let body = http::request::get_body();
 
-let upstream = http::exchange::default_upstream();
-http::exchange::set_target(upstream, "{upstream_origin}");
-http::exchange::set_method(upstream, method);
-http::exchange::set_path(upstream, path);
-http::exchange::set_header(upstream, "x-client-id", client_id);
-http::exchange::set_header(upstream, "x-downstream-version", downstream_version);
-{extra_upstream_header}
-http::exchange::set_body(upstream, body);
+let upstream = http::exchange::prepare_default_upstream(
+    "{upstream_origin}",
+    "{version_preference}",
+    {batched_upstream_headers}
+);
 {tls_prelude}
 
-let upstream_status = http::exchange::get_status(upstream);
-let upstream_version = http::exchange::get_http_version(upstream);
-let echoed_client_id = http::exchange::get_header(upstream, "x-bench-upstream-client-id");
-let echoed_path = http::exchange::get_header(upstream, "x-bench-upstream-path");
-let echoed_program_header = http::exchange::get_header(upstream, "x-bench-upstream-program-header");
-let upstream_body = http::exchange::get_body(upstream);
-
-http::response::set_status(upstream_status);
-http::response::set_header("x-downstream-version", downstream_version);
-http::response::set_header("x-perf-client-id", client_id);
-http::response::set_header("x-upstream-version", upstream_version);
-http::response::set_header("x-upstream-client-id", echoed_client_id);
-http::response::set_header("x-upstream-path", echoed_path);
-{extra_response_headers}
-{tls_response_headers}
-http::response::set_body(upstream_body);
+{response_header_program}
 "#
     )
 }
@@ -336,7 +328,7 @@ const SCENARIOS: [Scenario; 8] = [
     },
     Scenario {
         id: "host_calls_upstream_roundtrip",
-        description: "pd-edge-http-proxy with program proxying to hardcoded plaintext HTTP upstream and request/response header mutations",
+        description: "pd-edge-http-proxy with program proxying inherited downstream request to hardcoded plaintext HTTP upstream and request/response header mutations",
         expected_status: 200,
         program_variant: ProgramVariant::ProxyRoundTrip {
             flavor: ProxyProgramFlavor::HeaderTransform,
@@ -355,7 +347,7 @@ const SCENARIOS: [Scenario; 8] = [
     },
     Scenario {
         id: "host_calls_upstream_roundtrip_http2_upstream",
-        description: "pd-edge-http-proxy with program proxying to hardcoded HTTPS HTTP/2 upstream while downstream stays plaintext HTTP/1.1",
+        description: "pd-edge-http-proxy with program proxying inherited downstream request to hardcoded HTTPS HTTP/2 upstream while downstream stays plaintext HTTP/1.1",
         expected_status: 200,
         program_variant: ProgramVariant::ProxyRoundTrip {
             flavor: ProxyProgramFlavor::HeaderTransform,
@@ -365,7 +357,7 @@ const SCENARIOS: [Scenario; 8] = [
     },
     Scenario {
         id: "host_calls_upstream_roundtrip_downstream_http2",
-        description: "pd-edge-http-proxy with program proxying to hardcoded plaintext HTTP upstream while downstream uses HTTPS HTTP/2",
+        description: "pd-edge-http-proxy with program proxying inherited downstream request to hardcoded plaintext HTTP upstream while downstream uses HTTPS HTTP/2",
         expected_status: 200,
         program_variant: ProgramVariant::ProxyRoundTrip {
             flavor: ProxyProgramFlavor::HeaderTransform,
@@ -1502,37 +1494,28 @@ fn verify_proxy_roundtrip_probe_response(
         .into());
     }
     if scenario.expects_header_transform()
-        && probe_header(response, "x-upstream-program-header") != "program-proxy"
+        && probe_header(response, "x-bench-upstream-program-header") != "program-proxy"
     {
         return Err(io::Error::other(format!(
-            "header-transform probe missing expected x-upstream-program-header: got '{}'",
-            probe_header(response, "x-upstream-program-header")
-        ))
-        .into());
-    }
-    if scenario.expects_header_transform()
-        && probe_header(response, "x-perf-client-id") != expected_client_id
-    {
-        return Err(io::Error::other(format!(
-            "header-transform probe missing expected x-perf-client-id: got '{}'",
-            probe_header(response, "x-perf-client-id")
+            "header-transform probe missing expected x-bench-upstream-program-header: got '{}'",
+            probe_header(response, "x-bench-upstream-program-header")
         ))
         .into());
     }
 
-    let upstream_client_id = probe_header(response, "x-upstream-client-id");
+    let upstream_client_id = probe_header(response, "x-bench-upstream-client-id");
     if upstream_client_id != expected_client_id {
         return Err(io::Error::other(format!(
-            "probe missing expected x-upstream-client-id header: got '{}'",
+            "probe missing expected x-bench-upstream-client-id header: got '{}'",
             upstream_client_id
         ))
         .into());
     }
 
-    let upstream_path = probe_header(response, "x-upstream-path");
+    let upstream_path = probe_header(response, "x-bench-upstream-path");
     if upstream_path != expected_path {
         return Err(io::Error::other(format!(
-            "probe missing expected x-upstream-path header: got '{}'",
+            "probe missing expected x-bench-upstream-path header: got '{}'",
             upstream_path
         ))
         .into());
@@ -1542,10 +1525,10 @@ fn verify_proxy_roundtrip_probe_response(
         .upstream_protocol()
         .map(UpstreamProtocol::label)
         .unwrap_or_default();
-    let upstream_version = probe_header(response, "x-upstream-version");
+    let upstream_version = probe_header(response, "x-bench-upstream-http-version");
     if !expected_upstream_version.is_empty() && upstream_version != expected_upstream_version {
         return Err(io::Error::other(format!(
-            "probe missing expected x-upstream-version {}: got '{}'",
+            "probe missing expected x-bench-upstream-http-version {}: got '{}'",
             expected_upstream_version, upstream_version
         ))
         .into());
