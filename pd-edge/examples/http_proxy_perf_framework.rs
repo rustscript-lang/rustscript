@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     env, fs, io,
-    net::{SocketAddr, TcpListener},
+    net::{SocketAddr, TcpListener, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -12,44 +12,70 @@ use std::{
 };
 
 use edge::HOST_FUNCTION_COUNT;
+#[cfg(feature = "http3")]
+use futures_util::future::poll_fn;
 use http_body_util::{BodyExt, Full};
 use hyper::{
     Request as HyperRequest,
     Response as HyperResponse,
     body::{Bytes, Incoming},
-    http::HeaderValue,
+    http::{HeaderMap, HeaderValue, StatusCode as HttpStatusCode, Version as HttpVersion},
     service::service_fn,
 };
 use hyper_util::rt::TokioIo;
 #[cfg(all(feature = "http2", feature = "tls"))]
 use rcgen::generate_simple_self_signed;
-use reqwest::{Client, StatusCode, Version as ReqwestVersion};
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
+use socket2::SockRef;
 use tokio::{
+    sync::Mutex as AsyncMutex,
     task::{JoinHandle, JoinSet},
     time::sleep,
 };
+#[cfg(feature = "http3")]
+use tokio::net::lookup_host;
 #[cfg(all(feature = "http2", feature = "tls"))]
-use tokio_rustls::{
-    TlsAcceptor,
-    rustls::{
-        ServerConfig,
-        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
-    },
-};
+use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
+#[cfg(all(feature = "http2", feature = "tls", not(feature = "http3")))]
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+#[cfg(feature = "http3")]
+use url::Url;
 use vm::{compile_source, encode_program, validate_program};
+
+#[cfg(feature = "http3")]
+use rustls::{
+    self,
+    ClientConfig as RustlsClientConfig, RootCertStore, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
+};
 
 const LOAD_REQUEST_BODY: &str = "edge-perf-payload";
 const BENCH_TLS_SESSION_REUSE_ENTRIES: usize = 128;
 const BENCH_UPSTREAM_HTTP_REUSE_ENTRIES: usize = 128;
 const BENCH_DOWNSTREAM_HTTP2_SESSION_ENTRIES: usize = 128;
+const BENCH_UPSTREAM_HTTP3_REUSE_ENTRIES: usize = 128;
+const BENCH_DOWNSTREAM_HTTP3_SESSION_ENTRIES: usize = 128;
+const BENCH_HTTP3_CLIENT_POOL_MAX: usize = 8;
+const BENCH_HTTP3_SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const BENCH_HTTP3_STREAM_RECEIVE_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
+const BENCH_HTTP3_CONNECTION_RECEIVE_WINDOW_BYTES: u32 = 32 * 1024 * 1024;
+const BENCH_HTTP3_SEND_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+const BENCH_HTTP3_KEEPALIVE_INTERVAL_MS: u64 = 5_000;
+const BENCH_HTTP3_MAX_CONCURRENT_BIDI_STREAMS: u32 = 1024;
 const HTTP2_TLS_FEATURE_HINT: &str =
     "HTTP/2 benchmark scenarios require running the example with --features http2,tls";
+const HTTP3_TLS_FEATURE_HINT: &str =
+    "HTTP/3 benchmark scenarios require running the example with --features http3,tls";
 
-#[cfg(all(feature = "http2", feature = "tls"))]
+#[cfg(any(all(feature = "http2", feature = "tls"), feature = "http3"))]
 fn ensure_rustls_provider() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
+        #[cfg(feature = "http3")]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        #[cfg(all(not(feature = "http3"), feature = "http2", feature = "tls"))]
         let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
 }
@@ -117,6 +143,7 @@ http::response::set_body("");
 enum UpstreamProtocol {
     Http1,
     HttpsHttp2,
+    HttpsHttp3,
 }
 
 impl UpstreamProtocol {
@@ -124,11 +151,20 @@ impl UpstreamProtocol {
         match self {
             Self::Http1 => "1.1",
             Self::HttpsHttp2 => "2",
+            Self::HttpsHttp3 => "3",
         }
     }
 
     fn requires_http2_tls(self) -> bool {
         matches!(self, Self::HttpsHttp2)
+    }
+
+    fn requires_http3_tls(self) -> bool {
+        matches!(self, Self::HttpsHttp3)
+    }
+
+    fn requires_tls(self) -> bool {
+        !matches!(self, Self::Http1)
     }
 }
 
@@ -136,6 +172,7 @@ impl UpstreamProtocol {
 enum DownstreamProtocol {
     Http1,
     HttpsHttp2,
+    HttpsHttp3,
 }
 
 impl DownstreamProtocol {
@@ -143,11 +180,16 @@ impl DownstreamProtocol {
         match self {
             Self::Http1 => "1.1",
             Self::HttpsHttp2 => "2",
+            Self::HttpsHttp3 => "3",
         }
     }
 
     fn requires_http2_tls(self) -> bool {
         matches!(self, Self::HttpsHttp2)
+    }
+
+    fn requires_http3_tls(self) -> bool {
+        matches!(self, Self::HttpsHttp3)
     }
 }
 
@@ -187,19 +229,26 @@ fn proxy_roundtrip_program_source(
     upstream_protocol: UpstreamProtocol,
     flavor: ProxyProgramFlavor,
 ) -> String {
-    let tls_import = if upstream_protocol.requires_http2_tls() {
+    let tls_import = if upstream_protocol.requires_tls() {
         "use tls;\n"
     } else {
         ""
     };
-    let tls_prelude = if upstream_protocol.requires_http2_tls() {
-        r#"
+    let tls_prelude = match upstream_protocol {
+        UpstreamProtocol::Http1 => "",
+        UpstreamProtocol::HttpsHttp2 => {
+            r#"
 let session = tls::session::from_socket(upstream);
 tls::session::set_verify(session, false);
 tls::session::set_alpn(session, "h2,http/1.1");
 "#
-    } else {
-        ""
+        }
+        UpstreamProtocol::HttpsHttp3 => {
+            r#"
+let session = tls::session::from_socket(upstream);
+tls::session::set_verify(session, false);
+"#
+        }
     };
     let version_preference = upstream_protocol.label();
     let batched_upstream_headers = match flavor {
@@ -215,7 +264,7 @@ tls::session::set_alpn(session, "h2,http/1.1");
 ]"#
         .to_string(),
     };
-    let response_header_program = if upstream_protocol.requires_http2_tls() {
+    let response_header_program = if upstream_protocol.requires_tls() {
         format!(
             r#"
 let downstream = proxy::stream::downstream();
@@ -312,8 +361,16 @@ impl Scenario {
                 .is_some_and(UpstreamProtocol::requires_http2_tls)
     }
 
+    fn requires_http3_tls(self) -> bool {
+        self.downstream_protocol.requires_http3_tls()
+            || self
+                .upstream_protocol()
+                .is_some_and(UpstreamProtocol::requires_http3_tls)
+    }
+
     fn supports_current_build(self) -> bool {
-        !self.requires_http2_tls() || cfg!(all(feature = "http2", feature = "tls"))
+        (!self.requires_http2_tls() || cfg!(all(feature = "http2", feature = "tls")))
+            && (!self.requires_http3_tls() || cfg!(all(feature = "http3", feature = "tls")))
     }
 
     fn expects_header_transform(self) -> bool {
@@ -327,7 +384,7 @@ impl Scenario {
     }
 }
 
-const SCENARIOS: [Scenario; 11] = [
+const SCENARIOS: [Scenario; 13] = [
     Scenario {
         id: "raw_no_program",
         description: "raw pd-edge-http-proxy (no program loaded)",
@@ -433,6 +490,27 @@ const SCENARIOS: [Scenario; 11] = [
             body_mode: RequestBodyMode::HeadersOnly,
         },
         downstream_protocol: DownstreamProtocol::HttpsHttp2,
+    },
+    Scenario {
+        id: "raw_http3_upstream",
+        description: "perf client hits hardcoded HTTPS HTTP/3 upstream directly (headers only, no body read)",
+        expected_status: 200,
+        program_variant: ProgramVariant::DirectUpstream {
+            upstream: UpstreamProtocol::HttpsHttp3,
+            body_mode: RequestBodyMode::HeadersOnly,
+        },
+        downstream_protocol: DownstreamProtocol::HttpsHttp3,
+    },
+    Scenario {
+        id: "http3->http3",
+        description: "pd-edge-http-proxy with downstream HTTPS HTTP/3 and upstream HTTPS HTTP/3 (header-only upstream response)",
+        expected_status: 200,
+        program_variant: ProgramVariant::ProxyRoundTrip {
+            flavor: ProxyProgramFlavor::HeaderTransform,
+            upstream: UpstreamProtocol::HttpsHttp3,
+            body_mode: RequestBodyMode::HeadersOnly,
+        },
+        downstream_protocol: DownstreamProtocol::HttpsHttp3,
     },
 ];
 
@@ -651,11 +729,55 @@ struct BenchClients {
     https: Client,
 }
 
+#[derive(Clone)]
+struct ReqwestScenarioClient {
+    client: Client,
+    origin: String,
+}
+
+#[cfg(feature = "http3")]
+type Http3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
+#[cfg(feature = "http3")]
+type Http3Driver = h3::client::Connection<h3_quinn::Connection, Bytes>;
+#[cfg(feature = "http3")]
+type Http3BenchSendStream =
+    h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
+#[cfg(feature = "http3")]
+type Http3BenchRecvStream = h3::server::RequestStream<h3_quinn::RecvStream, Bytes>;
+
+#[derive(Clone)]
+enum ScenarioHttpClient {
+    Reqwest(ReqwestScenarioClient),
+    #[cfg(feature = "http3")]
+    Http3(Arc<Http3BenchClient>),
+    #[cfg(feature = "http3")]
+    Http3Pool(Vec<Arc<Http3BenchClient>>),
+}
+
+#[cfg(feature = "http3")]
+struct Http3BenchClient {
+    _endpoint: quinn::Endpoint,
+    connection: quinn::Connection,
+    sender: AsyncMutex<Http3SendRequest>,
+    driver: Mutex<Option<JoinHandle<()>>>,
+    origin: String,
+    authority: String,
+    request_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchHttpVersion {
+    Http11,
+    Http2,
+    Http3,
+    Unknown,
+}
+
 #[derive(Debug)]
 struct ProbeResponse {
     status: u16,
-    version: ReqwestVersion,
-    headers: reqwest::header::HeaderMap,
+    version: BenchHttpVersion,
+    headers: HeaderMap,
     body: String,
 }
 
@@ -682,6 +804,7 @@ impl ProxyProcess {
         binary_path: &Path,
         data_addr: SocketAddr,
         https_addr: Option<SocketAddr>,
+        http3_addr: Option<SocketAddr>,
         admin_addr: SocketAddr,
         vm_fuel: Option<u64>,
         vm_fuel_check_interval: u32,
@@ -704,6 +827,10 @@ impl ProxyProcess {
             .arg(BENCH_UPSTREAM_HTTP_REUSE_ENTRIES.to_string())
             .arg("--downstream-http2-session-entries")
             .arg(BENCH_DOWNSTREAM_HTTP2_SESSION_ENTRIES.to_string())
+            .arg("--upstream-http3-reuse-entries")
+            .arg(BENCH_UPSTREAM_HTTP3_REUSE_ENTRIES.to_string())
+            .arg("--downstream-http3-session-entries")
+            .arg(BENCH_DOWNSTREAM_HTTP3_SESSION_ENTRIES.to_string())
             .arg("--admin-addr")
             .arg(admin_addr.to_string())
             .arg("--vm-execution-mode")
@@ -714,6 +841,9 @@ impl ProxyProcess {
             .stderr(Stdio::inherit());
         if let Some(https_addr) = https_addr {
             command.arg("--https-addr").arg(https_addr.to_string());
+        }
+        if let Some(http3_addr) = http3_addr {
+            command.arg("--http3-addr").arg(http3_addr.to_string());
         }
         if let Some(fuel) = vm_fuel {
             command.arg("--vm-fuel").arg(fuel.to_string());
@@ -758,10 +888,266 @@ fn build_bench_client(
     Ok(builder.build()?)
 }
 
-fn request_client_for_scenario(clients: &BenchClients, scenario: Scenario) -> &Client {
+impl BenchHttpVersion {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Http11 => "1.1",
+            Self::Http2 => "2",
+            Self::Http3 => "3",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn from_http(version: HttpVersion) -> Self {
+        match version {
+            HttpVersion::HTTP_11 => Self::Http11,
+            HttpVersion::HTTP_2 => Self::Http2,
+            #[allow(unreachable_patterns)]
+            HttpVersion::HTTP_3 => Self::Http3,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl ScenarioHttpClient {
+    fn for_worker(&self, worker_index: usize) -> Self {
+        match self {
+            Self::Reqwest(client) => Self::Reqwest(client.clone()),
+            #[cfg(feature = "http3")]
+            Self::Http3(client) => Self::Http3(client.clone()),
+            #[cfg(feature = "http3")]
+            Self::Http3Pool(pool) => {
+                let client = pool[worker_index % pool.len()].clone();
+                Self::Http3(client)
+            }
+        }
+    }
+
+    async fn send_request(
+        &self,
+        path: &str,
+        client_id: &str,
+        body_mode: RequestBodyMode,
+    ) -> Result<ProbeResponse, Box<dyn std::error::Error>> {
+        match self {
+            Self::Reqwest(client) => client.send_request(path, client_id, body_mode).await,
+            #[cfg(feature = "http3")]
+            Self::Http3(client) => client.send_request(path, client_id, body_mode).await,
+            #[cfg(feature = "http3")]
+            Self::Http3Pool(pool) => pool[0].send_request(path, client_id, body_mode).await,
+        }
+    }
+}
+
+impl ReqwestScenarioClient {
+    async fn send_request(
+        &self,
+        path: &str,
+        client_id: &str,
+        body_mode: RequestBodyMode,
+    ) -> Result<ProbeResponse, Box<dyn std::error::Error>> {
+        let response = self
+            .client
+            .post(format!("{}{}", self.origin, path))
+            .header("x-client-id", client_id)
+            .header("x-bench-body-mode", body_mode.label())
+            .header("content-type", "text/plain")
+            .body(body_mode.request_body().to_string())
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        let version = BenchHttpVersion::from_http(response.version());
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap_or_default();
+        Ok(ProbeResponse {
+            status,
+            version,
+            headers,
+            body,
+        })
+    }
+}
+
+#[cfg(feature = "http3")]
+impl Http3BenchClient {
+    async fn connect(
+        origin: &str,
+        request_timeout: Duration,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        ensure_rustls_provider();
+        let url = Url::parse(origin)?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| io::Error::other("http3 origin should include host"))?;
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| io::Error::other("http3 origin should include port"))?;
+        let remotes = lookup_host((host, port)).await?.collect::<Vec<_>>();
+        let remote = remotes
+            .iter()
+            .copied()
+            .find(SocketAddr::is_ipv4)
+            .or_else(|| remotes.first().copied())
+            .ok_or_else(|| io::Error::other("http3 origin should resolve"))?;
+        let bind_addr: SocketAddr = if remote.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" }
+            .parse()?;
+        let socket = std::net::UdpSocket::bind(bind_addr)?;
+        socket.set_nonblocking(true)?;
+        tune_udp_socket_buffers(&socket)?;
+        let mut endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )?;
+        endpoint.set_default_client_config(build_http3_bench_client_config());
+        let connecting = endpoint.connect(remote, host)?;
+        let connection = tokio::time::timeout(request_timeout, connecting)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "http3 connect timed out"))??;
+        let h3_connection = h3_quinn::Connection::new(connection.clone());
+        let (driver, sender) = h3::client::new(h3_connection).await?;
+        let driver_handle = tokio::spawn(async move {
+            let mut driver: Http3Driver = driver;
+            let _ = poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        let authority = if let Some(port) = url.port() {
+            format!("{host}:{port}")
+        } else {
+            host.to_string()
+        };
+        Ok(Arc::new(Self {
+            _endpoint: endpoint,
+            connection,
+            sender: AsyncMutex::new(sender),
+            driver: Mutex::new(Some(driver_handle)),
+            origin: origin.to_string(),
+            authority,
+            request_timeout,
+        }))
+    }
+
+    async fn send_request(
+        &self,
+        path: &str,
+        client_id: &str,
+        body_mode: RequestBodyMode,
+    ) -> Result<ProbeResponse, Box<dyn std::error::Error>> {
+        let request = hyper::Request::builder()
+            .method("POST")
+            .uri(format!("{}{}", self.origin, path))
+            .header("host", &self.authority)
+            .header("x-client-id", client_id)
+            .header("x-bench-body-mode", body_mode.label())
+            .header("content-type", "text/plain")
+            .body(())
+            .map_err(|err| io::Error::other(format!("http3 request should build: {err}")))?;
+        tokio::time::timeout(self.request_timeout, async {
+            let mut stream = {
+                let mut sender = self.sender.lock().await;
+                sender.send_request(request).await.map_err(|err| {
+                    io::Error::other(format!("http3 request stream should open: {err}"))
+                })?
+            };
+            if !body_mode.request_body().is_empty() {
+                stream
+                    .send_data(Bytes::copy_from_slice(body_mode.request_body().as_bytes()))
+                    .await
+                    .map_err(|err| {
+                        io::Error::other(format!("http3 request body should send: {err}"))
+                    })?;
+            }
+            stream.finish().await.map_err(|err| {
+                io::Error::other(format!("http3 request should finish: {err}"))
+            })?;
+            let response = stream.recv_response().await.map_err(|err| {
+                io::Error::other(format!("http3 response head should arrive: {err}"))
+            })?;
+            let status = response.status().as_u16();
+            let version = BenchHttpVersion::from_http(response.version());
+            let headers = response.headers().clone();
+            let mut response_body = Vec::new();
+            while let Some(mut chunk) = stream.recv_data().await.map_err(|err| {
+                io::Error::other(format!("http3 response body should read: {err}"))
+            })? {
+                use hyper::body::Buf;
+                response_body.extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref());
+            }
+            Ok::<ProbeResponse, Box<dyn std::error::Error>>(ProbeResponse {
+                status,
+                version,
+                headers,
+                body: String::from_utf8_lossy(&response_body).to_string(),
+            })
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "http3 request timed out"))?
+    }
+}
+
+#[cfg(feature = "http3")]
+impl Drop for Http3BenchClient {
+    fn drop(&mut self) {
+        self.connection.close(0_u32.into(), b"benchmark-done");
+        if let Ok(mut guard) = self.driver.lock()
+            && let Some(handle) = guard.take()
+        {
+            handle.abort();
+        }
+    }
+}
+
+async fn build_scenario_client(
+    clients: &BenchClients,
+    scenario: Scenario,
+    request_origin: &str,
+    request_timeout_ms: u64,
+    http3_pool_size: usize,
+) -> Result<ScenarioHttpClient, Box<dyn std::error::Error>> {
     match scenario.downstream_protocol {
-        DownstreamProtocol::Http1 => &clients.http,
-        DownstreamProtocol::HttpsHttp2 => &clients.https,
+        DownstreamProtocol::Http1 => Ok(ScenarioHttpClient::Reqwest(ReqwestScenarioClient {
+            client: clients.http.clone(),
+            origin: request_origin.to_string(),
+        })),
+        DownstreamProtocol::HttpsHttp2 => Ok(ScenarioHttpClient::Reqwest(ReqwestScenarioClient {
+            client: clients.https.clone(),
+            origin: request_origin.to_string(),
+        })),
+        DownstreamProtocol::HttpsHttp3 => {
+            #[cfg(feature = "http3")]
+            {
+                let pool_size = http3_pool_size.max(1);
+                if pool_size == 1 {
+                    return Ok(ScenarioHttpClient::Http3(
+                        Http3BenchClient::connect(
+                            request_origin,
+                            Duration::from_millis(request_timeout_ms),
+                        )
+                        .await?,
+                    ));
+                }
+                let mut pool = Vec::with_capacity(pool_size);
+                for _ in 0..pool_size {
+                    pool.push(
+                        Http3BenchClient::connect(
+                            request_origin,
+                            Duration::from_millis(request_timeout_ms),
+                        )
+                        .await?,
+                    );
+                }
+                Ok(ScenarioHttpClient::Http3Pool(pool))
+            }
+            #[cfg(not(feature = "http3"))]
+            {
+                let _ = clients;
+                let _ = scenario;
+                let _ = request_origin;
+                let _ = request_timeout_ms;
+                let _ = http3_pool_size;
+                Err(io::Error::other(HTTP3_TLS_FEATURE_HINT).into())
+            }
+        }
     }
 }
 
@@ -940,11 +1326,14 @@ fn select_scenarios(config: &BenchConfig) -> Result<Vec<Scenario>, Box<dyn std::
             .find(|scenario| scenario.id == filter)
             .ok_or_else(|| io::Error::other(format!("unknown --scenario: {filter}")))?;
         if !matched.supports_current_build() {
-            return Err(io::Error::other(format!(
-                "scenario '{}' requires HTTP/2 + TLS support; {}",
-                matched.id, HTTP2_TLS_FEATURE_HINT
-            ))
-            .into());
+            let hint = if matched.requires_http3_tls() {
+                HTTP3_TLS_FEATURE_HINT
+            } else {
+                HTTP2_TLS_FEATURE_HINT
+            };
+            return Err(
+                io::Error::other(format!("scenario '{}' requires feature support; {}", matched.id, hint)).into(),
+            );
         }
         Ok(vec![matched])
     } else {
@@ -959,7 +1348,7 @@ fn select_scenarios(config: &BenchConfig) -> Result<Vec<Scenario>, Box<dyn std::
         }
         if !skipped.is_empty() {
             println!(
-                "skipping scenarios requiring HTTP/2 + TLS support: {}",
+                "skipping scenarios requiring protocol feature support: {}",
                 skipped.join(", ")
             );
         }
@@ -1008,14 +1397,20 @@ fn scenario_error_report(scenario: Scenario, error: String) -> ScenarioReport {
 }
 
 fn required_proxy_build_features(scenarios: &[Scenario]) -> Vec<&'static str> {
-    if scenarios
-        .iter()
-        .any(|scenario| scenario.requires_http2_tls())
-    {
-        vec!["http2", "tls"]
-    } else {
-        Vec::new()
+    let needs_http2 = scenarios.iter().any(|scenario| scenario.requires_http2_tls());
+    let needs_http3 = scenarios.iter().any(|scenario| scenario.requires_http3_tls());
+    let needs_tls = needs_http2 || needs_http3;
+    let mut features = Vec::new();
+    if needs_http2 {
+        features.push("http2");
     }
+    if needs_http3 {
+        features.push("http3");
+    }
+    if needs_tls {
+        features.push("tls");
+    }
+    features
 }
 
 fn print_sweep_summary(title: &str, cases: &[FuelSweepCaseReport]) {
@@ -1142,6 +1537,7 @@ async fn run_scenario(
     let upstream_fixture = match scenario.upstream_protocol() {
         Some(UpstreamProtocol::Http1) => Some(spawn_plain_http_upstream_fixture().await?),
         Some(UpstreamProtocol::HttpsHttp2) => Some(spawn_https_http2_upstream_fixture().await?),
+        Some(UpstreamProtocol::HttpsHttp3) => Some(spawn_https_http3_upstream_fixture().await?),
         None => None,
     };
     let program_bytes = match scenario.program_variant {
@@ -1178,11 +1574,17 @@ async fn run_scenario(
         } else {
             None
         };
+        let http3_addr = if scenario.downstream_protocol.requires_http3_tls() {
+            Some(reserve_loopback_udp_addr()?)
+        } else {
+            None
+        };
         let admin_addr = reserve_loopback_addr()?;
         let mut proxy = ProxyProcess::spawn(
             binary_path,
             data_addr,
             https_addr,
+            http3_addr,
             admin_addr,
             config.vm_fuel,
             config.vm_fuel_check_interval,
@@ -1201,17 +1603,21 @@ async fn run_scenario(
             upload_program(&clients.http, admin_addr, bytes).await?;
         }
 
-        Some((proxy, data_addr, https_addr, admin_addr))
+        Some((proxy, data_addr, https_addr, http3_addr, admin_addr))
     } else {
         None
     };
 
-    let request_origin = if let Some((_, data_addr, https_addr, _)) = proxy.as_ref() {
+    let request_origin = if let Some((_, data_addr, https_addr, http3_addr, _)) = proxy.as_ref() {
         match scenario.downstream_protocol {
             DownstreamProtocol::Http1 => format!("http://{data_addr}"),
             DownstreamProtocol::HttpsHttp2 => {
                 let https_addr = https_addr.expect("https addr should exist");
                 format!("https://127.0.0.1:{}", https_addr.port())
+            }
+            DownstreamProtocol::HttpsHttp3 => {
+                let http3_addr = http3_addr.expect("http3 addr should exist");
+                format!("https://127.0.0.1:{}", http3_addr.port())
             }
         }
     } else {
@@ -1221,20 +1627,34 @@ async fn run_scenario(
             .origin()
             .to_string()
     };
-    let request_url = format!("{request_origin}/perf");
-    let request_client = request_client_for_scenario(clients, scenario);
+    let probe_client =
+        build_scenario_client(clients, scenario, &request_origin, config.request_timeout_ms, 1)
+            .await?;
     verify_scenario_probe(
-        request_client,
-        &request_origin,
+        &probe_client,
         scenario,
         upstream_fixture.as_ref(),
+    )
+    .await?;
+    let load_http3_pool_size = if scenario.downstream_protocol.requires_http3_tls() {
+        config
+            .concurrency
+            .clamp(1, BENCH_HTTP3_CLIENT_POOL_MAX)
+    } else {
+        1
+    };
+    let request_client = build_scenario_client(
+        clients,
+        scenario,
+        &request_origin,
+        config.request_timeout_ms,
+        load_http3_pool_size,
     )
     .await?;
 
     if config.warmup_requests > 0 {
         let warmup = run_load(
-            request_client,
-            &request_url,
+            &request_client,
             scenario,
             config.warmup_requests,
             config.concurrency,
@@ -1249,7 +1669,7 @@ async fn run_scenario(
         }
     }
 
-    let pid = proxy.as_mut().map(|(proxy, _, _, _)| proxy.pid());
+    let pid = proxy.as_mut().map(|(proxy, _, _, _, _)| proxy.pid());
     let start_rss_kib = pid.and_then(read_process_rss_kib);
     let stop_sampler = pid.map(|_| Arc::new(AtomicBool::new(false)));
     let rss_samples = pid.map(|_| Arc::new(Mutex::new(Vec::<u64>::new())));
@@ -1264,8 +1684,7 @@ async fn run_scenario(
     };
 
     let run = run_load(
-        request_client,
-        &request_url,
+        &request_client,
         scenario,
         config.requests,
         config.concurrency,
@@ -1291,7 +1710,7 @@ async fn run_scenario(
     } else {
         empty_memory_stats()
     };
-    let telemetry = if let Some((_, _, _, admin_addr)) = proxy.as_ref() {
+    let telemetry = if let Some((_, _, _, _, admin_addr)) = proxy.as_ref() {
         fetch_telemetry_summary(&clients.http, *admin_addr).await
     } else {
         None
@@ -1429,18 +1848,11 @@ fn compile_program_to_vmbc(source: &str) -> Result<Vec<u8>, Box<dyn std::error::
 }
 
 async fn verify_scenario_probe(
-    client: &Client,
-    request_origin: &str,
+    client: &ScenarioHttpClient,
     scenario: Scenario,
     upstream_fixture: Option<&UpstreamFixture>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let response = send_probe_request(
-        client,
-        &format!("{request_origin}/perf"),
-        "perf-client",
-        scenario,
-    )
-    .await?;
+    let response = send_probe_request(client, "/perf", "perf-client", scenario).await?;
     ensure_probe_status(&response, scenario, "baseline probe")?;
 
     match scenario.program_variant {
@@ -1472,20 +1884,18 @@ async fn verify_scenario_probe(
                 "perf-client",
                 "/perf",
             )?;
-            if upstream.requires_http2_tls() {
+            if upstream.requires_http2_tls() || upstream.requires_http3_tls() {
                 let fixture = upstream_fixture
-                    .ok_or_else(|| io::Error::other("missing HTTP/2 upstream fixture"))?;
-                verify_http2_upstream_reuse_probe(client, request_origin, scenario, fixture)
-                    .await?;
+                    .ok_or_else(|| io::Error::other("missing multiplexed upstream fixture"))?;
+                verify_upstream_reuse_probe(client, scenario, fixture, upstream.label()).await?;
             }
         }
         ProgramVariant::ProxyRoundTrip { upstream, .. } => {
             verify_proxy_roundtrip_probe_response(&response, scenario, "perf-client", "/perf")?;
-            if upstream.requires_http2_tls() {
+            if upstream.requires_http2_tls() || upstream.requires_http3_tls() {
                 let fixture = upstream_fixture
-                    .ok_or_else(|| io::Error::other("missing HTTP/2 upstream fixture"))?;
-                verify_http2_upstream_reuse_probe(client, request_origin, scenario, fixture)
-                    .await?;
+                    .ok_or_else(|| io::Error::other("missing multiplexed upstream fixture"))?;
+                verify_upstream_reuse_probe(client, scenario, fixture, upstream.label()).await?;
             }
         }
     }
@@ -1494,30 +1904,14 @@ async fn verify_scenario_probe(
 }
 
 async fn send_probe_request(
-    client: &Client,
-    url: &str,
+    client: &ScenarioHttpClient,
+    path: &str,
     client_id: &str,
     scenario: Scenario,
 ) -> Result<ProbeResponse, Box<dyn std::error::Error>> {
-    let body_mode = scenario.request_body_mode();
-    let response = client
-        .post(url)
-        .header("x-client-id", client_id)
-        .header("x-bench-body-mode", body_mode.label())
-        .header("content-type", "text/plain")
-        .body(body_mode.request_body().to_string())
-        .send()
-        .await?;
-    let status = response.status().as_u16();
-    let version = response.version();
-    let headers = response.headers().clone();
-    let body = response.text().await.unwrap_or_default();
-    Ok(ProbeResponse {
-        status,
-        version,
-        headers,
-        body,
-    })
+    client
+        .send_request(path, client_id, scenario.request_body_mode())
+        .await
 }
 
 fn probe_header(response: &ProbeResponse, name: &str) -> String {
@@ -1562,14 +1956,15 @@ fn verify_proxy_roundtrip_probe_response(
     }
 
     let expected_response_version = match scenario.downstream_protocol {
-        DownstreamProtocol::Http1 => ReqwestVersion::HTTP_11,
-        DownstreamProtocol::HttpsHttp2 => ReqwestVersion::HTTP_2,
+        DownstreamProtocol::Http1 => BenchHttpVersion::Http11,
+        DownstreamProtocol::HttpsHttp2 => BenchHttpVersion::Http2,
+        DownstreamProtocol::HttpsHttp3 => BenchHttpVersion::Http3,
     };
     if response.version != expected_response_version {
         return Err(io::Error::other(format!(
             "downstream response version mismatch: expected {}, got {}",
-            downstream_version_label(expected_response_version),
-            downstream_version_label(response.version)
+            expected_response_version.label(),
+            response.version.label()
         ))
         .into());
     }
@@ -1624,16 +2019,21 @@ fn verify_proxy_roundtrip_probe_response(
         .into());
     }
 
-    if scenario
-        .upstream_protocol()
-        .is_some_and(UpstreamProtocol::requires_http2_tls)
-        && probe_header(response, "x-upstream-alpn") != "h2"
+    if let Some(upstream) = scenario.upstream_protocol()
+        && upstream.requires_tls()
     {
-        return Err(io::Error::other(format!(
-            "probe missing expected x-upstream-alpn=h2: got '{}'",
-            probe_header(response, "x-upstream-alpn")
-        ))
-        .into());
+        let expected_alpn = match upstream {
+            UpstreamProtocol::Http1 => "",
+            UpstreamProtocol::HttpsHttp2 => "h2",
+            UpstreamProtocol::HttpsHttp3 => "h3",
+        };
+        let actual_alpn = probe_header(response, "x-upstream-alpn");
+        if actual_alpn != expected_alpn {
+            return Err(io::Error::other(format!(
+                "probe missing expected x-upstream-alpn={expected_alpn}: got '{actual_alpn}'"
+            ))
+            .into());
+        }
     }
 
     let expected_body_mode = scenario.request_body_mode().label();
@@ -1679,14 +2079,15 @@ fn verify_direct_upstream_probe_response(
     ensure_probe_status(response, scenario, "direct-upstream probe")?;
 
     let expected_response_version = match upstream {
-        UpstreamProtocol::Http1 => ReqwestVersion::HTTP_11,
-        UpstreamProtocol::HttpsHttp2 => ReqwestVersion::HTTP_2,
+        UpstreamProtocol::Http1 => BenchHttpVersion::Http11,
+        UpstreamProtocol::HttpsHttp2 => BenchHttpVersion::Http2,
+        UpstreamProtocol::HttpsHttp3 => BenchHttpVersion::Http3,
     };
     if response.version != expected_response_version {
         return Err(io::Error::other(format!(
             "direct-upstream response version mismatch: expected {}, got {}",
-            downstream_version_label(expected_response_version),
-            downstream_version_label(response.version)
+            expected_response_version.label(),
+            response.version.label()
         ))
         .into());
     }
@@ -1752,28 +2153,25 @@ fn verify_direct_upstream_probe_response(
     Ok(())
 }
 
-async fn verify_http2_upstream_reuse_probe(
-    client: &Client,
-    request_origin: &str,
+async fn verify_upstream_reuse_probe(
+    client: &ScenarioHttpClient,
     scenario: Scenario,
     upstream_fixture: &UpstreamFixture,
+    protocol_label: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let baseline_connections = upstream_fixture
         .connection_count()
-        .ok_or_else(|| io::Error::other("missing upstream HTTP/2 connection counter"))?;
+        .ok_or_else(|| io::Error::other("missing upstream connection counter"))?;
     if baseline_connections != 1 {
         return Err(io::Error::other(format!(
-            "expected one upstream HTTP/2 TLS connection after baseline probe, got {}",
-            baseline_connections
+            "expected one upstream {protocol_label} TLS connection after baseline probe, got {baseline_connections}",
         ))
         .into());
     }
 
-    let slow_url = format!("{request_origin}/slow");
-    let fast_url = format!("{request_origin}/fast");
     let (slow, fast) = tokio::try_join!(
-        send_probe_request(client, &slow_url, "perf-client-slow", scenario),
-        send_probe_request(client, &fast_url, "perf-client-fast", scenario),
+        send_probe_request(client, "/slow", "perf-client-slow", scenario),
+        send_probe_request(client, "/fast", "perf-client-fast", scenario),
     )?;
 
     match scenario.program_variant {
@@ -1799,7 +2197,7 @@ async fn verify_http2_upstream_reuse_probe(
         }
         _ => {
             return Err(io::Error::other(format!(
-                "http2 reuse probe is only valid for upstream round-trip scenarios, got {}",
+                "{protocol_label} reuse probe is only valid for upstream round-trip scenarios, got {}",
                 scenario.id
             ))
             .into());
@@ -1808,18 +2206,17 @@ async fn verify_http2_upstream_reuse_probe(
 
     let after_parallel = upstream_fixture
         .connection_count()
-        .ok_or_else(|| io::Error::other("missing upstream HTTP/2 connection counter"))?;
+        .ok_or_else(|| io::Error::other("missing upstream connection counter"))?;
     if after_parallel != 1 {
         return Err(io::Error::other(format!(
-            "expected HTTP/2 multiplexing over one upstream TLS connection, observed {} connections",
-            after_parallel
+            "expected {protocol_label} multiplexing over one upstream TLS connection, observed {after_parallel} connections",
         ))
         .into());
     }
 
     let reused = send_probe_request(
         client,
-        &format!("{request_origin}/reuse"),
+        "/reuse",
         "perf-client-reuse",
         scenario,
     )
@@ -1847,26 +2244,15 @@ async fn verify_http2_upstream_reuse_probe(
 
     let after_reuse = upstream_fixture
         .connection_count()
-        .ok_or_else(|| io::Error::other("missing upstream HTTP/2 connection counter"))?;
+        .ok_or_else(|| io::Error::other("missing upstream connection counter"))?;
     if after_reuse != 1 {
         return Err(io::Error::other(format!(
-            "expected HTTP/2 connection reuse over one upstream TLS connection, observed {} connections",
-            after_reuse
+            "expected {protocol_label} connection reuse over one upstream TLS connection, observed {after_reuse} connections",
         ))
         .into());
     }
 
     Ok(())
-}
-
-fn downstream_version_label(version: ReqwestVersion) -> &'static str {
-    match version {
-        ReqwestVersion::HTTP_09 => "0.9",
-        ReqwestVersion::HTTP_10 => "1.0",
-        ReqwestVersion::HTTP_11 => "1.1",
-        ReqwestVersion::HTTP_2 => "2",
-        _ => "unknown",
-    }
 }
 
 async fn spawn_plain_http_upstream_fixture() -> Result<UpstreamFixture, Box<dyn std::error::Error>>
@@ -1903,21 +2289,99 @@ async fn build_benchmark_upstream_response(
     version_label: &'static str,
 ) -> Result<HyperResponse<Full<Bytes>>, std::convert::Infallible> {
     let (parts, body) = request.into_parts();
-    let path = parts.uri.path().to_string();
-    let client_id = parts
-        .headers
+    let response = prepare_benchmark_upstream_response(parts.uri.path(), &parts.headers, body, version_label)
+        .await;
+    Ok(response.into_hyper_response())
+}
+
+struct BenchmarkUpstreamResponse {
+    client_id: String,
+    path: String,
+    program_header: String,
+    body_mode: String,
+    version_label: &'static str,
+    body: Bytes,
+}
+
+impl BenchmarkUpstreamResponse {
+    fn response_headers(&self) -> [(&'static str, String); 4] {
+        [
+            ("x-bench-upstream-client-id", self.client_id.clone()),
+            ("x-bench-upstream-path", self.path.clone()),
+            (
+                "x-bench-upstream-program-header",
+                self.program_header.clone(),
+            ),
+            ("x-bench-upstream-body-mode", self.body_mode.clone()),
+        ]
+    }
+
+    fn into_hyper_response(self) -> HyperResponse<Full<Bytes>> {
+        let BenchmarkUpstreamResponse {
+            client_id,
+            path,
+            program_header,
+            body_mode,
+            version_label,
+            body,
+        } = self;
+        let mut response = HyperResponse::new(Full::new(body));
+        for (name, value) in [
+            ("x-bench-upstream-client-id", client_id),
+            ("x-bench-upstream-path", path),
+            ("x-bench-upstream-program-header", program_header),
+            ("x-bench-upstream-body-mode", body_mode),
+        ] {
+            response.headers_mut().insert(
+                name,
+                HeaderValue::from_str(&value)
+                    .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+            );
+        }
+        response.headers_mut().insert(
+            "x-bench-upstream-http-version",
+            HeaderValue::from_static(version_label),
+        );
+        response
+    }
+
+    fn into_http3_head(&self) -> HyperResponse<()> {
+        let mut response = HyperResponse::builder()
+            .status(HttpStatusCode::OK)
+            .body(())
+            .expect("http3 benchmark response head should build");
+        for (name, value) in self.response_headers() {
+            response.headers_mut().insert(
+                name,
+                HeaderValue::from_str(&value)
+                    .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+            );
+        }
+        response.headers_mut().insert(
+            "x-bench-upstream-http-version",
+            HeaderValue::from_static(self.version_label),
+        );
+        response
+    }
+}
+
+async fn prepare_benchmark_upstream_response(
+    path: &str,
+    headers: &HeaderMap,
+    body: Incoming,
+    version_label: &'static str,
+) -> BenchmarkUpstreamResponse {
+    let client_id = headers
         .get("x-client-id")
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let program_header = parts
-        .headers
+    let program_header = headers
         .get("x-bench-program-header")
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let body_mode = parts
-        .headers
+    let body_mode = headers
         .get("x-bench-body-mode")
         .and_then(|value| value.to_str().ok())
         .unwrap_or(RequestBodyMode::HeadersOnly.label())
@@ -1942,29 +2406,14 @@ async fn build_benchmark_upstream_response(
         Bytes::new()
     };
 
-    let mut response = HyperResponse::new(Full::new(response_body));
-    response.headers_mut().insert(
-        "x-bench-upstream-client-id",
-        HeaderValue::from_str(&client_id).unwrap_or_else(|_| HeaderValue::from_static("invalid")),
-    );
-    response.headers_mut().insert(
-        "x-bench-upstream-path",
-        HeaderValue::from_str(&path).unwrap_or_else(|_| HeaderValue::from_static("/invalid")),
-    );
-    response.headers_mut().insert(
-        "x-bench-upstream-program-header",
-        HeaderValue::from_str(&program_header)
-            .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
-    );
-    response.headers_mut().insert(
-        "x-bench-upstream-body-mode",
-        HeaderValue::from_str(&body_mode).unwrap_or_else(|_| HeaderValue::from_static("invalid")),
-    );
-    response.headers_mut().insert(
-        "x-bench-upstream-http-version",
-        HeaderValue::from_static(version_label),
-    );
-    Ok(response)
+    BenchmarkUpstreamResponse {
+        client_id,
+        path: path.to_string(),
+        program_header,
+        body_mode,
+        version_label,
+        body: response_body,
+    }
 }
 
 #[cfg(all(feature = "http2", feature = "tls"))]
@@ -2029,6 +2478,330 @@ async fn spawn_https_http2_upstream_fixture() -> Result<UpstreamFixture, Box<dyn
 async fn spawn_https_http2_upstream_fixture() -> Result<UpstreamFixture, Box<dyn std::error::Error>>
 {
     Err(io::Error::other(HTTP2_TLS_FEATURE_HINT).into())
+}
+
+#[cfg(feature = "http3")]
+fn build_http3_bench_client_config() -> quinn::ClientConfig {
+    ensure_rustls_provider();
+    let builder =
+        RustlsClientConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("http3 benchmark TLS versions should configure");
+    let mut config = builder
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PermissiveServerCertVerifier::new()))
+        .with_no_client_auth();
+    config.enable_sni = true;
+    config.alpn_protocols = vec![b"h3".to_vec()];
+
+    let mut client = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(config)
+            .expect("http3 benchmark QUIC client config should build"),
+    ));
+    client.transport_config(Arc::new(build_http3_transport_config()));
+    client
+}
+
+#[cfg(feature = "http3")]
+fn build_http3_transport_config() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(
+        quinn::VarInt::from_u32(BENCH_HTTP3_MAX_CONCURRENT_BIDI_STREAMS).into(),
+    );
+    transport.stream_receive_window(
+        quinn::VarInt::from_u32(BENCH_HTTP3_STREAM_RECEIVE_WINDOW_BYTES).into(),
+    );
+    transport.receive_window(
+        quinn::VarInt::from_u32(BENCH_HTTP3_CONNECTION_RECEIVE_WINDOW_BYTES).into(),
+    );
+    transport.send_window(BENCH_HTTP3_SEND_WINDOW_BYTES);
+    transport.keep_alive_interval(Some(Duration::from_millis(
+        BENCH_HTTP3_KEEPALIVE_INTERVAL_MS,
+    )));
+    transport
+}
+
+#[cfg(feature = "http3")]
+fn tune_udp_socket_buffers(socket: &std::net::UdpSocket) -> io::Result<()> {
+    let sock_ref = SockRef::from(socket);
+    sock_ref.set_recv_buffer_size(BENCH_HTTP3_SOCKET_BUFFER_BYTES)?;
+    sock_ref.set_send_buffer_size(BENCH_HTTP3_SOCKET_BUFFER_BYTES)?;
+    Ok(())
+}
+
+#[cfg(feature = "http3")]
+#[derive(Debug)]
+struct PermissiveServerCertVerifier {
+    delegate: Arc<dyn ServerCertVerifier>,
+}
+
+#[cfg(feature = "http3")]
+impl PermissiveServerCertVerifier {
+    fn new() -> Self {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let delegate = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .expect("http3 benchmark verifier should build");
+        Self { delegate }
+    }
+}
+
+#[cfg(feature = "http3")]
+impl ServerCertVerifier for PermissiveServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.delegate.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.delegate.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.delegate.supported_verify_schemes()
+    }
+}
+
+#[cfg(feature = "http3")]
+fn build_http3_upstream_server_config() -> quinn::ServerConfig {
+    ensure_rustls_provider();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+        .expect("http3 upstream benchmark certificate should generate");
+    let mut server_crypto = rustls::ServerConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .expect("http3 upstream benchmark TLS versions should configure")
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![CertificateDer::from(
+            cert.serialize_der()
+                .expect("http3 upstream benchmark certificate should serialize"),
+        )],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.serialize_private_key_der())),
+    )
+    .expect("http3 upstream benchmark server config should build");
+    server_crypto.alpn_protocols = vec![b"h3".to_vec()];
+
+    let mut server = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
+            .expect("http3 upstream benchmark QUIC server config should build"),
+    ));
+    server.transport_config(Arc::new(build_http3_transport_config()));
+    server
+}
+
+#[cfg(feature = "http3")]
+fn prepare_benchmark_upstream_response_from_bytes(
+    path: &str,
+    headers: &HeaderMap,
+    request_body: Bytes,
+    version_label: &'static str,
+) -> BenchmarkUpstreamResponse {
+    let client_id = headers
+        .get("x-client-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let program_header = headers
+        .get("x-bench-program-header")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body_mode = headers
+        .get("x-bench-body-mode")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or(RequestBodyMode::HeadersOnly.label())
+        .to_string();
+    let response_body = if body_mode == RequestBodyMode::BodyRead.label() {
+        Bytes::from(format!(
+            "upstream-roundtrip|{path}|{}",
+            String::from_utf8_lossy(&request_body)
+        ))
+    } else {
+        Bytes::new()
+    };
+    BenchmarkUpstreamResponse {
+        client_id,
+        path: path.to_string(),
+        program_header,
+        body_mode,
+        version_label,
+        body: response_body,
+    }
+}
+
+#[cfg(feature = "http3")]
+async fn read_http3_bench_request_body(mut stream: Http3BenchRecvStream) -> Bytes {
+    use hyper::body::Buf;
+
+    let mut body = Vec::new();
+    while let Some(mut chunk) = stream
+        .recv_data()
+        .await
+        .expect("http3 upstream benchmark request body should read")
+    {
+        body.extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref());
+    }
+    Bytes::from(body)
+}
+
+#[cfg(feature = "http3")]
+async fn write_http3_bench_response(
+    stream: &mut Http3BenchSendStream,
+    response: BenchmarkUpstreamResponse,
+) {
+    let body = response.body.clone();
+    stream
+        .send_response(response.into_http3_head())
+        .await
+        .expect("http3 upstream benchmark response head should send");
+    if !body.is_empty() {
+        stream
+            .send_data(body)
+            .await
+            .expect("http3 upstream benchmark response body should send");
+    }
+    stream
+        .finish()
+        .await
+        .expect("http3 upstream benchmark response should finish");
+}
+
+#[cfg(feature = "http3")]
+async fn serve_http3_bench_fixture_connection(connection: quinn::Connection) {
+    let mut h3_conn = match h3::server::builder()
+        .build(h3_quinn::Connection::new(connection))
+        .await
+    {
+        Ok(connection) => connection,
+        Err(err) => {
+            let rendered = err.to_string();
+            if !err.is_h3_no_error()
+                && !rendered.contains("ApplicationClose")
+                && !rendered.contains("ConnectionLost")
+            {
+                eprintln!("http3 upstream benchmark connection init failed: {err}");
+            }
+            return;
+        }
+    };
+
+    loop {
+        match h3_conn.accept().await {
+            Ok(Some(resolver)) => {
+                tokio::spawn(async move {
+                    let (request, stream) = match resolver.resolve_request().await {
+                        Ok(value) => value,
+                        Err(err) => {
+                            let rendered = err.to_string();
+                            if !err.is_h3_no_error()
+                                && !rendered.contains("ApplicationClose")
+                                && !rendered.contains("ConnectionLost")
+                            {
+                                eprintln!(
+                                    "http3 upstream benchmark request resolution failed: {err}"
+                                );
+                            }
+                            return;
+                        }
+                    };
+                    let (parts, _) = request.into_parts();
+                    let path = parts.uri.path().to_string();
+                    let headers = parts.headers.clone();
+                    let (mut send_stream, recv_stream) = stream.split();
+                    let request_body = read_http3_bench_request_body(recv_stream).await;
+                    if path == "/slow" {
+                        sleep(Duration::from_millis(75)).await;
+                    }
+                    let response = prepare_benchmark_upstream_response_from_bytes(
+                        &path,
+                        &headers,
+                        request_body,
+                        "3",
+                    );
+                    write_http3_bench_response(&mut send_stream, response).await;
+                });
+            }
+            Ok(None) => break,
+            Err(err) => {
+                let rendered = err.to_string();
+                if err.is_h3_no_error()
+                    || rendered.contains("ApplicationClose")
+                    || rendered.contains("ConnectionLost")
+                    || rendered.contains("H3_CLOSED_CRITICAL_STREAM")
+                    || rendered.contains("control stream was closed")
+                {
+                    break;
+                }
+                panic!("http3 upstream benchmark connection should stay healthy: {err}");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "http3")]
+async fn spawn_https_http3_upstream_fixture() -> Result<UpstreamFixture, Box<dyn std::error::Error>>
+{
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let addr = socket.local_addr()?;
+    let std_socket = socket.into_std()?;
+    tune_udp_socket_buffers(&std_socket)?;
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(build_http3_upstream_server_config()),
+        std_socket,
+        Arc::new(quinn::TokioRuntime),
+    )?;
+    let connection_count = Arc::new(AtomicUsize::new(0));
+    let task = tokio::spawn({
+        let connection_count = connection_count.clone();
+        async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let connection_count = connection_count.clone();
+                tokio::spawn(async move {
+                    let connection = incoming
+                        .await
+                        .expect("http3 upstream benchmark QUIC handshake should succeed");
+                    connection_count.fetch_add(1, Ordering::Relaxed);
+                    serve_http3_bench_fixture_connection(connection).await;
+                });
+            }
+        }
+    });
+
+    Ok(UpstreamFixture {
+        origin: format!("https://127.0.0.1:{}", addr.port()),
+        connection_count: Some(connection_count),
+        tasks: vec![task],
+    })
+}
+
+#[cfg(not(feature = "http3"))]
+async fn spawn_https_http3_upstream_fixture() -> Result<UpstreamFixture, Box<dyn std::error::Error>>
+{
+    Err(io::Error::other(HTTP3_TLS_FEATURE_HINT).into())
 }
 
 async fn upload_program(
@@ -2109,8 +2882,7 @@ fn spawn_memory_sampler(
 }
 
 async fn run_load(
-    client: &Client,
-    url: &str,
+    client: &ScenarioHttpClient,
     scenario: Scenario,
     requests: usize,
     concurrency: usize,
@@ -2120,13 +2892,12 @@ async fn run_load(
     let worker_count = concurrency.max(1);
     let started = Instant::now();
     let body_mode = scenario.request_body_mode();
+    let client = client.clone();
     let mut tasks = JoinSet::new();
 
-    for _ in 0..worker_count {
+    for worker_index in 0..worker_count {
         let shared_counter = shared_counter.clone();
-        let url = url.to_string();
-        let client = client.clone();
-        let request_body = body_mode.request_body();
+        let client = client.for_worker(worker_index);
         tasks.spawn(async move {
             let mut worker = WorkerRun {
                 latencies_us: if collect_latencies {
@@ -2146,25 +2917,15 @@ async fn run_load(
 
                 let request_started = Instant::now();
                 match client
-                    .post(&url)
-                    .header("x-client-id", "perf-client")
-                    .header("x-bench-body-mode", body_mode.label())
-                    .header("content-type", "text/plain")
-                    .body(request_body)
-                    .send()
+                    .send_request("/perf", "perf-client", body_mode)
                     .await
                 {
                     Ok(response) => {
-                        let status = response.status().as_u16();
-                        if response.bytes().await.is_ok() {
-                            *worker.status_counts.entry(status).or_insert(0) += 1;
-                            if collect_latencies {
-                                worker
-                                    .latencies_us
-                                    .push(request_started.elapsed().as_micros() as u64);
-                            }
-                        } else {
-                            worker.request_errors += 1;
+                        *worker.status_counts.entry(response.status).or_insert(0) += 1;
+                        if collect_latencies {
+                            worker
+                                .latencies_us
+                                .push(request_started.elapsed().as_micros() as u64);
                         }
                     }
                     Err(_) => {
@@ -2215,6 +2976,13 @@ fn reserve_loopback_addr() -> Result<SocketAddr, io::Error> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
     drop(listener);
+    Ok(addr)
+}
+
+fn reserve_loopback_udp_addr() -> Result<SocketAddr, io::Error> {
+    let socket = UdpSocket::bind("127.0.0.1:0")?;
+    let addr = socket.local_addr()?;
+    drop(socket);
     Ok(addr)
 }
 
@@ -2645,6 +3413,8 @@ Options:\n\
 Notes:\n\
   - Plain HTTP scenarios use plaintext HTTP/1.1 only.\n\
   - HTTP/2 scenarios use HTTPS + ALPN-negotiated h2 only; h2c is not used.\n\
-  - {HTTP2_TLS_FEATURE_HINT}\n"
+  - HTTP/3 scenarios use HTTPS over QUIC with ALPN-negotiated h3 only.\n\
+  - {HTTP2_TLS_FEATURE_HINT}\n\
+  - {HTTP3_TLS_FEATURE_HINT}\n"
     );
 }
