@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    http::{HeaderMap, Response, StatusCode},
+    http::{Response, StatusCode},
 };
 use tokio::net::TcpListener;
 #[cfg(feature = "tls")]
@@ -53,7 +53,7 @@ pub(crate) async fn serve_transport_connection(
 
 pub(crate) async fn serve_transport_connection_with_listener_goal(
     stream: tokio::net::TcpStream,
-    peer_addr: std::net::SocketAddr,
+    _peer_addr: std::net::SocketAddr,
     state: SharedState,
     downstream_listener_goal: DownstreamHttpListenerGoal,
     #[cfg(feature = "tls")] downstream_tls_termination: Option<Arc<ServerConfig>>,
@@ -65,13 +65,9 @@ pub(crate) async fn serve_transport_connection_with_listener_goal(
     };
 
     let request_id = Uuid::new_v4().to_string();
-    let request_path = format!("tcp://{peer_addr}");
     let debug = VmDebugInvocation {
         attach_debugger: false,
         force_threading: false,
-        request_headers: HeaderMap::new(),
-        request_path,
-        request_id: request_id.clone(),
     };
 
     let vm_context = match ProxyVmContext::from_downstream_tcp_stream_with_services(

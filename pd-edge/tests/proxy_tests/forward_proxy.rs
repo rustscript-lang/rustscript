@@ -38,6 +38,13 @@ async fn sample_forward_proxy_program_tunnels_https_request_through_connect_prox
     assert_eq!(
         response
             .headers()
+            .get("x-proxy-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("forwarded")
+    );
+    assert_eq!(
+        response
+            .headers()
             .get("x-forward-proxy-phase")
             .and_then(|value| value.to_str().ok()),
         Some("attached-http")

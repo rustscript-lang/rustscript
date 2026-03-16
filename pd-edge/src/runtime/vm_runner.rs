@@ -1,6 +1,4 @@
-use std::{future::Future, pin::Pin, time::Duration};
-
-use axum::http::HeaderMap;
+use std::time::Duration;
 use tokio::{
     runtime::Handle,
     task::JoinHandle,
@@ -40,21 +38,6 @@ impl VmRunnerStoreData {
 }
 
 type VmRunnerStore = Store<VmRunnerStoreData>;
-type VmExecutionModeFuture =
-    Pin<Box<dyn Future<Output = Result<(), VmExecutionError>> + Send + 'static>>;
-
-trait VmModeRunner {
-    fn execute(
-        vm_store: VmRunnerStore,
-        debug_session: SharedDebugSession,
-        debug: VmDebugInvocation,
-        register_host_modules: HostModuleRegistrar,
-        vm_execution: VmExecutionConfig,
-    ) -> VmExecutionModeFuture;
-}
-
-struct AsyncModeRunner;
-struct ThreadingModeRunner;
 
 enum ActiveVmInterrupt {
     None,
@@ -100,13 +83,10 @@ pub enum VmExecutionError {
     Vm(vm::VmError),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct VmDebugInvocation {
     pub attach_debugger: bool,
     pub force_threading: bool,
-    pub request_headers: HeaderMap,
-    pub request_path: String,
-    pub request_id: String,
 }
 
 pub async fn execute_vm_with_context(
@@ -127,7 +107,7 @@ pub async fn execute_vm_with_context(
 
     match execution_mode {
         VmExecutionMode::Async => {
-            AsyncModeRunner::execute(
+            execute_vm_with_async_mode(
                 vm_store,
                 debug_session,
                 debug,
@@ -137,7 +117,7 @@ pub async fn execute_vm_with_context(
             .await
         }
         VmExecutionMode::Threading => {
-            ThreadingModeRunner::execute(
+            execute_vm_with_threading_mode(
                 vm_store,
                 debug_session,
                 debug,
@@ -146,42 +126,6 @@ pub async fn execute_vm_with_context(
             )
             .await
         }
-    }
-}
-
-impl VmModeRunner for AsyncModeRunner {
-    fn execute(
-        vm_store: VmRunnerStore,
-        debug_session: SharedDebugSession,
-        debug: VmDebugInvocation,
-        register_host_modules: HostModuleRegistrar,
-        vm_execution: VmExecutionConfig,
-    ) -> VmExecutionModeFuture {
-        Box::pin(execute_vm_with_async_mode(
-            vm_store,
-            debug_session,
-            debug,
-            register_host_modules,
-            vm_execution,
-        ))
-    }
-}
-
-impl VmModeRunner for ThreadingModeRunner {
-    fn execute(
-        vm_store: VmRunnerStore,
-        debug_session: SharedDebugSession,
-        debug: VmDebugInvocation,
-        register_host_modules: HostModuleRegistrar,
-        vm_execution: VmExecutionConfig,
-    ) -> VmExecutionModeFuture {
-        Box::pin(execute_vm_with_threading_mode(
-            vm_store,
-            debug_session,
-            debug,
-            register_host_modules,
-            vm_execution,
-        ))
     }
 }
 
@@ -193,7 +137,7 @@ async fn execute_vm_with_async_mode(
     vm_execution: VmExecutionConfig,
 ) -> Result<(), VmExecutionError> {
     let started = std::time::Instant::now();
-    let request_id = debug.request_id.clone();
+    let request_id = tail_profile_request_id(&vm_store);
     let mut profile = run_vm_async(
         vm_store,
         debug_session,
@@ -205,7 +149,7 @@ async fn execute_vm_with_async_mode(
 
     profile.queue_wait_us = 0;
     profile.blocking_run_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    maybe_log_tail_profile(&request_id, &profile);
+    maybe_log_tail_profile(request_id.as_deref(), &profile);
     Ok(())
 }
 
@@ -217,10 +161,10 @@ async fn execute_vm_with_threading_mode(
     vm_execution: VmExecutionConfig,
 ) -> Result<(), VmExecutionError> {
     let queued_at = std::time::Instant::now();
+    let request_id = tail_profile_request_id(&vm_store);
     let task = tokio::task::spawn_blocking(move || {
         let queue_wait_us = u64::try_from(queued_at.elapsed().as_micros()).unwrap_or(u64::MAX);
         let threading_started = std::time::Instant::now();
-        let request_id = debug.request_id.clone();
         let result = run_vm_threading(
             vm_store,
             debug_session,
@@ -234,7 +178,7 @@ async fn execute_vm_with_threading_mode(
                 profile.queue_wait_us = queue_wait_us;
                 profile.blocking_run_us =
                     u64::try_from(threading_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                maybe_log_tail_profile(&request_id, &profile);
+                maybe_log_tail_profile(request_id.as_deref(), &profile);
                 Ok(())
             }
             Err(err) => Err(err),
@@ -267,11 +211,10 @@ async fn run_vm_async(
                 vm_store.data().async_ops.clone(),
             );
             if debug.attach_debugger {
+                let vm_context = vm_store.data().vm_context.clone();
                 run_vm_with_optional_debugger(
                     &debug_session,
-                    &debug.request_headers,
-                    &debug.request_path,
-                    &debug.request_id,
+                    vm_context,
                     vm_store.vm_mut(),
                 )
             } else {
@@ -323,11 +266,10 @@ fn run_vm_threading(
                 vm_store.data().async_ops.clone(),
             );
             if debug.attach_debugger {
+                let vm_context = vm_store.data().vm_context.clone();
                 run_vm_with_optional_debugger(
                     &debug_session,
-                    &debug.request_headers,
-                    &debug.request_path,
-                    &debug.request_id,
+                    vm_context,
                     vm_store.vm_mut(),
                 )
             } else {
@@ -468,10 +410,13 @@ struct VmExecutionProfile {
     vm_fuel_recharge_count: u32,
 }
 
-fn maybe_log_tail_profile(request_id: &str, profile: &VmExecutionProfile) {
+fn maybe_log_tail_profile(request_id: Option<&str>, profile: &VmExecutionProfile) {
     if !tail_profile_enabled() {
         return;
     }
+    let Some(request_id) = request_id else {
+        return;
+    };
     let total_us = profile
         .queue_wait_us
         .saturating_add(profile.blocking_run_us);
@@ -492,6 +437,18 @@ fn maybe_log_tail_profile(request_id: &str, profile: &VmExecutionProfile) {
         profile.vm_yield_count,
         profile.vm_fuel_recharge_count
     );
+}
+
+fn tail_profile_request_id(vm_store: &VmRunnerStore) -> Option<String> {
+    if !tail_profile_enabled() {
+        return None;
+    }
+    Some(
+        vm_store
+            .data()
+            .vm_context
+            .with_request_head(|request_head| request_head.request_id().to_string()),
+    )
 }
 
 fn tail_profile_enabled() -> bool {
@@ -559,9 +516,6 @@ mod tests {
         let debug = VmDebugInvocation {
             attach_debugger: false,
             force_threading: false,
-            request_headers: HeaderMap::new(),
-            request_path: "/".to_string(),
-            request_id: "epoch-test".to_string(),
         };
         let debug_session = new_debug_session_store();
         let execution = VmExecutionConfig {

@@ -687,9 +687,9 @@ async fn sample_proxy_program_streams_or_buffers_upstream_body() {
     assert_eq!(
         buffered
             .headers()
-            .get("x-stream")
+            .get("x-proxy-status")
             .and_then(|value| value.to_str().ok()),
-        Some("false")
+        Some("forwarded")
     );
     assert_eq!(
         buffered.text().await.expect("buffered body should read"),
@@ -754,6 +754,13 @@ async fn sample_request_transform_program_streams_or_buffers_downstream_request_
     );
     assert_eq!(
         transformed
+            .headers()
+            .get("x-proxy-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("forwarded")
+    );
+    assert_eq!(
+        transformed
             .text()
             .await
             .expect("transformed body should read"),
@@ -781,6 +788,13 @@ async fn sample_request_transform_program_streams_or_buffers_downstream_request_
             .get("content-type")
             .and_then(|value| value.to_str().ok()),
         Some("text/plain")
+    );
+    assert_eq!(
+        buffered
+            .headers()
+            .get("x-proxy-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("forwarded")
     );
     assert_eq!(
         buffered.text().await.expect("buffered body should read"),

@@ -67,10 +67,10 @@ use crate::{
 };
 #[cfg(feature = "http3")]
 use {
+    crate::abi_impl::tune_udp_socket_buffers,
     axum::body::Bytes,
     rcgen::generate_simple_self_signed,
     rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
-    crate::abi_impl::tune_udp_socket_buffers,
 };
 
 pub fn build_http_proxy_app(state: SharedState) -> Router {
@@ -498,11 +498,13 @@ async fn promote_captured_downstream_transport_into_http_request(
         )
     })?;
     let captured = captured.map_err(VmError::HostError)?;
-    context.promote_downstream_http_request(
+    context
+        .promote_downstream_http_request(
         captured.request,
         captured.http2_attachment,
         captured.http1_upgrade,
-    );
+    )
+    .await;
     Ok(())
 }
 
@@ -916,9 +918,8 @@ async fn handle_data_plane_request(state: SharedState, request: Request) -> Resp
     let downstream_http1_upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
     let vm_context = {
         let request_id = Uuid::new_v4().to_string();
-        let request_path = parts.uri.path().to_string();
         let vm_request = build_downstream_http_request_context(
-            request_id.clone(),
+            request_id,
             parts,
             body,
             connection_metadata.as_ref(),
@@ -927,16 +928,13 @@ async fn handle_data_plane_request(state: SharedState, request: Request) -> Resp
             attach_debugger: request_will_attach_debugger(
                 &state.debug_session,
                 &vm_request.headers,
-                &request_path,
+                &vm_request.path,
             ),
             force_threading: request_uses_blocking_debugger(
                 &state.debug_session,
                 &vm_request.headers,
-                &request_path,
+                &vm_request.path,
             ),
-            request_headers: vm_request.headers.clone(),
-            request_path,
-            request_id,
         };
         let mut vm_context = ProxyVmContext::from_http_request_with_services(
             vm_request,

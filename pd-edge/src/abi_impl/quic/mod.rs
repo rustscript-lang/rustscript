@@ -5,14 +5,14 @@ use std::{io, io::BufReader, sync::Arc};
 #[cfg(feature = "http3")]
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 #[cfg(feature = "http3")]
-use socket2::SockRef;
-#[cfg(feature = "http3")]
 use rustls::{
     self, ClientConfig, RootCertStore, ServerConfig, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
     version::TLS13,
 };
+#[cfg(feature = "http3")]
+use socket2::SockRef;
 
 use crate::abi_impl::transport::{TlsFlowState, TlsProtocolVersion};
 
@@ -151,12 +151,9 @@ fn default_quic_transport_config() -> quinn::TransportConfig {
     transport.max_concurrent_bidi_streams(
         quinn::VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS).into(),
     );
-    transport.stream_receive_window(
-        quinn::VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW_BYTES).into(),
-    );
-    transport.receive_window(
-        quinn::VarInt::from_u32(QUIC_CONNECTION_RECEIVE_WINDOW_BYTES).into(),
-    );
+    transport
+        .stream_receive_window(quinn::VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW_BYTES).into());
+    transport.receive_window(quinn::VarInt::from_u32(QUIC_CONNECTION_RECEIVE_WINDOW_BYTES).into());
     transport.send_window(QUIC_SEND_WINDOW_BYTES);
     transport.keep_alive_interval(Some(std::time::Duration::from_millis(
         QUIC_KEEPALIVE_INTERVAL_MS,

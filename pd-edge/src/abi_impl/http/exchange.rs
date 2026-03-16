@@ -35,11 +35,21 @@ fn with_exchange_request_mut<T>(
     handle: i64,
     mutate: impl FnOnce(&mut super::state::HttpOutboundRequestNode) -> T,
 ) -> Result<T, VmError> {
+    let request_head = if handle == default_upstream_exchange_handle() {
+        Some(context.with_request_head(Clone::clone))
+    } else {
+        None
+    };
     let mut exchanges = context.lock_exchanges();
     let exchange = exchanges
         .exchanges
         .get_mut(&handle)
         .ok_or_else(|| unknown_exchange_handle(handle))?;
+    if let Some(request_head) = request_head.as_ref() {
+        exchange
+            .request
+            .materialize_inherited_request_head(request_head);
+    }
     Ok(mutate(&mut exchange.request))
 }
 

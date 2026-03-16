@@ -208,6 +208,7 @@ impl SharedState {
         store_limits: RuntimeStoreLimits,
     ) -> Self {
         let client = upstream_reqwest_client_builder()
+            .pool_max_idle_per_host(store_limits.upstream_http_reuse_entries.max(1))
             .build()
             .expect("default upstream client should build");
         let upstream_client_cache =

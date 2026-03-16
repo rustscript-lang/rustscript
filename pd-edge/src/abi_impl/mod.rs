@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -12,7 +12,7 @@ use edge_abi::FUNCTIONS as EDGE_ABI_FUNCTIONS;
 use tokio::sync::oneshot;
 use vm::{CallOutcome, HostAsyncBridge, HostFunction, HostOpId, Value, Vm, VmError};
 
-use crate::lock_metrics::{self, LockMetricKey};
+use crate::lock_metrics::{self, LockMetricKey, ProfiledMutexGuard};
 
 #[cfg(feature = "console")]
 mod console;
@@ -48,11 +48,11 @@ pub(crate) use self::quic::{build_quic_server_config, tune_udp_socket_buffers};
 #[cfg(feature = "tls")]
 pub(crate) use self::transport::build_default_self_signed_server_config;
 pub(crate) use self::transport::{
-    ReplayPrefixedIo, SharedTlsSessionCache, new_shared_tls_session_cache,
+    ReplayPrefixedIo, new_shared_tls_session_cache,
 };
 
 pub type SharedRateLimiter = Arc<RateLimiterStore>;
-pub type SharedVmAsyncOps = Arc<Mutex<VmAsyncOps>>;
+pub type SharedVmAsyncOps = Arc<LazyVmAsyncOps>;
 #[cfg(feature = "console")]
 pub type SharedConsoleProgramArgs = Arc<Vec<String>>;
 
@@ -222,6 +222,18 @@ impl VmAsyncOps {
     }
 }
 
+#[derive(Default)]
+pub struct LazyVmAsyncOps {
+    inner: OnceLock<Mutex<VmAsyncOps>>,
+}
+
+impl LazyVmAsyncOps {
+    fn lock_ops(&self) -> ProfiledMutexGuard<'_, VmAsyncOps> {
+        let inner = self.inner.get_or_init(|| Mutex::new(VmAsyncOps::new()));
+        lock_metrics::lock(inner, LockMetricKey::VmAsyncOps, "vm async ops lock poisoned")
+    }
+}
+
 pub struct VmAsyncOpBridge {
     ops: SharedVmAsyncOps,
 }
@@ -234,17 +246,13 @@ impl VmAsyncOpBridge {
 
 impl HostAsyncBridge for VmAsyncOpBridge {
     fn poll_op(&mut self, op_id: HostOpId, cx: &mut Context<'_>) -> Poll<AsyncOpResult> {
-        let mut guard = lock_metrics::lock(
-            &self.ops,
-            LockMetricKey::VmAsyncOps,
-            "vm async ops lock poisoned",
-        );
+        let mut guard = self.ops.lock_ops();
         guard.poll_op(op_id, cx)
     }
 }
 
 pub fn new_shared_vm_async_ops() -> SharedVmAsyncOps {
-    Arc::new(Mutex::new(VmAsyncOps::new()))
+    Arc::new(LazyVmAsyncOps::default())
 }
 
 pub fn enter_edge_host_context(
@@ -738,11 +746,7 @@ fn schedule_future_call<F>(async_ops: &SharedVmAsyncOps, future: F) -> Result<Ca
 where
     F: Future<Output = AsyncOpResult> + Send + 'static,
 {
-    let mut ops = lock_metrics::lock(
-        async_ops,
-        LockMetricKey::VmAsyncOps,
-        "vm async ops lock poisoned",
-    );
+    let mut ops = async_ops.lock_ops();
     let op_id = ops.schedule_future(future)?;
     Ok(CallOutcome::Pending(op_id))
 }
@@ -770,11 +774,7 @@ fn schedule_ready_call(
     async_ops: &SharedVmAsyncOps,
     values: Vec<Value>,
 ) -> Result<CallOutcome, VmError> {
-    let mut ops = lock_metrics::lock(
-        async_ops,
-        LockMetricKey::VmAsyncOps,
-        "vm async ops lock poisoned",
-    );
+    let mut ops = async_ops.lock_ops();
     let op_id = ops.schedule_ready(Ok(values))?;
     Ok(CallOutcome::Pending(op_id))
 }

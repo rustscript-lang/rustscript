@@ -381,7 +381,6 @@ impl InboundRequestBodyState {
     }
 }
 
-type SharedInboundRequestBody = Arc<tokio::sync::Mutex<InboundRequestBodyState>>;
 #[derive(Clone)]
 pub(crate) struct DownstreamHttp1Upgrade {
     inner: Arc<tokio::sync::Mutex<Option<OnUpgrade>>>,
@@ -702,11 +701,20 @@ pub(crate) fn new_shared_upstream_client_cache(capacity: usize) -> SharedUpstrea
 }
 
 pub(crate) fn upstream_reqwest_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().tls_info(true)
+    let builder = reqwest::Client::builder().tls_info(true).tcp_nodelay(true);
+    #[cfg(feature = "http2")]
+    {
+        return builder.http2_adaptive_window(true);
+    }
+    #[cfg(not(feature = "http2"))]
+    {
+        builder
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct HttpOutboundRequestNode {
+    inherits_request_head: bool,
     pub(crate) method: Method,
     pub(crate) path: String,
     pub(crate) query: String,
@@ -714,6 +722,88 @@ pub(crate) struct HttpOutboundRequestNode {
     pub(crate) body_override: Option<Vec<u8>>,
     pub(crate) target: Option<String>,
     pub(crate) version_preference: HttpVersionPreference,
+}
+
+impl HttpOutboundRequestNode {
+    fn new() -> Self {
+        Self {
+            inherits_request_head: false,
+            method: Method::GET,
+            path: "/".to_string(),
+            query: String::new(),
+            headers: HeaderMap::new(),
+            body_override: None,
+            target: None,
+            version_preference: HttpVersionPreference::Auto,
+        }
+    }
+
+    fn default_upstream() -> Self {
+        Self {
+            inherits_request_head: true,
+            method: Method::GET,
+            path: String::new(),
+            query: String::new(),
+            headers: HeaderMap::new(),
+            body_override: None,
+            target: None,
+            version_preference: HttpVersionPreference::Auto,
+        }
+    }
+
+    fn reset_inherited_request_head(&mut self) {
+        self.inherits_request_head = true;
+        self.method = Method::GET;
+        self.path.clear();
+        self.query.clear();
+        self.headers.clear();
+    }
+
+    pub(crate) fn materialize_inherited_request_head(&mut self, request_head: &HttpRequestHead) {
+        if !self.inherits_request_head {
+            return;
+        }
+        self.method = request_head.method().clone();
+        self.path = request_head.path().to_string();
+        self.query = request_head.query().to_string();
+        self.headers = request_head.headers().clone();
+        self.inherits_request_head = false;
+    }
+
+    fn method_or_request_head<'a>(&'a self, request_head: &'a HttpRequestHead) -> &'a Method {
+        if self.inherits_request_head {
+            request_head.method()
+        } else {
+            &self.method
+        }
+    }
+
+    fn path_or_request_head<'a>(&'a self, request_head: &'a HttpRequestHead) -> &'a str {
+        if self.inherits_request_head {
+            request_head.path()
+        } else {
+            &self.path
+        }
+    }
+
+    fn query_or_request_head<'a>(&'a self, request_head: &'a HttpRequestHead) -> &'a str {
+        if self.inherits_request_head {
+            request_head.query()
+        } else {
+            &self.query
+        }
+    }
+
+    fn headers_or_request_head<'a>(
+        &'a self,
+        request_head: &'a HttpRequestHead,
+    ) -> &'a HeaderMap {
+        if self.inherits_request_head {
+            request_head.headers()
+        } else {
+            &self.headers
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1152,15 +1242,7 @@ pub(crate) struct HttpOutboundExchangeState {
 impl HttpOutboundExchangeState {
     fn new() -> Self {
         Self {
-            request: HttpOutboundRequestNode {
-                method: Method::GET,
-                path: "/".to_string(),
-                query: String::new(),
-                headers: HeaderMap::new(),
-                body_override: None,
-                target: None,
-                version_preference: HttpVersionPreference::Auto,
-            },
+            request: HttpOutboundRequestNode::new(),
             response: HttpUpstreamResponseNode::NotStarted,
             transport: HttpExchangeTransportState::default(),
             websocket_dag: WebSocketConnectionState::default(),
@@ -1168,17 +1250,9 @@ impl HttpOutboundExchangeState {
         }
     }
 
-    fn default_upstream(request_head: &HttpRequestHead) -> Self {
+    fn default_upstream() -> Self {
         Self {
-            request: HttpOutboundRequestNode {
-                method: request_head.method.clone(),
-                path: request_head.path.clone(),
-                query: request_head.query.clone(),
-                headers: request_head.headers.clone(),
-                body_override: None,
-                target: None,
-                version_preference: HttpVersionPreference::Auto,
-            },
+            request: HttpOutboundRequestNode::default_upstream(),
             ..Self::new()
         }
     }
@@ -1303,7 +1377,6 @@ pub(crate) fn new_shared_http_plane_runtime_services(
 
 #[derive(Debug)]
 pub(crate) struct DownstreamState {
-    pub(crate) inbound_request_body: SharedInboundRequestBody,
     #[cfg_attr(not(feature = "websocket"), allow(dead_code))]
     pub(crate) downstream_websocket: WebSocketConnectionState,
     pub(crate) response_output: HttpResponseOutputNode,
@@ -1314,11 +1387,8 @@ pub(crate) struct DownstreamState {
 }
 
 impl DownstreamState {
-    fn from_http_request(request_head: &HttpRequestHead, body: Body) -> Self {
+    fn from_http_request(request_head: &HttpRequestHead) -> Self {
         Self {
-            inbound_request_body: Arc::new(tokio::sync::Mutex::new(InboundRequestBodyState::new(
-                body,
-            ))),
             downstream_websocket: WebSocketConnectionState::for_http_request(&request_head.headers),
             response_output: HttpResponseOutputNode::default(),
             downstream_carrier_ref: Some(HttpCarrierRef::DownstreamHttp1),
@@ -1355,9 +1425,6 @@ impl DownstreamState {
 
     fn for_transport_connection() -> Self {
         Self {
-            inbound_request_body: Arc::new(tokio::sync::Mutex::new(InboundRequestBodyState::new(
-                Body::empty(),
-            ))),
             downstream_websocket: WebSocketConnectionState::default(),
             response_output: HttpResponseOutputNode::default(),
             downstream_carrier_ref: None,
@@ -1375,11 +1442,11 @@ pub(crate) struct ExchangeRegistry {
 }
 
 impl ExchangeRegistry {
-    fn from_http_request(request_head: &HttpRequestHead) -> Self {
+    fn from_http_request(_request_head: &HttpRequestHead) -> Self {
         let mut exchanges = HashMap::new();
         exchanges.insert(
             DEFAULT_UPSTREAM_EXCHANGE_HANDLE,
-            HttpOutboundExchangeState::default_upstream(request_head),
+            HttpOutboundExchangeState::default_upstream(),
         );
         Self {
             next_outbound_exchange_handle: FIRST_DYNAMIC_EXCHANGE_HANDLE,
@@ -1411,11 +1478,7 @@ where
         self.0.get_or_insert_with(HashMap::new).insert(key, value)
     }
 
-    pub(crate) fn get_or_insert_with(
-        &mut self,
-        key: K,
-        default: impl FnOnce() -> V,
-    ) -> &mut V {
+    pub(crate) fn get_or_insert_with(&mut self, key: K, default: impl FnOnce() -> V) -> &mut V {
         self.0
             .get_or_insert_with(HashMap::new)
             .entry(key)
@@ -1587,6 +1650,7 @@ impl Default for EdgeIoRegistry {
 #[derive(Debug)]
 pub struct ProxyVmContext {
     request_head: Mutex<HttpRequestHead>,
+    inbound_request_body: tokio::sync::Mutex<InboundRequestBodyState>,
     services: SharedRuntimeServices,
     downstream: Mutex<DownstreamState>,
     exchanges: Mutex<ExchangeRegistry>,
@@ -1606,24 +1670,34 @@ impl ProxyVmContext {
         request: HttpRequestContext,
         services: SharedRuntimeServices,
     ) -> Self {
-        let request_headers = request.headers;
+        let HttpRequestContext {
+            request_id,
+            method,
+            path,
+            query,
+            http_version,
+            port,
+            scheme,
+            host,
+            client_ip,
+            body,
+            headers,
+        } = request;
         let request_head = HttpRequestHead {
-            request_id: request.request_id,
-            method: request.method,
-            path: request.path,
-            query: request.query,
-            http_version: request.http_version,
-            port: request.port,
-            scheme: request.scheme,
-            host: request.host,
-            client_ip: request.client_ip,
-            headers: request_headers,
+            request_id,
+            method,
+            path,
+            query,
+            http_version,
+            port,
+            scheme,
+            host,
+            client_ip,
+            headers,
         };
         Self {
-            downstream: Mutex::new(DownstreamState::from_http_request(
-                &request_head,
-                request.body,
-            )),
+            inbound_request_body: tokio::sync::Mutex::new(InboundRequestBodyState::new(body)),
+            downstream: Mutex::new(DownstreamState::from_http_request(&request_head)),
             exchanges: Mutex::new(ExchangeRegistry::from_http_request(&request_head)),
             transport: Mutex::new(TransportState::from_http_request(&request_head)),
             request_head: Mutex::new(request_head),
@@ -1704,6 +1778,9 @@ impl ProxyVmContext {
             headers: HeaderMap::new(),
         };
         Ok(Self {
+            inbound_request_body: tokio::sync::Mutex::new(InboundRequestBodyState::new(
+                Body::empty(),
+            )),
             downstream: Mutex::new(DownstreamState::for_transport_connection()),
             exchanges: Mutex::new(ExchangeRegistry::from_http_request(&request_head)),
             transport: Mutex::new(TransportState::from_downstream_tcp_stream(
@@ -1893,26 +1970,39 @@ impl ProxyVmContext {
         })
     }
 
-    pub(crate) fn promote_downstream_http_request(
+    pub(crate) async fn promote_downstream_http_request(
         &self,
         request: HttpRequestContext,
         http2_attachment: Option<http2::Http2DownstreamStreamAttachment>,
         downstream_http1_upgrade: Option<OnUpgrade>,
     ) {
-        let request_headers = request.headers.clone();
+        let HttpRequestContext {
+            request_id,
+            method,
+            path,
+            query,
+            http_version,
+            port,
+            scheme,
+            host,
+            client_ip,
+            body,
+            headers,
+        } = request;
         let request_head = HttpRequestHead {
-            request_id: request.request_id,
-            method: request.method,
-            path: request.path,
-            query: request.query,
-            http_version: request.http_version,
-            port: request.port,
-            scheme: request.scheme,
-            host: request.host,
-            client_ip: request.client_ip,
-            headers: request_headers.clone(),
+            request_id,
+            method,
+            path,
+            query,
+            http_version,
+            port,
+            scheme,
+            host,
+            client_ip,
+            headers,
         };
-        *self.lock_request_head() = request_head.clone();
+        let downstream_websocket = WebSocketConnectionState::for_http_request(request_head.headers());
+        *self.lock_request_head() = request_head;
 
         {
             let mut exchanges = self.lock_exchanges();
@@ -1920,18 +2010,13 @@ impl ProxyVmContext {
                 .exchanges
                 .get_mut(&DEFAULT_UPSTREAM_EXCHANGE_HANDLE)
                 .expect("default upstream exchange should exist");
-            default_exchange.request.method = request_head.method.clone();
-            default_exchange.request.path = request_head.path.clone();
-            default_exchange.request.query = request_head.query.clone();
-            default_exchange.request.headers = request_head.headers.clone();
+            default_exchange.request.reset_inherited_request_head();
         }
 
+        *self.inbound_request_body.lock().await = InboundRequestBodyState::new(body);
+
         let mut downstream = self.lock_downstream();
-        downstream.inbound_request_body = Arc::new(tokio::sync::Mutex::new(
-            InboundRequestBodyState::new(request.body),
-        ));
-        downstream.downstream_websocket =
-            WebSocketConnectionState::for_http_request(&request_headers);
+        downstream.downstream_websocket = downstream_websocket;
         downstream.downstream_carrier_ref =
             http2_attachment.map_or(Some(HttpCarrierRef::DownstreamHttp1), |attachment| {
                 Some(HttpCarrierRef::DownstreamHttp2Stream(
@@ -2454,26 +2539,20 @@ pub(crate) struct ResolvedHttpGraphResponse {
 pub async fn resolve_outbound_request_body(
     context: &SharedProxyVmContext,
 ) -> Result<Vec<u8>, VmError> {
-    let (body_override, inbound_body) = {
-        let exchanges = context.lock_exchanges();
-        let downstream = context.lock_downstream();
-        (
-            exchanges
-                .exchanges
-                .get(&DEFAULT_UPSTREAM_EXCHANGE_HANDLE)
-                .expect("default upstream exchange should exist")
-                .request
-                .body_override
-                .clone(),
-            downstream.inbound_request_body.clone(),
-        )
-    };
+    let body_override = context
+        .lock_exchanges()
+        .exchanges
+        .get(&DEFAULT_UPSTREAM_EXCHANGE_HANDLE)
+        .expect("default upstream exchange should exist")
+        .request
+        .body_override
+        .clone();
 
     if let Some(body) = body_override {
         return Ok(body);
     }
 
-    let mut inbound = inbound_body.lock().await;
+    let mut inbound = context.inbound_request_body.lock().await;
     inbound.read_all().await
 }
 
@@ -2713,6 +2792,14 @@ fn prepared_upstream_request(
         _ => context.lock_transport().tls_dag.default_upstream.clone(),
     };
     let services = context.services();
+    let (method, path, query, headers) = context.with_request_head(|request_head| {
+        (
+            exchange.request.method_or_request_head(request_head).clone(),
+            exchange.request.path_or_request_head(request_head).to_string(),
+            exchange.request.query_or_request_head(request_head).to_string(),
+            exchange.request.headers_or_request_head(request_head).clone(),
+        )
+    });
     Ok(PreparedUpstreamRequest {
         client: services
             .upstream_client()
@@ -2733,10 +2820,10 @@ fn prepared_upstream_request(
         ),
         tls_flow,
         attached_transport,
-        method: exchange.request.method.clone(),
-        path: exchange.request.path.clone(),
-        query: exchange.request.query.clone(),
-        headers: exchange.request.headers.clone(),
+        method,
+        path,
+        query,
+        headers,
         target,
     })
 }
@@ -4247,16 +4334,14 @@ fn finalize_downstream_body_eof_result(
 pub(crate) async fn read_request_body_all(
     context: &SharedProxyVmContext,
 ) -> Result<Vec<u8>, VmError> {
-    let body: SharedInboundRequestBody = context.lock_downstream().inbound_request_body.clone();
-    let mut inbound = body.lock().await;
+    let mut inbound = context.inbound_request_body.lock().await;
     finalize_downstream_body_all_result(context, inbound.read_all().await)
 }
 
 pub(crate) async fn consume_request_body_all(
     context: &SharedProxyVmContext,
 ) -> Result<Vec<u8>, VmError> {
-    let body: SharedInboundRequestBody = context.lock_downstream().inbound_request_body.clone();
-    let mut inbound = body.lock().await;
+    let mut inbound = context.inbound_request_body.lock().await;
     finalize_downstream_body_all_result(context, inbound.read_all_and_consume().await)
 }
 
@@ -4264,8 +4349,7 @@ pub(crate) async fn read_request_body_next_chunk(
     context: &SharedProxyVmContext,
     max_bytes: usize,
 ) -> Result<Vec<u8>, VmError> {
-    let body: SharedInboundRequestBody = context.lock_downstream().inbound_request_body.clone();
-    let mut inbound = body.lock().await;
+    let mut inbound = context.inbound_request_body.lock().await;
     let result = inbound.read_next_chunk(max_bytes).await;
     finalize_downstream_body_read_result(context, &inbound, result)
 }
@@ -4273,15 +4357,13 @@ pub(crate) async fn read_request_body_next_chunk(
 pub(crate) async fn read_request_body_next_line(
     context: &SharedProxyVmContext,
 ) -> Result<Vec<u8>, VmError> {
-    let body: SharedInboundRequestBody = context.lock_downstream().inbound_request_body.clone();
-    let mut inbound = body.lock().await;
+    let mut inbound = context.inbound_request_body.lock().await;
     let result = inbound.read_next_line().await;
     finalize_downstream_body_read_result(context, &inbound, result)
 }
 
 pub(crate) async fn request_body_eof(context: &SharedProxyVmContext) -> Result<bool, VmError> {
-    let body: SharedInboundRequestBody = context.lock_downstream().inbound_request_body.clone();
-    let mut inbound = body.lock().await;
+    let mut inbound = context.inbound_request_body.lock().await;
     finalize_downstream_body_eof_result(context, inbound.eof().await)
 }
 

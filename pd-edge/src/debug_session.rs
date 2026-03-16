@@ -11,6 +11,7 @@ use tracing::{info, warn};
 use vm::{DebugCommandBridge, DebugCommandBridgeError, Debugger, Vm, VmResult, VmStatus};
 
 use crate::{
+    abi_impl::SharedProxyVmContext,
     control_plane_rpc::{DebugSessionMode, RemoteDebugCommand, RemoteDebugCommandResponse},
     logging::category_debug,
 };
@@ -337,9 +338,7 @@ pub fn debug_session_status(store: &SharedDebugSession) -> DebugSessionStatus {
 
 pub fn run_vm_with_optional_debugger(
     store: &SharedDebugSession,
-    request_headers: &HeaderMap,
-    request_path: &str,
-    request_id: &str,
+    context: SharedProxyVmContext,
     vm: &mut Vm,
 ) -> VmResult<VmStatus> {
     let session = {
@@ -347,12 +346,21 @@ pub fn run_vm_with_optional_debugger(
         guard.clone()
     };
 
-    if let Some(session) = session
-        && request_matches_session(request_headers, request_path, &session)
-    {
+    if let Some(session) = session {
+        let matched = context
+            .with_request_head(|request_head| request_matches_session(
+                request_head.headers(),
+                request_head.path(),
+                &session,
+            ));
+        if !matched {
+            return vm.run();
+        }
+        let request_id =
+            context.with_request_head(|request_head| request_head.request_id().to_string());
         match &session.state {
             DebugSessionState::Interactive { debugger, .. } => {
-                session.set_request_id(Some(request_id.to_string()));
+                session.set_request_id(Some(request_id));
                 info!(
                     "{} request matched interactive debug session header={}",
                     category_debug(),
@@ -373,13 +381,15 @@ pub fn run_vm_with_optional_debugger(
                 return result;
             }
             DebugSessionState::Recording { runtime } => {
-                session.set_request_id(Some(request_id.to_string()));
+                session.set_request_id(Some(request_id.clone()));
                 {
                     let guard = runtime.lock().expect("recording runtime lock poisoned");
                     if guard.completed {
                         return vm.run();
                     }
                 }
+                let request_path =
+                    context.with_request_head(|request_head| request_head.path().to_string());
 
                 info!(
                     "{} request matched recording debug session path={}",
@@ -411,7 +421,7 @@ pub fn run_vm_with_optional_debugger(
                             runtime.outbox.push_back(DebugRecordingArtifact {
                                 session_id: session.session_id.clone(),
                                 recording_id: format!("{}-{}", session.session_id, sequence),
-                                request_id: Some(request_id.to_string()),
+                                request_id: Some(request_id.clone()),
                                 request_path: session.request_path.clone(),
                                 recording_base64: STANDARD.encode(bytes),
                                 frame_count,

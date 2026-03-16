@@ -16,8 +16,7 @@ use edge::HOST_FUNCTION_COUNT;
 use futures_util::future::poll_fn;
 use http_body_util::{BodyExt, Full};
 use hyper::{
-    Request as HyperRequest,
-    Response as HyperResponse,
+    Request as HyperRequest, Response as HyperResponse,
     body::{Bytes, Incoming},
     http::{HeaderMap, HeaderValue, StatusCode as HttpStatusCode, Version as HttpVersion},
     service::service_fn,
@@ -28,25 +27,24 @@ use rcgen::generate_simple_self_signed;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use socket2::SockRef;
+#[cfg(feature = "http3")]
+use tokio::net::lookup_host;
 use tokio::{
     sync::Mutex as AsyncMutex,
     task::{JoinHandle, JoinSet},
     time::sleep,
 };
-#[cfg(feature = "http3")]
-use tokio::net::lookup_host;
-#[cfg(all(feature = "http2", feature = "tls"))]
-use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
 #[cfg(all(feature = "http2", feature = "tls", not(feature = "http3")))]
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+#[cfg(all(feature = "http2", feature = "tls"))]
+use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
 #[cfg(feature = "http3")]
 use url::Url;
 use vm::{compile_source, encode_program, validate_program};
 
 #[cfg(feature = "http3")]
 use rustls::{
-    self,
-    ClientConfig as RustlsClientConfig, RootCertStore, SignatureScheme,
+    self, ClientConfig as RustlsClientConfig, RootCertStore, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
 };
@@ -98,10 +96,19 @@ while outer < 12 {
 }
 "#;
 
+fn selected_base_workload_source() -> &'static str {
+    if env_flag("PD_EDGE_PERF_SKIP_BASE_WORKLOAD") {
+        "let mut acc = 0;"
+    } else {
+        BASE_WORKLOAD_SOURCE
+    }
+}
+
 fn no_host_calls_program_source() -> String {
+    let workload_source = selected_base_workload_source();
     format!(
         r#"
-{BASE_WORKLOAD_SOURCE}
+{workload_source}
 let parity = acc % 2;
 if parity == 0 {{
     acc;
@@ -113,9 +120,10 @@ if parity == 0 {{
 }
 
 fn host_calls_terminate_program_source() -> String {
+    let workload_source = selected_base_workload_source();
     format!(
         r#"
-{BASE_WORKLOAD_SOURCE}
+{workload_source}
 
 use http;
 
@@ -229,6 +237,7 @@ fn proxy_roundtrip_program_source(
     upstream_protocol: UpstreamProtocol,
     flavor: ProxyProgramFlavor,
 ) -> String {
+    let workload_source = selected_base_workload_source();
     let tls_import = if upstream_protocol.requires_tls() {
         "use tls;\n"
     } else {
@@ -286,7 +295,7 @@ http::response::set_headers({batched_response_headers});
     };
     format!(
         r#"
-{BASE_WORKLOAD_SOURCE}
+{workload_source}
 
 use http;
 use proxy;
@@ -740,8 +749,7 @@ type Http3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 #[cfg(feature = "http3")]
 type Http3Driver = h3::client::Connection<h3_quinn::Connection, Bytes>;
 #[cfg(feature = "http3")]
-type Http3BenchSendStream =
-    h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
+type Http3BenchSendStream = h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
 #[cfg(feature = "http3")]
 type Http3BenchRecvStream = h3::server::RequestStream<h3_quinn::RecvStream, Bytes>;
 
@@ -989,8 +997,12 @@ impl Http3BenchClient {
             .find(SocketAddr::is_ipv4)
             .or_else(|| remotes.first().copied())
             .ok_or_else(|| io::Error::other("http3 origin should resolve"))?;
-        let bind_addr: SocketAddr = if remote.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" }
-            .parse()?;
+        let bind_addr: SocketAddr = if remote.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        }
+        .parse()?;
         let socket = std::net::UdpSocket::bind(bind_addr)?;
         socket.set_nonblocking(true)?;
         tune_udp_socket_buffers(&socket)?;
@@ -1003,8 +1015,8 @@ impl Http3BenchClient {
         endpoint.set_default_client_config(build_http3_bench_client_config());
         let connecting = endpoint.connect(remote, host)?;
         let connection = tokio::time::timeout(request_timeout, connecting)
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "http3 connect timed out"))??;
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "http3 connect timed out"))??;
         let h3_connection = h3_quinn::Connection::new(connection.clone());
         let (driver, sender) = h3::client::new(h3_connection).await?;
         let driver_handle = tokio::spawn(async move {
@@ -1057,9 +1069,10 @@ impl Http3BenchClient {
                         io::Error::other(format!("http3 request body should send: {err}"))
                     })?;
             }
-            stream.finish().await.map_err(|err| {
-                io::Error::other(format!("http3 request should finish: {err}"))
-            })?;
+            stream
+                .finish()
+                .await
+                .map_err(|err| io::Error::other(format!("http3 request should finish: {err}")))?;
             let response = stream.recv_response().await.map_err(|err| {
                 io::Error::other(format!("http3 response head should arrive: {err}"))
             })?;
@@ -1331,9 +1344,11 @@ fn select_scenarios(config: &BenchConfig) -> Result<Vec<Scenario>, Box<dyn std::
             } else {
                 HTTP2_TLS_FEATURE_HINT
             };
-            return Err(
-                io::Error::other(format!("scenario '{}' requires feature support; {}", matched.id, hint)).into(),
-            );
+            return Err(io::Error::other(format!(
+                "scenario '{}' requires feature support; {}",
+                matched.id, hint
+            ))
+            .into());
         }
         Ok(vec![matched])
     } else {
@@ -1397,8 +1412,12 @@ fn scenario_error_report(scenario: Scenario, error: String) -> ScenarioReport {
 }
 
 fn required_proxy_build_features(scenarios: &[Scenario]) -> Vec<&'static str> {
-    let needs_http2 = scenarios.iter().any(|scenario| scenario.requires_http2_tls());
-    let needs_http3 = scenarios.iter().any(|scenario| scenario.requires_http3_tls());
+    let needs_http2 = scenarios
+        .iter()
+        .any(|scenario| scenario.requires_http2_tls());
+    let needs_http3 = scenarios
+        .iter()
+        .any(|scenario| scenario.requires_http3_tls());
     let needs_tls = needs_http2 || needs_http3;
     let mut features = Vec::new();
     if needs_http2 {
@@ -1627,19 +1646,17 @@ async fn run_scenario(
             .origin()
             .to_string()
     };
-    let probe_client =
-        build_scenario_client(clients, scenario, &request_origin, config.request_timeout_ms, 1)
-            .await?;
-    verify_scenario_probe(
-        &probe_client,
+    let probe_client = build_scenario_client(
+        clients,
         scenario,
-        upstream_fixture.as_ref(),
+        &request_origin,
+        config.request_timeout_ms,
+        1,
     )
     .await?;
+    verify_scenario_probe(&probe_client, scenario, upstream_fixture.as_ref()).await?;
     let load_http3_pool_size = if scenario.downstream_protocol.requires_http3_tls() {
-        config
-            .concurrency
-            .clamp(1, BENCH_HTTP3_CLIENT_POOL_MAX)
+        config.concurrency.clamp(1, BENCH_HTTP3_CLIENT_POOL_MAX)
     } else {
         1
     };
@@ -2214,13 +2231,7 @@ async fn verify_upstream_reuse_probe(
         .into());
     }
 
-    let reused = send_probe_request(
-        client,
-        "/reuse",
-        "perf-client-reuse",
-        scenario,
-    )
-    .await?;
+    let reused = send_probe_request(client, "/reuse", "perf-client-reuse", scenario).await?;
     match scenario.program_variant {
         ProgramVariant::DirectUpstream { upstream, .. } => {
             verify_direct_upstream_probe_response(
@@ -2289,8 +2300,9 @@ async fn build_benchmark_upstream_response(
     version_label: &'static str,
 ) -> Result<HyperResponse<Full<Bytes>>, std::convert::Infallible> {
     let (parts, body) = request.into_parts();
-    let response = prepare_benchmark_upstream_response(parts.uri.path(), &parts.headers, body, version_label)
-        .await;
+    let response =
+        prepare_benchmark_upstream_response(parts.uri.path(), &parts.headers, body, version_label)
+            .await;
     Ok(response.into_hyper_response())
 }
 
@@ -2483,10 +2495,11 @@ async fn spawn_https_http2_upstream_fixture() -> Result<UpstreamFixture, Box<dyn
 #[cfg(feature = "http3")]
 fn build_http3_bench_client_config() -> quinn::ClientConfig {
     ensure_rustls_provider();
-    let builder =
-        RustlsClientConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .expect("http3 benchmark TLS versions should configure");
+    let builder = RustlsClientConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .expect("http3 benchmark TLS versions should configure");
     let mut config = builder
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PermissiveServerCertVerifier::new()))
@@ -2586,8 +2599,9 @@ impl ServerCertVerifier for PermissiveServerCertVerifier {
 #[cfg(feature = "http3")]
 fn build_http3_upstream_server_config() -> quinn::ServerConfig {
     ensure_rustls_provider();
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
-        .expect("http3 upstream benchmark certificate should generate");
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("http3 upstream benchmark certificate should generate");
     let mut server_crypto = rustls::ServerConfig::builder_with_provider(
         rustls::crypto::aws_lc_rs::default_provider().into(),
     )
@@ -2595,10 +2609,9 @@ fn build_http3_upstream_server_config() -> quinn::ServerConfig {
     .expect("http3 upstream benchmark TLS versions should configure")
     .with_no_client_auth()
     .with_single_cert(
-        vec![CertificateDer::from(
-            cert.serialize_der()
-                .expect("http3 upstream benchmark certificate should serialize"),
-        )],
+        vec![CertificateDer::from(cert.serialize_der().expect(
+            "http3 upstream benchmark certificate should serialize",
+        ))],
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.serialize_private_key_der())),
     )
     .expect("http3 upstream benchmark server config should build");
@@ -2916,10 +2929,7 @@ async fn run_load(
                 }
 
                 let request_started = Instant::now();
-                match client
-                    .send_request("/perf", "perf-client", body_mode)
-                    .await
-                {
+                match client.send_request("/perf", "perf-client", body_mode).await {
                     Ok(response) => {
                         *worker.status_counts.entry(response.status).or_insert(0) += 1;
                         if collect_latencies {

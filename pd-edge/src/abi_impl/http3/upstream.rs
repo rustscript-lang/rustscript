@@ -1,12 +1,12 @@
 #![cfg_attr(not(feature = "http3"), allow(dead_code))]
 
 #[cfg(feature = "http3")]
+use std::collections::HashMap;
+#[cfg(feature = "http3")]
 use std::env;
 #[cfg(feature = "http3")]
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-#[cfg(feature = "http3")]
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "http3")]
 use axum::{
@@ -24,7 +24,9 @@ use url::Url;
 
 #[cfg(feature = "http3")]
 use crate::abi_impl::{
-    quic::{build_quic_client_config, negotiated_alpn, peer_certificate_der, tune_udp_socket_buffers},
+    quic::{
+        build_quic_client_config, negotiated_alpn, peer_certificate_der, tune_udp_socket_buffers,
+    },
     transport::{TlsFlowState, TlsSessionCacheKey, tls_session_cache_key},
 };
 #[cfg(feature = "http3")]
@@ -298,14 +300,12 @@ impl Http3UpstreamSession {
     }
 
     fn is_reusable(&self) -> bool {
-        let dag = self
-            .lock_dag();
+        let dag = self.lock_dag();
         dag.can_accept_new_streams()
     }
 
     fn should_retain(&self) -> bool {
-        let dag = self
-            .lock_dag();
+        let dag = self.lock_dag();
         !dag.frontier.is_terminal() || dag.has_active_streams()
     }
 
@@ -644,9 +644,12 @@ async fn acquire_or_open_session(
             let session_id = guard.next_session_id.saturating_add(1);
             guard.next_session_id = session_id;
             let session = session.into_session(session_id);
-            guard
-                .sessions
-                .insert(key, Http3SessionPoolEntry { sessions: vec![session.clone()] });
+            guard.sessions.insert(
+                key,
+                Http3SessionPoolEntry {
+                    sessions: vec![session.clone()],
+                },
+            );
             Ok(session)
         }
         Err(_) if matches!(mode, Http3UpstreamMode::Preferred) => {
