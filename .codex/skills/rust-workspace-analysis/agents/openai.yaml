@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rust Workspace Analysis"
+  short_description: "Analyze Cargo workspace LOC, features, and tests"
+  default_prompt: "Use $rust-workspace-analysis to generate a crate, feature, and test breakdown for this Rust repo."
