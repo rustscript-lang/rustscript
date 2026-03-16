@@ -5,6 +5,8 @@ use std::{io, io::BufReader, sync::Arc};
 #[cfg(feature = "http3")]
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 #[cfg(feature = "http3")]
+use socket2::SockRef;
+#[cfg(feature = "http3")]
 use rustls::{
     self, ClientConfig, RootCertStore, ServerConfig, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -15,6 +17,18 @@ use rustls::{
 use crate::abi_impl::transport::{TlsFlowState, TlsProtocolVersion};
 
 pub(crate) const ALPN_PROTOCOL: &str = "h3";
+#[cfg(feature = "http3")]
+const QUIC_SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(feature = "http3")]
+const QUIC_STREAM_RECEIVE_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
+#[cfg(feature = "http3")]
+const QUIC_CONNECTION_RECEIVE_WINDOW_BYTES: u32 = 32 * 1024 * 1024;
+#[cfg(feature = "http3")]
+const QUIC_SEND_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+#[cfg(feature = "http3")]
+const QUIC_KEEPALIVE_INTERVAL_MS: u64 = 5_000;
+#[cfg(feature = "http3")]
+const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 1024;
 
 #[cfg(feature = "http3")]
 pub(crate) fn ensure_rustls_provider() {
@@ -87,10 +101,12 @@ pub(crate) fn build_quic_client_config(
 
     config.enable_sni = tls_flow.sni_enabled();
     config.alpn_protocols = alpn_protocols_for_http3(tls_flow);
-    Ok(quinn::ClientConfig::new(Arc::new(
+    let mut client = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(config)
             .map_err(|err| format!("failed to wrap QUIC client config: {err}"))?,
-    )))
+    ));
+    client.transport_config(Arc::new(default_quic_transport_config()));
+    Ok(client)
 }
 
 #[cfg(feature = "http3")]
@@ -116,7 +132,36 @@ pub(crate) fn build_quic_server_config(
     server_crypto.alpn_protocols = alpn_protocols;
     let quic_crypto = QuicServerConfig::try_from(server_crypto)
         .map_err(|err| io::Error::other(format!("failed to wrap QUIC server config: {err}")))?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic_crypto)))
+    let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    server.transport_config(Arc::new(default_quic_transport_config()));
+    Ok(server)
+}
+
+#[cfg(feature = "http3")]
+pub(crate) fn tune_udp_socket_buffers(socket: &std::net::UdpSocket) -> io::Result<()> {
+    let sock_ref = SockRef::from(socket);
+    sock_ref.set_recv_buffer_size(QUIC_SOCKET_BUFFER_BYTES)?;
+    sock_ref.set_send_buffer_size(QUIC_SOCKET_BUFFER_BYTES)?;
+    Ok(())
+}
+
+#[cfg(feature = "http3")]
+fn default_quic_transport_config() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(
+        quinn::VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS).into(),
+    );
+    transport.stream_receive_window(
+        quinn::VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW_BYTES).into(),
+    );
+    transport.receive_window(
+        quinn::VarInt::from_u32(QUIC_CONNECTION_RECEIVE_WINDOW_BYTES).into(),
+    );
+    transport.send_window(QUIC_SEND_WINDOW_BYTES);
+    transport.keep_alive_interval(Some(std::time::Duration::from_millis(
+        QUIC_KEEPALIVE_INTERVAL_MS,
+    )));
+    transport
 }
 
 #[cfg(feature = "http3")]

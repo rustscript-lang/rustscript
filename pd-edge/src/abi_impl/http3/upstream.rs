@@ -1,8 +1,12 @@
 #![cfg_attr(not(feature = "http3"), allow(dead_code))]
 
 #[cfg(feature = "http3")]
+use std::env;
+#[cfg(feature = "http3")]
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "http3")]
+use std::sync::OnceLock;
 
 #[cfg(feature = "http3")]
 use axum::{
@@ -20,11 +24,13 @@ use url::Url;
 
 #[cfg(feature = "http3")]
 use crate::abi_impl::{
-    quic::{build_quic_client_config, negotiated_alpn, peer_certificate_der},
+    quic::{build_quic_client_config, negotiated_alpn, peer_certificate_der, tune_udp_socket_buffers},
     transport::{TlsFlowState, TlsSessionCacheKey, tls_session_cache_key},
 };
 #[cfg(feature = "http3")]
 use crate::cache::BoundedLruStore;
+#[cfg(feature = "http3")]
+use crate::lock_metrics::{self, LockMetricKey};
 
 use super::model::Http3UpstreamMode;
 #[cfg(feature = "http3")]
@@ -33,10 +39,41 @@ use super::model::{
     Http3SessionGoal, Http3StreamFrontier, Http3StreamRef, session_origin,
 };
 
+#[cfg(feature = "http3")]
+const DEFAULT_HTTP3_UPSTREAM_MAX_REUSABLE_SESSIONS_PER_ORIGIN: usize = 8;
+#[cfg(feature = "http3")]
+const DEFAULT_HTTP3_UPSTREAM_TARGET_ACTIVE_STREAMS_PER_SESSION: usize = 4;
+#[cfg(feature = "http3")]
+static HTTP3_UPSTREAM_MAX_REUSABLE_SESSIONS_PER_ORIGIN: OnceLock<usize> = OnceLock::new();
+#[cfg(feature = "http3")]
+static HTTP3_UPSTREAM_TARGET_ACTIVE_STREAMS_PER_SESSION: OnceLock<usize> = OnceLock::new();
+
+#[cfg(feature = "http3")]
+fn http3_upstream_max_reusable_sessions_per_origin() -> usize {
+    *HTTP3_UPSTREAM_MAX_REUSABLE_SESSIONS_PER_ORIGIN.get_or_init(|| {
+        env::var("PD_EDGE_HTTP3_UPSTREAM_MAX_REUSABLE_SESSIONS_PER_ORIGIN")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_HTTP3_UPSTREAM_MAX_REUSABLE_SESSIONS_PER_ORIGIN)
+    })
+}
+
+#[cfg(feature = "http3")]
+fn http3_upstream_target_active_streams_per_session() -> usize {
+    *HTTP3_UPSTREAM_TARGET_ACTIVE_STREAMS_PER_SESSION.get_or_init(|| {
+        env::var("PD_EDGE_HTTP3_UPSTREAM_TARGET_ACTIVE_STREAMS_PER_SESSION")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_HTTP3_UPSTREAM_TARGET_ACTIVE_STREAMS_PER_SESSION)
+    })
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Http3SessionStore {
     #[cfg(feature = "http3")]
-    sessions: BoundedLruStore<Http3SessionKey, Arc<Http3UpstreamSession>>,
+    sessions: BoundedLruStore<Http3SessionKey, Http3SessionPoolEntry>,
     #[cfg(feature = "http3")]
     next_session_id: u64,
 }
@@ -74,6 +111,12 @@ pub(crate) fn new_shared_http3_upstream_sessions(capacity: usize) -> SharedHttp3
 struct Http3SessionKey {
     origin: String,
     tls_key: Option<TlsSessionCacheKey>,
+}
+
+#[cfg(feature = "http3")]
+#[derive(Clone, Debug, Default)]
+struct Http3SessionPoolEntry {
+    sessions: Vec<Arc<Http3UpstreamSession>>,
 }
 
 #[cfg(feature = "http3")]
@@ -256,18 +299,19 @@ impl Http3UpstreamSession {
 
     fn is_reusable(&self) -> bool {
         let dag = self
-            .dag
-            .lock()
-            .expect("http3 upstream session lock poisoned");
+            .lock_dag();
         dag.can_accept_new_streams()
     }
 
     fn should_retain(&self) -> bool {
         let dag = self
-            .dag
-            .lock()
-            .expect("http3 upstream session lock poisoned");
+            .lock_dag();
         !dag.frontier.is_terminal() || dag.has_active_streams()
+    }
+
+    fn active_stream_count(&self) -> usize {
+        let dag = self.lock_dag();
+        dag.streams.len()
     }
 
     async fn sender_clone(&self) -> Http3SendRequest {
@@ -275,42 +319,27 @@ impl Http3UpstreamSession {
     }
 
     fn attach_stream(&self, exchange_handle: i64, stream_id: u64) -> Http3StreamRef {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http3 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         dag.attach_stream(self.session_id, exchange_handle, stream_id)
     }
 
     fn mark_stream_request_committed(&self, stream_id: u64, body_present: bool) {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http3 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         dag.mark_stream_request_committed(stream_id, body_present);
     }
 
     fn mark_stream_response_head_ready(&self, stream_id: u64) {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http3 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         dag.mark_stream_response_head_ready(stream_id);
     }
 
     fn mark_stream_response_body_ready(&self, stream_id: u64) {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http3 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         dag.mark_stream_response_body_ready(stream_id);
     }
 
     fn mark_stream_closed(&self, stream_id: u64) {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http3 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         dag.mark_stream_closed(stream_id);
     }
 
@@ -320,27 +349,18 @@ impl Http3UpstreamSession {
         reason: Option<String>,
         source: Http3ControlEventSource,
     ) {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http3 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         dag.mark_stream_reset(stream_id, reason, source);
     }
 
     fn mark_goaway(&self, reason: Option<String>, source: Http3ControlEventSource) {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http3 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         dag.goaway = Some(Http3GoawayState { reason, source });
         dag.advance_session_goal(Http3SessionGoal::Draining);
     }
 
     fn mark_connection_closed(&self) {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http3 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         if dag.frontier == Http3SessionFrontier::Draining && dag.streams.is_empty() {
             dag.frontier = Http3SessionFrontier::Closed;
         } else if dag.frontier == Http3SessionFrontier::Open {
@@ -349,10 +369,7 @@ impl Http3UpstreamSession {
     }
 
     fn mark_connection_failed(&self, reason: Option<String>) {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http3 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         dag.frontier = Http3SessionFrontier::Failed;
         for stream in dag.streams.values_mut() {
             if !stream.frontier.is_terminal() {
@@ -363,6 +380,14 @@ impl Http3UpstreamSession {
                 stream.frontier = Http3StreamFrontier::Reset;
             }
         }
+    }
+
+    fn lock_dag(&self) -> lock_metrics::ProfiledMutexGuard<'_, Http3UpstreamSessionDagState> {
+        lock_metrics::lock(
+            &self.dag,
+            LockMetricKey::Http3UpstreamSessionDag,
+            "http3 upstream session lock poisoned",
+        )
     }
 }
 
@@ -485,6 +510,28 @@ impl Http3ResponseBodyTracker {
 }
 
 #[cfg(feature = "http3")]
+impl Http3SessionPoolEntry {
+    fn retain_sessions(&mut self) {
+        self.sessions.retain(|session| session.should_retain());
+    }
+
+    fn reusable_session_count(&self) -> usize {
+        self.sessions
+            .iter()
+            .filter(|session| session.is_reusable())
+            .count()
+    }
+
+    fn select_reusable_session(&self) -> Option<(Arc<Http3UpstreamSession>, usize)> {
+        self.sessions
+            .iter()
+            .filter(|session| session.is_reusable())
+            .map(|session| (session.clone(), session.active_stream_count()))
+            .min_by_key(|(_, active_streams)| *active_streams)
+    }
+}
+
+#[cfg(feature = "http3")]
 fn session_key(target: &str, tls_flow: &TlsFlowState) -> Option<Http3SessionKey> {
     Some(Http3SessionKey {
         origin: session_origin(target)?,
@@ -537,32 +584,69 @@ async fn acquire_or_open_session(
     })?;
 
     {
-        let mut guard = sessions
-            .lock()
-            .expect("http3 upstream session store lock poisoned");
-        guard.sessions.retain(|_, session| session.should_retain());
-        if let Some(session) = guard.sessions.get(&key).cloned()
-            && session.is_reusable()
-        {
-            return Ok(session);
+        let mut guard = lock_metrics::lock(
+            sessions,
+            LockMetricKey::Http3UpstreamSessionStore,
+            "http3 upstream session store lock poisoned",
+        );
+        guard
+            .sessions
+            .retain(|_, entry| entry.sessions.iter().any(|session| session.should_retain()));
+        if let Some(entry) = guard.sessions.get_mut(&key) {
+            entry.retain_sessions();
+            if let Some((session, active_streams)) = entry.select_reusable_session()
+                && (active_streams < http3_upstream_target_active_streams_per_session()
+                    || entry.reusable_session_count()
+                        >= http3_upstream_max_reusable_sessions_per_origin())
+            {
+                return Ok(session);
+            }
         }
     }
 
     match connect_session(target, tls_flow, mode).await {
         Ok(session) => {
-            let mut guard = sessions
-                .lock()
-                .expect("http3 upstream session store lock poisoned");
-            guard.sessions.retain(|_, cached| cached.should_retain());
-            if let Some(cached) = guard.sessions.get(&key).cloned()
-                && cached.is_reusable()
-            {
-                return Ok(cached);
+            let mut guard = lock_metrics::lock(
+                sessions,
+                LockMetricKey::Http3UpstreamSessionStore,
+                "http3 upstream session store lock poisoned",
+            );
+            guard
+                .sessions
+                .retain(|_, entry| entry.sessions.iter().any(|cached| cached.should_retain()));
+            if guard.sessions.peek(&key).is_some() {
+                {
+                    let entry = guard
+                        .sessions
+                        .get_mut(&key)
+                        .expect("existing http3 session entry should still exist");
+                    entry.retain_sessions();
+                    if let Some((cached, active_streams)) = entry.select_reusable_session()
+                        && (active_streams < http3_upstream_target_active_streams_per_session()
+                            || entry.reusable_session_count()
+                                >= http3_upstream_max_reusable_sessions_per_origin())
+                    {
+                        return Ok(cached);
+                    }
+                }
+
+                let session_id = guard.next_session_id.saturating_add(1);
+                guard.next_session_id = session_id;
+                let session = session.into_session(session_id);
+                guard
+                    .sessions
+                    .get_mut(&key)
+                    .expect("existing http3 session entry should still exist")
+                    .sessions
+                    .push(session.clone());
+                return Ok(session);
             }
             let session_id = guard.next_session_id.saturating_add(1);
             guard.next_session_id = session_id;
             let session = session.into_session(session_id);
-            guard.sessions.insert(key, session.clone());
+            guard
+                .sessions
+                .insert(key, Http3SessionPoolEntry { sessions: vec![session.clone()] });
             Ok(session)
         }
         Err(_) if matches!(mode, Http3UpstreamMode::Preferred) => {
@@ -632,14 +716,29 @@ async fn connect_session(
         .ok_or_else(|| {
             Http3RequestError::transport(format!("http3 could not resolve {host}:{port}"))
         })?;
-    let bind_addr = if remote.is_ipv6() {
+    let bind_addr: std::net::SocketAddr = if remote.is_ipv6() {
         "[::]:0"
     } else {
         "0.0.0.0:0"
     }
     .parse()
     .expect("valid wildcard addr");
-    let mut endpoint = quinn::Endpoint::client(bind_addr).map_err(|err| {
+    let socket = std::net::UdpSocket::bind(bind_addr).map_err(|err| {
+        Http3RequestError::transport(format!("http3 failed to bind local udp socket: {err}"))
+    })?;
+    socket.set_nonblocking(true).map_err(|err| {
+        Http3RequestError::transport(format!("http3 failed to set udp socket nonblocking: {err}"))
+    })?;
+    tune_udp_socket_buffers(&socket).map_err(|err| {
+        Http3RequestError::transport(format!("http3 failed to tune udp socket buffers: {err}"))
+    })?;
+    let mut endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(|err| {
         Http3RequestError::transport(format!("http3 failed to create endpoint: {err}"))
     })?;
     endpoint.set_default_client_config(

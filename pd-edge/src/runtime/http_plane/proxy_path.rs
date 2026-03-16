@@ -70,6 +70,7 @@ use {
     axum::body::Bytes,
     rcgen::generate_simple_self_signed,
     rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    crate::abi_impl::tune_udp_socket_buffers,
 };
 
 pub fn build_http_proxy_app(state: SharedState) -> Router {
@@ -852,10 +853,12 @@ pub async fn serve_https_proxy(listener: TcpListener, state: SharedState) -> std
 #[cfg(feature = "http3")]
 pub async fn serve_http3_proxy(listener: UdpSocket, state: SharedState) -> std::io::Result<()> {
     let local_addr = listener.local_addr()?;
+    let std_listener = listener.into_std()?;
+    tune_udp_socket_buffers(&std_listener)?;
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(generate_http3_proxy_quic_server_config()?),
-        listener.into_std()?,
+        std_listener,
         Arc::new(quinn::TokioRuntime),
     )?;
     let app = build_http_proxy_app(state.clone());

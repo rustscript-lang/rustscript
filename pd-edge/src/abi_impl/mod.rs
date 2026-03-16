@@ -42,7 +42,7 @@ pub(crate) use self::http3::{
     new_shared_http3_downstream_sessions, new_shared_http3_upstream_sessions,
 };
 #[cfg(feature = "http3")]
-pub(crate) use self::quic::build_quic_server_config;
+pub(crate) use self::quic::{build_quic_server_config, tune_udp_socket_buffers};
 #[cfg(feature = "tls")]
 pub(crate) use self::transport::build_default_self_signed_server_config;
 pub(crate) use self::transport::{
