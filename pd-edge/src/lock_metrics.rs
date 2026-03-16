@@ -26,10 +26,12 @@ pub(crate) enum LockMetricKey {
     Http2UpstreamSessionStore = 10,
     Http2UpstreamSessionDag = 11,
     Http2DownstreamSessionStore = 12,
+    Http3UpstreamSessionStore = 13,
+    Http3UpstreamSessionDag = 14,
 }
 
 impl LockMetricKey {
-    pub(crate) const COUNT: usize = 13;
+    pub(crate) const COUNT: usize = 15;
 
     const ALL: [Self; Self::COUNT] = [
         Self::VmRequestHead,
@@ -45,6 +47,8 @@ impl LockMetricKey {
         Self::Http2UpstreamSessionStore,
         Self::Http2UpstreamSessionDag,
         Self::Http2DownstreamSessionStore,
+        Self::Http3UpstreamSessionStore,
+        Self::Http3UpstreamSessionDag,
     ];
 
     const fn as_str(self) -> &'static str {
@@ -62,6 +66,8 @@ impl LockMetricKey {
             Self::Http2UpstreamSessionStore => "http2_upstream_session_store",
             Self::Http2UpstreamSessionDag => "http2_upstream_session_dag",
             Self::Http2DownstreamSessionStore => "http2_downstream_session_store",
+            Self::Http3UpstreamSessionStore => "http3_upstream_session_store",
+            Self::Http3UpstreamSessionDag => "http3_upstream_session_dag",
         }
     }
 }
@@ -98,6 +104,8 @@ impl LockMetricCounter {
 
 static LOCK_METRICS_ENABLED: OnceLock<bool> = OnceLock::new();
 static LOCK_METRICS: [LockMetricCounter; LockMetricKey::COUNT] = [
+    LockMetricCounter::new(),
+    LockMetricCounter::new(),
     LockMetricCounter::new(),
     LockMetricCounter::new(),
     LockMetricCounter::new(),
