@@ -27,16 +27,18 @@ Config:
 - `vm_fuel_check_interval=32`
 - HTTP/2 cases use TLS only. No h2c was used.
 
-| Scenario | Async RPS | Async p50 (ms) | Async p95 (ms) | Async p99 (ms) | Threading RPS | Threading p50 (ms) | Threading p95 (ms) | Threading p99 (ms) |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `raw_no_program` | 110,944.99 | 1.113 | 1.791 | 2.144 | 114,265.67 | 1.079 | 1.746 | 2.094 |
-| `no_host_calls_program` | 49,873.75 | 2.486 | 4.186 | 5.143 | 47,284.51 | 2.352 | 5.621 | 9.418 |
-| `host_calls_terminate` | 45,896.72 | 2.709 | 4.573 | 5.654 | 44,035.37 | 2.588 | 5.657 | 9.621 |
-| `raw_http_upstream` | 67,925.07 | 1.846 | 2.776 | 3.288 | 71,136.22 | 1.762 | 2.657 | 3.098 |
-| `host_calls_upstream_roundtrip` | 29,197.30 | 4.298 | 6.215 | 7.199 | 29,516.36 | 4.025 | 7.197 | 10.133 |
-| `raw_http2_upstream` | 59,904.95 | 2.086 | 2.992 | 3.503 | 59,586.63 | 2.099 | 2.974 | 3.402 |
-| `host_calls_upstream_roundtrip_http2_upstream` | 27,998.45 | 4.505 | 6.314 | 7.242 | 27,231.87 | 4.409 | 7.455 | 10.996 |
-| `host_calls_upstream_roundtrip_downstream_http2` | 26,288.26 | 4.798 | 6.786 | 7.748 | 26,066.47 | 4.762 | 7.160 | 8.989 |
+Baseline ratio columns use each mode's `raw_no_program` row as `100%`.
+
+| Scenario | Async RPS | Async Baseline Ratio | Async p50 (ms) | Async p95 (ms) | Async p99 (ms) | Threading RPS | Threading Baseline Ratio | Threading p50 (ms) | Threading p95 (ms) | Threading p99 (ms) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `raw_no_program` | 110,944.99 | 100.00% | 1.113 | 1.791 | 2.144 | 114,265.67 | 100.00% | 1.079 | 1.746 | 2.094 |
+| `no_host_calls_program` | 49,873.75 | 44.95% | 2.486 | 4.186 | 5.143 | 47,284.51 | 41.38% | 2.352 | 5.621 | 9.418 |
+| `host_calls_terminate` | 45,896.72 | 41.37% | 2.709 | 4.573 | 5.654 | 44,035.37 | 38.54% | 2.588 | 5.657 | 9.621 |
+| `raw_http_upstream` | 67,925.07 | 61.22% | 1.846 | 2.776 | 3.288 | 71,136.22 | 62.26% | 1.762 | 2.657 | 3.098 |
+| `host_calls_upstream_roundtrip` | 29,197.30 | 26.32% | 4.298 | 6.215 | 7.199 | 29,516.36 | 25.83% | 4.025 | 7.197 | 10.133 |
+| `raw_http2_upstream` | 59,904.95 | 54.00% | 2.086 | 2.992 | 3.503 | 59,586.63 | 52.15% | 2.099 | 2.974 | 3.402 |
+| `host_calls_upstream_roundtrip_http2_upstream` | 27,998.45 | 25.24% | 4.505 | 6.314 | 7.242 | 27,231.87 | 23.83% | 4.409 | 7.455 | 10.996 |
+| `host_calls_upstream_roundtrip_downstream_http2` | 26,288.26 | 23.69% | 4.798 | 6.786 | 7.748 | 26,066.47 | 22.81% | 4.762 | 7.160 | 8.989 |
 
 ```mermaid
 xychart-beta

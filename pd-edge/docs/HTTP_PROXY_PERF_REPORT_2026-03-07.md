@@ -20,11 +20,13 @@ Config:
 - `vm_fuel=50000`
 - `vm_fuel_check_interval=32`
 
-| Scenario | Async RPS | Async p50 (ms) | Async p95 (ms) | Async p99 (ms) | Threading RPS | Threading p50 (ms) | Threading p95 (ms) | Threading p99 (ms) |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `raw_no_program` | 80,753.16 | 1.485 | 2.612 | 3.195 | 84,774.38 | 1.414 | 2.544 | 3.207 |
-| `no_host_calls_program` | 31,213.58 | 3.918 | 6.972 | 8.831 | 26,598.49 | 3.812 | 10.454 | 30.124 |
-| `host_calls_terminate` | 25,382.71 | 4.768 | 8.925 | 11.742 | 27,020.55 | 4.172 | 9.454 | 14.503 |
+Baseline ratio columns use each mode's `raw_no_program` row as `100%`.
+
+| Scenario | Async RPS | Async Baseline Ratio | Async p50 (ms) | Async p95 (ms) | Async p99 (ms) | Threading RPS | Threading Baseline Ratio | Threading p50 (ms) | Threading p95 (ms) | Threading p99 (ms) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `raw_no_program` | 80,753.16 | 100.00% | 1.485 | 2.612 | 3.195 | 84,774.38 | 100.00% | 1.414 | 2.544 | 3.207 |
+| `no_host_calls_program` | 31,213.58 | 38.65% | 3.918 | 6.972 | 8.831 | 26,598.49 | 31.38% | 3.812 | 10.454 | 30.124 |
+| `host_calls_terminate` | 25,382.71 | 31.43% | 4.768 | 8.925 | 11.742 | 27,020.55 | 31.87% | 4.172 | 9.454 | 14.503 |
 
 ```mermaid
 xychart-beta
