@@ -704,7 +704,7 @@ pub(crate) fn upstream_reqwest_client_builder() -> reqwest::ClientBuilder {
     let builder = reqwest::Client::builder().tls_info(true).tcp_nodelay(true);
     #[cfg(feature = "http2")]
     {
-        return builder.http2_adaptive_window(true);
+        builder.http2_adaptive_window(true)
     }
     #[cfg(not(feature = "http2"))]
     {
@@ -794,10 +794,7 @@ impl HttpOutboundRequestNode {
         }
     }
 
-    fn headers_or_request_head<'a>(
-        &'a self,
-        request_head: &'a HttpRequestHead,
-    ) -> &'a HeaderMap {
+    fn headers_or_request_head<'a>(&'a self, request_head: &'a HttpRequestHead) -> &'a HeaderMap {
         if self.inherits_request_head {
             request_head.headers()
         } else {
@@ -1284,8 +1281,6 @@ pub(crate) struct RuntimeServices {
     upstream_http_sessions: Option<SharedHttpUpstreamSessions>,
     upstream_http3_sessions: Option<SharedHttp3UpstreamSessions>,
     downstream_http_sessions: Option<http2::SharedHttpDownstreamSessions>,
-    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
-    downstream_http3_sessions: Option<http3::SharedHttp3DownstreamSessions>,
     #[cfg(feature = "tls")]
     downstream_tls_termination: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
     rate_limiter: SharedRateLimiter,
@@ -1302,7 +1297,6 @@ impl RuntimeServices {
             upstream_http_sessions: None,
             upstream_http3_sessions: None,
             downstream_http_sessions: None,
-            downstream_http3_sessions: None,
             #[cfg(feature = "tls")]
             downstream_tls_termination: None,
             rate_limiter,
@@ -1359,7 +1353,6 @@ pub(crate) fn new_shared_http_plane_runtime_services(
     upstream_http_sessions: SharedHttpUpstreamSessions,
     upstream_http3_sessions: SharedHttp3UpstreamSessions,
     downstream_http_sessions: http2::SharedHttpDownstreamSessions,
-    downstream_http3_sessions: http3::SharedHttp3DownstreamSessions,
 ) -> SharedRuntimeServices {
     Arc::new(RuntimeServices {
         upstream_client: Some(upstream_client),
@@ -1368,7 +1361,6 @@ pub(crate) fn new_shared_http_plane_runtime_services(
         upstream_http_sessions: Some(upstream_http_sessions),
         upstream_http3_sessions: Some(upstream_http3_sessions),
         downstream_http_sessions: Some(downstream_http_sessions),
-        downstream_http3_sessions: Some(downstream_http3_sessions),
         #[cfg(feature = "tls")]
         downstream_tls_termination: None,
         rate_limiter,
@@ -2001,7 +1993,8 @@ impl ProxyVmContext {
             client_ip,
             headers,
         };
-        let downstream_websocket = WebSocketConnectionState::for_http_request(request_head.headers());
+        let downstream_websocket =
+            WebSocketConnectionState::for_http_request(request_head.headers());
         *self.lock_request_head() = request_head;
 
         {
@@ -2794,10 +2787,22 @@ fn prepared_upstream_request(
     let services = context.services();
     let (method, path, query, headers) = context.with_request_head(|request_head| {
         (
-            exchange.request.method_or_request_head(request_head).clone(),
-            exchange.request.path_or_request_head(request_head).to_string(),
-            exchange.request.query_or_request_head(request_head).to_string(),
-            exchange.request.headers_or_request_head(request_head).clone(),
+            exchange
+                .request
+                .method_or_request_head(request_head)
+                .clone(),
+            exchange
+                .request
+                .path_or_request_head(request_head)
+                .to_string(),
+            exchange
+                .request
+                .query_or_request_head(request_head)
+                .to_string(),
+            exchange
+                .request
+                .headers_or_request_head(request_head)
+                .clone(),
         )
     });
     Ok(PreparedUpstreamRequest {

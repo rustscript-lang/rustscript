@@ -47,9 +47,7 @@ pub(crate) use self::http3::{
 pub(crate) use self::quic::{build_quic_server_config, tune_udp_socket_buffers};
 #[cfg(feature = "tls")]
 pub(crate) use self::transport::build_default_self_signed_server_config;
-pub(crate) use self::transport::{
-    ReplayPrefixedIo, new_shared_tls_session_cache,
-};
+pub(crate) use self::transport::{ReplayPrefixedIo, new_shared_tls_session_cache};
 
 pub type SharedRateLimiter = Arc<RateLimiterStore>;
 pub type SharedVmAsyncOps = Arc<LazyVmAsyncOps>;
@@ -230,7 +228,11 @@ pub struct LazyVmAsyncOps {
 impl LazyVmAsyncOps {
     fn lock_ops(&self) -> ProfiledMutexGuard<'_, VmAsyncOps> {
         let inner = self.inner.get_or_init(|| Mutex::new(VmAsyncOps::new()));
-        lock_metrics::lock(inner, LockMetricKey::VmAsyncOps, "vm async ops lock poisoned")
+        lock_metrics::lock(
+            inner,
+            LockMetricKey::VmAsyncOps,
+            "vm async ops lock poisoned",
+        )
     }
 }
 
@@ -261,7 +263,7 @@ pub fn enter_edge_host_context(
 ) -> EdgeHostContextGuard {
     #[cfg(feature = "console")]
     {
-        return enter_edge_host_context_inner(vm_context, async_ops, None);
+        enter_edge_host_context_inner(vm_context, async_ops, None)
     }
     #[cfg(not(feature = "console"))]
     {
@@ -657,6 +659,12 @@ impl RateLimiterStore {
         } else {
             false
         }
+    }
+}
+
+impl Default for RateLimiterStore {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

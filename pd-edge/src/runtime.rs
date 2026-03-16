@@ -232,7 +232,6 @@ impl SharedState {
             upstream_http_sessions.clone(),
             upstream_http3_sessions.clone(),
             downstream_http2_sessions.clone(),
-            downstream_http3_sessions.clone(),
         );
         Self {
             active_program: Arc::new(ArcSwapOption::from(None::<Arc<LoadedProgram>>)),

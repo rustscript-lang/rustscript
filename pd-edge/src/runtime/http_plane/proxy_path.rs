@@ -500,11 +500,11 @@ async fn promote_captured_downstream_transport_into_http_request(
     let captured = captured.map_err(VmError::HostError)?;
     context
         .promote_downstream_http_request(
-        captured.request,
-        captured.http2_attachment,
-        captured.http1_upgrade,
-    )
-    .await;
+            captured.request,
+            captured.http2_attachment,
+            captured.http1_upgrade,
+        )
+        .await;
     Ok(())
 }
 
