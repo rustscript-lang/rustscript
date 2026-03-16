@@ -930,7 +930,10 @@ async fn stream_from_websocket_binary(
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 
-/// Pipes bytes from one proxy byte stream into another.
+/// Copies bytes in one direction from `source` into `destination`.
+///
+/// This always uses the buffered proxy stream loop. On EOF from `source`, the destination write
+/// side is closed.
 #[pd_edge_host_function(name = proxy_symbols::PIPE.name, scope = proxy)]
 async fn proxy_pipe(
     _vm: &mut Vm,
@@ -944,8 +947,11 @@ async fn proxy_pipe(
     Ok(CallOutcome::Return(vec![Value::string(status)]))
 }
 
-/// Bidirectionally bridges bytes between two proxy byte streams.
-#[pd_edge_host_function(name = "proxy::bridge", scope = proxy)]
+/// Relays bytes in both directions between `left` and `right`.
+///
+/// `proxy::bridge` first tries native forward/handoff pairs. If no native handoff is available,
+/// it falls back to the buffered bidirectional proxy stream loop using `max_bytes` chunks.
+#[pd_edge_host_function(name = proxy_symbols::BRIDGE.name, scope = proxy)]
 async fn proxy_bridge(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
@@ -958,8 +964,19 @@ async fn proxy_bridge(
     Ok(CallOutcome::Return(vec![Value::string(status)]))
 }
 
-/// Natively forwards between proxy byte streams when a direct runtime handoff is available.
-#[pd_edge_host_function(name = "proxy::forward", scope = proxy)]
+/// Performs a native runtime handoff between supported proxy stream pairs.
+///
+/// Supported pairs currently are:
+/// - downstream CONNECT <-> dynamic TCP from `proxy::stream::from_tcp`
+/// - downstream CONNECT <-> dynamic TLS plaintext from `proxy::stream::from_tls_plaintext`
+/// - downstream binary WebSocket <-> outbound binary WebSocket from
+///   `proxy::stream::from_websocket_binary`
+/// - downstream HTTP body stream <-> default upstream HTTP exchange from
+///   `proxy::stream::exchange(http::exchange::default_upstream())`, as long as neither stream
+///   has already been written through the proxy stream API
+///
+/// Unsupported pairs return an error. Use `proxy::bridge` when you want buffered fallback.
+#[pd_edge_host_function(name = proxy_symbols::FORWARD.name, scope = proxy)]
 async fn proxy_forward(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
@@ -968,7 +985,7 @@ async fn proxy_forward(
 ) -> Result<CallOutcome, VmError> {
     let status = try_native_forward(&context, left, right).await?.ok_or_else(|| {
         VmError::HostError(
-            "proxy::forward requires a native-forward-compatible pair; use proxy::bridge for the buffered fallback path".to_string(),
+            "proxy::forward supports only downstream CONNECT<->dynamic tcp/tls, downstream websocket<->websocket, or downstream HTTP<->default upstream exchange native pairs; use proxy::bridge for the buffered fallback path".to_string(),
         )
     })?;
     Ok(CallOutcome::Return(vec![Value::string(status)]))
