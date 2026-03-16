@@ -77,11 +77,17 @@ pub const ABI_VERSION: u16 = 21;
 mod callable_specs {
     mod marker {
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        pub struct Any;
+
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
         pub struct Map;
+
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        pub struct Value;
     }
 
     #[allow(unused_imports)]
-    use self::marker::Map;
+    use self::marker::{Any, Map, Value};
     use pd_host_function::pd_host_function;
 
     include!("abi_spec/functions.rs");

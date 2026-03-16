@@ -8,6 +8,11 @@ fn http_exchange_default_upstream() -> i64 {
     unreachable!("abi declaration only")
 }
 
+#[pd_host_function(name = "http::exchange::prepare_default_upstream")]
+fn http_exchange_prepare_default_upstream(target: &str, version: &str, headers: Value) -> i64 {
+    unreachable!("abi declaration only")
+}
+
 #[pd_host_function(name = "http::exchange::send")]
 fn http_exchange_send(exchange: i64) {
     unreachable!("abi declaration only")

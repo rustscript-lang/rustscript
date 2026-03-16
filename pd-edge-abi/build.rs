@@ -417,9 +417,9 @@ fn type_label(ty: &Type) -> String {
                 "f32" | "f64" => "Float".to_string(),
                 "bool" => "Bool".to_string(),
                 "String" | "str" => "String".to_string(),
-                "Any" => "Any".to_string(),
+                "Any" | "AnyValue" | "Value" => "Any".to_string(),
                 "Array" => "Array".to_string(),
-                "Map" => "Map".to_string(),
+                "Map" | "VmMap" => "Map".to_string(),
                 "Number" => "Number".to_string(),
                 "Unknown" => "Unknown".to_string(),
                 "Option" => {

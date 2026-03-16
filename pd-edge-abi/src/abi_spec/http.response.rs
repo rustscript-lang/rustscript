@@ -3,6 +3,11 @@ fn http_response_set_header(name: &str, value: &str) {
     unreachable!("abi declaration only")
 }
 
+#[pd_host_function(name = "http::response::set_headers")]
+fn http_response_set_headers(headers: Value) {
+    unreachable!("abi declaration only")
+}
+
 #[pd_host_function(name = "http::response::set_body")]
 fn http_response_set_body(body: &str) {
     unreachable!("abi declaration only")
@@ -10,6 +15,16 @@ fn http_response_set_body(body: &str) {
 
 #[pd_host_function(name = "http::response::set_status")]
 fn http_response_set_status(status: i64) {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "http::response::apply_exchange")]
+fn http_response_apply_exchange(exchange: i64) {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "http::response::apply_exchange_with_headers")]
+fn http_response_apply_exchange_with_headers(exchange: i64, headers: Value) {
     unreachable!("abi declaration only")
 }
 
