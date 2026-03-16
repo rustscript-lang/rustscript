@@ -4,8 +4,6 @@ use std::sync::{OnceLock, RwLock};
 use edge_abi::FUNCTIONS as EDGE_ABI_FUNCTIONS;
 use vm::{HostFunctionRegistry, StaticHostArgsFunction, StaticHostFunction, Vm, VmError};
 
-use super::{SharedProxyVmContext, SharedVmAsyncOps};
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EdgeHostScope {
     Runtime,
@@ -17,6 +15,8 @@ pub(crate) enum EdgeHostScope {
     #[cfg(feature = "webrtc")]
     WebRtc,
     Proxy,
+    #[cfg(feature = "console")]
+    Console,
 }
 
 #[allow(dead_code)]
@@ -38,7 +38,7 @@ pub(crate) struct EdgeHostRegistration {
 #[::linkme::distributed_slice]
 pub(crate) static PD_EDGE_HOST_FUNCTIONS: [EdgeHostRegistration];
 
-fn scope_mask(scope: EdgeHostScope) -> u8 {
+fn scope_mask(scope: EdgeHostScope) -> u16 {
     match scope {
         EdgeHostScope::Runtime => 1 << 0,
         EdgeHostScope::Http => 1 << 1,
@@ -48,12 +48,14 @@ fn scope_mask(scope: EdgeHostScope) -> u8 {
         EdgeHostScope::WebSocket => 1 << 5,
         #[cfg(feature = "webrtc")]
         EdgeHostScope::WebRtc => 1 << 6,
-        EdgeHostScope::Proxy => 1 << if cfg!(feature = "webrtc") { 7 } else { 6 },
+        EdgeHostScope::Proxy => 1 << 7,
+        #[cfg(feature = "console")]
+        EdgeHostScope::Console => 1 << 8,
     }
 }
 
-fn scopes_mask(scopes: &[EdgeHostScope]) -> u8 {
-    let mut mask = 0u8;
+fn scopes_mask(scopes: &[EdgeHostScope]) -> u16 {
+    let mut mask = 0u16;
     for scope in scopes {
         mask |= scope_mask(*scope);
     }
@@ -62,13 +64,13 @@ fn scopes_mask(scopes: &[EdgeHostScope]) -> u8 {
 
 fn registration_matches_scope_mask(
     registration: &EdgeHostRegistration,
-    scope_mask_bits: u8,
+    scope_mask_bits: u16,
 ) -> bool {
     scope_mask_bits & scope_mask(registration.scope) != 0
 }
 
-fn cached_registry_for_scope_mask(scope_mask_bits: u8) -> HostFunctionRegistry {
-    static REGISTRY_CACHE: OnceLock<RwLock<HashMap<u8, HostFunctionRegistry>>> = OnceLock::new();
+fn cached_registry_for_scope_mask(scope_mask_bits: u16) -> HostFunctionRegistry {
+    static REGISTRY_CACHE: OnceLock<RwLock<HashMap<u16, HostFunctionRegistry>>> = OnceLock::new();
     let cache = REGISTRY_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
     if let Some(registry) = cache
         .read()
@@ -123,12 +125,8 @@ pub(crate) fn bind_host_scopes(vm: &mut Vm, scopes: &[EdgeHostScope]) -> Result<
     if scope_mask_bits == 0 {
         return Ok(());
     }
-    if vm.bound_function_count() == 0 {
-        cached_registry_for_scope_mask(scope_mask_bits).bind_vm_cached(vm)?;
-        apply_cached_builtin_overrides(vm, scopes);
-        return Ok(());
-    }
-    bind_host_scopes_direct(vm, scopes);
+    cached_registry_for_scope_mask(scope_mask_bits).bind_vm_cached(vm)?;
+    apply_cached_builtin_overrides(vm, scopes);
     Ok(())
 }
 
@@ -146,13 +144,4 @@ pub(crate) fn bind_host_scopes_direct(vm: &mut Vm, scopes: &[EdgeHostScope]) {
             }
         }
     }
-}
-
-pub(crate) fn register_host_scope(
-    vm: &mut Vm,
-    _context: &SharedProxyVmContext,
-    _async_ops: &SharedVmAsyncOps,
-    scope: EdgeHostScope,
-) {
-    bind_host_scopes_direct(vm, &[scope]);
 }

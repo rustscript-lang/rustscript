@@ -1,9 +1,6 @@
 #![cfg_attr(not(feature = "tls"), allow(dead_code))]
 
 use axum::http::Version;
-use vm::Vm;
-
-use super::{SharedProxyVmContext, SharedVmAsyncOps, registry};
 
 mod state;
 mod tcp;
@@ -24,14 +21,6 @@ pub(crate) use state::{
 pub(crate) use state::{DownstreamTlsServerStart, SharedServerTlsStreamIo, SharedTlsStreamIo};
 #[cfg(feature = "tls")]
 pub(crate) use tls::build_default_self_signed_server_config;
-
-pub(super) fn register_transport_extensions(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-) {
-    registry::register_host_scope(vm, &context, &async_ops, registry::EdgeHostScope::Transport);
-}
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn configure_upstream_transport_for_target(

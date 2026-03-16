@@ -8,7 +8,8 @@ build = "build.rs"
 name = "edge_abi"
 
 [features]
-default = ["http", "tls", "websocket"]
+default = ["console", "http", "tls", "websocket"]
+console = []
 http = []
 http2 = ["http"]
 tls = []

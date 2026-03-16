@@ -14,6 +14,8 @@ use vm::{CallOutcome, HostAsyncBridge, HostFunction, HostOpId, Value, Vm, VmErro
 
 use crate::lock_metrics::{self, LockMetricKey};
 
+#[cfg(feature = "console")]
+mod console;
 pub(crate) mod http;
 mod http2;
 mod http3;
@@ -51,6 +53,8 @@ pub(crate) use self::transport::{
 
 pub type SharedRateLimiter = Arc<RateLimiterStore>;
 pub type SharedVmAsyncOps = Arc<Mutex<VmAsyncOps>>;
+#[cfg(feature = "console")]
+pub type SharedConsoleProgramArgs = Arc<Vec<String>>;
 
 type AsyncOpResult = Result<Vec<Value>, VmError>;
 type PendingFuture = Pin<Box<dyn Future<Output = AsyncOpResult> + Send + 'static>>;
@@ -61,6 +65,8 @@ type HostCallHandler = dyn FnMut(&mut Vm, &[Value]) -> HostCallResult + Send + '
 struct ActiveEdgeHostContext {
     vm_context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
+    #[cfg(feature = "console")]
+    console_program_args: Option<SharedConsoleProgramArgs>,
 }
 
 std::thread_local! {
@@ -245,12 +251,52 @@ pub fn enter_edge_host_context(
     vm_context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
 ) -> EdgeHostContextGuard {
+    #[cfg(feature = "console")]
+    {
+        return enter_edge_host_context_inner(vm_context, async_ops, None);
+    }
+    #[cfg(not(feature = "console"))]
+    {
+        enter_edge_host_context_inner(vm_context, async_ops)
+    }
+}
+
+#[cfg(feature = "console")]
+fn enter_edge_host_context_inner(
+    vm_context: SharedProxyVmContext,
+    async_ops: SharedVmAsyncOps,
+    console_program_args: Option<SharedConsoleProgramArgs>,
+) -> EdgeHostContextGuard {
+    let next = ActiveEdgeHostContext {
+        vm_context,
+        async_ops,
+        #[cfg(feature = "console")]
+        console_program_args,
+    };
+    let previous = CURRENT_EDGE_HOST_CONTEXT.with(|slot| slot.borrow_mut().replace(next));
+    EdgeHostContextGuard { previous }
+}
+
+#[cfg(not(feature = "console"))]
+fn enter_edge_host_context_inner(
+    vm_context: SharedProxyVmContext,
+    async_ops: SharedVmAsyncOps,
+) -> EdgeHostContextGuard {
     let next = ActiveEdgeHostContext {
         vm_context,
         async_ops,
     };
     let previous = CURRENT_EDGE_HOST_CONTEXT.with(|slot| slot.borrow_mut().replace(next));
     EdgeHostContextGuard { previous }
+}
+
+#[cfg(feature = "console")]
+pub fn enter_edge_host_context_with_console(
+    vm_context: SharedProxyVmContext,
+    async_ops: SharedVmAsyncOps,
+    console_program_args: SharedConsoleProgramArgs,
+) -> EdgeHostContextGuard {
+    enter_edge_host_context_inner(vm_context, async_ops, Some(console_program_args))
 }
 
 pub(crate) fn current_vm_context() -> Result<SharedProxyVmContext, VmError> {
@@ -275,6 +321,21 @@ pub(crate) fn current_async_ops() -> Result<SharedVmAsyncOps, VmError> {
             .ok_or_else(|| {
                 VmError::HostError(
                     "pd-edge async ops are unavailable outside Store-backed execution".to_string(),
+                )
+            })
+    })
+}
+
+#[cfg(feature = "console")]
+pub(crate) fn current_console_program_args() -> Result<SharedConsoleProgramArgs, VmError> {
+    CURRENT_EDGE_HOST_CONTEXT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|context| context.console_program_args.clone())
+            .ok_or_else(|| {
+                VmError::HostError(
+                    "pd-edge console arguments are unavailable outside console execution"
+                        .to_string(),
                 )
             })
     })
@@ -402,7 +463,7 @@ pub trait EdgeProtocolHostModule {
         async_ops: SharedVmAsyncOps,
     ) -> Result<(), VmError>;
 
-    fn scope_mask(&self) -> Option<u8> {
+    fn scope_mask(&self) -> Option<u16> {
         None
     }
 }
@@ -419,7 +480,7 @@ impl EdgeProtocolHostModule for RuntimeProtocolHostModule {
         register_runtime_host_module(vm, context, async_ops)
     }
 
-    fn scope_mask(&self) -> Option<u8> {
+    fn scope_mask(&self) -> Option<u16> {
         Some(1 << 0)
     }
 }
@@ -436,8 +497,27 @@ impl EdgeProtocolHostModule for HttpProtocolHostModule {
         register_http_host_module(vm, context, async_ops)
     }
 
-    fn scope_mask(&self) -> Option<u8> {
+    fn scope_mask(&self) -> Option<u16> {
         Some(1 << 1)
+    }
+}
+
+#[cfg(feature = "console")]
+pub struct ConsoleProtocolHostModule;
+
+#[cfg(feature = "console")]
+impl EdgeProtocolHostModule for ConsoleProtocolHostModule {
+    fn register(
+        &self,
+        vm: &mut Vm,
+        context: SharedProxyVmContext,
+        async_ops: SharedVmAsyncOps,
+    ) -> Result<(), VmError> {
+        register_console_host_module(vm, context, async_ops)
+    }
+
+    fn scope_mask(&self) -> Option<u16> {
+        Some(1 << 8)
     }
 }
 
@@ -450,18 +530,10 @@ pub(crate) fn unbound_edge_abi_function(
     ))
 }
 
-fn ensure_edge_abi_host_slots(vm: &mut Vm) -> Result<(), VmError> {
-    if EDGE_ABI_FUNCTIONS
-        .iter()
-        .all(|function| vm.has_bound_function(function.name))
-    {
-        return Ok(());
-    }
-
+fn initialize_edge_abi_host_slots(vm: &mut Vm) -> Result<(), VmError> {
     if vm.bound_function_count() != 0 {
         return Err(VmError::HostError(
-            "edge ABI host slots must be initialized before registering custom host functions"
-                .to_string(),
+            "pd-edge custom host registration requires an unbound vm".to_string(),
         ));
     }
 
@@ -471,16 +543,50 @@ fn ensure_edge_abi_host_slots(vm: &mut Vm) -> Result<(), VmError> {
     Ok(())
 }
 
+fn protocol_scopes_from_mask(scope_mask_bits: u16) -> Vec<registry::EdgeHostScope> {
+    let mut scopes = Vec::new();
+    if scope_mask_bits & (1 << 0) != 0 {
+        scopes.push(registry::EdgeHostScope::Runtime);
+    }
+    if scope_mask_bits & (1 << 1) != 0 {
+        scopes.push(registry::EdgeHostScope::Http);
+    }
+    if scope_mask_bits & (1 << 2) != 0 {
+        scopes.push(registry::EdgeHostScope::HttpExtension);
+    }
+    if scope_mask_bits & (1 << 3) != 0 {
+        scopes.push(registry::EdgeHostScope::Io);
+    }
+    if scope_mask_bits & (1 << 4) != 0 {
+        scopes.push(registry::EdgeHostScope::Transport);
+    }
+    if scope_mask_bits & (1 << 5) != 0 {
+        scopes.push(registry::EdgeHostScope::WebSocket);
+    }
+    #[cfg(feature = "webrtc")]
+    if scope_mask_bits & (1 << 6) != 0 {
+        scopes.push(registry::EdgeHostScope::WebRtc);
+    }
+    if scope_mask_bits & (1 << 7) != 0 {
+        scopes.push(registry::EdgeHostScope::Proxy);
+    }
+    #[cfg(feature = "console")]
+    if scope_mask_bits & (1 << 8) != 0 {
+        scopes.push(registry::EdgeHostScope::Console);
+    }
+    scopes
+}
+
 pub fn register_protocol_modules(
     vm: &mut Vm,
     context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
     modules: &[&dyn EdgeProtocolHostModule],
 ) -> Result<(), VmError> {
-    let mut scope_mask_bits = 0u8;
+    let mut scope_mask_bits = 0u16;
     for module in modules {
         let Some(scope_mask) = module.scope_mask() else {
-            ensure_edge_abi_host_slots(vm)?;
+            initialize_edge_abi_host_slots(vm)?;
             for module in modules {
                 module.register(vm, context.clone(), async_ops.clone())?;
             }
@@ -488,30 +594,7 @@ pub fn register_protocol_modules(
         };
         scope_mask_bits |= scope_mask;
     }
-    if scope_mask_bits != 0 && vm.bound_function_count() == 0 {
-        let mut scopes = Vec::new();
-        if scope_mask_bits & (1 << 0) != 0 {
-            scopes.push(registry::EdgeHostScope::Runtime);
-        }
-        if scope_mask_bits & (1 << 1) != 0 {
-            scopes.push(registry::EdgeHostScope::Http);
-        }
-        if scope_mask_bits & (1 << 2) != 0 {
-            scopes.push(registry::EdgeHostScope::HttpExtension);
-        }
-        if scope_mask_bits & (1 << 3) != 0 {
-            scopes.push(registry::EdgeHostScope::Io);
-        }
-        if scope_mask_bits & (1 << 4) != 0 {
-            scopes.push(registry::EdgeHostScope::Transport);
-        }
-        return registry::bind_host_scopes(vm, &scopes);
-    }
-    ensure_edge_abi_host_slots(vm)?;
-    for module in modules {
-        module.register(vm, context.clone(), async_ops.clone())?;
-    }
-    Ok(())
+    registry::bind_host_scopes(vm, &protocol_scopes_from_mask(scope_mask_bits))
 }
 
 #[derive(Debug)]
@@ -577,6 +660,30 @@ pub(crate) enum EdgeVirtualIoHandle {
 
 const EDGE_IO_HANDLE_DYNAMIC_BASE: i64 = 1_i64 << 48;
 
+fn http_plane_scopes() -> &'static [registry::EdgeHostScope] {
+    &[
+        registry::EdgeHostScope::Http,
+        registry::EdgeHostScope::Runtime,
+        registry::EdgeHostScope::HttpExtension,
+        registry::EdgeHostScope::Io,
+        registry::EdgeHostScope::Transport,
+        registry::EdgeHostScope::WebSocket,
+        #[cfg(feature = "webrtc")]
+        registry::EdgeHostScope::WebRtc,
+        registry::EdgeHostScope::Proxy,
+    ]
+}
+
+fn register_http_plane_host_scopes(
+    vm: &mut Vm,
+    extra_scopes: &[registry::EdgeHostScope],
+) -> Result<(), VmError> {
+    let mut scopes = Vec::with_capacity(http_plane_scopes().len() + extra_scopes.len());
+    scopes.extend(extra_scopes.iter().copied());
+    scopes.extend(http_plane_scopes().iter().copied());
+    registry::bind_host_scopes(vm, &scopes)
+}
+
 pub fn register_host_module(
     vm: &mut Vm,
     _context: SharedProxyVmContext,
@@ -587,40 +694,28 @@ pub fn register_host_module(
 
 pub fn register_http_plane_host_module(
     vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
+    _context: SharedProxyVmContext,
+    _async_ops: SharedVmAsyncOps,
 ) -> Result<(), VmError> {
-    if vm.bound_function_count() == 0 {
-        return registry::bind_host_scopes(
-            vm,
-            &[
-                registry::EdgeHostScope::Http,
-                registry::EdgeHostScope::Runtime,
-                registry::EdgeHostScope::HttpExtension,
-                registry::EdgeHostScope::Io,
-                registry::EdgeHostScope::Transport,
-                registry::EdgeHostScope::WebSocket,
-                #[cfg(feature = "webrtc")]
-                registry::EdgeHostScope::WebRtc,
-                registry::EdgeHostScope::Proxy,
-            ],
-        );
-    }
-    static HTTP_PROTOCOL_MODULE: HttpProtocolHostModule = HttpProtocolHostModule;
-    static RUNTIME_PROTOCOL_MODULE: RuntimeProtocolHostModule = RuntimeProtocolHostModule;
-    register_protocol_modules(
-        vm,
-        context.clone(),
-        async_ops.clone(),
-        &[&HTTP_PROTOCOL_MODULE, &RUNTIME_PROTOCOL_MODULE],
-    )?;
-    http::register_http_extensions(vm, context.clone(), async_ops.clone());
-    transport::register_transport_extensions(vm, context.clone(), async_ops.clone());
-    websocket::register_websocket_extensions(vm, context.clone(), async_ops.clone());
-    #[cfg(feature = "webrtc")]
-    webrtc::register_webrtc_extensions(vm, context.clone(), async_ops.clone());
-    proxy::register_proxy_extensions(vm, context.clone(), async_ops.clone());
-    io::register_builtin_io_overrides(vm, context, async_ops)
+    register_http_plane_host_scopes(vm, &[])
+}
+
+#[cfg(feature = "console")]
+pub fn register_console_host_module(
+    vm: &mut Vm,
+    _context: SharedProxyVmContext,
+    _async_ops: SharedVmAsyncOps,
+) -> Result<(), VmError> {
+    registry::bind_host_scopes(vm, &[registry::EdgeHostScope::Console])
+}
+
+#[cfg(feature = "console")]
+pub fn register_console_http_plane_host_module(
+    vm: &mut Vm,
+    _context: SharedProxyVmContext,
+    _async_ops: SharedVmAsyncOps,
+) -> Result<(), VmError> {
+    register_http_plane_host_scopes(vm, &[registry::EdgeHostScope::Console])
 }
 
 pub fn register_runtime_host_module(
@@ -847,6 +942,28 @@ mod tests {
             .filter(|entry| entry.scope == EdgeHostScope::Io)
             .count();
         assert_eq!(vm.bound_function_count(), import_count + io_scope_bindings);
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn register_http_plane_host_module_rejects_prebound_vm() {
+        let imports = vec![HostImport {
+            name: http_request::GET_METHOD.name.to_string(),
+            arity: 0,
+            return_type: ValueType::Unknown,
+        }];
+        let program =
+            Program::with_imports_and_debug(vec![], vec![OpCode::Ret as u8], imports, None);
+        let mut vm = Vm::new(program);
+        vm.bind_static_function("custom::noop", super::unbound_edge_abi_function);
+
+        let err =
+            register_http_plane_host_module(&mut vm, test_context(), new_shared_vm_async_ops())
+                .expect_err("pre-bound vm should be rejected");
+        assert!(
+            matches!(err, VmError::HostError(ref message) if message.contains("unbound vm")),
+            "unexpected error: {err}"
+        );
     }
 
     #[cfg(feature = "http")]
