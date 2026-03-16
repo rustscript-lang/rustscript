@@ -11,23 +11,15 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(all(feature = "http2", feature = "tls"))]
-use axum::body::Bytes;
-use axum::{
-    Router,
-    body::{Body, to_bytes},
-    extract::Request,
-    http::{HeaderValue, Response},
-    routing::any,
-};
 use edge::HOST_FUNCTION_COUNT;
-#[cfg(all(feature = "http2", feature = "tls"))]
 use http_body_util::{BodyExt, Full};
-#[cfg(all(feature = "http2", feature = "tls"))]
 use hyper::{
-    Request as HyperRequest, Response as HyperResponse, body::Incoming, service::service_fn,
+    Request as HyperRequest,
+    Response as HyperResponse,
+    body::{Bytes, Incoming},
+    http::HeaderValue,
+    service::service_fn,
 };
-#[cfg(all(feature = "http2", feature = "tls"))]
 use hyper_util::rt::TokioIo;
 #[cfg(all(feature = "http2", feature = "tls"))]
 use rcgen::generate_simple_self_signed;
@@ -104,17 +96,19 @@ use http;
 let method = http::request::get_method();
 let path = http::request::get_path();
 let client_id = http::request::get_header("x-client-id");
-let body = http::request::get_body();
+let request_body_mode = http::request::get_header("x-bench-body-mode");
 
 if (acc % 2) == 0 {{
     http::response::set_header("x-perf-acc", "even");
 }} else {{
     http::response::set_header("x-perf-acc", "odd");
 }}
-    http::response::set_header("x-perf-method", method);
-    http::response::set_header("x-perf-path", path);
-    http::response::set_header("x-perf-client-id", client_id);
-    http::response::set_body("host-calls-terminate|" + body);
+http::response::set_status(200);
+http::response::set_header("x-perf-method", method);
+http::response::set_header("x-perf-path", path);
+http::response::set_header("x-perf-client-id", client_id);
+http::response::set_header("x-perf-request-body-mode", request_body_mode);
+http::response::set_body("");
 "#
     )
 }
@@ -154,6 +148,32 @@ impl DownstreamProtocol {
 
     fn requires_http2_tls(self) -> bool {
         matches!(self, Self::HttpsHttp2)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestBodyMode {
+    HeadersOnly,
+    BodyRead,
+}
+
+impl RequestBodyMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::HeadersOnly => "headers-only",
+            Self::BodyRead => "body-read",
+        }
+    }
+
+    fn request_body(self) -> &'static str {
+        match self {
+            Self::HeadersOnly => "",
+            Self::BodyRead => LOAD_REQUEST_BODY,
+        }
+    }
+
+    fn reads_body(self) -> bool {
+        matches!(self, Self::BodyRead)
     }
 }
 
@@ -244,10 +264,12 @@ enum ProgramVariant {
     HostCallsAdditive,
     DirectUpstream {
         upstream: UpstreamProtocol,
+        body_mode: RequestBodyMode,
     },
     ProxyRoundTrip {
         flavor: ProxyProgramFlavor,
         upstream: UpstreamProtocol,
+        body_mode: RequestBodyMode,
     },
 }
 
@@ -263,7 +285,7 @@ struct Scenario {
 impl Scenario {
     fn upstream_protocol(self) -> Option<UpstreamProtocol> {
         match self.program_variant {
-            ProgramVariant::DirectUpstream { upstream } => Some(upstream),
+            ProgramVariant::DirectUpstream { upstream, .. } => Some(upstream),
             ProgramVariant::ProxyRoundTrip { upstream, .. } => Some(upstream),
             _ => None,
         }
@@ -271,6 +293,16 @@ impl Scenario {
 
     fn uses_proxy(self) -> bool {
         !matches!(self.program_variant, ProgramVariant::DirectUpstream { .. })
+    }
+
+    fn request_body_mode(self) -> RequestBodyMode {
+        match self.program_variant {
+            ProgramVariant::None
+            | ProgramVariant::NoHostCallsBase
+            | ProgramVariant::HostCallsAdditive => RequestBodyMode::HeadersOnly,
+            ProgramVariant::DirectUpstream { body_mode, .. }
+            | ProgramVariant::ProxyRoundTrip { body_mode, .. } => body_mode,
+        }
     }
 
     fn requires_http2_tls(self) -> bool {
@@ -295,7 +327,7 @@ impl Scenario {
     }
 }
 
-const SCENARIOS: [Scenario; 8] = [
+const SCENARIOS: [Scenario; 11] = [
     Scenario {
         id: "raw_no_program",
         description: "raw pd-edge-http-proxy (no program loaded)",
@@ -312,56 +344,93 @@ const SCENARIOS: [Scenario; 8] = [
     },
     Scenario {
         id: "host_calls_terminate",
-        description: "pd-edge-http-proxy with additive host calls and terminate (no upstream)",
+        description: "pd-edge-http-proxy with additive host calls and terminate (no request-body read, empty response body, no upstream)",
         expected_status: 200,
         program_variant: ProgramVariant::HostCallsAdditive,
         downstream_protocol: DownstreamProtocol::Http1,
     },
     Scenario {
         id: "raw_http_upstream",
-        description: "perf client hits hardcoded plaintext HTTP upstream directly",
+        description: "perf client hits hardcoded plaintext HTTP upstream directly (headers only, no body read)",
         expected_status: 200,
         program_variant: ProgramVariant::DirectUpstream {
             upstream: UpstreamProtocol::Http1,
+            body_mode: RequestBodyMode::HeadersOnly,
         },
         downstream_protocol: DownstreamProtocol::Http1,
     },
     Scenario {
-        id: "host_calls_upstream_roundtrip",
-        description: "pd-edge-http-proxy with program proxying inherited downstream request to hardcoded plaintext HTTP upstream and request/response header mutations",
+        id: "raw_http_upstream_body_read",
+        description: "perf client hits hardcoded plaintext HTTP upstream directly with request body read and echoed response body",
+        expected_status: 200,
+        program_variant: ProgramVariant::DirectUpstream {
+            upstream: UpstreamProtocol::Http1,
+            body_mode: RequestBodyMode::BodyRead,
+        },
+        downstream_protocol: DownstreamProtocol::Http1,
+    },
+    Scenario {
+        id: "http_proxy",
+        description: "pd-edge-http-proxy with plaintext downstream and plaintext HTTP upstream (header-only upstream response)",
         expected_status: 200,
         program_variant: ProgramVariant::ProxyRoundTrip {
             flavor: ProxyProgramFlavor::HeaderTransform,
             upstream: UpstreamProtocol::Http1,
+            body_mode: RequestBodyMode::HeadersOnly,
+        },
+        downstream_protocol: DownstreamProtocol::Http1,
+    },
+    Scenario {
+        id: "http_proxy_body_read",
+        description: "pd-edge-http-proxy with plaintext downstream and plaintext HTTP upstream with request body read and echoed response body",
+        expected_status: 200,
+        program_variant: ProgramVariant::ProxyRoundTrip {
+            flavor: ProxyProgramFlavor::HeaderTransform,
+            upstream: UpstreamProtocol::Http1,
+            body_mode: RequestBodyMode::BodyRead,
         },
         downstream_protocol: DownstreamProtocol::Http1,
     },
     Scenario {
         id: "raw_http2_upstream",
-        description: "perf client hits hardcoded HTTPS HTTP/2 upstream directly",
+        description: "perf client hits hardcoded HTTPS HTTP/2 upstream directly (headers only, no body read)",
         expected_status: 200,
         program_variant: ProgramVariant::DirectUpstream {
             upstream: UpstreamProtocol::HttpsHttp2,
+            body_mode: RequestBodyMode::HeadersOnly,
         },
         downstream_protocol: DownstreamProtocol::HttpsHttp2,
     },
     Scenario {
-        id: "host_calls_upstream_roundtrip_http2_upstream",
-        description: "pd-edge-http-proxy with program proxying inherited downstream request to hardcoded HTTPS HTTP/2 upstream while downstream stays plaintext HTTP/1.1",
+        id: "http->http2",
+        description: "pd-edge-http-proxy with plaintext downstream and HTTPS HTTP/2 upstream (header-only upstream response)",
         expected_status: 200,
         program_variant: ProgramVariant::ProxyRoundTrip {
             flavor: ProxyProgramFlavor::HeaderTransform,
             upstream: UpstreamProtocol::HttpsHttp2,
+            body_mode: RequestBodyMode::HeadersOnly,
         },
         downstream_protocol: DownstreamProtocol::Http1,
     },
     Scenario {
-        id: "host_calls_upstream_roundtrip_downstream_http2",
-        description: "pd-edge-http-proxy with program proxying inherited downstream request to hardcoded plaintext HTTP upstream while downstream uses HTTPS HTTP/2",
+        id: "http2->http",
+        description: "pd-edge-http-proxy with downstream HTTPS HTTP/2 and plaintext HTTP upstream (header-only upstream response)",
         expected_status: 200,
         program_variant: ProgramVariant::ProxyRoundTrip {
             flavor: ProxyProgramFlavor::HeaderTransform,
             upstream: UpstreamProtocol::Http1,
+            body_mode: RequestBodyMode::HeadersOnly,
+        },
+        downstream_protocol: DownstreamProtocol::HttpsHttp2,
+    },
+    Scenario {
+        id: "http2->http2",
+        description: "pd-edge-http-proxy with downstream HTTPS HTTP/2 and upstream HTTPS HTTP/2 (header-only upstream response)",
+        expected_status: 200,
+        program_variant: ProgramVariant::ProxyRoundTrip {
+            flavor: ProxyProgramFlavor::HeaderTransform,
+            upstream: UpstreamProtocol::HttpsHttp2,
+            body_mode: RequestBodyMode::HeadersOnly,
         },
         downstream_protocol: DownstreamProtocol::HttpsHttp2,
     },
@@ -562,6 +631,18 @@ struct TelemetrySummary {
     program_loaded: bool,
     data_requests_total: u64,
     vm_execution_errors_total: u64,
+    #[serde(default)]
+    lock_metrics: Vec<LockMetricSummary>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct LockMetricSummary {
+    name: String,
+    acquisitions_total: u64,
+    wait_ns_total: u64,
+    hold_ns_total: u64,
+    wait_ns_max: u64,
+    hold_ns_max: u64,
 }
 
 #[derive(Clone)]
@@ -1074,7 +1155,9 @@ async fn run_scenario(
             Some(compile_program_to_vmbc(&source)?)
         }
         ProgramVariant::DirectUpstream { .. } => None,
-        ProgramVariant::ProxyRoundTrip { flavor, upstream } => {
+        ProgramVariant::ProxyRoundTrip {
+            flavor, upstream, ..
+        } => {
             let upstream_origin = upstream_fixture
                 .as_ref()
                 .expect("upstream fixture should exist")
@@ -1152,6 +1235,7 @@ async fn run_scenario(
         let warmup = run_load(
             request_client,
             &request_url,
+            scenario,
             config.warmup_requests,
             config.concurrency,
             false,
@@ -1182,6 +1266,7 @@ async fn run_scenario(
     let run = run_load(
         request_client,
         &request_url,
+        scenario,
         config.requests,
         config.concurrency,
         true,
@@ -1353,7 +1438,7 @@ async fn verify_scenario_probe(
         client,
         &format!("{request_origin}/perf"),
         "perf-client",
-        LOAD_REQUEST_BODY,
+        scenario,
     )
     .await?;
     ensure_probe_status(&response, scenario, "baseline probe")?;
@@ -1368,15 +1453,18 @@ async fn verify_scenario_probe(
                 ))
                 .into());
             }
-            if !response.body.contains(LOAD_REQUEST_BODY) {
+            if probe_header(&response, "x-perf-request-body-mode")
+                != scenario.request_body_mode().label()
+            {
                 return Err(io::Error::other(format!(
-                    "host-call probe body missing request payload marker '{}': body='{}'",
-                    LOAD_REQUEST_BODY, response.body
+                    "host-call probe missing expected x-perf-request-body-mode '{}': got '{}'",
+                    scenario.request_body_mode().label(),
+                    probe_header(&response, "x-perf-request-body-mode")
                 ))
                 .into());
             }
         }
-        ProgramVariant::DirectUpstream { upstream } => {
+        ProgramVariant::DirectUpstream { upstream, .. } => {
             verify_direct_upstream_probe_response(
                 &response,
                 scenario,
@@ -1409,13 +1497,15 @@ async fn send_probe_request(
     client: &Client,
     url: &str,
     client_id: &str,
-    body: &str,
+    scenario: Scenario,
 ) -> Result<ProbeResponse, Box<dyn std::error::Error>> {
+    let body_mode = scenario.request_body_mode();
     let response = client
         .post(url)
         .header("x-client-id", client_id)
+        .header("x-bench-body-mode", body_mode.label())
         .header("content-type", "text/plain")
-        .body(body.to_string())
+        .body(body_mode.request_body().to_string())
         .send()
         .await?;
     let status = response.status().as_u16();
@@ -1546,14 +1636,32 @@ fn verify_proxy_roundtrip_probe_response(
         .into());
     }
 
-    if !response
-        .body
-        .contains(&format!("upstream-roundtrip|{expected_path}|"))
-        || !response.body.contains(LOAD_REQUEST_BODY)
-    {
+    let expected_body_mode = scenario.request_body_mode().label();
+    let actual_body_mode = probe_header(response, "x-bench-upstream-body-mode");
+    if actual_body_mode != expected_body_mode {
         return Err(io::Error::other(format!(
-            "proxy round-trip probe body missing expected markers for path {}: body='{}'",
-            expected_path, response.body
+            "proxy round-trip probe missing expected x-bench-upstream-body-mode '{}': got '{}'",
+            expected_body_mode, actual_body_mode
+        ))
+        .into());
+    }
+
+    if scenario.request_body_mode().reads_body() {
+        if !response
+            .body
+            .contains(&format!("upstream-roundtrip|{expected_path}|"))
+            || !response.body.contains(LOAD_REQUEST_BODY)
+        {
+            return Err(io::Error::other(format!(
+                "proxy round-trip probe body missing expected markers for path {}: body='{}'",
+                expected_path, response.body
+            ))
+            .into());
+        }
+    } else if !response.body.is_empty() {
+        return Err(io::Error::other(format!(
+            "proxy round-trip probe expected empty body for header-only scenario, got '{}'",
+            response.body
         ))
         .into());
     }
@@ -1611,14 +1719,32 @@ fn verify_direct_upstream_probe_response(
         .into());
     }
 
-    if !response
-        .body
-        .contains(&format!("upstream-roundtrip|{expected_path}|"))
-        || !response.body.contains(LOAD_REQUEST_BODY)
-    {
+    let expected_body_mode = scenario.request_body_mode().label();
+    let actual_body_mode = probe_header(response, "x-bench-upstream-body-mode");
+    if actual_body_mode != expected_body_mode {
         return Err(io::Error::other(format!(
-            "direct-upstream probe body missing expected markers for path {}: body='{}'",
-            expected_path, response.body
+            "direct-upstream probe missing expected x-bench-upstream-body-mode '{}': got '{}'",
+            expected_body_mode, actual_body_mode
+        ))
+        .into());
+    }
+
+    if scenario.request_body_mode().reads_body() {
+        if !response
+            .body
+            .contains(&format!("upstream-roundtrip|{expected_path}|"))
+            || !response.body.contains(LOAD_REQUEST_BODY)
+        {
+            return Err(io::Error::other(format!(
+                "direct-upstream probe body missing expected markers for path {}: body='{}'",
+                expected_path, response.body
+            ))
+            .into());
+        }
+    } else if !response.body.is_empty() {
+        return Err(io::Error::other(format!(
+            "direct-upstream probe expected empty body for header-only scenario, got '{}'",
+            response.body
         ))
         .into());
     }
@@ -1646,12 +1772,12 @@ async fn verify_http2_upstream_reuse_probe(
     let slow_url = format!("{request_origin}/slow");
     let fast_url = format!("{request_origin}/fast");
     let (slow, fast) = tokio::try_join!(
-        send_probe_request(client, &slow_url, "perf-client-slow", LOAD_REQUEST_BODY),
-        send_probe_request(client, &fast_url, "perf-client-fast", LOAD_REQUEST_BODY),
+        send_probe_request(client, &slow_url, "perf-client-slow", scenario),
+        send_probe_request(client, &fast_url, "perf-client-fast", scenario),
     )?;
 
     match scenario.program_variant {
-        ProgramVariant::DirectUpstream { upstream } => {
+        ProgramVariant::DirectUpstream { upstream, .. } => {
             verify_direct_upstream_probe_response(
                 &slow,
                 scenario,
@@ -1695,11 +1821,11 @@ async fn verify_http2_upstream_reuse_probe(
         client,
         &format!("{request_origin}/reuse"),
         "perf-client-reuse",
-        LOAD_REQUEST_BODY,
+        scenario,
     )
     .await?;
     match scenario.program_variant {
-        ProgramVariant::DirectUpstream { upstream } => {
+        ProgramVariant::DirectUpstream { upstream, .. } => {
             verify_direct_upstream_probe_response(
                 &reused,
                 scenario,
@@ -1709,7 +1835,12 @@ async fn verify_http2_upstream_reuse_probe(
             )?;
         }
         ProgramVariant::ProxyRoundTrip { .. } => {
-            verify_proxy_roundtrip_probe_response(&reused, scenario, "perf-client-reuse", "/reuse")?;
+            verify_proxy_roundtrip_probe_response(
+                &reused,
+                scenario,
+                "perf-client-reuse",
+                "/reuse",
+            )?;
         }
         _ => unreachable!("unsupported scenario variant for HTTP/2 upstream reuse probe"),
     }
@@ -1742,61 +1873,98 @@ async fn spawn_plain_http_upstream_fixture() -> Result<UpstreamFixture, Box<dyn 
 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let app = Router::new().fallback(any(|request: Request<Body>| async move {
-        let (parts, body) = request.into_parts();
-        let path = parts.uri.path().to_string();
-        let client_id = parts
-            .headers
-            .get("x-client-id")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        let program_header = parts
-            .headers
-            .get("x-bench-program-header")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        if path == "/slow" {
-            sleep(Duration::from_millis(75)).await;
-        }
-        let body = to_bytes(body, usize::MAX)
-            .await
-            .expect("upstream perf server should read body");
-        let mut response = Response::new(Body::from(format!(
-            "upstream-roundtrip|{path}|{}",
-            String::from_utf8_lossy(&body)
-        )));
-        response.headers_mut().insert(
-            "x-bench-upstream-client-id",
-            HeaderValue::from_str(&client_id)
-                .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
-        );
-        response.headers_mut().insert(
-            "x-bench-upstream-path",
-            HeaderValue::from_str(&path).unwrap_or_else(|_| HeaderValue::from_static("/invalid")),
-        );
-        response.headers_mut().insert(
-            "x-bench-upstream-program-header",
-            HeaderValue::from_str(&program_header)
-                .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
-        );
-        response.headers_mut().insert(
-            "x-bench-upstream-http-version",
-            HeaderValue::from_static("1.1"),
-        );
-        response
-    }));
     let task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("upstream perf server should run");
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("http upstream benchmark accept should succeed");
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let service = service_fn(|request| async move {
+                    build_benchmark_upstream_response(request, "1.1").await
+                });
+                let builder = hyper::server::conn::http1::Builder::new();
+                if let Err(err) = builder.serve_connection(io, service).await {
+                    eprintln!("http upstream benchmark connection ended: {err}");
+                }
+            });
+        }
     });
     Ok(UpstreamFixture {
         origin: format!("http://{addr}"),
         connection_count: None,
         tasks: vec![task],
     })
+}
+
+async fn build_benchmark_upstream_response(
+    request: HyperRequest<Incoming>,
+    version_label: &'static str,
+) -> Result<HyperResponse<Full<Bytes>>, std::convert::Infallible> {
+    let (parts, body) = request.into_parts();
+    let path = parts.uri.path().to_string();
+    let client_id = parts
+        .headers
+        .get("x-client-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let program_header = parts
+        .headers
+        .get("x-bench-program-header")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body_mode = parts
+        .headers
+        .get("x-bench-body-mode")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or(RequestBodyMode::HeadersOnly.label())
+        .to_string();
+
+    if path == "/slow" {
+        sleep(Duration::from_millis(75)).await;
+    }
+
+    let response_body = if body_mode == RequestBodyMode::BodyRead.label() {
+        let body = body
+            .collect()
+            .await
+            .expect("upstream benchmark body should collect")
+            .to_bytes();
+        Bytes::from(format!(
+            "upstream-roundtrip|{path}|{}",
+            String::from_utf8_lossy(&body)
+        ))
+    } else {
+        drop(body);
+        Bytes::new()
+    };
+
+    let mut response = HyperResponse::new(Full::new(response_body));
+    response.headers_mut().insert(
+        "x-bench-upstream-client-id",
+        HeaderValue::from_str(&client_id).unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+    );
+    response.headers_mut().insert(
+        "x-bench-upstream-path",
+        HeaderValue::from_str(&path).unwrap_or_else(|_| HeaderValue::from_static("/invalid")),
+    );
+    response.headers_mut().insert(
+        "x-bench-upstream-program-header",
+        HeaderValue::from_str(&program_header)
+            .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+    );
+    response.headers_mut().insert(
+        "x-bench-upstream-body-mode",
+        HeaderValue::from_str(&body_mode).unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+    );
+    response.headers_mut().insert(
+        "x-bench-upstream-http-version",
+        HeaderValue::from_static(version_label),
+    );
+    Ok(response)
 }
 
 #[cfg(all(feature = "http2", feature = "tls"))]
@@ -1835,53 +2003,8 @@ async fn spawn_https_http2_upstream_fixture() -> Result<UpstreamFixture, Box<dyn
                         .accept(stream)
                         .await
                         .expect("http2 upstream benchmark tls accept should succeed");
-                    let service = service_fn(|request: HyperRequest<Incoming>| async move {
-                        let (parts, body) = request.into_parts();
-                        let path = parts.uri.path().to_string();
-                        let client_id = parts
-                            .headers
-                            .get("x-client-id")
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or_default()
-                            .to_string();
-                        let program_header = parts
-                            .headers
-                            .get("x-bench-program-header")
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or_default()
-                            .to_string();
-                        if path == "/slow" {
-                            sleep(Duration::from_millis(75)).await;
-                        }
-                        let body = body
-                            .collect()
-                            .await
-                            .expect("http2 upstream benchmark body should collect")
-                            .to_bytes();
-                        let mut response = HyperResponse::new(Full::new(Bytes::from(format!(
-                            "upstream-roundtrip|{path}|{}",
-                            String::from_utf8_lossy(&body)
-                        ))));
-                        response.headers_mut().insert(
-                            "x-bench-upstream-client-id",
-                            HeaderValue::from_str(&client_id)
-                                .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
-                        );
-                        response.headers_mut().insert(
-                            "x-bench-upstream-path",
-                            HeaderValue::from_str(&path)
-                                .unwrap_or_else(|_| HeaderValue::from_static("/invalid")),
-                        );
-                        response.headers_mut().insert(
-                            "x-bench-upstream-program-header",
-                            HeaderValue::from_str(&program_header)
-                                .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
-                        );
-                        response.headers_mut().insert(
-                            "x-bench-upstream-http-version",
-                            HeaderValue::from_static("2"),
-                        );
-                        Ok::<_, std::convert::Infallible>(response)
+                    let service = service_fn(|request| async move {
+                        build_benchmark_upstream_response(request, "2").await
                     });
                     let io = TokioIo::new(tls_stream);
                     let builder = hyper::server::conn::http2::Builder::new(
@@ -1988,6 +2111,7 @@ fn spawn_memory_sampler(
 async fn run_load(
     client: &Client,
     url: &str,
+    scenario: Scenario,
     requests: usize,
     concurrency: usize,
     collect_latencies: bool,
@@ -1995,12 +2119,14 @@ async fn run_load(
     let shared_counter = Arc::new(AtomicUsize::new(0));
     let worker_count = concurrency.max(1);
     let started = Instant::now();
+    let body_mode = scenario.request_body_mode();
     let mut tasks = JoinSet::new();
 
     for _ in 0..worker_count {
         let shared_counter = shared_counter.clone();
         let url = url.to_string();
         let client = client.clone();
+        let request_body = body_mode.request_body();
         tasks.spawn(async move {
             let mut worker = WorkerRun {
                 latencies_us: if collect_latencies {
@@ -2022,8 +2148,9 @@ async fn run_load(
                 match client
                     .post(&url)
                     .header("x-client-id", "perf-client")
+                    .header("x-bench-body-mode", body_mode.label())
                     .header("content-type", "text/plain")
-                    .body(LOAD_REQUEST_BODY)
+                    .body(request_body)
                     .send()
                     .await
                 {
