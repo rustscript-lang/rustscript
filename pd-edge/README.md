@@ -279,6 +279,7 @@ Run the built-in framework to benchmark these scenarios:
 - proxy with plaintext upstream and HTTPS HTTP/2 downstream over TLS (`host_calls_upstream_roundtrip_downstream_http2`)
 
 Detailed report with charts: [`docs/HTTP_PROXY_PERF_REPORT_2026-03-14.md`](docs/HTTP_PROXY_PERF_REPORT_2026-03-14.md)
+Generic `proxy::forward` experiment report: [`docs/HTTP_PROXY_PERF_REPORT_2026-03-15.md`](docs/HTTP_PROXY_PERF_REPORT_2026-03-15.md)
 
 Harness A standard comparisons run with VM fuel disabled by default. Pass `--vm-fuel <UNITS>` to turn it on.
 
