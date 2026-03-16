@@ -84,6 +84,18 @@ pub(crate) fn new_shared_http_upstream_sessions(capacity: usize) -> SharedHttpUp
     }))
 }
 
+#[cfg(all(test, feature = "http2"))]
+pub(crate) fn total_active_streams(sessions: &SharedHttpUpstreamSessions) -> usize {
+    let guard = sessions
+        .lock()
+        .expect("http upstream session store lock poisoned");
+    guard
+        .sessions
+        .values()
+        .map(|session| session.active_stream_count())
+        .sum()
+}
+
 #[cfg(feature = "http2")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Http2SessionKey {
@@ -235,6 +247,18 @@ impl Http2UpstreamSession {
             .lock()
             .expect("http2 upstream session lock poisoned");
         !dag.frontier.is_terminal() || dag.has_active_streams()
+    }
+
+    #[cfg(test)]
+    fn active_stream_count(&self) -> usize {
+        let dag = self
+            .dag
+            .lock()
+            .expect("http2 upstream session lock poisoned");
+        dag.streams
+            .values()
+            .filter(|stream| !stream.frontier.is_terminal())
+            .count()
     }
 
     fn reserve_stream(&self, exchange_handle: i64) -> Result<Http2StreamRef, Http2RequestError> {

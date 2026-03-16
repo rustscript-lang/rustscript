@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     future::Future,
+    io,
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex, MutexGuard},
@@ -16,6 +17,7 @@ use axum::{
         header::{CONTENT_LENGTH, CONTENT_TYPE, HOST},
     },
 };
+use futures_util::stream::try_unfold;
 use http_body_util::{BodyExt, Full};
 #[cfg(feature = "http3")]
 use hyper::body::Buf;
@@ -801,7 +803,22 @@ struct UpstreamResponseBodySource {
     source: UpstreamResponseSource,
     http2_tracker: Option<http2::Http2ResponseBodyTracker>,
     http3_tracker: Option<http3::Http3ResponseBodyTracker>,
+    remaining_body_bytes: Option<u64>,
     body_started: bool,
+    body_finished: bool,
+}
+
+impl Default for UpstreamResponseBodySource {
+    fn default() -> Self {
+        Self {
+            source: UpstreamResponseSource::Exhausted,
+            http2_tracker: None,
+            http3_tracker: None,
+            remaining_body_bytes: None,
+            body_started: false,
+            body_finished: false,
+        }
+    }
 }
 
 impl UpstreamResponseBodySource {
@@ -816,6 +833,33 @@ impl UpstreamResponseBodySource {
             self.body_started = true;
         }
     }
+
+    fn note_body_complete(&mut self) {
+        self.note_body_ready();
+        if !self.body_finished {
+            if let Some(tracker) = &self.http2_tracker {
+                tracker.note_body_eof();
+            }
+            if let Some(tracker) = &self.http3_tracker {
+                tracker.note_body_eof();
+            }
+            self.body_finished = true;
+        }
+    }
+
+    fn note_chunk_delivered(&mut self, chunk_len: usize) {
+        if chunk_len == 0 {
+            return;
+        }
+        self.note_body_ready();
+        if let Some(remaining) = self.remaining_body_bytes.as_mut() {
+            let consumed = u64::try_from(chunk_len).unwrap_or(u64::MAX);
+            *remaining = remaining.saturating_sub(consumed);
+            if *remaining == 0 {
+                self.note_body_complete();
+            }
+        }
+    }
 }
 
 impl BufferedByteSource for UpstreamResponseBodySource {
@@ -823,8 +867,12 @@ impl BufferedByteSource for UpstreamResponseBodySource {
         Box::pin(async move {
             match &mut self.source {
                 UpstreamResponseSource::Reqwest(response) => match response.chunk().await {
-                    Ok(Some(chunk)) => Ok(BufferedByteStreamPull::Chunk(chunk)),
+                    Ok(Some(chunk)) => {
+                        self.note_chunk_delivered(chunk.len());
+                        Ok(BufferedByteStreamPull::Chunk(chunk))
+                    }
                     Ok(None) => {
+                        self.note_body_complete();
                         self.source = UpstreamResponseSource::Exhausted;
                         Ok(BufferedByteStreamPull::Eof)
                     }
@@ -835,9 +883,7 @@ impl BufferedByteSource for UpstreamResponseBodySource {
                 UpstreamResponseSource::Hyper(body) => match body.frame().await {
                     Some(Ok(frame)) => {
                         if let Ok(chunk) = frame.into_data() {
-                            if !chunk.is_empty() {
-                                self.note_body_ready();
-                            }
+                            self.note_chunk_delivered(chunk.len());
                             Ok(BufferedByteStreamPull::Chunk(chunk))
                         } else {
                             Ok(BufferedByteStreamPull::Skip)
@@ -854,10 +900,7 @@ impl BufferedByteSource for UpstreamResponseBodySource {
                         )))
                     }
                     None => {
-                        self.note_body_ready();
-                        if let Some(tracker) = &self.http2_tracker {
-                            tracker.note_body_eof();
-                        }
+                        self.note_body_complete();
                         self.source = UpstreamResponseSource::Exhausted;
                         Ok(BufferedByteStreamPull::Eof)
                     }
@@ -867,16 +910,11 @@ impl BufferedByteSource for UpstreamResponseBodySource {
                     match request_stream.as_mut().recv_data().await {
                         Ok(Some(mut chunk)) => {
                             let bytes = chunk.copy_to_bytes(chunk.remaining());
-                            if !bytes.is_empty() {
-                                self.note_body_ready();
-                            }
+                            self.note_chunk_delivered(bytes.len());
                             Ok(BufferedByteStreamPull::Chunk(bytes))
                         }
                         Ok(None) => {
-                            self.note_body_ready();
-                            if let Some(tracker) = &self.http3_tracker {
-                                tracker.note_body_eof();
-                            }
+                            self.note_body_complete();
                             self.source = UpstreamResponseSource::Exhausted;
                             Ok(BufferedByteStreamPull::Eof)
                         }
@@ -903,6 +941,33 @@ struct UpstreamResponseBodyState {
     stream: BufferedByteStream,
 }
 
+struct StreamingUpstreamResponseBodyState {
+    prefix: Option<Bytes>,
+    source: UpstreamResponseBodySource,
+}
+
+impl StreamingUpstreamResponseBodyState {
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>, VmError> {
+        if let Some(prefix) = self.prefix.take()
+            && !prefix.is_empty()
+        {
+            return Ok(Some(prefix));
+        }
+
+        loop {
+            match self.source.pull_next().await? {
+                BufferedByteStreamPull::Chunk(chunk) => {
+                    if !chunk.is_empty() {
+                        return Ok(Some(chunk));
+                    }
+                }
+                BufferedByteStreamPull::Skip => {}
+                BufferedByteStreamPull::Eof => return Ok(None),
+            }
+        }
+    }
+}
+
 impl std::fmt::Debug for UpstreamResponseBodyState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UpstreamResponseBodyState")
@@ -911,15 +976,36 @@ impl std::fmt::Debug for UpstreamResponseBodyState {
     }
 }
 
+fn upstream_response_body_source(
+    source: UpstreamResponseSource,
+    http2_tracker: Option<http2::Http2ResponseBodyTracker>,
+    http3_tracker: Option<http3::Http3ResponseBodyTracker>,
+    content_length: Option<u64>,
+) -> UpstreamResponseBodySource {
+    let mut source = UpstreamResponseBodySource {
+        source,
+        http2_tracker,
+        http3_tracker,
+        remaining_body_bytes: content_length,
+        body_started: false,
+        body_finished: false,
+    };
+    if matches!(content_length, Some(0)) {
+        source.note_body_complete();
+    }
+    source
+}
+
 impl UpstreamResponseBodyState {
     fn from_reqwest(response: reqwest::Response) -> Self {
+        let content_length = response.content_length();
         Self {
-            source: UpstreamResponseBodySource {
-                source: UpstreamResponseSource::Reqwest(response),
-                http2_tracker: None,
-                http3_tracker: None,
-                body_started: false,
-            },
+            source: upstream_response_body_source(
+                UpstreamResponseSource::Reqwest(response),
+                None,
+                None,
+                content_length,
+            ),
             stream: BufferedByteStream::default(),
         }
     }
@@ -928,14 +1014,15 @@ impl UpstreamResponseBodyState {
     fn from_hyper(
         body: hyper::body::Incoming,
         http2_tracker: Option<http2::Http2ResponseBodyTracker>,
+        content_length: Option<u64>,
     ) -> Self {
         Self {
-            source: UpstreamResponseBodySource {
-                source: UpstreamResponseSource::Hyper(body),
+            source: upstream_response_body_source(
+                UpstreamResponseSource::Hyper(body),
                 http2_tracker,
-                http3_tracker: None,
-                body_started: false,
-            },
+                None,
+                content_length,
+            ),
             stream: BufferedByteStream::default(),
         }
     }
@@ -944,14 +1031,15 @@ impl UpstreamResponseBodyState {
     fn from_http3(
         request_stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
         http3_tracker: Option<http3::Http3ResponseBodyTracker>,
+        content_length: Option<u64>,
     ) -> Self {
         Self {
-            source: UpstreamResponseBodySource {
-                source: UpstreamResponseSource::Http3(Box::new(request_stream)),
-                http2_tracker: None,
+            source: upstream_response_body_source(
+                UpstreamResponseSource::Http3(Box::new(request_stream)),
+                None,
                 http3_tracker,
-                body_started: false,
-            },
+                content_length,
+            ),
             stream: BufferedByteStream::default(),
         }
     }
@@ -972,6 +1060,18 @@ impl UpstreamResponseBodyState {
 
     async fn eof(&mut self) -> Result<bool, VmError> {
         self.stream.eof(&mut self.source).await
+    }
+
+    fn take_streaming_passthrough(&mut self) -> StreamingUpstreamResponseBodyState {
+        let stream = std::mem::take(&mut self.stream);
+        StreamingUpstreamResponseBodyState {
+            prefix: if stream.buffered.is_empty() {
+                None
+            } else {
+                Some(Bytes::from(stream.buffered))
+            },
+            source: std::mem::take(&mut self.source),
+        }
     }
 }
 
@@ -2859,6 +2959,13 @@ fn with_outbound_tls_flow_mut<T>(
     Ok(mutate(&mut exchange.transport.tls_flow))
 }
 
+fn header_content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
 async fn start_upstream_response_via_reqwest(
     handle: i64,
     prepared: &PreparedUpstreamRequest,
@@ -2941,6 +3048,7 @@ where
         ))
     })?;
     let version = response.version();
+    let content_length = header_content_length(response.headers());
     Ok(StartedUpstreamResponse {
         status: response.status().as_u16(),
         headers: response.headers().clone(),
@@ -2954,7 +3062,7 @@ where
         negotiated_alpn: Some(HTTP11_ALPN_PROTOCOL.to_string()),
         peer_certificate_der: None,
         body: Arc::new(tokio::sync::Mutex::new(
-            UpstreamResponseBodyState::from_hyper(response.into_body(), None),
+            UpstreamResponseBodyState::from_hyper(response.into_body(), None, content_length),
         )),
     })
 }
@@ -3069,6 +3177,7 @@ async fn start_upstream_response_via_http2(
     })
     .await?;
     let version = started.response.version();
+    let content_length = header_content_length(started.response.headers());
     Ok(StartedUpstreamResponse {
         status: started.response.status().as_u16(),
         headers: started.response.headers().clone(),
@@ -3081,6 +3190,7 @@ async fn start_upstream_response_via_http2(
             UpstreamResponseBodyState::from_hyper(
                 started.response.into_body(),
                 Some(started.body_tracker),
+                content_length,
             ),
         )),
     })
@@ -3111,6 +3221,7 @@ async fn start_upstream_response_via_http3(
     })
     .await?;
     let version = started.response.version();
+    let content_length = header_content_length(started.response.headers());
     Ok(StartedUpstreamResponse {
         status: started.response.status().as_u16(),
         headers: started.response.headers().clone(),
@@ -3123,6 +3234,7 @@ async fn start_upstream_response_via_http3(
             UpstreamResponseBodyState::from_http3(
                 started.request_stream,
                 Some(started.body_tracker),
+                content_length,
             ),
         )),
     })
@@ -3769,9 +3881,16 @@ async fn response_from_upstream_snapshot(
 ) -> Result<Response<Body>, VmError> {
     let body = {
         let mut upstream_body = snapshot.body.lock().await;
-        upstream_body.read_all().await?
+        let passthrough = upstream_body.take_streaming_passthrough();
+        Body::from_stream(try_unfold(passthrough, |mut state| async move {
+            let chunk = state
+                .next_chunk()
+                .await
+                .map_err(|err| io::Error::other(err.to_string()))?;
+            Ok::<_, io::Error>(chunk.map(|chunk| (chunk, state)))
+        }))
     };
-    let mut response = Response::new(Body::from(body));
+    let mut response = Response::new(body);
     *response.status_mut() = StatusCode::from_u16(snapshot.status).unwrap_or(StatusCode::OK);
     for (name, value) in &snapshot.headers {
         if !is_hop_by_hop_header(name) {
@@ -4054,20 +4173,31 @@ mod tests {
     use axum::{
         Router,
         body::{Body, Bytes, to_bytes},
-        http::{HeaderMap, Request},
+        http::{HeaderMap, Request, Response},
         routing::any,
     };
-    use http_body_util::StreamBody;
+    use futures_util::stream::try_unfold;
+    use http_body_util::{BodyExt, StreamBody};
+    use tokio::{
+        sync::{Mutex as AsyncMutex, oneshot},
+        time::{Duration, timeout},
+    };
 
     use super::{
-        HttpCarrierRef, HttpExchangeTransportState, HttpRequestContext, ProxyVmContext,
+        HttpCarrierRef, HttpExchangeTransportState, HttpRequestContext,
+        HttpUpstreamResponseSnapshot, ProxyVmContext, UpstreamResponseBodyState,
+        header_content_length, response_from_upstream_snapshot,
         SharedProxyVmContext, allocate_outbound_exchange_handle, append_outbound_exchange_body,
         default_upstream_exchange_handle, ensure_outbound_exchange_response_started,
         outbound_exchange_exists, read_request_body_all, read_request_body_next_chunk,
-        read_request_body_next_line,
+        read_request_body_next_line, resolve_http_graph_response,
     };
     use crate::abi_impl::RateLimiterStore;
-    use crate::abi_impl::http2::{Http2DownstreamStreamAttachment, Http2StreamRef};
+    use crate::abi_impl::http2::{
+        Http2DownstreamStreamAttachment, Http2SendRequest, Http2StreamRef, Http2UpstreamMode,
+        new_shared_http_upstream_sessions, send_request, total_active_streams,
+    };
+    use crate::abi_impl::transport::TlsFlowState;
 
     fn test_context() -> SharedProxyVmContext {
         Arc::new(ProxyVmContext::from_request_headers(
@@ -4313,5 +4443,221 @@ mod tests {
             transport.tls_dag.downstream.server_name(),
             "origin.example.test"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_http_graph_response_streams_upstream_body_without_waiting_for_eof() {
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let release = Arc::new(AsyncMutex::new(Some(release_rx)));
+        let upstream_addr = spawn_server(Router::new().fallback(any({
+            let release = release.clone();
+            move |_request: Request<Body>| {
+                let release = release.clone();
+                async move {
+                    let release_rx = release
+                        .lock()
+                        .await
+                        .take()
+                        .expect("release receiver should be available");
+                    let stream = try_unfold(
+                        (Some(Bytes::from_static(b"hello")), Some(release_rx)),
+                        |(first, release_rx)| async move {
+                            if let Some(chunk) = first {
+                                return Ok::<_, io::Error>(Some((chunk, (None, release_rx))));
+                            }
+                            if let Some(release_rx) = release_rx {
+                                let _ = release_rx.await;
+                                return Ok(Some((Bytes::from_static(b"world"), (None, None))));
+                            }
+                            Ok(None)
+                        },
+                    );
+                    Response::new(Body::from_stream(stream))
+                }
+            }
+        })))
+        .await;
+
+        let mut context = test_context_with_request(Body::from("payload"), "http", "");
+        Arc::get_mut(&mut context)
+            .expect("context should be uniquely owned")
+            .attach_upstream_client(reqwest::Client::new());
+        {
+            let target = format!("http://{upstream_addr}/stream");
+            let mut exchanges = context.lock_exchanges();
+            let exchange = exchanges
+                .exchanges
+                .get_mut(&default_upstream_exchange_handle())
+                .expect("default upstream exchange should exist");
+            exchange.request.target = Some(target.clone());
+            exchange.transport.tcp_flow.configure();
+            exchange.transport.tls_flow.observe_target(&target);
+        }
+
+        let resolved = timeout(Duration::from_millis(100), resolve_http_graph_response(&context))
+            .await
+            .expect("response resolution should not wait for the full upstream body");
+
+        let mut body = resolved.response.into_body();
+        let first = timeout(Duration::from_millis(100), body.frame())
+            .await
+            .expect("first upstream chunk should arrive promptly")
+            .expect("body should yield a frame")
+            .expect("frame should be successful")
+            .into_data()
+            .expect("frame should contain data");
+        assert_eq!(first.as_ref(), b"hello");
+
+        assert!(
+            timeout(Duration::from_millis(50), body.frame()).await.is_err(),
+            "second upstream chunk should still be pending before release"
+        );
+
+        release_tx
+            .send(())
+            .expect("release signal should be deliverable");
+
+        let second = timeout(Duration::from_millis(100), body.frame())
+            .await
+            .expect("second upstream chunk should arrive after release")
+            .expect("body should yield a second frame")
+            .expect("frame should be successful")
+            .into_data()
+            .expect("frame should contain data");
+        assert_eq!(second.as_ref(), b"world");
+        assert!(
+            timeout(Duration::from_millis(100), body.frame())
+                .await
+                .expect("body eof should be observable")
+                .is_none()
+        );
+    }
+
+    #[cfg(all(feature = "http2", feature = "tls"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn known_length_streaming_response_retires_upstream_http2_stream_without_eof_poll() {
+        use std::convert::Infallible;
+
+        use http_body_util::Full;
+        use hyper::{Response as HyperResponse, body::Incoming, service::service_fn};
+        use hyper_util::rt::TokioIo;
+        use rcgen::generate_simple_self_signed;
+        use reqwest::Method;
+        use tokio_rustls::{
+            TlsAcceptor,
+            rustls::{
+                ServerConfig,
+                pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+            },
+        };
+
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let cert =
+            generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .expect("test cert should build");
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(
+                    cert.serialize_der()
+                        .expect("cert der should serialize"),
+                )],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    cert.serialize_private_key_der(),
+                )),
+            )
+            .expect("server config should build");
+        server_config.alpn_protocols = vec![b"h2".to_vec()];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have addr");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let server_handle = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let tls_stream = acceptor.accept(stream).await.expect("tls should accept");
+                    let service = service_fn(|_request: hyper::Request<Incoming>| async move {
+                        Ok::<_, Infallible>(HyperResponse::new(Full::new(Bytes::from_static(
+                            b"hello",
+                        ))))
+                    });
+                    let builder = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    );
+                    let _ = builder
+                        .serve_connection(TokioIo::new(tls_stream), service)
+                        .await;
+                });
+            }
+        });
+
+        let sessions = new_shared_http_upstream_sessions(8);
+        let origin = format!("https://127.0.0.1:{}", addr.port());
+        let upstream_url = format!("{origin}/");
+        let mut tls_flow = TlsFlowState::default();
+        tls_flow.observe_target(&origin);
+        tls_flow.set_verify_peer(false);
+        tls_flow.set_verify_hostname(false);
+        tls_flow.set_desired_alpn(vec!["h2".to_string(), "http/1.1".to_string()]);
+
+        let started = send_request(Http2SendRequest {
+            sessions: &sessions,
+            exchange_handle: default_upstream_exchange_handle(),
+            target: &origin,
+            upstream_url: &upstream_url,
+            mode: Http2UpstreamMode::AutomaticTls,
+            tls_flow: &tls_flow,
+            method: Method::GET,
+            headers: HeaderMap::new(),
+            request_body: Vec::new(),
+        })
+        .await
+        .expect("http2 request should start");
+
+        let carrier_ref = HttpCarrierRef::UpstreamHttp2Stream(started.stream_ref);
+        let response_headers = started.response.headers().clone();
+        let content_length = header_content_length(&response_headers);
+        let response_status = started.response.status().as_u16();
+        let snapshot = HttpUpstreamResponseSnapshot {
+            status: response_status,
+            headers: response_headers,
+            http_version: "2".to_string(),
+            carrier_kind: carrier_ref.kind(),
+            carrier_ref,
+            body: Arc::new(tokio::sync::Mutex::new(UpstreamResponseBodyState::from_hyper(
+                started.response.into_body(),
+                Some(started.body_tracker),
+                content_length,
+            ))),
+        };
+
+        let response = response_from_upstream_snapshot(snapshot, HeaderMap::new(), None)
+            .await
+            .expect("response should build");
+        let mut body = response.into_body();
+        let first = body
+            .frame()
+            .await
+            .expect("body should yield a frame")
+            .expect("frame should be successful")
+            .into_data()
+            .expect("frame should contain data");
+        assert_eq!(first.as_ref(), b"hello");
+
+        drop(body);
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            total_active_streams(&sessions),
+            0,
+            "known-length streamed upstream response should retire the http2 stream without a trailing eof poll"
+        );
+
+        server_handle.abort();
     }
 }
