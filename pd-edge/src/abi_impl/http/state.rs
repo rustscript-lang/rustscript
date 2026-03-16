@@ -1577,11 +1577,12 @@ impl ProxyVmContext {
             .downstream_listener_goal = goal;
     }
 
-    pub(crate) fn request_head(&self) -> HttpRequestHead {
-        self.request_head
+    pub(crate) fn with_request_head<T>(&self, read: impl FnOnce(&HttpRequestHead) -> T) -> T {
+        let request_head = self
+            .request_head
             .lock()
-            .expect("vm request head lock poisoned")
-            .clone()
+            .expect("vm request head lock poisoned");
+        read(&request_head)
     }
 
     pub(crate) fn services(&self) -> &RuntimeServices {
@@ -3579,7 +3580,8 @@ pub(crate) async fn read_upstream_response_all(
     context: &SharedProxyVmContext,
 ) -> Result<Vec<u8>, VmError> {
     let snapshot = ensure_upstream_response_started(context).await?;
-    let mut body = snapshot.body.lock().await;
+    let body = snapshot.body;
+    let mut body = body.lock().await;
     body.read_all().await
 }
 
@@ -3591,7 +3593,8 @@ pub(crate) async fn read_outbound_exchange_response_all(
         return read_upstream_response_all(context).await;
     }
     let snapshot = ensure_outbound_exchange_response_started(context, handle).await?;
-    let mut body = snapshot.body.lock().await;
+    let body = snapshot.body;
+    let mut body = body.lock().await;
     body.read_all().await
 }
 
@@ -3600,7 +3603,8 @@ pub(crate) async fn read_upstream_response_next_chunk(
     max_bytes: usize,
 ) -> Result<Vec<u8>, VmError> {
     let snapshot = ensure_upstream_response_started(context).await?;
-    let mut body = snapshot.body.lock().await;
+    let body = snapshot.body;
+    let mut body = body.lock().await;
     body.read_next_chunk(max_bytes).await
 }
 
@@ -3613,7 +3617,8 @@ pub(crate) async fn read_outbound_exchange_response_next_chunk(
         return read_upstream_response_next_chunk(context, max_bytes).await;
     }
     let snapshot = ensure_outbound_exchange_response_started(context, handle).await?;
-    let mut body = snapshot.body.lock().await;
+    let body = snapshot.body;
+    let mut body = body.lock().await;
     body.read_next_chunk(max_bytes).await
 }
 
@@ -3621,7 +3626,8 @@ pub(crate) async fn read_upstream_response_next_line(
     context: &SharedProxyVmContext,
 ) -> Result<Vec<u8>, VmError> {
     let snapshot = ensure_upstream_response_started(context).await?;
-    let mut body = snapshot.body.lock().await;
+    let body = snapshot.body;
+    let mut body = body.lock().await;
     body.read_next_line().await
 }
 
@@ -3634,13 +3640,15 @@ pub(crate) async fn read_outbound_exchange_response_next_line(
         return read_upstream_response_next_line(context).await;
     }
     let snapshot = ensure_outbound_exchange_response_started(context, handle).await?;
-    let mut body = snapshot.body.lock().await;
+    let body = snapshot.body;
+    let mut body = body.lock().await;
     body.read_next_line().await
 }
 
 pub(crate) async fn upstream_response_eof(context: &SharedProxyVmContext) -> Result<bool, VmError> {
     let snapshot = ensure_upstream_response_started(context).await?;
-    let mut body = snapshot.body.lock().await;
+    let body = snapshot.body;
+    let mut body = body.lock().await;
     body.eof().await
 }
 
@@ -3652,7 +3660,8 @@ pub(crate) async fn outbound_exchange_response_eof(
         return upstream_response_eof(context).await;
     }
     let snapshot = ensure_outbound_exchange_response_started(context, handle).await?;
-    let mut body = snapshot.body.lock().await;
+    let body = snapshot.body;
+    let mut body = body.lock().await;
     body.eof().await
 }
 
@@ -3812,16 +3821,19 @@ pub(crate) async fn resolve_http_graph_response(
         let plan = context
             .take_downstream_post_response_plan()
             .expect("downstream post-response plan should exist");
-        let request_head = context.request_head();
         let response = match &plan {
             DownstreamPostResponsePlan::ConnectTunnel(_) => {
                 Ok(response_from_connect_tunnel(response_headers))
             }
             #[cfg(feature = "websocket")]
-            DownstreamPostResponsePlan::WebSocketTunnel(plan) => response_from_websocket_tunnel(
-                request_head.headers(),
-                response_headers,
-                plan.selected_subprotocol.as_deref(),
+            DownstreamPostResponsePlan::WebSocketTunnel(plan) => context.with_request_head(
+                |request_head| {
+                    response_from_websocket_tunnel(
+                        request_head.headers(),
+                        response_headers,
+                        plan.selected_subprotocol.as_deref(),
+                    )
+                },
             ),
         };
         let response = match response {

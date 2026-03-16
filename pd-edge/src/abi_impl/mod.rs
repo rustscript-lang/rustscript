@@ -296,6 +296,27 @@ pub(crate) async fn prepare_scoped_host_call(
         .await
 }
 
+pub(crate) fn scoped_host_call_can_run_synchronously(
+    context: &SharedProxyVmContext,
+    scope: registry::EdgeHostScope,
+    host_name: &str,
+) -> Result<bool, VmError> {
+    let requires_http_entry = matches!(
+        scope,
+        registry::EdgeHostScope::Http | registry::EdgeHostScope::HttpExtension
+    );
+    if !requires_http_entry {
+        return Ok(true);
+    }
+    if host_name == edge_abi::symbols::http::request::GET_SCHEME.name
+        || host_name == "http::downstream::attach_transport"
+    {
+        return Ok(true);
+    }
+
+    crate::runtime::scoped_http_host_call_can_run_synchronously(context, host_name)
+}
+
 struct AsyncHostAdapter {
     inner: Box<dyn HostFunction>,
     async_ops: SharedVmAsyncOps,
@@ -605,7 +626,6 @@ pub fn register_http_host_module(
 }
 
 fn schedule_future_call<F>(
-    _vm: &mut Vm,
     async_ops: &SharedVmAsyncOps,
     future: F,
 ) -> Result<CallOutcome, VmError>
@@ -618,22 +638,22 @@ where
 }
 
 pub(crate) fn schedule_current_future_call<F>(
-    vm: &mut Vm,
+    _vm: &mut Vm,
     future: F,
 ) -> Result<CallOutcome, VmError>
 where
     F: Future<Output = AsyncOpResult> + Send + 'static,
 {
     let async_ops = current_async_ops()?;
-    schedule_future_call(vm, &async_ops, future)
+    schedule_future_call(&async_ops, future)
 }
 
-pub(crate) fn schedule_current_ready_call(
-    _vm: &mut Vm,
-    values: Vec<Value>,
-) -> Result<CallOutcome, VmError> {
+pub(crate) fn schedule_current_args_future_call<F>(future: F) -> Result<CallOutcome, VmError>
+where
+    F: Future<Output = AsyncOpResult> + Send + 'static,
+{
     let async_ops = current_async_ops()?;
-    schedule_ready_call(&async_ops, values)
+    schedule_future_call(&async_ops, future)
 }
 
 fn schedule_ready_call(
@@ -643,18 +663,6 @@ fn schedule_ready_call(
     let mut ops = async_ops.lock().expect("vm async ops lock poisoned");
     let op_id = ops.schedule_ready(Ok(values))?;
     Ok(CallOutcome::Pending(op_id))
-}
-
-pub(crate) fn adapt_edge_call_outcome(
-    vm: &mut Vm,
-    outcome: CallOutcome,
-) -> Result<CallOutcome, VmError> {
-    match outcome {
-        CallOutcome::Return(values) => schedule_current_ready_call(vm, values),
-        CallOutcome::Halt => Ok(CallOutcome::Halt),
-        CallOutcome::Yield => Ok(CallOutcome::Yield),
-        CallOutcome::Pending(op_id) => Ok(CallOutcome::Pending(op_id)),
-    }
 }
 
 #[allow(dead_code)]
@@ -721,6 +729,13 @@ mod tests {
         _context: SharedProxyVmContext,
     ) -> Result<CallOutcome, VmError> {
         tokio::task::yield_now().await;
+        Ok(CallOutcome::Return(vec![]))
+    }
+
+    #[cfg(feature = "http")]
+    /// Returns immediately from a scoped HTTP host call while taking Vm.
+    #[pd_edge_host_function(name = "test::sync_return_with_vm", scope = http)]
+    fn sync_return_with_vm(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
         Ok(CallOutcome::Return(vec![]))
     }
 
@@ -844,20 +859,54 @@ mod tests {
             let _host_context = enter_edge_host_context(context.clone(), async_ops.clone());
             vm.run().expect("edge host call should execute")
         };
-        if status == VmStatus::Waiting(vm.waiting_host_op_id().expect("waiting op id should exist"))
-        {
-            vm.wait_for_host_op_blocking()
-                .expect("ready edge host op should complete");
-            let _host_context = enter_edge_host_context(context.clone(), async_ops.clone());
-            assert_eq!(vm.resume().expect("vm should resume"), VmStatus::Halted);
-        } else {
-            assert_eq!(status, VmStatus::Halted);
-        }
+        assert_eq!(
+            status,
+            VmStatus::Halted,
+            "sync scoped http host calls should return directly without a ready async op"
+        );
+        assert!(
+            vm.waiting_host_op_id().is_none(),
+            "sync scoped http host calls should not leave the vm waiting on a host op"
+        );
 
         let guard = context.lock_downstream();
         assert_eq!(
             guard.response_output.body.as_deref(),
             Some("payload".as_bytes())
+        );
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn sync_scoped_host_calls_using_vm_return_directly() {
+        let imports = vec![HostImport {
+            name: "test::sync_return_with_vm".to_string(),
+            arity: 0,
+            return_type: ValueType::Unknown,
+        }];
+        let mut bc = BytecodeBuilder::new();
+        bc.call(0, 0);
+        bc.ret();
+        let program = Program::with_imports_and_debug(vec![], bc.finish(), imports, None);
+        let context = test_context();
+        let async_ops = new_shared_vm_async_ops();
+        let mut vm = Vm::new(program);
+        vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));
+        register_http_plane_host_module(&mut vm, context.clone(), async_ops.clone())
+            .expect("http plane vm should bind");
+
+        let status = {
+            let _host_context = enter_edge_host_context(context, async_ops);
+            vm.run().expect("sync scoped vm host call should execute")
+        };
+        assert_eq!(
+            status,
+            VmStatus::Halted,
+            "sync scoped host calls using &mut Vm should return directly"
+        );
+        assert!(
+            vm.waiting_host_op_id().is_none(),
+            "sync scoped host calls using &mut Vm should not leave the vm waiting on a host op"
         );
     }
 

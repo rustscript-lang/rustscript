@@ -9,6 +9,7 @@ pub(crate) fn expand_pd_edge_host_function(
     mut item: ItemFn,
 ) -> Result<proc_macro2::TokenStream, Error> {
     let edge_attr = parse_edge_host_attr(&attr)?;
+    let was_async = item.sig.asyncness.is_some();
     let docs = doc_string(&item.attrs);
     if docs.trim().is_empty() {
         return Err(Error::new_spanned(
@@ -36,7 +37,7 @@ pub(crate) fn expand_pd_edge_host_function(
     }
     let wrapper = generate_edge_host_binder(&item, &wrapper_name, &edge_attr)?;
     let static_wrapper =
-        generate_scoped_edge_host_static_wrapper(&item, &wrapper_name, &edge_attr)?;
+        generate_scoped_edge_host_static_wrapper(&item, &wrapper_name, &edge_attr, was_async)?;
     let registration = generate_edge_host_registration(&item, &wrapper_name, &edge_attr, &docs)?;
     Ok(quote! {
         #item
@@ -511,13 +512,21 @@ fn generate_scoped_edge_host_static_wrapper(
     item: &ItemFn,
     wrapper_name: &syn::Ident,
     attr: &EdgeHostAttr,
+    was_async: bool,
 ) -> Result<proc_macro2::TokenStream, Error> {
-    let Some(_scope) = attr.scope else {
+    let Some(scope) = attr.scope else {
         return Ok(quote!());
     };
     let impl_name = &item.sig.ident;
     let static_wrapper_name = format_ident!("__pd_edge_static_{}", wrapper_name);
     let uses_vm = scoped_wrapper_uses_vm(item);
+    let scope_tokens = edge_scope_tokens(scope);
+    let scope_requires_prepare = matches!(
+        scope,
+        EdgeHostScopeAttr::Http | EdgeHostScopeAttr::HttpExtension
+    );
+    let args_only_sync_fast_path = !uses_vm && !was_async;
+    let prepare_context_ident = format_ident!("__pd_edge_prepare_context");
     let mut setup_stmts = Vec::<proc_macro2::TokenStream>::new();
     let mut call_args = Vec::<proc_macro2::TokenStream>::new();
     let mut extract_stmts = Vec::<proc_macro2::TokenStream>::new();
@@ -547,7 +556,11 @@ fn generate_scoped_edge_host_static_wrapper(
         }
 
         if is_edge_context_type(ty) {
-            setup_stmts.push(quote!(let #ident = crate::abi_impl::current_vm_context()?;));
+            if args_only_sync_fast_path && scope_requires_prepare {
+                setup_stmts.push(quote!(let #ident = #prepare_context_ident.clone();));
+            } else {
+                setup_stmts.push(quote!(let #ident = crate::abi_impl::current_vm_context()?;));
+            }
             call_args.push(quote!(#ident));
             continue;
         }
@@ -607,7 +620,54 @@ fn generate_scoped_edge_host_static_wrapper(
                     #(#extract_stmts)*
                     #call_expr
                 }?;
-                crate::abi_impl::adapt_edge_call_outcome(vm, __pd_edge_outcome)
+                Ok(__pd_edge_outcome)
+            }
+        })
+    } else if args_only_sync_fast_path && scope_requires_prepare {
+        let name_expr = &attr.name;
+        Ok(quote! {
+            fn #static_wrapper_name(
+                args: &[::vm::Value],
+            ) -> Result<::vm::CallOutcome, ::vm::VmError> {
+                if args.len() != #arg_index {
+                    return Err(::vm::VmError::HostError(format!(
+                        "expected {} arguments, got {}",
+                        #arg_index,
+                        args.len()
+                    )));
+                }
+                let #prepare_context_ident = crate::abi_impl::current_vm_context()?;
+                #(#setup_stmts)*
+                #(#extract_stmts)*
+                if crate::abi_impl::scoped_host_call_can_run_synchronously(
+                    &#prepare_context_ident,
+                    #scope_tokens,
+                    #name_expr,
+                )? {
+                    let __pd_edge_outcome = #call_expr?;
+                    return Ok(__pd_edge_outcome);
+                }
+                crate::abi_impl::schedule_current_args_future_call(async move {
+                    crate::abi_impl::prepare_scoped_host_call(
+                        #prepare_context_ident.clone(),
+                        #scope_tokens,
+                        #name_expr,
+                    )
+                    .await?;
+                    let __pd_edge_outcome = #call_expr?;
+                    match __pd_edge_outcome {
+                        ::vm::CallOutcome::Return(values) => Ok(values),
+                        ::vm::CallOutcome::Halt => Err(::vm::VmError::HostError(
+                            "sync scoped host fast-path future must not return Halt".to_string(),
+                        )),
+                        ::vm::CallOutcome::Yield => Err(::vm::VmError::HostError(
+                            "sync scoped host fast-path future must not return Yield".to_string(),
+                        )),
+                        ::vm::CallOutcome::Pending(_) => Err(::vm::VmError::HostError(
+                            "sync scoped host fast-path future must not return Pending".to_string(),
+                        )),
+                    }
+                })
             }
         })
     } else {
@@ -627,7 +687,7 @@ fn generate_scoped_edge_host_static_wrapper(
                     #(#extract_stmts)*
                     #call_expr
                 }?;
-                crate::abi_impl::adapt_edge_args_call_outcome(__pd_edge_outcome)
+                Ok(__pd_edge_outcome)
             }
         })
     }

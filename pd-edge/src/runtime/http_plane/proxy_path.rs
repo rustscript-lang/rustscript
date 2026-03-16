@@ -437,6 +437,19 @@ fn blocked_downstream_http_auto_promotion(host_name: &str) -> VmError {
     ))
 }
 
+pub(crate) fn scoped_http_host_call_can_run_synchronously(
+    context: &SharedProxyVmContext,
+    host_name: &str,
+) -> Result<bool, VmError> {
+    match downstream_http_auto_promotion(context) {
+        DownstreamHttpAutoPromotion::None => Ok(true),
+        DownstreamHttpAutoPromotion::Eligible(_) => Ok(false),
+        DownstreamHttpAutoPromotion::Blocked => {
+            Err(blocked_downstream_http_auto_promotion(host_name))
+        }
+    }
+}
+
 async fn promote_captured_downstream_transport_into_http_request(
     context: SharedProxyVmContext,
     promoted: PromotedDownstreamTransport,
@@ -446,7 +459,7 @@ async fn promote_captured_downstream_transport_into_http_request(
         #[cfg(feature = "tls")]
         PromotedDownstreamTransport::Tls(_) => context.downstream_connection_metadata(true)?,
     };
-    let request_id = context.request_head().request_id().to_string();
+    let request_id = context.with_request_head(|request_head| request_head.request_id().to_string());
     let downstream_http_sessions = context.services().downstream_http_sessions();
     let (captured_tx, captured_rx) =
         oneshot::channel::<Result<CapturedPromotedHttpRequest, String>>();

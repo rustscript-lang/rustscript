@@ -25,12 +25,11 @@ enum RequestField {
     ClientIp,
 }
 
-async fn request_field_outcome(
+fn request_field_outcome(
     context: SharedProxyVmContext,
     field: RequestField,
 ) -> Result<CallOutcome, VmError> {
-    let request_head = context.request_head();
-    let value = match field {
+    let value = context.with_request_head(|request_head| match field {
         RequestField::Id => request_head.request_id().to_string(),
         RequestField::Method => request_head.method().as_str().to_string(),
         RequestField::Path => request_head.path().to_string(),
@@ -42,151 +41,117 @@ async fn request_field_outcome(
         RequestField::Scheme => request_head.scheme().to_string(),
         RequestField::Host => request_head.host().to_string(),
         RequestField::ClientIp => request_head.client_ip().to_string(),
-    };
+    });
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 
 /// Returns the current downstream request id.
 #[pd_edge_host_function(name = http_request::GET_ID.name, scope = http)]
-async fn get_request_id(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    request_field_outcome(context, RequestField::Id).await
+fn get_request_id(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::Id)
 }
 
 /// Returns the HTTP method for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_METHOD.name, scope = http)]
-async fn get_request_method(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    request_field_outcome(context, RequestField::Method).await
+fn get_request_method(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::Method)
 }
 
 /// Returns the request path for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_PATH.name, scope = http)]
-async fn get_request_path(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    request_field_outcome(context, RequestField::Path).await
+fn get_request_path(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::Path)
 }
 
 /// Returns the decoded query string for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_QUERY.name, scope = http)]
-async fn get_request_query(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    request_field_outcome(context, RequestField::Query).await
+fn get_request_query(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::Query)
 }
 
 /// Returns the URL scheme for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_SCHEME.name, scope = http)]
-async fn get_request_scheme(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    request_field_outcome(context, RequestField::Scheme).await
+fn get_request_scheme(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::Scheme)
 }
 
 /// Returns the host name for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_HOST.name, scope = http)]
-async fn get_request_host(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    request_field_outcome(context, RequestField::Host).await
+fn get_request_host(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::Host)
 }
 
 /// Returns the downstream client IP address.
 #[pd_edge_host_function(name = http_request::GET_CLIENT_IP.name, scope = http)]
-async fn get_request_client_ip(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    request_field_outcome(context, RequestField::ClientIp).await
+fn get_request_client_ip(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::ClientIp)
 }
 
 /// Returns the request path and query string for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_PATH_WITH_QUERY.name, scope = http)]
-async fn get_request_path_with_query(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    request_field_outcome(context, RequestField::PathWithQuery).await
+fn get_request_path_with_query(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::PathWithQuery)
 }
 
 /// Returns the HTTP version for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_HTTP_VERSION.name, scope = http)]
-async fn get_request_http_version(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    request_field_outcome(context, RequestField::HttpVersion).await
+fn get_request_http_version(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
+    request_field_outcome(context, RequestField::HttpVersion)
 }
 
 /// Returns the first value for a header on the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_HEADER.name, scope = http)]
-async fn get_request_header(
-    _vm: &mut Vm,
+fn get_request_header(
     context: SharedProxyVmContext,
     name: String,
 ) -> Result<CallOutcome, VmError> {
     let header_name = HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
-    let request_head = context.request_head();
-    let value = request_head
-        .headers()
-        .get(&header_name)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
+    let value = context.with_request_head(|request_head| {
+        request_head
+            .headers()
+            .get(&header_name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    });
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 
 /// Returns all headers on the downstream HTTP request as a map.
 #[pd_edge_host_function(name = http_request::GET_HEADERS.name, scope = http)]
-async fn get_request_headers(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    let request_head = context.request_head();
-    Ok(CallOutcome::Return(vec![headers_to_value_map(
-        request_head.headers(),
-    )]))
+fn get_request_headers(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
+    Ok(CallOutcome::Return(vec![context.with_request_head(|request_head| {
+        headers_to_value_map(request_head.headers())
+    })]))
 }
 
 /// Returns a query parameter from the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_QUERY_ARG.name, scope = http)]
-async fn get_request_query_arg(
-    _vm: &mut Vm,
+fn get_request_query_arg(
     context: SharedProxyVmContext,
     name: String,
 ) -> Result<CallOutcome, VmError> {
-    let request_head = context.request_head();
-    let value = url::form_urlencoded::parse(request_head.query().as_bytes())
-        .find_map(|(key, value)| {
-            if key == name {
-                Some(value.into_owned())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
+    let value = context.with_request_head(|request_head| {
+        url::form_urlencoded::parse(request_head.query().as_bytes())
+            .find_map(|(key, value)| {
+                if key == name {
+                    Some(value.into_owned())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default()
+    });
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 
 /// Returns all query parameters from the downstream HTTP request as a map.
 #[pd_edge_host_function(name = http_request::GET_QUERY_ARGS.name, scope = http)]
-async fn get_request_query_args(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    let request_head = context.request_head();
-    Ok(CallOutcome::Return(vec![query_to_value_map(
-        request_head.query(),
-    )]))
+fn get_request_query_args(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
+    Ok(CallOutcome::Return(vec![context.with_request_head(|request_head| {
+        query_to_value_map(request_head.query())
+    })]))
 }
 
 /// Returns the full body for the downstream HTTP request as text.
@@ -231,13 +196,9 @@ async fn get_request_body_eof(
 
 /// Returns the local destination port for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_PORT.name, scope = http)]
-async fn get_request_port(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    let request_head = context.request_head();
+fn get_request_port(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
     Ok(CallOutcome::Return(vec![Value::Int(
-        request_head.port() as i64
+        context.with_request_head(|request_head| request_head.port() as i64),
     )]))
 }
 

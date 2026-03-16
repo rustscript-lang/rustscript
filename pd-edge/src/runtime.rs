@@ -46,6 +46,7 @@ pub(crate) use http_plane::{
     auto_promote_downstream_listener_goal_into_http_request,
     maybe_auto_promote_downstream_listener_goal_into_http_request,
     promote_transport_context_into_http_request,
+    scoped_http_host_call_can_run_synchronously,
 };
 pub use http_plane::{build_admin_app, build_http_proxy_app, serve_http_proxy, serve_https_proxy};
 pub use transport_plane::serve_transport_proxy;

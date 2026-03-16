@@ -123,8 +123,8 @@ fn proxy_stream_state(
 }
 
 fn downstream_proxy_endpoint(context: &SharedProxyVmContext) -> ProxyByteStreamEndpoint {
-    let request_head = context.request_head();
-    if request_head.method() == axum::http::Method::CONNECT {
+    if context.with_request_head(|request_head| request_head.method() == axum::http::Method::CONNECT)
+    {
         ProxyByteStreamEndpoint::DownstreamConnect
     } else if context.downstream_websocket().is_present() {
         ProxyByteStreamEndpoint::DownstreamWebSocketBinary
@@ -758,6 +758,50 @@ async fn schedule_downstream_websocket_tunnel(
     Ok(Some("upgraded".to_string()))
 }
 
+async fn schedule_default_upstream_http_forward(
+    context: &SharedProxyVmContext,
+    left: i64,
+    right: i64,
+) -> Result<Option<String>, VmError> {
+    let left_state = proxy_stream_state(context, left)?;
+    let right_state = proxy_stream_state(context, right)?;
+    let default_upstream = http::default_upstream_exchange_handle();
+
+    let is_default_http_forward = matches!(
+        (&left_state.endpoint, &right_state.endpoint),
+        (
+            ProxyByteStreamEndpoint::HttpDownstream,
+            ProxyByteStreamEndpoint::HttpExchange(exchange),
+        ) | (
+            ProxyByteStreamEndpoint::HttpExchange(exchange),
+            ProxyByteStreamEndpoint::HttpDownstream,
+        ) if *exchange == default_upstream
+            && !left_state.write_observed
+            && !right_state.write_observed
+    );
+
+    if !is_default_http_forward {
+        return Ok(None);
+    }
+
+    http::ensure_outbound_exchange_response_started(context, default_upstream).await?;
+    Ok(Some("forwarded".to_string()))
+}
+
+async fn try_native_forward(
+    context: &SharedProxyVmContext,
+    left: i64,
+    right: i64,
+) -> Result<Option<String>, VmError> {
+    if let Some(status) = schedule_downstream_connect_tunnel(context, left, right).await? {
+        return Ok(Some(status));
+    }
+    if let Some(status) = schedule_downstream_websocket_tunnel(context, left, right).await? {
+        return Ok(Some(status));
+    }
+    schedule_default_upstream_http_forward(context, left, right).await
+}
+
 async fn drive_pipe_direction(
     context: SharedProxyVmContext,
     source: i64,
@@ -813,10 +857,7 @@ async fn drive_bridge(
     right: i64,
     max_bytes: usize,
 ) -> Result<String, VmError> {
-    if let Some(status) = schedule_downstream_connect_tunnel(&context, left, right).await? {
-        return Ok(status);
-    }
-    if let Some(status) = schedule_downstream_websocket_tunnel(&context, left, right).await? {
+    if let Some(status) = try_native_forward(&context, left, right).await? {
         return Ok(status);
     }
     try_join!(
@@ -917,6 +958,22 @@ async fn proxy_bridge(
     Ok(CallOutcome::Return(vec![Value::string(status)]))
 }
 
+/// Natively forwards between proxy byte streams when a direct runtime handoff is available.
+#[pd_edge_host_function(name = "proxy::forward", scope = proxy)]
+async fn proxy_forward(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    left: i64,
+    right: i64,
+) -> Result<CallOutcome, VmError> {
+    let status = try_native_forward(&context, left, right).await?.ok_or_else(|| {
+        VmError::HostError(
+            "proxy::forward requires a native-forward-compatible pair; use proxy::bridge for the buffered fallback path".to_string(),
+        )
+    })?;
+    Ok(CallOutcome::Return(vec![Value::string(status)]))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -935,7 +992,7 @@ mod tests {
     use super::{
         ProxyByteStreamEndpoint, ProxyReadStep, allocate_proxy_stream_handle, drive_bridge,
         drive_pipe, endpoint_from_tls_plaintext, proxy_stream_close_write, proxy_stream_read_step,
-        proxy_stream_write_bytes,
+        proxy_stream_write_bytes, try_native_forward,
     };
     use crate::abi_impl::{
         RateLimiterStore,
@@ -1098,6 +1155,48 @@ mod tests {
             guard.response_output.body.as_deref(),
             Some("echo:abcdefgh".as_bytes())
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_forward_starts_default_upstream_without_materializing_response_body() {
+        let upstream_addr = spawn_server(Router::new().fallback(any(
+            |request: Request<Body>| async move {
+                let body = to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .expect("body should read");
+                Body::from(format!("echo:{}", String::from_utf8_lossy(&body)))
+            },
+        )))
+        .await;
+
+        let mut context = test_context("abcdefgh");
+        configure_default_upstream(
+            &mut context,
+            format!("http://{upstream_addr}/echo"),
+            Client::new(),
+        );
+
+        let downstream =
+            allocate_proxy_stream_handle(&context, ProxyByteStreamEndpoint::HttpDownstream)
+                .expect("downstream stream should allocate");
+        let upstream = allocate_proxy_stream_handle(
+            &context,
+            ProxyByteStreamEndpoint::HttpExchange(edge_http::default_upstream_exchange_handle()),
+        )
+        .expect("upstream stream should allocate");
+
+        let status = try_native_forward(&context, downstream, upstream)
+            .await
+            .expect("native forward should succeed");
+        assert_eq!(status.as_deref(), Some("forwarded"));
+
+        assert!(context.lock_downstream().response_output.body.is_none());
+
+        let resolved = edge_http::resolve_http_graph_response(&context).await;
+        let body = to_bytes(resolved.response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        assert_eq!(body.as_ref(), b"echo:abcdefgh");
     }
 
     #[tokio::test(flavor = "current_thread")]
