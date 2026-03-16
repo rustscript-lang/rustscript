@@ -6,7 +6,7 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -64,7 +64,11 @@ use crate::abi_impl::websocket::{
     close_websocket_binary_stream, read_websocket_binary_bytes, write_websocket_binary_bytes,
 };
 use crate::abi_impl::{http2, http3};
-use crate::cache::BoundedLruStore;
+use crate::cache::ShardedRwLruStore;
+use crate::lock_metrics::{self, LockMetricKey, ProfiledMutexGuard};
+
+#[cfg(feature = "webrtc")]
+use std::sync::MutexGuard;
 
 #[derive(Debug)]
 pub struct HttpRequestContext {
@@ -684,7 +688,7 @@ impl DownstreamPostResponsePlan {
 }
 
 pub(crate) type SharedUpstreamClientCache =
-    Arc<Mutex<BoundedLruStore<UpstreamClientCacheKey, reqwest::Client>>>;
+    Arc<ShardedRwLruStore<UpstreamClientCacheKey, reqwest::Client>>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct UpstreamClientCacheKey {
@@ -693,7 +697,11 @@ pub(crate) struct UpstreamClientCacheKey {
 }
 
 pub(crate) fn new_shared_upstream_client_cache(capacity: usize) -> SharedUpstreamClientCache {
-    Arc::new(Mutex::new(BoundedLruStore::new(capacity)))
+    Arc::new(ShardedRwLruStore::new(capacity))
+}
+
+pub(crate) fn upstream_reqwest_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().tls_info(true)
 }
 
 #[derive(Clone, Debug)]
@@ -1720,10 +1728,7 @@ impl ProxyVmContext {
     }
 
     pub(crate) fn with_request_head<T>(&self, read: impl FnOnce(&HttpRequestHead) -> T) -> T {
-        let request_head = self
-            .request_head
-            .lock()
-            .expect("vm request head lock poisoned");
+        let request_head = self.lock_request_head();
         read(&request_head)
     }
 
@@ -1861,10 +1866,7 @@ impl ProxyVmContext {
             client_ip: request.client_ip,
             headers: request_headers.clone(),
         };
-        *self
-            .request_head
-            .lock()
-            .expect("vm request head lock poisoned") = request_head.clone();
+        *self.lock_request_head() = request_head.clone();
 
         {
             let mut exchanges = self.lock_exchanges();
@@ -1905,22 +1907,36 @@ impl ProxyVmContext {
         mutate(&mut downstream.downstream_websocket)
     }
 
-    pub(crate) fn lock_downstream(&self) -> MutexGuard<'_, DownstreamState> {
-        self.downstream
-            .lock()
-            .expect("vm downstream state lock poisoned")
+    fn lock_request_head(&self) -> ProfiledMutexGuard<'_, HttpRequestHead> {
+        lock_metrics::lock(
+            &self.request_head,
+            LockMetricKey::VmRequestHead,
+            "vm request head lock poisoned",
+        )
     }
 
-    pub(crate) fn lock_exchanges(&self) -> MutexGuard<'_, ExchangeRegistry> {
-        self.exchanges
-            .lock()
-            .expect("vm exchange registry lock poisoned")
+    pub(crate) fn lock_downstream(&self) -> ProfiledMutexGuard<'_, DownstreamState> {
+        lock_metrics::lock(
+            &self.downstream,
+            LockMetricKey::VmDownstream,
+            "vm downstream state lock poisoned",
+        )
     }
 
-    pub(crate) fn lock_transport(&self) -> MutexGuard<'_, TransportState> {
-        self.transport
-            .lock()
-            .expect("vm transport state lock poisoned")
+    pub(crate) fn lock_exchanges(&self) -> ProfiledMutexGuard<'_, ExchangeRegistry> {
+        lock_metrics::lock(
+            &self.exchanges,
+            LockMetricKey::VmExchanges,
+            "vm exchange registry lock poisoned",
+        )
+    }
+
+    pub(crate) fn lock_transport(&self) -> ProfiledMutexGuard<'_, TransportState> {
+        lock_metrics::lock(
+            &self.transport,
+            LockMetricKey::VmTransport,
+            "vm transport state lock poisoned",
+        )
     }
 
     #[cfg(feature = "webrtc")]
@@ -1930,14 +1946,20 @@ impl ProxyVmContext {
             .expect("vm webrtc registry lock poisoned")
     }
 
-    pub(crate) fn lock_proxy(&self) -> MutexGuard<'_, ProxyStreamRegistry> {
-        self.proxy.lock().expect("vm proxy registry lock poisoned")
+    pub(crate) fn lock_proxy(&self) -> ProfiledMutexGuard<'_, ProxyStreamRegistry> {
+        lock_metrics::lock(
+            &self.proxy,
+            LockMetricKey::VmProxy,
+            "vm proxy registry lock poisoned",
+        )
     }
 
-    pub(crate) fn lock_edge_io(&self) -> MutexGuard<'_, EdgeIoRegistry> {
-        self.edge_io
-            .lock()
-            .expect("vm edge io registry lock poisoned")
+    pub(crate) fn lock_edge_io(&self) -> ProfiledMutexGuard<'_, EdgeIoRegistry> {
+        lock_metrics::lock(
+            &self.edge_io,
+            LockMetricKey::VmEdgeIo,
+            "vm edge io registry lock poisoned",
+        )
     }
 }
 
@@ -2806,8 +2828,11 @@ fn cached_upstream_client(
     cache: &SharedUpstreamClientCache,
     key: &UpstreamClientCacheKey,
 ) -> Option<reqwest::Client> {
-    let mut cache = cache.lock().expect("upstream client cache lock poisoned");
-    cache.get(key).cloned()
+    cache.peek_cloned(
+        key,
+        LockMetricKey::UpstreamClientCache,
+        "upstream client cache lock poisoned",
+    )
 }
 
 fn store_upstream_client(
@@ -2815,8 +2840,12 @@ fn store_upstream_client(
     key: UpstreamClientCacheKey,
     client: reqwest::Client,
 ) {
-    let mut cache = cache.lock().expect("upstream client cache lock poisoned");
-    let _ = cache.insert(key, client);
+    let _ = cache.insert(
+        key,
+        client,
+        LockMetricKey::UpstreamClientCache,
+        "upstream client cache lock poisoned",
+    );
 }
 
 fn build_configured_upstream_client(
@@ -2834,7 +2863,7 @@ fn build_configured_upstream_client(
         )));
     }
 
-    let mut builder = reqwest::Client::builder().tls_info(true);
+    let mut builder = upstream_reqwest_client_builder();
     builder = http2::configure_reqwest_builder(builder, prepared.http2_mode);
     if !prepared.tls_flow.verify_peer() {
         builder = builder.danger_accept_invalid_certs(true);
@@ -3357,8 +3386,12 @@ fn cache_outbound_tls_session(
         (cache, key, cached)
     };
 
-    let mut guard = cache.lock().expect("tls session cache lock poisoned");
-    guard.insert(key, cached);
+    let _ = cache.insert(
+        key,
+        cached,
+        LockMetricKey::TlsSessionCache,
+        "tls session cache lock poisoned",
+    );
     Ok(())
 }
 
@@ -4209,7 +4242,7 @@ pub(crate) async fn request_body_eof(context: &SharedProxyVmContext) -> Result<b
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::{io, net::SocketAddr};
 
     use axum::{
@@ -4244,7 +4277,7 @@ mod tests {
     fn test_context() -> SharedProxyVmContext {
         Arc::new(ProxyVmContext::from_request_headers(
             HeaderMap::new(),
-            Arc::new(Mutex::new(RateLimiterStore::new())),
+            Arc::new(RateLimiterStore::new()),
         ))
     }
 
@@ -4263,7 +4296,7 @@ mod tests {
                 body,
                 headers: HeaderMap::new(),
             },
-            Arc::new(Mutex::new(RateLimiterStore::new())),
+            Arc::new(RateLimiterStore::new()),
         ))
     }
 
@@ -4315,7 +4348,7 @@ mod tests {
     fn downstream_http2_attachment_updates_explicit_carrier_ref() {
         let mut context = ProxyVmContext::from_request_headers(
             HeaderMap::new(),
-            Arc::new(Mutex::new(RateLimiterStore::new())),
+            Arc::new(RateLimiterStore::new()),
         );
         assert_eq!(
             context.lock_downstream().downstream_carrier_ref.clone(),

@@ -2,7 +2,13 @@
 
 #[cfg(feature = "http2")]
 use std::collections::HashMap;
+#[cfg(not(feature = "http2"))]
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "http2")]
+use std::sync::{
+    Arc, Mutex, RwLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 #[cfg(feature = "http2")]
 use axum::{
@@ -37,7 +43,9 @@ use crate::abi_impl::transport::{
     tls_session_cache_key,
 };
 #[cfg(feature = "http2")]
-use crate::cache::BoundedLruStore;
+use crate::cache::ShardedRwLruStore;
+#[cfg(feature = "http2")]
+use crate::lock_metrics::{self, LockMetricKey, ProfiledMutexGuard};
 
 use super::Http2UpstreamMode;
 #[cfg(feature = "http2")]
@@ -47,12 +55,12 @@ use super::model::{
 };
 use super::model::{Http2GoawayState, Http2ResetState};
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Http2SessionStore {
     #[cfg(feature = "http2")]
-    sessions: BoundedLruStore<Http2SessionKey, Arc<Http2UpstreamSession>>,
+    sessions: ShardedRwLruStore<Http2SessionKey, Arc<Http2SessionEntry>>,
     #[cfg(feature = "http2")]
-    next_session_id: u64,
+    next_session_id: AtomicU64,
 }
 
 #[cfg(test)]
@@ -70,29 +78,27 @@ impl Http2SessionStore {
     }
 }
 
-pub(crate) type SharedHttpUpstreamSessions = Arc<Mutex<Http2SessionStore>>;
+pub(crate) type SharedHttpUpstreamSessions = Arc<Http2SessionStore>;
 
 pub(crate) fn new_shared_http_upstream_sessions(capacity: usize) -> SharedHttpUpstreamSessions {
     #[cfg(not(feature = "http2"))]
     let _ = capacity;
 
-    Arc::new(Mutex::new(Http2SessionStore {
+    Arc::new(Http2SessionStore {
         #[cfg(feature = "http2")]
-        sessions: BoundedLruStore::new(capacity),
+        sessions: ShardedRwLruStore::new(capacity),
         #[cfg(feature = "http2")]
-        next_session_id: 0,
-    }))
+        next_session_id: AtomicU64::new(0),
+    })
 }
 
 #[cfg(all(test, feature = "http2"))]
 pub(crate) fn total_active_streams(sessions: &SharedHttpUpstreamSessions) -> usize {
-    let guard = sessions
-        .lock()
-        .expect("http upstream session store lock poisoned");
-    guard
+    sessions
         .sessions
-        .values()
-        .map(|session| session.active_stream_count())
+        .values_cloned()
+        .into_iter()
+        .map(|entry| entry.active_stream_count())
         .sum()
 }
 
@@ -111,6 +117,76 @@ struct Http2UpstreamStreamState {
     exchange_handle: i64,
     frontier: Http2StreamFrontier,
     reset: Option<Http2ResetState>,
+}
+
+#[cfg(feature = "http2")]
+#[derive(Debug)]
+struct Http2SessionEntry {
+    current: RwLock<Option<Arc<Http2UpstreamSession>>>,
+    opening: AtomicBool,
+    opened: tokio::sync::Notify,
+}
+
+#[cfg(feature = "http2")]
+impl Http2SessionEntry {
+    fn new() -> Self {
+        Self {
+            current: RwLock::new(None),
+            opening: AtomicBool::new(false),
+            opened: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn reusable_session(&self) -> Option<Arc<Http2UpstreamSession>> {
+        let session = self
+            .current
+            .read()
+            .expect("http2 session entry lock poisoned")
+            .clone()?;
+        if session.is_reusable() {
+            return Some(session);
+        }
+
+        let mut current = self
+            .current
+            .write()
+            .expect("http2 session entry lock poisoned");
+        if current
+            .as_ref()
+            .is_some_and(|existing| Arc::ptr_eq(existing, &session) && !existing.is_reusable())
+        {
+            *current = None;
+        }
+        None
+    }
+
+    fn try_begin_open(&self) -> bool {
+        self.opening
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn finish_open(&self, session: Option<Arc<Http2UpstreamSession>>) {
+        *self
+            .current
+            .write()
+            .expect("http2 session entry lock poisoned") = session;
+        self.opening.store(false, Ordering::Release);
+        self.opened.notify_waiters();
+    }
+
+    async fn wait_for_open(&self) {
+        self.opened.notified().await;
+    }
+
+    #[cfg(test)]
+    fn active_stream_count(&self) -> usize {
+        self.current
+            .read()
+            .expect("http2 session entry lock poisoned")
+            .as_ref()
+            .map_or(0, |session| session.active_stream_count())
+    }
 }
 
 #[cfg(feature = "http2")]
@@ -206,6 +282,14 @@ pub(crate) fn should_use_explicit_upstream_transport(
 
 #[cfg(feature = "http2")]
 impl Http2UpstreamSession {
+    fn lock_dag(&self) -> ProfiledMutexGuard<'_, Http2UpstreamSessionDagState> {
+        lock_metrics::lock(
+            &self.dag,
+            LockMetricKey::Http2UpstreamSessionDag,
+            "http2 upstream session lock poisoned",
+        )
+    }
+
     fn new(
         session_id: u64,
         sender: hyper::client::conn::http2::SendRequest<Full<Bytes>>,
@@ -234,27 +318,13 @@ impl Http2UpstreamSession {
     }
 
     fn is_reusable(&self) -> bool {
-        let dag = self
-            .dag
-            .lock()
-            .expect("http2 upstream session lock poisoned");
+        let dag = self.lock_dag();
         dag.can_accept_new_streams()
-    }
-
-    fn should_retain(&self) -> bool {
-        let dag = self
-            .dag
-            .lock()
-            .expect("http2 upstream session lock poisoned");
-        !dag.frontier.is_terminal() || dag.has_active_streams()
     }
 
     #[cfg(test)]
     fn active_stream_count(&self) -> usize {
-        let dag = self
-            .dag
-            .lock()
-            .expect("http2 upstream session lock poisoned");
+        let dag = self.lock_dag();
         dag.streams
             .values()
             .filter(|stream| !stream.frontier.is_terminal())
@@ -262,42 +332,27 @@ impl Http2UpstreamSession {
     }
 
     fn reserve_stream(&self, exchange_handle: i64) -> Result<Http2StreamRef, Http2RequestError> {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http2 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         dag.reserve_stream(self.session_id, exchange_handle)
     }
 
     fn mark_stream_request_committed(&self, stream_id: u64, body_present: bool) {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http2 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         dag.mark_stream_request_committed(stream_id, body_present);
     }
 
     fn mark_stream_response_head_ready(&self, stream_id: u64) {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http2 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         dag.advance_stream_goal(stream_id, Http2StreamGoal::ResponseHeadReady);
     }
 
     fn mark_stream_response_body_ready(&self, stream_id: u64) {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http2 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         dag.advance_stream_goal(stream_id, Http2StreamGoal::ResponseBodyReady);
     }
 
     fn mark_stream_closed(&self, stream_id: u64) {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http2 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         dag.advance_stream_goal(stream_id, Http2StreamGoal::Closed);
         dag.prune_terminal_streams();
     }
@@ -308,35 +363,23 @@ impl Http2UpstreamSession {
         reason: Option<String>,
         source: Http2ControlEventSource,
     ) {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http2 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         dag.mark_stream_reset(stream_id, reason, source);
         dag.prune_terminal_streams();
     }
 
     fn mark_goaway(&self, reason: Option<String>, source: Http2ControlEventSource) {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http2 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         dag.mark_goaway(reason, source);
     }
 
     fn mark_connection_closed(&self) {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http2 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         dag.mark_connection_closed();
     }
 
     fn mark_connection_failed(&self, reason: Option<String>) {
-        let mut dag = self
-            .dag
-            .lock()
-            .expect("http2 upstream session lock poisoned");
+        let mut dag = self.lock_dag();
         dag.mark_connection_failed(reason);
     }
 }
@@ -782,48 +825,35 @@ async fn acquire_or_open_session(
         ))
     })?;
 
-    {
-        let mut guard = sessions
-            .lock()
-            .expect("http upstream session store lock poisoned");
-        cleanup_closed_sessions(&mut guard);
-        if let Some(existing) = guard.sessions.get(&key).cloned() {
-            if existing.is_reusable() {
-                return Ok(existing);
-            }
-            let _ = guard.sessions.remove(&key);
-        }
-    }
+    let entry = sessions.sessions.get_or_insert_with_cloned(
+        key,
+        LockMetricKey::Http2UpstreamSessionStore,
+        "http upstream session store lock poisoned",
+        || Arc::new(Http2SessionEntry::new()),
+    );
 
-    let session_id = {
-        let mut guard = sessions
-            .lock()
-            .expect("http upstream session store lock poisoned");
-        let next = guard.next_session_id.saturating_add(1);
-        guard.next_session_id = next;
-        next
-    };
-    let opened = open_session(target, mode, tls_flow, session_id).await?;
-
-    let mut guard = sessions
-        .lock()
-        .expect("http upstream session store lock poisoned");
-    cleanup_closed_sessions(&mut guard);
-    if let Some(existing) = guard.sessions.get(&key).cloned() {
-        if existing.is_reusable() {
+    loop {
+        if let Some(existing) = entry.reusable_session() {
             return Ok(existing);
         }
-        let _ = guard.sessions.remove(&key);
-    }
-    guard.sessions.insert(key, opened.clone());
-    Ok(opened)
-}
 
-#[cfg(feature = "http2")]
-fn cleanup_closed_sessions(store: &mut Http2SessionStore) {
-    store
-        .sessions
-        .retain(|_key, session| session.should_retain());
+        if entry.try_begin_open() {
+            let session_id = sessions.next_session_id.fetch_add(1, Ordering::Relaxed) + 1;
+            let opened = open_session(target, mode, tls_flow, session_id).await;
+            match opened {
+                Ok(session) => {
+                    entry.finish_open(Some(session.clone()));
+                    return Ok(session);
+                }
+                Err(err) => {
+                    entry.finish_open(None);
+                    return Err(err);
+                }
+            }
+        }
+
+        entry.wait_for_open().await;
+    }
 }
 
 #[cfg(feature = "http2")]

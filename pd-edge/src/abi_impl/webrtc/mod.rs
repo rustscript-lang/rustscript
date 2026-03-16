@@ -974,7 +974,7 @@ mod tests {
     fn test_context() -> SharedProxyVmContext {
         Arc::new(ProxyVmContext::from_request_headers(
             HeaderMap::new(),
-            Arc::new(Mutex::new(RateLimiterStore::new())),
+            Arc::new(RateLimiterStore::new()),
         ))
     }
 

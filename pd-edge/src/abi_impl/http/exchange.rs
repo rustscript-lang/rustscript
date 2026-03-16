@@ -10,8 +10,8 @@ use super::{
     attach_outbound_exchange_tcp_transport, default_upstream_exchange_handle,
     ensure_outbound_exchange_response_started, headers_to_value_map, is_valid_request_path,
     is_valid_upstream, outbound_exchange_exists, outbound_exchange_response_eof, parse_header,
-    parse_header_name, read_outbound_exchange_response_all, read_outbound_exchange_response_next_chunk,
-    serialize_query_pairs,
+    parse_header_name, read_outbound_exchange_response_all,
+    read_outbound_exchange_response_next_chunk, serialize_query_pairs,
 };
 use crate::abi_impl::schedule_current_future_call;
 
@@ -71,14 +71,10 @@ fn apply_header_batch(
             }
             for pair in values.chunks(2) {
                 let name = pair[0].clone().into_owned_string().map_err(|_| {
-                    VmError::HostError(
-                        "header batch array keys must be strings".to_string(),
-                    )
+                    VmError::HostError("header batch array keys must be strings".to_string())
                 })?;
                 let value = pair[1].clone().into_owned_string().map_err(|_| {
-                    VmError::HostError(
-                        "header batch array values must be strings".to_string(),
-                    )
+                    VmError::HostError("header batch array values must be strings".to_string())
                 })?;
                 let (header_name, header_value) = parse_header(name, value)?;
                 request.headers.insert(header_name, header_value);
@@ -526,7 +522,7 @@ async fn get_exchange_body_eof(
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Mutex, mpsc},
+        sync::{Arc, mpsc},
         time::Duration,
     };
 
@@ -538,7 +534,7 @@ mod tests {
     fn test_context() -> SharedProxyVmContext {
         Arc::new(ProxyVmContext::from_request_headers(
             HeaderMap::new(),
-            Arc::new(Mutex::new(RateLimiterStore::new())),
+            Arc::new(RateLimiterStore::new()),
         ))
     }
 
@@ -586,7 +582,7 @@ mod tests {
     }
 
     #[test]
-fn setting_default_upstream_target_updates_transport_state_in_place() {
+    fn setting_default_upstream_target_updates_transport_state_in_place() {
         let context = test_context();
         let target = "https://origin.example.com/api".to_string();
 
@@ -604,7 +600,10 @@ fn setting_default_upstream_target_updates_transport_state_in_place() {
         let transport = context.lock_transport();
         assert!(transport.tcp_dag.default_upstream.is_configured());
         assert!(transport.tls_dag.default_upstream.is_present());
-        assert_eq!(transport.tls_dag.default_upstream.peer_name(), "origin.example.com");
+        assert_eq!(
+            transport.tls_dag.default_upstream.peer_name(),
+            "origin.example.com"
+        );
     }
 
     #[test]

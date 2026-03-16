@@ -5,6 +5,7 @@ mod cache;
 mod compile;
 mod control_plane_rpc;
 mod debug_session;
+mod lock_metrics;
 mod logging;
 mod runtime;
 pub mod sample_echo;

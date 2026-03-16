@@ -44,7 +44,7 @@ pub(crate) use state::{
     read_upstream_response_next_chunk, read_upstream_response_next_line, request_body_eof,
     resolve_http_graph_response, schedule_downstream_http_handoff,
     take_promoted_downstream_transport, tcp_stream_exists, udp_socket_exists,
-    upstream_response_eof,
+    upstream_reqwest_client_builder, upstream_response_eof,
 };
 #[cfg(feature = "websocket")]
 pub(crate) use state::{HttpOutboundRequestNode, build_upstream_url, is_hop_by_hop_header};

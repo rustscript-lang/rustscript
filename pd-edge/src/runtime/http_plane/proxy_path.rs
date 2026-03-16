@@ -817,10 +817,8 @@ pub async fn serve_https_proxy(listener: TcpListener, state: SharedState) -> std
         let state = state.clone();
         let tls_server_config = tls_server_config.clone();
         let app = app.clone();
-        let use_transport_handoff = {
-            let guard = state.active_program.read().await;
-            https_listener_needs_transport_handoff(guard.as_deref())
-        };
+        let snapshot = state.loaded_program_snapshot();
+        let use_transport_handoff = https_listener_needs_transport_handoff(snapshot.as_deref());
         tokio::spawn(async move {
             if use_transport_handoff {
                 serve_transport_connection_with_listener_goal(
@@ -886,10 +884,7 @@ async fn handle_data_plane_request(state: SharedState, request: Request) -> Resp
 
     state.record_data_plane_request();
 
-    let snapshot = {
-        let guard = state.active_program.read().await;
-        guard.clone()
-    };
+    let snapshot = state.loaded_program_snapshot();
 
     let Some(program) = snapshot else {
         warn!("{} no program loaded; returning 404", category_program());

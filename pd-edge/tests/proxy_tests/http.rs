@@ -878,7 +878,7 @@ async fn direct_vm_can_read_upstream_response_line_by_line_via_io_handle_api() {
     let compiled = compile_source(&source).expect("source should compile");
     let mut context = Arc::new(ProxyVmContext::from_request_headers(
         axum::http::HeaderMap::new(),
-        Arc::new(Mutex::new(RateLimiterStore::new())),
+        Arc::new(RateLimiterStore::new()),
     ));
     {
         Arc::get_mut(&mut context)

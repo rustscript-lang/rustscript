@@ -1275,7 +1275,7 @@ async fn transport_dynamic_tls_session_socket_target_direct_vm_run() {
     let compiled = compile_source(&source).expect("source should compile");
     let context = Arc::new(ProxyVmContext::from_request_headers(
         axum::http::HeaderMap::new(),
-        Arc::new(Mutex::new(RateLimiterStore::new())),
+        Arc::new(RateLimiterStore::new()),
     ));
 
     run_edge_program_direct(compiled.program, context)

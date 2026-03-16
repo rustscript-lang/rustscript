@@ -447,7 +447,7 @@ async fn run_console_loop(
             continue;
         }
         if input == ".status" {
-            let has_program = state.active_program.read().await.is_some();
+            let has_program = state.loaded_program_snapshot().is_some();
             println!("program_loaded={has_program}");
             continue;
         }
@@ -579,10 +579,7 @@ async fn run_loaded_program_once(
     state: &SharedState,
     program_args: Arc<Vec<String>>,
 ) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
-    let loaded = {
-        let guard = state.active_program.read().await;
-        guard.clone()
-    };
+    let loaded = state.loaded_program_snapshot();
     let Some(loaded) = loaded else {
         return Err("no program loaded".into());
     };

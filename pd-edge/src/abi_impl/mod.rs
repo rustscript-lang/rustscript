@@ -12,6 +12,8 @@ use edge_abi::FUNCTIONS as EDGE_ABI_FUNCTIONS;
 use tokio::sync::oneshot;
 use vm::{CallOutcome, HostAsyncBridge, HostFunction, HostOpId, Value, Vm, VmError};
 
+use crate::lock_metrics::{self, LockMetricKey};
+
 pub(crate) mod http;
 mod http2;
 mod http3;
@@ -47,7 +49,7 @@ pub(crate) use self::transport::{
     ReplayPrefixedIo, SharedTlsSessionCache, new_shared_tls_session_cache,
 };
 
-pub type SharedRateLimiter = Arc<Mutex<RateLimiterStore>>;
+pub type SharedRateLimiter = Arc<RateLimiterStore>;
 pub type SharedVmAsyncOps = Arc<Mutex<VmAsyncOps>>;
 
 type AsyncOpResult = Result<Vec<Value>, VmError>;
@@ -226,7 +228,11 @@ impl VmAsyncOpBridge {
 
 impl HostAsyncBridge for VmAsyncOpBridge {
     fn poll_op(&mut self, op_id: HostOpId, cx: &mut Context<'_>) -> Poll<AsyncOpResult> {
-        let mut guard = self.ops.lock().expect("vm async ops lock poisoned");
+        let mut guard = lock_metrics::lock(
+            &self.ops,
+            LockMetricKey::VmAsyncOps,
+            "vm async ops lock poisoned",
+        );
         guard.poll_op(op_id, cx)
     }
 }
@@ -508,9 +514,9 @@ pub fn register_protocol_modules(
     Ok(())
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RateLimiterStore {
-    buckets: HashMap<String, RateLimitBucket>,
+    shards: Box<[Mutex<HashMap<String, RateLimitBucket>>]>,
 }
 
 #[derive(Debug)]
@@ -521,20 +527,28 @@ struct RateLimitBucket {
 
 impl RateLimiterStore {
     pub fn new() -> Self {
-        Self {
-            buckets: HashMap::new(),
-        }
+        const RATE_LIMITER_SHARDS: usize = 64;
+        let shards = std::iter::repeat_with(|| Mutex::new(HashMap::new()))
+            .take(RATE_LIMITER_SHARDS)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self { shards }
     }
 
-    fn allow(&mut self, key: &str, limit: u64, window_seconds: u64) -> bool {
+    fn allow(&self, key: &str, limit: u64, window_seconds: u64) -> bool {
         if limit == 0 || window_seconds == 0 {
             return false;
         }
 
         let now = Instant::now();
         let window = Duration::from_secs(window_seconds);
-        let bucket = self
-            .buckets
+        let shard_index = crate::cache::shard_index_for(key, self.shards.len());
+        let mut shard = lock_metrics::lock(
+            &self.shards[shard_index],
+            LockMetricKey::RateLimiter,
+            "rate limiter lock poisoned",
+        );
+        let bucket = shard
             .entry(key.to_string())
             .or_insert_with(|| RateLimitBucket {
                 window_start: now,
@@ -625,14 +639,15 @@ pub fn register_http_host_module(
     registry::bind_host_scopes(vm, &[registry::EdgeHostScope::Http])
 }
 
-fn schedule_future_call<F>(
-    async_ops: &SharedVmAsyncOps,
-    future: F,
-) -> Result<CallOutcome, VmError>
+fn schedule_future_call<F>(async_ops: &SharedVmAsyncOps, future: F) -> Result<CallOutcome, VmError>
 where
     F: Future<Output = AsyncOpResult> + Send + 'static,
 {
-    let mut ops = async_ops.lock().expect("vm async ops lock poisoned");
+    let mut ops = lock_metrics::lock(
+        async_ops,
+        LockMetricKey::VmAsyncOps,
+        "vm async ops lock poisoned",
+    );
     let op_id = ops.schedule_future(future)?;
     Ok(CallOutcome::Pending(op_id))
 }
@@ -660,7 +675,11 @@ fn schedule_ready_call(
     async_ops: &SharedVmAsyncOps,
     values: Vec<Value>,
 ) -> Result<CallOutcome, VmError> {
-    let mut ops = async_ops.lock().expect("vm async ops lock poisoned");
+    let mut ops = lock_metrics::lock(
+        async_ops,
+        LockMetricKey::VmAsyncOps,
+        "vm async ops lock poisoned",
+    );
     let op_id = ops.schedule_ready(Ok(values))?;
     Ok(CallOutcome::Pending(op_id))
 }
@@ -680,7 +699,7 @@ pub(crate) fn adapt_edge_args_call_outcome(outcome: CallOutcome) -> Result<CallO
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     #[cfg(feature = "http")]
     use std::task::{Wake, Waker};
 
@@ -742,7 +761,7 @@ mod tests {
     fn test_context() -> SharedProxyVmContext {
         Arc::new(ProxyVmContext::from_request_headers(
             HeaderMap::new(),
-            Arc::new(Mutex::new(RateLimiterStore::new())),
+            Arc::new(RateLimiterStore::new()),
         ))
     }
 

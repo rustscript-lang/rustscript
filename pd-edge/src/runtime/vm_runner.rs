@@ -117,9 +117,8 @@ pub async fn execute_vm_with_context(
     register_host_modules: HostModuleRegistrar,
     vm_execution: VmExecutionConfig,
 ) -> Result<(), VmExecutionError> {
-    let program = program.program.clone();
     let async_ops = new_shared_vm_async_ops();
-    let vm_store = new_vm_runner_store(program, vm_context, async_ops);
+    let vm_store = new_vm_runner_store(program.program.clone(), vm_context, async_ops);
     let execution_mode = if debug.force_threading {
         VmExecutionMode::Threading
     } else {
@@ -385,7 +384,11 @@ fn configure_vm_interrupt(
     vm_execution: VmExecutionConfig,
 ) -> Result<ActiveVmInterrupt, VmExecutionError> {
     match vm_execution.interrupt {
-        VmInterruptConfig::None => Ok(ActiveVmInterrupt::None),
+        VmInterruptConfig::None => {
+            vm_store.clear_fuel();
+            vm_store.clear_epoch_deadline();
+            Ok(ActiveVmInterrupt::None)
+        }
         VmInterruptConfig::Fuel {
             fuel_per_yield,
             check_interval,
@@ -515,10 +518,7 @@ fn tail_profile_threshold_us() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
+    use std::{sync::Arc, time::Duration};
 
     use axum::http::HeaderMap;
     use tokio::time::sleep;
@@ -552,7 +552,7 @@ mod tests {
         let program = Arc::new(compiled.program.with_local_count(compiled.locals));
         let context = Arc::new(ProxyVmContext::from_request_headers(
             HeaderMap::new(),
-            Arc::new(Mutex::new(RateLimiterStore::new())),
+            Arc::new(RateLimiterStore::new()),
         ));
         let async_ops = new_shared_vm_async_ops();
         let store = new_vm_runner_store(program, context, async_ops);

@@ -7,8 +7,8 @@ use std::{
     time::Instant,
 };
 
+use arc_swap::ArcSwapOption;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 use tracing::{info, warn};
 use vm::{Program, decode_program, validate_program};
 
@@ -19,7 +19,7 @@ use crate::{
         SharedHttpDownstreamSessions, SharedRateLimiter,
         http::{
             SharedRuntimeServices, new_shared_http_plane_runtime_services,
-            new_shared_upstream_client_cache,
+            new_shared_upstream_client_cache, upstream_reqwest_client_builder,
         },
         new_shared_http_downstream_sessions, new_shared_http_upstream_sessions,
         new_shared_http3_downstream_sessions, new_shared_http3_upstream_sessions,
@@ -32,6 +32,7 @@ use crate::{
     },
     control_plane_rpc::EdgeTrafficSample,
     debug_session::{SharedDebugSession, debug_session_status, new_debug_session_store},
+    lock_metrics::{self, LockMetricSnapshot},
     logging::category_program,
 };
 
@@ -139,7 +140,7 @@ impl Default for RuntimeStoreLimits {
 
 #[derive(Clone)]
 pub struct SharedState {
-    pub active_program: Arc<RwLock<Option<Arc<LoadedProgram>>>>,
+    pub active_program: Arc<ArcSwapOption<LoadedProgram>>,
     pub max_program_bytes: usize,
     pub client: reqwest::Client,
     pub(crate) downstream_http2_sessions: SharedHttpDownstreamSessions,
@@ -184,6 +185,8 @@ pub struct TelemetrySnapshot {
     pub control_rpc_polls_error_total: u64,
     pub control_rpc_results_success_total: u64,
     pub control_rpc_results_error_total: u64,
+    #[serde(default)]
+    pub lock_metrics: Vec<LockMetricSnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -204,8 +207,7 @@ impl SharedState {
         max_program_bytes: usize,
         store_limits: RuntimeStoreLimits,
     ) -> Self {
-        let client = reqwest::Client::builder()
-            .tls_info(true)
+        let client = upstream_reqwest_client_builder()
             .build()
             .expect("default upstream client should build");
         let upstream_client_cache =
@@ -220,7 +222,7 @@ impl SharedState {
             new_shared_http_downstream_sessions(store_limits.downstream_http2_session_entries);
         let downstream_http3_sessions =
             new_shared_http3_downstream_sessions(store_limits.downstream_http3_session_entries);
-        let rate_limiter = Arc::new(std::sync::Mutex::new(RateLimiterStore::new()));
+        let rate_limiter = Arc::new(RateLimiterStore::new());
         let runtime_services = new_shared_http_plane_runtime_services(
             rate_limiter.clone(),
             client.clone(),
@@ -232,7 +234,7 @@ impl SharedState {
             downstream_http3_sessions.clone(),
         );
         Self {
-            active_program: Arc::new(RwLock::new(None)),
+            active_program: Arc::new(ArcSwapOption::from(None::<Arc<LoadedProgram>>)),
             max_program_bytes,
             client,
             downstream_http2_sessions,
@@ -243,6 +245,10 @@ impl SharedState {
             vm_execution: VmExecutionConfig::default(),
             runtime_metrics: Arc::new(RuntimeMetrics::default()),
         }
+    }
+
+    pub fn loaded_program_snapshot(&self) -> Option<Arc<LoadedProgram>> {
+        self.active_program.load_full()
     }
 
     pub fn with_vm_execution_config(mut self, vm_execution: VmExecutionConfig) -> Self {
@@ -323,7 +329,7 @@ impl SharedState {
     }
 
     pub async fn health_status(&self) -> HealthStatus {
-        let program_loaded = self.active_program.read().await.is_some();
+        let program_loaded = self.loaded_program_snapshot().is_some();
         let debug_status = debug_session_status(&self.debug_session);
         HealthStatus {
             status: "ok".to_string(),
@@ -335,7 +341,7 @@ impl SharedState {
     }
 
     pub async fn telemetry_snapshot(&self) -> TelemetrySnapshot {
-        let program_loaded = self.active_program.read().await.is_some();
+        let program_loaded = self.loaded_program_snapshot().is_some();
         let debug_status = debug_session_status(&self.debug_session);
         TelemetrySnapshot {
             uptime_seconds: self.runtime_metrics.started_at.elapsed().as_secs(),
@@ -376,6 +382,7 @@ impl SharedState {
                 .runtime_metrics
                 .control_rpc_results_error_total
                 .load(Ordering::Relaxed),
+            lock_metrics: lock_metrics::snapshot(),
         }
     }
 
@@ -424,7 +431,7 @@ impl SharedState {
         };
         let program_loaded = if telemetry.program_loaded { 1 } else { 0 };
 
-        format!(
+        let mut metrics = format!(
             concat!(
                 "pd_proxy_uptime_seconds {}\n",
                 "pd_proxy_program_loaded {}\n",
@@ -451,7 +458,9 @@ impl SharedState {
             telemetry.control_rpc_polls_error_total,
             telemetry.control_rpc_results_success_total,
             telemetry.control_rpc_results_error_total,
-        )
+        );
+        metrics.push_str(&lock_metrics::metrics_text());
+        metrics
     }
 }
 
@@ -473,9 +482,7 @@ struct RuntimeMetrics {
     control_rpc_polls_error_total: AtomicU64,
     control_rpc_results_success_total: AtomicU64,
     control_rpc_results_error_total: AtomicU64,
-    latency_total_samples_ms: Mutex<VecDeque<u64>>,
-    latency_upstream_samples_ms: Mutex<VecDeque<u64>>,
-    latency_edge_added_samples_ms: Mutex<VecDeque<u64>>,
+    latency_samples_ms: Mutex<LatencySampleBuffers>,
 }
 
 impl Default for RuntimeMetrics {
@@ -494,9 +501,7 @@ impl Default for RuntimeMetrics {
             control_rpc_polls_error_total: AtomicU64::new(0),
             control_rpc_results_success_total: AtomicU64::new(0),
             control_rpc_results_error_total: AtomicU64::new(0),
-            latency_total_samples_ms: Mutex::new(VecDeque::new()),
-            latency_upstream_samples_ms: Mutex::new(VecDeque::new()),
-            latency_edge_added_samples_ms: Mutex::new(VecDeque::new()),
+            latency_samples_ms: Mutex::new(LatencySampleBuffers::default()),
         }
     }
 }
@@ -505,40 +510,47 @@ impl RuntimeMetrics {
     fn record_latency_ms(&self, total_latency_ms: u64, upstream_latency_ms: u64) {
         let upstream_latency_ms = upstream_latency_ms.min(total_latency_ms);
         let edge_added_latency_ms = total_latency_ms.saturating_sub(upstream_latency_ms);
-        self.push_latency_sample(&self.latency_total_samples_ms, total_latency_ms);
-        self.push_latency_sample(&self.latency_upstream_samples_ms, upstream_latency_ms);
-        self.push_latency_sample(&self.latency_edge_added_samples_ms, edge_added_latency_ms);
+        let mut samples = self
+            .latency_samples_ms
+            .lock()
+            .expect("latency samples lock poisoned");
+        Self::push_latency_sample(&mut samples.total, total_latency_ms);
+        Self::push_latency_sample(&mut samples.upstream, upstream_latency_ms);
+        Self::push_latency_sample(&mut samples.edge_added, edge_added_latency_ms);
     }
 
-    fn push_latency_sample(&self, target: &Mutex<VecDeque<u64>>, value: u64) {
-        let mut samples = target.lock().expect("latency samples lock poisoned");
-        samples.push_back(value);
-        while samples.len() > MAX_LATENCY_SAMPLES {
-            let _ = samples.pop_front();
+    fn push_latency_sample(target: &mut VecDeque<u64>, value: u64) {
+        target.push_back(value);
+        while target.len() > MAX_LATENCY_SAMPLES {
+            let _ = target.pop_front();
         }
-    }
-
-    fn drain_latency_samples(&self, target: &Mutex<VecDeque<u64>>) -> Vec<u64> {
-        let mut samples = target.lock().expect("latency samples lock poisoned");
-        samples.drain(..).collect::<Vec<_>>()
     }
 
     fn take_latency_percentiles_ms(&self) -> LatencySampleGroup {
-        let total = latency_percentiles_from_values(
-            self.drain_latency_samples(&self.latency_total_samples_ms),
-        );
-        let upstream = latency_percentiles_from_values(
-            self.drain_latency_samples(&self.latency_upstream_samples_ms),
-        );
-        let edge_added = latency_percentiles_from_values(
-            self.drain_latency_samples(&self.latency_edge_added_samples_ms),
-        );
+        let (total, upstream, edge_added) = {
+            let mut samples = self
+                .latency_samples_ms
+                .lock()
+                .expect("latency samples lock poisoned");
+            (
+                samples.total.drain(..).collect::<Vec<_>>(),
+                samples.upstream.drain(..).collect::<Vec<_>>(),
+                samples.edge_added.drain(..).collect::<Vec<_>>(),
+            )
+        };
         LatencySampleGroup {
-            total,
-            upstream,
-            edge_added,
+            total: latency_percentiles_from_values(total),
+            upstream: latency_percentiles_from_values(upstream),
+            edge_added: latency_percentiles_from_values(edge_added),
         }
     }
+}
+
+#[derive(Default)]
+struct LatencySampleBuffers {
+    total: VecDeque<u64>,
+    upstream: VecDeque<u64>,
+    edge_added: VecDeque<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -630,10 +642,9 @@ pub async fn apply_program_from_bytes(state: &SharedState, bytes: &[u8]) -> Prog
     let local_count = program.local_count;
     let const_count = program.constants.len();
     let code_len = program.code.len();
-    let mut guard = state.active_program.write().await;
-    *guard = Some(Arc::new(LoadedProgram {
+    state.active_program.store(Some(Arc::new(LoadedProgram {
         program: Arc::new(program),
-    }));
+    })));
     state.record_program_apply_success();
     info!(
         "{} loaded program successfully (constants={}, code_bytes={}, locals={})",
@@ -664,14 +675,10 @@ mod tests {
         let tls_capacity = services
             .tls_session_cache()
             .expect("tls session cache should exist")
-            .lock()
-            .expect("tls session cache lock poisoned")
             .capacity();
         let upstream_capacity = services
             .upstream_http_sessions()
             .expect("http upstream session store should exist")
-            .lock()
-            .expect("http upstream session store lock poisoned")
             .capacity();
         let downstream_capacity = state
             .downstream_http2_sessions
@@ -736,8 +743,6 @@ mod tests {
             services
                 .tls_session_cache()
                 .expect("tls session cache should exist")
-                .lock()
-                .expect("tls session cache lock poisoned")
                 .capacity(),
             8
         );
@@ -745,8 +750,6 @@ mod tests {
             services
                 .upstream_http_sessions()
                 .expect("http upstream session store should exist")
-                .lock()
-                .expect("http upstream session store lock poisoned")
                 .capacity(),
             if cfg!(feature = "http2") { 16 } else { 0 }
         );

@@ -59,10 +59,7 @@ pub(crate) async fn serve_transport_connection_with_listener_goal(
     #[cfg(feature = "tls")] downstream_tls_termination: Option<Arc<ServerConfig>>,
     #[cfg(not(feature = "tls"))] _downstream_tls_termination: Option<()>,
 ) {
-    let snapshot = {
-        let guard = state.active_program.read().await;
-        guard.clone()
-    };
+    let snapshot = state.loaded_program_snapshot();
     let Some(program) = snapshot else {
         return;
     };

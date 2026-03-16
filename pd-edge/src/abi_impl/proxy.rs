@@ -123,7 +123,8 @@ fn proxy_stream_state(
 }
 
 fn downstream_proxy_endpoint(context: &SharedProxyVmContext) -> ProxyByteStreamEndpoint {
-    if context.with_request_head(|request_head| request_head.method() == axum::http::Method::CONNECT)
+    if context
+        .with_request_head(|request_head| request_head.method() == axum::http::Method::CONNECT)
     {
         ProxyByteStreamEndpoint::DownstreamConnect
     } else if context.downstream_websocket().is_present() {
@@ -993,10 +994,7 @@ async fn proxy_forward(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::SocketAddr,
-        sync::{Arc, Mutex},
-    };
+    use std::{net::SocketAddr, sync::Arc};
 
     use axum::{
         Router,
@@ -1032,7 +1030,7 @@ mod tests {
                 body: Body::from(body.to_string()),
                 headers: HeaderMap::new(),
             },
-            Arc::new(Mutex::new(RateLimiterStore::new())),
+            Arc::new(RateLimiterStore::new()),
         ))
     }
 

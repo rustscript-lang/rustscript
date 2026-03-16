@@ -5,14 +5,18 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    hash::Hash,
+    hash::{DefaultHasher, Hash, Hasher},
+    sync::RwLock,
 };
+
+use crate::lock_metrics::{self, LockMetricKey};
 
 pub(crate) const DEFAULT_TLS_SESSION_REUSE_STORE_CAPACITY: usize = 256;
 pub(crate) const DEFAULT_UPSTREAM_HTTP_REUSE_STORE_CAPACITY: usize = 256;
 pub(crate) const DEFAULT_DOWNSTREAM_HTTP2_SESSION_STORE_CAPACITY: usize = 256;
 pub(crate) const DEFAULT_UPSTREAM_HTTP3_REUSE_STORE_CAPACITY: usize = 256;
 pub(crate) const DEFAULT_DOWNSTREAM_HTTP3_SESSION_STORE_CAPACITY: usize = 256;
+const DEFAULT_SHARD_COUNT: usize = 32;
 
 #[derive(Clone, Debug)]
 pub(crate) struct BoundedLruStore<K, V>
@@ -41,6 +45,10 @@ where
             return None;
         }
         self.touch_key(key);
+        self.values.get(key)
+    }
+
+    pub(crate) fn peek(&self, key: &K) -> Option<&V> {
         self.values.get(key)
     }
 
@@ -81,6 +89,13 @@ where
     }
 
     fn touch_key(&mut self, key: &K) {
+        if self
+            .lru_order
+            .back()
+            .is_some_and(|most_recent| most_recent == key)
+        {
+            return;
+        }
         self.remove_from_lru(key);
         self.lru_order.push_back(key.clone());
     }
@@ -109,7 +124,6 @@ where
         self.values.len()
     }
 
-    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
@@ -120,9 +134,135 @@ where
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ShardedRwLruStore<K, V>
+where
+    K: Clone + Eq + Hash,
+{
+    capacity: usize,
+    shards: Box<[RwLock<BoundedLruStore<K, V>>]>,
+}
+
+impl<K, V> ShardedRwLruStore<K, V>
+where
+    K: Clone + Eq + Hash,
+{
+    pub(crate) fn new(capacity: usize) -> Self {
+        let shard_count = recommended_shard_count(capacity);
+        let base_capacity = capacity / shard_count;
+        let extra_capacity = capacity % shard_count;
+        let shards = (0..shard_count)
+            .map(|index| {
+                let shard_capacity = base_capacity + usize::from(index < extra_capacity);
+                RwLock::new(BoundedLruStore::new(shard_capacity))
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self { capacity, shards }
+    }
+
+    pub(crate) fn peek_cloned(
+        &self,
+        key: &K,
+        metric_key: LockMetricKey,
+        poison_message: &'static str,
+    ) -> Option<V>
+    where
+        V: Clone,
+    {
+        let shard = self.shard(key);
+        let guard = lock_metrics::read_lock(shard, metric_key, poison_message);
+        guard.peek(key).cloned()
+    }
+
+    pub(crate) fn insert(
+        &self,
+        key: K,
+        value: V,
+        metric_key: LockMetricKey,
+        poison_message: &'static str,
+    ) -> Option<V> {
+        let shard = self.shard(&key);
+        let mut guard = lock_metrics::write_lock(shard, metric_key, poison_message);
+        guard.insert(key, value)
+    }
+
+    pub(crate) fn get_or_insert_with_cloned(
+        &self,
+        key: K,
+        metric_key: LockMetricKey,
+        poison_message: &'static str,
+        create: impl FnOnce() -> V,
+    ) -> V
+    where
+        V: Clone,
+    {
+        {
+            let shard = self.shard(&key);
+            let guard = lock_metrics::read_lock(shard, metric_key, poison_message);
+            if let Some(existing) = guard.peek(&key) {
+                return existing.clone();
+            }
+        }
+
+        let shard = self.shard(&key);
+        let mut guard = lock_metrics::write_lock(shard, metric_key, poison_message);
+        if let Some(existing) = guard.peek(&key) {
+            return existing.clone();
+        }
+
+        let value = create();
+        let cloned = value.clone();
+        let _ = guard.insert(key, value);
+        cloned
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    #[cfg(test)]
+    pub(crate) fn values_cloned(&self) -> Vec<V>
+    where
+        V: Clone,
+    {
+        self.shards
+            .iter()
+            .flat_map(|shard| {
+                shard
+                    .read()
+                    .expect("sharded lru store lock poisoned")
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn shard(&self, key: &K) -> &RwLock<BoundedLruStore<K, V>> {
+        &self.shards[shard_index_for(key, self.shards.len())]
+    }
+}
+
+pub(crate) fn shard_index_for<K>(key: &K, shard_count: usize) -> usize
+where
+    K: Hash + ?Sized,
+{
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) % shard_count.max(1)
+}
+
+fn recommended_shard_count(capacity: usize) -> usize {
+    capacity.clamp(1, DEFAULT_SHARD_COUNT)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::BoundedLruStore;
+    use crate::lock_metrics::LockMetricKey;
+
+    use super::{BoundedLruStore, ShardedRwLruStore};
 
     #[test]
     fn least_recently_used_entry_is_evicted_after_capacity_is_reached() {
@@ -152,5 +292,31 @@ mod tests {
         assert_eq!(store.get(&"a"), None);
         assert_eq!(store.get(&"b"), None);
         assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn sharded_store_retains_requested_total_capacity() {
+        let store = ShardedRwLruStore::<&str, i32>::new(10);
+        assert_eq!(store.capacity(), 10);
+    }
+
+    #[test]
+    fn sharded_store_get_or_insert_reuses_existing_value() {
+        let store = ShardedRwLruStore::<&str, i32>::new(4);
+        let first = store.get_or_insert_with_cloned(
+            "a",
+            LockMetricKey::UpstreamClientCache,
+            "test store lock poisoned",
+            || 1,
+        );
+        let second = store.get_or_insert_with_cloned(
+            "a",
+            LockMetricKey::UpstreamClientCache,
+            "test store lock poisoned",
+            || 2,
+        );
+        assert_eq!(first, 1);
+        assert_eq!(second, 1);
+        assert_eq!(store.values_cloned(), vec![1]);
     }
 }

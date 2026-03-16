@@ -58,7 +58,7 @@ pub(crate) fn mark_upstream_transport_started(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use axum::http::{HeaderMap, Version};
 
@@ -66,10 +66,7 @@ mod tests {
     use crate::abi_impl::{ProxyVmContext, RateLimiterStore};
 
     fn test_context() -> ProxyVmContext {
-        ProxyVmContext::from_request_headers(
-            HeaderMap::new(),
-            Arc::new(Mutex::new(RateLimiterStore::new())),
-        )
+        ProxyVmContext::from_request_headers(HeaderMap::new(), Arc::new(RateLimiterStore::new()))
     }
 
     #[test]

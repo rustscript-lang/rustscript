@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use axum::http::Version;
 
 use crate::cache::BoundedLruStore;
+#[cfg(feature = "http2")]
+use crate::lock_metrics::{self, LockMetricKey};
 
 #[cfg(feature = "http2")]
 use super::model::{Http2ControlEventSource, supports_response_version};
@@ -83,9 +85,11 @@ pub(crate) struct DownstreamHttp2ConnectionTracker {
 impl DownstreamHttp2ConnectionTracker {
     pub(crate) fn new(store: SharedHttpDownstreamSessions, peer_address: String) -> Self {
         let session_id = {
-            let mut guard = store
-                .lock()
-                .expect("http downstream session store lock poisoned");
+            let mut guard = lock_metrics::lock(
+                &store,
+                LockMetricKey::Http2DownstreamSessionStore,
+                "http downstream session store lock poisoned",
+            );
             let next = guard.next_session_id.saturating_add(1);
             guard.next_session_id = next;
             guard.sessions.insert(
@@ -121,10 +125,11 @@ impl DownstreamHttp2ConnectionTracker {
             return None;
         }
         self.saw_http2.store(true, Ordering::Relaxed);
-        let mut guard = self
-            .store
-            .lock()
-            .expect("http downstream session store lock poisoned");
+        let mut guard = lock_metrics::lock(
+            &self.store,
+            LockMetricKey::Http2DownstreamSessionStore,
+            "http downstream session store lock poisoned",
+        );
         let session = guard.sessions.get_mut(&self.session_id)?;
         if session.frontier == Http2SessionFrontier::Candidate {
             session.frontier = Http2SessionFrontier::Attachable;
@@ -154,10 +159,11 @@ impl DownstreamHttp2ConnectionTracker {
         let Some(attachment) = attachment else {
             return;
         };
-        let mut guard = self
-            .store
-            .lock()
-            .expect("http downstream session store lock poisoned");
+        let mut guard = lock_metrics::lock(
+            &self.store,
+            LockMetricKey::Http2DownstreamSessionStore,
+            "http downstream session store lock poisoned",
+        );
         let Some(session) = guard.sessions.get_mut(&attachment.session_id) else {
             return;
         };
@@ -175,10 +181,11 @@ impl DownstreamHttp2ConnectionTracker {
         let Some(attachment) = attachment else {
             return;
         };
-        let mut guard = self
-            .store
-            .lock()
-            .expect("http downstream session store lock poisoned");
+        let mut guard = lock_metrics::lock(
+            &self.store,
+            LockMetricKey::Http2DownstreamSessionStore,
+            "http downstream session store lock poisoned",
+        );
         let Some(session) = guard.sessions.get_mut(&attachment.session_id) else {
             return;
         };
@@ -206,10 +213,11 @@ impl DownstreamHttp2ConnectionTracker {
     }
 
     pub(crate) fn finish_connection(&self, error: Option<String>) {
-        let mut guard = self
-            .store
-            .lock()
-            .expect("http downstream session store lock poisoned");
+        let mut guard = lock_metrics::lock(
+            &self.store,
+            LockMetricKey::Http2DownstreamSessionStore,
+            "http downstream session store lock poisoned",
+        );
         if !self.saw_http2.load(Ordering::Relaxed) {
             let _ = guard.sessions.remove(&self.session_id);
             return;

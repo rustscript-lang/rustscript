@@ -4,7 +4,7 @@ use std::{
     hash::{Hash, Hasher},
     io,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -12,7 +12,7 @@ use axum::http::Version;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use url::Url;
 
-use crate::cache::BoundedLruStore;
+use crate::cache::ShardedRwLruStore;
 
 pub(crate) const TCP_STREAM_DOWNSTREAM: i64 = 0;
 pub(crate) const TCP_STREAM_DEFAULT_UPSTREAM: i64 = 1;
@@ -565,7 +565,7 @@ pub(crate) struct CachedTlsSession {
 }
 
 pub(crate) type SharedTlsSessionCache =
-    Arc<Mutex<BoundedLruStore<TlsSessionCacheKey, CachedTlsSession>>>;
+    Arc<ShardedRwLruStore<TlsSessionCacheKey, CachedTlsSession>>;
 pub(crate) type SharedTcpStreamIo = Arc<tokio::sync::Mutex<Option<tokio::net::TcpStream>>>;
 pub(crate) type SharedUdpSocketIo = Arc<tokio::sync::Mutex<tokio::net::UdpSocket>>;
 #[cfg(feature = "tls")]
@@ -698,7 +698,7 @@ impl std::fmt::Debug for DownstreamTlsServerStart {
 }
 
 pub(crate) fn new_shared_tls_session_cache(capacity: usize) -> SharedTlsSessionCache {
-    Arc::new(Mutex::new(BoundedLruStore::new(capacity)))
+    Arc::new(ShardedRwLruStore::new(capacity))
 }
 
 impl TlsProtocolVersion {

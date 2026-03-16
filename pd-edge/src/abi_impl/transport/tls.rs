@@ -34,6 +34,7 @@ use super::state::{
     decode_tls_session_handle,
 };
 use crate::abi_impl::transport::HTTP11_ALPN_PROTOCOL;
+use crate::lock_metrics::LockMetricKey;
 use rcgen::generate_simple_self_signed;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,8 +129,11 @@ fn apply_cached_session(
     };
 
     let cached = {
-        let mut guard = cache.lock().expect("tls session cache lock poisoned");
-        guard.get(&key).cloned()
+        cache.peek_cloned(
+            &key,
+            LockMetricKey::TlsSessionCache,
+            "tls session cache lock poisoned",
+        )
     };
     let Some(cached) = cached else {
         return Ok(false);

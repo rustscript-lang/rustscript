@@ -136,10 +136,7 @@ fn set_response_headers(
 
 /// Sets the body for the downstream HTTP response.
 #[pd_edge_host_function(name = http_response::SET_BODY.name, scope = http)]
-fn set_response_body(
-    context: SharedProxyVmContext,
-    body: String,
-) -> Result<CallOutcome, VmError> {
+fn set_response_body(context: SharedProxyVmContext, body: String) -> Result<CallOutcome, VmError> {
     context.with_downstream_response_mut(|response| {
         response.body = Some(body.into_bytes());
     });
@@ -173,10 +170,7 @@ async fn apply_exchange_to_response_with_headers(
 
 /// Sets the status code on the downstream HTTP response.
 #[pd_edge_host_function(name = http_response::SET_STATUS.name, scope = http)]
-fn set_response_status(
-    context: SharedProxyVmContext,
-    status: i64,
-) -> Result<CallOutcome, VmError> {
+fn set_response_status(context: SharedProxyVmContext, status: i64) -> Result<CallOutcome, VmError> {
     if !(100..=599).contains(&status) {
         return Err(VmError::HostError(format!(
             "status code must be in range 100..=599, got '{status}'",

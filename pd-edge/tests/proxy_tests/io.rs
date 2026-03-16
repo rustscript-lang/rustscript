@@ -194,7 +194,7 @@ async fn direct_vm_io_protocol_handles_accept_direct_integer_arguments() {
     let compiled = compile_source(&source).expect("source should compile");
     let mut context = Arc::new(ProxyVmContext::from_request_headers(
         axum::http::HeaderMap::new(),
-        Arc::new(Mutex::new(RateLimiterStore::new())),
+        Arc::new(RateLimiterStore::new()),
     ));
     {
         Arc::get_mut(&mut context)
@@ -219,7 +219,7 @@ async fn io_open_no_longer_treats_virtual_protocol_paths_as_builtin_handles() {
     let compiled = compile_source(source).expect("source should compile");
     let context = Arc::new(ProxyVmContext::from_request_headers(
         axum::http::HeaderMap::new(),
-        Arc::new(Mutex::new(RateLimiterStore::new())),
+        Arc::new(RateLimiterStore::new()),
     ));
 
     let error = run_edge_program_direct(compiled.program, context.clone())

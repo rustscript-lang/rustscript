@@ -101,10 +101,7 @@ fn get_request_http_version(context: SharedProxyVmContext) -> Result<CallOutcome
 
 /// Returns the first value for a header on the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_HEADER.name, scope = http)]
-fn get_request_header(
-    context: SharedProxyVmContext,
-    name: String,
-) -> Result<CallOutcome, VmError> {
+fn get_request_header(context: SharedProxyVmContext, name: String) -> Result<CallOutcome, VmError> {
     let header_name = HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
     let value = context.with_request_head(|request_head| {
@@ -121,9 +118,9 @@ fn get_request_header(
 /// Returns all headers on the downstream HTTP request as a map.
 #[pd_edge_host_function(name = http_request::GET_HEADERS.name, scope = http)]
 fn get_request_headers(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return(vec![context.with_request_head(|request_head| {
-        headers_to_value_map(request_head.headers())
-    })]))
+    Ok(CallOutcome::Return(vec![context.with_request_head(
+        |request_head| headers_to_value_map(request_head.headers()),
+    )]))
 }
 
 /// Returns a query parameter from the downstream HTTP request.
@@ -149,9 +146,9 @@ fn get_request_query_arg(
 /// Returns all query parameters from the downstream HTTP request as a map.
 #[pd_edge_host_function(name = http_request::GET_QUERY_ARGS.name, scope = http)]
 fn get_request_query_args(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return(vec![context.with_request_head(|request_head| {
-        query_to_value_map(request_head.query())
-    })]))
+    Ok(CallOutcome::Return(vec![context.with_request_head(
+        |request_head| query_to_value_map(request_head.query()),
+    )]))
 }
 
 /// Returns the full body for the downstream HTTP request as text.
