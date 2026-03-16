@@ -10,7 +10,6 @@ use super::http::{
 };
 use super::{
     EDGE_IO_HANDLE_DYNAMIC_BASE, EdgeVirtualIoHandle, ProxyVmContext, SharedProxyVmContext,
-    SharedVmAsyncOps,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,20 +28,6 @@ enum EdgeIoReadSource {
 enum EdgeIoWriteTarget {
     Protocol(EdgeProtocolIoHandle),
     FilePath { path: String, append: bool },
-}
-
-pub(super) fn register_builtin_io_overrides(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-) -> Result<(), VmError> {
-    super::registry::register_host_scope(
-        vm,
-        &context,
-        &async_ops,
-        super::registry::EdgeHostScope::Io,
-    );
-    Ok(())
 }
 
 fn decode_protocol_io_handle(

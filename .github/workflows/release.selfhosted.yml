@@ -60,9 +60,9 @@ jobs:
             echo "PD_BUILD_GIT_DIRTY=false" >> "$GITHUB_ENV"
           fi
 
-      - name: Build pd-edge binaries, pd-controller and pd-vm-run
+      - name: Build pd-edge binaries with console, pd-controller and pd-vm-run
         run: |
-          cargo build -p pd-edge --release --locked --bins
+          cargo build -p pd-edge --release --locked --bins --features console
           cargo build -p pd-controller --release --locked
           cargo build -p pd-vm --bin pd-vm-run --release --locked
 

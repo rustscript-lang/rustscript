@@ -10,7 +10,8 @@ name = "edge"
 
 [features]
 # Keep HTTP/3 opt-in in normal builds; release.yml enables it explicitly with --all-features.
-default = ["http", "tls", "websocket"]
+default = ["console", "http", "tls", "websocket"]
+console = ["edge_abi/console"]
 http = ["vm/http", "edge_abi/http"]
 http2 = ["http", "vm/http2", "edge_abi/http2", "reqwest/http2", "dep:h2", "dep:tokio-rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
 http3 = ["http", "dep:quinn", "dep:h3", "dep:h3-quinn", "dep:rustls", "dep:webpki-roots", "dep:rustls-pemfile", "dep:rcgen"]
@@ -29,6 +30,7 @@ path = "src/bin/pd-edge-transport-proxy.rs"
 [[bin]]
 name = "pd-edge-console"
 path = "src/bin/pd-edge-console.rs"
+required-features = ["console"]
 
 [[bin]]
 name = "pd-edge-sample-echo-server"

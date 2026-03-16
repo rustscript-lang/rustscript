@@ -28,7 +28,7 @@ use edge_abi::symbols::webrtc;
 use pd_edge_host_function::pd_edge_host_function;
 use vm::{CallOutcome, Value, Vm, VmError};
 
-use super::{SharedProxyVmContext, SharedVmAsyncOps, http, registry};
+use super::{SharedProxyVmContext, http};
 
 const DOWNSTREAM_CONNECTION_HANDLE: i64 = 0;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -592,14 +592,6 @@ async fn pop_next_message(io: &Arc<WebRtcIoState>) -> Result<Option<WebRtcMessag
         }
         io.inbox_notify.notified().await;
     }
-}
-
-pub(super) fn register_webrtc_extensions(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-) {
-    registry::register_host_scope(vm, &context, &async_ops, registry::EdgeHostScope::WebRtc);
 }
 
 /// Allocates a WebRTC connection handle.

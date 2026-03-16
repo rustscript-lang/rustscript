@@ -12,6 +12,11 @@ pub mod sample_echo;
 
 pub use edge_abi::*;
 
+#[cfg(feature = "console")]
+pub use abi_impl::{
+    ConsoleProtocolHostModule, SharedConsoleProgramArgs, enter_edge_host_context_with_console,
+    register_console_host_module, register_console_http_plane_host_module,
+};
 pub use abi_impl::{
     EdgeProtocolHostModule, HttpProtocolHostModule, ProxyVmContext, RateLimiterStore,
     RuntimeProtocolHostModule, SharedProxyVmContext, SharedRateLimiter, SharedVmAsyncOps,

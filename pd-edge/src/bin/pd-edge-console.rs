@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::{self, Read, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -12,8 +12,9 @@ use edge::{
     SharedState, SharedVmAsyncOps, VM_EPOCH_TICK_INTERVAL_MS, VmAsyncOpBridge, VmExecutionConfig,
     VmExecutionMode, VmInterruptConfig, apply_program_from_bytes,
     attach_http_plane_runtime_services, binary_version_report, binary_version_text,
-    compile_edge_source_file, enabled_feature_line, enter_edge_host_context, init_logging,
-    new_shared_vm_async_ops, register_http_plane_host_module, spawn_active_control_plane_client,
+    compile_edge_source_file, enabled_feature_line, enter_edge_host_context_with_console,
+    init_logging, new_shared_vm_async_ops, register_console_http_plane_host_module,
+    spawn_active_control_plane_client,
 };
 use tokio::{
     runtime::Handle,
@@ -22,10 +23,7 @@ use tokio::{
 };
 use tracing::info;
 use uuid::Uuid;
-use vm::{
-    CallOutcome, EpochHandle, HostFunction, Store, Value, Vm, VmError, VmStatus, VmYieldReason,
-    encode_program,
-};
+use vm::{EpochHandle, Store, Value, Vm, VmStatus, VmYieldReason, encode_program};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -619,18 +617,17 @@ async fn run_loaded_program_once(
 
     let vm_context = store.data().vm_context.clone();
     let async_ops = store.data().async_ops.clone();
-    let program_args = store.data().program_args.clone();
-    register_console_host_module(store.vm_mut(), async_ops.clone(), program_args)?;
-    register_http_plane_host_module(store.vm_mut(), vm_context, async_ops)?;
+    register_console_http_plane_host_module(store.vm_mut(), vm_context, async_ops)?;
 
     loop {
         if let Some((ticks_per_slice, _driver)) = &epoch_driver {
             store.set_epoch_deadline(*ticks_per_slice)?;
         }
         let status = {
-            let _host_context = enter_edge_host_context(
+            let _host_context = enter_edge_host_context_with_console(
                 store.data().vm_context.clone(),
                 store.data().async_ops.clone(),
+                store.data().program_args.clone(),
             );
             store.run()
         };
@@ -656,330 +653,6 @@ async fn run_loaded_program_once(
                 return Err(format!("vm execution failed: {err}").into());
             }
         }
-    }
-}
-
-fn register_console_host_module(
-    vm: &mut Vm,
-    async_ops: SharedVmAsyncOps,
-    program_args: Arc<Vec<String>>,
-) -> Result<(), VmError> {
-    ensure_console_edge_abi_host_slots(vm)?;
-    vm.bind_function(
-        "console::stdin::read_line",
-        Box::new(ConsoleStdinReadLineFunction::new(async_ops.clone())),
-    );
-    vm.bind_function(
-        "console::stdin::read_all",
-        Box::new(ConsoleStdinReadAllFunction::new(async_ops.clone())),
-    );
-    vm.bind_function(
-        "console::stdout::write",
-        Box::new(ConsoleStdoutWriteFunction::new(async_ops.clone())),
-    );
-    vm.bind_function(
-        "console::stdout::flush",
-        Box::new(ConsoleStdoutFlushFunction::new(async_ops.clone())),
-    );
-    vm.bind_function(
-        "console::stderr::write",
-        Box::new(ConsoleStderrWriteFunction::new(async_ops.clone())),
-    );
-    vm.bind_function(
-        "console::stderr::flush",
-        Box::new(ConsoleStderrFlushFunction::new(async_ops)),
-    );
-    vm.bind_function(
-        "console::args::count",
-        Box::new(ConsoleArgsCountFunction::new(program_args.clone())),
-    );
-    vm.bind_function(
-        "console::args::get",
-        Box::new(ConsoleArgsGetFunction::new(program_args)),
-    );
-    Ok(())
-}
-
-fn ensure_console_edge_abi_host_slots(vm: &mut Vm) -> Result<(), VmError> {
-    if edge_abi::FUNCTIONS
-        .iter()
-        .all(|function| vm.has_bound_function(function.name))
-    {
-        return Ok(());
-    }
-
-    if vm.bound_function_count() != 0 {
-        return Err(VmError::HostError(
-            "edge ABI host slots must be initialized before registering console host functions"
-                .to_string(),
-        ));
-    }
-
-    for function in edge_abi::FUNCTIONS {
-        vm.bind_static_function(function.name, unbound_console_edge_abi_function);
-    }
-    Ok(())
-}
-
-fn unbound_console_edge_abi_function(
-    _vm: &mut Vm,
-    _args: &[Value],
-) -> Result<CallOutcome, VmError> {
-    Err(VmError::HostError(
-        "edge ABI host function is not bound in pd-edge-console".to_string(),
-    ))
-}
-
-struct ConsoleStdinReadLineFunction {
-    async_ops: SharedVmAsyncOps,
-}
-
-impl ConsoleStdinReadLineFunction {
-    fn new(async_ops: SharedVmAsyncOps) -> Self {
-        Self { async_ops }
-    }
-}
-
-impl HostFunction for ConsoleStdinReadLineFunction {
-    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
-        expect_arg_count(args, 0)?;
-        schedule_future_call(vm, &self.async_ops, async move {
-            let line = tokio::task::spawn_blocking(move || {
-                let mut input = String::new();
-                io::stdin()
-                    .read_line(&mut input)
-                    .map_err(|err| VmError::HostError(format!("stdin read_line failed: {err}")))?;
-                Ok::<String, VmError>(input)
-            })
-            .await
-            .map_err(|err| VmError::HostError(format!("stdin read_line task failed: {err}")))??;
-            Ok(vec![Value::string(line)])
-        })
-    }
-}
-
-struct ConsoleStdinReadAllFunction {
-    async_ops: SharedVmAsyncOps,
-}
-
-impl ConsoleStdinReadAllFunction {
-    fn new(async_ops: SharedVmAsyncOps) -> Self {
-        Self { async_ops }
-    }
-}
-
-impl HostFunction for ConsoleStdinReadAllFunction {
-    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
-        expect_arg_count(args, 0)?;
-        schedule_future_call(vm, &self.async_ops, async move {
-            let text = tokio::task::spawn_blocking(move || {
-                let mut input = String::new();
-                io::stdin()
-                    .read_to_string(&mut input)
-                    .map_err(|err| VmError::HostError(format!("stdin read_all failed: {err}")))?;
-                Ok::<String, VmError>(input)
-            })
-            .await
-            .map_err(|err| VmError::HostError(format!("stdin read_all task failed: {err}")))??;
-            Ok(vec![Value::string(text)])
-        })
-    }
-}
-
-struct ConsoleStdoutWriteFunction {
-    async_ops: SharedVmAsyncOps,
-}
-
-impl ConsoleStdoutWriteFunction {
-    fn new(async_ops: SharedVmAsyncOps) -> Self {
-        Self { async_ops }
-    }
-}
-
-impl HostFunction for ConsoleStdoutWriteFunction {
-    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
-        expect_arg_count(args, 1)?;
-        let text = expect_string(args, 0)?;
-        schedule_future_call(vm, &self.async_ops, async move {
-            let written = tokio::task::spawn_blocking(move || {
-                let mut out = io::stdout().lock();
-                out.write_all(text.as_bytes())
-                    .and_then(|_| out.flush())
-                    .map_err(|err| VmError::HostError(format!("stdout write failed: {err}")))?;
-                Ok::<i64, VmError>(text.len() as i64)
-            })
-            .await
-            .map_err(|err| VmError::HostError(format!("stdout write task failed: {err}")))??;
-            Ok(vec![Value::Int(written)])
-        })
-    }
-}
-
-struct ConsoleStdoutFlushFunction {
-    async_ops: SharedVmAsyncOps,
-}
-
-impl ConsoleStdoutFlushFunction {
-    fn new(async_ops: SharedVmAsyncOps) -> Self {
-        Self { async_ops }
-    }
-}
-
-impl HostFunction for ConsoleStdoutFlushFunction {
-    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
-        expect_arg_count(args, 0)?;
-        schedule_future_call(vm, &self.async_ops, async move {
-            tokio::task::spawn_blocking(move || {
-                io::stdout()
-                    .flush()
-                    .map_err(|err| VmError::HostError(format!("stdout flush failed: {err}")))?;
-                Ok::<(), VmError>(())
-            })
-            .await
-            .map_err(|err| VmError::HostError(format!("stdout flush task failed: {err}")))??;
-            Ok(vec![Value::Bool(true)])
-        })
-    }
-}
-
-struct ConsoleStderrWriteFunction {
-    async_ops: SharedVmAsyncOps,
-}
-
-impl ConsoleStderrWriteFunction {
-    fn new(async_ops: SharedVmAsyncOps) -> Self {
-        Self { async_ops }
-    }
-}
-
-impl HostFunction for ConsoleStderrWriteFunction {
-    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
-        expect_arg_count(args, 1)?;
-        let text = expect_string(args, 0)?;
-        schedule_future_call(vm, &self.async_ops, async move {
-            let written = tokio::task::spawn_blocking(move || {
-                let mut out = io::stderr().lock();
-                out.write_all(text.as_bytes())
-                    .and_then(|_| out.flush())
-                    .map_err(|err| VmError::HostError(format!("stderr write failed: {err}")))?;
-                Ok::<i64, VmError>(text.len() as i64)
-            })
-            .await
-            .map_err(|err| VmError::HostError(format!("stderr write task failed: {err}")))??;
-            Ok(vec![Value::Int(written)])
-        })
-    }
-}
-
-struct ConsoleStderrFlushFunction {
-    async_ops: SharedVmAsyncOps,
-}
-
-impl ConsoleStderrFlushFunction {
-    fn new(async_ops: SharedVmAsyncOps) -> Self {
-        Self { async_ops }
-    }
-}
-
-impl HostFunction for ConsoleStderrFlushFunction {
-    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
-        expect_arg_count(args, 0)?;
-        schedule_future_call(vm, &self.async_ops, async move {
-            tokio::task::spawn_blocking(move || {
-                io::stderr()
-                    .flush()
-                    .map_err(|err| VmError::HostError(format!("stderr flush failed: {err}")))?;
-                Ok::<(), VmError>(())
-            })
-            .await
-            .map_err(|err| VmError::HostError(format!("stderr flush task failed: {err}")))??;
-            Ok(vec![Value::Bool(true)])
-        })
-    }
-}
-
-struct ConsoleArgsCountFunction {
-    program_args: Arc<Vec<String>>,
-}
-
-impl ConsoleArgsCountFunction {
-    fn new(program_args: Arc<Vec<String>>) -> Self {
-        Self { program_args }
-    }
-}
-
-impl HostFunction for ConsoleArgsCountFunction {
-    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
-        expect_arg_count(args, 0)?;
-        Ok(CallOutcome::Return(vec![Value::Int(
-            self.program_args.len() as i64,
-        )]))
-    }
-}
-
-struct ConsoleArgsGetFunction {
-    program_args: Arc<Vec<String>>,
-}
-
-impl ConsoleArgsGetFunction {
-    fn new(program_args: Arc<Vec<String>>) -> Self {
-        Self { program_args }
-    }
-}
-
-impl HostFunction for ConsoleArgsGetFunction {
-    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
-        expect_arg_count(args, 1)?;
-        let index = expect_int(args, 0)?;
-        if index < 0 {
-            return Err(VmError::HostError(format!(
-                "console::args::get expects a non-negative index, got {index}",
-            )));
-        }
-        let value = self
-            .program_args
-            .get(index as usize)
-            .cloned()
-            .unwrap_or_default();
-        Ok(CallOutcome::Return(vec![Value::string(value)]))
-    }
-}
-
-fn schedule_future_call<F>(
-    _vm: &mut Vm,
-    async_ops: &SharedVmAsyncOps,
-    future: F,
-) -> Result<CallOutcome, VmError>
-where
-    F: std::future::Future<Output = Result<Vec<Value>, VmError>> + Send + 'static,
-{
-    let mut ops = async_ops.lock().expect("vm async ops lock poisoned");
-    let op_id = ops.schedule_future(future)?;
-    Ok(CallOutcome::Pending(op_id))
-}
-
-fn expect_arg_count(args: &[Value], expected: usize) -> Result<(), VmError> {
-    if args.len() == expected {
-        Ok(())
-    } else {
-        Err(VmError::HostError(format!(
-            "expected {expected} arguments, got {}",
-            args.len()
-        )))
-    }
-}
-
-fn expect_string(args: &[Value], index: usize) -> Result<String, VmError> {
-    match args.get(index) {
-        Some(Value::String(value)) => Ok(value.to_string()),
-        _ => Err(VmError::TypeMismatch("string")),
-    }
-}
-
-fn expect_int(args: &[Value], index: usize) -> Result<i64, VmError> {
-    match args.get(index) {
-        Some(Value::Int(value)) => Ok(*value),
-        _ => Err(VmError::TypeMismatch("int")),
     }
 }
 

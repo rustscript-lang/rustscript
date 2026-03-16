@@ -1,15 +1,8 @@
-#![cfg_attr(not(feature = "http"), allow(unused_imports))]
-
-use vm::Vm;
-
 #[cfg(feature = "http")]
 use self::helpers::{
     headers_to_value_map, is_valid_request_path, is_valid_upstream, parse_header,
     parse_header_name, query_to_value_map, request_path_with_query, serialize_query_pairs,
 };
-use super::SharedVmAsyncOps;
-#[cfg(feature = "http")]
-use super::registry;
 
 #[cfg(feature = "http")]
 mod exchange;
@@ -60,25 +53,3 @@ pub(crate) use state::{
     webrtc_connection_exists,
 };
 pub(crate) use version::HttpVersionPreference;
-
-#[cfg(feature = "http")]
-pub(super) fn register_http_extensions(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-) {
-    registry::register_host_scope(
-        vm,
-        &context,
-        &async_ops,
-        registry::EdgeHostScope::HttpExtension,
-    );
-}
-
-#[cfg(not(feature = "http"))]
-pub(super) fn register_http_extensions(
-    _vm: &mut Vm,
-    _context: SharedProxyVmContext,
-    _async_ops: SharedVmAsyncOps,
-) {
-}

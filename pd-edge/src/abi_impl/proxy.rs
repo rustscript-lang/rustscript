@@ -11,7 +11,7 @@ use tokio::{
 use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::{
-    SharedProxyVmContext, SharedVmAsyncOps, http, registry,
+    SharedProxyVmContext, http,
     transport::{TcpStreamRef, TlsSessionRef, decode_tcp_stream_handle, decode_tls_session_handle},
     websocket::{
         close_websocket_binary_stream, ensure_outbound_websocket_connection_open,
@@ -65,14 +65,6 @@ enum ProxyReadStep {
     Eof,
     WaitingForWriteClose,
     Blocked,
-}
-
-pub(super) fn register_proxy_extensions(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-    async_ops: SharedVmAsyncOps,
-) {
-    registry::register_host_scope(vm, &context, &async_ops, registry::EdgeHostScope::Proxy);
 }
 
 fn unknown_proxy_stream_handle(handle: i64) -> VmError {
