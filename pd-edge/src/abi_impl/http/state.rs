@@ -7,7 +7,10 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -698,6 +701,70 @@ pub(crate) type SharedUpstreamClientCache =
 pub(crate) type SharedPlainHttp1UpstreamClient = Arc<HyperLegacyClient<HttpConnector, Full<Bytes>>>;
 type PlainHttp1PooledSender = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
 pub(crate) type SharedPlainHttp1SenderPool = Arc<ParkingMutex<PlainHttp1SenderPool>>;
+static NATIVE_FORWARD_METRICS_ENABLED: OnceLock<bool> = OnceLock::new();
+static NATIVE_FORWARD_METRICS_COUNT: AtomicU64 = AtomicU64::new(0);
+static NATIVE_FORWARD_METRICS_POOL_HITS: AtomicU64 = AtomicU64::new(0);
+static NATIVE_FORWARD_METRICS_POOL_MISSES: AtomicU64 = AtomicU64::new(0);
+static NATIVE_FORWARD_METRICS_RETRIES: AtomicU64 = AtomicU64::new(0);
+static NATIVE_FORWARD_METRICS_BUILD_US: AtomicU64 = AtomicU64::new(0);
+static NATIVE_FORWARD_METRICS_CONNECT_US: AtomicU64 = AtomicU64::new(0);
+static NATIVE_FORWARD_METRICS_READY_US: AtomicU64 = AtomicU64::new(0);
+static NATIVE_FORWARD_METRICS_SEND_US: AtomicU64 = AtomicU64::new(0);
+static NATIVE_FORWARD_METRICS_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+
+fn native_forward_metrics_enabled() -> bool {
+    *NATIVE_FORWARD_METRICS_ENABLED
+        .get_or_init(|| std::env::var_os("PD_EDGE_NATIVE_FORWARD_METRICS").is_some())
+}
+
+fn record_native_forward_metrics(
+    pool_hit: bool,
+    retries: u64,
+    build_us: u64,
+    connect_us: u64,
+    ready_us: u64,
+    send_us: u64,
+    total_us: u64,
+) {
+    if !native_forward_metrics_enabled() {
+        return;
+    }
+    let count = NATIVE_FORWARD_METRICS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if pool_hit {
+        NATIVE_FORWARD_METRICS_POOL_HITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        NATIVE_FORWARD_METRICS_POOL_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+    NATIVE_FORWARD_METRICS_RETRIES.fetch_add(retries, Ordering::Relaxed);
+    NATIVE_FORWARD_METRICS_BUILD_US.fetch_add(build_us, Ordering::Relaxed);
+    NATIVE_FORWARD_METRICS_CONNECT_US.fetch_add(connect_us, Ordering::Relaxed);
+    NATIVE_FORWARD_METRICS_READY_US.fetch_add(ready_us, Ordering::Relaxed);
+    NATIVE_FORWARD_METRICS_SEND_US.fetch_add(send_us, Ordering::Relaxed);
+    NATIVE_FORWARD_METRICS_TOTAL_US.fetch_add(total_us, Ordering::Relaxed);
+    if count % 1000 == 0 {
+        let hits = NATIVE_FORWARD_METRICS_POOL_HITS.load(Ordering::Relaxed);
+        let misses = NATIVE_FORWARD_METRICS_POOL_MISSES.load(Ordering::Relaxed);
+        let retries = NATIVE_FORWARD_METRICS_RETRIES.load(Ordering::Relaxed);
+        let build_avg =
+            NATIVE_FORWARD_METRICS_BUILD_US.load(Ordering::Relaxed) as f64 / count as f64;
+        let connect_avg =
+            NATIVE_FORWARD_METRICS_CONNECT_US.load(Ordering::Relaxed) as f64 / count as f64;
+        let ready_avg =
+            NATIVE_FORWARD_METRICS_READY_US.load(Ordering::Relaxed) as f64 / count as f64;
+        let send_avg = NATIVE_FORWARD_METRICS_SEND_US.load(Ordering::Relaxed) as f64 / count as f64;
+        let total_avg =
+            NATIVE_FORWARD_METRICS_TOTAL_US.load(Ordering::Relaxed) as f64 / count as f64;
+        eprintln!(
+            "native_forward_metrics requests={count} pool_hit_rate={:.2}% retries={} avg_build_us={build_avg:.1} avg_connect_us={connect_avg:.1} avg_ready_us={ready_avg:.1} avg_send_us={send_avg:.1} avg_total_us={total_avg:.1}",
+            if hits + misses == 0 {
+                0.0
+            } else {
+                (hits as f64 * 100.0) / (hits + misses) as f64
+            },
+            retries,
+        );
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct PlainHttp1SenderPool {
@@ -780,11 +847,12 @@ async fn acquire_plain_http1_sender(
     authority: &str,
     host: &str,
     port: u16,
-) -> Result<PlainHttp1PooledSender, VmError> {
+) -> Result<(PlainHttp1PooledSender, bool, u64), VmError> {
     if let Some(sender) = pool.lock().take(authority) {
-        return Ok(sender);
+        return Ok((sender, true, 0));
     }
 
+    let connect_started = Instant::now();
     let stream = tokio::net::TcpStream::connect((host, port))
         .await
         .map_err(|err| VmError::HostError(format!("failed to connect to {authority}: {err}")))?;
@@ -807,7 +875,18 @@ async fn acquire_plain_http1_sender(
     tokio::spawn(async move {
         let _ = connection.await;
     });
-    Ok(sender)
+    Ok((
+        sender,
+        false,
+        u64::try_from(connect_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+    ))
+}
+
+struct PlainHttp1SenderAcquire {
+    sender: PlainHttp1PooledSender,
+    pool_hit: bool,
+    connect_us: u64,
+    ready_us: u64,
 }
 
 async fn acquire_ready_plain_http1_sender(
@@ -815,12 +894,22 @@ async fn acquire_ready_plain_http1_sender(
     authority: &str,
     host: &str,
     port: u16,
-) -> Result<PlainHttp1PooledSender, VmError> {
+) -> Result<PlainHttp1SenderAcquire, VmError> {
     let mut last_err = None;
     for _ in 0..3 {
-        let mut sender = acquire_plain_http1_sender(pool, authority, host, port).await?;
+        let (mut sender, pool_hit, connect_us) =
+            acquire_plain_http1_sender(pool, authority, host, port).await?;
+        let ready_started = Instant::now();
         match sender.ready().await {
-            Ok(()) => return Ok(sender),
+            Ok(()) => {
+                return Ok(PlainHttp1SenderAcquire {
+                    sender,
+                    pool_hit,
+                    connect_us,
+                    ready_us: u64::try_from(ready_started.elapsed().as_micros())
+                        .unwrap_or(u64::MAX),
+                });
+            }
             Err(err) => {
                 last_err = Some(err);
             }
@@ -4257,6 +4346,7 @@ async fn forward_native_default_upstream_http_via_sender_pool(
     context: &SharedProxyVmContext,
     request: &DefaultUpstreamRequestSnapshot,
 ) -> Result<NativeDefaultUpstreamForwardResponse, UpstreamResponseStartError> {
+    let total_started = Instant::now();
     let services = context.services();
     let pool = services
         .plain_http1_sender_pool()
@@ -4291,7 +4381,9 @@ async fn forward_native_default_upstream_http_via_sender_pool(
             request.query_or_request_head(request_head),
         )
     });
-    let make_request = || {
+    let mut build_us = 0u64;
+    let mut make_request = || {
+        let build_started = Instant::now();
         context.with_request_head(|request_head| {
             let method = request.method_or_request_head(request_head).clone();
             let mut outbound = hyper::Request::builder()
@@ -4309,27 +4401,54 @@ async fn forward_native_default_upstream_http_via_sender_pool(
                 request_head,
                 Some(authority.as_str()),
             );
+            build_us = build_us
+                .saturating_add(
+                    u64::try_from(build_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                );
             Ok::<_, UpstreamResponseStartError>(outbound)
         })
     };
-    let mut sender = acquire_ready_plain_http1_sender(&pool, &authority, &host, port)
+    let acquired = acquire_ready_plain_http1_sender(&pool, &authority, &host, port)
         .await
         .map_err(|err| UpstreamResponseStartError::UpstreamRequest(err.to_string()))?;
+    let mut sender = acquired.sender;
+    let mut pool_hit = acquired.pool_hit;
+    let mut connect_us = acquired.connect_us;
+    let mut ready_us = acquired.ready_us;
+    let mut retries = 0u64;
     let mut outbound = make_request()?;
+    let mut send_us = 0u64;
+    let send_started = Instant::now();
     let upstream_response = match sender.send_request(outbound).await {
         Ok(response) => response,
         Err(_) => {
-            sender = acquire_ready_plain_http1_sender(&pool, &authority, &host, port)
+            retries = 1;
+            send_us = send_us.saturating_add(
+                u64::try_from(send_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
+            let reacquired = acquire_ready_plain_http1_sender(&pool, &authority, &host, port)
                 .await
                 .map_err(|err| UpstreamResponseStartError::UpstreamRequest(err.to_string()))?;
+            sender = reacquired.sender;
+            pool_hit &= reacquired.pool_hit;
+            connect_us = connect_us.saturating_add(reacquired.connect_us);
+            ready_us = ready_us.saturating_add(reacquired.ready_us);
             outbound = make_request()?;
-            sender.send_request(outbound).await.map_err(|err| {
+            let retry_send_started = Instant::now();
+            let response = sender.send_request(outbound).await.map_err(|err| {
                 UpstreamResponseStartError::UpstreamRequest(format!(
                     "outbound request to http://{authority}{request_path} failed while evaluating host call: {err}",
                 ))
-            })?
+            })?;
+            send_us = send_us.saturating_add(
+                u64::try_from(retry_send_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
+            response
         }
     };
+    if send_us == 0 {
+        send_us = u64::try_from(send_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    }
     let (parts, body) = upstream_response.into_parts();
     let content_length = header_content_length(&parts.headers);
     let body_is_empty = matches!(content_length, Some(0)) || body.is_end_stream();
@@ -4350,6 +4469,15 @@ async fn forward_native_default_upstream_http_via_sender_pool(
     };
     mark_outbound_tcp_connected(context, DEFAULT_UPSTREAM_EXCHANGE_HANDLE)
         .map_err(|err| UpstreamResponseStartError::Protocol(err.as_vm_error().to_string()))?;
+    record_native_forward_metrics(
+        pool_hit,
+        retries,
+        build_us,
+        connect_us,
+        ready_us,
+        send_us,
+        u64::try_from(total_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+    );
     Ok(NativeDefaultUpstreamForwardResponse {
         status: parts.status.as_u16(),
         headers: parts.headers,
