@@ -163,6 +163,25 @@ impl UpstreamProtocol {
         }
     }
 
+    fn fixture_flag_value(self) -> &'static str {
+        match self {
+            Self::Http1 => "http1",
+            Self::HttpsHttp2 => "https-http2",
+            Self::HttpsHttp3 => "https-http3",
+        }
+    }
+
+    fn parse_fixture_flag(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "http1" | "http" | "http11" | "1.1" => Ok(Self::Http1),
+            "https-http2" | "http2" | "https_h2" | "2" => Ok(Self::HttpsHttp2),
+            "https-http3" | "http3" | "https_h3" | "3" => Ok(Self::HttpsHttp3),
+            _ => Err(format!(
+                "invalid --serve-bench-upstream value: {value} (expected http1|https-http2|https-http3)"
+            )),
+        }
+    }
+
     fn requires_http2_tls(self) -> bool {
         matches!(self, Self::HttpsHttp2)
     }
@@ -238,6 +257,8 @@ fn proxy_roundtrip_program_source(
     flavor: ProxyProgramFlavor,
 ) -> String {
     let workload_source = selected_base_workload_source();
+    let use_specialized_default_forward = env_flag("PD_EDGE_PERF_USE_SPECIALIZED_DEFAULT_FORWARD");
+    let use_combined_default_forward = env_flag("PD_EDGE_PERF_USE_COMBINED_DEFAULT_FORWARD");
     let tls_import = if upstream_protocol.requires_tls() {
         "use tls;\n"
     } else {
@@ -273,26 +294,61 @@ tls::session::set_verify(session, false);
 ]"#
         .to_string(),
     };
-    let response_header_program = if upstream_protocol.requires_tls() {
-        format!(
-            r#"
+    let upstream_prelude =
+        if use_combined_default_forward && matches!(upstream_protocol, UpstreamProtocol::Http1) {
+            String::new()
+        } else {
+            format!(
+                r#"
+let upstream = http::exchange::prepare_default_upstream(
+    "{upstream_origin}",
+    "{version_preference}",
+    {batched_upstream_headers}
+);
+{tls_prelude}
+"#
+            )
+        };
+    let response_header_program =
+        if use_combined_default_forward && matches!(upstream_protocol, UpstreamProtocol::Http1) {
+            format!(
+                r#"
+proxy::prepare_and_forward_default_upstream(
+    "{upstream_origin}",
+    "{version_preference}",
+    {batched_upstream_headers},
+    {batched_response_headers}
+);
+"#
+            )
+        } else if use_specialized_default_forward
+            && matches!(upstream_protocol, UpstreamProtocol::Http1)
+        {
+            format!(
+                r#"
+proxy::forward_default_upstream({batched_response_headers});
+"#
+            )
+        } else if upstream_protocol.requires_tls() {
+            format!(
+                r#"
 let downstream = proxy::stream::downstream();
 let upstream_stream = proxy::stream::exchange(upstream);
 proxy::forward(downstream, upstream_stream);
 http::response::set_headers({batched_response_headers});
 http::response::set_header("x-upstream-alpn", tls::session::get_alpn(session));
 "#
-        )
-    } else {
-        format!(
-            r#"
+            )
+        } else {
+            format!(
+                r#"
 let downstream = proxy::stream::downstream();
 let upstream_stream = proxy::stream::exchange(upstream);
 proxy::forward(downstream, upstream_stream);
 http::response::set_headers({batched_response_headers});
 "#
-        )
-    };
+            )
+        };
     format!(
         r#"
 {workload_source}
@@ -303,12 +359,7 @@ use proxy;
 
 let downstream_version = http::request::get_http_version();
 
-let upstream = http::exchange::prepare_default_upstream(
-    "{upstream_origin}",
-    "{version_preference}",
-    {batched_upstream_headers}
-);
-{tls_prelude}
+{upstream_prelude}
 
 {response_header_program}
 "#
@@ -525,8 +576,9 @@ const SCENARIOS: [Scenario; 13] = [
 
 struct UpstreamFixture {
     origin: String,
-    connection_count: Option<Arc<AtomicUsize>>,
-    tasks: Vec<JoinHandle<()>>,
+    admin_origin: String,
+    tracks_connections: bool,
+    process: Child,
 }
 
 impl UpstreamFixture {
@@ -534,18 +586,37 @@ impl UpstreamFixture {
         &self.origin
     }
 
-    fn connection_count(&self) -> Option<usize> {
-        self.connection_count
-            .as_ref()
-            .map(|value| value.load(Ordering::Relaxed))
+    async fn connection_count(&self) -> Result<Option<usize>, Box<dyn std::error::Error>> {
+        if !self.tracks_connections {
+            return Ok(None);
+        }
+        let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
+        let response = client
+            .get(format!("{}/stats", self.admin_origin))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(io::Error::other(format!(
+                "upstream admin stats request failed: status={}",
+                response.status()
+            ))
+            .into());
+        }
+        #[derive(Deserialize)]
+        struct UpstreamStats {
+            connection_count: usize,
+        }
+        let stats: UpstreamStats = response.json().await?;
+        Ok(Some(stats.connection_count))
     }
 }
 
 impl Drop for UpstreamFixture {
     fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
+        if let Ok(None) = self.process.try_wait() {
+            let _ = self.process.kill();
         }
+        let _ = self.process.wait();
     }
 }
 
@@ -789,6 +860,13 @@ struct ProbeResponse {
     body: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BenchUpstreamServerConfig {
+    protocol: UpstreamProtocol,
+    data_addr: SocketAddr,
+    admin_addr: SocketAddr,
+}
+
 #[derive(Default)]
 struct WorkerRun {
     latencies_us: Vec<u64>,
@@ -807,6 +885,10 @@ struct ProxyProcess {
     child: Child,
 }
 
+struct UpstreamProcess {
+    child: Child,
+}
+
 struct ProxyProcessConfig<'a> {
     binary_path: &'a Path,
     data_addr: SocketAddr,
@@ -816,6 +898,13 @@ struct ProxyProcessConfig<'a> {
     vm_fuel: Option<u64>,
     vm_fuel_check_interval: u32,
     vm_execution_mode: VmExecutionModeArg,
+}
+
+struct UpstreamProcessConfig<'a> {
+    binary_path: &'a Path,
+    protocol: UpstreamProtocol,
+    data_addr: SocketAddr,
+    admin_addr: SocketAddr,
 }
 
 impl ProxyProcess {
@@ -832,15 +921,19 @@ impl ProxyProcess {
         } = config;
         let rust_log = env::var("PD_EDGE_PROXY_RUST_LOG").unwrap_or_else(|_| "error".to_string());
         let inherit_stdout = env_flag("PD_EDGE_PROXY_STDOUT_INHERIT");
+        let enable_proxy_logging = env_flag("PD_EDGE_PROXY_ENABLE_LOGGING");
         let mut command = Command::new(binary_path);
         let stdout = if inherit_stdout {
             Stdio::inherit()
         } else {
             Stdio::null()
         };
+        command.arg("--data-addr").arg(data_addr.to_string());
+        if !enable_proxy_logging {
+            command.arg("--disable-logging");
+        }
         command
-            .arg("--data-addr")
-            .arg(data_addr.to_string())
+            .arg("--disable-metrics")
             .arg("--tls-session-reuse-entries")
             .arg(BENCH_TLS_SESSION_REUSE_ENTRIES.to_string())
             .arg("--upstream-http-reuse-entries")
@@ -883,6 +976,42 @@ impl ProxyProcess {
 
     fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, io::Error> {
+        self.child.try_wait()
+    }
+}
+
+impl UpstreamProcess {
+    fn spawn(config: UpstreamProcessConfig<'_>) -> Result<Self, Box<dyn std::error::Error>> {
+        let UpstreamProcessConfig {
+            binary_path,
+            protocol,
+            data_addr,
+            admin_addr,
+        } = config;
+        let rust_log =
+            env::var("PD_EDGE_UPSTREAM_RUST_LOG").unwrap_or_else(|_| "error".to_string());
+        let inherit_stdout = env_flag("PD_EDGE_UPSTREAM_STDOUT_INHERIT");
+        let stdout = if inherit_stdout {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        };
+        let child = Command::new(binary_path)
+            .arg("--serve-bench-upstream")
+            .arg(protocol.fixture_flag_value())
+            .arg("--listen-addr")
+            .arg(data_addr.to_string())
+            .arg("--admin-addr")
+            .arg(admin_addr.to_string())
+            .env("RUST_LOG", rust_log)
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        Ok(Self { child })
     }
 
     fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, io::Error> {
@@ -1187,6 +1316,11 @@ impl Drop for ProxyProcess {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(server_config) = parse_bench_upstream_server_args(env::args().skip(1))? {
+        run_bench_upstream_server(server_config).await?;
+        return Ok(());
+    }
+
     let config = match parse_args() {
         Ok(value) => value,
         Err(message) => {
@@ -1231,6 +1365,148 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn parse_bench_upstream_server_args<I>(
+    args: I,
+) -> Result<Option<BenchUpstreamServerConfig>, Box<dyn std::error::Error>>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter().peekable();
+    let mut protocol = None;
+    let mut data_addr = None;
+    let mut admin_addr = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--serve-bench-upstream" => {
+                let value = next_internal_arg_value("--serve-bench-upstream", &mut args)
+                    .map_err(io::Error::other)?;
+                protocol =
+                    Some(UpstreamProtocol::parse_fixture_flag(&value).map_err(io::Error::other)?);
+            }
+            "--listen-addr" => {
+                let value = next_internal_arg_value("--listen-addr", &mut args)
+                    .map_err(io::Error::other)?;
+                data_addr = Some(
+                    parse_internal_socket_addr("--listen-addr", &value)
+                        .map_err(io::Error::other)?,
+                );
+            }
+            "--admin-addr" => {
+                let value =
+                    next_internal_arg_value("--admin-addr", &mut args).map_err(io::Error::other)?;
+                admin_addr = Some(
+                    parse_internal_socket_addr("--admin-addr", &value).map_err(io::Error::other)?,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    if protocol.is_none() && data_addr.is_none() && admin_addr.is_none() {
+        return Ok(None);
+    }
+
+    let protocol = protocol.ok_or_else(|| io::Error::other("missing --serve-bench-upstream"))?;
+    let data_addr = data_addr.ok_or_else(|| io::Error::other("missing --listen-addr"))?;
+    let admin_addr = admin_addr.ok_or_else(|| io::Error::other("missing --admin-addr"))?;
+
+    Ok(Some(BenchUpstreamServerConfig {
+        protocol,
+        data_addr,
+        admin_addr,
+    }))
+}
+
+fn parse_internal_socket_addr(flag: &str, value: &str) -> Result<SocketAddr, String> {
+    value
+        .parse::<SocketAddr>()
+        .map_err(|_| format!("invalid {flag}: {value}"))
+}
+
+fn next_internal_arg_value(
+    flag: &str,
+    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+) -> Result<String, String> {
+    let value = args
+        .next()
+        .ok_or_else(|| format!("missing value for {flag}"))?;
+    if value.trim().is_empty() {
+        return Err(format!("value for {flag} cannot be empty"));
+    }
+    Ok(value)
+}
+
+async fn run_bench_upstream_server(
+    config: BenchUpstreamServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let connection_count = Arc::new(AtomicUsize::new(0));
+    let admin_listener = tokio::net::TcpListener::bind(config.admin_addr).await?;
+    let admin_connection_count = connection_count.clone();
+    let admin_task = tokio::spawn(async move {
+        if let Err(err) = serve_bench_upstream_admin(admin_listener, admin_connection_count).await {
+            eprintln!("bench upstream admin server exited: {err}");
+        }
+    });
+
+    let data_result = match config.protocol {
+        UpstreamProtocol::Http1 => {
+            serve_plain_http_upstream_listener(config.data_addr, connection_count.clone()).await
+        }
+        UpstreamProtocol::HttpsHttp2 => {
+            serve_https_http2_upstream_listener(config.data_addr, connection_count.clone()).await
+        }
+        UpstreamProtocol::HttpsHttp3 => {
+            serve_https_http3_upstream_listener(config.data_addr, connection_count.clone()).await
+        }
+    };
+
+    admin_task.abort();
+    data_result
+}
+
+async fn serve_bench_upstream_admin(
+    listener: tokio::net::TcpListener,
+    connection_count: Arc<AtomicUsize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let connection_count = connection_count.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let service = service_fn(move |request: HyperRequest<Incoming>| {
+                let connection_count = connection_count.clone();
+                async move {
+                    let response = match request.uri().path() {
+                        "/healthz" => HyperResponse::new(Full::new(Bytes::from_static(b"ok"))),
+                        "/stats" => {
+                            let payload = format!(
+                                "{{\"connection_count\":{}}}",
+                                connection_count.load(Ordering::Relaxed)
+                            );
+                            let mut response = HyperResponse::new(Full::new(Bytes::from(payload)));
+                            response.headers_mut().insert(
+                                hyper::http::header::CONTENT_TYPE,
+                                HeaderValue::from_static("application/json"),
+                            );
+                            response
+                        }
+                        _ => HyperResponse::builder()
+                            .status(HttpStatusCode::NOT_FOUND)
+                            .body(Full::new(Bytes::from_static(b"not found")))
+                            .expect("upstream admin not found response should build"),
+                    };
+                    Ok::<_, std::convert::Infallible>(response)
+                }
+            });
+            let builder = hyper::server::conn::http1::Builder::new();
+            if let Err(err) = builder.serve_connection(io, service).await {
+                eprintln!("bench upstream admin connection ended: {err}");
+            }
+        });
+    }
 }
 
 async fn run_standard_bench(
@@ -1566,9 +1842,18 @@ async fn run_scenario(
     scenario: Scenario,
 ) -> Result<ScenarioReport, Box<dyn std::error::Error>> {
     let upstream_fixture = match scenario.upstream_protocol() {
-        Some(UpstreamProtocol::Http1) => Some(spawn_plain_http_upstream_fixture().await?),
-        Some(UpstreamProtocol::HttpsHttp2) => Some(spawn_https_http2_upstream_fixture().await?),
-        Some(UpstreamProtocol::HttpsHttp3) => Some(spawn_https_http3_upstream_fixture().await?),
+        Some(UpstreamProtocol::Http1) => Some(
+            spawn_plain_http_upstream_fixture(Duration::from_millis(config.startup_timeout_ms))
+                .await?,
+        ),
+        Some(UpstreamProtocol::HttpsHttp2) => Some(
+            spawn_https_http2_upstream_fixture(Duration::from_millis(config.startup_timeout_ms))
+                .await?,
+        ),
+        Some(UpstreamProtocol::HttpsHttp3) => Some(
+            spawn_https_http3_upstream_fixture(Duration::from_millis(config.startup_timeout_ms))
+                .await?,
+        ),
         None => None,
     };
     let program_bytes = match scenario.program_variant {
@@ -1744,6 +2029,12 @@ async fn run_scenario(
     } else {
         None
     };
+    if matches!(scenario.upstream_protocol(), Some(UpstreamProtocol::Http1))
+        && let Some(upstream_fixture) = upstream_fixture.as_ref()
+        && let Some(connection_count) = upstream_fixture.connection_count().await?
+    {
+        println!("upstream_connection_count={connection_count}");
+    }
 
     let responses_received: usize = run.status_counts.values().copied().sum();
     let unexpected_status_responses = run
@@ -2190,6 +2481,7 @@ async fn verify_upstream_reuse_probe(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let baseline_connections = upstream_fixture
         .connection_count()
+        .await?
         .ok_or_else(|| io::Error::other("missing upstream connection counter"))?;
     if baseline_connections != 1 {
         return Err(io::Error::other(format!(
@@ -2235,6 +2527,7 @@ async fn verify_upstream_reuse_probe(
 
     let after_parallel = upstream_fixture
         .connection_count()
+        .await?
         .ok_or_else(|| io::Error::other("missing upstream connection counter"))?;
     if after_parallel != 1 {
         return Err(io::Error::other(format!(
@@ -2267,6 +2560,7 @@ async fn verify_upstream_reuse_probe(
 
     let after_reuse = upstream_fixture
         .connection_count()
+        .await?
         .ok_or_else(|| io::Error::other("missing upstream connection counter"))?;
     if after_reuse != 1 {
         return Err(io::Error::other(format!(
@@ -2278,33 +2572,31 @@ async fn verify_upstream_reuse_probe(
     Ok(())
 }
 
-async fn spawn_plain_http_upstream_fixture() -> Result<UpstreamFixture, Box<dyn std::error::Error>>
-{
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let task = tokio::spawn(async move {
-        loop {
-            let (stream, _) = listener
-                .accept()
-                .await
-                .expect("http upstream benchmark accept should succeed");
-            tokio::spawn(async move {
-                let io = TokioIo::new(stream);
-                let service = service_fn(|request| async move {
-                    build_benchmark_upstream_response(request, "1.1").await
-                });
-                let builder = hyper::server::conn::http1::Builder::new();
-                if let Err(err) = builder.serve_connection(io, service).await {
-                    eprintln!("http upstream benchmark connection ended: {err}");
-                }
+async fn serve_plain_http_upstream_listener(
+    addr: SocketAddr,
+    connection_count: Arc<AtomicUsize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    loop {
+        let (stream, _) = listener.accept().await?;
+        connection_count.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let service = service_fn(|request| async move {
+                build_benchmark_upstream_response(request, "1.1").await
             });
-        }
-    });
-    Ok(UpstreamFixture {
-        origin: format!("http://{addr}"),
-        connection_count: None,
-        tasks: vec![task],
-    })
+            let builder = hyper::server::conn::http1::Builder::new();
+            if let Err(err) = builder.serve_connection(io, service).await {
+                eprintln!("http upstream benchmark connection ended: {err}");
+            }
+        });
+    }
+}
+
+async fn spawn_plain_http_upstream_fixture(
+    startup_timeout: Duration,
+) -> Result<UpstreamFixture, Box<dyn std::error::Error>> {
+    spawn_upstream_fixture_process(UpstreamProtocol::Http1, startup_timeout).await
 }
 
 async fn build_benchmark_upstream_response(
@@ -2441,8 +2733,10 @@ async fn prepare_benchmark_upstream_response(
 }
 
 #[cfg(all(feature = "http2", feature = "tls"))]
-async fn spawn_https_http2_upstream_fixture() -> Result<UpstreamFixture, Box<dyn std::error::Error>>
-{
+async fn serve_https_http2_upstream_listener(
+    addr: SocketAddr,
+    connection_count: Arc<AtomicUsize>,
+) -> Result<(), Box<dyn std::error::Error>> {
     ensure_rustls_provider();
     let cert = generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
         .map_err(|err| io::Error::other(format!("failed to generate benchmark cert: {err}")))?;
@@ -2457,50 +2751,49 @@ async fn spawn_https_http2_upstream_fixture() -> Result<UpstreamFixture, Box<dyn
         .map_err(|err| io::Error::other(format!("failed to build benchmark TLS config: {err}")))?;
     server_config.alpn_protocols = vec![b"h2".to_vec()];
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
-    let connection_count = Arc::new(AtomicUsize::new(0));
-    let task = tokio::spawn({
-        let connection_count = connection_count.clone();
-        async move {
-            loop {
-                let (stream, _) = listener
-                    .accept()
-                    .await
-                    .expect("http2 upstream benchmark accept should succeed");
-                connection_count.fetch_add(1, Ordering::Relaxed);
-                let acceptor = acceptor.clone();
-                tokio::spawn(async move {
-                    let tls_stream = acceptor
-                        .accept(stream)
-                        .await
-                        .expect("http2 upstream benchmark tls accept should succeed");
-                    let service = service_fn(|request| async move {
-                        build_benchmark_upstream_response(request, "2").await
-                    });
-                    let io = TokioIo::new(tls_stream);
-                    let builder = hyper::server::conn::http2::Builder::new(
-                        hyper_util::rt::TokioExecutor::new(),
-                    );
-                    if let Err(err) = builder.serve_connection(io, service).await {
-                        eprintln!("http2 upstream benchmark connection ended: {err}");
-                    }
-                });
+    loop {
+        let (stream, _) = listener.accept().await?;
+        connection_count.fetch_add(1, Ordering::Relaxed);
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            let tls_stream = acceptor
+                .accept(stream)
+                .await
+                .expect("http2 upstream benchmark tls accept should succeed");
+            let service = service_fn(|request| async move {
+                build_benchmark_upstream_response(request, "2").await
+            });
+            let io = TokioIo::new(tls_stream);
+            let builder =
+                hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+            if let Err(err) = builder.serve_connection(io, service).await {
+                eprintln!("http2 upstream benchmark connection ended: {err}");
             }
-        }
-    });
-
-    Ok(UpstreamFixture {
-        origin: format!("https://127.0.0.1:{}", addr.port()),
-        connection_count: Some(connection_count),
-        tasks: vec![task],
-    })
+        });
+    }
 }
 
 #[cfg(not(all(feature = "http2", feature = "tls")))]
-async fn spawn_https_http2_upstream_fixture() -> Result<UpstreamFixture, Box<dyn std::error::Error>>
-{
+async fn serve_https_http2_upstream_listener(
+    _addr: SocketAddr,
+    _connection_count: Arc<AtomicUsize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err(io::Error::other(HTTP2_TLS_FEATURE_HINT).into())
+}
+
+#[cfg(all(feature = "http2", feature = "tls"))]
+async fn spawn_https_http2_upstream_fixture(
+    startup_timeout: Duration,
+) -> Result<UpstreamFixture, Box<dyn std::error::Error>> {
+    spawn_upstream_fixture_process(UpstreamProtocol::HttpsHttp2, startup_timeout).await
+}
+
+#[cfg(not(all(feature = "http2", feature = "tls")))]
+async fn spawn_https_http2_upstream_fixture(
+    _startup_timeout: Duration,
+) -> Result<UpstreamFixture, Box<dyn std::error::Error>> {
     Err(io::Error::other(HTTP2_TLS_FEATURE_HINT).into())
 }
 
@@ -2787,10 +3080,11 @@ async fn serve_http3_bench_fixture_connection(connection: quinn::Connection) {
 }
 
 #[cfg(feature = "http3")]
-async fn spawn_https_http3_upstream_fixture() -> Result<UpstreamFixture, Box<dyn std::error::Error>>
-{
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
-    let addr = socket.local_addr()?;
+async fn serve_https_http3_upstream_listener(
+    addr: SocketAddr,
+    connection_count: Arc<AtomicUsize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let socket = tokio::net::UdpSocket::bind(addr).await?;
     let std_socket = socket.into_std()?;
     tune_udp_socket_buffers(&std_socket)?;
     let endpoint = quinn::Endpoint::new(
@@ -2799,34 +3093,71 @@ async fn spawn_https_http3_upstream_fixture() -> Result<UpstreamFixture, Box<dyn
         std_socket,
         Arc::new(quinn::TokioRuntime),
     )?;
-    let connection_count = Arc::new(AtomicUsize::new(0));
-    let task = tokio::spawn({
+    while let Some(incoming) = endpoint.accept().await {
         let connection_count = connection_count.clone();
-        async move {
-            while let Some(incoming) = endpoint.accept().await {
-                let connection_count = connection_count.clone();
-                tokio::spawn(async move {
-                    let connection = incoming
-                        .await
-                        .expect("http3 upstream benchmark QUIC handshake should succeed");
-                    connection_count.fetch_add(1, Ordering::Relaxed);
-                    serve_http3_bench_fixture_connection(connection).await;
-                });
-            }
-        }
-    });
-
-    Ok(UpstreamFixture {
-        origin: format!("https://127.0.0.1:{}", addr.port()),
-        connection_count: Some(connection_count),
-        tasks: vec![task],
-    })
+        tokio::spawn(async move {
+            let connection = incoming
+                .await
+                .expect("http3 upstream benchmark QUIC handshake should succeed");
+            connection_count.fetch_add(1, Ordering::Relaxed);
+            serve_http3_bench_fixture_connection(connection).await;
+        });
+    }
+    Ok(())
 }
 
 #[cfg(not(feature = "http3"))]
-async fn spawn_https_http3_upstream_fixture() -> Result<UpstreamFixture, Box<dyn std::error::Error>>
-{
+async fn serve_https_http3_upstream_listener(
+    _addr: SocketAddr,
+    _connection_count: Arc<AtomicUsize>,
+) -> Result<(), Box<dyn std::error::Error>> {
     Err(io::Error::other(HTTP3_TLS_FEATURE_HINT).into())
+}
+
+#[cfg(feature = "http3")]
+async fn spawn_https_http3_upstream_fixture(
+    startup_timeout: Duration,
+) -> Result<UpstreamFixture, Box<dyn std::error::Error>> {
+    spawn_upstream_fixture_process(UpstreamProtocol::HttpsHttp3, startup_timeout).await
+}
+
+#[cfg(not(feature = "http3"))]
+async fn spawn_https_http3_upstream_fixture(
+    _startup_timeout: Duration,
+) -> Result<UpstreamFixture, Box<dyn std::error::Error>> {
+    Err(io::Error::other(HTTP3_TLS_FEATURE_HINT).into())
+}
+
+async fn spawn_upstream_fixture_process(
+    protocol: UpstreamProtocol,
+    startup_timeout: Duration,
+) -> Result<UpstreamFixture, Box<dyn std::error::Error>> {
+    let data_addr = match protocol {
+        UpstreamProtocol::HttpsHttp3 => reserve_loopback_udp_addr()?,
+        _ => reserve_loopback_addr()?,
+    };
+    let admin_addr = reserve_loopback_addr()?;
+    let binary_path = env::current_exe()?;
+    let mut process = UpstreamProcess::spawn(UpstreamProcessConfig {
+        binary_path: &binary_path,
+        protocol,
+        data_addr,
+        admin_addr,
+    })?;
+    let admin_origin = format!("http://{admin_addr}");
+    let admin_client = Client::builder().timeout(Duration::from_secs(2)).build()?;
+    wait_until_upstream_ready(&admin_client, &admin_origin, startup_timeout, &mut process).await?;
+    Ok(UpstreamFixture {
+        origin: match protocol {
+            UpstreamProtocol::Http1 => format!("http://{data_addr}"),
+            UpstreamProtocol::HttpsHttp2 | UpstreamProtocol::HttpsHttp3 => {
+                format!("https://127.0.0.1:{}", data_addr.port())
+            }
+        },
+        admin_origin,
+        tracks_connections: true,
+        process: process.child,
+    })
 }
 
 async fn upload_program(
@@ -2849,6 +3180,39 @@ async fn upload_program(
         .into());
     }
     Ok(())
+}
+
+async fn wait_until_upstream_ready(
+    client: &Client,
+    admin_origin: &str,
+    timeout: Duration,
+    process: &mut UpstreamProcess,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = process.try_wait()? {
+            return Err(io::Error::other(format!(
+                "upstream process exited before ready: {status}"
+            ))
+            .into());
+        }
+
+        if let Ok(response) = client.get(format!("{admin_origin}/healthz")).send().await
+            && response.status().is_success()
+        {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out waiting for upstream admin endpoint at {admin_origin}"),
+            )
+            .into());
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn wait_until_proxy_ready(
@@ -3062,8 +3426,7 @@ fn resolve_proxy_binary_path(
         .join(profile)
         .join(proxy_binary_name());
 
-    let force_rebuild_for_features = !required_features.is_empty();
-    if !binary_path.exists() || (config.auto_build && force_rebuild_for_features) {
+    if !binary_path.exists() || config.auto_build {
         if config.auto_build {
             build_proxy_binary(&workspace_root, config.release_build, required_features)?;
         } else {
