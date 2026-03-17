@@ -8,9 +8,8 @@ use std::{
     task::{Context, Poll},
 };
 
-use axum::http::Version;
+use axum::http::{Version, uri::Authority};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use url::Url;
 
 use crate::cache::ShardedRwLruStore;
 
@@ -227,10 +226,17 @@ impl TcpSocketPhase {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SocketTargetState {
+    authority: String,
+    host: String,
+    port: u16,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct SocketAddressState {
     present: bool,
     bind_address: Option<String>,
-    target: Option<String>,
+    target: Option<SocketTargetState>,
     local_address: Option<String>,
     peer_address: Option<String>,
     failure_message: Option<String>,
@@ -248,9 +254,13 @@ impl SocketAddressState {
         self.failure_message = None;
     }
 
-    fn set_target(&mut self, target: String) {
+    fn set_target(&mut self, authority: String, host: String, port: u16) {
         self.present = true;
-        self.target = Self::optional_value(target);
+        self.target = Some(SocketTargetState {
+            authority,
+            host,
+            port,
+        });
         self.peer_address = None;
         self.failure_message = None;
     }
@@ -284,7 +294,11 @@ impl SocketAddressState {
     }
 
     fn target(&self) -> Option<&str> {
-        self.target.as_deref()
+        self.target.as_ref().map(|target| target.authority.as_str())
+    }
+
+    fn target_host(&self) -> Option<&str> {
+        self.target.as_ref().map(|target| target.host.as_str())
     }
 
     fn local_address(&self) -> &str {
@@ -294,7 +308,7 @@ impl SocketAddressState {
     fn peer_address(&self) -> &str {
         self.peer_address
             .as_deref()
-            .or(self.target.as_deref())
+            .or_else(|| self.target())
             .unwrap_or_default()
     }
 
@@ -320,8 +334,8 @@ impl TcpSocketState {
         }
     }
 
-    pub(crate) fn set_target(&mut self, target: String) {
-        self.core.set_target(target);
+    pub(crate) fn set_target(&mut self, authority: String, host: String, port: u16) {
+        self.core.set_target(authority, host, port);
         self.read_eof = false;
         self.phase = TcpSocketPhase::Configured;
     }
@@ -386,6 +400,10 @@ impl TcpSocketState {
         self.core.target()
     }
 
+    pub(crate) fn target_host(&self) -> Option<&str> {
+        self.core.target_host()
+    }
+
     pub(crate) fn local_address(&self) -> &str {
         self.core.local_address()
     }
@@ -437,8 +455,8 @@ impl UdpSocketState {
         }
     }
 
-    pub(crate) fn set_target(&mut self, target: String) {
-        self.core.set_target(target);
+    pub(crate) fn set_target(&mut self, authority: String, host: String, port: u16) {
+        self.core.set_target(authority, host, port);
         self.phase = UdpSocketPhase::Configured;
     }
 
@@ -791,13 +809,15 @@ impl TlsFlowState {
         }
     }
 
-    pub(crate) fn observe_target(&mut self, target: &str) {
-        let peer_name = upstream_target_host(target);
-        self.observe_target_parts(upstream_target_uses_tls(target), peer_name);
+    pub(crate) fn observe_target(&mut self, scheme: &str, host: &str) {
+        self.observe_target_parts(
+            matches!(scheme.to_ascii_lowercase().as_str(), "https" | "wss"),
+            normalize_authority_host(host),
+        );
     }
 
-    pub(crate) fn observe_socket_target(&mut self, target: &str) {
-        let peer_name = upstream_target_host(target);
+    pub(crate) fn observe_socket_target(&mut self, host: &str) {
+        let peer_name = normalize_authority_host(host);
         self.present = peer_name.is_some();
         self.handshake_complete = false;
         self.plaintext_ready = false;
@@ -1211,36 +1231,6 @@ fn alpn_from_http_version_label(version: &str) -> Option<String> {
     }
 }
 
-fn upstream_target_uses_tls(target: &str) -> bool {
-    Url::parse(target)
-        .map(|url| matches!(url.scheme().to_ascii_lowercase().as_str(), "https" | "wss"))
-        .unwrap_or(false)
-}
-
-fn upstream_target_host(target: &str) -> Option<String> {
-    if target.contains("://")
-        && let Ok(url) = Url::parse(target)
-    {
-        return url.host_str().map(str::to_string);
-    }
-
-    Url::parse(&format!("http://{target}"))
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string))
-}
-
-fn tls_session_origin(target: &str) -> Option<String> {
-    let url = Url::parse(target).ok()?;
-    let host = url.host_str()?.to_ascii_lowercase();
-    let port = url.port_or_known_default()?;
-    Some(format!(
-        "{}://{}:{}",
-        url.scheme().to_ascii_lowercase(),
-        host,
-        port
-    ))
-}
-
 fn fingerprint_optional_pem(value: Option<&str>) -> Option<u64> {
     let value = value?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1249,14 +1239,16 @@ fn fingerprint_optional_pem(value: Option<&str>) -> Option<u64> {
 }
 
 pub(crate) fn tls_session_cache_key(
-    target: &str,
+    scheme: &str,
+    host: &str,
+    port: u16,
     flow: &TlsFlowState,
 ) -> Option<TlsSessionCacheKey> {
     if !flow.is_present() {
         return None;
     }
     Some(TlsSessionCacheKey {
-        origin: tls_session_origin(target)?,
+        origin: tls_session_origin(scheme, host, port)?,
         desired_alpn: flow.desired_alpn().to_vec(),
         verify_peer: flow.verify_peer(),
         verify_hostname: flow.verify_hostname(),
@@ -1269,10 +1261,19 @@ pub(crate) fn tls_session_cache_key(
     })
 }
 
+fn tls_session_origin(scheme: &str, host: &str, port: u16) -> Option<String> {
+    let host = normalize_authority_host(host)?.to_ascii_lowercase();
+    Some(format!("{}://{}:{port}", scheme.to_ascii_lowercase(), host))
+}
+
 fn normalize_authority_host(value: &str) -> Option<String> {
-    Url::parse(&format!("http://{value}"))
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string))
+    let authority = Authority::from_maybe_shared(value.to_string()).ok()?;
+    let host = authority.host().trim_matches(['[', ']']);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1333,7 +1334,7 @@ mod tests {
         assert_eq!(socket.phase(), UdpSocketPhase::Bound);
         assert_eq!(socket.bind_address(), Some("127.0.0.1:0"));
 
-        socket.set_target("127.0.0.1:9000".to_string());
+        socket.set_target("127.0.0.1:9000".to_string(), "127.0.0.1".to_string(), 9000);
         assert_eq!(socket.phase(), UdpSocketPhase::Configured);
         assert_eq!(socket.peer_address(), "127.0.0.1:9000");
 
@@ -1389,7 +1390,7 @@ mod tests {
     #[test]
     fn observing_upstream_https_target_resets_tls_flow_until_handshake_completes() {
         let mut flow = TlsFlowState::default();
-        flow.observe_target("https://origin.example.net:8443/path");
+        flow.observe_target("https", "origin.example.net");
         assert!(flow.is_present());
         assert_eq!(flow.peer_name(), "origin.example.net");
         assert_eq!(flow.server_name(), "origin.example.net");
@@ -1413,7 +1414,7 @@ mod tests {
     #[test]
     fn observing_plain_http_target_clears_tls_presence() {
         let mut flow = TlsFlowState::for_downstream_request("https", "downstream.example", "1.1");
-        flow.observe_target("http://origin.example.net/plain");
+        flow.observe_target("http", "origin.example.net");
         assert!(!flow.is_present());
         assert_eq!(flow.peer_name(), "origin.example.net");
         assert_eq!(flow.alpn(), "");
@@ -1425,7 +1426,7 @@ mod tests {
     #[test]
     fn observing_dynamic_socket_target_sets_tls_server_name() {
         let mut flow = TlsFlowState::for_dynamic_socket();
-        flow.observe_socket_target("localhost:8443");
+        flow.observe_socket_target("localhost");
 
         assert!(flow.is_present());
         assert_eq!(flow.phase_label(), "configured");
@@ -1436,7 +1437,7 @@ mod tests {
     #[test]
     fn tls_configuration_flags_and_alpn_filters_are_tracked() {
         let mut flow = TlsFlowState::default();
-        flow.observe_target("https://origin.example.net/api");
+        flow.observe_target("https", "origin.example.net");
         flow.set_desired_alpn(vec!["h2".to_string(), "http/1.1".to_string()]);
         flow.set_verify_peer(false);
         flow.set_verify_hostname(false);
@@ -1465,7 +1466,7 @@ mod tests {
     #[test]
     fn tls_failure_phase_is_recorded() {
         let mut flow = TlsFlowState::default();
-        flow.observe_target("https://origin.example.net/api");
+        flow.observe_target("https", "origin.example.net");
         flow.note_handshake_prepared();
         flow.note_client_hello_sent();
         flow.mark_failed();
@@ -1494,7 +1495,7 @@ mod tests {
     #[test]
     fn resumed_tls_session_marks_handshake_complete_without_full_handshake_path() {
         let mut flow = TlsFlowState::default();
-        flow.observe_target("https://origin.example.net/api");
+        flow.observe_target("https", "origin.example.net");
         flow.mark_session_reused(&CachedTlsSession {
             negotiated_alpn: Some("h2".to_string()),
             peer_name: Some("origin.example.net".to_string()),
@@ -1513,21 +1514,21 @@ mod tests {
     #[test]
     fn tls_session_cache_key_is_origin_scoped_and_configuration_sensitive() {
         let mut first = TlsFlowState::default();
-        first.observe_target("https://origin.example.net:8443/a");
+        first.observe_target("https", "origin.example.net");
         first.set_verify_peer(false);
         first.set_desired_alpn(vec!["h2".to_string()]);
 
         let mut second = first.clone();
-        second.observe_target("https://origin.example.net:8443/b");
+        second.observe_target("https", "origin.example.net");
 
-        let first_key = tls_session_cache_key("https://origin.example.net:8443/a", &first)
+        let first_key = tls_session_cache_key("https", "origin.example.net", 8443, &first)
             .expect("key should build");
-        let second_key = tls_session_cache_key("https://origin.example.net:8443/b", &second)
+        let second_key = tls_session_cache_key("https", "origin.example.net", 8443, &second)
             .expect("key should build");
         assert_eq!(first_key, second_key);
 
         second.set_verify_hostname(false);
-        let changed_key = tls_session_cache_key("https://origin.example.net:8443/b", &second)
+        let changed_key = tls_session_cache_key("https", "origin.example.net", 8443, &second)
             .expect("key should build");
         assert_ne!(first_key, changed_key);
     }

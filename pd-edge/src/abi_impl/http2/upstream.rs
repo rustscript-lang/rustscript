@@ -10,6 +10,16 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+use crate::abi_impl::http::HttpUpstreamScheme;
+#[cfg(feature = "http2")]
+use crate::abi_impl::transport::{
+    HTTP11_ALPN_PROTOCOL, TlsFlowState, TlsProtocolVersion, TlsSessionCacheKey,
+    tls_session_cache_key,
+};
+#[cfg(feature = "http2")]
+use crate::cache::ShardedRwLruStore;
+#[cfg(feature = "http2")]
+use crate::lock_metrics::{self, LockMetricKey, ProfiledMutexGuard};
 #[cfg(feature = "http2")]
 use axum::{
     body::Bytes,
@@ -35,17 +45,6 @@ use tokio_rustls::{
         version::{TLS12, TLS13},
     },
 };
-use url::Url;
-
-#[cfg(feature = "http2")]
-use crate::abi_impl::transport::{
-    HTTP11_ALPN_PROTOCOL, TlsFlowState, TlsProtocolVersion, TlsSessionCacheKey,
-    tls_session_cache_key,
-};
-#[cfg(feature = "http2")]
-use crate::cache::ShardedRwLruStore;
-#[cfg(feature = "http2")]
-use crate::lock_metrics::{self, LockMetricKey, ProfiledMutexGuard};
 
 use super::Http2UpstreamMode;
 #[cfg(feature = "http2")]
@@ -640,8 +639,12 @@ impl Http2UpstreamSessionDagState {
 pub(crate) struct Http2SendRequest<'a> {
     pub(crate) sessions: &'a SharedHttpUpstreamSessions,
     pub(crate) exchange_handle: i64,
-    pub(crate) target: &'a str,
-    pub(crate) upstream_url: &'a str,
+    pub(crate) target_scheme: HttpUpstreamScheme,
+    pub(crate) target_host: &'a str,
+    pub(crate) target_port: u16,
+    pub(crate) target_host_header: Option<&'a str>,
+    pub(crate) request_path: &'a str,
+    pub(crate) request_query: &'a str,
     pub(crate) mode: Http2UpstreamMode,
     pub(crate) tls_flow: &'a TlsFlowState,
     pub(crate) method: Method,
@@ -656,15 +659,27 @@ pub(crate) async fn send_request(
     let Http2SendRequest {
         sessions,
         exchange_handle,
-        target,
-        upstream_url,
+        target_scheme,
+        target_host,
+        target_port,
+        target_host_header,
+        request_path,
+        request_query,
         mode,
         tls_flow,
         method,
         headers,
         request_body,
     } = request;
-    let session = acquire_or_open_session(sessions, target, mode, tls_flow).await?;
+    let session = acquire_or_open_session(
+        sessions,
+        target_scheme,
+        target_host,
+        target_port,
+        mode,
+        tls_flow,
+    )
+    .await?;
     let mut sender = session.sender.clone();
     sender.ready().await.map_err(|err| {
         let observed = classify_http2_error(&err);
@@ -677,7 +692,16 @@ pub(crate) async fn send_request(
 
     let stream_ref = session.reserve_stream(exchange_handle)?;
     let request_body_present = !request_body.is_empty();
-    let request = build_http2_request(upstream_url, method, headers, request_body)?;
+    let request = build_http2_request(
+        request_path,
+        request_query,
+        target_host,
+        target_port,
+        target_host_header,
+        method,
+        headers,
+        request_body,
+    )?;
     let response = sender.send_request(request).await.map_err(|err| {
         let observed = classify_http2_error(&err);
         apply_stream_error(&session, stream_ref.stream_id, &observed);
@@ -778,27 +802,35 @@ where
 
 #[cfg(feature = "http2")]
 fn build_http2_request(
-    upstream_url: &str,
+    request_path: &str,
+    request_query: &str,
+    target_host: &str,
+    target_port: u16,
+    target_host_header: Option<&str>,
     method: Method,
     mut headers: HeaderMap,
     request_body: Vec<u8>,
 ) -> Result<Request<Full<Bytes>>, Http2RequestError> {
-    let url = Url::parse(upstream_url).map_err(|err| {
-        Http2RequestError::transport(format!("invalid upstream URL '{upstream_url}': {err}"))
-    })?;
-    let path_and_query = match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => url.path().to_string(),
+    let path = if request_path.is_empty() {
+        "/"
+    } else {
+        request_path
+    };
+    let path_and_query = if request_query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{request_query}")
     };
 
     if !headers.contains_key(HOST) {
-        let host_value = if let Some(port) = url.port() {
-            format!("{}:{port}", url.host_str().unwrap_or_default())
-        } else {
-            url.host_str().unwrap_or_default().to_string()
-        };
+        let host_value = target_host_header
+            .map(str::to_string)
+            .unwrap_or_else(|| format_upstream_authority(target_host, target_port));
         let value = HeaderValue::from_str(&host_value).map_err(|err| {
-            Http2RequestError::transport(format!("invalid host header for '{upstream_url}': {err}"))
+            Http2RequestError::transport(format!(
+                "invalid host header for '{}://{}': {err}",
+                "http", host_value
+            ))
         })?;
         headers.insert(HOST, value);
     }
@@ -815,15 +847,18 @@ fn build_http2_request(
 #[cfg(feature = "http2")]
 async fn acquire_or_open_session(
     sessions: &SharedHttpUpstreamSessions,
-    target: &str,
+    target_scheme: HttpUpstreamScheme,
+    target_host: &str,
+    target_port: u16,
     mode: Http2UpstreamMode,
     tls_flow: &TlsFlowState,
 ) -> Result<Arc<Http2UpstreamSession>, Http2RequestError> {
-    let key = session_key(target, mode, tls_flow).ok_or_else(|| {
-        Http2RequestError::transport(format!(
-            "http2 session key could not be built for target '{target}'",
-        ))
-    })?;
+    let key =
+        session_key(target_scheme, target_host, target_port, mode, tls_flow).ok_or_else(|| {
+            Http2RequestError::transport(format!(
+                "http2 session key could not be built for target {target_host}:{target_port}",
+            ))
+        })?;
 
     let entry = sessions.sessions.get_or_insert_with_cloned(
         key,
@@ -839,7 +874,15 @@ async fn acquire_or_open_session(
 
         if entry.try_begin_open() {
             let session_id = sessions.next_session_id.fetch_add(1, Ordering::Relaxed) + 1;
-            let opened = open_session(target, mode, tls_flow, session_id).await;
+            let opened = open_session(
+                target_scheme,
+                target_host,
+                target_port,
+                mode,
+                tls_flow,
+                session_id,
+            )
+            .await;
             match opened {
                 Ok(session) => {
                     entry.finish_open(Some(session.clone()));
@@ -858,15 +901,17 @@ async fn acquire_or_open_session(
 
 #[cfg(feature = "http2")]
 fn session_key(
-    target: &str,
+    target_scheme: HttpUpstreamScheme,
+    target_host: &str,
+    target_port: u16,
     mode: Http2UpstreamMode,
     tls_flow: &TlsFlowState,
 ) -> Option<Http2SessionKey> {
     Some(Http2SessionKey {
-        origin: session_origin(target)?,
+        origin: session_origin(target_scheme, target_host, target_port)?,
         mode,
         tls_key: if tls_flow.is_present() {
-            tls_session_cache_key(target, tls_flow)
+            tls_session_cache_key(target_scheme.as_str(), target_host, target_port, tls_flow)
         } else {
             None
         },
@@ -875,7 +920,9 @@ fn session_key(
 
 #[cfg(feature = "http2")]
 async fn open_session(
-    target: &str,
+    _target_scheme: HttpUpstreamScheme,
+    target_host: &str,
+    target_port: u16,
     mode: Http2UpstreamMode,
     tls_flow: &TlsFlowState,
     session_id: u64,
@@ -883,7 +930,7 @@ async fn open_session(
     match mode {
         Http2UpstreamMode::AutomaticTls => {
             let (sender, negotiated_alpn, peer_certificate_der, connection, peer_addr) =
-                connect_tls_http2(target, tls_flow, session_id).await?;
+                connect_tls_http2(target_host, target_port, tls_flow, session_id).await?;
             let session = Arc::new(Http2UpstreamSession::new(
                 session_id,
                 sender,
@@ -896,7 +943,7 @@ async fn open_session(
         }
         Http2UpstreamMode::PriorKnowledge => {
             let (sender, peer_addr, connection) =
-                connect_cleartext_http2(target, session_id).await?;
+                connect_cleartext_http2(target_host, target_port, session_id).await?;
             let session = Arc::new(Http2UpstreamSession::new(
                 session_id, sender, peer_addr, None, None,
             ));
@@ -911,7 +958,8 @@ async fn open_session(
 
 #[cfg(feature = "http2")]
 async fn connect_cleartext_http2(
-    target: &str,
+    host: &str,
+    port: u16,
     session_id: u64,
 ) -> Result<
     (
@@ -921,16 +969,6 @@ async fn connect_cleartext_http2(
     ),
     Http2RequestError,
 > {
-    let url = Url::parse(target).map_err(|err| {
-        Http2RequestError::transport(format!("invalid cleartext http2 target '{target}': {err}"))
-    })?;
-    let host = url.host_str().ok_or_else(|| {
-        Http2RequestError::transport(format!("http2 target '{target}' is missing a host"))
-    })?;
-    let port = url.port_or_known_default().ok_or_else(|| {
-        Http2RequestError::transport(format!("http2 target '{target}' is missing a port"))
-    })?;
-
     let stream = TcpStream::connect((host, port)).await.map_err(|err| {
         Http2RequestError::transport(format!(
             "http2 session {session_id} failed to connect to {host}:{port}: {err}",
@@ -958,7 +996,8 @@ async fn connect_cleartext_http2(
 
 #[cfg(feature = "http2")]
 async fn connect_tls_http2(
-    target: &str,
+    host: &str,
+    port: u16,
     tls_flow: &TlsFlowState,
     session_id: u64,
 ) -> Result<
@@ -975,15 +1014,6 @@ async fn connect_tls_http2(
     ),
     Http2RequestError,
 > {
-    let url = Url::parse(target).map_err(|err| {
-        Http2RequestError::transport(format!("invalid tls http2 target '{target}': {err}"))
-    })?;
-    let host = url.host_str().ok_or_else(|| {
-        Http2RequestError::transport(format!("http2 target '{target}' is missing a host"))
-    })?;
-    let port = url.port_or_known_default().ok_or_else(|| {
-        Http2RequestError::transport(format!("http2 target '{target}' is missing a port"))
-    })?;
     let stream = TcpStream::connect((host, port)).await.map_err(|err| {
         Http2RequestError::transport(format!(
             "http2 session {session_id} failed to connect to {host}:{port}: {err}",
@@ -1348,30 +1378,44 @@ impl ServerCertVerifier for PermissiveServerCertVerifier {
     }
 }
 
-fn session_origin(target: &str) -> Option<String> {
-    let url = Url::parse(target).ok()?;
-    let host = url.host_str()?.to_ascii_lowercase();
-    let port = url.port_or_known_default()?;
+fn session_origin(
+    target_scheme: HttpUpstreamScheme,
+    target_host: &str,
+    target_port: u16,
+) -> Option<String> {
+    if target_host.is_empty() || target_port == 0 {
+        return None;
+    }
     Some(format!(
-        "{}://{}:{}",
-        url.scheme().to_ascii_lowercase(),
-        host,
-        port
+        "{}://{}:{target_port}",
+        target_scheme.as_str(),
+        target_host.to_ascii_lowercase()
     ))
+}
+
+#[cfg(feature = "http2")]
+fn format_upstream_authority(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::abi_impl::http::HttpUpstreamScheme;
+
     use super::session_origin;
 
     #[test]
     fn session_origin_normalizes_scheme_host_and_port() {
         assert_eq!(
-            session_origin("HTTPS://Example.COM/path?x=1").as_deref(),
+            session_origin(HttpUpstreamScheme::Https, "Example.COM", 443).as_deref(),
             Some("https://example.com:443")
         );
         assert_eq!(
-            session_origin("http://Example.COM:8080/path").as_deref(),
+            session_origin(HttpUpstreamScheme::Http, "Example.COM", 8080).as_deref(),
             Some("http://example.com:8080")
         );
     }

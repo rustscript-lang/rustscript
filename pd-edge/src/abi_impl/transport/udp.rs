@@ -54,7 +54,11 @@ fn parse_positive_chunk_size(max_bytes: i64) -> Result<usize, VmError> {
     })
 }
 
-fn format_socket_authority(host: &str, port: i64, protocol: &str) -> Result<String, VmError> {
+fn format_socket_authority(
+    host: &str,
+    port: i64,
+    protocol: &str,
+) -> Result<(String, String, u16), VmError> {
     if host.is_empty() || host.chars().any(|ch| ch.is_whitespace()) {
         return Err(VmError::HostError(format!(
             "{protocol} target host must be non-empty and contain no whitespace, got '{host}'",
@@ -79,13 +83,13 @@ fn format_socket_authority(host: &str, port: i64, protocol: &str) -> Result<Stri
     } else {
         format!("{bare_host}:{port}")
     };
-    Authority::from_maybe_shared(authority.clone())
-        .map_err(|_| {
-            VmError::HostError(format!(
-                "invalid {protocol} target host='{host}' port={port}",
-            ))
-        })
-        .map(|_| authority)
+    let parsed = Authority::from_maybe_shared(authority.clone()).map_err(|_| {
+        VmError::HostError(format!(
+            "invalid {protocol} target host='{host}' port={port}",
+        ))
+    })?;
+    let normalized_host = parsed.host().trim_matches(['[', ']']).to_string();
+    Ok((authority, normalized_host, port))
 }
 
 fn socket_state(context: &SharedProxyVmContext, socket: UdpSocketHandle) -> UdpSocketState {
@@ -326,11 +330,12 @@ async fn socket_set_target(
     host: String,
     port: i64,
 ) -> Result<CallOutcome, VmError> {
-    let normalized = format_socket_authority(&host, port, "udp")?;
+    let (authority, normalized_host, normalized_port) =
+        format_socket_authority(&host, port, "udp")?;
     decode_socket(&context, socket)?;
     with_mutable_udp_socket_state(&context, socket, |state, io| {
         *io = None;
-        state.set_target(normalized);
+        state.set_target(authority, normalized_host, normalized_port);
         Ok(())
     })?;
     Ok(CallOutcome::Return(vec![]))

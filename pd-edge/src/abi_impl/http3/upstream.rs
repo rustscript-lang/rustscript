@@ -19,11 +19,10 @@ use futures_util::future;
 use quinn::ConnectionError;
 #[cfg(feature = "http3")]
 use tokio::net::lookup_host;
-#[cfg(feature = "http3")]
-use url::Url;
 
 #[cfg(feature = "http3")]
 use crate::abi_impl::{
+    http::HttpUpstreamScheme,
     quic::{
         build_quic_client_config, negotiated_alpn, peer_certificate_der, tune_udp_socket_buffers,
     },
@@ -241,7 +240,10 @@ pub(crate) struct Http3ObservedError {
 #[derive(Clone)]
 pub(crate) struct Http3SendRequestOptions {
     pub(crate) exchange_handle: i64,
-    pub(crate) target: String,
+    pub(crate) target_scheme: HttpUpstreamScheme,
+    pub(crate) target_host: String,
+    pub(crate) target_port: u16,
+    pub(crate) target_host_header: Option<String>,
     pub(crate) upstream_url: String,
     pub(crate) method: Method,
     pub(crate) headers: HeaderMap,
@@ -532,29 +534,31 @@ impl Http3SessionPoolEntry {
 }
 
 #[cfg(feature = "http3")]
-fn session_key(target: &str, tls_flow: &TlsFlowState) -> Option<Http3SessionKey> {
+fn session_key(
+    target_scheme: HttpUpstreamScheme,
+    target_host: &str,
+    target_port: u16,
+    tls_flow: &TlsFlowState,
+) -> Option<Http3SessionKey> {
     Some(Http3SessionKey {
-        origin: session_origin(target)?,
-        tls_key: tls_session_cache_key(target, tls_flow),
+        origin: session_origin(target_scheme, target_host, target_port)?,
+        tls_key: tls_session_cache_key(target_scheme.as_str(), target_host, target_port, tls_flow),
     })
 }
 
 #[cfg(feature = "http3")]
 fn build_http3_request(
     upstream_url: &str,
+    target_host: &str,
+    target_port: u16,
+    target_host_header: Option<&str>,
     method: Method,
     mut headers: HeaderMap,
 ) -> Result<Request<()>, Http3RequestError> {
-    let url = Url::parse(upstream_url).map_err(|err| {
-        Http3RequestError::transport(format!("invalid upstream URL '{upstream_url}': {err}"))
-    })?;
-
     if !headers.contains_key(HOST) {
-        let host_value = if let Some(port) = url.port() {
-            format!("{}:{port}", url.host_str().unwrap_or_default())
-        } else {
-            url.host_str().unwrap_or_default().to_string()
-        };
+        let host_value = target_host_header
+            .map(str::to_string)
+            .unwrap_or_else(|| format_upstream_authority(target_host, target_port));
         let value = HeaderValue::from_str(&host_value).map_err(|err| {
             Http3RequestError::transport(format!("invalid host header for '{upstream_url}': {err}"))
         })?;
@@ -571,15 +575,26 @@ fn build_http3_request(
 }
 
 #[cfg(feature = "http3")]
+fn format_upstream_authority(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+#[cfg(feature = "http3")]
 async fn acquire_or_open_session(
     sessions: &SharedHttp3UpstreamSessions,
-    target: &str,
+    target_scheme: HttpUpstreamScheme,
+    target_host: &str,
+    target_port: u16,
     tls_flow: &TlsFlowState,
     mode: Http3UpstreamMode,
 ) -> Result<Arc<Http3UpstreamSession>, Http3RequestError> {
-    let key = session_key(target, tls_flow).ok_or_else(|| {
+    let key = session_key(target_scheme, target_host, target_port, tls_flow).ok_or_else(|| {
         Http3RequestError::transport(format!(
-            "http3 session key could not be built for target '{target}'"
+            "http3 session key could not be built for target {target_host}:{target_port}"
         ))
     })?;
 
@@ -604,7 +619,7 @@ async fn acquire_or_open_session(
         }
     }
 
-    match connect_session(target, tls_flow, mode).await {
+    match connect_session(target_scheme, target_host, target_port, tls_flow, mode).await {
         Ok(session) => {
             let mut guard = lock_metrics::lock(
                 sessions,
@@ -691,33 +706,29 @@ impl ConnectedHttp3Session {
 
 #[cfg(feature = "http3")]
 async fn connect_session(
-    target: &str,
+    target_scheme: HttpUpstreamScheme,
+    target_host: &str,
+    target_port: u16,
     tls_flow: &TlsFlowState,
     mode: Http3UpstreamMode,
 ) -> Result<ConnectedHttp3Session, Http3RequestError> {
-    let url = Url::parse(target).map_err(|err| {
-        Http3RequestError::transport(format!("invalid http3 target '{target}': {err}"))
-    })?;
-    if !url.scheme().eq_ignore_ascii_case("https") {
+    if target_scheme != HttpUpstreamScheme::Https {
         return Err(Http3RequestError::transport(
             "http3 requires an https target".to_string(),
         ));
     }
-
-    let host = url.host_str().ok_or_else(|| {
-        Http3RequestError::transport(format!("http3 target '{target}' is missing a host"))
-    })?;
-    let port = url.port_or_known_default().ok_or_else(|| {
-        Http3RequestError::transport(format!("http3 target '{target}' is missing a port"))
-    })?;
-    let remote = lookup_host((host, port))
+    let remote = lookup_host((target_host, target_port))
         .await
         .map_err(|err| {
-            Http3RequestError::transport(format!("http3 failed to resolve {host}:{port}: {err}"))
+            Http3RequestError::transport(format!(
+                "http3 failed to resolve {target_host}:{target_port}: {err}"
+            ))
         })?
         .next()
         .ok_or_else(|| {
-            Http3RequestError::transport(format!("http3 could not resolve {host}:{port}"))
+            Http3RequestError::transport(format!(
+                "http3 could not resolve {target_host}:{target_port}"
+            ))
         })?;
     let bind_addr: std::net::SocketAddr = if remote.is_ipv6() {
         "[::]:0"
@@ -753,7 +764,7 @@ async fn connect_session(
     } else if !tls_flow.peer_name().is_empty() {
         tls_flow.peer_name().to_string()
     } else {
-        host.to_string()
+        target_host.to_string()
     };
     let connection = endpoint
         .connect(remote, &server_name)
@@ -883,13 +894,18 @@ pub(crate) async fn send_request(
 ) -> Result<Http3StartedResponse, Http3RequestError> {
     let session = acquire_or_open_session(
         &options.sessions,
-        &options.target,
+        options.target_scheme,
+        &options.target_host,
+        options.target_port,
         &options.tls_flow,
         options.mode,
     )
     .await?;
     let request = build_http3_request(
         &options.upstream_url,
+        &options.target_host,
+        options.target_port,
+        options.target_host_header.as_deref(),
         options.method.clone(),
         options.headers.clone(),
     )?;

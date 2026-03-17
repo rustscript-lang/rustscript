@@ -25,11 +25,15 @@ pub(crate) use tls::build_default_self_signed_server_config;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn configure_upstream_transport_for_target(
     context: &super::ProxyVmContext,
-    target: &str,
+    scheme: &str,
+    host: &str,
 ) {
     let mut transport = context.lock_transport();
     transport.tcp_dag.default_upstream.configure();
-    transport.tls_dag.default_upstream.observe_target(target);
+    transport
+        .tls_dag
+        .default_upstream
+        .observe_target(scheme, host);
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -61,7 +65,7 @@ mod tests {
     #[test]
     fn configuring_https_target_marks_default_upstream_transport_capabilities() {
         let context = test_context();
-        configure_upstream_transport_for_target(&context, "https://origin.example.com/api");
+        configure_upstream_transport_for_target(&context, "https", "origin.example.com");
 
         let transport = context.lock_transport();
         assert!(transport.tcp_dag.default_upstream.is_configured());
@@ -81,7 +85,7 @@ mod tests {
     #[test]
     fn starting_upstream_transport_publishes_connection_and_alpn() {
         let context = test_context();
-        configure_upstream_transport_for_target(&context, "https://origin.example.com/api");
+        configure_upstream_transport_for_target(&context, "https", "origin.example.com");
         mark_upstream_transport_started(&context, Version::HTTP_2);
 
         let transport = context.lock_transport();

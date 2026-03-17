@@ -2450,7 +2450,9 @@ impl ProxyVmContext {
             .is_some()
     }
 
-    fn take_native_default_upstream_forward_task(&self) -> Option<NativeDefaultUpstreamForwardTask> {
+    fn take_native_default_upstream_forward_task(
+        &self,
+    ) -> Option<NativeDefaultUpstreamForwardTask> {
         self.lock_downstream()
             .native_default_upstream_forward_task
             .take()
@@ -2764,7 +2766,22 @@ pub(crate) fn attach_outbound_exchange_tls_transport(
     session: i64,
 ) -> Result<(), VmError> {
     let mut exchanges = context.lock_exchanges();
-    let target = exchange_target_snapshot(&exchanges, exchange)?;
+    let (target_scheme, target_host) = exchanges
+        .exchanges
+        .get(&exchange)
+        .ok_or_else(|| VmError::HostError(format!("unknown outbound exchange handle {exchange}")))?
+        .request
+        .target
+        .as_ref()
+        .map(|_| {
+            let request = &exchanges.exchanges[&exchange].request;
+            (request.target_scheme, request.target_host.clone())
+        })
+        .ok_or_else(|| {
+            VmError::HostError(
+                "http exchange target must be configured before attaching a transport".to_string(),
+            )
+        })?;
     let mut transport = context.lock_transport();
     let tcp_state = transport.tcp_streams.get(&session).ok_or_else(|| {
         VmError::HostError(format!(
@@ -2785,7 +2802,9 @@ pub(crate) fn attach_outbound_exchange_tls_transport(
         .dynamic_tls_sessions
         .get_or_insert_with(session, TlsFlowState::for_dynamic_socket);
     if !tls_flow.handshake_complete() {
-        tls_flow.observe_target(&target);
+        if let Some(target_host) = target_host {
+            tls_flow.observe_target(target_scheme.as_str(), &target_host);
+        }
     }
     drop(transport);
     let exchange_state = exchanges
@@ -3057,6 +3076,8 @@ struct PreparedUpstreamRequest {
     query: String,
     headers: HeaderMap,
     target: String,
+    target_host: Option<String>,
+    target_port: Option<u16>,
     target_host_header: Option<String>,
     target_inherits_request_path: bool,
     target_scheme: HttpUpstreamScheme,
@@ -3635,8 +3656,16 @@ fn prepared_upstream_request(
         http2_sessions: services.upstream_http_sessions(),
         http3_sessions: services.upstream_http3_sessions(),
         version_preference: request.version_preference,
-        http2_mode: http2::select_upstream_mode(&target, &tls_flow, request.version_preference),
-        http3_mode: http3::select_upstream_mode(&target, &tls_flow, request.version_preference),
+        http2_mode: http2::select_upstream_mode(
+            request.target_scheme,
+            &tls_flow,
+            request.version_preference,
+        ),
+        http3_mode: http3::select_upstream_mode(
+            request.target_scheme,
+            &tls_flow,
+            request.version_preference,
+        ),
         tls_flow,
         attached_transport,
         method,
@@ -3644,6 +3673,8 @@ fn prepared_upstream_request(
         query,
         headers,
         target,
+        target_host: request.target_host.clone(),
+        target_port: request.target_port,
         target_host_header: request.target_host_header.clone(),
         target_inherits_request_path: request.target_inherits_request_path,
         target_scheme: request.target_scheme,
@@ -3699,6 +3730,9 @@ fn prepared_outbound_exchange_request(
             tls_flow,
         )
     };
+    if request.target.is_none() {
+        return Err(UpstreamResponseStartError::MissingTarget);
+    }
     let target = request
         .target
         .clone()
@@ -3712,8 +3746,16 @@ fn prepared_outbound_exchange_request(
         http2_sessions: services.upstream_http_sessions(),
         http3_sessions: services.upstream_http3_sessions(),
         version_preference: request.version_preference,
-        http2_mode: http2::select_upstream_mode(&target, &tls_flow, request.version_preference),
-        http3_mode: http3::select_upstream_mode(&target, &tls_flow, request.version_preference),
+        http2_mode: http2::select_upstream_mode(
+            request.target_scheme,
+            &tls_flow,
+            request.version_preference,
+        ),
+        http3_mode: http3::select_upstream_mode(
+            request.target_scheme,
+            &tls_flow,
+            request.version_preference,
+        ),
         tls_flow,
         attached_transport,
         method: request.method.clone(),
@@ -3721,6 +3763,8 @@ fn prepared_outbound_exchange_request(
         query: request.query.clone(),
         headers: request.headers.clone(),
         target,
+        target_host: request.target_host.clone(),
+        target_port: request.target_port,
         target_host_header: request.target_host_header.clone(),
         target_inherits_request_path: request.target_inherits_request_path,
         target_scheme: request.target_scheme,
@@ -3761,7 +3805,18 @@ fn upstream_client_cache_key(prepared: &PreparedUpstreamRequest) -> Option<Upstr
         return None;
     }
 
-    let tls_key = tls_session_cache_key(&prepared.target, &prepared.tls_flow);
+    let tls_key = prepared
+        .target_host
+        .as_deref()
+        .zip(prepared.target_port)
+        .and_then(|(host, port)| {
+            tls_session_cache_key(
+                prepared.target_scheme.as_str(),
+                host,
+                port,
+                &prepared.tls_flow,
+            )
+        });
     if tls_key.is_none()
         && !matches!(
             prepared.http2_mode,
@@ -4123,16 +4178,17 @@ async fn start_default_upstream_plain_http1_fast_path(
         return Ok(None);
     }
 
-    let target = request
-        .target
-        .clone()
-        .ok_or(UpstreamResponseStartError::MissingTarget)?;
+    if request.target.is_none() {
+        return Err(UpstreamResponseStartError::MissingTarget);
+    }
     let tls_flow = context.lock_transport().tls_dag.default_upstream.clone();
     let services = context.services();
     let http2_sessions = services.upstream_http_sessions();
     let http3_sessions = services.upstream_http3_sessions();
-    let http2_mode = http2::select_upstream_mode(&target, &tls_flow, request.version_preference);
-    let http3_mode = http3::select_upstream_mode(&target, &tls_flow, request.version_preference);
+    let http2_mode =
+        http2::select_upstream_mode(request.target_scheme, &tls_flow, request.version_preference);
+    let http3_mode =
+        http3::select_upstream_mode(request.target_scheme, &tls_flow, request.version_preference);
     if tls_flow.requires_custom_client()
         || http2::should_use_explicit_upstream_transport(http2_mode, http2_sessions.as_ref())
         || http3::should_use_explicit_upstream_transport(http3_mode, http3_sessions.as_ref())
@@ -4308,8 +4364,12 @@ async fn try_resolve_ready_or_pending_native_default_upstream_forward_response(
     };
     let upstream_latency_ms = response.upstream_latency_ms;
     Ok(Some(ResolvedHttpGraphResponse {
-        response: response_from_started_upstream_response(response, response_headers, response_status)
-            .await,
+        response: response_from_started_upstream_response(
+            response,
+            response_headers,
+            response_status,
+        )
+        .await,
         upstream_latency_ms,
         post_response_plan: None,
     }))
@@ -4521,16 +4581,17 @@ async fn try_resolve_native_default_upstream_http_forward_response(
         return Ok(None);
     }
 
-    let target = request
-        .target
-        .clone()
-        .ok_or(UpstreamResponseStartError::MissingTarget)?;
+    if request.target.is_none() {
+        return Err(UpstreamResponseStartError::MissingTarget);
+    }
     let tls_flow = context.lock_transport().tls_dag.default_upstream.clone();
     let services = context.services();
     let http2_sessions = services.upstream_http_sessions();
     let http3_sessions = services.upstream_http3_sessions();
-    let http2_mode = http2::select_upstream_mode(&target, &tls_flow, request.version_preference);
-    let http3_mode = http3::select_upstream_mode(&target, &tls_flow, request.version_preference);
+    let http2_mode =
+        http2::select_upstream_mode(request.target_scheme, &tls_flow, request.version_preference);
+    let http3_mode =
+        http3::select_upstream_mode(request.target_scheme, &tls_flow, request.version_preference);
     if tls_flow.requires_custom_client()
         || http2::should_use_explicit_upstream_transport(http2_mode, http2_sessions.as_ref())
         || http3::should_use_explicit_upstream_transport(http3_mode, http3_sessions.as_ref())
@@ -4836,7 +4897,6 @@ async fn start_upstream_response_via_attached_transport(
 async fn start_upstream_response_via_http2(
     handle: i64,
     prepared: &PreparedUpstreamRequest,
-    upstream_url: &str,
     headers: HeaderMap,
     request_body: Vec<u8>,
 ) -> Result<StartedUpstreamResponse, http2::Http2RequestError> {
@@ -4847,8 +4907,17 @@ async fn start_upstream_response_via_http2(
     let started = http2::send_request(http2::Http2SendRequest {
         sessions,
         exchange_handle: handle,
-        target: &prepared.target,
-        upstream_url,
+        target_scheme: prepared.target_scheme,
+        target_host: prepared
+            .target_host
+            .as_deref()
+            .expect("http2 upstream target host should exist"),
+        target_port: prepared
+            .target_port
+            .expect("http2 upstream target port should exist"),
+        target_host_header: prepared.target_host_header.as_deref(),
+        request_path: &prepared.path,
+        request_query: &prepared.query,
         mode: prepared.http2_mode,
         tls_flow: &prepared.tls_flow,
         method: prepared.method.clone(),
@@ -4891,7 +4960,15 @@ async fn start_upstream_response_via_http3(
         .expect("explicit http3 transport requires shared sessions");
     let started = http3::send_request(http3::Http3SendRequestOptions {
         exchange_handle: handle,
-        target: prepared.target.clone(),
+        target_scheme: prepared.target_scheme,
+        target_host: prepared
+            .target_host
+            .clone()
+            .expect("http3 upstream target host should exist"),
+        target_port: prepared
+            .target_port
+            .expect("http3 upstream target port should exist"),
+        target_host_header: prepared.target_host_header.clone(),
         upstream_url: upstream_url.to_string(),
         method: prepared.method.clone(),
         headers,
@@ -4962,14 +5039,22 @@ fn cache_outbound_tls_session(
         let Some(cache) = context.services().tls_session_cache() else {
             return Ok(());
         };
-        let (target, flow) = if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
-            let target = context
+        let (scheme, target_host, target_port, flow) = if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE
+        {
+            let (scheme, target_host, target_port) = context
                 .lock_exchanges()
                 .exchanges
                 .get(&handle)
-                .and_then(|exchange| exchange.request.target.clone());
+                .map(|exchange| {
+                    (
+                        exchange.request.target_scheme,
+                        exchange.request.target_host.clone(),
+                        exchange.request.target_port,
+                    )
+                })
+                .unwrap_or((HttpUpstreamScheme::Http, None, None));
             let flow = context.lock_transport().tls_dag.default_upstream.clone();
-            (target, flow)
+            (scheme, target_host, target_port, flow)
         } else {
             let exchanges = context.lock_exchanges();
             let exchange = exchanges
@@ -4977,14 +5062,20 @@ fn cache_outbound_tls_session(
                 .get(&handle)
                 .ok_or(UpstreamResponseStartError::UnknownExchangeHandle(handle))?;
             (
-                exchange.request.target.clone(),
+                exchange.request.target_scheme,
+                exchange.request.target_host.clone(),
+                exchange.request.target_port,
                 exchange.transport.tls_flow.clone(),
             )
         };
-        let Some(target) = target else {
+        let Some(target_host) = target_host else {
             return Ok(());
         };
-        let Some(key) = tls_session_cache_key(&target, &flow) else {
+        let Some(target_port) = target_port else {
+            return Ok(());
+        };
+        let Some(key) = tls_session_cache_key(scheme.as_str(), &target_host, target_port, &flow)
+        else {
             return Ok(());
         };
         let cached = CachedTlsSession {
@@ -5188,7 +5279,6 @@ async fn start_outbound_exchange_response(
                             match start_upstream_response_via_http2(
                                 handle,
                                 &prepared,
-                                &upstream_url,
                                 outbound_headers.clone(),
                                 request_body.clone(),
                             )
@@ -5264,7 +5354,6 @@ async fn start_outbound_exchange_response(
             match start_upstream_response_via_http2(
                 handle,
                 &prepared,
-                &upstream_url,
                 outbound_headers.clone(),
                 request_body.clone(),
             )
@@ -5997,7 +6086,7 @@ mod tests {
 
     use super::{
         HttpCarrierRef, HttpExchangeTransportState, HttpRequestContext,
-        HttpUpstreamResponseSnapshot, ProxyVmContext, SharedProxyVmContext,
+        HttpUpstreamResponseSnapshot, HttpUpstreamScheme, ProxyVmContext, SharedProxyVmContext,
         UpstreamResponseBodyState, allocate_outbound_exchange_handle,
         append_outbound_exchange_body, default_upstream_exchange_handle,
         ensure_outbound_exchange_response_started, header_content_length, outbound_exchange_exists,
@@ -6154,10 +6243,15 @@ mod tests {
                 .exchanges
                 .get_mut(&first)
                 .expect("first exchange should exist");
-            let target = format!("http://{upstream_addr}");
-            exchange.request.target = Some(target.clone());
+            exchange
+                .request
+                .set_target_host_port("127.0.0.1", upstream_addr.port())
+                .expect("target should be valid");
             exchange.transport.tcp_flow.configure();
-            exchange.transport.tls_flow.observe_target(&target);
+            exchange
+                .transport
+                .tls_flow
+                .observe_target("http", "127.0.0.1");
         }
 
         let snapshot = ensure_outbound_exchange_response_started(&context, first)
@@ -6296,15 +6390,23 @@ mod tests {
             .expect("context should be uniquely owned")
             .attach_upstream_client(reqwest::Client::new());
         {
-            let target = format!("http://{upstream_addr}/stream");
             let mut exchanges = context.lock_exchanges();
             let exchange = exchanges
                 .exchanges
                 .get_mut(&default_upstream_exchange_handle())
                 .expect("default upstream exchange should exist");
-            exchange.request.target = Some(target.clone());
+            exchange
+                .request
+                .set_target_host_port("127.0.0.1", upstream_addr.port())
+                .expect("target should be valid");
+            exchange.request.inherits_request_head = false;
+            exchange.request.path = "/stream".to_string();
+            exchange.request.query.clear();
             exchange.transport.tcp_flow.configure();
-            exchange.transport.tls_flow.observe_target(&target);
+            exchange
+                .transport
+                .tls_flow
+                .observe_target("http", "127.0.0.1");
         }
 
         let resolved = timeout(
@@ -6412,19 +6514,22 @@ mod tests {
         });
 
         let sessions = new_shared_http_upstream_sessions(8);
-        let origin = format!("https://127.0.0.1:{}", addr.port());
-        let upstream_url = format!("{origin}/");
         let mut tls_flow = TlsFlowState::default();
-        tls_flow.observe_target(&origin);
+        tls_flow.observe_target("https", "127.0.0.1");
         tls_flow.set_verify_peer(false);
         tls_flow.set_verify_hostname(false);
         tls_flow.set_desired_alpn(vec!["h2".to_string(), "http/1.1".to_string()]);
+        let authority = format!("127.0.0.1:{}", addr.port());
 
         let started = send_request(Http2SendRequest {
             sessions: &sessions,
             exchange_handle: default_upstream_exchange_handle(),
-            target: &origin,
-            upstream_url: &upstream_url,
+            target_scheme: HttpUpstreamScheme::Https,
+            target_host: "127.0.0.1",
+            target_port: addr.port(),
+            target_host_header: Some(&authority),
+            request_path: "/",
+            request_query: "",
             mode: Http2UpstreamMode::AutomaticTls,
             tls_flow: &tls_flow,
             method: Method::GET,

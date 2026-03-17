@@ -96,16 +96,21 @@ fn apply_cached_session(
         let Some(cache) = context.services().tls_session_cache() else {
             return Ok(false);
         };
-        let (target, flow) = match session {
+        let (scheme, host, port, flow) = match session {
             TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => return Ok(false),
             TlsSessionHandle::Reserved(TlsSessionRef::DefaultUpstream) => {
-                let target = context
-                    .with_default_upstream_exchange(|exchange| exchange.request.target.clone());
+                let (scheme, host, port) = context.with_default_upstream_exchange(|exchange| {
+                    (
+                        exchange.request.target_scheme,
+                        exchange.request.target_host.clone(),
+                        exchange.request.target_port,
+                    )
+                });
                 let flow = {
                     let transport = context.lock_transport();
                     transport.tls_dag.default_upstream.clone()
                 };
-                (target, flow)
+                (scheme.as_str(), host, port, flow)
             }
             TlsSessionHandle::Dynamic(_) => return Ok(false),
             TlsSessionHandle::OutboundExchange(handle) => {
@@ -114,15 +119,20 @@ fn apply_cached_session(
                     return Ok(false);
                 };
                 (
-                    exchange.request.target.clone(),
+                    exchange.request.target_scheme.as_str(),
+                    exchange.request.target_host.clone(),
+                    exchange.request.target_port,
                     exchange.transport.tls_flow.clone(),
                 )
             }
         };
-        let Some(target) = target else {
+        let Some(host) = host else {
             return Ok(false);
         };
-        let Some(key) = tls_session_cache_key(&target, &flow) else {
+        let Some(port) = port else {
+            return Ok(false);
+        };
+        let Some(key) = tls_session_cache_key(scheme, &host, port, &flow) else {
             return Ok(false);
         };
         (cache, key)
@@ -701,15 +711,15 @@ async fn session_from_socket(
         TlsSessionHandle::Reserved(reserved) => reserved.handle(),
         TlsSessionHandle::Dynamic(handle) => {
             let mut guard = context.lock_transport();
-            let target = guard
+            let target_host = guard
                 .tcp_streams
                 .get(&handle)
-                .and_then(|state| state.target().map(str::to_string));
+                .and_then(|state| state.target_host().map(str::to_string));
             let flow = guard
                 .dynamic_tls_sessions
                 .get_or_insert_with(handle, TlsFlowState::for_dynamic_socket);
-            if let Some(target) = target {
-                flow.observe_socket_target(&target);
+            if let Some(target_host) = target_host {
+                flow.observe_socket_target(&target_host);
             }
             handle
         }

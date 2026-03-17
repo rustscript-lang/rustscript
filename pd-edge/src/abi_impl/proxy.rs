@@ -1191,23 +1191,33 @@ mod tests {
 
     fn configure_default_upstream(
         context: &mut SharedProxyVmContext,
-        target: String,
+        host: &str,
+        port: u16,
+        path: &str,
         client: Client,
     ) {
         let context = Arc::get_mut(context).expect("context should be uniquely owned");
         context.attach_upstream_client(client);
-        {
+        context.with_request_head(|request_head| {
             let mut exchanges = context.lock_exchanges();
-            exchanges
+            let request = &mut exchanges
                 .exchanges
                 .get_mut(&edge_http::default_upstream_exchange_handle())
                 .expect("default upstream exchange should exist")
-                .request
-                .target = Some(target.clone());
-        }
+                .request;
+            request
+                .set_target_host_port(host, port)
+                .expect("upstream target should be valid");
+            request.materialize_inherited_request_head(request_head);
+            request.path = path.to_string();
+            request.query.clear();
+        });
         let mut transport = context.lock_transport();
         transport.tcp_dag.default_upstream.configure();
-        transport.tls_dag.default_upstream.observe_target(&target);
+        transport
+            .tls_dag
+            .default_upstream
+            .observe_target("http", host);
     }
 
     #[test]
@@ -1240,7 +1250,9 @@ mod tests {
         let mut context = test_context("");
         configure_default_upstream(
             &mut context,
-            format!("http://{upstream_addr}/echo"),
+            "127.0.0.1",
+            upstream_addr.port(),
+            "/echo",
             Client::new(),
         );
 
@@ -1291,7 +1303,9 @@ mod tests {
         let mut context = test_context("abcdefgh");
         configure_default_upstream(
             &mut context,
-            format!("http://{upstream_addr}/echo"),
+            "127.0.0.1",
+            upstream_addr.port(),
+            "/echo",
             Client::new(),
         );
 
@@ -1333,7 +1347,9 @@ mod tests {
         let mut context = test_context("abcdefgh");
         configure_default_upstream(
             &mut context,
-            format!("http://{upstream_addr}/echo"),
+            "127.0.0.1",
+            upstream_addr.port(),
+            "/echo",
             Client::new(),
         );
 
@@ -1380,18 +1396,28 @@ mod tests {
         let exchange = edge_http::allocate_outbound_exchange_handle(&context)
             .expect("exchange should allocate");
         {
-            let mut guard = context.lock_exchanges();
-            let exchange_state = guard
-                .exchanges
-                .get_mut(&exchange)
-                .expect("exchange should exist");
-            exchange_state.request.target = Some(format!("http://{upstream_addr}/dyn"));
-            exchange_state.request.body_override = Some(b"payload".to_vec());
-            exchange_state.transport.tcp_flow.configure();
-            exchange_state
-                .transport
-                .tls_flow
-                .observe_target(&format!("http://{upstream_addr}/dyn"));
+            context.with_request_head(|request_head| {
+                let mut guard = context.lock_exchanges();
+                let exchange_state = guard
+                    .exchanges
+                    .get_mut(&exchange)
+                    .expect("exchange should exist");
+                exchange_state
+                    .request
+                    .set_target_host_port("127.0.0.1", upstream_addr.port())
+                    .expect("upstream target should be valid");
+                exchange_state
+                    .request
+                    .materialize_inherited_request_head(request_head);
+                exchange_state.request.path = "/dyn".to_string();
+                exchange_state.request.query.clear();
+                exchange_state.request.body_override = Some(b"payload".to_vec());
+                exchange_state.transport.tcp_flow.configure();
+                exchange_state
+                    .transport
+                    .tls_flow
+                    .observe_target("http", "127.0.0.1");
+            });
         }
 
         let source =
@@ -1430,7 +1456,9 @@ mod tests {
         let mut context = test_context("");
         configure_default_upstream(
             &mut context,
-            format!("http://{upstream_addr}/perf"),
+            "127.0.0.1",
+            upstream_addr.port(),
+            "/perf",
             Client::new(),
         );
 

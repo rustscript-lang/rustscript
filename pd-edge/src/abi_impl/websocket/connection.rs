@@ -23,8 +23,7 @@ use super::super::http::{
     is_hop_by_hop_header, outbound_exchange_exists, outbound_exchange_response_available,
 };
 use super::state::{
-    OutboundWebSocketIoState, SharedWebSocketIo, WebSocketConnectionState,
-    WebSocketUpstreamScheme,
+    OutboundWebSocketIoState, SharedWebSocketIo, WebSocketConnectionState, WebSocketUpstreamScheme,
 };
 use crate::abi_impl::transport::{DownstreamReplayTcpStream, ReplayPrefixedIo};
 
@@ -246,10 +245,7 @@ fn prepare_outbound_socket_target(
         |_request, tcp_flow, tls_flow, websocket| {
             websocket.set_target_host_port(host.clone(), port);
             tcp_flow.configure();
-            tls_flow.observe_target_parts(
-                websocket.target_scheme().uses_tls(),
-                Some(host.clone()),
-            );
+            tls_flow.observe_target_parts(websocket.target_scheme().uses_tls(), Some(host.clone()));
         },
     )?;
     Ok(())
@@ -261,11 +257,15 @@ fn prepare_outbound_scheme(
     scheme: String,
 ) -> Result<(), VmError> {
     let scheme = WebSocketUpstreamScheme::parse(&scheme)?;
-    with_outbound_connection_mut(context, connection, |_request, _tcp_flow, tls_flow, websocket| {
-        websocket.set_target_scheme(scheme);
-        let peer_name = websocket.target_host().map(str::to_string);
-        tls_flow.observe_target_parts(scheme.uses_tls(), peer_name);
-    })?;
+    with_outbound_connection_mut(
+        context,
+        connection,
+        |_request, _tcp_flow, tls_flow, websocket| {
+            websocket.set_target_scheme(scheme);
+            let peer_name = websocket.target_host().map(str::to_string);
+            tls_flow.observe_target_parts(scheme.uses_tls(), peer_name);
+        },
+    )?;
     Ok(())
 }
 
@@ -275,10 +275,14 @@ fn prepare_outbound_path(
     path: String,
 ) -> Result<(), VmError> {
     let path = normalize_websocket_path(&path)?;
-    with_outbound_connection_mut(context, connection, |request, _tcp_flow, _tls_flow, websocket| {
-        request.path = path;
-        websocket.prepare_outbound();
-    })?;
+    with_outbound_connection_mut(
+        context,
+        connection,
+        |request, _tcp_flow, _tls_flow, websocket| {
+            request.path = path;
+            websocket.prepare_outbound();
+        },
+    )?;
     Ok(())
 }
 
@@ -288,10 +292,14 @@ fn prepare_outbound_query(
     query: String,
 ) -> Result<(), VmError> {
     let query = normalize_websocket_query(&query)?;
-    with_outbound_connection_mut(context, connection, |request, _tcp_flow, _tls_flow, websocket| {
-        request.query = query;
-        websocket.prepare_outbound();
-    })?;
+    with_outbound_connection_mut(
+        context,
+        connection,
+        |request, _tcp_flow, _tls_flow, websocket| {
+            request.query = query;
+            websocket.prepare_outbound();
+        },
+    )?;
     Ok(())
 }
 

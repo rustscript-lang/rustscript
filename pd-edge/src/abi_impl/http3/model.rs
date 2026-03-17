@@ -1,9 +1,12 @@
 #![cfg_attr(not(feature = "http3"), allow(dead_code))]
 
 use axum::http::Version;
-use url::Url;
 
-use crate::abi_impl::{http::HttpVersionPreference, quic::ALPN_PROTOCOL, transport::TlsFlowState};
+use crate::abi_impl::{
+    http::{HttpUpstreamScheme, HttpVersionPreference},
+    quic::ALPN_PROTOCOL,
+    transport::TlsFlowState,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Http3StreamRef {
@@ -87,7 +90,7 @@ pub(crate) fn supports_response_version(version: Version) -> bool {
 }
 
 pub(crate) fn select_upstream_mode(
-    target: &str,
+    scheme: HttpUpstreamScheme,
     tls_flow: &TlsFlowState,
     version_preference: HttpVersionPreference,
 ) -> Http3UpstreamMode {
@@ -102,15 +105,11 @@ pub(crate) fn select_upstream_mode(
         HttpVersionPreference::Http3 | HttpVersionPreference::Auto => {}
     }
 
-    let scheme = Url::parse(target)
-        .ok()
-        .map(|url| url.scheme().to_ascii_lowercase())
-        .unwrap_or_default();
     let desired_alpn = tls_flow.desired_alpn();
     let explicitly_offers_http3 = desired_alpn
         .iter()
         .any(|protocol| protocol.eq_ignore_ascii_case(ALPN_PROTOCOL));
-    let https_target = scheme == "https";
+    let https_target = scheme == HttpUpstreamScheme::Https;
 
     match version_preference {
         HttpVersionPreference::Http3 if https_target => Http3UpstreamMode::Required,
@@ -124,14 +123,13 @@ pub(crate) fn select_upstream_mode(
     }
 }
 
-pub(crate) fn session_origin(target: &str) -> Option<String> {
-    let url = Url::parse(target).ok()?;
-    let host = url.host_str()?.to_ascii_lowercase();
-    let port = url.port_or_known_default()?;
+pub(crate) fn session_origin(scheme: HttpUpstreamScheme, host: &str, port: u16) -> Option<String> {
+    if host.is_empty() || port == 0 {
+        return None;
+    }
     Some(format!(
-        "{}://{}:{}",
-        url.scheme().to_ascii_lowercase(),
-        host,
-        port
+        "{}://{}:{port}",
+        scheme.as_str(),
+        host.to_ascii_lowercase()
     ))
 }

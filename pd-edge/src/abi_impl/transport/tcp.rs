@@ -60,7 +60,11 @@ fn decode_chunk_size(max_bytes: i64) -> Result<usize, VmError> {
     })
 }
 
-fn format_socket_authority(host: &str, port: i64, protocol: &str) -> Result<String, VmError> {
+fn format_socket_authority(
+    host: &str,
+    port: i64,
+    protocol: &str,
+) -> Result<(String, String, u16), VmError> {
     if host.is_empty() || host.chars().any(|ch| ch.is_whitespace()) {
         return Err(VmError::HostError(format!(
             "{protocol} target host must be non-empty and contain no whitespace, got '{host}'",
@@ -85,13 +89,13 @@ fn format_socket_authority(host: &str, port: i64, protocol: &str) -> Result<Stri
     } else {
         format!("{bare_host}:{port}")
     };
-    Authority::from_maybe_shared(authority.clone())
-        .map_err(|_| {
-            VmError::HostError(format!(
-                "invalid {protocol} target host='{host}' port={port}",
-            ))
-        })
-        .map(|_| authority)
+    let parsed = Authority::from_maybe_shared(authority.clone()).map_err(|_| {
+        VmError::HostError(format!(
+            "invalid {protocol} target host='{host}' port={port}",
+        ))
+    })?;
+    let normalized_host = parsed.host().trim_matches(['[', ']']).to_string();
+    Ok((authority, normalized_host, port))
 }
 
 fn mutable_dynamic_tcp_stream_only() -> VmError {
@@ -684,9 +688,9 @@ async fn stream_set_target(
     host: String,
     port: i64,
 ) -> Result<CallOutcome, VmError> {
-    let target = format_socket_authority(&host, port, "tcp")?;
+    let (target, normalized_host, normalized_port) = format_socket_authority(&host, port, "tcp")?;
     with_mutable_dynamic_tcp_socket_state(&context, stream, |state, io| {
-        state.set_target(target);
+        state.set_target(target, normalized_host, normalized_port);
         *io = None;
         Ok(())
     })?;

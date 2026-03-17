@@ -306,9 +306,8 @@ fn new_vm_runner_store(
     prefer_aot: bool,
     jit_enabled: bool,
 ) -> VmRunnerStore {
-    let prefer_aot = prefer_aot
-        && jit_enabled
-        && std::env::var_os("PD_EDGE_DISABLE_NO_INTERRUPT_AOT").is_none();
+    let prefer_aot =
+        prefer_aot && jit_enabled && std::env::var_os("PD_EDGE_DISABLE_NO_INTERRUPT_AOT").is_none();
     let mut vm = if prefer_aot {
         if let Some(bundle) = program.no_interrupt_aot_bundle.as_ref() {
             match Vm::from_aot_bundle_bytes(bundle.as_ref().as_slice()) {

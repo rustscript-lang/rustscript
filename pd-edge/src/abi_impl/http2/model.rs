@@ -1,10 +1,9 @@
 #![cfg_attr(not(feature = "http2"), allow(dead_code))]
 
 use axum::http::Version;
-use url::Url;
 
 use crate::abi_impl::{
-    http::HttpVersionPreference,
+    http::{HttpUpstreamScheme, HttpVersionPreference},
     transport::{HTTP11_ALPN_PROTOCOL, TlsFlowState},
 };
 
@@ -120,7 +119,7 @@ pub(crate) fn response_version_label() -> &'static str {
 }
 
 pub(crate) fn select_upstream_mode(
-    target: &str,
+    scheme: HttpUpstreamScheme,
     tls_flow: &TlsFlowState,
     version_preference: HttpVersionPreference,
 ) -> Http2UpstreamMode {
@@ -133,17 +132,7 @@ pub(crate) fn select_upstream_mode(
             return Http2UpstreamMode::Disabled;
         }
         HttpVersionPreference::Http2 => {
-            let scheme = Url::parse(target)
-                .ok()
-                .map(|url| url.scheme().to_ascii_lowercase())
-                .unwrap_or_else(|| {
-                    if tls_flow.is_present() {
-                        "https".to_string()
-                    } else {
-                        "http".to_string()
-                    }
-                });
-            return if scheme == "https" {
+            return if scheme == HttpUpstreamScheme::Https {
                 Http2UpstreamMode::AutomaticTls
             } else {
                 Http2UpstreamMode::PriorKnowledge
@@ -165,19 +154,9 @@ pub(crate) fn select_upstream_mode(
         return Http2UpstreamMode::Disabled;
     }
 
-    let scheme = Url::parse(target)
-        .ok()
-        .map(|url| url.scheme().to_ascii_lowercase())
-        .unwrap_or_else(|| {
-            if tls_flow.is_present() {
-                "https".to_string()
-            } else {
-                "http".to_string()
-            }
-        });
-    match scheme.as_str() {
-        "https" => Http2UpstreamMode::AutomaticTls,
-        "http" if explicitly_offers_http2 => Http2UpstreamMode::PriorKnowledge,
+    match scheme {
+        HttpUpstreamScheme::Https => Http2UpstreamMode::AutomaticTls,
+        HttpUpstreamScheme::Http if explicitly_offers_http2 => Http2UpstreamMode::PriorKnowledge,
         _ => Http2UpstreamMode::Disabled,
     }
 }
@@ -203,14 +182,17 @@ pub(crate) fn configure_reqwest_builder(
 
 #[cfg(test)]
 mod tests {
-    use crate::abi_impl::{http::HttpVersionPreference, transport::TlsFlowState};
+    use crate::abi_impl::{
+        http::{HttpUpstreamScheme, HttpVersionPreference},
+        transport::TlsFlowState,
+    };
 
     use super::{ALPN_PROTOCOL, Http2UpstreamMode, select_upstream_mode};
 
     #[test]
     fn https_targets_select_automatic_http2_when_enabled() {
         let mode = select_upstream_mode(
-            "https://example.com/data",
+            HttpUpstreamScheme::Https,
             &TlsFlowState::default(),
             HttpVersionPreference::Auto,
         );
@@ -225,11 +207,8 @@ mod tests {
     fn cleartext_prior_knowledge_requires_explicit_h2_preference() {
         let mut flow = TlsFlowState::default();
         flow.set_desired_alpn(vec![ALPN_PROTOCOL.to_string()]);
-        let mode = select_upstream_mode(
-            "http://example.com/data",
-            &flow,
-            HttpVersionPreference::Auto,
-        );
+        let mode =
+            select_upstream_mode(HttpUpstreamScheme::Http, &flow, HttpVersionPreference::Auto);
         if cfg!(feature = "http2") {
             assert_eq!(mode, Http2UpstreamMode::PriorKnowledge);
         } else {
@@ -240,7 +219,7 @@ mod tests {
     #[test]
     fn explicit_http3_preference_disables_http2() {
         let mode = select_upstream_mode(
-            "https://example.com/data",
+            HttpUpstreamScheme::Https,
             &TlsFlowState::default(),
             HttpVersionPreference::Http3,
         );
@@ -250,7 +229,7 @@ mod tests {
     #[test]
     fn explicit_http2_preference_requires_http2_even_without_alpn_hint() {
         let mode = select_upstream_mode(
-            "http://example.com/data",
+            HttpUpstreamScheme::Http,
             &TlsFlowState::default(),
             HttpVersionPreference::Http2,
         );
