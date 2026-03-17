@@ -476,7 +476,7 @@ impl ServerCertVerifier for PermissiveServerCertVerifier {
     }
 }
 
-fn build_dynamic_client_config(flow: &TlsFlowState) -> Result<ClientConfig, VmError> {
+pub(crate) fn build_dynamic_client_config(flow: &TlsFlowState) -> Result<ClientConfig, VmError> {
     ensure_rustls_provider();
     let versions = supported_protocol_versions(flow)?;
     let builder =

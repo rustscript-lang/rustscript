@@ -3,6 +3,7 @@ use edge_abi::symbols::http::response as http_response;
 use pd_edge_host_function::pd_edge_host_function;
 use vm::{CallOutcome, Value, Vm, VmError};
 
+use super::state::sync_response_output_body_headers;
 use super::{
     SharedProxyVmContext, ensure_outbound_exchange_response_started, headers_to_value_map,
     is_hop_by_hop_header, lookup_cached_header_batch, parse_header, parse_header_name,
@@ -75,6 +76,15 @@ fn apply_response_header_batch(context: &SharedProxyVmContext, headers: axum::ht
     context.insert_downstream_response_headers(headers);
 }
 
+fn validate_response_status(status: i64) -> Result<u16, VmError> {
+    if !(100..=599).contains(&status) {
+        return Err(VmError::HostError(format!(
+            "status code must be in range 100..=599, got '{status}'",
+        )));
+    }
+    Ok(status as u16)
+}
+
 /// Sets a header on the downstream HTTP response.
 #[pd_edge_host_function(name = http_response::SET_HEADER.name, scope = http)]
 fn set_response_header(
@@ -103,6 +113,7 @@ fn set_response_headers(
 fn set_response_body(context: SharedProxyVmContext, body: String) -> Result<CallOutcome, VmError> {
     context.with_downstream_response_mut(|response| {
         response.body = Some(body.into_bytes());
+        sync_response_output_body_headers(response);
     });
     Ok(CallOutcome::Return(vec![]))
 }
@@ -127,6 +138,7 @@ async fn apply_exchange_to_response_with_headers(
                 response.headers.insert(name.clone(), value.clone());
             }
         }
+        sync_response_output_body_headers(response);
     });
     apply_response_header_batch(&context, parsed_headers);
     Ok(CallOutcome::Return(vec![]))
@@ -135,12 +147,7 @@ async fn apply_exchange_to_response_with_headers(
 /// Sets the status code on the downstream HTTP response.
 #[pd_edge_host_function(name = http_response::SET_STATUS.name, scope = http)]
 fn set_response_status(context: SharedProxyVmContext, status: i64) -> Result<CallOutcome, VmError> {
-    if !(100..=599).contains(&status) {
-        return Err(VmError::HostError(format!(
-            "status code must be in range 100..=599, got '{status}'",
-        )));
-    }
-    context.set_downstream_response_status(status as u16);
+    context.set_downstream_response_status(validate_response_status(status)?);
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -161,6 +168,7 @@ async fn apply_exchange_to_response(
                 response.headers.insert(name.clone(), value.clone());
             }
         }
+        sync_response_output_body_headers(response);
     });
     Ok(CallOutcome::Return(vec![]))
 }

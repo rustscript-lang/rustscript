@@ -977,6 +977,8 @@ mod tests {
     #[cfg(feature = "http")]
     #[test]
     fn http_response_set_body_scoped_binding_runs_under_edge_context() {
+        use axum::http::header::CONTENT_LENGTH;
+
         let imports = vec![HostImport {
             name: http_response::SET_BODY.name.to_string(),
             arity: 1,
@@ -1017,6 +1019,14 @@ mod tests {
         assert_eq!(
             guard.response_output.body.as_deref(),
             Some("payload".as_bytes())
+        );
+        assert_eq!(
+            guard
+                .response_output
+                .headers
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some("7")
         );
     }
 

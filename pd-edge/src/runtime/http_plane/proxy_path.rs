@@ -1,4 +1,5 @@
 use std::{
+    io,
     net::SocketAddr,
     sync::{
         Arc, Mutex, OnceLock,
@@ -10,19 +11,20 @@ use std::{
 use axum::{
     body::Body,
     extract::Request,
-    http::{Response, StatusCode},
+    http::{
+        HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Uri, Version,
+        header::{CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING},
+    },
 };
-#[cfg(feature = "http3")]
+use bytes::{Buf, BytesMut};
 use futures_util::stream::try_unfold;
-#[cfg(feature = "http3")]
 use http_body_util::BodyExt;
-#[cfg(feature = "http3")]
-use hyper::body::Buf;
 use hyper::body::Incoming;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as AutoBuilder,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 #[cfg(feature = "http3")]
 use tokio::net::UdpSocket;
@@ -48,13 +50,19 @@ use crate::abi_impl::{
 };
 use crate::{
     abi_impl::http::{
-        DownstreamConnectionMetadata, DownstreamHttpListenerGoal, InlineDownstreamHttpResponse,
-        PromotedDownstreamTransport, build_downstream_http_request_context,
-        resolve_http_graph_response, take_promoted_downstream_transport,
+        DownstreamConnectionMetadata, DownstreamHttp1FastBodyKind, DownstreamHttpListenerGoal,
+        InlineDownstreamHttpResponse, MAX_DOWNSTREAM_HTTP1_FAST_BODY_BYTES,
+        OutboundHttp1ForwardBody, OutboundHttp1ForwardResponse, PromotedDownstreamTransport,
+        ResolvedNativeHttp1DownstreamResponse, ResolvedNativeLocalHttp1DownstreamResponse,
+        build_downstream_http_request_context, classify_downstream_http1_fast_body,
+        downstream_http1_fast_path_eligible, downstream_http1_fast_path_expects_continue,
+        is_hop_by_hop_header, resolve_http_graph_response, take_promoted_downstream_transport,
+        try_resolve_native_http1_downstream_response,
+        try_take_native_local_http1_downstream_response,
     },
     abi_impl::{
         DownstreamHttp2ConnectionTracker, Http2DownstreamStreamAttachment, ProxyVmContext,
-        SharedProxyVmContext, build_default_self_signed_server_config,
+        ReplayPrefixedIo, SharedProxyVmContext, build_default_self_signed_server_config,
         register_http_plane_host_module,
     },
     debug_session::{request_uses_blocking_debugger, request_will_attach_debugger},
@@ -73,6 +81,7 @@ use {
 static NEXT_HTTP_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 #[cfg(feature = "http2")]
 static HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+const HTTP1_CHUNK_WRITE_OVERHEAD_BYTES: usize = 32;
 static STAGE_METRICS_ENABLED: OnceLock<bool> = OnceLock::new();
 static STAGE_METRICS_COUNT: AtomicU64 = AtomicU64::new(0);
 static STAGE_METRICS_PRE_VM_US: AtomicU64 = AtomicU64::new(0);
@@ -171,7 +180,7 @@ async fn serve_http_connection<S>(
     tracker.finish_connection(result.err().map(|err| err.to_string()));
 }
 
-async fn serve_http1_connection<S>(
+async fn serve_http1_connection_via_hyper<S>(
     state: SharedState,
     stream: S,
     peer_addr: SocketAddr,
@@ -220,6 +229,1551 @@ async fn serve_http1_connection<S>(
     builder.max_buf_size(16 * 1024);
     let result = builder.serve_connection(io, service).with_upgrades().await;
     tracker.finish_connection(result.err().map(|err| err.to_string()));
+}
+
+#[derive(Debug)]
+struct FastHttp1Request {
+    method: Method,
+    uri: Uri,
+    version: Version,
+    headers: HeaderMap,
+    keep_alive: bool,
+    body: Body,
+}
+
+struct FastHttp1ConnectionIo<S> {
+    stream: Option<S>,
+    buffered: BytesMut,
+}
+
+impl<S> FastHttp1ConnectionIo<S> {
+    fn new(stream: S) -> Self {
+        Self {
+            stream: Some(stream),
+            buffered: BytesMut::with_capacity(8 * 1024),
+        }
+    }
+
+    fn stream_mut(&mut self) -> io::Result<&mut S> {
+        self.stream.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "downstream http/1.1 connection stream is unavailable",
+            )
+        })
+    }
+
+    fn parts_mut(&mut self) -> io::Result<(&mut S, &mut BytesMut)> {
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "downstream http/1.1 connection stream is unavailable",
+            )
+        })?;
+        Ok((stream, &mut self.buffered))
+    }
+
+    fn take_owned(&mut self) -> io::Result<Self> {
+        Ok(Self {
+            stream: Some(self.stream.take().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "downstream http/1.1 connection stream is unavailable",
+                )
+            })?),
+            buffered: std::mem::take(&mut self.buffered),
+        })
+    }
+
+    fn restore(&mut self, mut other: Self) {
+        self.stream = other.stream.take();
+        self.buffered = other.buffered;
+    }
+
+    fn into_replay(self) -> ReplayPrefixedIo<S> {
+        ReplayPrefixedIo::new(
+            self.buffered.to_vec(),
+            self.stream.expect("stream should exist"),
+        )
+    }
+}
+
+struct FastHttp1ParsedRequest<S> {
+    request: FastHttp1Request,
+    body_lease: Option<FastHttp1RequestBodyLease<S>>,
+}
+
+enum FastHttp1Decision<S> {
+    Request(FastHttp1ParsedRequest<S>),
+    EndOfStream,
+    FallbackToHyper,
+}
+
+enum FastHttp1ReadError {
+    Io(io::Error),
+    BadRequest(String),
+    PayloadTooLarge,
+}
+
+#[derive(Clone)]
+enum StoredFastHttp1ReadError {
+    Io(String),
+    BadRequest(String),
+    PayloadTooLarge,
+}
+
+impl From<io::Error> for FastHttp1ReadError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl FastHttp1ReadError {
+    fn into_io_error(self) -> io::Error {
+        match self {
+            FastHttp1ReadError::Io(err) => err,
+            FastHttp1ReadError::BadRequest(message) => {
+                io::Error::new(io::ErrorKind::InvalidData, message)
+            }
+            FastHttp1ReadError::PayloadTooLarge => io::Error::new(
+                io::ErrorKind::InvalidData,
+                "downstream http/1.1 request body exceeds fast-path limit",
+            ),
+        }
+    }
+
+    fn to_stored(&self) -> StoredFastHttp1ReadError {
+        match self {
+            FastHttp1ReadError::Io(err) => StoredFastHttp1ReadError::Io(err.to_string()),
+            FastHttp1ReadError::BadRequest(message) => {
+                StoredFastHttp1ReadError::BadRequest(message.clone())
+            }
+            FastHttp1ReadError::PayloadTooLarge => StoredFastHttp1ReadError::PayloadTooLarge,
+        }
+    }
+}
+
+impl StoredFastHttp1ReadError {
+    fn to_read_error(&self) -> FastHttp1ReadError {
+        match self {
+            StoredFastHttp1ReadError::Io(message) => {
+                FastHttp1ReadError::Io(io::Error::other(message.clone()))
+            }
+            StoredFastHttp1ReadError::BadRequest(message) => {
+                FastHttp1ReadError::BadRequest(message.clone())
+            }
+            StoredFastHttp1ReadError::PayloadTooLarge => FastHttp1ReadError::PayloadTooLarge,
+        }
+    }
+}
+
+enum FastHttp1ChunkedState {
+    NeedSize,
+    ReadData { remaining: usize },
+    ExpectChunkTerminator,
+    ReadTrailers,
+}
+
+enum FastHttp1StreamingBodyKind {
+    Fixed { remaining: usize },
+    Chunked { state: FastHttp1ChunkedState },
+}
+
+struct FastHttp1RequestBodyState<S> {
+    connection: Option<FastHttp1ConnectionIo<S>>,
+    kind: FastHttp1StreamingBodyKind,
+    remaining_budget: usize,
+    terminal_error: Option<StoredFastHttp1ReadError>,
+}
+
+struct FastHttp1RequestBodyLease<S> {
+    shared: Arc<tokio::sync::Mutex<FastHttp1RequestBodyState<S>>>,
+}
+
+fn http_header_contains_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .any(|value| value.eq_ignore_ascii_case(token))
+}
+
+fn http1_connection_keep_alive(version: Version, headers: &HeaderMap) -> bool {
+    let connection_close = http_header_contains_token(headers, CONNECTION, "close");
+    let connection_keep_alive = http_header_contains_token(headers, CONNECTION, "keep-alive");
+    match version {
+        Version::HTTP_10 => connection_keep_alive && !connection_close,
+        _ => !connection_close,
+    }
+}
+
+fn http1_response_has_no_body(status: StatusCode, method: &Method) -> bool {
+    method == Method::HEAD
+        || (100..200).contains(&status.as_u16())
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED
+}
+
+fn merge_http_headers(target: &mut HeaderMap, overlay: &HeaderMap) {
+    for (name, value) in overlay {
+        target.insert(name, value.clone());
+    }
+}
+
+fn find_crlf(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(2).position(|window| window == b"\r\n")
+}
+
+impl<S> FastHttp1RequestBodyState<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    fn from_connection(
+        connection: FastHttp1ConnectionIo<S>,
+        kind: FastHttp1StreamingBodyKind,
+        remaining_budget: usize,
+    ) -> Self {
+        Self {
+            connection: Some(connection),
+            kind,
+            remaining_budget,
+            terminal_error: None,
+        }
+    }
+
+    fn remember_error(&mut self, err: FastHttp1ReadError) -> FastHttp1ReadError {
+        self.terminal_error = Some(err.to_stored());
+        err
+    }
+
+    fn connection_mut(&mut self) -> Result<&mut FastHttp1ConnectionIo<S>, FastHttp1ReadError> {
+        self.connection.as_mut().ok_or_else(|| {
+            FastHttp1ReadError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "downstream http/1.1 request body connection is unavailable",
+            ))
+        })
+    }
+
+    async fn pull_next(&mut self) -> Result<Option<bytes::Bytes>, FastHttp1ReadError> {
+        if let Some(err) = self.terminal_error.clone() {
+            return Err(err.to_read_error());
+        }
+        loop {
+            let kind = std::mem::replace(
+                &mut self.kind,
+                FastHttp1StreamingBodyKind::Fixed { remaining: 0 },
+            );
+            match kind {
+                FastHttp1StreamingBodyKind::Fixed { mut remaining } => {
+                    if remaining == 0 {
+                        return Ok(None);
+                    }
+                    let available = self.connection_mut()?.buffered.len();
+                    if available == 0 {
+                        let read = {
+                            let (stream, buffered) = self.connection_mut()?.parts_mut()?;
+                            stream.read_buf(buffered).await?
+                        };
+                        if read == 0 {
+                            let err = FastHttp1ReadError::BadRequest(
+                                "downstream http/1.1 request body closed before content-length completed"
+                                    .to_string(),
+                            );
+                            return Err(self.remember_error(err));
+                        }
+                        self.kind = FastHttp1StreamingBodyKind::Fixed { remaining };
+                        continue;
+                    }
+                    let take = available.min(remaining);
+                    remaining -= take;
+                    let chunk = self.connection_mut()?.buffered.split_to(take).freeze();
+                    self.kind = FastHttp1StreamingBodyKind::Fixed { remaining };
+                    return Ok(Some(chunk));
+                }
+                FastHttp1StreamingBodyKind::Chunked { mut state } => match state {
+                    FastHttp1ChunkedState::NeedSize => {
+                        let Some(line) = ({
+                            let (stream, buffered) = self.connection_mut()?.parts_mut()?;
+                            read_fast_http1_line(stream, buffered).await?
+                        }) else {
+                            let err = FastHttp1ReadError::BadRequest(
+                                "chunked downstream http/1.1 request closed before chunk size"
+                                    .to_string(),
+                            );
+                            return Err(self.remember_error(err));
+                        };
+                        let line = std::str::from_utf8(&line).map_err(|err| {
+                            let err = FastHttp1ReadError::BadRequest(format!(
+                                "invalid utf-8 in downstream http/1.1 chunk size: {err}",
+                            ));
+                            self.remember_error(err)
+                        })?;
+                        let size = line
+                            .split(';')
+                            .next()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| {
+                                let err = FastHttp1ReadError::BadRequest(
+                                    "missing downstream http/1.1 chunk size".to_string(),
+                                );
+                                self.remember_error(err)
+                            })
+                            .and_then(|value| {
+                                usize::from_str_radix(value, 16).map_err(|err| {
+                                    let err = FastHttp1ReadError::BadRequest(format!(
+                                        "invalid downstream http/1.1 chunk size `{value}`: {err}",
+                                    ));
+                                    self.remember_error(err)
+                                })
+                            })?;
+                        if size == 0 {
+                            state = FastHttp1ChunkedState::ReadTrailers;
+                        } else {
+                            if size > self.remaining_budget {
+                                return Err(FastHttp1ReadError::PayloadTooLarge);
+                            }
+                            self.remaining_budget -= size;
+                            state = FastHttp1ChunkedState::ReadData { remaining: size };
+                        }
+                        self.kind = FastHttp1StreamingBodyKind::Chunked { state };
+                    }
+                    FastHttp1ChunkedState::ReadData { mut remaining } => {
+                        if remaining == 0 {
+                            self.kind = FastHttp1StreamingBodyKind::Chunked {
+                                state: FastHttp1ChunkedState::ExpectChunkTerminator,
+                            };
+                            continue;
+                        }
+                        let available = self.connection_mut()?.buffered.len();
+                        if available == 0 {
+                            let read = {
+                                let (stream, buffered) = self.connection_mut()?.parts_mut()?;
+                                stream.read_buf(buffered).await?
+                            };
+                            if read == 0 {
+                                let err = FastHttp1ReadError::BadRequest(
+                                    "chunked downstream http/1.1 request closed before chunk data completed"
+                                        .to_string(),
+                                );
+                                return Err(self.remember_error(err));
+                            }
+                            self.kind = FastHttp1StreamingBodyKind::Chunked {
+                                state: FastHttp1ChunkedState::ReadData { remaining },
+                            };
+                            continue;
+                        }
+                        let take = available.min(remaining);
+                        remaining -= take;
+                        let chunk = self.connection_mut()?.buffered.split_to(take).freeze();
+                        self.kind = if remaining == 0 {
+                            FastHttp1StreamingBodyKind::Chunked {
+                                state: FastHttp1ChunkedState::ExpectChunkTerminator,
+                            }
+                        } else {
+                            FastHttp1StreamingBodyKind::Chunked {
+                                state: FastHttp1ChunkedState::ReadData { remaining },
+                            }
+                        };
+                        return Ok(Some(chunk));
+                    }
+                    FastHttp1ChunkedState::ExpectChunkTerminator => {
+                        let has_bytes = {
+                            let (stream, buffered) = self.connection_mut()?.parts_mut()?;
+                            ensure_fast_http1_buffered_bytes(stream, buffered, 2).await?
+                        };
+                        if !has_bytes {
+                            let err = FastHttp1ReadError::BadRequest(
+                                "chunked downstream http/1.1 request closed before chunk terminator"
+                                    .to_string(),
+                            );
+                            return Err(self.remember_error(err));
+                        }
+                        if self.connection_mut()?.buffered.split_to(2).as_ref() != b"\r\n" {
+                            let err = FastHttp1ReadError::BadRequest(
+                                "invalid downstream http/1.1 chunk terminator".to_string(),
+                            );
+                            return Err(self.remember_error(err));
+                        }
+                        self.kind = FastHttp1StreamingBodyKind::Chunked {
+                            state: FastHttp1ChunkedState::NeedSize,
+                        };
+                    }
+                    FastHttp1ChunkedState::ReadTrailers => {
+                        let Some(trailer) = ({
+                            let (stream, buffered) = self.connection_mut()?.parts_mut()?;
+                            read_fast_http1_line(stream, buffered).await?
+                        }) else {
+                            let err = FastHttp1ReadError::BadRequest(
+                                "chunked downstream http/1.1 request closed before trailers completed"
+                                    .to_string(),
+                            );
+                            return Err(self.remember_error(err));
+                        };
+                        if trailer.is_empty() {
+                            return Ok(None);
+                        }
+                        self.kind = FastHttp1StreamingBodyKind::Chunked {
+                            state: FastHttp1ChunkedState::ReadTrailers,
+                        };
+                    }
+                },
+            }
+        }
+    }
+
+    async fn drain_remaining(&mut self) -> Result<(), FastHttp1ReadError> {
+        while self.pull_next().await?.is_some() {}
+        Ok(())
+    }
+
+    fn take_connection(&mut self) -> Option<FastHttp1ConnectionIo<S>> {
+        self.connection.take()
+    }
+}
+
+impl<S> FastHttp1RequestBodyLease<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    fn new(
+        connection: FastHttp1ConnectionIo<S>,
+        kind: FastHttp1StreamingBodyKind,
+        remaining_budget: usize,
+    ) -> (Body, Self) {
+        let shared = Arc::new(tokio::sync::Mutex::new(
+            FastHttp1RequestBodyState::from_connection(connection, kind, remaining_budget),
+        ));
+        let body = Body::from_stream(try_unfold(shared.clone(), |shared| async move {
+            let chunk = {
+                let mut state = shared.lock().await;
+                state
+                    .pull_next()
+                    .await
+                    .map_err(FastHttp1ReadError::into_io_error)?
+            };
+            Ok::<_, io::Error>(chunk.map(|chunk| (chunk, shared)))
+        }));
+        (body, Self { shared })
+    }
+
+    async fn finish(
+        self,
+    ) -> Result<FastHttp1ConnectionIo<S>, (FastHttp1ReadError, FastHttp1ConnectionIo<S>)> {
+        let mut state = self.shared.lock().await;
+        let drain_result = state.drain_remaining().await;
+        let connection = state.take_connection().ok_or_else(|| {
+            (
+                FastHttp1ReadError::Io(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "downstream http/1.1 request body connection is unavailable",
+                )),
+                FastHttp1ConnectionIo {
+                    stream: None,
+                    buffered: BytesMut::new(),
+                },
+            )
+        })?;
+        match drain_result {
+            Ok(()) => Ok(connection),
+            Err(err) => Err((err, connection)),
+        }
+    }
+}
+
+async fn ensure_fast_http1_buffered_bytes<S>(
+    stream: &mut S,
+    buffered: &mut BytesMut,
+    count: usize,
+) -> Result<bool, FastHttp1ReadError>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    loop {
+        if buffered.len() >= count {
+            return Ok(true);
+        }
+        let read = stream.read_buf(buffered).await?;
+        if read == 0 {
+            return Ok(false);
+        }
+    }
+}
+
+async fn read_fast_http1_line<S>(
+    stream: &mut S,
+    buffered: &mut BytesMut,
+) -> Result<Option<bytes::Bytes>, FastHttp1ReadError>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    loop {
+        if let Some(line_end) = find_crlf(buffered) {
+            let line = buffered.split_to(line_end).freeze();
+            buffered.advance(2);
+            return Ok(Some(line));
+        }
+        let read = stream.read_buf(buffered).await?;
+        if read == 0 {
+            return Ok(None);
+        }
+    }
+}
+
+fn fast_http1_error_response(status: StatusCode, body: &str) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(CONTENT_LENGTH, body.len().to_string())
+        .header(CONNECTION, "close")
+        .body(Body::from(body.to_string()))
+        .expect("fast http/1.1 error response should build")
+}
+
+async fn read_next_fast_http1_request<S>(
+    connection: &mut FastHttp1ConnectionIo<S>,
+) -> Result<FastHttp1Decision<S>, FastHttp1ReadError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    const MAX_HTTP1_HEAD_BYTES: usize = 64 * 1024;
+    loop {
+        if connection.buffered.len() > MAX_HTTP1_HEAD_BYTES {
+            return Ok(FastHttp1Decision::FallbackToHyper);
+        }
+
+        let mut header_storage = [httparse::EMPTY_HEADER; 64];
+        let mut request = httparse::Request::new(&mut header_storage);
+        match request.parse(connection.buffered.as_ref()) {
+            Ok(httparse::Status::Complete(consumed)) => {
+                let Some(method) = request.method else {
+                    return Ok(FastHttp1Decision::FallbackToHyper);
+                };
+                let Ok(method) = Method::from_bytes(method.as_bytes()) else {
+                    return Ok(FastHttp1Decision::FallbackToHyper);
+                };
+                let version = match request.version {
+                    Some(0) => Version::HTTP_10,
+                    Some(1) => Version::HTTP_11,
+                    _ => return Ok(FastHttp1Decision::FallbackToHyper),
+                };
+                let Some(uri) = request.path else {
+                    return Ok(FastHttp1Decision::FallbackToHyper);
+                };
+                let Ok(uri) = uri.parse::<Uri>() else {
+                    return Ok(FastHttp1Decision::FallbackToHyper);
+                };
+                let mut headers = HeaderMap::new();
+                for header in request.headers {
+                    let Ok(name) = HeaderName::from_bytes(header.name.as_bytes()) else {
+                        return Ok(FastHttp1Decision::FallbackToHyper);
+                    };
+                    let Ok(value) = HeaderValue::from_bytes(header.value) else {
+                        return Ok(FastHttp1Decision::FallbackToHyper);
+                    };
+                    headers.append(name, value);
+                }
+                if !downstream_http1_fast_path_eligible(&method, &headers) {
+                    return Ok(FastHttp1Decision::FallbackToHyper);
+                }
+                if downstream_http1_fast_path_expects_continue(&headers) {
+                    connection
+                        .stream_mut()?
+                        .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                        .await?;
+                    connection.stream_mut()?.flush().await?;
+                }
+                let Some(body_kind) = classify_downstream_http1_fast_body(&headers) else {
+                    return Ok(FastHttp1Decision::FallbackToHyper);
+                };
+                connection.buffered.advance(consumed);
+                let (body, body_lease) = match body_kind {
+                    DownstreamHttp1FastBodyKind::Empty => (Body::empty(), None),
+                    DownstreamHttp1FastBodyKind::Fixed(content_length) => {
+                        let leased_io = connection.take_owned()?;
+                        let (body, lease) = FastHttp1RequestBodyLease::new(
+                            leased_io,
+                            FastHttp1StreamingBodyKind::Fixed {
+                                remaining: content_length,
+                            },
+                            MAX_DOWNSTREAM_HTTP1_FAST_BODY_BYTES,
+                        );
+                        (body, Some(lease))
+                    }
+                    DownstreamHttp1FastBodyKind::Chunked => {
+                        let leased_io = connection.take_owned()?;
+                        let (body, lease) = FastHttp1RequestBodyLease::new(
+                            leased_io,
+                            FastHttp1StreamingBodyKind::Chunked {
+                                state: FastHttp1ChunkedState::NeedSize,
+                            },
+                            MAX_DOWNSTREAM_HTTP1_FAST_BODY_BYTES,
+                        );
+                        (body, Some(lease))
+                    }
+                };
+                return Ok(FastHttp1Decision::Request(FastHttp1ParsedRequest {
+                    request: FastHttp1Request {
+                        body,
+                        keep_alive: http1_connection_keep_alive(version, &headers),
+                        method,
+                        uri,
+                        version,
+                        headers,
+                    },
+                    body_lease,
+                }));
+            }
+            Ok(httparse::Status::Partial) => {
+                let read = {
+                    let (stream, buffered) = connection.parts_mut()?;
+                    stream.read_buf(buffered).await?
+                };
+                if read == 0 {
+                    if connection.buffered.is_empty() {
+                        return Ok(FastHttp1Decision::EndOfStream);
+                    }
+                    return Ok(FastHttp1Decision::FallbackToHyper);
+                }
+            }
+            Err(_) => return Ok(FastHttp1Decision::FallbackToHyper),
+        }
+    }
+}
+
+fn build_fast_http_request_context(
+    request_id: String,
+    request: FastHttp1Request,
+    connection_metadata: Option<&DownstreamConnectionMetadata>,
+) -> Result<crate::abi_impl::http::HttpRequestContext, Response<Body>> {
+    let FastHttp1Request {
+        method,
+        uri,
+        version,
+        headers,
+        keep_alive: _,
+        body,
+    } = request;
+    let mut downstream_request = axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .version(version)
+        .body(body)
+        .map_err(|err| {
+            text_response(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid downstream http/1.1 request: {err}"),
+            )
+        })?;
+    *downstream_request.headers_mut() = headers;
+    let (parts, body) = downstream_request.into_parts();
+    Ok(build_downstream_http_request_context(
+        request_id,
+        parts,
+        body,
+        connection_metadata,
+    ))
+}
+
+fn write_http1_status_line(version: Version, status: StatusCode, encoded: &mut BytesMut) {
+    let version_label = match version {
+        Version::HTTP_10 => "HTTP/1.0",
+        _ => "HTTP/1.1",
+    };
+    encoded.extend_from_slice(version_label.as_bytes());
+    encoded.extend_from_slice(b" ");
+    encoded.extend_from_slice(status.as_str().as_bytes());
+    encoded.extend_from_slice(b" ");
+    encoded.extend_from_slice(status.canonical_reason().unwrap_or("OK").as_bytes());
+    encoded.extend_from_slice(b"\r\n");
+}
+
+async fn write_http1_response<S>(
+    stream: &mut S,
+    request_method: &Method,
+    request_keep_alive: bool,
+    response: Response<Body>,
+) -> io::Result<bool>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let (mut parts, mut body) = response.into_parts();
+    let version = match parts.version {
+        Version::HTTP_10 => Version::HTTP_10,
+        _ => Version::HTTP_11,
+    };
+    let status = parts.status;
+    let has_body = !http1_response_has_no_body(status, request_method);
+    let has_content_length = parts.headers.contains_key(CONTENT_LENGTH);
+    let mut use_chunked = http_header_contains_token(&parts.headers, TRANSFER_ENCODING, "chunked");
+    let mut keep_alive = request_keep_alive && http1_connection_keep_alive(version, &parts.headers);
+
+    if has_body && !has_content_length && !use_chunked {
+        if version == Version::HTTP_10 {
+            keep_alive = false;
+        } else {
+            use_chunked = true;
+            parts
+                .headers
+                .insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+        }
+    }
+
+    if !keep_alive {
+        parts
+            .headers
+            .insert(CONNECTION, HeaderValue::from_static("close"));
+    } else if version == Version::HTTP_10 && !parts.headers.contains_key(CONNECTION) {
+        parts
+            .headers
+            .insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+    }
+
+    let mut head = BytesMut::with_capacity(1024);
+    write_http1_status_line(version, status, &mut head);
+    for (name, value) in &parts.headers {
+        head.extend_from_slice(name.as_str().as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(value.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
+    head.extend_from_slice(b"\r\n");
+    stream.write_all(&head).await?;
+
+    if !has_body {
+        stream.flush().await?;
+        return Ok(keep_alive);
+    }
+
+    let mut trailers = HeaderMap::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|err| io::Error::other(err.to_string()))?;
+        match frame.into_data() {
+            Ok(data) => {
+                if use_chunked {
+                    let mut encoded =
+                        BytesMut::with_capacity(HTTP1_CHUNK_WRITE_OVERHEAD_BYTES + data.len());
+                    encoded.extend_from_slice(format!("{:X}\r\n", data.len()).as_bytes());
+                    encoded.extend_from_slice(&data);
+                    encoded.extend_from_slice(b"\r\n");
+                    stream.write_all(&encoded).await?;
+                } else {
+                    stream.write_all(&data).await?;
+                }
+            }
+            Err(frame) => {
+                if let Ok(frame_trailers) = frame.into_trailers() {
+                    trailers = frame_trailers;
+                } else {
+                    keep_alive = false;
+                }
+            }
+        }
+    }
+
+    if use_chunked {
+        let mut encoded = BytesMut::with_capacity(HTTP1_CHUNK_WRITE_OVERHEAD_BYTES);
+        encoded.extend_from_slice(b"0\r\n");
+        for (name, value) in &trailers {
+            encoded.extend_from_slice(name.as_str().as_bytes());
+            encoded.extend_from_slice(b": ");
+            encoded.extend_from_slice(value.as_bytes());
+            encoded.extend_from_slice(b"\r\n");
+        }
+        encoded.extend_from_slice(b"\r\n");
+        stream.write_all(&encoded).await?;
+    }
+
+    stream.flush().await?;
+    Ok(keep_alive)
+}
+
+async fn write_native_http1_response<S>(
+    stream: &mut S,
+    request_method: &Method,
+    request_keep_alive: bool,
+    native: ResolvedNativeHttp1DownstreamResponse,
+) -> io::Result<bool>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let ResolvedNativeHttp1DownstreamResponse {
+        response,
+        response_headers,
+        response_status,
+        upstream_latency_ms: _,
+    } = native;
+    let OutboundHttp1ForwardResponse {
+        status,
+        mut headers,
+        version,
+        body,
+        upstream_latency_ms: _,
+        negotiated_alpn: _,
+        peer_certificate_der: _,
+    } = response;
+
+    let hop_by_hop_headers = headers
+        .keys()
+        .filter(|name| is_hop_by_hop_header(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    for header in hop_by_hop_headers {
+        headers.remove(header);
+    }
+    merge_http_headers(&mut headers, &response_headers);
+
+    let status = response_status
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .unwrap_or_else(|| StatusCode::from_u16(status).unwrap_or(StatusCode::OK));
+    let version = match version {
+        Version::HTTP_10 => Version::HTTP_10,
+        _ => Version::HTTP_11,
+    };
+    let has_body = !http1_response_has_no_body(status, request_method);
+    let body_content_length = match &body {
+        OutboundHttp1ForwardBody::Empty => Some(0),
+        OutboundHttp1ForwardBody::Raw { content_length, .. } => *content_length,
+    };
+    if !headers.contains_key(CONTENT_LENGTH)
+        && !http_header_contains_token(&headers, TRANSFER_ENCODING, "chunked")
+        && let Some(content_length) = body_content_length
+        && let Ok(value) = HeaderValue::from_str(&content_length.to_string())
+    {
+        headers.insert(CONTENT_LENGTH, value);
+    }
+
+    let has_content_length = headers.contains_key(CONTENT_LENGTH);
+    let mut use_chunked = http_header_contains_token(&headers, TRANSFER_ENCODING, "chunked");
+    let mut keep_alive = request_keep_alive && http1_connection_keep_alive(version, &headers);
+
+    if has_body && !has_content_length && !use_chunked {
+        if version == Version::HTTP_10 {
+            keep_alive = false;
+        } else {
+            use_chunked = true;
+            headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+        }
+    }
+
+    if !keep_alive {
+        headers.insert(CONNECTION, HeaderValue::from_static("close"));
+    } else if version == Version::HTTP_10 && !headers.contains_key(CONNECTION) {
+        headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+    }
+
+    let mut head = BytesMut::with_capacity(1024);
+    write_http1_status_line(version, status, &mut head);
+    for (name, value) in &headers {
+        head.extend_from_slice(name.as_str().as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(value.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
+    head.extend_from_slice(b"\r\n");
+    stream.write_all(&head).await?;
+
+    if has_body {
+        match body {
+            OutboundHttp1ForwardBody::Empty => {}
+            OutboundHttp1ForwardBody::Raw { mut body, .. } => {
+                while let Some(chunk) = body
+                    .pull_next()
+                    .await
+                    .map_err(|err| io::Error::other(err.to_string()))?
+                {
+                    if use_chunked {
+                        let mut encoded =
+                            BytesMut::with_capacity(HTTP1_CHUNK_WRITE_OVERHEAD_BYTES + chunk.len());
+                        encoded.extend_from_slice(format!("{:X}\r\n", chunk.len()).as_bytes());
+                        encoded.extend_from_slice(&chunk);
+                        encoded.extend_from_slice(b"\r\n");
+                        stream.write_all(&encoded).await?;
+                    } else {
+                        stream.write_all(&chunk).await?;
+                    }
+                }
+            }
+        }
+    }
+
+    if use_chunked {
+        stream.write_all(b"0\r\n\r\n").await?;
+    }
+
+    stream.flush().await?;
+    Ok(keep_alive)
+}
+
+async fn write_native_local_http1_response<S>(
+    stream: &mut S,
+    request_method: &Method,
+    request_keep_alive: bool,
+    request_version: Version,
+    native: ResolvedNativeLocalHttp1DownstreamResponse,
+) -> io::Result<bool>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let ResolvedNativeLocalHttp1DownstreamResponse {
+        status,
+        mut headers,
+        body,
+        default_content_type,
+    } = native;
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+    let version = match request_version {
+        Version::HTTP_10 => Version::HTTP_10,
+        _ => Version::HTTP_11,
+    };
+    let has_body = !http1_response_has_no_body(status, request_method);
+    let body_len = if has_body { body.len() } else { 0 };
+
+    headers.remove(TRANSFER_ENCODING);
+    if let Ok(value) = HeaderValue::from_str(&body_len.to_string()) {
+        headers.insert(CONTENT_LENGTH, value);
+    }
+    if default_content_type
+        && body_len > 0
+        && !headers.contains_key(axum::http::header::CONTENT_TYPE)
+    {
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain"),
+        );
+    }
+
+    let keep_alive = request_keep_alive && http1_connection_keep_alive(version, &headers);
+    if !keep_alive {
+        headers.insert(CONNECTION, HeaderValue::from_static("close"));
+    } else if version == Version::HTTP_10 && !headers.contains_key(CONNECTION) {
+        headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+    }
+
+    let mut encoded = BytesMut::with_capacity(1024 + body_len);
+    write_http1_status_line(version, status, &mut encoded);
+    for (name, value) in &headers {
+        encoded.extend_from_slice(name.as_str().as_bytes());
+        encoded.extend_from_slice(b": ");
+        encoded.extend_from_slice(value.as_bytes());
+        encoded.extend_from_slice(b"\r\n");
+    }
+    encoded.extend_from_slice(b"\r\n");
+    if body_len > 0 {
+        encoded.extend_from_slice(&body);
+    }
+    stream.write_all(&encoded).await?;
+    stream.flush().await?;
+    Ok(keep_alive)
+}
+
+async fn serve_http1_fast_connection<S>(
+    state: SharedState,
+    stream: S,
+    peer_addr: SocketAddr,
+    connection_metadata: Option<DownstreamConnectionMetadata>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut connection = FastHttp1ConnectionIo::new(stream);
+    loop {
+        let decision = match read_next_fast_http1_request(&mut connection).await {
+            Ok(decision) => decision,
+            Err(FastHttp1ReadError::Io(err)) => {
+                warn!(
+                    "{} downstream http/1.1 fast path read failed for {peer_addr}: {err}",
+                    category_program()
+                );
+                return;
+            }
+            Err(FastHttp1ReadError::BadRequest(message)) => {
+                let response = fast_http1_error_response(StatusCode::BAD_REQUEST, &message);
+                let _ = write_http1_response(
+                    connection
+                        .stream_mut()
+                        .expect("downstream stream should exist"),
+                    &Method::GET,
+                    false,
+                    response,
+                )
+                .await;
+                return;
+            }
+            Err(FastHttp1ReadError::PayloadTooLarge) => {
+                let response = fast_http1_error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body exceeds fast http/1.1 limit",
+                );
+                let _ = write_http1_response(
+                    connection
+                        .stream_mut()
+                        .expect("downstream stream should exist"),
+                    &Method::GET,
+                    false,
+                    response,
+                )
+                .await;
+                return;
+            }
+        };
+        let FastHttp1Decision::Request(parsed_request) = decision else {
+            match decision {
+                FastHttp1Decision::EndOfStream => return,
+                FastHttp1Decision::FallbackToHyper => {
+                    let replay = connection.into_replay();
+                    serve_http1_connection_via_hyper(state, replay, peer_addr, connection_metadata)
+                        .await;
+                    return;
+                }
+                FastHttp1Decision::Request(_) => unreachable!(),
+            }
+        };
+        let FastHttp1ParsedRequest {
+            request,
+            body_lease,
+        } = parsed_request;
+
+        let request_method = request.method.clone();
+        let request_uri = request.uri.clone();
+        let request_version = request.version;
+        let request_keep_alive = request.keep_alive;
+        let mut body_lease = body_lease;
+        if state.loaded_program_snapshot().is_none() {
+            let started = Instant::now();
+            if let Some(body_lease) = body_lease.take() {
+                match body_lease.finish().await {
+                    Ok(returned) => connection.restore(returned),
+                    Err((FastHttp1ReadError::Io(err), returned)) => {
+                        connection.restore(returned);
+                        warn!(
+                            "{} downstream http/1.1 request body finalize failed for {peer_addr}: {err}",
+                            category_program()
+                        );
+                        return;
+                    }
+                    Err((FastHttp1ReadError::BadRequest(message), returned)) => {
+                        connection.restore(returned);
+                        let response = fast_http1_error_response(StatusCode::BAD_REQUEST, &message);
+                        let _ = write_http1_response(
+                            connection
+                                .stream_mut()
+                                .expect("downstream stream should exist"),
+                            &request_method,
+                            false,
+                            response,
+                        )
+                        .await;
+                        return;
+                    }
+                    Err((FastHttp1ReadError::PayloadTooLarge, returned)) => {
+                        connection.restore(returned);
+                        let response = fast_http1_error_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "request body exceeds fast http/1.1 limit",
+                        );
+                        let _ = write_http1_response(
+                            connection
+                                .stream_mut()
+                                .expect("downstream stream should exist"),
+                            &request_method,
+                            false,
+                            response,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            let finished = Instant::now();
+            record_stage_metrics(
+                0,
+                0,
+                0,
+                u64::try_from(finished.duration_since(started).as_micros()).unwrap_or(u64::MAX),
+            );
+            record_data_plane_response_metrics(&state, started, StatusCode::NOT_FOUND.as_u16(), 0);
+            match write_native_local_http1_response(
+                connection
+                    .stream_mut()
+                    .expect("downstream stream should exist"),
+                &request_method,
+                request_keep_alive,
+                request_version,
+                ResolvedNativeLocalHttp1DownstreamResponse {
+                    status: StatusCode::NOT_FOUND.as_u16(),
+                    headers: HeaderMap::new(),
+                    body: b"not found".to_vec(),
+                    default_content_type: false,
+                },
+            )
+            .await
+            {
+                Ok(keep_alive) => {
+                    if logging_enabled() {
+                        info!(
+                            "{} {} {} {}",
+                            category_access(),
+                            method_label(request_method.as_str()),
+                            status_label(StatusCode::NOT_FOUND.as_u16()),
+                            request_uri,
+                        );
+                    }
+                    if !keep_alive {
+                        return;
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    warn!(
+                        "{} downstream http/1.1 fast path write failed for {peer_addr}: {err}",
+                        category_program()
+                    );
+                    return;
+                }
+            }
+        }
+        let request_id = next_http_request_id();
+        let vm_request = match build_fast_http_request_context(
+            request_id,
+            request,
+            connection_metadata.as_ref(),
+        ) {
+            Ok(vm_request) => vm_request,
+            Err(response) => {
+                let _ = write_http1_response(
+                    connection
+                        .stream_mut()
+                        .expect("downstream stream should exist"),
+                    &request_method,
+                    false,
+                    response,
+                )
+                .await;
+                return;
+            }
+        };
+        state.record_data_plane_request();
+        let started = Instant::now();
+        let execution = execute_data_plane_http_request_context(
+            &state,
+            vm_request,
+            connection_metadata.clone(),
+            None,
+            #[cfg(feature = "http3")]
+            None,
+            None,
+        )
+        .await;
+        let delay_body_finalize = matches!(
+            &execution,
+            Ok((vm_context, ..)) if vm_context.native_default_upstream_http_forward_active()
+        );
+        if !delay_body_finalize && let Some(body_lease) = body_lease.take() {
+            match body_lease.finish().await {
+                Ok(returned) => connection.restore(returned),
+                Err((FastHttp1ReadError::Io(err), returned)) => {
+                    connection.restore(returned);
+                    warn!(
+                        "{} downstream http/1.1 request body finalize failed for {peer_addr}: {err}",
+                        category_program()
+                    );
+                    return;
+                }
+                Err((FastHttp1ReadError::BadRequest(message), returned)) => {
+                    connection.restore(returned);
+                    let response = fast_http1_error_response(StatusCode::BAD_REQUEST, &message);
+                    let _ = write_http1_response(
+                        connection
+                            .stream_mut()
+                            .expect("downstream stream should exist"),
+                        &request_method,
+                        false,
+                        response,
+                    )
+                    .await;
+                    return;
+                }
+                Err((FastHttp1ReadError::PayloadTooLarge, returned)) => {
+                    connection.restore(returned);
+                    let response = fast_http1_error_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request body exceeds fast http/1.1 limit",
+                    );
+                    let _ = write_http1_response(
+                        connection
+                            .stream_mut()
+                            .expect("downstream stream should exist"),
+                        &request_method,
+                        false,
+                        response,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+        let (keep_alive, response_status) = match execution {
+            Ok((vm_context, pre_vm_finished, after_vm)) => {
+                if let Some(native_local) =
+                    try_take_native_local_http1_downstream_response(&vm_context)
+                {
+                    let after_resolve = Instant::now();
+                    if let Some(body_lease) = body_lease.take() {
+                        match body_lease.finish().await {
+                            Ok(returned) => connection.restore(returned),
+                            Err((FastHttp1ReadError::Io(err), returned)) => {
+                                connection.restore(returned);
+                                warn!(
+                                    "{} downstream http/1.1 request body finalize failed for {peer_addr}: {err}",
+                                    category_program()
+                                );
+                                return;
+                            }
+                            Err((FastHttp1ReadError::BadRequest(message), returned)) => {
+                                connection.restore(returned);
+                                let response =
+                                    fast_http1_error_response(StatusCode::BAD_REQUEST, &message);
+                                let _ = write_http1_response(
+                                    connection
+                                        .stream_mut()
+                                        .expect("downstream stream should exist"),
+                                    &request_method,
+                                    false,
+                                    response,
+                                )
+                                .await;
+                                return;
+                            }
+                            Err((FastHttp1ReadError::PayloadTooLarge, returned)) => {
+                                connection.restore(returned);
+                                let response = fast_http1_error_response(
+                                    StatusCode::PAYLOAD_TOO_LARGE,
+                                    "request body exceeds fast http/1.1 limit",
+                                );
+                                let _ = write_http1_response(
+                                    connection
+                                        .stream_mut()
+                                        .expect("downstream stream should exist"),
+                                    &request_method,
+                                    false,
+                                    response,
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                    }
+                    let finished = Instant::now();
+                    record_stage_metrics(
+                        u64::try_from(pre_vm_finished.duration_since(started).as_micros())
+                            .unwrap_or(u64::MAX),
+                        u64::try_from(after_vm.duration_since(pre_vm_finished).as_micros())
+                            .unwrap_or(u64::MAX),
+                        u64::try_from(after_resolve.duration_since(after_vm).as_micros())
+                            .unwrap_or(u64::MAX),
+                        u64::try_from(finished.duration_since(started).as_micros())
+                            .unwrap_or(u64::MAX),
+                    );
+                    let response_status =
+                        StatusCode::from_u16(native_local.status).unwrap_or(StatusCode::OK);
+                    record_data_plane_response_metrics(
+                        &state,
+                        started,
+                        response_status.as_u16(),
+                        0,
+                    );
+                    match write_native_local_http1_response(
+                        connection
+                            .stream_mut()
+                            .expect("downstream stream should exist"),
+                        &request_method,
+                        request_keep_alive,
+                        request_version,
+                        native_local,
+                    )
+                    .await
+                    {
+                        Ok(keep_alive) => (keep_alive, response_status),
+                        Err(err) => {
+                            warn!(
+                                "{} downstream http/1.1 fast path write failed for {peer_addr}: {err}",
+                                category_program()
+                            );
+                            return;
+                        }
+                    }
+                } else if let Some(native_result) =
+                    try_resolve_native_http1_downstream_response(&vm_context).await
+                {
+                    let after_resolve = Instant::now();
+                    if let Some(body_lease) = body_lease.take() {
+                        match body_lease.finish().await {
+                            Ok(returned) => connection.restore(returned),
+                            Err((FastHttp1ReadError::Io(err), returned)) => {
+                                connection.restore(returned);
+                                warn!(
+                                    "{} downstream http/1.1 request body finalize failed for {peer_addr}: {err}",
+                                    category_program()
+                                );
+                                return;
+                            }
+                            Err((FastHttp1ReadError::BadRequest(message), returned)) => {
+                                connection.restore(returned);
+                                let response =
+                                    fast_http1_error_response(StatusCode::BAD_REQUEST, &message);
+                                let _ = write_http1_response(
+                                    connection
+                                        .stream_mut()
+                                        .expect("downstream stream should exist"),
+                                    &request_method,
+                                    false,
+                                    response,
+                                )
+                                .await;
+                                return;
+                            }
+                            Err((FastHttp1ReadError::PayloadTooLarge, returned)) => {
+                                connection.restore(returned);
+                                let response = fast_http1_error_response(
+                                    StatusCode::PAYLOAD_TOO_LARGE,
+                                    "request body exceeds fast http/1.1 limit",
+                                );
+                                let _ = write_http1_response(
+                                    connection
+                                        .stream_mut()
+                                        .expect("downstream stream should exist"),
+                                    &request_method,
+                                    false,
+                                    response,
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                    }
+                    let finished = Instant::now();
+                    record_stage_metrics(
+                        u64::try_from(pre_vm_finished.duration_since(started).as_micros())
+                            .unwrap_or(u64::MAX),
+                        u64::try_from(after_vm.duration_since(pre_vm_finished).as_micros())
+                            .unwrap_or(u64::MAX),
+                        u64::try_from(after_resolve.duration_since(after_vm).as_micros())
+                            .unwrap_or(u64::MAX),
+                        u64::try_from(finished.duration_since(started).as_micros())
+                            .unwrap_or(u64::MAX),
+                    );
+                    match native_result {
+                        Ok(native_response) => {
+                            let response_status = native_response
+                                .response_status
+                                .and_then(|code| StatusCode::from_u16(code).ok())
+                                .unwrap_or_else(|| {
+                                    StatusCode::from_u16(native_response.response.status)
+                                        .unwrap_or(StatusCode::OK)
+                                });
+                            record_data_plane_response_metrics(
+                                &state,
+                                started,
+                                response_status.as_u16(),
+                                native_response.upstream_latency_ms,
+                            );
+                            match write_native_http1_response(
+                                connection
+                                    .stream_mut()
+                                    .expect("downstream stream should exist"),
+                                &request_method,
+                                request_keep_alive,
+                                native_response,
+                            )
+                            .await
+                            {
+                                Ok(keep_alive) => (keep_alive, response_status),
+                                Err(err) => {
+                                    warn!(
+                                        "{} downstream http/1.1 fast path write failed for {peer_addr}: {err}",
+                                        category_program()
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        Err(response) => {
+                            let response =
+                                finalize_data_plane_response(&state, started, response, 0);
+                            let response_status = response.status();
+                            match write_http1_response(
+                                connection
+                                    .stream_mut()
+                                    .expect("downstream stream should exist"),
+                                &request_method,
+                                request_keep_alive,
+                                response,
+                            )
+                            .await
+                            {
+                                Ok(keep_alive) => (keep_alive, response_status),
+                                Err(err) => {
+                                    warn!(
+                                        "{} downstream http/1.1 fast path write failed for {peer_addr}: {err}",
+                                        category_program()
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let resolved = resolve_http_graph_response(&vm_context).await;
+                    let after_resolve = Instant::now();
+                    if let Some(body_lease) = body_lease.take() {
+                        match body_lease.finish().await {
+                            Ok(returned) => connection.restore(returned),
+                            Err((FastHttp1ReadError::Io(err), returned)) => {
+                                connection.restore(returned);
+                                warn!(
+                                    "{} downstream http/1.1 request body finalize failed for {peer_addr}: {err}",
+                                    category_program()
+                                );
+                                return;
+                            }
+                            Err((FastHttp1ReadError::BadRequest(message), returned)) => {
+                                connection.restore(returned);
+                                let response =
+                                    fast_http1_error_response(StatusCode::BAD_REQUEST, &message);
+                                let _ = write_http1_response(
+                                    connection
+                                        .stream_mut()
+                                        .expect("downstream stream should exist"),
+                                    &request_method,
+                                    false,
+                                    response,
+                                )
+                                .await;
+                                return;
+                            }
+                            Err((FastHttp1ReadError::PayloadTooLarge, returned)) => {
+                                connection.restore(returned);
+                                let response = fast_http1_error_response(
+                                    StatusCode::PAYLOAD_TOO_LARGE,
+                                    "request body exceeds fast http/1.1 limit",
+                                );
+                                let _ = write_http1_response(
+                                    connection
+                                        .stream_mut()
+                                        .expect("downstream stream should exist"),
+                                    &request_method,
+                                    false,
+                                    response,
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                    }
+                    let crate::abi_impl::http::ResolvedHttpGraphResponse {
+                        response,
+                        upstream_latency_ms,
+                        post_response_plan,
+                    } = resolved;
+                    if let Some(plan) = post_response_plan {
+                        tokio::spawn(async move {
+                            if let Err(err) = plan.run().await {
+                                warn!(
+                                    "{} downstream post-response transport failed: {err}",
+                                    category_program()
+                                );
+                            }
+                        });
+                    }
+                    let finished = Instant::now();
+                    record_stage_metrics(
+                        u64::try_from(pre_vm_finished.duration_since(started).as_micros())
+                            .unwrap_or(u64::MAX),
+                        u64::try_from(after_vm.duration_since(pre_vm_finished).as_micros())
+                            .unwrap_or(u64::MAX),
+                        u64::try_from(after_resolve.duration_since(after_vm).as_micros())
+                            .unwrap_or(u64::MAX),
+                        u64::try_from(finished.duration_since(started).as_micros())
+                            .unwrap_or(u64::MAX),
+                    );
+                    let response = finalize_data_plane_response(
+                        &state,
+                        started,
+                        response,
+                        upstream_latency_ms,
+                    );
+                    let response_status = response.status();
+                    match write_http1_response(
+                        connection
+                            .stream_mut()
+                            .expect("downstream stream should exist"),
+                        &request_method,
+                        request_keep_alive,
+                        response,
+                    )
+                    .await
+                    {
+                        Ok(keep_alive) => (keep_alive, response_status),
+                        Err(err) => {
+                            warn!(
+                                "{} downstream http/1.1 fast path write failed for {peer_addr}: {err}",
+                                category_program()
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(response) => {
+                let response = finalize_data_plane_response(&state, started, response, 0);
+                let response_status = response.status();
+                match write_http1_response(
+                    connection
+                        .stream_mut()
+                        .expect("downstream stream should exist"),
+                    &request_method,
+                    request_keep_alive,
+                    response,
+                )
+                .await
+                {
+                    Ok(keep_alive) => (keep_alive, response_status),
+                    Err(err) => {
+                        warn!(
+                            "{} downstream http/1.1 fast path write failed for {peer_addr}: {err}",
+                            category_program()
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+        if logging_enabled() {
+            info!(
+                "{} {} {} {}",
+                category_access(),
+                method_label(request_method.as_str()),
+                status_label(response_status.as_u16()),
+                request_uri,
+            );
+        }
+        if !keep_alive {
+            return;
+        }
+    }
+}
+
+async fn serve_http1_connection<S>(
+    state: SharedState,
+    stream: S,
+    peer_addr: SocketAddr,
+    connection_metadata: Option<DownstreamConnectionMetadata>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    serve_http1_fast_connection(state, stream, peer_addr, connection_metadata).await;
 }
 
 #[cfg(feature = "http2")]
@@ -481,7 +2035,13 @@ async fn serve_https_http_connection(
                 peer_addr,
                 secure: true,
             };
-            serve_http_connection(state, tls_stream, peer_addr, Some(connection_metadata)).await;
+            #[cfg(feature = "http2")]
+            if tls_stream.get_ref().1.alpn_protocol() == Some(b"h2") {
+                serve_http_connection(state, tls_stream, peer_addr, Some(connection_metadata))
+                    .await;
+                return;
+            }
+            serve_http1_connection(state, tls_stream, peer_addr, Some(connection_metadata)).await;
         }
         Err(err) => {
             warn!(
@@ -895,7 +2455,14 @@ async fn run_inline_promoted_http_connection<S>(
 pub async fn serve_http_proxy(listener: TcpListener, state: SharedState) -> std::io::Result<()> {
     #[cfg(not(feature = "http2"))]
     {
-        return axum::serve(listener, build_http_proxy_app(state)).await;
+        loop {
+            let (stream, peer_addr) = listener.accept().await?;
+            let _ = stream.set_nodelay(true);
+            let state = state.clone();
+            tokio::spawn(async move {
+                serve_http1_connection(state, stream, peer_addr, None).await;
+            });
+        }
     }
 
     #[cfg(feature = "http2")]
@@ -988,18 +2555,6 @@ async fn handle_data_plane_request(state: SharedState, request: Request) -> Resp
 
     state.record_data_plane_request();
 
-    let snapshot = state.loaded_program_snapshot();
-
-    let Some(program) = snapshot else {
-        warn!("{} no program loaded; returning 404", category_program());
-        return finalize_data_plane_response(
-            &state,
-            started,
-            text_response(StatusCode::NOT_FOUND, "not found"),
-            0,
-        );
-    };
-
     let (mut parts, body) = request.into_parts();
     let downstream_http2_attachment = parts
         .extensions
@@ -1015,88 +2570,48 @@ async fn handle_data_plane_request(state: SharedState, request: Request) -> Resp
         .get::<DownstreamConnectionMetadata>()
         .cloned();
     let downstream_http1_upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
-    let (vm_context, pre_vm_finished, after_vm) = {
-        let request_id = next_http_request_id();
-        let vm_request = build_downstream_http_request_context(
-            request_id,
-            parts,
-            body,
-            connection_metadata.as_ref(),
-        );
-        let debug = VmDebugInvocation {
-            attach_debugger: request_will_attach_debugger(
-                &state.debug_session,
-                &vm_request.headers,
-                &vm_request.path,
-            ),
-            force_threading: request_uses_blocking_debugger(
-                &state.debug_session,
-                &vm_request.headers,
-                &vm_request.path,
-            ),
-        };
-        let mut vm_context = ProxyVmContext::from_http_request_with_services(
-            vm_request,
-            state.runtime_services.clone(),
-        );
-        if let Some(connection_metadata) = &connection_metadata {
-            vm_context.attach_downstream_connection_metadata(connection_metadata);
-        }
-        if let Some(attachment) = &downstream_http2_attachment {
-            vm_context.attach_downstream_http2_stream(attachment);
-        }
+    let request_id = next_http_request_id();
+    let vm_request = build_downstream_http_request_context(
+        request_id,
+        parts,
+        body,
+        connection_metadata.as_ref(),
+    );
+    handle_data_plane_http_request_context(
+        state,
+        vm_request,
+        connection_metadata,
+        downstream_http2_attachment,
         #[cfg(feature = "http3")]
-        if let Some(attachment) = &downstream_http3_attachment {
-            vm_context.attach_downstream_http3_stream(attachment);
-        }
-        if let Some(upgrade) = downstream_http1_upgrade {
-            vm_context.attach_downstream_http1_upgrade(upgrade);
-        }
-        let vm_context = Arc::new(vm_context);
-        let pre_vm_finished = Instant::now();
-        match execute_vm_with_context(
-            &program,
-            vm_context.clone(),
-            state.debug_session.clone(),
-            debug,
-            register_http_plane_host_module,
-            state.vm_execution,
-        )
-        .await
-        {
-            Ok(()) => {}
-            Err(VmExecutionError::HostRegistration(err)) => {
-                state.record_vm_execution_error();
-                warn!(
-                    "{} failed to register host module: {err}",
-                    category_program()
-                );
-                return finalize_data_plane_response(
-                    &state,
-                    started,
-                    text_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &format!("host registration error: {err}"),
-                    ),
-                    0,
-                );
-            }
-            Err(VmExecutionError::Vm(err)) => {
-                state.record_vm_execution_error();
-                warn!("{} vm execution error: {err}", category_program());
-                return finalize_data_plane_response(
-                    &state,
-                    started,
-                    text_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &format!("vm execution error: {err}"),
-                    ),
-                    0,
-                );
-            }
-        }
+        downstream_http3_attachment,
+        downstream_http1_upgrade,
+        started,
+    )
+    .await
+}
 
-        (vm_context, pre_vm_finished, Instant::now())
+async fn handle_data_plane_http_request_context(
+    state: SharedState,
+    vm_request: crate::abi_impl::http::HttpRequestContext,
+    connection_metadata: Option<DownstreamConnectionMetadata>,
+    downstream_http2_attachment: Option<Http2DownstreamStreamAttachment>,
+    #[cfg(feature = "http3")] downstream_http3_attachment: Option<Http3DownstreamStreamAttachment>,
+    downstream_http1_upgrade: Option<hyper::upgrade::OnUpgrade>,
+    started: Instant,
+) -> Response<Body> {
+    let (vm_context, pre_vm_finished, after_vm) = match execute_data_plane_http_request_context(
+        &state,
+        vm_request,
+        connection_metadata,
+        downstream_http2_attachment,
+        #[cfg(feature = "http3")]
+        downstream_http3_attachment,
+        downstream_http1_upgrade,
+    )
+    .await
+    {
+        Ok(executed) => executed,
+        Err(response) => return finalize_data_plane_response(&state, started, response, 0),
     };
 
     let resolved = resolve_http_graph_response(&vm_context).await;
@@ -1124,6 +2639,83 @@ async fn handle_data_plane_request(state: SharedState, request: Request) -> Resp
         u64::try_from(finished.duration_since(started).as_micros()).unwrap_or(u64::MAX),
     );
     finalize_data_plane_response(&state, started, response, upstream_latency_ms)
+}
+
+async fn execute_data_plane_http_request_context(
+    state: &SharedState,
+    vm_request: crate::abi_impl::http::HttpRequestContext,
+    connection_metadata: Option<DownstreamConnectionMetadata>,
+    downstream_http2_attachment: Option<Http2DownstreamStreamAttachment>,
+    #[cfg(feature = "http3")] downstream_http3_attachment: Option<Http3DownstreamStreamAttachment>,
+    downstream_http1_upgrade: Option<hyper::upgrade::OnUpgrade>,
+) -> Result<(SharedProxyVmContext, Instant, Instant), Response<Body>> {
+    let Some(program) = state.loaded_program_snapshot() else {
+        warn!("{} no program loaded; returning 404", category_program());
+        return Err(text_response(StatusCode::NOT_FOUND, "not found"));
+    };
+
+    let debug = VmDebugInvocation {
+        attach_debugger: request_will_attach_debugger(
+            &state.debug_session,
+            &vm_request.headers,
+            &vm_request.path,
+        ),
+        force_threading: request_uses_blocking_debugger(
+            &state.debug_session,
+            &vm_request.headers,
+            &vm_request.path,
+        ),
+    };
+    let mut vm_context =
+        ProxyVmContext::from_http_request_with_services(vm_request, state.runtime_services.clone());
+    if let Some(connection_metadata) = &connection_metadata {
+        vm_context.attach_downstream_connection_metadata(connection_metadata);
+    }
+    if let Some(attachment) = &downstream_http2_attachment {
+        vm_context.attach_downstream_http2_stream(attachment);
+    }
+    #[cfg(feature = "http3")]
+    if let Some(attachment) = &downstream_http3_attachment {
+        vm_context.attach_downstream_http3_stream(attachment);
+    }
+    if let Some(upgrade) = downstream_http1_upgrade {
+        vm_context.attach_downstream_http1_upgrade(upgrade);
+    }
+    let vm_context = Arc::new(vm_context);
+    let pre_vm_finished = Instant::now();
+    match execute_vm_with_context(
+        &program,
+        vm_context.clone(),
+        state.debug_session.clone(),
+        debug,
+        register_http_plane_host_module,
+        state.vm_execution,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(VmExecutionError::HostRegistration(err)) => {
+            state.record_vm_execution_error();
+            warn!(
+                "{} failed to register host module: {err}",
+                category_program()
+            );
+            return Err(text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("host registration error: {err}"),
+            ));
+        }
+        Err(VmExecutionError::Vm(err)) => {
+            state.record_vm_execution_error();
+            warn!("{} vm execution error: {err}", category_program());
+            return Err(text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("vm execution error: {err}"),
+            ));
+        }
+    }
+
+    Ok((vm_context, pre_vm_finished, Instant::now()))
 }
 
 async fn dispatch_data_plane_request(state: SharedState, request: Request) -> Response<Body> {
@@ -1159,11 +2751,25 @@ fn finalize_data_plane_response(
     response: Response<Body>,
     upstream_latency_ms: u64,
 ) -> Response<Body> {
-    state.record_data_plane_status(response.status().as_u16());
+    record_data_plane_response_metrics(
+        state,
+        started,
+        response.status().as_u16(),
+        upstream_latency_ms,
+    );
+    response
+}
+
+fn record_data_plane_response_metrics(
+    state: &SharedState,
+    started: Instant,
+    status: u16,
+    upstream_latency_ms: u64,
+) {
+    state.record_data_plane_status(status);
     let elapsed_ms = started.elapsed().as_millis();
     let total_latency_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
     state.record_data_plane_latency_ms(total_latency_ms, upstream_latency_ms);
-    response
 }
 
 fn request_supports_upgrade(request: &hyper::Request<Incoming>) -> bool {
