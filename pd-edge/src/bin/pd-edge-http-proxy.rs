@@ -71,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vm_execution = VmExecutionConfig {
         interrupt: cli.vm_interrupt_config()?,
         execution_mode: cli.vm_execution_mode.unwrap_or_default(),
+        jit_enabled: cli.vm_jit,
     };
     let store_limits = cli.runtime_store_limits();
     if cli.disable_metrics {
@@ -80,6 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_metrics_collection_enabled(!cli.disable_metrics)
         .with_vm_execution_config(vm_execution);
     info!("vm execution mode={}", vm_execution.execution_mode.as_str());
+    info!("vm jit enabled={}", vm_execution.jit_enabled);
     match vm_execution.interrupt {
         VmInterruptConfig::None => {}
         VmInterruptConfig::Fuel {
@@ -212,6 +214,7 @@ struct CliArgs {
     vm_epoch_deadline: Option<u64>,
     vm_epoch_check_interval: Option<u32>,
     vm_execution_mode: Option<VmExecutionMode>,
+    vm_jit: bool,
     control_plane_url: Option<String>,
     edge_id: Option<String>,
     edge_name: Option<String>,
@@ -378,6 +381,9 @@ where
                 let value = next_arg_value("--vm-execution-mode", &mut args)?;
                 cli.vm_execution_mode = Some(parse_vm_execution_mode(&value)?);
             }
+            "--vm-jit" => {
+                cli.vm_jit = true;
+            }
             "--edge-id" => {
                 cli.edge_id = Some(next_arg_value("--edge-id", &mut args)?);
             }
@@ -471,6 +477,7 @@ fn print_cli_help() {
             "  --vm-epoch-deadline <TICKS>               Enable cooperative VM epoch slices per request (1 tick = 1ms wall clock)\n",
             "  --vm-epoch-check-interval <OPS>           Epoch check interval when --vm-epoch-deadline is enabled (default: 1)\n",
             "  --vm-execution-mode <MODE>                VM execution mode: async|threading (default: async)\n",
+            "  --vm-jit                                  Enable VM JIT/trace execution (default: off)\n",
             "  --control-plane-url <URL>                 Enable active control-plane RPC client\n",
             "  --edge-id <UUID>                          Explicit edge UUID used by active control-plane client\n",
             "  --edge-name <NAME>                        Friendly edge name (default: hostname)\n",
@@ -667,6 +674,7 @@ mod tests {
                 vm_epoch_deadline: None,
                 vm_epoch_check_interval: None,
                 vm_execution_mode: None,
+                vm_jit: false,
                 control_plane_url: Some("http://127.0.0.1:9100".to_string()),
                 edge_id: Some("123e4567-e89b-12d3-a456-426614174000".to_string()),
                 edge_name: Some("test-edge".to_string()),
@@ -779,6 +787,16 @@ mod tests {
             panic!("expected run action");
         };
         assert_eq!(cli.vm_execution_mode, Some(VmExecutionMode::Threading));
+    }
+
+    #[test]
+    fn parse_cli_args_from_parses_vm_jit_flag() {
+        let action = parse_cli_args_from(["--vm-jit".to_string()]).expect("parse should succeed");
+
+        let CliAction::Run(cli) = action else {
+            panic!("expected run action");
+        };
+        assert!(cli.vm_jit);
     }
 
     #[test]

@@ -1192,6 +1192,7 @@ mod tests {
         let state = SharedState::new(1024 * 1024).with_vm_execution_config(VmExecutionConfig {
             interrupt: crate::runtime::VmInterruptConfig::None,
             execution_mode: VmExecutionMode::Threading,
+            jit_enabled: true,
         });
         let source = r#"
             use http;
@@ -1339,6 +1340,7 @@ mod tests {
         let state = SharedState::new(1024 * 1024).with_vm_execution_config(VmExecutionConfig {
             interrupt: crate::runtime::VmInterruptConfig::None,
             execution_mode: VmExecutionMode::Threading,
+            jit_enabled: true,
         });
         let source = format!(
             r#"
@@ -1458,6 +1460,7 @@ mod tests {
         let state = SharedState::new(1024 * 1024).with_vm_execution_config(VmExecutionConfig {
             interrupt: crate::runtime::VmInterruptConfig::None,
             execution_mode: VmExecutionMode::Threading,
+            jit_enabled: true,
         });
         let source = format!(
             r#"

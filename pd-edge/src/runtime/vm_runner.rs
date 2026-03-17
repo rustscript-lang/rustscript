@@ -103,6 +103,7 @@ pub async fn execute_vm_with_context(
         vm_context,
         async_ops,
         !debug.attach_debugger && matches!(vm_execution.interrupt, VmInterruptConfig::None),
+        vm_execution.jit_enabled,
     );
     let execution_mode = if debug.force_threading {
         VmExecutionMode::Threading
@@ -303,8 +304,11 @@ fn new_vm_runner_store(
     vm_context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
     prefer_aot: bool,
+    jit_enabled: bool,
 ) -> VmRunnerStore {
-    let prefer_aot = prefer_aot && std::env::var_os("PD_EDGE_DISABLE_NO_INTERRUPT_AOT").is_none();
+    let prefer_aot = prefer_aot
+        && jit_enabled
+        && std::env::var_os("PD_EDGE_DISABLE_NO_INTERRUPT_AOT").is_none();
     let mut vm = if prefer_aot {
         if let Some(bundle) = program.no_interrupt_aot_bundle.as_ref() {
             match Vm::from_aot_bundle_bytes(bundle.as_ref().as_slice()) {
@@ -321,6 +325,11 @@ fn new_vm_runner_store(
     } else {
         Vm::new_shared(program.program.clone())
     };
+    if !jit_enabled {
+        let mut jit_config = *vm.jit_config();
+        jit_config.enabled = false;
+        vm.set_jit_config(jit_config);
+    }
     vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));
     Store::new(vm, VmRunnerStoreData::new(vm_context, async_ops))
 }
@@ -530,7 +539,7 @@ mod tests {
             Arc::new(RateLimiterStore::new()),
         ));
         let async_ops = new_shared_vm_async_ops();
-        let store = new_vm_runner_store(&loaded_program, context, async_ops, false);
+        let store = new_vm_runner_store(&loaded_program, context, async_ops, false, true);
         let debug = VmDebugInvocation {
             attach_debugger: false,
             force_threading: false,
@@ -542,6 +551,7 @@ mod tests {
                 check_interval: 1,
             },
             execution_mode: VmExecutionMode::Threading,
+            jit_enabled: true,
         };
 
         let result = tokio::task::spawn_blocking(move || {
