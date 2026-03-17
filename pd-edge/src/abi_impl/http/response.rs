@@ -75,6 +75,15 @@ fn apply_response_header_batch(context: &SharedProxyVmContext, headers: axum::ht
     context.insert_downstream_response_headers(headers);
 }
 
+fn validate_response_status(status: i64) -> Result<u16, VmError> {
+    if !(100..=599).contains(&status) {
+        return Err(VmError::HostError(format!(
+            "status code must be in range 100..=599, got '{status}'",
+        )));
+    }
+    Ok(status as u16)
+}
+
 /// Sets a header on the downstream HTTP response.
 #[pd_edge_host_function(name = http_response::SET_HEADER.name, scope = http)]
 fn set_response_header(
@@ -135,12 +144,7 @@ async fn apply_exchange_to_response_with_headers(
 /// Sets the status code on the downstream HTTP response.
 #[pd_edge_host_function(name = http_response::SET_STATUS.name, scope = http)]
 fn set_response_status(context: SharedProxyVmContext, status: i64) -> Result<CallOutcome, VmError> {
-    if !(100..=599).contains(&status) {
-        return Err(VmError::HostError(format!(
-            "status code must be in range 100..=599, got '{status}'",
-        )));
-    }
-    context.set_downstream_response_status(status as u16);
+    context.set_downstream_response_status(validate_response_status(status)?);
     Ok(CallOutcome::Return(vec![]))
 }
 

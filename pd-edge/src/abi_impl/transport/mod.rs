@@ -21,6 +21,8 @@ pub(crate) use state::{
 pub(crate) use state::{DownstreamTlsServerStart, SharedServerTlsStreamIo, SharedTlsStreamIo};
 #[cfg(feature = "tls")]
 pub(crate) use tls::build_default_self_signed_server_config;
+#[cfg(feature = "tls")]
+pub(crate) use tls::build_dynamic_client_config;
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn configure_upstream_transport_for_target(

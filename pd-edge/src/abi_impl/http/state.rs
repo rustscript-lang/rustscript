@@ -7,11 +7,8 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, Instant},
+    sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use axum::{
@@ -24,15 +21,10 @@ use axum::{
 };
 use futures_util::stream::try_unfold;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Body as _;
 #[cfg(feature = "http3")]
 use hyper::body::Buf;
 use hyper::upgrade::OnUpgrade;
-use hyper_util::{
-    client::legacy::{Client as HyperLegacyClient, connect::HttpConnector},
-    rt::{TokioExecutor, TokioIo, TokioTimer},
-};
-use parking_lot::Mutex as ParkingMutex;
+use hyper_util::rt::TokioIo;
 use tokio::io::copy_bidirectional;
 use tokio::sync::oneshot;
 use vm::VmError;
@@ -61,6 +53,12 @@ use super::super::{
     },
     websocket::WebSocketConnectionState,
 };
+use super::outbound_http1::{
+    OutboundHttp1ForwardBody, OutboundHttp1ForwardResponse, OutboundHttp1Request,
+    OutboundHttp1RequestBody, OutboundHttp1Scheme, OutboundHttp1Target, PlainHttp1ResponseBody,
+    PlainHttp1SenderLease, SharedPlainHttp1SenderPool, forward_via_sender_pool,
+};
+use super::outbound_http1_fast_path_eligible;
 use super::version::HttpVersionPreference;
 #[cfg(feature = "tls")]
 use crate::abi_impl::transport::{
@@ -387,6 +385,10 @@ impl InboundRequestBodyState {
     fn is_drained(&self) -> bool {
         self.stream.eof && self.stream.read_offset >= self.stream.buffered.len()
     }
+
+    fn is_pristine_unread(&self) -> bool {
+        self.stream.buffered.is_empty() && self.stream.read_offset == 0 && !self.stream.eof
+    }
 }
 
 #[derive(Clone)]
@@ -697,108 +699,6 @@ impl DownstreamPostResponsePlan {
 
 pub(crate) type SharedUpstreamClientCache =
     Arc<ShardedRwLruStore<UpstreamClientCacheKey, reqwest::Client>>;
-pub(crate) type SharedPlainHttp1UpstreamClient = Arc<HyperLegacyClient<HttpConnector, Full<Bytes>>>;
-type PlainHttp1PooledSender = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
-pub(crate) type SharedPlainHttp1SenderPool = Arc<ParkingMutex<PlainHttp1SenderPool>>;
-static NATIVE_FORWARD_METRICS_ENABLED: OnceLock<bool> = OnceLock::new();
-static NATIVE_FORWARD_METRICS_COUNT: AtomicU64 = AtomicU64::new(0);
-static NATIVE_FORWARD_METRICS_POOL_HITS: AtomicU64 = AtomicU64::new(0);
-static NATIVE_FORWARD_METRICS_POOL_MISSES: AtomicU64 = AtomicU64::new(0);
-static NATIVE_FORWARD_METRICS_RETRIES: AtomicU64 = AtomicU64::new(0);
-static NATIVE_FORWARD_METRICS_BUILD_US: AtomicU64 = AtomicU64::new(0);
-static NATIVE_FORWARD_METRICS_CONNECT_US: AtomicU64 = AtomicU64::new(0);
-static NATIVE_FORWARD_METRICS_READY_US: AtomicU64 = AtomicU64::new(0);
-static NATIVE_FORWARD_METRICS_SEND_US: AtomicU64 = AtomicU64::new(0);
-static NATIVE_FORWARD_METRICS_TOTAL_US: AtomicU64 = AtomicU64::new(0);
-
-fn native_forward_metrics_enabled() -> bool {
-    *NATIVE_FORWARD_METRICS_ENABLED
-        .get_or_init(|| std::env::var_os("PD_EDGE_NATIVE_FORWARD_METRICS").is_some())
-}
-
-fn record_native_forward_metrics(
-    pool_hit: bool,
-    retries: u64,
-    build_us: u64,
-    connect_us: u64,
-    ready_us: u64,
-    send_us: u64,
-    total_us: u64,
-) {
-    if !native_forward_metrics_enabled() {
-        return;
-    }
-    let count = NATIVE_FORWARD_METRICS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if pool_hit {
-        NATIVE_FORWARD_METRICS_POOL_HITS.fetch_add(1, Ordering::Relaxed);
-    } else {
-        NATIVE_FORWARD_METRICS_POOL_MISSES.fetch_add(1, Ordering::Relaxed);
-    }
-    NATIVE_FORWARD_METRICS_RETRIES.fetch_add(retries, Ordering::Relaxed);
-    NATIVE_FORWARD_METRICS_BUILD_US.fetch_add(build_us, Ordering::Relaxed);
-    NATIVE_FORWARD_METRICS_CONNECT_US.fetch_add(connect_us, Ordering::Relaxed);
-    NATIVE_FORWARD_METRICS_READY_US.fetch_add(ready_us, Ordering::Relaxed);
-    NATIVE_FORWARD_METRICS_SEND_US.fetch_add(send_us, Ordering::Relaxed);
-    NATIVE_FORWARD_METRICS_TOTAL_US.fetch_add(total_us, Ordering::Relaxed);
-    if count.is_multiple_of(1000) {
-        let hits = NATIVE_FORWARD_METRICS_POOL_HITS.load(Ordering::Relaxed);
-        let misses = NATIVE_FORWARD_METRICS_POOL_MISSES.load(Ordering::Relaxed);
-        let retries = NATIVE_FORWARD_METRICS_RETRIES.load(Ordering::Relaxed);
-        let build_avg =
-            NATIVE_FORWARD_METRICS_BUILD_US.load(Ordering::Relaxed) as f64 / count as f64;
-        let connect_avg =
-            NATIVE_FORWARD_METRICS_CONNECT_US.load(Ordering::Relaxed) as f64 / count as f64;
-        let ready_avg =
-            NATIVE_FORWARD_METRICS_READY_US.load(Ordering::Relaxed) as f64 / count as f64;
-        let send_avg = NATIVE_FORWARD_METRICS_SEND_US.load(Ordering::Relaxed) as f64 / count as f64;
-        let total_avg =
-            NATIVE_FORWARD_METRICS_TOTAL_US.load(Ordering::Relaxed) as f64 / count as f64;
-        eprintln!(
-            "native_forward_metrics requests={count} pool_hit_rate={:.2}% retries={} avg_build_us={build_avg:.1} avg_connect_us={connect_avg:.1} avg_ready_us={ready_avg:.1} avg_send_us={send_avg:.1} avg_total_us={total_avg:.1}",
-            if hits + misses == 0 {
-                0.0
-            } else {
-                (hits as f64 * 100.0) / (hits + misses) as f64
-            },
-            retries,
-        );
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct PlainHttp1SenderPool {
-    hot_authority: Option<String>,
-    hot_senders: Vec<PlainHttp1PooledSender>,
-    other_senders: HashMap<String, Vec<PlainHttp1PooledSender>>,
-}
-
-impl PlainHttp1SenderPool {
-    fn take(&mut self, authority: &str) -> Option<PlainHttp1PooledSender> {
-        if self.hot_authority.as_deref() == Some(authority) {
-            return self.hot_senders.pop();
-        }
-        self.other_senders.get_mut(authority).and_then(Vec::pop)
-    }
-
-    fn put(&mut self, authority: String, capacity: usize, sender: PlainHttp1PooledSender) {
-        let capacity = capacity.max(1);
-        if self.hot_authority.as_deref() == Some(authority.as_str()) {
-            if self.hot_senders.len() < capacity {
-                self.hot_senders.push(sender);
-            }
-            return;
-        }
-        if self.hot_authority.is_none() {
-            self.hot_authority = Some(authority);
-            self.hot_senders.push(sender);
-            return;
-        }
-        let senders = self.other_senders.entry(authority).or_default();
-        if senders.len() < capacity {
-            senders.push(sender);
-        }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct UpstreamClientCacheKey {
@@ -810,10 +710,6 @@ pub(crate) fn new_shared_upstream_client_cache(capacity: usize) -> SharedUpstrea
     Arc::new(ShardedRwLruStore::new(capacity))
 }
 
-pub(crate) fn new_shared_plain_http1_sender_pool() -> SharedPlainHttp1SenderPool {
-    Arc::new(ParkingMutex::new(PlainHttp1SenderPool::default()))
-}
-
 pub(crate) fn upstream_reqwest_client_builder() -> reqwest::ClientBuilder {
     let builder = reqwest::Client::builder().tls_info(true).tcp_nodelay(true);
     #[cfg(feature = "http2")]
@@ -823,151 +719,6 @@ pub(crate) fn upstream_reqwest_client_builder() -> reqwest::ClientBuilder {
     #[cfg(not(feature = "http2"))]
     {
         builder
-    }
-}
-
-pub(crate) fn new_shared_plain_http1_upstream_client(
-    capacity: usize,
-) -> SharedPlainHttp1UpstreamClient {
-    let mut connector = HttpConnector::new();
-    connector.enforce_http(true);
-    connector.set_nodelay(true);
-    let mut builder = HyperLegacyClient::builder(TokioExecutor::new());
-    builder.pool_timer(TokioTimer::new());
-    builder.pool_idle_timeout(Duration::from_secs(90));
-    builder.pool_max_idle_per_host(capacity.max(1));
-    builder.http1_writev(true);
-    builder.set_host(false);
-    Arc::new(builder.build(connector))
-}
-
-async fn acquire_plain_http1_sender(
-    pool: &SharedPlainHttp1SenderPool,
-    authority: &str,
-    host: &str,
-    port: u16,
-) -> Result<(PlainHttp1PooledSender, bool, u64), VmError> {
-    if let Some(sender) = pool.lock().take(authority) {
-        return Ok((sender, true, 0));
-    }
-
-    let connect_started = Instant::now();
-    let stream = tokio::net::TcpStream::connect((host, port))
-        .await
-        .map_err(|err| VmError::HostError(format!("failed to connect to {authority}: {err}")))?;
-    stream
-        .set_nodelay(true)
-        .map_err(|err| VmError::HostError(format!("failed to tune upstream socket: {err}")))?;
-    let mut builder = hyper::client::conn::http1::Builder::new();
-    builder.writev(true);
-    builder.max_headers(64);
-    builder.read_buf_exact_size(Some(8 * 1024));
-    builder.max_buf_size(16 * 1024);
-    let (sender, connection) = builder
-        .handshake(TokioIo::new(stream))
-        .await
-        .map_err(|err| {
-            VmError::HostError(format!(
-                "failed to establish pooled http/1.1 client connection to {authority}: {err}",
-            ))
-        })?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    Ok((
-        sender,
-        false,
-        u64::try_from(connect_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-    ))
-}
-
-struct PlainHttp1SenderAcquire {
-    sender: PlainHttp1PooledSender,
-    pool_hit: bool,
-    connect_us: u64,
-    ready_us: u64,
-}
-
-async fn acquire_ready_plain_http1_sender(
-    pool: &SharedPlainHttp1SenderPool,
-    authority: &str,
-    host: &str,
-    port: u16,
-) -> Result<PlainHttp1SenderAcquire, VmError> {
-    let mut last_err = None;
-    for _ in 0..3 {
-        let (mut sender, pool_hit, connect_us) =
-            acquire_plain_http1_sender(pool, authority, host, port).await?;
-        let ready_started = Instant::now();
-        match sender.ready().await {
-            Ok(()) => {
-                return Ok(PlainHttp1SenderAcquire {
-                    sender,
-                    pool_hit,
-                    connect_us,
-                    ready_us: u64::try_from(ready_started.elapsed().as_micros())
-                        .unwrap_or(u64::MAX),
-                });
-            }
-            Err(err) => {
-                last_err = Some(err);
-            }
-        }
-    }
-    Err(VmError::HostError(format!(
-        "pooled http/1.1 client connection to {authority} was not ready after retries: {}",
-        last_err
-            .map(|err| err.to_string())
-            .unwrap_or_else(|| "unknown error".to_string())
-    )))
-}
-
-fn release_plain_http1_sender(
-    pool: &SharedPlainHttp1SenderPool,
-    authority: String,
-    capacity: usize,
-    sender: PlainHttp1PooledSender,
-) {
-    let mut guard = pool.lock();
-    guard.put(authority, capacity, sender);
-}
-
-struct PlainHttp1SenderLease {
-    pool: SharedPlainHttp1SenderPool,
-    authority: String,
-    capacity: usize,
-    sender: Option<PlainHttp1PooledSender>,
-}
-
-impl std::fmt::Debug for PlainHttp1SenderLease {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PlainHttp1SenderLease")
-            .field("authority", &self.authority)
-            .field("capacity", &self.capacity)
-            .field("sender_available", &self.sender.is_some())
-            .finish()
-    }
-}
-
-impl PlainHttp1SenderLease {
-    fn new(
-        pool: SharedPlainHttp1SenderPool,
-        authority: String,
-        capacity: usize,
-        sender: PlainHttp1PooledSender,
-    ) -> Self {
-        Self {
-            pool,
-            authority,
-            capacity,
-            sender: Some(sender),
-        }
-    }
-
-    fn release(&mut self) {
-        if let Some(sender) = self.sender.take() {
-            release_plain_http1_sender(&self.pool, self.authority.clone(), self.capacity, sender);
-        }
     }
 }
 
@@ -1254,6 +1005,7 @@ enum UpstreamResponseSource {
     Reqwest(reqwest::Response),
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
     Hyper(hyper::body::Incoming),
+    PlainHttp1(PlainHttp1ResponseBody),
     #[cfg(feature = "http3")]
     Http3(Box<h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>>),
     Exhausted,
@@ -1363,6 +1115,17 @@ impl BufferedByteSource for UpstreamResponseBodySource {
                             "failed to read upstream response frame: {}",
                             observed.message,
                         )))
+                    }
+                    None => {
+                        self.note_body_complete();
+                        self.source = UpstreamResponseSource::Exhausted;
+                        Ok(BufferedByteStreamPull::Eof)
+                    }
+                },
+                UpstreamResponseSource::PlainHttp1(body) => match body.pull_next().await? {
+                    Some(chunk) => {
+                        self.note_chunk_delivered(chunk.len());
+                        Ok(BufferedByteStreamPull::Chunk(chunk))
                     }
                     None => {
                         self.note_body_complete();
@@ -1510,6 +1273,22 @@ impl UpstreamResponseBodyState {
                 http2_tracker,
                 None,
                 plain_http1_sender_lease,
+                content_length,
+            ),
+            stream: BufferedByteStream::default(),
+        }
+    }
+
+    fn from_plain_http1(body: PlainHttp1ResponseBody, content_length: Option<u64>) -> Self {
+        if matches!(content_length, Some(0)) {
+            return Self::empty();
+        }
+        Self {
+            source: upstream_response_body_source(
+                UpstreamResponseSource::PlainHttp1(body),
+                None,
+                None,
+                None,
                 content_length,
             ),
             stream: BufferedByteStream::default(),
@@ -1678,7 +1457,6 @@ impl HttpOutboundExchangeState {
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeServices {
     upstream_client: Option<reqwest::Client>,
-    plain_http1_upstream_client: Option<SharedPlainHttp1UpstreamClient>,
     plain_http1_sender_pool: Option<SharedPlainHttp1SenderPool>,
     upstream_http_reuse_entries: usize,
     upstream_client_cache: Option<SharedUpstreamClientCache>,
@@ -1697,7 +1475,6 @@ impl RuntimeServices {
     fn new(rate_limiter: SharedRateLimiter) -> Self {
         Self {
             upstream_client: None,
-            plain_http1_upstream_client: None,
             plain_http1_sender_pool: None,
             upstream_http_reuse_entries: 0,
             upstream_client_cache: None,
@@ -1713,10 +1490,6 @@ impl RuntimeServices {
 
     pub(crate) fn upstream_client(&self) -> Option<reqwest::Client> {
         self.upstream_client.clone()
-    }
-
-    pub(crate) fn plain_http1_upstream_client(&self) -> Option<SharedPlainHttp1UpstreamClient> {
-        self.plain_http1_upstream_client.clone()
     }
 
     pub(crate) fn plain_http1_sender_pool(&self) -> Option<SharedPlainHttp1SenderPool> {
@@ -1768,7 +1541,6 @@ pub(crate) fn new_shared_runtime_services(
 pub(crate) struct HttpPlaneRuntimeServicesConfig {
     pub(crate) rate_limiter: SharedRateLimiter,
     pub(crate) upstream_client: reqwest::Client,
-    pub(crate) plain_http1_upstream_client: SharedPlainHttp1UpstreamClient,
     pub(crate) plain_http1_sender_pool: SharedPlainHttp1SenderPool,
     pub(crate) upstream_http_reuse_entries: usize,
     pub(crate) upstream_client_cache: SharedUpstreamClientCache,
@@ -1783,7 +1555,6 @@ pub(crate) fn new_shared_http_plane_runtime_services(
 ) -> SharedRuntimeServices {
     Arc::new(RuntimeServices {
         upstream_client: Some(config.upstream_client),
-        plain_http1_upstream_client: Some(config.plain_http1_upstream_client),
         plain_http1_sender_pool: Some(config.plain_http1_sender_pool),
         upstream_http_reuse_entries: config.upstream_http_reuse_entries,
         upstream_client_cache: Some(config.upstream_client_cache),
@@ -1801,6 +1572,7 @@ pub(crate) fn new_shared_http_plane_runtime_services(
 pub(crate) struct DownstreamState {
     #[cfg_attr(not(feature = "websocket"), allow(dead_code))]
     pub(crate) downstream_websocket: WebSocketConnectionState,
+    downstream_websocket_initialized: bool,
     pub(crate) response_output: HttpResponseOutputNode,
     pub(crate) downstream_carrier_ref: Option<HttpCarrierRef>,
     pub(crate) downstream_http1_upgrade: Option<DownstreamHttp1Upgrade>,
@@ -1812,9 +1584,10 @@ pub(crate) struct DownstreamState {
 }
 
 impl DownstreamState {
-    fn from_http_request(request_head: &HttpRequestHead) -> Self {
+    fn from_http_request(_request_head: &HttpRequestHead) -> Self {
         Self {
-            downstream_websocket: WebSocketConnectionState::for_http_request(&request_head.headers),
+            downstream_websocket: WebSocketConnectionState::default(),
+            downstream_websocket_initialized: false,
             response_output: HttpResponseOutputNode::default(),
             downstream_carrier_ref: Some(HttpCarrierRef::DownstreamHttp1),
             downstream_http1_upgrade: None,
@@ -1854,6 +1627,7 @@ impl DownstreamState {
     fn for_transport_connection() -> Self {
         Self {
             downstream_websocket: WebSocketConnectionState::default(),
+            downstream_websocket_initialized: true,
             response_output: HttpResponseOutputNode::default(),
             downstream_carrier_ref: None,
             downstream_http1_upgrade: None,
@@ -1870,19 +1644,27 @@ impl DownstreamState {
 pub(crate) struct ExchangeRegistry {
     pub(crate) next_outbound_exchange_handle: i64,
     pub(crate) exchanges: HashMap<i64, HttpOutboundExchangeState>,
+    initialized_from_request: bool,
 }
 
 impl ExchangeRegistry {
     fn from_http_request(_request_head: &HttpRequestHead) -> Self {
-        let mut exchanges = HashMap::new();
-        exchanges.insert(
+        Self {
+            next_outbound_exchange_handle: FIRST_DYNAMIC_EXCHANGE_HANDLE,
+            exchanges: HashMap::new(),
+            initialized_from_request: false,
+        }
+    }
+
+    fn seed_from_http_request(&mut self) {
+        if self.initialized_from_request {
+            return;
+        }
+        self.exchanges.insert(
             DEFAULT_UPSTREAM_EXCHANGE_HANDLE,
             HttpOutboundExchangeState::default_upstream(),
         );
-        Self {
-            next_outbound_exchange_handle: FIRST_DYNAMIC_EXCHANGE_HANDLE,
-            exchanges,
-        }
+        self.initialized_from_request = true;
     }
 }
 
@@ -1931,6 +1713,8 @@ impl<K, V> Default for LazyHandleMap<K, V> {
 pub(crate) struct TransportState {
     pub(crate) tcp_dag: TcpTransportDag,
     pub(crate) tls_dag: TlsTransportDag,
+    downstream_request_seed: Option<DownstreamTransportRequestSeed>,
+    initialized_from_request: bool,
     pub(crate) downstream_listener_goal: DownstreamHttpListenerGoal,
     pub(crate) downstream_transport_accessed: bool,
     pub(crate) downstream_tcp_io: Option<SharedTcpStreamIo>,
@@ -1956,15 +1740,24 @@ pub(crate) struct TransportState {
     pub(crate) udp_socket_ios: LazyHandleMap<i64, SharedUdpSocketIo>,
 }
 
+#[derive(Clone, Debug)]
+struct DownstreamTransportRequestSeed {
+    scheme: String,
+    host: String,
+    http_version: String,
+}
+
 impl TransportState {
     fn from_http_request(request_head: &HttpRequestHead) -> Self {
         Self {
-            tcp_dag: TcpTransportDag::for_http_request(),
-            tls_dag: TlsTransportDag::for_http_request(
-                request_head.scheme(),
-                request_head.host(),
-                request_head.http_version(),
-            ),
+            tcp_dag: TcpTransportDag::default(),
+            tls_dag: TlsTransportDag::default(),
+            downstream_request_seed: Some(DownstreamTransportRequestSeed {
+                scheme: request_head.scheme().to_string(),
+                host: request_head.host().to_string(),
+                http_version: request_head.http_version().to_string(),
+            }),
+            initialized_from_request: false,
             downstream_listener_goal: DownstreamHttpListenerGoal::None,
             downstream_transport_accessed: false,
             downstream_tcp_io: None,
@@ -2002,6 +1795,8 @@ impl TransportState {
                 default_upstream: TcpFlowState::default(),
             },
             tls_dag: TlsTransportDag::default(),
+            downstream_request_seed: None,
+            initialized_from_request: true,
             downstream_listener_goal: DownstreamHttpListenerGoal::None,
             downstream_transport_accessed: false,
             downstream_tcp_io: Some(io),
@@ -2026,6 +1821,20 @@ impl TransportState {
             udp_sockets: LazyHandleMap::default(),
             udp_socket_ios: LazyHandleMap::default(),
         }
+    }
+
+    fn seed_from_http_request(&mut self) {
+        if self.initialized_from_request {
+            return;
+        }
+        self.tcp_dag = TcpTransportDag::for_http_request();
+        if let Some(seed) = &self.downstream_request_seed {
+            self.tls_dag =
+                TlsTransportDag::for_http_request(&seed.scheme, &seed.host, &seed.http_version);
+        } else {
+            self.tls_dag = TlsTransportDag::default();
+        }
+        self.initialized_from_request = true;
     }
 }
 
@@ -2282,15 +2091,18 @@ impl ProxyVmContext {
             .transport
             .get_mut()
             .expect("transport state lock poisoned");
+        transport.seed_from_http_request();
         transport.downstream_local_addr = Some(metadata.local_addr);
         transport.downstream_peer_addr = Some(metadata.peer_addr);
     }
 
     pub(crate) fn set_downstream_listener_goal(&mut self, goal: DownstreamHttpListenerGoal) {
-        self.transport
+        let transport = self
+            .transport
             .get_mut()
-            .expect("transport state lock poisoned")
-            .downstream_listener_goal = goal;
+            .expect("transport state lock poisoned");
+        transport.seed_from_http_request();
+        transport.downstream_listener_goal = goal;
     }
 
     pub(crate) fn with_request_head<T>(&self, read: impl FnOnce(&HttpRequestHead) -> T) -> T {
@@ -2400,6 +2212,7 @@ impl ProxyVmContext {
     }
 
     pub(crate) fn downstream_websocket(&self) -> WebSocketConnectionState {
+        self.ensure_downstream_websocket_initialized();
         self.lock_downstream().downstream_websocket.clone()
     }
 
@@ -2432,6 +2245,13 @@ impl ProxyVmContext {
         if let Some(task) = downstream.native_default_upstream_forward_task.take() {
             task.abort();
         }
+    }
+
+    fn begin_native_default_upstream_http_forward(&self) {
+        let mut downstream = self.lock_downstream();
+        downstream.native_default_upstream_http_forward = true;
+        downstream.native_default_upstream_forward_response = None;
+        downstream.native_default_upstream_forward_task = None;
     }
 
     fn store_native_default_upstream_forward_task(&self, task: NativeDefaultUpstreamForwardTask) {
@@ -2474,6 +2294,10 @@ impl ProxyVmContext {
             .native_default_upstream_forward_response
             .as_ref()
             .map(|response| response.upstream_latency_ms)
+    }
+
+    pub(crate) fn native_default_upstream_http_forward_active(&self) -> bool {
+        self.lock_downstream().native_default_upstream_http_forward
     }
 
     pub(crate) fn begin_inline_downstream_http_response(
@@ -2548,8 +2372,6 @@ impl ProxyVmContext {
             client_ip,
             headers,
         };
-        let downstream_websocket =
-            WebSocketConnectionState::for_http_request(request_head.headers());
         *self.lock_request_head() = request_head;
 
         {
@@ -2564,7 +2386,8 @@ impl ProxyVmContext {
         *self.inbound_request_body.lock().await = InboundRequestBodyState::new(body);
 
         let mut downstream = self.lock_downstream();
-        downstream.downstream_websocket = downstream_websocket;
+        downstream.downstream_websocket = WebSocketConnectionState::default();
+        downstream.downstream_websocket_initialized = false;
         downstream.downstream_carrier_ref =
             http2_attachment.map_or(Some(HttpCarrierRef::DownstreamHttp1), |attachment| {
                 Some(HttpCarrierRef::DownstreamHttp2Stream(
@@ -2582,8 +2405,27 @@ impl ProxyVmContext {
         &self,
         mutate: impl FnOnce(&mut WebSocketConnectionState) -> T,
     ) -> T {
+        self.ensure_downstream_websocket_initialized();
         let mut downstream = self.lock_downstream();
         mutate(&mut downstream.downstream_websocket)
+    }
+
+    fn ensure_downstream_websocket_initialized(&self) {
+        let needs_init = {
+            let downstream = self.lock_downstream();
+            !downstream.downstream_websocket_initialized
+        };
+        if !needs_init {
+            return;
+        }
+        let websocket = self.with_request_head(|request_head| {
+            WebSocketConnectionState::for_http_request(request_head.headers())
+        });
+        let mut downstream = self.lock_downstream();
+        if !downstream.downstream_websocket_initialized {
+            downstream.downstream_websocket = websocket;
+            downstream.downstream_websocket_initialized = true;
+        }
     }
 
     fn lock_request_head(&self) -> ProfiledMutexGuard<'_, HttpRequestHead> {
@@ -2603,19 +2445,23 @@ impl ProxyVmContext {
     }
 
     pub(crate) fn lock_exchanges(&self) -> ProfiledMutexGuard<'_, ExchangeRegistry> {
-        lock_metrics::lock(
+        let mut guard = lock_metrics::lock(
             &self.exchanges,
             LockMetricKey::VmExchanges,
             "vm exchange registry lock poisoned",
-        )
+        );
+        guard.seed_from_http_request();
+        guard
     }
 
     pub(crate) fn lock_transport(&self) -> ProfiledMutexGuard<'_, TransportState> {
-        lock_metrics::lock(
+        let mut guard = lock_metrics::lock(
             &self.transport,
             LockMetricKey::VmTransport,
             "vm transport state lock poisoned",
-        )
+        );
+        guard.seed_from_http_request();
+        guard
     }
 
     #[cfg(feature = "webrtc")]
@@ -3171,74 +3017,19 @@ impl DefaultUpstreamRequestSnapshot {
         }
     }
 
-    fn build_upstream_url(
+    fn filtered_headers_or_request_head(
         &self,
-        request_path: &str,
-        request_query: &str,
-    ) -> Option<(String, Option<String>)> {
-        let target = self.target.as_ref()?;
-        if !self.target_inherits_request_path {
-            return Some((target.clone(), self.target_host_header.clone()));
-        }
-
-        let path = if request_path.is_empty() {
-            "/"
-        } else {
-            request_path
-        };
-        let path_and_query = if request_query.is_empty() {
-            path.to_string()
-        } else {
-            format!("{path}?{request_query}")
-        };
-        Some((
-            format!("{target}{path_and_query}"),
-            self.target_host_header.clone(),
-        ))
-    }
-
-    fn apply_headers_to_hyper_request(
-        &self,
-        outbound: &mut hyper::Request<Full<Bytes>>,
         request_head: &HttpRequestHead,
         host_header: Option<&str>,
-    ) {
+    ) -> HeaderMap {
         match &self.head {
             DefaultUpstreamRequestHead::Inherit { header_overrides } => {
-                apply_filtered_request_head_headers_to_hyper_request(
-                    outbound,
-                    request_head.headers(),
-                    header_overrides,
-                    host_header,
-                );
+                let mut headers = filtered_upstream_headers(request_head.headers(), host_header);
+                merge_headers(&mut headers, header_overrides);
+                headers
             }
             DefaultUpstreamRequestHead::Explicit { headers, .. } => {
-                apply_filtered_exchange_headers_to_hyper_request(outbound, headers, host_header);
-            }
-        }
-    }
-
-    fn apply_headers_to_reqwest_request(
-        &self,
-        mut outbound: reqwest::RequestBuilder,
-        request_head: &HttpRequestHead,
-        host_header: Option<&str>,
-    ) -> reqwest::RequestBuilder {
-        match &self.head {
-            DefaultUpstreamRequestHead::Inherit { header_overrides } => {
-                outbound = apply_filtered_upstream_headers_to_reqwest_request(
-                    outbound,
-                    request_head.headers(),
-                    None,
-                );
-                apply_filtered_upstream_headers_to_reqwest_request(
-                    outbound,
-                    header_overrides,
-                    host_header,
-                )
-            }
-            DefaultUpstreamRequestHead::Explicit { headers, .. } => {
-                apply_filtered_upstream_headers_to_reqwest_request(outbound, headers, host_header)
+                filtered_upstream_headers(headers, host_header)
             }
         }
     }
@@ -3272,27 +3063,27 @@ impl std::fmt::Debug for StartedUpstreamResponse {
     }
 }
 
-#[derive(Debug)]
-enum NativeDefaultUpstreamForwardBody {
-    Empty,
-    Hyper {
-        body: hyper::body::Incoming,
-        content_length: Option<u64>,
-        plain_http1_sender_lease: Option<PlainHttp1SenderLease>,
-    },
-}
+type NativeDefaultUpstreamForwardBody = OutboundHttp1ForwardBody;
 
 type NativeDefaultUpstreamForwardTask = tokio::task::JoinHandle<
     Result<NativeDefaultUpstreamForwardResponse, UpstreamResponseStartError>,
 >;
 
+type NativeDefaultUpstreamForwardResponse = OutboundHttp1ForwardResponse;
+
 #[derive(Debug)]
-struct NativeDefaultUpstreamForwardResponse {
-    status: u16,
-    headers: HeaderMap,
-    version: Version,
-    body: NativeDefaultUpstreamForwardBody,
-    upstream_latency_ms: u64,
+pub(crate) struct ResolvedNativeHttp1DownstreamResponse {
+    pub(crate) response: NativeDefaultUpstreamForwardResponse,
+    pub(crate) response_headers: HeaderMap,
+    pub(crate) response_status: Option<u16>,
+    pub(crate) upstream_latency_ms: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedNativeLocalHttp1DownstreamResponse {
+    pub(crate) status: u16,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -3301,6 +3092,23 @@ pub(crate) struct ResolvedHttpGraphResponse {
     pub upstream_latency_ms: u64,
     pub post_response_plan: Option<DownstreamPostResponsePlan>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeDefaultUpstreamRequestBodyMode {
+    Empty,
+    BufferedImmediate,
+    StreamInbound,
+    BufferRemaining,
+}
+
+#[derive(Clone, Debug)]
+enum NativeDefaultUpstreamRequestBodyTemplate {
+    Empty,
+    Bytes(Bytes),
+    Streaming { content_length: Option<u64> },
+}
+
+const OUTBOUND_HTTP1_REQUEST_BODY_STREAM_CHUNK_BYTES: usize = 16 * 1024;
 
 pub async fn resolve_outbound_request_body(
     context: &SharedProxyVmContext,
@@ -3330,6 +3138,126 @@ pub async fn resolve_outbound_request_body(
     inbound.read_all().await
 }
 
+async fn native_default_upstream_request_body_mode(
+    context: &SharedProxyVmContext,
+) -> NativeDefaultUpstreamRequestBodyMode {
+    let (body_override, request_body_known_empty) = {
+        let exchanges = context.lock_exchanges();
+        let exchange = exchanges
+            .exchanges
+            .get(&DEFAULT_UPSTREAM_EXCHANGE_HANDLE)
+            .expect("default upstream exchange should exist");
+        (
+            exchange.request.body_override.clone(),
+            request_body_known_empty_for_exchange(context, exchange),
+        )
+    };
+
+    if let Some(body_override) = body_override {
+        if body_override.is_empty() {
+            return NativeDefaultUpstreamRequestBodyMode::Empty;
+        }
+        return NativeDefaultUpstreamRequestBodyMode::BufferedImmediate;
+    }
+
+    if request_body_known_empty {
+        return NativeDefaultUpstreamRequestBodyMode::Empty;
+    }
+
+    let inbound = context.inbound_request_body.lock().await;
+    if inbound.is_pristine_unread() {
+        NativeDefaultUpstreamRequestBodyMode::StreamInbound
+    } else {
+        NativeDefaultUpstreamRequestBodyMode::BufferRemaining
+    }
+}
+
+fn stream_remaining_inbound_request_body(
+    context: SharedProxyVmContext,
+) -> impl futures_util::Stream<Item = Result<Bytes, VmError>> + Send + 'static {
+    try_unfold(context, |context| async move {
+        let (chunk, drained) = {
+            let mut inbound = context.inbound_request_body.lock().await;
+            let chunk = inbound
+                .read_next_chunk(OUTBOUND_HTTP1_REQUEST_BODY_STREAM_CHUNK_BYTES)
+                .await;
+            let drained = chunk.as_ref().is_ok_and(|_| inbound.is_drained());
+            (chunk, drained)
+        };
+
+        match chunk {
+            Ok(chunk) => {
+                if chunk.is_empty() {
+                    mark_downstream_transport_closed(&context);
+                    Ok(None)
+                } else {
+                    if drained {
+                        mark_downstream_transport_closed(&context);
+                    }
+                    Ok(Some((Bytes::from(chunk), context)))
+                }
+            }
+            Err(err) => {
+                mark_downstream_transport_failed(&context, &err.to_string());
+                Err(err)
+            }
+        }
+    })
+}
+
+async fn default_upstream_outbound_http1_request_body_template(
+    context: &SharedProxyVmContext,
+) -> Result<NativeDefaultUpstreamRequestBodyTemplate, UpstreamResponseStartError> {
+    let (body_override, request_body_known_empty, content_length) = {
+        let exchanges = context.lock_exchanges();
+        let exchange = exchanges
+            .exchanges
+            .get(&DEFAULT_UPSTREAM_EXCHANGE_HANDLE)
+            .expect("default upstream exchange should exist");
+        (
+            exchange.request.body_override.clone(),
+            request_body_known_empty_for_exchange(context, exchange),
+            context.with_request_head(|request_head| header_content_length(request_head.headers())),
+        )
+    };
+
+    if let Some(body_override) = body_override {
+        return Ok(if body_override.is_empty() {
+            NativeDefaultUpstreamRequestBodyTemplate::Empty
+        } else {
+            NativeDefaultUpstreamRequestBodyTemplate::Bytes(Bytes::from(body_override))
+        });
+    }
+
+    if request_body_known_empty {
+        return Ok(NativeDefaultUpstreamRequestBodyTemplate::Empty);
+    }
+
+    match native_default_upstream_request_body_mode(context).await {
+        NativeDefaultUpstreamRequestBodyMode::Empty => {
+            Ok(NativeDefaultUpstreamRequestBodyTemplate::Empty)
+        }
+        NativeDefaultUpstreamRequestBodyMode::BufferedImmediate
+        | NativeDefaultUpstreamRequestBodyMode::BufferRemaining => {
+            let request_body = resolve_outbound_request_body(context)
+                .await
+                .map_err(|err| {
+                    UpstreamResponseStartError::ResolveOutboundBody(format!(
+                        "failed to resolve outbound exchange body: {err}",
+                    ))
+                })?;
+            Ok(if request_body.is_empty() {
+                NativeDefaultUpstreamRequestBodyTemplate::Empty
+            } else {
+                NativeDefaultUpstreamRequestBodyTemplate::Bytes(Bytes::from(request_body))
+            })
+        }
+        NativeDefaultUpstreamRequestBodyMode::StreamInbound => {
+            Ok(NativeDefaultUpstreamRequestBodyTemplate::Streaming { content_length })
+        }
+    }
+}
+
 fn request_body_known_empty_for_exchange(
     context: &SharedProxyVmContext,
     exchange: &HttpOutboundExchangeState,
@@ -3341,15 +3269,6 @@ fn request_body_known_empty_for_exchange(
     context.with_request_head(|request_head| {
         request_headers_indicate_empty_body(request_head.headers())
     })
-}
-
-fn default_upstream_request_body_known_empty(context: &SharedProxyVmContext) -> bool {
-    let exchanges = context.lock_exchanges();
-    let exchange = exchanges
-        .exchanges
-        .get(&DEFAULT_UPSTREAM_EXCHANGE_HANDLE)
-        .expect("default upstream exchange should exist");
-    request_body_known_empty_for_exchange(context, exchange)
 }
 
 pub(crate) fn build_configured_upstream_url(
@@ -3558,44 +3477,6 @@ fn apply_filtered_upstream_headers_to_reqwest_request(
         outbound = outbound.header(HOST, host);
     }
     outbound
-}
-
-fn apply_filtered_request_head_headers_to_hyper_request<B>(
-    request: &mut hyper::Request<B>,
-    request_headers: &HeaderMap,
-    inherited_header_overrides: &HeaderMap,
-    host_header: Option<&str>,
-) {
-    for (name, value) in request_headers {
-        if name != HOST && name != CONTENT_LENGTH && !is_hop_by_hop_header(name) {
-            request.headers_mut().insert(name, value.clone());
-        }
-    }
-    for (name, value) in inherited_header_overrides {
-        request.headers_mut().insert(name, value.clone());
-    }
-    if let Some(host) = host_header
-        && let Ok(value) = HeaderValue::from_str(host)
-    {
-        request.headers_mut().insert(HOST, value);
-    }
-}
-
-fn apply_filtered_exchange_headers_to_hyper_request<B>(
-    request: &mut hyper::Request<B>,
-    headers: &HeaderMap,
-    host_header: Option<&str>,
-) {
-    for (name, value) in headers {
-        if name != HOST && name != CONTENT_LENGTH && !is_hop_by_hop_header(name) {
-            request.headers_mut().insert(name, value.clone());
-        }
-    }
-    if let Some(host) = host_header
-        && let Ok(value) = HeaderValue::from_str(host)
-    {
-        request.headers_mut().insert(HOST, value);
-    }
 }
 
 fn snapshot_default_upstream_request(
@@ -4081,6 +3962,89 @@ async fn start_upstream_response_via_reqwest(
     ))
 }
 
+async fn start_upstream_response_via_plain_http1_sender_pool(
+    context: &SharedProxyVmContext,
+    handle: i64,
+    prepared: &PreparedUpstreamRequest,
+    request_body: Vec<u8>,
+) -> Result<StartedUpstreamResponse, UpstreamResponseStartError> {
+    let services = context.services();
+    let pool = services
+        .plain_http1_sender_pool()
+        .ok_or(UpstreamResponseStartError::MissingClient)?;
+    let sender_pool_capacity = services.upstream_http_reuse_entries();
+    let host = prepared.target_host.clone().ok_or_else(|| {
+        UpstreamResponseStartError::Protocol(
+            "outbound exchange host should be configured for plain http/1.1 forwarding".to_string(),
+        )
+    })?;
+    let port = prepared.target_port.ok_or_else(|| {
+        UpstreamResponseStartError::Protocol(
+            "outbound exchange port should be configured for plain http/1.1 forwarding".to_string(),
+        )
+    })?;
+    let authority = prepared
+        .target_host_header
+        .clone()
+        .unwrap_or_else(|| format_upstream_authority(&host, port));
+    let target = OutboundHttp1Target {
+        scheme: match prepared.target_scheme {
+            HttpUpstreamScheme::Http => OutboundHttp1Scheme::Http,
+            #[cfg(feature = "tls")]
+            HttpUpstreamScheme::Https => OutboundHttp1Scheme::Https,
+            #[cfg(not(feature = "tls"))]
+            HttpUpstreamScheme::Https => {
+                return Err(UpstreamResponseStartError::Protocol(
+                    "https http/1.1 forwarding requires the tls feature".to_string(),
+                ));
+            }
+        },
+        authority: authority.clone(),
+        host: host.clone(),
+        port,
+        #[cfg(feature = "tls")]
+        tls_flow: (prepared.target_scheme == HttpUpstreamScheme::Https)
+            .then_some(prepared.tls_flow.clone()),
+    };
+    let request_path = super::request_path_with_query(&prepared.path, &prepared.query);
+    let request_body = (!request_body.is_empty()).then(|| Bytes::from(request_body));
+    let started = Instant::now();
+    let response = forward_via_sender_pool(&pool, sender_pool_capacity, &target, started, || {
+        Ok(OutboundHttp1Request {
+            method: prepared.method.clone(),
+            path_and_query: request_path.clone(),
+            headers: filtered_upstream_headers(&prepared.headers, Some(authority.as_str())),
+            body: request_body
+                .as_ref()
+                .map_or(OutboundHttp1RequestBody::Empty, |body| {
+                    OutboundHttp1RequestBody::Bytes(body.clone())
+                }),
+        })
+    })
+    .await
+    .map_err(|err| UpstreamResponseStartError::UpstreamRequest(err.to_string()))?;
+    Ok(StartedUpstreamResponse {
+        status: response.status,
+        headers: response.headers,
+        version: response.version,
+        carrier_ref: if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+            HttpCarrierRef::Http1DefaultUpstream
+        } else {
+            HttpCarrierRef::Http1DynamicExchange(handle)
+        },
+        peer_addr: None,
+        negotiated_alpn: response.negotiated_alpn,
+        peer_certificate_der: response.peer_certificate_der,
+        body: Arc::new(tokio::sync::Mutex::new(match response.body {
+            OutboundHttp1ForwardBody::Empty => UpstreamResponseBodyState::empty(),
+            OutboundHttp1ForwardBody::Raw {
+                body,
+                content_length,
+            } => UpstreamResponseBodyState::from_plain_http1(body, content_length),
+        })),
+    })
+}
+
 fn started_upstream_response_from_reqwest(
     handle: i64,
     upstream_response: reqwest::Response,
@@ -4135,18 +4099,12 @@ async fn response_from_started_upstream_response(
 ) -> Response<Body> {
     let mut response = Response::new(match native_response.body {
         NativeDefaultUpstreamForwardBody::Empty => Body::empty(),
-        NativeDefaultUpstreamForwardBody::Hyper {
+        NativeDefaultUpstreamForwardBody::Raw {
             body,
             content_length,
-            plain_http1_sender_lease,
         } => {
-            let passthrough = UpstreamResponseBodyState::from_hyper(
-                body,
-                None,
-                plain_http1_sender_lease,
-                content_length,
-            )
-            .take_streaming_passthrough();
+            let passthrough = UpstreamResponseBodyState::from_plain_http1(body, content_length)
+                .take_streaming_passthrough();
             Body::from_stream(try_unfold(passthrough, |mut state| async move {
                 let chunk = state
                     .next_chunk()
@@ -4194,82 +4152,26 @@ async fn start_default_upstream_plain_http1_fast_path(
         http2::select_upstream_mode(request.target_scheme, &tls_flow, request.version_preference);
     let http3_mode =
         http3::select_upstream_mode(request.target_scheme, &tls_flow, request.version_preference);
-    if tls_flow.requires_custom_client()
-        || http2::should_use_explicit_upstream_transport(http2_mode, http2_sessions.as_ref())
-        || http3::should_use_explicit_upstream_transport(http3_mode, http3_sessions.as_ref())
-    {
+    if tls_flow.requires_custom_client() {
+        return Ok(None);
+    }
+    let use_http2 =
+        http2::should_use_explicit_upstream_transport(http2_mode, http2_sessions.as_ref());
+    let use_http3 =
+        http3::should_use_explicit_upstream_transport(http3_mode, http3_sessions.as_ref());
+    if !outbound_http1_fast_path_eligible(
+        request.version_preference,
+        request.target.is_some(),
+        false,
+        services.plain_http1_sender_pool().is_some(),
+        use_http2,
+        use_http3,
+    ) {
         return Ok(None);
     }
 
-    let request_body = resolve_outbound_request_body(context)
-        .await
-        .map_err(|err| {
-            UpstreamResponseStartError::ResolveOutboundBody(format!(
-                "failed to resolve outbound exchange body: {err}",
-            ))
-        })?;
-    let started = Instant::now();
-    let client = services
-        .upstream_client()
-        .ok_or(UpstreamResponseStartError::MissingClient)?;
-    let (upstream_url, upstream_response) = context.with_request_head(|request_head| {
-        let method = request.method_or_request_head(request_head).clone();
-        let (upstream_url, host_header) = request
-            .build_upstream_url(
-                request.path_or_request_head(request_head),
-                request.query_or_request_head(request_head),
-            )
-            .expect("default upstream target should be configured");
-        let mut outbound = client.request(method, &upstream_url).body(request_body);
-        outbound = request.apply_headers_to_reqwest_request(
-            outbound,
-            request_head,
-            host_header.as_deref(),
-        );
-        (upstream_url, outbound)
-    });
-    let upstream_response = upstream_response.send().await.map_err(|err| {
-        UpstreamResponseStartError::UpstreamRequest(format!(
-            "outbound request to {upstream_url} failed while evaluating host call: {err}",
-        ))
-    })?;
-    let upstream_response =
-        started_upstream_response_from_reqwest(DEFAULT_UPSTREAM_EXCHANGE_HANDLE, upstream_response);
-    let StartedUpstreamResponse {
-        status,
-        headers,
-        version: upstream_response_version,
-        carrier_ref,
-        peer_addr,
-        negotiated_alpn: _,
-        peer_certificate_der: _,
-        body,
-    } = upstream_response;
-    mark_outbound_tcp_connected(context, DEFAULT_UPSTREAM_EXCHANGE_HANDLE)?;
-    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let snapshot = HttpUpstreamResponseSnapshot {
-        status,
-        headers: Arc::new(headers),
-        http_version: http_version_label(upstream_response_version),
-        carrier_kind: carrier_ref.kind(),
-        carrier_ref: carrier_ref.clone(),
-        body,
-    };
-
-    let mut guard = context.lock_exchanges();
-    let exchange = guard
-        .exchanges
-        .get_mut(&DEFAULT_UPSTREAM_EXCHANGE_HANDLE)
-        .expect("default upstream exchange should exist");
-    if let Ok(existing) = exchange.response_snapshot() {
-        return Ok(Some(existing));
-    }
-    exchange.store_response(StoredUpstreamResponse::new(snapshot.clone(), latency_ms));
-    exchange
-        .transport
-        .mark_response_ready(upstream_response_version, snapshot.carrier_ref.clone());
-    exchange.transport.set_peer_addr(peer_addr);
-    Ok(Some(snapshot))
+    let response = forward_native_default_upstream_http_via_sender_pool(context, &request).await?;
+    materialize_native_default_upstream_forward_response(context, response)
 }
 
 fn materialize_native_default_upstream_forward_response(
@@ -4282,6 +4184,8 @@ fn materialize_native_default_upstream_forward_response(
         version,
         body,
         upstream_latency_ms,
+        negotiated_alpn,
+        peer_certificate_der,
     } = response;
     let started = StartedUpstreamResponse {
         status,
@@ -4289,20 +4193,14 @@ fn materialize_native_default_upstream_forward_response(
         version,
         carrier_ref: HttpCarrierRef::Http1DefaultUpstream,
         peer_addr: None,
-        negotiated_alpn: Some(HTTP11_ALPN_PROTOCOL.to_string()),
-        peer_certificate_der: None,
+        negotiated_alpn,
+        peer_certificate_der,
         body: Arc::new(tokio::sync::Mutex::new(match body {
             NativeDefaultUpstreamForwardBody::Empty => UpstreamResponseBodyState::empty(),
-            NativeDefaultUpstreamForwardBody::Hyper {
+            NativeDefaultUpstreamForwardBody::Raw {
                 body,
                 content_length,
-                plain_http1_sender_lease,
-            } => UpstreamResponseBodyState::from_hyper(
-                body,
-                None,
-                plain_http1_sender_lease,
-                content_length,
-            ),
+            } => UpstreamResponseBodyState::from_plain_http1(body, content_length),
         })),
     };
     let (snapshot, upstream_response_version, peer_addr) =
@@ -4380,25 +4278,96 @@ async fn try_resolve_ready_or_pending_native_default_upstream_forward_response(
     }))
 }
 
+pub(crate) async fn try_resolve_native_http1_downstream_response(
+    context: &SharedProxyVmContext,
+) -> Option<Result<ResolvedNativeHttp1DownstreamResponse, Response<Body>>> {
+    let (
+        response_headers,
+        response_status,
+        native_forward_active,
+        has_post_response_plan,
+        has_response_body,
+    ) = {
+        let downstream = context.lock_downstream();
+        (
+            downstream.response_output.headers.clone(),
+            downstream.response_output.status,
+            downstream.native_default_upstream_http_forward,
+            downstream.post_response_plan.is_some(),
+            downstream.response_output.body.is_some(),
+        )
+    };
+    if has_post_response_plan || has_response_body || !native_forward_active {
+        return None;
+    }
+
+    match take_or_await_native_default_upstream_forward_response(context).await {
+        Ok(Some(response)) => {
+            let upstream_latency_ms = response.upstream_latency_ms;
+            context.clear_native_default_upstream_http_forward();
+            Some(Ok(ResolvedNativeHttp1DownstreamResponse {
+                response,
+                response_headers,
+                response_status,
+                upstream_latency_ms,
+            }))
+        }
+        Ok(None) | Err(UpstreamResponseStartError::MissingTarget) => None,
+        Err(UpstreamResponseStartError::UpstreamRequest(_)) => {
+            context.clear_native_default_upstream_http_forward();
+            Some(Err(text_response(StatusCode::BAD_GATEWAY, "bad gateway")))
+        }
+        Err(
+            err @ (UpstreamResponseStartError::UnknownExchangeHandle(_)
+            | UpstreamResponseStartError::MissingClient
+            | UpstreamResponseStartError::Protocol(_)
+            | UpstreamResponseStartError::TlsConfiguration(_)
+            | UpstreamResponseStartError::ResolveOutboundBody(_)),
+        ) => {
+            context.clear_native_default_upstream_http_forward();
+            Some(Err(text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &err.as_vm_error().to_string(),
+            )))
+        }
+    }
+}
+
+pub(crate) fn try_take_native_local_http1_downstream_response(
+    context: &SharedProxyVmContext,
+) -> Option<ResolvedNativeLocalHttp1DownstreamResponse> {
+    let mut downstream = context.lock_downstream();
+    if downstream.post_response_plan.is_some() {
+        return None;
+    }
+    let body = downstream.response_output.body.take()?;
+    downstream.native_default_upstream_http_forward = false;
+    downstream.native_default_upstream_forward_response = None;
+    if let Some(task) = downstream.native_default_upstream_forward_task.take() {
+        task.abort();
+    }
+    Some(ResolvedNativeLocalHttp1DownstreamResponse {
+        status: downstream
+            .response_output
+            .status
+            .take()
+            .unwrap_or(StatusCode::OK.as_u16()),
+        headers: std::mem::take(&mut downstream.response_output.headers),
+        body,
+    })
+}
+
 async fn forward_native_default_upstream_http_via_sender_pool(
     context: &SharedProxyVmContext,
     request: &DefaultUpstreamRequestSnapshot,
 ) -> Result<NativeDefaultUpstreamForwardResponse, UpstreamResponseStartError> {
-    let total_started = Instant::now();
     let services = context.services();
     let pool = services
         .plain_http1_sender_pool()
         .ok_or(UpstreamResponseStartError::MissingClient)?;
     let sender_pool_capacity = services.upstream_http_reuse_entries();
-    let request_body = resolve_outbound_request_body(context)
-        .await
-        .map_err(|err| {
-            UpstreamResponseStartError::ResolveOutboundBody(format!(
-                "failed to resolve outbound exchange body: {err}",
-            ))
-        })?;
+    let request_body = default_upstream_outbound_http1_request_body_template(context).await?;
     let started_at = Instant::now();
-    let request_body = Bytes::from(request_body);
     let host = request.target_host.clone().ok_or_else(|| {
         UpstreamResponseStartError::Protocol(
             "default upstream host should be configured".to_string(),
@@ -4413,116 +4382,83 @@ async fn forward_native_default_upstream_http_via_sender_pool(
         .target_host_header
         .clone()
         .unwrap_or_else(|| format_upstream_authority(&host, port));
+    let tls_flow = context.lock_transport().tls_dag.default_upstream.clone();
+    let target = OutboundHttp1Target {
+        scheme: match request.target_scheme {
+            HttpUpstreamScheme::Http => OutboundHttp1Scheme::Http,
+            #[cfg(feature = "tls")]
+            HttpUpstreamScheme::Https => OutboundHttp1Scheme::Https,
+            #[cfg(not(feature = "tls"))]
+            HttpUpstreamScheme::Https => {
+                return Err(UpstreamResponseStartError::Protocol(
+                    "https http/1.1 forwarding requires the tls feature".to_string(),
+                ));
+            }
+        },
+        authority: authority.clone(),
+        host: host.clone(),
+        port,
+        #[cfg(feature = "tls")]
+        tls_flow: (request.target_scheme == HttpUpstreamScheme::Https).then_some(tls_flow),
+    };
     let request_path = context.with_request_head(|request_head| {
         super::request_path_with_query(
             request.path_or_request_head(request_head),
             request.query_or_request_head(request_head),
         )
     });
-    let mut build_us = 0u64;
     let mut make_request = || {
-        let build_started = Instant::now();
         context.with_request_head(|request_head| {
-            let method = request.method_or_request_head(request_head).clone();
-            let mut outbound = hyper::Request::builder()
-                .method(method)
-                .uri(request_path.as_str())
-                .version(Version::HTTP_11)
-                .body(Full::new(request_body.clone()))
-                .map_err(|err| {
-                    UpstreamResponseStartError::Protocol(format!(
-                        "failed to build outbound request for http://{authority}{request_path}: {err}",
-                    ))
-                })?;
-            request.apply_headers_to_hyper_request(
-                &mut outbound,
-                request_head,
-                Some(authority.as_str()),
-            );
-            build_us = build_us
-                .saturating_add(
-                    u64::try_from(build_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                );
-            Ok::<_, UpstreamResponseStartError>(outbound)
+            Ok::<_, VmError>(OutboundHttp1Request {
+                method: request.method_or_request_head(request_head).clone(),
+                path_and_query: request_path.clone(),
+                headers: request
+                    .filtered_headers_or_request_head(request_head, Some(authority.as_str())),
+                body: match &request_body {
+                    NativeDefaultUpstreamRequestBodyTemplate::Empty => {
+                        OutboundHttp1RequestBody::Empty
+                    }
+                    NativeDefaultUpstreamRequestBodyTemplate::Bytes(body) => {
+                        OutboundHttp1RequestBody::Bytes(body.clone())
+                    }
+                    NativeDefaultUpstreamRequestBodyTemplate::Streaming { content_length } => {
+                        OutboundHttp1RequestBody::Streaming {
+                            content_length: *content_length,
+                            stream: Box::pin(stream_remaining_inbound_request_body(
+                                context.clone(),
+                            )),
+                        }
+                    }
+                },
+            })
         })
     };
-    let acquired = acquire_ready_plain_http1_sender(&pool, &authority, &host, port)
-        .await
-        .map_err(|err| UpstreamResponseStartError::UpstreamRequest(err.to_string()))?;
-    let mut sender = acquired.sender;
-    let mut pool_hit = acquired.pool_hit;
-    let mut connect_us = acquired.connect_us;
-    let mut ready_us = acquired.ready_us;
-    let mut retries = 0u64;
-    let mut outbound = make_request()?;
-    let mut send_us = 0u64;
-    let send_started = Instant::now();
-    let upstream_response = match sender.send_request(outbound).await {
-        Ok(response) => response,
-        Err(_) => {
-            retries = 1;
-            send_us = send_us.saturating_add(
-                u64::try_from(send_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-            );
-            let reacquired = acquire_ready_plain_http1_sender(&pool, &authority, &host, port)
-                .await
-                .map_err(|err| UpstreamResponseStartError::UpstreamRequest(err.to_string()))?;
-            sender = reacquired.sender;
-            pool_hit &= reacquired.pool_hit;
-            connect_us = connect_us.saturating_add(reacquired.connect_us);
-            ready_us = ready_us.saturating_add(reacquired.ready_us);
-            outbound = make_request()?;
-            let retry_send_started = Instant::now();
-            let response = sender.send_request(outbound).await.map_err(|err| {
-                UpstreamResponseStartError::UpstreamRequest(format!(
-                    "outbound request to http://{authority}{request_path} failed while evaluating host call: {err}",
-                ))
-            })?;
-            send_us = send_us.saturating_add(
-                u64::try_from(retry_send_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-            );
-            response
-        }
-    };
-    if send_us == 0 {
-        send_us = u64::try_from(send_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    }
-    let (parts, body) = upstream_response.into_parts();
-    let content_length = header_content_length(&parts.headers);
-    let body_is_empty = matches!(content_length, Some(0)) || body.is_end_stream();
-    let response_body = if body_is_empty {
-        release_plain_http1_sender(&pool, authority, sender_pool_capacity, sender);
-        NativeDefaultUpstreamForwardBody::Empty
-    } else {
-        NativeDefaultUpstreamForwardBody::Hyper {
-            body,
-            content_length,
-            plain_http1_sender_lease: Some(PlainHttp1SenderLease::new(
-                pool.clone(),
-                authority,
-                sender_pool_capacity,
-                sender,
-            )),
-        }
-    };
+    let response = forward_via_sender_pool(
+        &pool,
+        sender_pool_capacity,
+        &target,
+        started_at,
+        &mut make_request,
+    )
+    .await
+    .map_err(|err| UpstreamResponseStartError::UpstreamRequest(err.to_string()))?;
     mark_outbound_tcp_connected(context, DEFAULT_UPSTREAM_EXCHANGE_HANDLE)
         .map_err(|err| UpstreamResponseStartError::Protocol(err.as_vm_error().to_string()))?;
-    record_native_forward_metrics(
-        pool_hit,
-        retries,
-        build_us,
-        connect_us,
-        ready_us,
-        send_us,
-        u64::try_from(total_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-    );
-    Ok(NativeDefaultUpstreamForwardResponse {
-        status: parts.status.as_u16(),
-        headers: parts.headers,
-        version: parts.version,
-        body: response_body,
-        upstream_latency_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-    })
+    if request.target_scheme == HttpUpstreamScheme::Https {
+        finalize_outbound_tls_handshake(
+            context,
+            DEFAULT_UPSTREAM_EXCHANGE_HANDLE,
+            response.negotiated_alpn.clone(),
+            response.peer_certificate_der.clone(),
+        )?;
+        cache_outbound_tls_session(
+            context,
+            DEFAULT_UPSTREAM_EXCHANGE_HANDLE,
+            response.negotiated_alpn.clone(),
+            response.peer_certificate_der.clone(),
+        )?;
+    }
+    Ok(response)
 }
 
 fn schedule_native_default_upstream_http_forward_response(
@@ -4541,6 +4477,7 @@ pub(crate) async fn start_native_default_upstream_http_forward_response(
 ) -> Result<bool, VmError> {
     if context.native_default_upstream_forward_response_ready()
         || context.native_default_upstream_forward_task_pending()
+        || context.native_default_upstream_http_forward_active()
     {
         return Ok(true);
     }
@@ -4552,28 +4489,43 @@ pub(crate) async fn start_native_default_upstream_http_forward_response(
         return Ok(false);
     }
 
-    if request.target.is_none() {
-        return Ok(false);
-    }
-    if request.target_scheme != HttpUpstreamScheme::Http
-        || !matches!(
-            request.version_preference,
-            HttpVersionPreference::Auto | HttpVersionPreference::Http1
-        )
-    {
-        return Ok(false);
-    }
-
     let services = context.services();
-    if services.plain_http1_sender_pool().is_none() {
-        return Ok(false);
-    }
-    if !default_upstream_request_body_known_empty(context) {
+    let tls_flow = context.lock_transport().tls_dag.default_upstream.clone();
+    let http2_mode =
+        http2::select_upstream_mode(request.target_scheme, &tls_flow, request.version_preference);
+    let http3_mode =
+        http3::select_upstream_mode(request.target_scheme, &tls_flow, request.version_preference);
+    let use_http2 = http2::should_use_explicit_upstream_transport(
+        http2_mode,
+        services.upstream_http_sessions().as_ref(),
+    );
+    let use_http3 = http3::should_use_explicit_upstream_transport(
+        http3_mode,
+        services.upstream_http3_sessions().as_ref(),
+    );
+    if !outbound_http1_fast_path_eligible(
+        request.version_preference,
+        request.target.is_some(),
+        false,
+        services.plain_http1_sender_pool().is_some(),
+        use_http2,
+        use_http3,
+    ) {
         return Ok(false);
     }
 
-    schedule_native_default_upstream_http_forward_response(context, request);
-    Ok(true)
+    match native_default_upstream_request_body_mode(context).await {
+        NativeDefaultUpstreamRequestBodyMode::Empty
+        | NativeDefaultUpstreamRequestBodyMode::BufferedImmediate => {
+            schedule_native_default_upstream_http_forward_response(context, request);
+            Ok(true)
+        }
+        NativeDefaultUpstreamRequestBodyMode::StreamInbound => {
+            context.begin_native_default_upstream_http_forward();
+            Ok(true)
+        }
+        NativeDefaultUpstreamRequestBodyMode::BufferRemaining => Ok(false),
+    }
 }
 
 async fn try_resolve_native_default_upstream_http_forward_response(
@@ -4597,93 +4549,33 @@ async fn try_resolve_native_default_upstream_http_forward_response(
         http2::select_upstream_mode(request.target_scheme, &tls_flow, request.version_preference);
     let http3_mode =
         http3::select_upstream_mode(request.target_scheme, &tls_flow, request.version_preference);
-    if tls_flow.requires_custom_client()
-        || http2::should_use_explicit_upstream_transport(http2_mode, http2_sessions.as_ref())
-        || http3::should_use_explicit_upstream_transport(http3_mode, http3_sessions.as_ref())
-    {
+    let use_http2 =
+        http2::should_use_explicit_upstream_transport(http2_mode, http2_sessions.as_ref());
+    let use_http3 =
+        http3::should_use_explicit_upstream_transport(http3_mode, http3_sessions.as_ref());
+    if use_http2 || use_http3 {
         return Ok(None);
     }
 
     let started = Instant::now();
-    if request.target_scheme == HttpUpstreamScheme::Http {
-        if services.plain_http1_sender_pool().is_some()
-            && default_upstream_request_body_known_empty(context)
-            && let Ok(response) =
-                forward_native_default_upstream_http_via_sender_pool(context, &request).await
-        {
-            let upstream_latency_ms = response.upstream_latency_ms;
-            return Ok(Some(ResolvedHttpGraphResponse {
-                response: response_from_started_upstream_response(
-                    response,
-                    response_headers,
-                    response_status,
-                )
-                .await,
-                upstream_latency_ms,
-                post_response_plan: None,
-            }));
-        }
-        let client = services
-            .plain_http1_upstream_client()
-            .ok_or(UpstreamResponseStartError::MissingClient)?;
-        let request_body = resolve_outbound_request_body(context)
-            .await
-            .map_err(|err| {
-                UpstreamResponseStartError::ResolveOutboundBody(format!(
-                    "failed to resolve outbound exchange body: {err}",
-                ))
-            })?;
-        let request_body = Bytes::from(request_body);
-        let outbound = context.with_request_head(|request_head| {
-            let method = request.method_or_request_head(request_head).clone();
-            let (upstream_url, host_header) = request
-                .build_upstream_url(
-                    request.path_or_request_head(request_head),
-                    request.query_or_request_head(request_head),
-                )
-                .expect("default upstream target should be configured");
-            let mut outbound = hyper::Request::builder()
-                .method(method)
-                .uri(&upstream_url)
-                .version(Version::HTTP_11)
-                .body(Full::new(request_body.clone()))
-                .map_err(|err| {
-                    UpstreamResponseStartError::Protocol(format!(
-                        "failed to build outbound request for {upstream_url}: {err}",
-                    ))
-                })?;
-            request.apply_headers_to_hyper_request(
-                &mut outbound,
-                request_head,
-                host_header.as_deref(),
-            );
-            Ok::<_, UpstreamResponseStartError>((upstream_url, outbound))
-        })?;
-        let (upstream_url, outbound) = outbound;
-        let upstream_response = client.request(outbound).await.map_err(|err| {
-            UpstreamResponseStartError::UpstreamRequest(format!(
-                "outbound request to {upstream_url} failed while evaluating host call: {err}",
-            ))
-        })?;
-        let (parts, body) = upstream_response.into_parts();
-        let mut response = Response::from_parts(parts, Body::new(body));
-        let hop_by_hop_headers = response
-            .headers()
-            .keys()
-            .filter(|name| is_hop_by_hop_header(name))
-            .cloned()
-            .collect::<Vec<_>>();
-        for header in hop_by_hop_headers {
-            response.headers_mut().remove(header);
-        }
-        mark_outbound_tcp_connected(context, DEFAULT_UPSTREAM_EXCHANGE_HANDLE)?;
-        let upstream_latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        if let Some(status) = response_status.and_then(|code| StatusCode::from_u16(code).ok()) {
-            *response.status_mut() = status;
-        }
-        merge_headers(response.headers_mut(), &response_headers);
+    if outbound_http1_fast_path_eligible(
+        request.version_preference,
+        request.target.is_some(),
+        false,
+        services.plain_http1_sender_pool().is_some(),
+        use_http2,
+        use_http3,
+    ) && let Ok(response) =
+        forward_native_default_upstream_http_via_sender_pool(context, &request).await
+    {
+        let upstream_latency_ms = response.upstream_latency_ms;
         return Ok(Some(ResolvedHttpGraphResponse {
-            response,
+            response: response_from_started_upstream_response(
+                response,
+                response_headers,
+                response_status,
+            )
+            .await,
             upstream_latency_ms,
             post_response_plan: None,
         }));
@@ -4698,22 +4590,29 @@ async fn try_resolve_native_default_upstream_http_forward_response(
                 "failed to resolve outbound exchange body: {err}",
             ))
         })?;
-    let (upstream_url, outbound) = context.with_request_head(|request_head| {
+    let (method, upstream_url, outbound_headers) = context.with_request_head(|request_head| {
         let method = request.method_or_request_head(request_head).clone();
-        let (upstream_url, host_header) = request
-            .build_upstream_url(
-                request.path_or_request_head(request_head),
-                request.query_or_request_head(request_head),
-            )
-            .expect("default upstream target should be configured");
-        let mut outbound = client.request(method, &upstream_url).body(request_body);
-        outbound = request.apply_headers_to_reqwest_request(
-            outbound,
-            request_head,
-            host_header.as_deref(),
+        let path = request.path_or_request_head(request_head);
+        let query = request.query_or_request_head(request_head);
+        let (upstream_url, host_header) = build_configured_upstream_url(
+            request
+                .target
+                .as_deref()
+                .expect("default upstream target should be configured"),
+            request.target_inherits_request_path,
+            request.target_host_header.as_deref(),
+            path,
+            query,
         );
-        (upstream_url, outbound)
+        let outbound_headers =
+            request.filtered_headers_or_request_head(request_head, host_header.as_deref());
+        (method, upstream_url, outbound_headers)
     });
+    let outbound = apply_filtered_upstream_headers_to_reqwest_request(
+        client.request(method, &upstream_url).body(request_body),
+        &outbound_headers,
+        None,
+    );
     let upstream_response = outbound.send().await.map_err(|err| {
         UpstreamResponseStartError::UpstreamRequest(format!(
             "outbound request to {upstream_url} failed while evaluating host call: {err}",
@@ -5392,19 +5291,43 @@ async fn start_outbound_exchange_response(
             unreachable!("explicit http2 transport requires the http2 feature");
         }
     } else {
-        match start_upstream_response_via_reqwest(
-            handle,
-            &prepared,
-            &upstream_url,
-            &outbound_headers,
-            request_body,
-        )
-        .await
-        {
-            Ok(started) => started,
-            Err(err) => {
-                let _ = note_outbound_tls_failure(context, handle);
-                return Err(err);
+        if outbound_http1_fast_path_eligible(
+            prepared.version_preference,
+            true,
+            false,
+            context.services().plain_http1_sender_pool().is_some(),
+            use_http2,
+            use_http3,
+        ) {
+            match start_upstream_response_via_plain_http1_sender_pool(
+                context,
+                handle,
+                &prepared,
+                request_body,
+            )
+            .await
+            {
+                Ok(started) => started,
+                Err(err) => {
+                    let _ = note_outbound_tls_failure(context, handle);
+                    return Err(err);
+                }
+            }
+        } else {
+            match start_upstream_response_via_reqwest(
+                handle,
+                &prepared,
+                &upstream_url,
+                &outbound_headers,
+                request_body,
+            )
+            .await
+            {
+                Ok(started) => started,
+                Err(err) => {
+                    let _ = note_outbound_tls_failure(context, handle);
+                    return Err(err);
+                }
             }
         }
     };
@@ -5615,13 +5538,23 @@ fn response_from_output(
     headers: HeaderMap,
     status_code: Option<u16>,
 ) -> Response<Body> {
-    let mut response = Response::new(Body::from(body));
+    let body_is_empty = body.is_empty();
+    let mut response = if body_is_empty {
+        Response::new(Body::empty())
+    } else {
+        Response::new(Body::from(body))
+    };
     let status = status_code
         .and_then(|code| StatusCode::from_u16(code).ok())
         .unwrap_or(StatusCode::OK);
     *response.status_mut() = status;
     merge_headers(response.headers_mut(), &headers);
-    if !response.headers().contains_key(CONTENT_TYPE) {
+    if body_is_empty {
+        response
+            .headers_mut()
+            .entry(CONTENT_LENGTH)
+            .or_insert_with(|| HeaderValue::from_static("0"));
+    } else if !response.headers().contains_key(CONTENT_TYPE) {
         response
             .headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
