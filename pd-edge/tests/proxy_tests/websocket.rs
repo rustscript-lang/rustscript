@@ -3,7 +3,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 #[tokio::test]
 async fn sample_websocket_proxy_program_round_trips_text_frames() {
-    let (upstream_addr, upstream_handle) = spawn_websocket_echo_upstream().await;
+    let (_upstream_addr, upstream_handle) =
+        spawn_websocket_echo_upstream_on(loopback_addr(SAMPLE_WEBSOCKET_UPSTREAM_PORT)).await;
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -18,7 +19,6 @@ async fn sample_websocket_proxy_program_round_trips_text_frames() {
 
     let response = client
         .get(format!("http://{data_addr}/ws"))
-        .header("x-ws-target", format!("ws://{upstream_addr}/echo"))
         .header("x-ws-message", "hello")
         .header("x-ws-subprotocols", "superchat, chat")
         .header("x-ws-header-name", "x-client-tag")
@@ -137,7 +137,8 @@ async fn sample_websocket_proxy_program_round_trips_text_frames() {
 
 #[tokio::test]
 async fn sample_websocket_proxy_program_round_trips_binary_frames_with_default_handle() {
-    let (upstream_addr, upstream_handle) = spawn_websocket_echo_upstream().await;
+    let (_upstream_addr, upstream_handle) =
+        spawn_websocket_echo_upstream_on(loopback_addr(SAMPLE_WEBSOCKET_UPSTREAM_PORT)).await;
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -153,7 +154,6 @@ async fn sample_websocket_proxy_program_round_trips_binary_frames_with_default_h
 
     let response = client
         .get(format!("http://{data_addr}/ws-binary-sample"))
-        .header("x-ws-target", format!("ws://{upstream_addr}/binary"))
         .header("x-ws-binary-base64", &payload)
         .header("x-ws-handle", "default")
         .send()
@@ -256,14 +256,17 @@ async fn websocket_connection_can_round_trip_binary_frames() {
         use websocket;
 
         let connection = websocket::connection::default_upstream();
-        websocket::connection::set_target(connection, "ws://{upstream_addr}/binary");
+        websocket::connection::set_target(connection, "{upstream_host}", {upstream_port});
+        websocket::connection::set_path(connection, "/binary");
         websocket::connection::connect(connection);
         websocket::connection::send_binary_base64(connection, "{payload}");
         let echoed = websocket::connection::read_binary_base64(connection);
         http::response::set_header("x-phase", websocket::connection::get_phase(connection));
         websocket::connection::close(connection, 1000, "binary-complete");
         http::response::set_body(echoed);
-    "#
+    "#,
+        upstream_host = upstream_addr.ip(),
+        upstream_port = upstream_addr.port()
     );
     let compiled = compile_source(&source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
@@ -337,30 +340,29 @@ async fn downstream_websocket_binary_tunnel_upgrades_and_relays_frames() {
     let (upstream_addr, upstream_handle) = spawn_websocket_echo_upstream().await;
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
     let client = reqwest::Client::new();
-    let source = r#"
+    let source = format!(
+        r#"
         use http;
         use proxy;
         use websocket;
 
-        let target = http::request::get_header("x-ws-target");
-        if target == "" {
-            http::response::set_status(400);
-            http::response::set_body("missing x-ws-target");
-        } else {
-            let upstream = websocket::connection::new();
-            websocket::connection::set_target(upstream, target);
-            let protocols = http::request::get_header("sec-websocket-protocol");
-            if protocols != "" {
-                websocket::connection::set_subprotocols(upstream, protocols);
-            }
-            let downstream = proxy::stream::downstream();
-            let peer = proxy::stream::from_websocket_binary(upstream);
-            let status = proxy::bridge(downstream, peer, 1024);
-            http::response::set_header("x-proxy-status", status);
-            http::response::set_header("x-upstream-phase", websocket::connection::get_phase(upstream));
-            http::response::set_header("x-upstream-protocol", websocket::connection::get_subprotocol(upstream));
+        let upstream = websocket::connection::new();
+        websocket::connection::set_target(upstream, "{upstream_host}", {upstream_port});
+        websocket::connection::set_path(upstream, "/binary");
+        let protocols = http::request::get_header("sec-websocket-protocol");
+        if protocols != "" {
+            websocket::connection::set_subprotocols(upstream, protocols);
         }
-    "#;
+        let downstream = proxy::stream::downstream();
+        let peer = proxy::stream::from_websocket_binary(upstream);
+        let status = proxy::bridge(downstream, peer, 1024);
+        http::response::set_header("x-proxy-status", status);
+        http::response::set_header("x-upstream-phase", websocket::connection::get_phase(upstream));
+        http::response::set_header("x-upstream-protocol", websocket::connection::get_subprotocol(upstream));
+    "#,
+        upstream_host = upstream_addr.ip(),
+        upstream_port = upstream_addr.port()
+    );
     let compiled = compile_source(source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
@@ -368,11 +370,6 @@ async fn downstream_websocket_binary_tunnel_upgrades_and_relays_frames() {
     let mut request = format!("ws://{data_addr}/ws-tunnel")
         .into_client_request()
         .expect("websocket request should build");
-    request.headers_mut().insert(
-        "x-ws-target",
-        HeaderValue::from_str(&format!("ws://{upstream_addr}/binary"))
-            .expect("websocket target header should encode"),
-    );
     request.headers_mut().insert(
         "sec-websocket-protocol",
         HeaderValue::from_static("superchat, chat"),
@@ -500,14 +497,17 @@ async fn downstream_transport_proxy_accepts_and_executes_websocket_frames_direct
 
 #[tokio::test]
 async fn sample_transport_websocket_sse_bridge_program_forwards_events_as_text_frames() {
-    let (upstream_addr, upstream_handle) = spawn_sse_upstream(vec![
-        "id: 1\n",
-        "data: alpha\n",
-        "\n",
-        "event: update\n",
-        "data: beta\n",
-        "\n",
-    ])
+    let (_upstream_addr, upstream_handle) = spawn_sse_upstream_on(
+        vec![
+            "id: 1\n",
+            "data: alpha\n",
+            "\n",
+            "event: update\n",
+            "data: beta\n",
+            "\n",
+        ],
+        loopback_addr(SAMPLE_WEBSOCKET_SSE_BRIDGE_PORT),
+    )
     .await;
     let (data_addr, admin_addr, data_handle, admin_handle) =
         spawn_transport_proxy(1024 * 1024).await;
@@ -540,13 +540,6 @@ async fn sample_transport_websocket_sse_bridge_program_forwards_events_as_text_f
             .and_then(|value| value.to_str().ok()),
         Some("sse-bridge")
     );
-
-    websocket
-        .send(Message::Text(
-            format!("http://{upstream_addr}/events").into(),
-        ))
-        .await
-        .expect("upstream target frame should send");
 
     let first = websocket
         .next()

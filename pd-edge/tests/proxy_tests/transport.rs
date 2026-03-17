@@ -62,7 +62,11 @@ impl rustls::client::danger::ServerCertVerifier for PermissiveTestServerCertVeri
 
 #[tokio::test]
 async fn sample_upstream_transport_proxy_program_streams_plain_http_body() {
-    let (upstream_addr, upstream_handle) = spawn_chunked_upstream(vec!["ab", "cd", "ef"]).await;
+    let (_upstream_addr, upstream_handle) = spawn_chunked_upstream_on(
+        vec!["ab", "cd", "ef"],
+        loopback_addr(SAMPLE_TRANSPORT_UPSTREAM_HTTP_PORT),
+    )
+    .await;
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -75,10 +79,8 @@ async fn sample_upstream_transport_proxy_program_streams_plain_http_body() {
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
 
-    let upstream_target = format!("http://{upstream_addr}/sample");
     let response = client
         .get(format!("http://{data_addr}/proxy"))
-        .header("x-upstream-target", &upstream_target)
         .header("Streaming", "1")
         .send()
         .await
@@ -118,7 +120,8 @@ async fn sample_upstream_transport_proxy_program_streams_plain_http_body() {
 #[cfg(feature = "tls")]
 #[tokio::test]
 async fn sample_upstream_transport_proxy_program_handles_https_tls_session() {
-    let (upstream_addr, upstream_handle) = spawn_https_echo_upstream().await;
+    let (_upstream_addr, upstream_handle) =
+        spawn_https_echo_upstream_on(loopback_addr(SAMPLE_TRANSPORT_UPSTREAM_HTTPS_PORT)).await;
     let mut state = SharedState::new(1024 * 1024);
     state.client = reqwest::Client::builder()
         .tls_info(true)
@@ -137,10 +140,9 @@ async fn sample_upstream_transport_proxy_program_handles_https_tls_session() {
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
 
-    let upstream_target = format!("https://localhost:{}/echo", upstream_addr.port());
     let response = client
         .post(format!("http://{data_addr}/proxy"))
-        .header("x-upstream-target", &upstream_target)
+        .header("x-upstream-scheme", "https")
         .body("secure-payload")
         .send()
         .await
@@ -695,7 +697,11 @@ async fn sample_tunnel_proxy_program_tunnels_plain_http_body() {
             String::from_utf8_lossy(&body)
         )))
     }));
-    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+    let (_upstream_addr, upstream_handle) = spawn_server_on(
+        upstream_app,
+        loopback_addr(SAMPLE_TUNNEL_UPSTREAM_HTTP_PORT),
+    )
+    .await;
 
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
     let client = reqwest::Client::new();
@@ -711,7 +717,6 @@ async fn sample_tunnel_proxy_program_tunnels_plain_http_body() {
 
     let response = client
         .post(format!("http://{data_addr}/tunnel"))
-        .header("x-upstream-target", format!("http://{upstream_addr}/echo"))
         .body("abcdefghij")
         .send()
         .await
@@ -722,14 +727,14 @@ async fn sample_tunnel_proxy_program_tunnels_plain_http_body() {
             .headers()
             .get("x-proxy-status")
             .and_then(|value| value.to_str().ok()),
-        Some("closed")
+        Some("forwarded")
     );
     assert_eq!(
         response
             .headers()
             .get("content-type")
             .and_then(|value| value.to_str().ok()),
-        Some("text/plain")
+        None
     );
     assert_eq!(
         response.text().await.expect("body should read"),
@@ -867,7 +872,8 @@ async fn transport_connect_tunnel_upgrades_downstream_into_dynamic_tcp() {
 #[cfg(feature = "tls")]
 #[tokio::test]
 async fn sample_tunnel_proxy_program_tunnels_https_body_via_tls_plaintext_stream() {
-    let (upstream_addr, upstream_handle) = spawn_https_echo_upstream().await;
+    let (_upstream_addr, upstream_handle) =
+        spawn_https_echo_upstream_on(loopback_addr(SAMPLE_TUNNEL_UPSTREAM_HTTPS_PORT)).await;
     let mut state = SharedState::new(1024 * 1024);
     state.client = reqwest::Client::builder()
         .tls_info(true)
@@ -888,10 +894,7 @@ async fn sample_tunnel_proxy_program_tunnels_https_body_via_tls_plaintext_stream
 
     let response = client
         .post(format!("http://{data_addr}/tls-tunnel"))
-        .header(
-            "x-upstream-target",
-            format!("https://localhost:{}/echo", upstream_addr.port()),
-        )
+        .header("x-upstream-scheme", "https")
         .body("secure-payload")
         .send()
         .await
@@ -902,7 +905,7 @@ async fn sample_tunnel_proxy_program_tunnels_https_body_via_tls_plaintext_stream
             .headers()
             .get("x-proxy-status")
             .and_then(|value| value.to_str().ok()),
-        Some("closed")
+        Some("forwarded")
     );
     assert_eq!(
         response

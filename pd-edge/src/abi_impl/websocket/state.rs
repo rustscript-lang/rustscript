@@ -40,6 +40,36 @@ pub(crate) enum WebSocketPhase {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WebSocketUpstreamScheme {
+    #[default]
+    Ws,
+    Wss,
+}
+
+impl WebSocketUpstreamScheme {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Ws => "ws",
+            Self::Wss => "wss",
+        }
+    }
+
+    pub(crate) fn uses_tls(self) -> bool {
+        matches!(self, Self::Wss)
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, VmError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ws" => Ok(Self::Ws),
+            "wss" => Ok(Self::Wss),
+            _ => Err(VmError::HostError(format!(
+                "invalid websocket scheme '{value}'; expected ws or wss",
+            ))),
+        }
+    }
+}
+
 impl WebSocketPhase {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -273,6 +303,9 @@ enum OutboundWebSocketFrame {
 pub(crate) struct WebSocketConnectionState {
     phase: WebSocketPhase,
     present: bool,
+    target_host: Option<String>,
+    target_port: Option<u16>,
+    target_scheme: WebSocketUpstreamScheme,
     requested_subprotocols: Vec<String>,
     negotiated_subprotocol: Option<String>,
     failure_message: Option<String>,
@@ -286,6 +319,9 @@ impl Default for WebSocketConnectionState {
         Self {
             phase: WebSocketPhase::Inactive,
             present: false,
+            target_host: None,
+            target_port: None,
+            target_scheme: WebSocketUpstreamScheme::Ws,
             requested_subprotocols: Vec::new(),
             negotiated_subprotocol: None,
             failure_message: None,
@@ -304,6 +340,9 @@ impl WebSocketConnectionState {
         Self {
             phase: WebSocketPhase::UpgradeObserved,
             present: true,
+            target_host: None,
+            target_port: None,
+            target_scheme: WebSocketUpstreamScheme::Ws,
             requested_subprotocols: parse_subprotocols_header(headers),
             negotiated_subprotocol: None,
             failure_message: None,
@@ -338,6 +377,29 @@ impl WebSocketConnectionState {
         ) {
             self.phase = WebSocketPhase::UpgradePrepared;
         }
+    }
+
+    pub(crate) fn set_target_host_port(&mut self, host: String, port: u16) {
+        self.prepare_outbound();
+        self.target_host = Some(host);
+        self.target_port = Some(port);
+    }
+
+    pub(crate) fn set_target_scheme(&mut self, scheme: WebSocketUpstreamScheme) {
+        self.prepare_outbound();
+        self.target_scheme = scheme;
+    }
+
+    pub(crate) fn target_host(&self) -> Option<&str> {
+        self.target_host.as_deref()
+    }
+
+    pub(crate) fn target_port(&self) -> Option<u16> {
+        self.target_port
+    }
+
+    pub(crate) fn target_scheme(&self) -> WebSocketUpstreamScheme {
+        self.target_scheme
     }
 
     pub(crate) fn set_requested_subprotocols(&mut self, requested_subprotocols: Vec<String>) {

@@ -14,7 +14,8 @@ async fn sample_io_upstream_handle_program_uses_tcp_and_http_handles_with_io() {
         );
         response
     }));
-    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+    let (_upstream_addr, upstream_handle) =
+        spawn_server_on(upstream_app, loopback_addr(SAMPLE_IO_UPSTREAM_PORT)).await;
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -29,7 +30,6 @@ async fn sample_io_upstream_handle_program_uses_tcp_and_http_handles_with_io() {
 
     let response = client
         .post(format!("http://{data_addr}/io-upstream-handles"))
-        .header("x-upstream-target", format!("http://{upstream_addr}/echo"))
         .body("payload")
         .send()
         .await

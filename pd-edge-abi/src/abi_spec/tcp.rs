@@ -24,7 +24,7 @@ fn tcp_stream_bind(stream: i64, local_addr: &str) {
 }
 
 #[pd_host_function(name = "tcp::stream::set_target")]
-fn tcp_stream_set_target(stream: i64, target: &str) {
+fn tcp_stream_set_target(stream: i64, host: &str, port: i64) {
     unreachable!("abi declaration only")
 }
 

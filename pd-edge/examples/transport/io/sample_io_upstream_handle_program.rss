@@ -1,21 +1,17 @@
 use http;
 use io;
-use runtime;
 use tcp;
 
-let target = http::request::get_header("x-upstream-target");
-
-if target == "" {
-    http::response::set_status(400);
-    http::response::set_body("missing x-upstream-target");
-    runtime::exit();
-}
+let upstream_host = "127.0.0.1";
+let upstream_port = 18084;
+let upstream_path = "/echo";
 
 let downstream = tcp::stream::downstream();
 let upstream = http::exchange::default_upstream();
 
 // Configure the default outbound exchange with the same method as the downstream request.
-http::exchange::set_target(upstream, target);
+http::exchange::set_target(upstream, upstream_host, upstream_port);
+http::exchange::set_path(upstream, upstream_path);
 http::exchange::set_method(upstream, http::request::get_method());
 
 // `io::read_all(0)` consumes the downstream request body.

@@ -2,7 +2,6 @@ use http;
 use websocket;
 
 // Request headers:
-// - x-ws-target: required ws:// or wss:// target
 // - x-ws-message: optional text payload
 // - x-ws-binary-base64: optional binary payload; when present the sample uses binary frame APIs
 // - x-ws-handle: "default" to use websocket::connection::default_upstream(), otherwise websocket::connection::new()
@@ -14,9 +13,8 @@ if websocket::connection::is_present(downstream) {
     http::response::set_header("x-downstream-ws-phase", websocket::connection::get_phase(downstream));
 } else {
     http::response::set_header("x-downstream-ws-present", "false");
-}
-
-let target = http::request::get_header("x-ws-target");
+let upstream_host = "127.0.0.1";
+let upstream_port = 18091;
 let text_payload = http::request::get_header("x-ws-message");
 let binary_payload = http::request::get_header("x-ws-binary-base64");
 let requested_handle = http::request::get_header("x-ws-handle");
@@ -24,77 +22,77 @@ let mut requested_subprotocols = http::request::get_header("x-ws-subprotocols");
 let custom_header_name = http::request::get_header("x-ws-header-name");
 let custom_header_value = http::request::get_header("x-ws-header-value");
 
-if target == "" {
-    http::response::set_status(400);
-    http::response::set_body("missing x-ws-target");
+let mut connection = websocket::connection::new();
+let mut handle_label = "new";
+if requested_handle == "default" {
+    connection = websocket::connection::default_upstream();
+    handle_label = "default-upstream";
+}
+http::response::set_header("x-ws-handle", handle_label);
+
+if websocket::connection::is_present(connection) {
+    http::response::set_header("x-ws-present-before-configure", "true");
 } else {
-    let mut connection = websocket::connection::new();
-    let mut handle_label = "new";
-    if requested_handle == "default" {
-        connection = websocket::connection::default_upstream();
-        handle_label = "default-upstream";
-    }
-    http::response::set_header("x-ws-handle", handle_label);
+    http::response::set_header("x-ws-present-before-configure", "false");
+}
 
-    if websocket::connection::is_present(connection) {
-        http::response::set_header("x-ws-present-before-configure", "true");
-    } else {
-        http::response::set_header("x-ws-present-before-configure", "false");
-    }
+websocket::connection::set_target(connection, upstream_host, upstream_port);
+if binary_payload != "" {
+    websocket::connection::set_path(connection, "/binary");
+} else {
+    websocket::connection::set_path(connection, "/echo");
+}
 
-    websocket::connection::set_target(connection, target);
+if custom_header_name != "" && custom_header_value != "" {
+    websocket::connection::set_header(connection, custom_header_name, custom_header_value);
+    http::response::set_header("x-ws-custom-header", custom_header_name);
+}
 
-    if custom_header_name != "" && custom_header_value != "" {
-        websocket::connection::set_header(connection, custom_header_name, custom_header_value);
-        http::response::set_header("x-ws-custom-header", custom_header_name);
-    }
+if requested_subprotocols == "" {
+    requested_subprotocols = "chat";
+}
+websocket::connection::set_subprotocols(connection, requested_subprotocols);
+http::response::set_header("x-ws-requested-subprotocols", requested_subprotocols);
 
-    if requested_subprotocols == "" {
-        requested_subprotocols = "chat";
-    }
-    websocket::connection::set_subprotocols(connection, requested_subprotocols);
-    http::response::set_header("x-ws-requested-subprotocols", requested_subprotocols);
+if websocket::connection::is_present(connection) {
+    http::response::set_header("x-ws-present-after-configure", "true");
+} else {
+    http::response::set_header("x-ws-present-after-configure", "false");
+}
 
-    if websocket::connection::is_present(connection) {
-        http::response::set_header("x-ws-present-after-configure", "true");
-    } else {
-        http::response::set_header("x-ws-present-after-configure", "false");
-    }
+http::response::set_header("x-ws-phase-before-connect", websocket::connection::get_phase(connection));
+websocket::connection::connect(connection);
+http::response::set_header("x-ws-phase-after-connect", websocket::connection::get_phase(connection));
 
-    http::response::set_header("x-ws-phase-before-connect", websocket::connection::get_phase(connection));
-    websocket::connection::connect(connection);
-    http::response::set_header("x-ws-phase-after-connect", websocket::connection::get_phase(connection));
+if websocket::connection::eof(connection) {
+    http::response::set_header("x-ws-eof-before-close", "true");
+} else {
+    http::response::set_header("x-ws-eof-before-close", "false");
+}
 
-    if websocket::connection::eof(connection) {
-        http::response::set_header("x-ws-eof-before-close", "true");
-    } else {
-        http::response::set_header("x-ws-eof-before-close", "false");
-    }
+let protocol = websocket::connection::get_subprotocol(connection);
+if binary_payload != "" {
+    websocket::connection::send_binary_base64(connection, binary_payload);
+    let reply = websocket::connection::read_binary_base64(connection);
+    http::response::set_header("x-ws-mode", "binary");
+    http::response::set_body(reply);
+} else {
+    websocket::connection::send_text(connection, text_payload);
+    let reply = websocket::connection::read_text(connection);
+    http::response::set_header("x-ws-mode", "text");
+    http::response::set_body(reply);
+}
 
-    let protocol = websocket::connection::get_subprotocol(connection);
-    if binary_payload != "" {
-        websocket::connection::send_binary_base64(connection, binary_payload);
-        let reply = websocket::connection::read_binary_base64(connection);
-        http::response::set_header("x-ws-mode", "binary");
-        http::response::set_body(reply);
-    } else {
-        websocket::connection::send_text(connection, text_payload);
-        let reply = websocket::connection::read_text(connection);
-        http::response::set_header("x-ws-mode", "text");
-        http::response::set_body(reply);
-    }
+websocket::connection::close(connection, 1000, "sample-complete");
+let phase = websocket::connection::get_phase(connection);
 
-    websocket::connection::close(connection, 1000, "sample-complete");
-    let phase = websocket::connection::get_phase(connection);
-
-    http::response::set_header("x-ws-phase", phase);
-    http::response::set_header("x-ws-phase-after-close", websocket::connection::get_phase(connection));
-    if protocol != "" {
-        http::response::set_header("x-ws-protocol", protocol);
-    }
-    if websocket::connection::eof(connection) {
-        http::response::set_header("x-ws-eof-after-close", "true");
-    } else {
-        http::response::set_header("x-ws-eof-after-close", "false");
-    }
+http::response::set_header("x-ws-phase", phase);
+http::response::set_header("x-ws-phase-after-close", websocket::connection::get_phase(connection));
+if protocol != "" {
+    http::response::set_header("x-ws-protocol", protocol);
+}
+if websocket::connection::eof(connection) {
+    http::response::set_header("x-ws-eof-after-close", "true");
+} else {
+    http::response::set_header("x-ws-eof-after-close", "false");
 }

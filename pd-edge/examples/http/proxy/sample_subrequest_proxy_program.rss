@@ -1,32 +1,30 @@
 use http;
-use runtime;
 use tcp;
 use tls;
 
-// Required request headers:
-// - x-primary-target: first upstream endpoint sent through the default exchange handle
-// - x-secondary-target: second upstream endpoint sent through an explicit exchange handle
-let primary_target = http::request::get_header("x-primary-target");
-let secondary_target = http::request::get_header("x-secondary-target");
-
-if primary_target == "" || secondary_target == "" {
-    http::response::set_status(400);
-    http::response::set_body("missing x-primary-target or x-secondary-target");
-    runtime::exit();
-}
+let primary_host = "127.0.0.1";
+let primary_port = 18083;
+let primary_path = "/plain";
+let secondary_host = "localhost";
+let secondary_port = 18483;
+let secondary_path = "/secure";
+let secondary_scheme = "https";
 
 // Use both the default handle and a second explicit handle to demonstrate concurrent subrequests.
 let primary = http::exchange::default_upstream();
 let secondary = http::exchange::new();
 
 http::exchange::set_method(primary, "POST");
-http::exchange::set_target(primary, primary_target);
+http::exchange::set_target(primary, primary_host, primary_port);
+http::exchange::set_path(primary, primary_path);
 http::exchange::set_header(primary, "x-exchange-id", "primary");
 // Writes against the exchange handle stage the outbound request body.
 tcp::stream::write(primary, "alpha");
 
 http::exchange::set_method(secondary, "POST");
-http::exchange::set_target(secondary, secondary_target);
+http::exchange::set_target(secondary, secondary_host, secondary_port);
+http::exchange::set_scheme(secondary, secondary_scheme);
+http::exchange::set_path(secondary, secondary_path);
 http::exchange::set_header(secondary, "x-exchange-id", "secondary");
 tcp::stream::write(secondary, "beta");
 

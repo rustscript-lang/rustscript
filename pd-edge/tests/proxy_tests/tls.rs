@@ -12,7 +12,9 @@ async fn tls_session_can_disable_verification_and_expose_handshake_phase() {
         use tls;
 
         let exchange = http::exchange::default_upstream();
-        http::exchange::set_target(exchange, "https://localhost:{}/echo");
+        http::exchange::set_target(exchange, "localhost", {});
+        http::exchange::set_scheme(exchange, "https");
+        http::exchange::set_path(exchange, "/echo");
         http::exchange::set_body(exchange, "phase-body");
 
         let session = tls::session::from_socket(exchange);
@@ -70,7 +72,9 @@ async fn tls_session_handshake_advances_from_cached_session_without_presence_gua
         use tls;
 
         let exchange = http::exchange::default_upstream();
-        http::exchange::set_target(exchange, "https://localhost:{}/echo");
+        http::exchange::set_target(exchange, "localhost", {});
+        http::exchange::set_scheme(exchange, "https");
+        http::exchange::set_path(exchange, "/echo");
         http::exchange::set_body(exchange, "reuse-body");
 
         let session = tls::session::from_socket(exchange);
@@ -153,7 +157,9 @@ async fn tls_session_accepts_custom_trusted_certificate_bundle() {
         use tls;
 
         let exchange = http::exchange::default_upstream();
-        http::exchange::set_target(exchange, "https://localhost:{}/echo");
+        http::exchange::set_target(exchange, "localhost", {});
+        http::exchange::set_scheme(exchange, "https");
+        http::exchange::set_path(exchange, "/echo");
         http::exchange::set_body(exchange, "trusted-body");
 
         let session = tls::session::from_socket(exchange);
@@ -214,7 +220,9 @@ async fn tls_session_supports_client_certificate_authentication() {
         use tls;
 
         let exchange = http::exchange::default_upstream();
-        http::exchange::set_target(exchange, "https://localhost:{}/echo");
+        http::exchange::set_target(exchange, "localhost", {});
+        http::exchange::set_scheme(exchange, "https");
+        http::exchange::set_path(exchange, "/echo");
         http::exchange::set_body(exchange, "mtls-body");
 
         let session = tls::session::from_socket(exchange);
@@ -269,7 +277,9 @@ async fn tls_session_rejects_alpn_policy_mismatch() {
         use tls;
 
         let exchange = http::exchange::default_upstream();
-        http::exchange::set_target(exchange, "https://localhost:{}/echo");
+        http::exchange::set_target(exchange, "localhost", {});
+        http::exchange::set_scheme(exchange, "https");
+        http::exchange::set_path(exchange, "/echo");
         let session = tls::session::from_socket(exchange);
         tls::session::set_verify(session, false);
         tls::session::set_alpn(session, "h2");
@@ -306,7 +316,9 @@ async fn tls_session_accepts_h2_alpn_policy_when_http2_is_negotiated() {
         use tls;
 
         let exchange = http::exchange::default_upstream();
-        http::exchange::set_target(exchange, "https://localhost:{}/fast");
+        http::exchange::set_target(exchange, "localhost", {});
+        http::exchange::set_scheme(exchange, "https");
+        http::exchange::set_path(exchange, "/fast");
 
         let session = tls::session::from_socket(exchange);
         tls::session::set_verify(session, false);
@@ -376,7 +388,9 @@ async fn http2_capable_client_falls_back_to_http11_when_h2_is_unavailable() {
         use tls;
 
         let upstream = http::exchange::default_upstream();
-        http::exchange::set_target(upstream, "https://localhost:{}/echo");
+        http::exchange::set_target(upstream, "localhost", {});
+        http::exchange::set_scheme(upstream, "https");
+        http::exchange::set_path(upstream, "/echo");
         http::exchange::set_body(upstream, "fallback-body");
 
         let session = tls::session::from_socket(http::exchange::default_upstream());

@@ -1333,9 +1333,9 @@ mod tests {
         assert_eq!(socket.phase(), UdpSocketPhase::Bound);
         assert_eq!(socket.bind_address(), Some("127.0.0.1:0"));
 
-        socket.set_target("udp://127.0.0.1:9000".to_string());
+        socket.set_target("127.0.0.1:9000".to_string());
         assert_eq!(socket.phase(), UdpSocketPhase::Configured);
-        assert_eq!(socket.peer_address(), "udp://127.0.0.1:9000");
+        assert_eq!(socket.peer_address(), "127.0.0.1:9000");
 
         socket.mark_connected("127.0.0.1:45000".to_string(), "127.0.0.1:9000".to_string());
         assert_eq!(socket.phase(), UdpSocketPhase::Connected);

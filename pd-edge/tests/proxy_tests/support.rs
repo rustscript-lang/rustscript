@@ -52,6 +52,32 @@ pub(crate) use vm::{
     BytecodeBuilder, Program, Value, Vm, VmError, VmStatus, compile_source, encode_program,
 };
 
+pub(crate) const SAMPLE_PROXY_UPSTREAM_PORT: u16 = 18080;
+pub(crate) const SAMPLE_REQUEST_TRANSFORM_UPSTREAM_PORT: u16 = 18081;
+pub(crate) const SAMPLE_SSE_UPSTREAM_PORT: u16 = 18082;
+pub(crate) const SAMPLE_SUBREQUEST_PRIMARY_PORT: u16 = 18083;
+pub(crate) const SAMPLE_SUBREQUEST_SECONDARY_PORT: u16 = 18483;
+pub(crate) const SAMPLE_IO_UPSTREAM_PORT: u16 = 18084;
+pub(crate) const SAMPLE_TRANSPORT_UPSTREAM_HTTP_PORT: u16 = 18085;
+pub(crate) const SAMPLE_TRANSPORT_UPSTREAM_HTTPS_PORT: u16 = 18485;
+pub(crate) const SAMPLE_TUNNEL_UPSTREAM_HTTP_PORT: u16 = 18086;
+pub(crate) const SAMPLE_TUNNEL_UPSTREAM_HTTPS_PORT: u16 = 18486;
+pub(crate) const SAMPLE_FORWARD_UPSTREAM_HTTPS_PORT: u16 = 18487;
+pub(crate) const SAMPLE_FORWARD_PROXY_PORT: u16 = 18090;
+pub(crate) const SAMPLE_WEBRTC_SIGNAL_TEXT_PORT: u16 = 18087;
+pub(crate) const SAMPLE_WEBRTC_SIGNAL_BINARY_PORT: u16 = 18088;
+pub(crate) const SAMPLE_WEBSOCKET_SSE_BRIDGE_PORT: u16 = 18089;
+#[cfg(feature = "websocket")]
+pub(crate) const SAMPLE_WEBSOCKET_UPSTREAM_PORT: u16 = 18091;
+#[cfg(all(feature = "tls", feature = "http2"))]
+pub(crate) const SAMPLE_UPSTREAM_HTTP2_PORT: u16 = 18444;
+#[cfg(all(feature = "tls", feature = "http3"))]
+pub(crate) const SAMPLE_UPSTREAM_HTTP3_PORT: u16 = 18445;
+
+pub(crate) fn loopback_addr(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
+
 #[cfg(feature = "tls")]
 pub(crate) fn ensure_rustls_provider() {
     static INIT: std::sync::Once = std::sync::Once::new();
@@ -60,8 +86,11 @@ pub(crate) fn ensure_rustls_provider() {
     });
 }
 
-pub(crate) async fn spawn_server(app: Router) -> (SocketAddr, JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+pub(crate) async fn spawn_server_on(
+    app: Router,
+    bind_addr: SocketAddr,
+) -> (SocketAddr, JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .expect("listener should bind");
     let addr = listener.local_addr().expect("listener should have addr");
@@ -69,6 +98,10 @@ pub(crate) async fn spawn_server(app: Router) -> (SocketAddr, JoinHandle<()>) {
         axum::serve(listener, app).await.expect("server should run");
     });
     (addr, handle)
+}
+
+pub(crate) async fn spawn_server(app: Router) -> (SocketAddr, JoinHandle<()>) {
+    spawn_server_on(app, loopback_addr(0)).await
 }
 
 pub(crate) async fn spawn_proxy(
@@ -214,10 +247,11 @@ pub(crate) async fn spawn_transport_proxy(
     (data_addr, admin_addr, data_handle, admin_handle)
 }
 
-pub(crate) async fn spawn_chunked_upstream(
+pub(crate) async fn spawn_chunked_upstream_on(
     chunks: Vec<&'static str>,
+    bind_addr: SocketAddr,
 ) -> (SocketAddr, JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .expect("listener should bind");
     let addr = listener.local_addr().expect("listener should have addr");
@@ -266,6 +300,14 @@ pub(crate) async fn spawn_connect_forward_proxy() -> (SocketAddr, JoinHandle<()>
         .expect("forward proxy should start")
 }
 
+pub(crate) async fn spawn_connect_forward_proxy_on(
+    bind_addr: SocketAddr,
+) -> (SocketAddr, JoinHandle<()>) {
+    edge::sample_echo::spawn_connect_forward_proxy(bind_addr)
+        .await
+        .expect("forward proxy should start")
+}
+
 pub(crate) async fn run_edge_program_direct(
     program: Program,
     context: Arc<ProxyVmContext>,
@@ -297,8 +339,11 @@ pub(crate) async fn run_edge_program_direct(
     }
 }
 
-pub(crate) async fn spawn_sse_upstream(lines: Vec<&'static str>) -> (SocketAddr, JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+pub(crate) async fn spawn_sse_upstream_on(
+    lines: Vec<&'static str>,
+    bind_addr: SocketAddr,
+) -> (SocketAddr, JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .expect("listener should bind");
     let addr = listener.local_addr().expect("listener should have addr");
@@ -341,9 +386,15 @@ pub(crate) async fn spawn_sse_upstream(lines: Vec<&'static str>) -> (SocketAddr,
     (addr, handle)
 }
 
+pub(crate) async fn spawn_sse_upstream(lines: Vec<&'static str>) -> (SocketAddr, JoinHandle<()>) {
+    spawn_sse_upstream_on(lines, loopback_addr(0)).await
+}
+
 #[cfg(feature = "websocket")]
-pub(crate) async fn spawn_websocket_echo_upstream() -> (SocketAddr, JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+pub(crate) async fn spawn_websocket_echo_upstream_on(
+    bind_addr: SocketAddr,
+) -> (SocketAddr, JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .expect("listener should bind");
     let addr = listener.local_addr().expect("listener should have addr");
@@ -425,8 +476,15 @@ pub(crate) async fn spawn_websocket_echo_upstream() -> (SocketAddr, JoinHandle<(
     (addr, handle)
 }
 
+#[cfg(feature = "websocket")]
+pub(crate) async fn spawn_websocket_echo_upstream() -> (SocketAddr, JoinHandle<()>) {
+    spawn_websocket_echo_upstream_on(loopback_addr(0)).await
+}
+
 #[cfg(feature = "tls")]
-pub(crate) async fn spawn_https_echo_upstream() -> (SocketAddr, JoinHandle<()>) {
+pub(crate) async fn spawn_https_echo_upstream_on(
+    bind_addr: SocketAddr,
+) -> (SocketAddr, JoinHandle<()>) {
     ensure_rustls_provider();
     let cert =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
@@ -443,7 +501,7 @@ pub(crate) async fn spawn_https_echo_upstream() -> (SocketAddr, JoinHandle<()>) 
     server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .expect("listener should bind");
     let addr = listener.local_addr().expect("listener should have addr");
@@ -516,6 +574,11 @@ pub(crate) async fn spawn_https_echo_upstream() -> (SocketAddr, JoinHandle<()>) 
         }
     });
     (addr, handle)
+}
+
+#[cfg(feature = "tls")]
+pub(crate) async fn spawn_https_echo_upstream() -> (SocketAddr, JoinHandle<()>) {
+    spawn_https_echo_upstream_on(loopback_addr(0)).await
 }
 
 #[cfg(all(feature = "tls", feature = "http2"))]
@@ -715,12 +778,13 @@ async fn serve_http3_fixture_connection(connection: quinn::Connection, kind: Htt
 #[cfg(all(feature = "tls", feature = "http3"))]
 async fn spawn_https_http3_upstream_fixture(
     kind: Http3FixtureKind,
+    bind_addr: SocketAddr,
 ) -> (
     SocketAddr,
     Arc<std::sync::atomic::AtomicUsize>,
     JoinHandle<()>,
 ) {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+    let socket = tokio::net::UdpSocket::bind(bind_addr)
         .await
         .expect("http3 upstream socket should bind");
     let addr = socket
@@ -760,16 +824,18 @@ pub(crate) async fn spawn_https_http3_multiplex_upstream() -> (
     Arc<std::sync::atomic::AtomicUsize>,
     JoinHandle<()>,
 ) {
-    spawn_https_http3_upstream_fixture(Http3FixtureKind::Multiplex).await
+    spawn_https_http3_upstream_fixture(Http3FixtureKind::Multiplex, loopback_addr(0)).await
 }
 
 #[cfg(all(feature = "tls", feature = "http3"))]
-pub(crate) async fn spawn_https_http3_sample_upstream() -> (
+pub(crate) async fn spawn_https_http3_sample_upstream_on(
+    bind_addr: SocketAddr,
+) -> (
     SocketAddr,
     Arc<std::sync::atomic::AtomicUsize>,
     JoinHandle<()>,
 ) {
-    spawn_https_http3_upstream_fixture(Http3FixtureKind::Sample).await
+    spawn_https_http3_upstream_fixture(Http3FixtureKind::Sample, bind_addr).await
 }
 
 #[cfg(all(feature = "tls", feature = "http2"))]
@@ -862,7 +928,90 @@ pub(crate) async fn spawn_https_http2_sample_upstream() -> (
     server_config.alpn_protocols = vec![b"h2".to_vec()];
 
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind(loopback_addr(0))
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener should have addr");
+    let connection_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handle = tokio::spawn({
+        let connection_count = Arc::clone(&connection_count);
+        async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                connection_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let tls_stream = acceptor
+                        .accept(stream)
+                        .await
+                        .expect("http2 tls accept should succeed");
+                    let service = hyper::service::service_fn(
+                        |request: hyper::Request<hyper::body::Incoming>| async move {
+                            let (parts, body) = request.into_parts();
+                            let path = parts.uri.path().to_string();
+                            let method = parts.method.to_string();
+                            let tag = parts
+                                .headers
+                                .get("x-demo-request")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let body = http_body_util::BodyExt::collect(body)
+                                .await
+                                .expect("sample http2 request body should collect")
+                                .to_bytes();
+                            let payload =
+                                format!("{method}|{path}|{tag}|{}", String::from_utf8_lossy(&body));
+                            let body = if path == "/slow" {
+                                boxed_http2_delayed_body_owned(payload, Duration::from_millis(75))
+                            } else {
+                                boxed_http2_full_body_owned(payload)
+                            };
+                            let mut response = hyper::Response::new(body);
+                            response
+                                .headers_mut()
+                                .insert("x-upstream-http-version", HeaderValue::from_static("2"));
+                            Ok::<_, std::convert::Infallible>(response)
+                        },
+                    );
+                    let io = hyper_util::rt::TokioIo::new(tls_stream);
+                    let builder = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    );
+                    if let Err(err) = builder.serve_connection(io, service).await {
+                        panic!("http2 sample upstream connection should serve: {err}");
+                    }
+                });
+            }
+        }
+    });
+    (addr, connection_count, handle)
+}
+
+#[cfg(all(feature = "tls", feature = "http2"))]
+pub(crate) async fn spawn_https_http2_sample_upstream_on(
+    bind_addr: SocketAddr,
+) -> (
+    SocketAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    JoinHandle<()>,
+) {
+    ensure_rustls_provider();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("certificate should generate");
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(
+                cert.serialize_der().expect("certificate should serialize"),
+            )],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.serialize_private_key_der())),
+        )
+        .expect("server config should build");
+    server_config.alpn_protocols = vec![b"h2".to_vec()];
+
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .expect("listener should bind");
     let addr = listener.local_addr().expect("listener should have addr");

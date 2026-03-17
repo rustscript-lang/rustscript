@@ -1,18 +1,14 @@
 use http;
 use proxy;
-use runtime;
 
-// Minimal forwarding sample: send the request to x-upstream-target and mirror the response.
-let upstream = http::request::get_header("x-upstream-target");
-
-if upstream == "" {
-    http::response::set_status(400);
-    http::response::set_body("missing x-upstream-target");
-    runtime::exit();
-}
+// Minimal forwarding sample wired to a fixed local upstream fixture.
+let upstream_host = "127.0.0.1";
+let upstream_port = 18080;
+let upstream_path = "/sample";
 
 let exchange = http::exchange::default_upstream();
-http::exchange::set_target(exchange, upstream);
+http::exchange::set_target(exchange, upstream_host, upstream_port);
+http::exchange::set_path(exchange, upstream_path);
 
 if http::request::get_header("Streaming") != "" {
     // Accessing the response metadata/body implicitly executes the outbound exchange.

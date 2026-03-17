@@ -2,8 +2,8 @@ use super::support::*;
 
 #[tokio::test]
 async fn sample_webrtc_proxy_program_round_trips_text_messages() {
-    let (webrtc_addr, webrtc_handle) =
-        spawn_webrtc_echo_server("127.0.0.1:0".parse().expect("valid ephemeral addr"))
+    let (_webrtc_addr, webrtc_handle) =
+        spawn_webrtc_echo_server(loopback_addr(SAMPLE_WEBRTC_SIGNAL_TEXT_PORT))
             .await
             .expect("webrtc echo server should start");
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
@@ -20,10 +20,6 @@ async fn sample_webrtc_proxy_program_round_trips_text_messages() {
 
     let response = client
         .get(format!("http://{data_addr}/webrtc"))
-        .header(
-            "x-webrtc-signal-target",
-            format!("http://{webrtc_addr}/offer"),
-        )
         .header("x-webrtc-message", "ping")
         .header("x-webrtc-data-channel-label", "sample-chat")
         .send()
@@ -137,8 +133,8 @@ async fn sample_webrtc_proxy_program_round_trips_text_messages() {
 
 #[tokio::test]
 async fn sample_webrtc_proxy_program_round_trips_binary_messages_with_default_handle() {
-    let (webrtc_addr, webrtc_handle) =
-        spawn_webrtc_echo_server("127.0.0.1:0".parse().expect("valid ephemeral addr"))
+    let (_webrtc_addr, webrtc_handle) =
+        spawn_webrtc_echo_server(loopback_addr(SAMPLE_WEBRTC_SIGNAL_BINARY_PORT))
             .await
             .expect("webrtc echo server should start");
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
@@ -156,10 +152,6 @@ async fn sample_webrtc_proxy_program_round_trips_binary_messages_with_default_ha
 
     let response = client
         .get(format!("http://{data_addr}/webrtc-binary"))
-        .header(
-            "x-webrtc-signal-target",
-            format!("http://{webrtc_addr}/offer"),
-        )
         .header("x-webrtc-binary-base64", &payload)
         .header("x-webrtc-handle", "default")
         .send()

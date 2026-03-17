@@ -71,6 +71,8 @@ use {
 };
 
 static NEXT_HTTP_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "http2")]
+static HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 static STAGE_METRICS_ENABLED: OnceLock<bool> = OnceLock::new();
 static STAGE_METRICS_COUNT: AtomicU64 = AtomicU64::new(0);
 static STAGE_METRICS_PRE_VM_US: AtomicU64 = AtomicU64::new(0);
@@ -218,6 +220,22 @@ async fn serve_http1_connection<S>(
     builder.max_buf_size(16 * 1024);
     let result = builder.serve_connection(io, service).with_upgrades().await;
     tracker.finish_connection(result.err().map(|err| err.to_string()));
+}
+
+#[cfg(feature = "http2")]
+async fn serve_http_auto_connection(
+    state: SharedState,
+    stream: tokio::net::TcpStream,
+    peer_addr: SocketAddr,
+    connection_metadata: Option<DownstreamConnectionMetadata>,
+) {
+    let mut preface = [0u8; 24];
+    let preface_len = stream.peek(&mut preface).await.unwrap_or(0);
+    if preface_len >= HTTP2_PREFACE.len() && &preface[..HTTP2_PREFACE.len()] == HTTP2_PREFACE {
+        serve_http_connection(state, stream, peer_addr, connection_metadata).await;
+    } else {
+        serve_http1_connection(state, stream, peer_addr, connection_metadata).await;
+    }
 }
 
 #[cfg(feature = "http3")]
@@ -887,7 +905,7 @@ pub async fn serve_http_proxy(listener: TcpListener, state: SharedState) -> std:
             let _ = stream.set_nodelay(true);
             let state = state.clone();
             tokio::spawn(async move {
-                serve_http1_connection(state, stream, peer_addr, None).await;
+                serve_http_auto_connection(state, stream, peer_addr, None).await;
             });
         }
     }

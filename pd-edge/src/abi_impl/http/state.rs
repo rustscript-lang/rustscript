@@ -35,7 +35,6 @@ use hyper_util::{
 use parking_lot::Mutex as ParkingMutex;
 use tokio::io::copy_bidirectional;
 use tokio::sync::oneshot;
-use url::Url;
 use vm::VmError;
 #[cfg(feature = "websocket")]
 use {
@@ -1058,70 +1057,6 @@ fn build_upstream_origin(
         target,
         inherits_request_path: true,
     })
-}
-
-pub(crate) fn parse_http_upstream_target(
-    upstream: &str,
-) -> Result<ParsedHttpUpstreamTarget, VmError> {
-    if let Ok(url) = Url::parse(upstream) {
-        let scheme = HttpUpstreamScheme::parse(url.scheme())?;
-        if url.host_str().is_none() {
-            return Err(VmError::HostError(format!(
-                "upstream must include a host, got '{upstream}'",
-            )));
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(VmError::HostError(format!(
-                "upstream must not include userinfo, got '{upstream}'",
-            )));
-        }
-        let host = url
-            .host_str()
-            .expect("checked upstream host presence above")
-            .to_string();
-        let port = url.port_or_known_default().ok_or_else(|| {
-            VmError::HostError(format!(
-                "upstream must include a known port, got '{upstream}'",
-            ))
-        })? as u16;
-        if url.path() == "/" && url.query().is_none() && url.fragment().is_none() {
-            return build_upstream_origin(scheme, &host, port);
-        }
-        return Ok(ParsedHttpUpstreamTarget {
-            scheme,
-            host,
-            port,
-            host_header: format_upstream_authority(
-                url.host_str()
-                    .expect("checked upstream host presence above"),
-                port,
-            ),
-            target: url.to_string(),
-            inherits_request_path: false,
-        });
-    }
-
-    let explicit = Url::parse(&format!("http://{upstream}")).map_err(|_| {
-        VmError::HostError(format!(
-            "upstream must be host:port or http(s)://host[:port][/path], got '{upstream}'",
-        ))
-    })?;
-    if explicit.path() != "/" || explicit.query().is_some() || explicit.fragment().is_some() {
-        return Err(VmError::HostError(format!(
-            "upstream must be host:port or http(s)://host[:port][/path], got '{upstream}'",
-        )));
-    }
-    let host = explicit.host_str().ok_or_else(|| {
-        VmError::HostError(format!(
-            "upstream must be host:port or http(s)://host[:port][/path], got '{upstream}'",
-        ))
-    })?;
-    let port = explicit.port().ok_or_else(|| {
-        VmError::HostError(format!(
-            "upstream must be host:port or http(s)://host[:port][/path], got '{upstream}'",
-        ))
-    })?;
-    build_upstream_origin(HttpUpstreamScheme::Http, host, port)
 }
 
 #[derive(Clone, Debug)]
@@ -3416,35 +3351,6 @@ pub(crate) fn build_configured_upstream_url(
         format!("{upstream}{path_and_query}"),
         host_header.map(str::to_string),
     )
-}
-
-pub(crate) fn build_upstream_url(
-    upstream: &str,
-    request_path: &str,
-    request_query: &str,
-) -> (String, Option<String>) {
-    if let Ok(parsed) = parse_http_upstream_target(upstream) {
-        return build_configured_upstream_url(
-            &parsed.target,
-            parsed.inherits_request_path,
-            Some(parsed.host_header.as_str()),
-            request_path,
-            request_query,
-        );
-    }
-
-    let path = if request_path.is_empty() {
-        "/"
-    } else {
-        request_path
-    };
-    let path_and_query = if request_query.is_empty() {
-        path.to_string()
-    } else {
-        format!("{path}?{request_query}")
-    };
-    let upstream_url = format!("http://{}{path_and_query}", upstream);
-    (upstream_url, Some(upstream.to_string()))
 }
 
 pub(crate) fn http_version_label(version: Version) -> &'static str {

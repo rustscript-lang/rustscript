@@ -1,23 +1,24 @@
 use http;
 use tls;
 
-let origin = http::request::get_header("x-h3-origin");
+let origin_port = 18445;
 
-if origin == "" {
-    http::response::set_status(400);
-    http::response::set_body("missing x-h3-origin");
-} else {
+if true {
     let slow = http::exchange::new();
     let fast = http::exchange::new();
 
     // These are two different outbound HTTP requests to the same origin.
-    http::exchange::set_target(slow, origin + "/slow");
+    http::exchange::set_target(slow, "127.0.0.1", origin_port);
+    http::exchange::set_scheme(slow, "https");
+    http::exchange::set_path(slow, "/slow");
     http::exchange::set_method(slow, "POST");
     http::exchange::set_version(slow, "3");
     http::exchange::set_header(slow, "x-demo-request", "slow-request");
     http::exchange::set_body(slow, "alpha");
 
-    http::exchange::set_target(fast, origin + "/fast");
+    http::exchange::set_target(fast, "127.0.0.1", origin_port);
+    http::exchange::set_scheme(fast, "https");
+    http::exchange::set_path(fast, "/fast");
     http::exchange::set_method(fast, "PUT");
     http::exchange::set_version(fast, "3");
     http::exchange::set_header(fast, "x-demo-request", "fast-request");
@@ -54,7 +55,9 @@ if origin == "" {
     );
 
     let reused = http::exchange::new();
-    http::exchange::set_target(reused, origin + "/reuse");
+    http::exchange::set_target(reused, "127.0.0.1", origin_port);
+    http::exchange::set_scheme(reused, "https");
+    http::exchange::set_path(reused, "/reuse");
     http::exchange::set_method(reused, "PATCH");
     http::exchange::set_version(reused, "3");
     http::exchange::set_header(reused, "x-demo-request", "reuse-request");

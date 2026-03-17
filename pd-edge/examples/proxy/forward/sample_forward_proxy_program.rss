@@ -5,23 +5,18 @@ use tcp;
 use tls;
 
 // Required request headers:
-// - x-forward-proxy-target: address of the intermediary proxy that accepts CONNECT
-// - x-connect-authority: host:port authority sent in the CONNECT line
-// - x-upstream-target: final https:// target fetched through the tunnel
 // - x-insecure-upstream: optional flag to disable TLS verification for local/self-signed tests
-let forward_proxy = http::request::get_header("x-forward-proxy-target");
-let connect_authority = http::request::get_header("x-connect-authority");
-let upstream_target = http::request::get_header("x-upstream-target");
-
-if forward_proxy == "" || connect_authority == "" || upstream_target == "" {
-    http::response::set_status(400);
-    http::response::set_body("missing x-forward-proxy-target, x-connect-authority, or x-upstream-target");
-    runtime::exit();
-}
+let forward_proxy_host = "127.0.0.1";
+let forward_proxy_port = 18090;
+let connect_authority = "localhost:18487";
+let upstream_host = "localhost";
+let upstream_port = 18487;
+let upstream_path = "/echo";
+let upstream_scheme = "https";
 
 // Open a raw TCP socket to the intermediary proxy first.
 let proxy_socket = tcp::stream::new();
-tcp::stream::set_target(proxy_socket, forward_proxy);
+tcp::stream::set_target(proxy_socket, forward_proxy_host, forward_proxy_port);
 
 if !tcp::stream::connect(proxy_socket) {
     http::response::set_status(502);
@@ -44,7 +39,9 @@ if connect_response == "" {
 
 // Bind the real outbound HTTP exchange onto the tunneled socket.
 let upstream = http::exchange::default_upstream();
-http::exchange::set_target(upstream, upstream_target);
+http::exchange::set_target(upstream, upstream_host, upstream_port);
+http::exchange::set_scheme(upstream, upstream_scheme);
+http::exchange::set_path(upstream, upstream_path);
 http::exchange::set_method(upstream, http::request::get_method());
 http::exchange::set_body(upstream, http::request::get_body());
 

@@ -24,7 +24,7 @@ fn udp_socket_bind(socket: i64, local_addr: &str) {
 }
 
 #[pd_host_function(name = "udp::socket::set_target")]
-fn udp_socket_set_target(socket: i64, target: &str) {
+fn udp_socket_set_target(socket: i64, host: &str, port: i64) {
     unreachable!("abi declaration only")
 }
 

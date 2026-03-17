@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use axum::http::{
     HeaderName, HeaderValue,
     header::{CONTENT_LENGTH, HOST},
+    uri::Authority,
 };
 use edge_abi::symbols::websocket;
 use pd_edge_host_function::pd_edge_host_function;
@@ -14,16 +15,17 @@ use tokio_tungstenite::{
         http::HeaderValue as WsHeaderValue,
     },
 };
-use url::Url;
 use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::super::SharedProxyVmContext;
 use super::super::http::{
-    HttpOutboundRequestNode, allocate_outbound_exchange_handle, build_upstream_url,
-    default_upstream_exchange_handle, is_hop_by_hop_header, outbound_exchange_exists,
-    outbound_exchange_response_available,
+    HttpOutboundRequestNode, allocate_outbound_exchange_handle, default_upstream_exchange_handle,
+    is_hop_by_hop_header, outbound_exchange_exists, outbound_exchange_response_available,
 };
-use super::state::{OutboundWebSocketIoState, SharedWebSocketIo, WebSocketConnectionState};
+use super::state::{
+    OutboundWebSocketIoState, SharedWebSocketIo, WebSocketConnectionState,
+    WebSocketUpstreamScheme,
+};
 use crate::abi_impl::transport::{DownstreamReplayTcpStream, ReplayPrefixedIo};
 
 const DOWNSTREAM_CONNECTION_HANDLE: i64 = 0;
@@ -90,55 +92,83 @@ fn parse_subprotocols(raw: &str) -> Result<Vec<String>, VmError> {
     Ok(protocols)
 }
 
-fn is_valid_websocket_target(value: &str) -> bool {
-    if value.is_empty() || value.chars().any(|ch| ch.is_whitespace()) {
-        return false;
+fn format_websocket_authority(host: &str, port: i64) -> Result<(String, u16), VmError> {
+    if host.is_empty() || host.chars().any(|ch| ch.is_whitespace()) {
+        return Err(VmError::HostError(format!(
+            "websocket target host must be non-empty and contain no whitespace, got '{host}'",
+        )));
     }
-    if let Ok(url) = Url::parse(value) {
-        return matches!(url.scheme(), "http" | "https" | "ws" | "wss")
-            && url.host_str().is_some()
-            && url.username().is_empty()
-            && url.password().is_none();
+    let port = u16::try_from(port).map_err(|_| {
+        VmError::HostError(format!(
+            "websocket target port must be between 1 and 65535, got {port}",
+        ))
+    })?;
+    if port == 0 {
+        return Err(VmError::HostError(format!(
+            "websocket target port must be between 1 and 65535, got {port}",
+        )));
     }
-    let Some((host, port)) = value.rsplit_once(':') else {
-        return false;
+    let bare_host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let authority = if bare_host.contains(':') {
+        format!("[{bare_host}]:{port}")
+    } else {
+        format!("{bare_host}:{port}")
     };
-    if host.is_empty() || port.is_empty() || host.contains(':') {
-        return false;
+    Authority::from_maybe_shared(authority)
+        .map_err(|_| {
+            VmError::HostError(format!(
+                "invalid websocket target host='{host}' port={port}",
+            ))
+        })
+        .map(|_| (bare_host.to_string(), port))
+}
+
+fn websocket_host_header(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
     }
-    port.parse::<u16>().ok().is_some_and(|port| port != 0)
+}
+
+fn normalize_websocket_path(path: &str) -> Result<String, VmError> {
+    let path = if path.is_empty() { "/" } else { path };
+    if !path.starts_with('/') || path.chars().any(|ch| ch.is_whitespace()) {
+        return Err(VmError::HostError(format!(
+            "websocket path must start with '/' and contain no whitespace, got '{path}'",
+        )));
+    }
+    Ok(path.to_string())
+}
+
+fn normalize_websocket_query(query: &str) -> Result<String, VmError> {
+    if query.chars().any(|ch| ch.is_whitespace()) || query.contains('#') {
+        return Err(VmError::HostError(format!(
+            "websocket query must contain no whitespace or fragments, got '{query}'",
+        )));
+    }
+    Ok(query.trim_start_matches('?').to_string())
 }
 
 fn build_websocket_url(
-    target: &str,
+    scheme: WebSocketUpstreamScheme,
+    host: &str,
+    port: u16,
     path: &str,
     query: &str,
 ) -> Result<(String, Option<String>), VmError> {
-    let (url, host_header) = build_upstream_url(target, path, query);
-    let mut parsed = Url::parse(&url).map_err(|err| {
-        VmError::HostError(format!(
-            "failed to build websocket target URL from '{target}': {err}"
-        ))
-    })?;
-    match parsed.scheme() {
-        "http" => {
-            parsed
-                .set_scheme("ws")
-                .map_err(|_| VmError::HostError("failed to convert http URL to ws".to_string()))?;
-        }
-        "https" => {
-            parsed.set_scheme("wss").map_err(|_| {
-                VmError::HostError("failed to convert https URL to wss".to_string())
-            })?;
-        }
-        "ws" | "wss" => {}
-        scheme => {
-            return Err(VmError::HostError(format!(
-                "unsupported websocket target scheme '{scheme}'; expected ws, wss, http, or https",
-            )));
-        }
-    }
-    Ok((parsed.to_string(), host_header))
+    let path = normalize_websocket_path(path)?;
+    let query = normalize_websocket_query(query)?;
+    let authority = websocket_host_header(host, port);
+    let url = if query.is_empty() {
+        format!("{}://{authority}{path}", scheme.as_str())
+    } else {
+        format!("{}://{authority}{path}?{query}", scheme.as_str())
+    };
+    Ok((url, Some(authority)))
 }
 
 fn with_outbound_connection_mut<T>(
@@ -206,18 +236,62 @@ fn connection_state(
 fn prepare_outbound_socket_target(
     context: &SharedProxyVmContext,
     connection: i64,
-    target: String,
+    host: String,
+    port: i64,
 ) -> Result<(), VmError> {
+    let (host, port) = format_websocket_authority(&host, port)?;
     with_outbound_connection_mut(
         context,
         connection,
-        |request, tcp_flow, tls_flow, websocket| {
-            request.target = Some(target.clone());
+        |_request, tcp_flow, tls_flow, websocket| {
+            websocket.set_target_host_port(host.clone(), port);
             tcp_flow.configure();
-            tls_flow.observe_target(&target);
-            websocket.prepare_outbound();
+            tls_flow.observe_target_parts(
+                websocket.target_scheme().uses_tls(),
+                Some(host.clone()),
+            );
         },
     )?;
+    Ok(())
+}
+
+fn prepare_outbound_scheme(
+    context: &SharedProxyVmContext,
+    connection: i64,
+    scheme: String,
+) -> Result<(), VmError> {
+    let scheme = WebSocketUpstreamScheme::parse(&scheme)?;
+    with_outbound_connection_mut(context, connection, |_request, _tcp_flow, tls_flow, websocket| {
+        websocket.set_target_scheme(scheme);
+        let peer_name = websocket.target_host().map(str::to_string);
+        tls_flow.observe_target_parts(scheme.uses_tls(), peer_name);
+    })?;
+    Ok(())
+}
+
+fn prepare_outbound_path(
+    context: &SharedProxyVmContext,
+    connection: i64,
+    path: String,
+) -> Result<(), VmError> {
+    let path = normalize_websocket_path(&path)?;
+    with_outbound_connection_mut(context, connection, |request, _tcp_flow, _tls_flow, websocket| {
+        request.path = path;
+        websocket.prepare_outbound();
+    })?;
+    Ok(())
+}
+
+fn prepare_outbound_query(
+    context: &SharedProxyVmContext,
+    connection: i64,
+    query: String,
+) -> Result<(), VmError> {
+    let query = normalize_websocket_query(&query)?;
+    with_outbound_connection_mut(context, connection, |request, _tcp_flow, _tls_flow, websocket| {
+        request.query = query;
+        websocket.prepare_outbound();
+    })?;
     Ok(())
 }
 
@@ -266,12 +340,23 @@ fn prepared_outbound_websocket(
         )
     };
 
-    let target = request.target.ok_or_else(|| {
+    let target_host = websocket.target_host().ok_or_else(|| {
         VmError::HostError(
             "websocket target is unavailable before websocket::connection::set_target".to_string(),
         )
     })?;
-    let (url, host_header) = build_websocket_url(&target, &request.path, &request.query)?;
+    let target_port = websocket.target_port().ok_or_else(|| {
+        VmError::HostError(
+            "websocket target is unavailable before websocket::connection::set_target".to_string(),
+        )
+    })?;
+    let (url, host_header) = build_websocket_url(
+        websocket.target_scheme(),
+        target_host,
+        target_port,
+        &request.path,
+        &request.query,
+    )?;
     Ok(PreparedOutboundWebSocket {
         url,
         host_header,
@@ -882,17 +967,64 @@ async fn connection_set_target(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
     connection: i64,
-    target: String,
+    host: String,
+    port: i64,
 ) -> Result<CallOutcome, VmError> {
-    if !is_valid_websocket_target(&target) {
-        return Err(VmError::HostError(format!(
-            "websocket target must be host:port or http(s)/ws(s) URL, got '{target}'",
-        )));
-    }
     match decode_connection(&context, connection)? {
         WebSocketHandle::Downstream => return Err(websocket_operation_on_downstream()),
         WebSocketHandle::DefaultUpstream | WebSocketHandle::OutboundExchange(_) => {
-            prepare_outbound_socket_target(&context, connection, target)?;
+            prepare_outbound_socket_target(&context, connection, host, port)?;
+        }
+    }
+    Ok(CallOutcome::Return(vec![]))
+}
+
+/// Sets the scheme for the WebSocket connection.
+#[pd_edge_host_function(name = websocket::connection::SET_SCHEME.name, scope = websocket)]
+async fn connection_set_scheme(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    connection: i64,
+    scheme: String,
+) -> Result<CallOutcome, VmError> {
+    match decode_connection(&context, connection)? {
+        WebSocketHandle::Downstream => return Err(websocket_operation_on_downstream()),
+        WebSocketHandle::DefaultUpstream | WebSocketHandle::OutboundExchange(_) => {
+            prepare_outbound_scheme(&context, connection, scheme)?;
+        }
+    }
+    Ok(CallOutcome::Return(vec![]))
+}
+
+/// Sets the path for the WebSocket connection.
+#[pd_edge_host_function(name = websocket::connection::SET_PATH.name, scope = websocket)]
+async fn connection_set_path(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    connection: i64,
+    path: String,
+) -> Result<CallOutcome, VmError> {
+    match decode_connection(&context, connection)? {
+        WebSocketHandle::Downstream => return Err(websocket_operation_on_downstream()),
+        WebSocketHandle::DefaultUpstream | WebSocketHandle::OutboundExchange(_) => {
+            prepare_outbound_path(&context, connection, path)?;
+        }
+    }
+    Ok(CallOutcome::Return(vec![]))
+}
+
+/// Sets the query string for the WebSocket connection.
+#[pd_edge_host_function(name = websocket::connection::SET_QUERY.name, scope = websocket)]
+async fn connection_set_query(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    connection: i64,
+    query: String,
+) -> Result<CallOutcome, VmError> {
+    match decode_connection(&context, connection)? {
+        WebSocketHandle::Downstream => return Err(websocket_operation_on_downstream()),
+        WebSocketHandle::DefaultUpstream | WebSocketHandle::OutboundExchange(_) => {
+            prepare_outbound_query(&context, connection, query)?;
         }
     }
     Ok(CallOutcome::Return(vec![]))

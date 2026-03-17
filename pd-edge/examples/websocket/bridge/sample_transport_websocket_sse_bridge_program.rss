@@ -4,9 +4,8 @@ use websocket;
 
 // Run this under pd-edge-transport-proxy.
 //
-// The downstream client upgrades to WebSocket and sends the upstream SSE URL
-// as its first text frame. Each completed SSE event is forwarded as one text
-// frame back to the downstream WebSocket client.
+// The bridge connects to a fixed local SSE fixture and forwards each completed
+// event as one text frame back to the downstream WebSocket client.
 //
 // For secure downstream WSS, perform the downstream TLS handshake first and
 // then accept the WebSocket over the resulting plaintext transport.
@@ -14,36 +13,31 @@ let downstream = websocket::connection::downstream();
 websocket::connection::set_subprotocols(downstream, "sse-bridge");
 websocket::connection::connect(downstream);
 
-let target = websocket::connection::read_text(downstream);
-if target == "" {
-    websocket::connection::send_text(downstream, "error: missing upstream SSE target");
-    websocket::connection::close(downstream, 1008, "missing-target");
-} else {
-    let upstream = http::exchange::default_upstream();
-    http::exchange::set_target(upstream, target);
-    http::exchange::set_header(upstream, "accept", "text/event-stream");
+let upstream = http::exchange::default_upstream();
+http::exchange::set_target(upstream, "127.0.0.1", 18089);
+http::exchange::set_path(upstream, "/events");
+http::exchange::set_header(upstream, "accept", "text/event-stream");
 
-    let mut event = "";
+let mut event = "";
 
-    while !http::exchange::body::eof(upstream) && !websocket::connection::eof(downstream) {
-        let line = io::read_line(upstream);
-        if line == "" {
-            if event != "" {
-                websocket::connection::send_text(downstream, event);
-                event = "";
-            }
-        } else if event == "" {
-            event = line;
-        } else {
-            event = event + "\n" + line;
+while !http::exchange::body::eof(upstream) && !websocket::connection::eof(downstream) {
+    let line = io::read_line(upstream);
+    if line == "" {
+        if event != "" {
+            websocket::connection::send_text(downstream, event);
+            event = "";
         }
+    } else if event == "" {
+        event = line;
+    } else {
+        event = event + "\n" + line;
     }
+}
 
-    if event != "" && !websocket::connection::eof(downstream) {
-        websocket::connection::send_text(downstream, event);
-    }
+if event != "" && !websocket::connection::eof(downstream) {
+    websocket::connection::send_text(downstream, event);
+}
 
-    if !websocket::connection::eof(downstream) {
-        websocket::connection::close(downstream, 1000, "sse-complete");
-    }
+if !websocket::connection::eof(downstream) {
+    websocket::connection::close(downstream, 1000, "sse-complete");
 }

@@ -2,23 +2,22 @@ use http;
 use webrtc;
 
 // Request headers:
-// - x-webrtc-signal-target: required HTTP signaling endpoint, for example http://127.0.0.1:7008/offer
 // - x-webrtc-message: optional text payload
 // - x-webrtc-binary-base64: optional binary payload; when present the sample uses binary message APIs
 // - x-webrtc-handle: "default" to use webrtc::connection::default_upstream(), otherwise webrtc::connection::new()
 // - x-webrtc-data-channel-label: optional data channel label; defaults to "sample-channel"
 // - x-webrtc-ice-servers: optional comma-separated ICE server URLs
-let signal_target = http::request::get_header("x-webrtc-signal-target");
 let text_payload = http::request::get_header("x-webrtc-message");
 let binary_payload = http::request::get_header("x-webrtc-binary-base64");
 let requested_handle = http::request::get_header("x-webrtc-handle");
 let mut data_channel_label = http::request::get_header("x-webrtc-data-channel-label");
 let ice_servers = http::request::get_header("x-webrtc-ice-servers");
+let signal_host = "127.0.0.1";
+let signal_port = if binary_payload != "" || requested_handle == "default" => { 18088 } else => { 18087 };
+let signal_path = "/offer";
+let signal_scheme = "http";
 
-if signal_target == "" {
-    http::response::set_status(400);
-    http::response::set_body("missing x-webrtc-signal-target");
-} else {
+if true {
     let mut connection = webrtc::connection::new();
     let mut handle_label = "new";
     if requested_handle == "default" {
@@ -56,7 +55,9 @@ if signal_target == "" {
 
     let signal = http::exchange::new();
     http::exchange::set_method(signal, "POST");
-    http::exchange::set_target(signal, signal_target);
+    http::exchange::set_target(signal, signal_host, signal_port);
+    http::exchange::set_scheme(signal, signal_scheme);
+    http::exchange::set_path(signal, signal_path);
     http::exchange::set_header(signal, "content-type", "application/json");
     http::exchange::set_body(signal, offer);
     http::exchange::send(signal);

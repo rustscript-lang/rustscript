@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
+use axum::http::uri::Authority;
 use edge_abi::symbols::tcp;
 use pd_edge_host_function::pd_edge_host_function;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpSocket, lookup_host},
 };
-use url::Url;
 use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::super::SharedProxyVmContext;
@@ -60,44 +60,38 @@ fn decode_chunk_size(max_bytes: i64) -> Result<usize, VmError> {
     })
 }
 
-fn normalize_tcp_target(value: &str) -> Result<String, VmError> {
-    if value.is_empty() || value.chars().any(|ch| ch.is_whitespace()) {
+fn format_socket_authority(host: &str, port: i64, protocol: &str) -> Result<String, VmError> {
+    if host.is_empty() || host.chars().any(|ch| ch.is_whitespace()) {
         return Err(VmError::HostError(format!(
-            "tcp target must be host:port or tcp://host:port, got '{value}'",
+            "{protocol} target host must be non-empty and contain no whitespace, got '{host}'",
         )));
     }
-    if value.contains("://")
-        && let Ok(url) = Url::parse(value)
-    {
-        if !url.scheme().eq_ignore_ascii_case("tcp") {
-            return Err(VmError::HostError(format!(
-                "tcp target scheme must be tcp, got '{}'",
-                url.scheme()
-            )));
-        }
-        let host = url.host_str().ok_or_else(|| {
-            VmError::HostError(format!("tcp target is missing a host: '{value}'"))
-        })?;
-        let port = url.port().ok_or_else(|| {
-            VmError::HostError(format!("tcp target is missing a port: '{value}'"))
-        })?;
-        if !url.path().is_empty() && url.path() != "/" {
-            return Err(VmError::HostError(format!(
-                "tcp target must not contain a path, got '{value}'",
-            )));
-        }
-        return Ok(if host.contains(':') {
-            format!("[{host}]:{port}")
-        } else {
-            format!("{host}:{port}")
-        });
+    let port = u16::try_from(port).map_err(|_| {
+        VmError::HostError(format!(
+            "{protocol} target port must be between 1 and 65535, got {port}",
+        ))
+    })?;
+    if port == 0 {
+        return Err(VmError::HostError(format!(
+            "{protocol} target port must be between 1 and 65535, got {port}",
+        )));
     }
-    if value.rsplit_once(':').is_some() {
-        return Ok(value.to_string());
-    }
-    Err(VmError::HostError(format!(
-        "tcp target must be host:port or tcp://host:port, got '{value}'",
-    )))
+    let bare_host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let authority = if bare_host.contains(':') {
+        format!("[{bare_host}]:{port}")
+    } else {
+        format!("{bare_host}:{port}")
+    };
+    Authority::from_maybe_shared(authority.clone())
+        .map_err(|_| {
+            VmError::HostError(format!(
+                "invalid {protocol} target host='{host}' port={port}",
+            ))
+        })
+        .map(|_| authority)
 }
 
 fn mutable_dynamic_tcp_stream_only() -> VmError {
@@ -687,9 +681,10 @@ async fn stream_set_target(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
     stream: i64,
-    target: String,
+    host: String,
+    port: i64,
 ) -> Result<CallOutcome, VmError> {
-    let target = normalize_tcp_target(&target)?;
+    let target = format_socket_authority(&host, port, "tcp")?;
     with_mutable_dynamic_tcp_socket_state(&context, stream, |state, io| {
         state.set_target(target);
         *io = None;

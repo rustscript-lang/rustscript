@@ -1,20 +1,20 @@
 use http;
 use proxy;
-use runtime;
 use tcp;
 use tls;
 
-let target = http::request::get_header("x-upstream-target");
-
-if target == "" {
-    http::response::set_status(400);
-    http::response::set_body("missing x-upstream-target");
-    runtime::exit();
-}
+let upstream_scheme = http::request::get_header("x-upstream-scheme");
+let upstream_host = if upstream_scheme == "https" => { "localhost" } else => { "127.0.0.1" };
+let upstream_port = if upstream_scheme == "https" => { 18486 } else => { 18086 };
+let upstream_path = "/echo";
 
 // Bind the default outbound exchange to the requested target.
 let exchange = http::exchange::default_upstream();
-http::exchange::set_target(exchange, target);
+http::exchange::set_target(exchange, upstream_host, upstream_port);
+if upstream_scheme != "" {
+    http::exchange::set_scheme(exchange, upstream_scheme);
+}
+http::exchange::set_path(exchange, upstream_path);
 
 // Export the downstream side as a byte-stream endpoint.
 let downstream = proxy::stream::downstream();

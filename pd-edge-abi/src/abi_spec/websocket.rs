@@ -19,7 +19,22 @@ fn websocket_connection_is_present(connection: i64) -> bool {
 }
 
 #[pd_host_function(name = "websocket::connection::set_target")]
-fn websocket_connection_set_target(connection: i64, target: &str) {
+fn websocket_connection_set_target(connection: i64, host: &str, port: i64) {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "websocket::connection::set_scheme")]
+fn websocket_connection_set_scheme(connection: i64, scheme: &str) {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "websocket::connection::set_path")]
+fn websocket_connection_set_path(connection: i64, path: &str) {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "websocket::connection::set_query")]
+fn websocket_connection_set_query(connection: i64, query: &str) {
     unreachable!("abi declaration only")
 }
 

@@ -506,12 +506,13 @@ async fn http_prefixed_host_abi_can_rewrite_request_and_short_circuit() {
             http::exchange::set_path(upstream, "/rewritten");
             http::exchange::set_query(upstream, "from=vm");
             http::exchange::set_header(upstream, "x-added", "yes");
-            http::exchange::set_target(upstream, "{upstream_addr}");
+            http::exchange::set_target(upstream, "127.0.0.1", {upstream_port});
         }} else {{
             http::response::set_status(429);
             http::response::set_body("blocked");
         }}
-    "#
+    "#,
+        upstream_port = upstream_addr.port()
     );
     let compiled = compile_source(&source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
@@ -572,8 +573,9 @@ async fn http_request_body_can_be_rewritten_before_proxying() {
 
         let upstream = http::exchange::default_upstream();
         http::exchange::set_body(upstream, "rewritten-body");
-        http::exchange::set_target(upstream, "{upstream_addr}");
-    "#
+        http::exchange::set_target(upstream, "127.0.0.1", {upstream_port});
+    "#,
+        upstream_port = upstream_addr.port()
     );
     let compiled = compile_source(&source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
@@ -736,7 +738,11 @@ async fn http_request_body_chunk_api_reads_in_chunks() {
 
 #[tokio::test]
 async fn sample_proxy_program_streams_or_buffers_upstream_body() {
-    let (upstream_addr, upstream_handle) = spawn_chunked_upstream(vec!["ab", "cd", "ef"]).await;
+    let (_upstream_addr, upstream_handle) = spawn_chunked_upstream_on(
+        vec!["ab", "cd", "ef"],
+        loopback_addr(SAMPLE_PROXY_UPSTREAM_PORT),
+    )
+    .await;
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -749,10 +755,8 @@ async fn sample_proxy_program_streams_or_buffers_upstream_body() {
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
 
-    let upstream_target = format!("http://{upstream_addr}/sample");
     let streaming = client
         .get(format!("http://{data_addr}/proxy"))
-        .header("x-upstream-target", &upstream_target)
         .header("Streaming", "1")
         .send()
         .await
@@ -779,7 +783,6 @@ async fn sample_proxy_program_streams_or_buffers_upstream_body() {
 
     let buffered = client
         .get(format!("http://{data_addr}/proxy"))
-        .header("x-upstream-target", &upstream_target)
         .send()
         .await
         .expect("buffered request should complete");
@@ -814,7 +817,11 @@ async fn sample_request_transform_program_streams_or_buffers_downstream_request_
         );
         response
     }));
-    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+    let (_upstream_addr, upstream_handle) = spawn_server_on(
+        upstream_app,
+        loopback_addr(SAMPLE_REQUEST_TRANSFORM_UPSTREAM_PORT),
+    )
+    .await;
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -827,11 +834,8 @@ async fn sample_request_transform_program_streams_or_buffers_downstream_request_
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
 
-    let upstream_target = format!("http://{upstream_addr}/transform");
-
     let transformed = client
         .post(format!("http://{data_addr}/transform"))
-        .header("x-upstream-target", &upstream_target)
         .header("Chunk-Transform", "1")
         .body("abcdefghi")
         .send()
@@ -869,7 +873,6 @@ async fn sample_request_transform_program_streams_or_buffers_downstream_request_
 
     let buffered = client
         .post(format!("http://{data_addr}/transform"))
-        .header("x-upstream-target", &upstream_target)
         .body("abcdefghi")
         .send()
         .await
@@ -908,14 +911,17 @@ async fn sample_request_transform_program_streams_or_buffers_downstream_request_
 
 #[tokio::test]
 async fn sample_sse_proxy_program_mutates_each_upstream_event_before_returning() {
-    let (upstream_addr, upstream_handle) = spawn_sse_upstream(vec![
-        "id: 1\n",
-        "data: alpha\n",
-        "\n",
-        "id: 2\n",
-        "data: beta\n",
-        "\n",
-    ])
+    let (_upstream_addr, upstream_handle) = spawn_sse_upstream_on(
+        vec![
+            "id: 1\n",
+            "data: alpha\n",
+            "\n",
+            "id: 2\n",
+            "data: beta\n",
+            "\n",
+        ],
+        loopback_addr(SAMPLE_SSE_UPSTREAM_PORT),
+    )
     .await;
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
     let client = reqwest::Client::new();
@@ -931,10 +937,6 @@ async fn sample_sse_proxy_program_mutates_each_upstream_event_before_returning()
 
     let response = client
         .get(format!("http://{data_addr}/sse"))
-        .header(
-            "x-upstream-target",
-            format!("http://{upstream_addr}/events"),
-        )
         .send()
         .await
         .expect("sse request should complete");
@@ -975,7 +977,8 @@ async fn direct_vm_can_read_upstream_response_line_by_line_via_io_handle_api() {
         use tcp;
 
         let upstream = http::exchange::default_upstream();
-        http::exchange::set_target(upstream, "http://{upstream_addr}/events");
+        http::exchange::set_target(upstream, "127.0.0.1", {upstream_port});
+        http::exchange::set_path(upstream, "/events");
         http::response::set_status(http::exchange::get_status(upstream));
         let downstream = tcp::stream::downstream();
 
@@ -987,7 +990,8 @@ async fn direct_vm_can_read_upstream_response_line_by_line_via_io_handle_api() {
                 tcp::stream::write(downstream, line + "\n");
             }}
         }}
-    "#
+    "#,
+        upstream_port = upstream_addr.port()
     );
     let compiled = compile_source(&source).expect("source should compile");
     let mut context = Arc::new(ProxyVmContext::from_request_headers(
@@ -1019,8 +1023,10 @@ async fn sample_subrequest_proxy_program_fans_out_across_default_and_dynamic_exc
             String::from_utf8_lossy(&body)
         )))
     }));
-    let (plain_addr, plain_handle) = spawn_server(plain_app).await;
-    let (secure_addr, secure_handle) = spawn_https_echo_upstream().await;
+    let (_plain_addr, plain_handle) =
+        spawn_server_on(plain_app, loopback_addr(SAMPLE_SUBREQUEST_PRIMARY_PORT)).await;
+    let (_secure_addr, secure_handle) =
+        spawn_https_echo_upstream_on(loopback_addr(SAMPLE_SUBREQUEST_SECONDARY_PORT)).await;
 
     let mut state = SharedState::new(1024 * 1024);
     state.client = reqwest::Client::builder()
@@ -1042,11 +1048,6 @@ async fn sample_subrequest_proxy_program_fans_out_across_default_and_dynamic_exc
 
     let response = client
         .get(format!("http://{data_addr}/fanout"))
-        .header("x-primary-target", format!("http://{plain_addr}/plain"))
-        .header(
-            "x-secondary-target",
-            format!("https://localhost:{}/secure", secure_addr.port()),
-        )
         .send()
         .await
         .expect("fanout request should complete");
@@ -1112,15 +1113,19 @@ async fn http_exchange_supports_multiple_dynamic_subrequests_in_one_vm_run() {
             http::response::set_status(500);
             http::response::set_body("same-handle");
         }} else {{
-            http::exchange::set_target(first, "http://{first_addr}/one");
-            http::exchange::set_target(second, "http://{second_addr}/two");
+            http::exchange::set_target(first, "127.0.0.1", {first_port});
+            http::exchange::set_path(first, "/one");
+            http::exchange::set_target(second, "127.0.0.1", {second_port});
+            http::exchange::set_path(second, "/two");
             tcp::stream::write(first, "one");
             tcp::stream::write(second, "two");
             http::response::set_body(
                 http::exchange::get_body(first) + "|" + http::exchange::get_body(second)
             );
         }}
-    "#
+    "#,
+        first_port = first_addr.port(),
+        second_port = second_addr.port()
     );
     let compiled = compile_source(&source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
@@ -1158,10 +1163,11 @@ async fn dynamic_exchange_rejects_write_after_response_has_started() {
         use tcp;
 
         let exchange = http::exchange::new();
-        http::exchange::set_target(exchange, "{upstream_addr}");
+        http::exchange::set_target(exchange, "127.0.0.1", {upstream_port});
         http::exchange::get_status(exchange);
         tcp::stream::write(exchange, "late");
-    "#
+    "#,
+        upstream_port = upstream_addr.port()
     );
     let compiled = compile_source(&source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
@@ -1195,7 +1201,9 @@ async fn upstream_http2_response_version_is_exposed_to_vm_programs() {
         use tls;
 
         let upstream = http::exchange::default_upstream();
-        http::exchange::set_target(upstream, "https://127.0.0.1:{}/fast");
+        http::exchange::set_target(upstream, "127.0.0.1", {});
+        http::exchange::set_scheme(upstream, "https");
+        http::exchange::set_path(upstream, "/fast");
         let session = tls::session::from_socket(upstream);
         tls::session::set_verify(session, false);
         http::response::set_header(
@@ -1249,7 +1257,9 @@ async fn upstream_http3_response_version_is_exposed_to_vm_programs() {
         use tls;
 
         let upstream = http::exchange::default_upstream();
-        http::exchange::set_target(upstream, "https://127.0.0.1:{}/fast");
+        http::exchange::set_target(upstream, "127.0.0.1", {});
+        http::exchange::set_scheme(upstream, "https");
+        http::exchange::set_path(upstream, "/fast");
         http::exchange::set_version(upstream, "3");
         let session = tls::session::from_socket(upstream);
         tls::session::set_verify(session, false);
@@ -1450,8 +1460,8 @@ async fn sample_downstream_http3_program_handles_http3_requests() {
 #[cfg(all(feature = "tls", feature = "http2"))]
 #[tokio::test]
 async fn sample_upstream_http2_program_demonstrates_multiplex_and_reuse() {
-    let (upstream_addr, connection_count, upstream_handle) =
-        spawn_https_http2_sample_upstream().await;
+    let (_upstream_addr, connection_count, upstream_handle) =
+        spawn_https_http2_sample_upstream_on(loopback_addr(SAMPLE_UPSTREAM_HTTP2_PORT)).await;
 
     let (data_addr, admin_addr, data_handle, admin_handle) =
         spawn_proxy_with_state(SharedState::new(1024 * 1024)).await;
@@ -1468,10 +1478,6 @@ async fn sample_upstream_http2_program_demonstrates_multiplex_and_reuse() {
 
     let response = client
         .get(format!("http://{data_addr}/upstream-http2-sample"))
-        .header(
-            "x-h2-origin",
-            format!("https://localhost:{}", upstream_addr.port()),
-        )
         .send()
         .await
         .expect("request should complete");
@@ -1564,8 +1570,8 @@ async fn sample_upstream_http2_program_demonstrates_multiplex_and_reuse() {
 #[cfg(all(feature = "tls", feature = "http3"))]
 #[tokio::test]
 async fn sample_upstream_http3_program_demonstrates_multiplex_and_reuse() {
-    let (upstream_addr, connection_count, upstream_handle) =
-        spawn_https_http3_sample_upstream().await;
+    let (_upstream_addr, connection_count, upstream_handle) =
+        spawn_https_http3_sample_upstream_on(loopback_addr(SAMPLE_UPSTREAM_HTTP3_PORT)).await;
 
     let (data_addr, admin_addr, data_handle, admin_handle) =
         spawn_proxy_with_state(SharedState::new(1024 * 1024)).await;
@@ -1582,10 +1588,6 @@ async fn sample_upstream_http3_program_demonstrates_multiplex_and_reuse() {
 
     let response = client
         .get(format!("http://{data_addr}/upstream-http3-sample"))
-        .header(
-            "x-h3-origin",
-            format!("https://127.0.0.1:{}", upstream_addr.port()),
-        )
         .send()
         .await
         .expect("request should complete");
@@ -1693,8 +1695,12 @@ async fn dynamic_exchanges_can_multiplex_over_single_http2_connection() {
         let first = http::exchange::new();
         let second = http::exchange::new();
 
-        http::exchange::set_target(first, "https://localhost:{}/slow");
-        http::exchange::set_target(second, "https://localhost:{}/fast");
+        http::exchange::set_target(first, "localhost", {});
+        http::exchange::set_scheme(first, "https");
+        http::exchange::set_path(first, "/slow");
+        http::exchange::set_target(second, "localhost", {});
+        http::exchange::set_scheme(second, "https");
+        http::exchange::set_path(second, "/fast");
         tls::session::set_verify(tls::session::from_socket(first), false);
         tls::session::set_verify(tls::session::from_socket(second), false);
 
@@ -1764,9 +1770,13 @@ async fn dynamic_exchanges_can_multiplex_over_single_http3_connection() {
         let first = http::exchange::new();
         let second = http::exchange::new();
 
-        http::exchange::set_target(first, "https://127.0.0.1:{}/slow");
+        http::exchange::set_target(first, "127.0.0.1", {});
+        http::exchange::set_scheme(first, "https");
+        http::exchange::set_path(first, "/slow");
         http::exchange::set_version(first, "3");
-        http::exchange::set_target(second, "https://127.0.0.1:{}/fast");
+        http::exchange::set_target(second, "127.0.0.1", {});
+        http::exchange::set_scheme(second, "https");
+        http::exchange::set_path(second, "/fast");
         http::exchange::set_version(second, "3");
         tls::session::set_verify(tls::session::from_socket(first), false);
         tls::session::set_verify(tls::session::from_socket(second), false);
@@ -1837,8 +1847,12 @@ async fn dynamic_exchange_body_chunks_can_be_read_independently_over_http2() {
         let slow = http::exchange::new();
         let fast = http::exchange::new();
 
-        http::exchange::set_target(slow, "https://localhost:{}/slow");
-        http::exchange::set_target(fast, "https://localhost:{}/fast");
+        http::exchange::set_target(slow, "localhost", {});
+        http::exchange::set_scheme(slow, "https");
+        http::exchange::set_path(slow, "/slow");
+        http::exchange::set_target(fast, "localhost", {});
+        http::exchange::set_scheme(fast, "https");
+        http::exchange::set_path(fast, "/fast");
         tls::session::set_verify(tls::session::from_socket(slow), false);
         tls::session::set_verify(tls::session::from_socket(fast), false);
 
@@ -1936,9 +1950,13 @@ async fn dynamic_exchange_body_chunks_can_be_read_independently_over_http3() {
         let slow = http::exchange::new();
         let fast = http::exchange::new();
 
-        http::exchange::set_target(slow, "https://127.0.0.1:{}/slow");
+        http::exchange::set_target(slow, "127.0.0.1", {});
+        http::exchange::set_scheme(slow, "https");
+        http::exchange::set_path(slow, "/slow");
         http::exchange::set_version(slow, "3");
-        http::exchange::set_target(fast, "https://127.0.0.1:{}/fast");
+        http::exchange::set_target(fast, "127.0.0.1", {});
+        http::exchange::set_scheme(fast, "https");
+        http::exchange::set_path(fast, "/fast");
         http::exchange::set_version(fast, "3");
         tls::session::set_verify(tls::session::from_socket(slow), false);
         tls::session::set_verify(tls::session::from_socket(fast), false);
@@ -2438,7 +2456,8 @@ async fn http_proxy_https_listener_reuses_http2_connections_for_tls_upstream_pro
         use tls;
 
         let upstream = http::exchange::default_upstream();
-        http::exchange::set_target(upstream, "https://127.0.0.1:{}");
+        http::exchange::set_target(upstream, "127.0.0.1", {});
+        http::exchange::set_scheme(upstream, "https");
         http::exchange::set_method(upstream, http::request::get_method());
         http::exchange::set_path(upstream, http::request::get_path());
         http::exchange::set_body(upstream, http::request::get_body());

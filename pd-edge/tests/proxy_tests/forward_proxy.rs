@@ -3,8 +3,10 @@ use super::support::*;
 #[cfg(feature = "tls")]
 #[tokio::test]
 async fn sample_forward_proxy_program_tunnels_https_request_through_connect_proxy() {
-    let (upstream_addr, upstream_handle) = spawn_https_echo_upstream().await;
-    let (forward_proxy_addr, forward_proxy_handle) = spawn_connect_forward_proxy().await;
+    let (_upstream_addr, upstream_handle) =
+        spawn_https_echo_upstream_on(loopback_addr(SAMPLE_FORWARD_UPSTREAM_HTTPS_PORT)).await;
+    let (_forward_proxy_addr, forward_proxy_handle) =
+        spawn_connect_forward_proxy_on(loopback_addr(SAMPLE_FORWARD_PROXY_PORT)).await;
 
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
     let client = reqwest::Client::new();
@@ -20,15 +22,6 @@ async fn sample_forward_proxy_program_tunnels_https_request_through_connect_prox
 
     let response = client
         .post(format!("http://{data_addr}/forward"))
-        .header("x-forward-proxy-target", forward_proxy_addr.to_string())
-        .header(
-            "x-connect-authority",
-            format!("localhost:{}", upstream_addr.port()),
-        )
-        .header(
-            "x-upstream-target",
-            format!("https://localhost:{}/echo", upstream_addr.port()),
-        )
         .header("x-insecure-upstream", "1")
         .body("via-forward-proxy")
         .send()

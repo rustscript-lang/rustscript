@@ -1,5 +1,5 @@
 // Run with:
-// cargo run -p pd-edge --bin pd-edge-console -- --program pd-edge/examples/console/sample_console_http3_client.rss --run -- https://127.0.0.1:4443 GET
+// cargo run -p pd-edge --bin pd-edge-console -- --program pd-edge/examples/console/sample_console_http3_client.rss --run -- 127.0.0.1 GET
 // Pass "-" as the body argument to stream the request body from stdin.
 // Pass "false" as the fourth argument to disable TLS certificate verification.
 
@@ -11,12 +11,18 @@ use tls;
 let argc = console::args::count();
 
 if argc == 0 {
-    console::stderr::write("usage: <url> [method] [body|-] [verify=true|false]\n");
-    console::stderr::write("example: https://127.0.0.1:4443 POST - false\n");
+    console::stderr::write("usage: <host> [method] [body|-] [verify=true|false]\n");
+    console::stderr::write("example: 127.0.0.1 POST - false\n");
     console::stderr::flush();
     runtime::exit();
 } else {
-    let target = console::args::get(0);
+    let host = console::args::get(0);
+    let port = 4443;
+    if host == "" {
+        console::stderr::write("host is required\n");
+        console::stderr::flush();
+        runtime::exit();
+    }
     let method = if argc > 1 => {
         console::args::get(1)
     } else => {
@@ -40,7 +46,8 @@ if argc == 0 {
     let verify_tls = verify_arg != "false" && verify_arg != "0" && verify_arg != "off";
 
     let exchange = http::exchange::new();
-    http::exchange::set_target(exchange, target);
+    http::exchange::set_target(exchange, host, port);
+    http::exchange::set_scheme(exchange, "https");
     http::exchange::set_method(exchange, method);
     http::exchange::set_version(exchange, "3");
     if body != "" {

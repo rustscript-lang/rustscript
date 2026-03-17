@@ -1,19 +1,15 @@
 use http;
 use io;
-use runtime;
 use tcp;
 
-let target = http::request::get_header("x-upstream-target");
-
-if target == "" {
-    http::response::set_status(400);
-    http::response::set_body("missing x-upstream-target");
-    runtime::exit();
-}
+let upstream_host = "127.0.0.1";
+let upstream_port = 18082;
+let upstream_path = "/events";
 
 // Start the upstream exchange and mirror the SSE response head.
 let upstream = http::exchange::default_upstream();
-http::exchange::set_target(upstream, target);
+http::exchange::set_target(upstream, upstream_host, upstream_port);
+http::exchange::set_path(upstream, upstream_path);
 
 let status = http::exchange::get_status(upstream);
 http::response::set_status(status);

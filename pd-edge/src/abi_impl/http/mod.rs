@@ -46,7 +46,7 @@ pub(crate) use state::{
     tcp_stream_exists, udp_socket_exists, upstream_reqwest_client_builder, upstream_response_eof,
 };
 #[cfg(feature = "websocket")]
-pub(crate) use state::{HttpOutboundRequestNode, build_upstream_url, is_hop_by_hop_header};
+pub(crate) use state::{HttpOutboundRequestNode, is_hop_by_hop_header};
 pub use state::{HttpRequestContext, ProxyVmContext, SharedProxyVmContext};
 #[cfg(any(feature = "http", test))]
 pub(crate) use state::{

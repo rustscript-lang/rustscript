@@ -6,17 +6,19 @@ use tls;
 // HTTP-runtime sample that proxies via transport-style upstream handles.
 //
 // This is distinct from:
-// - http/proxy/sample_proxy_program.rss: pure HTTP request/response APIs
-// - proxy/tunnel/sample_tunnel_proxy_program.rss: raw downstream<->upstream byte tunnel
-let target = http::request::get_header("x-upstream-target");
+let upstream_scheme = http::request::get_header("x-upstream-scheme");
+let upstream_host = if upstream_scheme == "https" => { "localhost" } else => { "127.0.0.1" };
+let upstream_port = if upstream_scheme == "https" => { 18485 } else => { 18085 };
+let upstream_path = "/echo";
 
-if target == "" {
-    http::response::set_status(400);
-    http::response::set_body("missing x-upstream-target");
-} else {
+if true {
     // Configure the default outbound exchange first.
     let exchange = http::exchange::default_upstream();
-    http::exchange::set_target(exchange, target);
+    http::exchange::set_target(exchange, upstream_host, upstream_port);
+    if upstream_scheme != "" {
+        http::exchange::set_scheme(exchange, upstream_scheme);
+    }
+    http::exchange::set_path(exchange, upstream_path);
 
     let upstream = tcp::stream::default_upstream();
     let upstream_tls = tls::session::from_socket(upstream);
