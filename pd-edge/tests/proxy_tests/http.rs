@@ -134,6 +134,38 @@ async fn short_circuit_path_returns_200_body_and_headers() {
 }
 
 #[tokio::test]
+async fn set_body_emits_content_length_and_clears_chunked_response_header() {
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program = build_short_circuit_program("payload", Some(("transfer-encoding", "chunked")));
+
+    let upload = upload_program(&client, admin_addr, &program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok()),
+        Some("7")
+    );
+    assert!(
+        response.headers().get("transfer-encoding").is_none(),
+        "set_body should replace chunked framing with a fixed content-length"
+    );
+    assert_eq!(response.text().await.expect("body should read"), "payload");
+
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
 async fn upstream_path_proxies_method_path_query_and_body() {
     let upstream_app = Router::new().fallback(any(|request: Request<Body>| async move {
         let (parts, body) = request.into_parts();
@@ -697,6 +729,841 @@ async fn http_proxy_reuses_plain_http1_upstream_connection_for_non_empty_forward
     );
 
     upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn http_proxy_reuses_plain_http1_upstream_connection_for_chunked_forwarded_bodies() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_http1_request_head(
+        stream: &mut tokio::net::TcpStream,
+        buffered: &mut Vec<u8>,
+    ) -> std::io::Result<bool> {
+        loop {
+            if buffered.windows(4).any(|window| window == b"\r\n\r\n") {
+                buffered.clear();
+                return Ok(true);
+            }
+            let mut chunk = [0u8; 1024];
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Ok(false);
+            }
+            buffered.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("upstream listener should bind");
+    let upstream_addr = upstream_listener
+        .local_addr()
+        .expect("upstream listener should have addr");
+    let upstream_connection_count = Arc::new(AtomicUsize::new(0));
+    let upstream_handle = tokio::spawn({
+        let upstream_connection_count = Arc::clone(&upstream_connection_count);
+        async move {
+            loop {
+                let (mut stream, _) = upstream_listener
+                    .accept()
+                    .await
+                    .expect("upstream accept should succeed");
+                upstream_connection_count.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut buffered = Vec::new();
+                    loop {
+                        let has_request = read_http1_request_head(&mut stream, &mut buffered)
+                            .await
+                            .expect("request head should read");
+                        if !has_request {
+                            break;
+                        }
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\nX-Upstream-Transfer: chunked\r\n\r\n6\r\nHello \r\n6\r\nWorld!\r\n0\r\n\r\n",
+                            )
+                            .await
+                            .expect("chunked response should write");
+                    }
+                });
+            }
+        }
+    });
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use proxy;
+
+        let upstream = http::exchange::default_upstream();
+        http::exchange::set_target(upstream, "127.0.0.1", {});
+        proxy::forward_default_upstream([]);
+    "#,
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    for _ in 0..2 {
+        let response = client
+            .get(format!("http://{data_addr}/chunked"))
+            .send()
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-upstream-transfer")
+                .and_then(|value| value.to_str().ok()),
+            Some("chunked")
+        );
+        assert_eq!(
+            response.text().await.expect("body should read"),
+            "Hello World!"
+        );
+    }
+
+    assert_eq!(
+        upstream_connection_count.load(Ordering::Relaxed),
+        1,
+        "chunked forwarded http/1.1 bodies should still allow upstream connection reuse",
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn http_proxy_handles_close_delimited_http1_forwarded_bodies_without_reuse() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_http1_request_head(
+        stream: &mut tokio::net::TcpStream,
+        buffered: &mut Vec<u8>,
+    ) -> std::io::Result<bool> {
+        loop {
+            if buffered.windows(4).any(|window| window == b"\r\n\r\n") {
+                buffered.clear();
+                return Ok(true);
+            }
+            let mut chunk = [0u8; 1024];
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Ok(false);
+            }
+            buffered.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("upstream listener should bind");
+    let upstream_addr = upstream_listener
+        .local_addr()
+        .expect("upstream listener should have addr");
+    let upstream_connection_count = Arc::new(AtomicUsize::new(0));
+    let upstream_handle = tokio::spawn({
+        let upstream_connection_count = Arc::clone(&upstream_connection_count);
+        async move {
+            loop {
+                let (mut stream, _) = upstream_listener
+                    .accept()
+                    .await
+                    .expect("upstream accept should succeed");
+                upstream_connection_count.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut buffered = Vec::new();
+                    if read_http1_request_head(&mut stream, &mut buffered)
+                        .await
+                        .expect("request head should read")
+                    {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nConnection: close\r\nX-Upstream-Transfer: close-delimited\r\n\r\nHello close-delimited",
+                            )
+                            .await
+                            .expect("close-delimited response should write");
+                        let _ = stream.shutdown().await;
+                    }
+                });
+            }
+        }
+    });
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use proxy;
+
+        let upstream = http::exchange::default_upstream();
+        http::exchange::set_target(upstream, "127.0.0.1", {});
+        proxy::forward_default_upstream([]);
+    "#,
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    for _ in 0..2 {
+        let response = client
+            .get(format!("http://{data_addr}/close-delimited"))
+            .send()
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-upstream-transfer")
+                .and_then(|value| value.to_str().ok()),
+            Some("close-delimited")
+        );
+        assert_eq!(
+            response.text().await.expect("body should read"),
+            "Hello close-delimited"
+        );
+    }
+
+    assert_eq!(
+        upstream_connection_count.load(Ordering::Relaxed),
+        2,
+        "close-delimited forwarded http/1.1 bodies should not be reused",
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn http_proxy_reuses_https_http1_default_upstream_connections() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    ensure_rustls_provider();
+
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("certificate should generate");
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(
+                cert.serialize_der().expect("certificate should serialize"),
+            )],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.serialize_private_key_der())),
+        )
+        .expect("server config should build");
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let upstream_addr = listener.local_addr().expect("listener should have addr");
+    let connection_count = Arc::new(AtomicUsize::new(0));
+    let upstream_handle = tokio::spawn({
+        let connection_count = Arc::clone(&connection_count);
+        async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                connection_count.fetch_add(1, Ordering::Relaxed);
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(tls_stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let io = hyper_util::rt::TokioIo::new(tls_stream);
+                    let service = hyper::service::service_fn(
+                        |request: hyper::Request<hyper::body::Incoming>| async move {
+                            let method = request.method().clone();
+                            let path = request.uri().path().to_string();
+                            let body = http_body_util::BodyExt::collect(request.into_body())
+                                .await
+                                .expect("https echo request body should collect")
+                                .to_bytes();
+                            let echoed_body = if body.is_empty() {
+                                axum::body::Bytes::from(format!("echo:https:{}:{path}", method))
+                            } else {
+                                body
+                            };
+                            let mut response =
+                                hyper::Response::new(http_body_util::Full::new(echoed_body));
+                            *response.status_mut() = hyper::StatusCode::OK;
+                            response
+                                .headers_mut()
+                                .insert("x-echo-protocol", HeaderValue::from_static("https"));
+                            Ok::<_, std::convert::Infallible>(response)
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .keep_alive(true)
+                        .serve_connection(io, service)
+                        .await;
+                });
+            }
+        }
+    });
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use proxy;
+        use tls;
+
+        let upstream = http::exchange::default_upstream();
+        http::exchange::set_target(upstream, "127.0.0.1", {});
+        http::exchange::set_scheme(upstream, "https");
+        let session = tls::session::from_socket(upstream);
+        tls::session::set_verify(session, false);
+        proxy::forward_default_upstream([]);
+    "#,
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    for path in ["/https-default-1", "/https-default-2"] {
+        let response = client
+            .get(format!("http://{data_addr}{path}"))
+            .send()
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.text().await.expect("body should read"),
+            format!("echo:https:GET:{path}")
+        );
+    }
+
+    assert_eq!(
+        connection_count.load(Ordering::Relaxed),
+        1,
+        "two proxied https http/1.1 default-upstream requests should reuse one upstream tls connection",
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn http_proxy_handles_fixed_length_downstream_http1_requests_on_persistent_connection() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_http1_response(
+        stream: &mut tokio::net::TcpStream,
+        buffered: &mut Vec<u8>,
+    ) -> std::io::Result<(u16, Vec<u8>)> {
+        loop {
+            if let Some(head_end) = buffered.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head_len = head_end + 4;
+                let head = buffered[..head_len].to_vec();
+                let head_text = String::from_utf8_lossy(&head);
+                let mut lines = head_text.split("\r\n").filter(|line| !line.is_empty());
+                let status = lines
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .expect("status line should parse");
+                let content_length = lines
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while buffered.len() < head_len + content_length {
+                    let mut chunk = [0u8; 1024];
+                    let read = stream.read(&mut chunk).await?;
+                    if read == 0 {
+                        break;
+                    }
+                    buffered.extend_from_slice(&chunk[..read]);
+                }
+                let body = buffered[head_len..head_len + content_length].to_vec();
+                buffered.drain(..head_len + content_length);
+                return Ok((status, body));
+            }
+
+            let mut chunk = [0u8; 1024];
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "stream closed before response head completed",
+                ));
+            }
+            buffered.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("upstream listener should bind");
+    let upstream_addr = upstream_listener
+        .local_addr()
+        .expect("upstream listener should have addr");
+    let upstream_handle = tokio::spawn(async move {
+        let app = Router::new().fallback(any(|request: Request<Body>| async move {
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("request body should read");
+            if body.is_empty() {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("x-upstream-path", "ping")
+                    .body(Body::from("pong"))
+                    .expect("response should build")
+            } else {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("x-upstream-path", "echo")
+                    .body(Body::from(body))
+                    .expect("response should build")
+            }
+        }));
+        axum::serve(upstream_listener, app)
+            .await
+            .expect("upstream server should run");
+    });
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use proxy;
+
+        let upstream = http::exchange::default_upstream();
+        http::exchange::set_target(upstream, "127.0.0.1", {});
+        proxy::forward_default_upstream([]);
+    "#,
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let mut stream = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("downstream stream should connect");
+    let mut buffered = Vec::new();
+    stream
+        .write_all(
+            b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nhello",
+        )
+        .await
+        .expect("post request should write");
+    let (post_status, post_body) = read_http1_response(&mut stream, &mut buffered)
+        .await
+        .expect("post response should read");
+    assert_eq!(post_status, StatusCode::OK.as_u16());
+    assert_eq!(post_body, b"hello");
+
+    stream
+        .write_all(
+            b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nworld",
+        )
+        .await
+        .expect("second post request should write");
+    let (second_status, second_body) = read_http1_response(&mut stream, &mut buffered)
+        .await
+        .expect("second post response should read");
+    assert_eq!(second_status, StatusCode::OK.as_u16());
+    assert_eq!(second_body, b"world");
+
+    stream
+        .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("get request should write");
+    let (get_status, get_body) = read_http1_response(&mut stream, &mut buffered)
+        .await
+        .expect("get response should read");
+    assert_eq!(get_status, StatusCode::OK.as_u16());
+    assert_eq!(get_body, b"pong");
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn http_proxy_rejects_truncated_fixed_length_downstream_http1_requests_before_upstream_send()
+{
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_http1_response(
+        stream: &mut tokio::net::TcpStream,
+        buffered: &mut Vec<u8>,
+    ) -> std::io::Result<(u16, Vec<u8>)> {
+        loop {
+            if let Some(head_end) = buffered.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head_len = head_end + 4;
+                let head = buffered[..head_len].to_vec();
+                let head_text = String::from_utf8_lossy(&head);
+                let mut lines = head_text.split("\r\n").filter(|line| !line.is_empty());
+                let status = lines
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .expect("status line should parse");
+                let content_length = lines
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while buffered.len() < head_len + content_length {
+                    let mut chunk = [0u8; 1024];
+                    let read = stream.read(&mut chunk).await?;
+                    if read == 0 {
+                        break;
+                    }
+                    buffered.extend_from_slice(&chunk[..read]);
+                }
+                let body = buffered[head_len..head_len + content_length].to_vec();
+                buffered.drain(..head_len + content_length);
+                return Ok((status, body));
+            }
+
+            let mut chunk = [0u8; 1024];
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "stream closed before response head completed",
+                ));
+            }
+            buffered.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    let upstream_request_count = Arc::new(AtomicUsize::new(0));
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("upstream listener should bind");
+    let upstream_addr = upstream_listener
+        .local_addr()
+        .expect("upstream listener should have addr");
+    let upstream_handle = tokio::spawn({
+        let upstream_request_count = Arc::clone(&upstream_request_count);
+        async move {
+            let app = Router::new().fallback(any(move |request: Request<Body>| {
+                let upstream_request_count = Arc::clone(&upstream_request_count);
+                async move {
+                    upstream_request_count.fetch_add(1, Ordering::Relaxed);
+                    let body = to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .expect("request body should read");
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::from(body))
+                        .expect("response should build")
+                }
+            }));
+            axum::serve(upstream_listener, app)
+                .await
+                .expect("upstream server should run");
+        }
+    });
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use proxy;
+
+        let upstream = http::exchange::default_upstream();
+        http::exchange::set_target(upstream, "127.0.0.1", {});
+        proxy::forward_default_upstream([]);
+    "#,
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let mut stream = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("downstream stream should connect");
+    let mut buffered = Vec::new();
+    stream
+        .write_all(
+            b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhello",
+        )
+        .await
+        .expect("truncated request should write");
+    stream
+        .shutdown()
+        .await
+        .expect("client half-close should succeed");
+
+    let (status, body) = read_http1_response(&mut stream, &mut buffered)
+        .await
+        .expect("proxy should return an error response");
+    assert_eq!(status, StatusCode::BAD_REQUEST.as_u16());
+    assert!(
+        String::from_utf8_lossy(&body).contains("content-length completed"),
+        "error body should describe the truncated request",
+    );
+    assert_eq!(
+        upstream_request_count.load(Ordering::Relaxed),
+        0,
+        "proxy should reject a truncated fixed-length request before sending anything upstream",
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn http_proxy_handles_chunked_downstream_http1_requests_on_persistent_connection() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_http1_response(
+        stream: &mut tokio::net::TcpStream,
+        buffered: &mut Vec<u8>,
+    ) -> std::io::Result<(u16, Vec<u8>)> {
+        loop {
+            if let Some(head_end) = buffered.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head_len = head_end + 4;
+                let head = buffered[..head_len].to_vec();
+                let head_text = String::from_utf8_lossy(&head);
+                let mut lines = head_text.split("\r\n").filter(|line| !line.is_empty());
+                let status = lines
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .expect("status line should parse");
+                let content_length = lines
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while buffered.len() < head_len + content_length {
+                    let mut chunk = [0u8; 1024];
+                    let read = stream.read(&mut chunk).await?;
+                    if read == 0 {
+                        break;
+                    }
+                    buffered.extend_from_slice(&chunk[..read]);
+                }
+                let body = buffered[head_len..head_len + content_length].to_vec();
+                buffered.drain(..head_len + content_length);
+                return Ok((status, body));
+            }
+
+            let mut chunk = [0u8; 1024];
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "stream closed before response head completed",
+                ));
+            }
+            buffered.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("upstream listener should bind");
+    let upstream_addr = upstream_listener
+        .local_addr()
+        .expect("upstream listener should have addr");
+    let upstream_handle = tokio::spawn(async move {
+        let app = Router::new().fallback(any(|request: Request<Body>| async move {
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("request body should read");
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from(body))
+                .expect("response should build")
+        }));
+        axum::serve(upstream_listener, app)
+            .await
+            .expect("upstream server should run");
+    });
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use proxy;
+
+        let upstream = http::exchange::default_upstream();
+        http::exchange::set_target(upstream, "127.0.0.1", {});
+        proxy::forward_default_upstream([]);
+    "#,
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let mut stream = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("downstream stream should connect");
+    let mut buffered = Vec::new();
+    stream
+        .write_all(
+            b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        )
+        .await
+        .expect("chunked post request should write");
+    let (post_status, post_body) = read_http1_response(&mut stream, &mut buffered)
+        .await
+        .expect("chunked post response should read");
+    assert_eq!(post_status, StatusCode::OK.as_u16());
+    assert_eq!(post_body, b"hello");
+
+    stream
+        .write_all(
+            b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nworld\r\n0\r\n\r\n",
+        )
+        .await
+        .expect("second chunked post request should write");
+    let (second_status, second_body) = read_http1_response(&mut stream, &mut buffered)
+        .await
+        .expect("second chunked post response should read");
+    assert_eq!(second_status, StatusCode::OK.as_u16());
+    assert_eq!(second_body, b"world");
+
+    stream
+        .write_all(b"GET /echo HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("get request should write");
+    let (get_status, get_body) = read_http1_response(&mut stream, &mut buffered)
+        .await
+        .expect("get response should read");
+    assert_eq!(get_status, StatusCode::OK.as_u16());
+    assert_eq!(get_body, b"");
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn http_proxy_rejects_oversized_chunked_downstream_http1_requests() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_http1_response(
+        stream: &mut tokio::net::TcpStream,
+        buffered: &mut Vec<u8>,
+    ) -> std::io::Result<(u16, Vec<u8>)> {
+        loop {
+            if let Some(head_end) = buffered.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head_len = head_end + 4;
+                let head = buffered[..head_len].to_vec();
+                let head_text = String::from_utf8_lossy(&head);
+                let mut lines = head_text.split("\r\n").filter(|line| !line.is_empty());
+                let status = lines
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .expect("status line should parse");
+                let content_length = lines
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while buffered.len() < head_len + content_length {
+                    let mut chunk = [0u8; 1024];
+                    let read = stream.read(&mut chunk).await?;
+                    if read == 0 {
+                        break;
+                    }
+                    buffered.extend_from_slice(&chunk[..read]);
+                }
+                let body = buffered[head_len..head_len + content_length].to_vec();
+                buffered.drain(..head_len + content_length);
+                return Ok((status, body));
+            }
+
+            let mut chunk = [0u8; 1024];
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "stream closed before response head completed",
+                ));
+            }
+            buffered.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = r#"
+        use http;
+
+        http::response::set_body("ignored");
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let mut stream = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("downstream stream should connect");
+    let mut buffered = Vec::new();
+    stream
+        .write_all(
+            b"POST /too-large HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n100001\r\n",
+        )
+        .await
+        .expect("oversized chunked request head should write");
+    let (status, body) = read_http1_response(&mut stream, &mut buffered)
+        .await
+        .expect("oversized response should read");
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE.as_u16());
+    assert_eq!(body, b"request body exceeds fast http/1.1 limit");
+
     data_handle.abort();
     admin_handle.abort();
 }
@@ -2434,6 +3301,178 @@ async fn http_proxy_https_listener_returns_404_for_noop_program() {
         "not found"
     );
 
+    http_handle.abort();
+    https_handle.abort();
+    admin_handle.abort();
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn http_proxy_https_listener_handles_fixed_length_http1_requests_on_persistent_connection() {
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+    async fn read_http1_response<S>(
+        stream: &mut S,
+        buffered: &mut Vec<u8>,
+    ) -> std::io::Result<(u16, Vec<u8>)>
+    where
+        S: AsyncRead + Unpin,
+    {
+        loop {
+            if let Some(head_end) = buffered.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head_len = head_end + 4;
+                let head = buffered[..head_len].to_vec();
+                let head_text = String::from_utf8_lossy(&head);
+                let mut lines = head_text.split("\r\n").filter(|line| !line.is_empty());
+                let status = lines
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .expect("status line should parse");
+                let content_length = lines
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while buffered.len() < head_len + content_length {
+                    let mut chunk = [0u8; 1024];
+                    let read = stream.read(&mut chunk).await?;
+                    if read == 0 {
+                        break;
+                    }
+                    buffered.extend_from_slice(&chunk[..read]);
+                }
+                let body = buffered[head_len..head_len + content_length].to_vec();
+                buffered.drain(..head_len + content_length);
+                return Ok((status, body));
+            }
+
+            let mut chunk = [0u8; 1024];
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "stream closed before response head completed",
+                ));
+            }
+            buffered.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    ensure_rustls_provider();
+
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("upstream listener should bind");
+    let upstream_addr = upstream_listener
+        .local_addr()
+        .expect("upstream listener should have addr");
+    let upstream_handle = tokio::spawn(async move {
+        let app = Router::new().fallback(any(|request: Request<Body>| async move {
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("request body should read");
+            if body.is_empty() {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("x-upstream-path", "ping")
+                    .body(Body::from("pong"))
+                    .expect("response should build")
+            } else {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("x-upstream-path", "echo")
+                    .body(Body::from(body))
+                    .expect("response should build")
+            }
+        }));
+        axum::serve(upstream_listener, app)
+            .await
+            .expect("upstream server should run");
+    });
+
+    let (_http_addr, https_addr, admin_addr, http_handle, https_handle, admin_handle) =
+        spawn_http_https_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use proxy;
+
+        let upstream = http::exchange::default_upstream();
+        http::exchange::set_target(upstream, "127.0.0.1", {});
+        proxy::forward_default_upstream([]);
+    "#,
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let mut config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PermissiveTestServerCertVerifier::new()))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let stream = tokio::net::TcpStream::connect(https_addr)
+        .await
+        .expect("https listener should accept tls clients");
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .expect("server name should parse")
+        .to_owned();
+    let mut tls_stream = connector
+        .connect(server_name, stream)
+        .await
+        .expect("https handshake should succeed");
+    assert_eq!(
+        tls_stream
+            .get_ref()
+            .1
+            .alpn_protocol()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
+        Some("http/1.1".to_string())
+    );
+
+    let mut buffered = Vec::new();
+    tls_stream
+        .write_all(
+            b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nhello",
+        )
+        .await
+        .expect("post request should write");
+    let (post_status, post_body) = read_http1_response(&mut tls_stream, &mut buffered)
+        .await
+        .expect("post response should read");
+    assert_eq!(post_status, StatusCode::OK.as_u16());
+    assert_eq!(post_body, b"hello");
+
+    tls_stream
+        .write_all(
+            b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nworld",
+        )
+        .await
+        .expect("second post request should write");
+    let (second_status, second_body) = read_http1_response(&mut tls_stream, &mut buffered)
+        .await
+        .expect("second post response should read");
+    assert_eq!(second_status, StatusCode::OK.as_u16());
+    assert_eq!(second_body, b"world");
+
+    tls_stream
+        .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("get request should write");
+    let (get_status, get_body) = read_http1_response(&mut tls_stream, &mut buffered)
+        .await
+        .expect("get response should read");
+    assert_eq!(get_status, StatusCode::OK.as_u16());
+    assert_eq!(get_body, b"pong");
+
+    upstream_handle.abort();
     http_handle.abort();
     https_handle.abort();
     admin_handle.abort();
