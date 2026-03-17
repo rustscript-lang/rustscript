@@ -21,7 +21,7 @@ async fn dynamic_tcp_stream_can_attach_to_http_exchange() {
         use tcp;
 
         let stream = tcp::stream::new();
-        tcp::stream::set_target(stream, "{upstream_addr}");
+        tcp::stream::set_target(stream, "{upstream_host}", {upstream_port});
         if !tcp::stream::connect(stream) {{
             http::response::set_status(502);
             http::response::set_body("connect failed");
@@ -89,14 +89,14 @@ async fn dynamic_tls_session_can_attach_to_http_exchange() {
         use tls;
 
         let stream = tcp::stream::new();
-        tcp::stream::set_target(stream, "{upstream_addr}");
+        tcp::stream::set_target(stream, "localhost", {upstream_port});
         if !tcp::stream::connect(stream) {{
             http::response::set_status(502);
             http::response::set_body("connect failed");
         }} else {{
             let exchange = http::exchange::new();
             http::exchange::set_scheme(exchange, "https");
-            http::exchange::set_target(exchange, "localhost", {});
+            http::exchange::set_target(exchange, "localhost", {upstream_port});
             http::exchange::set_path(exchange, "/echo");
             http::exchange::set_method(exchange, "POST");
             http::exchange::set_body(exchange, "secure-payload");
@@ -119,7 +119,7 @@ async fn dynamic_tls_session_can_attach_to_http_exchange() {
             }}
         }}
     "#,
-        upstream_addr.port()
+        upstream_port = upstream_addr.port()
     );
     let compiled = compile_source(&source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;

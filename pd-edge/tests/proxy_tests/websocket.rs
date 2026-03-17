@@ -350,9 +350,9 @@ async fn downstream_websocket_binary_tunnel_upgrades_and_relays_frames() {
         websocket::connection::set_target(upstream, "{upstream_host}", {upstream_port});
         websocket::connection::set_path(upstream, "/binary");
         let protocols = http::request::get_header("sec-websocket-protocol");
-        if protocols != "" {
+        if protocols != "" {{
             websocket::connection::set_subprotocols(upstream, protocols);
-        }
+        }}
         let downstream = proxy::stream::downstream();
         let peer = proxy::stream::from_websocket_binary(upstream);
         let status = proxy::bridge(downstream, peer, 1024);
@@ -363,7 +363,7 @@ async fn downstream_websocket_binary_tunnel_upgrades_and_relays_frames() {
         upstream_host = upstream_addr.ip(),
         upstream_port = upstream_addr.port()
     );
-    let compiled = compile_source(source).expect("source should compile");
+    let compiled = compile_source(&source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
 
