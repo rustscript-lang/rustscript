@@ -318,7 +318,7 @@ async fn transport_downstream_http_handoff_continues_same_vm_invocation() {
         let downstream = tcp::stream::downstream();
         if http::request::get_scheme() == "tcp" {
             http::downstream::attach_transport();
-        }}
+        }
 
         if http::request::get_scheme() != "tcp" {
             http::response::set_status(201);
@@ -327,7 +327,7 @@ async fn transport_downstream_http_handoff_continues_same_vm_invocation() {
                 http::request::get_path_with_query() + "|" +
                 http::request::get_body()
             );
-        }}
+        }
     "#;
     let compiled = compile_source(source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;

@@ -53,6 +53,7 @@ pub(crate) fn empty_telemetry() -> TelemetrySnapshot {
         control_rpc_polls_error_total: 0,
         control_rpc_results_success_total: 0,
         control_rpc_results_error_total: 0,
+        lock_metrics: Vec::new(),
     }
 }
 

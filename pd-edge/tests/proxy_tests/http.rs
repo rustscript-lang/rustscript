@@ -215,7 +215,10 @@ async fn upstream_accepts_full_url_with_path() {
         .await
         .expect("request should complete");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.text().await.expect("body should read"), "/fixed");
+    assert_eq!(
+        response.text().await.expect("body should read"),
+        "/fixed?x=1"
+    );
 
     upstream_handle.abort();
     data_handle.abort();

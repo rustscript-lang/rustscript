@@ -22,11 +22,10 @@ pub(crate) use edge::sample_echo::spawn_webrtc_echo_server;
 pub(crate) use edge::serve_http3_proxy;
 pub(crate) use edge::{
     ActiveControlPlaneConfig, CommandResultPayload, ControlPlaneCommand, EdgeCommandResult,
-    EdgePollRequest, EdgePollResponse, FN_HTTP_RESPONSE_SET_BODY, FN_HTTP_RESPONSE_SET_HEADER,
-    ProxyVmContext, RateLimiterStore, SharedState, VmAsyncOpBridge, build_admin_app,
-    build_http_proxy_app, compile_edge_source_file, enter_edge_host_context, function_by_name,
-    new_shared_vm_async_ops, register_http_plane_host_module, serve_http_proxy, serve_https_proxy,
-    serve_transport_proxy, spawn_active_control_plane_client,
+    EdgePollRequest, EdgePollResponse, ProxyVmContext, RateLimiterStore, SharedState,
+    VmAsyncOpBridge, build_admin_app, build_http_proxy_app, compile_edge_source_file,
+    enter_edge_host_context, new_shared_vm_async_ops, register_http_plane_host_module,
+    serve_http_proxy, serve_https_proxy, serve_transport_proxy, spawn_active_control_plane_client,
 };
 #[cfg(feature = "websocket")]
 pub(crate) use futures_util::{SinkExt, StreamExt};
@@ -48,9 +47,7 @@ pub(crate) use tokio_tungstenite::{
         http::HeaderValue as WsHeaderValue,
     },
 };
-pub(crate) use vm::{
-    BytecodeBuilder, Program, Value, Vm, VmError, VmStatus, compile_source, encode_program,
-};
+pub(crate) use vm::{Program, Vm, VmError, VmStatus, compile_source, encode_program};
 
 pub(crate) const SAMPLE_PROXY_UPSTREAM_PORT: u16 = 18080;
 pub(crate) const SAMPLE_REQUEST_TRANSFORM_UPSTREAM_PORT: u16 = 18081;
@@ -292,12 +289,6 @@ pub(crate) async fn spawn_chunked_upstream_on(
         }
     });
     (addr, handle)
-}
-
-pub(crate) async fn spawn_connect_forward_proxy() -> (SocketAddr, JoinHandle<()>) {
-    edge::sample_echo::spawn_connect_forward_proxy("127.0.0.1:0".parse().expect("valid addr"))
-        .await
-        .expect("forward proxy should start")
 }
 
 pub(crate) async fn spawn_connect_forward_proxy_on(
@@ -1279,32 +1270,29 @@ pub(crate) async fn spawn_ca_signed_https_echo_upstream(
     spawn_tls_echo_server(server_config, require_client_certificate).await
 }
 
+fn rss_string_literal(value: &str) -> String {
+    format!("{value:?}")
+}
+
 pub(crate) fn build_short_circuit_program(body: &str, header: Option<(&str, &str)>) -> Program {
-    let mut constants = Vec::new();
-    let mut bc = BytecodeBuilder::new();
-
+    let mut source = String::from("use http;\n");
     if let Some((name, value)) = header {
-        let name_index = constants.len() as u32;
-        constants.push(Value::string(name));
-        let value_index = constants.len() as u32;
-        constants.push(Value::string(value));
-        bc.ldc(name_index);
-        bc.ldc(value_index);
-        bc.call(FN_HTTP_RESPONSE_SET_HEADER, 2);
+        source.push_str(&format!(
+            "http::response::set_header({}, {});\n",
+            rss_string_literal(name),
+            rss_string_literal(value)
+        ));
     }
-
-    let body_index = constants.len() as u32;
-    constants.push(Value::string(body));
-    bc.ldc(body_index);
-    bc.call(FN_HTTP_RESPONSE_SET_BODY, 1);
-    bc.ret();
-
-    Program::new(constants, bc.finish())
+    source.push_str(&format!(
+        "http::response::set_body({});\n",
+        rss_string_literal(body)
+    ));
+    compile_source(&source)
+        .expect("short-circuit helper source should compile")
+        .program
 }
 
 pub(crate) fn build_upstream_program(upstream: &str, header: Option<(&str, &str)>) -> Program {
-    let mut constants = Vec::new();
-    let mut bc = BytecodeBuilder::new();
     let (scheme, remainder) = if let Some(value) = upstream.strip_prefix("https://") {
         ("https", value)
     } else if let Some(value) = upstream.strip_prefix("http://") {
@@ -1330,77 +1318,40 @@ pub(crate) fn build_upstream_program(upstream: &str, header: Option<(&str, &str)
         .rsplit_once(':')
         .expect("upstream authority should include a port");
     let port = port
-        .parse::<i64>()
+        .parse::<u16>()
         .expect("upstream authority port should be numeric");
-
-    let exchange_index = constants.len() as u32;
-    constants.push(Value::Int(1));
-    let host_index = constants.len() as u32;
-    constants.push(Value::string(host));
-    let port_index = constants.len() as u32;
-    constants.push(Value::Int(port));
-
+    let mut source =
+        String::from("use http;\nlet exchange = http::exchange::default_upstream();\n");
     if scheme == "https" {
-        let scheme_index = constants.len() as u32;
-        constants.push(Value::string("https"));
-        bc.ldc(exchange_index);
-        bc.ldc(scheme_index);
-        bc.call(
-            function_by_name("http::exchange::set_scheme")
-                .expect("http::exchange::set_scheme should exist")
-                .index,
-            2,
-        );
+        source.push_str("http::exchange::set_scheme(exchange, \"https\");\n");
     }
-
-    bc.ldc(exchange_index);
-    bc.ldc(host_index);
-    bc.ldc(port_index);
-    bc.call(
-        function_by_name("http::exchange::set_target")
-            .expect("http::exchange::set_target should exist")
-            .index,
-        3,
-    );
-
+    source.push_str(&format!(
+        "http::exchange::set_target(exchange, {}, {});\n",
+        rss_string_literal(host),
+        port
+    ));
     if let Some(path) = path {
-        let path_index = constants.len() as u32;
-        constants.push(Value::string(path));
-        bc.ldc(exchange_index);
-        bc.ldc(path_index);
-        bc.call(
-            function_by_name("http::exchange::set_path")
-                .expect("http::exchange::set_path should exist")
-                .index,
-            2,
-        );
+        source.push_str(&format!(
+            "http::exchange::set_path(exchange, {});\n",
+            rss_string_literal(&path)
+        ));
     }
-
     if let Some(query) = query {
-        let query_index = constants.len() as u32;
-        constants.push(Value::string(query));
-        bc.ldc(exchange_index);
-        bc.ldc(query_index);
-        bc.call(
-            function_by_name("http::exchange::set_query")
-                .expect("http::exchange::set_query should exist")
-                .index,
-            2,
-        );
+        source.push_str(&format!(
+            "http::exchange::set_query(exchange, {});\n",
+            rss_string_literal(&query)
+        ));
     }
-
     if let Some((name, value)) = header {
-        let name_index = constants.len() as u32;
-        constants.push(Value::string(name));
-        let value_index = constants.len() as u32;
-        constants.push(Value::string(value));
-        bc.ldc(name_index);
-        bc.ldc(value_index);
-        bc.call(FN_HTTP_RESPONSE_SET_HEADER, 2);
+        source.push_str(&format!(
+            "http::response::set_header({}, {});\n",
+            rss_string_literal(name),
+            rss_string_literal(value)
+        ));
     }
-
-    bc.ret();
-    Program::new(constants, bc.finish())
+    compile_source(&source)
+        .expect("upstream helper source should compile")
+        .program
 }
 
 pub(crate) async fn upload_program(

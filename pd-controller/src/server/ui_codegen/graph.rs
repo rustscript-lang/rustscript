@@ -1091,17 +1091,28 @@ pub(super) fn flow_action_statement(
             })
         }
         "set_upstream" => {
-            let upstream = block_value(block, "upstream", "127.0.0.1:8088");
+            let host = block_value(block, "host", "127.0.0.1");
+            let port = render_number_expr(block_value(block, "port", "8088"), "8088");
             Ok(FlowActionStatement {
                 rustscript: format!(
-                    "upstream_request::set_target({});",
-                    render_expr_rss(upstream)
+                    "upstream_request::set_target({}, {});",
+                    render_expr_rss(host),
+                    port
                 ),
-                javascript: format!("upstream_request.set_target({});", render_expr_js(upstream)),
-                lua: format!("upstream_request.set_target({})", render_expr_lua(upstream)),
+                javascript: format!(
+                    "upstream_request.set_target({}, {});",
+                    render_expr_js(host),
+                    port
+                ),
+                lua: format!(
+                    "upstream_request.set_target({}, {})",
+                    render_expr_lua(host),
+                    port
+                ),
                 scheme: format!(
-                    "(upstream_request:set_target {})",
-                    render_expr_scheme(upstream)
+                    "(upstream_request:set_target {} {})",
+                    render_expr_scheme(host),
+                    port
                 ),
             })
         }

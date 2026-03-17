@@ -93,11 +93,10 @@ async fn active_control_plane_can_push_program_and_receive_result() {
         .send()
         .await
         .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.text().await.expect("body should read"),
-        "from-active-control-plane"
-    );
+    let status = response.status();
+    let body = response.text().await.expect("body should read");
+    assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+    assert_eq!(body, "from-active-control-plane");
 
     active_handle.abort();
     data_handle.abort();

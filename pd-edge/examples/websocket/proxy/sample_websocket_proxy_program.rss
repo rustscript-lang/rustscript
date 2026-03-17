@@ -13,6 +13,7 @@ if websocket::connection::is_present(downstream) {
     http::response::set_header("x-downstream-ws-phase", websocket::connection::get_phase(downstream));
 } else {
     http::response::set_header("x-downstream-ws-present", "false");
+}
 let upstream_host = "127.0.0.1";
 let upstream_port = 18091;
 let text_payload = http::request::get_header("x-ws-message");

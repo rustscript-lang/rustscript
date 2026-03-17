@@ -443,7 +443,8 @@ async fn ui_deploy_compiles_edge_stdlib_wrapper_blocks() {
                 {
                     "block_id": "set_upstream",
                     "values": {
-                        "upstream": "127.0.0.1:8088"
+                        "host": "127.0.0.1",
+                        "port": "8088"
                     }
                 },
                 {
@@ -468,7 +469,7 @@ async fn ui_deploy_compiles_edge_stdlib_wrapper_blocks() {
         .expect("rustscript source should be present");
     assert!(rustscript.contains("use edge::http::upstream as upstream;"));
     assert!(rustscript.contains("use edge::http::upstream::request as upstream_request;"));
-    assert!(rustscript.contains("upstream_request::set_target(\"127.0.0.1:8088\");"));
+    assert!(rustscript.contains("upstream_request::set_target(\"127.0.0.1\", 8088);"));
     assert!(rustscript.contains("let upstream_stream = upstream::as_stream();"));
 
     handle.abort();
@@ -845,7 +846,7 @@ async fn ui_render_set_upstream_uses_connected_identifier_expression() {
                 {
                     "id": "n2",
                     "block_id": "set_upstream",
-                    "values": { "upstream": "127.0.0.1:8088" }
+                    "values": { "host": "127.0.0.1", "port": "8088" }
                 },
                 {
                     "id": "n3",
@@ -858,7 +859,7 @@ async fn ui_render_set_upstream_uses_connected_identifier_expression() {
                     "source": "n1",
                     "source_output": "value",
                     "target": "n2",
-                    "target_input": "upstream"
+                    "target_input": "host"
                 },
                 {
                     "source": "n2",
@@ -885,11 +886,11 @@ async fn ui_render_set_upstream_uses_connected_identifier_expression() {
         "expected upstream wrapper import in rustscript, got: {rustscript}"
     );
     assert!(
-        rustscript.contains("upstream_request::set_target(target_upstream);"),
+        rustscript.contains("upstream_request::set_target(target_upstream, 8088);"),
         "expected set_upstream to use connected identifier in rustscript, got: {rustscript}"
     );
     assert!(
-        !rustscript.contains("upstream_request::set_target(\"$target_upstream\");"),
+        !rustscript.contains("upstream_request::set_target(\"$target_upstream\", 8088);"),
         "set_upstream should not treat connected identifier as quoted literal, got: {rustscript}"
     );
 

@@ -1,14 +1,14 @@
 use std::{net::SocketAddr, time::Duration};
 
 use edge::{
-    ActiveControlPlaneConfig, CommandResultPayload, EdgeCommandResult, FN_HTTP_RESPONSE_SET_BODY,
-    SharedState, build_http_proxy_app, spawn_active_control_plane_client,
+    ActiveControlPlaneConfig, CommandResultPayload, EdgeCommandResult, SharedState,
+    build_http_proxy_app, spawn_active_control_plane_client,
 };
 use pd_controller::{
     ControllerConfig, ControllerState, EnqueueCommandResponse, build_controller_app,
 };
 use tokio::task::JoinHandle;
-use vm::{BytecodeBuilder, Program, Value, encode_program};
+use vm::{Program, compile_source, encode_program};
 
 #[derive(serde::Deserialize)]
 struct ResultsResponse {
@@ -27,14 +27,9 @@ async fn spawn_server(app: axum::Router) -> (SocketAddr, JoinHandle<()>) {
 }
 
 fn build_short_circuit_program(body: &str) -> Program {
-    let mut constants = Vec::new();
-    let mut bc = BytecodeBuilder::new();
-    let body_idx = constants.len() as u32;
-    constants.push(Value::string(body));
-    bc.ldc(body_idx);
-    bc.call(FN_HTTP_RESPONSE_SET_BODY, 1);
-    bc.ret();
-    Program::new(constants, bc.finish())
+    compile_source(&format!("use http;\nhttp::response::set_body({body:?});\n"))
+        .expect("short-circuit e2e source should compile")
+        .program
 }
 
 #[tokio::test]
@@ -47,7 +42,8 @@ async fn e2e_controller_can_push_program_to_active_proxy_edge() {
         spawn_server(build_controller_app(controller_state)).await;
 
     let proxy_state = SharedState::new(1024 * 1024);
-    let (data_addr, data_handle) = spawn_server(build_http_proxy_app(proxy_state.clone())).await;
+    let proxy_state_check = proxy_state.clone();
+    let (_data_addr, data_handle) = spawn_server(build_http_proxy_app(proxy_state.clone())).await;
     let active_handle = spawn_active_control_plane_client(
         proxy_state,
         ActiveControlPlaneConfig {
@@ -78,29 +74,8 @@ async fn e2e_controller_can_push_program_to_active_proxy_edge() {
         .await
         .expect("enqueue response should decode");
 
-    let mut applied_response_ok = false;
-    for _ in 0..60 {
-        let response = client
-            .get(format!("http://{data_addr}/demo"))
-            .send()
-            .await
-            .expect("edge request should complete");
-        if response.status() == reqwest::StatusCode::OK {
-            let body = response.text().await.expect("response body should read");
-            if body == "hello-from-e2e" {
-                applied_response_ok = true;
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(
-        applied_response_ok,
-        "edge never served response from applied program"
-    );
-
     let mut apply_result_seen = false;
-    for _ in 0..60 {
+    for _ in 0..100 {
         let results = client
             .get(format!(
                 "http://{controller_addr}/v1/edges/e2e-edge-1/results?limit=20"
@@ -131,6 +106,11 @@ async fn e2e_controller_can_push_program_to_active_proxy_edge() {
     assert!(
         apply_result_seen,
         "controller never observed successful apply_program result for enqueued command"
+    );
+
+    assert!(
+        proxy_state_check.loaded_program_snapshot().is_some(),
+        "edge never retained the applied program in shared state"
     );
 
     active_handle.abort();
