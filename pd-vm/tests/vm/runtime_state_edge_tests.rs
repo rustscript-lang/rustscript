@@ -30,6 +30,12 @@ fn noop_waker() -> Waker {
     Waker::from(Arc::new(NoopWake))
 }
 
+fn new_runtime_state_vm(program: Program) -> Vm {
+    let mut vm = Vm::new(program);
+    vm.set_drop_contract_events_enabled(true);
+    vm
+}
+
 #[test]
 fn run_while_waiting_does_not_replay_pending_host_call() {
     let mut bc = BytecodeBuilder::new();
@@ -38,7 +44,7 @@ fn run_while_waiting_does_not_replay_pending_host_call() {
     let program = Program::new(Vec::new(), bc.finish());
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut vm = Vm::new(program);
+    let mut vm = new_runtime_state_vm(program);
     vm.register_function(Box::new(PendingOnce {
         call_count: Arc::clone(&calls),
         op_id: 55,
@@ -70,7 +76,7 @@ fn complete_host_op_rejects_wrong_and_missing_ids() {
     bc.ret();
     let program = Program::new(Vec::new(), bc.finish());
 
-    let mut vm = Vm::new(program);
+    let mut vm = new_runtime_state_vm(program);
     vm.register_function(Box::new(PendingOnce {
         call_count: Arc::new(AtomicUsize::new(0)),
         op_id: 99,
@@ -116,7 +122,7 @@ fn poll_waiting_host_op_reports_missing_async_bridge() {
     bc.ret();
     let program = Program::new(Vec::new(), bc.finish());
 
-    let mut vm = Vm::new(program);
+    let mut vm = new_runtime_state_vm(program);
     vm.register_function(Box::new(PendingOnce {
         call_count: Arc::new(AtomicUsize::new(0)),
         op_id: 321,
@@ -165,7 +171,7 @@ fn waiting_host_op_preserves_single_drop_state_for_moved_locals() {
     let b_index = debug.local_index("b").expect("b binding should exist");
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = new_runtime_state_vm(compiled.program);
     vm.register_function(Box::new(PendingOnce {
         call_count: Arc::clone(&calls),
         op_id: 700,
@@ -220,7 +226,7 @@ fn waiting_host_op_preserves_interprocedural_closure_state_then_clears_on_resume
 
     let compiled = compile_source(source).expect("compile should succeed");
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = new_runtime_state_vm(compiled.program);
     vm.register_function(Box::new(PendingOnce {
         call_count: Arc::clone(&calls),
         op_id: 701,
@@ -265,7 +271,7 @@ fn drop_contract_counts_overwrites_and_reset_clears_counter() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = new_runtime_state_vm(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     let after_run = vm.drop_contract_event_count();
@@ -296,7 +302,7 @@ fn reset_for_reuse_counts_cleanup_drops_from_live_state() {
     bc.ret();
 
     let program = Program::new(vec![live_map, live_stack_value], bc.finish());
-    let mut vm = Vm::new(program);
+    let mut vm = new_runtime_state_vm(program);
     vm.set_fuel(3);
 
     let status = vm.run().expect("run should yield before cleanup");
@@ -338,7 +344,7 @@ fn waiting_run_does_not_replay_drop_contract_events() {
 
     let compiled = compile_source(source).expect("compile should succeed");
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = new_runtime_state_vm(compiled.program);
     vm.register_function(Box::new(PendingOnce {
         call_count: Arc::clone(&calls),
         op_id: 702,

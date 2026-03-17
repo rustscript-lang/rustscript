@@ -80,11 +80,13 @@ pub(super) fn compile_native_trace(
     trace: &super::JitTrace,
     interrupt_settings: Option<NativeInterruptSettings>,
     profile: NativeCompileProfile,
+    drop_contract_events_enabled: bool,
 ) -> VmResult<Box<CompiledTrace>> {
     Ok(Box::new(cranelift::compile_trace(
         trace,
         interrupt_settings,
         profile,
+        drop_contract_events_enabled,
     )?))
 }
 
@@ -93,6 +95,7 @@ pub(super) fn compile_native_trace(
     _trace: &super::JitTrace,
     _interrupt_settings: Option<NativeInterruptSettings>,
     _profile: NativeCompileProfile,
+    _drop_contract_events_enabled: bool,
 ) -> VmResult<Box<CompiledTrace>> {
     Err(VmError::JitNative(
         "native JIT backend is disabled (feature 'cranelift-jit' is not enabled)".to_string(),

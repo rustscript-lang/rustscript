@@ -240,6 +240,7 @@ pub struct Vm {
     native_only_aot: bool,
     native_aot_interrupt_check_interval: Option<u32>,
     native_aot_interrupt_mode: Option<InterruptMode>,
+    drop_contract_events_enabled: bool,
     drop_contract_events: u64,
 }
 
@@ -373,6 +374,7 @@ impl Vm {
             native_only_aot: false,
             native_aot_interrupt_check_interval: None,
             native_aot_interrupt_mode: None,
+            drop_contract_events_enabled: false,
             drop_contract_events: 0,
         }
     }
@@ -511,6 +513,20 @@ impl Vm {
         self.drop_contract_events
     }
 
+    pub fn set_drop_contract_events_enabled(&mut self, enabled: bool) {
+        if self.drop_contract_events_enabled != enabled {
+            self.native_traces.clear();
+        }
+        self.drop_contract_events_enabled = enabled;
+        if !enabled {
+            self.drop_contract_events = 0;
+        }
+    }
+
+    pub fn drop_contract_events_enabled(&self) -> bool {
+        self.drop_contract_events_enabled
+    }
+
     fn interruption_mode_conflict(&self, requested: InterruptMode) -> VmError {
         VmError::InterruptionModeConflict {
             active: self.interrupt_mode.label(),
@@ -567,7 +583,9 @@ impl Vm {
     }
 
     pub(super) fn drop_value_with_contract(&mut self, value: Value) {
-        self.count_value_drop_contract(&value);
+        if self.drop_contract_events_enabled {
+            self.count_value_drop_contract(&value);
+        }
     }
 
     pub(super) fn count_value_drop_contract(&mut self, value: &Value) {

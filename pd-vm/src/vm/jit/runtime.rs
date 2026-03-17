@@ -46,6 +46,7 @@ pub(crate) struct NativeTrace {
     has_yielding_call: bool,
     interrupt_settings: Option<native::NativeInterruptSettings>,
     compile_profile: native::NativeCompileProfile,
+    drop_contract_events_enabled: bool,
 }
 
 #[cfg(any(
@@ -59,6 +60,7 @@ pub(crate) struct NativeTrace {
 struct NativeTraceCacheKey {
     interrupt_settings: Option<native::NativeInterruptSettings>,
     compile_profile: native::NativeCompileProfile,
+    drop_contract_events_enabled: bool,
     root_ip: usize,
     terminal: JitTraceTerminal,
     steps: Vec<TraceStep>,
@@ -132,10 +134,12 @@ fn native_trace_cache_key(
     trace: &JitTrace,
     interrupt_settings: Option<native::NativeInterruptSettings>,
     compile_profile: native::NativeCompileProfile,
+    drop_contract_events_enabled: bool,
 ) -> NativeTraceCacheKey {
     NativeTraceCacheKey {
         interrupt_settings,
         compile_profile,
+        drop_contract_events_enabled,
         root_ip: trace.root_ip,
         terminal: trace.terminal.clone(),
         steps: trace.steps.clone(),
@@ -943,6 +947,7 @@ impl Vm {
         if let Some(native) = self.native_traces.get(&trace_id)
             && native.interrupt_settings == interrupt_settings
             && compile_profile_satisfies(native.compile_profile, compile_profile)
+            && native.drop_contract_events_enabled == self.drop_contract_events_enabled()
         {
             return Ok(());
         }
@@ -952,12 +957,19 @@ impl Vm {
         let trace = self.jit.trace_clone(trace_id).ok_or_else(|| {
             VmError::JitNative(format!("trace {} missing for native compile", trace_id))
         })?;
-        let key = native_trace_cache_key(&trace, interrupt_settings, compile_profile);
+        let drop_contract_events_enabled = self.drop_contract_events_enabled();
+        let key = native_trace_cache_key(
+            &trace,
+            interrupt_settings,
+            compile_profile,
+            drop_contract_events_enabled,
+        );
         let fallback_key = (compile_profile == native::NativeCompileProfile::Jit).then_some(
             native_trace_cache_key(
                 &trace,
                 interrupt_settings,
                 native::NativeCompileProfile::Aot,
+                drop_contract_events_enabled,
             ),
         );
         let cached = with_native_trace_cache(|cache| {
@@ -982,12 +994,18 @@ impl Vm {
                     has_yielding_call: trace.has_yielding_call,
                     interrupt_settings,
                     compile_profile: cached.compile_profile,
+                    drop_contract_events_enabled,
                 },
             );
             return Ok(());
         }
 
-        let compiled = native::compile_native_trace(&trace, interrupt_settings, compile_profile)?;
+        let compiled = native::compile_native_trace(
+            &trace,
+            interrupt_settings,
+            compile_profile,
+            drop_contract_events_enabled,
+        )?;
         let entry = unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(compiled.entry) };
         let code = Arc::<[u8]>::from(compiled.code.into_boxed_slice());
         let keepalive = Arc::new(Mutex::new(compiled.keepalive));
@@ -1015,6 +1033,7 @@ impl Vm {
                 has_yielding_call: trace.has_yielding_call,
                 interrupt_settings,
                 compile_profile,
+                drop_contract_events_enabled,
             },
         );
         Ok(())
@@ -1031,6 +1050,7 @@ impl Vm {
         trace: &JitTrace,
         compiled: native::CompiledTrace,
         interrupt_settings: Option<native::NativeInterruptSettings>,
+        drop_contract_events_enabled: bool,
     ) -> NativeTrace {
         let entry = unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(compiled.entry) };
         let code = Arc::<[u8]>::from(compiled.code.into_boxed_slice());
@@ -1044,6 +1064,7 @@ impl Vm {
             has_yielding_call: trace.has_yielding_call,
             interrupt_settings,
             compile_profile: native::NativeCompileProfile::Aot,
+            drop_contract_events_enabled,
         }
     }
 
