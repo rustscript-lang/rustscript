@@ -290,6 +290,7 @@ pub(super) fn emit_inline_or_helper_step(
     step_ip: usize,
     step: &TraceStep,
     loop_target_block: Option<Block>,
+    drop_contract_events_enabled: bool,
 ) -> VmResult<bool> {
     match step {
         TraceStep::Nop => Ok(true),
@@ -336,6 +337,7 @@ pub(super) fn emit_inline_or_helper_step(
                 *index,
                 root_ip,
                 step_ip,
+                drop_contract_events_enabled,
             )?;
             Ok(true)
         }
@@ -1333,6 +1335,7 @@ fn emit_inline_stloc(
     index: u8,
     root_ip: usize,
     step_ip: usize,
+    drop_contract_events_enabled: bool,
 ) -> VmResult<()> {
     let slow = b.create_block();
     let fast = b.create_block();
@@ -1374,29 +1377,33 @@ fn emit_inline_stloc(
     b.ins().brif(dst_scalar, scalar_ok, &[], slow, &[]);
 
     b.switch_to_block(scalar_ok);
-    let count_drop_block = b.create_block();
     let copy_block = b.create_block();
     let dst_is_null = b
         .ins()
         .icmp_imm(IntCC::Equal, dst_tag, i64::from(layout.value.null_tag));
-    b.ins()
-        .brif(dst_is_null, copy_block, &[], count_drop_block, &[]);
+    if drop_contract_events_enabled {
+        let count_drop_block = b.create_block();
+        b.ins()
+            .brif(dst_is_null, copy_block, &[], count_drop_block, &[]);
 
-    b.switch_to_block(count_drop_block);
-    let drop_count = b.ins().load(
-        types::I64,
-        MemFlags::new(),
-        vm_ptr,
-        offsets.drop_contract_events,
-    );
-    let next_drop_count = b.ins().iadd_imm(drop_count, 1);
-    b.ins().store(
-        MemFlags::new(),
-        next_drop_count,
-        vm_ptr,
-        offsets.drop_contract_events,
-    );
-    b.ins().jump(copy_block, &[]);
+        b.switch_to_block(count_drop_block);
+        let drop_count = b.ins().load(
+            types::I64,
+            MemFlags::new(),
+            vm_ptr,
+            offsets.drop_contract_events,
+        );
+        let next_drop_count = b.ins().iadd_imm(drop_count, 1);
+        b.ins().store(
+            MemFlags::new(),
+            next_drop_count,
+            vm_ptr,
+            offsets.drop_contract_events,
+        );
+        b.ins().jump(copy_block, &[]);
+    } else {
+        b.ins().jump(copy_block, &[]);
+    }
 
     b.switch_to_block(copy_block);
     copy_value_bytes(b, src_addr, dst_addr, layout.value.size);

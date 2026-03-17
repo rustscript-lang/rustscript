@@ -169,6 +169,7 @@ pub(crate) fn compile_trace(
     trace: &JitTrace,
     interrupt_settings: Option<NativeInterruptSettings>,
     profile: NativeCompileProfile,
+    drop_contract_events_enabled: bool,
 ) -> VmResult<CompiledTrace> {
     if interrupt_settings.is_some_and(|settings| settings.check_interval == 0) {
         return Err(VmError::InvalidFuelCheckInterval(0));
@@ -286,6 +287,7 @@ pub(crate) fn compile_trace(
                 step_ip,
                 step,
                 loop_target_block,
+                drop_contract_events_enabled,
             )? {
                 step_index += 1;
                 continue;

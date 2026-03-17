@@ -76,6 +76,11 @@ impl Vm {
             all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
         ))]
         {
+            if self.drop_contract_events_enabled() {
+                return Err(VmError::JitNative(
+                    "native AOT bundles do not support drop-contract event tracking".to_string(),
+                ));
+            }
             if !self.jit_config().enabled {
                 return Err(VmError::JitNative(
                     "cannot emit native AOT bundle when JIT is disabled".to_string(),
@@ -214,6 +219,7 @@ impl Vm {
                     &trace,
                     *compiled,
                     aot_native_interrupt_settings(bundle.interrupt_mode, fuel_check_interval),
+                    false,
                 );
                 vm.native_traces.insert(trace_id, native_trace);
             }
@@ -288,7 +294,7 @@ impl Vm {
                 let compiled = native::load_compiled_trace(&encoded.code)?;
                 let trace_id = trace.id;
                 let native_trace =
-                    Vm::build_loaded_native_aot_trace(&trace, *compiled, interrupt_settings);
+                    Vm::build_loaded_native_aot_trace(&trace, *compiled, interrupt_settings, false);
                 self.native_traces.insert(trace_id, native_trace);
             }
 

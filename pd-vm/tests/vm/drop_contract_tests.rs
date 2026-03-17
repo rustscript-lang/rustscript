@@ -27,7 +27,7 @@ use std::sync::{
 /// Compile RustScript source, run to halt, return final drop-contract count.
 fn compile_run_drop_count(source: &str) -> u64 {
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = new_drop_contract_vm(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     vm.drop_contract_event_count()
@@ -36,9 +36,15 @@ fn compile_run_drop_count(source: &str) -> u64 {
 /// Compile RustScript source, run to halt, return the Vm for further inspection.
 fn compile_run_vm(source: &str) -> Vm {
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = new_drop_contract_vm(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
+    vm
+}
+
+fn new_drop_contract_vm(program: Program) -> Vm {
+    let mut vm = Vm::new(program);
+    vm.set_drop_contract_events_enabled(true);
     vm
 }
 
@@ -197,7 +203,7 @@ fn drop_events_fire_across_host_op_boundary() {
 
     let compiled = compile_source(source).expect("compile should succeed");
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = new_drop_contract_vm(compiled.program);
     vm.register_function(Box::new(PendingOnce {
         call_count: Arc::clone(&calls),
         op_id: 800,
@@ -239,13 +245,13 @@ fn cooperative_yield_does_not_duplicate_drops() {
     "#;
 
     let baseline_compiled = compile_source(source).expect("compile baseline");
-    let mut baseline_vm = Vm::new(baseline_compiled.program);
+    let mut baseline_vm = new_drop_contract_vm(baseline_compiled.program);
     let baseline_status = baseline_vm.run().expect("baseline run should halt");
     assert_eq!(baseline_status, VmStatus::Halted);
     let baseline_drops = baseline_vm.drop_contract_event_count();
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = new_drop_contract_vm(compiled.program);
     vm.set_fuel(10);
 
     let mut total_yields = 0u64;
@@ -367,7 +373,7 @@ fn native_jit_drop_parity_loop() {
 
     // Interpreter-only run
     let compiled_interp = compile_source(source).expect("compile interp");
-    let mut vm_interp = Vm::new(compiled_interp.program);
+    let mut vm_interp = new_drop_contract_vm(compiled_interp.program);
     vm_interp.set_jit_config(JitConfig {
         enabled: false,
         hot_loop_threshold: 1_000,
@@ -379,7 +385,7 @@ fn native_jit_drop_parity_loop() {
 
     // JIT run (native if supported, else bytecode JIT)
     let compiled_jit = compile_source(source).expect("compile jit");
-    let mut vm_jit = Vm::new(compiled_jit.program);
+    let mut vm_jit = new_drop_contract_vm(compiled_jit.program);
     vm_jit.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1, // force hot-loop tracing immediately
@@ -421,7 +427,7 @@ fn native_jit_drop_parity_branch() {
     "#;
 
     let compiled_interp = compile_source(source).expect("compile interp");
-    let mut vm_interp = Vm::new(compiled_interp.program);
+    let mut vm_interp = new_drop_contract_vm(compiled_interp.program);
     vm_interp.set_jit_config(JitConfig {
         enabled: false,
         hot_loop_threshold: 1_000,
@@ -432,7 +438,7 @@ fn native_jit_drop_parity_branch() {
     let drops_interp = vm_interp.drop_contract_event_count();
 
     let compiled_jit = compile_source(source).expect("compile jit");
-    let mut vm_jit = Vm::new(compiled_jit.program);
+    let mut vm_jit = new_drop_contract_vm(compiled_jit.program);
     vm_jit.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -472,7 +478,7 @@ fn dead_local_slot_is_null_after_drop() {
         .as_ref()
         .expect("debug info should exist");
     let a_index = debug.local_index("a").expect("a binding should exist");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = new_drop_contract_vm(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
@@ -508,7 +514,7 @@ fn branch_dead_local_slot_is_null_after_convergence() {
         .expect("debug info should exist");
     let tmp_index = debug.local_index("tmp").expect("tmp binding should exist");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = new_drop_contract_vm(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(10)]);
@@ -539,7 +545,7 @@ fn loop_body_dead_local_slot_is_null_after_exit() {
         .expect("debug info should exist");
     let tmp_index = debug.local_index("tmp").expect("tmp binding should exist");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = new_drop_contract_vm(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(3)]);
@@ -589,7 +595,7 @@ fn nested_container_slot_is_null_after_drop() {
         .local_index("deep")
         .expect("deep binding should exist");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = new_drop_contract_vm(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
@@ -669,7 +675,7 @@ fn reset_for_reuse_clears_all_locals_to_null() {
         null;
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = new_drop_contract_vm(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
 
@@ -714,7 +720,7 @@ fn drop_events_across_host_op_hide_dead_local_before_wait() {
 
     let compiled = compile_source(source).expect("compile should succeed");
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = new_drop_contract_vm(compiled.program);
     vm.register_function(Box::new(PendingOnce {
         call_count: Arc::clone(&calls),
         op_id: 900,
@@ -767,7 +773,7 @@ fn cooperative_yield_drop_count_is_bounded_tightly() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = new_drop_contract_vm(compiled.program);
     vm.set_fuel(10);
 
     let mut yields = 0u64;
@@ -822,7 +828,7 @@ fn mutable_local_overwrite_drops_previous_and_nullifies() {
         .expect("debug info should exist");
     let val_index = debug.local_index("val").expect("val binding should exist");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = new_drop_contract_vm(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     let drops = vm.drop_contract_event_count();
@@ -866,7 +872,7 @@ fn all_locals_null_after_halt_for_simple_program() {
     let b_index = debug.local_index("b").expect("b should exist");
     let c_index = debug.local_index("c").expect("c should exist");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = new_drop_contract_vm(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);
