@@ -167,7 +167,7 @@ fn evict_oldest(limit, size, next_id, lookup, nodes, head, tail) {
     let out = if size == 0 || head == 0 => {
         make_cache(limit, size, next_id, head, tail, lookup, nodes)
     } else => {
-        let head_node: LruNode =&((&nodes)[head]);
+        let head_node: LruNode = &((&nodes)[head]);
         let next_head = head_node.next;
         let mut next_lookup = lookup;
         let mut next_nodes = nodes;
@@ -201,7 +201,7 @@ fn evict_oldest(limit, size, next_id, lookup, nodes, head, tail) {
 
 fn entry_report(cache, id) {
     let out: FeedCacheEntry = if id != 0 => {
-        let node: LruNode =&((&cache).nodes[id]);
+        let node: LruNode = &((&cache).nodes[id]);
         {found: true, key: node.key.copy(), value: node.value.copy()}
     } else => {
         {found: false, key: "", value: empty_feed_item()}
@@ -239,7 +239,7 @@ pub fn peek(cache, key) {
     let lookup = state.lookup;
     let out: FeedCachePeek = if lookup.has(key) => {
         let id: int =(&lookup)[key];
-        let node: LruNode =&((&state.nodes)[id]);
+        let node: LruNode = &((&state.nodes)[id]);
         {found: true, value: node.value.copy()}
     } else => {
         {found: false, value: empty_feed_item()}
@@ -259,7 +259,7 @@ pub fn get(cache, key) {
 
     let out: FeedCacheHit = if lookup.has(key) => {
         let id: int =(&lookup)[key];
-        let node: LruNode =&((&nodes)[id]);
+        let node: LruNode = &((&nodes)[id]);
         let next_cache = if id == tail => {
             make_cache(limit, size, next_id, head, tail, lookup, nodes)
         } else => {
@@ -336,7 +336,14 @@ pub fn put(cache, key, value) {
         } else => {
             let id = next_id;
             let mut next_lookup = lookup;
-            let appended: LinkState = append_new_node(nodes, head, tail, id, key.copy(), value);
+            let appended: LinkState = append_new_node(
+                nodes,
+                head,
+                tail,
+                id,
+                key.copy(),
+                value
+            );
             let appended_head = appended.head;
             let appended_tail = appended.tail;
             let appended_nodes = appended.nodes;
@@ -451,7 +458,7 @@ pub fn keys(cache) {
     let mut current = state.head;
     let mut out: [string] = [];
     while current != 0 {
-        let node: LruNode =&((&nodes)[current]);
+        let node: LruNode = &((&nodes)[current]);
         let next_id = node.next;
         out[out.length] = node.key.copy();
         current = next_id;
@@ -465,7 +472,7 @@ pub fn values(cache) {
     let mut current = state.head;
     let mut out: [FeedCacheItem] = [];
     while current != 0 {
-        let node: LruNode =&((&nodes)[current]);
+        let node: LruNode = &((&nodes)[current]);
         let next_id = node.next;
         out[out.length] = node.value.copy();
         current = next_id;
@@ -479,7 +486,7 @@ pub fn entries(cache) {
     let mut current = state.head;
     let mut out: [FeedCacheRow] = [];
     while current != 0 {
-        let node: LruNode =&((&nodes)[current]);
+        let node: LruNode = &((&nodes)[current]);
         let next_id = node.next;
         out[out.length] = {key: node.key.copy(), value: node.value.copy()};
         current = next_id;

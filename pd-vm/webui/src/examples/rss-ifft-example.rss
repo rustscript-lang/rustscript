@@ -19,8 +19,8 @@ fn clean(value) {
 }
 
 // A 4-point inverse DFT using the same spectrum as the native IFFT example.
-let spectrum_re = [10.0,-2.0,-2.0,-2.0];
-let spectrum_im = [0.0, 2.0, 0.0,-2.0];
+let spectrum_re = [10.0, -2.0, -2.0, -2.0];
+let spectrum_im = [0.0, 2.0, 0.0, -2.0];
 let re0 = spectrum_re[0];
 let re1 = spectrum_re[1];
 let re2 = spectrum_re[2];

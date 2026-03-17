@@ -52,11 +52,11 @@ let route_parts: [string] = string::split(first_route, "/");
 assert(string::equals(route_parts[0], "feed"));
 assert(first_latency == "18");
 assert(string::contains(&warn_message, "cache"));
-assert(re::match("(?i).*payload.*",&error_message));
+assert(re::match("(?i).*payload.*", &error_message));
 
 let rewritten_warn: string = string::replace(warn_message, "cache", "edge-cache");
 let rewritten_route = re::replace("^feed/", warn_route, "rss::");
-let error_words = re::split("\\s+",&error_message);
+let error_words = re::split("\\s+", &error_message);
 let error_word_count = error_words.length;
 let id_groups = re::captures("id=([0-9]+)", error_message);
 let error_id: string = if id_groups.length == 2 => {
