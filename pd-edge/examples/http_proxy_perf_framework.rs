@@ -38,7 +38,6 @@ use tokio::{
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 #[cfg(all(feature = "http2", feature = "tls"))]
 use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
-#[cfg(feature = "http3")]
 use url::Url;
 use vm::{compile_source, encode_program, validate_program};
 

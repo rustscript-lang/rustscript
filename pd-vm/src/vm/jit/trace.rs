@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::builtins::BuiltinFunction;
 use crate::debug_info::DebugInfo;
@@ -248,6 +249,7 @@ pub struct TraceJitEngine {
     blocked_roots: HashSet<usize>,
     loop_headers: Option<HashSet<usize>>,
     traces: Vec<JitTrace>,
+    trace_step_indices_by_ip: Vec<Arc<HashMap<usize, usize>>>,
     attempts: Vec<JitAttempt>,
 }
 
@@ -266,6 +268,7 @@ impl TraceJitEngine {
             blocked_roots: HashSet::new(),
             loop_headers: None,
             traces: Vec::new(),
+            trace_step_indices_by_ip: Vec::new(),
             attempts: Vec::new(),
         }
     }
@@ -281,6 +284,7 @@ impl TraceJitEngine {
         self.blocked_roots.clear();
         self.loop_headers = None;
         self.traces.clear();
+        self.trace_step_indices_by_ip.clear();
         self.attempts.clear();
     }
 
@@ -290,6 +294,7 @@ impl TraceJitEngine {
         self.blocked_roots.clear();
         self.loop_headers = Some(scan_loop_headers(program));
         self.traces.clear();
+        self.trace_step_indices_by_ip.clear();
         self.attempts.clear();
 
         if !self.config.enabled || !native_jit_supported() {
@@ -429,6 +434,10 @@ impl TraceJitEngine {
         self.traces.get(trace_id).cloned()
     }
 
+    pub fn trace_step_index_lookup(&self, trace_id: usize) -> Option<Arc<HashMap<usize, usize>>> {
+        self.trace_step_indices_by_ip.get(trace_id).cloned()
+    }
+
     pub fn observe_exit_ip(&mut self, ip: usize, program: &Program) -> Option<usize> {
         if !self.config.enabled || !native_jit_supported() {
             return None;
@@ -544,6 +553,10 @@ impl TraceJitEngine {
                 line: trace.start_line,
                 result: Ok(trace.id),
             })
+            .collect();
+        self.trace_step_indices_by_ip = traces
+            .iter()
+            .map(|trace| build_trace_step_index_lookup(&trace.step_ips))
             .collect();
         self.traces = traces;
         Ok(())
@@ -1069,6 +1082,7 @@ impl TraceJitEngine {
                 false
             }
         });
+        let step_index_lookup = build_trace_step_index_lookup(&step_ips);
         self.traces.push(JitTrace {
             id,
             root_ip,
@@ -1080,6 +1094,7 @@ impl TraceJitEngine {
             terminal,
             executions: 0,
         });
+        self.trace_step_indices_by_ip.push(step_index_lookup);
         Ok(id)
     }
 
@@ -1091,6 +1106,17 @@ impl TraceJitEngine {
             .as_ref()
             .is_some_and(|headers| headers.contains(&ip))
     }
+}
+
+fn build_trace_step_index_lookup(step_ips: &[usize]) -> Arc<HashMap<usize, usize>> {
+    Arc::new(
+        step_ips
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(step_index, step_ip)| (step_ip, step_index))
+            .collect(),
+    )
 }
 
 fn read_u8(code: &[u8], ip: &mut usize) -> Option<u8> {

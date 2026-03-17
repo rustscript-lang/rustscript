@@ -1867,6 +1867,7 @@ pub(crate) struct DownstreamState {
     pub(crate) post_response_plan: Option<DownstreamPostResponsePlan>,
     pub(crate) native_default_upstream_http_forward: bool,
     native_default_upstream_forward_response: Option<NativeDefaultUpstreamForwardResponse>,
+    native_default_upstream_forward_task: Option<NativeDefaultUpstreamForwardTask>,
     inline_http_response_sender: Option<InlineDownstreamHttpResponseSender>,
 }
 
@@ -1880,6 +1881,7 @@ impl DownstreamState {
             post_response_plan: None,
             native_default_upstream_http_forward: false,
             native_default_upstream_forward_response: None,
+            native_default_upstream_forward_task: None,
             inline_http_response_sender: None,
         }
     }
@@ -1918,6 +1920,7 @@ impl DownstreamState {
             post_response_plan: None,
             native_default_upstream_http_forward: false,
             native_default_upstream_forward_response: None,
+            native_default_upstream_forward_task: None,
             inline_http_response_sender: None,
         }
     }
@@ -2483,16 +2486,19 @@ impl ProxyVmContext {
     }
 
     pub(crate) fn clear_native_default_upstream_http_forward(&self) {
-        self.lock_downstream().native_default_upstream_http_forward = false;
+        let mut downstream = self.lock_downstream();
+        downstream.native_default_upstream_http_forward = false;
+        downstream.native_default_upstream_forward_response = None;
+        if let Some(task) = downstream.native_default_upstream_forward_task.take() {
+            task.abort();
+        }
     }
 
-    fn store_native_default_upstream_forward_response(
-        &self,
-        response: NativeDefaultUpstreamForwardResponse,
-    ) {
+    fn store_native_default_upstream_forward_task(&self, task: NativeDefaultUpstreamForwardTask) {
         let mut downstream = self.lock_downstream();
         downstream.native_default_upstream_http_forward = true;
-        downstream.native_default_upstream_forward_response = Some(response);
+        downstream.native_default_upstream_forward_response = None;
+        downstream.native_default_upstream_forward_task = Some(task);
     }
 
     fn take_native_default_upstream_forward_response(
@@ -2506,6 +2512,18 @@ impl ProxyVmContext {
     fn native_default_upstream_forward_response_ready(&self) -> bool {
         self.lock_downstream()
             .native_default_upstream_forward_response
+            .is_some()
+    }
+
+    fn take_native_default_upstream_forward_task(&self) -> Option<NativeDefaultUpstreamForwardTask> {
+        self.lock_downstream()
+            .native_default_upstream_forward_task
+            .take()
+    }
+
+    fn native_default_upstream_forward_task_pending(&self) -> bool {
+        self.lock_downstream()
+            .native_default_upstream_forward_task
             .is_some()
     }
 
@@ -3302,6 +3320,10 @@ enum NativeDefaultUpstreamForwardBody {
         plain_http1_sender_lease: Option<PlainHttp1SenderLease>,
     },
 }
+
+type NativeDefaultUpstreamForwardTask = tokio::task::JoinHandle<
+    Result<NativeDefaultUpstreamForwardResponse, UpstreamResponseStartError>,
+>;
 
 #[derive(Debug)]
 struct NativeDefaultUpstreamForwardResponse {
@@ -4285,10 +4307,8 @@ async fn start_default_upstream_plain_http1_fast_path(
 
 fn materialize_native_default_upstream_forward_response(
     context: &SharedProxyVmContext,
+    response: NativeDefaultUpstreamForwardResponse,
 ) -> Result<Option<HttpUpstreamResponseSnapshot>, UpstreamResponseStartError> {
-    let Some(response) = context.take_native_default_upstream_forward_response() else {
-        return Ok(None);
-    };
     let NativeDefaultUpstreamForwardResponse {
         status,
         headers,
@@ -4340,6 +4360,53 @@ fn materialize_native_default_upstream_forward_response(
     exchange.transport.set_peer_addr(peer_addr);
     context.clear_native_default_upstream_http_forward();
     Ok(Some(snapshot))
+}
+
+async fn take_or_await_native_default_upstream_forward_response(
+    context: &SharedProxyVmContext,
+) -> Result<Option<NativeDefaultUpstreamForwardResponse>, UpstreamResponseStartError> {
+    if let Some(response) = context.take_native_default_upstream_forward_response() {
+        return Ok(Some(response));
+    }
+
+    let Some(task) = context.take_native_default_upstream_forward_task() else {
+        return Ok(None);
+    };
+    match task.await {
+        Ok(Ok(response)) => Ok(Some(response)),
+        Ok(Err(err)) => Err(err),
+        Err(err) => Err(UpstreamResponseStartError::Protocol(format!(
+            "native default upstream forward task failed: {err}"
+        ))),
+    }
+}
+
+async fn try_materialize_ready_or_pending_native_default_upstream_forward_response(
+    context: &SharedProxyVmContext,
+) -> Result<Option<HttpUpstreamResponseSnapshot>, UpstreamResponseStartError> {
+    let Some(response) = take_or_await_native_default_upstream_forward_response(context).await?
+    else {
+        return Ok(None);
+    };
+    materialize_native_default_upstream_forward_response(context, response)
+}
+
+async fn try_resolve_ready_or_pending_native_default_upstream_forward_response(
+    context: &SharedProxyVmContext,
+    response_headers: HeaderMap,
+    response_status: Option<u16>,
+) -> Result<Option<ResolvedHttpGraphResponse>, UpstreamResponseStartError> {
+    let Some(response) = take_or_await_native_default_upstream_forward_response(context).await?
+    else {
+        return Ok(None);
+    };
+    let upstream_latency_ms = response.upstream_latency_ms;
+    Ok(Some(ResolvedHttpGraphResponse {
+        response: response_from_started_upstream_response(response, response_headers, response_status)
+            .await,
+        upstream_latency_ms,
+        post_response_plan: None,
+    }))
 }
 
 async fn forward_native_default_upstream_http_via_sender_pool(
@@ -4487,10 +4554,23 @@ async fn forward_native_default_upstream_http_via_sender_pool(
     })
 }
 
+fn schedule_native_default_upstream_http_forward_response(
+    context: &SharedProxyVmContext,
+    request: DefaultUpstreamRequestSnapshot,
+) {
+    let task_context = context.clone();
+    let task = tokio::spawn(async move {
+        forward_native_default_upstream_http_via_sender_pool(&task_context, &request).await
+    });
+    context.store_native_default_upstream_forward_task(task);
+}
+
 pub(crate) async fn start_native_default_upstream_http_forward_response(
     context: &SharedProxyVmContext,
 ) -> Result<bool, VmError> {
-    if context.native_default_upstream_forward_response_ready() {
+    if context.native_default_upstream_forward_response_ready()
+        || context.native_default_upstream_forward_task_pending()
+    {
         return Ok(true);
     }
 
@@ -4521,13 +4601,8 @@ pub(crate) async fn start_native_default_upstream_http_forward_response(
         return Ok(false);
     }
 
-    match forward_native_default_upstream_http_via_sender_pool(context, &request).await {
-        Ok(response) => {
-            context.store_native_default_upstream_forward_response(response);
-            Ok(true)
-        }
-        Err(_) => Ok(false),
-    }
+    schedule_native_default_upstream_http_forward_response(context, request);
+    Ok(true)
 }
 
 async fn try_resolve_native_default_upstream_http_forward_response(
@@ -5096,10 +5171,13 @@ async fn start_outbound_exchange_response(
         }
     }
 
-    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE
-        && let Some(snapshot) = materialize_native_default_upstream_forward_response(context)?
-    {
-        return Ok(snapshot);
+    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
+        match try_materialize_ready_or_pending_native_default_upstream_forward_response(context)
+            .await
+        {
+            Ok(Some(snapshot)) => return Ok(snapshot),
+            Ok(None) | Err(_) => {}
+        }
     }
 
     if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE
@@ -5690,7 +5768,6 @@ pub(crate) async fn resolve_http_graph_response(
         default_upstream_websocket_mode,
         upstream_response,
         native_default_upstream_http_forward,
-        native_default_upstream_forward_response_ready,
     ) = {
         let downstream = context.lock_downstream();
         let exchanges = context.lock_exchanges();
@@ -5710,9 +5787,6 @@ pub(crate) async fn resolve_http_graph_response(
                 HttpUpstreamResponseNode::NotStarted => None,
             },
             downstream.native_default_upstream_http_forward,
-            downstream
-                .native_default_upstream_forward_response
-                .is_some(),
         )
     };
 
@@ -5763,24 +5837,20 @@ pub(crate) async fn resolve_http_graph_response(
         };
     }
 
-    if native_default_upstream_forward_response_ready {
-        if let Some(response) = context.take_native_default_upstream_forward_response() {
-            let upstream_latency_ms = response.upstream_latency_ms;
-            context.clear_native_default_upstream_http_forward();
-            return ResolvedHttpGraphResponse {
-                response: response_from_started_upstream_response(
-                    response,
-                    response_headers,
-                    response_status,
-                )
-                .await,
-                upstream_latency_ms,
-                post_response_plan: None,
-            };
-        }
-    }
-
     if native_default_upstream_http_forward && upstream_response.is_none() {
+        match try_resolve_ready_or_pending_native_default_upstream_forward_response(
+            context,
+            response_headers.clone(),
+            response_status,
+        )
+        .await
+        {
+            Ok(Some(resolved)) => {
+                context.clear_native_default_upstream_http_forward();
+                return resolved;
+            }
+            Ok(None) | Err(_) => {}
+        }
         match try_resolve_native_default_upstream_http_forward_response(
             context,
             response_headers.clone(),
@@ -6029,10 +6099,13 @@ mod tests {
         resolve_http_graph_response, response_from_upstream_snapshot,
     };
     use crate::abi_impl::RateLimiterStore;
+    use crate::abi_impl::http2::{Http2DownstreamStreamAttachment, Http2StreamRef};
+    #[cfg(feature = "http2")]
     use crate::abi_impl::http2::{
-        Http2DownstreamStreamAttachment, Http2SendRequest, Http2StreamRef, Http2UpstreamMode,
-        new_shared_http_upstream_sessions, send_request, total_active_streams,
+        Http2SendRequest, Http2UpstreamMode, new_shared_http_upstream_sessions, send_request,
+        total_active_streams,
     };
+    #[cfg(feature = "http2")]
     use crate::abi_impl::transport::TlsFlowState;
 
     fn test_context() -> SharedProxyVmContext {
