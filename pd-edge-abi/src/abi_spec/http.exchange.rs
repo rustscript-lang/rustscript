@@ -49,7 +49,12 @@ fn http_exchange_get_version(exchange: i64) -> String {
 }
 
 #[pd_host_function(name = "http::exchange::set_target")]
-fn http_exchange_set_target(exchange: i64, target: &str) {
+fn http_exchange_set_target(exchange: i64, host: &str, port: i64) {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "http::exchange::set_scheme")]
+fn http_exchange_set_scheme(exchange: i64, scheme: &str) {
     unreachable!("abi declaration only")
 }
 

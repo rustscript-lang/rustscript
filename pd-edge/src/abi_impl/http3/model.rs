@@ -95,6 +95,13 @@ pub(crate) fn select_upstream_mode(
         return Http3UpstreamMode::Disabled;
     }
 
+    match version_preference {
+        HttpVersionPreference::Http1 | HttpVersionPreference::Http2 => {
+            return Http3UpstreamMode::Disabled;
+        }
+        HttpVersionPreference::Http3 | HttpVersionPreference::Auto => {}
+    }
+
     let scheme = Url::parse(target)
         .ok()
         .map(|url| url.scheme().to_ascii_lowercase())
@@ -111,7 +118,9 @@ pub(crate) fn select_upstream_mode(
         HttpVersionPreference::Auto if https_target && explicitly_offers_http3 => {
             Http3UpstreamMode::Preferred
         }
-        _ => Http3UpstreamMode::Disabled,
+        HttpVersionPreference::Http1
+        | HttpVersionPreference::Http2
+        | HttpVersionPreference::Auto => Http3UpstreamMode::Disabled,
     }
 }
 

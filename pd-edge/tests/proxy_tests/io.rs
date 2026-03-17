@@ -80,13 +80,16 @@ async fn io_protocol_handles_accept_direct_integer_arguments() {
         use io;
 
         let upstream = http::exchange::default_upstream();
-        http::exchange::set_target(upstream, "http://{upstream_addr}/literal");
+        http::exchange::set_target(upstream, "{upstream_host}", {upstream_port});
+        http::exchange::set_path(upstream, "/literal");
         http::exchange::set_method(upstream, "POST");
         io::write(1, "direct-int-body");
         http::response::set_status(http::exchange::get_status(upstream));
         http::response::set_header("x-first-line", io::read_line(1));
         http::response::set_body(io::read_all(1));
-    "#
+    "#,
+        upstream_host = upstream_addr.ip(),
+        upstream_port = upstream_addr.port()
     );
     let compiled = compile_source(&source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
@@ -127,7 +130,9 @@ async fn io_protocol_handles_accept_tls_session_handles_for_https_exchange() {
         use tls;
 
         let upstream = http::exchange::default_upstream();
-        http::exchange::set_target(upstream, "https://localhost:{}/echo");
+        http::exchange::set_scheme(upstream, "https");
+        http::exchange::set_target(upstream, "localhost", {});
+        http::exchange::set_path(upstream, "/echo");
         http::exchange::set_method(upstream, "POST");
 
         let session = tls::session::from_socket(upstream);
@@ -184,12 +189,15 @@ async fn direct_vm_io_protocol_handles_accept_direct_integer_arguments() {
         use io;
 
         let upstream = http::exchange::default_upstream();
-        http::exchange::set_target(upstream, "http://{upstream_addr}/literal");
+        http::exchange::set_target(upstream, "{upstream_host}", {upstream_port});
+        http::exchange::set_path(upstream, "/literal");
         http::exchange::set_method(upstream, "POST");
         io::write(1, "direct-int-body");
         http::response::set_header("x-first-line", io::read_line(1));
         http::response::set_body(io::read_all(1));
-    "#
+    "#,
+        upstream_host = upstream_addr.ip(),
+        upstream_port = upstream_addr.port()
     );
     let compiled = compile_source(&source).expect("source should compile");
     let mut context = Arc::new(ProxyVmContext::from_request_headers(

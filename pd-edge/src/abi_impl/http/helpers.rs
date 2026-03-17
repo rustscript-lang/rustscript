@@ -1,23 +1,53 @@
 #![cfg_attr(not(feature = "http"), allow(dead_code))]
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, OnceLock, Weak},
+};
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
-use url::Url;
+use parking_lot::Mutex;
+use vm::bytecode::VmMap;
 use vm::{Value, VmError};
 
-pub(super) fn parse_header_name(name: String) -> Result<HeaderName, VmError> {
+const HEADER_BATCH_CACHE_CAPACITY: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum HeaderBatchCacheKey {
+    Array(usize),
+    Map(usize),
+}
+
+#[derive(Debug)]
+enum HeaderBatchCacheSource {
+    Array(Weak<Vec<Value>>),
+    Map(Weak<VmMap>),
+}
+
+#[derive(Debug)]
+struct CachedHeaderBatch {
+    source: HeaderBatchCacheSource,
+    headers: HeaderMap,
+}
+
+static HEADER_BATCH_CACHE: OnceLock<Mutex<HashMap<HeaderBatchCacheKey, CachedHeaderBatch>>> =
+    OnceLock::new();
+
+pub(super) fn parse_header_name(name: impl AsRef<str>) -> Result<HeaderName, VmError> {
+    let name = name.as_ref();
     HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))
 }
 
 pub(super) fn parse_header(
-    name: String,
-    value: String,
+    name: impl AsRef<str>,
+    value: impl AsRef<str>,
 ) -> Result<(HeaderName, HeaderValue), VmError> {
+    let name = name.as_ref();
+    let value = value.as_ref();
     let header_name = HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
-    let header_value = HeaderValue::from_str(&value)
+    let header_value = HeaderValue::from_str(value)
         .map_err(|_| VmError::HostError(format!("invalid header value '{value}'")))?;
     Ok((header_name, header_value))
 }
@@ -28,6 +58,78 @@ pub(super) fn request_path_with_query(path: &str, query: &str) -> String {
     } else {
         format!("{path}?{query}")
     }
+}
+
+fn header_batch_cache() -> &'static Mutex<HashMap<HeaderBatchCacheKey, CachedHeaderBatch>> {
+    HEADER_BATCH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn header_batch_cache_key(headers: &Value) -> Option<HeaderBatchCacheKey> {
+    match headers {
+        Value::Array(values) => Some(HeaderBatchCacheKey::Array(Arc::as_ptr(values) as usize)),
+        Value::Map(entries) => Some(HeaderBatchCacheKey::Map(Arc::as_ptr(entries) as usize)),
+        _ => None,
+    }
+}
+
+fn header_batch_cache_source(headers: &Value) -> Option<HeaderBatchCacheSource> {
+    match headers {
+        Value::Array(values) => Some(HeaderBatchCacheSource::Array(Arc::downgrade(values))),
+        Value::Map(entries) => Some(HeaderBatchCacheSource::Map(Arc::downgrade(entries))),
+        _ => None,
+    }
+}
+
+fn cached_header_batch_matches(source: &HeaderBatchCacheSource, headers: &Value) -> bool {
+    match (source, headers) {
+        (HeaderBatchCacheSource::Array(cached), Value::Array(values)) => cached
+            .upgrade()
+            .is_some_and(|current| Arc::ptr_eq(&current, values)),
+        (HeaderBatchCacheSource::Map(cached), Value::Map(entries)) => cached
+            .upgrade()
+            .is_some_and(|current| Arc::ptr_eq(&current, entries)),
+        _ => false,
+    }
+}
+
+pub(super) fn lookup_cached_header_batch(headers: &Value) -> Option<HeaderMap> {
+    let key = header_batch_cache_key(headers)?;
+    let mut guard = header_batch_cache().lock();
+    let cached = guard.get(&key)?;
+    if cached_header_batch_matches(&cached.source, headers) {
+        return Some(cached.headers.clone());
+    }
+    guard.remove(&key);
+    None
+}
+
+pub(super) fn store_cached_header_batch(headers: &Value, parsed: &HeaderMap) {
+    let (Some(key), Some(source)) = (
+        header_batch_cache_key(headers),
+        header_batch_cache_source(headers),
+    ) else {
+        return;
+    };
+
+    let mut guard = header_batch_cache().lock();
+    if guard.len() >= HEADER_BATCH_CACHE_CAPACITY {
+        guard.retain(|_, cached| match &cached.source {
+            HeaderBatchCacheSource::Array(values) => values.strong_count() > 0,
+            HeaderBatchCacheSource::Map(entries) => entries.strong_count() > 0,
+        });
+    }
+    if guard.len() >= HEADER_BATCH_CACHE_CAPACITY
+        && let Some(key_to_remove) = guard.keys().next().copied()
+    {
+        guard.remove(&key_to_remove);
+    }
+    guard.insert(
+        key,
+        CachedHeaderBatch {
+            source,
+            headers: parsed.clone(),
+        },
+    );
 }
 
 pub(super) fn headers_to_value_map(headers: &HeaderMap) -> Value {
@@ -89,38 +191,4 @@ pub(super) fn is_valid_request_path(value: &str) -> bool {
         && !value.contains('?')
         && !value.contains('#')
         && !value.chars().any(|ch| ch.is_whitespace())
-}
-
-pub(super) fn is_valid_upstream(value: &str) -> bool {
-    if value.is_empty()
-        || value.contains('/')
-        || value.contains('?')
-        || value.contains('#')
-        || value.chars().any(|ch| ch.is_whitespace())
-    {
-        if let Ok(url) = Url::parse(value) {
-            if url.scheme() != "http" && url.scheme() != "https" {
-                return false;
-            }
-            if url.host_str().is_none() {
-                return false;
-            }
-            if !url.username().is_empty() || url.password().is_some() {
-                return false;
-            }
-            return true;
-        }
-        return false;
-    }
-
-    let Some((host, port)) = value.rsplit_once(':') else {
-        return false;
-    };
-    if host.is_empty() || port.is_empty() || host.contains(':') {
-        return false;
-    }
-    match port.parse::<u16>() {
-        Ok(port) => port != 0,
-        Err(_) => false,
-    }
 }

@@ -1,19 +1,16 @@
 use std::{
     net::SocketAddr,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
 
 use axum::{
-    Router,
     body::Body,
-    extract::{Request, State},
+    extract::Request,
     http::{Response, StatusCode},
-    middleware,
-    routing::any,
 };
 #[cfg(feature = "http3")]
 use futures_util::stream::try_unfold;
@@ -37,9 +34,7 @@ use tokio_rustls::{
 };
 #[cfg(feature = "http3")]
 use tower::Service;
-use tower::ServiceExt;
-use tracing::warn;
-use uuid::Uuid;
+use tracing::{info, warn};
 use vm::VmError;
 
 #[cfg(feature = "tls")]
@@ -63,7 +58,9 @@ use crate::{
         register_http_plane_host_module,
     },
     debug_session::{request_uses_blocking_debugger, request_will_attach_debugger},
-    logging::category_program,
+    logging::{
+        category_access, category_program, enabled as logging_enabled, method_label, status_label,
+    },
 };
 #[cfg(feature = "http3")]
 use {
@@ -73,15 +70,57 @@ use {
     rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
 };
 
-pub fn build_http_proxy_app(state: SharedState) -> Router {
-    Router::new()
-        .fallback(any(data_plane_handler))
-        .layer(middleware::from_fn(access_log_middleware))
-        .with_state(state)
+static NEXT_HTTP_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+static STAGE_METRICS_ENABLED: OnceLock<bool> = OnceLock::new();
+static STAGE_METRICS_COUNT: AtomicU64 = AtomicU64::new(0);
+static STAGE_METRICS_PRE_VM_US: AtomicU64 = AtomicU64::new(0);
+static STAGE_METRICS_VM_US: AtomicU64 = AtomicU64::new(0);
+static STAGE_METRICS_RESOLVE_US: AtomicU64 = AtomicU64::new(0);
+static STAGE_METRICS_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+
+fn next_http_request_id() -> String {
+    format!(
+        "req-{:016x}",
+        NEXT_HTTP_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn stage_metrics_enabled() -> bool {
+    *STAGE_METRICS_ENABLED.get_or_init(|| std::env::var_os("PD_EDGE_STAGE_METRICS").is_some())
+}
+
+fn record_stage_metrics(pre_vm_us: u64, vm_us: u64, resolve_us: u64, total_us: u64) {
+    if !stage_metrics_enabled() {
+        return;
+    }
+    let count = STAGE_METRICS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    STAGE_METRICS_PRE_VM_US.fetch_add(pre_vm_us, Ordering::Relaxed);
+    STAGE_METRICS_VM_US.fetch_add(vm_us, Ordering::Relaxed);
+    STAGE_METRICS_RESOLVE_US.fetch_add(resolve_us, Ordering::Relaxed);
+    STAGE_METRICS_TOTAL_US.fetch_add(total_us, Ordering::Relaxed);
+    if count % 1000 == 0 {
+        let pre_vm_avg = STAGE_METRICS_PRE_VM_US.load(Ordering::Relaxed) as f64 / count as f64;
+        let vm_avg = STAGE_METRICS_VM_US.load(Ordering::Relaxed) as f64 / count as f64;
+        let resolve_avg = STAGE_METRICS_RESOLVE_US.load(Ordering::Relaxed) as f64 / count as f64;
+        let total_avg = STAGE_METRICS_TOTAL_US.load(Ordering::Relaxed) as f64 / count as f64;
+        eprintln!(
+            "stage_metrics requests={count} avg_pre_vm_us={pre_vm_avg:.1} avg_vm_us={vm_avg:.1} avg_resolve_us={resolve_avg:.1} avg_total_us={total_avg:.1}"
+        );
+    }
+}
+
+pub fn build_http_proxy_app(state: SharedState) -> axum::Router {
+    let app = axum::Router::new()
+        .fallback(axum::routing::any(data_plane_handler))
+        .with_state(state);
+    if logging_enabled() {
+        app.layer(axum::middleware::from_fn(access_log_middleware))
+    } else {
+        app
+    }
 }
 
 async fn serve_http_connection<S>(
-    app: Router,
     state: SharedState,
     stream: S,
     peer_addr: SocketAddr,
@@ -97,34 +136,29 @@ async fn serve_http_connection<S>(
     let service = {
         let connection_tracker = tracker.clone();
         hyper::service::service_fn(move |request: hyper::Request<Incoming>| {
-            let app = app.clone();
+            let state = state.clone();
             let tracker = connection_tracker.clone();
             let connection_metadata = connection_metadata.clone();
             async move {
                 let version = request.version();
-                let path = request.uri().path().to_string();
-                let attachment = tracker.observe_request(version, &path);
+                let attachment = tracker.observe_request(version, request.uri().path());
                 let mut request = request;
-                let on_upgrade = hyper::upgrade::on(&mut request);
+                let on_upgrade =
+                    request_supports_upgrade(&request).then(|| hyper::upgrade::on(&mut request));
                 if let Some(ref attachment) = attachment {
                     request.extensions_mut().insert(attachment.clone());
                 }
                 if let Some(connection_metadata) = connection_metadata {
                     request.extensions_mut().insert(connection_metadata);
                 }
-                request.extensions_mut().insert(on_upgrade);
-                let request = request.map(Body::new);
-                let response = app.oneshot(request).await;
-                if response.is_ok() {
-                    tracker.note_response_head(attachment.as_ref());
-                    tracker.finish_request(attachment.as_ref(), None);
-                } else {
-                    tracker.finish_request(
-                        attachment.as_ref(),
-                        Some("data plane request handling failed".to_string()),
-                    );
+                if let Some(on_upgrade) = on_upgrade {
+                    request.extensions_mut().insert(on_upgrade);
                 }
-                response
+                let request = request.map(Body::new);
+                let response = dispatch_data_plane_request(state, request).await;
+                tracker.note_response_head(attachment.as_ref());
+                tracker.finish_request(attachment.as_ref(), None);
+                Ok::<_, std::convert::Infallible>(response)
             }
         })
     };
@@ -132,6 +166,57 @@ async fn serve_http_connection<S>(
     let result = AutoBuilder::new(TokioExecutor::new())
         .serve_connection_with_upgrades(io, service)
         .await;
+    tracker.finish_connection(result.err().map(|err| err.to_string()));
+}
+
+async fn serve_http1_connection<S>(
+    state: SharedState,
+    stream: S,
+    peer_addr: SocketAddr,
+    connection_metadata: Option<DownstreamConnectionMetadata>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let io = TokioIo::new(stream);
+    let tracker = DownstreamHttp2ConnectionTracker::new(
+        state.downstream_http2_sessions.clone(),
+        peer_addr.to_string(),
+    );
+    let service = {
+        let connection_tracker = tracker.clone();
+        hyper::service::service_fn(move |request: hyper::Request<Incoming>| {
+            let state = state.clone();
+            let tracker = connection_tracker.clone();
+            let connection_metadata = connection_metadata.clone();
+            async move {
+                let version = request.version();
+                let attachment = tracker.observe_request(version, request.uri().path());
+                let mut request = request;
+                let on_upgrade =
+                    request_supports_upgrade(&request).then(|| hyper::upgrade::on(&mut request));
+                if let Some(ref attachment) = attachment {
+                    request.extensions_mut().insert(attachment.clone());
+                }
+                if let Some(connection_metadata) = connection_metadata {
+                    request.extensions_mut().insert(connection_metadata);
+                }
+                if let Some(on_upgrade) = on_upgrade {
+                    request.extensions_mut().insert(on_upgrade);
+                }
+                let request = request.map(Body::new);
+                let response = dispatch_data_plane_request(state, request).await;
+                tracker.note_response_head(attachment.as_ref());
+                tracker.finish_request(attachment.as_ref(), None);
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        })
+    };
+
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder.keep_alive(true);
+    builder.writev(true);
+    builder.max_buf_size(16 * 1024);
+    let result = builder.serve_connection(io, service).with_upgrades().await;
     tracker.finish_connection(result.err().map(|err| err.to_string()));
 }
 
@@ -223,7 +308,7 @@ async fn write_http3_response(
 
 #[cfg(feature = "http3")]
 async fn serve_http3_connection(
-    app: Router,
+    app: axum::Router,
     state: SharedState,
     local_addr: SocketAddr,
     connection: quinn::Connection,
@@ -364,7 +449,6 @@ fn https_listener_needs_transport_handoff(program: Option<&LoadedProgram>) -> bo
 
 #[cfg(feature = "tls")]
 async fn serve_https_http_connection(
-    app: Router,
     state: SharedState,
     stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,
@@ -379,8 +463,7 @@ async fn serve_https_http_connection(
                 peer_addr,
                 secure: true,
             };
-            serve_http_connection(app, state, tls_stream, peer_addr, Some(connection_metadata))
-                .await;
+            serve_http_connection(state, tls_stream, peer_addr, Some(connection_metadata)).await;
         }
         Err(err) => {
             warn!(
@@ -700,10 +783,10 @@ async fn run_inline_promoted_http_connection<S>(
                 }
 
                 let version = request.version();
-                let path = request.uri().path().to_string();
-                let attachment = tracker.observe_request(version, &path);
+                let attachment = tracker.observe_request(version, request.uri().path());
                 let mut request = request;
-                let on_upgrade = hyper::upgrade::on(&mut request);
+                let on_upgrade =
+                    request_supports_upgrade(&request).then(|| hyper::upgrade::on(&mut request));
                 let request = request.map(Body::new);
                 let (parts, body) = request.into_parts();
                 let captured_request = CapturedPromotedHttpRequest {
@@ -715,7 +798,8 @@ async fn run_inline_promoted_http_connection<S>(
                     ),
                     http2_attachment: attachment.clone(),
                     http1_upgrade: (!matches!(version, axum::http::Version::HTTP_2))
-                        .then_some(on_upgrade),
+                        .then_some(on_upgrade)
+                        .flatten(),
                 };
 
                 if let Some(sender) = capture_sender
@@ -798,13 +882,12 @@ pub async fn serve_http_proxy(listener: TcpListener, state: SharedState) -> std:
 
     #[cfg(feature = "http2")]
     {
-        let app = build_http_proxy_app(state.clone());
         loop {
             let (stream, peer_addr) = listener.accept().await?;
-            let app = app.clone();
+            let _ = stream.set_nodelay(true);
             let state = state.clone();
             tokio::spawn(async move {
-                serve_http_connection(app, state, stream, peer_addr, None).await;
+                serve_http1_connection(state, stream, peer_addr, None).await;
             });
         }
     }
@@ -813,13 +896,12 @@ pub async fn serve_http_proxy(listener: TcpListener, state: SharedState) -> std:
 #[cfg(feature = "tls")]
 pub async fn serve_https_proxy(listener: TcpListener, state: SharedState) -> std::io::Result<()> {
     let tls_server_config = generate_https_proxy_tls_server_config()?;
-    let app = build_http_proxy_app(state.clone());
     let local_addr = listener.local_addr()?;
     loop {
         let (stream, peer_addr) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
         let state = state.clone();
         let tls_server_config = tls_server_config.clone();
-        let app = app.clone();
         let snapshot = state.loaded_program_snapshot();
         let use_transport_handoff = https_listener_needs_transport_handoff(snapshot.as_deref());
         tokio::spawn(async move {
@@ -834,7 +916,6 @@ pub async fn serve_https_proxy(listener: TcpListener, state: SharedState) -> std
                 .await;
             } else {
                 serve_https_http_connection(
-                    app,
                     state,
                     stream,
                     peer_addr,
@@ -916,8 +997,8 @@ async fn handle_data_plane_request(state: SharedState, request: Request) -> Resp
         .get::<DownstreamConnectionMetadata>()
         .cloned();
     let downstream_http1_upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
-    let vm_context = {
-        let request_id = Uuid::new_v4().to_string();
+    let (vm_context, pre_vm_finished, after_vm) = {
+        let request_id = next_http_request_id();
         let vm_request = build_downstream_http_request_context(
             request_id,
             parts,
@@ -940,6 +1021,9 @@ async fn handle_data_plane_request(state: SharedState, request: Request) -> Resp
             vm_request,
             state.runtime_services.clone(),
         );
+        if let Some(connection_metadata) = &connection_metadata {
+            vm_context.attach_downstream_connection_metadata(connection_metadata);
+        }
         if let Some(attachment) = &downstream_http2_attachment {
             vm_context.attach_downstream_http2_stream(attachment);
         }
@@ -951,6 +1035,7 @@ async fn handle_data_plane_request(state: SharedState, request: Request) -> Resp
             vm_context.attach_downstream_http1_upgrade(upgrade);
         }
         let vm_context = Arc::new(vm_context);
+        let pre_vm_finished = Instant::now();
         match execute_vm_with_context(
             &program,
             vm_context.clone(),
@@ -971,7 +1056,10 @@ async fn handle_data_plane_request(state: SharedState, request: Request) -> Resp
                 return finalize_data_plane_response(
                     &state,
                     started,
-                    text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
+                    text_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("host registration error: {err}"),
+                    ),
                     0,
                 );
             }
@@ -981,16 +1069,20 @@ async fn handle_data_plane_request(state: SharedState, request: Request) -> Resp
                 return finalize_data_plane_response(
                     &state,
                     started,
-                    text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
+                    text_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("vm execution error: {err}"),
+                    ),
                     0,
                 );
             }
         }
 
-        vm_context
+        (vm_context, pre_vm_finished, Instant::now())
     };
 
     let resolved = resolve_http_graph_response(&vm_context).await;
+    let after_resolve = Instant::now();
     let crate::abi_impl::http::ResolvedHttpGraphResponse {
         response,
         upstream_latency_ms,
@@ -1006,11 +1098,41 @@ async fn handle_data_plane_request(state: SharedState, request: Request) -> Resp
             }
         });
     }
+    let finished = Instant::now();
+    record_stage_metrics(
+        u64::try_from(pre_vm_finished.duration_since(started).as_micros()).unwrap_or(u64::MAX),
+        u64::try_from(after_vm.duration_since(pre_vm_finished).as_micros()).unwrap_or(u64::MAX),
+        u64::try_from(after_resolve.duration_since(after_vm).as_micros()).unwrap_or(u64::MAX),
+        u64::try_from(finished.duration_since(started).as_micros()).unwrap_or(u64::MAX),
+    );
     finalize_data_plane_response(&state, started, response, upstream_latency_ms)
 }
 
-async fn data_plane_handler(State(state): State<SharedState>, request: Request) -> Response<Body> {
-    handle_data_plane_request(state, request).await
+async fn dispatch_data_plane_request(state: SharedState, request: Request) -> Response<Body> {
+    if !logging_enabled() {
+        return handle_data_plane_request(state, request).await;
+    }
+
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let started = Instant::now();
+    let response = handle_data_plane_request(state, request).await;
+    info!(
+        "{} {} {} {} {}ms",
+        category_access(),
+        method_label(method.as_str()),
+        status_label(response.status().as_u16()),
+        uri,
+        started.elapsed().as_millis()
+    );
+    response
+}
+
+async fn data_plane_handler(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    request: Request,
+) -> Response<Body> {
+    dispatch_data_plane_request(state, request).await
 }
 
 fn finalize_data_plane_response(
@@ -1024,6 +1146,25 @@ fn finalize_data_plane_response(
     let total_latency_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
     state.record_data_plane_latency_ms(total_latency_ms, upstream_latency_ms);
     response
+}
+
+fn request_supports_upgrade(request: &hyper::Request<Incoming>) -> bool {
+    if request.method() == axum::http::Method::CONNECT {
+        return true;
+    }
+    if request.headers().contains_key(axum::http::header::UPGRADE) {
+        return true;
+    }
+    request
+        .headers()
+        .get(axum::http::header::CONNECTION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        })
+        .unwrap_or(false)
 }
 
 fn text_response(status: StatusCode, text: &str) -> Response<Body> {
@@ -1046,12 +1187,15 @@ mod tests {
     #[cfg(feature = "http2")]
     use crate::abi_impl::Http2SessionFrontier;
     #[cfg(feature = "http2")]
-    use crate::runtime::apply_program_from_bytes;
+    use crate::runtime::{VmExecutionConfig, VmExecutionMode, apply_program_from_bytes};
 
     #[cfg(feature = "http2")]
     #[tokio::test(flavor = "current_thread")]
     async fn downstream_http2_session_store_tracks_streams_outside_vm_context() {
-        let state = SharedState::new(1024 * 1024);
+        let state = SharedState::new(1024 * 1024).with_vm_execution_config(VmExecutionConfig {
+            interrupt: crate::runtime::VmInterruptConfig::None,
+            execution_mode: VmExecutionMode::Threading,
+        });
         let source = r#"
             use http;
             use runtime;
@@ -1068,7 +1212,16 @@ mod tests {
             .await
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener should have addr");
-        let server = tokio::spawn(serve_http_proxy(listener, state.clone()));
+        let server = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let (stream, peer_addr) = listener
+                    .accept()
+                    .await
+                    .expect("listener should accept http2 client");
+                serve_http_connection(state, stream, peer_addr, None).await;
+            }
+        });
 
         let stream = tokio::net::TcpStream::connect(addr)
             .await
@@ -1160,5 +1313,237 @@ mod tests {
         drop(sender);
         connection_task.abort();
         server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn program_can_forward_default_upstream_via_specialized_proxy_api() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let upstream_addr = upstream_listener
+            .local_addr()
+            .expect("upstream listener should have addr");
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(
+                upstream_listener,
+                axum::Router::new().fallback(axum::routing::any(|| async move {
+                    let mut response = Response::new(Body::empty());
+                    response.headers_mut().insert(
+                        "x-upstream-test",
+                        "ok".parse().expect("header should parse"),
+                    );
+                    response
+                })),
+            )
+            .await
+            .expect("upstream server should run");
+        });
+
+        let state = SharedState::new(1024 * 1024).with_vm_execution_config(VmExecutionConfig {
+            interrupt: crate::runtime::VmInterruptConfig::None,
+            execution_mode: VmExecutionMode::Threading,
+        });
+        let source = format!(
+            r#"
+                use http;
+                use proxy;
+
+                let mut outer = 0;
+                let mut acc = 1;
+                while outer < 12 {{
+                    let mut inner = 0;
+                    while inner < 24 {{
+                        let mixed = (outer * 31 + inner * 17) % 97;
+                        if (mixed % 2) == 0 {{
+                            acc = acc + mixed;
+                        }} else {{
+                            acc = acc - mixed;
+                        }}
+                        inner = inner + 1;
+                    }}
+                    outer = outer + 1;
+                }}
+
+                let downstream_version = http::request::get_http_version();
+                let upstream = http::exchange::prepare_default_upstream(
+                    "http://{upstream_addr}",
+                    "1.1",
+                    [
+                        "x-downstream-version", downstream_version,
+                        "x-bench-program-header", "program-proxy"
+                    ]
+                );
+                proxy::forward_default_upstream([
+                    "x-proxy-test", "ok",
+                    "x-downstream-version", downstream_version
+                ]);
+            "#
+        );
+        let compiled = compile_source(&source).expect("source should compile");
+        let program = encode_program(&compiled.program).expect("program should encode");
+        let report = apply_program_from_bytes(&state, &program).await;
+        assert!(report.applied, "program should apply");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have addr");
+        let server = tokio::spawn(serve_http_proxy(listener, state.clone()));
+
+        let client = reqwest::Client::builder()
+            .tcp_nodelay(true)
+            .build()
+            .expect("client should build");
+        let response = client
+            .post(format!("http://{addr}/perf"))
+            .header("x-client-id", "perf-client")
+            .header("x-bench-body-mode", "headers-only")
+            .header("content-type", "text/plain")
+            .body("")
+            .send()
+            .await
+            .expect("request should succeed");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.text().await.expect("body should read");
+
+        assert_eq!(status, reqwest::StatusCode::OK, "body={body}");
+        assert_eq!(
+            headers
+                .get("x-upstream-test")
+                .and_then(|value| value.to_str().ok()),
+            Some("ok")
+        );
+        assert_eq!(
+            headers
+                .get("x-proxy-test")
+                .and_then(|value| value.to_str().ok()),
+            Some("ok")
+        );
+        assert_eq!(
+            headers
+                .get("x-downstream-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("1.1")
+        );
+
+        server.abort();
+        upstream_server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn program_can_prepare_and_forward_default_upstream_via_combined_proxy_api() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let upstream_addr = upstream_listener
+            .local_addr()
+            .expect("upstream listener should have addr");
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(
+                upstream_listener,
+                axum::Router::new().fallback(axum::routing::any(|| async move {
+                    let mut response = Response::new(Body::empty());
+                    response.headers_mut().insert(
+                        "x-upstream-test",
+                        "ok".parse().expect("header should parse"),
+                    );
+                    response
+                })),
+            )
+            .await
+            .expect("upstream server should run");
+        });
+
+        let state = SharedState::new(1024 * 1024).with_vm_execution_config(VmExecutionConfig {
+            interrupt: crate::runtime::VmInterruptConfig::None,
+            execution_mode: VmExecutionMode::Threading,
+        });
+        let source = format!(
+            r#"
+                use http;
+                use proxy;
+
+                let mut outer = 0;
+                let mut acc = 1;
+                while outer < 12 {{
+                    let mut inner = 0;
+                    while inner < 24 {{
+                        let mixed = (outer * 31 + inner * 17) % 97;
+                        if (mixed % 2) == 0 {{
+                            acc = acc + mixed;
+                        }} else {{
+                            acc = acc - mixed;
+                        }}
+                        inner = inner + 1;
+                    }}
+                    outer = outer + 1;
+                }}
+
+                let downstream_version = http::request::get_http_version();
+                proxy::prepare_and_forward_default_upstream(
+                    "http://{upstream_addr}",
+                    "1.1",
+                    [
+                        "x-downstream-version", downstream_version,
+                        "x-bench-program-header", "program-proxy"
+                    ],
+                    [
+                        "x-proxy-test", "ok",
+                        "x-downstream-version", downstream_version
+                    ]
+                );
+            "#
+        );
+        let compiled = compile_source(&source).expect("source should compile");
+        let program = encode_program(&compiled.program).expect("program should encode");
+        let report = apply_program_from_bytes(&state, &program).await;
+        assert!(report.applied, "program should apply");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have addr");
+        let server = tokio::spawn(serve_http_proxy(listener, state.clone()));
+
+        let client = reqwest::Client::builder()
+            .tcp_nodelay(true)
+            .build()
+            .expect("client should build");
+        let response = client
+            .post(format!("http://{addr}/perf"))
+            .header("x-client-id", "perf-client")
+            .header("x-bench-body-mode", "headers-only")
+            .header("content-type", "text/plain")
+            .body("")
+            .send()
+            .await
+            .expect("request should succeed");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.text().await.expect("body should read");
+
+        assert_eq!(status, reqwest::StatusCode::OK, "body={body}");
+        assert_eq!(
+            headers
+                .get("x-upstream-test")
+                .and_then(|value| value.to_str().ok()),
+            Some("ok")
+        );
+        assert_eq!(
+            headers
+                .get("x-proxy-test")
+                .and_then(|value| value.to_str().ok()),
+            Some("ok")
+        );
+        assert_eq!(
+            headers
+                .get("x-downstream-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("1.1")
+        );
+
+        server.abort();
+        upstream_server.abort();
     }
 }

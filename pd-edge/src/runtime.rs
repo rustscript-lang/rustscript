@@ -10,7 +10,7 @@ use std::{
 use arc_swap::ArcSwapOption;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
-use vm::{Program, decode_program, validate_program};
+use vm::{Program, Vm, decode_program, validate_program};
 
 use crate::{
     HOST_FUNCTION_COUNT,
@@ -19,7 +19,9 @@ use crate::{
         SharedHttpDownstreamSessions, SharedRateLimiter,
         http::{
             SharedRuntimeServices, new_shared_http_plane_runtime_services,
-            new_shared_upstream_client_cache, upstream_reqwest_client_builder,
+            new_shared_parsed_upstream_target_cache, new_shared_plain_http1_sender_pool,
+            new_shared_plain_http1_upstream_client, new_shared_upstream_client_cache,
+            upstream_reqwest_client_builder,
         },
         new_shared_http_downstream_sessions, new_shared_http_upstream_sessions,
         new_shared_http3_downstream_sessions, new_shared_http3_upstream_sessions,
@@ -157,6 +159,7 @@ pub struct SharedState {
 #[derive(Clone)]
 pub struct LoadedProgram {
     pub program: Arc<Program>,
+    pub no_interrupt_aot_bundle: Option<Arc<Vec<u8>>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -212,8 +215,13 @@ impl SharedState {
             .pool_max_idle_per_host(store_limits.upstream_http_reuse_entries.max(1))
             .build()
             .expect("default upstream client should build");
+        let plain_http1_upstream_client =
+            new_shared_plain_http1_upstream_client(store_limits.upstream_http_reuse_entries);
+        let plain_http1_sender_pool = new_shared_plain_http1_sender_pool();
         let upstream_client_cache =
             new_shared_upstream_client_cache(store_limits.upstream_http_reuse_entries);
+        let parsed_upstream_target_cache =
+            new_shared_parsed_upstream_target_cache(store_limits.upstream_http_reuse_entries);
         let tls_session_cache =
             new_shared_tls_session_cache(store_limits.tls_session_reuse_entries);
         let upstream_http_sessions =
@@ -228,7 +236,11 @@ impl SharedState {
         let runtime_services = new_shared_http_plane_runtime_services(
             rate_limiter.clone(),
             client.clone(),
+            plain_http1_upstream_client,
+            plain_http1_sender_pool,
+            store_limits.upstream_http_reuse_entries,
             upstream_client_cache.clone(),
+            parsed_upstream_target_cache.clone(),
             tls_session_cache.clone(),
             upstream_http_sessions.clone(),
             upstream_http3_sessions.clone(),
@@ -708,8 +720,21 @@ pub async fn apply_program_from_bytes(state: &SharedState, bytes: &[u8]) -> Prog
     let local_count = program.local_count;
     let const_count = program.constants.len();
     let code_len = program.code.len();
+    let program = Arc::new(program);
+    let no_interrupt_aot_bundle =
+        match Vm::new_shared(program.clone()).emit_aot_bundle_with_fuel_check_interval(0) {
+            Ok(bundle) => Some(Arc::new(bundle)),
+            Err(err) => {
+                warn!(
+                    "{} native AOT bundle unavailable for loaded program: {err}",
+                    category_program()
+                );
+                None
+            }
+        };
     state.active_program.store(Some(Arc::new(LoadedProgram {
-        program: Arc::new(program),
+        program,
+        no_interrupt_aot_bundle,
     })));
     state.record_program_apply_success();
     info!(

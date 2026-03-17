@@ -27,7 +27,8 @@ async fn dynamic_tcp_stream_can_attach_to_http_exchange() {
             http::response::set_body("connect failed");
         }} else {{
             let exchange = http::exchange::new();
-            http::exchange::set_target(exchange, "http://{upstream_addr}/attached");
+            http::exchange::set_target(exchange, "{upstream_host}", {upstream_port});
+            http::exchange::set_path(exchange, "/attached");
             http::exchange::set_method(exchange, "POST");
             http::exchange::set_body(exchange, "payload");
             http::exchange::attach_tcp(exchange, stream);
@@ -36,7 +37,9 @@ async fn dynamic_tcp_stream_can_attach_to_http_exchange() {
             http::response::set_header("x-after", tcp::stream::get_phase(stream));
             http::response::set_body(http::exchange::get_body(exchange));
         }}
-    "#
+    "#,
+        upstream_host = upstream_addr.ip(),
+        upstream_port = upstream_addr.port()
     );
     let compiled = compile_source(&source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
@@ -92,7 +95,9 @@ async fn dynamic_tls_session_can_attach_to_http_exchange() {
             http::response::set_body("connect failed");
         }} else {{
             let exchange = http::exchange::new();
-            http::exchange::set_target(exchange, "https://localhost:{}/echo");
+            http::exchange::set_scheme(exchange, "https");
+            http::exchange::set_target(exchange, "localhost", {});
+            http::exchange::set_path(exchange, "/echo");
             http::exchange::set_method(exchange, "POST");
             http::exchange::set_body(exchange, "secure-payload");
 

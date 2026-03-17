@@ -4,8 +4,10 @@ use supports_color::Stream;
 use tracing_subscriber::EnvFilter;
 
 static ANSI_ENABLED: OnceLock<bool> = OnceLock::new();
+static LOGGING_ENABLED: OnceLock<bool> = OnceLock::new();
 
 pub fn init(enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = LOGGING_ENABLED.set(enabled);
     if !enabled {
         return Ok(());
     }
@@ -24,6 +26,10 @@ pub fn init(enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
         .try_init()
         .map_err(|err| std::io::Error::other(err.to_string()))?;
     Ok(())
+}
+
+pub fn enabled() -> bool {
+    *LOGGING_ENABLED.get_or_init(|| false)
 }
 
 pub fn category_access() -> String {

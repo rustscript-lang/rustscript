@@ -10,6 +10,10 @@ mod logging;
 mod runtime;
 pub mod sample_echo;
 
+#[cfg(target_os = "windows")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub use edge_abi::*;
 
 #[cfg(feature = "console")]

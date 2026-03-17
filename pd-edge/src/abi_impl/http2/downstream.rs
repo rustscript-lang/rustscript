@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 #[cfg(feature = "http2")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::http::Version;
 
@@ -77,43 +77,51 @@ pub(crate) fn new_shared_http_downstream_sessions(capacity: usize) -> SharedHttp
 #[derive(Clone, Debug)]
 pub(crate) struct DownstreamHttp2ConnectionTracker {
     store: SharedHttpDownstreamSessions,
-    session_id: u64,
+    peer_address: Arc<String>,
+    session_id: Arc<OnceLock<u64>>,
     saw_http2: Arc<AtomicBool>,
 }
 
 #[cfg(feature = "http2")]
 impl DownstreamHttp2ConnectionTracker {
     pub(crate) fn new(store: SharedHttpDownstreamSessions, peer_address: String) -> Self {
-        let session_id = {
-            let mut guard = lock_metrics::lock(
-                &store,
-                LockMetricKey::Http2DownstreamSessionStore,
-                "http downstream session store lock poisoned",
-            );
-            let next = guard.next_session_id.saturating_add(1);
-            guard.next_session_id = next;
-            guard.sessions.insert(
-                next,
-                Http2DownstreamSessionState {
-                    session_id: next,
-                    frontier: Http2SessionFrontier::Candidate,
-                    peer_address,
-                    total_streams: 0,
-                    active_streams: 0,
-                    last_path: None,
-                    last_error: None,
-                    goaway: None,
-                    streams: HashMap::new(),
-                    next_stream_id: 1,
-                },
-            );
-            next
-        };
         Self {
             store,
-            session_id,
+            peer_address: Arc::new(peer_address),
+            session_id: Arc::new(OnceLock::new()),
             saw_http2: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn session_id(&self) -> Option<u64> {
+        if let Some(session_id) = self.session_id.get().copied() {
+            return Some(session_id);
+        }
+
+        let mut guard = lock_metrics::lock(
+            &self.store,
+            LockMetricKey::Http2DownstreamSessionStore,
+            "http downstream session store lock poisoned",
+        );
+        let next = guard.next_session_id.saturating_add(1);
+        guard.next_session_id = next;
+        guard.sessions.insert(
+            next,
+            Http2DownstreamSessionState {
+                session_id: next,
+                frontier: Http2SessionFrontier::Candidate,
+                peer_address: self.peer_address.as_str().to_string(),
+                total_streams: 0,
+                active_streams: 0,
+                last_path: None,
+                last_error: None,
+                goaway: None,
+                streams: HashMap::new(),
+                next_stream_id: 1,
+            },
+        );
+        let _ = self.session_id.set(next);
+        self.session_id.get().copied()
     }
 
     pub(crate) fn observe_request(
@@ -125,12 +133,13 @@ impl DownstreamHttp2ConnectionTracker {
             return None;
         }
         self.saw_http2.store(true, Ordering::Relaxed);
+        let session_id = self.session_id()?;
         let mut guard = lock_metrics::lock(
             &self.store,
             LockMetricKey::Http2DownstreamSessionStore,
             "http downstream session store lock poisoned",
         );
-        let session = guard.sessions.get_mut(&self.session_id)?;
+        let session = guard.sessions.get_mut(&session_id)?;
         if session.frontier == Http2SessionFrontier::Candidate {
             session.frontier = Http2SessionFrontier::Attachable;
         }
@@ -150,7 +159,7 @@ impl DownstreamHttp2ConnectionTracker {
             },
         );
         Some(Http2DownstreamStreamAttachment {
-            session_id: self.session_id,
+            session_id,
             stream_id,
         })
     }
@@ -219,10 +228,12 @@ impl DownstreamHttp2ConnectionTracker {
             "http downstream session store lock poisoned",
         );
         if !self.saw_http2.load(Ordering::Relaxed) {
-            let _ = guard.sessions.remove(&self.session_id);
             return;
         }
-        let Some(session) = guard.sessions.get_mut(&self.session_id) else {
+        let Some(session_id) = self.session_id.get().copied() else {
+            return;
+        };
+        let Some(session) = guard.sessions.get_mut(&session_id) else {
             return;
         };
         session.active_streams = 0;
