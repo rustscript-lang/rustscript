@@ -958,7 +958,11 @@ fn parse_pub_functions(source: &str) -> Vec<ParsedFunction> {
             continue;
         };
         let close_paren = open_paren + 1 + close_paren_offset;
-        let name = rest[..open_paren].trim();
+        let name = rest[..open_paren]
+            .split('<')
+            .next()
+            .unwrap_or_default()
+            .trim();
         if name.is_empty() {
             continue;
         }
