@@ -16,6 +16,7 @@ use axum::{
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Version,
         header::{CONTENT_LENGTH, CONTENT_TYPE, HOST, TRANSFER_ENCODING},
+        uri::Authority,
     },
 };
 use futures_util::stream::try_unfold;
@@ -694,8 +695,6 @@ impl DownstreamPostResponsePlan {
 
 pub(crate) type SharedUpstreamClientCache =
     Arc<ShardedRwLruStore<UpstreamClientCacheKey, reqwest::Client>>;
-pub(crate) type SharedParsedUpstreamTargetCache =
-    Arc<ShardedRwLruStore<String, ParsedHttpUpstreamTarget>>;
 pub(crate) type SharedPlainHttp1UpstreamClient = Arc<HyperLegacyClient<HttpConnector, Full<Bytes>>>;
 type PlainHttp1PooledSender = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
 pub(crate) type SharedPlainHttp1SenderPool = Arc<ParkingMutex<PlainHttp1SenderPool>>;
@@ -742,12 +741,6 @@ pub(crate) struct UpstreamClientCacheKey {
 }
 
 pub(crate) fn new_shared_upstream_client_cache(capacity: usize) -> SharedUpstreamClientCache {
-    Arc::new(ShardedRwLruStore::new(capacity))
-}
-
-pub(crate) fn new_shared_parsed_upstream_target_cache(
-    capacity: usize,
-) -> SharedParsedUpstreamTargetCache {
     Arc::new(ShardedRwLruStore::new(capacity))
 }
 
@@ -911,11 +904,17 @@ fn build_upstream_origin(
     }
 
     let authority = format_upstream_authority(host, port);
-    let target = format!("{}://{authority}", scheme.as_str());
-    let url = Url::parse(&target).map_err(|_| {
+    if authority.contains('@') {
+        return Err(VmError::HostError(format!(
+            "invalid upstream target host='{host}' port={port}",
+        )));
+    }
+    let parsed_authority = authority.parse::<Authority>().map_err(|_| {
         VmError::HostError(format!("invalid upstream target host='{host}' port={port}",))
     })?;
-    if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+    let target = format!("{}://{authority}", scheme.as_str());
+    let parsed_host = parsed_authority.host().trim_matches(['[', ']']);
+    if parsed_host.is_empty() {
         return Err(VmError::HostError(format!(
             "invalid upstream target host='{host}' port={port}",
         )));
@@ -923,13 +922,10 @@ fn build_upstream_origin(
 
     Ok(ParsedHttpUpstreamTarget {
         scheme,
-        host: url
-            .host_str()
-            .expect("checked upstream host presence above")
-            .to_string(),
-        port: url
-            .port_or_known_default()
-            .expect("http upstream origin should have a known port"),
+        host: parsed_host.to_string(),
+        port: parsed_authority
+            .port_u16()
+            .expect("http upstream origin should have an explicit port"),
         host_header: authority,
         target,
         inherits_request_path: true,
@@ -1000,33 +996,6 @@ pub(crate) fn parse_http_upstream_target(
     build_upstream_origin(HttpUpstreamScheme::Http, host, port)
 }
 
-pub(crate) fn parse_http_upstream_target_cached(
-    cache: Option<&SharedParsedUpstreamTargetCache>,
-    upstream: &str,
-) -> Result<ParsedHttpUpstreamTarget, VmError> {
-    let cache_key = upstream.to_string();
-    if let Some(cache) = cache
-        && let Some(parsed) = cache.peek_cloned(
-            &cache_key,
-            LockMetricKey::UpstreamClientCache,
-            "parsed upstream target cache lock poisoned",
-        )
-    {
-        return Ok(parsed);
-    }
-
-    let parsed = parse_http_upstream_target(upstream)?;
-    if let Some(cache) = cache {
-        let _ = cache.insert(
-            cache_key,
-            parsed.clone(),
-            LockMetricKey::UpstreamClientCache,
-            "parsed upstream target cache lock poisoned",
-        );
-    }
-    Ok(parsed)
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct HttpOutboundRequestNode {
     inherits_request_head: bool,
@@ -1093,52 +1062,22 @@ impl HttpOutboundRequestNode {
         self.inherited_header_overrides.clear();
     }
 
-    fn apply_parsed_target(&mut self, parsed: ParsedHttpUpstreamTarget) {
+    pub(crate) fn set_target_host_port(&mut self, host: &str, port: u16) -> Result<(), VmError> {
+        let parsed = build_upstream_origin(self.target_scheme, host, port)?;
         self.target = Some(parsed.target);
         self.target_host = Some(parsed.host);
         self.target_port = Some(parsed.port);
         self.target_host_header = Some(parsed.host_header);
-        self.target_inherits_request_path = parsed.inherits_request_path;
-        self.target_scheme = parsed.scheme;
-    }
-
-    pub(crate) fn set_target_from_parsed(&mut self, parsed: ParsedHttpUpstreamTarget) {
-        self.apply_parsed_target(parsed);
-    }
-
-    pub(crate) fn set_target_host_port(&mut self, host: &str, port: u16) -> Result<(), VmError> {
-        let parsed = build_upstream_origin(self.target_scheme, host, port)?;
-        self.apply_parsed_target(parsed);
+        self.target_inherits_request_path = true;
         Ok(())
     }
 
     pub(crate) fn set_target_scheme(&mut self, scheme: HttpUpstreamScheme) -> Result<(), VmError> {
         self.target_scheme = scheme;
-        if let Some(target) = self.target.as_ref() {
-            let updated = if let Ok(mut url) = Url::parse(target) {
-                url.set_scheme(scheme.as_str()).map_err(|_| {
-                    VmError::HostError(format!(
-                        "failed to update upstream scheme for target '{target}'",
-                    ))
-                })?;
-                if url.path() == "/"
-                    && url.query().is_none()
-                    && url.fragment().is_none()
-                    && let (Some(host), Some(port)) =
-                        (self.target_host.as_deref(), self.target_port)
-                {
-                    build_upstream_origin(scheme, host, port)?.target
-                } else {
-                    url.to_string()
-                }
-            } else if let (Some(host), Some(port)) = (self.target_host.as_deref(), self.target_port)
-            {
-                build_upstream_origin(scheme, host, port)?.target
-            } else {
-                return Ok(());
-            };
-            let parsed = parse_http_upstream_target(&updated)?;
-            self.apply_parsed_target(parsed);
+        if let (Some(host), Some(port)) = (self.target_host.as_deref(), self.target_port) {
+            let parsed = build_upstream_origin(scheme, host, port)?;
+            self.target = Some(parsed.target);
+            self.target_host_header = Some(parsed.host_header);
         }
         Ok(())
     }
@@ -1665,7 +1604,6 @@ pub(crate) struct RuntimeServices {
     plain_http1_sender_pool: Option<SharedPlainHttp1SenderPool>,
     upstream_http_reuse_entries: usize,
     upstream_client_cache: Option<SharedUpstreamClientCache>,
-    parsed_upstream_target_cache: Option<SharedParsedUpstreamTargetCache>,
     tls_session_cache: Option<SharedTlsSessionCache>,
     upstream_http_sessions: Option<SharedHttpUpstreamSessions>,
     upstream_http3_sessions: Option<SharedHttp3UpstreamSessions>,
@@ -1685,7 +1623,6 @@ impl RuntimeServices {
             plain_http1_sender_pool: None,
             upstream_http_reuse_entries: 0,
             upstream_client_cache: None,
-            parsed_upstream_target_cache: None,
             tls_session_cache: None,
             upstream_http_sessions: None,
             upstream_http3_sessions: None,
@@ -1714,10 +1651,6 @@ impl RuntimeServices {
 
     pub(crate) fn upstream_http_reuse_entries(&self) -> usize {
         self.upstream_http_reuse_entries
-    }
-
-    pub(crate) fn parsed_upstream_target_cache(&self) -> Option<SharedParsedUpstreamTargetCache> {
-        self.parsed_upstream_target_cache.clone()
     }
 
     pub(crate) fn tls_session_cache(&self) -> Option<SharedTlsSessionCache> {
@@ -1761,7 +1694,6 @@ pub(crate) fn new_shared_http_plane_runtime_services(
     plain_http1_sender_pool: SharedPlainHttp1SenderPool,
     upstream_http_reuse_entries: usize,
     upstream_client_cache: SharedUpstreamClientCache,
-    parsed_upstream_target_cache: SharedParsedUpstreamTargetCache,
     tls_session_cache: SharedTlsSessionCache,
     upstream_http_sessions: SharedHttpUpstreamSessions,
     upstream_http3_sessions: SharedHttp3UpstreamSessions,
@@ -1773,7 +1705,6 @@ pub(crate) fn new_shared_http_plane_runtime_services(
         plain_http1_sender_pool: Some(plain_http1_sender_pool),
         upstream_http_reuse_entries,
         upstream_client_cache: Some(upstream_client_cache),
-        parsed_upstream_target_cache: Some(parsed_upstream_target_cache),
         tls_session_cache: Some(tls_session_cache),
         upstream_http_sessions: Some(upstream_http_sessions),
         upstream_http3_sessions: Some(upstream_http3_sessions),

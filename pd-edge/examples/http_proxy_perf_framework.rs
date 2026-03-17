@@ -256,6 +256,13 @@ fn proxy_roundtrip_program_source(
     upstream_protocol: UpstreamProtocol,
     flavor: ProxyProgramFlavor,
 ) -> String {
+    let upstream_url = Url::parse(upstream_origin).expect("upstream origin should parse");
+    let upstream_host = upstream_url
+        .host_str()
+        .expect("upstream origin should include host");
+    let upstream_port = upstream_url
+        .port_or_known_default()
+        .expect("upstream origin should include port");
     let workload_source = selected_base_workload_source();
     let use_specialized_default_forward = env_flag("PD_EDGE_PERF_USE_SPECIALIZED_DEFAULT_FORWARD");
     let use_combined_default_forward = env_flag("PD_EDGE_PERF_USE_COMBINED_DEFAULT_FORWARD");
@@ -268,6 +275,7 @@ fn proxy_roundtrip_program_source(
         UpstreamProtocol::Http1 => "",
         UpstreamProtocol::HttpsHttp2 => {
             r#"
+http::exchange::set_scheme(upstream, "https");
 let session = tls::session::from_socket(upstream);
 tls::session::set_verify(session, false);
 tls::session::set_alpn(session, "h2,http/1.1");
@@ -275,6 +283,7 @@ tls::session::set_alpn(session, "h2,http/1.1");
         }
         UpstreamProtocol::HttpsHttp3 => {
             r#"
+http::exchange::set_scheme(upstream, "https");
 let session = tls::session::from_socket(upstream);
 tls::session::set_verify(session, false);
 "#
@@ -301,7 +310,8 @@ tls::session::set_verify(session, false);
             format!(
                 r#"
 let upstream = http::exchange::prepare_default_upstream(
-    "{upstream_origin}",
+    "{upstream_host}",
+    {upstream_port},
     "{version_preference}",
     {batched_upstream_headers}
 );
@@ -314,7 +324,8 @@ let upstream = http::exchange::prepare_default_upstream(
             format!(
                 r#"
 proxy::prepare_and_forward_default_upstream(
-    "{upstream_origin}",
+    "{upstream_host}",
+    {upstream_port},
     "{version_preference}",
     {batched_upstream_headers},
     {batched_response_headers}

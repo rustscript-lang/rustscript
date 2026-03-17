@@ -11,8 +11,8 @@ use super::{
     default_upstream_exchange_handle, ensure_outbound_exchange_response_started,
     headers_to_value_map, is_valid_request_path, lookup_cached_header_batch,
     outbound_exchange_exists, outbound_exchange_response_eof, parse_header, parse_header_name,
-    parse_http_upstream_target_cached, read_outbound_exchange_response_all,
-    read_outbound_exchange_response_next_chunk, serialize_query_pairs, store_cached_header_batch,
+    read_outbound_exchange_response_all, read_outbound_exchange_response_next_chunk,
+    serialize_query_pairs, store_cached_header_batch,
 };
 use crate::abi_impl::schedule_current_future_call;
 
@@ -201,17 +201,22 @@ fn parse_version_preference(label: &str) -> Result<HttpVersionPreference, VmErro
     })
 }
 
+fn parse_upstream_port(port: i64) -> Result<u16, VmError> {
+    u16::try_from(port)
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| VmError::HostError(format!("invalid upstream port '{port}'")))
+}
+
 pub(crate) fn prepare_default_upstream_request(
     context: &SharedProxyVmContext,
-    upstream: String,
+    host: String,
+    port: i64,
     version: String,
     headers: Value,
 ) -> Result<(), VmError> {
     let version = parse_version_preference(&version)?;
-    let parsed = parse_http_upstream_target_cached(
-        context.services().parsed_upstream_target_cache().as_ref(),
-        &upstream,
-    )?;
+    let port = parse_upstream_port(port)?;
     let mut exchanges = context.lock_exchanges();
     let exchange = exchanges
         .exchanges
@@ -219,7 +224,7 @@ pub(crate) fn prepare_default_upstream_request(
         .ok_or_else(|| unknown_exchange_handle(default_upstream_exchange_handle()))?;
     let (target_scheme, target_host) = {
         let request = &mut exchange.request;
-        request.set_target_from_parsed(parsed);
+        request.set_target_host_port(&host, port)?;
         request.version_preference = version;
         apply_header_batch(request, headers)?;
         (request.target_scheme, request.target_host.clone())
@@ -252,11 +257,12 @@ fn default_upstream_exchange(_context: SharedProxyVmContext) -> Result<CallOutco
 #[pd_edge_host_function(name = http_exchange::PREPARE_DEFAULT_UPSTREAM.name, scope = http)]
 fn prepare_default_upstream(
     context: SharedProxyVmContext,
-    upstream: String,
+    host: String,
+    port: i64,
     version: String,
     headers: Value,
 ) -> Result<CallOutcome, VmError> {
-    prepare_default_upstream_request(&context, upstream, version, headers)?;
+    prepare_default_upstream_request(&context, host, port, version, headers)?;
     Ok(CallOutcome::Return(vec![Value::Int(
         default_upstream_exchange_handle(),
     )]))
@@ -366,10 +372,7 @@ fn set_exchange_target(
     host: String,
     port: i64,
 ) -> Result<CallOutcome, VmError> {
-    let port = u16::try_from(port)
-        .ok()
-        .filter(|port| *port != 0)
-        .ok_or_else(|| VmError::HostError(format!("invalid upstream port '{port}'")))?;
+    let port = parse_upstream_port(port)?;
     let (target_scheme, target_host) = with_exchange_request_mut(&context, exchange, |request| {
         request.set_target_host_port(&host, port)?;
         Ok((request.target_scheme, request.target_host.clone()))
@@ -754,7 +757,8 @@ mod tests {
 
         let outcome = prepare_default_upstream_impl(
             context.clone(),
-            "https://origin.example.com/api".to_string(),
+            "origin.example.com".to_string(),
+            8080,
             "2".to_string(),
             headers,
         )
@@ -763,7 +767,7 @@ mod tests {
         assert_eq!(outcome, CallOutcome::Return(vec![Value::Int(1)]));
         assert_eq!(
             context.with_default_upstream_exchange(|exchange| exchange.request.target.clone()),
-            Some("https://origin.example.com/api".to_string())
+            Some("http://origin.example.com:8080".to_string())
         );
         assert_eq!(
             context.with_default_upstream_exchange(|exchange| {
