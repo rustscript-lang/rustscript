@@ -844,6 +844,45 @@ fn release_plain_http1_sender(
     guard.put(authority, capacity, sender);
 }
 
+struct PlainHttp1SenderLease {
+    pool: SharedPlainHttp1SenderPool,
+    authority: String,
+    capacity: usize,
+    sender: Option<PlainHttp1PooledSender>,
+}
+
+impl std::fmt::Debug for PlainHttp1SenderLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlainHttp1SenderLease")
+            .field("authority", &self.authority)
+            .field("capacity", &self.capacity)
+            .field("sender_available", &self.sender.is_some())
+            .finish()
+    }
+}
+
+impl PlainHttp1SenderLease {
+    fn new(
+        pool: SharedPlainHttp1SenderPool,
+        authority: String,
+        capacity: usize,
+        sender: PlainHttp1PooledSender,
+    ) -> Self {
+        Self {
+            pool,
+            authority,
+            capacity,
+            sender: Some(sender),
+        }
+    }
+
+    fn release(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            release_plain_http1_sender(&self.pool, self.authority.clone(), self.capacity, sender);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum HttpUpstreamScheme {
     #[default]
@@ -1200,6 +1239,7 @@ struct UpstreamResponseBodySource {
     source: UpstreamResponseSource,
     http2_tracker: Option<http2::Http2ResponseBodyTracker>,
     http3_tracker: Option<http3::Http3ResponseBodyTracker>,
+    plain_http1_sender_lease: Option<PlainHttp1SenderLease>,
     remaining_body_bytes: Option<u64>,
     body_started: bool,
     body_finished: bool,
@@ -1211,6 +1251,7 @@ impl Default for UpstreamResponseBodySource {
             source: UpstreamResponseSource::Exhausted,
             http2_tracker: None,
             http3_tracker: None,
+            plain_http1_sender_lease: None,
             remaining_body_bytes: None,
             body_started: false,
             body_finished: false,
@@ -1239,6 +1280,9 @@ impl UpstreamResponseBodySource {
             }
             if let Some(tracker) = &self.http3_tracker {
                 tracker.note_body_eof();
+            }
+            if let Some(lease) = self.plain_http1_sender_lease.as_mut() {
+                lease.release();
             }
             self.body_finished = true;
         }
@@ -1377,12 +1421,14 @@ fn upstream_response_body_source(
     source: UpstreamResponseSource,
     http2_tracker: Option<http2::Http2ResponseBodyTracker>,
     http3_tracker: Option<http3::Http3ResponseBodyTracker>,
+    plain_http1_sender_lease: Option<PlainHttp1SenderLease>,
     content_length: Option<u64>,
 ) -> UpstreamResponseBodySource {
     let mut source = UpstreamResponseBodySource {
         source,
         http2_tracker,
         http3_tracker,
+        plain_http1_sender_lease,
         remaining_body_bytes: content_length,
         body_started: false,
         body_finished: false,
@@ -1413,6 +1459,7 @@ impl UpstreamResponseBodyState {
                 UpstreamResponseSource::Reqwest(response),
                 None,
                 None,
+                None,
                 content_length,
             ),
             stream: BufferedByteStream::default(),
@@ -1423,9 +1470,13 @@ impl UpstreamResponseBodyState {
     fn from_hyper(
         body: hyper::body::Incoming,
         http2_tracker: Option<http2::Http2ResponseBodyTracker>,
+        plain_http1_sender_lease: Option<PlainHttp1SenderLease>,
         content_length: Option<u64>,
     ) -> Self {
         if matches!(content_length, Some(0)) {
+            if let Some(mut lease) = plain_http1_sender_lease {
+                lease.release();
+            }
             return Self::empty();
         }
         Self {
@@ -1433,6 +1484,7 @@ impl UpstreamResponseBodyState {
                 UpstreamResponseSource::Hyper(body),
                 http2_tracker,
                 None,
+                plain_http1_sender_lease,
                 content_length,
             ),
             stream: BufferedByteStream::default(),
@@ -1453,6 +1505,7 @@ impl UpstreamResponseBodyState {
                 UpstreamResponseSource::Http3(Box::new(request_stream)),
                 None,
                 http3_tracker,
+                None,
                 content_length,
             ),
             stream: BufferedByteStream::default(),
@@ -3154,7 +3207,11 @@ impl std::fmt::Debug for StartedUpstreamResponse {
 #[derive(Debug)]
 enum NativeDefaultUpstreamForwardBody {
     Empty,
-    Hyper(hyper::body::Incoming),
+    Hyper {
+        body: hyper::body::Incoming,
+        content_length: Option<u64>,
+        plain_http1_sender_lease: Option<PlainHttp1SenderLease>,
+    },
 }
 
 #[derive(Debug)]
@@ -4001,7 +4058,26 @@ async fn response_from_started_upstream_response(
 ) -> Response<Body> {
     let mut response = Response::new(match native_response.body {
         NativeDefaultUpstreamForwardBody::Empty => Body::empty(),
-        NativeDefaultUpstreamForwardBody::Hyper(body) => Body::new(body),
+        NativeDefaultUpstreamForwardBody::Hyper {
+            body,
+            content_length,
+            plain_http1_sender_lease,
+        } => {
+            let passthrough = UpstreamResponseBodyState::from_hyper(
+                body,
+                None,
+                plain_http1_sender_lease,
+                content_length,
+            )
+            .take_streaming_passthrough();
+            Body::from_stream(try_unfold(passthrough, |mut state| async move {
+                let chunk = state
+                    .next_chunk()
+                    .await
+                    .map_err(|err| io::Error::other(err.to_string()))?;
+                Ok::<_, io::Error>(chunk.map(|chunk| (chunk, state)))
+            }))
+        }
     });
     *response.status_mut() = StatusCode::from_u16(native_response.status).unwrap_or(StatusCode::OK);
     *response.version_mut() = native_response.version;
@@ -4141,9 +4217,16 @@ fn materialize_native_default_upstream_forward_response(
         peer_certificate_der: None,
         body: Arc::new(tokio::sync::Mutex::new(match body {
             NativeDefaultUpstreamForwardBody::Empty => UpstreamResponseBodyState::empty(),
-            NativeDefaultUpstreamForwardBody::Hyper(body) => {
-                UpstreamResponseBodyState::from_hyper(body, None, None)
-            }
+            NativeDefaultUpstreamForwardBody::Hyper {
+                body,
+                content_length,
+                plain_http1_sender_lease,
+            } => UpstreamResponseBodyState::from_hyper(
+                body,
+                None,
+                plain_http1_sender_lease,
+                content_length,
+            ),
         })),
     };
     let (snapshot, upstream_response_version, peer_addr) =
@@ -4178,6 +4261,7 @@ async fn forward_native_default_upstream_http_via_sender_pool(
     let pool = services
         .plain_http1_sender_pool()
         .ok_or(UpstreamResponseStartError::MissingClient)?;
+    let sender_pool_capacity = services.upstream_http_reuse_entries();
     let request_body = resolve_outbound_request_body(context)
         .await
         .map_err(|err| {
@@ -4249,25 +4333,28 @@ async fn forward_native_default_upstream_http_via_sender_pool(
     let (parts, body) = upstream_response.into_parts();
     let content_length = header_content_length(&parts.headers);
     let body_is_empty = matches!(content_length, Some(0)) || body.is_end_stream();
-    if body_is_empty {
-        release_plain_http1_sender(
-            &pool,
-            authority,
-            services.upstream_http_reuse_entries(),
-            sender,
-        );
-    }
+    let response_body = if body_is_empty {
+        release_plain_http1_sender(&pool, authority, sender_pool_capacity, sender);
+        NativeDefaultUpstreamForwardBody::Empty
+    } else {
+        NativeDefaultUpstreamForwardBody::Hyper {
+            body,
+            content_length,
+            plain_http1_sender_lease: Some(PlainHttp1SenderLease::new(
+                pool.clone(),
+                authority,
+                sender_pool_capacity,
+                sender,
+            )),
+        }
+    };
     mark_outbound_tcp_connected(context, DEFAULT_UPSTREAM_EXCHANGE_HANDLE)
         .map_err(|err| UpstreamResponseStartError::Protocol(err.as_vm_error().to_string()))?;
     Ok(NativeDefaultUpstreamForwardResponse {
         status: parts.status.as_u16(),
         headers: parts.headers,
         version: parts.version,
-        body: if body_is_empty {
-            NativeDefaultUpstreamForwardBody::Empty
-        } else {
-            NativeDefaultUpstreamForwardBody::Hyper(body)
-        },
+        body: response_body,
         upstream_latency_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
     })
 }
@@ -4550,7 +4637,7 @@ where
         negotiated_alpn: Some(HTTP11_ALPN_PROTOCOL.to_string()),
         peer_certificate_der: None,
         body: Arc::new(tokio::sync::Mutex::new(
-            UpstreamResponseBodyState::from_hyper(response.into_body(), None, content_length),
+            UpstreamResponseBodyState::from_hyper(response.into_body(), None, None, content_length),
         )),
     })
 }
@@ -4674,6 +4761,7 @@ async fn start_upstream_response_via_http2(
             UpstreamResponseBodyState::from_hyper(
                 started.response.into_body(),
                 Some(started.body_tracker),
+                None,
                 content_length,
             ),
         )),
@@ -6253,6 +6341,7 @@ mod tests {
                 UpstreamResponseBodyState::from_hyper(
                     started.response.into_body(),
                     Some(started.body_tracker),
+                    None,
                     content_length,
                 ),
             )),

@@ -597,6 +597,106 @@ async fn http_request_body_can_be_rewritten_before_proxying() {
 }
 
 #[tokio::test]
+async fn http_proxy_reuses_plain_http1_upstream_connection_for_non_empty_forwarded_bodies() {
+    use std::convert::Infallible;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::body::Body;
+    use hyper::{Request, Response, service::service_fn};
+    use hyper_util::rt::TokioIo;
+
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("upstream listener should bind");
+    let upstream_addr = upstream_listener
+        .local_addr()
+        .expect("upstream listener should have addr");
+    let upstream_connection_count = Arc::new(AtomicUsize::new(0));
+    let upstream_handle = tokio::spawn({
+        let upstream_connection_count = Arc::clone(&upstream_connection_count);
+        async move {
+            loop {
+                let (stream, _) = upstream_listener
+                    .accept()
+                    .await
+                    .expect("upstream accept should succeed");
+                upstream_connection_count.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let service =
+                        service_fn(|request: Request<hyper::body::Incoming>| async move {
+                            let path = request.uri().path().to_string();
+                            let mut response =
+                                Response::new(Body::from(format!("Hello, World! {path}")));
+                            response.headers_mut().insert(
+                                "x-upstream-http1-keepalive",
+                                "ok".parse().expect("header should parse"),
+                            );
+                            Ok::<_, Infallible>(response)
+                        });
+                    let builder = hyper::server::conn::http1::Builder::new();
+                    if let Err(err) = builder
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                    {
+                        panic!("http1 upstream connection should serve: {err}");
+                    }
+                });
+            }
+        }
+    });
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use proxy;
+
+        let upstream = http::exchange::default_upstream();
+        http::exchange::set_target(upstream, "127.0.0.1", {});
+        proxy::forward_default_upstream([]);
+    "#,
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    for path in ["/first", "/second"] {
+        let response = client
+            .get(format!("http://{data_addr}{path}"))
+            .send()
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-upstream-http1-keepalive")
+                .and_then(|value| value.to_str().ok()),
+            Some("ok")
+        );
+        assert_eq!(
+            response.text().await.expect("body should read"),
+            format!("Hello, World! {path}")
+        );
+    }
+
+    assert_eq!(
+        upstream_connection_count.load(Ordering::Relaxed),
+        1,
+        "two proxied http/1.1 requests with non-empty upstream bodies should reuse one upstream connection",
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
 async fn http_request_body_chunk_api_reads_in_chunks() {
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
     let client = reqwest::Client::new();
