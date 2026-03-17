@@ -107,6 +107,7 @@ impl VmInterruptConfig {
 pub struct VmExecutionConfig {
     pub interrupt: VmInterruptConfig,
     pub execution_mode: VmExecutionMode,
+    pub jit_enabled: bool,
 }
 
 impl Default for VmExecutionConfig {
@@ -114,6 +115,7 @@ impl Default for VmExecutionConfig {
         Self {
             interrupt: VmInterruptConfig::None,
             execution_mode: VmExecutionMode::default(),
+            jit_enabled: true,
         }
     }
 }
