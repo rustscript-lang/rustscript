@@ -100,7 +100,7 @@ fn record_stage_metrics(pre_vm_us: u64, vm_us: u64, resolve_us: u64, total_us: u
     STAGE_METRICS_VM_US.fetch_add(vm_us, Ordering::Relaxed);
     STAGE_METRICS_RESOLVE_US.fetch_add(resolve_us, Ordering::Relaxed);
     STAGE_METRICS_TOTAL_US.fetch_add(total_us, Ordering::Relaxed);
-    if count % 1000 == 0 {
+    if count.is_multiple_of(1000) {
         let pre_vm_avg = STAGE_METRICS_PRE_VM_US.load(Ordering::Relaxed) as f64 / count as f64;
         let vm_avg = STAGE_METRICS_VM_US.load(Ordering::Relaxed) as f64 / count as f64;
         let resolve_avg = STAGE_METRICS_RESOLVE_US.load(Ordering::Relaxed) as f64 / count as f64;

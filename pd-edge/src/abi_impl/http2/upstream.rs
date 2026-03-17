@@ -79,6 +79,18 @@ impl Http2SessionStore {
 
 pub(crate) type SharedHttpUpstreamSessions = Arc<Http2SessionStore>;
 
+#[cfg(feature = "http2")]
+struct Http2RequestParts<'a> {
+    request_path: &'a str,
+    request_query: &'a str,
+    target_host: &'a str,
+    target_port: u16,
+    target_host_header: Option<&'a str>,
+    method: Method,
+    headers: HeaderMap,
+    request_body: Vec<u8>,
+}
+
 pub(crate) fn new_shared_http_upstream_sessions(capacity: usize) -> SharedHttpUpstreamSessions {
     #[cfg(not(feature = "http2"))]
     let _ = capacity;
@@ -692,7 +704,7 @@ pub(crate) async fn send_request(
 
     let stream_ref = session.reserve_stream(exchange_handle)?;
     let request_body_present = !request_body.is_empty();
-    let request = build_http2_request(
+    let request = build_http2_request(Http2RequestParts {
         request_path,
         request_query,
         target_host,
@@ -701,7 +713,7 @@ pub(crate) async fn send_request(
         method,
         headers,
         request_body,
-    )?;
+    })?;
     let response = sender.send_request(request).await.map_err(|err| {
         let observed = classify_http2_error(&err);
         apply_stream_error(&session, stream_ref.stream_id, &observed);
@@ -802,30 +814,25 @@ where
 
 #[cfg(feature = "http2")]
 fn build_http2_request(
-    request_path: &str,
-    request_query: &str,
-    target_host: &str,
-    target_port: u16,
-    target_host_header: Option<&str>,
-    method: Method,
-    mut headers: HeaderMap,
-    request_body: Vec<u8>,
+    parts: Http2RequestParts<'_>,
 ) -> Result<Request<Full<Bytes>>, Http2RequestError> {
-    let path = if request_path.is_empty() {
+    let path = if parts.request_path.is_empty() {
         "/"
     } else {
-        request_path
+        parts.request_path
     };
-    let path_and_query = if request_query.is_empty() {
+    let path_and_query = if parts.request_query.is_empty() {
         path.to_string()
     } else {
-        format!("{path}?{request_query}")
+        format!("{path}?{}", parts.request_query)
     };
+    let mut headers = parts.headers;
 
     if !headers.contains_key(HOST) {
-        let host_value = target_host_header
+        let host_value = parts
+            .target_host_header
             .map(str::to_string)
-            .unwrap_or_else(|| format_upstream_authority(target_host, target_port));
+            .unwrap_or_else(|| format_upstream_authority(parts.target_host, parts.target_port));
         let value = HeaderValue::from_str(&host_value).map_err(|err| {
             Http2RequestError::transport(format!(
                 "invalid host header for '{}://{}': {err}",
@@ -835,12 +842,12 @@ fn build_http2_request(
         headers.insert(HOST, value);
     }
 
-    let mut request = Request::builder().method(method).uri(path_and_query);
+    let mut request = Request::builder().method(parts.method).uri(path_and_query);
     for (name, value) in &headers {
         request = request.header(name, value);
     }
     request
-        .body(Full::new(Bytes::from(request_body)))
+        .body(Full::new(Bytes::from(parts.request_body)))
         .map_err(|err| Http2RequestError::transport(format!("invalid http2 request: {err}")))
 }
 

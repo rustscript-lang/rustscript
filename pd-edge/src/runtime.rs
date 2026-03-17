@@ -18,9 +18,10 @@ use crate::{
         ProxyVmContext, RateLimiterStore, SharedHttp3DownstreamSessions,
         SharedHttpDownstreamSessions, SharedRateLimiter,
         http::{
-            SharedRuntimeServices, new_shared_http_plane_runtime_services,
-            new_shared_plain_http1_sender_pool, new_shared_plain_http1_upstream_client,
-            new_shared_upstream_client_cache, upstream_reqwest_client_builder,
+            HttpPlaneRuntimeServicesConfig, SharedRuntimeServices,
+            new_shared_http_plane_runtime_services, new_shared_plain_http1_sender_pool,
+            new_shared_plain_http1_upstream_client, new_shared_upstream_client_cache,
+            upstream_reqwest_client_builder,
         },
         new_shared_http_downstream_sessions, new_shared_http_upstream_sessions,
         new_shared_http3_downstream_sessions, new_shared_http3_upstream_sessions,
@@ -232,18 +233,19 @@ impl SharedState {
         let downstream_http3_sessions =
             new_shared_http3_downstream_sessions(store_limits.downstream_http3_session_entries);
         let rate_limiter = Arc::new(RateLimiterStore::new());
-        let runtime_services = new_shared_http_plane_runtime_services(
-            rate_limiter.clone(),
-            client.clone(),
-            plain_http1_upstream_client,
-            plain_http1_sender_pool,
-            store_limits.upstream_http_reuse_entries,
-            upstream_client_cache.clone(),
-            tls_session_cache.clone(),
-            upstream_http_sessions.clone(),
-            upstream_http3_sessions.clone(),
-            downstream_http2_sessions.clone(),
-        );
+        let runtime_services =
+            new_shared_http_plane_runtime_services(HttpPlaneRuntimeServicesConfig {
+                rate_limiter: rate_limiter.clone(),
+                upstream_client: client.clone(),
+                plain_http1_upstream_client,
+                plain_http1_sender_pool,
+                upstream_http_reuse_entries: store_limits.upstream_http_reuse_entries,
+                upstream_client_cache: upstream_client_cache.clone(),
+                tls_session_cache: tls_session_cache.clone(),
+                upstream_http_sessions: upstream_http_sessions.clone(),
+                upstream_http3_sessions: upstream_http3_sessions.clone(),
+                downstream_http_sessions: downstream_http2_sessions.clone(),
+            });
         Self {
             active_program: Arc::new(ArcSwapOption::from(None::<Arc<LoadedProgram>>)),
             max_program_bytes,

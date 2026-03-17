@@ -956,7 +956,7 @@ async fn connection_close(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use axum::http::HeaderMap;
 

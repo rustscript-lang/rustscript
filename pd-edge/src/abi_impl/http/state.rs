@@ -740,7 +740,7 @@ fn record_native_forward_metrics(
     NATIVE_FORWARD_METRICS_READY_US.fetch_add(ready_us, Ordering::Relaxed);
     NATIVE_FORWARD_METRICS_SEND_US.fetch_add(send_us, Ordering::Relaxed);
     NATIVE_FORWARD_METRICS_TOTAL_US.fetch_add(total_us, Ordering::Relaxed);
-    if count % 1000 == 0 {
+    if count.is_multiple_of(1000) {
         let hits = NATIVE_FORWARD_METRICS_POOL_HITS.load(Ordering::Relaxed);
         let misses = NATIVE_FORWARD_METRICS_POOL_MISSES.load(Ordering::Relaxed);
         let retries = NATIVE_FORWARD_METRICS_RETRIES.load(Ordering::Relaxed);
@@ -1465,11 +1465,12 @@ fn upstream_response_body_source(
 
 impl UpstreamResponseBodyState {
     fn empty() -> Self {
-        let mut stream = BufferedByteStream::default();
-        stream.eof = true;
         Self {
             source: UpstreamResponseBodySource::default(),
-            stream,
+            stream: BufferedByteStream {
+                eof: true,
+                ..BufferedByteStream::default()
+            },
         }
     }
 
@@ -1764,31 +1765,35 @@ pub(crate) fn new_shared_runtime_services(
     Arc::new(RuntimeServices::new(rate_limiter))
 }
 
+pub(crate) struct HttpPlaneRuntimeServicesConfig {
+    pub(crate) rate_limiter: SharedRateLimiter,
+    pub(crate) upstream_client: reqwest::Client,
+    pub(crate) plain_http1_upstream_client: SharedPlainHttp1UpstreamClient,
+    pub(crate) plain_http1_sender_pool: SharedPlainHttp1SenderPool,
+    pub(crate) upstream_http_reuse_entries: usize,
+    pub(crate) upstream_client_cache: SharedUpstreamClientCache,
+    pub(crate) tls_session_cache: SharedTlsSessionCache,
+    pub(crate) upstream_http_sessions: SharedHttpUpstreamSessions,
+    pub(crate) upstream_http3_sessions: SharedHttp3UpstreamSessions,
+    pub(crate) downstream_http_sessions: http2::SharedHttpDownstreamSessions,
+}
+
 pub(crate) fn new_shared_http_plane_runtime_services(
-    rate_limiter: SharedRateLimiter,
-    upstream_client: reqwest::Client,
-    plain_http1_upstream_client: SharedPlainHttp1UpstreamClient,
-    plain_http1_sender_pool: SharedPlainHttp1SenderPool,
-    upstream_http_reuse_entries: usize,
-    upstream_client_cache: SharedUpstreamClientCache,
-    tls_session_cache: SharedTlsSessionCache,
-    upstream_http_sessions: SharedHttpUpstreamSessions,
-    upstream_http3_sessions: SharedHttp3UpstreamSessions,
-    downstream_http_sessions: http2::SharedHttpDownstreamSessions,
+    config: HttpPlaneRuntimeServicesConfig,
 ) -> SharedRuntimeServices {
     Arc::new(RuntimeServices {
-        upstream_client: Some(upstream_client),
-        plain_http1_upstream_client: Some(plain_http1_upstream_client),
-        plain_http1_sender_pool: Some(plain_http1_sender_pool),
-        upstream_http_reuse_entries,
-        upstream_client_cache: Some(upstream_client_cache),
-        tls_session_cache: Some(tls_session_cache),
-        upstream_http_sessions: Some(upstream_http_sessions),
-        upstream_http3_sessions: Some(upstream_http3_sessions),
-        downstream_http_sessions: Some(downstream_http_sessions),
+        upstream_client: Some(config.upstream_client),
+        plain_http1_upstream_client: Some(config.plain_http1_upstream_client),
+        plain_http1_sender_pool: Some(config.plain_http1_sender_pool),
+        upstream_http_reuse_entries: config.upstream_http_reuse_entries,
+        upstream_client_cache: Some(config.upstream_client_cache),
+        tls_session_cache: Some(config.tls_session_cache),
+        upstream_http_sessions: Some(config.upstream_http_sessions),
+        upstream_http3_sessions: Some(config.upstream_http3_sessions),
+        downstream_http_sessions: Some(config.downstream_http_sessions),
         #[cfg(feature = "tls")]
         downstream_tls_termination: None,
-        rate_limiter,
+        rate_limiter: config.rate_limiter,
     })
 }
 
@@ -2801,10 +2806,10 @@ pub(crate) fn attach_outbound_exchange_tls_transport(
     let tls_flow = transport
         .dynamic_tls_sessions
         .get_or_insert_with(session, TlsFlowState::for_dynamic_socket);
-    if !tls_flow.handshake_complete() {
-        if let Some(target_host) = target_host {
-            tls_flow.observe_target(target_scheme.as_str(), &target_host);
-        }
+    if !tls_flow.handshake_complete()
+        && let Some(target_host) = target_host
+    {
+        tls_flow.observe_target(target_scheme.as_str(), &target_host);
     }
     drop(transport);
     let exchange_state = exchanges
@@ -4603,22 +4608,20 @@ async fn try_resolve_native_default_upstream_http_forward_response(
     if request.target_scheme == HttpUpstreamScheme::Http {
         if services.plain_http1_sender_pool().is_some()
             && default_upstream_request_body_known_empty(context)
-        {
-            if let Ok(response) =
+            && let Ok(response) =
                 forward_native_default_upstream_http_via_sender_pool(context, &request).await
-            {
-                let upstream_latency_ms = response.upstream_latency_ms;
-                return Ok(Some(ResolvedHttpGraphResponse {
-                    response: response_from_started_upstream_response(
-                        response,
-                        response_headers,
-                        response_status,
-                    )
-                    .await,
-                    upstream_latency_ms,
-                    post_response_plan: None,
-                }));
-            }
+        {
+            let upstream_latency_ms = response.upstream_latency_ms;
+            return Ok(Some(ResolvedHttpGraphResponse {
+                response: response_from_started_upstream_response(
+                    response,
+                    response_headers,
+                    response_status,
+                )
+                .await,
+                upstream_latency_ms,
+                post_response_plan: None,
+            }));
         }
         let client = services
             .plain_http1_upstream_client()
@@ -5168,13 +5171,11 @@ async fn start_outbound_exchange_response(
         }
     }
 
-    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
-        match try_materialize_ready_or_pending_native_default_upstream_forward_response(context)
-            .await
-        {
-            Ok(Some(snapshot)) => return Ok(snapshot),
-            Ok(None) | Err(_) => {}
-        }
+    if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE
+        && let Ok(Some(snapshot)) =
+            try_materialize_ready_or_pending_native_default_upstream_forward_response(context).await
+    {
+        return Ok(snapshot);
     }
 
     if handle == DEFAULT_UPSTREAM_EXCHANGE_HANDLE
@@ -5833,18 +5834,16 @@ pub(crate) async fn resolve_http_graph_response(
     }
 
     if native_default_upstream_http_forward && upstream_response.is_none() {
-        match try_resolve_ready_or_pending_native_default_upstream_forward_response(
-            context,
-            response_headers.clone(),
-            response_status,
-        )
-        .await
+        if let Ok(Some(resolved)) =
+            try_resolve_ready_or_pending_native_default_upstream_forward_response(
+                context,
+                response_headers.clone(),
+                response_status,
+            )
+            .await
         {
-            Ok(Some(resolved)) => {
-                context.clear_native_default_upstream_http_forward();
-                return resolved;
-            }
-            Ok(None) | Err(_) => {}
+            context.clear_native_default_upstream_http_forward();
+            return resolved;
         }
         match try_resolve_native_default_upstream_http_forward_response(
             context,

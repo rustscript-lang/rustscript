@@ -144,10 +144,10 @@ fn allocate_proxy_stream_handle(
     Ok(handle)
 }
 
-fn ensure_proxy_stream_state_mut<'a>(
-    guard: &'a mut http::ProxyStreamRegistry,
+fn ensure_proxy_stream_state_mut(
+    guard: &mut http::ProxyStreamRegistry,
     handle: i64,
-) -> Result<&'a mut ProxyByteStreamState, VmError> {
+) -> Result<&mut ProxyByteStreamState, VmError> {
     if guard.proxy_stream_handles.contains_key(&handle) {
         return guard
             .proxy_stream_handles

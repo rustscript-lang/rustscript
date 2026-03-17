@@ -1267,7 +1267,7 @@ fn tls_session_origin(scheme: &str, host: &str, port: u16) -> Option<String> {
 }
 
 fn normalize_authority_host(value: &str) -> Option<String> {
-    let authority = Authority::from_maybe_shared(value.to_string()).ok()?;
+    let authority = value.parse::<Authority>().ok()?;
     let host = authority.host().trim_matches(['[', ']']);
     if host.is_empty() {
         None
