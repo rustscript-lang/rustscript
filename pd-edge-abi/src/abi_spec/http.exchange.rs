@@ -9,7 +9,12 @@ fn http_exchange_default_upstream() -> i64 {
 }
 
 #[pd_host_function(name = "http::exchange::prepare_default_upstream")]
-fn http_exchange_prepare_default_upstream(target: &str, version: &str, headers: Value) -> i64 {
+fn http_exchange_prepare_default_upstream(
+    host: &str,
+    port: i64,
+    version: &str,
+    headers: Value,
+) -> i64 {
     unreachable!("abi declaration only")
 }
 

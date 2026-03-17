@@ -1101,13 +1101,14 @@ async fn proxy_forward_default_upstream(
 async fn proxy_prepare_and_forward_default_upstream(
     _vm: &mut Vm,
     context: SharedProxyVmContext,
-    target: String,
+    host: String,
+    port: i64,
     version: String,
     request_headers: Value,
     response_headers: Value,
 ) -> Result<CallOutcome, VmError> {
     let parsed_response_headers = http::parse_response_header_batch(response_headers)?;
-    http::prepare_default_upstream_request(&context, target, version, request_headers)?;
+    http::prepare_default_upstream_request(&context, host, port, version, request_headers)?;
     let status = if !http::start_native_default_upstream_http_forward_response(&context).await? {
         http::ensure_outbound_exchange_response_started(
             &context,

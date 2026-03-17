@@ -19,9 +19,8 @@ use crate::{
         SharedHttpDownstreamSessions, SharedRateLimiter,
         http::{
             SharedRuntimeServices, new_shared_http_plane_runtime_services,
-            new_shared_parsed_upstream_target_cache, new_shared_plain_http1_sender_pool,
-            new_shared_plain_http1_upstream_client, new_shared_upstream_client_cache,
-            upstream_reqwest_client_builder,
+            new_shared_plain_http1_sender_pool, new_shared_plain_http1_upstream_client,
+            new_shared_upstream_client_cache, upstream_reqwest_client_builder,
         },
         new_shared_http_downstream_sessions, new_shared_http_upstream_sessions,
         new_shared_http3_downstream_sessions, new_shared_http3_upstream_sessions,
@@ -220,8 +219,6 @@ impl SharedState {
         let plain_http1_sender_pool = new_shared_plain_http1_sender_pool();
         let upstream_client_cache =
             new_shared_upstream_client_cache(store_limits.upstream_http_reuse_entries);
-        let parsed_upstream_target_cache =
-            new_shared_parsed_upstream_target_cache(store_limits.upstream_http_reuse_entries);
         let tls_session_cache =
             new_shared_tls_session_cache(store_limits.tls_session_reuse_entries);
         let upstream_http_sessions =
@@ -240,7 +237,6 @@ impl SharedState {
             plain_http1_sender_pool,
             store_limits.upstream_http_reuse_entries,
             upstream_client_cache.clone(),
-            parsed_upstream_target_cache.clone(),
             tls_session_cache.clone(),
             upstream_http_sessions.clone(),
             upstream_http3_sessions.clone(),

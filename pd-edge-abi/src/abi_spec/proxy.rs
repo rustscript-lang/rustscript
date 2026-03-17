@@ -46,7 +46,8 @@ fn proxy_forward_default_upstream(response_headers: Value) -> String {
 /// Prepares the default upstream request target/header batch and forwards it in one call.
 #[pd_host_function(name = "proxy::prepare_and_forward_default_upstream")]
 fn proxy_prepare_and_forward_default_upstream(
-    target: &str,
+    host: &str,
+    port: i64,
     version: &str,
     request_headers: Value,
     response_headers: Value,

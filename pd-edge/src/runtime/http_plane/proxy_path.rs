@@ -1366,7 +1366,8 @@ mod tests {
 
                 let downstream_version = http::request::get_http_version();
                 let upstream = http::exchange::prepare_default_upstream(
-                    "http://{upstream_addr}",
+                    "{upstream_host}",
+                    {upstream_port},
                     "1.1",
                     [
                         "x-downstream-version", downstream_version,
@@ -1377,7 +1378,9 @@ mod tests {
                     "x-proxy-test", "ok",
                     "x-downstream-version", downstream_version
                 ]);
-            "#
+            "#,
+            upstream_host = upstream_addr.ip(),
+            upstream_port = upstream_addr.port(),
         );
         let compiled = compile_source(&source).expect("source should compile");
         let program = encode_program(&compiled.program).expect("program should encode");
@@ -1482,7 +1485,8 @@ mod tests {
 
                 let downstream_version = http::request::get_http_version();
                 proxy::prepare_and_forward_default_upstream(
-                    "http://{upstream_addr}",
+                    "{upstream_host}",
+                    {upstream_port},
                     "1.1",
                     [
                         "x-downstream-version", downstream_version,
@@ -1493,7 +1497,9 @@ mod tests {
                         "x-downstream-version", downstream_version
                     ]
                 );
-            "#
+            "#,
+            upstream_host = upstream_addr.ip(),
+            upstream_port = upstream_addr.port(),
         );
         let compiled = compile_source(&source).expect("source should compile");
         let program = encode_program(&compiled.program).expect("program should encode");
