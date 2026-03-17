@@ -318,7 +318,7 @@ async fn transport_downstream_http_handoff_continues_same_vm_invocation() {
         let downstream = tcp::stream::downstream();
         if http::request::get_scheme() == "tcp" {
             http::downstream::attach_transport();
-        }
+        }}
 
         if http::request::get_scheme() != "tcp" {
             http::response::set_status(201);
@@ -327,7 +327,7 @@ async fn transport_downstream_http_handoff_continues_same_vm_invocation() {
                 http::request::get_path_with_query() + "|" +
                 http::request::get_body()
             );
-        }
+        }}
     "#;
     let compiled = compile_source(source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
@@ -795,39 +795,35 @@ async fn transport_connect_tunnel_upgrades_downstream_into_dynamic_tcp() {
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
     let client = reqwest::Client::new();
 
-    let source = r#"
+    let source = format!(
+        r#"
         use http;
         use proxy;
         use tcp;
 
-        let target = http::request::get_header("x-connect-target");
-        if target == "" {
-            http::response::set_status(400);
-            http::response::set_body("missing x-connect-target");
-        } else {
-            let upstream = tcp::stream::new();
-            tcp::stream::set_target(upstream, target);
-            if !tcp::stream::connect(upstream) {
-                http::response::set_status(502);
-                http::response::set_body("tcp connect failed");
-            } else {
-                let downstream = proxy::stream::downstream();
-                let peer = proxy::stream::from_tcp(upstream);
-                let status = proxy::bridge(downstream, peer, 64);
-                http::response::set_header("x-proxy-status", status);
-            }
-        }
-    "#;
-    let compiled = compile_source(source).expect("source should compile");
+        let upstream = tcp::stream::new();
+        tcp::stream::set_target(upstream, "{upstream_host}", {upstream_port});
+        if !tcp::stream::connect(upstream) {{
+            http::response::set_status(502);
+            http::response::set_body("tcp connect failed");
+        }} else {{
+            let downstream = proxy::stream::downstream();
+            let peer = proxy::stream::from_tcp(upstream);
+            let status = proxy::bridge(downstream, peer, 64);
+            http::response::set_header("x-proxy-status", status);
+        }}
+    "#,
+        upstream_host = upstream_addr.ip(),
+        upstream_port = upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
 
     let mut stream = tokio::net::TcpStream::connect(data_addr)
         .await
         .expect("proxy should accept connect requests");
-    let request = format!(
-        "CONNECT tunnel HTTP/1.1\r\nHost: {data_addr}\r\nx-connect-target: {upstream_addr}\r\n\r\n"
-    );
+    let request = format!("CONNECT tunnel HTTP/1.1\r\nHost: {data_addr}\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .await
@@ -1006,50 +1002,44 @@ async fn transport_connect_tunnel_upgrades_downstream_into_dynamic_tls_plaintext
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
     let client = reqwest::Client::new();
 
-    let source = r#"
+    let source = format!(
+        r#"
         use http;
         use proxy;
         use tcp;
         use tls;
 
-        let target = http::request::get_header("x-connect-target");
-        if target == "" {
-            http::response::set_status(400);
-            http::response::set_body("missing x-connect-target");
-        } else {
-            let upstream = tcp::stream::new();
-            tcp::stream::set_target(upstream, target);
-            if !tcp::stream::connect(upstream) {
+        let upstream = tcp::stream::new();
+        tcp::stream::set_target(upstream, "localhost", {upstream_port});
+        if !tcp::stream::connect(upstream) {{
+            http::response::set_status(502);
+            http::response::set_body("tcp connect failed");
+        }} else {{
+            let session = tls::session::from_socket(upstream);
+            tls::session::set_verify(session, false);
+            tls::session::set_verify_hostname(session, false);
+            if !tls::session::handshake(session) {{
                 http::response::set_status(502);
-                http::response::set_body("tcp connect failed");
-            } else {
-                let session = tls::session::from_socket(upstream);
-                tls::session::set_verify(session, false);
-                tls::session::set_verify_hostname(session, false);
-                if !tls::session::handshake(session) {
-                    http::response::set_status(502);
-                    http::response::set_body("tls handshake failed");
-                } else {
-                    let downstream = proxy::stream::downstream();
-                    let peer = proxy::stream::from_tls_plaintext(session);
-                    let status = proxy::bridge(downstream, peer, 256);
-                    http::response::set_header("x-proxy-status", status);
-                    http::response::set_header("x-tls-phase", tls::session::get_phase(session));
-                }
-            }
-        }
-    "#;
-    let compiled = compile_source(source).expect("source should compile");
+                http::response::set_body("tls handshake failed");
+            }} else {{
+                let downstream = proxy::stream::downstream();
+                let peer = proxy::stream::from_tls_plaintext(session);
+                let status = proxy::bridge(downstream, peer, 256);
+                http::response::set_header("x-proxy-status", status);
+                http::response::set_header("x-tls-phase", tls::session::get_phase(session));
+            }}
+        }}
+    "#,
+        upstream_port = upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
 
     let mut stream = tokio::net::TcpStream::connect(data_addr)
         .await
         .expect("proxy should accept connect requests");
-    let connect_target = format!("localhost:{}", upstream_addr.port());
-    let request = format!(
-        "CONNECT secure HTTP/1.1\r\nHost: {data_addr}\r\nx-connect-target: {connect_target}\r\n\r\n"
-    );
+    let request = format!("CONNECT secure HTTP/1.1\r\nHost: {data_addr}\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .await
@@ -1190,7 +1180,7 @@ async fn transport_dynamic_tls_session_can_handshake_against_socket_target() {
         use tls;
 
         let stream = tcp::stream::new();
-        tcp::stream::set_target(stream, "localhost:{}");
+        tcp::stream::set_target(stream, "localhost", {});
         if !tcp::stream::connect(stream) {{
             http::response::set_status(502);
             http::response::set_body("connect failed");
@@ -1260,7 +1250,7 @@ async fn transport_dynamic_tls_session_socket_target_direct_vm_run() {
         use tls;
 
         let stream = tcp::stream::new();
-        tcp::stream::set_target(stream, "localhost:{}");
+        tcp::stream::set_target(stream, "localhost", {});
         if !tcp::stream::connect(stream) {{
             http::response::set_status(502);
             http::response::set_body("connect failed");
