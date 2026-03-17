@@ -162,6 +162,7 @@ pub struct SharedState {
 pub struct LoadedProgram {
     pub program: Arc<Program>,
     pub no_interrupt_aot_bundle: Option<Arc<Vec<u8>>>,
+    pub(crate) vm_pool: Arc<vm_runner::LoadedProgramVmPool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -735,6 +736,7 @@ pub async fn apply_program_from_bytes(state: &SharedState, bytes: &[u8]) -> Prog
     state.active_program.store(Some(Arc::new(LoadedProgram {
         program,
         no_interrupt_aot_bundle,
+        vm_pool: Arc::new(vm_runner::LoadedProgramVmPool::new()),
     })));
     state.record_program_apply_success();
     info!(

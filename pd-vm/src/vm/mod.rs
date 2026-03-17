@@ -487,8 +487,11 @@ impl Vm {
         self.drop_contract_events = 0;
         self.last_yield_reason = None;
         self.epoch_rearm_pending = false;
+        self.clear_fuel();
+        self.clear_epoch_deadline();
         self.clear_stack_with_drop_contract();
         self.clear_locals_with_drop_contract();
+        crate::builtins::runtime::close_all_handles(self);
         self.call_depth = 0;
         self.waiting_host_op = None;
         self.next_host_op_id = 1;
@@ -982,7 +985,7 @@ impl Vm {
                 active_debugger.on_instruction(self);
             }
 
-            if allow_jit {
+            if allow_jit && self.jit_config().enabled {
                 let trace_id = {
                     let program = &self.program;
                     self.jit.observe_hot_ip(self.ip, program)
