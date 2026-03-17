@@ -1,4 +1,5 @@
 use std::time::Duration;
+use parking_lot::Mutex;
 use tokio::{
     runtime::Handle,
     task::JoinHandle,
@@ -38,6 +39,67 @@ impl VmRunnerStoreData {
 }
 
 type VmRunnerStore = Store<VmRunnerStoreData>;
+
+const VM_POOL_MAX_PER_BUCKET: usize = 256;
+
+#[derive(Default)]
+struct VmPoolBuckets {
+    aot_enabled: Vec<Vm>,
+    baseline: Vec<Vm>,
+    jit_disabled: Vec<Vm>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VmPoolKey {
+    prefer_aot: bool,
+    jit_enabled: bool,
+}
+
+impl VmPoolKey {
+    const fn new(prefer_aot: bool, jit_enabled: bool) -> Self {
+        Self {
+            prefer_aot,
+            jit_enabled,
+        }
+    }
+
+    fn bucket_mut<'a>(&self, buckets: &'a mut VmPoolBuckets) -> &'a mut Vec<Vm> {
+        match (self.jit_enabled, self.prefer_aot) {
+            (false, _) => &mut buckets.jit_disabled,
+            (true, true) => &mut buckets.aot_enabled,
+            (true, false) => &mut buckets.baseline,
+        }
+    }
+}
+
+pub(crate) struct LoadedProgramVmPool {
+    buckets: Mutex<VmPoolBuckets>,
+}
+
+impl LoadedProgramVmPool {
+    pub(crate) fn new() -> Self {
+        Self {
+            buckets: Mutex::new(VmPoolBuckets::default()),
+        }
+    }
+
+    fn take(&self, key: VmPoolKey) -> Option<Vm> {
+        key.bucket_mut(&mut self.buckets.lock()).pop()
+    }
+
+    fn put(&self, key: VmPoolKey, vm: Vm) {
+        let mut buckets = self.buckets.lock();
+        let bucket = key.bucket_mut(&mut buckets);
+        if bucket.len() < VM_POOL_MAX_PER_BUCKET {
+            bucket.push(vm);
+        }
+    }
+}
+
+struct AcquiredVmRunnerStore {
+    vm_store: VmRunnerStore,
+    pool_key: Option<VmPoolKey>,
+}
 
 enum ActiveVmInterrupt {
     None,
@@ -97,27 +159,28 @@ pub async fn execute_vm_with_context(
     register_host_modules: HostModuleRegistrar,
     vm_execution: VmExecutionConfig,
 ) -> Result<(), VmExecutionError> {
-    let async_ops = new_shared_vm_async_ops();
-    let vm_store = new_vm_runner_store(
+    let prefer_aot =
+        !debug.attach_debugger && matches!(vm_execution.interrupt, VmInterruptConfig::None);
+    let AcquiredVmRunnerStore { vm_store, pool_key } = acquire_vm_runner_store(
         program,
         vm_context,
-        async_ops,
-        !debug.attach_debugger && matches!(vm_execution.interrupt, VmInterruptConfig::None),
+        register_host_modules,
+        prefer_aot,
         vm_execution.jit_enabled,
-    );
+        !debug.attach_debugger,
+    )?;
     let execution_mode = if debug.force_threading {
         VmExecutionMode::Threading
     } else {
         vm_execution.execution_mode
     };
 
-    match execution_mode {
+    let vm_store = match execution_mode {
         VmExecutionMode::Async => {
             execute_vm_with_async_mode(
                 vm_store,
                 debug_session,
                 debug,
-                register_host_modules,
                 vm_execution,
             )
             .await
@@ -127,28 +190,31 @@ pub async fn execute_vm_with_context(
                 vm_store,
                 debug_session,
                 debug,
-                register_host_modules,
                 vm_execution,
             )
             .await
         }
+    }?;
+
+    if let Some(pool_key) = pool_key {
+        recycle_vm_runner_store(program, pool_key, vm_store);
     }
+
+    Ok(())
 }
 
 async fn execute_vm_with_async_mode(
     vm_store: VmRunnerStore,
     debug_session: SharedDebugSession,
     debug: VmDebugInvocation,
-    register_host_modules: HostModuleRegistrar,
     vm_execution: VmExecutionConfig,
-) -> Result<(), VmExecutionError> {
+) -> Result<VmRunnerStore, VmExecutionError> {
     let started = std::time::Instant::now();
     let request_id = tail_profile_request_id(&vm_store);
     let mut profile = run_vm_async(
         vm_store,
         debug_session,
         debug,
-        register_host_modules,
         vm_execution,
     )
     .await?;
@@ -156,16 +222,15 @@ async fn execute_vm_with_async_mode(
     profile.queue_wait_us = 0;
     profile.blocking_run_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
     maybe_log_tail_profile(request_id.as_deref(), &profile);
-    Ok(())
+    Ok(profile.vm_store)
 }
 
 async fn execute_vm_with_threading_mode(
     vm_store: VmRunnerStore,
     debug_session: SharedDebugSession,
     debug: VmDebugInvocation,
-    register_host_modules: HostModuleRegistrar,
     vm_execution: VmExecutionConfig,
-) -> Result<(), VmExecutionError> {
+) -> Result<VmRunnerStore, VmExecutionError> {
     let queued_at = std::time::Instant::now();
     let request_id = tail_profile_request_id(&vm_store);
     let task = tokio::task::spawn_blocking(move || {
@@ -175,7 +240,6 @@ async fn execute_vm_with_threading_mode(
             vm_store,
             debug_session,
             debug,
-            register_host_modules,
             vm_execution,
         );
 
@@ -185,7 +249,7 @@ async fn execute_vm_with_threading_mode(
                 profile.blocking_run_us =
                     u64::try_from(threading_started.elapsed().as_micros()).unwrap_or(u64::MAX);
                 maybe_log_tail_profile(request_id.as_deref(), &profile);
-                Ok(())
+                Ok(profile.vm_store)
             }
             Err(err) => Err(err),
         }
@@ -202,25 +266,23 @@ async fn run_vm_async(
     mut vm_store: VmRunnerStore,
     debug_session: SharedDebugSession,
     debug: VmDebugInvocation,
-    register_host_modules: HostModuleRegistrar,
     vm_execution: VmExecutionConfig,
 ) -> Result<VmExecutionProfile, VmExecutionError> {
     let interrupt = configure_vm_interrupt(&mut vm_store, vm_execution)?;
-    register_host_modules_from_store(&mut vm_store, register_host_modules)?;
-    let mut profile = VmExecutionProfile::default();
+    let mut profile = VmExecutionProfile::default_with_store(vm_store);
 
     loop {
-        arm_epoch_interrupt_if_enabled(&mut vm_store, &interrupt, debug.attach_debugger)?;
+        arm_epoch_interrupt_if_enabled(&mut profile.vm_store, &interrupt, debug.attach_debugger)?;
         let status = {
             let _host_context = enter_edge_host_context(
-                vm_store.data().vm_context.clone(),
-                vm_store.data().async_ops.clone(),
+                profile.vm_store.data().vm_context.clone(),
+                profile.vm_store.data().async_ops.clone(),
             );
             if debug.attach_debugger {
-                let vm_context = vm_store.data().vm_context.clone();
-                run_vm_with_optional_debugger(&debug_session, vm_context, vm_store.vm_mut())
+                let vm_context = profile.vm_store.data().vm_context.clone();
+                run_vm_with_optional_debugger(&debug_session, vm_context, profile.vm_store.vm_mut())
             } else {
-                vm_store.run()
+                profile.vm_store.run()
             }
         }
         .map_err(VmExecutionError::Vm)?;
@@ -228,12 +290,16 @@ async fn run_vm_async(
             VmStatus::Halted => break,
             VmStatus::Yielded => {
                 profile.vm_yield_count = profile.vm_yield_count.saturating_add(1);
-                handle_interrupt_yield(&mut vm_store, &interrupt, &mut profile)?;
+                if handle_interrupt_yield(&mut profile.vm_store, &interrupt)? {
+                    profile.vm_fuel_recharge_count =
+                        profile.vm_fuel_recharge_count.saturating_add(1);
+                }
                 tokio::task::yield_now().await;
             }
             VmStatus::Waiting(_op_id) => {
                 let waiting_started = std::time::Instant::now();
-                vm_store
+                profile
+                    .vm_store
                     .vm_mut()
                     .await_waiting_host_op()
                     .await
@@ -253,25 +319,23 @@ fn run_vm_threading(
     mut vm_store: VmRunnerStore,
     debug_session: SharedDebugSession,
     debug: VmDebugInvocation,
-    register_host_modules: HostModuleRegistrar,
     vm_execution: VmExecutionConfig,
 ) -> Result<VmExecutionProfile, VmExecutionError> {
     let interrupt = configure_vm_interrupt(&mut vm_store, vm_execution)?;
-    register_host_modules_from_store(&mut vm_store, register_host_modules)?;
-    let mut profile = VmExecutionProfile::default();
+    let mut profile = VmExecutionProfile::default_with_store(vm_store);
 
     loop {
-        arm_epoch_interrupt_if_enabled(&mut vm_store, &interrupt, debug.attach_debugger)?;
+        arm_epoch_interrupt_if_enabled(&mut profile.vm_store, &interrupt, debug.attach_debugger)?;
         let status = {
             let _host_context = enter_edge_host_context(
-                vm_store.data().vm_context.clone(),
-                vm_store.data().async_ops.clone(),
+                profile.vm_store.data().vm_context.clone(),
+                profile.vm_store.data().async_ops.clone(),
             );
             if debug.attach_debugger {
-                let vm_context = vm_store.data().vm_context.clone();
-                run_vm_with_optional_debugger(&debug_session, vm_context, vm_store.vm_mut())
+                let vm_context = profile.vm_store.data().vm_context.clone();
+                run_vm_with_optional_debugger(&debug_session, vm_context, profile.vm_store.vm_mut())
             } else {
-                vm_store.run()
+                profile.vm_store.run()
             }
         }
         .map_err(VmExecutionError::Vm)?;
@@ -280,13 +344,16 @@ fn run_vm_threading(
             VmStatus::Halted => break,
             VmStatus::Yielded => {
                 profile.vm_yield_count = profile.vm_yield_count.saturating_add(1);
-                handle_interrupt_yield(&mut vm_store, &interrupt, &mut profile)?;
+                if handle_interrupt_yield(&mut profile.vm_store, &interrupt)? {
+                    profile.vm_fuel_recharge_count =
+                        profile.vm_fuel_recharge_count.saturating_add(1);
+                }
                 std::thread::yield_now();
             }
             VmStatus::Waiting(_op_id) => {
                 let waiting_started = std::time::Instant::now();
                 tokio::runtime::Handle::current()
-                    .block_on(vm_store.vm_mut().await_waiting_host_op())
+                    .block_on(profile.vm_store.vm_mut().await_waiting_host_op())
                     .map_err(VmExecutionError::Vm)?;
                 let wait_us =
                     u64::try_from(waiting_started.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -341,6 +408,39 @@ fn register_host_modules_from_store(
     let async_ops = vm_store.data().async_ops.clone();
     register_host_modules(vm_store.vm_mut(), vm_context, async_ops)
         .map_err(VmExecutionError::HostRegistration)
+}
+
+fn acquire_vm_runner_store(
+    program: &LoadedProgram,
+    vm_context: SharedProxyVmContext,
+    register_host_modules: HostModuleRegistrar,
+    prefer_aot: bool,
+    jit_enabled: bool,
+    pooling_enabled: bool,
+) -> Result<AcquiredVmRunnerStore, VmExecutionError> {
+    let async_ops = new_shared_vm_async_ops();
+    let pool_key = pooling_enabled.then(|| VmPoolKey::new(prefer_aot, jit_enabled));
+    if let Some(pool_key) = pool_key
+        && let Some(mut vm) = program.vm_pool.take(pool_key)
+    {
+        vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));
+        return Ok(AcquiredVmRunnerStore {
+            vm_store: Store::new(vm, VmRunnerStoreData::new(vm_context, async_ops)),
+            pool_key: Some(pool_key),
+        });
+    }
+
+    let mut vm_store = new_vm_runner_store(program, vm_context, async_ops, prefer_aot, jit_enabled);
+    register_host_modules_from_store(&mut vm_store, register_host_modules)?;
+    Ok(AcquiredVmRunnerStore { vm_store, pool_key })
+}
+
+fn recycle_vm_runner_store(program: &LoadedProgram, pool_key: VmPoolKey, vm_store: VmRunnerStore) {
+    let mut vm = vm_store.into_vm();
+    vm.reset_for_reuse();
+    vm.clear_async_bridge();
+    vm.clear_runtime_print_sink();
+    program.vm_pool.put(pool_key, vm);
 }
 
 fn configure_vm_interrupt(
@@ -403,8 +503,7 @@ fn arm_epoch_interrupt_if_enabled(
 fn handle_interrupt_yield(
     vm_store: &mut VmRunnerStore,
     interrupt: &ActiveVmInterrupt,
-    profile: &mut VmExecutionProfile,
-) -> Result<(), VmExecutionError> {
+) -> Result<bool, VmExecutionError> {
     match (interrupt, vm_store.vm().last_yield_reason()) {
         (ActiveVmInterrupt::Fuel { fuel_per_yield }, Some(VmYieldReason::Fuel))
             if vm_store.get_fuel() == Some(0) =>
@@ -412,24 +511,37 @@ fn handle_interrupt_yield(
             vm_store
                 .recharge(*fuel_per_yield)
                 .map_err(VmExecutionError::Vm)?;
-            profile.vm_fuel_recharge_count = profile.vm_fuel_recharge_count.saturating_add(1);
+            Ok(true)
         }
         (ActiveVmInterrupt::Epoch { .. }, Some(VmYieldReason::Epoch))
         | (ActiveVmInterrupt::None, _)
         | (ActiveVmInterrupt::Fuel { .. }, _)
-        | (ActiveVmInterrupt::Epoch { .. }, _) => {}
+        | (ActiveVmInterrupt::Epoch { .. }, _) => Ok(false),
     }
-    Ok(())
 }
 
-#[derive(Debug, Default)]
 struct VmExecutionProfile {
+    vm_store: VmRunnerStore,
     queue_wait_us: u64,
     blocking_run_us: u64,
     waiting_host_us: u64,
     waiting_host_count: u32,
     vm_yield_count: u32,
     vm_fuel_recharge_count: u32,
+}
+
+impl VmExecutionProfile {
+    fn default_with_store(vm_store: VmRunnerStore) -> Self {
+        Self {
+            vm_store,
+            queue_wait_us: 0,
+            blocking_run_us: 0,
+            waiting_host_us: 0,
+            waiting_host_count: 0,
+            vm_yield_count: 0,
+            vm_fuel_recharge_count: 0,
+        }
+    }
 }
 
 fn maybe_log_tail_profile(request_id: Option<&str>, profile: &VmExecutionProfile) {
@@ -532,6 +644,7 @@ mod tests {
         let loaded_program = LoadedProgram {
             program,
             no_interrupt_aot_bundle: None,
+            vm_pool: Arc::new(LoadedProgramVmPool::new()),
         };
         let context = Arc::new(ProxyVmContext::from_request_headers(
             HeaderMap::new(),
@@ -554,7 +667,7 @@ mod tests {
         };
 
         let result = tokio::task::spawn_blocking(move || {
-            run_vm_threading(store, debug_session, debug, no_host_modules, execution)
+            run_vm_threading(store, debug_session, debug, execution)
         })
         .await
         .expect("threading task should complete");
@@ -590,5 +703,70 @@ mod tests {
         })
         .await
         .expect("epoch ticker should advance without explicit wake arming");
+    }
+
+    #[tokio::test]
+    async fn vm_pool_reuses_registered_vm() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static REGISTRATIONS: AtomicUsize = AtomicUsize::new(0);
+
+        fn counting_host_modules(
+            _vm: &mut Vm,
+            _context: crate::SharedProxyVmContext,
+            _async_ops: crate::SharedVmAsyncOps,
+        ) -> Result<(), vm::VmError> {
+            REGISTRATIONS.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        let program = Arc::new(vm::Program::new(vec![], vec![vm::OpCode::Ret as u8]));
+        let loaded_program = LoadedProgram {
+            program,
+            no_interrupt_aot_bundle: None,
+            vm_pool: Arc::new(LoadedProgramVmPool::new()),
+        };
+        let context = Arc::new(ProxyVmContext::from_request_headers(
+            HeaderMap::new(),
+            Arc::new(RateLimiterStore::new()),
+        ));
+
+        REGISTRATIONS.store(0, Ordering::Relaxed);
+
+        let first = acquire_vm_runner_store(
+            &loaded_program,
+            context.clone(),
+            counting_host_modules,
+            false,
+            true,
+            true,
+        )
+        .expect("first vm checkout should succeed");
+        assert_eq!(REGISTRATIONS.load(Ordering::Relaxed), 1);
+        recycle_vm_runner_store(
+            &loaded_program,
+            first.pool_key.expect("pooling should be enabled"),
+            first.vm_store,
+        );
+
+        let second = acquire_vm_runner_store(
+            &loaded_program,
+            context,
+            counting_host_modules,
+            false,
+            true,
+            true,
+        )
+        .expect("second vm checkout should reuse pooled vm");
+        assert_eq!(
+            REGISTRATIONS.load(Ordering::Relaxed),
+            1,
+            "reused VM should not re-register host modules"
+        );
+        recycle_vm_runner_store(
+            &loaded_program,
+            second.pool_key.expect("pooling should be enabled"),
+            second.vm_store,
+        );
     }
 }
