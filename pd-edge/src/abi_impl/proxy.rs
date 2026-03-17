@@ -31,12 +31,16 @@ pub(crate) enum ProxyByteStreamEndpoint {
     WebSocketBinary(i64),
 }
 
+const RESERVED_HTTP_DOWNSTREAM_PROXY_STREAM_HANDLE: i64 = -1;
+const RESERVED_DOWNSTREAM_CONNECT_PROXY_STREAM_HANDLE: i64 = -2;
+const RESERVED_DEFAULT_UPSTREAM_PROXY_STREAM_HANDLE: i64 = -3;
+
 #[derive(Clone)]
 pub(crate) struct ProxyByteStreamState {
     endpoint: ProxyByteStreamEndpoint,
     write_observed: bool,
     write_closed: bool,
-    write_close_notify: Arc<Notify>,
+    write_close_notify: Option<Arc<Notify>>,
 }
 
 impl std::fmt::Debug for ProxyByteStreamState {
@@ -50,13 +54,19 @@ impl std::fmt::Debug for ProxyByteStreamState {
 }
 
 impl ProxyByteStreamState {
-    fn new(endpoint: ProxyByteStreamEndpoint) -> Self {
+    pub(crate) fn new(endpoint: ProxyByteStreamEndpoint) -> Self {
         Self {
             endpoint,
             write_observed: false,
             write_closed: false,
-            write_close_notify: Arc::new(Notify::new()),
+            write_close_notify: None,
         }
+    }
+
+    fn write_close_notify(&mut self) -> Arc<Notify> {
+        self.write_close_notify
+            .get_or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
     }
 }
 
@@ -69,6 +79,38 @@ enum ProxyReadStep {
 
 fn unknown_proxy_stream_handle(handle: i64) -> VmError {
     VmError::HostError(format!("unknown proxy byte-stream handle {handle}"))
+}
+
+fn reserved_proxy_stream_handle(endpoint: &ProxyByteStreamEndpoint) -> Option<i64> {
+    match endpoint {
+        ProxyByteStreamEndpoint::HttpDownstream => {
+            Some(RESERVED_HTTP_DOWNSTREAM_PROXY_STREAM_HANDLE)
+        }
+        ProxyByteStreamEndpoint::DownstreamConnect => {
+            Some(RESERVED_DOWNSTREAM_CONNECT_PROXY_STREAM_HANDLE)
+        }
+        ProxyByteStreamEndpoint::HttpExchange(exchange)
+            if *exchange == http::default_upstream_exchange_handle() =>
+        {
+            Some(RESERVED_DEFAULT_UPSTREAM_PROXY_STREAM_HANDLE)
+        }
+        _ => None,
+    }
+}
+
+fn reserved_proxy_stream_endpoint(handle: i64) -> Option<ProxyByteStreamEndpoint> {
+    match handle {
+        RESERVED_HTTP_DOWNSTREAM_PROXY_STREAM_HANDLE => {
+            Some(ProxyByteStreamEndpoint::HttpDownstream)
+        }
+        RESERVED_DOWNSTREAM_CONNECT_PROXY_STREAM_HANDLE => {
+            Some(ProxyByteStreamEndpoint::DownstreamConnect)
+        }
+        RESERVED_DEFAULT_UPSTREAM_PROXY_STREAM_HANDLE => Some(
+            ProxyByteStreamEndpoint::HttpExchange(http::default_upstream_exchange_handle()),
+        ),
+        _ => None,
+    }
 }
 
 fn decode_chunk_size(max_bytes: i64) -> Result<usize, VmError> {
@@ -102,16 +144,36 @@ fn allocate_proxy_stream_handle(
     Ok(handle)
 }
 
+fn ensure_proxy_stream_state_mut<'a>(
+    guard: &'a mut http::ProxyStreamRegistry,
+    handle: i64,
+) -> Result<&'a mut ProxyByteStreamState, VmError> {
+    if guard.proxy_stream_handles.contains_key(&handle) {
+        return guard
+            .proxy_stream_handles
+            .get_mut(&handle)
+            .ok_or_else(|| unknown_proxy_stream_handle(handle));
+    }
+    if let Some(endpoint) = reserved_proxy_stream_endpoint(handle) {
+        return Ok(guard
+            .proxy_stream_handles
+            .get_or_insert_with(handle, || ProxyByteStreamState::new(endpoint)));
+    }
+    Err(unknown_proxy_stream_handle(handle))
+}
+
 fn proxy_stream_state(
     context: &SharedProxyVmContext,
     handle: i64,
 ) -> Result<ProxyByteStreamState, VmError> {
     let guard = context.lock_proxy();
-    guard
-        .proxy_stream_handles
-        .get(&handle)
-        .cloned()
-        .ok_or_else(|| unknown_proxy_stream_handle(handle))
+    if let Some(stream) = guard.proxy_stream_handles.get(&handle).cloned() {
+        return Ok(stream);
+    }
+    if let Some(endpoint) = reserved_proxy_stream_endpoint(handle) {
+        return Ok(ProxyByteStreamState::new(endpoint));
+    }
+    Err(unknown_proxy_stream_handle(handle))
 }
 
 fn downstream_proxy_endpoint(context: &SharedProxyVmContext) -> ProxyByteStreamEndpoint {
@@ -198,10 +260,7 @@ fn prepare_proxy_stream_write(
     handle: i64,
 ) -> Result<ProxyByteStreamEndpoint, VmError> {
     let mut guard = context.lock_proxy();
-    let stream = guard
-        .proxy_stream_handles
-        .get_mut(&handle)
-        .ok_or_else(|| unknown_proxy_stream_handle(handle))?;
+    let stream = ensure_proxy_stream_state_mut(&mut guard, handle)?;
     if stream.write_closed {
         return Err(VmError::HostError(format!(
             "proxy byte-stream handle {handle} is write-closed",
@@ -217,17 +276,14 @@ fn mark_proxy_stream_write_closed(
 ) -> Result<ProxyByteStreamEndpoint, VmError> {
     let (endpoint, notify) = {
         let mut guard = context.lock_proxy();
-        let stream = guard
-            .proxy_stream_handles
-            .get_mut(&handle)
-            .ok_or_else(|| unknown_proxy_stream_handle(handle))?;
+        let stream = ensure_proxy_stream_state_mut(&mut guard, handle)?;
         if stream.write_closed {
             (stream.endpoint.clone(), None)
         } else {
             stream.write_closed = true;
             (
                 stream.endpoint.clone(),
-                Some(stream.write_close_notify.clone()),
+                stream.write_close_notify.as_ref().cloned(),
             )
         }
     };
@@ -239,23 +295,22 @@ fn mark_proxy_stream_write_closed(
 
 fn proxy_stream_write_closed(context: &SharedProxyVmContext, handle: i64) -> Result<bool, VmError> {
     let guard = context.lock_proxy();
-    let stream = guard
-        .proxy_stream_handles
-        .get(&handle)
-        .ok_or_else(|| unknown_proxy_stream_handle(handle))?;
-    Ok(stream.write_closed)
+    if let Some(stream) = guard.proxy_stream_handles.get(&handle) {
+        return Ok(stream.write_closed);
+    }
+    if reserved_proxy_stream_endpoint(handle).is_some() {
+        return Ok(false);
+    }
+    Err(unknown_proxy_stream_handle(handle))
 }
 
 fn proxy_stream_write_close_notify(
     context: &SharedProxyVmContext,
     handle: i64,
 ) -> Result<Arc<Notify>, VmError> {
-    let guard = context.lock_proxy();
-    let stream = guard
-        .proxy_stream_handles
-        .get(&handle)
-        .ok_or_else(|| unknown_proxy_stream_handle(handle))?;
-    Ok(stream.write_close_notify.clone())
+    let mut guard = context.lock_proxy();
+    let stream = ensure_proxy_stream_state_mut(&mut guard, handle)?;
+    Ok(stream.write_close_notify())
 }
 
 async fn wait_for_proxy_stream_write_close(
@@ -777,8 +832,46 @@ async fn schedule_default_upstream_http_forward(
         return Ok(None);
     }
 
-    http::ensure_outbound_exchange_response_started(context, default_upstream).await?;
+    if !http::start_native_default_upstream_http_forward_response(context).await? {
+        http::ensure_outbound_exchange_response_started(context, default_upstream).await?;
+    }
     Ok(Some("forwarded".to_string()))
+}
+
+async fn forward_default_upstream_with_response_headers(
+    context: &SharedProxyVmContext,
+    response_headers: Value,
+) -> Result<String, VmError> {
+    let debug = std::env::var_os("PD_EDGE_DEBUG_FORWARD_DEFAULT").is_some();
+    if debug {
+        eprintln!("forward_default_upstream: enter");
+    }
+    let parsed_headers = http::parse_response_header_batch(response_headers)?;
+    if debug {
+        eprintln!(
+            "forward_default_upstream: parsed headers count={}",
+            parsed_headers.len()
+        );
+    }
+    let default_upstream = http::default_upstream_exchange_handle();
+    if !http::start_native_default_upstream_http_forward_response(context).await? {
+        if debug {
+            eprintln!("forward_default_upstream: native fast path unavailable");
+        }
+        http::ensure_outbound_exchange_response_started(context, default_upstream).await?;
+    } else if debug {
+        eprintln!("forward_default_upstream: native fast path ready");
+    }
+    if !parsed_headers.is_empty() {
+        context.insert_downstream_response_headers(parsed_headers);
+        if debug {
+            eprintln!("forward_default_upstream: applied response headers");
+        }
+    }
+    if debug {
+        eprintln!("forward_default_upstream: return forwarded");
+    }
+    Ok("forwarded".to_string())
 }
 
 async fn try_native_forward(
@@ -862,59 +955,63 @@ async fn drive_bridge(
 
 /// Returns the proxy byte stream handle for the current downstream flow.
 #[pd_edge_host_function(name = proxy_symbols::stream::DOWNSTREAM.name, scope = proxy)]
-async fn stream_downstream(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    let handle = allocate_proxy_stream_handle(&context, downstream_proxy_endpoint(&context))?;
+fn stream_downstream(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
+    let endpoint = downstream_proxy_endpoint(&context);
+    let handle = if let Some(handle) = reserved_proxy_stream_handle(&endpoint) {
+        handle
+    } else {
+        allocate_proxy_stream_handle(&context, endpoint)?
+    };
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 
 /// Wraps an outbound HTTP exchange as a proxy byte stream.
 #[pd_edge_host_function(name = proxy_symbols::stream::EXCHANGE.name, scope = proxy)]
-async fn stream_exchange(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-    exchange: i64,
-) -> Result<CallOutcome, VmError> {
+fn stream_exchange(context: SharedProxyVmContext, exchange: i64) -> Result<CallOutcome, VmError> {
     if !http::outbound_exchange_exists(&context, exchange) {
         return Err(VmError::HostError(format!(
             "unknown outbound exchange handle {exchange}",
         )));
     }
-    let handle =
-        allocate_proxy_stream_handle(&context, ProxyByteStreamEndpoint::HttpExchange(exchange))?;
+    let endpoint = ProxyByteStreamEndpoint::HttpExchange(exchange);
+    let handle = if let Some(handle) = reserved_proxy_stream_handle(&endpoint) {
+        handle
+    } else {
+        allocate_proxy_stream_handle(&context, endpoint)?
+    };
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 
 /// Wraps a TCP stream as a proxy byte stream.
 #[pd_edge_host_function(name = proxy_symbols::stream::FROM_TCP.name, scope = proxy)]
-async fn stream_from_tcp(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-    stream: i64,
-) -> Result<CallOutcome, VmError> {
+fn stream_from_tcp(context: SharedProxyVmContext, stream: i64) -> Result<CallOutcome, VmError> {
     let endpoint = endpoint_from_tcp_stream(&context, stream)?;
-    let handle = allocate_proxy_stream_handle(&context, endpoint)?;
+    let handle = if let Some(handle) = reserved_proxy_stream_handle(&endpoint) {
+        handle
+    } else {
+        allocate_proxy_stream_handle(&context, endpoint)?
+    };
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 
 /// Wraps a TLS plaintext session as a proxy byte stream.
 #[pd_edge_host_function(name = proxy_symbols::stream::FROM_TLS_PLAINTEXT.name, scope = proxy)]
-async fn stream_from_tls_plaintext(
-    _vm: &mut Vm,
+fn stream_from_tls_plaintext(
     context: SharedProxyVmContext,
     session: i64,
 ) -> Result<CallOutcome, VmError> {
     let endpoint = endpoint_from_tls_plaintext(&context, session)?;
-    let handle = allocate_proxy_stream_handle(&context, endpoint)?;
+    let handle = if let Some(handle) = reserved_proxy_stream_handle(&endpoint) {
+        handle
+    } else {
+        allocate_proxy_stream_handle(&context, endpoint)?
+    };
     Ok(CallOutcome::Return(vec![Value::Int(handle)]))
 }
 
 /// Wraps a WebSocket connection as a proxy byte stream.
 #[pd_edge_host_function(name = proxy_symbols::stream::FROM_WEBSOCKET_BINARY.name, scope = proxy)]
-async fn stream_from_websocket_binary(
-    _vm: &mut Vm,
+fn stream_from_websocket_binary(
     context: SharedProxyVmContext,
     connection: i64,
 ) -> Result<CallOutcome, VmError> {
@@ -984,6 +1081,49 @@ async fn proxy_forward(
     Ok(CallOutcome::Return(vec![Value::string(status)]))
 }
 
+/// Performs a native forward from the current downstream HTTP request to the prepared default
+/// upstream exchange and overlays downstream response headers.
+#[pd_edge_host_function(name = proxy_symbols::FORWARD_DEFAULT_UPSTREAM.name, scope = proxy)]
+async fn proxy_forward_default_upstream(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    response_headers: Value,
+) -> Result<CallOutcome, VmError> {
+    let status = forward_default_upstream_with_response_headers(&context, response_headers).await?;
+    Ok(CallOutcome::Return(vec![Value::string(status)]))
+}
+
+#[pd_edge_host_function(
+    name = proxy_symbols::PREPARE_AND_FORWARD_DEFAULT_UPSTREAM.name,
+    scope = proxy
+)]
+/// Prepares the default upstream request target/header batch and forwards it in one call.
+async fn proxy_prepare_and_forward_default_upstream(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    target: String,
+    version: String,
+    request_headers: Value,
+    response_headers: Value,
+) -> Result<CallOutcome, VmError> {
+    let parsed_response_headers = http::parse_response_header_batch(response_headers)?;
+    http::prepare_default_upstream_request(&context, target, version, request_headers)?;
+    let status = if !http::start_native_default_upstream_http_forward_response(&context).await? {
+        http::ensure_outbound_exchange_response_started(
+            &context,
+            http::default_upstream_exchange_handle(),
+        )
+        .await?;
+        "forwarded".to_string()
+    } else {
+        "forwarded".to_string()
+    };
+    if !parsed_response_headers.is_empty() {
+        context.insert_downstream_response_headers(parsed_response_headers);
+    }
+    Ok(CallOutcome::Return(vec![Value::string(status)]))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{net::SocketAddr, sync::Arc};
@@ -995,6 +1135,7 @@ mod tests {
         routing::any,
     };
     use reqwest::Client;
+    use vm::Value;
 
     use super::{
         ProxyByteStreamEndpoint, ProxyReadStep, allocate_proxy_stream_handle, drive_bridge,
@@ -1008,6 +1149,16 @@ mod tests {
     };
 
     fn test_context(body: &str) -> SharedProxyVmContext {
+        let mut headers = HeaderMap::new();
+        if !body.is_empty() {
+            headers.insert(
+                axum::http::header::CONTENT_LENGTH,
+                body.len()
+                    .to_string()
+                    .parse()
+                    .expect("content-length should parse"),
+            );
+        }
         Arc::new(ProxyVmContext::from_http_request(
             HttpRequestContext {
                 request_id: "req-1".to_string(),
@@ -1020,7 +1171,7 @@ mod tests {
                 host: "example.com".to_string(),
                 client_ip: "127.0.0.1".to_string(),
                 body: Body::from(body.to_string()),
-                headers: HeaderMap::new(),
+                headers,
             },
             Arc::new(RateLimiterStore::new()),
         ))
@@ -1155,13 +1306,15 @@ mod tests {
         let status = drive_bridge(context.clone(), downstream, upstream, 3)
             .await
             .expect("tunnel should succeed");
-        assert_eq!(status, "closed");
+        assert_eq!(status, "forwarded");
 
-        let guard = context.lock_downstream();
-        assert_eq!(
-            guard.response_output.body.as_deref(),
-            Some("echo:abcdefgh".as_bytes())
-        );
+        assert!(context.lock_downstream().response_output.body.is_none());
+
+        let resolved = edge_http::resolve_http_graph_response(&context).await;
+        let body = to_bytes(resolved.response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        assert_eq!(body.as_ref(), b"echo:abcdefgh");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1256,6 +1409,58 @@ mod tests {
         assert_eq!(
             guard.response_output.body.as_deref(),
             Some("dyn:payload".as_bytes())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_default_upstream_with_response_headers_resolves_response() {
+        let upstream_addr = spawn_server(Router::new().fallback(any(
+            |_request: Request<Body>| async move {
+                let mut response = axum::http::Response::new(Body::empty());
+                response.headers_mut().insert(
+                    "x-upstream-test",
+                    "ok".parse().expect("header should parse"),
+                );
+                response
+            },
+        )))
+        .await;
+
+        let mut context = test_context("");
+        configure_default_upstream(
+            &mut context,
+            format!("http://{upstream_addr}/perf"),
+            Client::new(),
+        );
+
+        let status = super::forward_default_upstream_with_response_headers(
+            &context,
+            Value::array(vec![
+                Value::string("x-bench-response-header"),
+                Value::string("program-proxy"),
+            ]),
+        )
+        .await
+        .expect("forward should succeed");
+        assert_eq!(status, "forwarded");
+
+        let resolved = edge_http::resolve_http_graph_response(&context).await;
+        assert_eq!(resolved.response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            resolved
+                .response
+                .headers()
+                .get("x-upstream-test")
+                .and_then(|value| value.to_str().ok()),
+            Some("ok")
+        );
+        assert_eq!(
+            resolved
+                .response
+                .headers()
+                .get("x-bench-response-header")
+                .and_then(|value| value.to_str().ok()),
+            Some("program-proxy")
         );
     }
 

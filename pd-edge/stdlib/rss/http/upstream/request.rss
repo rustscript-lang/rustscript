@@ -21,8 +21,12 @@ pub fn set_query(query) {
     http::exchange::set_query(upstream_request_default_exchange(), query)
 }
 
-pub fn set_target(target) {
-    http::exchange::set_target(upstream_request_default_exchange(), target)
+pub fn set_target(host, port) {
+    http::exchange::set_target(upstream_request_default_exchange(), host, port)
+}
+
+pub fn set_scheme(scheme) {
+    http::exchange::set_scheme(upstream_request_default_exchange(), scheme)
 }
 
 pub fn set_body(body) {

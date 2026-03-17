@@ -5,56 +5,64 @@ use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::{
     SharedProxyVmContext, ensure_outbound_exchange_response_started, headers_to_value_map,
-    is_hop_by_hop_header, parse_header, parse_header_name, read_outbound_exchange_response_all,
+    is_hop_by_hop_header, lookup_cached_header_batch, parse_header, parse_header_name,
+    read_outbound_exchange_response_all, store_cached_header_batch,
 };
 
-fn apply_response_header_batch(
-    context: &SharedProxyVmContext,
+pub(crate) fn parse_response_header_batch(
     headers: Value,
-) -> Result<(), VmError> {
+) -> Result<axum::http::HeaderMap, VmError> {
     match headers {
-        Value::Null => Ok(()),
+        Value::Null => Ok(axum::http::HeaderMap::new()),
         Value::Array(values) => {
+            if let Some(parsed) = lookup_cached_header_batch(&Value::Array(values.clone())) {
+                return Ok(parsed);
+            }
             if values.len() % 2 != 0 {
                 return Err(VmError::HostError(
                     "response header batch arrays must contain alternating name/value string pairs"
                         .to_string(),
                 ));
             }
-            context.with_downstream_response_mut(|response| {
-                for pair in values.chunks(2) {
-                    let name = pair[0]
-                        .clone()
-                        .into_owned_string()
-                        .expect("checked by host type conversion");
-                    let value = pair[1]
-                        .clone()
-                        .into_owned_string()
-                        .expect("checked by host type conversion");
-                    let (header_name, header_value) =
-                        parse_header(name, value).expect("checked before response mutation");
-                    response.headers.insert(header_name, header_value);
-                }
-            });
-            Ok(())
+            let mut parsed = axum::http::HeaderMap::new();
+            for pair in values.chunks(2) {
+                let Value::String(name) = &pair[0] else {
+                    return Err(VmError::HostError(
+                        "response header batch array keys must be strings".to_string(),
+                    ));
+                };
+                let Value::String(value) = &pair[1] else {
+                    return Err(VmError::HostError(
+                        "response header batch array values must be strings".to_string(),
+                    ));
+                };
+                let (header_name, header_value) = parse_header(name.as_str(), value.as_str())?;
+                parsed.insert(header_name, header_value);
+            }
+            store_cached_header_batch(&Value::Array(values.clone()), &parsed);
+            Ok(parsed)
         }
         Value::Map(entries) => {
-            context.with_downstream_response_mut(|response| {
-                for (key, value) in entries.as_ref() {
-                    let name = key
-                        .clone()
-                        .into_owned_string()
-                        .expect("checked by host type conversion");
-                    let value = value
-                        .clone()
-                        .into_owned_string()
-                        .expect("checked by host type conversion");
-                    let (header_name, header_value) =
-                        parse_header(name, value).expect("checked before response mutation");
-                    response.headers.insert(header_name, header_value);
-                }
-            });
-            Ok(())
+            if let Some(parsed) = lookup_cached_header_batch(&Value::Map(entries.clone())) {
+                return Ok(parsed);
+            }
+            let mut parsed = axum::http::HeaderMap::new();
+            for (key, value) in entries.as_ref() {
+                let Value::String(name) = key else {
+                    return Err(VmError::HostError(
+                        "response header batch map keys must be strings".to_string(),
+                    ));
+                };
+                let Value::String(value) = value else {
+                    return Err(VmError::HostError(
+                        "response header batch map values must be strings".to_string(),
+                    ));
+                };
+                let (header_name, header_value) = parse_header(name.as_str(), value.as_str())?;
+                parsed.insert(header_name, header_value);
+            }
+            store_cached_header_batch(&Value::Map(entries.clone()), &parsed);
+            Ok(parsed)
         }
         _ => Err(VmError::HostError(
             "response header batch must be null, an array of alternating strings, or a string map"
@@ -63,50 +71,8 @@ fn apply_response_header_batch(
     }
 }
 
-fn validate_response_header_batch(headers: &Value) -> Result<(), VmError> {
-    match headers {
-        Value::Array(values) => {
-            if values.len() % 2 != 0 {
-                return Err(VmError::HostError(
-                    "response header batch arrays must contain alternating name/value string pairs"
-                        .to_string(),
-                ));
-            }
-            for pair in values.chunks(2) {
-                let name = pair[0].clone().into_owned_string().map_err(|_| {
-                    VmError::HostError(
-                        "response header batch array keys must be strings".to_string(),
-                    )
-                })?;
-                let value = pair[1].clone().into_owned_string().map_err(|_| {
-                    VmError::HostError(
-                        "response header batch array values must be strings".to_string(),
-                    )
-                })?;
-                let _ = parse_header(name, value)?;
-            }
-            Ok(())
-        }
-        Value::Map(entries) => {
-            for (key, value) in entries.as_ref() {
-                let name = key.clone().into_owned_string().map_err(|_| {
-                    VmError::HostError("response header batch map keys must be strings".to_string())
-                })?;
-                let value = value.clone().into_owned_string().map_err(|_| {
-                    VmError::HostError(
-                        "response header batch map values must be strings".to_string(),
-                    )
-                })?;
-                let _ = parse_header(name, value)?;
-            }
-            Ok(())
-        }
-        Value::Null => Ok(()),
-        _ => Err(VmError::HostError(
-            "response header batch must be null, an array of alternating strings, or a string map"
-                .to_string(),
-        )),
-    }
+fn apply_response_header_batch(context: &SharedProxyVmContext, headers: axum::http::HeaderMap) {
+    context.insert_downstream_response_headers(headers);
 }
 
 /// Sets a header on the downstream HTTP response.
@@ -117,9 +83,7 @@ fn set_response_header(
     value: String,
 ) -> Result<CallOutcome, VmError> {
     let (header_name, header_value) = parse_header(name, value)?;
-    context.with_downstream_response_mut(|response| {
-        response.headers.insert(header_name, header_value);
-    });
+    context.insert_downstream_response_header(header_name, header_value);
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -129,8 +93,8 @@ fn set_response_headers(
     context: SharedProxyVmContext,
     headers: Value,
 ) -> Result<CallOutcome, VmError> {
-    validate_response_header_batch(&headers)?;
-    apply_response_header_batch(&context, headers)?;
+    let parsed = parse_response_header_batch(headers)?;
+    apply_response_header_batch(&context, parsed);
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -152,19 +116,19 @@ async fn apply_exchange_to_response_with_headers(
     exchange: i64,
     headers: Value,
 ) -> Result<CallOutcome, VmError> {
-    validate_response_header_batch(&headers)?;
+    let parsed_headers = parse_response_header_batch(headers)?;
     let snapshot = ensure_outbound_exchange_response_started(&context, exchange).await?;
     let body = read_outbound_exchange_response_all(&context, exchange).await?;
     context.with_downstream_response_mut(|response| {
         response.status = Some(snapshot.status);
         response.body = Some(body);
-        for (name, value) in &snapshot.headers {
+        for (name, value) in snapshot.headers.iter() {
             if !is_hop_by_hop_header(name) {
                 response.headers.insert(name.clone(), value.clone());
             }
         }
     });
-    apply_response_header_batch(&context, headers)?;
+    apply_response_header_batch(&context, parsed_headers);
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -176,9 +140,7 @@ fn set_response_status(context: SharedProxyVmContext, status: i64) -> Result<Cal
             "status code must be in range 100..=599, got '{status}'",
         )));
     }
-    context.with_downstream_response_mut(|response| {
-        response.status = Some(status as u16);
-    });
+    context.set_downstream_response_status(status as u16);
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -194,7 +156,7 @@ async fn apply_exchange_to_response(
     context.with_downstream_response_mut(|response| {
         response.status = Some(snapshot.status);
         response.body = Some(body);
-        for (name, value) in &snapshot.headers {
+        for (name, value) in snapshot.headers.iter() {
             if !is_hop_by_hop_header(name) {
                 response.headers.insert(name.clone(), value.clone());
             }

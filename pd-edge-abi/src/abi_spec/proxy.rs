@@ -37,3 +37,19 @@ fn proxy_bridge(left: i64, right: i64, max_bytes: i64) -> String {
 fn proxy_forward(left: i64, right: i64) -> String {
     unreachable!("abi declaration only")
 }
+
+#[pd_host_function(name = "proxy::forward_default_upstream")]
+fn proxy_forward_default_upstream(response_headers: Value) -> String {
+    unreachable!("abi declaration only")
+}
+
+/// Prepares the default upstream request target/header batch and forwards it in one call.
+#[pd_host_function(name = "proxy::prepare_and_forward_default_upstream")]
+fn proxy_prepare_and_forward_default_upstream(
+    target: &str,
+    version: &str,
+    request_headers: Value,
+    response_headers: Value,
+) -> String {
+    unreachable!("abi declaration only")
+}

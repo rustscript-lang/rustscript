@@ -271,7 +271,7 @@ fn compile_edge_source_file_supports_embedded_edge_upstream_wrapper_modules() {
         use edge::http::upstream::request as upstream_request;
         use edge::http::upstream::response as upstream_response;
 
-        upstream_request::set_target("http://example.test");
+        upstream_request::set_target("example.test", 80);
         upstream_request::set_header("accept", "text/plain");
         let proxy_handle = upstream::as_stream();
         let status = upstream_response::get_status();

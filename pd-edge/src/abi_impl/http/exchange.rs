@@ -6,12 +6,13 @@ use vm::{CallOutcome, Value, Vm, VmError};
 #[cfg(feature = "tls")]
 use super::attach_outbound_exchange_tls_transport;
 use super::{
-    HttpVersionPreference, SharedProxyVmContext, allocate_outbound_exchange_handle,
-    attach_outbound_exchange_tcp_transport, default_upstream_exchange_handle,
-    ensure_outbound_exchange_response_started, headers_to_value_map, is_valid_request_path,
-    is_valid_upstream, outbound_exchange_exists, outbound_exchange_response_eof, parse_header,
-    parse_header_name, read_outbound_exchange_response_all,
-    read_outbound_exchange_response_next_chunk, serialize_query_pairs,
+    HttpUpstreamScheme, HttpVersionPreference, SharedProxyVmContext,
+    allocate_outbound_exchange_handle, attach_outbound_exchange_tcp_transport,
+    default_upstream_exchange_handle, ensure_outbound_exchange_response_started,
+    headers_to_value_map, is_valid_request_path, lookup_cached_header_batch,
+    outbound_exchange_exists, outbound_exchange_response_eof, parse_header, parse_header_name,
+    parse_http_upstream_target_cached, read_outbound_exchange_response_all,
+    read_outbound_exchange_response_next_chunk, serialize_query_pairs, store_cached_header_batch,
 };
 use crate::abi_impl::schedule_current_future_call;
 
@@ -73,34 +74,64 @@ fn apply_header_batch(
     match headers {
         Value::Null => Ok(()),
         Value::Array(values) => {
+            if let Some(parsed) = lookup_cached_header_batch(&Value::Array(values.clone())) {
+                for (name, value) in &parsed {
+                    request.insert_header(name.clone(), value.clone());
+                }
+                return Ok(());
+            }
             if values.len() % 2 != 0 {
                 return Err(VmError::HostError(
                     "header batch arrays must contain alternating name/value string pairs"
                         .to_string(),
                 ));
             }
+            let mut parsed = axum::http::HeaderMap::new();
             for pair in values.chunks(2) {
-                let name = pair[0].clone().into_owned_string().map_err(|_| {
-                    VmError::HostError("header batch array keys must be strings".to_string())
-                })?;
-                let value = pair[1].clone().into_owned_string().map_err(|_| {
-                    VmError::HostError("header batch array values must be strings".to_string())
-                })?;
-                let (header_name, header_value) = parse_header(name, value)?;
-                request.headers.insert(header_name, header_value);
+                let Value::String(name) = &pair[0] else {
+                    return Err(VmError::HostError(
+                        "header batch array keys must be strings".to_string(),
+                    ));
+                };
+                let Value::String(value) = &pair[1] else {
+                    return Err(VmError::HostError(
+                        "header batch array values must be strings".to_string(),
+                    ));
+                };
+                let (header_name, header_value) = parse_header(name.as_str(), value.as_str())?;
+                parsed.insert(header_name, header_value);
+            }
+            store_cached_header_batch(&Value::Array(values.clone()), &parsed);
+            for (name, value) in &parsed {
+                request.insert_header(name.clone(), value.clone());
             }
             Ok(())
         }
         Value::Map(entries) => {
+            if let Some(parsed) = lookup_cached_header_batch(&Value::Map(entries.clone())) {
+                for (name, value) in &parsed {
+                    request.headers.insert(name.clone(), value.clone());
+                }
+                return Ok(());
+            }
+            let mut parsed = axum::http::HeaderMap::new();
             for (key, value) in entries.as_ref() {
-                let name = key.clone().into_owned_string().map_err(|_| {
-                    VmError::HostError("header batch map keys must be strings".to_string())
-                })?;
-                let value = value.clone().into_owned_string().map_err(|_| {
-                    VmError::HostError("header batch map values must be strings".to_string())
-                })?;
-                let (header_name, header_value) = parse_header(name, value)?;
-                request.headers.insert(header_name, header_value);
+                let Value::String(name) = key else {
+                    return Err(VmError::HostError(
+                        "header batch map keys must be strings".to_string(),
+                    ));
+                };
+                let Value::String(value) = value else {
+                    return Err(VmError::HostError(
+                        "header batch map values must be strings".to_string(),
+                    ));
+                };
+                let (header_name, header_value) = parse_header(name.as_str(), value.as_str())?;
+                parsed.insert(header_name, header_value);
+            }
+            store_cached_header_batch(&Value::Map(entries.clone()), &parsed);
+            for (name, value) in &parsed {
+                request.headers.insert(name.clone(), value.clone());
             }
             Ok(())
         }
@@ -170,6 +201,38 @@ fn parse_version_preference(label: &str) -> Result<HttpVersionPreference, VmErro
     })
 }
 
+pub(crate) fn prepare_default_upstream_request(
+    context: &SharedProxyVmContext,
+    upstream: String,
+    version: String,
+    headers: Value,
+) -> Result<(), VmError> {
+    let version = parse_version_preference(&version)?;
+    let parsed = parse_http_upstream_target_cached(
+        context.services().parsed_upstream_target_cache().as_ref(),
+        &upstream,
+    )?;
+    let mut exchanges = context.lock_exchanges();
+    let exchange = exchanges
+        .exchanges
+        .get_mut(&default_upstream_exchange_handle())
+        .ok_or_else(|| unknown_exchange_handle(default_upstream_exchange_handle()))?;
+    let (target_scheme, target_host) = {
+        let request = &mut exchange.request;
+        request.set_target_from_parsed(parsed);
+        request.version_preference = version;
+        apply_header_batch(request, headers)?;
+        (request.target_scheme, request.target_host.clone())
+    };
+    let mut transport = context.lock_transport();
+    transport.tcp_dag.default_upstream.configure();
+    transport.tls_dag.default_upstream.observe_target_parts(
+        matches!(target_scheme, HttpUpstreamScheme::Https),
+        target_host,
+    );
+    Ok(())
+}
+
 /// Allocates an outbound HTTP exchange handle.
 #[pd_edge_host_function(name = http_exchange::NEW.name, scope = http)]
 fn new_exchange(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
@@ -193,20 +256,7 @@ fn prepare_default_upstream(
     version: String,
     headers: Value,
 ) -> Result<CallOutcome, VmError> {
-    if !is_valid_upstream(&upstream) {
-        return Err(VmError::HostError(format!(
-            "upstream must be host:port or http(s)://host[:port][/path], got '{upstream}'",
-        )));
-    }
-    let version = parse_version_preference(&version)?;
-    with_exchange_request_mut(&context, default_upstream_exchange_handle(), |request| {
-        request.target = Some(upstream.clone());
-        request.version_preference = version;
-        apply_header_batch(request, headers)
-    })??;
-    let mut transport = context.lock_transport();
-    transport.tcp_dag.default_upstream.configure();
-    transport.tls_dag.default_upstream.observe_target(&upstream);
+    prepare_default_upstream_request(&context, upstream, version, headers)?;
     Ok(CallOutcome::Return(vec![Value::Int(
         default_upstream_exchange_handle(),
     )]))
@@ -313,30 +363,76 @@ fn get_exchange_version(
 fn set_exchange_target(
     context: SharedProxyVmContext,
     exchange: i64,
-    upstream: String,
+    host: String,
+    port: i64,
 ) -> Result<CallOutcome, VmError> {
-    if !is_valid_upstream(&upstream) {
-        return Err(VmError::HostError(format!(
-            "upstream must be host:port or http(s)://host[:port][/path], got '{upstream}'",
-        )));
-    }
+    let port = u16::try_from(port)
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| VmError::HostError(format!("invalid upstream port '{port}'")))?;
+    let (target_scheme, target_host) = with_exchange_request_mut(&context, exchange, |request| {
+        request.set_target_host_port(&host, port)?;
+        Ok((request.target_scheme, request.target_host.clone()))
+    })??;
+
     if exchange == default_upstream_exchange_handle() {
-        with_exchange_request_mut(&context, exchange, |request| {
-            request.target = Some(upstream.clone());
-        })?;
         let mut transport = context.lock_transport();
         transport.tcp_dag.default_upstream.configure();
-        transport.tls_dag.default_upstream.observe_target(&upstream);
+        transport.tls_dag.default_upstream.observe_target_parts(
+            matches!(target_scheme, HttpUpstreamScheme::Https),
+            target_host,
+        );
     } else {
         let mut exchanges = context.lock_exchanges();
         let exchange_state = exchanges
             .exchanges
             .get_mut(&exchange)
             .ok_or_else(|| unknown_exchange_handle(exchange))?;
-        exchange_state.request.target = Some(upstream.clone());
         exchange_state.transport.tcp_flow.configure();
-        exchange_state.transport.tls_flow.observe_target(&upstream);
+        exchange_state.transport.tls_flow.observe_target_parts(
+            matches!(target_scheme, HttpUpstreamScheme::Https),
+            target_host,
+        );
     }
+    Ok(CallOutcome::Return(vec![]))
+}
+
+/// Sets the request scheme for the outbound HTTP exchange.
+#[pd_edge_host_function(name = http_exchange::SET_SCHEME.name, scope = http)]
+fn set_exchange_scheme(
+    context: SharedProxyVmContext,
+    exchange: i64,
+    scheme: String,
+) -> Result<CallOutcome, VmError> {
+    let scheme = HttpUpstreamScheme::parse(&scheme)?;
+    let (target_scheme, target_host) = with_exchange_request_mut(&context, exchange, |request| {
+        request.set_target_scheme(scheme)?;
+        Ok((request.target_scheme, request.target_host.clone()))
+    })??;
+
+    if target_host.is_some() {
+        if exchange == default_upstream_exchange_handle() {
+            context
+                .lock_transport()
+                .tls_dag
+                .default_upstream
+                .observe_target_parts(
+                    matches!(target_scheme, HttpUpstreamScheme::Https),
+                    target_host,
+                );
+        } else {
+            let mut exchanges = context.lock_exchanges();
+            let exchange_state = exchanges
+                .exchanges
+                .get_mut(&exchange)
+                .ok_or_else(|| unknown_exchange_handle(exchange))?;
+            exchange_state.transport.tls_flow.observe_target_parts(
+                matches!(target_scheme, HttpUpstreamScheme::Https),
+                target_host,
+            );
+        }
+    }
+
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -594,18 +690,24 @@ mod tests {
     #[test]
     fn setting_default_upstream_target_updates_transport_state_in_place() {
         let context = test_context();
-        let target = "https://origin.example.com/api".to_string();
+        set_exchange_scheme_impl(
+            context.clone(),
+            default_upstream_exchange_handle(),
+            "https".to_string(),
+        )
+        .expect("setting default upstream scheme should succeed");
 
         set_exchange_target_impl(
             context.clone(),
             default_upstream_exchange_handle(),
-            target.clone(),
+            "origin.example.com".to_string(),
+            443,
         )
         .expect("setting default upstream target should succeed");
 
         assert_eq!(
             context.with_default_upstream_exchange(|exchange| exchange.request.target.clone()),
-            Some(target.clone())
+            Some("https://origin.example.com:443".to_string())
         );
         let transport = context.lock_transport();
         assert!(transport.tcp_dag.default_upstream.is_configured());
@@ -613,6 +715,30 @@ mod tests {
         assert_eq!(
             transport.tls_dag.default_upstream.peer_name(),
             "origin.example.com"
+        );
+    }
+
+    #[test]
+    fn setting_default_upstream_scheme_rewrites_existing_target() {
+        let context = test_context();
+
+        set_exchange_target_impl(
+            context.clone(),
+            default_upstream_exchange_handle(),
+            "origin.example.com".to_string(),
+            8080,
+        )
+        .expect("setting default upstream target should succeed");
+        set_exchange_scheme_impl(
+            context.clone(),
+            default_upstream_exchange_handle(),
+            "https".to_string(),
+        )
+        .expect("setting default upstream scheme should succeed");
+
+        assert_eq!(
+            context.with_default_upstream_exchange(|exchange| exchange.request.target.clone()),
+            Some("https://origin.example.com:8080".to_string())
         );
     }
 
@@ -647,8 +773,10 @@ mod tests {
         );
         assert_eq!(
             context.with_default_upstream_exchange(|exchange| {
-                exchange
-                    .request
+                let mut request = exchange.request.clone();
+                request
+                    .materialize_inherited_request_head(&context.with_request_head(Clone::clone));
+                request
                     .headers
                     .get("x-first")
                     .and_then(|value| value.to_str().ok())
@@ -658,8 +786,10 @@ mod tests {
         );
         assert_eq!(
             context.with_default_upstream_exchange(|exchange| {
-                exchange
-                    .request
+                let mut request = exchange.request.clone();
+                request
+                    .materialize_inherited_request_head(&context.with_request_head(Clone::clone));
+                request
                     .headers
                     .get("x-second")
                     .and_then(|value| value.to_str().ok())

@@ -98,7 +98,12 @@ pub async fn execute_vm_with_context(
     vm_execution: VmExecutionConfig,
 ) -> Result<(), VmExecutionError> {
     let async_ops = new_shared_vm_async_ops();
-    let vm_store = new_vm_runner_store(program.program.clone(), vm_context, async_ops);
+    let vm_store = new_vm_runner_store(
+        program,
+        vm_context,
+        async_ops,
+        !debug.attach_debugger && matches!(vm_execution.interrupt, VmInterruptConfig::None),
+    );
     let execution_mode = if debug.force_threading {
         VmExecutionMode::Threading
     } else {
@@ -294,11 +299,28 @@ fn run_vm_threading(
 }
 
 fn new_vm_runner_store(
-    program: std::sync::Arc<vm::Program>,
+    program: &LoadedProgram,
     vm_context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
+    prefer_aot: bool,
 ) -> VmRunnerStore {
-    let mut vm = Vm::new_shared(program);
+    let prefer_aot = prefer_aot && std::env::var_os("PD_EDGE_DISABLE_NO_INTERRUPT_AOT").is_none();
+    let mut vm = if prefer_aot {
+        if let Some(bundle) = program.no_interrupt_aot_bundle.as_ref() {
+            match Vm::from_aot_bundle_bytes(bundle.as_ref().as_slice()) {
+                Ok(vm) => vm,
+                Err(_) => {
+                    let mut vm = Vm::new_shared(program.program.clone());
+                    let _ = vm.install_aot_bundle_bytes(bundle.as_ref().as_slice());
+                    vm
+                }
+            }
+        } else {
+            Vm::new_shared(program.program.clone())
+        }
+    } else {
+        Vm::new_shared(program.program.clone())
+    };
     vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));
     Store::new(vm, VmRunnerStoreData::new(vm_context, async_ops))
 }
@@ -499,12 +521,16 @@ mod tests {
         )
         .expect("program should compile");
         let program = Arc::new(compiled.program.with_local_count(compiled.locals));
+        let loaded_program = LoadedProgram {
+            program,
+            no_interrupt_aot_bundle: None,
+        };
         let context = Arc::new(ProxyVmContext::from_request_headers(
             HeaderMap::new(),
             Arc::new(RateLimiterStore::new()),
         ));
         let async_ops = new_shared_vm_async_ops();
-        let store = new_vm_runner_store(program, context, async_ops);
+        let store = new_vm_runner_store(&loaded_program, context, async_ops, false);
         let debug = VmDebugInvocation {
             attach_debugger: false,
             force_threading: false,
@@ -518,12 +544,21 @@ mod tests {
             execution_mode: VmExecutionMode::Threading,
         };
 
-        let profile = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             run_vm_threading(store, debug_session, debug, no_host_modules, execution)
         })
         .await
-        .expect("threading task should complete")
-        .expect("threading execution should succeed");
+        .expect("threading task should complete");
+
+        let profile = match result {
+            Ok(profile) => profile,
+            Err(VmExecutionError::Vm(vm::VmError::JitNative(message)))
+                if message.contains("native JIT backend is disabled") =>
+            {
+                return;
+            }
+            Err(err) => panic!("threading execution should succeed: {err:?}"),
+        };
 
         assert!(
             profile.vm_yield_count > 0,

@@ -1156,19 +1156,89 @@ pub(crate) fn build_short_circuit_program(body: &str, header: Option<(&str, &str
 pub(crate) fn build_upstream_program(upstream: &str, header: Option<(&str, &str)>) -> Program {
     let mut constants = Vec::new();
     let mut bc = BytecodeBuilder::new();
+    let (scheme, remainder) = if let Some(value) = upstream.strip_prefix("https://") {
+        ("https", value)
+    } else if let Some(value) = upstream.strip_prefix("http://") {
+        ("http", value)
+    } else {
+        ("http", upstream)
+    };
+    let (authority, path_and_query) = if let Some((authority, rest)) = remainder.split_once('/') {
+        (authority, Some(format!("/{rest}")))
+    } else {
+        (remainder, None)
+    };
+    let (path, query) = if let Some(path_and_query) = path_and_query.as_deref() {
+        if let Some((path, query)) = path_and_query.split_once('?') {
+            (Some(path.to_string()), Some(query.to_string()))
+        } else {
+            (Some(path_and_query.to_string()), None)
+        }
+    } else {
+        (None, None)
+    };
+    let (host, port) = authority
+        .rsplit_once(':')
+        .expect("upstream authority should include a port");
+    let port = port
+        .parse::<i64>()
+        .expect("upstream authority port should be numeric");
 
     let exchange_index = constants.len() as u32;
     constants.push(Value::Int(1));
-    let upstream_index = constants.len() as u32;
-    constants.push(Value::string(upstream));
+    let host_index = constants.len() as u32;
+    constants.push(Value::string(host));
+    let port_index = constants.len() as u32;
+    constants.push(Value::Int(port));
+
+    if scheme == "https" {
+        let scheme_index = constants.len() as u32;
+        constants.push(Value::string("https"));
+        bc.ldc(exchange_index);
+        bc.ldc(scheme_index);
+        bc.call(
+            function_by_name("http::exchange::set_scheme")
+                .expect("http::exchange::set_scheme should exist")
+                .index,
+            2,
+        );
+    }
+
     bc.ldc(exchange_index);
-    bc.ldc(upstream_index);
+    bc.ldc(host_index);
+    bc.ldc(port_index);
     bc.call(
         function_by_name("http::exchange::set_target")
             .expect("http::exchange::set_target should exist")
             .index,
-        2,
+        3,
     );
+
+    if let Some(path) = path {
+        let path_index = constants.len() as u32;
+        constants.push(Value::string(path));
+        bc.ldc(exchange_index);
+        bc.ldc(path_index);
+        bc.call(
+            function_by_name("http::exchange::set_path")
+                .expect("http::exchange::set_path should exist")
+                .index,
+            2,
+        );
+    }
+
+    if let Some(query) = query {
+        let query_index = constants.len() as u32;
+        constants.push(Value::string(query));
+        bc.ldc(exchange_index);
+        bc.ldc(query_index);
+        bc.call(
+            function_by_name("http::exchange::set_query")
+                .expect("http::exchange::set_query should exist")
+                .index,
+            2,
+        );
+    }
 
     if let Some((name, value)) = header {
         let name_index = constants.len() as u32;

@@ -1,6 +1,9 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -20,6 +23,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub struct DebugSessionStore {
     session: RwLock<Option<Arc<DebugSession>>>,
+    active: AtomicBool,
 }
 
 pub type SharedDebugSession = Arc<DebugSessionStore>;
@@ -147,6 +151,7 @@ impl std::error::Error for DebugSessionError {}
 pub fn new_debug_session_store() -> SharedDebugSession {
     Arc::new(DebugSessionStore {
         session: RwLock::new(None),
+        active: AtomicBool::new(false),
     })
 }
 
@@ -275,6 +280,7 @@ pub fn start_debug_session(
     });
     let status = DebugSessionStatus::from_session(&session);
     *guard = Some(session);
+    store.active.store(true, Ordering::Relaxed);
     info!(
         "{} started session header={} value={} stop_on_entry={}",
         category_debug(),
@@ -289,6 +295,7 @@ pub fn stop_debug_session(store: &SharedDebugSession) -> bool {
     let mut guard = store.session.write().expect("debug session lock poisoned");
     let stopped = guard.take();
     if let Some(session) = stopped {
+        store.active.store(false, Ordering::Relaxed);
         session.close();
         info!("{} session stopped", category_debug());
         true
@@ -341,6 +348,9 @@ pub fn run_vm_with_optional_debugger(
     context: SharedProxyVmContext,
     vm: &mut Vm,
 ) -> VmResult<VmStatus> {
+    if !store.active.load(Ordering::Relaxed) {
+        return vm.run();
+    }
     let session = {
         let guard = store.session.read().expect("debug session lock poisoned");
         guard.clone()
@@ -450,6 +460,9 @@ pub fn request_will_attach_debugger(
     request_headers: &HeaderMap,
     request_path: &str,
 ) -> bool {
+    if !store.active.load(Ordering::Relaxed) {
+        return false;
+    }
     let session = {
         let guard = store.session.read().expect("debug session lock poisoned");
         guard.clone()
@@ -465,6 +478,9 @@ pub fn request_uses_blocking_debugger(
     request_headers: &HeaderMap,
     request_path: &str,
 ) -> bool {
+    if !store.active.load(Ordering::Relaxed) {
+        return false;
+    }
     let session = {
         let guard = store.session.read().expect("debug session lock poisoned");
         guard.clone()
@@ -512,6 +528,7 @@ fn stop_debug_session_if_match(store: &SharedDebugSession, active: &Arc<DebugSes
     {
         current.close();
         *guard = None;
+        store.active.store(false, Ordering::Relaxed);
         info!(
             "{} session removed automatically after debugger detached",
             category_debug()

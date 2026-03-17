@@ -792,11 +792,17 @@ impl TlsFlowState {
     }
 
     pub(crate) fn observe_target(&mut self, target: &str) {
-        self.present = upstream_target_uses_tls(target);
+        let peer_name = upstream_target_host(target);
+        self.observe_target_parts(upstream_target_uses_tls(target), peer_name);
+    }
+
+    pub(crate) fn observe_socket_target(&mut self, target: &str) {
+        let peer_name = upstream_target_host(target);
+        self.present = peer_name.is_some();
         self.handshake_complete = false;
         self.plaintext_ready = false;
         self.session_path = TlsSessionPath::None;
-        self.peer_name = upstream_target_host(target);
+        self.peer_name = peer_name;
         self.server_name = if self.present && self.sni_enabled {
             self.peer_name.clone()
         } else {
@@ -811,12 +817,12 @@ impl TlsFlowState {
         };
     }
 
-    pub(crate) fn observe_socket_target(&mut self, target: &str) {
-        self.present = upstream_target_host(target).is_some();
+    pub(crate) fn observe_target_parts(&mut self, tls_present: bool, peer_name: Option<String>) {
+        self.present = tls_present;
         self.handshake_complete = false;
         self.plaintext_ready = false;
         self.session_path = TlsSessionPath::None;
-        self.peer_name = upstream_target_host(target);
+        self.peer_name = peer_name;
         self.server_name = if self.present && self.sni_enabled {
             self.peer_name.clone()
         } else {

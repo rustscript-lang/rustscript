@@ -949,7 +949,8 @@ async fn proxy_pipe_forwards_dynamic_exchange_response_via_proxy_stream_handle()
         use proxy;
 
         let exchange = http::exchange::new();
-        http::exchange::set_target(exchange, "http://{upstream_addr}/dynamic");
+        http::exchange::set_target(exchange, "{upstream_host}", {upstream_port});
+        http::exchange::set_path(exchange, "/dynamic");
         http::exchange::set_body(exchange, "payload");
 
         let response = proxy::stream::exchange(exchange);
@@ -962,7 +963,9 @@ async fn proxy_pipe_forwards_dynamic_exchange_response_via_proxy_stream_handle()
         if content_type != "" {{
             http::response::set_header("content-type", content_type);
         }}
-    "#
+    "#,
+        upstream_host = upstream_addr.ip(),
+        upstream_port = upstream_addr.port()
     );
     let compiled = compile_source(&source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
@@ -1354,7 +1357,7 @@ async fn transport_default_upstream_socket_accepts_multiple_writes_before_exchan
         use tcp;
 
         let upstream_exchange = http::exchange::default_upstream();
-        http::exchange::set_target(upstream_exchange, "{upstream_addr}");
+        http::exchange::set_target(upstream_exchange, "{upstream_host}", {upstream_port});
         let downstream = tcp::stream::downstream();
         let upstream = tcp::stream::default_upstream();
         while !tcp::stream::eof(downstream) {{
@@ -1364,7 +1367,9 @@ async fn transport_default_upstream_socket_accepts_multiple_writes_before_exchan
             }}
         }}
         http::response::set_body(http::exchange::get_body(upstream_exchange));
-    "#
+    "#,
+        upstream_host = upstream_addr.ip(),
+        upstream_port = upstream_addr.port()
     );
     let compiled = compile_source(&source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
@@ -1402,11 +1407,13 @@ async fn transport_default_upstream_socket_rejects_write_after_response_has_star
         use tcp;
 
         let upstream_exchange = http::exchange::default_upstream();
-        http::exchange::set_target(upstream_exchange, "{upstream_addr}");
+        http::exchange::set_target(upstream_exchange, "{upstream_host}", {upstream_port});
         let upstream = tcp::stream::default_upstream();
         http::exchange::get_status(upstream_exchange);
         tcp::stream::write(upstream, "late");
-    "#
+    "#,
+        upstream_host = upstream_addr.ip(),
+        upstream_port = upstream_addr.port()
     );
     let compiled = compile_source(&source).expect("source should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;

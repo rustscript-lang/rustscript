@@ -221,6 +221,80 @@ impl Vm {
             Ok(vm)
         }
     }
+
+    pub fn install_aot_bundle_bytes(&mut self, bytes: &[u8]) -> VmResult<usize> {
+        #[cfg(not(any(
+            all(
+                target_arch = "x86_64",
+                any(target_os = "windows", all(unix, not(target_os = "macos")))
+            ),
+            all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+        )))]
+        {
+            let _ = bytes;
+            return Err(VmError::JitNative(
+                "native AOT bundles are unsupported on this target".to_string(),
+            ));
+        }
+
+        #[cfg(any(
+            all(
+                target_arch = "x86_64",
+                any(target_os = "windows", all(unix, not(target_os = "macos")))
+            ),
+            all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+        ))]
+        {
+            let bundle = decode_aot_bundle(bytes)?;
+            if self.program.local_count != bundle.local_count {
+                return Err(VmError::JitNative(format!(
+                    "AOT bundle local_count {} does not match program local_count {}",
+                    bundle.local_count, self.program.local_count,
+                )));
+            }
+            if self.program.code.len() != bundle.code_len {
+                return Err(VmError::JitNative(format!(
+                    "AOT bundle code_len {} does not match program code_len {}",
+                    bundle.code_len,
+                    self.program.code.len(),
+                )));
+            }
+            if self.program.constants != bundle.constants {
+                return Err(VmError::JitNative(
+                    "AOT bundle constants do not match the loaded program".to_string(),
+                ));
+            }
+            if self.program.imports != bundle.imports {
+                return Err(VmError::JitNative(
+                    "AOT bundle imports do not match the loaded program".to_string(),
+                ));
+            }
+
+            self.native_traces.clear();
+            self.jit
+                .install_precompiled_traces(
+                    bundle
+                        .traces
+                        .iter()
+                        .map(|encoded| encoded.trace.clone())
+                        .collect(),
+                )
+                .map_err(VmError::JitNative)?;
+
+            let interrupt_settings =
+                aot_native_interrupt_settings(bundle.interrupt_mode, bundle.fuel_check_interval);
+            for encoded in bundle.traces {
+                let trace = encoded.trace;
+                let compiled = native::load_compiled_trace(&encoded.code)?;
+                let trace_id = trace.id;
+                let native_trace =
+                    Vm::build_loaded_native_aot_trace(&trace, *compiled, interrupt_settings);
+                self.native_traces.insert(trace_id, native_trace);
+            }
+
+            Ok(self.native_traces.len())
+        }
+    }
 }
 
 fn summarize_aot_prepare_failures(snapshot: &super::JitSnapshot) -> Option<String> {
