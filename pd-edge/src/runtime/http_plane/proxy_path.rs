@@ -1175,18 +1175,15 @@ fn text_response(status: StatusCode, text: &str) -> Response<Body> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[cfg(feature = "http2")]
     use axum::http::Version;
     #[cfg(feature = "http2")]
     use http_body_util::{BodyExt, Full};
-    #[cfg(feature = "http2")]
     use vm::{compile_source, encode_program};
 
     #[cfg(feature = "http2")]
-    use super::*;
-    #[cfg(feature = "http2")]
     use crate::abi_impl::Http2SessionFrontier;
-    #[cfg(feature = "http2")]
     use crate::runtime::{VmExecutionConfig, VmExecutionMode, apply_program_from_bytes};
 
     #[cfg(feature = "http2")]

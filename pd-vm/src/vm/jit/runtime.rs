@@ -282,13 +282,12 @@ impl Vm {
         let Some(trace) = self.jit.trace_clone(trace_id) else {
             return Ok(ExecOutcome::Continue);
         };
-        let step_indices_by_ip = trace
-            .step_ips
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(step_index, step_ip)| (step_ip, step_index))
-            .collect::<HashMap<_, _>>();
+        let step_indices_by_ip = self.jit.trace_step_index_lookup(trace_id).ok_or_else(|| {
+            VmError::JitNative(format!(
+                "trace {} is missing its step-index lookup",
+                trace_id
+            ))
+        })?;
         let mut step_index = 0usize;
         while step_index < trace.steps.len() {
             self.ip = trace
