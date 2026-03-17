@@ -53,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         interrupt: cli.vm_interrupt_config()?,
         execution_mode: VmExecutionMode::Async,
         jit_enabled: true,
+        drop_contract_events_enabled: false,
     };
     let store_limits = cli.runtime_store_limits();
     if cli.disable_metrics {
@@ -1025,6 +1026,7 @@ mod tests {
             interrupt: VmInterruptConfig::None,
             execution_mode: VmExecutionMode::Async,
             jit_enabled: true,
+            drop_contract_events_enabled: false,
         });
         load_program_from_path(&state, &program_path)
             .await
@@ -1057,6 +1059,7 @@ mod tests {
             interrupt: VmInterruptConfig::None,
             execution_mode: VmExecutionMode::Async,
             jit_enabled: true,
+            drop_contract_events_enabled: false,
         });
         load_program_from_path(&state, &program_path)
             .await

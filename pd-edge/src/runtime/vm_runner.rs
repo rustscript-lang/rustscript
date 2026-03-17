@@ -1,5 +1,5 @@
-use std::time::Duration;
 use parking_lot::Mutex;
+use std::time::Duration;
 use tokio::{
     runtime::Handle,
     task::JoinHandle,
@@ -167,6 +167,7 @@ pub async fn execute_vm_with_context(
         register_host_modules,
         prefer_aot,
         vm_execution.jit_enabled,
+        vm_execution.drop_contract_events_enabled,
         !debug.attach_debugger,
     )?;
     let execution_mode = if debug.force_threading {
@@ -177,22 +178,10 @@ pub async fn execute_vm_with_context(
 
     let vm_store = match execution_mode {
         VmExecutionMode::Async => {
-            execute_vm_with_async_mode(
-                vm_store,
-                debug_session,
-                debug,
-                vm_execution,
-            )
-            .await
+            execute_vm_with_async_mode(vm_store, debug_session, debug, vm_execution).await
         }
         VmExecutionMode::Threading => {
-            execute_vm_with_threading_mode(
-                vm_store,
-                debug_session,
-                debug,
-                vm_execution,
-            )
-            .await
+            execute_vm_with_threading_mode(vm_store, debug_session, debug, vm_execution).await
         }
     }?;
 
@@ -211,13 +200,7 @@ async fn execute_vm_with_async_mode(
 ) -> Result<VmRunnerStore, VmExecutionError> {
     let started = std::time::Instant::now();
     let request_id = tail_profile_request_id(&vm_store);
-    let mut profile = run_vm_async(
-        vm_store,
-        debug_session,
-        debug,
-        vm_execution,
-    )
-    .await?;
+    let mut profile = run_vm_async(vm_store, debug_session, debug, vm_execution).await?;
 
     profile.queue_wait_us = 0;
     profile.blocking_run_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -236,12 +219,7 @@ async fn execute_vm_with_threading_mode(
     let task = tokio::task::spawn_blocking(move || {
         let queue_wait_us = u64::try_from(queued_at.elapsed().as_micros()).unwrap_or(u64::MAX);
         let threading_started = std::time::Instant::now();
-        let result = run_vm_threading(
-            vm_store,
-            debug_session,
-            debug,
-            vm_execution,
-        );
+        let result = run_vm_threading(vm_store, debug_session, debug, vm_execution);
 
         match result {
             Ok(mut profile) => {
@@ -372,9 +350,12 @@ fn new_vm_runner_store(
     async_ops: SharedVmAsyncOps,
     prefer_aot: bool,
     jit_enabled: bool,
+    drop_contract_events_enabled: bool,
 ) -> VmRunnerStore {
-    let prefer_aot =
-        prefer_aot && jit_enabled && std::env::var_os("PD_EDGE_DISABLE_NO_INTERRUPT_AOT").is_none();
+    let prefer_aot = prefer_aot
+        && jit_enabled
+        && !drop_contract_events_enabled
+        && std::env::var_os("PD_EDGE_DISABLE_NO_INTERRUPT_AOT").is_none();
     let mut vm = if prefer_aot {
         if let Some(bundle) = program.no_interrupt_aot_bundle.as_ref() {
             match Vm::from_aot_bundle_bytes(bundle.as_ref().as_slice()) {
@@ -391,6 +372,7 @@ fn new_vm_runner_store(
     } else {
         Vm::new_shared(program.program.clone())
     };
+    vm.set_drop_contract_events_enabled(drop_contract_events_enabled);
     if !jit_enabled {
         let mut jit_config = *vm.jit_config();
         jit_config.enabled = false;
@@ -416,6 +398,7 @@ fn acquire_vm_runner_store(
     register_host_modules: HostModuleRegistrar,
     prefer_aot: bool,
     jit_enabled: bool,
+    drop_contract_events_enabled: bool,
     pooling_enabled: bool,
 ) -> Result<AcquiredVmRunnerStore, VmExecutionError> {
     let async_ops = new_shared_vm_async_ops();
@@ -423,6 +406,7 @@ fn acquire_vm_runner_store(
     if let Some(pool_key) = pool_key
         && let Some(mut vm) = program.vm_pool.take(pool_key)
     {
+        vm.set_drop_contract_events_enabled(drop_contract_events_enabled);
         vm.set_async_bridge(Box::new(VmAsyncOpBridge::new(async_ops.clone())));
         return Ok(AcquiredVmRunnerStore {
             vm_store: Store::new(vm, VmRunnerStoreData::new(vm_context, async_ops)),
@@ -430,7 +414,14 @@ fn acquire_vm_runner_store(
         });
     }
 
-    let mut vm_store = new_vm_runner_store(program, vm_context, async_ops, prefer_aot, jit_enabled);
+    let mut vm_store = new_vm_runner_store(
+        program,
+        vm_context,
+        async_ops,
+        prefer_aot,
+        jit_enabled,
+        drop_contract_events_enabled,
+    );
     register_host_modules_from_store(&mut vm_store, register_host_modules)?;
     Ok(AcquiredVmRunnerStore { vm_store, pool_key })
 }
@@ -651,7 +642,7 @@ mod tests {
             Arc::new(RateLimiterStore::new()),
         ));
         let async_ops = new_shared_vm_async_ops();
-        let store = new_vm_runner_store(&loaded_program, context, async_ops, false, true);
+        let store = new_vm_runner_store(&loaded_program, context, async_ops, false, true, false);
         let debug = VmDebugInvocation {
             attach_debugger: false,
             force_threading: false,
@@ -664,6 +655,7 @@ mod tests {
             },
             execution_mode: VmExecutionMode::Threading,
             jit_enabled: true,
+            drop_contract_events_enabled: false,
         };
 
         let result = tokio::task::spawn_blocking(move || {
@@ -739,6 +731,7 @@ mod tests {
             counting_host_modules,
             false,
             true,
+            false,
             true,
         )
         .expect("first vm checkout should succeed");
@@ -755,6 +748,7 @@ mod tests {
             counting_host_modules,
             false,
             true,
+            false,
             true,
         )
         .expect("second vm checkout should reuse pooled vm");

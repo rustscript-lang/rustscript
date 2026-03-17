@@ -1211,6 +1211,7 @@ mod tests {
             interrupt: crate::runtime::VmInterruptConfig::None,
             execution_mode: VmExecutionMode::Threading,
             jit_enabled: true,
+            drop_contract_events_enabled: false,
         });
         let source = r#"
             use http;
@@ -1359,6 +1360,7 @@ mod tests {
             interrupt: crate::runtime::VmInterruptConfig::None,
             execution_mode: VmExecutionMode::Threading,
             jit_enabled: true,
+            drop_contract_events_enabled: false,
         });
         let source = format!(
             r#"
@@ -1479,6 +1481,7 @@ mod tests {
             interrupt: crate::runtime::VmInterruptConfig::None,
             execution_mode: VmExecutionMode::Threading,
             jit_enabled: true,
+            drop_contract_events_enabled: false,
         });
         let source = format!(
             r#"

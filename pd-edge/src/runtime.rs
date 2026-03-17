@@ -109,6 +109,7 @@ pub struct VmExecutionConfig {
     pub interrupt: VmInterruptConfig,
     pub execution_mode: VmExecutionMode,
     pub jit_enabled: bool,
+    pub drop_contract_events_enabled: bool,
 }
 
 impl Default for VmExecutionConfig {
@@ -117,6 +118,7 @@ impl Default for VmExecutionConfig {
             interrupt: VmInterruptConfig::None,
             execution_mode: VmExecutionMode::default(),
             jit_enabled: true,
+            drop_contract_events_enabled: false,
         }
     }
 }
