@@ -54,7 +54,7 @@ struct PayloadPartial {
     score: int,
 }
 let payload_json = json::encode(payload);
-let payload_decoded: PayloadPartial = json::decode(payload_json);
+let payload_decoded = json::decode::<PayloadPartial>(payload_json);
 let json_score = payload_decoded.score;
 
 if regex_ok && json_score == matched {

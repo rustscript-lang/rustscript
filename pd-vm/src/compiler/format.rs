@@ -157,4 +157,60 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    fn keeps_generic_type_params_and_turbofish_tight() {
+        let input = concat!(
+            "struct Box < T > {\n",
+            "    value: T\n",
+            "}\n",
+            "fn wrap < T >(value: Box < T >) {\n",
+            "    let decoded = json::decode:: < Box < T > >(payload);\n",
+            "    decoded\n",
+            "}\n"
+        );
+        let formatted = format_source_with_flavor(input, SourceFlavor::RustScript)
+            .expect("formatting should succeed");
+
+        assert_eq!(
+            formatted,
+            concat!(
+                "struct Box<T> {\n",
+                "    value: T\n",
+                "}\n",
+                "fn wrap<T>(value: Box<T>) {\n",
+                "    let decoded = json::decode::<Box<T>>(payload);\n",
+                "    decoded\n",
+                "}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn keeps_nested_generic_type_annotations_tight() {
+        let input = concat!(
+            "struct LinkState < V > {\n",
+            "    nodes: map < LruNode < V > >,\n",
+            "    head: int,\n",
+            "    tail: int\n",
+            "}\n",
+            "let cache: LruCacheState < FeedCacheItem > = new:: < FeedCacheItem >(3);\n",
+            "let relinked = append_existing_node:: < FeedCacheItem >(nodes, head, tail, id, node);\n"
+        );
+        let formatted = format_source_with_flavor(input, SourceFlavor::RustScript)
+            .expect("formatting should succeed");
+
+        assert_eq!(
+            formatted,
+            concat!(
+                "struct LinkState<V> {\n",
+                "    nodes: map<LruNode<V>>,\n",
+                "    head: int,\n",
+                "    tail: int\n",
+                "}\n",
+                "let cache: LruCacheState<FeedCacheItem> = new::<FeedCacheItem>(3);\n",
+                "let relinked = append_existing_node::<FeedCacheItem>(nodes, head, tail, id, node);\n"
+            )
+        );
+    }
 }

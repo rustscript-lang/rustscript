@@ -52,8 +52,11 @@ let payload = {
     score: closure_value,
     matched: matched,
 };
+struct PayloadPartial {
+    score: int,
+}
 let payload_json = json::encode(payload);
-let payload_decoded = json::decode(payload_json);
+let payload_decoded = json::decode::<PayloadPartial>(payload_json);
 let json_score = payload_decoded.score;
 let sleep_ok = runtime::sleep(100);
 let io_ok = if true => {
