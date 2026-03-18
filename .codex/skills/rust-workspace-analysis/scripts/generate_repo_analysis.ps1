@@ -199,17 +199,81 @@ $crateRows = @(
 
 $totalCode = ($crateRows | Measure-Object -Property code_lines -Sum).Sum
 $totalTests = ($crateRows | Measure-Object -Property test_total -Sum).Sum
+$topCrates = @(
+    $crateRows |
+    Sort-Object @{Expression = "code_lines"; Descending = $true}, crate |
+    Select-Object -First 3
+)
+$featureRows = @(
+    foreach ($crate in $crateRows) {
+        foreach ($area in $crate.feature_areas) {
+            [pscustomobject]@{
+                crate = $crate.crate
+                feature = $area.feature
+                lines = $area.lines
+            }
+        }
+    }
+)
+$topFeatures = @(
+    $featureRows |
+    Sort-Object @{Expression = "lines"; Descending = $true}, crate, feature |
+    Select-Object -First 5
+)
+$testRows = @(
+    foreach ($crate in $crateRows) {
+        foreach ($suite in $crate.test_suites) {
+            [pscustomobject]@{
+                crate = $crate.crate
+                path = $suite.path
+                tests = $suite.tests
+            }
+        }
+    }
+)
+$topSuites = @(
+    $testRows |
+    Sort-Object @{Expression = "tests"; Descending = $true}, crate, path |
+    Select-Object -First 5
+)
 
 $lines = New-Object System.Collections.Generic.List[string]
 $lines.Add("# Repo Analysis")
 $lines.Add("")
-$lines.Add("- Count basis: physical Rust lines in `src/**/*.rs` plus `build.rs` for each crate.")
-$lines.Add("- Excluded from LOC totals: `tests/`, `examples/`, `docs/`, `target/`, and web assets.")
+$lines.Add('- Count basis: physical Rust lines in `src/**/*.rs` plus `build.rs` for each crate.')
+$lines.Add('- Excluded from LOC totals: `tests/`, `examples/`, `docs/`, `target/`, and web assets.')
 $lines.Add("- Feature buckets are source/module areas, not Cargo feature flags. Cargo feature flags are listed separately because they overlap.")
-$lines.Add("- Test counts come from detected `#[test]` and `#[tokio::test]` functions in `src/**/*.rs`, `tests/**/*.rs`, and `build.rs` when present.")
+$lines.Add('- Test counts come from detected `#[test]` and `#[tokio::test]` functions in `src/**/*.rs`, `tests/**/*.rs`, and `build.rs` when present.')
 $lines.Add("")
 $lines.Add(("Workspace production LOC: **{0}**" -f $totalCode))
 $lines.Add(("Detected tests: **{0}**" -f $totalTests))
+$lines.Add("")
+$lines.Add("## Highlights")
+$lines.Add("")
+if ($topCrates.Count -gt 0) {
+    $crateParts = @(
+        $topCrates | ForEach-Object {
+            '`{0}` ({1} LOC, {2} tests)' -f $_.crate, $_.code_lines, $_.test_total
+        }
+    )
+    $lines.Add(('- Largest crates by LOC: {0}.' -f ($crateParts -join "; ")))
+}
+if ($topFeatures.Count -gt 0) {
+    $featureParts = @(
+        $topFeatures | ForEach-Object {
+            '`{0}/{1}` ({2} LOC)' -f $_.crate, $_.feature, $_.lines
+        }
+    )
+    $lines.Add(('- Largest functionality buckets: {0}.' -f ($featureParts -join "; ")))
+}
+if ($topSuites.Count -gt 0) {
+    $suiteParts = @(
+        $topSuites | ForEach-Object {
+            '`{0}/{1}` ({2} tests)' -f $_.crate, $_.path, $_.tests
+        }
+    )
+    $lines.Add(('- Heaviest test suites: {0}.' -f ($suiteParts -join "; ")))
+}
 $lines.Add("")
 $lines.Add("## Crate Summary")
 $lines.Add("")
