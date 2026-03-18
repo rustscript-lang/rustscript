@@ -16,8 +16,8 @@ use tracing::{info, warn};
 use super::super::SharedState;
 use super::proxy_path::{
     execute_data_plane_http_request_context, finalize_data_plane_response,
-    record_data_plane_response_metrics, record_stage_metrics, serve_http_connection,
-    serve_http1_connection_via_hyper,
+    record_data_plane_response_metrics, record_stage_metrics, record_stage_metrics_if_enabled,
+    serve_http_connection, serve_http1_connection_via_hyper, stage_metrics_active,
 };
 use crate::{
     abi_impl::ReplayPrefixedIo,
@@ -692,7 +692,6 @@ where
                         .stream_mut()?
                         .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
                         .await?;
-                    connection.stream_mut()?.flush().await?;
                 }
                 let Some(body_kind) = classify_downstream_http1_fast_body_lazy(&headers) else {
                     return Ok(FastHttp1Decision::FallbackToHyper);
@@ -863,7 +862,6 @@ where
     stream.write_all(scratch).await?;
 
     if !has_body {
-        stream.flush().await?;
         return Ok(keep_alive);
     }
 
@@ -907,7 +905,6 @@ where
         stream.write_all(scratch).await?;
     }
 
-    stream.flush().await?;
     Ok(keep_alive)
 }
 
@@ -1038,7 +1035,6 @@ where
         }
     }
 
-    stream.flush().await?;
     Ok(keep_alive)
 }
 
@@ -1130,7 +1126,6 @@ where
         }
     }
 
-    stream.flush().await?;
     Ok(keep_alive)
 }
 
@@ -1181,7 +1176,7 @@ where
     }
 
     scratch.clear();
-    scratch.reserve(1024 + body_len);
+    scratch.reserve(1024);
     write_http1_status_line(version, status, scratch);
     for (name, value) in &headers {
         scratch.extend_from_slice(name.as_str().as_bytes());
@@ -1190,11 +1185,10 @@ where
         scratch.extend_from_slice(b"\r\n");
     }
     scratch.extend_from_slice(b"\r\n");
-    if body_len > 0 {
-        scratch.extend_from_slice(&body);
-    }
     stream.write_all(scratch).await?;
-    stream.flush().await?;
+    if body_len > 0 {
+        stream.write_all(&body).await?;
+    }
     Ok(keep_alive)
 }
 
@@ -1258,7 +1252,8 @@ async fn serve_http1_fast_connection<S>(
         let request_keep_alive = request.keep_alive;
         let mut body_lease = body_lease;
         if state.loaded_program_snapshot().is_none() {
-            let started = Instant::now();
+            let started =
+                (stage_metrics_active() || state.metrics_collection_enabled()).then(Instant::now);
             if let Some(body_lease) = body_lease.take() {
                 match body_lease.finish().await {
                     Ok(returned) => connection.restore(returned),
@@ -1291,13 +1286,20 @@ async fn serve_http1_fast_connection<S>(
                     }
                 }
             }
-            let finished = Instant::now();
-            record_stage_metrics(
-                0,
-                0,
-                0,
-                u64::try_from(finished.duration_since(started).as_micros()).unwrap_or(u64::MAX),
-            );
+            if stage_metrics_active() {
+                let finished = Instant::now();
+                record_stage_metrics(
+                    0,
+                    0,
+                    0,
+                    u64::try_from(
+                        finished
+                            .duration_since(started.expect("stage metrics start should exist"))
+                            .as_micros(),
+                    )
+                    .unwrap_or(u64::MAX),
+                );
+            }
             record_data_plane_response_metrics(&state, started, StatusCode::NOT_FOUND.as_u16(), 0);
             match connection
                 .write_native_local_response(
@@ -1352,7 +1354,8 @@ async fn serve_http1_fast_connection<S>(
             }
         };
         state.record_data_plane_request();
-        let started = Instant::now();
+        let started =
+            (stage_metrics_active() || state.metrics_collection_enabled()).then(Instant::now);
         let execution = execute_data_plane_http_request_context(
             &state,
             vm_request,
@@ -1403,7 +1406,6 @@ async fn serve_http1_fast_connection<S>(
             Ok((vm_context, pre_vm_finished, after_vm)) => {
                 match resolve_http1_downstream_response(&vm_context).await {
                     Http1DownstreamResolution::NativeLocal(native_local) => {
-                        let after_resolve = Instant::now();
                         if let Some(body_lease) = body_lease.take() {
                             match body_lease.finish().await {
                                 Ok(returned) => connection.restore(returned),
@@ -1439,17 +1441,7 @@ async fn serve_http1_fast_connection<S>(
                                 }
                             }
                         }
-                        let finished = Instant::now();
-                        record_stage_metrics(
-                            u64::try_from(pre_vm_finished.duration_since(started).as_micros())
-                                .unwrap_or(u64::MAX),
-                            u64::try_from(after_vm.duration_since(pre_vm_finished).as_micros())
-                                .unwrap_or(u64::MAX),
-                            u64::try_from(after_resolve.duration_since(after_vm).as_micros())
-                                .unwrap_or(u64::MAX),
-                            u64::try_from(finished.duration_since(started).as_micros())
-                                .unwrap_or(u64::MAX),
-                        );
+                        record_stage_metrics_if_enabled(started, pre_vm_finished, after_vm);
                         let response_status =
                             StatusCode::from_u16(native_local.status).unwrap_or(StatusCode::OK);
                         record_data_plane_response_metrics(
@@ -1478,7 +1470,6 @@ async fn serve_http1_fast_connection<S>(
                         }
                     }
                     Http1DownstreamResolution::Native(native_result) => {
-                        let after_resolve = Instant::now();
                         if let Some(body_lease) = body_lease.take() {
                             match body_lease.finish().await {
                                 Ok(returned) => connection.restore(returned),
@@ -1514,17 +1505,7 @@ async fn serve_http1_fast_connection<S>(
                                 }
                             }
                         }
-                        let finished = Instant::now();
-                        record_stage_metrics(
-                            u64::try_from(pre_vm_finished.duration_since(started).as_micros())
-                                .unwrap_or(u64::MAX),
-                            u64::try_from(after_vm.duration_since(pre_vm_finished).as_micros())
-                                .unwrap_or(u64::MAX),
-                            u64::try_from(after_resolve.duration_since(after_vm).as_micros())
-                                .unwrap_or(u64::MAX),
-                            u64::try_from(finished.duration_since(started).as_micros())
-                                .unwrap_or(u64::MAX),
-                        );
+                        record_stage_metrics_if_enabled(started, pre_vm_finished, after_vm);
                         match native_result {
                             Ok(native_response) => {
                                 let response_status = native_response
@@ -1579,7 +1560,6 @@ async fn serve_http1_fast_connection<S>(
                         }
                     }
                     Http1DownstreamResolution::Snapshot(snapshot_result) => {
-                        let after_resolve = Instant::now();
                         if let Some(body_lease) = body_lease.take() {
                             match body_lease.finish().await {
                                 Ok(returned) => connection.restore(returned),
@@ -1615,17 +1595,7 @@ async fn serve_http1_fast_connection<S>(
                                 }
                             }
                         }
-                        let finished = Instant::now();
-                        record_stage_metrics(
-                            u64::try_from(pre_vm_finished.duration_since(started).as_micros())
-                                .unwrap_or(u64::MAX),
-                            u64::try_from(after_vm.duration_since(pre_vm_finished).as_micros())
-                                .unwrap_or(u64::MAX),
-                            u64::try_from(after_resolve.duration_since(after_vm).as_micros())
-                                .unwrap_or(u64::MAX),
-                            u64::try_from(finished.duration_since(started).as_micros())
-                                .unwrap_or(u64::MAX),
-                        );
+                        record_stage_metrics_if_enabled(started, pre_vm_finished, after_vm);
                         match snapshot_result {
                             Ok(snapshot_response) => {
                                 let response_status =
@@ -1676,7 +1646,6 @@ async fn serve_http1_fast_connection<S>(
                         }
                     }
                     Http1DownstreamResolution::Graph(resolved) => {
-                        let after_resolve = Instant::now();
                         if let Some(body_lease) = body_lease.take() {
                             match body_lease.finish().await {
                                 Ok(returned) => connection.restore(returned),
@@ -1727,17 +1696,7 @@ async fn serve_http1_fast_connection<S>(
                                 }
                             });
                         }
-                        let finished = Instant::now();
-                        record_stage_metrics(
-                            u64::try_from(pre_vm_finished.duration_since(started).as_micros())
-                                .unwrap_or(u64::MAX),
-                            u64::try_from(after_vm.duration_since(pre_vm_finished).as_micros())
-                                .unwrap_or(u64::MAX),
-                            u64::try_from(after_resolve.duration_since(after_vm).as_micros())
-                                .unwrap_or(u64::MAX),
-                            u64::try_from(finished.duration_since(started).as_micros())
-                                .unwrap_or(u64::MAX),
-                        );
+                        record_stage_metrics_if_enabled(started, pre_vm_finished, after_vm);
                         let response = finalize_data_plane_response(
                             &state,
                             started,

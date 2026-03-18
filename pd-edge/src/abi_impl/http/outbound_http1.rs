@@ -160,6 +160,7 @@ pub(crate) struct OutboundHttp1ForwardResponse {
     pub(crate) peer_certificate_der: Option<Vec<u8>>,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct OutboundHttp1Request {
     pub(crate) method: Method,
@@ -173,7 +174,7 @@ pub(crate) enum OutboundHttp1RequestHeaders {
     Parsed(HeaderMap),
     InheritedFiltered {
         headers: LazyHttpHeaders,
-        host_header: Option<String>,
+        host_header: Option<Arc<str>>,
     },
 }
 
@@ -208,12 +209,18 @@ impl std::fmt::Debug for OutboundHttp1RequestBody {
     }
 }
 
+pub(crate) struct SerializedOutboundHttp1Request {
+    pub(crate) method: Method,
+    pub(crate) body: OutboundHttp1RequestBody,
+    pub(crate) use_chunked_body: bool,
+}
+
 impl OutboundHttp1RequestBody {
     fn is_retryable(&self) -> bool {
         matches!(self, Self::Empty | Self::Bytes(_))
     }
 
-    fn content_length(&self) -> Option<u64> {
+    pub(crate) fn content_length(&self) -> Option<u64> {
         match self {
             Self::Empty => Some(0),
             Self::Bytes(body) => Some(u64::try_from(body.len()).unwrap_or(u64::MAX)),
@@ -1178,6 +1185,7 @@ fn encode_request_headers(
     )
 }
 
+#[cfg(test)]
 fn serialize_request_head_into(
     request: &OutboundHttp1Request,
     authority: &str,
@@ -1222,6 +1230,56 @@ fn serialize_request_head_into(
     use_chunked_body
 }
 
+pub(crate) fn serialize_request_head_parts_into(
+    method: &Method,
+    request_path: &str,
+    request_query: &str,
+    headers: &OutboundHttp1RequestHeaders,
+    authority: &str,
+    body_content_length: Option<u64>,
+    encoded: &mut BytesMut,
+) -> bool {
+    let path = if request_path.is_empty() {
+        "/"
+    } else {
+        request_path
+    };
+    encoded.clear();
+    encoded.reserve(method.as_str().len() + path.len() + request_query.len().saturating_add(129));
+    encoded.extend_from_slice(method.as_str().as_bytes());
+    encoded.extend_from_slice(b" ");
+    encoded.extend_from_slice(path.as_bytes());
+    if !request_query.is_empty() {
+        encoded.extend_from_slice(b"?");
+        encoded.extend_from_slice(request_query.as_bytes());
+    }
+    encoded.extend_from_slice(b" HTTP/1.1\r\n");
+
+    let (_has_host, has_content_length, has_connection, has_transfer_encoding) =
+        encode_request_headers(encoded, headers, authority);
+    let use_chunked_body =
+        !has_transfer_encoding && !has_content_length && body_content_length.is_none();
+    if !has_content_length
+        && !has_transfer_encoding
+        && let Some(content_length) = body_content_length
+    {
+        encoded.extend_from_slice(CONTENT_LENGTH.as_str().as_bytes());
+        encoded.extend_from_slice(b": ");
+        encoded.extend_from_slice(content_length.to_string().as_bytes());
+        encoded.extend_from_slice(b"\r\n");
+    } else if use_chunked_body {
+        encoded.extend_from_slice(TRANSFER_ENCODING.as_str().as_bytes());
+        encoded.extend_from_slice(b": chunked\r\n");
+    }
+    if !has_connection {
+        encoded.extend_from_slice(CONNECTION.as_str().as_bytes());
+        encoded.extend_from_slice(b": keep-alive\r\n");
+    }
+    encoded.extend_from_slice(b"\r\n");
+    use_chunked_body
+}
+
+#[cfg(test)]
 pub(crate) async fn forward_via_sender_pool<F>(
     pool: &SharedPlainHttp1SenderPool,
     sender_pool_capacity: usize,
@@ -1364,6 +1422,145 @@ where
     })
 }
 
+pub(crate) async fn forward_serialized_via_sender_pool<F>(
+    pool: &SharedPlainHttp1SenderPool,
+    sender_pool_capacity: usize,
+    target: &OutboundHttp1Target,
+    started_at: Instant,
+    mut make_request: F,
+) -> Result<OutboundHttp1ForwardResponse, VmError>
+where
+    F: FnMut(&mut BytesMut, &str) -> Result<SerializedOutboundHttp1Request, VmError>,
+{
+    let total_started = Instant::now();
+    let pool_key = target_pool_key(target)?;
+    let acquired = acquire_plain_http1_connection(pool, target).await?;
+    let mut connection = acquired.connection;
+    let mut pool_hit = acquired.pool_hit;
+    let mut connect_us = acquired.connect_us;
+    let mut ready_us = acquired.ready_us;
+    let mut retries = 0u64;
+
+    let build_started = Instant::now();
+    let request = make_request(&mut connection.write_scratch, target.authority.as_ref())?;
+    let request_method = request.method.clone();
+    let request_retryable = request.body.is_retryable();
+    let mut request = request;
+    let mut build_us = u64::try_from(build_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let mut send_us = 0u64;
+
+    let send_started = Instant::now();
+    let mut parsed_response =
+        match send_serialized_request_and_parse_response(&mut connection, request, &request_method)
+            .await
+        {
+            Ok(parsed) => parsed,
+            Err(err) if request_retryable => {
+                note_http1_pool_connection_dropped_dirty();
+                retries = 1;
+                send_us = u64::try_from(send_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let reacquired = acquire_plain_http1_connection(pool, target).await?;
+                connection = reacquired.connection;
+                pool_hit &= reacquired.pool_hit;
+                connect_us = connect_us.saturating_add(reacquired.connect_us);
+                ready_us = ready_us.saturating_add(reacquired.ready_us);
+
+                let retry_build_started = Instant::now();
+                let retry_request =
+                    make_request(&mut connection.write_scratch, target.authority.as_ref())?;
+                let retry_method = retry_request.method.clone();
+                request = retry_request;
+                build_us = build_us.saturating_add(
+                    u64::try_from(retry_build_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                );
+                let retry_send_started = Instant::now();
+                let parsed = send_serialized_request_and_parse_response(
+                    &mut connection,
+                    request,
+                    &retry_method,
+                )
+                .await
+                .map_err(|err| {
+                    note_http1_pool_connection_dropped_dirty();
+                    VmError::HostError(format!(
+                        "outbound request to {}://{} failed while evaluating host call: {err}",
+                        match target.scheme {
+                            OutboundHttp1Scheme::Http => "http",
+                            #[cfg(feature = "tls")]
+                            OutboundHttp1Scheme::Https => "https",
+                        },
+                        target.authority,
+                    ))
+                })?;
+                send_us = send_us.saturating_add(
+                    u64::try_from(retry_send_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                );
+                parsed
+            }
+            Err(err) => {
+                note_http1_pool_connection_dropped_dirty();
+                return Err(VmError::HostError(format!(
+                    "outbound request to {}://{} failed while evaluating host call: {err}",
+                    match target.scheme {
+                        OutboundHttp1Scheme::Http => "http",
+                        #[cfg(feature = "tls")]
+                        OutboundHttp1Scheme::Https => "https",
+                    },
+                    target.authority,
+                )));
+            }
+        };
+    if send_us == 0 {
+        send_us = u64::try_from(send_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    }
+    let negotiated_alpn = connection.negotiated_alpn.clone();
+    let peer_certificate_der = connection.peer_certificate_der.clone();
+
+    let response_body = if let Some(body_kind) = parsed_response.body_kind.take() {
+        let may_reuse =
+            parsed_response.keep_alive && !matches!(body_kind, PlainHttp1BodyKind::CloseDelimited);
+        let lease = PlainHttp1SenderLease::new(
+            pool.clone(),
+            pool_key,
+            sender_pool_capacity,
+            may_reuse,
+            connection,
+        );
+        OutboundHttp1ForwardBody::Raw {
+            body: PlainHttp1ResponseBody::new(lease, body_kind),
+            content_length: parsed_response.content_length,
+        }
+    } else {
+        if parsed_response.keep_alive {
+            release_plain_http1_connection(pool, pool_key, sender_pool_capacity, connection);
+        } else {
+            note_http1_pool_connection_closed_clean();
+        }
+        OutboundHttp1ForwardBody::Empty
+    };
+
+    record_native_forward_metrics(
+        pool_hit,
+        retries,
+        build_us,
+        connect_us,
+        ready_us,
+        send_us,
+        u64::try_from(total_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+    );
+    record_http1_pool_metrics_sample();
+    Ok(OutboundHttp1ForwardResponse {
+        status: parsed_response.status,
+        headers: parsed_response.headers,
+        version: parsed_response.version,
+        body: response_body,
+        upstream_latency_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        negotiated_alpn,
+        peer_certificate_der,
+    })
+}
+
+#[cfg(test)]
 async fn send_and_parse_response(
     connection: &mut PlainHttp1PooledConnection,
     request: OutboundHttp1Request,
@@ -1374,6 +1571,25 @@ async fn send_and_parse_response(
     parse_response_head(connection, request_method).await
 }
 
+async fn send_serialized_request_and_parse_response(
+    connection: &mut PlainHttp1PooledConnection,
+    request: SerializedOutboundHttp1Request,
+    request_method: &Method,
+) -> Result<ParsedResponseHead, VmError> {
+    connection
+        .stream
+        .write_all(&connection.write_scratch)
+        .await
+        .map_err(|err| {
+            VmError::HostError(format!(
+                "failed to write plain http/1.1 upstream request: {err}"
+            ))
+        })?;
+    send_request_body(connection, request.body, request.use_chunked_body).await?;
+    parse_response_head(connection, request_method).await
+}
+
+#[cfg(test)]
 async fn send_request(
     connection: &mut PlainHttp1PooledConnection,
     request: OutboundHttp1Request,

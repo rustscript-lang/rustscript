@@ -78,6 +78,33 @@ fn stage_metrics_enabled() -> bool {
     *STAGE_METRICS_ENABLED.get_or_init(|| std::env::var_os("PD_EDGE_STAGE_METRICS").is_some())
 }
 
+pub(super) fn stage_metrics_active() -> bool {
+    stage_metrics_enabled()
+}
+
+pub(super) fn record_stage_metrics_if_enabled(
+    started: Option<Instant>,
+    pre_vm_finished: Option<Instant>,
+    after_vm: Option<Instant>,
+) {
+    let (Some(started), Some(pre_vm_finished), Some(after_vm)) =
+        (started, pre_vm_finished, after_vm)
+    else {
+        return;
+    };
+    let after_resolve = Instant::now();
+    record_stage_metrics(
+        u64::try_from(pre_vm_finished.duration_since(started).as_micros()).unwrap_or(u64::MAX),
+        u64::try_from(after_vm.duration_since(pre_vm_finished).as_micros()).unwrap_or(u64::MAX),
+        u64::try_from(after_resolve.duration_since(after_vm).as_micros()).unwrap_or(u64::MAX),
+        u64::try_from(after_resolve.duration_since(started).as_micros()).unwrap_or(u64::MAX),
+    );
+}
+
+fn response_timing_active(state: &SharedState) -> bool {
+    state.metrics_collection_enabled()
+}
+
 pub(super) fn record_stage_metrics(pre_vm_us: u64, vm_us: u64, resolve_us: u64, total_us: u64) {
     if !stage_metrics_enabled() {
         return;
@@ -955,7 +982,7 @@ pub async fn serve_http3_proxy(listener: UdpSocket, state: SharedState) -> std::
 }
 
 async fn handle_data_plane_request(state: SharedState, request: Request) -> Response<Body> {
-    let started = Instant::now();
+    let started = (response_timing_active(&state) || stage_metrics_active()).then(Instant::now);
 
     state.record_data_plane_request();
 
@@ -1001,7 +1028,7 @@ async fn handle_data_plane_http_request_context(
     downstream_http2_attachment: Option<Http2DownstreamStreamAttachment>,
     #[cfg(feature = "http3")] downstream_http3_attachment: Option<Http3DownstreamStreamAttachment>,
     downstream_http1_upgrade: Option<hyper::upgrade::OnUpgrade>,
-    started: Instant,
+    started: Option<Instant>,
 ) -> Response<Body> {
     let (vm_context, pre_vm_finished, after_vm) = match execute_data_plane_http_request_context(
         &state,
@@ -1019,7 +1046,6 @@ async fn handle_data_plane_http_request_context(
     };
 
     let resolved = resolve_http_graph_response(&vm_context).await;
-    let after_resolve = Instant::now();
     let crate::abi_impl::http::ResolvedHttpGraphResponse {
         response,
         upstream_latency_ms,
@@ -1035,13 +1061,7 @@ async fn handle_data_plane_http_request_context(
             }
         });
     }
-    let finished = Instant::now();
-    record_stage_metrics(
-        u64::try_from(pre_vm_finished.duration_since(started).as_micros()).unwrap_or(u64::MAX),
-        u64::try_from(after_vm.duration_since(pre_vm_finished).as_micros()).unwrap_or(u64::MAX),
-        u64::try_from(after_resolve.duration_since(after_vm).as_micros()).unwrap_or(u64::MAX),
-        u64::try_from(finished.duration_since(started).as_micros()).unwrap_or(u64::MAX),
-    );
+    record_stage_metrics_if_enabled(started, pre_vm_finished, after_vm);
     finalize_data_plane_response(&state, started, response, upstream_latency_ms)
 }
 
@@ -1052,7 +1072,7 @@ pub(super) async fn execute_data_plane_http_request_context(
     downstream_http2_attachment: Option<Http2DownstreamStreamAttachment>,
     #[cfg(feature = "http3")] downstream_http3_attachment: Option<Http3DownstreamStreamAttachment>,
     downstream_http1_upgrade: Option<hyper::upgrade::OnUpgrade>,
-) -> Result<(SharedProxyVmContext, Instant, Instant), Response<Body>> {
+) -> Result<(SharedProxyVmContext, Option<Instant>, Option<Instant>), Response<Body>> {
     let Some(program) = state.loaded_program_snapshot() else {
         warn!("{} no program loaded; returning 404", category_program());
         return Err(text_response(StatusCode::NOT_FOUND, "not found"));
@@ -1062,12 +1082,12 @@ pub(super) async fn execute_data_plane_http_request_context(
         attach_debugger: request_will_attach_debugger(
             &state.debug_session,
             &vm_request.headers,
-            &vm_request.path,
+            vm_request.path.as_str(),
         ),
         force_threading: request_uses_blocking_debugger(
             &state.debug_session,
             &vm_request.headers,
-            &vm_request.path,
+            vm_request.path.as_str(),
         ),
     };
     let mut vm_context =
@@ -1086,7 +1106,8 @@ pub(super) async fn execute_data_plane_http_request_context(
         vm_context.attach_downstream_http1_upgrade(upgrade);
     }
     let vm_context = Arc::new(vm_context);
-    let pre_vm_finished = Instant::now();
+    let stage_metrics = stage_metrics_active();
+    let pre_vm_finished = stage_metrics.then(Instant::now);
     match execute_vm_with_context(
         &program,
         vm_context.clone(),
@@ -1119,7 +1140,11 @@ pub(super) async fn execute_data_plane_http_request_context(
         }
     }
 
-    Ok((vm_context, pre_vm_finished, Instant::now()))
+    Ok((
+        vm_context,
+        pre_vm_finished,
+        stage_metrics.then(Instant::now),
+    ))
 }
 
 async fn dispatch_data_plane_request(state: SharedState, request: Request) -> Response<Body> {
@@ -1151,7 +1176,7 @@ async fn data_plane_handler(
 
 pub(super) fn finalize_data_plane_response(
     state: &SharedState,
-    started: Instant,
+    started: Option<Instant>,
     response: Response<Body>,
     upstream_latency_ms: u64,
 ) -> Response<Body> {
@@ -1166,14 +1191,16 @@ pub(super) fn finalize_data_plane_response(
 
 pub(super) fn record_data_plane_response_metrics(
     state: &SharedState,
-    started: Instant,
+    started: Option<Instant>,
     status: u16,
     upstream_latency_ms: u64,
 ) {
     state.record_data_plane_status(status);
-    let elapsed_ms = started.elapsed().as_millis();
-    let total_latency_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
-    state.record_data_plane_latency_ms(total_latency_ms, upstream_latency_ms);
+    if let Some(started) = started {
+        let elapsed_ms = started.elapsed().as_millis();
+        let total_latency_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
+        state.record_data_plane_latency_ms(total_latency_ms, upstream_latency_ms);
+    }
 }
 
 fn request_supports_upgrade(request: &hyper::Request<Incoming>) -> bool {

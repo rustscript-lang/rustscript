@@ -1158,7 +1158,7 @@ mod tests {
             HttpRequestContext {
                 request_id: LazyRequestId::from_string("req-1".to_string()),
                 method: axum::http::Method::POST,
-                path: "/".to_string(),
+                path: RequestStringField::Static("/".to_string()),
                 query: RequestStringField::Static(String::new()),
                 http_version: RequestStringField::Static("1.1".to_string()),
                 port: RequestPortField::Static(80),
