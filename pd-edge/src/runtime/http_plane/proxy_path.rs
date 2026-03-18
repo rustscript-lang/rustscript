@@ -222,7 +222,9 @@ pub(super) async fn serve_http1_connection_via_hyper<S>(
     tracker.finish_connection(result.err().map(|err| err.to_string()));
 }
 
-use super::http1_fast_path::{serve_http_auto_connection, serve_http1_connection};
+#[cfg(feature = "http2")]
+use super::http1_fast_path::serve_http_auto_connection;
+use super::http1_fast_path::serve_http1_connection;
 
 #[cfg(feature = "http3")]
 fn generate_http3_proxy_quic_server_config() -> std::io::Result<quinn::ServerConfig> {
