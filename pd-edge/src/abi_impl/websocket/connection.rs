@@ -18,7 +18,7 @@ use tokio_tungstenite::{
 use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::super::SharedProxyVmContext;
-use super::super::http::{
+use super::super::http::state::{
     HttpOutboundRequestNode, allocate_outbound_exchange_handle, default_upstream_exchange_handle,
     is_hop_by_hop_header, outbound_exchange_exists, outbound_exchange_response_available,
 };

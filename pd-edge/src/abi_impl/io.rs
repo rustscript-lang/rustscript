@@ -2,7 +2,7 @@ use pd_edge_host_function::pd_edge_host_function;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 use vm::{CallOutcome, Value, Vm, VmError};
 
-use super::http::{
+use super::http::state::{
     append_outbound_exchange_body, append_response_output_body_bytes, consume_request_body_all,
     default_upstream_exchange_handle, read_outbound_exchange_response_all,
     read_outbound_exchange_response_next_line, read_request_body_next_line,

@@ -18,8 +18,11 @@ use crate::{
         ProxyVmContext, RateLimiterStore, SharedHttp3DownstreamSessions,
         SharedHttpDownstreamSessions, SharedRateLimiter,
         http::{
-            HttpPlaneRuntimeServicesConfig, SharedRuntimeServices,
-            new_shared_http_plane_runtime_services, new_shared_plain_http1_sender_pool,
+            outbound_http1::new_shared_plain_http1_sender_pool,
+            state::{
+                HttpPlaneRuntimeServicesConfig, SharedRuntimeServices,
+                new_shared_http_plane_runtime_services,
+            },
         },
         new_shared_http_downstream_sessions, new_shared_http_upstream_sessions,
         new_shared_http3_downstream_sessions, new_shared_http3_upstream_sessions,

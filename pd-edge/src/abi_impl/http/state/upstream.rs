@@ -1,5 +1,5 @@
+use super::super::helpers::request_path_with_query;
 use super::*;
-use crate::abi_impl::http::request_path_with_query;
 
 pub(super) enum UpstreamResponseStartError {
     UnknownExchangeHandle(i64),

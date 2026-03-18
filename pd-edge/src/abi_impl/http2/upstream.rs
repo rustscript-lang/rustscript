@@ -10,7 +10,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-use crate::abi_impl::http::HttpUpstreamScheme;
+use crate::abi_impl::http::state::HttpUpstreamScheme;
 #[cfg(feature = "http2")]
 use crate::abi_impl::transport::{
     HTTP11_ALPN_PROTOCOL, TlsFlowState, TlsProtocolVersion, TlsSessionCacheKey,
@@ -1408,7 +1408,7 @@ fn format_upstream_authority(host: &str, port: u16) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::abi_impl::http::HttpUpstreamScheme;
+    use crate::abi_impl::http::state::HttpUpstreamScheme;
 
     use super::session_origin;
 

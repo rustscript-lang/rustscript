@@ -27,7 +27,7 @@ use tokio::{
 };
 use vm::VmError;
 
-use crate::abi_impl::http::LazyHttpHeaders;
+use crate::abi_impl::http::state::LazyHttpHeaders;
 use crate::abi_impl::transport::HTTP11_ALPN_PROTOCOL;
 #[cfg(feature = "tls")]
 use crate::abi_impl::transport::{

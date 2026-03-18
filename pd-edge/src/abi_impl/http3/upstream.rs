@@ -28,7 +28,7 @@ use tokio::net::lookup_host;
 
 #[cfg(feature = "http3")]
 use crate::abi_impl::{
-    http::HttpUpstreamScheme,
+    http::state::HttpUpstreamScheme,
     quic::{
         build_quic_client_config, negotiated_alpn, peer_certificate_der, tune_udp_socket_buffers,
     },

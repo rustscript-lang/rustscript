@@ -8,7 +8,7 @@ use tokio::net::{UdpSocket, lookup_host};
 use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::super::SharedProxyVmContext;
-use super::super::http::{
+use super::super::http::state::{
     allocate_udp_socket_handle, default_upstream_udp_socket_handle, udp_socket_exists,
 };
 use super::state::{SharedUdpSocketIo, UdpSocketRef, UdpSocketState, decode_udp_socket_handle};

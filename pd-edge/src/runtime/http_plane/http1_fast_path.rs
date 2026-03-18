@@ -23,15 +23,20 @@ use super::proxy_path::{
 use crate::{
     abi_impl::ReplayPrefixedIo,
     abi_impl::http::{
-        DownstreamConnectionMetadata, DownstreamHttp1FastBodyKind, Http1DownstreamResolution,
-        LazyHttpHeaders, LazyRequestId, MAX_DOWNSTREAM_HTTP1_FAST_BODY_BYTES,
-        OutboundHttp1ForwardBody, OutboundHttp1ForwardResponse,
-        ResolvedNativeHttp1DownstreamResponse, ResolvedNativeLocalHttp1DownstreamResponse,
-        ResolvedSnapshotHttp1DownstreamResponse,
-        build_downstream_http_request_context_from_components,
-        classify_downstream_http1_fast_body_lazy, downstream_http1_fast_path_eligible_lazy,
-        downstream_http1_fast_path_expects_continue_lazy, is_hop_by_hop_header,
-        resolve_http1_downstream_response,
+        fast_path::{
+            DownstreamHttp1FastBodyKind, MAX_DOWNSTREAM_HTTP1_FAST_BODY_BYTES,
+            classify_downstream_http1_fast_body_lazy, downstream_http1_fast_path_eligible_lazy,
+            downstream_http1_fast_path_expects_continue_lazy,
+        },
+        outbound_http1::{OutboundHttp1ForwardBody, OutboundHttp1ForwardResponse},
+        state::{
+            DownstreamConnectionMetadata, Http1DownstreamResolution, HttpRequestContext,
+            LazyHttpHeaders, LazyRequestId, ResolvedHttpGraphResponse,
+            ResolvedNativeHttp1DownstreamResponse, ResolvedNativeLocalHttp1DownstreamResponse,
+            ResolvedSnapshotHttp1DownstreamResponse,
+            build_downstream_http_request_context_from_components, is_hop_by_hop_header,
+            resolve_http1_downstream_response,
+        },
     },
     logging::{
         category_access, category_program, enabled as logging_enabled, method_label, status_label,
@@ -756,7 +761,7 @@ fn build_fast_http_request_context(
     request_id: LazyRequestId,
     request: FastHttp1Request,
     connection_metadata: Option<&DownstreamConnectionMetadata>,
-) -> Result<crate::abi_impl::http::HttpRequestContext, Response<Body>> {
+) -> Result<HttpRequestContext, Response<Body>> {
     let FastHttp1Request {
         method,
         uri,
@@ -1682,7 +1687,7 @@ async fn serve_http1_fast_connection<S>(
                                 }
                             }
                         }
-                        let crate::abi_impl::http::ResolvedHttpGraphResponse {
+                        let ResolvedHttpGraphResponse {
                             response,
                             upstream_latency_ms,
                             post_response_plan,

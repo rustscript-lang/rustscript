@@ -20,7 +20,7 @@ use tokio_rustls::{
 use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::super::SharedProxyVmContext;
-use super::super::http::{
+use super::super::http::state::{
     ensure_outbound_exchange_response_started, ensure_upstream_response_started,
     outbound_exchange_exists, outbound_exchange_response_available, outbound_exchange_tls_flow,
     tcp_stream_exists, upstream_response_available,

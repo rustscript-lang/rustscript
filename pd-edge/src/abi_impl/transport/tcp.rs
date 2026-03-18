@@ -10,11 +10,12 @@ use tokio::{
 use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::super::SharedProxyVmContext;
-use super::super::http::{
-    allocate_tcp_stream_handle, append_outbound_exchange_body, append_response_output_body_bytes,
-    default_upstream_exchange_handle, outbound_exchange_exists, outbound_exchange_response_eof,
-    read_outbound_exchange_response_next_chunk, read_request_body_next_chunk,
-    read_upstream_response_next_chunk, request_body_eof, tcp_stream_exists, upstream_response_eof,
+use super::super::http::state::{
+    AttachedHttpTransport, allocate_tcp_stream_handle, append_outbound_exchange_body,
+    append_response_output_body_bytes, default_upstream_exchange_handle, outbound_exchange_exists,
+    outbound_exchange_response_eof, read_outbound_exchange_response_next_chunk,
+    read_request_body_next_chunk, read_upstream_response_next_chunk, request_body_eof,
+    tcp_stream_exists, upstream_response_eof,
 };
 use super::state::{
     SharedTcpStreamIo, TcpSocketPhase, TcpSocketState, TcpStreamRef, decode_tcp_stream_handle,
@@ -166,8 +167,9 @@ fn outbound_http_peer_addr(context: &SharedProxyVmContext, handle: i64) -> Optio
         return Some(peer_addr);
     }
     let stream = match attached_transport {
-        Some(super::super::http::AttachedHttpTransport::Tcp(stream))
-        | Some(super::super::http::AttachedHttpTransport::Tls(stream)) => stream,
+        Some(AttachedHttpTransport::Tcp(stream)) | Some(AttachedHttpTransport::Tls(stream)) => {
+            stream
+        }
         None => return None,
     };
     let guard = context.lock_transport();

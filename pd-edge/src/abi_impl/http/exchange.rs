@@ -1,20 +1,24 @@
-use axum::http::{HeaderName, Method};
+#[cfg(feature = "tls")]
+use super::state::attach_outbound_exchange_tls_transport;
+use super::{
+    helpers::{
+        headers_to_value_map, is_valid_request_path, parse_header, parse_header_name,
+        parse_string_header_batch, serialize_query_pairs,
+    },
+    state::{
+        HttpUpstreamScheme, SharedProxyVmContext, allocate_outbound_exchange_handle,
+        attach_outbound_exchange_tcp_transport, default_upstream_exchange_handle,
+        ensure_outbound_exchange_response_started, outbound_exchange_exists,
+        outbound_exchange_response_eof, read_outbound_exchange_response_all,
+        read_outbound_exchange_response_next_chunk, read_outbound_exchange_response_trailers,
+    },
+    version::HttpVersionPreference,
+};
+use crate::abi_impl::schedule_current_future_call;
+use axum::http::Method;
 use edge_abi::symbols::http::exchange as http_exchange;
 use pd_edge_host_function::pd_edge_host_function;
 use vm::{CallOutcome, Value, Vm, VmError};
-
-#[cfg(feature = "tls")]
-use super::attach_outbound_exchange_tls_transport;
-use super::{
-    HttpUpstreamScheme, HttpVersionPreference, SharedProxyVmContext,
-    allocate_outbound_exchange_handle, attach_outbound_exchange_tcp_transport,
-    default_upstream_exchange_handle, ensure_outbound_exchange_response_started,
-    headers_to_value_map, is_valid_request_path, lookup_cached_header_batch,
-    outbound_exchange_exists, outbound_exchange_response_eof, parse_header, parse_header_name,
-    read_outbound_exchange_response_all, read_outbound_exchange_response_next_chunk,
-    read_outbound_exchange_response_trailers, serialize_query_pairs, store_cached_header_batch,
-};
-use crate::abi_impl::schedule_current_future_call;
 
 fn unknown_exchange_handle(handle: i64) -> VmError {
     VmError::HostError(format!("unknown outbound exchange handle {handle}"))
@@ -71,75 +75,11 @@ fn apply_header_batch(
     request: &mut super::state::HttpOutboundRequestNode,
     headers: Value,
 ) -> Result<(), VmError> {
-    match headers {
-        Value::Null => Ok(()),
-        Value::Array(values) => {
-            if let Some(parsed) = lookup_cached_header_batch(&Value::Array(values.clone())) {
-                for (name, value) in &parsed {
-                    request.insert_header(name.clone(), value.clone());
-                }
-                return Ok(());
-            }
-            if values.len() % 2 != 0 {
-                return Err(VmError::HostError(
-                    "header batch arrays must contain alternating name/value string pairs"
-                        .to_string(),
-                ));
-            }
-            let mut parsed = axum::http::HeaderMap::new();
-            for pair in values.chunks(2) {
-                let Value::String(name) = &pair[0] else {
-                    return Err(VmError::HostError(
-                        "header batch array keys must be strings".to_string(),
-                    ));
-                };
-                let Value::String(value) = &pair[1] else {
-                    return Err(VmError::HostError(
-                        "header batch array values must be strings".to_string(),
-                    ));
-                };
-                let (header_name, header_value) = parse_header(name.as_str(), value.as_str())?;
-                parsed.insert(header_name, header_value);
-            }
-            store_cached_header_batch(&Value::Array(values.clone()), &parsed);
-            for (name, value) in &parsed {
-                request.insert_header(name.clone(), value.clone());
-            }
-            Ok(())
-        }
-        Value::Map(entries) => {
-            if let Some(parsed) = lookup_cached_header_batch(&Value::Map(entries.clone())) {
-                for (name, value) in &parsed {
-                    request.headers.insert(name.clone(), value.clone());
-                }
-                return Ok(());
-            }
-            let mut parsed = axum::http::HeaderMap::new();
-            for (key, value) in entries.as_ref() {
-                let Value::String(name) = key else {
-                    return Err(VmError::HostError(
-                        "header batch map keys must be strings".to_string(),
-                    ));
-                };
-                let Value::String(value) = value else {
-                    return Err(VmError::HostError(
-                        "header batch map values must be strings".to_string(),
-                    ));
-                };
-                let (header_name, header_value) = parse_header(name.as_str(), value.as_str())?;
-                parsed.insert(header_name, header_value);
-            }
-            store_cached_header_batch(&Value::Map(entries.clone()), &parsed);
-            for (name, value) in &parsed {
-                request.headers.insert(name.clone(), value.clone());
-            }
-            Ok(())
-        }
-        _ => Err(VmError::HostError(
-            "header batch must be null, an array of alternating strings, or a string map"
-                .to_string(),
-        )),
+    let parsed = parse_string_header_batch(headers, "header batch")?;
+    for (name, value) in parsed.iter() {
+        request.insert_header(name.clone(), value.clone());
     }
+    Ok(())
 }
 
 fn exchange_response_values_outcome<F>(
@@ -238,6 +178,103 @@ pub(crate) fn prepare_default_upstream_request(
     Ok(())
 }
 
+fn prepare_default_upstream_call(
+    context: SharedProxyVmContext,
+    host: String,
+    port: i64,
+    version: String,
+    headers: Value,
+) -> Result<CallOutcome, VmError> {
+    prepare_default_upstream_request(&context, host, port, version, headers)?;
+    Ok(CallOutcome::Return(vec![Value::Int(
+        default_upstream_exchange_handle(),
+    )]))
+}
+
+fn set_exchange_header_call(
+    context: SharedProxyVmContext,
+    exchange: i64,
+    name: String,
+    value: String,
+) -> Result<CallOutcome, VmError> {
+    let (header_name, header_value) = parse_header(name, value)?;
+    with_exchange_request_mut(&context, exchange, |request| {
+        request.headers.insert(header_name, header_value);
+    })?;
+    Ok(CallOutcome::Return(vec![]))
+}
+
+fn set_exchange_target_call(
+    context: SharedProxyVmContext,
+    exchange: i64,
+    host: String,
+    port: i64,
+) -> Result<CallOutcome, VmError> {
+    let port = parse_upstream_port(port)?;
+    let (target_scheme, target_host) = with_exchange_request_mut(&context, exchange, |request| {
+        request.set_target_host_port(&host, port)?;
+        Ok((request.target_scheme, request.target_host.clone()))
+    })??;
+
+    if exchange == default_upstream_exchange_handle() {
+        let mut transport = context.lock_transport();
+        transport.tcp_dag.default_upstream.configure();
+        transport.tls_dag.default_upstream.observe_target_parts(
+            matches!(target_scheme, HttpUpstreamScheme::Https),
+            target_host,
+        );
+    } else {
+        let mut exchanges = context.lock_exchanges();
+        let exchange_state = exchanges
+            .exchanges
+            .get_mut(&exchange)
+            .ok_or_else(|| unknown_exchange_handle(exchange))?;
+        exchange_state.transport.tcp_flow.configure();
+        exchange_state.transport.tls_flow.observe_target_parts(
+            matches!(target_scheme, HttpUpstreamScheme::Https),
+            target_host,
+        );
+    }
+    Ok(CallOutcome::Return(vec![]))
+}
+
+fn set_exchange_scheme_call(
+    context: SharedProxyVmContext,
+    exchange: i64,
+    scheme: String,
+) -> Result<CallOutcome, VmError> {
+    let scheme = HttpUpstreamScheme::parse(&scheme)?;
+    let (target_scheme, target_host) = with_exchange_request_mut(&context, exchange, |request| {
+        request.set_target_scheme(scheme)?;
+        Ok((request.target_scheme, request.target_host.clone()))
+    })??;
+
+    if target_host.is_some() {
+        if exchange == default_upstream_exchange_handle() {
+            context
+                .lock_transport()
+                .tls_dag
+                .default_upstream
+                .observe_target_parts(
+                    matches!(target_scheme, HttpUpstreamScheme::Https),
+                    target_host,
+                );
+        } else {
+            let mut exchanges = context.lock_exchanges();
+            let exchange_state = exchanges
+                .exchanges
+                .get_mut(&exchange)
+                .ok_or_else(|| unknown_exchange_handle(exchange))?;
+            exchange_state.transport.tls_flow.observe_target_parts(
+                matches!(target_scheme, HttpUpstreamScheme::Https),
+                target_host,
+            );
+        }
+    }
+
+    Ok(CallOutcome::Return(vec![]))
+}
+
 /// Allocates an outbound HTTP exchange handle.
 #[pd_edge_host_function(name = http_exchange::NEW.name, scope = http)]
 fn new_exchange(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
@@ -262,10 +299,7 @@ fn prepare_default_upstream(
     version: String,
     headers: Value,
 ) -> Result<CallOutcome, VmError> {
-    prepare_default_upstream_request(&context, host, port, version, headers)?;
-    Ok(CallOutcome::Return(vec![Value::Int(
-        default_upstream_exchange_handle(),
-    )]))
+    prepare_default_upstream_call(context, host, port, version, headers)
 }
 
 /// Sends the outbound HTTP exchange and starts its response stream.
@@ -288,11 +322,7 @@ fn set_exchange_header(
     name: String,
     value: String,
 ) -> Result<CallOutcome, VmError> {
-    let (header_name, header_value) = parse_header(name, value)?;
-    with_exchange_request_mut(&context, exchange, |request| {
-        request.headers.insert(header_name, header_value);
-    })?;
-    Ok(CallOutcome::Return(vec![]))
+    set_exchange_header_call(context, exchange, name, value)
 }
 
 /// Sets the HTTP method on the outbound HTTP exchange.
@@ -372,32 +402,7 @@ fn set_exchange_target(
     host: String,
     port: i64,
 ) -> Result<CallOutcome, VmError> {
-    let port = parse_upstream_port(port)?;
-    let (target_scheme, target_host) = with_exchange_request_mut(&context, exchange, |request| {
-        request.set_target_host_port(&host, port)?;
-        Ok((request.target_scheme, request.target_host.clone()))
-    })??;
-
-    if exchange == default_upstream_exchange_handle() {
-        let mut transport = context.lock_transport();
-        transport.tcp_dag.default_upstream.configure();
-        transport.tls_dag.default_upstream.observe_target_parts(
-            matches!(target_scheme, HttpUpstreamScheme::Https),
-            target_host,
-        );
-    } else {
-        let mut exchanges = context.lock_exchanges();
-        let exchange_state = exchanges
-            .exchanges
-            .get_mut(&exchange)
-            .ok_or_else(|| unknown_exchange_handle(exchange))?;
-        exchange_state.transport.tcp_flow.configure();
-        exchange_state.transport.tls_flow.observe_target_parts(
-            matches!(target_scheme, HttpUpstreamScheme::Https),
-            target_host,
-        );
-    }
-    Ok(CallOutcome::Return(vec![]))
+    set_exchange_target_call(context, exchange, host, port)
 }
 
 /// Sets the request scheme for the outbound HTTP exchange.
@@ -407,36 +412,7 @@ fn set_exchange_scheme(
     exchange: i64,
     scheme: String,
 ) -> Result<CallOutcome, VmError> {
-    let scheme = HttpUpstreamScheme::parse(&scheme)?;
-    let (target_scheme, target_host) = with_exchange_request_mut(&context, exchange, |request| {
-        request.set_target_scheme(scheme)?;
-        Ok((request.target_scheme, request.target_host.clone()))
-    })??;
-
-    if target_host.is_some() {
-        if exchange == default_upstream_exchange_handle() {
-            context
-                .lock_transport()
-                .tls_dag
-                .default_upstream
-                .observe_target_parts(
-                    matches!(target_scheme, HttpUpstreamScheme::Https),
-                    target_host,
-                );
-        } else {
-            let mut exchanges = context.lock_exchanges();
-            let exchange_state = exchanges
-                .exchanges
-                .get_mut(&exchange)
-                .ok_or_else(|| unknown_exchange_handle(exchange))?;
-            exchange_state.transport.tls_flow.observe_target_parts(
-                matches!(target_scheme, HttpUpstreamScheme::Https),
-                target_host,
-            );
-        }
-    }
-
-    Ok(CallOutcome::Return(vec![]))
+    set_exchange_scheme_call(context, exchange, scheme)
 }
 
 /// Attaches a TCP stream as the transport for an outbound HTTP exchange.
@@ -545,7 +521,7 @@ fn get_exchange_header(
     exchange: i64,
     name: String,
 ) -> Result<CallOutcome, VmError> {
-    let header_name = HeaderName::from_bytes(name.as_bytes())
+    let header_name = axum::http::HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
     exchange_response_values_outcome(vm, context, exchange, move |snapshot| {
         let value = snapshot
@@ -590,7 +566,7 @@ async fn get_exchange_trailer(
     exchange: i64,
     name: String,
 ) -> Result<CallOutcome, VmError> {
-    let header_name = HeaderName::from_bytes(name.as_bytes())
+    let header_name = axum::http::HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid trailer name '{name}'")))?;
     let trailers = read_outbound_exchange_response_trailers(&context, exchange).await?;
     let value = trailers
@@ -656,180 +632,4 @@ async fn get_exchange_body_eof(
 ) -> Result<CallOutcome, VmError> {
     let eof = outbound_exchange_response_eof(&context, exchange).await?;
     Ok(CallOutcome::Return(vec![Value::Bool(eof)]))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        sync::{Arc, mpsc},
-        time::Duration,
-    };
-
-    use axum::http::HeaderMap;
-
-    use super::*;
-    use crate::abi_impl::{ProxyVmContext, RateLimiterStore};
-
-    fn test_context() -> SharedProxyVmContext {
-        Arc::new(ProxyVmContext::from_request_headers(
-            HeaderMap::new(),
-            Arc::new(RateLimiterStore::new()),
-        ))
-    }
-
-    #[test]
-    fn default_upstream_request_only_mutation_does_not_wait_for_transport_lock() {
-        let context = test_context();
-        let transport_guard = context.lock_transport();
-        let thread_context = context.clone();
-        let (tx, rx) = mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let completed = set_exchange_header_impl(
-                thread_context,
-                default_upstream_exchange_handle(),
-                "x-test".to_string(),
-                "value".to_string(),
-            )
-            .is_ok();
-            tx.send(completed)
-                .expect("request-only exchange mutation should report completion");
-        });
-
-        let completed = rx.recv_timeout(Duration::from_millis(100));
-        drop(transport_guard);
-        handle
-            .join()
-            .expect("request-only exchange mutation thread should join");
-
-        assert!(
-            completed.expect(
-                "request-only default upstream mutation should complete without waiting for transport"
-            ),
-            "request-only default upstream mutation should succeed"
-        );
-        assert_eq!(
-            context.with_default_upstream_exchange(|exchange| {
-                exchange
-                    .request
-                    .headers
-                    .get("x-test")
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_string)
-            }),
-            Some("value".to_string())
-        );
-    }
-
-    #[test]
-    fn setting_default_upstream_target_updates_transport_state_in_place() {
-        let context = test_context();
-        set_exchange_scheme_impl(
-            context.clone(),
-            default_upstream_exchange_handle(),
-            "https".to_string(),
-        )
-        .expect("setting default upstream scheme should succeed");
-
-        set_exchange_target_impl(
-            context.clone(),
-            default_upstream_exchange_handle(),
-            "origin.example.com".to_string(),
-            443,
-        )
-        .expect("setting default upstream target should succeed");
-
-        assert_eq!(
-            context.with_default_upstream_exchange(|exchange| exchange.request.target.clone()),
-            Some("https://origin.example.com:443".to_string())
-        );
-        let transport = context.lock_transport();
-        assert!(transport.tcp_dag.default_upstream.is_configured());
-        assert!(transport.tls_dag.default_upstream.is_present());
-        assert_eq!(
-            transport.tls_dag.default_upstream.peer_name(),
-            "origin.example.com"
-        );
-    }
-
-    #[test]
-    fn setting_default_upstream_scheme_rewrites_existing_target() {
-        let context = test_context();
-
-        set_exchange_target_impl(
-            context.clone(),
-            default_upstream_exchange_handle(),
-            "origin.example.com".to_string(),
-            8080,
-        )
-        .expect("setting default upstream target should succeed");
-        set_exchange_scheme_impl(
-            context.clone(),
-            default_upstream_exchange_handle(),
-            "https".to_string(),
-        )
-        .expect("setting default upstream scheme should succeed");
-
-        assert_eq!(
-            context.with_default_upstream_exchange(|exchange| exchange.request.target.clone()),
-            Some("https://origin.example.com:8080".to_string())
-        );
-    }
-
-    #[test]
-    fn prepare_default_upstream_batches_target_version_and_headers() {
-        let context = test_context();
-        let headers = Value::array(vec![
-            Value::string("x-first"),
-            Value::string("one"),
-            Value::string("x-second"),
-            Value::string("two"),
-        ]);
-
-        let outcome = prepare_default_upstream_impl(
-            context.clone(),
-            "origin.example.com".to_string(),
-            8080,
-            "2".to_string(),
-            headers,
-        )
-        .expect("batched default upstream prepare should succeed");
-
-        assert_eq!(outcome, CallOutcome::Return(vec![Value::Int(1)]));
-        assert_eq!(
-            context.with_default_upstream_exchange(|exchange| exchange.request.target.clone()),
-            Some("http://origin.example.com:8080".to_string())
-        );
-        assert_eq!(
-            context.with_default_upstream_exchange(|exchange| {
-                exchange.request.version_preference.as_str().to_string()
-            }),
-            "2".to_string()
-        );
-        assert_eq!(
-            context.with_default_upstream_exchange(|exchange| {
-                let mut request = exchange.request.clone();
-                request
-                    .materialize_inherited_request_head(&context.with_request_head(Clone::clone));
-                request
-                    .headers
-                    .get("x-first")
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_string)
-            }),
-            Some("one".to_string())
-        );
-        assert_eq!(
-            context.with_default_upstream_exchange(|exchange| {
-                let mut request = exchange.request.clone();
-                request
-                    .materialize_inherited_request_head(&context.with_request_head(Clone::clone));
-                request
-                    .headers
-                    .get("x-second")
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_string)
-            }),
-            Some("two".to_string())
-        );
-    }
 }

@@ -1,12 +1,14 @@
+use super::{
+    helpers::{headers_to_value_map, query_to_value_map, request_path_with_query},
+    state::{
+        SharedProxyVmContext, read_request_body_all, read_request_body_next_chunk,
+        request_body_eof, schedule_downstream_http_handoff,
+    },
+};
 use edge_abi::symbols::http::request as http_request;
 use pd_edge_host_function::pd_edge_host_function;
 use vm::{CallOutcome, Value, Vm, VmError};
 
-use super::{
-    SharedProxyVmContext, headers_to_value_map, query_to_value_map, read_request_body_all,
-    read_request_body_next_chunk, request_body_eof, request_path_with_query,
-    schedule_downstream_http_handoff,
-};
 use crate::{
     abi_impl::schedule_current_future_call, runtime::promote_transport_context_into_http_request,
 };
@@ -42,6 +44,60 @@ fn request_field_outcome(
         RequestField::ClientIp => request_head.client_ip().to_string(),
     });
     Ok(CallOutcome::Return(vec![Value::string(value)]))
+}
+
+/// Returns the full body for the downstream HTTP request as text.
+#[pd_edge_host_function(name = http_request::GET_BODY.name, scope = http)]
+async fn get_request_body(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    let body = read_request_body_all(&context).await?;
+    Ok(CallOutcome::Return(vec![Value::string(
+        String::from_utf8_lossy(&body).into_owned(),
+    )]))
+}
+
+/// Reads the next body chunk from the downstream HTTP request.
+#[pd_edge_host_function(name = "http::request::body::next_chunk", scope = http_extension)]
+async fn get_request_body_chunk(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    max_bytes: i64,
+) -> Result<CallOutcome, VmError> {
+    if max_bytes <= 0 {
+        return Err(VmError::HostError(format!(
+            "body chunk size must be > 0, got '{max_bytes}'",
+        )));
+    }
+    let chunk = read_request_body_next_chunk(&context, max_bytes as usize).await?;
+    Ok(CallOutcome::Return(vec![Value::string(
+        String::from_utf8_lossy(&chunk).into_owned(),
+    )]))
+}
+
+/// Returns whether the body stream for the downstream HTTP request is exhausted.
+#[pd_edge_host_function(name = "http::request::body::eof", scope = http_extension)]
+async fn get_request_body_eof(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    let eof = request_body_eof(&context).await?;
+    Ok(CallOutcome::Return(vec![Value::Bool(eof)]))
+}
+
+/// Attaches the untouched downstream transport to the HTTP stack and resumes
+/// the current VM invocation with HTTP request semantics.
+#[pd_edge_host_function(name = "http::downstream::attach_transport", scope = http)]
+fn attach_downstream_transport_to_http(
+    vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    schedule_downstream_http_handoff(&context)?;
+    schedule_current_future_call(vm, async move {
+        promote_transport_context_into_http_request(context).await?;
+        Ok(vec![])
+    })
 }
 
 /// Returns the current downstream request id.
@@ -143,64 +199,10 @@ fn get_request_query_args(context: SharedProxyVmContext) -> Result<CallOutcome, 
     )]))
 }
 
-/// Returns the full body for the downstream HTTP request as text.
-#[pd_edge_host_function(name = http_request::GET_BODY.name, scope = http)]
-async fn get_request_body(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    let body = read_request_body_all(&context).await?;
-    Ok(CallOutcome::Return(vec![Value::string(
-        String::from_utf8_lossy(&body).into_owned(),
-    )]))
-}
-
-/// Reads the next body chunk from the downstream HTTP request.
-#[pd_edge_host_function(name = "http::request::body::next_chunk", scope = http_extension)]
-async fn get_request_body_chunk(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-    max_bytes: i64,
-) -> Result<CallOutcome, VmError> {
-    if max_bytes <= 0 {
-        return Err(VmError::HostError(format!(
-            "body chunk size must be > 0, got '{max_bytes}'",
-        )));
-    }
-    let chunk = read_request_body_next_chunk(&context, max_bytes as usize).await?;
-    Ok(CallOutcome::Return(vec![Value::string(
-        String::from_utf8_lossy(&chunk).into_owned(),
-    )]))
-}
-
-/// Returns whether the body stream for the downstream HTTP request is exhausted.
-#[pd_edge_host_function(name = "http::request::body::eof", scope = http_extension)]
-async fn get_request_body_eof(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    let eof = request_body_eof(&context).await?;
-    Ok(CallOutcome::Return(vec![Value::Bool(eof)]))
-}
-
 /// Returns the local destination port for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_PORT.name, scope = http)]
 fn get_request_port(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
     Ok(CallOutcome::Return(vec![Value::Int(
         context.with_request_head(|request_head| request_head.port() as i64),
     )]))
-}
-
-/// Attaches the untouched downstream transport to the HTTP stack and resumes
-/// the current VM invocation with HTTP request semantics.
-#[pd_edge_host_function(name = "http::downstream::attach_transport", scope = http)]
-fn attach_downstream_transport_to_http(
-    vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    schedule_downstream_http_handoff(&context)?;
-    schedule_current_future_call(vm, async move {
-        promote_transport_context_into_http_request(context).await?;
-        Ok(vec![])
-    })
 }

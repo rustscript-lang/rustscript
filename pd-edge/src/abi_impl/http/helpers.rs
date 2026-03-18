@@ -33,33 +33,6 @@ struct CachedHeaderBatch {
 static HEADER_BATCH_CACHE: OnceLock<Mutex<HashMap<HeaderBatchCacheKey, CachedHeaderBatch>>> =
     OnceLock::new();
 
-pub(super) fn parse_header_name(name: impl AsRef<str>) -> Result<HeaderName, VmError> {
-    let name = name.as_ref();
-    HeaderName::from_bytes(name.as_bytes())
-        .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))
-}
-
-pub(super) fn parse_header(
-    name: impl AsRef<str>,
-    value: impl AsRef<str>,
-) -> Result<(HeaderName, HeaderValue), VmError> {
-    let name = name.as_ref();
-    let value = value.as_ref();
-    let header_name = HeaderName::from_bytes(name.as_bytes())
-        .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
-    let header_value = HeaderValue::from_str(value)
-        .map_err(|_| VmError::HostError(format!("invalid header value '{value}'")))?;
-    Ok((header_name, header_value))
-}
-
-pub(super) fn request_path_with_query(path: &str, query: &str) -> String {
-    if query.is_empty() {
-        path.to_string()
-    } else {
-        format!("{path}?{query}")
-    }
-}
-
 fn header_batch_cache() -> &'static Mutex<HashMap<HeaderBatchCacheKey, CachedHeaderBatch>> {
     HEADER_BATCH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -92,7 +65,7 @@ fn cached_header_batch_matches(source: &HeaderBatchCacheSource, headers: &Value)
     }
 }
 
-pub(super) fn lookup_cached_header_batch(headers: &Value) -> Option<HeaderMap> {
+fn lookup_cached_header_batch(headers: &Value) -> Option<HeaderMap> {
     let key = header_batch_cache_key(headers)?;
     let mut guard = header_batch_cache().lock();
     let cached = guard.get(&key)?;
@@ -103,7 +76,7 @@ pub(super) fn lookup_cached_header_batch(headers: &Value) -> Option<HeaderMap> {
     None
 }
 
-pub(super) fn store_cached_header_batch(headers: &Value, parsed: &HeaderMap) {
+fn store_cached_header_batch(headers: &Value, parsed: &HeaderMap) {
     let (Some(key), Some(source)) = (
         header_batch_cache_key(headers),
         header_batch_cache_source(headers),
@@ -132,6 +105,86 @@ pub(super) fn store_cached_header_batch(headers: &Value, parsed: &HeaderMap) {
     );
 }
 
+pub(super) fn parse_string_header_batch(
+    headers: Value,
+    batch_name: &'static str,
+) -> Result<HeaderMap, VmError> {
+    match headers {
+        Value::Null => Ok(HeaderMap::new()),
+        Value::Array(values) => {
+            if let Some(parsed) = lookup_cached_header_batch(&Value::Array(values.clone())) {
+                return Ok(parsed);
+            }
+            if values.len() % 2 != 0 {
+                return Err(VmError::HostError(format!(
+                    "{batch_name} arrays must contain alternating name/value string pairs",
+                )));
+            }
+            let mut parsed = HeaderMap::new();
+            for pair in values.chunks(2) {
+                let Value::String(name) = &pair[0] else {
+                    return Err(VmError::HostError(format!(
+                        "{batch_name} array keys must be strings",
+                    )));
+                };
+                let Value::String(value) = &pair[1] else {
+                    return Err(VmError::HostError(format!(
+                        "{batch_name} array values must be strings",
+                    )));
+                };
+                let (header_name, header_value) = parse_header(name.as_str(), value.as_str())?;
+                parsed.insert(header_name, header_value);
+            }
+            store_cached_header_batch(&Value::Array(values.clone()), &parsed);
+            Ok(parsed)
+        }
+        Value::Map(entries) => {
+            if let Some(parsed) = lookup_cached_header_batch(&Value::Map(entries.clone())) {
+                return Ok(parsed);
+            }
+            let mut parsed = HeaderMap::new();
+            for (key, value) in entries.as_ref() {
+                let Value::String(name) = key else {
+                    return Err(VmError::HostError(format!(
+                        "{batch_name} map keys must be strings",
+                    )));
+                };
+                let Value::String(value) = value else {
+                    return Err(VmError::HostError(format!(
+                        "{batch_name} map values must be strings",
+                    )));
+                };
+                let (header_name, header_value) = parse_header(name.as_str(), value.as_str())?;
+                parsed.insert(header_name, header_value);
+            }
+            store_cached_header_batch(&Value::Map(entries.clone()), &parsed);
+            Ok(parsed)
+        }
+        _ => Err(VmError::HostError(format!(
+            "{batch_name} must be null, an array of alternating strings, or a string map",
+        ))),
+    }
+}
+
+pub(super) fn parse_header_name(name: impl AsRef<str>) -> Result<HeaderName, VmError> {
+    let name = name.as_ref();
+    HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))
+}
+
+pub(super) fn parse_header(
+    name: impl AsRef<str>,
+    value: impl AsRef<str>,
+) -> Result<(HeaderName, HeaderValue), VmError> {
+    let name = name.as_ref();
+    let value = value.as_ref();
+    let header_name = HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
+    let header_value = HeaderValue::from_str(value)
+        .map_err(|_| VmError::HostError(format!("invalid header value '{value}'")))?;
+    Ok((header_name, header_value))
+}
+
 pub(super) fn headers_to_value_map(headers: &HeaderMap) -> Value {
     let mut values = BTreeMap::<String, Vec<String>>::new();
     for (name, value) in headers {
@@ -152,6 +205,14 @@ pub(super) fn headers_to_value_map(headers: &HeaderMap) -> Value {
             })
             .collect(),
     )
+}
+
+pub(super) fn request_path_with_query(path: &str, query: &str) -> String {
+    if query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{query}")
+    }
 }
 
 pub(super) fn query_to_value_map(query: &str) -> Value {

@@ -44,11 +44,12 @@ use crate::abi_impl::{
     DownstreamHttp3ConnectionTracker, Http3DownstreamStreamAttachment, build_quic_server_config,
 };
 use crate::{
-    abi_impl::http::{
-        DownstreamConnectionMetadata, DownstreamHttpListenerGoal, InlineDownstreamHttpResponse,
-        LazyRequestId, PromotedDownstreamTransport, build_downstream_http_request_context,
-        resolve_committed_http_graph_response, resolve_http_graph_response,
-        take_promoted_downstream_transport,
+    abi_impl::http::state::{
+        DownstreamConnectionMetadata, DownstreamHttpListenerGoal, HttpRequestContext,
+        InlineDownstreamHttpResponse, LazyRequestId, PromotedDownstreamTransport,
+        ResolvedHttpGraphResponse, build_downstream_http_request_context,
+        finish_downstream_response_stream, resolve_committed_http_graph_response,
+        resolve_http_graph_response, take_promoted_downstream_transport,
     },
     abi_impl::{
         DownstreamHttp2ConnectionTracker, Http2DownstreamStreamAttachment, ProxyVmContext,
@@ -1055,7 +1056,7 @@ async fn handle_data_plane_request(state: SharedState, request: Request) -> Resp
 
 async fn handle_data_plane_http_request_context(
     state: SharedState,
-    vm_request: crate::abi_impl::http::HttpRequestContext,
+    vm_request: HttpRequestContext,
     connection_metadata: Option<DownstreamConnectionMetadata>,
     downstream_http2_attachment: Option<Http2DownstreamStreamAttachment>,
     #[cfg(feature = "http3")] downstream_http3_attachment: Option<Http3DownstreamStreamAttachment>,
@@ -1100,7 +1101,7 @@ async fn handle_data_plane_http_request_context(
         execution_result = &mut execution => execution_result,
         _ = &mut wait_for_response_stream => {
             let resolved = resolve_committed_http_graph_response(&prepared.vm_context).await;
-            let crate::abi_impl::http::ResolvedHttpGraphResponse {
+            let ResolvedHttpGraphResponse {
                 response,
                 upstream_latency_ms,
                 post_response_plan,
@@ -1134,7 +1135,7 @@ async fn handle_data_plane_http_request_context(
     };
 
     let resolved = resolve_http_graph_response(&vm_context).await;
-    let crate::abi_impl::http::ResolvedHttpGraphResponse {
+    let ResolvedHttpGraphResponse {
         response,
         upstream_latency_ms,
         post_response_plan,
@@ -1161,7 +1162,7 @@ struct PreparedDataPlaneHttpRequestExecution {
 
 fn prepare_data_plane_http_request_context(
     state: &SharedState,
-    vm_request: crate::abi_impl::http::HttpRequestContext,
+    vm_request: HttpRequestContext,
     connection_metadata: Option<DownstreamConnectionMetadata>,
     downstream_http2_attachment: Option<Http2DownstreamStreamAttachment>,
     #[cfg(feature = "http3")] downstream_http3_attachment: Option<Http3DownstreamStreamAttachment>,
@@ -1226,7 +1227,7 @@ async fn run_prepared_data_plane_http_request_context(
     .await
     {
         Ok(()) => {
-            let _ = crate::abi_impl::http::finish_downstream_response_stream(&vm_context);
+            let _ = finish_downstream_response_stream(&vm_context);
         }
         Err(VmExecutionError::HostRegistration(err)) => {
             state.record_vm_execution_error();
@@ -1234,7 +1235,7 @@ async fn run_prepared_data_plane_http_request_context(
                 "{} failed to register host module: {err}",
                 category_program()
             );
-            let _ = crate::abi_impl::http::finish_downstream_response_stream(&vm_context);
+            let _ = finish_downstream_response_stream(&vm_context);
             return Err(text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("host registration error: {err}"),
@@ -1243,7 +1244,7 @@ async fn run_prepared_data_plane_http_request_context(
         Err(VmExecutionError::Vm(err)) => {
             state.record_vm_execution_error();
             warn!("{} vm execution error: {err}", category_program());
-            let _ = crate::abi_impl::http::finish_downstream_response_stream(&vm_context);
+            let _ = finish_downstream_response_stream(&vm_context);
             return Err(text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("vm execution error: {err}"),
@@ -1260,7 +1261,7 @@ async fn run_prepared_data_plane_http_request_context(
 
 pub(super) async fn execute_data_plane_http_request_context(
     state: &SharedState,
-    vm_request: crate::abi_impl::http::HttpRequestContext,
+    vm_request: HttpRequestContext,
     connection_metadata: Option<DownstreamConnectionMetadata>,
     downstream_http2_attachment: Option<Http2DownstreamStreamAttachment>,
     #[cfg(feature = "http3")] downstream_http3_attachment: Option<Http3DownstreamStreamAttachment>,

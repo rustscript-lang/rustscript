@@ -11,7 +11,8 @@ use tokio::{
 use vm::{CallOutcome, Value, Vm, VmError};
 
 use super::{
-    SharedProxyVmContext, http,
+    SharedProxyVmContext,
+    http::{exchange as http_exchange, response as http_response, state as http_state},
     transport::{TcpStreamRef, TlsSessionRef, decode_tcp_stream_handle, decode_tls_session_handle},
     websocket::{
         close_websocket_binary_stream, ensure_outbound_websocket_connection_open,
@@ -90,7 +91,7 @@ fn reserved_proxy_stream_handle(endpoint: &ProxyByteStreamEndpoint) -> Option<i6
             Some(RESERVED_DOWNSTREAM_CONNECT_PROXY_STREAM_HANDLE)
         }
         ProxyByteStreamEndpoint::HttpExchange(exchange)
-            if *exchange == http::default_upstream_exchange_handle() =>
+            if *exchange == http_state::default_upstream_exchange_handle() =>
         {
             Some(RESERVED_DEFAULT_UPSTREAM_PROXY_STREAM_HANDLE)
         }
@@ -107,7 +108,7 @@ fn reserved_proxy_stream_endpoint(handle: i64) -> Option<ProxyByteStreamEndpoint
             Some(ProxyByteStreamEndpoint::DownstreamConnect)
         }
         RESERVED_DEFAULT_UPSTREAM_PROXY_STREAM_HANDLE => Some(
-            ProxyByteStreamEndpoint::HttpExchange(http::default_upstream_exchange_handle()),
+            ProxyByteStreamEndpoint::HttpExchange(http_state::default_upstream_exchange_handle()),
         ),
         _ => None,
     }
@@ -145,7 +146,7 @@ fn allocate_proxy_stream_handle(
 }
 
 fn ensure_proxy_stream_state_mut(
-    guard: &mut http::ProxyStreamRegistry,
+    guard: &mut http_state::ProxyStreamRegistry,
     handle: i64,
 ) -> Result<&mut ProxyByteStreamState, VmError> {
     if guard.proxy_stream_handles.contains_key(&handle) {
@@ -335,14 +336,14 @@ fn endpoint_from_tcp_stream(
         return Ok(match stream_ref {
             TcpStreamRef::Downstream => downstream_proxy_endpoint(context),
             TcpStreamRef::DefaultUpstream => {
-                ProxyByteStreamEndpoint::HttpExchange(http::default_upstream_exchange_handle())
+                ProxyByteStreamEndpoint::HttpExchange(http_state::default_upstream_exchange_handle())
             }
         });
     }
-    if http::tcp_stream_exists(context, stream) {
+    if http_state::tcp_stream_exists(context, stream) {
         return Ok(ProxyByteStreamEndpoint::DynamicTcp(stream));
     }
-    if http::outbound_exchange_exists(context, stream) {
+    if http_state::outbound_exchange_exists(context, stream) {
         return Ok(ProxyByteStreamEndpoint::HttpExchange(stream));
     }
     Err(VmError::HostError(format!(
@@ -365,7 +366,7 @@ fn tls_present_for_endpoint(
         }
         ProxyByteStreamEndpoint::DownstreamWebSocketBinary => Ok(false),
         ProxyByteStreamEndpoint::HttpExchange(handle) => {
-            Ok(http::outbound_exchange_tls_flow(context, *handle)?.is_present())
+            Ok(http_state::outbound_exchange_tls_flow(context, *handle)?.is_present())
         }
         ProxyByteStreamEndpoint::DynamicTcp(_) => Ok(false),
         ProxyByteStreamEndpoint::DynamicTls(handle) => context
@@ -391,12 +392,12 @@ fn endpoint_from_tls_plaintext(
         match session_ref {
             TlsSessionRef::Downstream => downstream_proxy_endpoint(context),
             TlsSessionRef::DefaultUpstream => {
-                ProxyByteStreamEndpoint::HttpExchange(http::default_upstream_exchange_handle())
+                ProxyByteStreamEndpoint::HttpExchange(http_state::default_upstream_exchange_handle())
             }
         }
-    } else if http::tcp_stream_exists(context, session) {
+    } else if http_state::tcp_stream_exists(context, session) {
         ProxyByteStreamEndpoint::DynamicTls(session)
-    } else if http::outbound_exchange_exists(context, session) {
+    } else if http_state::outbound_exchange_exists(context, session) {
         ProxyByteStreamEndpoint::HttpExchange(session)
     } else {
         return Err(VmError::HostError(format!(
@@ -418,8 +419,8 @@ fn endpoint_from_websocket_binary(
     connection: i64,
 ) -> Result<ProxyByteStreamEndpoint, VmError> {
     validate_outbound_websocket_binary_connection(context, connection)?;
-    if connection != http::default_upstream_exchange_handle()
-        && !http::outbound_exchange_exists(context, connection)
+    if connection != http_state::default_upstream_exchange_handle()
+        && !http_state::outbound_exchange_exists(context, connection)
     {
         return Err(VmError::HostError(format!(
             "invalid websocket connection handle {connection}; expected 1 (default upstream) or an allocated outbound exchange handle",
@@ -436,7 +437,7 @@ async fn proxy_stream_read_step(
     let stream = proxy_stream_state(context, handle)?;
     match stream.endpoint {
         ProxyByteStreamEndpoint::HttpDownstream => {
-            let chunk = http::read_request_body_next_chunk(context, max_bytes).await?;
+            let chunk = http_state::read_request_body_next_chunk(context, max_bytes).await?;
             if chunk.is_empty() {
                 Ok(ProxyReadStep::Eof)
             } else {
@@ -450,17 +451,18 @@ async fn proxy_stream_read_step(
             "downstream websocket tunnels are only available through proxy::bridge".to_string(),
         )),
         ProxyByteStreamEndpoint::HttpExchange(exchange) => {
-            if !http::outbound_exchange_response_available(context, exchange)
+            if !http_state::outbound_exchange_response_available(context, exchange)
                 && stream.write_observed
                 && !stream.write_closed
             {
                 return Ok(ProxyReadStep::WaitingForWriteClose);
             }
-            let chunk =
-                http::read_outbound_exchange_response_next_chunk(context, exchange, max_bytes)
-                    .await?;
+            let chunk = http_state::read_outbound_exchange_response_next_chunk(
+                context, exchange, max_bytes,
+            )
+            .await?;
             if chunk.is_empty() {
-                if http::outbound_exchange_response_eof(context, exchange).await? {
+                if http_state::outbound_exchange_response_eof(context, exchange).await? {
                     Ok(ProxyReadStep::Eof)
                 } else {
                     Ok(ProxyReadStep::Blocked)
@@ -535,7 +537,7 @@ async fn proxy_stream_write_bytes(
     let endpoint = prepare_proxy_stream_write(context, handle)?;
     match endpoint {
         ProxyByteStreamEndpoint::HttpDownstream => {
-            http::append_response_output_body_bytes(context, bytes)?;
+            http_state::append_response_output_body_bytes(context, bytes)?;
             Ok(())
         }
         ProxyByteStreamEndpoint::DownstreamConnect => Err(VmError::HostError(
@@ -545,7 +547,7 @@ async fn proxy_stream_write_bytes(
             "downstream websocket tunnels are only available through proxy::bridge".to_string(),
         )),
         ProxyByteStreamEndpoint::HttpExchange(exchange) => {
-            http::append_outbound_exchange_body_bytes(context, exchange, bytes)
+            http_state::append_outbound_exchange_body_bytes(context, exchange, bytes)
         }
         ProxyByteStreamEndpoint::DynamicTcp(dynamic) => {
             let io = dynamic_tcp_proxy_io(context, dynamic)?;
@@ -638,7 +640,7 @@ async fn proxy_stream_close_write(
 async fn take_dynamic_tcp_connect_target(
     context: &SharedProxyVmContext,
     handle: i64,
-) -> Result<http::DownstreamConnectTunnelTarget, VmError> {
+) -> Result<http_state::DownstreamConnectTunnelTarget, VmError> {
     let io = {
         let mut guard = context.lock_transport();
         let state = guard.tcp_streams.get_mut(&handle).ok_or_else(|| {
@@ -659,14 +661,14 @@ async fn take_dynamic_tcp_connect_target(
             "dynamic tcp stream handle {handle} is already in use",
         ))
     })?;
-    Ok(http::DownstreamConnectTunnelTarget::Tcp { handle, stream })
+    Ok(http_state::DownstreamConnectTunnelTarget::Tcp { handle, stream })
 }
 
 #[cfg(feature = "tls")]
 async fn take_dynamic_tls_connect_target(
     context: &SharedProxyVmContext,
     handle: i64,
-) -> Result<http::DownstreamConnectTunnelTarget, VmError> {
+) -> Result<http_state::DownstreamConnectTunnelTarget, VmError> {
     let io = {
         let mut guard = context.lock_transport();
         let state = guard.tcp_streams.get_mut(&handle).ok_or_else(|| {
@@ -690,7 +692,7 @@ async fn take_dynamic_tls_connect_target(
             "dynamic tls session handle {handle} is already in use",
         ))
     })?;
-    Ok(http::DownstreamConnectTunnelTarget::Tls {
+    Ok(http_state::DownstreamConnectTunnelTarget::Tls {
         handle,
         stream: Box::new(stream),
     })
@@ -749,8 +751,8 @@ async fn schedule_downstream_connect_tunnel(
                 .to_string(),
         )
     })?;
-    let plan = http::DownstreamPostResponsePlan::ConnectTunnel(Box::new(
-        http::DownstreamConnectTunnelPlan::new(context.clone(), upgrade, target),
+    let plan = http_state::DownstreamPostResponsePlan::ConnectTunnel(Box::new(
+        http_state::DownstreamConnectTunnelPlan::new(context.clone(), upgrade, target),
     ));
     context.schedule_downstream_post_response_plan(plan)?;
     Ok(Some("upgraded".to_string()))
@@ -794,8 +796,8 @@ async fn schedule_downstream_websocket_tunnel(
                 .to_string(),
         )
     })?;
-    let plan = http::DownstreamPostResponsePlan::WebSocketTunnel(
-        http::DownstreamWebSocketTunnelPlan::new(
+    let plan = http_state::DownstreamPostResponsePlan::WebSocketTunnel(
+        http_state::DownstreamWebSocketTunnelPlan::new(
             context.clone(),
             upgrade,
             connection,
@@ -813,7 +815,7 @@ async fn schedule_default_upstream_http_forward(
 ) -> Result<Option<String>, VmError> {
     let left_state = proxy_stream_state(context, left)?;
     let right_state = proxy_stream_state(context, right)?;
-    let default_upstream = http::default_upstream_exchange_handle();
+    let default_upstream = http_state::default_upstream_exchange_handle();
 
     let is_default_http_forward = matches!(
         (&left_state.endpoint, &right_state.endpoint),
@@ -832,8 +834,8 @@ async fn schedule_default_upstream_http_forward(
         return Ok(None);
     }
 
-    if !http::start_native_default_upstream_http_forward_response(context).await? {
-        http::ensure_outbound_exchange_response_started(context, default_upstream).await?;
+    if !http_state::start_native_default_upstream_http_forward_response(context).await? {
+        http_state::ensure_outbound_exchange_response_started(context, default_upstream).await?;
     }
     Ok(Some("forwarded".to_string()))
 }
@@ -846,19 +848,19 @@ async fn forward_default_upstream_with_response_headers(
     if debug {
         eprintln!("forward_default_upstream: enter");
     }
-    let parsed_headers = http::parse_response_header_batch(response_headers)?;
+    let parsed_headers = http_response::parse_response_header_batch(response_headers)?;
     if debug {
         eprintln!(
             "forward_default_upstream: parsed headers count={}",
             parsed_headers.len()
         );
     }
-    let default_upstream = http::default_upstream_exchange_handle();
-    if !http::start_native_default_upstream_http_forward_response(context).await? {
+    let default_upstream = http_state::default_upstream_exchange_handle();
+    if !http_state::start_native_default_upstream_http_forward_response(context).await? {
         if debug {
             eprintln!("forward_default_upstream: native fast path unavailable");
         }
-        http::ensure_outbound_exchange_response_started(context, default_upstream).await?;
+        http_state::ensure_outbound_exchange_response_started(context, default_upstream).await?;
     } else if debug {
         eprintln!("forward_default_upstream: native fast path ready");
     }
@@ -925,7 +927,7 @@ async fn drive_pipe(
 ) -> Result<String, VmError> {
     let source_state = proxy_stream_state(&context, source)?;
     if let ProxyByteStreamEndpoint::HttpExchange(exchange) = source_state.endpoint
-        && !http::outbound_exchange_response_available(&context, exchange)
+        && !http_state::outbound_exchange_response_available(&context, exchange)
         && source_state.write_observed
         && !source_state.write_closed
     {
@@ -968,7 +970,7 @@ fn stream_downstream(context: SharedProxyVmContext) -> Result<CallOutcome, VmErr
 /// Wraps an outbound HTTP exchange as a proxy byte stream.
 #[pd_edge_host_function(name = proxy_symbols::stream::EXCHANGE.name, scope = proxy)]
 fn stream_exchange(context: SharedProxyVmContext, exchange: i64) -> Result<CallOutcome, VmError> {
-    if !http::outbound_exchange_exists(&context, exchange) {
+    if !http_state::outbound_exchange_exists(&context, exchange) {
         return Err(VmError::HostError(format!(
             "unknown outbound exchange handle {exchange}",
         )));
@@ -1107,18 +1109,25 @@ async fn proxy_prepare_and_forward_default_upstream(
     request_headers: Value,
     response_headers: Value,
 ) -> Result<CallOutcome, VmError> {
-    let parsed_response_headers = http::parse_response_header_batch(response_headers)?;
-    http::prepare_default_upstream_request(&context, host, port, version, request_headers)?;
-    let status = if !http::start_native_default_upstream_http_forward_response(&context).await? {
-        http::ensure_outbound_exchange_response_started(
-            &context,
-            http::default_upstream_exchange_handle(),
-        )
-        .await?;
-        "forwarded".to_string()
-    } else {
-        "forwarded".to_string()
-    };
+    let parsed_response_headers = http_response::parse_response_header_batch(response_headers)?;
+    http_exchange::prepare_default_upstream_request(
+        &context,
+        host,
+        port,
+        version,
+        request_headers,
+    )?;
+    let status =
+        if !http_state::start_native_default_upstream_http_forward_response(&context).await? {
+            http_state::ensure_outbound_exchange_response_started(
+                &context,
+                http_state::default_upstream_exchange_handle(),
+            )
+            .await?;
+            "forwarded".to_string()
+        } else {
+            "forwarded".to_string()
+        };
     if !parsed_response_headers.is_empty() {
         context.insert_downstream_response_headers(parsed_response_headers)?;
     }
@@ -1137,8 +1146,11 @@ mod tests {
     use crate::abi_impl::{
         RateLimiterStore,
         http::{
-            self as edge_http, HttpRequestContext, LazyRequestId, ProxyVmContext, RequestPortField,
-            RequestStringField, SharedProxyVmContext,
+            ProxyVmContext, SharedProxyVmContext,
+            state::{
+                HttpRequestContext, LazyRequestId, RequestPortField, RequestStringField,
+                default_upstream_exchange_handle,
+            },
         },
         transport::TlsSessionRef,
     };
@@ -1179,7 +1191,7 @@ mod tests {
             .expect("first stream should allocate");
         let second = allocate_proxy_stream_handle(
             &context,
-            ProxyByteStreamEndpoint::HttpExchange(edge_http::default_upstream_exchange_handle()),
+            ProxyByteStreamEndpoint::HttpExchange(default_upstream_exchange_handle()),
         )
         .expect("second stream should allocate");
 

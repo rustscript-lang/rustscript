@@ -194,7 +194,7 @@ mod tests {
         classify_downstream_http1_fast_body, downstream_http1_fast_path_eligible,
         downstream_http1_fast_path_expects_continue, outbound_http1_fast_path_eligible,
     };
-    use crate::abi_impl::http::HttpVersionPreference;
+    use crate::abi_impl::http::version::HttpVersionPreference;
 
     #[test]
     fn downstream_http1_fast_path_accepts_chunked_and_fixed_requests() {

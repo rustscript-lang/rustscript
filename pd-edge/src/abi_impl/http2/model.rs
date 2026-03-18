@@ -3,7 +3,7 @@
 use axum::http::Version;
 
 use crate::abi_impl::{
-    http::{HttpUpstreamScheme, HttpVersionPreference},
+    http::{state::HttpUpstreamScheme, version::HttpVersionPreference},
     transport::{HTTP11_ALPN_PROTOCOL, TlsFlowState},
 };
 

@@ -15,7 +15,7 @@ use super::{SharedState, maybe_auto_promote_downstream_listener_goal_into_http_r
 use crate::{
     abi_impl::{
         ProxyVmContext,
-        http::{
+        http::state::{
             DownstreamHttpListenerGoal, InlineDownstreamHttpResponse, resolve_http_graph_response,
         },
         register_http_plane_host_module,

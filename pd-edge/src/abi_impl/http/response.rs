@@ -1,82 +1,25 @@
-use axum::http::HeaderName;
+use super::{
+    helpers::{headers_to_value_map, parse_header, parse_header_name, parse_string_header_batch},
+    state::{
+        DownstreamResponseStreamWriteMode, SharedProxyVmContext,
+        ensure_outbound_exchange_response_started, finish_downstream_response_stream,
+        is_hop_by_hop_header, materialize_downstream_response_body_source,
+        read_downstream_response_trailers, start_downstream_response_stream,
+        sync_response_output_body_headers, write_downstream_response_stream_bytes,
+    },
+};
+use axum::http::{HeaderMap, HeaderName};
 use edge_abi::symbols::http::response as http_response;
 use pd_edge_host_function::pd_edge_host_function;
 use vm::{CallOutcome, Value, Vm, VmError};
 
-use super::state::{DownstreamResponseStreamWriteMode, sync_response_output_body_headers};
-use super::{
-    SharedProxyVmContext, ensure_outbound_exchange_response_started,
-    finish_downstream_response_stream, headers_to_value_map, is_hop_by_hop_header,
-    lookup_cached_header_batch, materialize_downstream_response_body_source, parse_header,
-    parse_header_name, read_downstream_response_trailers, start_downstream_response_stream,
-    store_cached_header_batch, write_downstream_response_stream_bytes,
-};
-
-pub(crate) fn parse_response_header_batch(
-    headers: Value,
-) -> Result<axum::http::HeaderMap, VmError> {
-    match headers {
-        Value::Null => Ok(axum::http::HeaderMap::new()),
-        Value::Array(values) => {
-            if let Some(parsed) = lookup_cached_header_batch(&Value::Array(values.clone())) {
-                return Ok(parsed);
-            }
-            if values.len() % 2 != 0 {
-                return Err(VmError::HostError(
-                    "response header batch arrays must contain alternating name/value string pairs"
-                        .to_string(),
-                ));
-            }
-            let mut parsed = axum::http::HeaderMap::new();
-            for pair in values.chunks(2) {
-                let Value::String(name) = &pair[0] else {
-                    return Err(VmError::HostError(
-                        "response header batch array keys must be strings".to_string(),
-                    ));
-                };
-                let Value::String(value) = &pair[1] else {
-                    return Err(VmError::HostError(
-                        "response header batch array values must be strings".to_string(),
-                    ));
-                };
-                let (header_name, header_value) = parse_header(name.as_str(), value.as_str())?;
-                parsed.insert(header_name, header_value);
-            }
-            store_cached_header_batch(&Value::Array(values.clone()), &parsed);
-            Ok(parsed)
-        }
-        Value::Map(entries) => {
-            if let Some(parsed) = lookup_cached_header_batch(&Value::Map(entries.clone())) {
-                return Ok(parsed);
-            }
-            let mut parsed = axum::http::HeaderMap::new();
-            for (key, value) in entries.as_ref() {
-                let Value::String(name) = key else {
-                    return Err(VmError::HostError(
-                        "response header batch map keys must be strings".to_string(),
-                    ));
-                };
-                let Value::String(value) = value else {
-                    return Err(VmError::HostError(
-                        "response header batch map values must be strings".to_string(),
-                    ));
-                };
-                let (header_name, header_value) = parse_header(name.as_str(), value.as_str())?;
-                parsed.insert(header_name, header_value);
-            }
-            store_cached_header_batch(&Value::Map(entries.clone()), &parsed);
-            Ok(parsed)
-        }
-        _ => Err(VmError::HostError(
-            "response header batch must be null, an array of alternating strings, or a string map"
-                .to_string(),
-        )),
-    }
+pub(crate) fn parse_response_header_batch(headers: Value) -> Result<HeaderMap, VmError> {
+    parse_string_header_batch(headers, "response header batch")
 }
 
 fn apply_response_header_batch(
     context: &SharedProxyVmContext,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
 ) -> Result<(), VmError> {
     context.insert_downstream_response_headers(headers)
 }
@@ -88,6 +31,88 @@ fn validate_response_status(status: i64) -> Result<u16, VmError> {
         )));
     }
     Ok(status as u16)
+}
+
+/// Returns the status code for the downstream HTTP response.
+#[pd_edge_host_function(name = http_response::GET_STATUS.name, scope = http)]
+fn get_response_status(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
+    let status = context.with_downstream_response(|response| response.status.unwrap_or(0));
+    Ok(CallOutcome::Return(vec![Value::Int(status as i64)]))
+}
+
+/// Returns the full body for the downstream HTTP response as text.
+#[pd_edge_host_function(name = http_response::GET_BODY.name, scope = http)]
+async fn get_response_body(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    materialize_downstream_response_body_source(&context).await?;
+    context.note_downstream_response_body_read();
+    let value = context.with_downstream_response(|response| {
+        if response.body_stream.is_some() {
+            return Err(VmError::HostError(
+                "http::response::get_body is unavailable after response streaming begins"
+                    .to_string(),
+            ));
+        }
+        Ok(String::from_utf8_lossy(response.body.as_deref().unwrap_or_default()).into_owned())
+    })?;
+    Ok(CallOutcome::Return(vec![Value::string(value)]))
+}
+
+/// Returns the first trailer value for the downstream HTTP response.
+#[pd_edge_host_function(name = "http::response::get_trailer", scope = http)]
+async fn get_response_trailer(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    name: String,
+) -> Result<CallOutcome, VmError> {
+    let header_name = HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| VmError::HostError(format!("invalid trailer name '{name}'")))?;
+    let trailers = read_downstream_response_trailers(&context).await?;
+    let value = trailers
+        .get(&header_name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    Ok(CallOutcome::Return(vec![Value::string(value)]))
+}
+
+/// Returns all trailers on the downstream HTTP response as a map.
+#[pd_edge_host_function(name = "http::response::get_trailers", scope = http)]
+async fn get_response_trailers(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    let trailers = read_downstream_response_trailers(&context).await?;
+    Ok(CallOutcome::Return(vec![headers_to_value_map(&trailers)]))
+}
+
+/// Returns the first value for a header on the downstream HTTP response.
+#[pd_edge_host_function(name = http_response::GET_HEADER.name, scope = http)]
+fn get_response_header(
+    context: SharedProxyVmContext,
+    name: String,
+) -> Result<CallOutcome, VmError> {
+    let header_name = HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
+    let value = context.with_downstream_response(|response| {
+        response
+            .headers
+            .get(&header_name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    });
+    Ok(CallOutcome::Return(vec![Value::string(value)]))
+}
+
+/// Returns all headers on the downstream HTTP response as a map.
+#[pd_edge_host_function(name = http_response::GET_HEADERS.name, scope = http)]
+fn get_response_headers(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
+    Ok(CallOutcome::Return(vec![headers_to_value_map(
+        &context.with_downstream_response(|response| response.headers.clone()),
+    )]))
 }
 
 /// Sets a header on the downstream HTTP response.
@@ -224,88 +249,6 @@ async fn apply_exchange_to_response(
         Ok(())
     })?;
     Ok(CallOutcome::Return(vec![]))
-}
-
-/// Returns the status code for the downstream HTTP response.
-#[pd_edge_host_function(name = http_response::GET_STATUS.name, scope = http)]
-fn get_response_status(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
-    let status = context.with_downstream_response(|response| response.status.unwrap_or(0));
-    Ok(CallOutcome::Return(vec![Value::Int(status as i64)]))
-}
-
-/// Returns the full body for the downstream HTTP response as text.
-#[pd_edge_host_function(name = http_response::GET_BODY.name, scope = http)]
-async fn get_response_body(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    materialize_downstream_response_body_source(&context).await?;
-    context.note_downstream_response_body_read();
-    let value = context.with_downstream_response(|response| {
-        if response.body_stream.is_some() {
-            return Err(VmError::HostError(
-                "http::response::get_body is unavailable after response streaming begins"
-                    .to_string(),
-            ));
-        }
-        Ok(String::from_utf8_lossy(response.body.as_deref().unwrap_or_default()).into_owned())
-    })?;
-    Ok(CallOutcome::Return(vec![Value::string(value)]))
-}
-
-/// Returns the first trailer value for the downstream HTTP response.
-#[pd_edge_host_function(name = "http::response::get_trailer", scope = http)]
-async fn get_response_trailer(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-    name: String,
-) -> Result<CallOutcome, VmError> {
-    let header_name = HeaderName::from_bytes(name.as_bytes())
-        .map_err(|_| VmError::HostError(format!("invalid trailer name '{name}'")))?;
-    let trailers = read_downstream_response_trailers(&context).await?;
-    let value = trailers
-        .get(&header_name)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    Ok(CallOutcome::Return(vec![Value::string(value)]))
-}
-
-/// Returns all trailers on the downstream HTTP response as a map.
-#[pd_edge_host_function(name = "http::response::get_trailers", scope = http)]
-async fn get_response_trailers(
-    _vm: &mut Vm,
-    context: SharedProxyVmContext,
-) -> Result<CallOutcome, VmError> {
-    let trailers = read_downstream_response_trailers(&context).await?;
-    Ok(CallOutcome::Return(vec![headers_to_value_map(&trailers)]))
-}
-
-/// Returns the first value for a header on the downstream HTTP response.
-#[pd_edge_host_function(name = http_response::GET_HEADER.name, scope = http)]
-fn get_response_header(
-    context: SharedProxyVmContext,
-    name: String,
-) -> Result<CallOutcome, VmError> {
-    let header_name = HeaderName::from_bytes(name.as_bytes())
-        .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
-    let value = context.with_downstream_response(|response| {
-        response
-            .headers
-            .get(&header_name)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string()
-    });
-    Ok(CallOutcome::Return(vec![Value::string(value)]))
-}
-
-/// Returns all headers on the downstream HTTP response as a map.
-#[pd_edge_host_function(name = http_response::GET_HEADERS.name, scope = http)]
-fn get_response_headers(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return(vec![headers_to_value_map(
-        &context.with_downstream_response(|response| response.headers.clone()),
-    )]))
 }
 
 /// Adds a header value to the downstream HTTP response.
