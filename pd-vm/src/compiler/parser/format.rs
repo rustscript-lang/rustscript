@@ -134,6 +134,7 @@ struct SourceFormatter<'a> {
     prev_kind: Option<PrevKind>,
     contexts: Vec<Context>,
     brace_expectations: Vec<BraceExpectation>,
+    generic_angle_depth: usize,
     at_stmt_start: bool,
     in_fn_signature: bool,
     in_closure_params: bool,
@@ -156,6 +157,7 @@ impl<'a> SourceFormatter<'a> {
             prev_kind: None,
             contexts: Vec::new(),
             brace_expectations: Vec::new(),
+            generic_angle_depth: 0,
             at_stmt_start: true,
             in_fn_signature: false,
             in_closure_params: false,
@@ -422,9 +424,21 @@ impl<'a> SourceFormatter<'a> {
                 self.emit_pipe();
             }
             TokenKind::EqualEqual => self.emit_binary_operator("==", PrevKind::EqEq),
-            TokenKind::Less => self.emit_binary_operator("<", PrevKind::Less),
+            TokenKind::Less => {
+                if self.starts_generic_angle_group(self.index) {
+                    self.emit_generic_open();
+                } else {
+                    self.emit_binary_operator("<", PrevKind::Less);
+                }
+            }
             TokenKind::LessEqual => self.emit_binary_operator("<=", PrevKind::LessEq),
-            TokenKind::Greater => self.emit_binary_operator(">", PrevKind::Greater),
+            TokenKind::Greater => {
+                if self.generic_angle_depth > 0 {
+                    self.emit_generic_close();
+                } else {
+                    self.emit_binary_operator(">", PrevKind::Greater);
+                }
+            }
             TokenKind::GreaterEqual => self.emit_binary_operator(">=", PrevKind::GreaterEq),
             TokenKind::Eof => {}
         }
@@ -565,6 +579,22 @@ impl<'a> SourceFormatter<'a> {
         if trailing_space {
             self.request_space();
         }
+        self.at_stmt_start = false;
+    }
+
+    fn emit_generic_open(&mut self) {
+        self.clear_pending_space();
+        self.write_raw("<");
+        self.prev_kind = Some(PrevKind::Less);
+        self.generic_angle_depth += 1;
+        self.at_stmt_start = false;
+    }
+
+    fn emit_generic_close(&mut self) {
+        self.clear_pending_space();
+        self.write_raw(">");
+        self.prev_kind = Some(PrevKind::Greater);
+        self.generic_angle_depth = self.generic_angle_depth.saturating_sub(1);
         self.at_stmt_start = false;
     }
 
@@ -899,6 +929,76 @@ impl<'a> SourceFormatter<'a> {
 
     fn peek_kind_at(&self, index: usize) -> Option<&TokenKind> {
         self.tokens.get(index).map(|token| &token.kind)
+    }
+
+    fn starts_generic_angle_group(&self, less_index: usize) -> bool {
+        if !matches!(self.peek_kind_at(less_index), Some(TokenKind::Less)) {
+            return false;
+        }
+
+        let Some(close_index) = self.find_generic_angle_group_close(less_index) else {
+            return false;
+        };
+
+        let next_kind = self.peek_kind_at(close_index + 1);
+        if self.prev_kind == Some(PrevKind::PathSeparator) {
+            return matches!(next_kind, Some(TokenKind::LParen));
+        }
+
+        matches!(
+            next_kind,
+            Some(
+                TokenKind::LParen
+                    | TokenKind::LBrace
+                    | TokenKind::LBracket
+                    | TokenKind::Equal
+                    | TokenKind::Comma
+                    | TokenKind::RParen
+                    | TokenKind::RBracket
+                    | TokenKind::RBrace
+                    | TokenKind::Greater
+                    | TokenKind::Semicolon
+            )
+        )
+    }
+
+    fn find_generic_angle_group_close(&self, less_index: usize) -> Option<usize> {
+        let mut angle_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut saw_content = false;
+
+        for index in less_index + 1..self.tokens.len() {
+            match self.peek_kind_at(index)? {
+                TokenKind::Ident(_) | TokenKind::Null => {
+                    saw_content = true;
+                }
+                TokenKind::Comma | TokenKind::Ellipsis => {}
+                TokenKind::LBracket => {
+                    bracket_depth += 1;
+                }
+                TokenKind::RBracket => {
+                    if bracket_depth == 0 {
+                        return None;
+                    }
+                    bracket_depth -= 1;
+                }
+                TokenKind::Less => {
+                    angle_depth += 1;
+                }
+                TokenKind::Greater => {
+                    if bracket_depth > 0 {
+                        return None;
+                    }
+                    if angle_depth == 0 {
+                        return saw_content.then_some(index);
+                    }
+                    angle_depth -= 1;
+                }
+                _ => return None,
+            }
+        }
+
+        None
     }
 
     fn should_collapse_gap_line_break(&self) -> bool {
