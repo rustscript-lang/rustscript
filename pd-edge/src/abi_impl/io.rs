@@ -231,8 +231,7 @@ fn write_io_target(
 ) -> Result<(), VmError> {
     match target {
         EdgeProtocolIoHandle::Downstream => {
-            append_response_output_body_bytes(context, text.as_bytes());
-            Ok(())
+            append_response_output_body_bytes(context, text.as_bytes())
         }
         EdgeProtocolIoHandle::OutboundExchange(handle) => {
             append_outbound_exchange_body(context, handle, text)

@@ -53,13 +53,14 @@ if true {
 
     if http::request::get_header("Streaming") != "" {
         // Stream the upstream response out incrementally after the exchange has started.
-        let downstream = tcp::stream::downstream();
+        http::response::stream::start();
         while !tcp::stream::eof(upstream) {
             let chunk = tcp::stream::read(upstream, 2);
             if chunk != "" {
-                tcp::stream::write(downstream, chunk + "A");
+                http::response::stream::write(chunk + "A");
             }
         }
+        http::response::stream::finish();
     } else {
         // Or buffer the full upstream response before writing the final body.
         let mut buffered = "";

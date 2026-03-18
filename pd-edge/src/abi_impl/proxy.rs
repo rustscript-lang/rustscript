@@ -535,7 +535,7 @@ async fn proxy_stream_write_bytes(
     let endpoint = prepare_proxy_stream_write(context, handle)?;
     match endpoint {
         ProxyByteStreamEndpoint::HttpDownstream => {
-            http::append_response_output_body_bytes(context, bytes);
+            http::append_response_output_body_bytes(context, bytes)?;
             Ok(())
         }
         ProxyByteStreamEndpoint::DownstreamConnect => Err(VmError::HostError(
@@ -863,7 +863,7 @@ async fn forward_default_upstream_with_response_headers(
         eprintln!("forward_default_upstream: native fast path ready");
     }
     if !parsed_headers.is_empty() {
-        context.insert_downstream_response_headers(parsed_headers);
+        context.insert_downstream_response_headers(parsed_headers)?;
         if debug {
             eprintln!("forward_default_upstream: applied response headers");
         }
@@ -1120,7 +1120,7 @@ async fn proxy_prepare_and_forward_default_upstream(
         "forwarded".to_string()
     };
     if !parsed_response_headers.is_empty() {
-        context.insert_downstream_response_headers(parsed_response_headers);
+        context.insert_downstream_response_headers(parsed_response_headers)?;
     }
     Ok(CallOutcome::Return(vec![Value::string(status)]))
 }

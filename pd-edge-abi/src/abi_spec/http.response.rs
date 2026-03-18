@@ -13,6 +13,21 @@ fn http_response_set_body(body: &str) {
     unreachable!("abi declaration only")
 }
 
+#[pd_host_function(name = "http::response::stream::start")]
+fn http_response_stream_start() {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "http::response::stream::write")]
+fn http_response_stream_write(chunk: &str) -> i64 {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "http::response::stream::finish")]
+fn http_response_stream_finish() {
+    unreachable!("abi declaration only")
+}
+
 #[pd_host_function(name = "http::response::set_status")]
 fn http_response_set_status(status: i64) {
     unreachable!("abi declaration only")

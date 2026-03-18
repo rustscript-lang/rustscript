@@ -47,7 +47,8 @@ use crate::{
     abi_impl::http::{
         DownstreamConnectionMetadata, DownstreamHttpListenerGoal, InlineDownstreamHttpResponse,
         LazyRequestId, PromotedDownstreamTransport, build_downstream_http_request_context,
-        resolve_http_graph_response, take_promoted_downstream_transport,
+        resolve_committed_http_graph_response, resolve_http_graph_response,
+        take_promoted_downstream_transport,
     },
     abi_impl::{
         DownstreamHttp2ConnectionTracker, Http2DownstreamStreamAttachment, ProxyVmContext,
@@ -448,6 +449,35 @@ fn https_listener_needs_transport_handoff(program: Option<&LoadedProgram>) -> bo
     }
 
     imports_transport_prelude || (imports_attach_transport && imports_downstream_tcp)
+}
+
+pub(crate) fn program_may_stream_downstream_http_response(program: Option<&LoadedProgram>) -> bool {
+    let Some(program) = program else {
+        return false;
+    };
+
+    let mut imports_response_stream = false;
+    let mut imports_downstream_tcp = false;
+    let mut imports_tcp_write = false;
+    let mut imports_proxy_downstream = false;
+    let mut imports_proxy_flow = false;
+
+    for import in &program.program.imports {
+        match import.name.as_str() {
+            "http::response::stream::start"
+            | "http::response::stream::write"
+            | "http::response::stream::finish" => imports_response_stream = true,
+            "tcp::stream::downstream" => imports_downstream_tcp = true,
+            "tcp::stream::write" => imports_tcp_write = true,
+            "proxy::stream::downstream" => imports_proxy_downstream = true,
+            "proxy::bridge" | "proxy::forward" | "proxy::pipe" => imports_proxy_flow = true,
+            _ => {}
+        }
+    }
+
+    imports_response_stream
+        || (imports_downstream_tcp && imports_tcp_write)
+        || (imports_proxy_downstream && imports_proxy_flow)
 }
 
 #[cfg(feature = "tls")]
@@ -1030,7 +1060,7 @@ async fn handle_data_plane_http_request_context(
     downstream_http1_upgrade: Option<hyper::upgrade::OnUpgrade>,
     started: Option<Instant>,
 ) -> Response<Body> {
-    let (vm_context, pre_vm_finished, after_vm) = match execute_data_plane_http_request_context(
+    let prepared = match prepare_data_plane_http_request_context(
         &state,
         vm_request,
         connection_metadata,
@@ -1038,11 +1068,67 @@ async fn handle_data_plane_http_request_context(
         #[cfg(feature = "http3")]
         downstream_http3_attachment,
         downstream_http1_upgrade,
-    )
-    .await
-    {
-        Ok(executed) => executed,
+    ) {
+        Ok(prepared) => prepared,
         Err(response) => return finalize_data_plane_response(&state, started, response, 0),
+    };
+    let response_stream_notify = prepared
+        .vm_context
+        .downstream_response_stream_ready_notify();
+    let wait_for_response_stream = {
+        let vm_context = prepared.vm_context.clone();
+        async move {
+            loop {
+                if vm_context.downstream_response_stream_committed() {
+                    break;
+                }
+                response_stream_notify.notified().await;
+            }
+        }
+    };
+    let mut execution = tokio::spawn(run_prepared_data_plane_http_request_context(
+        state.clone(),
+        prepared.program.clone(),
+        prepared.vm_context.clone(),
+        prepared.debug,
+    ));
+    tokio::pin!(wait_for_response_stream);
+
+    let (vm_context, pre_vm_finished, after_vm) = match tokio::select! {
+        execution_result = &mut execution => execution_result,
+        _ = &mut wait_for_response_stream => {
+            let resolved = resolve_committed_http_graph_response(&prepared.vm_context).await;
+            let crate::abi_impl::http::ResolvedHttpGraphResponse {
+                response,
+                upstream_latency_ms,
+                post_response_plan,
+            } = resolved;
+            if let Some(plan) = post_response_plan {
+                tokio::spawn(async move {
+                    if let Err(err) = plan.run().await {
+                        warn!(
+                            "{} downstream post-response transport failed: {err}",
+                            category_program()
+                        );
+                    }
+                });
+            }
+            return finalize_data_plane_response(&state, started, response, upstream_latency_ms);
+        }
+    } {
+        Ok(Ok(executed)) => executed,
+        Ok(Err(response)) => return finalize_data_plane_response(&state, started, response, 0),
+        Err(err) => {
+            return finalize_data_plane_response(
+                &state,
+                started,
+                text_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("vm execution task failed: {err}"),
+                ),
+                0,
+            );
+        }
     };
 
     let resolved = resolve_http_graph_response(&vm_context).await;
@@ -1065,14 +1151,20 @@ async fn handle_data_plane_http_request_context(
     finalize_data_plane_response(&state, started, response, upstream_latency_ms)
 }
 
-pub(super) async fn execute_data_plane_http_request_context(
+struct PreparedDataPlaneHttpRequestExecution {
+    program: Arc<LoadedProgram>,
+    vm_context: SharedProxyVmContext,
+    debug: VmDebugInvocation,
+}
+
+fn prepare_data_plane_http_request_context(
     state: &SharedState,
     vm_request: crate::abi_impl::http::HttpRequestContext,
     connection_metadata: Option<DownstreamConnectionMetadata>,
     downstream_http2_attachment: Option<Http2DownstreamStreamAttachment>,
     #[cfg(feature = "http3")] downstream_http3_attachment: Option<Http3DownstreamStreamAttachment>,
     downstream_http1_upgrade: Option<hyper::upgrade::OnUpgrade>,
-) -> Result<(SharedProxyVmContext, Option<Instant>, Option<Instant>), Response<Body>> {
+) -> Result<PreparedDataPlaneHttpRequestExecution, Response<Body>> {
     let Some(program) = state.loaded_program_snapshot() else {
         warn!("{} no program loaded; returning 404", category_program());
         return Err(text_response(StatusCode::NOT_FOUND, "not found"));
@@ -1106,6 +1198,19 @@ pub(super) async fn execute_data_plane_http_request_context(
         vm_context.attach_downstream_http1_upgrade(upgrade);
     }
     let vm_context = Arc::new(vm_context);
+    Ok(PreparedDataPlaneHttpRequestExecution {
+        program,
+        vm_context,
+        debug,
+    })
+}
+
+async fn run_prepared_data_plane_http_request_context(
+    state: SharedState,
+    program: Arc<LoadedProgram>,
+    vm_context: SharedProxyVmContext,
+    debug: VmDebugInvocation,
+) -> Result<(SharedProxyVmContext, Option<Instant>, Option<Instant>), Response<Body>> {
     let stage_metrics = stage_metrics_active();
     let pre_vm_finished = stage_metrics.then(Instant::now);
     match execute_vm_with_context(
@@ -1118,13 +1223,16 @@ pub(super) async fn execute_data_plane_http_request_context(
     )
     .await
     {
-        Ok(()) => {}
+        Ok(()) => {
+            let _ = crate::abi_impl::http::finish_downstream_response_stream(&vm_context);
+        }
         Err(VmExecutionError::HostRegistration(err)) => {
             state.record_vm_execution_error();
             warn!(
                 "{} failed to register host module: {err}",
                 category_program()
             );
+            let _ = crate::abi_impl::http::finish_downstream_response_stream(&vm_context);
             return Err(text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("host registration error: {err}"),
@@ -1133,6 +1241,7 @@ pub(super) async fn execute_data_plane_http_request_context(
         Err(VmExecutionError::Vm(err)) => {
             state.record_vm_execution_error();
             warn!("{} vm execution error: {err}", category_program());
+            let _ = crate::abi_impl::http::finish_downstream_response_stream(&vm_context);
             return Err(text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("vm execution error: {err}"),
@@ -1145,6 +1254,32 @@ pub(super) async fn execute_data_plane_http_request_context(
         pre_vm_finished,
         stage_metrics.then(Instant::now),
     ))
+}
+
+pub(super) async fn execute_data_plane_http_request_context(
+    state: &SharedState,
+    vm_request: crate::abi_impl::http::HttpRequestContext,
+    connection_metadata: Option<DownstreamConnectionMetadata>,
+    downstream_http2_attachment: Option<Http2DownstreamStreamAttachment>,
+    #[cfg(feature = "http3")] downstream_http3_attachment: Option<Http3DownstreamStreamAttachment>,
+    downstream_http1_upgrade: Option<hyper::upgrade::OnUpgrade>,
+) -> Result<(SharedProxyVmContext, Option<Instant>, Option<Instant>), Response<Body>> {
+    let prepared = prepare_data_plane_http_request_context(
+        state,
+        vm_request,
+        connection_metadata,
+        downstream_http2_attachment,
+        #[cfg(feature = "http3")]
+        downstream_http3_attachment,
+        downstream_http1_upgrade,
+    )?;
+    run_prepared_data_plane_http_request_context(
+        state.clone(),
+        prepared.program,
+        prepared.vm_context,
+        prepared.debug,
+    )
+    .await
 }
 
 async fn dispatch_data_plane_request(state: SharedState, request: Request) -> Response<Body> {

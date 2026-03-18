@@ -16,8 +16,9 @@ use tracing::{info, warn};
 use super::super::SharedState;
 use super::proxy_path::{
     execute_data_plane_http_request_context, finalize_data_plane_response,
-    record_data_plane_response_metrics, record_stage_metrics, record_stage_metrics_if_enabled,
-    serve_http_connection, serve_http1_connection_via_hyper, stage_metrics_active,
+    program_may_stream_downstream_http_response, record_data_plane_response_metrics,
+    record_stage_metrics, record_stage_metrics_if_enabled, serve_http_connection,
+    serve_http1_connection_via_hyper, stage_metrics_active,
 };
 use crate::{
     abi_impl::ReplayPrefixedIo,
@@ -1761,6 +1762,10 @@ pub(super) async fn serve_http1_connection<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    if program_may_stream_downstream_http_response(state.loaded_program_snapshot().as_deref()) {
+        serve_http1_connection_via_hyper(state, stream, peer_addr, connection_metadata).await;
+        return;
+    }
     serve_http1_fast_connection(state, stream, peer_addr, connection_metadata).await;
 }
 
