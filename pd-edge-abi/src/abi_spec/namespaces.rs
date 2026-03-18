@@ -1,5 +1,6 @@
 #[cfg(feature = "http")]
 edge_host_namespace!("http", "HTTP request, response, and upstream host namespace.");
+#[cfg(feature = "console")]
 edge_host_namespace!("console", "Console stdin/stdout/stderr and argv host namespace.");
 edge_host_namespace!("rate_limit", "Rate limiting host namespace.");
 edge_host_namespace!("runtime", "Runtime host namespace.");

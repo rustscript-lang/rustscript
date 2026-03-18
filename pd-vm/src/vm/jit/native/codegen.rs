@@ -337,7 +337,6 @@ pub(super) fn emit_inline_or_helper_step(
                 *index,
                 root_ip,
                 step_ip,
-                drop_contract_events_enabled,
             )?;
             Ok(true)
         }
@@ -368,6 +367,7 @@ pub(super) fn emit_inline_or_helper_step(
                 *index,
                 root_ip,
                 step_ip,
+                drop_contract_events_enabled,
             )?;
             Ok(true)
         }
