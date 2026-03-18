@@ -611,6 +611,7 @@ mod tests {
         ProxyVmContext, abi_impl::RateLimiterStore, debug_session::new_debug_session_store,
     };
 
+    #[allow(dead_code)]
     fn no_host_modules(
         _vm: &mut Vm,
         _context: crate::SharedProxyVmContext,

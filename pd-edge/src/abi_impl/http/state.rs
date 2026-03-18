@@ -747,7 +747,6 @@ impl HttpExchangeTransportState {
     }
 }
 
-#[cfg_attr(not(feature = "http2"), allow(dead_code))]
 pub(crate) const DEFAULT_UPSTREAM_EXCHANGE_HANDLE: i64 = 1;
 const FIRST_DYNAMIC_EXCHANGE_HANDLE: i64 = 2;
 pub(crate) const DEFAULT_UPSTREAM_UDP_SOCKET_HANDLE: i64 = 1;

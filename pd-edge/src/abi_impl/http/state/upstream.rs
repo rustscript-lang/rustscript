@@ -375,6 +375,7 @@ pub(crate) struct ResolvedHttpGraphResponse {
     pub post_response_plan: Option<DownstreamPostResponsePlan>,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Http1DownstreamResolution {
     NativeLocal(ResolvedNativeLocalHttp1DownstreamResponse),
     Native(Result<ResolvedNativeHttp1DownstreamResponse, Response<Body>>),

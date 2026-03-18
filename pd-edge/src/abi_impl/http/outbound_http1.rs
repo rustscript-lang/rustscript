@@ -141,6 +141,7 @@ pub(crate) struct PlainHttp1ResponseBody {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum OutboundHttp1ForwardBody {
     Empty,
     Raw {

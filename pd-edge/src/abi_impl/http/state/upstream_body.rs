@@ -1,5 +1,7 @@
 use super::*;
 
+#[cfg_attr(not(feature = "http2"), allow(dead_code))]
+#[allow(clippy::large_enum_variant)]
 enum UpstreamResponseSource {
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
     Hyper(hyper::body::Incoming),

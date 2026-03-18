@@ -1160,6 +1160,7 @@ struct PreparedDataPlaneHttpRequestExecution {
     debug: VmDebugInvocation,
 }
 
+#[allow(clippy::result_large_err)]
 fn prepare_data_plane_http_request_context(
     state: &SharedState,
     vm_request: HttpRequestContext,

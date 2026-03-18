@@ -11,3 +11,8 @@ pub(crate) mod state;
 pub(crate) mod version;
 
 pub use state::{HttpRequestContext, LazyHttpHeaders, ProxyVmContext, SharedProxyVmContext};
+#[cfg(feature = "webrtc")]
+pub(crate) use state::{
+    allocate_webrtc_connection_handle, default_upstream_webrtc_connection_handle,
+    webrtc_connection_exists,
+};

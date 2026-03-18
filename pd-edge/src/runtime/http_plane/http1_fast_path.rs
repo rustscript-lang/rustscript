@@ -757,6 +757,7 @@ where
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn build_fast_http_request_context(
     request_id: LazyRequestId,
     request: FastHttp1Request,
@@ -1774,7 +1775,6 @@ pub(super) async fn serve_http1_connection<S>(
     serve_http1_fast_connection(state, stream, peer_addr, connection_metadata).await;
 }
 
-#[cfg(feature = "http2")]
 #[cfg(feature = "http2")]
 pub(super) async fn serve_http_auto_connection(
     state: SharedState,
