@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     future::Future,
     pin::Pin,
+    rc::Rc,
     sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -10,6 +11,8 @@ use std::{
 
 use edge_abi::FUNCTIONS as EDGE_ABI_FUNCTIONS;
 use tokio::sync::oneshot;
+#[cfg(test)]
+use vm::LocalHostAsyncBridge;
 use vm::{CallOutcome, HostAsyncBridge, HostFunction, HostOpId, Value, Vm, VmError};
 
 use crate::lock_metrics::{self, LockMetricKey, ProfiledMutexGuard};
@@ -51,11 +54,13 @@ pub(crate) use self::transport::{ReplayPrefixedIo, new_shared_tls_session_cache}
 
 pub type SharedRateLimiter = Arc<RateLimiterStore>;
 pub type SharedVmAsyncOps = Arc<LazyVmAsyncOps>;
+pub(crate) type SharedLocalVmAsyncOps = Rc<RefCell<LocalVmAsyncOps>>;
 #[cfg(feature = "console")]
 pub type SharedConsoleProgramArgs = Arc<Vec<String>>;
 
 type AsyncOpResult = Result<Vec<Value>, VmError>;
 type PendingFuture = Pin<Box<dyn Future<Output = AsyncOpResult> + Send + 'static>>;
+type LocalPendingFuture = Pin<Box<dyn Future<Output = AsyncOpResult> + 'static>>;
 type HostCallResult = Result<CallOutcome, VmError>;
 type HostCallHandler = dyn FnMut(&mut Vm, &[Value]) -> HostCallResult + Send + 'static;
 
@@ -63,6 +68,7 @@ type HostCallHandler = dyn FnMut(&mut Vm, &[Value]) -> HostCallResult + Send + '
 struct ActiveEdgeHostContext {
     vm_context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
+    local_async_ops: Option<SharedLocalVmAsyncOps>,
     #[cfg(feature = "console")]
     console_program_args: Option<SharedConsoleProgramArgs>,
 }
@@ -86,6 +92,12 @@ impl Drop for EdgeHostContextGuard {
 enum PendingOp {
     Receiver(oneshot::Receiver<AsyncOpResult>),
     Future(PendingFuture),
+}
+
+#[derive(Default)]
+pub(crate) struct LocalVmAsyncOps {
+    pending: HashMap<HostOpId, LocalPendingFuture>,
+    next_op_id: HostOpId,
 }
 
 #[derive(Default)]
@@ -220,6 +232,57 @@ impl VmAsyncOps {
     }
 }
 
+impl LocalVmAsyncOps {
+    fn allocate_op_id(&mut self) -> Result<HostOpId, VmError> {
+        for _ in 0..u16::MAX {
+            let op_id = self.next_op_id;
+            self.next_op_id = self.next_op_id.wrapping_add(1).max(1);
+            if !self.pending.contains_key(&op_id) {
+                return Ok(op_id);
+            }
+        }
+        Err(VmError::HostError(
+            "exhausted edge local async host op ids".to_string(),
+        ))
+    }
+
+    fn schedule_future<F>(&mut self, future: F) -> Result<HostOpId, VmError>
+    where
+        F: Future<Output = AsyncOpResult> + 'static,
+    {
+        let op_id = self.allocate_op_id()?;
+        if self.pending.insert(op_id, Box::pin(future)).is_some() {
+            return Err(VmError::HostError(format!(
+                "duplicate local async host op id {op_id}",
+            )));
+        }
+        Ok(op_id)
+    }
+
+    #[cfg(test)]
+    fn poll_op(&mut self, op_id: HostOpId, cx: &mut Context<'_>) -> Poll<AsyncOpResult> {
+        let poll_state = {
+            let future = match self.pending.get_mut(&op_id) {
+                Some(future) => future,
+                None => {
+                    return Poll::Ready(Err(VmError::HostError(format!(
+                        "unknown local async host op {op_id}",
+                    ))));
+                }
+            };
+            future.as_mut().poll(cx)
+        };
+
+        match poll_state {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => {
+                self.pending.remove(&op_id);
+                Poll::Ready(result)
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct LazyVmAsyncOps {
     inner: OnceLock<Mutex<VmAsyncOps>>,
@@ -253,8 +316,32 @@ impl HostAsyncBridge for VmAsyncOpBridge {
     }
 }
 
+#[cfg(test)]
+pub(crate) struct LocalVmAsyncOpBridge {
+    ops: SharedLocalVmAsyncOps,
+}
+
+#[cfg(test)]
+impl LocalVmAsyncOpBridge {
+    pub(crate) fn new(ops: SharedLocalVmAsyncOps) -> Self {
+        Self { ops }
+    }
+}
+
+#[cfg(test)]
+impl LocalHostAsyncBridge for LocalVmAsyncOpBridge {
+    fn poll_op(&mut self, op_id: HostOpId, cx: &mut Context<'_>) -> Poll<AsyncOpResult> {
+        self.ops.borrow_mut().poll_op(op_id, cx)
+    }
+}
+
 pub fn new_shared_vm_async_ops() -> SharedVmAsyncOps {
     Arc::new(LazyVmAsyncOps::default())
+}
+
+#[cfg(test)]
+pub(crate) fn new_shared_local_vm_async_ops() -> SharedLocalVmAsyncOps {
+    Rc::new(RefCell::new(LocalVmAsyncOps::default()))
 }
 
 pub fn enter_edge_host_context(
@@ -263,11 +350,26 @@ pub fn enter_edge_host_context(
 ) -> EdgeHostContextGuard {
     #[cfg(feature = "console")]
     {
-        enter_edge_host_context_inner(vm_context, async_ops, None)
+        enter_edge_host_context_inner(vm_context, async_ops, None, None)
     }
     #[cfg(not(feature = "console"))]
     {
-        enter_edge_host_context_inner(vm_context, async_ops)
+        enter_edge_host_context_inner(vm_context, async_ops, None)
+    }
+}
+
+pub(crate) fn enter_edge_host_context_with_local_ops(
+    vm_context: SharedProxyVmContext,
+    async_ops: SharedVmAsyncOps,
+    local_async_ops: Option<SharedLocalVmAsyncOps>,
+) -> EdgeHostContextGuard {
+    #[cfg(feature = "console")]
+    {
+        enter_edge_host_context_inner(vm_context, async_ops, local_async_ops, None)
+    }
+    #[cfg(not(feature = "console"))]
+    {
+        enter_edge_host_context_inner(vm_context, async_ops, local_async_ops)
     }
 }
 
@@ -275,11 +377,13 @@ pub fn enter_edge_host_context(
 fn enter_edge_host_context_inner(
     vm_context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
+    local_async_ops: Option<SharedLocalVmAsyncOps>,
     console_program_args: Option<SharedConsoleProgramArgs>,
 ) -> EdgeHostContextGuard {
     let next = ActiveEdgeHostContext {
         vm_context,
         async_ops,
+        local_async_ops,
         #[cfg(feature = "console")]
         console_program_args,
     };
@@ -291,10 +395,12 @@ fn enter_edge_host_context_inner(
 fn enter_edge_host_context_inner(
     vm_context: SharedProxyVmContext,
     async_ops: SharedVmAsyncOps,
+    local_async_ops: Option<SharedLocalVmAsyncOps>,
 ) -> EdgeHostContextGuard {
     let next = ActiveEdgeHostContext {
         vm_context,
         async_ops,
+        local_async_ops,
     };
     let previous = CURRENT_EDGE_HOST_CONTEXT.with(|slot| slot.borrow_mut().replace(next));
     EdgeHostContextGuard { previous }
@@ -306,7 +412,7 @@ pub fn enter_edge_host_context_with_console(
     async_ops: SharedVmAsyncOps,
     console_program_args: SharedConsoleProgramArgs,
 ) -> EdgeHostContextGuard {
-    enter_edge_host_context_inner(vm_context, async_ops, Some(console_program_args))
+    enter_edge_host_context_inner(vm_context, async_ops, None, Some(console_program_args))
 }
 
 pub(crate) fn current_vm_context() -> Result<SharedProxyVmContext, VmError> {
@@ -333,6 +439,14 @@ pub(crate) fn current_async_ops() -> Result<SharedVmAsyncOps, VmError> {
                     "pd-edge async ops are unavailable outside Store-backed execution".to_string(),
                 )
             })
+    })
+}
+
+pub(crate) fn current_local_async_ops() -> Option<SharedLocalVmAsyncOps> {
+    CURRENT_EDGE_HOST_CONTEXT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|context| context.local_async_ops.clone())
     })
 }
 
@@ -759,6 +873,17 @@ where
     Ok(CallOutcome::Pending(op_id))
 }
 
+fn schedule_local_future_call<F>(
+    async_ops: &SharedLocalVmAsyncOps,
+    future: F,
+) -> Result<CallOutcome, VmError>
+where
+    F: Future<Output = AsyncOpResult> + 'static,
+{
+    let op_id = async_ops.borrow_mut().schedule_future(future)?;
+    Ok(CallOutcome::Pending(op_id))
+}
+
 pub(crate) fn schedule_current_future_call<F>(
     _vm: &mut Vm,
     future: F,
@@ -766,6 +891,9 @@ pub(crate) fn schedule_current_future_call<F>(
 where
     F: Future<Output = AsyncOpResult> + Send + 'static,
 {
+    if let Some(async_ops) = current_local_async_ops() {
+        return schedule_local_future_call(&async_ops, future);
+    }
     let async_ops = current_async_ops()?;
     schedule_future_call(&async_ops, future)
 }
@@ -774,8 +902,24 @@ pub(crate) fn schedule_current_args_future_call<F>(future: F) -> Result<CallOutc
 where
     F: Future<Output = AsyncOpResult> + Send + 'static,
 {
+    if let Some(async_ops) = current_local_async_ops() {
+        return schedule_local_future_call(&async_ops, future);
+    }
     let async_ops = current_async_ops()?;
     schedule_future_call(&async_ops, future)
+}
+
+#[cfg(test)]
+// Production HTTP handlers still run under Axum/Hyper `Send` futures, so a genuinely
+// non-`Send` host-op queue is only exercised in current-thread tests for now.
+pub(crate) fn schedule_current_local_future_call<F>(future: F) -> Result<CallOutcome, VmError>
+where
+    F: Future<Output = AsyncOpResult> + 'static,
+{
+    let async_ops = current_local_async_ops().ok_or_else(|| {
+        VmError::HostError("local async host ops require vm execution mode `local`".to_string())
+    })?;
+    schedule_local_future_call(&async_ops, future)
 }
 
 fn schedule_ready_call(
@@ -805,6 +949,8 @@ mod tests {
     use std::sync::Arc;
     #[cfg(feature = "http")]
     use std::task::{Wake, Waker};
+    #[cfg(feature = "http")]
+    use std::{cell::RefCell, rc::Rc};
 
     use axum::http::HeaderMap;
     #[cfg(feature = "http")]
@@ -814,21 +960,24 @@ mod tests {
     #[cfg(feature = "http")]
     use pd_edge_host_function::pd_edge_host_function;
     #[cfg(feature = "http")]
-    use vm::{BytecodeBuilder, CallOutcome, VmError, VmStatus};
+    use vm::{BytecodeBuilder, CallOutcome, Value, VmError, VmStatus};
     use vm::{HostImport, OpCode, Program, ValueType, Vm};
 
     use super::registry::{EdgeHostScope, PD_EDGE_HOST_FUNCTIONS};
+    #[cfg(feature = "http")]
+    use super::{
+        LocalVmAsyncOpBridge, VmAsyncOpBridge, current_vm_context, enter_edge_host_context,
+        enter_edge_host_context_with_local_ops, new_shared_local_vm_async_ops,
+        register_http_plane_host_module, schedule_current_local_future_call,
+    };
     use super::{
         ProxyVmContext, RateLimiterStore, SharedProxyVmContext, new_shared_vm_async_ops,
         register_host_module,
     };
     #[cfg(feature = "http")]
-    use super::{
-        VmAsyncOpBridge, current_vm_context, enter_edge_host_context,
-        register_http_plane_host_module,
-    };
-    #[cfg(feature = "http")]
     use std::task::{Context, Poll};
+    #[cfg(feature = "http")]
+    use vm::enter_local_async_bridge_context;
 
     #[cfg(feature = "http")]
     struct TestNoopWake;
@@ -859,6 +1008,19 @@ mod tests {
     #[pd_edge_host_function(name = "test::sync_return_with_vm", scope = http)]
     fn sync_return_with_vm(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
         Ok(CallOutcome::Return(vec![]))
+    }
+
+    #[cfg(feature = "http")]
+    /// Schedules a non-Send future that only works with local async host ops.
+    #[pd_edge_host_function(name = "test::local_pending_non_send", scope = http)]
+    fn local_pending_non_send() -> Result<CallOutcome, VmError> {
+        let marker = Rc::new(RefCell::new(0_i64));
+        let future_marker = marker.clone();
+        schedule_current_local_future_call(async move {
+            tokio::task::yield_now().await;
+            *future_marker.borrow_mut() = 7;
+            Ok(vec![Value::Int(*marker.borrow())])
+        })
     }
 
     fn test_context() -> SharedProxyVmContext {
@@ -1108,5 +1270,80 @@ mod tests {
             .expect("host op should complete on second poll");
         let _host_context = enter_edge_host_context(context.clone(), async_ops.clone());
         assert_eq!(vm.resume().expect("vm should halt"), VmStatus::Halted);
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_async_host_ops_support_non_send_futures() {
+        let imports = vec![HostImport {
+            name: "test::local_pending_non_send".to_string(),
+            arity: 0,
+            return_type: ValueType::Unknown,
+        }];
+        let mut bc = BytecodeBuilder::new();
+        bc.call(0, 0);
+        bc.ret();
+        let program = Program::with_imports_and_debug(vec![], bc.finish(), imports, None);
+        let context = test_context();
+        let async_ops = new_shared_vm_async_ops();
+        let local_async_ops = new_shared_local_vm_async_ops();
+        let mut vm = Vm::new(program);
+        vm.set_local_async_bridge();
+        register_http_plane_host_module(&mut vm, context.clone(), async_ops.clone())
+            .expect("http plane vm should bind");
+
+        let status = {
+            let _host_context = enter_edge_host_context_with_local_ops(
+                context.clone(),
+                async_ops.clone(),
+                Some(local_async_ops.clone()),
+            );
+            let mut local_bridge = LocalVmAsyncOpBridge::new(local_async_ops.clone());
+            let _local_bridge_context = enter_local_async_bridge_context(&mut local_bridge);
+            vm.run().expect("local host call should start")
+        };
+        assert_eq!(
+            status,
+            VmStatus::Waiting(vm.waiting_host_op_id().expect("waiting op id should exist"))
+        );
+
+        let waker = test_waker();
+        let mut poll_context = Context::from_waker(&waker);
+        let pending = {
+            let _host_context = enter_edge_host_context_with_local_ops(
+                context.clone(),
+                async_ops.clone(),
+                Some(local_async_ops.clone()),
+            );
+            let mut local_bridge = LocalVmAsyncOpBridge::new(local_async_ops.clone());
+            let _local_bridge_context = enter_local_async_bridge_context(&mut local_bridge);
+            vm.poll_waiting_host_op(&mut poll_context)
+        };
+        assert!(matches!(pending, Poll::Pending));
+
+        std::future::poll_fn(|cx| {
+            let _host_context = enter_edge_host_context_with_local_ops(
+                context.clone(),
+                async_ops.clone(),
+                Some(local_async_ops.clone()),
+            );
+            let mut local_bridge = LocalVmAsyncOpBridge::new(local_async_ops.clone());
+            let _local_bridge_context = enter_local_async_bridge_context(&mut local_bridge);
+            vm.poll_waiting_host_op(cx)
+        })
+        .await
+        .expect("local non-send host op should complete");
+
+        let status = {
+            let _host_context = enter_edge_host_context_with_local_ops(
+                context,
+                async_ops,
+                Some(local_async_ops.clone()),
+            );
+            let mut local_bridge = LocalVmAsyncOpBridge::new(local_async_ops);
+            let _local_bridge_context = enter_local_async_bridge_context(&mut local_bridge);
+            vm.resume().expect("vm should halt")
+        };
+        assert_eq!(status, VmStatus::Halted);
     }
 }

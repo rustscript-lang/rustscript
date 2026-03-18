@@ -13,8 +13,8 @@ use super::{
 };
 use crate::{
     abi_impl::{
-        SharedProxyVmContext, SharedVmAsyncOps, VmAsyncOpBridge, enter_edge_host_context,
-        new_shared_vm_async_ops,
+        SharedProxyVmContext, SharedVmAsyncOps, VmAsyncOpBridge,
+        enter_edge_host_context_with_local_ops, new_shared_vm_async_ops,
     },
     debug_session::{SharedDebugSession, run_vm_with_optional_debugger},
     logging::category_program,
@@ -161,6 +161,11 @@ pub async fn execute_vm_with_context(
 ) -> Result<(), VmExecutionError> {
     let prefer_aot =
         !debug.attach_debugger && matches!(vm_execution.interrupt, VmInterruptConfig::None);
+    let execution_mode = if debug.force_threading {
+        VmExecutionMode::Threading
+    } else {
+        vm_execution.execution_mode
+    };
     let AcquiredVmRunnerStore { vm_store, pool_key } = acquire_vm_runner_store(
         program,
         vm_context,
@@ -170,14 +175,9 @@ pub async fn execute_vm_with_context(
         vm_execution.drop_contract_events_enabled,
         !debug.attach_debugger,
     )?;
-    let execution_mode = if debug.force_threading {
-        VmExecutionMode::Threading
-    } else {
-        vm_execution.execution_mode
-    };
 
     let vm_store = match execution_mode {
-        VmExecutionMode::Async => {
+        VmExecutionMode::Async | VmExecutionMode::Local => {
             execute_vm_with_async_mode(vm_store, debug_session, debug, vm_execution).await
         }
         VmExecutionMode::Threading => {
@@ -240,6 +240,37 @@ async fn execute_vm_with_threading_mode(
     })?
 }
 
+fn current_edge_execution_handles(
+    vm_store: &VmRunnerStore,
+) -> (SharedProxyVmContext, SharedVmAsyncOps) {
+    let data = vm_store.data();
+    (data.vm_context.clone(), data.async_ops.clone())
+}
+
+fn run_vm_with_edge_context(
+    vm_store: &mut VmRunnerStore,
+    debug_session: &SharedDebugSession,
+    debug: VmDebugInvocation,
+) -> Result<VmStatus, vm::VmError> {
+    let (vm_context, async_ops) = current_edge_execution_handles(vm_store);
+    let _host_context = enter_edge_host_context_with_local_ops(vm_context, async_ops, None);
+    if debug.attach_debugger {
+        let vm_context = vm_store.data().vm_context.clone();
+        run_vm_with_optional_debugger(debug_session, vm_context, vm_store.vm_mut())
+    } else {
+        vm_store.run()
+    }
+}
+
+async fn await_vm_waiting_host_op(vm_store: &mut VmRunnerStore) -> Result<(), vm::VmError> {
+    std::future::poll_fn(|cx| {
+        let (vm_context, async_ops) = current_edge_execution_handles(vm_store);
+        let _host_context = enter_edge_host_context_with_local_ops(vm_context, async_ops, None);
+        vm_store.vm_mut().poll_waiting_host_op(cx)
+    })
+    .await
+}
+
 async fn run_vm_async(
     mut vm_store: VmRunnerStore,
     debug_session: SharedDebugSession,
@@ -251,19 +282,8 @@ async fn run_vm_async(
 
     loop {
         arm_epoch_interrupt_if_enabled(&mut profile.vm_store, &interrupt, debug.attach_debugger)?;
-        let status = {
-            let _host_context = enter_edge_host_context(
-                profile.vm_store.data().vm_context.clone(),
-                profile.vm_store.data().async_ops.clone(),
-            );
-            if debug.attach_debugger {
-                let vm_context = profile.vm_store.data().vm_context.clone();
-                run_vm_with_optional_debugger(&debug_session, vm_context, profile.vm_store.vm_mut())
-            } else {
-                profile.vm_store.run()
-            }
-        }
-        .map_err(VmExecutionError::Vm)?;
+        let status = run_vm_with_edge_context(&mut profile.vm_store, &debug_session, debug)
+            .map_err(VmExecutionError::Vm)?;
         match status {
             VmStatus::Halted => break,
             VmStatus::Yielded => {
@@ -276,10 +296,7 @@ async fn run_vm_async(
             }
             VmStatus::Waiting(_op_id) => {
                 let waiting_started = std::time::Instant::now();
-                profile
-                    .vm_store
-                    .vm_mut()
-                    .await_waiting_host_op()
+                await_vm_waiting_host_op(&mut profile.vm_store)
                     .await
                     .map_err(VmExecutionError::Vm)?;
                 let wait_us =
@@ -305,9 +322,10 @@ fn run_vm_threading(
     loop {
         arm_epoch_interrupt_if_enabled(&mut profile.vm_store, &interrupt, debug.attach_debugger)?;
         let status = {
-            let _host_context = enter_edge_host_context(
+            let _host_context = enter_edge_host_context_with_local_ops(
                 profile.vm_store.data().vm_context.clone(),
                 profile.vm_store.data().async_ops.clone(),
+                None,
             );
             if debug.attach_debugger {
                 let vm_context = profile.vm_store.data().vm_context.clone();

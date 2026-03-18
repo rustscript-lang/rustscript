@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::task::{Context, Poll, Wake, Waker};
 
@@ -25,6 +26,75 @@ pub trait HostArgsFunction: Send {
 
 pub trait HostAsyncBridge: Send {
     fn poll_op(&mut self, op_id: HostOpId, cx: &mut Context<'_>) -> Poll<VmResult<Vec<Value>>>;
+}
+
+pub trait LocalHostAsyncBridge {
+    fn poll_op(&mut self, op_id: HostOpId, cx: &mut Context<'_>) -> Poll<VmResult<Vec<Value>>>;
+}
+
+type LocalAsyncBridgePollFn =
+    unsafe fn(*mut (), HostOpId, &mut Context<'_>) -> Poll<VmResult<Vec<Value>>>;
+
+#[derive(Clone, Copy)]
+struct LocalAsyncBridgeErased {
+    data: *mut (),
+    poll: LocalAsyncBridgePollFn,
+}
+
+std::thread_local! {
+    static CURRENT_LOCAL_ASYNC_BRIDGE: RefCell<Option<LocalAsyncBridgeErased>> =
+        const { RefCell::new(None) };
+}
+
+pub struct LocalAsyncBridgeContextGuard {
+    previous: Option<LocalAsyncBridgeErased>,
+}
+
+impl Drop for LocalAsyncBridgeContextGuard {
+    fn drop(&mut self) {
+        CURRENT_LOCAL_ASYNC_BRIDGE.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+unsafe fn poll_local_async_bridge<B>(
+    data: *mut (),
+    op_id: HostOpId,
+    cx: &mut Context<'_>,
+) -> Poll<VmResult<Vec<Value>>>
+where
+    B: LocalHostAsyncBridge,
+{
+    unsafe { (&mut *(data as *mut B)).poll_op(op_id, cx) }
+}
+
+pub fn enter_local_async_bridge_context<B>(bridge: &mut B) -> LocalAsyncBridgeContextGuard
+where
+    B: LocalHostAsyncBridge,
+{
+    let next = LocalAsyncBridgeErased {
+        data: bridge as *mut B as *mut (),
+        poll: poll_local_async_bridge::<B>,
+    };
+    let previous = CURRENT_LOCAL_ASYNC_BRIDGE.with(|slot| slot.borrow_mut().replace(next));
+    LocalAsyncBridgeContextGuard { previous }
+}
+
+fn poll_current_local_async_bridge(
+    op_id: HostOpId,
+    cx: &mut Context<'_>,
+) -> Poll<VmResult<Vec<Value>>> {
+    CURRENT_LOCAL_ASYNC_BRIDGE.with(|slot| {
+        let Some(bridge) = *slot.borrow() else {
+            return Poll::Ready(Err(VmError::HostError(
+                "vm waiting on host op without a local async bridge context".to_string(),
+            )));
+        };
+        // Safety: the guard returned by `enter_local_async_bridge_context` only installs
+        // bridge pointers for the duration of a synchronous poll/run call.
+        unsafe { (bridge.poll)(bridge.data, op_id, cx) }
+    })
 }
 
 pub type StaticHostFunction = fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>;
@@ -307,6 +377,11 @@ pub(super) enum VmHostFunction {
     ArgsStatic(StaticHostArgsFunction),
 }
 
+pub(super) enum AsyncBridgeBinding {
+    Shared(Box<dyn HostAsyncBridge>),
+    Local,
+}
+
 pub(super) enum HostCallExecOutcome {
     Returned,
     Halted,
@@ -505,7 +580,11 @@ impl Vm {
     }
 
     pub fn set_async_bridge(&mut self, bridge: Box<dyn HostAsyncBridge>) {
-        self.async_bridge = Some(bridge);
+        self.async_bridge = Some(AsyncBridgeBinding::Shared(bridge));
+    }
+
+    pub fn set_local_async_bridge(&mut self) {
+        self.async_bridge = Some(AsyncBridgeBinding::Local);
     }
 
     pub fn clear_async_bridge(&mut self) {
@@ -554,8 +633,8 @@ impl Vm {
 
         let poll_result = match waiting.source {
             WaitingHostOpSource::HostBridge => {
-                let bridge_ptr = match self.async_bridge.as_mut() {
-                    Some(bridge) => bridge.as_mut() as *mut dyn HostAsyncBridge,
+                let bridge_binding = match self.async_bridge.as_mut() {
+                    Some(bridge) => bridge,
                     None => {
                         return Poll::Ready(Err(VmError::HostError(format!(
                             "vm waiting on host op {} without an async bridge",
@@ -563,8 +642,13 @@ impl Vm {
                         ))));
                     }
                 };
-
-                unsafe { (&mut *bridge_ptr).poll_op(waiting.op_id, cx) }
+                match bridge_binding {
+                    AsyncBridgeBinding::Shared(bridge) => {
+                        let bridge_ptr = bridge.as_mut() as *mut dyn HostAsyncBridge;
+                        unsafe { (&mut *bridge_ptr).poll_op(waiting.op_id, cx) }
+                    }
+                    AsyncBridgeBinding::Local => poll_current_local_async_bridge(waiting.op_id, cx),
+                }
             }
             WaitingHostOpSource::BuiltinIo => {
                 crate::builtins::runtime::poll_builtin_io_op(self, waiting.op_id, cx)

@@ -61,8 +61,9 @@ pub use vm::diagnostics::render_vm_error;
 #[cfg(feature = "runtime")]
 pub use vm::{
     CallOutcome, EpochCheckpoint, EpochHandle, FuelCheckpoint, HostArgsFunction, HostAsyncBridge,
-    HostBindingPlan, HostFunction, HostFunctionRegistry, HostOpId, StaticHostArgsFunction,
-    StaticHostFunction, Store, Vm, VmError, VmResult, VmStatus, VmYieldReason,
+    HostBindingPlan, HostFunction, HostFunctionRegistry, HostOpId, LocalAsyncBridgeContextGuard,
+    LocalHostAsyncBridge, StaticHostArgsFunction, StaticHostFunction, Store, Vm, VmError, VmResult,
+    VmStatus, VmYieldReason, enter_local_async_bridge_context,
 };
 #[cfg(feature = "runtime")]
 pub use vmbc::{

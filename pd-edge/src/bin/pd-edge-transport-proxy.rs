@@ -374,9 +374,10 @@ fn parse_vm_execution_mode(value: &str) -> Result<VmExecutionMode, String> {
     let normalized = value.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "async" => Ok(VmExecutionMode::Async),
+        "local" | "inline" | "current-task" | "current_task" => Ok(VmExecutionMode::Local),
         "threading" | "spawn-blocking" => Ok(VmExecutionMode::Threading),
         _ => Err(format!(
-            "invalid --vm-execution-mode: {value} (expected async|threading)"
+            "invalid --vm-execution-mode: {value} (expected async|local|threading)"
         )),
     }
 }
@@ -401,7 +402,7 @@ fn print_cli_help() {
             "  --vm-fuel-check-interval <OPS>            Fuel check interval when --vm-fuel is enabled (default: 1)\n",
             "  --vm-epoch-deadline <TICKS>               Enable cooperative VM epoch slices per connection (1 tick = 1ms wall clock)\n",
             "  --vm-epoch-check-interval <OPS>           Epoch check interval when --vm-epoch-deadline is enabled (default: 1)\n",
-            "  --vm-execution-mode <MODE>                VM execution mode: async|threading (default: async)\n",
+            "  --vm-execution-mode <MODE>                VM execution mode: async|local|threading (default: async)\n",
             "  --vm-jit                                  Enable VM JIT/trace execution (default: off)\n",
             "  --vm-drop-contract-events                 Enable VM drop-contract event accounting (default: off)\n",
             "  --control-plane-url <URL>                 Enable active control-plane RPC client\n",

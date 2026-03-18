@@ -37,7 +37,7 @@ use vm::VmError;
 #[cfg(feature = "tls")]
 use super::super::transport_plane::serve_transport_connection_with_listener_goal;
 use super::super::vm_runner::{VmDebugInvocation, VmExecutionError, execute_vm_with_context};
-use super::super::{LoadedProgram, SharedState};
+use super::super::{LoadedProgram, SharedState, VmExecutionMode};
 use super::shared::access_log_middleware;
 #[cfg(feature = "http3")]
 use crate::abi_impl::{
@@ -1091,48 +1091,93 @@ async fn handle_data_plane_http_request_context(
             }
         }
     };
-    let mut execution = tokio::spawn(run_prepared_data_plane_http_request_context(
-        state.clone(),
-        prepared.program.clone(),
-        prepared.vm_context.clone(),
-        prepared.debug,
-    ));
     tokio::pin!(wait_for_response_stream);
-
-    let (vm_context, pre_vm_finished, after_vm) = match tokio::select! {
-        execution_result = &mut execution => execution_result,
-        _ = &mut wait_for_response_stream => {
-            let resolved = resolve_committed_http_graph_response(&prepared.vm_context).await;
-            let ResolvedHttpGraphResponse {
-                response,
-                upstream_latency_ms,
-                post_response_plan,
-            } = resolved;
-            if let Some(plan) = post_response_plan {
-                tokio::spawn(async move {
-                    if let Err(err) = plan.run().await {
-                        warn!(
-                            "{} downstream post-response transport failed: {err}",
-                            category_program()
-                        );
-                    }
-                });
+    let execute_on_current_task =
+        matches!(state.vm_execution.execution_mode, VmExecutionMode::Local);
+    let (vm_context, pre_vm_finished, after_vm) = if execute_on_current_task {
+        let execution = run_prepared_data_plane_http_request_context(
+            state.clone(),
+            prepared.program.clone(),
+            prepared.vm_context.clone(),
+            prepared.debug,
+        );
+        tokio::pin!(execution);
+        match tokio::select! {
+            execution_result = &mut execution => Some(execution_result),
+            _ = &mut wait_for_response_stream => None,
+        } {
+            Some(Ok(executed)) => executed,
+            Some(Err(response)) => {
+                return finalize_data_plane_response(&state, started, response, 0);
             }
-            return finalize_data_plane_response(&state, started, response, upstream_latency_ms);
+            None => {
+                let resolved = resolve_committed_http_graph_response(&prepared.vm_context).await;
+                let ResolvedHttpGraphResponse {
+                    response,
+                    upstream_latency_ms,
+                    post_response_plan,
+                } = resolved;
+                if let Some(plan) = post_response_plan {
+                    tokio::spawn(async move {
+                        if let Err(err) = plan.run().await {
+                            warn!(
+                                "{} downstream post-response transport failed: {err}",
+                                category_program()
+                            );
+                        }
+                    });
+                }
+                return finalize_data_plane_response(
+                    &state,
+                    started,
+                    response,
+                    upstream_latency_ms,
+                );
+            }
         }
-    } {
-        Ok(Ok(executed)) => executed,
-        Ok(Err(response)) => return finalize_data_plane_response(&state, started, response, 0),
-        Err(err) => {
-            return finalize_data_plane_response(
-                &state,
-                started,
-                text_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("vm execution task failed: {err}"),
-                ),
-                0,
-            );
+    } else {
+        let execution = run_prepared_data_plane_http_request_context(
+            state.clone(),
+            prepared.program.clone(),
+            prepared.vm_context.clone(),
+            prepared.debug,
+        );
+        let mut execution = tokio::spawn(execution);
+        match tokio::select! {
+            execution_result = &mut execution => execution_result,
+            _ = &mut wait_for_response_stream => {
+                let resolved = resolve_committed_http_graph_response(&prepared.vm_context).await;
+                let ResolvedHttpGraphResponse {
+                    response,
+                    upstream_latency_ms,
+                    post_response_plan,
+                } = resolved;
+                if let Some(plan) = post_response_plan {
+                    tokio::spawn(async move {
+                        if let Err(err) = plan.run().await {
+                            warn!(
+                                "{} downstream post-response transport failed: {err}",
+                                category_program()
+                            );
+                        }
+                    });
+                }
+                return finalize_data_plane_response(&state, started, response, upstream_latency_ms);
+            }
+        } {
+            Ok(Ok(executed)) => executed,
+            Ok(Err(response)) => return finalize_data_plane_response(&state, started, response, 0),
+            Err(err) => {
+                return finalize_data_plane_response(
+                    &state,
+                    started,
+                    text_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("vm execution task failed: {err}"),
+                    ),
+                    0,
+                );
+            }
         }
     };
 

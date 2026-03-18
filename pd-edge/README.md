@@ -280,6 +280,7 @@ Run the built-in framework to benchmark these scenarios:
 
 Detailed report with charts: [`docs/HTTP_PROXY_PERF_REPORT_2026-03-14.md`](docs/HTTP_PROXY_PERF_REPORT_2026-03-14.md)
 Generic `proxy::forward` experiment report: [`docs/HTTP_PROXY_PERF_REPORT_2026-03-15.md`](docs/HTTP_PROXY_PERF_REPORT_2026-03-15.md)
+Perf methodology and baseline rules: [`docs/HTTP_PROXY_PERF_METHODOLOGY.md`](docs/HTTP_PROXY_PERF_METHODOLOGY.md)
 
 Harness A standard comparisons run with VM fuel disabled by default. Pass `--vm-fuel <UNITS>` to turn it on.
 
@@ -308,6 +309,12 @@ cargo run -p pd-edge --example http_proxy_perf_framework --release -- \
   --concurrency 128 \
   --json-out target/http_proxy_perf_mode_threading.json
 ```
+
+Important:
+
+- Baseline-relative percentages must use the matched baseline from the same run batch.
+- Do not compare a scenario from one rerun against a baseline row copied from another rerun.
+- If you repeat runs, compute each run's ratio first and then aggregate the ratios.
 
 Fuel-impact latency sweep (proxy harness, scenario `no_host_calls_program`):
 

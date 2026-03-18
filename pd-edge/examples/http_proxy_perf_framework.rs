@@ -682,6 +682,7 @@ impl Default for BenchConfig {
 #[serde(rename_all = "snake_case")]
 enum VmExecutionModeArg {
     Async,
+    Local,
     Threading,
 }
 
@@ -689,6 +690,7 @@ impl VmExecutionModeArg {
     fn as_flag_value(self) -> &'static str {
         match self {
             VmExecutionModeArg::Async => "async",
+            VmExecutionModeArg::Local => "local",
             VmExecutionModeArg::Threading => "threading",
         }
     }
@@ -698,11 +700,12 @@ fn parse_vm_execution_mode_arg(value: &str) -> Result<VmExecutionModeArg, String
     let normalized = value.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "async" => Ok(VmExecutionModeArg::Async),
+        "local" | "inline" | "current-task" | "current_task" => Ok(VmExecutionModeArg::Local),
         "threading" | "blocking" | "spawn-blocking" | "spawn_blocking" => {
             Ok(VmExecutionModeArg::Threading)
         }
         _ => Err(format!(
-            "invalid --vm-execution-mode: {value} (expected async|threading)"
+            "invalid --vm-execution-mode: {value} (expected async|local|threading)"
         )),
     }
 }
@@ -3794,7 +3797,7 @@ Options:\n\
   --vm-fuel <UNITS>                 Enable cooperative VM fuel slices (default: disabled)\n\
   --no-vm-fuel                      Disable VM fuel slices\n\
   --vm-fuel-check-interval <OPS>    Fuel check interval for proxy VM (default: 32)\n\
-  --vm-execution-mode <MODE>        Proxy VM execution mode: async|threading (default: async)\n\
+  --vm-execution-mode <MODE>        Proxy VM execution mode: async|local|threading (default: async)\n\
   --fuel-latency-sweep              Run latency sweeps for fuel and fuel-check-interval (defaults to scenario no_host_calls_program)\n\
   --fuel-latency-fuels <CSV>        CSV list for fuel sweep; must be > 0 (default starts at 1)\n\
   --fuel-latency-check-intervals <CSV> CSV list for check-interval sweep; must be > 0 (default starts at 1)\n\

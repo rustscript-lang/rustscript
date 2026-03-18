@@ -13,11 +13,12 @@ mod superinstructions;
 mod tests;
 pub use self::epoch::{EpochCheckpoint, EpochHandle};
 pub use self::fuel::FuelCheckpoint;
+use self::host::{AsyncBridgeBinding, HostCallExecOutcome, VmHostFunction, WaitingHostOp};
 pub use self::host::{
     CallOutcome, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction,
-    HostFunctionRegistry, HostOpId, StaticHostArgsFunction, StaticHostFunction,
+    HostFunctionRegistry, HostOpId, LocalAsyncBridgeContextGuard, LocalHostAsyncBridge,
+    StaticHostArgsFunction, StaticHostFunction, enter_local_async_bridge_context,
 };
-use self::host::{HostCallExecOutcome, VmHostFunction, WaitingHostOp};
 pub use crate::bytecode::{HostImport, OpCode, Program, Value, ValueType};
 use crate::bytecode::{StableHasher, hash_value};
 pub use store::Store;
@@ -221,7 +222,7 @@ pub struct Vm {
     native_trace_exec_count: u64,
     jit_native_bridge_stats_enabled: bool,
     jit_native_bridge_counts: HashMap<&'static str, u64>,
-    async_bridge: Option<Box<dyn HostAsyncBridge>>,
+    async_bridge: Option<AsyncBridgeBinding>,
     runtime_print_sink: Option<Box<RuntimePrintSink>>,
     waiting_host_op: Option<WaitingHostOp>,
     next_host_op_id: HostOpId,

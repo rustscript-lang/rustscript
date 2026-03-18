@@ -61,6 +61,7 @@ pub use transport_plane::serve_transport_proxy;
 pub enum VmExecutionMode {
     #[default]
     Async,
+    Local,
     Threading,
 }
 
@@ -68,6 +69,7 @@ impl VmExecutionMode {
     pub fn as_str(self) -> &'static str {
         match self {
             VmExecutionMode::Async => "async",
+            VmExecutionMode::Local => "local",
             VmExecutionMode::Threading => "threading",
         }
     }
