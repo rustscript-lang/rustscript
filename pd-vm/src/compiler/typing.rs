@@ -8,7 +8,9 @@ use std::collections::HashMap;
 
 use crate::bytecode::ValueType;
 
-use self::collect::{collect_function_types, collect_stmt_types};
+use self::collect::{
+    CollectFunctionTypeOutputs, CollectFunctionTypesEnv, collect_function_types, collect_stmt_types,
+};
 use self::context::TypeContext;
 pub(crate) use self::context::bound_type_from_schema;
 use self::helpers::{
@@ -91,28 +93,28 @@ pub(super) fn infer_types(ir: &FrontendIr) -> TypeInferenceResult {
     let observed_function_param_types = context.observed_function_param_types.clone();
     let observed_function_param_schemas = context.observed_function_param_schemas.clone();
     let observed_function_capture_states = context.observed_function_capture_states.clone();
+    let env = CollectFunctionTypesEnv {
+        function_impls: &ir.function_impls,
+        function_decls: &function_decls,
+        function_names: &function_names,
+        struct_schemas: &ir.struct_schemas,
+        host_import_return_types: &host_import_return_types,
+        host_import_signatures: &host_import_signatures,
+        observed_function_param_types: &observed_function_param_types,
+        observed_function_param_schemas: &observed_function_param_schemas,
+        observed_function_capture_states: &observed_function_capture_states,
+    };
 
     for decl in &ir.functions {
         let Some(function_impl) = ir.function_impls.get(&decl.index) else {
             continue;
         };
-        collect_function_types(
-            decl.index,
-            function_impl,
-            decl,
-            &mut local_types,
-            &mut local_schema_labels,
-            &mut callable_slots,
-            &ir.function_impls,
-            &function_decls,
-            &function_names,
-            &ir.struct_schemas,
-            &host_import_return_types,
-            &host_import_signatures,
-            &observed_function_param_types,
-            &observed_function_param_schemas,
-            &observed_function_capture_states,
-        );
+        let mut outputs = CollectFunctionTypeOutputs {
+            local_types: &mut local_types,
+            local_schema_labels: &mut local_schema_labels,
+            callable_slots: &mut callable_slots,
+        };
+        collect_function_types(decl.index, function_impl, decl, &mut outputs, &env);
     }
 
     TypeInferenceResult {

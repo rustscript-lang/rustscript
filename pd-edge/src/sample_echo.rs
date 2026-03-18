@@ -973,36 +973,31 @@ fn generate_http3_quic_server_config_from_identity(
 }
 
 #[cfg(feature = "websocket")]
-#[allow(clippy::result_large_err)]
-fn negotiate_chat_subprotocol(
-    request: &WsRequest,
-    mut response: WsResponse,
-) -> Result<WsResponse, tokio_tungstenite::tungstenite::handshake::server::ErrorResponse> {
-    let requested = request
-        .headers()
-        .get("sec-websocket-protocol")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    if requested
-        .split(',')
-        .map(str::trim)
-        .any(|protocol| protocol == "chat")
-    {
-        response
-            .headers_mut()
-            .insert("sec-websocket-protocol", WsHeaderValue::from_static("chat"));
-    }
-    Ok(response)
-}
-
-#[cfg(feature = "websocket")]
 async fn run_websocket_echo_session<S>(
     stream: S,
 ) -> Result<(), tokio_tungstenite::tungstenite::Error>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let mut websocket = accept_hdr_async(stream, negotiate_chat_subprotocol).await?;
+    let mut websocket =
+        accept_hdr_async(stream, |request: &WsRequest, mut response: WsResponse| {
+            let requested = request
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            if requested
+                .split(',')
+                .map(str::trim)
+                .any(|protocol| protocol == "chat")
+            {
+                response
+                    .headers_mut()
+                    .insert("sec-websocket-protocol", WsHeaderValue::from_static("chat"));
+            }
+            Ok(response)
+        })
+        .await?;
     while let Some(message) = websocket.next().await {
         match message? {
             Message::Text(text) => {

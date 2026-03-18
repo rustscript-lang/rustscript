@@ -25,6 +25,24 @@ pub(super) fn observed_function_param_schema_slice(
     observed.get(&function_index).map(Vec::as_slice)
 }
 
+pub(super) struct CollectFunctionTypeOutputs<'a> {
+    pub(super) local_types: &'a mut [ValueType],
+    pub(super) local_schema_labels: &'a mut [Option<String>],
+    pub(super) callable_slots: &'a mut [bool],
+}
+
+pub(super) struct CollectFunctionTypesEnv<'a> {
+    pub(super) function_impls: &'a HashMap<u16, FunctionImpl>,
+    pub(super) function_decls: &'a HashMap<u16, FunctionDecl>,
+    pub(super) function_names: &'a HashMap<u16, String>,
+    pub(super) struct_schemas: &'a HashMap<String, StructDecl>,
+    pub(super) host_import_return_types: &'a HashMap<u16, BoundType>,
+    pub(super) host_import_signatures: &'a HashMap<u16, HostCallableSignature>,
+    pub(super) observed_function_param_types: &'a HashMap<u16, Vec<BoundType>>,
+    pub(super) observed_function_param_schemas: &'a HashMap<u16, Vec<Option<TypeSchema>>>,
+    pub(super) observed_function_capture_states: &'a HashMap<u16, LocalTypeState>,
+}
+
 pub(super) fn seed_function_param_state(
     state: &mut LocalTypeState,
     param_slots: &[LocalSlot],
@@ -79,69 +97,58 @@ pub(super) fn seed_function_capture_state(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn collect_function_types(
     function_index: u16,
     function_impl: &FunctionImpl,
     function_decl: &FunctionDecl,
-    local_types: &mut [ValueType],
-    local_schema_labels: &mut [Option<String>],
-    callable_slots: &mut [bool],
-    function_impls: &HashMap<u16, FunctionImpl>,
-    function_decls: &HashMap<u16, FunctionDecl>,
-    function_names: &HashMap<u16, String>,
-    struct_schemas: &HashMap<String, StructDecl>,
-    host_import_return_types: &HashMap<u16, BoundType>,
-    host_import_signatures: &HashMap<u16, HostCallableSignature>,
-    observed_function_param_types: &HashMap<u16, Vec<BoundType>>,
-    observed_function_param_schemas: &HashMap<u16, Vec<Option<TypeSchema>>>,
-    observed_function_capture_states: &HashMap<u16, LocalTypeState>,
+    outputs: &mut CollectFunctionTypeOutputs<'_>,
+    env: &CollectFunctionTypesEnv<'_>,
 ) {
     let mut state = LocalTypeState::default();
     let mut context = TypeContext::new(
-        function_impls,
-        function_decls,
-        struct_schemas,
-        function_names,
-        host_import_return_types,
-        host_import_signatures,
+        env.function_impls,
+        env.function_decls,
+        env.struct_schemas,
+        env.function_names,
+        env.host_import_return_types,
+        env.host_import_signatures,
         false,
     );
     seed_function_param_state(
         &mut state,
         &function_impl.param_slots,
         Some(function_decl.arg_schemas.as_slice()),
-        observed_function_param_slice(observed_function_param_types, function_index),
-        observed_function_param_schema_slice(observed_function_param_schemas, function_index),
+        observed_function_param_slice(env.observed_function_param_types, function_index),
+        observed_function_param_schema_slice(env.observed_function_param_schemas, function_index),
     );
     seed_function_capture_state(
         &mut state,
         function_index,
         &function_impl.capture_copies,
-        observed_function_capture_states,
+        env.observed_function_capture_states,
     );
     for slot in &function_impl.param_slots {
-        record_local_type(local_types, *slot, state.get(*slot));
-        record_local_schema_label(local_schema_labels, *slot, state.schema(*slot));
+        record_local_type(outputs.local_types, *slot, state.get(*slot));
+        record_local_schema_label(outputs.local_schema_labels, *slot, state.schema(*slot));
     }
     for (_source_slot, captured_slot) in &function_impl.capture_copies {
         let ty = state.get(*captured_slot);
-        record_local_type(local_types, *captured_slot, ty);
+        record_local_type(outputs.local_types, *captured_slot, ty);
         record_local_schema_label(
-            local_schema_labels,
+            outputs.local_schema_labels,
             *captured_slot,
             state.schema(*captured_slot),
         );
         if state.callable(*captured_slot).is_some() {
-            record_callable_slot(callable_slots, *captured_slot);
+            record_callable_slot(outputs.callable_slots, *captured_slot);
         }
     }
     collect_stmt_types(
         &function_impl.body_stmts,
         &mut state,
-        local_types,
-        local_schema_labels,
-        callable_slots,
+        outputs.local_types,
+        outputs.local_schema_labels,
+        outputs.callable_slots,
         &mut context,
     );
     let _ = context.infer_expr_type(&function_impl.body_expr, &state);

@@ -375,12 +375,11 @@ pub(crate) struct ResolvedHttpGraphResponse {
     pub post_response_plan: Option<DownstreamPostResponsePlan>,
 }
 
-#[allow(clippy::large_enum_variant)]
 pub(crate) enum Http1DownstreamResolution {
-    NativeLocal(ResolvedNativeLocalHttp1DownstreamResponse),
-    Native(Result<ResolvedNativeHttp1DownstreamResponse, Response<Body>>),
-    Snapshot(Result<ResolvedSnapshotHttp1DownstreamResponse, Response<Body>>),
-    Graph(ResolvedHttpGraphResponse),
+    NativeLocal(Box<ResolvedNativeLocalHttp1DownstreamResponse>),
+    Native(Box<Result<ResolvedNativeHttp1DownstreamResponse, Response<Body>>>),
+    Snapshot(Box<Result<ResolvedSnapshotHttp1DownstreamResponse, Response<Body>>>),
+    Graph(Box<ResolvedHttpGraphResponse>),
 }
 
 #[derive(Clone, Debug)]
@@ -1249,7 +1248,7 @@ fn started_upstream_response_from_plain_http1_forward(
             OutboundHttp1ForwardBody::Raw {
                 body,
                 content_length,
-            } => UpstreamResponseBodyState::from_plain_http1(body, content_length),
+            } => UpstreamResponseBodyState::from_plain_http1(*body, content_length),
         })),
     }
 }
@@ -1289,7 +1288,7 @@ pub(super) async fn response_from_started_upstream_response(
             body,
             content_length,
         } => {
-            let passthrough = UpstreamResponseBodyState::from_plain_http1(body, content_length)
+            let passthrough = UpstreamResponseBodyState::from_plain_http1(*body, content_length)
                 .take_streaming_passthrough();
             Body::new(StreamBody::new(try_unfold(
                 passthrough,
@@ -1389,7 +1388,7 @@ fn materialize_native_default_upstream_forward_response(
             NativeDefaultUpstreamForwardBody::Raw {
                 body,
                 content_length,
-            } => UpstreamResponseBodyState::from_plain_http1(body, content_length),
+            } => UpstreamResponseBodyState::from_plain_http1(*body, content_length),
         })),
     };
     let (snapshot, upstream_response_version, peer_addr) =
@@ -1655,15 +1654,15 @@ pub(crate) async fn resolve_http1_downstream_response(
     context: &SharedProxyVmContext,
 ) -> Http1DownstreamResolution {
     if let Some(native_local) = try_take_native_local_http1_downstream_response(context) {
-        return Http1DownstreamResolution::NativeLocal(native_local);
+        return Http1DownstreamResolution::NativeLocal(Box::new(native_local));
     }
     if let Some(native_result) = try_resolve_native_http1_downstream_response(context).await {
-        return Http1DownstreamResolution::Native(native_result);
+        return Http1DownstreamResolution::Native(Box::new(native_result));
     }
     if let Some(snapshot_result) = try_resolve_snapshot_http1_downstream_response(context).await {
-        return Http1DownstreamResolution::Snapshot(snapshot_result);
+        return Http1DownstreamResolution::Snapshot(Box::new(snapshot_result));
     }
-    Http1DownstreamResolution::Graph(resolve_http_graph_response(context).await)
+    Http1DownstreamResolution::Graph(Box::new(resolve_http_graph_response(context).await))
 }
 
 pub(crate) fn try_take_native_local_http1_downstream_response(

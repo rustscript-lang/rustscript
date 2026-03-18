@@ -780,8 +780,7 @@ impl TraceJitEngine {
                 match record_trace_branch(
                     program,
                     code,
-                    root_ip,
-                    instr_ip,
+                    TraceBranchLocation { root_ip, instr_ip },
                     opcode,
                     &mut ip,
                     &mut steps,
@@ -798,8 +797,7 @@ impl TraceJitEngine {
                 match record_trace_branch(
                     program,
                     code,
-                    root_ip,
-                    instr_ip,
+                    TraceBranchLocation { root_ip, instr_ip },
                     opcode,
                     &mut ip,
                     &mut steps,
@@ -984,8 +982,7 @@ impl TraceJitEngine {
                 match record_trace_branch(
                     program,
                     code,
-                    root_ip,
-                    instr_ip,
+                    TraceBranchLocation { root_ip, instr_ip },
                     opcode,
                     &mut ip,
                     &mut steps,
@@ -1002,8 +999,7 @@ impl TraceJitEngine {
                 match record_trace_branch(
                     program,
                     code,
-                    root_ip,
-                    instr_ip,
+                    TraceBranchLocation { root_ip, instr_ip },
                     opcode,
                     &mut ip,
                     &mut steps,
@@ -1174,12 +1170,16 @@ enum TraceBranchOutcome {
     Finish(JitTraceTerminal),
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+struct TraceBranchLocation {
+    root_ip: usize,
+    instr_ip: usize,
+}
+
 fn record_trace_branch(
     program: &Program,
     code: &[u8],
-    root_ip: usize,
-    instr_ip: usize,
+    location: TraceBranchLocation,
     opcode: u8,
     ip: &mut usize,
     steps: &mut Vec<TraceStep>,
@@ -1192,7 +1192,7 @@ fn record_trace_branch(
             return Err(JitNyiReason::InvalidJumpTarget { target });
         }
         let fallthrough_ip = *ip;
-        step_ips.push(instr_ip);
+        step_ips.push(location.instr_ip);
         if target < fallthrough_ip {
             if step_ips[..step_ips.len().saturating_sub(1)].contains(&target) {
                 steps.push(TraceStep::LoopIfFalse {
@@ -1223,13 +1223,13 @@ fn record_trace_branch(
     if target >= code.len() {
         return Err(JitNyiReason::InvalidJumpTarget { target });
     }
-    if target == root_ip {
-        step_ips.push(instr_ip);
+    if target == location.root_ip {
+        step_ips.push(location.instr_ip);
         steps.push(TraceStep::JumpToRoot);
         return Ok(TraceBranchOutcome::Finish(JitTraceTerminal::LoopBack));
     }
     if target < *ip {
-        step_ips.push(instr_ip);
+        step_ips.push(location.instr_ip);
         steps.push(TraceStep::JumpToIp { target_ip: target });
         return Ok(TraceBranchOutcome::Finish(JitTraceTerminal::BranchExit));
     }

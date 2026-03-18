@@ -76,6 +76,8 @@ static STAGE_METRICS_VM_US: AtomicU64 = AtomicU64::new(0);
 static STAGE_METRICS_RESOLVE_US: AtomicU64 = AtomicU64::new(0);
 static STAGE_METRICS_TOTAL_US: AtomicU64 = AtomicU64::new(0);
 
+type HttpResponseResult<T> = Result<T, Box<Response<Body>>>;
+
 fn stage_metrics_enabled() -> bool {
     *STAGE_METRICS_ENABLED.get_or_init(|| std::env::var_os("PD_EDGE_STAGE_METRICS").is_some())
 }
@@ -1073,7 +1075,7 @@ async fn handle_data_plane_http_request_context(
         downstream_http1_upgrade,
     ) {
         Ok(prepared) => prepared,
-        Err(response) => return finalize_data_plane_response(&state, started, response, 0),
+        Err(response) => return finalize_data_plane_response(&state, started, *response, 0),
     };
     let response_stream_notify = prepared
         .vm_context
@@ -1160,7 +1162,6 @@ struct PreparedDataPlaneHttpRequestExecution {
     debug: VmDebugInvocation,
 }
 
-#[allow(clippy::result_large_err)]
 fn prepare_data_plane_http_request_context(
     state: &SharedState,
     vm_request: HttpRequestContext,
@@ -1168,10 +1169,10 @@ fn prepare_data_plane_http_request_context(
     downstream_http2_attachment: Option<Http2DownstreamStreamAttachment>,
     #[cfg(feature = "http3")] downstream_http3_attachment: Option<Http3DownstreamStreamAttachment>,
     downstream_http1_upgrade: Option<hyper::upgrade::OnUpgrade>,
-) -> Result<PreparedDataPlaneHttpRequestExecution, Response<Body>> {
+) -> HttpResponseResult<PreparedDataPlaneHttpRequestExecution> {
     let Some(program) = state.loaded_program_snapshot() else {
         warn!("{} no program loaded; returning 404", category_program());
-        return Err(text_response(StatusCode::NOT_FOUND, "not found"));
+        return Err(Box::new(text_response(StatusCode::NOT_FOUND, "not found")));
     };
 
     let debug = VmDebugInvocation {
@@ -1276,7 +1277,8 @@ pub(super) async fn execute_data_plane_http_request_context(
         #[cfg(feature = "http3")]
         downstream_http3_attachment,
         downstream_http1_upgrade,
-    )?;
+    )
+    .map_err(|response| *response)?;
     run_prepared_data_plane_http_request_context(
         state.clone(),
         prepared.program,
