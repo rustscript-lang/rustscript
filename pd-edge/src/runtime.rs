@@ -20,7 +20,6 @@ use crate::{
         http::{
             HttpPlaneRuntimeServicesConfig, SharedRuntimeServices,
             new_shared_http_plane_runtime_services, new_shared_plain_http1_sender_pool,
-            new_shared_upstream_client_cache, upstream_reqwest_client_builder,
         },
         new_shared_http_downstream_sessions, new_shared_http_upstream_sessions,
         new_shared_http3_downstream_sessions, new_shared_http3_upstream_sessions,
@@ -31,6 +30,7 @@ use crate::{
         DEFAULT_DOWNSTREAM_HTTP3_SESSION_STORE_CAPACITY, DEFAULT_TLS_SESSION_REUSE_STORE_CAPACITY,
         DEFAULT_UPSTREAM_HTTP_REUSE_STORE_CAPACITY, DEFAULT_UPSTREAM_HTTP3_REUSE_STORE_CAPACITY,
     },
+    control_plane_http_client::ControlPlaneHttpClient,
     control_plane_rpc::EdgeTrafficSample,
     debug_session::{SharedDebugSession, debug_session_status, new_debug_session_store},
     lock_metrics::{self, LockMetricSnapshot},
@@ -147,7 +147,7 @@ impl Default for RuntimeStoreLimits {
 pub struct SharedState {
     pub active_program: Arc<ArcSwapOption<LoadedProgram>>,
     pub max_program_bytes: usize,
-    pub client: reqwest::Client,
+    pub control_plane_client: ControlPlaneHttpClient,
     pub(crate) downstream_http2_sessions: SharedHttpDownstreamSessions,
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     pub(crate) downstream_http3_sessions: SharedHttp3DownstreamSessions,
@@ -215,13 +215,9 @@ impl SharedState {
         max_program_bytes: usize,
         store_limits: RuntimeStoreLimits,
     ) -> Self {
-        let client = upstream_reqwest_client_builder()
-            .pool_max_idle_per_host(store_limits.upstream_http_reuse_entries.max(1))
-            .build()
-            .expect("default upstream client should build");
+        let control_plane_client =
+            ControlPlaneHttpClient::new(store_limits.upstream_http_reuse_entries);
         let plain_http1_sender_pool = new_shared_plain_http1_sender_pool();
-        let upstream_client_cache =
-            new_shared_upstream_client_cache(store_limits.upstream_http_reuse_entries);
         let tls_session_cache =
             new_shared_tls_session_cache(store_limits.tls_session_reuse_entries);
         let upstream_http_sessions =
@@ -236,10 +232,8 @@ impl SharedState {
         let runtime_services =
             new_shared_http_plane_runtime_services(HttpPlaneRuntimeServicesConfig {
                 rate_limiter: rate_limiter.clone(),
-                upstream_client: client.clone(),
                 plain_http1_sender_pool,
                 upstream_http_reuse_entries: store_limits.upstream_http_reuse_entries,
-                upstream_client_cache: upstream_client_cache.clone(),
                 tls_session_cache: tls_session_cache.clone(),
                 upstream_http_sessions: upstream_http_sessions.clone(),
                 upstream_http3_sessions: upstream_http3_sessions.clone(),
@@ -248,7 +242,7 @@ impl SharedState {
         Self {
             active_program: Arc::new(ArcSwapOption::from(None::<Arc<LoadedProgram>>)),
             max_program_bytes,
-            client,
+            control_plane_client,
             downstream_http2_sessions,
             downstream_http3_sessions,
             rate_limiter,

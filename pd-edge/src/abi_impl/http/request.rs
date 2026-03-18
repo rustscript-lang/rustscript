@@ -1,4 +1,3 @@
-use axum::http::HeaderName;
 use edge_abi::symbols::http::request as http_request;
 use pd_edge_host_function::pd_edge_host_function;
 use vm::{CallOutcome, Value, Vm, VmError};
@@ -102,16 +101,9 @@ fn get_request_http_version(context: SharedProxyVmContext) -> Result<CallOutcome
 /// Returns the first value for a header on the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_HEADER.name, scope = http)]
 fn get_request_header(context: SharedProxyVmContext, name: String) -> Result<CallOutcome, VmError> {
-    let header_name = HeaderName::from_bytes(name.as_bytes())
-        .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
-    let value = context.with_request_head(|request_head| {
-        request_head
-            .headers()
-            .get(&header_name)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string()
-    });
+    let value = context
+        .with_request_head(|request_head| request_head.lazy_headers().get_str(&name))
+        .unwrap_or_default();
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 

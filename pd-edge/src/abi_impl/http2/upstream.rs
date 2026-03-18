@@ -22,11 +22,9 @@ use crate::cache::ShardedRwLruStore;
 use crate::lock_metrics::{self, LockMetricKey, ProfiledMutexGuard};
 #[cfg(feature = "http2")]
 use axum::{
-    body::Bytes,
+    body::Body,
     http::{HeaderMap, HeaderValue, Method, Request, header::HOST},
 };
-#[cfg(feature = "http2")]
-use http_body_util::Full;
 #[cfg(feature = "http2")]
 use hyper::{Response, body::Incoming};
 #[cfg(feature = "http2")]
@@ -88,7 +86,7 @@ struct Http2RequestParts<'a> {
     target_host_header: Option<&'a str>,
     method: Method,
     headers: HeaderMap,
-    request_body: Vec<u8>,
+    request_body: Body,
 }
 
 pub(crate) fn new_shared_http_upstream_sessions(capacity: usize) -> SharedHttpUpstreamSessions {
@@ -213,7 +211,7 @@ struct Http2UpstreamSessionDagState {
 #[derive(Debug)]
 struct Http2UpstreamSession {
     session_id: u64,
-    sender: hyper::client::conn::http2::SendRequest<Full<Bytes>>,
+    sender: hyper::client::conn::http2::SendRequest<Body>,
     peer_addr: String,
     negotiated_alpn: Option<String>,
     peer_certificate_der: Option<Vec<u8>>,
@@ -303,7 +301,7 @@ impl Http2UpstreamSession {
 
     fn new(
         session_id: u64,
-        sender: hyper::client::conn::http2::SendRequest<Full<Bytes>>,
+        sender: hyper::client::conn::http2::SendRequest<Body>,
         peer_addr: String,
         negotiated_alpn: Option<String>,
         peer_certificate_der: Option<Vec<u8>>,
@@ -661,7 +659,8 @@ pub(crate) struct Http2SendRequest<'a> {
     pub(crate) tls_flow: &'a TlsFlowState,
     pub(crate) method: Method,
     pub(crate) headers: HeaderMap,
-    pub(crate) request_body: Vec<u8>,
+    pub(crate) request_body: Body,
+    pub(crate) request_body_present: bool,
 }
 
 #[cfg(feature = "http2")]
@@ -682,6 +681,7 @@ pub(crate) async fn send_request(
         method,
         headers,
         request_body,
+        request_body_present,
     } = request;
     let session = acquire_or_open_session(
         sessions,
@@ -703,7 +703,6 @@ pub(crate) async fn send_request(
     })?;
 
     let stream_ref = session.reserve_stream(exchange_handle)?;
-    let request_body_present = !request_body.is_empty();
     let request = build_http2_request(Http2RequestParts {
         request_path,
         request_query,
@@ -813,9 +812,7 @@ where
 }
 
 #[cfg(feature = "http2")]
-fn build_http2_request(
-    parts: Http2RequestParts<'_>,
-) -> Result<Request<Full<Bytes>>, Http2RequestError> {
+fn build_http2_request(parts: Http2RequestParts<'_>) -> Result<Request<Body>, Http2RequestError> {
     let path = if parts.request_path.is_empty() {
         "/"
     } else {
@@ -847,7 +844,7 @@ fn build_http2_request(
         request = request.header(name, value);
     }
     request
-        .body(Full::new(Bytes::from(parts.request_body)))
+        .body(parts.request_body)
         .map_err(|err| Http2RequestError::transport(format!("invalid http2 request: {err}")))
 }
 
@@ -970,9 +967,9 @@ async fn connect_cleartext_http2(
     session_id: u64,
 ) -> Result<
     (
-        hyper::client::conn::http2::SendRequest<Full<Bytes>>,
+        hyper::client::conn::http2::SendRequest<Body>,
         String,
-        hyper::client::conn::http2::Connection<TokioIo<TcpStream>, Full<Bytes>, TokioExecutor>,
+        hyper::client::conn::http2::Connection<TokioIo<TcpStream>, Body, TokioExecutor>,
     ),
     Http2RequestError,
 > {
@@ -1009,12 +1006,12 @@ async fn connect_tls_http2(
     session_id: u64,
 ) -> Result<
     (
-        hyper::client::conn::http2::SendRequest<Full<Bytes>>,
+        hyper::client::conn::http2::SendRequest<Body>,
         Option<String>,
         Option<Vec<u8>>,
         hyper::client::conn::http2::Connection<
             TokioIo<tokio_rustls::client::TlsStream<TcpStream>>,
-            Full<Bytes>,
+            Body,
             TokioExecutor,
         >,
         String,
@@ -1096,7 +1093,7 @@ async fn connect_tls_http2(
 
 #[cfg(feature = "http2")]
 fn spawn_http2_connection<T>(
-    connection: hyper::client::conn::http2::Connection<T, Full<Bytes>, TokioExecutor>,
+    connection: hyper::client::conn::http2::Connection<T, Body, TokioExecutor>,
     session: Arc<Http2UpstreamSession>,
 ) where
     T: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,

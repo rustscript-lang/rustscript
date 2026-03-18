@@ -207,7 +207,7 @@ async fn direct_vm_io_protocol_handles_accept_direct_integer_arguments() {
     {
         Arc::get_mut(&mut context)
             .expect("vm context should be uniquely owned")
-            .attach_upstream_client(reqwest::Client::new());
+            .attach_upstream_http1_support(8);
     }
 
     run_edge_program_direct(compiled.program, context.clone())

@@ -27,6 +27,7 @@ use tokio::{
 };
 use vm::VmError;
 
+use crate::abi_impl::http::LazyHttpHeaders;
 use crate::abi_impl::transport::HTTP11_ALPN_PROTOCOL;
 #[cfg(feature = "tls")]
 use crate::abi_impl::transport::{
@@ -56,6 +57,7 @@ static HTTP1_POOL_METRICS_REUSED: AtomicU64 = AtomicU64::new(0);
 static HTTP1_POOL_METRICS_DROPPED_DIRTY: AtomicU64 = AtomicU64::new(0);
 static HTTP1_POOL_METRICS_PARSE_FAILURES: AtomicU64 = AtomicU64::new(0);
 static HTTP1_POOL_METRICS_CLOSE_DELIMITED: AtomicU64 = AtomicU64::new(0);
+const HTTP1_CHUNK_WRITE_OVERHEAD_BYTES: usize = 32;
 
 #[derive(Debug)]
 enum RawHttp1Stream {
@@ -68,13 +70,14 @@ enum RawHttp1Stream {
 struct RawHttp1Connection {
     stream: RawHttp1Stream,
     buffered: BytesMut,
+    write_scratch: BytesMut,
     negotiated_alpn: Option<String>,
     peer_certificate_der: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Http1PoolKey {
-    Plain(String),
+    Plain(Arc<str>),
     #[cfg(feature = "tls")]
     Tls(TlsSessionCacheKey),
 }
@@ -134,6 +137,7 @@ pub(crate) struct PlainHttp1SenderLease {
 pub(crate) struct PlainHttp1ResponseBody {
     lease: PlainHttp1SenderLease,
     kind: PlainHttp1BodyKind,
+    trailers: Option<HeaderMap>,
 }
 
 #[derive(Debug)]
@@ -160,8 +164,23 @@ pub(crate) struct OutboundHttp1ForwardResponse {
 pub(crate) struct OutboundHttp1Request {
     pub(crate) method: Method,
     pub(crate) path_and_query: String,
-    pub(crate) headers: HeaderMap,
+    pub(crate) headers: OutboundHttp1RequestHeaders,
     pub(crate) body: OutboundHttp1RequestBody,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum OutboundHttp1RequestHeaders {
+    Parsed(HeaderMap),
+    InheritedFiltered {
+        headers: LazyHttpHeaders,
+        host_header: Option<String>,
+    },
+}
+
+impl From<HeaderMap> for OutboundHttp1RequestHeaders {
+    fn from(headers: HeaderMap) -> Self {
+        Self::Parsed(headers)
+    }
 }
 
 pub(crate) enum OutboundHttp1RequestBody {
@@ -213,9 +232,10 @@ pub(crate) enum OutboundHttp1Scheme {
 #[derive(Clone, Debug)]
 pub(crate) struct OutboundHttp1Target {
     pub(crate) scheme: OutboundHttp1Scheme,
-    pub(crate) authority: String,
-    pub(crate) host: String,
+    pub(crate) authority: Arc<str>,
+    pub(crate) host: Arc<str>,
     pub(crate) port: u16,
+    pub(crate) plain_pool_key: Option<Arc<str>>,
     #[cfg(feature = "tls")]
     pub(crate) tls_flow: Option<TlsFlowState>,
 }
@@ -451,7 +471,7 @@ impl tokio::io::AsyncWrite for RawHttp1Stream {
 }
 
 fn plain_pool_key(authority: &str) -> Http1PoolKey {
-    Http1PoolKey::Plain(format!("http://{authority}"))
+    Http1PoolKey::Plain(Arc::from(format!("http://{authority}")))
 }
 
 #[cfg(feature = "tls")]
@@ -471,11 +491,15 @@ fn tls_pool_key(
 
 fn target_pool_key(target: &OutboundHttp1Target) -> Result<Http1PoolKey, VmError> {
     match &target.scheme {
-        OutboundHttp1Scheme::Http => Ok(plain_pool_key(&target.authority)),
+        OutboundHttp1Scheme::Http => Ok(target
+            .plain_pool_key
+            .as_ref()
+            .map(|key| Http1PoolKey::Plain(key.clone()))
+            .unwrap_or_else(|| plain_pool_key(target.authority.as_ref()))),
         #[cfg(feature = "tls")]
         OutboundHttp1Scheme::Https => tls_pool_key(
-            &target.authority,
-            &target.host,
+            target.authority.as_ref(),
+            target.host.as_ref(),
             target.port,
             target.tls_flow.as_ref().ok_or_else(|| {
                 VmError::HostError(format!(
@@ -516,7 +540,7 @@ async fn acquire_plain_http1_connection(
     }
 
     let connect_started = Instant::now();
-    let stream = TcpStream::connect((target.host.as_str(), target.port))
+    let stream = TcpStream::connect((target.host.as_ref(), target.port))
         .await
         .map_err(|err| {
             VmError::HostError(format!("failed to connect to {}: {err}", target.authority,))
@@ -533,6 +557,7 @@ async fn acquire_plain_http1_connection(
                 connection: PlainHttp1PooledConnection {
                     stream: RawHttp1Stream::Tcp(stream),
                     buffered: BytesMut::with_capacity(8 * 1024),
+                    write_scratch: BytesMut::with_capacity(8 * 1024),
                     negotiated_alpn: Some(HTTP11_ALPN_PROTOCOL.to_string()),
                     peer_certificate_der: None,
                 },
@@ -554,7 +579,7 @@ async fn acquire_plain_http1_connection(
             let server_name_value = if !tls_flow.server_name().is_empty() {
                 tls_flow.server_name().to_string()
             } else {
-                target.host.clone()
+                target.host.as_ref().to_string()
             };
             let server_name = ServerName::try_from(server_name_value.clone()).map_err(|err| {
                 VmError::HostError(format!(
@@ -588,6 +613,7 @@ async fn acquire_plain_http1_connection(
                 connection: PlainHttp1PooledConnection {
                     stream: RawHttp1Stream::Tls(Box::new(tls_stream)),
                     buffered: BytesMut::with_capacity(8 * 1024),
+                    write_scratch: BytesMut::with_capacity(8 * 1024),
                     negotiated_alpn,
                     peer_certificate_der,
                 },
@@ -672,7 +698,11 @@ impl Drop for PlainHttp1SenderLease {
 
 impl PlainHttp1ResponseBody {
     fn new(lease: PlainHttp1SenderLease, kind: PlainHttp1BodyKind) -> Self {
-        Self { lease, kind }
+        Self {
+            lease,
+            kind,
+            trailers: None,
+        }
     }
 
     fn take_buffer_prefix(&mut self, count: usize) -> Result<Bytes, VmError> {
@@ -712,6 +742,37 @@ impl PlainHttp1ResponseBody {
                 return Ok(None);
             }
         }
+    }
+
+    fn record_trailer_line(&mut self, line: &[u8]) -> Result<(), VmError> {
+        let Some(separator) = line.iter().position(|byte| *byte == b':') else {
+            note_http1_pool_parse_failure();
+            self.lease.mark_dirty();
+            return Err(VmError::HostError(
+                "invalid plain http/1.1 trailer line".to_string(),
+            ));
+        };
+        let name = HeaderName::from_bytes(&line[..separator]).map_err(|err| {
+            note_http1_pool_parse_failure();
+            self.lease.mark_dirty();
+            VmError::HostError(format!("invalid plain http/1.1 trailer name: {err}",))
+        })?;
+        let value =
+            HeaderValue::from_bytes(line[separator + 1..].trim_ascii_start()).map_err(|err| {
+                note_http1_pool_parse_failure();
+                self.lease.mark_dirty();
+                VmError::HostError(format!(
+                    "invalid plain http/1.1 trailer value for `{name}`: {err}",
+                ))
+            })?;
+        self.trailers
+            .get_or_insert_with(HeaderMap::new)
+            .append(name, value);
+        Ok(())
+    }
+
+    pub(crate) fn take_trailers(&mut self) -> Option<HeaderMap> {
+        self.trailers.take()
     }
 
     pub(crate) async fn pull_next(&mut self) -> Result<Option<Bytes>, VmError> {
@@ -864,6 +925,7 @@ impl PlainHttp1ResponseBody {
                                 self.kind = PlainHttp1BodyKind::Done;
                                 return Ok(None);
                             }
+                            self.record_trailer_line(&line)?;
                             self.kind = PlainHttp1BodyKind::Chunked {
                                 state: ChunkedState::ReadTrailers,
                             };
@@ -919,6 +981,26 @@ fn version_from_http11_minor(minor: Option<u8>) -> Version {
         Some(1) => Version::HTTP_11,
         _ => Version::HTTP_11,
     }
+}
+
+fn append_chunk_prefix(encoded: &mut BytesMut, len: usize) {
+    let mut value = len;
+    let mut digits = [0u8; usize::BITS as usize / 4];
+    let mut index = digits.len();
+    loop {
+        index -= 1;
+        let digit = (value & 0x0f) as u8;
+        digits[index] = match digit {
+            0..=9 => b'0' + digit,
+            _ => b'A' + (digit - 10),
+        };
+        value >>= 4;
+        if value == 0 {
+            break;
+        }
+    }
+    encoded.extend_from_slice(&digits[index..]);
+    encoded.extend_from_slice(b"\r\n");
 }
 
 async fn parse_response_head(
@@ -1002,56 +1084,85 @@ async fn parse_response_head(
     }
 }
 
-struct SerializedRequestHead {
-    head: Bytes,
-    use_chunked_body: bool,
+fn is_hop_by_hop_header_name(name: &str) -> bool {
+    let name = name.as_bytes();
+    name.eq_ignore_ascii_case(b"connection")
+        || name.eq_ignore_ascii_case(b"keep-alive")
+        || name.eq_ignore_ascii_case(b"proxy-authenticate")
+        || name.eq_ignore_ascii_case(b"proxy-authorization")
+        || name.eq_ignore_ascii_case(b"te")
+        || name.eq_ignore_ascii_case(b"trailer")
+        || name.eq_ignore_ascii_case(b"transfer-encoding")
+        || name.eq_ignore_ascii_case(b"upgrade")
 }
 
-fn serialize_request_head(
-    request: &OutboundHttp1Request,
+fn encode_request_headers(
+    encoded: &mut BytesMut,
+    headers: &OutboundHttp1RequestHeaders,
     authority: &str,
-) -> SerializedRequestHead {
-    let method = &request.method;
-    let path_and_query = &request.path_and_query;
-    let headers = &request.headers;
-    let path = if path_and_query.is_empty() {
-        "/"
-    } else {
-        path_and_query.as_str()
-    };
-    let body_content_length = request.body.content_length();
-    let mut encoded = BytesMut::with_capacity(
-        method.as_str().len()
-            + path.len()
-            + headers
-                .iter()
-                .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 4)
-                .sum::<usize>()
-            + 128,
-    );
-    encoded.extend_from_slice(method.as_str().as_bytes());
-    encoded.extend_from_slice(b" ");
-    encoded.extend_from_slice(path.as_bytes());
-    encoded.extend_from_slice(b" HTTP/1.1\r\n");
-
+) -> (bool, bool, bool, bool) {
     let mut has_host = false;
     let mut has_content_length = false;
     let mut has_connection = false;
     let mut has_transfer_encoding = false;
-    for (name, value) in headers {
-        if name == HOST {
-            has_host = true;
-        } else if name == CONTENT_LENGTH {
-            has_content_length = true;
-        } else if name == CONNECTION {
-            has_connection = true;
-        } else if name == TRANSFER_ENCODING {
-            has_transfer_encoding = true;
+    match headers {
+        OutboundHttp1RequestHeaders::Parsed(headers) => {
+            for (name, value) in headers {
+                if name == HOST {
+                    has_host = true;
+                } else if name == CONTENT_LENGTH {
+                    has_content_length = true;
+                } else if name == CONNECTION {
+                    has_connection = true;
+                } else if name == TRANSFER_ENCODING {
+                    has_transfer_encoding = true;
+                }
+                encoded.extend_from_slice(name.as_str().as_bytes());
+                encoded.extend_from_slice(b": ");
+                encoded.extend_from_slice(value.as_bytes());
+                encoded.extend_from_slice(b"\r\n");
+            }
         }
-        encoded.extend_from_slice(name.as_str().as_bytes());
-        encoded.extend_from_slice(b": ");
-        encoded.extend_from_slice(value.as_bytes());
-        encoded.extend_from_slice(b"\r\n");
+        OutboundHttp1RequestHeaders::InheritedFiltered {
+            headers,
+            host_header,
+        } => {
+            headers.for_each_header(|name, value| {
+                if name.eq_ignore_ascii_case(HOST.as_str()) {
+                    has_host = true;
+                    return;
+                }
+                if name.eq_ignore_ascii_case(CONTENT_LENGTH.as_str()) {
+                    has_content_length = true;
+                    return;
+                }
+                if name.eq_ignore_ascii_case(CONNECTION.as_str()) {
+                    has_connection = true;
+                    return;
+                }
+                if name.eq_ignore_ascii_case(TRANSFER_ENCODING.as_str()) {
+                    has_transfer_encoding = true;
+                    return;
+                }
+                if is_hop_by_hop_header_name(name) {
+                    return;
+                }
+                encoded.extend_from_slice(name.as_bytes());
+                encoded.extend_from_slice(b": ");
+                encoded.extend_from_slice(value);
+                encoded.extend_from_slice(b"\r\n");
+            });
+            if let Some(host) = host_header {
+                has_host = true;
+                encoded.extend_from_slice(HOST.as_str().as_bytes());
+                encoded.extend_from_slice(b": ");
+                encoded.extend_from_slice(host.as_bytes());
+                encoded.extend_from_slice(b"\r\n");
+            }
+            has_connection = false;
+            has_transfer_encoding = false;
+            has_content_length = false;
+        }
     }
     if !has_host {
         encoded.extend_from_slice(HOST.as_str().as_bytes());
@@ -1059,6 +1170,36 @@ fn serialize_request_head(
         encoded.extend_from_slice(authority.as_bytes());
         encoded.extend_from_slice(b"\r\n");
     }
+    (
+        has_host,
+        has_content_length,
+        has_connection,
+        has_transfer_encoding,
+    )
+}
+
+fn serialize_request_head_into(
+    request: &OutboundHttp1Request,
+    authority: &str,
+    encoded: &mut BytesMut,
+) -> bool {
+    let method = &request.method;
+    let path_and_query = &request.path_and_query;
+    let path = if path_and_query.is_empty() {
+        "/"
+    } else {
+        path_and_query.as_str()
+    };
+    let body_content_length = request.body.content_length();
+    encoded.clear();
+    encoded.reserve(method.as_str().len() + path.len() + 128);
+    encoded.extend_from_slice(method.as_str().as_bytes());
+    encoded.extend_from_slice(b" ");
+    encoded.extend_from_slice(path.as_bytes());
+    encoded.extend_from_slice(b" HTTP/1.1\r\n");
+
+    let (_has_host, has_content_length, has_connection, has_transfer_encoding) =
+        encode_request_headers(encoded, &request.headers, authority);
     let use_chunked_body =
         !has_transfer_encoding && !has_content_length && body_content_length.is_none();
     if !has_content_length
@@ -1078,10 +1219,7 @@ fn serialize_request_head(
         encoded.extend_from_slice(b": keep-alive\r\n");
     }
     encoded.extend_from_slice(b"\r\n");
-    SerializedRequestHead {
-        head: encoded.freeze(),
-        use_chunked_body,
-    }
+    use_chunked_body
 }
 
 pub(crate) async fn forward_via_sender_pool<F>(
@@ -1115,7 +1253,7 @@ where
     let mut parsed_response = match send_and_parse_response(
         &mut connection,
         request,
-        target.authority.as_str(),
+        target.authority.as_ref(),
         &request_method,
     )
     .await
@@ -1142,7 +1280,7 @@ where
             let parsed = send_and_parse_response(
                 &mut connection,
                 request,
-                target.authority.as_str(),
+                target.authority.as_ref(),
                 &retry_method,
             )
             .await
@@ -1241,15 +1379,17 @@ async fn send_request(
     request: OutboundHttp1Request,
     authority: &str,
 ) -> Result<(), VmError> {
-    let SerializedRequestHead {
-        head,
-        use_chunked_body,
-    } = serialize_request_head(&request, authority);
-    connection.stream.write_all(&head).await.map_err(|err| {
-        VmError::HostError(format!(
-            "failed to write plain http/1.1 upstream request: {err}"
-        ))
-    })?;
+    let use_chunked_body =
+        serialize_request_head_into(&request, authority, &mut connection.write_scratch);
+    connection
+        .stream
+        .write_all(&connection.write_scratch)
+        .await
+        .map_err(|err| {
+            VmError::HostError(format!(
+                "failed to write plain http/1.1 upstream request: {err}"
+            ))
+        })?;
     send_request_body(connection, request.body, use_chunked_body).await
 }
 
@@ -1288,10 +1428,14 @@ async fn send_request_body(
                     *remaining_bytes -= chunk_len;
                 }
                 if use_chunked_body {
-                    let header = format!("{:X}\r\n", chunk.len());
+                    connection.write_scratch.clear();
+                    connection
+                        .write_scratch
+                        .reserve(HTTP1_CHUNK_WRITE_OVERHEAD_BYTES + chunk.len());
+                    append_chunk_prefix(&mut connection.write_scratch, chunk.len());
                     connection
                         .stream
-                        .write_all(header.as_bytes())
+                        .write_all(&connection.write_scratch)
                         .await
                         .map_err(|err| {
                             VmError::HostError(format!(
@@ -1321,9 +1465,11 @@ async fn send_request_body(
                 ));
             }
             if use_chunked_body {
+                connection.write_scratch.clear();
+                connection.write_scratch.extend_from_slice(b"0\r\n\r\n");
                 connection
                     .stream
-                    .write_all(b"0\r\n\r\n")
+                    .write_all(&connection.write_scratch)
                     .await
                     .map_err(|err| {
                         VmError::HostError(format!(
@@ -1347,6 +1493,7 @@ mod tests {
         http::{HeaderMap, Method, Version},
     };
     use futures_util::stream::try_unfold;
+    use std::sync::Arc;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -1409,9 +1556,10 @@ mod tests {
         let pool = new_shared_plain_http1_sender_pool();
         let target = OutboundHttp1Target {
             scheme: OutboundHttp1Scheme::Http,
-            authority: format!("127.0.0.1:{}", addr.port()),
-            host: "127.0.0.1".to_string(),
+            authority: Arc::from(format!("127.0.0.1:{}", addr.port())),
+            host: Arc::from("127.0.0.1"),
             port: addr.port(),
+            plain_pool_key: None,
             #[cfg(feature = "tls")]
             tls_flow: None,
         };
@@ -1441,7 +1589,7 @@ mod tests {
                 Ok(OutboundHttp1Request {
                     method: Method::POST,
                     path_and_query: "/".to_string(),
-                    headers: HeaderMap::new(),
+                    headers: HeaderMap::new().into(),
                     body: OutboundHttp1RequestBody::Streaming {
                         content_length: Some(10),
                         stream,

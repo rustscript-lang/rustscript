@@ -734,6 +734,63 @@ async fn http_proxy_reuses_plain_http1_upstream_connection_for_non_empty_forward
 }
 
 #[tokio::test]
+async fn proxy_forward_default_upstream_overlays_response_headers() {
+    let upstream_app = Router::new().fallback(any(|_request: Request<Body>| async move {
+        let mut response = Response::new(Body::empty());
+        response.headers_mut().insert(
+            "x-upstream-test",
+            "ok".parse().expect("header should parse"),
+        );
+        response
+    }));
+    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use proxy;
+
+        let upstream = http::exchange::default_upstream();
+        http::exchange::set_target(upstream, "127.0.0.1", {});
+        proxy::forward_default_upstream([
+            "x-bench-response-header", "program-proxy"
+        ]);
+    "#,
+        upstream_addr.port()
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .get(format!("http://{data_addr}/perf"))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream-test")
+            .and_then(|value| value.to_str().ok()),
+        Some("ok")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-bench-response-header")
+            .and_then(|value| value.to_str().ok()),
+        Some("program-proxy")
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
 async fn http_proxy_reuses_plain_http1_upstream_connection_for_chunked_forwarded_bodies() {
     use std::sync::{
         Arc,
@@ -1871,7 +1928,7 @@ async fn direct_vm_can_read_upstream_response_line_by_line_via_io_handle_api() {
     {
         Arc::get_mut(&mut context)
             .expect("vm context should be uniquely owned")
-            .attach_upstream_client(reqwest::Client::new());
+            .attach_upstream_http1_support(8);
     }
 
     run_edge_program_direct(compiled.program, context.clone())
@@ -1898,12 +1955,7 @@ async fn sample_subrequest_proxy_program_fans_out_across_default_and_dynamic_exc
     let (_secure_addr, secure_handle) =
         spawn_https_echo_upstream_on(loopback_addr(SAMPLE_SUBREQUEST_SECONDARY_PORT)).await;
 
-    let mut state = SharedState::new(1024 * 1024);
-    state.client = reqwest::Client::builder()
-        .tls_info(true)
-        .danger_accept_invalid_certs(true)
-        .build()
-        .expect("tls test client should build");
+    let state = SharedState::new(1024 * 1024);
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy_with_state(state).await;
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

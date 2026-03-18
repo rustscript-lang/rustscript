@@ -719,17 +719,6 @@ pub(crate) fn new_shared_tls_session_cache(capacity: usize) -> SharedTlsSessionC
     Arc::new(ShardedRwLruStore::new(capacity))
 }
 
-impl TlsProtocolVersion {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Tls1_0 => "1.0",
-            Self::Tls1_1 => "1.1",
-            Self::Tls1_2 => "1.2",
-            Self::Tls1_3 => "1.3",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TlsFlowState {
     present: bool,

@@ -12,7 +12,7 @@ use super::{
     headers_to_value_map, is_valid_request_path, lookup_cached_header_batch,
     outbound_exchange_exists, outbound_exchange_response_eof, parse_header, parse_header_name,
     read_outbound_exchange_response_all, read_outbound_exchange_response_next_chunk,
-    serialize_query_pairs, store_cached_header_batch,
+    read_outbound_exchange_response_trailers, serialize_query_pairs, store_cached_header_batch,
 };
 use crate::abi_impl::schedule_current_future_call;
 
@@ -580,6 +580,36 @@ async fn get_exchange_body(
     Ok(CallOutcome::Return(vec![Value::string(
         String::from_utf8_lossy(&body).into_owned(),
     )]))
+}
+
+/// Returns the first trailer value for the outbound HTTP exchange.
+#[pd_edge_host_function(name = "http::exchange::get_trailer", scope = http)]
+async fn get_exchange_trailer(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    exchange: i64,
+    name: String,
+) -> Result<CallOutcome, VmError> {
+    let header_name = HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| VmError::HostError(format!("invalid trailer name '{name}'")))?;
+    let trailers = read_outbound_exchange_response_trailers(&context, exchange).await?;
+    let value = trailers
+        .get(&header_name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    Ok(CallOutcome::Return(vec![Value::string(value)]))
+}
+
+/// Returns all trailers on the outbound HTTP exchange as a map.
+#[pd_edge_host_function(name = "http::exchange::get_trailers", scope = http)]
+async fn get_exchange_trailers(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    exchange: i64,
+) -> Result<CallOutcome, VmError> {
+    let trailers = read_outbound_exchange_response_trailers(&context, exchange).await?;
+    Ok(CallOutcome::Return(vec![headers_to_value_map(&trailers)]))
 }
 
 /// Returns the HTTP version for the outbound HTTP exchange.

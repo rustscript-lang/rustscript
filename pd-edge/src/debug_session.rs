@@ -7,14 +7,14 @@ use std::{
     time::Duration,
 };
 
-use axum::http::{HeaderMap, HeaderName, StatusCode};
+use axum::http::{HeaderName, StatusCode};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use vm::{DebugCommandBridge, DebugCommandBridgeError, Debugger, Vm, VmResult, VmStatus};
 
 use crate::{
-    abi_impl::SharedProxyVmContext,
+    abi_impl::{SharedProxyVmContext, http::LazyHttpHeaders},
     control_plane_rpc::{DebugSessionMode, RemoteDebugCommand, RemoteDebugCommandResponse},
     logging::category_debug,
 };
@@ -358,7 +358,7 @@ pub fn run_vm_with_optional_debugger(
 
     if let Some(session) = session {
         let matched = context.with_request_head(|request_head| {
-            request_matches_session(request_head.headers(), request_head.path(), &session)
+            request_matches_session(request_head.lazy_headers(), request_head.path(), &session)
         });
         if !matched {
             return vm.run();
@@ -457,7 +457,7 @@ pub fn run_vm_with_optional_debugger(
 
 pub fn request_will_attach_debugger(
     store: &SharedDebugSession,
-    request_headers: &HeaderMap,
+    request_headers: &LazyHttpHeaders,
     request_path: &str,
 ) -> bool {
     if !store.active.load(Ordering::Relaxed) {
@@ -475,7 +475,7 @@ pub fn request_will_attach_debugger(
 
 pub fn request_uses_blocking_debugger(
     store: &SharedDebugSession,
-    request_headers: &HeaderMap,
+    request_headers: &LazyHttpHeaders,
     request_path: &str,
 ) -> bool {
     if !store.active.load(Ordering::Relaxed) {
@@ -537,15 +537,14 @@ fn stop_debug_session_if_match(store: &SharedDebugSession, active: &Arc<DebugSes
 }
 
 fn request_matches_session(
-    request_headers: &HeaderMap,
+    request_headers: &LazyHttpHeaders,
     request_path: &str,
     session: &DebugSession,
 ) -> bool {
     let header_match = match (&session.header_name, &session.header_value) {
         (Some(name), Some(expected)) => request_headers
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value == expected)
+            .get_str(name.as_str())
+            .map(|value| value == *expected)
             .unwrap_or(false),
         _ => true,
     };

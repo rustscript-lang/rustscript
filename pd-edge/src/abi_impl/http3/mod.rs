@@ -11,7 +11,8 @@ pub(crate) use self::model::{
 };
 #[cfg(feature = "http3")]
 pub(crate) use self::upstream::{
-    Http3RequestError, Http3SendRequestOptions, classify_http3_error, send_request,
+    Http3RequestBody, Http3RequestError, Http3SendRequestOptions, classify_http3_error,
+    send_request,
 };
 pub(crate) use self::upstream::{
     Http3ResponseBodyTracker, SharedHttp3UpstreamSessions, new_shared_http3_upstream_sessions,

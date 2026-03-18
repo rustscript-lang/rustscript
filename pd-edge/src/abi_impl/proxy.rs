@@ -1127,25 +1127,19 @@ async fn proxy_prepare_and_forward_default_upstream(
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, sync::Arc};
+    use std::sync::Arc;
 
-    use axum::{
-        Router,
-        body::{Body, to_bytes},
-        http::{HeaderMap, Request},
-        routing::any,
-    };
-    use reqwest::Client;
-    use vm::Value;
+    use axum::{body::Body, http::HeaderMap};
 
     use super::{
-        ProxyByteStreamEndpoint, ProxyReadStep, allocate_proxy_stream_handle, drive_bridge,
-        drive_pipe, endpoint_from_tls_plaintext, proxy_stream_close_write, proxy_stream_read_step,
-        proxy_stream_write_bytes, try_native_forward,
+        ProxyByteStreamEndpoint, allocate_proxy_stream_handle, endpoint_from_tls_plaintext,
     };
     use crate::abi_impl::{
         RateLimiterStore,
-        http::{self as edge_http, HttpRequestContext, ProxyVmContext, SharedProxyVmContext},
+        http::{
+            self as edge_http, HttpRequestContext, LazyRequestId, ProxyVmContext, RequestPortField,
+            RequestStringField, SharedProxyVmContext,
+        },
         transport::TlsSessionRef,
     };
 
@@ -1162,62 +1156,20 @@ mod tests {
         }
         Arc::new(ProxyVmContext::from_http_request(
             HttpRequestContext {
-                request_id: "req-1".to_string(),
+                request_id: LazyRequestId::from_string("req-1".to_string()),
                 method: axum::http::Method::POST,
                 path: "/".to_string(),
-                query: String::new(),
-                http_version: "1.1".to_string(),
-                port: 80,
-                scheme: "http".to_string(),
-                host: "example.com".to_string(),
-                client_ip: "127.0.0.1".to_string(),
+                query: RequestStringField::Static(String::new()),
+                http_version: RequestStringField::Static("1.1".to_string()),
+                port: RequestPortField::Static(80),
+                scheme: RequestStringField::Static("http".to_string()),
+                host: RequestStringField::Static("example.com".to_string()),
+                client_ip: RequestStringField::Static("127.0.0.1".to_string()),
                 body: Body::from(body.to_string()),
-                headers,
+                headers: headers.into(),
             },
             Arc::new(RateLimiterStore::new()),
         ))
-    }
-
-    async fn spawn_server(app: Router) -> SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let addr = listener.local_addr().expect("listener should have addr");
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("server should run");
-        });
-        addr
-    }
-
-    fn configure_default_upstream(
-        context: &mut SharedProxyVmContext,
-        host: &str,
-        port: u16,
-        path: &str,
-        client: Client,
-    ) {
-        let context = Arc::get_mut(context).expect("context should be uniquely owned");
-        context.attach_upstream_client(client);
-        context.with_request_head(|request_head| {
-            let mut exchanges = context.lock_exchanges();
-            let request = &mut exchanges
-                .exchanges
-                .get_mut(&edge_http::default_upstream_exchange_handle())
-                .expect("default upstream exchange should exist")
-                .request;
-            request
-                .set_target_host_port(host, port)
-                .expect("upstream target should be valid");
-            request.materialize_inherited_request_head(request_head);
-            request.path = path.to_string();
-            request.query.clear();
-        });
-        let mut transport = context.lock_transport();
-        transport.tcp_dag.default_upstream.configure();
-        transport
-            .tls_dag
-            .default_upstream
-            .observe_target("http", host);
     }
 
     #[test]
@@ -1233,264 +1185,6 @@ mod tests {
 
         assert!(first >= 4096);
         assert_eq!(second, first + 1);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn http_exchange_source_blocks_until_proxy_write_side_is_closed() {
-        let upstream_addr = spawn_server(Router::new().fallback(any(
-            |request: Request<Body>| async move {
-                let body = to_bytes(request.into_body(), usize::MAX)
-                    .await
-                    .expect("body should read");
-                Body::from(format!("echo:{}", String::from_utf8_lossy(&body)))
-            },
-        )))
-        .await;
-
-        let mut context = test_context("");
-        configure_default_upstream(
-            &mut context,
-            "127.0.0.1",
-            upstream_addr.port(),
-            "/echo",
-            Client::new(),
-        );
-
-        let upstream = allocate_proxy_stream_handle(
-            &context,
-            ProxyByteStreamEndpoint::HttpExchange(edge_http::default_upstream_exchange_handle()),
-        )
-        .expect("upstream stream should allocate");
-        proxy_stream_write_bytes(&context, upstream, b"payload")
-            .await
-            .expect("proxy write should succeed");
-
-        assert!(matches!(
-            proxy_stream_read_step(&context, upstream, 64)
-                .await
-                .expect("read step should succeed"),
-            ProxyReadStep::WaitingForWriteClose
-        ));
-
-        proxy_stream_close_write(&context, upstream)
-            .await
-            .expect("write close should succeed");
-        let next = proxy_stream_read_step(&context, upstream, 64)
-            .await
-            .expect("read step should succeed");
-        match next {
-            ProxyReadStep::Data(chunk) => {
-                assert_eq!(String::from_utf8_lossy(&chunk), "echo:payload");
-            }
-            ProxyReadStep::Eof | ProxyReadStep::WaitingForWriteClose | ProxyReadStep::Blocked => {
-                panic!("expected upstream body bytes after write close")
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn tunnel_round_trips_request_body_through_default_upstream_stream() {
-        let upstream_addr = spawn_server(Router::new().fallback(any(
-            |request: Request<Body>| async move {
-                let body = to_bytes(request.into_body(), usize::MAX)
-                    .await
-                    .expect("body should read");
-                Body::from(format!("echo:{}", String::from_utf8_lossy(&body)))
-            },
-        )))
-        .await;
-
-        let mut context = test_context("abcdefgh");
-        configure_default_upstream(
-            &mut context,
-            "127.0.0.1",
-            upstream_addr.port(),
-            "/echo",
-            Client::new(),
-        );
-
-        let downstream =
-            allocate_proxy_stream_handle(&context, ProxyByteStreamEndpoint::HttpDownstream)
-                .expect("downstream stream should allocate");
-        let upstream = allocate_proxy_stream_handle(
-            &context,
-            ProxyByteStreamEndpoint::HttpExchange(edge_http::default_upstream_exchange_handle()),
-        )
-        .expect("upstream stream should allocate");
-
-        let status = drive_bridge(context.clone(), downstream, upstream, 3)
-            .await
-            .expect("tunnel should succeed");
-        assert_eq!(status, "forwarded");
-
-        assert!(context.lock_downstream().response_output.body.is_none());
-
-        let resolved = edge_http::resolve_http_graph_response(&context).await;
-        let body = to_bytes(resolved.response.into_body(), usize::MAX)
-            .await
-            .expect("response body should read");
-        assert_eq!(body.as_ref(), b"echo:abcdefgh");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn native_forward_starts_default_upstream_without_materializing_response_body() {
-        let upstream_addr = spawn_server(Router::new().fallback(any(
-            |request: Request<Body>| async move {
-                let body = to_bytes(request.into_body(), usize::MAX)
-                    .await
-                    .expect("body should read");
-                Body::from(format!("echo:{}", String::from_utf8_lossy(&body)))
-            },
-        )))
-        .await;
-
-        let mut context = test_context("abcdefgh");
-        configure_default_upstream(
-            &mut context,
-            "127.0.0.1",
-            upstream_addr.port(),
-            "/echo",
-            Client::new(),
-        );
-
-        let downstream =
-            allocate_proxy_stream_handle(&context, ProxyByteStreamEndpoint::HttpDownstream)
-                .expect("downstream stream should allocate");
-        let upstream = allocate_proxy_stream_handle(
-            &context,
-            ProxyByteStreamEndpoint::HttpExchange(edge_http::default_upstream_exchange_handle()),
-        )
-        .expect("upstream stream should allocate");
-
-        let status = try_native_forward(&context, downstream, upstream)
-            .await
-            .expect("native forward should succeed");
-        assert_eq!(status.as_deref(), Some("forwarded"));
-
-        assert!(context.lock_downstream().response_output.body.is_none());
-
-        let resolved = edge_http::resolve_http_graph_response(&context).await;
-        let body = to_bytes(resolved.response.into_body(), usize::MAX)
-            .await
-            .expect("response body should read");
-        assert_eq!(body.as_ref(), b"echo:abcdefgh");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn pipe_can_forward_dynamic_exchange_response_without_proxy_writes() {
-        let upstream_addr = spawn_server(Router::new().fallback(any(
-            |request: Request<Body>| async move {
-                let body = to_bytes(request.into_body(), usize::MAX)
-                    .await
-                    .expect("body should read");
-                Body::from(format!("dyn:{}", String::from_utf8_lossy(&body)))
-            },
-        )))
-        .await;
-
-        let mut context = test_context("");
-        {
-            let context = Arc::get_mut(&mut context).expect("context should be uniquely owned");
-            context.attach_upstream_client(Client::new());
-        }
-        let exchange = edge_http::allocate_outbound_exchange_handle(&context)
-            .expect("exchange should allocate");
-        {
-            context.with_request_head(|request_head| {
-                let mut guard = context.lock_exchanges();
-                let exchange_state = guard
-                    .exchanges
-                    .get_mut(&exchange)
-                    .expect("exchange should exist");
-                exchange_state
-                    .request
-                    .set_target_host_port("127.0.0.1", upstream_addr.port())
-                    .expect("upstream target should be valid");
-                exchange_state
-                    .request
-                    .materialize_inherited_request_head(request_head);
-                exchange_state.request.path = "/dyn".to_string();
-                exchange_state.request.query.clear();
-                exchange_state.request.body_override = Some(b"payload".to_vec());
-                exchange_state.transport.tcp_flow.configure();
-                exchange_state
-                    .transport
-                    .tls_flow
-                    .observe_target("http", "127.0.0.1");
-            });
-        }
-
-        let source =
-            allocate_proxy_stream_handle(&context, ProxyByteStreamEndpoint::HttpExchange(exchange))
-                .expect("source stream should allocate");
-        let downstream =
-            allocate_proxy_stream_handle(&context, ProxyByteStreamEndpoint::HttpDownstream)
-                .expect("downstream stream should allocate");
-
-        let status = drive_pipe(context.clone(), source, downstream, 64)
-            .await
-            .expect("pipe should succeed");
-        assert_eq!(status, "eof");
-
-        let guard = context.lock_downstream();
-        assert_eq!(
-            guard.response_output.body.as_deref(),
-            Some("dyn:payload".as_bytes())
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn forward_default_upstream_with_response_headers_resolves_response() {
-        let upstream_addr = spawn_server(Router::new().fallback(any(
-            |_request: Request<Body>| async move {
-                let mut response = axum::http::Response::new(Body::empty());
-                response.headers_mut().insert(
-                    "x-upstream-test",
-                    "ok".parse().expect("header should parse"),
-                );
-                response
-            },
-        )))
-        .await;
-
-        let mut context = test_context("");
-        configure_default_upstream(
-            &mut context,
-            "127.0.0.1",
-            upstream_addr.port(),
-            "/perf",
-            Client::new(),
-        );
-
-        let status = super::forward_default_upstream_with_response_headers(
-            &context,
-            Value::array(vec![
-                Value::string("x-bench-response-header"),
-                Value::string("program-proxy"),
-            ]),
-        )
-        .await
-        .expect("forward should succeed");
-        assert_eq!(status, "forwarded");
-
-        let resolved = edge_http::resolve_http_graph_response(&context).await;
-        assert_eq!(resolved.response.status(), axum::http::StatusCode::OK);
-        assert_eq!(
-            resolved
-                .response
-                .headers()
-                .get("x-upstream-test")
-                .and_then(|value| value.to_str().ok()),
-            Some("ok")
-        );
-        assert_eq!(
-            resolved
-                .response
-                .headers()
-                .get("x-bench-response-header")
-                .and_then(|value| value.to_str().ok()),
-            Some("program-proxy")
-        );
     }
 
     #[test]

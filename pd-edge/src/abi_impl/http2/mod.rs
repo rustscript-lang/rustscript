@@ -9,8 +9,8 @@ pub(crate) use self::downstream::{
 #[cfg(test)]
 pub(crate) use self::model::Http2SessionFrontier;
 pub(crate) use self::model::{
-    Http2StreamRef, Http2UpstreamMode, configure_reqwest_builder, response_version_label,
-    select_upstream_mode, supports_response_version,
+    Http2StreamRef, Http2UpstreamMode, response_version_label, select_upstream_mode,
+    supports_response_version,
 };
 #[cfg(all(test, feature = "http2"))]
 pub(crate) use self::upstream::total_active_streams;

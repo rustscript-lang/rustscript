@@ -21,8 +21,8 @@ mod version;
 pub(crate) use exchange::prepare_default_upstream_request;
 pub(crate) use fast_path::{
     DownstreamHttp1FastBodyKind, MAX_DOWNSTREAM_HTTP1_FAST_BODY_BYTES,
-    classify_downstream_http1_fast_body, downstream_http1_fast_path_eligible,
-    downstream_http1_fast_path_expects_continue, outbound_http1_fast_path_eligible,
+    classify_downstream_http1_fast_body_lazy, downstream_http1_fast_path_eligible_lazy,
+    downstream_http1_fast_path_expects_continue_lazy, outbound_http1_fast_path_eligible,
 };
 pub(crate) use outbound_http1::new_shared_plain_http1_sender_pool;
 pub(crate) use outbound_http1::{OutboundHttp1ForwardBody, OutboundHttp1ForwardResponse};
@@ -40,27 +40,30 @@ pub(crate) use state::upstream_response_available;
 pub(crate) use state::{
     AttachedHttpTransport, DownstreamConnectTunnelPlan, DownstreamConnectTunnelTarget,
     DownstreamConnectionMetadata, DownstreamHttpListenerGoal, DownstreamPostResponsePlan,
-    HttpPlaneRuntimeServicesConfig, HttpUpstreamScheme, InlineDownstreamHttpResponse,
-    PromotedDownstreamTransport, ProxyStreamRegistry, ResolvedHttpGraphResponse,
-    ResolvedNativeHttp1DownstreamResponse, ResolvedNativeLocalHttp1DownstreamResponse,
+    Http1DownstreamResolution, HttpPlaneRuntimeServicesConfig, HttpUpstreamScheme,
+    InlineDownstreamHttpResponse, LazyRequestId, PromotedDownstreamTransport, ProxyStreamRegistry,
+    ResolvedHttpGraphResponse, ResolvedNativeHttp1DownstreamResponse,
+    ResolvedNativeLocalHttp1DownstreamResponse, ResolvedSnapshotHttp1DownstreamResponse,
     SharedRuntimeServices, allocate_tcp_stream_handle, allocate_udp_socket_handle,
     append_outbound_exchange_body, append_outbound_exchange_body_bytes,
     append_response_output_body_bytes, attach_outbound_exchange_tcp_transport,
-    build_downstream_http_request_context, consume_request_body_all,
-    default_upstream_exchange_handle, default_upstream_udp_socket_handle,
-    new_shared_http_plane_runtime_services, new_shared_upstream_client_cache,
+    build_downstream_http_request_context, build_downstream_http_request_context_from_components,
+    consume_request_body_all, default_upstream_exchange_handle, default_upstream_udp_socket_handle,
+    materialize_downstream_response_body_source, new_shared_http_plane_runtime_services,
     outbound_exchange_exists, outbound_exchange_response_available, outbound_exchange_response_eof,
-    outbound_exchange_tls_flow, read_outbound_exchange_response_all,
-    read_outbound_exchange_response_next_chunk, read_outbound_exchange_response_next_line,
+    outbound_exchange_tls_flow, read_downstream_response_trailers,
+    read_outbound_exchange_response_all, read_outbound_exchange_response_next_chunk,
+    read_outbound_exchange_response_next_line, read_outbound_exchange_response_trailers,
     read_request_body_next_chunk, read_request_body_next_line, read_upstream_response_all,
     read_upstream_response_next_chunk, read_upstream_response_next_line, request_body_eof,
-    resolve_http_graph_response, schedule_downstream_http_handoff,
-    start_native_default_upstream_http_forward_response, take_promoted_downstream_transport,
-    tcp_stream_exists, try_resolve_native_http1_downstream_response,
-    try_take_native_local_http1_downstream_response, udp_socket_exists,
-    upstream_reqwest_client_builder, upstream_response_eof,
+    resolve_http_graph_response, resolve_http1_downstream_response,
+    schedule_downstream_http_handoff, start_native_default_upstream_http_forward_response,
+    take_promoted_downstream_transport, tcp_stream_exists, udp_socket_exists,
+    upstream_response_eof,
 };
-pub use state::{HttpRequestContext, ProxyVmContext, SharedProxyVmContext};
+pub use state::{HttpRequestContext, LazyHttpHeaders, ProxyVmContext, SharedProxyVmContext};
+#[cfg(test)]
+pub(crate) use state::{RequestPortField, RequestStringField};
 #[cfg(any(feature = "http", test))]
 pub(crate) use state::{
     allocate_outbound_exchange_handle, ensure_outbound_exchange_response_started,

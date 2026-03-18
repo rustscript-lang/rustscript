@@ -6,8 +6,8 @@ use vm::{CallOutcome, Value, Vm, VmError};
 use super::state::sync_response_output_body_headers;
 use super::{
     SharedProxyVmContext, ensure_outbound_exchange_response_started, headers_to_value_map,
-    is_hop_by_hop_header, lookup_cached_header_batch, parse_header, parse_header_name,
-    read_outbound_exchange_response_all, store_cached_header_batch,
+    is_hop_by_hop_header, lookup_cached_header_batch, materialize_downstream_response_body_source,
+    parse_header, parse_header_name, read_downstream_response_trailers, store_cached_header_batch,
 };
 
 pub(crate) fn parse_response_header_batch(
@@ -111,7 +111,9 @@ fn set_response_headers(
 /// Sets the body for the downstream HTTP response.
 #[pd_edge_host_function(name = http_response::SET_BODY.name, scope = http)]
 fn set_response_body(context: SharedProxyVmContext, body: String) -> Result<CallOutcome, VmError> {
+    context.note_downstream_response_body_mutated();
     context.with_downstream_response_mut(|response| {
+        response.body_source_exchange = None;
         response.body = Some(body.into_bytes());
         sync_response_output_body_headers(response);
     });
@@ -129,16 +131,15 @@ async fn apply_exchange_to_response_with_headers(
 ) -> Result<CallOutcome, VmError> {
     let parsed_headers = parse_response_header_batch(headers)?;
     let snapshot = ensure_outbound_exchange_response_started(&context, exchange).await?;
-    let body = read_outbound_exchange_response_all(&context, exchange).await?;
     context.with_downstream_response_mut(|response| {
         response.status = Some(snapshot.status);
-        response.body = Some(body);
+        response.body = None;
+        response.body_source_exchange = Some(exchange);
         for (name, value) in snapshot.headers.iter() {
             if !is_hop_by_hop_header(name) {
                 response.headers.insert(name.clone(), value.clone());
             }
         }
-        sync_response_output_body_headers(response);
     });
     apply_response_header_batch(&context, parsed_headers);
     Ok(CallOutcome::Return(vec![]))
@@ -159,16 +160,15 @@ async fn apply_exchange_to_response(
     exchange: i64,
 ) -> Result<CallOutcome, VmError> {
     let snapshot = ensure_outbound_exchange_response_started(&context, exchange).await?;
-    let body = read_outbound_exchange_response_all(&context, exchange).await?;
     context.with_downstream_response_mut(|response| {
         response.status = Some(snapshot.status);
-        response.body = Some(body);
+        response.body = None;
+        response.body_source_exchange = Some(exchange);
         for (name, value) in snapshot.headers.iter() {
             if !is_hop_by_hop_header(name) {
                 response.headers.insert(name.clone(), value.clone());
             }
         }
-        sync_response_output_body_headers(response);
     });
     Ok(CallOutcome::Return(vec![]))
 }
@@ -182,11 +182,44 @@ fn get_response_status(context: SharedProxyVmContext) -> Result<CallOutcome, VmE
 
 /// Returns the full body for the downstream HTTP response as text.
 #[pd_edge_host_function(name = http_response::GET_BODY.name, scope = http)]
-fn get_response_body(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
+async fn get_response_body(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    materialize_downstream_response_body_source(&context).await?;
+    context.note_downstream_response_body_read();
     let value = context.with_downstream_response(|response| {
         String::from_utf8_lossy(response.body.as_deref().unwrap_or_default()).into_owned()
     });
     Ok(CallOutcome::Return(vec![Value::string(value)]))
+}
+
+/// Returns the first trailer value for the downstream HTTP response.
+#[pd_edge_host_function(name = "http::response::get_trailer", scope = http)]
+async fn get_response_trailer(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    name: String,
+) -> Result<CallOutcome, VmError> {
+    let header_name = HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| VmError::HostError(format!("invalid trailer name '{name}'")))?;
+    let trailers = read_downstream_response_trailers(&context).await?;
+    let value = trailers
+        .get(&header_name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    Ok(CallOutcome::Return(vec![Value::string(value)]))
+}
+
+/// Returns all trailers on the downstream HTTP response as a map.
+#[pd_edge_host_function(name = "http::response::get_trailers", scope = http)]
+async fn get_response_trailers(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+) -> Result<CallOutcome, VmError> {
+    let trailers = read_downstream_response_trailers(&context).await?;
+    Ok(CallOutcome::Return(vec![headers_to_value_map(&trailers)]))
 }
 
 /// Returns the first value for a header on the downstream HTTP response.
@@ -224,6 +257,7 @@ fn add_response_header(
     value: String,
 ) -> Result<CallOutcome, VmError> {
     let (header_name, header_value) = parse_header(name, value)?;
+    context.note_downstream_response_headers_mutated();
     context.with_downstream_response_mut(|response| {
         response.headers.append(header_name, header_value);
     });
@@ -237,6 +271,7 @@ fn clear_response_header(
     name: String,
 ) -> Result<CallOutcome, VmError> {
     let header_name = parse_header_name(name)?;
+    context.note_downstream_response_headers_mutated();
     context.with_downstream_response_mut(|response| {
         response.headers.remove(header_name);
     });

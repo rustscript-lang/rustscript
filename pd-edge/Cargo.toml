@@ -14,11 +14,11 @@ default = ["console", "http", "tls", "websocket"]
 console = ["edge_abi/console"]
 native-jit = ["vm/cranelift-jit"]
 http = ["vm/http", "edge_abi/http"]
-http2 = ["http", "vm/http2", "edge_abi/http2", "reqwest/http2", "dep:h2", "dep:tokio-rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
-http3 = ["http", "dep:quinn", "dep:h3", "dep:h3-quinn", "dep:rustls", "dep:webpki-roots", "dep:rustls-pemfile", "dep:rcgen"]
+http2 = ["http", "vm/http2", "edge_abi/http2", "dep:h2", "dep:tokio-rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
+http3 = ["http", "dep:quinn", "dep:h3", "dep:h3-quinn", "dep:webpki-roots", "dep:rustls-pemfile", "dep:rcgen"]
 tls = ["http", "vm/tls", "edge_abi/tls", "dep:tokio-rustls", "dep:rcgen", "dep:webpki-roots", "dep:rustls-pemfile"]
 websocket = ["http", "vm/websocket", "edge_abi/websocket", "dep:tokio-tungstenite"]
-webrtc = ["http", "vm/webrtc", "edge_abi/webrtc", "dep:webrtc", "dep:rustls"]
+webrtc = ["http", "vm/webrtc", "edge_abi/webrtc", "dep:webrtc"]
 
 [[bin]]
 name = "pd-edge-http-proxy"
@@ -40,10 +40,10 @@ path = "src/bin/pd-edge-sample-echo-server.rs"
 [dependencies]
 axum = "0.8"
 bytes = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["full"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-rustls = { version = "0.27", features = ["webpki-roots", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "client", "client-legacy", "http1", "http2"] }
 arc-swap = "1"
 socket2 = "0.5.10"
@@ -72,10 +72,13 @@ tokio-rustls = { version = "0.26", optional = true }
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"], optional = true }
 rcgen = { version = "0.12", optional = true }
 webrtc = { version = "0.17", optional = true }
-rustls = { version = "0.23", optional = true }
+rustls = "0.23"
 webpki-roots = { version = "1", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 httparse = "1"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
 
 [target.'cfg(windows)'.dependencies]
 mimalloc = "0.1"

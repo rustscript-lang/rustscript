@@ -38,6 +38,16 @@ fn http_response_get_body() -> String {
     unreachable!("abi declaration only")
 }
 
+#[pd_host_function(name = "http::response::get_trailer")]
+fn http_response_get_trailer(name: &str) -> String {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "http::response::get_trailers")]
+fn http_response_get_trailers() -> Map {
+    unreachable!("abi declaration only")
+}
+
 #[pd_host_function(name = "http::response::get_header")]
 fn http_response_get_header(name: &str) -> String {
     unreachable!("abi declaration only")

@@ -114,6 +114,16 @@ fn http_exchange_get_body(exchange: i64) -> String {
     unreachable!("abi declaration only")
 }
 
+#[pd_host_function(name = "http::exchange::get_trailer")]
+fn http_exchange_get_trailer(exchange: i64, name: &str) -> String {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "http::exchange::get_trailers")]
+fn http_exchange_get_trailers(exchange: i64) -> Map {
+    unreachable!("abi declaration only")
+}
+
 #[pd_host_function(name = "http::exchange::get_http_version")]
 fn http_exchange_get_http_version(exchange: i64) -> String {
     unreachable!("abi declaration only")

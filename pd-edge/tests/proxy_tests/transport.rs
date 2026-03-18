@@ -122,12 +122,7 @@ async fn sample_upstream_transport_proxy_program_streams_plain_http_body() {
 async fn sample_upstream_transport_proxy_program_handles_https_tls_session() {
     let (_upstream_addr, upstream_handle) =
         spawn_https_echo_upstream_on(loopback_addr(SAMPLE_TRANSPORT_UPSTREAM_HTTPS_PORT)).await;
-    let mut state = SharedState::new(1024 * 1024);
-    state.client = reqwest::Client::builder()
-        .tls_info(true)
-        .danger_accept_invalid_certs(true)
-        .build()
-        .expect("tls test client should build");
+    let state = SharedState::new(1024 * 1024);
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy_with_state(state).await;
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -870,12 +865,7 @@ async fn transport_connect_tunnel_upgrades_downstream_into_dynamic_tcp() {
 async fn sample_tunnel_proxy_program_tunnels_https_body_via_tls_plaintext_stream() {
     let (_upstream_addr, upstream_handle) =
         spawn_https_echo_upstream_on(loopback_addr(SAMPLE_TUNNEL_UPSTREAM_HTTPS_PORT)).await;
-    let mut state = SharedState::new(1024 * 1024);
-    state.client = reqwest::Client::builder()
-        .tls_info(true)
-        .danger_accept_invalid_certs(true)
-        .build()
-        .expect("tls test client should build");
+    let state = SharedState::new(1024 * 1024);
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy_with_state(state).await;
     let client = reqwest::Client::new();
     let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -62,11 +62,8 @@ pub async fn run_active_control_plane_client(state: SharedState, config: ActiveC
         };
 
         let response = state
-            .client
-            .post(&poll_url)
-            .timeout(request_timeout)
-            .json(&poll_request)
-            .send()
+            .control_plane_client
+            .post_json(&poll_url, request_timeout, &poll_request)
             .await;
 
         match response {
@@ -81,7 +78,7 @@ pub async fn run_active_control_plane_client(state: SharedState, config: ActiveC
                     continue;
                 }
 
-                let payload = match response.json::<EdgePollResponse>().await {
+                let payload = match response.json::<EdgePollResponse>() {
                     Ok(payload) => payload,
                     Err(err) => {
                         state.record_control_rpc_poll_error();
@@ -294,11 +291,8 @@ async fn report_result_to_control_plane(
 ) {
     let result_ok = result.ok;
     let send_result = state
-        .client
-        .post(result_url)
-        .timeout(request_timeout)
-        .json(&result)
-        .send()
+        .control_plane_client
+        .post_json(result_url, request_timeout, &result)
         .await;
 
     match send_result {

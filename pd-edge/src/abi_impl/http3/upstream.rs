@@ -5,6 +5,10 @@ use std::collections::HashMap;
 #[cfg(feature = "http3")]
 use std::env;
 #[cfg(feature = "http3")]
+use std::io;
+#[cfg(feature = "http3")]
+use std::pin::Pin;
+#[cfg(feature = "http3")]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
@@ -15,6 +19,8 @@ use axum::{
 };
 #[cfg(feature = "http3")]
 use futures_util::future;
+#[cfg(feature = "http3")]
+use futures_util::{Stream, StreamExt};
 #[cfg(feature = "http3")]
 use quinn::ConnectionError;
 #[cfg(feature = "http3")]
@@ -237,7 +243,13 @@ pub(crate) struct Http3ObservedError {
 }
 
 #[cfg(feature = "http3")]
-#[derive(Clone)]
+pub(crate) enum Http3RequestBody {
+    Empty,
+    Bytes(Bytes),
+    Streaming(Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + 'static>>),
+}
+
+#[cfg(feature = "http3")]
 pub(crate) struct Http3SendRequestOptions {
     pub(crate) exchange_handle: i64,
     pub(crate) target_scheme: HttpUpstreamScheme,
@@ -247,7 +259,7 @@ pub(crate) struct Http3SendRequestOptions {
     pub(crate) upstream_url: String,
     pub(crate) method: Method,
     pub(crate) headers: HeaderMap,
-    pub(crate) request_body: Vec<u8>,
+    pub(crate) request_body: Http3RequestBody,
     pub(crate) tls_flow: TlsFlowState,
     pub(crate) mode: Http3UpstreamMode,
     pub(crate) sessions: SharedHttp3UpstreamSessions,
@@ -926,20 +938,54 @@ pub(crate) async fn send_request(
     let stream_id = request_stream.id().into_inner();
     let stream_ref = session.attach_stream(options.exchange_handle, stream_id);
 
-    let request_body_present = !options.request_body.is_empty();
-    if request_body_present {
-        request_stream
-            .send_data(Bytes::from(options.request_body))
-            .await
-            .map_err(|err| {
-                let observed = classify_http3_error(&err);
-                apply_stream_error(&session, stream_id, &observed);
-                Http3RequestError::transport(format!(
-                    "http3 stream {} on session {} failed to send request body: {}",
-                    stream_id, session.session_id, observed.message
-                ))
-            })?;
-    }
+    let request_body_present = match options.request_body {
+        Http3RequestBody::Empty => false,
+        Http3RequestBody::Bytes(body) => {
+            if !body.is_empty() {
+                request_stream.send_data(body).await.map_err(|err| {
+                    let observed = classify_http3_error(&err);
+                    apply_stream_error(&session, stream_id, &observed);
+                    Http3RequestError::transport(format!(
+                        "http3 stream {} on session {} failed to send request body: {}",
+                        stream_id, session.session_id, observed.message
+                    ))
+                })?;
+                true
+            } else {
+                false
+            }
+        }
+        Http3RequestBody::Streaming(mut body_stream) => {
+            let mut sent_any = false;
+            while let Some(chunk) = body_stream.next().await {
+                let chunk = chunk.map_err(|err| {
+                    let message = err.to_string();
+                    session.mark_stream_reset(
+                        stream_id,
+                        Some(message.clone()),
+                        Http3ControlEventSource::Transport,
+                    );
+                    Http3RequestError::transport(format!(
+                        "http3 stream {} on session {} failed to read request body: {}",
+                        stream_id, session.session_id, message
+                    ))
+                })?;
+                if chunk.is_empty() {
+                    continue;
+                }
+                request_stream.send_data(chunk).await.map_err(|err| {
+                    let observed = classify_http3_error(&err);
+                    apply_stream_error(&session, stream_id, &observed);
+                    Http3RequestError::transport(format!(
+                        "http3 stream {} on session {} failed to send request body: {}",
+                        stream_id, session.session_id, observed.message
+                    ))
+                })?;
+                sent_any = true;
+            }
+            sent_any
+        }
+    };
     request_stream.finish().await.map_err(|err| {
         let observed = classify_http3_error(&err);
         apply_stream_error(&session, stream_id, &observed);

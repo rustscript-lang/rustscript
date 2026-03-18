@@ -1,8 +1,11 @@
+#[cfg(test)]
+use axum::http::{HeaderMap, HeaderName};
 use axum::http::{
-    HeaderMap, HeaderName, Method,
+    Method,
     header::{CONNECTION, CONTENT_LENGTH, EXPECT, TRANSFER_ENCODING, UPGRADE},
 };
 
+use super::state::LazyHttpHeaders;
 use super::version::HttpVersionPreference;
 
 pub(crate) const MAX_DOWNSTREAM_HTTP1_FAST_BODY_BYTES: usize = 1024 * 1024;
@@ -14,6 +17,7 @@ pub(crate) enum DownstreamHttp1FastBodyKind {
     Chunked,
 }
 
+#[cfg(test)]
 fn header_contains_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
     headers
         .get_all(name)
@@ -24,6 +28,7 @@ fn header_contains_token(headers: &HeaderMap, name: HeaderName, token: &str) -> 
         .any(|value| value.eq_ignore_ascii_case(token))
 }
 
+#[cfg(test)]
 fn header_tokens<'a>(
     headers: &'a HeaderMap,
     name: HeaderName,
@@ -37,6 +42,7 @@ fn header_tokens<'a>(
         .filter(|value| !value.is_empty())
 }
 
+#[cfg(test)]
 fn parse_content_length(headers: &HeaderMap) -> Option<u64> {
     headers
         .get(CONTENT_LENGTH)
@@ -44,6 +50,7 @@ fn parse_content_length(headers: &HeaderMap) -> Option<u64> {
         .and_then(|value| value.parse::<u64>().ok())
 }
 
+#[cfg(test)]
 fn request_transfer_encoding_is_chunked_only(headers: &HeaderMap) -> bool {
     let mut saw_chunked = false;
     for token in header_tokens(headers, TRANSFER_ENCODING) {
@@ -56,6 +63,7 @@ fn request_transfer_encoding_is_chunked_only(headers: &HeaderMap) -> bool {
     saw_chunked
 }
 
+#[cfg(test)]
 pub(crate) fn downstream_http1_fast_path_expects_continue(headers: &HeaderMap) -> bool {
     headers
         .get(EXPECT)
@@ -64,6 +72,14 @@ pub(crate) fn downstream_http1_fast_path_expects_continue(headers: &HeaderMap) -
         .is_some_and(|value| value.eq_ignore_ascii_case("100-continue"))
 }
 
+pub(crate) fn downstream_http1_fast_path_expects_continue_lazy(headers: &LazyHttpHeaders) -> bool {
+    headers
+        .get_str(EXPECT.as_str())
+        .map(|value| value.trim().eq_ignore_ascii_case("100-continue"))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
 pub(crate) fn classify_downstream_http1_fast_body(
     headers: &HeaderMap,
 ) -> Option<DownstreamHttp1FastBodyKind> {
@@ -80,13 +96,36 @@ pub(crate) fn classify_downstream_http1_fast_body(
     if content_length == 0 {
         return Some(DownstreamHttp1FastBodyKind::Empty);
     }
-    let Ok(content_length) = usize::try_from(content_length) else {
-        return None;
-    };
-    (content_length <= MAX_DOWNSTREAM_HTTP1_FAST_BODY_BYTES)
-        .then_some(DownstreamHttp1FastBodyKind::Fixed(content_length))
+    usize::try_from(content_length)
+        .ok()
+        .map(DownstreamHttp1FastBodyKind::Fixed)
 }
 
+pub(crate) fn classify_downstream_http1_fast_body_lazy(
+    headers: &LazyHttpHeaders,
+) -> Option<DownstreamHttp1FastBodyKind> {
+    if headers.contains_name(CONTENT_LENGTH.as_str())
+        && headers.contains_name(TRANSFER_ENCODING.as_str())
+    {
+        return None;
+    }
+    if headers.contains_name(TRANSFER_ENCODING.as_str()) {
+        return headers
+            .header_contains_token(TRANSFER_ENCODING.as_str(), "chunked")
+            .then_some(DownstreamHttp1FastBodyKind::Chunked);
+    }
+    let Some(content_length) = headers.content_length() else {
+        return Some(DownstreamHttp1FastBodyKind::Empty);
+    };
+    if content_length == 0 {
+        return Some(DownstreamHttp1FastBodyKind::Empty);
+    }
+    usize::try_from(content_length)
+        .ok()
+        .map(DownstreamHttp1FastBodyKind::Fixed)
+}
+
+#[cfg(test)]
 pub(crate) fn downstream_http1_fast_path_eligible(method: &Method, headers: &HeaderMap) -> bool {
     if method == Method::CONNECT {
         return false;
@@ -101,6 +140,27 @@ pub(crate) fn downstream_http1_fast_path_eligible(method: &Method, headers: &Hea
         return false;
     }
     classify_downstream_http1_fast_body(headers).is_some()
+}
+
+pub(crate) fn downstream_http1_fast_path_eligible_lazy(
+    method: &Method,
+    headers: &LazyHttpHeaders,
+) -> bool {
+    if method == Method::CONNECT {
+        return false;
+    }
+    if headers.contains_name(EXPECT.as_str())
+        && !downstream_http1_fast_path_expects_continue_lazy(headers)
+    {
+        return false;
+    }
+    if headers.contains_name(UPGRADE.as_str()) {
+        return false;
+    }
+    if headers.header_contains_token(CONNECTION.as_str(), "upgrade") {
+        return false;
+    }
+    classify_downstream_http1_fast_body_lazy(headers).is_some()
 }
 
 pub(crate) fn outbound_http1_fast_path_eligible(
@@ -130,9 +190,9 @@ mod tests {
     };
 
     use super::{
-        DownstreamHttp1FastBodyKind, classify_downstream_http1_fast_body,
-        downstream_http1_fast_path_eligible, downstream_http1_fast_path_expects_continue,
-        outbound_http1_fast_path_eligible,
+        DownstreamHttp1FastBodyKind, MAX_DOWNSTREAM_HTTP1_FAST_BODY_BYTES,
+        classify_downstream_http1_fast_body, downstream_http1_fast_path_eligible,
+        downstream_http1_fast_path_expects_continue, outbound_http1_fast_path_eligible,
     };
     use crate::abi_impl::http::HttpVersionPreference;
 
@@ -153,6 +213,22 @@ mod tests {
             Some(DownstreamHttp1FastBodyKind::Chunked)
         );
         assert!(downstream_http1_fast_path_eligible(&Method::POST, &chunked));
+
+        let mut large_fixed = HeaderMap::new();
+        large_fixed.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&(MAX_DOWNSTREAM_HTTP1_FAST_BODY_BYTES + 1).to_string()).unwrap(),
+        );
+        assert_eq!(
+            classify_downstream_http1_fast_body(&large_fixed),
+            Some(DownstreamHttp1FastBodyKind::Fixed(
+                MAX_DOWNSTREAM_HTTP1_FAST_BODY_BYTES + 1
+            ))
+        );
+        assert!(downstream_http1_fast_path_eligible(
+            &Method::POST,
+            &large_fixed
+        ));
     }
 
     #[test]

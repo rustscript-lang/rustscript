@@ -1,4 +1,5 @@
 mod admin_api;
+mod http1_fast_path;
 mod proxy_path;
 mod shared;
 

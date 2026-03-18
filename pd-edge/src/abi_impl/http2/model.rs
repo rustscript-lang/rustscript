@@ -161,25 +161,6 @@ pub(crate) fn select_upstream_mode(
     }
 }
 
-pub(crate) fn configure_reqwest_builder(
-    builder: reqwest::ClientBuilder,
-    mode: Http2UpstreamMode,
-) -> reqwest::ClientBuilder {
-    #[cfg(not(feature = "http2"))]
-    {
-        let _ = mode;
-        builder
-    }
-
-    #[cfg(feature = "http2")]
-    {
-        match mode {
-            Http2UpstreamMode::Disabled | Http2UpstreamMode::AutomaticTls => builder,
-            Http2UpstreamMode::PriorKnowledge => builder.http2_prior_knowledge(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::abi_impl::{

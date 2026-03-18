@@ -3,6 +3,7 @@ mod active_control_plane;
 mod build_info;
 mod cache;
 mod compile;
+mod control_plane_http_client;
 mod control_plane_rpc;
 mod debug_session;
 mod lock_metrics;
