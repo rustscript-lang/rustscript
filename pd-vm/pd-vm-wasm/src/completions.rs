@@ -222,15 +222,19 @@ fn add_host_function_entries(
             }
             other if other.contains("::") => {
                 add_namespaced_host_function_entries(
-                    rustscript,
-                    javascript,
-                    lua,
-                    scheme,
-                    other,
-                    &params,
-                    host.signature.params,
-                    host.signature.return_type,
-                    host.docs,
+                    NamespacedHostTargets {
+                        rustscript,
+                        javascript,
+                        lua,
+                        scheme,
+                    },
+                    NamespacedHostFunction {
+                        name: other,
+                        params: &params,
+                        signature_params: host.signature.params,
+                        return_type: host.signature.return_type,
+                        docs: host.docs,
+                    },
                 );
             }
             other => {
@@ -436,34 +440,51 @@ fn edge_function_docs(function_docs: &str, namespace_docs: &str, root: &str) -> 
     format!("{function_docs}\n\n{import_note}")
 }
 
-#[allow(clippy::too_many_arguments)]
+struct NamespacedHostTargets<'a> {
+    rustscript: &'a mut Vec<CompletionEntry>,
+    javascript: &'a mut Vec<CompletionEntry>,
+    lua: &'a mut Vec<CompletionEntry>,
+    scheme: &'a mut Vec<CompletionEntry>,
+}
+
+struct NamespacedHostFunction<'a> {
+    name: &'a str,
+    params: &'a [String],
+    signature_params: &'a [CallableParam],
+    return_type: &'a str,
+    docs: &'a str,
+}
+
 fn add_namespaced_host_function_entries(
-    rustscript: &mut Vec<CompletionEntry>,
-    javascript: &mut Vec<CompletionEntry>,
-    lua: &mut Vec<CompletionEntry>,
-    scheme: &mut Vec<CompletionEntry>,
-    name: &str,
-    params: &[String],
-    signature_params: &[CallableParam],
-    return_type: &str,
-    docs: &str,
+    targets: NamespacedHostTargets<'_>,
+    function: NamespacedHostFunction<'_>,
 ) {
-    let Some((root, _member)) = name.split_once("::") else {
+    let Some((root, _member)) = function.name.split_once("::") else {
         return;
     };
-    let dot_path = name.replace("::", ".");
+    let dot_path = function.name.replace("::", ".");
     let import_docs = format!("Imports virtual host namespace `{root}` for playground host calls.");
+    let NamespacedHostTargets {
+        rustscript,
+        javascript,
+        lua,
+        scheme,
+    } = targets;
 
     push_unique(
         rustscript,
         CompletionEntry {
-            label: name.to_string(),
-            insert_text: format!("{name}({})", comma_args(params)),
+            label: function.name.to_string(),
+            insert_text: format!("{}({})", function.name, comma_args(function.params)),
             detail: format!(
                 "playground host {}",
-                typed_signature(name, signature_params, return_type)
+                typed_signature(
+                    function.name,
+                    function.signature_params,
+                    function.return_type,
+                )
             ),
-            documentation: docs.to_string(),
+            documentation: function.docs.to_string(),
             kind: "function".to_string(),
         },
     );
@@ -482,12 +503,12 @@ fn add_namespaced_host_function_entries(
         javascript,
         CompletionEntry {
             label: dot_path.clone(),
-            insert_text: format!("{dot_path}({})", comma_args(params)),
+            insert_text: format!("{dot_path}({})", comma_args(function.params)),
             detail: format!(
                 "playground host {}",
-                typed_signature(&dot_path, signature_params, return_type)
+                typed_signature(&dot_path, function.signature_params, function.return_type)
             ),
-            documentation: docs.to_string(),
+            documentation: function.docs.to_string(),
             kind: "function".to_string(),
         },
     );
@@ -506,12 +527,12 @@ fn add_namespaced_host_function_entries(
         lua,
         CompletionEntry {
             label: dot_path.clone(),
-            insert_text: format!("{dot_path}({})", comma_args(params)),
+            insert_text: format!("{dot_path}({})", comma_args(function.params)),
             detail: format!(
                 "playground host {}",
-                typed_signature(&dot_path, signature_params, return_type)
+                typed_signature(&dot_path, function.signature_params, function.return_type)
             ),
-            documentation: docs.to_string(),
+            documentation: function.docs.to_string(),
             kind: "function".to_string(),
         },
     );
@@ -530,12 +551,12 @@ fn add_namespaced_host_function_entries(
         scheme,
         CompletionEntry {
             label: dot_path.clone(),
-            insert_text: format!("({dot_path} {})", space_args(params)),
+            insert_text: format!("({dot_path} {})", space_args(function.params)),
             detail: format!(
                 "playground host {}",
-                typed_signature(&dot_path, signature_params, return_type)
+                typed_signature(&dot_path, function.signature_params, function.return_type)
             ),
-            documentation: docs.to_string(),
+            documentation: function.docs.to_string(),
             kind: "function".to_string(),
         },
     );

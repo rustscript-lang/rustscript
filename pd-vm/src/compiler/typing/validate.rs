@@ -9,6 +9,21 @@ use super::helpers::{
 };
 use super::state::{BoundType, InferredCallable, LocalTypeState, are_compatible_bound_types};
 
+#[derive(Clone, Copy)]
+pub(super) struct DiagnosticSite<'a> {
+    pub(super) line: Option<u32>,
+    pub(super) source_name: Option<&'a str>,
+}
+
+struct CallableBody<'a> {
+    param_slots: &'a [LocalSlot],
+    param_schemas: Option<&'a [Option<super::super::ir::TypeSchema>]>,
+    capture_copies: &'a [(LocalSlot, LocalSlot)],
+    body_stmts: &'a [super::super::ir::Stmt],
+    body_expr: &'a Expr,
+    args: Option<&'a [Expr]>,
+}
+
 fn observe_direct_function_call_types(
     expr: &Expr,
     state: &LocalTypeState,
@@ -58,7 +73,6 @@ fn observe_direct_function_call_types(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn validate_signature_overloads(
     callable_name: &str,
     callable_kind: &str,
@@ -66,8 +80,7 @@ pub(super) fn validate_signature_overloads(
     args: &[Expr],
     state: &LocalTypeState,
     context: &mut TypeContext<'_>,
-    line_context: Option<u32>,
-    source_name: Option<&str>,
+    site: DiagnosticSite<'_>,
 ) -> Result<(), CompileError> {
     let actual = args
         .iter()
@@ -81,8 +94,8 @@ pub(super) fn validate_signature_overloads(
     }
 
     Err(CompileError::CallableArgumentTypeMismatch {
-        line: line_context,
-        source_name: owned_source_name(source_name),
+        line: site.line,
+        source_name: owned_source_name(site.source_name),
         detail: format!(
             "{callable_kind} '{callable_name}' does not accept argument types ({}); expected {}",
             format_actual_arg_types(&actual),
@@ -569,30 +582,38 @@ fn validate_expr_children(
                 && let Some(InferredCallable::Closure(closure)) = state.callable(*slot).cloned()
             {
                 validate_callable_body(
-                    closure.param_slots.as_slice(),
-                    None,
-                    closure.capture_copies.as_slice(),
-                    &[],
-                    &closure.body,
-                    Some(args.as_slice()),
+                    CallableBody {
+                        param_slots: closure.param_slots.as_slice(),
+                        param_schemas: None,
+                        capture_copies: closure.capture_copies.as_slice(),
+                        body_stmts: &[],
+                        body_expr: &closure.body,
+                        args: Some(args.as_slice()),
+                    },
                     state,
-                    line_context,
-                    source_name,
+                    DiagnosticSite {
+                        line: line_context,
+                        source_name,
+                    },
                     context,
                 )?;
             }
         }
         Expr::Closure(closure) => {
             validate_callable_body(
-                closure.param_slots.as_slice(),
-                None,
-                closure.capture_copies.as_slice(),
-                &[],
-                &closure.body,
-                None,
+                CallableBody {
+                    param_slots: closure.param_slots.as_slice(),
+                    param_schemas: None,
+                    capture_copies: closure.capture_copies.as_slice(),
+                    body_stmts: &[],
+                    body_expr: &closure.body,
+                    args: None,
+                },
                 state,
-                line_context,
-                source_name,
+                DiagnosticSite {
+                    line: line_context,
+                    source_name,
+                },
                 context,
             )?;
         }
@@ -616,15 +637,19 @@ fn validate_expr_children(
                 )?;
             }
             validate_callable_body(
-                closure.param_slots.as_slice(),
-                None,
-                closure.capture_copies.as_slice(),
-                &[],
-                &closure.body,
-                Some(args.as_slice()),
+                CallableBody {
+                    param_slots: closure.param_slots.as_slice(),
+                    param_schemas: None,
+                    capture_copies: closure.capture_copies.as_slice(),
+                    body_stmts: &[],
+                    body_expr: &closure.body,
+                    args: Some(args.as_slice()),
+                },
                 state,
-                line_context,
-                source_name,
+                DiagnosticSite {
+                    line: line_context,
+                    source_name,
+                },
                 context,
             )?;
         }
@@ -633,19 +658,20 @@ fn validate_expr_children(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_callable_body(
-    param_slots: &[LocalSlot],
-    param_schemas: Option<&[Option<super::super::ir::TypeSchema>]>,
-    capture_copies: &[(LocalSlot, LocalSlot)],
-    body_stmts: &[super::super::ir::Stmt],
-    body_expr: &Expr,
-    args: Option<&[Expr]>,
+    callable: CallableBody<'_>,
     state: &LocalTypeState,
-    line_context: Option<u32>,
-    source_name: Option<&str>,
+    site: DiagnosticSite<'_>,
     context: &mut TypeContext<'_>,
 ) -> Result<(), CompileError> {
+    let CallableBody {
+        param_slots,
+        param_schemas,
+        capture_copies,
+        body_stmts,
+        body_expr,
+        args,
+    } = callable;
     let Some(mut nested) =
         context.build_callable_state(param_slots, param_schemas, capture_copies, args, state)
     else {
@@ -654,16 +680,16 @@ fn validate_callable_body(
     validate_stmts(
         body_stmts,
         &mut nested,
-        line_context,
-        source_name,
+        site.line,
+        site.source_name,
         context,
         false,
     )?;
     let _ = validate_expr(
         body_expr,
         &nested,
-        line_context,
-        source_name,
+        site.line,
+        site.source_name,
         context,
         false,
     )?;

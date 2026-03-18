@@ -1389,8 +1389,10 @@ impl<'a> TypeContext<'a> {
             args,
             state,
             self,
-            line_context,
-            source_name,
+            super::validate::DiagnosticSite {
+                line: line_context,
+                source_name,
+            },
         )
     }
 

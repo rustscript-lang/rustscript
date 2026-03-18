@@ -141,11 +141,10 @@ pub(crate) struct PlainHttp1ResponseBody {
 }
 
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
 pub(crate) enum OutboundHttp1ForwardBody {
     Empty,
     Raw {
-        body: PlainHttp1ResponseBody,
+        body: Box<PlainHttp1ResponseBody>,
         content_length: Option<u64>,
     },
 }
@@ -1390,7 +1389,7 @@ where
             connection,
         );
         OutboundHttp1ForwardBody::Raw {
-            body: PlainHttp1ResponseBody::new(lease, body_kind),
+            body: Box::new(PlainHttp1ResponseBody::new(lease, body_kind)),
             content_length: parsed_response.content_length,
         }
     } else {
@@ -1528,7 +1527,7 @@ where
             connection,
         );
         OutboundHttp1ForwardBody::Raw {
-            body: PlainHttp1ResponseBody::new(lease, body_kind),
+            body: Box::new(PlainHttp1ResponseBody::new(lease, body_kind)),
             content_length: parsed_response.content_length,
         }
     } else {

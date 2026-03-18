@@ -47,6 +47,8 @@ use crate::{
 const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HTTP1_CHUNK_WRITE_OVERHEAD_BYTES: usize = 32;
 
+type HttpResponseResult<T> = Result<T, Box<Response<Body>>>;
+
 struct FastHttp1Request {
     method: Method,
     uri: Uri,
@@ -757,12 +759,11 @@ where
     }
 }
 
-#[allow(clippy::result_large_err)]
 fn build_fast_http_request_context(
     request_id: LazyRequestId,
     request: FastHttp1Request,
     connection_metadata: Option<&DownstreamConnectionMetadata>,
-) -> Result<HttpRequestContext, Response<Body>> {
+) -> HttpResponseResult<HttpRequestContext> {
     let FastHttp1Request {
         method,
         uri,
@@ -1355,7 +1356,7 @@ async fn serve_http1_fast_connection<S>(
             Ok(vm_request) => vm_request,
             Err(response) => {
                 let _ = connection
-                    .write_response(&request_method, false, response)
+                    .write_response(&request_method, false, *response)
                     .await;
                 return;
             }
@@ -1413,6 +1414,7 @@ async fn serve_http1_fast_connection<S>(
             Ok((vm_context, pre_vm_finished, after_vm)) => {
                 match resolve_http1_downstream_response(&vm_context).await {
                     Http1DownstreamResolution::NativeLocal(native_local) => {
+                        let native_local = *native_local;
                         if let Some(body_lease) = body_lease.take() {
                             match body_lease.finish().await {
                                 Ok(returned) => connection.restore(returned),
@@ -1477,6 +1479,7 @@ async fn serve_http1_fast_connection<S>(
                         }
                     }
                     Http1DownstreamResolution::Native(native_result) => {
+                        let native_result = *native_result;
                         if let Some(body_lease) = body_lease.take() {
                             match body_lease.finish().await {
                                 Ok(returned) => connection.restore(returned),
@@ -1567,6 +1570,7 @@ async fn serve_http1_fast_connection<S>(
                         }
                     }
                     Http1DownstreamResolution::Snapshot(snapshot_result) => {
+                        let snapshot_result = *snapshot_result;
                         if let Some(body_lease) = body_lease.take() {
                             match body_lease.finish().await {
                                 Ok(returned) => connection.restore(returned),
@@ -1653,6 +1657,7 @@ async fn serve_http1_fast_connection<S>(
                         }
                     }
                     Http1DownstreamResolution::Graph(resolved) => {
+                        let resolved = *resolved;
                         if let Some(body_lease) = body_lease.take() {
                             match body_lease.finish().await {
                                 Ok(returned) => connection.restore(returned),

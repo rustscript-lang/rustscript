@@ -2847,13 +2847,16 @@ mod tests {
 
         let (fast_status, fast_headers, fast_body, fast_default_content_type) =
             match resolve_http1_downstream_response(&fast_context).await {
-                Http1DownstreamResolution::NativeLocal(native_local) => (
-                    StatusCode::from_u16(native_local.status)
-                        .expect("native local status should be valid"),
-                    native_local.headers,
-                    native_local.body,
-                    native_local.default_content_type,
-                ),
+                Http1DownstreamResolution::NativeLocal(native_local) => {
+                    let native_local = *native_local;
+                    (
+                        StatusCode::from_u16(native_local.status)
+                            .expect("native local status should be valid"),
+                        native_local.headers,
+                        native_local.body,
+                        native_local.default_content_type,
+                    )
+                }
                 resolution => panic!(
                     "expected native local shortcut resolution, got {:?}",
                     std::mem::discriminant(&resolution)
@@ -2915,7 +2918,14 @@ mod tests {
 
         let (fast_status, fast_headers, fast_body) =
             match resolve_http1_downstream_response(&fast_context).await {
-                Http1DownstreamResolution::Snapshot(Ok(snapshot)) => {
+                Http1DownstreamResolution::Snapshot(snapshot_result) => {
+                    let snapshot = match *snapshot_result {
+                        Ok(snapshot) => snapshot,
+                        Err(response) => panic!(
+                            "expected snapshot shortcut success, got error response {}",
+                            response.status()
+                        ),
+                    };
                     snapshot_response_parts(snapshot).await
                 }
                 resolution => panic!(

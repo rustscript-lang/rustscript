@@ -164,7 +164,7 @@ pub(crate) fn select_upstream_mode(
 #[cfg(test)]
 mod tests {
     use crate::abi_impl::{
-        http::{HttpUpstreamScheme, HttpVersionPreference},
+        http::{state::HttpUpstreamScheme, version::HttpVersionPreference},
         transport::TlsFlowState,
     };
 

@@ -18,7 +18,8 @@ use super::state::{
     merge_container_element_types, stabilize_loop_state, try_stabilize_loop_state,
 };
 use super::validate::{
-    owned_source_name, refine_state_for_condition, validate_branch_state_merge, validate_expr,
+    DiagnosticSite, owned_source_name, refine_state_for_condition, validate_branch_state_merge,
+    validate_expr,
 };
 
 pub(super) struct FunctionLegalizeEnv<'a> {
@@ -323,8 +324,10 @@ pub(super) fn validate_stmts(
                     expr,
                     &expr_state,
                     ty,
-                    Some(*line),
-                    source_name,
+                    DiagnosticSite {
+                        line: Some(*line),
+                        source_name,
+                    },
                     context,
                 )?;
                 let declared_schema = state
@@ -500,15 +503,13 @@ fn validate_declared_local_schema(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_numeric_assignment_operands(
     kind: &AssignmentKind,
     index: LocalSlot,
     expr: &Expr,
     expr_state: &LocalTypeState,
     expr_ty: BoundType,
-    line: Option<u32>,
-    source_name: Option<&str>,
+    site: DiagnosticSite<'_>,
     context: &mut TypeContext<'_>,
 ) -> Result<(), CompileError> {
     if !kind.requires_numeric_operands() {
@@ -518,8 +519,8 @@ fn validate_numeric_assignment_operands(
     let target_ty = expr_state.get(index);
     if !is_numeric_bound_type(target_ty) {
         return Err(CompileError::BinaryOperandTypeMismatch {
-            line,
-            source_name: owned_source_name(source_name),
+            line: site.line,
+            source_name: owned_source_name(site.source_name),
             detail: format!(
                 "{} requires a numeric local, found {}",
                 kind.diagnostic_label(),
@@ -534,8 +535,8 @@ fn validate_numeric_assignment_operands(
     };
     if !is_numeric_bound_type(rhs_ty) || !is_numeric_bound_type(expr_ty) {
         return Err(CompileError::BinaryOperandTypeMismatch {
-            line,
-            source_name: owned_source_name(source_name),
+            line: site.line,
+            source_name: owned_source_name(site.source_name),
             detail: format!(
                 "{} requires numeric operands, found {} and {}",
                 kind.diagnostic_label(),

@@ -1,11 +1,10 @@
 use super::*;
 
 #[cfg_attr(not(feature = "http2"), allow(dead_code))]
-#[allow(clippy::large_enum_variant)]
 enum UpstreamResponseSource {
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
-    Hyper(hyper::body::Incoming),
-    PlainHttp1(PlainHttp1ResponseBody),
+    Hyper(Box<hyper::body::Incoming>),
+    PlainHttp1(Box<PlainHttp1ResponseBody>),
     #[cfg(feature = "http3")]
     Http3(Box<h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>>),
     Exhausted,
@@ -258,7 +257,7 @@ impl UpstreamResponseBodyState {
         }
         Self {
             source: upstream_response_body_source(
-                UpstreamResponseSource::Hyper(body),
+                UpstreamResponseSource::Hyper(Box::new(body)),
                 http2_tracker,
                 None,
                 plain_http1_sender_lease,
@@ -277,7 +276,7 @@ impl UpstreamResponseBodyState {
         }
         Self {
             source: upstream_response_body_source(
-                UpstreamResponseSource::PlainHttp1(body),
+                UpstreamResponseSource::PlainHttp1(Box::new(body)),
                 None,
                 None,
                 None,
