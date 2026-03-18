@@ -1480,7 +1480,7 @@ fn capture_downstream_http1_resolution_state(
         response_headers: downstream.response_output.headers.clone(),
         response_status: downstream.response_output.status,
         has_post_response_plan: downstream.post_response_plan.is_some(),
-        has_response_body: downstream.response_output.body.is_some(),
+        has_response_body: downstream.response_output.has_local_body(),
         body_source_exchange,
         has_upstream_target: default_exchange.request.target.is_some(),
         default_upstream_websocket_mode: default_exchange.websocket_dag.is_websocket_mode(),
@@ -1670,6 +1670,9 @@ pub(crate) fn try_take_native_local_http1_downstream_response(
 ) -> Option<ResolvedNativeLocalHttp1DownstreamResponse> {
     let mut downstream = context.lock_downstream();
     if downstream.post_response_plan.is_some() {
+        return None;
+    }
+    if downstream.response_output.stream_committed() {
         return None;
     }
     if downstream.response_output.body_source_exchange.is_some() {
@@ -2921,7 +2924,7 @@ pub(crate) async fn read_downstream_response_trailers(
             .get(&DEFAULT_UPSTREAM_EXCHANGE_HANDLE)
             .expect("default upstream exchange should exist");
         (
-            downstream.response_output.body.is_some(),
+            downstream.response_output.has_local_body(),
             downstream.response_output.body_source_exchange,
             downstream.post_response_plan.is_some(),
             default_exchange.request.target.is_some(),

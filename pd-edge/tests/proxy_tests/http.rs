@@ -61,6 +61,11 @@ impl rustls::client::danger::ServerCertVerifier for PermissiveTestServerCertVeri
     }
 }
 
+fn sample_sse_upstream_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 #[tokio::test]
 async fn no_active_program_returns_404() {
     let (data_addr, _admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
@@ -1838,6 +1843,7 @@ async fn sample_request_transform_program_streams_or_buffers_downstream_request_
 
 #[tokio::test]
 async fn sample_sse_proxy_program_mutates_each_upstream_event_before_returning() {
+    let _guard = sample_sse_upstream_test_lock().lock().await;
     let (_upstream_addr, upstream_handle) = spawn_sse_upstream_on(
         vec![
             "id: 1\n",
@@ -1886,6 +1892,533 @@ async fn sample_sse_proxy_program_mutates_each_upstream_event_before_returning()
     assert_eq!(
         body,
         "id: 1 [mutated]\ndata: alpha [mutated]\n\nid: 2 [mutated]\ndata: beta [mutated]\n\n"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn sample_sse_proxy_program_streams_the_first_event_before_upstream_completion() {
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+    let _guard = sample_sse_upstream_test_lock().lock().await;
+
+    async fn read_http1_response_head<S>(
+        stream: &mut S,
+        buffered: &mut Vec<u8>,
+    ) -> std::io::Result<()>
+    where
+        S: AsyncRead + Unpin,
+    {
+        loop {
+            if let Some(head_end) = buffered.windows(4).position(|window| window == b"\r\n\r\n") {
+                buffered.drain(..head_end + 4);
+                return Ok(());
+            }
+            let mut chunk = [0u8; 1024];
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "stream closed before response head completed",
+                ));
+            }
+            buffered.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind(loopback_addr(SAMPLE_SSE_UPSTREAM_PORT))
+        .await
+        .expect("listener should bind");
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let upstream_handle = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept should succeed");
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request).await;
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("response head should write");
+        for line in ["id: 1\n", "data: alpha\n", "\n"] {
+            let frame = format!("{:X}\r\n{}\r\n", line.len(), line);
+            stream
+                .write_all(frame.as_bytes())
+                .await
+                .expect("first event frame should write");
+        }
+        stream.flush().await.expect("first event should flush");
+        release_rx.await.expect("release signal should arrive");
+        for line in ["id: 2\n", "data: beta\n", "\n"] {
+            let frame = format!("{:X}\r\n{}\r\n", line.len(), line);
+            stream
+                .write_all(frame.as_bytes())
+                .await
+                .expect("second event frame should write");
+        }
+        stream
+            .write_all(b"0\r\n\r\n")
+            .await
+            .expect("terminator should write");
+        let _ = stream.shutdown().await;
+    });
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("http")
+        .join("proxy")
+        .join("sample_sse_proxy_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let mut stream = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("downstream stream should connect");
+    stream
+        .write_all(b"GET /sse HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("request should write");
+
+    let mut buffered = Vec::new();
+    read_http1_response_head(&mut stream, &mut buffered)
+        .await
+        .expect("response head should read");
+    if buffered.is_empty() {
+        let mut chunk = [0u8; 1024];
+        let read = timeout(Duration::from_millis(100), stream.read(&mut chunk))
+            .await
+            .expect("first streamed bytes should arrive promptly")
+            .expect("first streamed bytes should read");
+        buffered.extend_from_slice(&chunk[..read]);
+    }
+    let first_chunk = String::from_utf8_lossy(&buffered).into_owned();
+    assert!(
+        first_chunk.contains("alpha [mutated]"),
+        "expected first event in first streamed bytes, got: {first_chunk:?}"
+    );
+
+    buffered.clear();
+    assert!(
+        timeout(Duration::from_millis(50), stream.read(&mut [0u8; 128]))
+            .await
+            .is_err(),
+        "second event should still be pending before release"
+    );
+
+    release_tx
+        .send(())
+        .expect("release signal should be deliverable");
+
+    let mut body = String::new();
+    let mut tail = [0u8; 1024];
+    loop {
+        let read = timeout(Duration::from_millis(250), stream.read(&mut tail))
+            .await
+            .expect("remaining streamed bytes should arrive")
+            .expect("remaining streamed bytes should read");
+        if read == 0 {
+            break;
+        }
+        body.push_str(&String::from_utf8_lossy(&tail[..read]));
+    }
+    assert!(
+        body.contains("beta [mutated]"),
+        "expected second event after release"
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn sample_anthropic_messages_to_openai_chat_completions_program_translates_buffered_response()
+{
+    let observed_request = Arc::new(Mutex::new(None::<(String, String, String, String, String)>));
+    let upstream_app = Router::new().fallback(any({
+        let observed_request = Arc::clone(&observed_request);
+        move |request: Request<Body>| {
+            let observed_request = Arc::clone(&observed_request);
+            async move {
+                let (parts, body) = request.into_parts();
+                let body = to_bytes(body, usize::MAX)
+                    .await
+                    .expect("body should be readable");
+                let anthropic_version = parts
+                    .headers
+                    .get("anthropic-version")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let content_type = parts
+                    .headers
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                *observed_request
+                    .lock()
+                    .expect("observed request lock should not poison") = Some((
+                    parts.method.to_string(),
+                    parts.uri.path().to_string(),
+                    anthropic_version,
+                    content_type,
+                    String::from_utf8_lossy(&body).into_owned(),
+                ));
+
+                let mut response = Response::new(Body::from(
+                    r#"{"id":"msg_buffered","type":"message","role":"assistant","content":[{"type":"text","text":"Hello"},{"type":"text","text":" world"}],"model":"claude-sonnet-4-5","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":7}}"#,
+                ));
+                response.headers_mut().insert(
+                    "content-type",
+                    HeaderValue::from_static("application/json"),
+                );
+                response
+            }
+        }
+    }));
+    let (upstream_addr, upstream_handle) = spawn_server(upstream_app).await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("http")
+        .join("proxy")
+        .join("sample_anthropic_messages_to_openai_chat_completions_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let request_body = r#"{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}],"max_tokens":64}"#;
+    let response = client
+        .post(format!("http://{data_addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("x-anthropic-host", "127.0.0.1")
+        .header("x-anthropic-port", upstream_addr.port().to_string())
+        .body(request_body)
+        .send()
+        .await
+        .expect("buffered request should complete");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .expect("compat response body should decode");
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    assert_eq!(
+        headers
+            .get("x-compat-upstream")
+            .and_then(|value| value.to_str().ok()),
+        Some("anthropic-messages")
+    );
+    assert_eq!(body["object"].as_str(), Some("chat.completion"));
+    assert_eq!(body["id"].as_str(), Some("chatcmpl-msg_buffered"));
+    assert_eq!(body["model"].as_str(), Some("claude-sonnet-4-5"));
+    assert_eq!(
+        body["choices"][0]["message"]["role"].as_str(),
+        Some("assistant")
+    );
+    assert_eq!(
+        body["choices"][0]["message"]["content"].as_str(),
+        Some("Hello world")
+    );
+    assert_eq!(body["choices"][0]["finish_reason"].as_str(), Some("stop"));
+    assert_eq!(body["usage"]["prompt_tokens"].as_i64(), Some(12));
+    assert_eq!(body["usage"]["completion_tokens"].as_i64(), Some(7));
+    assert_eq!(body["usage"]["total_tokens"].as_i64(), Some(19));
+
+    let observed = observed_request
+        .lock()
+        .expect("observed request lock should not poison")
+        .clone()
+        .expect("upstream request should be observed");
+    assert_eq!(observed.0, "POST");
+    assert_eq!(observed.1, "/v1/messages");
+    assert_eq!(observed.2, "2023-06-01");
+    assert_eq!(observed.3, "application/json");
+    assert_eq!(observed.4, request_body);
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn sample_anthropic_messages_to_openai_chat_completions_program_translates_streaming_response()
+ {
+    let (upstream_addr, upstream_handle) = spawn_sse_upstream(vec![
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}\n",
+        "\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n",
+        "\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n",
+        "\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":7}}\n",
+        "\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n",
+        "\n",
+    ])
+    .await;
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("http")
+        .join("proxy")
+        .join("sample_anthropic_messages_to_openai_chat_completions_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let response = client
+        .post(format!("http://{data_addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header("x-anthropic-host", "127.0.0.1")
+        .header("x-anthropic-port", upstream_addr.port().to_string())
+        .body(
+            r#"{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}],"max_tokens":64,"stream":true}"#,
+        )
+        .send()
+        .await
+        .expect("streaming request should complete");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.text().await.expect("streaming body should read");
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    assert_eq!(
+        headers
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache")
+    );
+
+    let data_lines = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .collect::<Vec<_>>();
+    assert_eq!(data_lines.len(), 5, "{body}");
+    assert_eq!(data_lines[4], "[DONE]");
+
+    let first: serde_json::Value =
+        serde_json::from_str(data_lines[0]).expect("role chunk should decode");
+    let second: serde_json::Value =
+        serde_json::from_str(data_lines[1]).expect("first content chunk should decode");
+    let third: serde_json::Value =
+        serde_json::from_str(data_lines[2]).expect("second content chunk should decode");
+    let fourth: serde_json::Value =
+        serde_json::from_str(data_lines[3]).expect("terminal chunk should decode");
+
+    assert_eq!(first["object"].as_str(), Some("chat.completion.chunk"));
+    assert_eq!(first["id"].as_str(), Some("chatcmpl-msg_stream"));
+    assert_eq!(
+        first["choices"][0]["delta"]["role"].as_str(),
+        Some("assistant")
+    );
+    assert_eq!(first["choices"][0]["delta"]["content"].as_str(), Some(""));
+    assert_eq!(
+        second["choices"][0]["delta"]["content"].as_str(),
+        Some("Hello")
+    );
+    assert_eq!(
+        third["choices"][0]["delta"]["content"].as_str(),
+        Some(" world")
+    );
+    assert_eq!(fourth["choices"][0]["finish_reason"].as_str(), Some("stop"));
+    assert_eq!(
+        fourth["choices"][0]["delta"]
+            .as_object()
+            .expect("terminal delta should be an object")
+            .len(),
+        0
+    );
+
+    upstream_handle.abort();
+    data_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
+async fn sample_anthropic_messages_to_openai_chat_completions_program_streams_the_role_chunk_before_upstream_completion()
+ {
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+    async fn read_http1_response_head<S>(
+        stream: &mut S,
+        buffered: &mut Vec<u8>,
+    ) -> std::io::Result<()>
+    where
+        S: AsyncRead + Unpin,
+    {
+        loop {
+            if let Some(head_end) = buffered.windows(4).position(|window| window == b"\r\n\r\n") {
+                buffered.drain(..head_end + 4);
+                return Ok(());
+            }
+            let mut chunk = [0u8; 1024];
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "stream closed before response head completed",
+                ));
+            }
+            buffered.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let upstream_addr = listener.local_addr().expect("listener should have addr");
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let upstream_handle = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept should succeed");
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request).await;
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("response head should write");
+        for line in [
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}\n",
+            "\n",
+        ] {
+            let frame = format!("{:X}\r\n{}\r\n", line.len(), line);
+            stream
+                .write_all(frame.as_bytes())
+                .await
+                .expect("message_start frame should write");
+        }
+        stream.flush().await.expect("message_start should flush");
+        release_rx.await.expect("release signal should arrive");
+        for line in [
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n",
+            "\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n",
+            "\n",
+        ] {
+            let frame = format!("{:X}\r\n{}\r\n", line.len(), line);
+            stream
+                .write_all(frame.as_bytes())
+                .await
+                .expect("remaining event frame should write");
+        }
+        stream
+            .write_all(b"0\r\n\r\n")
+            .await
+            .expect("terminator should write");
+        let _ = stream.shutdown().await;
+    });
+
+    let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("http")
+        .join("proxy")
+        .join("sample_anthropic_messages_to_openai_chat_completions_program.rss");
+    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let mut stream = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("downstream stream should connect");
+    let request_body = "{\"model\":\"claude-sonnet-4-5\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":64,\"stream\":true}";
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nx-anthropic-host: 127.0.0.1\r\nx-anthropic-port: {}\r\nConnection: close\r\n\r\n{}",
+        request_body.len(),
+        upstream_addr.port(),
+        request_body,
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("request should write");
+
+    let mut buffered = Vec::new();
+    read_http1_response_head(&mut stream, &mut buffered)
+        .await
+        .expect("response head should read");
+    if buffered.is_empty() {
+        let mut chunk = [0u8; 1024];
+        let read = timeout(Duration::from_millis(100), stream.read(&mut chunk))
+            .await
+            .expect("first streamed bytes should arrive promptly")
+            .expect("first streamed bytes should read");
+        buffered.extend_from_slice(&chunk[..read]);
+    }
+    let first_chunk = String::from_utf8_lossy(&buffered).into_owned();
+    assert!(
+        first_chunk.contains("\"role\":\"assistant\""),
+        "expected role chunk in first streamed bytes, got: {first_chunk:?}"
+    );
+
+    buffered.clear();
+    assert!(
+        timeout(Duration::from_millis(50), stream.read(&mut [0u8; 128]))
+            .await
+            .is_err(),
+        "content chunk should still be pending before release"
+    );
+
+    release_tx
+        .send(())
+        .expect("release signal should be deliverable");
+
+    let mut body = String::new();
+    let mut tail = [0u8; 1024];
+    loop {
+        let read = timeout(Duration::from_millis(250), stream.read(&mut tail))
+            .await
+            .expect("remaining streamed bytes should arrive")
+            .expect("remaining streamed bytes should read");
+        if read == 0 {
+            break;
+        }
+        body.push_str(&String::from_utf8_lossy(&tail[..read]));
+    }
+    assert!(
+        body.contains("\"content\":\"Hello\""),
+        "expected content chunk after release"
+    );
+    assert!(
+        body.contains("[DONE]"),
+        "expected terminal marker after release"
     );
 
     upstream_handle.abort();

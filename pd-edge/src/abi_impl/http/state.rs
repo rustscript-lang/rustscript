@@ -33,7 +33,7 @@ use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use parking_lot::Mutex as ParkingMutex;
 use tokio::io::copy_bidirectional;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, mpsc, oneshot};
 use vm::VmError;
 #[cfg(feature = "websocket")]
 use {
@@ -81,9 +81,19 @@ use crate::abi_impl::websocket::{
 use crate::abi_impl::{http2, http3};
 use crate::lock_metrics::{self, LockMetricKey, ProfiledMutexGuard};
 
+mod downstream_response;
 mod request_context;
 mod upstream;
 
+pub(crate) use downstream_response::{
+    DownstreamResponseStreamWriteMode, HttpResponseOutputNode, append_response_output_body_bytes,
+    current_upstream_latency_ms, downstream_snapshot_response_head,
+    explicit_snapshot_downstream_response_head, finish_downstream_response_stream,
+    materialize_downstream_response_body_source, merge_headers, outbound_exchange_latency_ms,
+    resolve_committed_http_graph_response, resolve_http_graph_response,
+    response_from_upstream_snapshot, start_downstream_response_stream,
+    sync_response_output_body_headers, text_response, write_downstream_response_stream_bytes,
+};
 pub(crate) use request_context::{
     DownstreamConnectionMetadata, DownstreamHttpListenerGoal, HttpRequestHead, LazyRequestId,
     RequestPortField, RequestStringField, build_downstream_http_request_context,
@@ -95,15 +105,15 @@ pub(crate) use upstream::{
     DefaultUpstreamRequestSnapshot, DownstreamHttpBodyPassthrough, Http1DownstreamResolution,
     ResolvedHttpGraphResponse, ResolvedNativeHttp1DownstreamResponse,
     ResolvedNativeLocalHttp1DownstreamResponse, ResolvedSnapshotHttp1DownstreamResponse,
-    SnapshotHttp1DownstreamHeaders, build_configured_upstream_url, header_content_length,
+    SnapshotHttp1DownstreamHeaders, build_configured_upstream_url,
     ensure_outbound_exchange_response_started, ensure_upstream_response_started,
-    is_hop_by_hop_header, outbound_exchange_response_available, outbound_exchange_response_eof,
-    read_downstream_response_trailers, read_outbound_exchange_response_all,
-    read_outbound_exchange_response_next_chunk, read_outbound_exchange_response_next_line,
-    read_outbound_exchange_response_trailers, read_upstream_response_all,
-    read_upstream_response_next_chunk, read_upstream_response_next_line,
-    read_upstream_response_trailers, resolve_http1_downstream_response,
-    start_native_default_upstream_http_forward_response,
+    header_content_length, is_hop_by_hop_header, outbound_exchange_response_available,
+    outbound_exchange_response_eof, read_downstream_response_trailers,
+    read_outbound_exchange_response_all, read_outbound_exchange_response_next_chunk,
+    read_outbound_exchange_response_next_line, read_outbound_exchange_response_trailers,
+    read_upstream_response_all, read_upstream_response_next_chunk,
+    read_upstream_response_next_line, read_upstream_response_trailers,
+    resolve_http1_downstream_response, start_native_default_upstream_http_forward_response,
     try_resolve_native_http1_downstream_response, try_resolve_snapshot_http1_downstream_response,
     try_take_native_local_http1_downstream_response, upstream_response_available,
     upstream_response_eof,
@@ -851,14 +861,6 @@ impl HttpOutboundRequestNode {
             self.headers.insert(name, value);
         }
     }
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct HttpResponseOutputNode {
-    pub(crate) headers: HeaderMap,
-    pub(crate) body: Option<Vec<u8>>,
-    pub(crate) status: Option<u16>,
-    pub(crate) body_source_exchange: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2117,11 +2119,28 @@ impl ProxyVmContext {
             .insert(exchange);
     }
 
-    pub(crate) fn insert_downstream_response_header(&self, name: HeaderName, value: HeaderValue) {
+    fn ensure_downstream_response_head_mutable(
+        downstream: &DownstreamState,
+    ) -> Result<(), VmError> {
+        if downstream.response_output.stream_committed() {
+            return Err(VmError::HostError(
+                "downstream response headers and status are immutable after response streaming begins"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn insert_downstream_response_header(
+        &self,
+        name: HeaderName,
+        value: HeaderValue,
+    ) -> Result<(), VmError> {
         let mut downstream = self.lock_downstream();
         downstream.vm_touches.response_headers_mutated = true;
+        Self::ensure_downstream_response_head_mutable(&downstream)?;
         if downstream.post_response_plan.is_none()
-            && downstream.response_output.body.is_none()
+            && !downstream.response_output.has_local_body()
             && downstream.response_output.body_source_exchange.is_none()
             && downstream.response_output.status.is_none()
             && downstream.response_output.headers.is_empty()
@@ -2129,16 +2148,21 @@ impl ProxyVmContext {
                 downstream.native_default_upstream_forward_response.as_mut()
         {
             native_response.headers.insert(name, value);
-            return;
+            return Ok(());
         }
         downstream.response_output.headers.insert(name, value);
+        Ok(())
     }
 
-    pub(crate) fn insert_downstream_response_headers(&self, headers: HeaderMap) {
+    pub(crate) fn insert_downstream_response_headers(
+        &self,
+        headers: HeaderMap,
+    ) -> Result<(), VmError> {
         let mut downstream = self.lock_downstream();
         downstream.vm_touches.response_headers_mutated = true;
+        Self::ensure_downstream_response_head_mutable(&downstream)?;
         if downstream.post_response_plan.is_none()
-            && downstream.response_output.body.is_none()
+            && !downstream.response_output.has_local_body()
             && downstream.response_output.body_source_exchange.is_none()
             && downstream.response_output.status.is_none()
             && downstream.response_output.headers.is_empty()
@@ -2150,20 +2174,22 @@ impl ProxyVmContext {
                     native_response.headers.insert(name, value);
                 }
             }
-            return;
+            return Ok(());
         }
         for (name, value) in headers {
             if let Some(name) = name {
                 downstream.response_output.headers.insert(name, value);
             }
         }
+        Ok(())
     }
 
-    pub(crate) fn set_downstream_response_status(&self, status: u16) {
+    pub(crate) fn set_downstream_response_status(&self, status: u16) -> Result<(), VmError> {
         let mut downstream = self.lock_downstream();
         downstream.vm_touches.response_status_mutated = true;
+        Self::ensure_downstream_response_head_mutable(&downstream)?;
         if downstream.post_response_plan.is_none()
-            && downstream.response_output.body.is_none()
+            && !downstream.response_output.has_local_body()
             && downstream.response_output.body_source_exchange.is_none()
             && downstream.response_output.headers.is_empty()
             && downstream.response_output.status.is_none()
@@ -2171,9 +2197,10 @@ impl ProxyVmContext {
                 downstream.native_default_upstream_forward_response.as_mut()
         {
             native_response.status = status;
-            return;
+            return Ok(());
         }
         downstream.response_output.status = Some(status);
+        Ok(())
     }
 
     pub(crate) fn downstream_websocket(&self) -> WebSocketConnectionState {
@@ -2280,6 +2307,14 @@ impl ProxyVmContext {
             .inline_http_response_sender
             .take()
             .map(|sender| sender.0)
+    }
+
+    pub(crate) fn downstream_response_stream_ready_notify(&self) -> Arc<Notify> {
+        self.lock_downstream().response_output.stream_ready_notify()
+    }
+
+    pub(crate) fn downstream_response_stream_committed(&self) -> bool {
+        self.lock_downstream().response_output.stream_committed()
     }
 
     pub(crate) fn downstream_connection_metadata(
@@ -2826,559 +2861,6 @@ pub(crate) fn append_outbound_exchange_body_bytes(
         .get_or_insert_with(Vec::new)
         .extend_from_slice(bytes);
     Ok(())
-}
-
-pub(crate) fn append_response_output_body_bytes(context: &SharedProxyVmContext, bytes: &[u8]) {
-    context.lock_transport().tcp_dag.downstream.note_write();
-    let mut downstream = context.lock_downstream();
-    downstream.vm_touches.response_body_mutated = true;
-    downstream.response_output.body_source_exchange = None;
-    downstream
-        .response_output
-        .body
-        .get_or_insert_with(Vec::new)
-        .extend_from_slice(bytes);
-    sync_response_output_body_headers(&mut downstream.response_output);
-}
-
-pub(crate) fn sync_response_output_body_headers(response: &mut HttpResponseOutputNode) {
-    if let Some(body) = response.body.as_ref() {
-        response.headers.remove(TRANSFER_ENCODING);
-        if let Ok(value) = HeaderValue::from_str(&body.len().to_string()) {
-            response.headers.insert(CONTENT_LENGTH, value);
-        }
-    }
-}
-
-fn current_upstream_latency_ms(context: &SharedProxyVmContext) -> u64 {
-    if let Some(latency_ms) = context.native_default_upstream_forward_latency_ms() {
-        return latency_ms;
-    }
-    context
-        .lock_exchanges()
-        .exchanges
-        .get(&DEFAULT_UPSTREAM_EXCHANGE_HANDLE)
-        .map(|exchange| exchange.upstream_latency_ms)
-        .unwrap_or(0)
-}
-
-fn outbound_exchange_latency_ms(context: &SharedProxyVmContext, handle: i64) -> u64 {
-    context
-        .lock_exchanges()
-        .exchanges
-        .get(&handle)
-        .map(|exchange| exchange.upstream_latency_ms)
-        .unwrap_or(0)
-}
-
-fn merge_headers(target: &mut HeaderMap, overlay: &HeaderMap) {
-    for (name, value) in overlay {
-        target.insert(name, value.clone());
-    }
-}
-
-fn downstream_snapshot_response_head(
-    snapshot: &HttpUpstreamResponseSnapshot,
-    response_headers: HeaderMap,
-    response_status: Option<u16>,
-) -> (u16, SnapshotHttp1DownstreamHeaders) {
-    (
-        response_status.unwrap_or(snapshot.status),
-        SnapshotHttp1DownstreamHeaders::Snapshot {
-            base: snapshot.headers.clone(),
-            overlay: response_headers,
-        },
-    )
-}
-
-fn explicit_snapshot_downstream_response_head(
-    snapshot: &HttpUpstreamResponseSnapshot,
-    response_headers: HeaderMap,
-    response_status: Option<u16>,
-) -> (u16, SnapshotHttp1DownstreamHeaders) {
-    (
-        response_status.unwrap_or(snapshot.status),
-        SnapshotHttp1DownstreamHeaders::Explicit(response_headers),
-    )
-}
-
-fn text_response(status: StatusCode, text: &str) -> Response<Body> {
-    let mut response = Response::new(Body::from(text.to_string()));
-    *response.status_mut() = status;
-    response
-}
-
-fn response_from_output(
-    body: Vec<u8>,
-    headers: HeaderMap,
-    status_code: Option<u16>,
-) -> Response<Body> {
-    let body_is_empty = body.is_empty();
-    let mut response = if body_is_empty {
-        Response::new(Body::empty())
-    } else {
-        Response::new(Body::from(body))
-    };
-    let status = status_code
-        .and_then(|code| StatusCode::from_u16(code).ok())
-        .unwrap_or(StatusCode::OK);
-    *response.status_mut() = status;
-    merge_headers(response.headers_mut(), &headers);
-    if body_is_empty {
-        response
-            .headers_mut()
-            .entry(CONTENT_LENGTH)
-            .or_insert_with(|| HeaderValue::from_static("0"));
-    } else if !response.headers().contains_key(CONTENT_TYPE) {
-        response
-            .headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-    }
-    response
-}
-
-pub(crate) async fn materialize_downstream_response_body_source(
-    context: &SharedProxyVmContext,
-) -> Result<(), VmError> {
-    let exchange = {
-        let downstream = context.lock_downstream();
-        if downstream.response_output.body.is_some() {
-            return Ok(());
-        }
-        downstream.response_output.body_source_exchange
-    };
-    let Some(exchange) = exchange else {
-        return Ok(());
-    };
-    let body = read_outbound_exchange_response_all(context, exchange).await?;
-    let mut downstream = context.lock_downstream();
-    if downstream.response_output.body.is_none()
-        && downstream.response_output.body_source_exchange == Some(exchange)
-    {
-        downstream.response_output.body_source_exchange = None;
-        downstream.response_output.body = Some(body);
-        sync_response_output_body_headers(&mut downstream.response_output);
-    }
-    Ok(())
-}
-
-fn response_from_connect_tunnel(headers: HeaderMap) -> Response<Body> {
-    let mut response = Response::new(Body::empty());
-    *response.status_mut() = StatusCode::OK;
-    merge_headers(response.headers_mut(), &headers);
-    response.headers_mut().remove(CONTENT_TYPE);
-    response.headers_mut().remove(CONTENT_LENGTH);
-    response
-}
-
-#[cfg(feature = "websocket")]
-fn response_from_websocket_tunnel(
-    request_headers: &HeaderMap,
-    headers: HeaderMap,
-    selected_subprotocol: Option<&str>,
-) -> Result<Response<Body>, VmError> {
-    let request_key = request_headers
-        .get("sec-websocket-key")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| {
-            VmError::HostError(
-                "downstream websocket tunnel requires a valid sec-websocket-key header".to_string(),
-            )
-        })?;
-    let accept = derive_accept_key(request_key.as_bytes());
-    let accept = HeaderValue::from_str(&accept).map_err(|err| {
-        VmError::HostError(format!(
-            "failed to encode websocket accept header for downstream tunnel: {err}",
-        ))
-    })?;
-
-    let mut response = Response::new(Body::empty());
-    *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-    merge_headers(response.headers_mut(), &headers);
-    response
-        .headers_mut()
-        .insert("connection", HeaderValue::from_static("Upgrade"));
-    response
-        .headers_mut()
-        .insert("upgrade", HeaderValue::from_static("websocket"));
-    response
-        .headers_mut()
-        .insert("sec-websocket-accept", accept);
-    if let Some(subprotocol) = selected_subprotocol {
-        let value = HeaderValue::from_str(subprotocol).map_err(|err| {
-            VmError::HostError(format!(
-                "invalid negotiated websocket subprotocol '{subprotocol}': {err}",
-            ))
-        })?;
-        response
-            .headers_mut()
-            .insert("sec-websocket-protocol", value);
-    }
-    response.headers_mut().remove(CONTENT_TYPE);
-    response.headers_mut().remove(CONTENT_LENGTH);
-    Ok(response)
-}
-
-async fn streaming_body_from_upstream_snapshot(
-    snapshot: &HttpUpstreamResponseSnapshot,
-) -> Result<Body, VmError> {
-    let mut upstream_body = snapshot.body.lock().await;
-    if upstream_body.is_known_empty() {
-        return Ok(Body::empty());
-    }
-    let passthrough = upstream_body.take_streaming_passthrough();
-    Ok(Body::new(StreamBody::new(try_unfold(
-        passthrough,
-        |mut state| async move {
-            let frame: Option<Frame<Bytes>> = state
-                .next_frame()
-                .await
-                .map_err(|err: VmError| io::Error::other(err.to_string()))?;
-            Ok::<_, io::Error>(frame.map(|frame| (frame, state)))
-        },
-    ))))
-}
-
-fn filtered_snapshot_headers(snapshot: &HttpUpstreamResponseSnapshot) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    for (name, value) in snapshot.headers.iter() {
-        if !is_hop_by_hop_header(name) {
-            headers.insert(name, value.clone());
-        }
-    }
-    headers
-}
-
-async fn response_from_upstream_snapshot_head(
-    snapshot: HttpUpstreamResponseSnapshot,
-    status: u16,
-    headers: HeaderMap,
-) -> Result<Response<Body>, VmError> {
-    let body = streaming_body_from_upstream_snapshot(&snapshot).await?;
-    let mut response = Response::new(body);
-    *response.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-    *response.headers_mut() = headers;
-    Ok(response)
-}
-
-async fn response_from_upstream_snapshot(
-    snapshot: HttpUpstreamResponseSnapshot,
-    response_headers: HeaderMap,
-    response_status: Option<u16>,
-) -> Result<Response<Body>, VmError> {
-    let status = response_status.unwrap_or(snapshot.status);
-    let mut headers = filtered_snapshot_headers(&snapshot);
-    merge_headers(&mut headers, &response_headers);
-    response_from_upstream_snapshot_head(snapshot, status, headers).await
-}
-
-pub(crate) async fn resolve_http_graph_response(
-    context: &SharedProxyVmContext,
-) -> ResolvedHttpGraphResponse {
-    let native_fast_path = {
-        let mut downstream = context.lock_downstream();
-        if downstream.post_response_plan.is_none() && downstream.response_output.body.is_none() {
-            downstream
-                .native_default_upstream_forward_response
-                .take()
-                .map(|response| {
-                    downstream.native_default_upstream_http_forward = false;
-                    (
-                        response,
-                        std::mem::take(&mut downstream.response_output.headers),
-                        downstream.response_output.status.take(),
-                    )
-                })
-        } else {
-            None
-        }
-    };
-    if let Some((response, response_headers, response_status)) = native_fast_path {
-        let upstream_latency_ms = response.upstream_latency_ms;
-        return ResolvedHttpGraphResponse {
-            response: response_from_started_upstream_response(
-                response,
-                response_headers,
-                response_status,
-            )
-            .await,
-            upstream_latency_ms,
-            post_response_plan: None,
-        };
-    }
-
-    let (
-        response_body,
-        body_source_exchange,
-        response_headers,
-        response_status,
-        has_post_response_plan,
-        has_upstream_target,
-        default_upstream_websocket_mode,
-        upstream_response,
-        native_default_upstream_http_forward,
-    ) = {
-        let downstream = context.lock_downstream();
-        let exchanges = context.lock_exchanges();
-        let default_exchange = exchanges
-            .exchanges
-            .get(&DEFAULT_UPSTREAM_EXCHANGE_HANDLE)
-            .expect("default upstream exchange should exist");
-        (
-            downstream.response_output.body.clone(),
-            downstream.response_output.body_source_exchange,
-            downstream.response_output.headers.clone(),
-            downstream.response_output.status,
-            downstream.post_response_plan.is_some(),
-            default_exchange.request.target.is_some(),
-            default_exchange.websocket_dag.is_websocket_mode(),
-            match &default_exchange.response {
-                HttpUpstreamResponseNode::Ready(snapshot) => Some(snapshot.clone()),
-                HttpUpstreamResponseNode::NotStarted => None,
-            },
-            downstream.native_default_upstream_http_forward,
-        )
-    };
-
-    if has_post_response_plan {
-        let plan = context
-            .take_downstream_post_response_plan()
-            .expect("downstream post-response plan should exist");
-        let response = match &plan {
-            DownstreamPostResponsePlan::ConnectTunnel(_) => {
-                Ok(response_from_connect_tunnel(response_headers))
-            }
-            #[cfg(feature = "websocket")]
-            DownstreamPostResponsePlan::WebSocketTunnel(plan) => {
-                context.with_request_head(|request_head| {
-                    response_from_websocket_tunnel(
-                        request_head.headers(),
-                        response_headers,
-                        plan.selected_subprotocol.as_deref(),
-                    )
-                })
-            }
-        };
-        let response = match response {
-            Ok(response) => response,
-            Err(_) => {
-                return ResolvedHttpGraphResponse {
-                    response: text_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "internal server error",
-                    ),
-                    upstream_latency_ms: current_upstream_latency_ms(context),
-                    post_response_plan: None,
-                };
-            }
-        };
-        return ResolvedHttpGraphResponse {
-            response,
-            upstream_latency_ms: current_upstream_latency_ms(context),
-            post_response_plan: Some(plan),
-        };
-    }
-
-    if let Some(body) = response_body {
-        return ResolvedHttpGraphResponse {
-            response: response_from_output(body, response_headers, response_status),
-            upstream_latency_ms: current_upstream_latency_ms(context),
-            post_response_plan: None,
-        };
-    }
-
-    if let Some(exchange) = body_source_exchange {
-        let snapshot = if exchange == DEFAULT_UPSTREAM_EXCHANGE_HANDLE {
-            match start_upstream_response(context).await {
-                Ok(snapshot) => snapshot,
-                Err(UpstreamResponseStartError::MissingTarget) => {
-                    return ResolvedHttpGraphResponse {
-                        response: text_response(StatusCode::NOT_FOUND, "not found"),
-                        upstream_latency_ms: 0,
-                        post_response_plan: None,
-                    };
-                }
-                Err(
-                    err @ (UpstreamResponseStartError::UnknownExchangeHandle(_)
-                    | UpstreamResponseStartError::MissingClient
-                    | UpstreamResponseStartError::Protocol(_)
-                    | UpstreamResponseStartError::ResolveOutboundBody(_)),
-                ) => {
-                    return ResolvedHttpGraphResponse {
-                        response: text_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &err.as_vm_error().to_string(),
-                        ),
-                        upstream_latency_ms: current_upstream_latency_ms(context),
-                        post_response_plan: None,
-                    };
-                }
-                Err(UpstreamResponseStartError::UpstreamRequest(_)) => {
-                    return ResolvedHttpGraphResponse {
-                        response: text_response(StatusCode::BAD_GATEWAY, "bad gateway"),
-                        upstream_latency_ms: current_upstream_latency_ms(context),
-                        post_response_plan: None,
-                    };
-                }
-            }
-        } else {
-            match start_outbound_exchange_response(context, exchange).await {
-                Ok(snapshot) => snapshot,
-                Err(UpstreamResponseStartError::MissingTarget) => {
-                    return ResolvedHttpGraphResponse {
-                        response: text_response(StatusCode::NOT_FOUND, "not found"),
-                        upstream_latency_ms: 0,
-                        post_response_plan: None,
-                    };
-                }
-                Err(
-                    err @ (UpstreamResponseStartError::UnknownExchangeHandle(_)
-                    | UpstreamResponseStartError::MissingClient
-                    | UpstreamResponseStartError::Protocol(_)
-                    | UpstreamResponseStartError::ResolveOutboundBody(_)),
-                ) => {
-                    return ResolvedHttpGraphResponse {
-                        response: text_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &err.as_vm_error().to_string(),
-                        ),
-                        upstream_latency_ms: outbound_exchange_latency_ms(context, exchange),
-                        post_response_plan: None,
-                    };
-                }
-                Err(UpstreamResponseStartError::UpstreamRequest(_)) => {
-                    return ResolvedHttpGraphResponse {
-                        response: text_response(StatusCode::BAD_GATEWAY, "bad gateway"),
-                        upstream_latency_ms: outbound_exchange_latency_ms(context, exchange),
-                        post_response_plan: None,
-                    };
-                }
-            }
-        };
-
-        let explicit_status = response_status.unwrap_or(snapshot.status);
-        let response =
-            response_from_upstream_snapshot_head(snapshot, explicit_status, response_headers).await;
-
-        return match response {
-            Ok(response) => ResolvedHttpGraphResponse {
-                response,
-                upstream_latency_ms: outbound_exchange_latency_ms(context, exchange),
-                post_response_plan: None,
-            },
-            Err(_) => ResolvedHttpGraphResponse {
-                response: text_response(StatusCode::BAD_GATEWAY, "bad gateway"),
-                upstream_latency_ms: outbound_exchange_latency_ms(context, exchange),
-                post_response_plan: None,
-            },
-        };
-    }
-
-    if native_default_upstream_http_forward && upstream_response.is_none() {
-        if let Ok(Some(resolved)) =
-            try_resolve_ready_or_pending_native_default_upstream_forward_response(
-                context,
-                response_headers.clone(),
-                response_status,
-            )
-            .await
-        {
-            context.clear_native_default_upstream_http_forward();
-            return resolved;
-        }
-        match try_resolve_native_default_upstream_http_forward_response(
-            context,
-            response_headers.clone(),
-            response_status,
-        )
-        .await
-        {
-            Ok(Some(resolved)) => {
-                context.clear_native_default_upstream_http_forward();
-                return resolved;
-            }
-            Ok(None) => {}
-            Err(UpstreamResponseStartError::MissingTarget) => {}
-            Err(
-                err @ (UpstreamResponseStartError::UnknownExchangeHandle(_)
-                | UpstreamResponseStartError::MissingClient
-                | UpstreamResponseStartError::Protocol(_)
-                | UpstreamResponseStartError::ResolveOutboundBody(_)),
-            ) => {
-                context.clear_native_default_upstream_http_forward();
-                return ResolvedHttpGraphResponse {
-                    response: text_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &err.as_vm_error().to_string(),
-                    ),
-                    upstream_latency_ms: current_upstream_latency_ms(context),
-                    post_response_plan: None,
-                };
-            }
-            Err(UpstreamResponseStartError::UpstreamRequest(_)) => {
-                context.clear_native_default_upstream_http_forward();
-                return ResolvedHttpGraphResponse {
-                    response: text_response(StatusCode::BAD_GATEWAY, "bad gateway"),
-                    upstream_latency_ms: current_upstream_latency_ms(context),
-                    post_response_plan: None,
-                };
-            }
-        }
-    }
-
-    let snapshot = if let Some(snapshot) = upstream_response {
-        Some(snapshot)
-    } else if has_upstream_target && !default_upstream_websocket_mode {
-        match start_upstream_response(context).await {
-            Ok(snapshot) => Some(snapshot),
-            Err(UpstreamResponseStartError::MissingTarget) => None,
-            Err(
-                err @ (UpstreamResponseStartError::UnknownExchangeHandle(_)
-                | UpstreamResponseStartError::MissingClient
-                | UpstreamResponseStartError::Protocol(_)
-                | UpstreamResponseStartError::ResolveOutboundBody(_)),
-            ) => {
-                return ResolvedHttpGraphResponse {
-                    response: text_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &err.as_vm_error().to_string(),
-                    ),
-                    upstream_latency_ms: current_upstream_latency_ms(context),
-                    post_response_plan: None,
-                };
-            }
-            Err(UpstreamResponseStartError::UpstreamRequest(_)) => {
-                return ResolvedHttpGraphResponse {
-                    response: text_response(StatusCode::BAD_GATEWAY, "bad gateway"),
-                    upstream_latency_ms: current_upstream_latency_ms(context),
-                    post_response_plan: None,
-                };
-            }
-        }
-    } else {
-        None
-    };
-
-    let Some(snapshot) = snapshot else {
-        return ResolvedHttpGraphResponse {
-            response: text_response(StatusCode::NOT_FOUND, "not found"),
-            upstream_latency_ms: 0,
-            post_response_plan: None,
-        };
-    };
-
-    match response_from_upstream_snapshot(snapshot, response_headers, response_status).await {
-        Ok(response) => ResolvedHttpGraphResponse {
-            response,
-            upstream_latency_ms: current_upstream_latency_ms(context),
-            post_response_plan: None,
-        },
-        Err(_) => ResolvedHttpGraphResponse {
-            response: text_response(StatusCode::BAD_GATEWAY, "bad gateway"),
-            upstream_latency_ms: current_upstream_latency_ms(context),
-            post_response_plan: None,
-        },
-    }
 }
 
 fn mark_downstream_transport_closed(context: &SharedProxyVmContext) {

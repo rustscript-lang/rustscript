@@ -613,8 +613,8 @@ fn tcp_flow_phase_label(flow: &super::state::TcpFlowState) -> &'static str {
     flow.phase_label()
 }
 
-fn append_downstream_response(context: &SharedProxyVmContext, text: &str) {
-    append_response_output_body_bytes(context, text.as_bytes());
+fn append_downstream_response(context: &SharedProxyVmContext, text: &str) -> Result<(), VmError> {
+    append_response_output_body_bytes(context, text.as_bytes())
 }
 
 /// Returns the TCP stream handle for the current downstream flow.
@@ -968,7 +968,7 @@ async fn stream_write(
                     "downstream tcp stream is pending tls handshake; call tls::session::handshake before writing plaintext".to_string(),
                 ));
             } else {
-                append_downstream_response(&context, &text)
+                append_downstream_response(&context, &text)?;
             }
             #[cfg(not(feature = "tls"))]
             if let Some(io) = active_downstream_tcp_io(&context) {
@@ -977,7 +977,7 @@ async fn stream_write(
                     return Err(err);
                 }
             } else {
-                append_downstream_response(&context, &text)
+                append_downstream_response(&context, &text)?;
             }
         }
         TcpStreamHandle::Reserved(TcpStreamRef::DefaultUpstream) => {

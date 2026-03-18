@@ -1,5 +1,9 @@
 use edge::{compile_edge_source_file, compile_edge_source_file_with_options};
-use vm::{CompileSourceFileOptions, Value, Vm, VmStatus};
+use vm::{
+    CompileSourceFileOptions, SourceFlavor, Value, Vm, VmStatus,
+    lint_trailing_function_return_semicolons,
+    lint_unknown_inferred_local_types_at_path_with_options, lint_unknown_type_annotations,
+};
 
 fn unique_temp_root(label: &str) -> std::path::PathBuf {
     let unique = format!(
@@ -172,6 +176,43 @@ fn compile_edge_source_file_supports_console_http3_client_example() {
     assert!(
         import_names.contains(&"tls::session::from_socket"),
         "console sample should create a TLS session from the exchange"
+    );
+}
+
+#[test]
+fn sample_anthropic_messages_to_openai_chat_completions_program_compiles_and_lints_cleanly() {
+    let program_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        "examples/http/proxy/sample_anthropic_messages_to_openai_chat_completions_program.rss",
+    );
+    let source = std::fs::read_to_string(&program_path).expect("sample source should read");
+
+    compile_edge_source_file(&program_path).expect("sample should compile");
+
+    let unknown_inferred_locals = lint_unknown_inferred_local_types_at_path_with_options(
+        &program_path,
+        &source,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::new(),
+    )
+    .expect("unknown inferred local lint should succeed");
+    assert!(
+        unknown_inferred_locals.is_empty(),
+        "sample should not produce unknown inferred local warnings: {unknown_inferred_locals:?}"
+    );
+
+    let unknown_type_annotations = lint_unknown_type_annotations(&source, SourceFlavor::RustScript)
+        .expect("unknown type annotation lint should succeed");
+    assert!(
+        unknown_type_annotations.is_empty(),
+        "sample should not produce unknown type annotation warnings: {unknown_type_annotations:?}"
+    );
+
+    let trailing_return_semicolons =
+        lint_trailing_function_return_semicolons(&source, SourceFlavor::RustScript)
+            .expect("trailing function return semicolon lint should succeed");
+    assert!(
+        trailing_return_semicolons.is_empty(),
+        "sample should not produce trailing function return semicolon warnings: {trailing_return_semicolons:?}"
     );
 }
 

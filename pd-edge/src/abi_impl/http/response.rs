@@ -3,11 +3,13 @@ use edge_abi::symbols::http::response as http_response;
 use pd_edge_host_function::pd_edge_host_function;
 use vm::{CallOutcome, Value, Vm, VmError};
 
-use super::state::sync_response_output_body_headers;
+use super::state::{DownstreamResponseStreamWriteMode, sync_response_output_body_headers};
 use super::{
-    SharedProxyVmContext, ensure_outbound_exchange_response_started, headers_to_value_map,
-    is_hop_by_hop_header, lookup_cached_header_batch, materialize_downstream_response_body_source,
-    parse_header, parse_header_name, read_downstream_response_trailers, store_cached_header_batch,
+    SharedProxyVmContext, ensure_outbound_exchange_response_started,
+    finish_downstream_response_stream, headers_to_value_map, is_hop_by_hop_header,
+    lookup_cached_header_batch, materialize_downstream_response_body_source, parse_header,
+    parse_header_name, read_downstream_response_trailers, start_downstream_response_stream,
+    store_cached_header_batch, write_downstream_response_stream_bytes,
 };
 
 pub(crate) fn parse_response_header_batch(
@@ -72,8 +74,11 @@ pub(crate) fn parse_response_header_batch(
     }
 }
 
-fn apply_response_header_batch(context: &SharedProxyVmContext, headers: axum::http::HeaderMap) {
-    context.insert_downstream_response_headers(headers);
+fn apply_response_header_batch(
+    context: &SharedProxyVmContext,
+    headers: axum::http::HeaderMap,
+) -> Result<(), VmError> {
+    context.insert_downstream_response_headers(headers)
 }
 
 fn validate_response_status(status: i64) -> Result<u16, VmError> {
@@ -93,7 +98,7 @@ fn set_response_header(
     value: String,
 ) -> Result<CallOutcome, VmError> {
     let (header_name, header_value) = parse_header(name, value)?;
-    context.insert_downstream_response_header(header_name, header_value);
+    context.insert_downstream_response_header(header_name, header_value)?;
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -104,7 +109,7 @@ fn set_response_headers(
     headers: Value,
 ) -> Result<CallOutcome, VmError> {
     let parsed = parse_response_header_batch(headers)?;
-    apply_response_header_batch(&context, parsed);
+    apply_response_header_batch(&context, parsed)?;
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -112,11 +117,46 @@ fn set_response_headers(
 #[pd_edge_host_function(name = http_response::SET_BODY.name, scope = http)]
 fn set_response_body(context: SharedProxyVmContext, body: String) -> Result<CallOutcome, VmError> {
     context.note_downstream_response_body_mutated();
-    context.with_downstream_response_mut(|response| {
+    context.with_downstream_response_mut(|response| -> Result<(), VmError> {
+        if response.body_stream.is_some() {
+            return Err(VmError::HostError(
+                "http::response::set_body is unavailable after response streaming begins"
+                    .to_string(),
+            ));
+        }
         response.body_source_exchange = None;
         response.body = Some(body.into_bytes());
         sync_response_output_body_headers(response);
-    });
+        Ok(())
+    })?;
+    Ok(CallOutcome::Return(vec![]))
+}
+
+/// Starts a streaming downstream HTTP response body.
+#[pd_edge_host_function(name = http_response::stream::START.name, scope = http)]
+fn start_response_stream(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
+    start_downstream_response_stream(&context)?;
+    Ok(CallOutcome::Return(vec![]))
+}
+
+/// Writes a chunk to the streaming downstream HTTP response body.
+#[pd_edge_host_function(name = http_response::stream::WRITE.name, scope = http)]
+fn write_response_stream(
+    context: SharedProxyVmContext,
+    chunk: String,
+) -> Result<CallOutcome, VmError> {
+    write_downstream_response_stream_bytes(
+        &context,
+        chunk.as_bytes(),
+        DownstreamResponseStreamWriteMode::ExplicitImmediate,
+    )?;
+    Ok(CallOutcome::Return(vec![Value::Int(chunk.len() as i64)]))
+}
+
+/// Finishes the streaming downstream HTTP response body.
+#[pd_edge_host_function(name = http_response::stream::FINISH.name, scope = http)]
+fn finish_response_streaming(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
+    finish_downstream_response_stream(&context)?;
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -131,7 +171,12 @@ async fn apply_exchange_to_response_with_headers(
 ) -> Result<CallOutcome, VmError> {
     let parsed_headers = parse_response_header_batch(headers)?;
     let snapshot = ensure_outbound_exchange_response_started(&context, exchange).await?;
-    context.with_downstream_response_mut(|response| {
+    context.with_downstream_response_mut(|response| -> Result<(), VmError> {
+        if response.body_stream.is_some() {
+            return Err(VmError::HostError(
+                "http::response::apply_exchange_with_headers is unavailable after response streaming begins".to_string(),
+            ));
+        }
         response.status = Some(snapshot.status);
         response.body = None;
         response.body_source_exchange = Some(exchange);
@@ -140,15 +185,16 @@ async fn apply_exchange_to_response_with_headers(
                 response.headers.insert(name.clone(), value.clone());
             }
         }
-    });
-    apply_response_header_batch(&context, parsed_headers);
+        Ok(())
+    })?;
+    apply_response_header_batch(&context, parsed_headers)?;
     Ok(CallOutcome::Return(vec![]))
 }
 
 /// Sets the status code on the downstream HTTP response.
 #[pd_edge_host_function(name = http_response::SET_STATUS.name, scope = http)]
 fn set_response_status(context: SharedProxyVmContext, status: i64) -> Result<CallOutcome, VmError> {
-    context.set_downstream_response_status(validate_response_status(status)?);
+    context.set_downstream_response_status(validate_response_status(status)?)?;
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -160,7 +206,13 @@ async fn apply_exchange_to_response(
     exchange: i64,
 ) -> Result<CallOutcome, VmError> {
     let snapshot = ensure_outbound_exchange_response_started(&context, exchange).await?;
-    context.with_downstream_response_mut(|response| {
+    context.with_downstream_response_mut(|response| -> Result<(), VmError> {
+        if response.body_stream.is_some() {
+            return Err(VmError::HostError(
+                "http::response::apply_exchange is unavailable after response streaming begins"
+                    .to_string(),
+            ));
+        }
         response.status = Some(snapshot.status);
         response.body = None;
         response.body_source_exchange = Some(exchange);
@@ -169,7 +221,8 @@ async fn apply_exchange_to_response(
                 response.headers.insert(name.clone(), value.clone());
             }
         }
-    });
+        Ok(())
+    })?;
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -189,8 +242,14 @@ async fn get_response_body(
     materialize_downstream_response_body_source(&context).await?;
     context.note_downstream_response_body_read();
     let value = context.with_downstream_response(|response| {
-        String::from_utf8_lossy(response.body.as_deref().unwrap_or_default()).into_owned()
-    });
+        if response.body_stream.is_some() {
+            return Err(VmError::HostError(
+                "http::response::get_body is unavailable after response streaming begins"
+                    .to_string(),
+            ));
+        }
+        Ok(String::from_utf8_lossy(response.body.as_deref().unwrap_or_default()).into_owned())
+    })?;
     Ok(CallOutcome::Return(vec![Value::string(value)]))
 }
 
@@ -258,9 +317,16 @@ fn add_response_header(
 ) -> Result<CallOutcome, VmError> {
     let (header_name, header_value) = parse_header(name, value)?;
     context.note_downstream_response_headers_mutated();
-    context.with_downstream_response_mut(|response| {
+    context.with_downstream_response_mut(|response| -> Result<(), VmError> {
+        if response.stream_committed() {
+            return Err(VmError::HostError(
+                "downstream response headers are immutable after response streaming begins"
+                    .to_string(),
+            ));
+        }
         response.headers.append(header_name, header_value);
-    });
+        Ok(())
+    })?;
     Ok(CallOutcome::Return(vec![]))
 }
 
@@ -272,8 +338,15 @@ fn clear_response_header(
 ) -> Result<CallOutcome, VmError> {
     let header_name = parse_header_name(name)?;
     context.note_downstream_response_headers_mutated();
-    context.with_downstream_response_mut(|response| {
+    context.with_downstream_response_mut(|response| -> Result<(), VmError> {
+        if response.stream_committed() {
+            return Err(VmError::HostError(
+                "downstream response headers are immutable after response streaming begins"
+                    .to_string(),
+            ));
+        }
         response.headers.remove(header_name);
-    });
+        Ok(())
+    })?;
     Ok(CallOutcome::Return(vec![]))
 }
