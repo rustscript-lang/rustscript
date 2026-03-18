@@ -512,6 +512,8 @@ Rules:
 - With feature `http2`, outbound HTTPS exchanges can negotiate `h2` and dynamic exchanges may share one upstream connection when the client path permits multiplex.
 - `response.output` starts empty and is populated by VM host calls for local response construction.
 - Each `exchange[n].response` starts as `NotStarted` and becomes `Ready` only when the DAG actually needs response data for that handle.
+- On eligible HTTP/1 requests, runtime may detach from the generic `resolve_http_graph_response -> Response<Body>` materialization path into a shortcut writer (`native local`, `native upstream`, or `snapshot passthrough`). That detach is not a new DAG node visible to the VM; it is only legal when it is observationally equivalent to the same already-published DAG state.
+- Shortcut detaches are revoked once the VM has consumed or mutated state that would make the shortcut semantically lossy, such as response post-plans, local response bodies on passthrough paths, or exchange-response body reads.
 - What exists today:
   - internal `http2.session.*` and `http2.stream.*` goals drive attachment, request commitment, response-head readiness, response-body readiness, close, and reset progression
   - explicit stream carrier refs are attached to upstream exchanges and real downstream HTTP/2 requests
@@ -536,9 +538,13 @@ flowchart TD
     C -. request body may feed .-> G
     D --> H["exchange 1 response ready"]
     F --> I["exchange n response ready"]
+    H -. eligible http/1 detach .-> K["virtual detach: shortcut writer"]
+    I -. eligible http/1 detach .-> K
+    G -. eligible http/1 detach .-> K
     H --> J["client response committed"]
     G --> J
     I -. response data may be copied into .-> G
+    K --> J
 ```
 
 ### WebSocket DAG
