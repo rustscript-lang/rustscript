@@ -47,6 +47,81 @@ function stateHasMatch(
   return false;
 }
 
+function anchoredMatch(pattern: RegExp, text: string): RegExpExecArray | null {
+  const flags = pattern.flags.replaceAll("g", "").replaceAll("y", "");
+  return new RegExp(`^(?:${pattern.source})`, flags).exec(text);
+}
+
+function tokenizeLine(
+  provider: { tokenizer: Record<string, MonarchRule[]> },
+  text: string,
+  initialState = "root"
+): Array<{ token: string; value: string }> {
+  const stateStack = [initialState];
+  const tokens: Array<{ token: string; value: string }> = [];
+  let offset = 0;
+  let guard = 0;
+
+  while (offset < text.length && guard < text.length * 10) {
+    guard += 1;
+    const state = stateStack[stateStack.length - 1];
+    const rules = provider.tokenizer[state] ?? [];
+    let matched = false;
+
+    for (const rule of rules) {
+      const pattern = rule[0];
+      if (!(pattern instanceof RegExp)) {
+        continue;
+      }
+      const match = anchoredMatch(pattern, text.slice(offset));
+      if (!match) {
+        continue;
+      }
+
+      const action = rule[1];
+      if (typeof action === "string") {
+        if (action.length > 0 && match[0].length > 0) {
+          tokens.push({ token: action, value: match[0] });
+        }
+      } else if (Array.isArray(action)) {
+        for (let index = 0; index < action.length; index += 1) {
+          const token = action[index];
+          const value = match[index + 1] ?? "";
+          if (typeof token === "string" && token.length > 0 && value.length > 0) {
+            tokens.push({ token, value });
+          }
+        }
+      }
+
+      const next = rule[2];
+      if (typeof next === "string") {
+        if (next === "@pop") {
+          if (stateStack.length > 1) {
+            stateStack.pop();
+          }
+        } else if (next === "@push") {
+          stateStack.push(state);
+        } else if (next.startsWith("@")) {
+          stateStack[stateStack.length - 1] = next.slice(1);
+        }
+      }
+
+      offset += match[0].length;
+      if (match[0].length === 0) {
+        offset += 1;
+      }
+      matched = true;
+      break;
+    }
+
+    if (!matched) {
+      offset += 1;
+    }
+  }
+
+  return tokens;
+}
+
 const monaco = createMonacoMock();
 ensureRustScriptLanguage(monaco as never);
 const provider = monaco.getProvider();
@@ -80,5 +155,14 @@ describe("RustScript generic highlighting", () => {
     expect(stateHasMatch(provider, "root", "myfn::<string>(value)")).toBe(true);
     expect(stateHasMatch(provider, "root", "json::decode::<Profile>(payload)")).toBe(true);
     expect(stateHasMatch(provider, "root", "lrucache::new::<string, int>(2)")).toBe(true);
+  });
+
+  test("tokenizes generic punctuation separately from type identifiers", () => {
+    const tokens = tokenizeLine(provider, "let mut detached: LruNode<K, V> = node;");
+    expect(tokens).toContainEqual({ token: "type.identifier", value: "LruNode" });
+    expect(tokens).toContainEqual({ token: "delimiter", value: "<" });
+    expect(tokens).toContainEqual({ token: "delimiter", value: ">" });
+    expect(tokens).toContainEqual({ token: "type.identifier", value: "K" });
+    expect(tokens).toContainEqual({ token: "type.identifier", value: "V" });
   });
 });

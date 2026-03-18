@@ -213,4 +213,66 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    fn keeps_multi_param_generic_fields_tight_inside_struct_bodies() {
+        let input = concat!(
+            "struct LruGetResult < K, V > {\n",
+            "    cache: LruCacheState < K,\n",
+            "    V >,\n",
+            "    found: bool,\n",
+            "    value: V\n",
+            "}\n"
+        );
+        let formatted = format_source_with_flavor(input, SourceFlavor::RustScript)
+            .expect("formatting should succeed");
+
+        assert_eq!(
+            formatted,
+            concat!(
+                "struct LruGetResult<K, V> {\n",
+                "    cache: LruCacheState<K, V>,\n",
+                "    found: bool,\n",
+                "    value: V\n",
+                "}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn keeps_multi_param_generic_calls_tight_inside_collection_literals() {
+        let input = concat!(
+            "let out = {\n",
+            "    cache: make_cache:: < K,\n",
+            "    V >(limit, size),\n",
+            "    found: false,\n",
+            "    value: null\n",
+            "};\n"
+        );
+        let formatted = format_source_with_flavor(input, SourceFlavor::RustScript)
+            .expect("formatting should succeed");
+
+        assert_eq!(
+            formatted,
+            concat!(
+                "let out = {\n",
+                "    cache: make_cache::<K, V>(limit, size),\n",
+                "    found: false,\n",
+                "    value: null\n",
+                "};\n"
+            )
+        );
+    }
+
+    #[test]
+    fn keeps_space_before_grouped_expression_after_assignment() {
+        let input = "let mut next_node: LruNode<K, V> =(&next_nodes)[next_head];\n";
+        let formatted = format_source_with_flavor(input, SourceFlavor::RustScript)
+            .expect("formatting should succeed");
+
+        assert_eq!(
+            formatted,
+            "let mut next_node: LruNode<K, V> = (&next_nodes)[next_head];\n"
+        );
+    }
 }

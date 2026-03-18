@@ -37,9 +37,6 @@
       "include": "#keywords"
     },
     {
-      "include": "#type-annotations"
-    },
-    {
       "include": "#wildcard-pattern"
     },
     {
@@ -212,19 +209,13 @@
       "patterns": [
         {
           "name": "meta.struct.declaration.rss",
-          "begin": "\\b(struct)(\\s+)([A-Za-z_][A-Za-z0-9_]*)(\\s*)(<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)?(\\s*)(\\{)",
+          "begin": "\\b(struct)(\\s+)([A-Za-z_][A-Za-z0-9_]*)\\b",
           "beginCaptures": {
             "1": {
               "name": "storage.type.rss"
             },
             "3": {
               "name": "entity.name.type.rss"
-            },
-            "5": {
-              "name": "support.type.rss"
-            },
-            "7": {
-              "name": "punctuation.section.block.begin.rss"
             }
           },
           "end": "\\}",
@@ -241,10 +232,10 @@
               "include": "#strings"
             },
             {
-              "include": "#struct-field"
+              "include": "#generic-type-arguments"
             },
             {
-              "include": "#type-annotations"
+              "include": "#struct-field"
             },
             {
               "name": "punctuation.separator.rss",
@@ -258,61 +249,134 @@
       "patterns": [
         {
           "name": "meta.struct.field.rss",
-          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(\\s*)(:)(\\s*)((?:[A-Za-z_][A-Za-z0-9_]*(?:\\s*<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)?|\\[[^\\]\\n]+\\]))(?=\\s*(?:,|\\}))",
-          "captures": {
+          "begin": "\\b([A-Za-z_][A-Za-z0-9_]*)(\\s*)(:)(\\s*)",
+          "beginCaptures": {
             "1": {
               "name": "variable.other.member.rss"
             },
             "3": {
               "name": "punctuation.separator.type.rss"
-            },
-            "5": {
-              "name": "support.type.rss"
             }
-          }
+          },
+          "end": "(?=\\s*(?:,|\\}))",
+          "patterns": [
+            {
+              "include": "#type-expression"
+            }
+          ]
+        }
+      ]
+    },
+    "function-parameter": {
+      "patterns": [
+        {
+          "name": "meta.function.parameter.rss",
+          "begin": "\\b([A-Za-z_][A-Za-z0-9_]*)(\\s*)(:)(\\s*)",
+          "beginCaptures": {
+            "1": {
+              "name": "variable.parameter.rss"
+            },
+            "3": {
+              "name": "punctuation.separator.type.rss"
+            }
+          },
+          "end": "(?=\\s*(?:,|\\)))",
+          "patterns": [
+            {
+              "include": "#type-expression"
+            }
+          ]
+        }
+      ]
+    },
+    "return-type-annotation": {
+      "patterns": [
+        {
+          "name": "meta.return.type.rss",
+          "begin": "(->)(\\s*)",
+          "beginCaptures": {
+            "1": {
+              "name": "keyword.operator.rss"
+            }
+          },
+          "end": "(?=\\s*(?:\\{|=|;))",
+          "patterns": [
+            {
+              "include": "#type-expression"
+            }
+          ]
+        }
+      ]
+    },
+    "type-expression": {
+      "patterns": [
+        {
+          "include": "#array-type-expression"
+        },
+        {
+          "include": "#generic-type-arguments"
+        },
+        {
+          "name": "support.type.rss",
+          "match": "\\b(?:self|super|crate|[A-Za-z_][A-Za-z0-9_]*)\\b"
+        },
+        {
+          "name": "punctuation.accessor.rss",
+          "match": "::"
+        },
+        {
+          "name": "punctuation.separator.rss",
+          "match": ","
+        }
+      ]
+    },
+    "generic-type-arguments": {
+      "name": "meta.generic.arguments.rss",
+      "begin": "<",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.definition.generic.begin.rss"
+        }
+      },
+      "end": ">",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.generic.end.rss"
+        }
+      },
+      "patterns": [
+        {
+          "include": "#type-expression"
+        }
+      ]
+    },
+    "array-type-expression": {
+      "name": "meta.type.array.rss",
+      "begin": "\\[",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.section.brackets.begin.rss"
+        }
+      },
+      "end": "\\]",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.section.brackets.end.rss"
+        }
+      },
+      "patterns": [
+        {
+          "include": "#type-expression"
         }
       ]
     },
     "type-annotations": {
       "patterns": [
         {
-          "name": "meta.type.annotation.rss",
-          "match": "(:)(\\s*)((?:[A-Za-z_][A-Za-z0-9_]*(?:\\s*<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)?|\\[[^\\]\\n]+\\]))",
-          "captures": {
-            "1": {
-              "name": "punctuation.separator.type.rss"
-            },
-            "3": {
-              "name": "support.type.rss"
-            }
-          }
+          "include": "#function-parameter"
         },
         {
-          "name": "meta.type.annotation.array.rss",
-          "match": "(\\[)(\\s*)((?:[A-Za-z_][A-Za-z0-9_]*(?:\\s*<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)?|[^\\]\\n]+))(\\s*)(\\])",
-          "captures": {
-            "1": {
-              "name": "punctuation.section.brackets.begin.rss"
-            },
-            "3": {
-              "name": "support.type.rss"
-            },
-            "5": {
-              "name": "punctuation.section.brackets.end.rss"
-            }
-          }
-        },
-        {
-          "name": "meta.return.type.rss",
-          "match": "(->)(\\s*)((?:[A-Za-z_][A-Za-z0-9_]*(?:\\s*<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)?|\\[[^\\]\\n]+\\]))",
-          "captures": {
-            "1": {
-              "name": "keyword.operator.rss"
-            },
-            "3": {
-              "name": "support.type.rss"
-            }
-          }
+          "include": "#return-type-annotation"
         }
       ]
     },
@@ -332,8 +396,8 @@
       "patterns": [
         {
           "name": "meta.function.declaration.rss",
-          "match": "\\b(pub)(\\s+)(fn)(\\s+)([A-Za-z_][A-Za-z0-9_]*)(\\s*)(<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)?\\s*(?=\\()",
-          "captures": {
+          "begin": "\\b(pub)(\\s+)(fn)(\\s+)([A-Za-z_][A-Za-z0-9_]*)\\b",
+          "beginCaptures": {
             "1": {
               "name": "storage.modifier.rss"
             },
@@ -342,24 +406,138 @@
             },
             "5": {
               "name": "entity.name.function.rss"
-            },
-            "7": {
-              "name": "support.type.rss"
             }
-          }
+          },
+          "end": "(?=\\s*(?:\\{|=|;))",
+          "patterns": [
+            {
+              "include": "#comments"
+            },
+            {
+              "include": "#strings"
+            },
+            {
+              "include": "#generic-type-arguments"
+            },
+            {
+              "include": "#function-parameter"
+            },
+            {
+              "include": "#return-type-annotation"
+            },
+            {
+              "name": "punctuation.separator.rss",
+              "match": "[(){}\\[\\],;:]"
+            }
+          ]
         },
         {
           "name": "meta.function.declaration.rss",
-          "match": "\\b(fn)(\\s+)([A-Za-z_][A-Za-z0-9_]*)(\\s*)(<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)?\\s*(?=\\()",
-          "captures": {
+          "begin": "\\b(fn)(\\s+)([A-Za-z_][A-Za-z0-9_]*)\\b",
+          "beginCaptures": {
             "1": {
               "name": "storage.type.function.rss"
             },
             "3": {
               "name": "entity.name.function.rss"
+            }
+          },
+          "end": "(?=\\s*(?:\\{|=|;))",
+          "patterns": [
+            {
+              "include": "#comments"
+            },
+            {
+              "include": "#strings"
+            },
+            {
+              "include": "#generic-type-arguments"
+            },
+            {
+              "include": "#function-parameter"
+            },
+            {
+              "include": "#return-type-annotation"
+            },
+            {
+              "name": "punctuation.separator.rss",
+              "match": "[(){}\\[\\],;:]"
+            }
+          ]
+        }
+      ]
+    },
+    "variable-declaration": {
+      "patterns": [
+        {
+          "name": "meta.variable.declaration.rss",
+          "begin": "\\b(let)(\\s+)(mut)(\\s+)([A-Za-z_][A-Za-z0-9_]*)(\\s*)(:)(\\s*)",
+          "beginCaptures": {
+            "1": {
+              "name": "storage.modifier.rss"
+            },
+            "3": {
+              "name": "storage.modifier.rss"
             },
             "5": {
-              "name": "support.type.rss"
+              "name": "variable.other.definition.rss"
+            },
+            "7": {
+              "name": "punctuation.separator.type.rss"
+            }
+          },
+          "end": "(?=\\s*=)",
+          "patterns": [
+            {
+              "include": "#type-expression"
+            }
+          ]
+        },
+        {
+          "name": "meta.variable.declaration.rss",
+          "begin": "\\b(let)(\\s+)([A-Za-z_][A-Za-z0-9_]*)(\\s*)(:)(\\s*)",
+          "beginCaptures": {
+            "1": {
+              "name": "storage.modifier.rss"
+            },
+            "3": {
+              "name": "variable.other.definition.rss"
+            },
+            "5": {
+              "name": "punctuation.separator.type.rss"
+            }
+          },
+          "end": "(?=\\s*=)",
+          "patterns": [
+            {
+              "include": "#type-expression"
+            }
+          ]
+        },
+        {
+          "name": "meta.variable.declaration.rss",
+          "match": "\\b(let)(\\s+)(mut)(\\s+)([A-Za-z_][A-Za-z0-9_]*)\\b",
+          "captures": {
+            "1": {
+              "name": "storage.modifier.rss"
+            },
+            "3": {
+              "name": "storage.modifier.rss"
+            },
+            "5": {
+              "name": "variable.other.definition.rss"
+            }
+          }
+        },
+        {
+          "name": "meta.variable.declaration.rss",
+          "match": "\\b(let)(\\s+)([A-Za-z_][A-Za-z0-9_]*)\\b",
+          "captures": {
+            "1": {
+              "name": "storage.modifier.rss"
+            },
+            "3": {
+              "name": "variable.other.definition.rss"
             }
           }
         }
@@ -423,37 +601,6 @@
             },
             "5": {
               "name": "entity.name.function.rss"
-            }
-          }
-        }
-      ]
-    },
-    "variable-declaration": {
-      "patterns": [
-        {
-          "name": "meta.variable.declaration.rss",
-          "match": "\\b(let)(\\s+)(mut)(\\s+)([A-Za-z_][A-Za-z0-9_]*)\\b",
-          "captures": {
-            "1": {
-              "name": "storage.modifier.rss"
-            },
-            "3": {
-              "name": "storage.modifier.rss"
-            },
-            "5": {
-              "name": "variable.other.definition.rss"
-            }
-          }
-        },
-        {
-          "name": "meta.variable.declaration.rss",
-          "match": "\\b(let)(\\s+)([A-Za-z_][A-Za-z0-9_]*)\\b",
-          "captures": {
-            "1": {
-              "name": "storage.modifier.rss"
-            },
-            "3": {
-              "name": "variable.other.definition.rss"
             }
           }
         }

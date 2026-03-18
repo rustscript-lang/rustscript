@@ -1,0 +1,603 @@
+use json;
+use re;
+
+// LRU cache helpers implemented in pure RustScript.
+//
+// The live set uses:
+// - `lookup`: user key -> node id
+// - `nodes`: node id -> LruNode<K, V>
+//
+// Node ids start at 1. The cache uses `0` as the internal "no link" sentinel,
+// because storing `null` into a map entry now deletes that entry.
+struct LruNode<K, V> {
+    key: K,
+    value: V,
+    prev: int,
+    next: int
+}
+
+struct LinkState<K, V> {
+    nodes: map,
+    head: int,
+    tail: int
+}
+
+struct LruCacheState<K, V> {
+    capacity: int,
+    size: int,
+    next_id: int,
+    head: int,
+    tail: int,
+    lookup: map,
+    nodes: map
+}
+
+struct LruPeekResult<V> {
+    found: bool,
+    value: V
+}
+
+struct LruGetResult<K, V> {
+    cache: LruCacheState<K, V>,
+    found: bool,
+    value: V
+}
+
+struct LruEntryReport<K, V> {
+    found: bool,
+    key: K,
+    value: V
+}
+
+struct LruEntryRow<K, V> {
+    key: K,
+    value: V
+}
+
+fn normalized_capacity(raw_capacity) {
+    let out = if raw_capacity > 0 => {
+        raw_capacity
+    } else => {
+        0
+    };
+    out
+}
+
+fn make_cache<K, V>(limit, size, next_id, head, tail, lookup, nodes) {
+    let out: LruCacheState<K, V> = {
+        capacity: limit,
+        size: size,
+        next_id: next_id,
+        head: head,
+        tail: tail,
+        lookup: lookup,
+        nodes: nodes
+    };
+    out
+}
+
+fn append_existing_node<K, V>(nodes, head, tail, id, node) {
+    let mut next_nodes: map = nodes;
+    let mut appended: LruNode<K, V> = node;
+    appended.prev = tail;
+    appended.next = 0;
+    next_nodes[id] = appended;
+
+    let next_head: int = if tail != 0 => {
+        let mut tail_node: LruNode<K, V> = next_nodes[tail].copy();
+        tail_node.next = id;
+        next_nodes[tail] = tail_node;
+        head
+    } else => {
+        id
+    };
+
+    let out: LinkState<K, V> = {nodes: next_nodes, head: next_head, tail: id};
+    out
+}
+
+fn append_new_node<K, V>(nodes, head, tail, id, key, value) {
+    let mut next_nodes: map = nodes;
+    let appended: LruNode<K, V> = {key: key, value: value, prev: tail, next: 0};
+    next_nodes[id] = appended;
+
+    let next_head: int = if tail != 0 => {
+        let mut tail_node: LruNode<K, V> = next_nodes[tail].copy();
+        tail_node.next = id;
+        next_nodes[tail] = tail_node;
+        head
+    } else => {
+        id
+    };
+
+    let out: LinkState<K, V> = {nodes: next_nodes, head: next_head, tail: id};
+    out
+}
+
+fn unlink_node<K, V>(nodes, head, tail, id, node) {
+    let node_view: LruNode<K, V> = node.copy();
+    let prev: int = node_view.prev;
+    let next: int = node_view.next;
+    let mut next_nodes: map = nodes;
+    let mut next_head: int = head;
+    let mut next_tail: int = tail;
+
+    if prev != 0 {
+        let mut prev_node: LruNode<K, V> = next_nodes[prev].copy();
+        prev_node.next = next;
+        next_nodes[prev] = prev_node;
+    } else {
+        next_head = next;
+    }
+
+    if next != 0 {
+        let mut next_node: LruNode<K, V> = next_nodes[next].copy();
+        next_node.prev = prev;
+        next_nodes[next] = next_node;
+    } else {
+        next_tail = prev;
+    }
+
+    let mut detached: LruNode<K, V> = node;
+    detached.prev = 0;
+    detached.next = 0;
+    next_nodes[id] = detached;
+
+    let out: LinkState<K, V> = {nodes: next_nodes, head: next_head, tail: next_tail};
+    out
+}
+
+fn evict_oldest<K, V>(limit, size, next_id, lookup, nodes, head, tail) {
+    let out = if size == 0 || head == 0 => {
+        make_cache::<K, V>(limit, size, next_id, head, tail, lookup, nodes)
+    } else => {
+        let head_node: LruNode<K, V> = &((&nodes)[head]);
+        let next_head: int = head_node.next;
+        let evicted_key = head_node.key.copy();
+        let mut next_lookup: map = lookup;
+        let mut next_nodes: map = nodes;
+        next_lookup[evicted_key] = null;
+        next_nodes[head] = null;
+
+        let next_tail: int = if tail == head => {
+            0
+        } else => {
+            tail
+        };
+
+        if next_head != 0 {
+            let mut next_node: LruNode<K, V> = (&next_nodes)[next_head];
+            next_node.prev = 0;
+            next_nodes[next_head] = next_node;
+        }
+
+        make_cache::<K, V>(
+            limit,
+            size - 1,
+            next_id,
+            next_head,
+            next_tail,
+            next_lookup,
+            next_nodes
+        )
+    };
+    out
+}
+
+fn entry_report<K, V>(cache, id) {
+    let out: LruEntryReport<K, V> = if id != 0 => {
+        let node: LruNode<K, V> = &((&cache).nodes[id]);
+        {found: true, key: node.key.copy(), value: node.value.copy()}
+    } else => {
+        {found: false, key: null, value: null}
+    };
+    out
+}
+
+// Creates an LRU cache with the given capacity.
+pub fn new<K, V>(raw_capacity) {
+    let limit: int = normalized_capacity(raw_capacity);
+    make_cache::<K, V>(limit, 0, 1, 0, 0, {}, {})
+}
+
+// Returns the cache capacity.
+pub fn capacity<K, V>(cache) {
+    let state: LruCacheState<K, V> = cache;
+    normalized_capacity(state.capacity)
+}
+
+// Returns the number of cached entries.
+pub fn len<K, V>(cache) {
+    let state: LruCacheState<K, V> = cache;
+    state.size
+}
+
+// Returns whether the cache is empty.
+pub fn is_empty<K, V>(cache) {
+    len::<K, V>(cache) == 0
+}
+
+// Returns whether the cache contains a key.
+pub fn has<K, V>(cache, key) {
+    let state: LruCacheState<K, V> = cache;
+    let lookup = state.lookup;
+    lookup.has(key)
+}
+
+// Returns the cached value without updating recency.
+pub fn peek<K, V>(cache, key) {
+    let state: LruCacheState<K, V> = cache;
+    let lookup = state.lookup;
+    let out: LruPeekResult<V> = if lookup.has(key) => {
+        let id: int = (&lookup)[key];
+        let node: LruNode<K, V> = &((&state.nodes)[id]);
+        {found: true, value: node.value.copy()}
+    } else => {
+        {found: false, value: null}
+    };
+    out
+}
+
+// Returns the cached value and promotes it to the most recently used position.
+pub fn get<K, V>(cache, key) {
+    let state: LruCacheState<K, V> = cache;
+    let limit = normalized_capacity(state.capacity);
+    let size = state.size;
+    let next_id = state.next_id;
+    let head = state.head;
+    let tail = state.tail;
+    let lookup = state.lookup;
+    let nodes = state.nodes;
+
+    let out: LruGetResult<K, V> = if lookup.has(key) => {
+        let id: int = (&lookup)[key];
+        let node: LruNode<K, V> = &((&nodes)[id]);
+        let value = node.value.copy();
+        let next_cache = if id == tail => {
+            make_cache::<K, V>(limit, size, next_id, head, tail, lookup, nodes)
+        } else => {
+            let node_copy: LruNode<K, V> = (&nodes)[id];
+            let unlinked: LinkState<K, V> =
+            unlink_node::<K, V>(nodes, head, tail, id, node_copy.copy());
+            let relinked: LinkState<K, V> = append_existing_node::<K, V>(
+                unlinked.nodes,
+                unlinked.head,
+                unlinked.tail,
+                id,
+                node_copy
+            );
+            make_cache::<K, V>(
+                limit,
+                size,
+                next_id,
+                relinked.head,
+                relinked.tail,
+                lookup,
+                relinked.nodes
+            )
+        };
+        {cache: next_cache, found: true, value: value}
+    } else => {
+        {
+            cache: make_cache::<K, V>(limit, size, next_id, head, tail, lookup, nodes),
+            found: false,
+            value: null
+        }
+    };
+    out
+}
+
+// Inserts or updates a cache entry and returns the next cache state.
+pub fn put<K, V>(cache, key, value) {
+    let state: LruCacheState<K, V> = cache;
+    let limit = normalized_capacity(state.capacity);
+    let size = state.size;
+    let next_id = state.next_id;
+    let head = state.head;
+    let tail = state.tail;
+    let lookup = state.lookup;
+    let nodes = state.nodes;
+
+    let out = if limit == 0 => {
+        make_cache::<K, V>(0, 0, 1, 0, 0, {}, {})
+    } else => {
+        if lookup.has(key) => {
+            let id: int = (&lookup)[key];
+            let mut node: LruNode<K, V> = (&nodes)[id];
+            node.value = value;
+            if id == tail => {
+                let mut next_nodes = nodes;
+                next_nodes[id] = node;
+                make_cache::<K, V>(limit, size, next_id, head, tail, lookup, next_nodes)
+            } else => {
+                let unlinked: LinkState<K, V> =
+                unlink_node::<K, V>(nodes, head, tail, id, node.copy());
+                let relinked: LinkState<K, V> = append_existing_node::<K, V>(
+                    unlinked.nodes,
+                    unlinked.head,
+                    unlinked.tail,
+                    id,
+                    node
+                );
+                make_cache::<K, V>(
+                    limit,
+                    size,
+                    next_id,
+                    relinked.head,
+                    relinked.tail,
+                    lookup,
+                    relinked.nodes
+                )
+            }
+        } else => {
+            let id = next_id;
+            let mut next_lookup = lookup;
+            let appended: LinkState<K, V> =
+            append_new_node::<K, V>(nodes, head, tail, id, key.copy(), value);
+            let appended_head = appended.head;
+            let appended_tail = appended.tail;
+            let appended_nodes = appended.nodes;
+            next_lookup[key] = id;
+            if size + 1 > limit => {
+                evict_oldest::<K, V>(
+                    limit,
+                    size + 1,
+                    id + 1,
+                    next_lookup,
+                    appended_nodes,
+                    appended_head,
+                    appended_tail
+                )
+            } else => {
+                make_cache::<K, V>(
+                    limit,
+                    size + 1,
+                    id + 1,
+                    appended_head,
+                    appended_tail,
+                    next_lookup,
+                    appended_nodes
+                )
+            }
+        }
+    };
+    out
+}
+
+// Promotes a key to the most recently used position if it exists.
+pub fn touch<K, V>(cache, key) {
+    let state: LruCacheState<K, V> = cache;
+    let limit = normalized_capacity(state.capacity);
+    let size = state.size;
+    let next_id = state.next_id;
+    let head = state.head;
+    let tail = state.tail;
+    let lookup = state.lookup;
+    let nodes = state.nodes;
+
+    let out = if lookup.has(key) => {
+        let id: int = (&lookup)[key];
+        if id != tail => {
+            let node: LruNode<K, V> = (&nodes)[id];
+            let unlinked: LinkState<K, V> = unlink_node::<K, V>(
+                nodes,
+                head,
+                tail,
+                id,
+                node.copy()
+            );
+            let relinked: LinkState<K, V> = append_existing_node::<K, V>(
+                unlinked.nodes,
+                unlinked.head,
+                unlinked.tail,
+                id,
+                node
+            );
+            make_cache::<K, V>(
+                limit,
+                size,
+                next_id,
+                relinked.head,
+                relinked.tail,
+                lookup,
+                relinked.nodes
+            )
+        } else => {
+            make_cache::<K, V>(limit, size, next_id, head, tail, lookup, nodes)
+        }
+    } else => {
+        make_cache::<K, V>(limit, size, next_id, head, tail, lookup, nodes)
+    };
+    out
+}
+
+// Removes a cache entry by key.
+pub fn remove<K, V>(cache, key) {
+    let state: LruCacheState<K, V> = cache;
+    let limit = normalized_capacity(state.capacity);
+    let size = state.size;
+    let next_id = state.next_id;
+    let head = state.head;
+    let tail = state.tail;
+    let lookup = state.lookup;
+    let nodes = state.nodes;
+
+    let out = if lookup.has(key) => {
+        let id: int = (&lookup)[key];
+        let node: LruNode<K, V> = (&nodes)[id];
+        let mut next_lookup = lookup;
+        next_lookup[key] = null;
+        let unlinked: LinkState<K, V> = unlink_node::<K, V>(nodes, head, tail, id, node);
+        let mut next_nodes = unlinked.nodes;
+        next_nodes[id] = null;
+        make_cache::<K, V>(
+            limit,
+            size - 1,
+            next_id,
+            unlinked.head,
+            unlinked.tail,
+            next_lookup,
+            next_nodes
+        )
+    } else => {
+        make_cache::<K, V>(limit, size, next_id, head, tail, lookup, nodes)
+    };
+    out
+}
+
+// Removes all entries from the cache.
+pub fn clear<K, V>(cache) {
+    let state: LruCacheState<K, V> = cache;
+    make_cache::<K, V>(normalized_capacity(state.capacity), 0, 1, 0, 0, {}, {})
+}
+
+// Returns cache keys from oldest to newest.
+pub fn keys<K, V>(cache) {
+    let state: LruCacheState<K, V> = cache;
+    let nodes = state.nodes;
+    let mut current = state.head;
+    let mut out: [K] = [];
+    while current != 0 {
+        let node: LruNode<K, V> = &((&nodes)[current]);
+        let next_id = node.next;
+        out[out.length] = node.key.copy();
+        current = next_id;
+    }
+    out
+}
+
+// Returns cache values from oldest to newest.
+pub fn values<K, V>(cache) {
+    let state: LruCacheState<K, V> = cache;
+    let nodes = state.nodes;
+    let mut current = state.head;
+    let mut out: [V] = [];
+    while current != 0 {
+        let node: LruNode<K, V> = &((&nodes)[current]);
+        let next_id = node.next;
+        out[out.length] = node.value.copy();
+        current = next_id;
+    }
+    out
+}
+
+// Returns cache entries from oldest to newest.
+pub fn entries<K, V>(cache) {
+    let state: LruCacheState<K, V> = cache;
+    let nodes = state.nodes;
+    let mut current = state.head;
+    let mut out: [LruEntryRow<K, V>] = [];
+    while current != 0 {
+        let node: LruNode<K, V> = &((&nodes)[current]);
+        let next_id = node.next;
+        out[out.length] = {key: node.key.copy(), value: node.value.copy()};
+        current = next_id;
+    }
+    out
+}
+
+// Returns the oldest cache entry report.
+pub fn oldest<K, V>(cache) {
+    let state: LruCacheState<K, V> = cache;
+    entry_report::<K, V>(state, state.head)
+}
+
+// Returns the newest cache entry report.
+pub fn newest<K, V>(cache) {
+    let state: LruCacheState<K, V> = cache;
+    entry_report::<K, V>(state, state.tail)
+}
+
+struct FeedCacheItem {
+    day: string,
+    topic: string,
+    article_count: int,
+    slug: string
+}
+
+let mut cache = new::<string, FeedCacheItem>(3);
+assert(capacity::<string, FeedCacheItem>(cache) == 3);
+assert(is_empty::<string, FeedCacheItem>(cache));
+
+cache = put::<string, FeedCacheItem>(
+    cache,
+    "world-news",
+    {day: "2026-03-10", topic: "world news", article_count: 5, slug: "world-news"}
+);
+cache = put::<string, FeedCacheItem>(
+    cache,
+    "markets",
+    {day: "2026-03-10", topic: "markets", article_count: 7, slug: "markets"}
+);
+cache = put::<string, FeedCacheItem>(
+    cache,
+    "build-ops",
+    {day: "2026-03-10", topic: "build ops", article_count: 2, slug: "build-ops"}
+);
+
+assert(len::<string, FeedCacheItem>(cache) == 3);
+let initial_order: [string] = keys::<string, FeedCacheItem>(cache);
+assert(initial_order[0] == "world-news");
+assert(initial_order[1] == "markets");
+assert(initial_order[2] == "build-ops");
+
+let mut world_hit = get::<string, FeedCacheItem>(cache, "world-news");
+assert(world_hit.found);
+let world_item: FeedCacheItem = world_hit.value.copy();
+assert(world_item.article_count == 5);
+assert(re::match("^[a-z-]+$", world_item.slug));
+cache = world_hit.cache;
+
+cache = put::<string, FeedCacheItem>(
+    cache,
+    "breaking-alerts",
+    {
+        day: "2026-03-10",
+        topic: "breaking alerts",
+        article_count: 11,
+        slug: "breaking-alerts"
+    }
+);
+
+assert(has::<string, FeedCacheItem>(cache, "markets") == false);
+assert(peek::<string, FeedCacheItem>(cache, "world-news").value.article_count == 5);
+
+cache = touch::<string, FeedCacheItem>(cache, "build-ops");
+
+let oldest_entry = oldest::<string, FeedCacheItem>(cache);
+let newest_entry = newest::<string, FeedCacheItem>(cache);
+let oldest_key: string = oldest_entry.key.copy();
+let newest_key: string = newest_entry.key.copy();
+assert(oldest_key == "world-news");
+assert(newest_key == "build-ops");
+
+let visible_items: [FeedCacheItem] = values::<string, FeedCacheItem>(cache);
+let mut visible_topics: [string] = [];
+let mut total_visible_articles: int = 0;
+let visible_count = visible_items.length;
+for (let mut index = 0; index < visible_count; index = index + 1) {
+    let item: FeedCacheItem = (&visible_items)[index];
+    visible_topics[visible_topics.length] = item.topic;
+    total_visible_articles = total_visible_articles + item.article_count;
+}
+
+let cache_entries = entries::<string, FeedCacheItem>(cache);
+let newest_row = cache_entries[2].copy();
+assert(newest_row.key == "build-ops");
+
+let report = {
+    order: keys::<string, FeedCacheItem>(cache),
+    oldest_key: oldest_key,
+    newest_key: newest_key,
+    visible_topics: visible_topics,
+    total_visible_articles: total_visible_articles
+};
+
+let archived = remove::<string, FeedCacheItem>(cache, "world-news");
+assert(has::<string, FeedCacheItem>(archived, "world-news") == false);
+
+let cleared = clear::<string, FeedCacheItem>(cache);
+assert(capacity::<string, FeedCacheItem>(cleared) == 3);
+assert(is_empty::<string, FeedCacheItem>(cleared));
+
+print(json::encode(report));

@@ -295,16 +295,20 @@ impl<'a> SourceFormatter<'a> {
             TokenKind::Comma => {
                 self.clear_pending_space();
                 self.write_raw(",");
+                let in_generic_angle_group = self.generic_angle_depth > 0;
                 self.prev_kind = Some(PrevKind::Comma);
-                let should_break = matches!(
-                    self.contexts.last().map(|context| context.kind),
-                    Some(ContextKind::Brace(
-                        BraceKind::MatchBody | BraceKind::StructBody
-                    ))
-                );
+                let should_break = !in_generic_angle_group
+                    && matches!(
+                        self.contexts.last().map(|context| context.kind),
+                        Some(ContextKind::Brace(
+                            BraceKind::MatchBody | BraceKind::StructBody
+                        ))
+                    );
                 if should_break {
                     self.pending_code_break = true;
                     self.at_stmt_start = true;
+                } else if in_generic_angle_group {
+                    self.request_space();
                 } else if self.current_context_breaks_after_commas() {
                     self.request_newline(1);
                 } else if !self.next_is_closer(self.index + 1) {
@@ -602,7 +606,12 @@ impl<'a> SourceFormatter<'a> {
         let needs_space = matches!(
             self.prev_kind,
             Some(
-                PrevKind::If | PrevKind::For | PrevKind::While | PrevKind::Match | PrevKind::Import
+                PrevKind::If
+                    | PrevKind::For
+                    | PrevKind::While
+                    | PrevKind::Match
+                    | PrevKind::Import
+                    | PrevKind::Equal
             )
         );
         if needs_space {
@@ -1004,6 +1013,9 @@ impl<'a> SourceFormatter<'a> {
     fn should_collapse_gap_line_break(&self) -> bool {
         if self.pending_code_break {
             return false;
+        }
+        if self.generic_angle_depth > 0 {
+            return true;
         }
 
         let previous = self.previous_token_kind();

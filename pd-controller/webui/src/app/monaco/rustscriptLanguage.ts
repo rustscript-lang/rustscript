@@ -31,13 +31,11 @@ const FALLBACK_STRING_ESCAPE = "\\\\(?:[nrt\\\\\"0])";
 const FALLBACK_NUMBERS = "\\b(?:\\d+\\.\\d+|\\d+)\\b";
 const FALLBACK_OPERATORS = "=>|==|!=|&&|\\|\\||&|=|\\+|-|\\*|/|%|<|>|!|\\?";
 const IDENT = "[A-Za-z_][A-Za-z0-9_]*";
-const TYPE_IDENT = "[A-Za-z_][A-Za-z0-9_]*";
 const GENERIC_BLOCK = "<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>";
-const TYPE_EXPR = `${TYPE_IDENT}(?:\\s*${GENERIC_BLOCK})?`;
-const TYPE_ANNOTATION_EXPR = `(?:${TYPE_EXPR}|\\[[^\\]\\n]+\\])`;
 const PATH_IDENT = `(?:self|super|crate|${IDENT})`;
 const PATH = `(?:${PATH_IDENT})(?:::(?:${PATH_IDENT}))*`;
 const PATH_CALL = `${IDENT}(?:(?:\\s*::\\s*)${IDENT})*`;
+const TYPE_TOKEN = new RegExp(`\\b${PATH_IDENT}\\b`);
 
 let rustScriptLanguageRegistered = false;
 
@@ -79,6 +77,20 @@ function beginPattern(entry: TmPattern | null, fallback: string): RegExp {
 
 function endPattern(entry: TmPattern | null, fallback: string): RegExp {
   return patternMatch(entry?.end, fallback);
+}
+
+function typeExpressionRules(
+  terminators: ReadonlyArray<{ pattern: RegExp; token: string }>
+): Monaco.languages.IMonarchLanguageRule[] {
+  return [
+    [/\s+/, ""],
+    ...terminators.map(({ pattern, token }) => [pattern, token, "@pop"] as Monaco.languages.IMonarchLanguageRule),
+    [/::/, "delimiter"],
+    [/,/, "delimiter"],
+    [/\[/, "delimiter", "@typeArray"],
+    [/</, "delimiter", "@typeGeneric"],
+    [TYPE_TOKEN, "type.identifier"]
+  ];
 }
 
 export function ensureRustScriptLanguage(monaco: typeof import("monaco-editor")): void {
@@ -124,8 +136,8 @@ export function ensureRustScriptLanguage(monaco: typeof import("monaco-editor"))
     ],
     [new RegExp(`\\b(pub)(\\s+)(fn)(\\s+)(${IDENT})(\\s*)(\\()`), ["keyword", "", "keyword", "", "function", "", "delimiter"], "@functionSignature"],
     [new RegExp(`\\b(fn)(\\s+)(${IDENT})(\\s*)(\\()`), ["keyword", "", "function", "", "delimiter"], "@functionSignature"],
-    [new RegExp(`\\b(let)(\\s+)(mut)(\\s+)(${IDENT})(\\s*)(:)(\\s+)(${TYPE_ANNOTATION_EXPR})(?=\\s*=)`), ["keyword", "", "keyword", "", "identifier", "", "delimiter", "", "type.identifier"]],
-    [new RegExp(`\\b(let)(\\s+)(${IDENT})(\\s*)(:)(\\s+)(${TYPE_ANNOTATION_EXPR})(?=\\s*=)`), ["keyword", "", "identifier", "", "delimiter", "", "type.identifier"]],
+    [new RegExp(`\\b(let)(\\s+)(mut)(\\s+)(${IDENT})(\\s*)(:)(\\s*)`), ["keyword", "", "keyword", "", "identifier", "", "delimiter", ""], "@typeBeforeAssign"],
+    [new RegExp(`\\b(let)(\\s+)(${IDENT})(\\s*)(:)(\\s*)`), ["keyword", "", "identifier", "", "delimiter", ""], "@typeBeforeAssign"],
     [new RegExp(`\\b(let)(\\s+)(mut)(\\s+)(${IDENT})\\b`), ["keyword", "", "keyword", "", "identifier"]],
     [new RegExp(`\\b(let)(\\s+)(${IDENT})\\b`), ["keyword", "", "identifier"]],
     [
@@ -167,11 +179,8 @@ export function ensureRustScriptLanguage(monaco: typeof import("monaco-editor"))
         [lineCommentPattern, "comment"],
         [blockCommentBegin, "comment", "@blockComment"],
         [stringBegin, "string", "@string"],
-        [
-          new RegExp(`\\b(${IDENT})(\\s*)(:)(\\s*)(${TYPE_ANNOTATION_EXPR})(?=\\s*(?:,|\\)))`),
-          ["identifier", "", "delimiter", "", "type.identifier"]
-        ],
-        [new RegExp(`(->)(\\s*)(${TYPE_ANNOTATION_EXPR})(?=\\s*(?:\\{|=|;))`), ["operator", "", "type.identifier"]],
+        [new RegExp(`\\b(${IDENT})(\\s*)(:)(\\s*)`), ["identifier", "", "delimiter", ""], "@typeBeforeParamDelimiter"],
+        [/(->)(\s*)/, ["operator", ""], "@typeBeforeReturnTerminator"],
         [/\{/, "delimiter", "@pop"],
         [/=/, "operator", "@pop"],
         [/;/, "delimiter", "@pop"],
@@ -186,11 +195,40 @@ export function ensureRustScriptLanguage(monaco: typeof import("monaco-editor"))
         [/\}/, "delimiter", "@pop"],
         [/\[/, "delimiter"],
         [/\]/, "delimiter"],
-        [
-          new RegExp(`\\b(${IDENT})(\\s*)(:)(\\s*)(${TYPE_ANNOTATION_EXPR})(?=\\s*(?:,|\\}))`),
-          ["variable", "", "delimiter", "", "type.identifier"]
-        ],
+        [new RegExp(`\\b(${IDENT})(\\s*)(:)(\\s*)`), ["variable", "", "delimiter", ""], "@typeBeforeStructFieldDelimiter"],
         [sectionMatch("punctuation", "[(){}\\[\\],;:]"), "delimiter"]
+      ],
+      typeBeforeAssign: typeExpressionRules([{ pattern: /=/, token: "operator" }]),
+      typeBeforeParamDelimiter: typeExpressionRules([
+        { pattern: /,/, token: "delimiter" },
+        { pattern: /\)/, token: "delimiter" }
+      ]),
+      typeBeforeReturnTerminator: typeExpressionRules([
+        { pattern: /\{/, token: "delimiter" },
+        { pattern: /=/, token: "operator" },
+        { pattern: /;/, token: "delimiter" }
+      ]),
+      typeBeforeStructFieldDelimiter: typeExpressionRules([
+        { pattern: /,/, token: "delimiter" },
+        { pattern: /\}/, token: "delimiter" }
+      ]),
+      typeGeneric: [
+        [/\s+/, ""],
+        [/>/, "delimiter", "@pop"],
+        [/::/, "delimiter"],
+        [/,/, "delimiter"],
+        [/\[/, "delimiter", "@typeArray"],
+        [/</, "delimiter", "@typeGeneric"],
+        [TYPE_TOKEN, "type.identifier"]
+      ],
+      typeArray: [
+        [/\s+/, ""],
+        [/\]/, "delimiter", "@pop"],
+        [/::/, "delimiter"],
+        [/,/, "delimiter"],
+        [/\[/, "delimiter", "@typeArray"],
+        [/</, "delimiter", "@typeGeneric"],
+        [TYPE_TOKEN, "type.identifier"]
       ]
     }
   });
