@@ -512,7 +512,12 @@ Rules:
 - With feature `http2`, outbound HTTPS exchanges can negotiate `h2` and dynamic exchanges may share one upstream connection when the client path permits multiplex.
 - `response.output` starts empty and is populated by VM host calls for local response construction.
 - Each `exchange[n].response` starts as `NotStarted` and becomes `Ready` only when the DAG actually needs response data for that handle.
-- On eligible HTTP/1 requests, runtime may detach from the generic `resolve_http_graph_response -> Response<Body>` materialization path into a shortcut writer (`native local`, `native upstream`, or `snapshot passthrough`). That detach is not a new DAG node visible to the VM; it is only legal when it is observationally equivalent to the same already-published DAG state.
+- On eligible HTTP/1 requests, runtime resolves the downstream response through exactly one of four internal choices:
+  - `NativeLocal`: local terminate or local-response output is written directly from `response.output`
+  - `Native`: default-upstream HTTP/1 forwarding stays on the native sender-pool path and writes the resulting upstream response directly
+  - `Snapshot`: the response stays backed by an upstream or exchange snapshot and is streamed out without first materializing a generic `Response<Body>`
+  - `Graph`: the generic `resolve_http_graph_response -> Response<Body>` path is used
+- `NativeLocal`, `Native`, and `Snapshot` are shortcut detaches from the same already-published DAG state. They are not VM-visible DAG nodes; they are only legal when they are observationally equivalent to the `Graph` result.
 - Shortcut detaches are revoked once the VM has consumed or mutated state that would make the shortcut semantically lossy, such as response post-plans, local response bodies on passthrough paths, or exchange-response body reads.
 - What exists today:
   - internal `http2.session.*` and `http2.stream.*` goals drive attachment, request commitment, response-head readiness, response-body readiness, close, and reset progression
@@ -538,13 +543,16 @@ flowchart TD
     C -. request body may feed .-> G
     D --> H["exchange 1 response ready"]
     F --> I["exchange n response ready"]
-    H -. eligible http/1 detach .-> K["virtual detach: shortcut writer"]
+    H -. eligible http/1 detach .-> K["virtual detach: shortcut writer (Native / Snapshot)"]
     I -. eligible http/1 detach .-> K
-    G -. eligible http/1 detach .-> K
-    H --> J["client response committed"]
-    G --> J
+    G -. eligible http/1 detach .-> L["virtual detach: local writer (NativeLocal)"]
+    H --> M["generic graph materialize Response<Body> (Graph)"]
+    I --> M
+    G --> M
+    M --> J["client response committed"]
     I -. response data may be copied into .-> G
     K --> J
+    L --> J
 ```
 
 ### WebSocket DAG
