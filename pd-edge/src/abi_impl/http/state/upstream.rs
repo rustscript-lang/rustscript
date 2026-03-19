@@ -1,6 +1,7 @@
 use super::super::helpers::request_path_with_query;
 use super::*;
 
+#[derive(Debug)]
 pub(super) enum UpstreamResponseStartError {
     UnknownExchangeHandle(i64),
     MissingTarget,
@@ -178,6 +179,13 @@ impl DefaultUpstreamRequestSnapshot {
                 headers: request_head.lazy_headers().clone(),
                 host_header,
             },
+            DefaultUpstreamRequestHead::InheritOverrides { header_overrides } => {
+                OutboundHttp1RequestHeaders::InheritedFilteredWithOverrides {
+                    headers: request_head.lazy_headers().clone(),
+                    host_header,
+                    overrides: header_overrides.clone(),
+                }
+            }
             _ => self
                 .filtered_headers_or_request_head(request_head, host_header.as_deref())
                 .into(),
@@ -216,6 +224,8 @@ impl std::fmt::Debug for StartedUpstreamResponse {
 type NativeDefaultUpstreamForwardBody = OutboundHttp1ForwardBody;
 
 pub(super) type NativeDefaultUpstreamForwardResponse = OutboundHttp1ForwardResponse;
+pub(super) type NativeDefaultUpstreamForwardResult =
+    Result<NativeDefaultUpstreamForwardResponse, UpstreamResponseStartError>;
 
 #[derive(Debug)]
 pub(crate) struct ResolvedNativeHttp1DownstreamResponse {
@@ -1419,19 +1429,9 @@ async fn take_or_start_native_default_upstream_forward_response(
     context: &SharedProxyVmContext,
 ) -> Result<Option<NativeDefaultUpstreamForwardResponse>, UpstreamResponseStartError> {
     if let Some(response) = context.take_native_default_upstream_forward_response() {
-        return Ok(Some(response));
+        return response.map(Some);
     }
-
-    let Some(request) = context.take_native_default_upstream_forward_request() else {
-        return Ok(None);
-    };
-    match forward_native_default_upstream_http_via_sender_pool(context, &request).await {
-        Ok(response) => Ok(Some(response)),
-        Err(err) => {
-            context.clear_native_default_upstream_http_forward();
-            Err(err)
-        }
-    }
+    Ok(None)
 }
 
 async fn try_materialize_ready_or_pending_native_default_upstream_forward_response(
@@ -1680,7 +1680,6 @@ pub(crate) fn try_take_native_local_http1_downstream_response(
     }
     let body = downstream.response_output.body.take()?;
     downstream.native_default_upstream_http_forward = false;
-    downstream.native_default_upstream_forward_request = None;
     downstream.native_default_upstream_forward_response = None;
     Some(ResolvedNativeLocalHttp1DownstreamResponse {
         status: downstream
@@ -1782,7 +1781,6 @@ pub(crate) async fn start_native_default_upstream_http_forward_response(
     context: &SharedProxyVmContext,
 ) -> Result<bool, VmError> {
     if context.native_default_upstream_forward_response_ready()
-        || context.native_default_upstream_forward_request_pending()
         || context.native_default_upstream_http_forward_active()
     {
         return Ok(true);
@@ -1820,18 +1818,22 @@ pub(crate) async fn start_native_default_upstream_http_forward_response(
         return Ok(false);
     }
 
-    match native_default_upstream_request_body_mode(context).await {
-        NativeDefaultUpstreamRequestBodyMode::Empty
-        | NativeDefaultUpstreamRequestBodyMode::BufferedImmediate => {
-            context.store_native_default_upstream_forward_request(request);
-            Ok(true)
-        }
-        NativeDefaultUpstreamRequestBodyMode::StreamInbound => {
-            context.store_native_default_upstream_forward_request(request);
-            Ok(true)
-        }
-        NativeDefaultUpstreamRequestBodyMode::BufferRemaining => Ok(false),
+    if matches!(
+        native_default_upstream_request_body_mode(context).await,
+        NativeDefaultUpstreamRequestBodyMode::BufferRemaining
+    ) {
+        return Ok(false);
     }
+
+    match forward_native_default_upstream_http_via_sender_pool(context, &request).await {
+        Ok(response) => {
+            context.store_native_default_upstream_forward_response(response);
+        }
+        Err(err) => {
+            context.store_native_default_upstream_forward_error(err);
+        }
+    }
+    Ok(true)
 }
 
 pub(super) async fn try_resolve_native_default_upstream_http_forward_response(

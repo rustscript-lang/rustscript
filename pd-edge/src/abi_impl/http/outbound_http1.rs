@@ -176,6 +176,11 @@ pub(crate) enum OutboundHttp1RequestHeaders {
         headers: LazyHttpHeaders,
         host_header: Option<Arc<str>>,
     },
+    InheritedFilteredWithOverrides {
+        headers: LazyHttpHeaders,
+        host_header: Option<Arc<str>>,
+        overrides: HeaderMap,
+    },
 }
 
 impl From<HeaderMap> for OutboundHttp1RequestHeaders {
@@ -1170,6 +1175,86 @@ fn encode_request_headers(
             has_transfer_encoding = false;
             has_content_length = false;
         }
+        OutboundHttp1RequestHeaders::InheritedFilteredWithOverrides {
+            headers,
+            host_header,
+            overrides,
+        } => {
+            let mut host_overridden = false;
+            let mut content_length_overridden = false;
+            let mut connection_overridden = false;
+            let mut transfer_encoding_overridden = false;
+            for name in overrides.keys() {
+                if name == HOST {
+                    host_overridden = true;
+                    has_host = true;
+                } else if name == CONTENT_LENGTH {
+                    content_length_overridden = true;
+                    has_content_length = true;
+                } else if name == CONNECTION {
+                    connection_overridden = true;
+                    has_connection = true;
+                } else if name == TRANSFER_ENCODING {
+                    transfer_encoding_overridden = true;
+                    has_transfer_encoding = true;
+                }
+            }
+            headers.for_each_header(|name, value| {
+                if name.eq_ignore_ascii_case(HOST.as_str()) {
+                    if host_overridden {
+                        return;
+                    }
+                    has_host = true;
+                    return;
+                }
+                if name.eq_ignore_ascii_case(CONTENT_LENGTH.as_str()) {
+                    if content_length_overridden {
+                        return;
+                    }
+                    has_content_length = true;
+                    return;
+                }
+                if name.eq_ignore_ascii_case(CONNECTION.as_str()) {
+                    if connection_overridden {
+                        return;
+                    }
+                    has_connection = true;
+                    return;
+                }
+                if name.eq_ignore_ascii_case(TRANSFER_ENCODING.as_str()) {
+                    if transfer_encoding_overridden {
+                        return;
+                    }
+                    has_transfer_encoding = true;
+                    return;
+                }
+                if is_hop_by_hop_header_name(name) || overrides.contains_key(name) {
+                    return;
+                }
+                encoded.extend_from_slice(name.as_bytes());
+                encoded.extend_from_slice(b": ");
+                encoded.extend_from_slice(value);
+                encoded.extend_from_slice(b"\r\n");
+            });
+            for (name, value) in overrides {
+                encoded.extend_from_slice(name.as_str().as_bytes());
+                encoded.extend_from_slice(b": ");
+                encoded.extend_from_slice(value.as_bytes());
+                encoded.extend_from_slice(b"\r\n");
+            }
+            if let Some(host) = host_header
+                && !host_overridden
+            {
+                has_host = true;
+                encoded.extend_from_slice(HOST.as_str().as_bytes());
+                encoded.extend_from_slice(b": ");
+                encoded.extend_from_slice(host.as_bytes());
+                encoded.extend_from_slice(b"\r\n");
+            }
+            has_connection = connection_overridden;
+            has_transfer_encoding = transfer_encoding_overridden;
+            has_content_length = content_length_overridden;
+        }
     }
     if !has_host {
         encoded.extend_from_slice(HOST.as_str().as_bytes());
@@ -1701,8 +1786,9 @@ async fn send_request_body(
 #[cfg(test)]
 mod tests {
     use super::{
-        OutboundHttp1Request, OutboundHttp1RequestBody, OutboundHttp1Scheme, OutboundHttp1Target,
-        forward_via_sender_pool, new_shared_plain_http1_sender_pool,
+        OutboundHttp1Request, OutboundHttp1RequestBody, OutboundHttp1RequestHeaders,
+        OutboundHttp1Scheme, OutboundHttp1Target, forward_via_sender_pool,
+        new_shared_plain_http1_sender_pool, serialize_request_head_parts_into,
     };
     use axum::{
         body::Bytes,
@@ -1717,6 +1803,8 @@ mod tests {
         time::{Duration, timeout},
     };
     use vm::VmError;
+
+    use crate::abi_impl::http::state::LazyHttpHeaders;
 
     fn split_http1_head_and_body(buffer: &[u8]) -> Option<(&[u8], &[u8])> {
         buffer
@@ -1830,5 +1918,55 @@ mod tests {
         assert_eq!(response.status, 200);
         assert_eq!(response.version, Version::HTTP_11);
         server.await.expect("server task should complete");
+    }
+
+    #[test]
+    fn serializes_inherited_headers_with_overrides_without_duplication() {
+        let headers = LazyHttpHeaders::from_raw_header_bytes(vec![
+            (
+                Bytes::from_static(b"host"),
+                Bytes::from_static(b"old.example"),
+            ),
+            (Bytes::from_static(b"x-base"), Bytes::from_static(b"keep")),
+            (
+                Bytes::from_static(b"x-override"),
+                Bytes::from_static(b"old"),
+            ),
+            (
+                Bytes::from_static(b"connection"),
+                Bytes::from_static(b"close"),
+            ),
+        ]);
+        let mut overrides = HeaderMap::new();
+        overrides.insert("x-override", "new".parse().expect("header should parse"));
+        overrides.insert("x-extra", "extra".parse().expect("header should parse"));
+        let request_headers = OutboundHttp1RequestHeaders::InheritedFilteredWithOverrides {
+            headers,
+            host_header: Some(Arc::from("new.example")),
+            overrides,
+        };
+        let mut encoded = bytes::BytesMut::new();
+        let use_chunked = serialize_request_head_parts_into(
+            &Method::POST,
+            "/demo",
+            "a=1",
+            &request_headers,
+            "fallback.example",
+            Some(0),
+            &mut encoded,
+        );
+        assert!(!use_chunked);
+
+        let head = String::from_utf8(encoded.to_vec()).expect("request head should be utf8");
+        assert!(head.starts_with("POST /demo?a=1 HTTP/1.1\r\n"));
+        assert!(head.contains("host: new.example\r\n"));
+        assert!(head.contains("x-base: keep\r\n"));
+        assert!(head.contains("x-override: new\r\n"));
+        assert!(head.contains("x-extra: extra\r\n"));
+        assert!(head.contains("content-length: 0\r\n"));
+        assert!(head.contains("connection: keep-alive\r\n"));
+        assert!(!head.contains("host: old.example\r\n"));
+        assert!(!head.contains("x-override: old\r\n"));
+        assert!(!head.contains("connection: close\r\n"));
     }
 }

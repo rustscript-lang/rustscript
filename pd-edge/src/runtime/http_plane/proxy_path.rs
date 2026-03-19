@@ -465,7 +465,11 @@ pub(crate) fn program_may_stream_downstream_http_response(program: Option<&Loade
     let mut imports_downstream_tcp = false;
     let mut imports_tcp_write = false;
     let mut imports_proxy_downstream = false;
-    let mut imports_proxy_flow = false;
+    let mut imports_proxy_exchange = false;
+    let mut imports_proxy_forward = false;
+    let mut imports_proxy_bridge = false;
+    let mut imports_proxy_pipe = false;
+    let mut imports_proxy_non_http_streams = false;
 
     for import in &program.program.imports {
         match import.name.as_str() {
@@ -475,14 +479,31 @@ pub(crate) fn program_may_stream_downstream_http_response(program: Option<&Loade
             "tcp::stream::downstream" => imports_downstream_tcp = true,
             "tcp::stream::write" => imports_tcp_write = true,
             "proxy::stream::downstream" => imports_proxy_downstream = true,
-            "proxy::bridge" | "proxy::forward" | "proxy::pipe" => imports_proxy_flow = true,
+            "proxy::stream::exchange" => imports_proxy_exchange = true,
+            "proxy::stream::from_tcp"
+            | "proxy::stream::from_tls_plaintext"
+            | "proxy::stream::from_websocket_binary" => imports_proxy_non_http_streams = true,
+            "proxy::forward" => imports_proxy_forward = true,
+            "proxy::bridge" => imports_proxy_bridge = true,
+            "proxy::pipe" => imports_proxy_pipe = true,
             _ => {}
         }
     }
 
+    let proxy_forward_is_simple_http_exchange = imports_proxy_forward
+        && imports_proxy_downstream
+        && imports_proxy_exchange
+        && !imports_proxy_bridge
+        && !imports_proxy_pipe
+        && !imports_proxy_non_http_streams;
+    let imports_proxy_streaming_flow = imports_proxy_bridge
+        || imports_proxy_pipe
+        || imports_proxy_non_http_streams
+        || (imports_proxy_forward && !proxy_forward_is_simple_http_exchange);
+
     imports_response_stream
         || (imports_downstream_tcp && imports_tcp_write)
-        || (imports_proxy_downstream && imports_proxy_flow)
+        || imports_proxy_streaming_flow
 }
 
 #[cfg(feature = "tls")]
@@ -1077,6 +1098,39 @@ async fn handle_data_plane_http_request_context(
         Ok(prepared) => prepared,
         Err(response) => return finalize_data_plane_response(&state, started, *response, 0),
     };
+    if !program_may_stream_downstream_http_response(Some(prepared.program.as_ref())) {
+        let (vm_context, pre_vm_finished, after_vm) =
+            match run_prepared_data_plane_http_request_context(
+                state.clone(),
+                prepared.program,
+                prepared.vm_context,
+                prepared.debug,
+            )
+            .await
+            {
+                Ok(executed) => executed,
+                Err(response) => return finalize_data_plane_response(&state, started, response, 0),
+            };
+        let resolved = resolve_http_graph_response(&vm_context).await;
+        let ResolvedHttpGraphResponse {
+            response,
+            upstream_latency_ms,
+            post_response_plan,
+        } = resolved;
+        if let Some(plan) = post_response_plan {
+            tokio::spawn(async move {
+                if let Err(err) = plan.run().await {
+                    warn!(
+                        "{} downstream post-response transport failed: {err}",
+                        category_program()
+                    );
+                }
+            });
+        }
+        record_stage_metrics_if_enabled(started, pre_vm_finished, after_vm);
+        return finalize_data_plane_response(&state, started, response, upstream_latency_ms);
+    }
+
     let response_stream_notify = prepared
         .vm_context
         .downstream_response_stream_ready_notify();
@@ -1371,6 +1425,8 @@ fn text_response(status: StatusCode, text: &str) -> Response<Body> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     #[cfg(feature = "http2")]
     use axum::http::Version;
@@ -1380,7 +1436,42 @@ mod tests {
 
     #[cfg(feature = "http2")]
     use crate::abi_impl::Http2SessionFrontier;
-    use crate::runtime::{VmExecutionConfig, VmExecutionMode, apply_program_from_bytes};
+    use crate::runtime::{
+        LoadedProgram, VmExecutionConfig, VmExecutionMode, apply_program_from_bytes,
+    };
+
+    fn loaded_program_from_source(source: &str) -> LoadedProgram {
+        let compiled = compile_source(source).expect("source should compile");
+        LoadedProgram {
+            program: Arc::new(compiled.program.with_local_count(compiled.locals)),
+            no_interrupt_aot_bundle: None,
+            vm_pool: Arc::new(crate::runtime::vm_runner::LoadedProgramVmPool::new()),
+        }
+    }
+
+    #[test]
+    fn simple_http_proxy_forward_does_not_force_streaming_path() {
+        let loaded = loaded_program_from_source(
+            r#"
+                use http;
+                use proxy;
+
+                let upstream = http::exchange::prepare_default_upstream(
+                    "127.0.0.1",
+                    8080,
+                    "1.1",
+                    []
+                );
+                let downstream = proxy::stream::downstream();
+                let upstream_stream = proxy::stream::exchange(upstream);
+                proxy::forward(downstream, upstream_stream);
+            "#,
+        );
+        assert!(
+            !program_may_stream_downstream_http_response(Some(&loaded)),
+            "simple downstream->http exchange forward should stay on the fast HTTP/1 path"
+        );
+    }
 
     #[cfg(feature = "http2")]
     #[tokio::test(flavor = "current_thread")]

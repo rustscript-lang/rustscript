@@ -560,16 +560,39 @@ async fn resolve_http_graph_response_inner(
         }
     };
     if let Some((response, response_headers, response_status)) = native_fast_path {
-        let upstream_latency_ms = response.upstream_latency_ms;
-        return ResolvedHttpGraphResponse {
-            response: response_from_started_upstream_response(
-                response,
-                response_headers,
-                response_status,
-            )
-            .await,
-            upstream_latency_ms,
-            post_response_plan: None,
+        return match response {
+            Ok(response) => {
+                let upstream_latency_ms = response.upstream_latency_ms;
+                ResolvedHttpGraphResponse {
+                    response: response_from_started_upstream_response(
+                        response,
+                        response_headers,
+                        response_status,
+                    )
+                    .await,
+                    upstream_latency_ms,
+                    post_response_plan: None,
+                }
+            }
+            Err(UpstreamResponseStartError::UpstreamRequest(_)) => ResolvedHttpGraphResponse {
+                response: text_response(StatusCode::BAD_GATEWAY, "bad gateway"),
+                upstream_latency_ms: current_upstream_latency_ms(context),
+                post_response_plan: None,
+            },
+            Err(
+                err @ (UpstreamResponseStartError::UnknownExchangeHandle(_)
+                | UpstreamResponseStartError::MissingClient
+                | UpstreamResponseStartError::Protocol(_)
+                | UpstreamResponseStartError::ResolveOutboundBody(_)
+                | UpstreamResponseStartError::MissingTarget),
+            ) => ResolvedHttpGraphResponse {
+                response: text_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &err.as_vm_error().to_string(),
+                ),
+                upstream_latency_ms: current_upstream_latency_ms(context),
+                post_response_plan: None,
+            },
         };
     }
 

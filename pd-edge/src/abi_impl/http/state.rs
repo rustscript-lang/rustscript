@@ -128,9 +128,10 @@ pub(crate) use upstream::{
     upstream_response_eof,
 };
 use upstream::{
-    NativeDefaultUpstreamForwardResponse, UpstreamResponseStartError,
-    response_from_started_upstream_response, start_outbound_exchange_response,
-    start_upstream_response, try_resolve_native_default_upstream_http_forward_response,
+    NativeDefaultUpstreamForwardResponse, NativeDefaultUpstreamForwardResult,
+    UpstreamResponseStartError, response_from_started_upstream_response,
+    start_outbound_exchange_response, start_upstream_response,
+    try_resolve_native_default_upstream_http_forward_response,
     try_resolve_ready_or_pending_native_default_upstream_forward_response,
 };
 use upstream_body::{SharedHttpHeaders, SharedUpstreamResponseBody};
@@ -955,8 +956,7 @@ pub(crate) struct DownstreamState {
     pub(crate) downstream_http1_upgrade: Option<DownstreamHttp1Upgrade>,
     pub(crate) post_response_plan: Option<DownstreamPostResponsePlan>,
     pub(crate) native_default_upstream_http_forward: bool,
-    native_default_upstream_forward_request: Option<DefaultUpstreamRequestSnapshot>,
-    native_default_upstream_forward_response: Option<NativeDefaultUpstreamForwardResponse>,
+    native_default_upstream_forward_response: Option<NativeDefaultUpstreamForwardResult>,
     inline_http_response_sender: Option<InlineDownstreamHttpResponseSender>,
     pub(crate) vm_touches: HttpVmTouchState,
 }
@@ -971,7 +971,6 @@ impl DownstreamState {
             downstream_http1_upgrade: None,
             post_response_plan: None,
             native_default_upstream_http_forward: false,
-            native_default_upstream_forward_request: None,
             native_default_upstream_forward_response: None,
             inline_http_response_sender: None,
             vm_touches: HttpVmTouchState::default(),
@@ -1012,7 +1011,6 @@ impl DownstreamState {
             downstream_http1_upgrade: None,
             post_response_plan: None,
             native_default_upstream_http_forward: false,
-            native_default_upstream_forward_request: None,
             native_default_upstream_forward_response: None,
             inline_http_response_sender: None,
             vm_touches: HttpVmTouchState::default(),
@@ -1595,7 +1593,7 @@ impl ProxyVmContext {
             && downstream.response_output.body_source_exchange.is_none()
             && downstream.response_output.status.is_none()
             && downstream.response_output.headers.is_empty()
-            && let Some(native_response) =
+            && let Some(Ok(native_response)) =
                 downstream.native_default_upstream_forward_response.as_mut()
         {
             native_response.headers.insert(name, value);
@@ -1617,7 +1615,7 @@ impl ProxyVmContext {
             && downstream.response_output.body_source_exchange.is_none()
             && downstream.response_output.status.is_none()
             && downstream.response_output.headers.is_empty()
-            && let Some(native_response) =
+            && let Some(Ok(native_response)) =
                 downstream.native_default_upstream_forward_response.as_mut()
         {
             for (name, value) in headers {
@@ -1644,7 +1642,7 @@ impl ProxyVmContext {
             && downstream.response_output.body_source_exchange.is_none()
             && downstream.response_output.headers.is_empty()
             && downstream.response_output.status.is_none()
-            && let Some(native_response) =
+            && let Some(Ok(native_response)) =
                 downstream.native_default_upstream_forward_response.as_mut()
         {
             native_response.status = status;
@@ -1684,33 +1682,29 @@ impl ProxyVmContext {
     pub(crate) fn clear_native_default_upstream_http_forward(&self) {
         let mut downstream = self.lock_downstream();
         downstream.native_default_upstream_http_forward = false;
-        downstream.native_default_upstream_forward_request = None;
         downstream.native_default_upstream_forward_response = None;
     }
 
-    fn store_native_default_upstream_forward_request(
+    fn store_native_default_upstream_forward_response(
         &self,
-        request: DefaultUpstreamRequestSnapshot,
+        response: NativeDefaultUpstreamForwardResponse,
     ) {
         let mut downstream = self.lock_downstream();
         downstream.native_default_upstream_http_forward = true;
-        downstream.native_default_upstream_forward_request = Some(request);
-        downstream.native_default_upstream_forward_response = None;
+        downstream.native_default_upstream_forward_response = Some(Ok(response));
+    }
+
+    fn store_native_default_upstream_forward_error(&self, err: UpstreamResponseStartError) {
+        let mut downstream = self.lock_downstream();
+        downstream.native_default_upstream_http_forward = true;
+        downstream.native_default_upstream_forward_response = Some(Err(err));
     }
 
     fn take_native_default_upstream_forward_response(
         &self,
-    ) -> Option<NativeDefaultUpstreamForwardResponse> {
+    ) -> Option<NativeDefaultUpstreamForwardResult> {
         self.lock_downstream()
             .native_default_upstream_forward_response
-            .take()
-    }
-
-    fn take_native_default_upstream_forward_request(
-        &self,
-    ) -> Option<DefaultUpstreamRequestSnapshot> {
-        self.lock_downstream()
-            .native_default_upstream_forward_request
             .take()
     }
 
@@ -1720,16 +1714,11 @@ impl ProxyVmContext {
             .is_some()
     }
 
-    fn native_default_upstream_forward_request_pending(&self) -> bool {
-        self.lock_downstream()
-            .native_default_upstream_forward_request
-            .is_some()
-    }
-
     fn native_default_upstream_forward_latency_ms(&self) -> Option<u64> {
         self.lock_downstream()
             .native_default_upstream_forward_response
             .as_ref()
+            .and_then(|response| response.as_ref().ok())
             .map(|response| response.upstream_latency_ms)
     }
 
