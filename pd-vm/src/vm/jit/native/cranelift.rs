@@ -5,12 +5,14 @@ use crate::vm::native::{
     ExecutableBuffer, NativeInterruptSettings, OP_ADD, OP_AND, OP_BUILTIN_CALL, OP_CALL, OP_CEQ,
     OP_CGT, OP_CLT, OP_DIV, OP_DUP, OP_GUARD_FALSE, OP_GUARD_TRUE, OP_JUMP, OP_LDC, OP_LDLOC,
     OP_LOOP_IF_FALSE, OP_LSHR, OP_MOD, OP_MUL, OP_NEG, OP_NOT, OP_OR, OP_POP, OP_SHL, OP_SHR,
-    OP_STLOC, OP_SUB, OP_TRACE_BYTES_FROM_ARRAY_U8, OP_TRACE_BYTES_TO_ARRAY_U8,
-    OP_TRACE_CONCAT_BYTES, OP_TRACE_CONCAT_STRING, OP_TRACE_GET_BYTES, OP_TRACE_GET_STRING,
-    OP_TRACE_HAS_BYTES, OP_TRACE_LEN_BYTES, OP_TRACE_LEN_STRING, OP_TRACE_SLICE_BYTES,
-    OP_TRACE_SLICE_STRING, STATUS_CONTINUE, STATUS_HALTED, STATUS_OUT_OF_FUEL, STATUS_TRACE_EXIT,
-    detect_native_stack_layout, entry_signature, helper_signature, jump_with_status,
-    typed_step_helper_entry_address, typed_step_signature,
+    OP_STLOC, OP_SUB, STATUS_CONTINUE, STATUS_HALTED, STATUS_OUT_OF_FUEL, STATUS_TRACE_EXIT,
+    alloc_buffer_signature, alloc_byte_buffer_entry_address, alloc_value_buffer_entry_address,
+    copy_bytes_entry_address, copy_bytes_signature, detect_native_stack_layout,
+    drop_shared_array_entry_address, drop_shared_bytes_entry_address, drop_shared_signature,
+    drop_shared_string_entry_address, entry_signature, free_buffer_signature, helper_signature,
+    jump_with_status, pack_shared_signature, shared_array_from_buffer_entry_address,
+    shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
+    zero_bytes_entry_address,
 };
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{Block, BlockArg, InstBuilder, MemFlags, SigRef, types};
@@ -108,7 +110,11 @@ pub(crate) fn compile_trace(
     let call_conv = module.target_config().default_call_conv;
 
     let helper_sig = helper_signature(pointer_type, call_conv);
-    let typed_step_sig = typed_step_signature(pointer_type, call_conv);
+    let alloc_buffer_sig = alloc_buffer_signature(pointer_type, call_conv);
+    let free_buffer_sig = free_buffer_signature(pointer_type, call_conv);
+    let pack_shared_sig = pack_shared_signature(pointer_type, call_conv);
+    let drop_shared_sig = drop_shared_signature(pointer_type, call_conv);
+    let copy_bytes_sig = copy_bytes_signature(pointer_type, call_conv);
 
     let mut ctx = module.make_context();
     ctx.func.signature = entry_signature(pointer_type, call_conv);
@@ -147,9 +153,26 @@ pub(crate) fn compile_trace(
         b.switch_to_block(root_block);
 
         let helper_ref = b.import_signature(helper_sig.clone());
-        let typed_step_ref = b.import_signature(typed_step_sig.clone());
         let vm_status_helper_ref = b.import_signature(entry_signature(pointer_type, call_conv));
-        let typed_step_helper_addr = typed_step_helper_entry_address();
+        let heap_refs = crate::vm::native::HeapIntrinsicRefs {
+            alloc_buffer_ref: b.import_signature(alloc_buffer_sig.clone()),
+            free_buffer_ref: b.import_signature(free_buffer_sig.clone()),
+            pack_shared_ref: b.import_signature(pack_shared_sig.clone()),
+            drop_shared_ref: b.import_signature(drop_shared_sig.clone()),
+            copy_bytes_ref: b.import_signature(copy_bytes_sig.clone()),
+        };
+        let heap_addrs = crate::vm::native::HeapIntrinsicAddrs {
+            alloc_byte_buffer: alloc_byte_buffer_entry_address(),
+            alloc_value_buffer: alloc_value_buffer_entry_address(),
+            pack_string: shared_string_from_buffer_entry_address(),
+            pack_bytes: shared_bytes_from_buffer_entry_address(),
+            pack_array: shared_array_from_buffer_entry_address(),
+            copy_bytes: copy_bytes_entry_address(),
+            zero_bytes: zero_bytes_entry_address(),
+            drop_string: drop_shared_string_entry_address(),
+            drop_bytes: drop_shared_bytes_entry_address(),
+            drop_array: drop_shared_array_entry_address(),
+        };
 
         let mut step_index = 0usize;
         while step_index < trace.steps.len() {
@@ -201,8 +224,8 @@ pub(crate) fn compile_trace(
                 pointer_type,
                 layout,
                 offsets,
-                typed_step_ref,
-                typed_step_helper_addr,
+                heap_refs,
+                heap_addrs,
                 trace.root_ip,
                 step_ip,
                 step,

@@ -1,5 +1,7 @@
 use std::sync::OnceLock;
 
+use crate::bytecode::VmMap;
+
 use super::super::{Value, Vm, VmError, VmResult};
 
 static NATIVE_STACK_LAYOUT: OnceLock<Result<NativeStackLayout, String>> = OnceLock::new();
@@ -20,9 +22,14 @@ pub(crate) struct ValueLayout {
     pub(crate) int_tag: u32,
     pub(crate) float_tag: u32,
     pub(crate) bool_tag: u32,
+    pub(crate) string_tag: u32,
+    pub(crate) bytes_tag: u32,
+    pub(crate) array_tag: u32,
     pub(crate) int_payload_offset: i32,
     pub(crate) float_payload_offset: i32,
     pub(crate) bool_payload_offset: i32,
+    pub(crate) heap_payload_offset: i32,
+    pub(crate) arc_data_offset: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -189,6 +196,20 @@ fn detect_value_layout() -> VmResult<ValueLayout> {
     let int_b = 0x1112_1314_1516_1718_i64;
     let float_a = 3.25_f64;
     let float_b = -11.5_f64;
+    let string_a = std::sync::Arc::new(String::from("a"));
+    let string_b = std::sync::Arc::new(String::from("b"));
+    let bytes_a = std::sync::Arc::new(vec![1u8, 2, 3]);
+    let bytes_b = std::sync::Arc::new(vec![4u8, 5, 6]);
+    let array_a = std::sync::Arc::new(vec![Value::Int(1), Value::Int(2)]);
+    let array_b = std::sync::Arc::new(vec![Value::Int(3), Value::Int(4)]);
+    let map_a = std::sync::Arc::new(VmMap::from_entries(vec![(
+        Value::string("left"),
+        Value::Int(1),
+    )]));
+    let map_b = std::sync::Arc::new(VmMap::from_entries(vec![(
+        Value::string("right"),
+        Value::Int(2),
+    )]));
     let null_a_bytes = encode_value_bytes(Value::Null);
     let null_b_bytes = encode_value_bytes(Value::Null);
     let int_a_bytes = encode_value_bytes(Value::Int(int_a));
@@ -197,8 +218,14 @@ fn detect_value_layout() -> VmResult<ValueLayout> {
     let float_b_bytes = encode_value_bytes(Value::Float(float_b));
     let bool_false_bytes = encode_value_bytes(Value::Bool(false));
     let bool_true_bytes = encode_value_bytes(Value::Bool(true));
-    let string_a_bytes = encode_value_bytes(Value::string("a"));
-    let string_b_bytes = encode_value_bytes(Value::string("b"));
+    let string_a_bytes = encode_value_bytes(Value::String(string_a.clone()));
+    let string_b_bytes = encode_value_bytes(Value::String(string_b.clone()));
+    let bytes_a_bytes = encode_value_bytes(Value::Bytes(bytes_a.clone()));
+    let bytes_b_bytes = encode_value_bytes(Value::Bytes(bytes_b.clone()));
+    let array_a_bytes = encode_value_bytes(Value::Array(array_a.clone()));
+    let array_b_bytes = encode_value_bytes(Value::Array(array_b.clone()));
+    let map_a_bytes = encode_value_bytes(Value::Map(map_a.clone()));
+    let map_b_bytes = encode_value_bytes(Value::Map(map_b.clone()));
 
     let stable_tag_pairs = [
         (&null_a_bytes[..], &null_b_bytes[..]),
@@ -206,12 +233,18 @@ fn detect_value_layout() -> VmResult<ValueLayout> {
         (&float_a_bytes[..], &float_b_bytes[..]),
         (&bool_false_bytes[..], &bool_true_bytes[..]),
         (&string_a_bytes[..], &string_b_bytes[..]),
+        (&bytes_a_bytes[..], &bytes_b_bytes[..]),
+        (&array_a_bytes[..], &array_b_bytes[..]),
+        (&map_a_bytes[..], &map_b_bytes[..]),
     ];
     let (tag_offset, tag_size) = detect_tag_layout(&stable_tag_pairs)?;
     let null_tag = decode_tag(&null_a_bytes, tag_offset, tag_size);
     let int_tag = decode_tag(&int_a_bytes, tag_offset, tag_size);
     let float_tag = decode_tag(&float_a_bytes, tag_offset, tag_size);
     let bool_tag = decode_tag(&bool_false_bytes, tag_offset, tag_size);
+    let string_tag = decode_tag(&string_a_bytes, tag_offset, tag_size);
+    let bytes_tag = decode_tag(&bytes_a_bytes, tag_offset, tag_size);
+    let array_tag = decode_tag(&array_a_bytes, tag_offset, tag_size);
 
     let payload_match_a = int_a.to_le_bytes();
     let payload_match_b = int_b.to_le_bytes();
@@ -279,6 +312,54 @@ fn detect_value_layout() -> VmResult<ValueLayout> {
         ));
     }
 
+    let heap_payload_offset = detect_heap_payload_offset(
+        value_size,
+        &[
+            (&string_a_bytes, arc_repr_word(&string_a)),
+            (&string_b_bytes, arc_repr_word(&string_b)),
+            (&bytes_a_bytes, arc_repr_word(&bytes_a)),
+            (&bytes_b_bytes, arc_repr_word(&bytes_b)),
+            (&array_a_bytes, arc_repr_word(&array_a)),
+            (&array_b_bytes, arc_repr_word(&array_b)),
+            (&map_a_bytes, arc_repr_word(&map_a)),
+            (&map_b_bytes, arc_repr_word(&map_b)),
+        ],
+    )?;
+    let arc_data_offset = detect_arc_data_offset(&[
+        (
+            arc_repr_word(&string_a),
+            std::sync::Arc::as_ptr(&string_a) as usize,
+        ),
+        (
+            arc_repr_word(&string_b),
+            std::sync::Arc::as_ptr(&string_b) as usize,
+        ),
+        (
+            arc_repr_word(&bytes_a),
+            std::sync::Arc::as_ptr(&bytes_a) as usize,
+        ),
+        (
+            arc_repr_word(&bytes_b),
+            std::sync::Arc::as_ptr(&bytes_b) as usize,
+        ),
+        (
+            arc_repr_word(&array_a),
+            std::sync::Arc::as_ptr(&array_a) as usize,
+        ),
+        (
+            arc_repr_word(&array_b),
+            std::sync::Arc::as_ptr(&array_b) as usize,
+        ),
+        (
+            arc_repr_word(&map_a),
+            std::sync::Arc::as_ptr(&map_a) as usize,
+        ),
+        (
+            arc_repr_word(&map_b),
+            std::sync::Arc::as_ptr(&map_b) as usize,
+        ),
+    ])?;
+
     Ok(ValueLayout {
         size: usize_to_i32(value_size, "Value size")?,
         tag_offset: usize_to_i32(tag_offset, "Value tag offset")?,
@@ -287,10 +368,68 @@ fn detect_value_layout() -> VmResult<ValueLayout> {
         int_tag,
         float_tag,
         bool_tag,
+        string_tag,
+        bytes_tag,
+        array_tag,
         int_payload_offset: usize_to_i32(int_payload_offset, "Value::Int payload offset")?,
         float_payload_offset: usize_to_i32(float_payload_offset, "Value::Float payload offset")?,
         bool_payload_offset: usize_to_i32(bool_payload_offset, "Value::Bool payload offset")?,
+        heap_payload_offset: usize_to_i32(heap_payload_offset, "Value heap payload offset")?,
+        arc_data_offset: usize_to_i32(arc_data_offset, "Arc data offset")?,
     })
+}
+
+fn detect_heap_payload_offset(value_size: usize, samples: &[(&[u8], usize)]) -> VmResult<usize> {
+    let pointer_size = std::mem::size_of::<usize>();
+    let mut payload_offset = None;
+
+    for offset in 0..=value_size.saturating_sub(pointer_size) {
+        let matches = samples
+            .iter()
+            .all(|(bytes, ptr)| bytes[offset..offset + pointer_size] == ptr.to_ne_bytes());
+        if !matches {
+            continue;
+        }
+        if payload_offset.is_some() {
+            return Err(VmError::JitNative(
+                "ambiguous heap payload offset for native emission".to_string(),
+            ));
+        }
+        payload_offset = Some(offset);
+    }
+
+    payload_offset.ok_or_else(|| {
+        VmError::JitNative("unable to find heap payload offset for native emission".to_string())
+    })
+}
+
+fn detect_arc_data_offset(samples: &[(usize, usize)]) -> VmResult<usize> {
+    let mut data_offset = None;
+    for (arc_word, data_ptr) in samples {
+        let offset = data_ptr.checked_sub(*arc_word).ok_or_else(|| {
+            VmError::JitNative("Arc data pointer precedes Arc storage word".to_string())
+        })?;
+        if let Some(existing) = data_offset {
+            if existing != offset {
+                return Err(VmError::JitNative(
+                    "inconsistent Arc data offset for native emission".to_string(),
+                ));
+            }
+        } else {
+            data_offset = Some(offset);
+        }
+    }
+    data_offset.ok_or_else(|| {
+        VmError::JitNative("unable to detect Arc data offset for native emission".to_string())
+    })
+}
+
+fn arc_repr_word<T>(value: &std::sync::Arc<T>) -> usize {
+    debug_assert_eq!(
+        std::mem::size_of::<std::sync::Arc<T>>(),
+        std::mem::size_of::<usize>()
+    );
+    unsafe { *(&raw const *value as *const usize) }
 }
 
 fn detect_tag_layout(stable_pairs: &[(&[u8], &[u8])]) -> VmResult<(usize, usize)> {

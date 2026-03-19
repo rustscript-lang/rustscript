@@ -1,5 +1,7 @@
 use crate::builtins::BuiltinFunction;
+use crate::bytecode::Value;
 use crate::vm::{HostCallExecOutcome, NumericValue, Vm, VmError, VmResult, logical_shr_i64};
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 pub(crate) const STATUS_CONTINUE: i32 = 0;
@@ -36,17 +38,6 @@ pub(crate) const OP_JUMP: i64 = 23;
 pub(crate) const OP_BUILTIN_CALL: i64 = 24;
 pub(crate) const OP_GUARD_TRUE: i64 = 25;
 pub(crate) const OP_LOOP_IF_FALSE: i64 = 26;
-pub(crate) const OP_TRACE_CONCAT_STRING: i64 = 101;
-pub(crate) const OP_TRACE_CONCAT_BYTES: i64 = 102;
-pub(crate) const OP_TRACE_LEN_STRING: i64 = 103;
-pub(crate) const OP_TRACE_LEN_BYTES: i64 = 104;
-pub(crate) const OP_TRACE_SLICE_STRING: i64 = 105;
-pub(crate) const OP_TRACE_SLICE_BYTES: i64 = 106;
-pub(crate) const OP_TRACE_GET_STRING: i64 = 107;
-pub(crate) const OP_TRACE_GET_BYTES: i64 = 108;
-pub(crate) const OP_TRACE_HAS_BYTES: i64 = 109;
-pub(crate) const OP_TRACE_BYTES_FROM_ARRAY_U8: i64 = 110;
-pub(crate) const OP_TRACE_BYTES_TO_ARRAY_U8: i64 = 111;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum NativeInterruptMode {
@@ -99,6 +90,34 @@ pub(crate) fn take_bridge_error() -> Option<VmError> {
         return guard.take();
     }
     None
+}
+
+fn arc_repr_word<T>(value: &Arc<T>) -> usize {
+    debug_assert_eq!(std::mem::size_of::<Arc<T>>(), std::mem::size_of::<usize>());
+    unsafe { *(value as *const Arc<T> as *const usize) }
+}
+
+fn arc_into_repr_ptr<T>(value: Arc<T>) -> *mut u8 {
+    let ptr = arc_repr_word(&value) as *mut u8;
+    std::mem::forget(value);
+    ptr
+}
+
+unsafe fn arc_from_repr_ptr<T>(ptr: *mut u8) -> Arc<T> {
+    debug_assert_eq!(
+        std::mem::size_of::<Arc<T>>(),
+        std::mem::size_of::<*mut u8>()
+    );
+    unsafe { std::mem::transmute_copy(&ptr) }
+}
+
+unsafe fn drop_arc_from_repr_ptr<T>(ptr: *mut u8) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        drop(arc_from_repr_ptr::<T>(ptr));
+    }
 }
 
 fn run_step<F>(vm: *mut Vm, helper_name: &str, f: F) -> i32
@@ -161,12 +180,44 @@ pub(crate) fn interrupt_helper_entry_address() -> usize {
     pd_vm_native_interrupt_tick as *const () as usize
 }
 
-pub(crate) fn string_concat_helper_entry_address() -> usize {
-    pd_vm_native_sconcat as *const () as usize
+pub(crate) fn alloc_byte_buffer_entry_address() -> usize {
+    pd_vm_native_alloc_byte_buffer as *const () as usize
 }
 
-pub(crate) fn typed_step_helper_entry_address() -> usize {
-    pd_vm_native_typed_step as *const () as usize
+pub(crate) fn alloc_value_buffer_entry_address() -> usize {
+    pd_vm_native_alloc_value_buffer as *const () as usize
+}
+
+pub(crate) fn shared_string_from_buffer_entry_address() -> usize {
+    pd_vm_native_shared_string_from_buffer as *const () as usize
+}
+
+pub(crate) fn shared_bytes_from_buffer_entry_address() -> usize {
+    pd_vm_native_shared_bytes_from_buffer as *const () as usize
+}
+
+pub(crate) fn shared_array_from_buffer_entry_address() -> usize {
+    pd_vm_native_shared_array_from_buffer as *const () as usize
+}
+
+pub(crate) fn copy_bytes_entry_address() -> usize {
+    pd_vm_native_copy_bytes as *const () as usize
+}
+
+pub(crate) fn zero_bytes_entry_address() -> usize {
+    pd_vm_native_zero_bytes as *const () as usize
+}
+
+pub(crate) fn drop_shared_string_entry_address() -> usize {
+    pd_vm_native_drop_shared_string as *const () as usize
+}
+
+pub(crate) fn drop_shared_bytes_entry_address() -> usize {
+    pd_vm_native_drop_shared_bytes as *const () as usize
+}
+
+pub(crate) fn drop_shared_array_entry_address() -> usize {
+    pd_vm_native_drop_shared_array as *const () as usize
 }
 
 pub(crate) fn helper_entry_offset() -> i32 {
@@ -197,64 +248,76 @@ pub(crate) extern "C" fn pd_vm_native_interrupt_tick(vm: *mut Vm) -> i32 {
     }
 }
 
-pub(crate) extern "C" fn pd_vm_native_sconcat(vm: *mut Vm) -> i32 {
-    run_step(vm, "sconcat", |vm| {
-        vm.record_native_bridge_hit("sconcat");
-        vm.string_concat_op()?;
-        Ok(STATUS_CONTINUE)
-    })
+pub(crate) extern "C" fn pd_vm_native_alloc_byte_buffer(cap: usize) -> *mut u8 {
+    let mut buffer = Vec::<u8>::with_capacity(cap);
+    let ptr = buffer.as_mut_ptr();
+    std::mem::forget(buffer);
+    ptr
 }
 
-pub(crate) extern "C" fn pd_vm_native_typed_step(vm: *mut Vm, op: i64) -> i32 {
-    run_step(vm, "typed_step", |vm| match op {
-        OP_TRACE_CONCAT_STRING => {
-            vm.string_concat_op()?;
-            Ok(STATUS_CONTINUE)
-        }
-        OP_TRACE_CONCAT_BYTES => {
-            vm.bytes_concat_op()?;
-            Ok(STATUS_CONTINUE)
-        }
-        OP_TRACE_LEN_STRING => {
-            vm.string_len_op()?;
-            Ok(STATUS_CONTINUE)
-        }
-        OP_TRACE_LEN_BYTES => {
-            vm.bytes_len_op()?;
-            Ok(STATUS_CONTINUE)
-        }
-        OP_TRACE_SLICE_STRING => {
-            vm.string_slice_op()?;
-            Ok(STATUS_CONTINUE)
-        }
-        OP_TRACE_SLICE_BYTES => {
-            vm.bytes_slice_op()?;
-            Ok(STATUS_CONTINUE)
-        }
-        OP_TRACE_GET_STRING => {
-            vm.string_get_op()?;
-            Ok(STATUS_CONTINUE)
-        }
-        OP_TRACE_GET_BYTES => {
-            vm.bytes_get_op()?;
-            Ok(STATUS_CONTINUE)
-        }
-        OP_TRACE_HAS_BYTES => {
-            vm.bytes_has_op()?;
-            Ok(STATUS_CONTINUE)
-        }
-        OP_TRACE_BYTES_FROM_ARRAY_U8 => {
-            vm.bytes_from_array_u8_op()?;
-            Ok(STATUS_CONTINUE)
-        }
-        OP_TRACE_BYTES_TO_ARRAY_U8 => {
-            vm.bytes_to_array_u8_op()?;
-            Ok(STATUS_CONTINUE)
-        }
-        _ => Err(VmError::JitNative(format!(
-            "native typed step helper received unsupported op id {op}"
-        ))),
-    })
+pub(crate) extern "C" fn pd_vm_native_alloc_value_buffer(cap: usize) -> *mut Value {
+    let mut buffer = Vec::<Value>::with_capacity(cap);
+    let ptr = buffer.as_mut_ptr();
+    std::mem::forget(buffer);
+    ptr
+}
+
+pub(crate) extern "C" fn pd_vm_native_shared_string_from_buffer(
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
+) -> *mut u8 {
+    let bytes = unsafe { Vec::<u8>::from_raw_parts(ptr, len, cap) };
+    let text = unsafe { String::from_utf8_unchecked(bytes) };
+    arc_into_repr_ptr(Arc::new(text))
+}
+
+pub(crate) extern "C" fn pd_vm_native_shared_bytes_from_buffer(
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
+) -> *mut u8 {
+    let bytes = unsafe { Vec::<u8>::from_raw_parts(ptr, len, cap) };
+    arc_into_repr_ptr(Arc::new(bytes))
+}
+
+pub(crate) extern "C" fn pd_vm_native_shared_array_from_buffer(
+    ptr: *mut Value,
+    len: usize,
+    cap: usize,
+) -> *mut u8 {
+    let values = unsafe { Vec::<Value>::from_raw_parts(ptr, len, cap) };
+    arc_into_repr_ptr(Arc::new(values))
+}
+
+pub(crate) extern "C" fn pd_vm_native_copy_bytes(dst: *mut u8, src: *const u8, len: usize) {
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, dst, len);
+    }
+}
+
+pub(crate) extern "C" fn pd_vm_native_zero_bytes(dst: *mut u8, len: usize) {
+    unsafe {
+        std::ptr::write_bytes(dst, 0, len);
+    }
+}
+
+pub(crate) extern "C" fn pd_vm_native_drop_shared_string(ptr: *mut u8) {
+    unsafe {
+        drop_arc_from_repr_ptr::<String>(ptr);
+    }
+}
+
+pub(crate) extern "C" fn pd_vm_native_drop_shared_bytes(ptr: *mut u8) {
+    unsafe {
+        drop_arc_from_repr_ptr::<Vec<u8>>(ptr);
+    }
+}
+
+pub(crate) extern "C" fn pd_vm_native_drop_shared_array(ptr: *mut u8) {
+    unsafe {
+        drop_arc_from_repr_ptr::<Vec<Value>>(ptr);
+    }
 }
 
 pub(crate) extern "C" fn pd_vm_native_step(vm: *mut Vm, op: i64, a: i64, b: i64, c: i64) -> i32 {

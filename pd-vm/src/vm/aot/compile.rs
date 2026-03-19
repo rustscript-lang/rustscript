@@ -12,12 +12,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::vm::native::ExecutableBuffer;
 #[cfg(feature = "cranelift-jit")]
 use crate::vm::native::{
-    InlineEmitCtx, NativeInlineStep, OP_ADD, OP_AND, OP_BUILTIN_CALL, OP_CALL, OP_CEQ, OP_CGT,
-    OP_CLT, OP_DIV, OP_DUP, OP_GUARD_FALSE, OP_JUMP, OP_LDC, OP_LDLOC, OP_LSHR, OP_MOD, OP_MUL,
-    OP_NEG, OP_NOT, OP_OR, OP_POP, OP_SHL, OP_SHR, OP_STLOC, OP_SUB, STATUS_CONTINUE, STATUS_ERROR,
-    STATUS_TRACE_EXIT, detect_native_stack_layout, emit_native_inline_step, entry_signature,
-    helper_entry_offset, helper_signature, interrupt_helper_entry_offset, jump_with_status,
-    resolve_offsets,
+    HeapIntrinsicAddrs, HeapIntrinsicRefs, InlineEmitCtx, NativeInlineStep, OP_ADD, OP_AND,
+    OP_BUILTIN_CALL, OP_CALL, OP_CEQ, OP_CGT, OP_CLT, OP_DIV, OP_DUP, OP_GUARD_FALSE, OP_JUMP,
+    OP_LDC, OP_LDLOC, OP_LSHR, OP_MOD, OP_MUL, OP_NEG, OP_NOT, OP_OR, OP_POP, OP_SHL, OP_SHR,
+    OP_STLOC, OP_SUB, STATUS_CONTINUE, STATUS_ERROR, STATUS_TRACE_EXIT, alloc_buffer_signature,
+    alloc_byte_buffer_entry_address, alloc_value_buffer_entry_address, copy_bytes_entry_address,
+    copy_bytes_signature, detect_native_stack_layout, drop_shared_array_entry_address,
+    drop_shared_bytes_entry_address, drop_shared_signature, drop_shared_string_entry_address,
+    emit_native_inline_step, entry_signature, free_buffer_signature, helper_entry_offset,
+    helper_signature, interrupt_helper_entry_offset, jump_with_status, pack_shared_signature,
+    resolve_offsets, shared_array_from_buffer_entry_address,
+    shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
+    zero_bytes_entry_address,
 };
 use crate::vm::{OpCode, Program, Vm, VmError, VmResult};
 #[cfg(feature = "cranelift-jit")]
@@ -36,11 +42,12 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 
 use super::cfg::AotBlockTerminal;
-#[cfg(feature = "cranelift-jit")]
-use super::ir::AotCallDispatch;
 #[cfg(any(feature = "cranelift-jit", test))]
 use super::ir::lower_program;
-use super::ir::{AotInstruction, AotIrBlock, AotLowerError, AotProgram};
+use super::ir::{
+    AotBytesCodecKind, AotCallDispatch, AotConcatKind, AotInstruction, AotIrBlock, AotLowerError,
+    AotProgram, AotTextBytesKind,
+};
 
 #[cfg(any(
     all(
@@ -224,10 +231,27 @@ fn compile_segments(
     let pointer_type = module.target_config().pointer_type();
     let call_conv = module.target_config().default_call_conv;
     let helper_sig = helper_signature(pointer_type, call_conv);
+    let alloc_buffer_sig = alloc_buffer_signature(pointer_type, call_conv);
+    let free_buffer_sig = free_buffer_signature(pointer_type, call_conv);
+    let pack_shared_sig = pack_shared_signature(pointer_type, call_conv);
+    let drop_shared_sig = drop_shared_signature(pointer_type, call_conv);
+    let copy_bytes_sig = copy_bytes_signature(pointer_type, call_conv);
     let interrupt_sig = entry_signature(pointer_type, call_conv);
     let vm_status_sig = entry_signature(pointer_type, call_conv);
     let helper_offset = helper_entry_offset();
     let interrupt_helper_offset = interrupt_helper_entry_offset();
+    let heap_addrs = HeapIntrinsicAddrs {
+        alloc_byte_buffer: alloc_byte_buffer_entry_address(),
+        alloc_value_buffer: alloc_value_buffer_entry_address(),
+        pack_string: shared_string_from_buffer_entry_address(),
+        pack_bytes: shared_bytes_from_buffer_entry_address(),
+        pack_array: shared_array_from_buffer_entry_address(),
+        copy_bytes: copy_bytes_entry_address(),
+        zero_bytes: zero_bytes_entry_address(),
+        drop_string: drop_shared_string_entry_address(),
+        drop_bytes: drop_shared_bytes_entry_address(),
+        drop_array: drop_shared_array_entry_address(),
+    };
     let layout = detect_native_stack_layout().map_err(|err| {
         AotCompileError::Codegen(format!("detect native stack layout failed: {err}"))
     })?;
@@ -289,6 +313,13 @@ fn compile_segments(
         let helper_ref = b.import_signature(helper_sig);
         let vm_status_helper_ref = b.import_signature(vm_status_sig);
         let interrupt_ref = b.import_signature(interrupt_sig);
+        let heap_refs = HeapIntrinsicRefs {
+            alloc_buffer_ref: b.import_signature(alloc_buffer_sig),
+            free_buffer_ref: b.import_signature(free_buffer_sig),
+            pack_shared_ref: b.import_signature(pack_shared_sig),
+            drop_shared_ref: b.import_signature(drop_shared_sig),
+            copy_bytes_ref: b.import_signature(copy_bytes_sig),
+        };
 
         for segment in segments {
             let segment_block = segment_blocks[&segment.entry_ip];
@@ -330,6 +361,8 @@ fn compile_segments(
                     pointer_type,
                     layout,
                     offsets,
+                    heap_refs,
+                    heap_addrs,
                     exit_block,
                     step,
                 )?;
@@ -612,6 +645,8 @@ fn emit_step(
     pointer_type: cranelift_codegen::ir::Type,
     layout: crate::vm::native::NativeStackLayout,
     offsets: crate::vm::native::ResolvedOffsets,
+    heap_refs: HeapIntrinsicRefs,
+    heap_addrs: HeapIntrinsicAddrs,
     exit_block: Block,
     step: &SegmentStep,
 ) -> Result<(), AotCompileError> {
@@ -658,11 +693,13 @@ fn emit_step(
                 InlineEmitCtx {
                     vm_ptr,
                     helper_ref,
-                    vm_status_helper_ref,
+                    _vm_status_helper_ref: vm_status_helper_ref,
                     exit_block,
                     pointer_type,
                     layout,
                     offsets,
+                    heap_refs,
+                    heap_addrs,
                 },
                 step.ip,
                 inline_step,
@@ -914,7 +951,21 @@ fn inline_step_for_instruction(instruction: &AotInstruction) -> Option<NativeInl
         AotInstruction::Add => NativeInlineStep::Add,
         AotInstruction::IAdd => NativeInlineStep::IAdd,
         AotInstruction::FAdd => NativeInlineStep::FAdd,
-        AotInstruction::SConcat => NativeInlineStep::SConcat,
+        AotInstruction::Concat(AotConcatKind::String) => NativeInlineStep::StringConcat,
+        AotInstruction::Concat(AotConcatKind::Bytes) => NativeInlineStep::BytesConcat,
+        AotInstruction::Len(AotTextBytesKind::String) => NativeInlineStep::StringLen,
+        AotInstruction::Len(AotTextBytesKind::Bytes) => NativeInlineStep::BytesLen,
+        AotInstruction::Slice(AotTextBytesKind::String) => NativeInlineStep::StringSlice,
+        AotInstruction::Slice(AotTextBytesKind::Bytes) => NativeInlineStep::BytesSlice,
+        AotInstruction::Get(AotTextBytesKind::String) => NativeInlineStep::StringGet,
+        AotInstruction::Get(AotTextBytesKind::Bytes) => NativeInlineStep::BytesGet,
+        AotInstruction::HasBytes => NativeInlineStep::BytesHas,
+        AotInstruction::BytesCodec(AotBytesCodecKind::FromArrayU8) => {
+            NativeInlineStep::BytesFromArrayU8
+        }
+        AotInstruction::BytesCodec(AotBytesCodecKind::ToArrayU8) => {
+            NativeInlineStep::BytesToArrayU8
+        }
         AotInstruction::Sub => NativeInlineStep::Sub,
         AotInstruction::ISub => NativeInlineStep::ISub,
         AotInstruction::FSub => NativeInlineStep::FSub,
@@ -956,10 +1007,7 @@ fn step_to_call_tuple(
     Ok(match instruction {
         AotInstruction::Nop => (0, 0, 0, 0),
         AotInstruction::Ldc { const_index } => (OP_LDC, i64::from(*const_index), 0, 0),
-        AotInstruction::Add
-        | AotInstruction::IAdd
-        | AotInstruction::FAdd
-        | AotInstruction::SConcat => (OP_ADD, 0, 0, 0),
+        AotInstruction::Add | AotInstruction::IAdd | AotInstruction::FAdd => (OP_ADD, 0, 0, 0),
         AotInstruction::Sub | AotInstruction::ISub | AotInstruction::FSub => (OP_SUB, 0, 0, 0),
         AotInstruction::Mul | AotInstruction::IMul | AotInstruction::FMul => (OP_MUL, 0, 0, 0),
         AotInstruction::Div | AotInstruction::IDiv | AotInstruction::FDiv => (OP_DIV, 0, 0, 0),
@@ -978,6 +1026,16 @@ fn step_to_call_tuple(
         AotInstruction::Dup => (OP_DUP, 0, 0, 0),
         AotInstruction::Ldloc { index } => (OP_LDLOC, i64::from(*index), 0, 0),
         AotInstruction::Stloc { index } => (OP_STLOC, i64::from(*index), 0, 0),
+        AotInstruction::Concat(_)
+        | AotInstruction::Len(_)
+        | AotInstruction::Slice(_)
+        | AotInstruction::Get(_)
+        | AotInstruction::HasBytes
+        | AotInstruction::BytesCodec(_) => {
+            return Err(AotCompileError::Codegen(
+                "typed string/bytes aot instruction must lower natively".to_string(),
+            ));
+        }
         AotInstruction::Call(call) => {
             let op = match call.dispatch {
                 AotCallDispatch::Builtin => OP_BUILTIN_CALL,

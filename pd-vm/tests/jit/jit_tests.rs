@@ -187,6 +187,225 @@ fn aot_inlines_typed_numeric_steps_without_bridge_fallback() {
 }
 
 #[test]
+fn aot_executes_typed_string_concat_without_helper_bridge() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let mut i = 0;
+        let mut acc = "";
+        while i < 4 {
+            acc = acc + "ab";
+            i = i + 1;
+        }
+        acc;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_bridge_stats_enabled(true);
+    install_aot(&mut vm);
+
+    let status = vm.run().expect("aot vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("abababab")]);
+
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert!(
+        !bridge_hits
+            .iter()
+            .any(|(name, count)| *name == "add" && *count > 0),
+        "expected string concat to avoid generic add bridge, bridge hits: {bridge_hits:?}\n{}",
+        vm.dump_aot_info()
+    );
+    assert!(
+        !bridge_hits
+            .iter()
+            .any(|(name, count)| *name == "sconcat" && *count > 0),
+        "expected string concat to avoid sconcat helper bridge, bridge hits: {bridge_hits:?}\n{}",
+        vm.dump_aot_info()
+    );
+}
+
+#[test]
+fn aot_executes_typed_bytes_concat_without_helper_bridge() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        use bytes;
+        let mut i = 0;
+        let mut payload = bytes::from_hex("");
+        while i < 5 {
+            payload = payload + bytes::from_hex("00ff");
+            i = i + 1;
+        }
+        payload;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_bridge_stats_enabled(true);
+    install_aot(&mut vm);
+
+    let status = vm.run().expect("aot vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::bytes(vec![
+            0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF
+        ])]
+    );
+
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert!(
+        !bridge_hits
+            .iter()
+            .any(|(name, count)| *name == "add" && *count > 0),
+        "expected bytes concat to avoid generic add bridge, bridge hits: {bridge_hits:?}\n{}",
+        vm.dump_aot_info()
+    );
+    assert!(
+        !bridge_hits
+            .iter()
+            .any(|(name, count)| name.contains("concat") && *count > 0),
+        "expected bytes concat to avoid concat helper bridges, bridge hits: {bridge_hits:?}\n{}",
+        vm.dump_aot_info()
+    );
+}
+
+#[test]
+fn aot_executes_typed_bytes_sequence_builtins_without_builtin_bridge() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        use bytes;
+        let payload = bytes::from_hex("00ff10");
+        let total = payload.length;
+        let byte = (&payload)[1].copy();
+        let present = payload.has(2);
+        let part = payload[1:3];
+        total;
+        part;
+        byte;
+        present;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_bridge_stats_enabled(true);
+    install_aot(&mut vm);
+
+    let status = vm.run().expect("aot vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[
+            Value::Int(3),
+            Value::bytes(vec![0xFF, 0x10]),
+            Value::Int(255),
+            Value::Bool(true),
+        ]
+    );
+
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    for bridge_name in ["len", "slice", "get", "has"] {
+        assert!(
+            !bridge_hits
+                .iter()
+                .any(|(name, count)| *name == bridge_name && *count > 0),
+            "expected bytes builtin '{bridge_name}' to avoid builtin helper bridge, bridge hits: {bridge_hits:?}\n{}",
+            vm.dump_aot_info()
+        );
+    }
+}
+
+#[test]
+fn aot_executes_typed_string_sequence_builtins_without_builtin_bridge() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let text = "a界🙂";
+        let total = text.length;
+        let ch = (&text)[1].copy();
+        let part = text[1:3];
+        total;
+        part;
+        ch;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_bridge_stats_enabled(true);
+    install_aot(&mut vm);
+
+    let status = vm.run().expect("aot vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::Int(3), Value::string("界🙂"), Value::string("界"),]
+    );
+
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    for bridge_name in ["len", "slice", "get"] {
+        assert!(
+            !bridge_hits
+                .iter()
+                .any(|(name, count)| *name == bridge_name && *count > 0),
+            "expected string builtin '{bridge_name}' to avoid builtin helper bridge, bridge hits: {bridge_hits:?}\n{}",
+            vm.dump_aot_info()
+        );
+    }
+}
+
+#[test]
+fn aot_executes_typed_bytes_array_codec_builtins_without_builtin_bridge() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        use bytes;
+        let arr = bytes::to_array_u8(bytes::from_array_u8([1, 2, 255]));
+        let payload = bytes::from_array_u8(arr);
+        arr;
+        payload;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_bridge_stats_enabled(true);
+    install_aot(&mut vm);
+
+    let status = vm.run().expect("aot vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[
+            Value::array(vec![Value::Int(1), Value::Int(2), Value::Int(255)]),
+            Value::bytes(vec![1, 2, 255]),
+        ]
+    );
+
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    for bridge_name in ["bytes_from_array_u8", "bytes_to_array_u8"] {
+        assert!(
+            !bridge_hits
+                .iter()
+                .any(|(name, count)| *name == bridge_name && *count > 0),
+            "expected bytes array codec '{bridge_name}' to avoid builtin helper bridge, bridge hits: {bridge_hits:?}\n{}",
+            vm.dump_aot_info()
+        );
+    }
+}
+
+#[test]
 fn aot_replays_host_yield_and_resumes_at_call_site() {
     if !native_jit_supported() {
         return;

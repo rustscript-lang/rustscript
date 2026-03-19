@@ -26,6 +26,24 @@ pub(crate) struct AotIrBlock {
     pub(crate) terminal: AotBlockTerminal,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AotConcatKind {
+    String,
+    Bytes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AotTextBytesKind {
+    String,
+    Bytes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AotBytesCodecKind {
+    FromArrayU8,
+    ToArrayU8,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AotInstruction {
     Nop,
@@ -33,7 +51,12 @@ pub(crate) enum AotInstruction {
     Add,
     IAdd,
     FAdd,
-    SConcat,
+    Concat(AotConcatKind),
+    Len(AotTextBytesKind),
+    Slice(AotTextBytesKind),
+    Get(AotTextBytesKind),
+    HasBytes,
+    BytesCodec(AotBytesCodecKind),
     Sub,
     ISub,
     FSub,
@@ -207,23 +230,40 @@ fn lower_block(
                     opcode,
                     kind: "call argc",
                 })?;
-                let dispatch = if BuiltinFunction::from_call_index(index)
-                    .is_some_and(|builtin| builtin.accepts_arity(argc))
-                {
-                    AotCallDispatch::Builtin
+                if let Some(builtin) = BuiltinFunction::from_call_index(index) {
+                    if !builtin.accepts_arity(argc) {
+                        return Err(AotLowerError::InvalidImmediate {
+                            ip,
+                            opcode,
+                            kind: "builtin call arity",
+                        });
+                    }
+                    if let Some(instruction) = typed_builtin_instruction(program, ip, builtin) {
+                        instructions.push(instruction);
+                    } else {
+                        let call = AotCall {
+                            index,
+                            argc,
+                            call_ip: ip,
+                            resume_ip: next_ip,
+                            dispatch: AotCallDispatch::Builtin,
+                        };
+                        resume_ips.insert(call.call_ip);
+                        resume_ips.insert(call.resume_ip);
+                        instructions.push(AotInstruction::Call(call));
+                    }
                 } else {
-                    AotCallDispatch::HostImport
-                };
-                let call = AotCall {
-                    index,
-                    argc,
-                    call_ip: ip,
-                    resume_ip: next_ip,
-                    dispatch,
-                };
-                resume_ips.insert(call.call_ip);
-                resume_ips.insert(call.resume_ip);
-                instructions.push(AotInstruction::Call(call));
+                    let call = AotCall {
+                        index,
+                        argc,
+                        call_ip: ip,
+                        resume_ip: next_ip,
+                        dispatch: AotCallDispatch::HostImport,
+                    };
+                    resume_ips.insert(call.call_ip);
+                    resume_ips.insert(call.resume_ip);
+                    instructions.push(AotInstruction::Call(call));
+                }
             }
             OpCode::Ret | OpCode::Br | OpCode::Brfalse => {
                 return Err(AotLowerError::InvalidImmediate {
@@ -296,7 +336,12 @@ fn typed_instruction(program: &Program, ip: usize, opcode: OpCode) -> AotInstruc
     match (opcode, operand_types) {
         (OpCode::Add, (ValueType::Int, ValueType::Int)) => AotInstruction::IAdd,
         (OpCode::Add, (ValueType::Float, ValueType::Float)) => AotInstruction::FAdd,
-        (OpCode::Add, (ValueType::String, ValueType::String)) => AotInstruction::SConcat,
+        (OpCode::Add, (ValueType::String, ValueType::String)) => {
+            AotInstruction::Concat(AotConcatKind::String)
+        }
+        (OpCode::Add, (ValueType::Bytes, ValueType::Bytes)) => {
+            AotInstruction::Concat(AotConcatKind::Bytes)
+        }
         (OpCode::Sub, (ValueType::Int, ValueType::Int)) => AotInstruction::ISub,
         (OpCode::Sub, (ValueType::Float, ValueType::Float)) => AotInstruction::FSub,
         (OpCode::Mul, (ValueType::Int, ValueType::Int)) => AotInstruction::IMul,
@@ -320,6 +365,45 @@ fn typed_instruction(program: &Program, ip: usize, opcode: OpCode) -> AotInstruc
         (OpCode::Clt, _) => AotInstruction::Clt,
         (OpCode::Cgt, _) => AotInstruction::Cgt,
         _ => unreachable!("typed_instruction only supports arithmetic and comparison opcodes"),
+    }
+}
+
+fn typed_builtin_instruction(
+    program: &Program,
+    call_ip: usize,
+    builtin: BuiltinFunction,
+) -> Option<AotInstruction> {
+    let (lhs, _) = program
+        .type_map
+        .as_ref()
+        .and_then(|type_map| type_map.operand_types.get(&call_ip))
+        .copied()
+        .unwrap_or((ValueType::Unknown, ValueType::Unknown));
+
+    match builtin {
+        BuiltinFunction::Len => match lhs {
+            ValueType::String => Some(AotInstruction::Len(AotTextBytesKind::String)),
+            ValueType::Bytes => Some(AotInstruction::Len(AotTextBytesKind::Bytes)),
+            _ => None,
+        },
+        BuiltinFunction::Slice => match lhs {
+            ValueType::String => Some(AotInstruction::Slice(AotTextBytesKind::String)),
+            ValueType::Bytes => Some(AotInstruction::Slice(AotTextBytesKind::Bytes)),
+            _ => None,
+        },
+        BuiltinFunction::Get => match lhs {
+            ValueType::String => Some(AotInstruction::Get(AotTextBytesKind::String)),
+            ValueType::Bytes => Some(AotInstruction::Get(AotTextBytesKind::Bytes)),
+            _ => None,
+        },
+        BuiltinFunction::Has if lhs == ValueType::Bytes => Some(AotInstruction::HasBytes),
+        BuiltinFunction::BytesFromArrayU8 if lhs == ValueType::Array => {
+            Some(AotInstruction::BytesCodec(AotBytesCodecKind::FromArrayU8))
+        }
+        BuiltinFunction::BytesToArrayU8 if lhs == ValueType::Bytes => {
+            Some(AotInstruction::BytesCodec(AotBytesCodecKind::ToArrayU8))
+        }
+        _ => None,
     }
 }
 
@@ -476,6 +560,161 @@ mod tests {
                 AotInstruction::Ldloc { index: 3 },
                 AotInstruction::Ldloc { index: 4 },
                 AotInstruction::FCeq,
+            ]
+        );
+    }
+
+    #[test]
+    fn aot_ir_lowers_typed_string_and_bytes_steps() {
+        let mut bc = BytecodeBuilder::new();
+        bc.ldc(0);
+        bc.ldc(1);
+        let string_concat_ip = bc.position();
+        bc.add();
+
+        bc.ldc(0);
+        let string_len_ip = bc.position();
+        bc.call(BuiltinFunction::Len.call_index(), 1);
+
+        bc.ldc(0);
+        bc.ldc(2);
+        bc.ldc(3);
+        let string_slice_ip = bc.position();
+        bc.call(BuiltinFunction::Slice.call_index(), 3);
+
+        bc.ldc(0);
+        bc.ldc(3);
+        let string_get_ip = bc.position();
+        bc.call(BuiltinFunction::Get.call_index(), 2);
+
+        bc.ldc(4);
+        bc.ldc(5);
+        let bytes_concat_ip = bc.position();
+        bc.add();
+
+        bc.ldc(6);
+        let bytes_len_ip = bc.position();
+        bc.call(BuiltinFunction::Len.call_index(), 1);
+
+        bc.ldc(6);
+        bc.ldc(3);
+        bc.ldc(7);
+        let bytes_slice_ip = bc.position();
+        bc.call(BuiltinFunction::Slice.call_index(), 3);
+
+        bc.ldc(6);
+        bc.ldc(3);
+        let bytes_get_ip = bc.position();
+        bc.call(BuiltinFunction::Get.call_index(), 2);
+
+        bc.ldc(6);
+        bc.ldc(7);
+        let bytes_has_ip = bc.position();
+        bc.call(BuiltinFunction::Has.call_index(), 2);
+
+        bc.ldc(8);
+        let bytes_from_array_ip = bc.position();
+        bc.call(BuiltinFunction::BytesFromArrayU8.call_index(), 1);
+
+        bc.ldc(6);
+        let bytes_to_array_ip = bc.position();
+        bc.call(BuiltinFunction::BytesToArrayU8.call_index(), 1);
+        bc.ret();
+
+        let mut program = Program::new(
+            vec![
+                Value::string("ab"),
+                Value::string("c"),
+                Value::Int(0),
+                Value::Int(1),
+                Value::bytes(vec![1, 2]),
+                Value::bytes(vec![3]),
+                Value::bytes(vec![1, 2, 3]),
+                Value::Int(2),
+                Value::array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            ],
+            bc.finish(),
+        );
+        let mut type_map = TypeMap::default();
+        type_map.operand_types.insert(
+            string_concat_ip as usize,
+            (ValueType::String, ValueType::String),
+        );
+        type_map.operand_types.insert(
+            string_len_ip as usize,
+            (ValueType::String, ValueType::Unknown),
+        );
+        type_map.operand_types.insert(
+            string_slice_ip as usize,
+            (ValueType::String, ValueType::Int),
+        );
+        type_map
+            .operand_types
+            .insert(string_get_ip as usize, (ValueType::String, ValueType::Int));
+        type_map.operand_types.insert(
+            bytes_concat_ip as usize,
+            (ValueType::Bytes, ValueType::Bytes),
+        );
+        type_map.operand_types.insert(
+            bytes_len_ip as usize,
+            (ValueType::Bytes, ValueType::Unknown),
+        );
+        type_map
+            .operand_types
+            .insert(bytes_slice_ip as usize, (ValueType::Bytes, ValueType::Int));
+        type_map
+            .operand_types
+            .insert(bytes_get_ip as usize, (ValueType::Bytes, ValueType::Int));
+        type_map
+            .operand_types
+            .insert(bytes_has_ip as usize, (ValueType::Bytes, ValueType::Int));
+        type_map.operand_types.insert(
+            bytes_from_array_ip as usize,
+            (ValueType::Array, ValueType::Unknown),
+        );
+        type_map.operand_types.insert(
+            bytes_to_array_ip as usize,
+            (ValueType::Bytes, ValueType::Unknown),
+        );
+        program.type_map = Some(type_map);
+
+        let lowered = lower_program(&program).expect("lowering should succeed");
+        let block = lowered.block(0).expect("entry block");
+
+        assert_eq!(
+            block.instructions,
+            vec![
+                AotInstruction::Ldc { const_index: 0 },
+                AotInstruction::Ldc { const_index: 1 },
+                AotInstruction::Concat(AotConcatKind::String),
+                AotInstruction::Ldc { const_index: 0 },
+                AotInstruction::Len(AotTextBytesKind::String),
+                AotInstruction::Ldc { const_index: 0 },
+                AotInstruction::Ldc { const_index: 2 },
+                AotInstruction::Ldc { const_index: 3 },
+                AotInstruction::Slice(AotTextBytesKind::String),
+                AotInstruction::Ldc { const_index: 0 },
+                AotInstruction::Ldc { const_index: 3 },
+                AotInstruction::Get(AotTextBytesKind::String),
+                AotInstruction::Ldc { const_index: 4 },
+                AotInstruction::Ldc { const_index: 5 },
+                AotInstruction::Concat(AotConcatKind::Bytes),
+                AotInstruction::Ldc { const_index: 6 },
+                AotInstruction::Len(AotTextBytesKind::Bytes),
+                AotInstruction::Ldc { const_index: 6 },
+                AotInstruction::Ldc { const_index: 3 },
+                AotInstruction::Ldc { const_index: 7 },
+                AotInstruction::Slice(AotTextBytesKind::Bytes),
+                AotInstruction::Ldc { const_index: 6 },
+                AotInstruction::Ldc { const_index: 3 },
+                AotInstruction::Get(AotTextBytesKind::Bytes),
+                AotInstruction::Ldc { const_index: 6 },
+                AotInstruction::Ldc { const_index: 7 },
+                AotInstruction::HasBytes,
+                AotInstruction::Ldc { const_index: 8 },
+                AotInstruction::BytesCodec(AotBytesCodecKind::FromArrayU8),
+                AotInstruction::Ldc { const_index: 6 },
+                AotInstruction::BytesCodec(AotBytesCodecKind::ToArrayU8),
             ]
         );
     }
