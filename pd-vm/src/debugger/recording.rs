@@ -263,15 +263,20 @@ fn encode_value(value: &Value, out: &mut Vec<u8>) -> Result<(), VmRecordingError
             write_u32_len(value.len(), out)?;
             out.extend_from_slice(value.as_bytes());
         }
-        Value::Array(values) => {
+        Value::Bytes(value) => {
             out.push(6);
+            write_u32_len(value.len(), out)?;
+            out.extend_from_slice(value.as_slice());
+        }
+        Value::Array(values) => {
+            out.push(7);
             write_u32_len(values.len(), out)?;
             for value in values.iter() {
                 encode_value(value, out)?;
             }
         }
         Value::Map(entries) => {
-            out.push(7);
+            out.push(8);
             write_u32_len(entries.len(), out)?;
             for (key, value) in entries.iter() {
                 encode_value(key, out)?;
@@ -298,13 +303,17 @@ fn decode_value(cursor: &mut RecordingCursor<'_>) -> Result<Value, VmRecordingEr
         }
         6 => {
             let len = cursor.read_u32()? as usize;
+            Ok(Value::bytes(cursor.read_exact(len)?.to_vec()))
+        }
+        7 => {
+            let len = cursor.read_u32()? as usize;
             let mut values = Vec::with_capacity(len);
             for _ in 0..len {
                 values.push(decode_value(cursor)?);
             }
             Ok(Value::Array(values.into()))
         }
-        7 => {
+        8 => {
             let len = cursor.read_u32()? as usize;
             let mut entries = Vec::with_capacity(len);
             for _ in 0..len {

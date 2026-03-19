@@ -1,0 +1,147 @@
+use bytes as native_bytes;
+
+fn hex_digit(value) {
+    let digits = "0123456789abcdef";
+    digits[value:(value + 1)];
+}
+
+fn byte_to_hex(value) {
+    assert(value >= 0 && value <= 255);
+    let high = value / 16;
+    let low = value % 16;
+    hex_digit(high) + hex_digit(low);
+}
+
+fn one_byte(value) {
+    native_bytes::from_hex(byte_to_hex(value));
+}
+
+// Returns an empty byte sequence.
+pub fn empty() {
+    native_bytes::from_hex("");
+}
+
+// Encodes a string as UTF-8 bytes.
+pub fn from_utf8(text) {
+    native_bytes::from_utf8(text);
+}
+
+// Decodes UTF-8 bytes into a string.
+pub fn to_utf8(payload) {
+    native_bytes::to_utf8(payload);
+}
+
+// Decodes bytes into a string using UTF-8 replacement semantics.
+pub fn to_utf8_lossy(payload) {
+    native_bytes::to_utf8_lossy(payload);
+}
+
+// Decodes a hexadecimal string into bytes.
+pub fn from_hex(text) {
+    native_bytes::from_hex(text);
+}
+
+// Encodes bytes as lowercase hexadecimal.
+pub fn to_hex(payload) {
+    native_bytes::to_hex(payload);
+}
+
+// Decodes a base64 string into bytes.
+pub fn from_base64(text) {
+    native_bytes::from_base64(text);
+}
+
+// Encodes bytes as base64.
+pub fn to_base64(payload) {
+    native_bytes::to_base64(payload);
+}
+
+// Concatenates two byte sequences.
+pub fn append(lhs, rhs) {
+    lhs + rhs;
+}
+
+// Returns a byte slice.
+pub fn slice(buf, start, len) {
+    assert(start >= 0);
+    assert(len >= 0);
+    assert(start + len <= buf.length);
+    buf[start:(start + len)];
+}
+
+// Returns whether two byte sequences are equal.
+pub fn equal(lhs, rhs) {
+    lhs == rhs;
+}
+
+// Returns whether buf starts with prefix.
+pub fn starts_with(buf, prefix) {
+    let prefix_len = prefix.length;
+    prefix_len <= buf.length && buf[0:prefix_len] == prefix;
+}
+
+// Returns whether buf ends with suffix.
+pub fn ends_with(buf, suffix) {
+    let suffix_len = suffix.length;
+    suffix_len <= buf.length && buf[(buf.length - suffix_len):buf.length] == suffix;
+}
+
+// Returns the first index of needle in buf, or -1 when it is absent.
+pub fn index_of(buf, needle) {
+    let buf_len = buf.length;
+    let needle_len = needle.length;
+    let out = if needle_len == 0 => {
+        0
+    } else if needle_len > buf_len => {
+        -1
+    } else => {
+        let mut found = -1;
+        let limit = buf_len - needle_len + 1;
+        for (let mut index = 0; index < limit; index = index + 1) {
+            if buf[index:(index + needle_len)] == needle {
+                found = index;
+                break;
+            }
+        }
+        found
+    };
+    out;
+}
+
+// Appends a single u8 value to a byte sequence.
+pub fn push_u8(buf, value) {
+    buf + one_byte(value);
+}
+
+// Reads a u8 value at the given offset.
+pub fn read_u8(buf, offset) {
+    assert(offset >= 0);
+    assert(offset < buf.length);
+    buf[offset];
+}
+
+// Reads a big-endian u16 at the given offset.
+pub fn read_u16_be(buf, offset) {
+    assert(offset >= 0);
+    assert(offset + 1 < buf.length);
+    buf[offset] * 256 + buf[offset + 1];
+}
+
+// Reads a little-endian u16 at the given offset.
+pub fn read_u16_le(buf, offset) {
+    assert(offset >= 0);
+    assert(offset + 1 < buf.length);
+    buf[offset] + buf[offset + 1] * 256;
+}
+
+// Encodes a big-endian u16 value.
+pub fn write_u16_be(value) {
+    assert(value >= 0 && value <= 65535);
+    one_byte(value / 256) + one_byte(value % 256);
+}
+
+// Encodes a little-endian u16 value.
+pub fn write_u16_le(value) {
+    assert(value >= 0 && value <= 65535);
+    one_byte(value % 256) + one_byte(value / 256);
+}

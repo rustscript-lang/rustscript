@@ -12,6 +12,7 @@ pub(crate) enum SimpleType {
     Float,
     Bool,
     String,
+    Bytes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +23,7 @@ pub(crate) enum BoundType {
     Float,
     Bool,
     String,
+    Bytes,
     Array,
     ArrayOf(Option<SimpleType>),
     Map,
@@ -37,6 +39,7 @@ impl BoundType {
             BoundType::Float => Some("float"),
             BoundType::Bool => Some("bool"),
             BoundType::String => Some("string"),
+            BoundType::Bytes => Some("bytes"),
             BoundType::Array | BoundType::ArrayOf(_) => Some("array"),
             BoundType::Map | BoundType::MapOf(_) => Some("map"),
         }
@@ -49,6 +52,7 @@ impl BoundType {
             BoundType::Float => Some(SimpleType::Float),
             BoundType::Bool => Some(SimpleType::Bool),
             BoundType::String => Some(SimpleType::String),
+            BoundType::Bytes => Some(SimpleType::Bytes),
             _ => None,
         }
     }
@@ -60,6 +64,7 @@ impl BoundType {
             SimpleType::Float => BoundType::Float,
             SimpleType::Bool => BoundType::Bool,
             SimpleType::String => BoundType::String,
+            SimpleType::Bytes => BoundType::Bytes,
         }
     }
 }
@@ -73,6 +78,7 @@ impl From<BoundType> for ValueType {
             BoundType::Float => ValueType::Float,
             BoundType::Bool => ValueType::Bool,
             BoundType::String => ValueType::String,
+            BoundType::Bytes => ValueType::Bytes,
             BoundType::Array | BoundType::ArrayOf(_) => ValueType::Array,
             BoundType::Map | BoundType::MapOf(_) => ValueType::Map,
         }
@@ -88,6 +94,7 @@ impl From<ValueType> for BoundType {
             ValueType::Float => BoundType::Float,
             ValueType::Bool => BoundType::Bool,
             ValueType::String => BoundType::String,
+            ValueType::Bytes => BoundType::Bytes,
             ValueType::Array => BoundType::Array,
             ValueType::Map => BoundType::Map,
         }

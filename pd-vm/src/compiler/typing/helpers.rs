@@ -954,6 +954,7 @@ pub(super) fn callable_param_type_from_abi(value: edge_abi::AbiParamType) -> Cal
         edge_abi::AbiParamType::Float => CallableParamType::Float,
         edge_abi::AbiParamType::Bool => CallableParamType::Bool,
         edge_abi::AbiParamType::String => CallableParamType::String,
+        edge_abi::AbiParamType::Bytes => CallableParamType::Bytes,
         edge_abi::AbiParamType::Array => CallableParamType::Array,
         edge_abi::AbiParamType::Map => CallableParamType::Map,
         edge_abi::AbiParamType::Number => CallableParamType::Number,
@@ -1460,7 +1461,13 @@ pub(super) fn infer_static_len(expr: &Expr) -> Option<usize> {
 pub(super) fn infer_binary_type(expr: &Expr, lhs: BoundType, rhs: BoundType) -> BoundType {
     match expr {
         Expr::Add(_, _) => {
-            if lhs == BoundType::String || rhs == BoundType::String {
+            if lhs == BoundType::Bytes || rhs == BoundType::Bytes {
+                if lhs == BoundType::Bytes && rhs == BoundType::Bytes {
+                    BoundType::Bytes
+                } else {
+                    BoundType::Unknown
+                }
+            } else if lhs == BoundType::String || rhs == BoundType::String {
                 BoundType::String
             } else if let Some(array_ty) = infer_array_concat_type(lhs, rhs) {
                 array_ty
@@ -1523,6 +1530,7 @@ pub(super) fn bound_type_label(ty: BoundType) -> &'static str {
         BoundType::Float => "float",
         BoundType::Bool => "bool",
         BoundType::String => "string",
+        BoundType::Bytes => "bytes",
         BoundType::Array | BoundType::ArrayOf(_) => "array",
         BoundType::Map | BoundType::MapOf(_) => "map",
     }

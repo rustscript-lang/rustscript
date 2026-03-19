@@ -15,6 +15,7 @@ pub enum TypeSchema {
     Float,
     Bool,
     String,
+    Bytes,
     GenericParam(String),
     Named(String, Vec<TypeSchema>),
     Array(Box<TypeSchema>),
@@ -125,6 +126,7 @@ pub enum MatchTypePattern {
     Number,
     Bool,
     String,
+    Bytes,
     Array,
     Map,
 }

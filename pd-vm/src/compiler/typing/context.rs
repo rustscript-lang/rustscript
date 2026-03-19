@@ -481,6 +481,7 @@ impl<'a> TypeContext<'a> {
         };
         match container_ty {
             BoundType::String => BoundType::String,
+            BoundType::Bytes => BoundType::Int,
             BoundType::ArrayOf(Some(element_type)) | BoundType::MapOf(Some(element_type)) => {
                 BoundType::from_simple(element_type)
             }
@@ -947,6 +948,7 @@ impl<'a> TypeContext<'a> {
                         .collapsed_array_item_schema()
                         .map(|element| TypeSchema::Array(Box::new(element))),
                     Some(TypeSchema::String) => Some(TypeSchema::String),
+                    Some(TypeSchema::Bytes) => Some(TypeSchema::Bytes),
                     _ => None,
                 }
             }
@@ -997,6 +999,7 @@ impl<'a> TypeContext<'a> {
         let rhs_ty = self.infer_expr_type(rhs, state);
         match (lhs_ty, rhs_ty) {
             (BoundType::String, BoundType::String) => BoundType::String,
+            (BoundType::Bytes, BoundType::Bytes) => BoundType::Bytes,
             (BoundType::ArrayOf(lhs), BoundType::ArrayOf(rhs)) => {
                 merge_container_element_types(lhs, rhs)
             }
@@ -1014,6 +1017,7 @@ impl<'a> TypeContext<'a> {
     ) -> BoundType {
         match self.infer_expr_type(source, state) {
             BoundType::String => BoundType::String,
+            BoundType::Bytes => BoundType::Bytes,
             BoundType::Array => BoundType::Array,
             BoundType::ArrayOf(element_type) => BoundType::ArrayOf(element_type),
             _ => BoundType::Unknown,
@@ -1567,6 +1571,7 @@ fn schema_from_bound_type(ty: BoundType) -> Option<TypeSchema> {
         BoundType::Float => Some(TypeSchema::Float),
         BoundType::Bool => Some(TypeSchema::Bool),
         BoundType::String => Some(TypeSchema::String),
+        BoundType::Bytes => Some(TypeSchema::Bytes),
         BoundType::Array | BoundType::ArrayOf(_) => {
             Some(TypeSchema::Array(Box::new(TypeSchema::Unknown)))
         }
@@ -1584,6 +1589,7 @@ pub(crate) fn bound_type_from_schema(schema: &TypeSchema) -> BoundType {
         TypeSchema::Float => BoundType::Float,
         TypeSchema::Bool => BoundType::Bool,
         TypeSchema::String => BoundType::String,
+        TypeSchema::Bytes => BoundType::Bytes,
         TypeSchema::GenericParam(_) => BoundType::Unknown,
         TypeSchema::Named(_, _) => BoundType::Map,
         TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
@@ -1745,6 +1751,17 @@ pub(super) fn infer_access_schema(
                 ))
             }
         }
+        TypeSchema::Bytes => {
+            let key_ty = context.infer_expr_type(key, state);
+            if matches!(key_ty, BoundType::Unknown | BoundType::Int) {
+                Ok(TypeSchema::Int)
+            } else {
+                Err(format!(
+                    "schema-typed bytes access requires an int index, got {}",
+                    bound_type_label(key_ty)
+                ))
+            }
+        }
         TypeSchema::Map(value) => Ok(*value),
         other => Err(format!(
             "cannot access fields on schema type '{}'",
@@ -1773,6 +1790,7 @@ pub(super) fn schema_label(schema: &TypeSchema) -> &'static str {
         TypeSchema::Float => "float",
         TypeSchema::Bool => "bool",
         TypeSchema::String => "string",
+        TypeSchema::Bytes => "bytes",
         TypeSchema::GenericParam(_) => "unknown",
         TypeSchema::Named(_, _) => "map",
         TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
@@ -1799,6 +1817,7 @@ pub(crate) fn render_schema_label(schema: &TypeSchema) -> String {
         TypeSchema::Float => "float".to_string(),
         TypeSchema::Bool => "bool".to_string(),
         TypeSchema::String => "string".to_string(),
+        TypeSchema::Bytes => "bytes".to_string(),
         TypeSchema::GenericParam(name) => name.clone(),
         TypeSchema::Named(name, type_args) if type_args.is_empty() => name.clone(),
         TypeSchema::Named(name, type_args) => format!(

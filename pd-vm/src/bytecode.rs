@@ -4,6 +4,7 @@ use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
 pub type SharedString = Arc<String>;
+pub type SharedBytes = Arc<Vec<u8>>;
 pub type SharedArray = Arc<Vec<Value>>;
 pub type SharedMap = Arc<VmMap>;
 
@@ -12,7 +13,7 @@ type VmMapStorage = HashMap<MapKey, Value, BuildHasherDefault<StableHasher>>;
 /// Runtime map storage for VM values.
 ///
 /// Keys and values may be any runtime [`Value`]. Key equality is hybrid:
-/// scalars and strings compare by value, while arrays and maps compare by
+/// scalars, strings, and bytes compare by value, while arrays and maps compare by
 /// heap-object identity. Float keys use canonicalized IEEE bits: `0.0` /
 /// `-0.0` are treated as the same key, while `NaN` keys only compare equal
 /// when their bit patterns match. Duplicate inserts overwrite the prior value
@@ -207,12 +208,16 @@ fn hash_map_key(value: &Value, state: &mut impl Hasher) {
             3u8.hash(state);
             value.hash(state);
         }
-        Value::Array(values) => {
+        Value::Bytes(value) => {
             4u8.hash(state);
+            value.hash(state);
+        }
+        Value::Array(values) => {
+            5u8.hash(state);
             Arc::as_ptr(values).hash(state);
         }
         Value::Map(entries) => {
-            5u8.hash(state);
+            6u8.hash(state);
             Arc::as_ptr(entries).hash(state);
         }
     }
@@ -227,6 +232,7 @@ fn map_key_eq(lhs: &Value, rhs: &Value) -> bool {
         }
         (Value::Bool(lhs), Value::Bool(rhs)) => lhs == rhs,
         (Value::String(lhs), Value::String(rhs)) => lhs == rhs,
+        (Value::Bytes(lhs), Value::Bytes(rhs)) => lhs == rhs,
         (Value::Array(lhs), Value::Array(rhs)) => Arc::ptr_eq(lhs, rhs),
         (Value::Map(lhs), Value::Map(rhs)) => Arc::ptr_eq(lhs, rhs),
         _ => false,
@@ -259,15 +265,19 @@ pub(crate) fn hash_value(value: &Value, state: &mut impl Hasher) {
             3u8.hash(state);
             value.hash(state);
         }
-        Value::Array(values) => {
+        Value::Bytes(value) => {
             4u8.hash(state);
+            value.hash(state);
+        }
+        Value::Array(values) => {
+            5u8.hash(state);
             values.len().hash(state);
             for value in values.iter() {
                 hash_value(value, state);
             }
         }
         Value::Map(entries) => {
-            5u8.hash(state);
+            6u8.hash(state);
             entries.len().hash(state);
             let mut entry_hashes = entries
                 .iter()
@@ -301,6 +311,7 @@ pub enum Value {
     Float(f64),
     Bool(bool),
     String(SharedString),
+    Bytes(SharedBytes),
     Array(SharedArray),
     Map(SharedMap),
 }
@@ -314,8 +325,9 @@ pub enum ValueType {
     Float = 3,
     Bool = 4,
     String = 5,
-    Array = 6,
-    Map = 7,
+    Bytes = 6,
+    Array = 7,
+    Map = 8,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -333,6 +345,10 @@ impl Value {
         Self::Array(Arc::new(values))
     }
 
+    pub fn bytes(value: impl Into<Vec<u8>>) -> Self {
+        Self::Bytes(Arc::new(value.into()))
+    }
+
     pub fn map(entries: Vec<(Value, Value)>) -> Self {
         Self::Map(Arc::new(VmMap::from(entries)))
     }
@@ -347,6 +363,13 @@ impl Value {
     pub fn into_owned_array(self) -> Result<Vec<Value>, Self> {
         match self {
             Self::Array(values) => Ok(unwrap_or_clone_shared(values)),
+            other => Err(other),
+        }
+    }
+
+    pub fn into_owned_bytes(self) -> Result<Vec<u8>, Self> {
+        match self {
+            Self::Bytes(value) => Ok(unwrap_or_clone_shared(value)),
             other => Err(other),
         }
     }
@@ -374,6 +397,7 @@ impl PartialEq for Value {
             (Self::Float(lhs), Self::Float(rhs)) => lhs == rhs,
             (Self::Bool(lhs), Self::Bool(rhs)) => lhs == rhs,
             (Self::String(lhs), Self::String(rhs)) => lhs == rhs,
+            (Self::Bytes(lhs), Self::Bytes(rhs)) => lhs == rhs,
             (Self::Array(lhs), Self::Array(rhs)) => lhs == rhs,
             (Self::Map(lhs), Self::Map(rhs)) => lhs == rhs,
             _ => false,
@@ -747,12 +771,34 @@ mod tests {
         };
         assert!(Arc::ptr_eq(lhs, rhs));
 
+        let bytes = Value::bytes([1u8, 2, 3]);
+        let bytes_clone = bytes.clone();
+        let (Value::Bytes(lhs), Value::Bytes(rhs)) = (&bytes, &bytes_clone) else {
+            panic!("expected bytes values");
+        };
+        assert!(Arc::ptr_eq(lhs, rhs));
+
         let map = Value::map(vec![(Value::string("k"), Value::Int(9))]);
         let map_clone = map.clone();
         let (Value::Map(lhs), Value::Map(rhs)) = (&map, &map_clone) else {
             panic!("expected map values");
         };
         assert!(Arc::ptr_eq(lhs, rhs));
+    }
+
+    #[test]
+    fn bytes_map_key_uses_value_lookup() {
+        let key = Value::bytes([0x01u8, 0x02, 0x03]);
+        let expected = Value::Bool(true);
+
+        let mut map = VmMap::new();
+        map.insert(key, expected.clone());
+
+        assert_eq!(
+            map.get(&Value::bytes([0x01u8, 0x02, 0x03])),
+            Some(&expected)
+        );
+        assert_eq!(map.get(&Value::bytes([0x01u8, 0x02, 0x04])), None);
     }
 
     #[test]

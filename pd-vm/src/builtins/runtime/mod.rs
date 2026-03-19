@@ -5,6 +5,7 @@ use std::task::{Context, Poll};
 use crate::builtins::BuiltinFunction;
 use crate::vm::{CallOutcome, HostOpId, Value, Vm, VmResult};
 
+mod bytes;
 mod core;
 mod host;
 #[cfg(not(target_arch = "wasm32"))]
@@ -24,7 +25,7 @@ use io_wasm as io;
 pub(crate) use io::IoState;
 use typed::{
     AnyValue, BuiltinResult, IntoBuiltinCallOutcome, IntoHostCallOutcome, NumberValue,
-    UnknownValue, VmArray, VmMap, arg, return_values,
+    UnknownValue, VmArray, VmBytes, VmMap, arg, return_values,
 };
 
 pub(crate) enum BuiltinCallOutcome {

@@ -2,6 +2,10 @@ use vm::CompileSourceFileOptions;
 
 const STDLIB_RSS_MODULES: &[(&str, &str)] = &[
     (
+        "stdlib/rss/bytes.rss",
+        include_str!("../../stdlib/rss/bytes.rss"),
+    ),
+    (
         "stdlib/rss/collections.rss",
         include_str!("../../stdlib/rss/collections.rss"),
     ),

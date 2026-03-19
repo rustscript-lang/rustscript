@@ -22,6 +22,7 @@ fn abi_value_type_to_value_type(value: edge_abi::AbiValueType) -> ValueType {
         edge_abi::AbiValueType::Float => ValueType::Float,
         edge_abi::AbiValueType::Bool => ValueType::Bool,
         edge_abi::AbiValueType::String => ValueType::String,
+        edge_abi::AbiValueType::Bytes => ValueType::Bytes,
         edge_abi::AbiValueType::Array => ValueType::Array,
         edge_abi::AbiValueType::Map => ValueType::Map,
     }

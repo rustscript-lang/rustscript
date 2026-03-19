@@ -7,6 +7,7 @@ pub fn format_value(value: &Value) -> String {
         Value::Float(value) => value.to_string(),
         Value::Bool(value) => value.to_string(),
         Value::String(value) => value.as_str().to_string(),
+        Value::Bytes(value) => format_bytes(value.as_ref()),
         Value::Array(values) => {
             let parts = values
                 .iter()
@@ -23,6 +24,28 @@ pub fn format_value(value: &Value) -> String {
                 .join(", ");
             format!("{{{parts}}}")
         }
+    }
+}
+
+fn format_bytes(bytes: &[u8]) -> String {
+    let preview_len = bytes.len().min(16);
+    let mut preview = String::with_capacity(preview_len * 2);
+    for byte in &bytes[..preview_len] {
+        preview.push(hex_nibble(byte >> 4));
+        preview.push(hex_nibble(byte & 0x0F));
+    }
+    if bytes.len() > preview_len {
+        format!("bytes[len={} hex={}..]", bytes.len(), preview)
+    } else {
+        format!("bytes[len={} hex={}]", bytes.len(), preview)
+    }
+}
+
+fn hex_nibble(value: u8) -> char {
+    match value {
+        0..=9 => char::from(b'0' + value),
+        10..=15 => char::from(b'a' + (value - 10)),
+        _ => unreachable!("hex nibble out of range"),
     }
 }
 

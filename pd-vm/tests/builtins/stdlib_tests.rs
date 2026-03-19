@@ -36,6 +36,14 @@ fn stdlib_strings_spec_passes() {
 }
 
 #[test]
+fn stdlib_bytes_spec_passes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("stdlib/tests/bytes.rss");
+    let stack = run_rustscript_spec(&path);
+    assert_eq!(stack, Vec::<Value>::new());
+}
+
+#[test]
 fn stdlib_io_primitives_spec_passes() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let path = root.join("stdlib/tests/io_primitives.rss");

@@ -1,4 +1,5 @@
 builtin_namespaces![
+    builtin_namespace!("bytes", "bytes", "Binary bytes builtin namespace.", true),
     builtin_namespace!("io", "io", "I/O builtin namespace.", false),
     builtin_namespace!("re", "regex", "Regex builtin namespace.", true),
     builtin_namespace!("json", "json", "JSON builtin namespace.", true),

@@ -160,6 +160,7 @@ fn param_accepts_bound_type(expected: CallableParamType, actual: BoundType) -> b
         CallableParamType::Float => actual == BoundType::Float,
         CallableParamType::Bool => actual == BoundType::Bool,
         CallableParamType::String => actual == BoundType::String,
+        CallableParamType::Bytes => actual == BoundType::Bytes,
         CallableParamType::Array => {
             matches!(actual, BoundType::Array | BoundType::ArrayOf(_))
         }
@@ -887,6 +888,7 @@ fn bound_type_from_type_name(type_name: &str) -> Option<BoundType> {
         "float" => Some(BoundType::Float),
         "bool" => Some(BoundType::Bool),
         "string" => Some(BoundType::String),
+        "bytes" => Some(BoundType::Bytes),
         "array" => Some(BoundType::Array),
         "map" => Some(BoundType::Map),
         _ => None,

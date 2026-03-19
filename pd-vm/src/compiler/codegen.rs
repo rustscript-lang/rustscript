@@ -1429,6 +1429,7 @@ impl Compiler {
             MatchTypePattern::Float => self.compile_type_name_equals(value_slot, "float")?,
             MatchTypePattern::Bool => self.compile_type_name_equals(value_slot, "bool")?,
             MatchTypePattern::String => self.compile_type_name_equals(value_slot, "string")?,
+            MatchTypePattern::Bytes => self.compile_type_name_equals(value_slot, "bytes")?,
             MatchTypePattern::Array => self.compile_type_name_equals(value_slot, "array")?,
             MatchTypePattern::Map => self.compile_type_name_equals(value_slot, "map")?,
             MatchTypePattern::Number => {

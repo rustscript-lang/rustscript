@@ -276,6 +276,7 @@ fn value_type_name(ty: crate::ValueType) -> &'static str {
         crate::ValueType::Float => "float",
         crate::ValueType::Bool => "bool",
         crate::ValueType::String => "string",
+        crate::ValueType::Bytes => "bytes",
         crate::ValueType::Array => "array",
         crate::ValueType::Map => "map",
     }

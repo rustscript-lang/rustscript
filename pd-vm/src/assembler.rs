@@ -36,6 +36,7 @@ pub struct Assembler {
     float_constants: HashMap<u64, u32>,
     bool_constants: HashMap<bool, u32>,
     string_constants: HashMap<String, u32>,
+    bytes_constants: HashMap<Vec<u8>, u32>,
     labels: HashMap<String, u32>,
     fixups: Vec<Fixup>,
     debug: DebugInfoBuilder,
@@ -56,6 +57,7 @@ impl Assembler {
             float_constants: HashMap::new(),
             bool_constants: HashMap::new(),
             string_constants: HashMap::new(),
+            bytes_constants: HashMap::new(),
             labels: HashMap::new(),
             fixups: Vec::new(),
             debug: DebugInfoBuilder::new(),
@@ -140,6 +142,15 @@ impl Assembler {
                 let index = self.constants.len() as u32;
                 self.constants.push(Value::String(text.clone()));
                 self.string_constants.insert(text.as_ref().clone(), index);
+                index
+            }
+            Value::Bytes(bytes) => {
+                if let Some(index) = self.bytes_constants.get(bytes.as_ref()).copied() {
+                    return index;
+                }
+                let index = self.constants.len() as u32;
+                self.constants.push(Value::Bytes(bytes.clone()));
+                self.bytes_constants.insert(bytes.as_ref().clone(), index);
                 index
             }
             other => {

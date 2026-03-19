@@ -5,6 +5,7 @@ use crate::vm::{CallOutcome, HostOpId, Value, VmError, VmResult};
 pub(super) type AnyValue = Value;
 pub(super) type UnknownValue = Value;
 pub(super) type VmArray = Vec<Value>;
+pub(super) type VmBytes = Vec<u8>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum NumberValue {
@@ -69,6 +70,15 @@ impl FromVmValue<'_> for VmArray {
         match value {
             Value::Array(values) => Ok(crate::bytecode::unwrap_or_clone_shared(values.clone())),
             _ => Err(VmError::TypeMismatch("array")),
+        }
+    }
+}
+
+impl FromVmValue<'_> for VmBytes {
+    fn from_vm_value(value: &Value, _label: &str) -> VmResult<Self> {
+        match value {
+            Value::Bytes(values) => Ok(crate::bytecode::unwrap_or_clone_shared(values.clone())),
+            _ => Err(VmError::TypeMismatch("bytes")),
         }
     }
 }
@@ -236,6 +246,12 @@ where
 impl IntoVmValue for Vec<Value> {
     fn into_vm_value(self) -> Value {
         Value::array(self)
+    }
+}
+
+impl IntoVmValue for VmBytes {
+    fn into_vm_value(self) -> Value {
+        Value::bytes(self)
     }
 }
 

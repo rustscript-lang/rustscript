@@ -6,6 +6,7 @@ pub enum CallableParamType {
     Float,
     Bool,
     String,
+    Bytes,
     Array,
     Map,
     Number,
@@ -20,6 +21,7 @@ impl CallableParamType {
             Self::Float => "float",
             Self::Bool => "bool",
             Self::String => "string",
+            Self::Bytes => "bytes",
             Self::Array => "array",
             Self::Map => "map",
             Self::Number => "number",
@@ -54,6 +56,9 @@ pub mod marker {
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct Array;
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Bytes;
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct Map;

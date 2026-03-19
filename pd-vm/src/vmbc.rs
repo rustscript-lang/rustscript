@@ -12,8 +12,8 @@ const VERSION_V3: u16 = 3;
 const VERSION_V4: u16 = 4;
 const VERSION_V5: u16 = 5;
 const VERSION_V6: u16 = 6;
-const VERSION_V7: u16 = 7;
-const ENCODE_VERSION: u16 = VERSION_V7;
+const VERSION_V8: u16 = 8;
+const ENCODE_VERSION: u16 = VERSION_V8;
 const FLAGS: u16 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +165,11 @@ pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
                 write_u32_len("constant string", value.len(), &mut out)?;
                 out.extend_from_slice(value.as_bytes());
             }
+            Value::Bytes(value) => {
+                out.push(5);
+                write_u32_len("constant bytes", value.len(), &mut out)?;
+                out.extend_from_slice(value.as_slice());
+            }
             Value::Array(_) => {
                 return Err(WireError::UnsupportedConstantType("array"));
             }
@@ -206,7 +211,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION_V7 {
+    if version != VERSION_V8 {
         return Err(WireError::UnsupportedVersion(version));
     }
 
@@ -237,6 +242,10 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
                 let text =
                     String::from_utf8(text_bytes.to_vec()).map_err(|_| WireError::InvalidUtf8)?;
                 Value::string(text)
+            }
+            5 => {
+                let len = cursor.read_u32()? as usize;
+                Value::bytes(cursor.read_exact(len)?.to_vec())
             }
             other => return Err(WireError::InvalidConstantTag(other)),
         };
@@ -785,8 +794,9 @@ fn read_value_type(raw: u8) -> Result<ValueType, WireError> {
         3 => Ok(ValueType::Float),
         4 => Ok(ValueType::Bool),
         5 => Ok(ValueType::String),
-        6 => Ok(ValueType::Array),
-        7 => Ok(ValueType::Map),
+        6 => Ok(ValueType::Bytes),
+        7 => Ok(ValueType::Array),
+        8 => Ok(ValueType::Map),
         other => Err(WireError::InvalidValueType(other)),
     }
 }

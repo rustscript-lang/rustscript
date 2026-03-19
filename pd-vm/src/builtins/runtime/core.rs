@@ -1,4 +1,4 @@
-use super::{AnyValue, UnknownValue, VmArray, VmMap, arg, return_values};
+use super::{AnyValue, UnknownValue, VmArray, VmBytes, VmMap, arg, return_values};
 use crate::bytecode::unwrap_or_clone_shared;
 use crate::vm::{Value, VmError, VmResult};
 use pd_host_function::pd_host_function;
@@ -16,6 +16,12 @@ pub(super) fn builtin_len_array_impl(items: VmArray) -> i64 {
     items.len() as i64
 }
 
+/// Return the length of a byte sequence.
+#[pd_host_function(name = "len")]
+pub(super) fn builtin_len_bytes_impl(items: VmBytes) -> i64 {
+    items.len() as i64
+}
+
 /// Return the number of entries in a map.
 #[pd_host_function(name = "len")]
 pub(super) fn builtin_len_map_impl(entries: VmMap) -> i64 {
@@ -26,9 +32,10 @@ pub(super) fn builtin_len(args: &[Value]) -> VmResult<Vec<Value>> {
     let value = arg::<&Value>(args, 0, "len value")?;
     match value {
         Value::String(text) => Ok(return_values(builtin_len_string_impl(text.as_str()))),
+        Value::Bytes(values) => Ok(return_values(values.len())),
         Value::Array(values) => Ok(return_values(values.len())),
         Value::Map(entries) => Ok(return_values(entries.len())),
-        _ => Err(VmError::TypeMismatch("string/array/map")),
+        _ => Err(VmError::TypeMismatch("string/bytes/array/map")),
     }
 }
 
@@ -77,6 +84,23 @@ pub(super) fn builtin_slice_array_impl(
         .collect::<Vec<_>>())
 }
 
+/// Slice bytes from the given start and length.
+#[pd_host_function(name = "slice")]
+pub(super) fn builtin_slice_bytes_impl(
+    items: VmBytes,
+    start: i64,
+    length: i64,
+) -> VmResult<VmBytes> {
+    let Some((start, length)) = slice_bounds(start, length)? else {
+        return Ok(Vec::new());
+    };
+    Ok(items
+        .into_iter()
+        .skip(start)
+        .take(length)
+        .collect::<Vec<_>>())
+}
+
 pub(super) fn builtin_slice(args: &[Value]) -> VmResult<Vec<Value>> {
     let source = arg::<&Value>(args, 0, "slice source")?;
     let start = arg::<i64>(args, 1, "slice start")?;
@@ -98,7 +122,20 @@ pub(super) fn builtin_slice(args: &[Value]) -> VmResult<Vec<Value>> {
                     .collect::<Vec<_>>(),
             ))
         }
-        _ => Err(VmError::TypeMismatch("string/array")),
+        Value::Bytes(values) => {
+            let Some((start, length)) = slice_bounds(start, length)? else {
+                return Ok(return_values(Vec::<u8>::new()));
+            };
+            Ok(return_values(
+                values
+                    .iter()
+                    .skip(start)
+                    .take(length)
+                    .copied()
+                    .collect::<Vec<_>>(),
+            ))
+        }
+        _ => Err(VmError::TypeMismatch("string/bytes/array")),
     }
 }
 
@@ -118,6 +155,13 @@ pub(super) fn builtin_concat_array_impl(mut left: VmArray, right: VmArray) -> Vm
     left
 }
 
+/// Concatenate two byte sequences.
+#[pd_host_function(name = "concat")]
+pub(super) fn builtin_concat_bytes_impl(mut left: VmBytes, right: VmBytes) -> VmBytes {
+    left.extend(right);
+    left
+}
+
 pub(super) fn builtin_concat(args: &[Value]) -> VmResult<Vec<Value>> {
     let left = arg::<&Value>(args, 0, "concat left")?;
     let right = arg::<&Value>(args, 1, "concat right")?;
@@ -131,7 +175,15 @@ pub(super) fn builtin_concat(args: &[Value]) -> VmResult<Vec<Value>> {
             values.extend(right.iter().cloned());
             Ok(return_values(values))
         }
-        _ => Err(VmError::TypeMismatch("string/string or array/array")),
+        (Value::Bytes(left), Value::Bytes(right)) => {
+            let mut values = Vec::with_capacity(left.len() + right.len());
+            values.extend(left.iter().copied());
+            values.extend(right.iter().copied());
+            Ok(return_values(values))
+        }
+        _ => Err(VmError::TypeMismatch(
+            "string/string or bytes/bytes or array/array",
+        )),
     }
 }
 
@@ -198,6 +250,23 @@ pub(super) fn builtin_get_array_impl(items: VmArray, index: i64) -> VmResult<Unk
     Ok(items.swap_remove(index))
 }
 
+/// Read a byte value by index.
+#[pd_host_function(name = "get")]
+pub(super) fn builtin_get_bytes_impl(items: VmBytes, index: i64) -> VmResult<i64> {
+    if index < 0 {
+        return Err(VmError::HostError(
+            "bytes index must be non-negative".to_string(),
+        ));
+    }
+    let index = usize::try_from(index)
+        .map_err(|_| VmError::HostError("bytes index overflow".to_string()))?;
+    items
+        .get(index)
+        .copied()
+        .map(i64::from)
+        .ok_or_else(|| VmError::HostError(format!("bytes index {index} out of bounds")))
+}
+
 /// Read a map value by key.
 #[pd_host_function(name = "get")]
 pub(super) fn builtin_get_map_impl(entries: VmMap, key: AnyValue) -> VmResult<UnknownValue> {
@@ -210,6 +279,17 @@ pub(super) fn builtin_get_map_impl(entries: VmMap, key: AnyValue) -> VmResult<Un
 /// Check whether an array contains a valid index.
 #[pd_host_function(name = "has")]
 pub(super) fn builtin_has_array_impl(items: VmArray, index: i64) -> bool {
+    if index < 0 {
+        return false;
+    }
+    usize::try_from(index)
+        .ok()
+        .is_some_and(|index| index < items.len())
+}
+
+/// Check whether bytes contain a valid index.
+#[pd_host_function(name = "has")]
+pub(super) fn builtin_has_bytes_impl(items: VmBytes, index: i64) -> bool {
     if index < 0 {
         return false;
     }
@@ -239,8 +319,19 @@ pub(super) fn builtin_has(args: &[Value]) -> VmResult<Vec<Value>> {
             };
             Ok(return_values(present))
         }
+        Value::Bytes(values) => {
+            let index = key.as_int()?;
+            let present = if index < 0 {
+                false
+            } else {
+                usize::try_from(index)
+                    .ok()
+                    .is_some_and(|index| index < values.len())
+            };
+            Ok(return_values(present))
+        }
         Value::Map(entries) => Ok(return_values(entries.get(key).is_some())),
-        _ => Err(VmError::TypeMismatch("array/map")),
+        _ => Err(VmError::TypeMismatch("bytes/array/map")),
     }
 }
 
@@ -266,10 +357,25 @@ pub(super) fn builtin_get(args: &[Value]) -> VmResult<Vec<Value>> {
                 || VmError::HostError("map key not found".to_string()),
             )?))
         }
+        Value::Bytes(values) => {
+            let index = key.as_int()?;
+            if index < 0 {
+                return Err(VmError::HostError(
+                    "bytes index must be non-negative".to_string(),
+                ));
+            }
+            let index = usize::try_from(index)
+                .map_err(|_| VmError::HostError("bytes index overflow".to_string()))?;
+            Ok(return_values(i64::from(
+                values.get(index).copied().ok_or_else(|| {
+                    VmError::HostError(format!("bytes index {index} out of bounds"))
+                })?,
+            )))
+        }
         Value::String(text) => {
             builtin_get_string_impl(text.as_str(), key.as_int()?).map(return_values)
         }
-        _ => Err(VmError::TypeMismatch("array/map/string")),
+        _ => Err(VmError::TypeMismatch("bytes/array/map/string")),
     }
 }
 
@@ -282,6 +388,7 @@ pub(super) fn builtin_type_of_impl(value: &AnyValue) -> String {
         Value::Float(_) => "float",
         Value::Bool(_) => "bool",
         Value::String(_) => "string",
+        Value::Bytes(_) => "bytes",
         Value::Array(_) => "array",
         Value::Map(_) => "map",
     }
@@ -313,6 +420,7 @@ fn render_value_for_display(value: &Value) -> String {
         Value::Float(v) => v.to_string(),
         Value::Bool(v) => v.to_string(),
         Value::String(v) => v.as_str().to_string(),
+        Value::Bytes(v) => render_bytes_for_display(v.as_ref()),
         Value::Array(values) => {
             let parts = values
                 .iter()
@@ -338,6 +446,28 @@ fn render_value_for_display(value: &Value) -> String {
     }
 }
 
+fn render_bytes_for_display(bytes: &[u8]) -> String {
+    let preview_len = bytes.len().min(16);
+    let mut preview = String::with_capacity(preview_len * 2);
+    for byte in &bytes[..preview_len] {
+        preview.push(hex_nibble(byte >> 4));
+        preview.push(hex_nibble(byte & 0x0F));
+    }
+    if bytes.len() > preview_len {
+        format!("bytes[len={} hex={}..]", bytes.len(), preview)
+    } else {
+        format!("bytes[len={} hex={}]", bytes.len(), preview)
+    }
+}
+
+fn hex_nibble(value: u8) -> char {
+    match value {
+        0..=9 => char::from(b'0' + value),
+        10..=15 => char::from(b'a' + (value - 10)),
+        _ => unreachable!("hex nibble out of range"),
+    }
+}
+
 impl FormatArgument for Value {
     fn supports_format(&self, specifier: &Specifier) -> bool {
         match self {
@@ -348,7 +478,9 @@ impl FormatArgument for Value {
                 Format::Display | Format::Debug | Format::LowerExp | Format::UpperExp
             ),
             Value::Bool(_) => matches!(specifier.format, Format::Display | Format::Debug),
-            Value::String(_) => matches!(specifier.format, Format::Display | Format::Debug),
+            Value::String(_) | Value::Bytes(_) => {
+                matches!(specifier.format, Format::Display | Format::Debug)
+            }
             Value::Array(_) | Value::Map(_) => {
                 matches!(specifier.format, Format::Display | Format::Debug)
             }
@@ -362,7 +494,9 @@ impl FormatArgument for Value {
             Value::Float(value) => std::fmt::Display::fmt(value, f),
             Value::Bool(value) => std::fmt::Display::fmt(value, f),
             Value::String(value) => std::fmt::Display::fmt(value.as_str(), f),
-            Value::Array(_) | Value::Map(_) => f.write_str(render_value_for_display(self).as_str()),
+            Value::Bytes(_) | Value::Array(_) | Value::Map(_) => {
+                f.write_str(render_value_for_display(self).as_str())
+            }
         }
     }
 
@@ -373,6 +507,7 @@ impl FormatArgument for Value {
             Value::Float(value) => std::fmt::Debug::fmt(value, f),
             Value::Bool(value) => std::fmt::Debug::fmt(value, f),
             Value::String(value) => std::fmt::Debug::fmt(value.as_str(), f),
+            Value::Bytes(_) => f.write_str(render_value_for_display(self).as_str()),
             Value::Array(values) => {
                 let mut list = f.debug_list();
                 for value in values.iter() {

@@ -37,6 +37,9 @@ fn vm_to_json_value(value: &Value) -> VmResult<JsonValue> {
         }
         Value::Bool(value) => Ok(JsonValue::Bool(*value)),
         Value::String(value) => Ok(JsonValue::String(value.as_str().to_string())),
+        Value::Bytes(_) => Err(VmError::HostError(
+            "json_encode does not support bytes values".to_string(),
+        )),
         Value::Array(values) => values
             .iter()
             .map(vm_to_json_value)

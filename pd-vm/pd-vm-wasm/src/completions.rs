@@ -912,6 +912,7 @@ fn abi_param_type_label(value: AbiParamType) -> &'static str {
         AbiParamType::Float => "float",
         AbiParamType::Bool => "bool",
         AbiParamType::String => "string",
+        AbiParamType::Bytes => "bytes",
         AbiParamType::Array => "array",
         AbiParamType::Map => "map",
         AbiParamType::Number => "number",
@@ -926,6 +927,7 @@ fn abi_value_type_label(value: AbiValueType) -> &'static str {
         AbiValueType::Float => "float",
         AbiValueType::Bool => "bool",
         AbiValueType::String => "string",
+        AbiValueType::Bytes => "bytes",
         AbiValueType::Array => "array",
         AbiValueType::Map => "map",
     }

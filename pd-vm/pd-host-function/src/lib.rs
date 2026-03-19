@@ -290,6 +290,7 @@ fn type_label(ty: &Type) -> Result<String, Error> {
                 "f32" | "f64" => Ok("float".to_string()),
                 "bool" => Ok("bool".to_string()),
                 "String" | "str" => Ok("string".to_string()),
+                "Bytes" | "VmBytes" => Ok("bytes".to_string()),
                 "Any" | "AnyValue" | "Value" => Ok("any".to_string()),
                 "Array" | "VmArray" => Ok("array".to_string()),
                 "Map" | "VmMap" => Ok("map".to_string()),

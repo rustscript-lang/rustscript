@@ -188,6 +188,8 @@ const BOOL_BOOL_OPERAND_TYPE_HINT: PackedOperandTypes =
     pack_operand_types(ValueType::Bool, ValueType::Bool);
 const STRING_STRING_OPERAND_TYPE_HINT: PackedOperandTypes =
     pack_operand_types(ValueType::String, ValueType::String);
+const BYTES_BYTES_OPERAND_TYPE_HINT: PackedOperandTypes =
+    pack_operand_types(ValueType::Bytes, ValueType::Bytes);
 const NULL_NULL_OPERAND_TYPE_HINT: PackedOperandTypes =
     pack_operand_types(ValueType::Null, ValueType::Null);
 const INT_UNARY_OPERAND_TYPE_HINT: PackedOperandTypes =
@@ -604,7 +606,11 @@ impl Vm {
                     self.count_value_drop_contract(value);
                 }
             }
-            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::String(_) => {
+            Value::Int(_)
+            | Value::Float(_)
+            | Value::Bool(_)
+            | Value::String(_)
+            | Value::Bytes(_) => {
                 self.drop_contract_events = self.drop_contract_events.saturating_add(1);
             }
         }
@@ -683,6 +689,21 @@ impl Vm {
         out.push_str(lhs.as_str());
         out.push_str(rhs.as_str());
         self.stack.push(Value::string(out));
+        Ok(())
+    }
+
+    pub(super) fn bytes_concat_op(&mut self) -> VmResult<()> {
+        let rhs = match self.pop_value()? {
+            Value::Bytes(value) => value,
+            _ => return Err(VmError::TypeMismatch("bytes")),
+        };
+        let lhs = match self.pop_value()? {
+            Value::Bytes(value) => value,
+            _ => return Err(VmError::TypeMismatch("bytes")),
+        };
+        let mut out = crate::bytecode::unwrap_or_clone_shared(lhs);
+        out.extend(crate::bytecode::unwrap_or_clone_shared(rhs));
+        self.stack.push(Value::bytes(out));
         Ok(())
     }
 
@@ -794,12 +815,21 @@ impl Vm {
                 out.push_str(rhs.as_str());
                 self.stack.push(Value::string(out));
             }
+            (Value::Bytes(lhs), Value::Bytes(rhs)) => {
+                let mut out = crate::bytecode::unwrap_or_clone_shared(lhs);
+                out.extend(crate::bytecode::unwrap_or_clone_shared(rhs));
+                self.stack.push(Value::bytes(out));
+            }
             (Value::Array(lhs), Value::Array(rhs)) => {
                 let mut out = crate::bytecode::unwrap_or_clone_shared(lhs);
                 out.extend(crate::bytecode::unwrap_or_clone_shared(rhs));
                 self.stack.push(Value::array(out));
             }
-            _ => return Err(VmError::TypeMismatch("number/string or array/array")),
+            _ => {
+                return Err(VmError::TypeMismatch(
+                    "number/string or bytes/bytes or array/array",
+                ));
+            }
         }
         Ok(())
     }
@@ -1119,6 +1149,7 @@ impl Vm {
                     INT_INT_OPERAND_TYPE_HINT => self.int_add_op()?,
                     FLOAT_FLOAT_OPERAND_TYPE_HINT => self.float_add_op()?,
                     STRING_STRING_OPERAND_TYPE_HINT => self.string_concat_op()?,
+                    BYTES_BYTES_OPERAND_TYPE_HINT => self.bytes_concat_op()?,
                     _ => self.binary_add_op()?,
                 }
             }

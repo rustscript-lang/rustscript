@@ -550,6 +550,7 @@ impl Parser {
                 "float" => ValueType::Float,
                 "bool" => ValueType::Bool,
                 "string" => ValueType::String,
+                "bytes" => ValueType::Bytes,
                 "array" => ValueType::Array,
                 "map" => ValueType::Map,
                 other => {
@@ -558,7 +559,7 @@ impl Parser {
                         code: None,
                         line: self.current_line(),
                         message: format!(
-                            "unknown declared return type '{other}', expected unknown/null/int/float/bool/string/array/map"
+                            "unknown declared return type '{other}', expected unknown/null/int/float/bool/string/bytes/array/map"
                         ),
                     });
                 }
@@ -658,6 +659,7 @@ impl Parser {
                 "float" => TypeSchema::Float,
                 "bool" => TypeSchema::Bool,
                 "string" => TypeSchema::String,
+                "bytes" => TypeSchema::Bytes,
                 "array" => TypeSchema::Array(Box::new(TypeSchema::Unknown)),
                 "map" => TypeSchema::Map(Box::new(TypeSchema::Unknown)),
                 other => {

@@ -4,7 +4,7 @@ use crate::{HostImport, Value, ValueType};
 use std::collections::{BTreeSet, HashMap};
 
 const AOT_MAGIC: [u8; 4] = *b"VMAO";
-const AOT_VERSION: u16 = 7;
+const AOT_VERSION: u16 = 8;
 const AOT_FLAGS: u16 = 0;
 const AOT_NATIVE_ABI_VERSION: u16 = 1;
 const DEFAULT_AOT_BUNDLE_FUEL_CHECK_INTERVAL: u32 = 64;
@@ -1007,15 +1007,20 @@ fn encode_aot_value(value: &Value, out: &mut Vec<u8>) -> VmResult<()> {
             out.push(4);
             write_aot_string(value, out)?;
         }
-        Value::Array(values) => {
+        Value::Bytes(value) => {
             out.push(5);
+            write_aot_len(value.len(), "bytes value", out)?;
+            out.extend_from_slice(value.as_slice());
+        }
+        Value::Array(values) => {
+            out.push(6);
             write_aot_len(values.len(), "array value", out)?;
             for value in values.iter() {
                 encode_aot_value(value, out)?;
             }
         }
         Value::Map(entries) => {
-            out.push(6);
+            out.push(7);
             write_aot_len(entries.len(), "map value", out)?;
             for (key, value) in entries.iter() {
                 encode_aot_value(key, out)?;
@@ -1040,6 +1045,10 @@ fn decode_aot_value(cursor: &mut AotCursor<'_>) -> VmResult<Value> {
         },
         4 => Value::string(cursor.read_string("string value")?),
         5 => {
+            let len = cursor.read_u32("bytes len")? as usize;
+            Value::bytes(cursor.read_bytes(len, "bytes value")?.to_vec())
+        }
+        6 => {
             let len = cursor.read_u32("array len")? as usize;
             let mut values = Vec::with_capacity(len);
             for _ in 0..len {
@@ -1047,7 +1056,7 @@ fn decode_aot_value(cursor: &mut AotCursor<'_>) -> VmResult<Value> {
             }
             Value::array(values)
         }
-        6 => {
+        7 => {
             let len = cursor.read_u32("map len")? as usize;
             let mut entries = Vec::with_capacity(len);
             for _ in 0..len {
@@ -1073,8 +1082,9 @@ fn decode_aot_value_type(raw: u8) -> VmResult<ValueType> {
         3 => Ok(ValueType::Float),
         4 => Ok(ValueType::Bool),
         5 => Ok(ValueType::String),
-        6 => Ok(ValueType::Array),
-        7 => Ok(ValueType::Map),
+        6 => Ok(ValueType::Bytes),
+        7 => Ok(ValueType::Array),
+        8 => Ok(ValueType::Map),
         other => Err(VmError::JitNative(format!(
             "invalid AOT import return type tag {other}"
         ))),
