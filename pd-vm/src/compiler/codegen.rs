@@ -395,6 +395,9 @@ impl Compiler {
             Expr::String(value) => {
                 self.assembler.push_const(Value::string(value.clone()));
             }
+            Expr::Bytes(value) => {
+                self.assembler.push_const(Value::bytes(value.clone()));
+            }
             Expr::OptionalGet {
                 container,
                 key,
@@ -994,6 +997,7 @@ impl Compiler {
             | Expr::Int(_)
             | Expr::Float(_)
             | Expr::Bool(_)
+            | Expr::Bytes(_)
             | Expr::String(_)
             | Expr::FunctionRef(_) => {}
             Expr::Var(index) => {
@@ -1396,6 +1400,11 @@ impl Compiler {
                 self.assembler.push_const(Value::string(v.clone()));
                 self.assembler.ceq();
             }
+            MatchPattern::Bytes(v) => {
+                self.emit_copy_ldloc(value_slot)?;
+                self.assembler.push_const(Value::bytes(v.clone()));
+                self.assembler.ceq();
+            }
             MatchPattern::Null => {
                 self.emit_copy_ldloc(value_slot)?;
                 self.assembler.push_const(Value::Null);
@@ -1755,6 +1764,7 @@ fn collect_expr_slot_footprint(expr: &Expr, slots: &mut BTreeSet<LocalSlot>) {
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
+        | Expr::Bytes(_)
         | Expr::String(_)
         | Expr::FunctionRef(_) => {}
         Expr::Var(index) | Expr::MoveVar(index) => {

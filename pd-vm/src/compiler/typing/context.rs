@@ -593,6 +593,7 @@ impl<'a> TypeContext<'a> {
             Expr::Int(_) => Some(TypeSchema::Int),
             Expr::Float(_) => Some(TypeSchema::Float),
             Expr::Bool(_) => Some(TypeSchema::Bool),
+            Expr::Bytes(_) => Some(TypeSchema::Bytes),
             Expr::String(_) => Some(TypeSchema::String),
             Expr::OptionalGet { container, key, .. } => self
                 .infer_expr_schema(container, state)
@@ -695,6 +696,7 @@ impl<'a> TypeContext<'a> {
             Expr::Int(_) => BoundType::Int,
             Expr::Float(_) => BoundType::Float,
             Expr::Bool(_) => BoundType::Bool,
+            Expr::Bytes(_) => BoundType::Bytes,
             Expr::String(_) => BoundType::String,
             Expr::OptionalGet { .. } => BoundType::Unknown,
             Expr::OptionUnwrapOr {

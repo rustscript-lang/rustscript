@@ -637,6 +637,7 @@ impl AvailabilityAnalyzer {
             | Expr::Int(_)
             | Expr::Float(_)
             | Expr::Bool(_)
+            | Expr::Bytes(_)
             | Expr::String(_)
             | Expr::FunctionRef(_) => Ok(state.clone()),
             Expr::Var(index) => {
@@ -1132,6 +1133,7 @@ impl AvailabilityAnalyzer {
             return false;
         }
         match expr {
+            Expr::Bytes(_) => true,
             Expr::String(_) => true,
             Expr::Var(index) => state
                 .movable_locals

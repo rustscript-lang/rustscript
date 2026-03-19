@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::HostImport;
+use crate::builtins::BuiltinFunction;
 
 use super::codegen::Compiler;
 use super::frontends;
@@ -33,6 +34,14 @@ pub struct InferredLocalTypeHint {
     pub inferred_type: String,
     pub declared_line: Option<u32>,
     pub last_line: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeprecatedFunctionCall {
+    pub name: String,
+    pub message: String,
+    pub line: usize,
+    pub span: Option<crate::compiler::source_map::Span>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -169,6 +178,7 @@ fn record_expr_local_debug_ranges(
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
+        | Expr::Bytes(_)
         | Expr::String(_)
         | Expr::FunctionRef(_) => {}
         Expr::Var(index) | Expr::MoveVar(index) => {
@@ -487,6 +497,13 @@ pub fn lint_unknown_inferred_local_types(
     lint_unknown_inferred_local_types_impl(source, flavor)
 }
 
+pub fn lint_deprecated_function_calls(
+    source: &str,
+    flavor: SourceFlavor,
+) -> Result<Vec<DeprecatedFunctionCall>, SourceError> {
+    lint_deprecated_function_calls_impl(source, flavor)
+}
+
 pub fn collect_inferred_local_type_hints(
     source: &str,
     flavor: SourceFlavor,
@@ -534,6 +551,17 @@ pub fn lint_unknown_inferred_local_types_with_options(
     })
 }
 
+pub fn lint_deprecated_function_calls_with_options(
+    source: &str,
+    flavor: SourceFlavor,
+    options: CompileSourceFileOptions,
+) -> Result<Vec<DeprecatedFunctionCall>, SourcePathError> {
+    let source_owned = source.to_string();
+    run_with_compiler_stack(move || {
+        lint_deprecated_function_calls_with_options_impl(&source_owned, flavor, &options)
+    })
+}
+
 pub fn lint_unknown_inferred_local_types_at_path_with_options(
     path: impl AsRef<Path>,
     source: &str,
@@ -544,6 +572,24 @@ pub fn lint_unknown_inferred_local_types_at_path_with_options(
     let source_owned = source.to_string();
     run_with_compiler_stack(move || {
         lint_unknown_inferred_local_types_at_path_with_options_impl(
+            &path,
+            &source_owned,
+            flavor,
+            &options,
+        )
+    })
+}
+
+pub fn lint_deprecated_function_calls_at_path_with_options(
+    path: impl AsRef<Path>,
+    source: &str,
+    flavor: SourceFlavor,
+    options: CompileSourceFileOptions,
+) -> Result<Vec<DeprecatedFunctionCall>, SourcePathError> {
+    let path = path.as_ref().to_path_buf();
+    let source_owned = source.to_string();
+    run_with_compiler_stack(move || {
+        lint_deprecated_function_calls_at_path_with_options_impl(
             &path,
             &source_owned,
             flavor,
@@ -565,6 +611,22 @@ fn lint_unknown_inferred_local_types_impl(
         &source_map,
         source_id,
         parsed,
+    ))
+}
+
+fn lint_deprecated_function_calls_impl(
+    source: &str,
+    flavor: SourceFlavor,
+) -> Result<Vec<DeprecatedFunctionCall>, SourceError> {
+    let mut source_map = SourceMap::new();
+    let source_id = source_map.add_source("<source>", source.to_string());
+    let parsed = frontends::parse_source(source, flavor).map_err(|err| {
+        SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
+    })?;
+    Ok(collect_deprecated_function_calls(
+        &source_map,
+        source_id,
+        &parsed,
     ))
 }
 
@@ -592,6 +654,20 @@ fn lint_unknown_inferred_local_types_with_options_impl(
 
     let path = virtual_inmemory_entry_path(flavor);
     lint_unknown_inferred_local_types_at_path_with_options_impl(&path, source, flavor, options)
+}
+
+fn lint_deprecated_function_calls_with_options_impl(
+    source: &str,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+) -> Result<Vec<DeprecatedFunctionCall>, SourcePathError> {
+    if !options.has_module_overrides() {
+        return lint_deprecated_function_calls_impl(source, flavor)
+            .map_err(SourcePathError::Source);
+    }
+
+    let path = virtual_inmemory_entry_path(flavor);
+    lint_deprecated_function_calls_at_path_with_options_impl(&path, source, flavor, options)
 }
 
 fn collect_inferred_local_type_hints_with_options_impl(
@@ -626,6 +702,27 @@ fn lint_unknown_inferred_local_types_at_path_with_options_impl(
         &source_map,
         source_id,
         parsed,
+    ))
+}
+
+fn lint_deprecated_function_calls_at_path_with_options_impl(
+    path: &Path,
+    source: &str,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+) -> Result<Vec<DeprecatedFunctionCall>, SourcePathError> {
+    let mut source_map = SourceMap::new();
+    let source_id = source_map.add_source(path.display().to_string(), source.to_string());
+    let (_root_parse_source, units) = load_units_for_source_file(path, flavor, source, options)?;
+    let parsed = units
+        .into_iter()
+        .last()
+        .map(|unit| unit.parsed)
+        .expect("root parsed unit should always be present");
+    Ok(collect_deprecated_function_calls(
+        &source_map,
+        source_id,
+        &parsed,
     ))
 }
 
@@ -690,6 +787,467 @@ fn collect_unknown_inferred_local_types(
         });
     }
     warnings
+}
+
+fn collect_deprecated_function_calls(
+    source_map: &SourceMap,
+    source_id: u32,
+    parsed: &FrontendIr,
+) -> Vec<DeprecatedFunctionCall> {
+    let functions_by_index = parsed
+        .functions
+        .iter()
+        .map(|decl| (decl.index, decl.name.as_str()))
+        .collect::<HashMap<_, _>>();
+    let mut warnings = Vec::new();
+    for stmt in &parsed.stmts {
+        collect_deprecated_calls_from_stmt(
+            stmt,
+            source_map,
+            source_id,
+            &functions_by_index,
+            &mut warnings,
+        );
+    }
+    for function_impl in parsed.function_impls.values() {
+        for stmt in &function_impl.body_stmts {
+            collect_deprecated_calls_from_stmt(
+                stmt,
+                source_map,
+                source_id,
+                &functions_by_index,
+                &mut warnings,
+            );
+        }
+        collect_deprecated_calls_from_expr(
+            &function_impl.body_expr,
+            function_impl.body_expr_line,
+            source_map,
+            source_id,
+            &functions_by_index,
+            &mut warnings,
+        );
+    }
+    warnings
+}
+
+fn collect_deprecated_calls_from_stmt(
+    stmt: &Stmt,
+    source_map: &SourceMap,
+    source_id: u32,
+    functions_by_index: &HashMap<u16, &str>,
+    warnings: &mut Vec<DeprecatedFunctionCall>,
+) {
+    match stmt {
+        Stmt::Noop { .. }
+        | Stmt::FuncDecl { .. }
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Drop { .. } => {}
+        Stmt::Let { expr, line, .. }
+        | Stmt::Assign { expr, line, .. }
+        | Stmt::Expr { expr, line } => {
+            collect_deprecated_calls_from_expr(
+                expr,
+                *line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+        }
+        Stmt::ClosureLet { line, closure } => {
+            collect_deprecated_calls_from_expr(
+                &closure.body,
+                *line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+        }
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            line,
+        } => {
+            collect_deprecated_calls_from_expr(
+                condition,
+                *line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+            for nested in then_branch {
+                collect_deprecated_calls_from_stmt(
+                    nested,
+                    source_map,
+                    source_id,
+                    functions_by_index,
+                    warnings,
+                );
+            }
+            for nested in else_branch {
+                collect_deprecated_calls_from_stmt(
+                    nested,
+                    source_map,
+                    source_id,
+                    functions_by_index,
+                    warnings,
+                );
+            }
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            line,
+        } => {
+            collect_deprecated_calls_from_stmt(
+                init,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+            collect_deprecated_calls_from_expr(
+                condition,
+                *line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+            collect_deprecated_calls_from_stmt(
+                post,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+            for nested in body {
+                collect_deprecated_calls_from_stmt(
+                    nested,
+                    source_map,
+                    source_id,
+                    functions_by_index,
+                    warnings,
+                );
+            }
+        }
+        Stmt::While {
+            condition,
+            body,
+            line,
+        } => {
+            collect_deprecated_calls_from_expr(
+                condition,
+                *line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+            for nested in body {
+                collect_deprecated_calls_from_stmt(
+                    nested,
+                    source_map,
+                    source_id,
+                    functions_by_index,
+                    warnings,
+                );
+            }
+        }
+    }
+}
+
+fn collect_deprecated_calls_from_expr(
+    expr: &Expr,
+    line: u32,
+    source_map: &SourceMap,
+    source_id: u32,
+    functions_by_index: &HashMap<u16, &str>,
+    warnings: &mut Vec<DeprecatedFunctionCall>,
+) {
+    match expr {
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::Bytes(_)
+        | Expr::String(_)
+        | Expr::FunctionRef(_)
+        | Expr::Var(_)
+        | Expr::MoveVar(_)
+        | Expr::MoveField { .. }
+        | Expr::MoveIndex { .. } => {}
+        Expr::Call(index, _, args) => {
+            let maybe_name = BuiltinFunction::from_call_index(*index)
+                .map(|builtin| builtin.name())
+                .or_else(|| functions_by_index.get(index).copied());
+            if let Some(name) = maybe_name
+                && let Some(message) = deprecated_function_message(name)
+            {
+                let warning_line = usize::try_from(line).unwrap_or(usize::MAX);
+                warnings.push(DeprecatedFunctionCall {
+                    name: name.to_string(),
+                    message: message.to_string(),
+                    line: warning_line,
+                    span: find_symbol_name_span(source_map, source_id, warning_line, name)
+                        .or_else(|| source_map.line_span(source_id, warning_line)),
+                });
+            }
+            for arg in args {
+                collect_deprecated_calls_from_expr(
+                    arg,
+                    line,
+                    source_map,
+                    source_id,
+                    functions_by_index,
+                    warnings,
+                );
+            }
+        }
+        Expr::LocalCall(_, _, args) => {
+            for arg in args {
+                collect_deprecated_calls_from_expr(
+                    arg,
+                    line,
+                    source_map,
+                    source_id,
+                    functions_by_index,
+                    warnings,
+                );
+            }
+        }
+        Expr::Closure(closure) => {
+            collect_deprecated_calls_from_expr(
+                &closure.body,
+                line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+        }
+        Expr::ClosureCall(closure, args) => {
+            collect_deprecated_calls_from_expr(
+                &closure.body,
+                line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+            for arg in args {
+                collect_deprecated_calls_from_expr(
+                    arg,
+                    line,
+                    source_map,
+                    source_id,
+                    functions_by_index,
+                    warnings,
+                );
+            }
+        }
+        Expr::OptionalGet { container, key, .. } => {
+            collect_deprecated_calls_from_expr(
+                container,
+                line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+            collect_deprecated_calls_from_expr(
+                key,
+                line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            collect_deprecated_calls_from_expr(
+                value,
+                line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+            collect_deprecated_calls_from_expr(
+                fallback,
+                line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            collect_deprecated_calls_from_expr(
+                lhs,
+                line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+            collect_deprecated_calls_from_expr(
+                rhs,
+                line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+        }
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => {
+            collect_deprecated_calls_from_expr(
+                inner,
+                line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+        }
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            collect_deprecated_calls_from_expr(
+                condition,
+                line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+            collect_deprecated_calls_from_expr(
+                then_expr,
+                line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+            collect_deprecated_calls_from_expr(
+                else_expr,
+                line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+        }
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            collect_deprecated_calls_from_expr(
+                value,
+                line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+            for (_, arm_expr) in arms {
+                collect_deprecated_calls_from_expr(
+                    arm_expr,
+                    line,
+                    source_map,
+                    source_id,
+                    functions_by_index,
+                    warnings,
+                );
+            }
+            collect_deprecated_calls_from_expr(
+                default,
+                line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+        }
+        Expr::Block { stmts, expr } => {
+            for stmt in stmts {
+                collect_deprecated_calls_from_stmt(
+                    stmt,
+                    source_map,
+                    source_id,
+                    functions_by_index,
+                    warnings,
+                );
+            }
+            collect_deprecated_calls_from_expr(
+                expr,
+                line,
+                source_map,
+                source_id,
+                functions_by_index,
+                warnings,
+            );
+        }
+    }
+}
+
+fn deprecated_function_message(name: &str) -> Option<&'static str> {
+    match name {
+        "bytes::from_base64" | "from_base64" | "bytes_from_base64" => Some(
+            "'bytes::from_base64' is deprecated; prefer native bytes values and decode base64 only at explicit text boundaries",
+        ),
+        "bytes::to_base64" | "to_base64" | "bytes_to_base64" => Some(
+            "'bytes::to_base64' is deprecated; prefer native bytes values and encode base64 only at explicit text boundaries",
+        ),
+        "udp::socket::send_binary_base64" => {
+            Some("'udp::socket::send_binary_base64' is deprecated; use 'udp::socket::send_binary'")
+        }
+        "udp::socket::recv_binary_base64" => {
+            Some("'udp::socket::recv_binary_base64' is deprecated; use 'udp::socket::recv_binary'")
+        }
+        "websocket::connection::send_binary_base64" => Some(
+            "'websocket::connection::send_binary_base64' is deprecated; use 'websocket::connection::send_binary'",
+        ),
+        "websocket::connection::read_binary_base64" => Some(
+            "'websocket::connection::read_binary_base64' is deprecated; use 'websocket::connection::read_binary'",
+        ),
+        "webrtc::connection::send_binary_base64" => Some(
+            "'webrtc::connection::send_binary_base64' is deprecated; use 'webrtc::connection::send_binary'",
+        ),
+        "webrtc::connection::read_binary_base64" => Some(
+            "'webrtc::connection::read_binary_base64' is deprecated; use 'webrtc::connection::read_binary'",
+        ),
+        "mqtt::connection::publish_binary_base64" => Some(
+            "'mqtt::connection::publish_binary_base64' is deprecated; use 'mqtt::connection::publish_binary'",
+        ),
+        _ => None,
+    }
 }
 
 fn collect_named_local_type_hints(parsed: FrontendIr) -> Vec<InferredLocalTypeHint> {
@@ -858,8 +1416,47 @@ fn find_local_name_span(
     None
 }
 
+fn find_symbol_name_span(
+    source_map: &SourceMap,
+    source_id: u32,
+    line: usize,
+    name: &str,
+) -> Option<crate::compiler::source_map::Span> {
+    let file = source_map.file(source_id)?;
+    let line_range = file.line_span(line)?;
+    let line_text = file.line_text(line)?;
+    let mut search_start = 0usize;
+    while let Some(relative) = line_text[search_start..].find(name) {
+        let start = search_start + relative;
+        let end = start + name.len();
+        let prev_ok = start == 0
+            || !line_text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_symbol_name_char);
+        let next_ok = end == line_text.len()
+            || !line_text[end..]
+                .chars()
+                .next()
+                .is_some_and(is_symbol_name_char);
+        if prev_ok && next_ok {
+            return Some(crate::compiler::source_map::Span::new(
+                source_id,
+                line_range.start + start,
+                line_range.start + end,
+            ));
+        }
+        search_start = end;
+    }
+    None
+}
+
 fn is_ident_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn is_symbol_name_char(ch: char) -> bool {
+    is_ident_char(ch) || ch == ':'
 }
 
 pub fn compile_source_for_repl(source: &str) -> Result<CompiledProgram, SourceError> {

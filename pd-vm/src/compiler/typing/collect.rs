@@ -386,6 +386,7 @@ fn collect_expr_types(
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
+        | Expr::Bytes(_)
         | Expr::String(_)
         | Expr::Var(_)
         | Expr::MoveVar(_)

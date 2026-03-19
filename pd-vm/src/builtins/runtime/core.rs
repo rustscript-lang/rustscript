@@ -18,7 +18,7 @@ pub(super) fn builtin_len_array_impl(items: VmArray) -> i64 {
 
 /// Return the length of a byte sequence.
 #[pd_host_function(name = "len")]
-pub(super) fn builtin_len_bytes_impl(items: VmBytes) -> i64 {
+pub(super) fn builtin_len_bytes_impl(items: &[u8]) -> i64 {
     items.len() as i64
 }
 
@@ -86,18 +86,15 @@ pub(super) fn builtin_slice_array_impl(
 
 /// Slice bytes from the given start and length.
 #[pd_host_function(name = "slice")]
-pub(super) fn builtin_slice_bytes_impl(
-    items: VmBytes,
-    start: i64,
-    length: i64,
-) -> VmResult<VmBytes> {
+pub(super) fn builtin_slice_bytes_impl(items: &[u8], start: i64, length: i64) -> VmResult<VmBytes> {
     let Some((start, length)) = slice_bounds(start, length)? else {
         return Ok(Vec::new());
     };
     Ok(items
-        .into_iter()
+        .iter()
         .skip(start)
         .take(length)
+        .copied()
         .collect::<Vec<_>>())
 }
 
@@ -252,7 +249,7 @@ pub(super) fn builtin_get_array_impl(items: VmArray, index: i64) -> VmResult<Unk
 
 /// Read a byte value by index.
 #[pd_host_function(name = "get")]
-pub(super) fn builtin_get_bytes_impl(items: VmBytes, index: i64) -> VmResult<i64> {
+pub(super) fn builtin_get_bytes_impl(items: &[u8], index: i64) -> VmResult<i64> {
     if index < 0 {
         return Err(VmError::HostError(
             "bytes index must be non-negative".to_string(),
@@ -289,7 +286,7 @@ pub(super) fn builtin_has_array_impl(items: VmArray, index: i64) -> bool {
 
 /// Check whether bytes contain a valid index.
 #[pd_host_function(name = "has")]
-pub(super) fn builtin_has_bytes_impl(items: VmBytes, index: i64) -> bool {
+pub(super) fn builtin_has_bytes_impl(items: &[u8], index: i64) -> bool {
     if index < 0 {
         return false;
     }

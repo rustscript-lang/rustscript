@@ -278,6 +278,19 @@ fn type_label(ty: &Type) -> Result<String, Error> {
         Type::Group(group) => type_label(&group.elem),
         Type::Paren(paren) => type_label(&paren.elem),
         Type::Reference(reference) => type_label(&reference.elem),
+        Type::Slice(slice) => match slice.elem.as_ref() {
+            Type::Path(path) => {
+                let Some(segment) = path.path.segments.last() else {
+                    return Err(Error::new_spanned(slice, "unsupported callable type"));
+                };
+                if segment.ident == "u8" {
+                    Ok("bytes".to_string())
+                } else {
+                    Err(Error::new_spanned(slice, "unsupported callable type"))
+                }
+            }
+            _ => Err(Error::new_spanned(slice, "unsupported callable type")),
+        },
         Type::Tuple(tuple) if tuple.elems.is_empty() => Ok("null".to_string()),
         Type::Path(path) => {
             let Some(segment) = path.path.segments.last() else {

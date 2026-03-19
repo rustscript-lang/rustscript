@@ -320,6 +320,9 @@ impl Parser {
         if let Some(value) = self.match_string() {
             return Ok(Expr::String(value));
         }
+        if let Some(value) = self.match_bytes() {
+            return Ok(Expr::Bytes(value));
+        }
         if self.match_kind(&TokenKind::Pipe) {
             return self.parse_closure_literal();
         }
@@ -756,6 +759,9 @@ impl Parser {
         self.reject_out_of_range_int_literal()?;
         if let Some(value) = self.match_string() {
             return Ok((Some(MatchPattern::String(value)), None));
+        }
+        if let Some(value) = self.match_bytes() {
+            return Ok((Some(MatchPattern::Bytes(value)), None));
         }
         if self.match_kind(&TokenKind::Null) {
             return Ok((Some(MatchPattern::Null), None));
@@ -1195,6 +1201,9 @@ impl Parser {
         if let Some(value) = self.match_string() {
             return Ok(Expr::String(value));
         }
+        if let Some(value) = self.match_bytes() {
+            return Ok(Expr::Bytes(value));
+        }
         if let Some(value) = self.match_int() {
             return Ok(Expr::Int(value));
         }
@@ -1255,6 +1264,7 @@ impl Parser {
             current.kind,
             TokenKind::Ident(_)
                 | TokenKind::String(_)
+                | TokenKind::Bytes(_)
                 | TokenKind::Int(_)
                 | TokenKind::IntMinMagnitude(_)
                 | TokenKind::Float(_)

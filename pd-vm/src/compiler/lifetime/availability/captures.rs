@@ -281,6 +281,7 @@ impl AvailabilityAnalyzer {
             | Expr::Int(_)
             | Expr::Float(_)
             | Expr::Bool(_)
+            | Expr::Bytes(_)
             | Expr::String(_)
             | Expr::FunctionRef(_) => {}
             Expr::Var(index) => {

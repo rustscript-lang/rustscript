@@ -100,6 +100,7 @@ pub struct ClosureExpr {
 pub enum MatchPattern {
     Int(i64),
     String(String),
+    Bytes(Vec<u8>),
     Null,
     None,
     SomeBinding(LocalSlot),
@@ -138,6 +139,7 @@ pub enum Expr {
     Float(f64),
     Bool(bool),
     String(String),
+    Bytes(Vec<u8>),
     FunctionRef(u16),
     OptionalGet {
         container: Box<Expr>,

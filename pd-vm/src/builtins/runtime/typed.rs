@@ -65,6 +65,15 @@ impl<'a> FromVmValue<'a> for &'a str {
     }
 }
 
+impl<'a> FromVmValue<'a> for &'a [u8] {
+    fn from_vm_value(value: &'a Value, _label: &str) -> VmResult<Self> {
+        match value {
+            Value::Bytes(values) => Ok(values.as_slice()),
+            _ => Err(VmError::TypeMismatch("bytes")),
+        }
+    }
+}
+
 impl FromVmValue<'_> for VmArray {
     fn from_vm_value(value: &Value, _label: &str) -> VmResult<Self> {
         match value {

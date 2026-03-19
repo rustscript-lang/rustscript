@@ -267,6 +267,7 @@ impl<'a> SourceFormatter<'a> {
             | TokenKind::Int(_)
             | TokenKind::IntMinMagnitude(_)
             | TokenKind::Float(_)
+            | TokenKind::Bytes(_)
             | TokenKind::String(_)
             | TokenKind::True
             | TokenKind::False

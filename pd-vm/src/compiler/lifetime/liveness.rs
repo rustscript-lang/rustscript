@@ -435,6 +435,7 @@ impl LivenessRewriter {
             | Expr::Int(_)
             | Expr::Float(_)
             | Expr::Bool(_)
+            | Expr::Bytes(_)
             | Expr::String(_)
             | Expr::FunctionRef(_) => {}
             Expr::Var(index) | Expr::MoveVar(index) => self.mark_live(live, *index),
@@ -733,6 +734,7 @@ impl LivenessRewriter {
             | Expr::Int(_)
             | Expr::Float(_)
             | Expr::Bool(_)
+            | Expr::Bytes(_)
             | Expr::String(_)
             | Expr::FunctionRef(_) => {}
             Expr::Var(index) | Expr::MoveVar(index) | Expr::LocalCall(index, _, _) => {
@@ -893,6 +895,7 @@ fn expr_contains_local_call(expr: &Expr) -> bool {
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
+        | Expr::Bytes(_)
         | Expr::String(_)
         | Expr::FunctionRef(_)
         | Expr::Var(_)
@@ -1125,6 +1128,7 @@ impl LocalSlotAllocator {
             | Expr::Int(_)
             | Expr::Float(_)
             | Expr::Bool(_)
+            | Expr::Bytes(_)
             | Expr::String(_)
             | Expr::FunctionRef(_) => {}
             Expr::Var(index) | Expr::MoveVar(index) => {
@@ -1348,6 +1352,7 @@ impl LocalSlotAllocator {
             | Expr::Int(_)
             | Expr::Float(_)
             | Expr::Bool(_)
+            | Expr::Bytes(_)
             | Expr::String(_)
             | Expr::FunctionRef(_) => {}
             Expr::Var(index) | Expr::MoveVar(index) | Expr::LocalCall(index, _, _) => {
@@ -1710,7 +1715,12 @@ fn remap_stmt_slots(stmt: &mut Stmt, mapping: &[LocalSlot]) -> Result<(), ParseE
 
 fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseError> {
     match expr {
-        Expr::Null | Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::String(_) => {}
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::Bytes(_)
+        | Expr::String(_) => {}
         Expr::FunctionRef(_) => {}
         Expr::Call(_, _, args) => {
             for arg in args {

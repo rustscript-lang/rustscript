@@ -1052,6 +1052,7 @@ pub(super) fn expr_contains_param_add(expr: &Expr, param_slots: &[LocalSlot]) ->
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
+        | Expr::Bytes(_)
         | Expr::String(_)
         | Expr::FunctionRef(_)
         | Expr::Var(_)
@@ -1126,6 +1127,7 @@ pub(super) fn expr_uses_param(expr: &Expr, param_slots: &[LocalSlot]) -> bool {
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
+        | Expr::Bytes(_)
         | Expr::String(_)
         | Expr::FunctionRef(_)
         | Expr::MoveField { .. }
@@ -1268,6 +1270,7 @@ pub(super) fn legalize_expr(
         Expr::Int(_) => BoundType::Int,
         Expr::Float(_) => BoundType::Float,
         Expr::Bool(_) => BoundType::Bool,
+        Expr::Bytes(_) => BoundType::Bytes,
         Expr::String(_) => BoundType::String,
         Expr::OptionalGet { container, key, .. } => {
             let _ = legalize_expr(container, state, context);
@@ -1438,6 +1441,7 @@ pub(super) fn fold_builtin_call(expr: &mut Expr, builtin: BuiltinFunction, state
 
 pub(super) fn infer_static_len(expr: &Expr) -> Option<usize> {
     match expr {
+        Expr::Bytes(bytes) => Some(bytes.len()),
         Expr::String(text) => Some(text.chars().count()),
         Expr::Call(index, _, args) => {
             let builtin = BuiltinFunction::from_call_index(*index)?;

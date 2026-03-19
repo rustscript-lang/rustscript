@@ -213,6 +213,7 @@ pub(super) fn validate_expr(
         Expr::Int(_) => BoundType::Int,
         Expr::Float(_) => BoundType::Float,
         Expr::Bool(_) => BoundType::Bool,
+        Expr::Bytes(_) => BoundType::Bytes,
         Expr::String(_) => BoundType::String,
         Expr::OptionalGet { container, key, .. } => {
             let _ = validate_expr(

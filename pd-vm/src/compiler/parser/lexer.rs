@@ -11,6 +11,7 @@ pub(super) enum TokenKind {
     IntMinMagnitude(String),
     Float(f64),
     String(String),
+    Bytes(Vec<u8>),
     True,
     False,
     Null,
@@ -314,6 +315,14 @@ impl<'a> Lexer<'a> {
                 let value = self.consume_string(ch)?;
                 TokenKind::String(value)
             }
+            'b' if self.peek_char() == Some('"') => {
+                self.advance();
+                let delimiter = self
+                    .current
+                    .expect("byte string delimiter should be present");
+                let value = self.consume_bytes(delimiter)?;
+                TokenKind::Bytes(value)
+            }
             c if c.is_ascii_digit() => match self.consume_number()? {
                 NumberLiteral::Int(value) => TokenKind::Int(value),
                 NumberLiteral::IntMinMagnitude(value) => TokenKind::IntMinMagnitude(value),
@@ -370,6 +379,10 @@ impl<'a> Lexer<'a> {
             self.offset += current.len_utf8();
         }
         self.current = self.chars.next();
+    }
+
+    fn peek_char(&self) -> Option<char> {
+        self.chars.clone().next()
     }
 
     fn skip_whitespace_and_comments(&mut self) -> Result<(), ParseError> {
@@ -624,6 +637,122 @@ impl<'a> Lexer<'a> {
                 other => {
                     out.push(other);
                     self.advance();
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    fn consume_bytes(&mut self, delimiter: char) -> Result<Vec<u8>, ParseError> {
+        let line = self.line;
+        if self.current != Some(delimiter) {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line,
+                message: "bytes literal has invalid delimiter".to_string(),
+            });
+        }
+        self.advance();
+
+        let mut out = Vec::new();
+        loop {
+            let Some(ch) = self.current else {
+                return Err(ParseError {
+                    span: None,
+                    code: None,
+                    line,
+                    message: "unterminated bytes literal".to_string(),
+                });
+            };
+
+            match ch {
+                quote if quote == delimiter => {
+                    self.advance();
+                    break;
+                }
+                '\\' => {
+                    self.advance();
+                    let Some(escaped) = self.current else {
+                        return Err(ParseError {
+                            span: None,
+                            code: None,
+                            line,
+                            message: "unterminated bytes escape".to_string(),
+                        });
+                    };
+                    let mapped = match escaped {
+                        'n' => b'\n',
+                        'r' => b'\r',
+                        't' => b'\t',
+                        '\\' => b'\\',
+                        '"' => b'"',
+                        '\'' => b'\'',
+                        '0' => b'\0',
+                        'x' => {
+                            self.advance();
+                            let Some(hi) = self.current else {
+                                return Err(ParseError {
+                                    span: None,
+                                    code: None,
+                                    line,
+                                    message: "unterminated bytes escape".to_string(),
+                                });
+                            };
+                            let Some(hi) = hex_nibble(hi) else {
+                                return Err(ParseError {
+                                    span: None,
+                                    code: None,
+                                    line,
+                                    message: "invalid bytes escape '\\x'".to_string(),
+                                });
+                            };
+                            self.advance();
+                            let Some(lo) = self.current else {
+                                return Err(ParseError {
+                                    span: None,
+                                    code: None,
+                                    line,
+                                    message: "unterminated bytes escape".to_string(),
+                                });
+                            };
+                            let Some(lo) = hex_nibble(lo) else {
+                                return Err(ParseError {
+                                    span: None,
+                                    code: None,
+                                    line,
+                                    message: "invalid bytes escape '\\x'".to_string(),
+                                });
+                            };
+                            self.advance();
+                            out.push((hi << 4) | lo);
+                            continue;
+                        }
+                        other => {
+                            return Err(ParseError {
+                                span: None,
+                                code: None,
+                                line,
+                                message: format!("invalid bytes escape '\\{other}'"),
+                            });
+                        }
+                    };
+                    out.push(mapped);
+                    self.advance();
+                }
+                other if other.is_ascii() => {
+                    out.push(other as u8);
+                    self.advance();
+                }
+                _ => {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line,
+                        message: "bytes literals only support ASCII characters; use '\\xHH' for raw bytes"
+                            .to_string(),
+                    });
                 }
             }
         }

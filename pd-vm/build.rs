@@ -1630,6 +1630,20 @@ fn type_label(ty: &Type) -> String {
         Type::Group(group) => type_label(&group.elem),
         Type::Paren(paren) => type_label(&paren.elem),
         Type::Reference(reference) => type_label(&reference.elem),
+        Type::Slice(slice) => match slice.elem.as_ref() {
+            Type::Path(path) => {
+                let segment = path
+                    .path
+                    .segments
+                    .last()
+                    .unwrap_or_else(|| panic!("unsupported callable type"));
+                match segment.ident.to_string().as_str() {
+                    "u8" => "bytes".to_string(),
+                    _ => panic!("unsupported callable type"),
+                }
+            }
+            _ => panic!("unsupported callable type"),
+        },
         Type::Tuple(tuple) if tuple.elems.is_empty() => "null".to_string(),
         Type::Path(path) => {
             let segment = path

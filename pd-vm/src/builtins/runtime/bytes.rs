@@ -12,15 +12,16 @@ pub(super) fn builtin_bytes_from_utf8_impl(text: &str) -> VmBytes {
 
 /// Decodes UTF-8 bytes into a string.
 #[pd_host_function(name = "bytes::to_utf8")]
-pub(super) fn builtin_bytes_to_utf8_impl(payload: VmBytes) -> VmResult<String> {
-    String::from_utf8(payload)
+pub(super) fn builtin_bytes_to_utf8_impl(payload: &[u8]) -> VmResult<String> {
+    std::str::from_utf8(payload)
+        .map(str::to_string)
         .map_err(|err| VmError::HostError(format!("bytes::to_utf8 requires valid utf-8: {err}")))
 }
 
 /// Decodes bytes into a string using UTF-8 replacement semantics.
 #[pd_host_function(name = "bytes::to_utf8_lossy")]
-pub(super) fn builtin_bytes_to_utf8_lossy_impl(payload: VmBytes) -> String {
-    String::from_utf8_lossy(&payload).into_owned()
+pub(super) fn builtin_bytes_to_utf8_lossy_impl(payload: &[u8]) -> String {
+    String::from_utf8_lossy(payload).into_owned()
 }
 
 /// Decodes a hexadecimal string into bytes.
@@ -57,7 +58,7 @@ pub(super) fn builtin_bytes_from_hex_impl(text: &str) -> VmResult<VmBytes> {
 
 /// Encodes bytes as lowercase hexadecimal.
 #[pd_host_function(name = "bytes::to_hex")]
-pub(super) fn builtin_bytes_to_hex_impl(payload: VmBytes) -> String {
+pub(super) fn builtin_bytes_to_hex_impl(payload: &[u8]) -> String {
     let mut out = String::with_capacity(payload.len() * 2);
     for byte in payload {
         out.push(nibble_to_hex(byte >> 4));
@@ -66,7 +67,8 @@ pub(super) fn builtin_bytes_to_hex_impl(payload: VmBytes) -> String {
     out
 }
 
-/// Decodes a base64 string into bytes.
+/// Deprecated: decodes a base64 string into bytes.
+/// Prefer native `bytes` values and only decode base64 at explicit text boundaries.
 #[pd_host_function(name = "bytes::from_base64")]
 pub(super) fn builtin_bytes_from_base64_impl(text: &str) -> VmResult<VmBytes> {
     STANDARD.decode(text).map_err(|err| {
@@ -74,9 +76,10 @@ pub(super) fn builtin_bytes_from_base64_impl(text: &str) -> VmResult<VmBytes> {
     })
 }
 
-/// Encodes bytes as base64.
+/// Deprecated: encodes bytes as base64 text.
+/// Prefer native `bytes` values and only encode base64 at explicit text boundaries.
 #[pd_host_function(name = "bytes::to_base64")]
-pub(super) fn builtin_bytes_to_base64_impl(payload: VmBytes) -> String {
+pub(super) fn builtin_bytes_to_base64_impl(payload: &[u8]) -> String {
     STANDARD.encode(payload)
 }
 
@@ -102,9 +105,10 @@ pub(super) fn builtin_bytes_from_array_u8_impl(values: VmArray) -> VmResult<VmBy
 
 /// Converts bytes into an array of ints in 0..=255.
 #[pd_host_function(name = "bytes::to_array_u8")]
-pub(super) fn builtin_bytes_to_array_u8_impl(payload: VmBytes) -> VmArray {
+pub(super) fn builtin_bytes_to_array_u8_impl(payload: &[u8]) -> VmArray {
     payload
-        .into_iter()
+        .iter()
+        .copied()
         .map(|byte| Value::Int(i64::from(byte)))
         .collect()
 }
@@ -144,7 +148,7 @@ mod tests {
 
     #[test]
     fn to_utf8_rejects_invalid_sequences() {
-        let err = builtin_bytes_to_utf8_impl(vec![0xFF]).expect_err("invalid utf-8 should fail");
+        let err = builtin_bytes_to_utf8_impl(&[0xFF]).expect_err("invalid utf-8 should fail");
         assert!(err.to_string().contains("valid utf-8"));
     }
 
@@ -154,7 +158,7 @@ mod tests {
             .expect("array<u8> should decode");
         assert_eq!(bytes, vec![1, 255]);
         assert_eq!(
-            builtin_bytes_to_array_u8_impl(bytes),
+            builtin_bytes_to_array_u8_impl(&bytes),
             vec![Value::Int(1), Value::Int(255)]
         );
     }

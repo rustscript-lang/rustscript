@@ -176,6 +176,20 @@ impl Parser {
         }
     }
 
+    pub(super) fn match_bytes(&mut self) -> Option<Vec<u8>> {
+        match self.tokens.get(self.pos) {
+            Some(Token {
+                kind: TokenKind::Bytes(value),
+                ..
+            }) => {
+                let value = value.clone();
+                self.pos += 1;
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn check_kind_at(&self, index: usize, kind: &TokenKind) -> bool {
         matches!(
             self.tokens.get(index),
