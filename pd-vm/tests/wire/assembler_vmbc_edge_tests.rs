@@ -1,7 +1,7 @@
 use vm::{
     Assembler, AssemblerError, DebugInfo, DisassembleOptions, LineInfo, OpCode, Program,
-    ValidationError, Value, WireError, assemble, decode_program, disassemble_program_with_options,
-    encode_program, validate_program,
+    ValidationError, Value, WireError, assemble, compile_source, decode_program,
+    disassemble_program_with_options, encode_program, validate_program,
 };
 
 fn assert_asm_error_contains(source: &str, expected: &str) {
@@ -11,6 +11,19 @@ fn assert_asm_error_contains(source: &str, expected: &str) {
         "expected assembler error containing '{expected}', got '{:?}'",
         err
     );
+}
+
+fn first_call_offset_and_index(program: &Program) -> (usize, u16) {
+    let mut ip = 0usize;
+    while ip < program.code.len() {
+        let opcode = OpCode::try_from(program.code[ip]).expect("program should be valid");
+        if opcode == OpCode::Call {
+            let index = u16::from_le_bytes([program.code[ip + 1], program.code[ip + 2]]);
+            return (ip, index);
+        }
+        ip += 1 + opcode.operand_len();
+    }
+    panic!("expected program to contain a call instruction");
 }
 
 #[test]
@@ -208,16 +221,24 @@ fn validate_rejects_truncated_operands_for_ldc_call_and_branches() {
 
 #[test]
 fn validate_rejects_builtin_call_arity_mismatch() {
-    // Builtin len() currently lives at 0xFFB0 and expects arity 1.
-    let program = Program::new(vec![], vec![OpCode::Call as u8, 0xB0, 0xFF, 0x02]);
+    let mut program = compile_source(
+        r#"
+        let text = "abc";
+        text.length;
+        "#,
+    )
+    .expect("compile should succeed")
+    .program;
+    let (call_offset, builtin_len) = first_call_offset_and_index(&program);
+    program.code[call_offset + 3] = 2;
     assert!(matches!(
         validate_program(&program, 0),
         Err(ValidationError::InvalidCallArity {
-            index: 0xFFB0,
+            index,
             expected: 1,
             got: 2,
             ..
-        })
+        }) if index == builtin_len
     ));
 }
 

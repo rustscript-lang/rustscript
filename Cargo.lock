@@ -1950,6 +1950,7 @@ dependencies = [
 name = "pd-vm"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-jit",

@@ -79,7 +79,7 @@ fn websocket_connection_send_binary_base64(connection: i64, payload: &str) -> i6
 }
 
 #[pd_host_function(name = "websocket::connection::send_binary")]
-fn websocket_connection_send_binary(connection: i64, payload: Array) -> i64 {
+fn websocket_connection_send_binary(connection: i64, payload: Bytes) -> i64 {
     unreachable!("abi declaration only")
 }
 
@@ -89,7 +89,7 @@ fn websocket_connection_read_binary_base64(connection: i64) -> String {
 }
 
 #[pd_host_function(name = "websocket::connection::read_binary")]
-fn websocket_connection_read_binary(connection: i64) -> Array {
+fn websocket_connection_read_binary(connection: i64) -> Bytes {
     unreachable!("abi declaration only")
 }
 

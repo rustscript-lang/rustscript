@@ -57,7 +57,7 @@ assert(plus_one[0] == 2);
 assert(plus_one[2] == 4);
 
 fn double(value) {
-    value * 2;
+    value * 2
 }
 let mut doubled = map([1, 2, 3], double);
 assert(doubled.length == 3);

@@ -1126,13 +1126,6 @@ mod tests {
             catalog
                 .rustscript
                 .iter()
-                .any(|entry| entry.label == "set::union"),
-            "expected RustScript stdlib completion for set::union",
-        );
-        assert!(
-            catalog
-                .rustscript
-                .iter()
                 .any(|entry| entry.label == "lrucache::put"),
             "expected RustScript stdlib completion for lrucache::put",
         );
@@ -1146,13 +1139,6 @@ mod tests {
         assert!(
             catalog
                 .javascript
-                .iter()
-                .any(|entry| entry.label == "set.union"),
-            "expected JavaScript stdlib completion for set.union",
-        );
-        assert!(
-            catalog
-                .rustscript
                 .iter()
                 .any(|entry| entry.label == "math::sqrt"),
             "expected RustScript builtin completion for math::sqrt",

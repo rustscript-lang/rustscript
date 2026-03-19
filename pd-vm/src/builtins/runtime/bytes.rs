@@ -26,7 +26,7 @@ pub(super) fn builtin_bytes_to_utf8_lossy_impl(payload: VmBytes) -> String {
 /// Decodes a hexadecimal string into bytes.
 #[pd_host_function(name = "bytes::from_hex")]
 pub(super) fn builtin_bytes_from_hex_impl(text: &str) -> VmResult<VmBytes> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return Err(VmError::HostError(
             "bytes::from_hex requires an even number of hex digits".to_string(),
         ));

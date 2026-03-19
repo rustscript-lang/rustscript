@@ -3,6 +3,26 @@ mod common;
 use common::*;
 use vm::OpCode;
 
+fn builtin_call_index_with_arity(source: &str, argc: u8) -> u16 {
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut ip = 0usize;
+    let mut matched = None;
+    while ip < compiled.program.code.len() {
+        let opcode =
+            OpCode::try_from(compiled.program.code[ip]).expect("compiled program should be valid");
+        if opcode == OpCode::Call && compiled.program.code[ip + 3] == argc {
+            let index =
+                u16::from_le_bytes([compiled.program.code[ip + 1], compiled.program.code[ip + 2]]);
+            assert!(
+                matched.replace(index).is_none(),
+                "expected exactly one call with arity {argc} in `{source}`"
+            );
+        }
+        ip += 1 + opcode.operand_len();
+    }
+    matched.unwrap_or_else(|| panic!("expected a call with arity {argc} in `{source}`"))
+}
+
 #[test]
 fn arithmetic_works() {
     let constants = vec![Value::Int(2), Value::Int(3)];
@@ -1127,8 +1147,20 @@ fn map_equality_ignores_entry_order() {
 
 #[test]
 fn get_and_set_use_hash_map_overwrite_semantics() {
-    const BUILTIN_GET: u16 = 0xFFB6;
-    const BUILTIN_SET: u16 = 0xFFB8;
+    let builtin_get = builtin_call_index_with_arity(
+        r#"
+        let text = "abc";
+        text[0];
+        "#,
+        2,
+    );
+    let builtin_set = builtin_call_index_with_arity(
+        r#"
+        let mut values = [1];
+        values[0] = 2;
+        "#,
+        3,
+    );
 
     let map = Value::map(vec![
         (Value::string("k"), Value::Int(1)),
@@ -1140,7 +1172,7 @@ fn get_and_set_use_hash_map_overwrite_semantics() {
     let mut get_bc = BytecodeBuilder::new();
     get_bc.ldc(0);
     get_bc.ldc(1);
-    get_bc.call(BUILTIN_GET, 2);
+    get_bc.call(builtin_get, 2);
     get_bc.ret();
     let mut get_vm = Vm::new(Program::new(constants.clone(), get_bc.finish()));
     let get_status = get_vm.run().expect("get should succeed");
@@ -1151,7 +1183,7 @@ fn get_and_set_use_hash_map_overwrite_semantics() {
     set_bc.ldc(0);
     set_bc.ldc(1);
     set_bc.ldc(2);
-    set_bc.call(BUILTIN_SET, 3);
+    set_bc.call(builtin_set, 3);
     set_bc.ret();
     let mut set_vm = Vm::new(Program::new(constants, set_bc.finish()));
     let set_status = set_vm.run().expect("set should succeed");
@@ -1166,7 +1198,13 @@ fn get_and_set_use_hash_map_overwrite_semantics() {
 
 #[test]
 fn set_rejects_sparse_array_indexes() {
-    const BUILTIN_SET: u16 = 0xFFB8;
+    let builtin_set = builtin_call_index_with_arity(
+        r#"
+        let mut values = [1];
+        values[0] = 2;
+        "#,
+        3,
+    );
 
     let constants = vec![
         Value::array(vec![Value::Int(10), Value::Int(20)]),
@@ -1177,7 +1215,7 @@ fn set_rejects_sparse_array_indexes() {
     bc.ldc(0);
     bc.ldc(1);
     bc.ldc(2);
-    bc.call(BUILTIN_SET, 3);
+    bc.call(builtin_set, 3);
     bc.ret();
 
     let mut vm = Vm::new(Program::new(constants, bc.finish()));

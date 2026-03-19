@@ -68,8 +68,18 @@ fn webrtc_connection_send_binary_base64(connection: i64, payload: &str) -> i64 {
     unreachable!("abi declaration only")
 }
 
+#[pd_host_function(name = "webrtc::connection::send_binary")]
+fn webrtc_connection_send_binary(connection: i64, payload: Bytes) -> i64 {
+    unreachable!("abi declaration only")
+}
+
 #[pd_host_function(name = "webrtc::connection::read_binary_base64")]
 fn webrtc_connection_read_binary_base64(connection: i64) -> String {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "webrtc::connection::read_binary")]
+fn webrtc_connection_read_binary(connection: i64) -> Bytes {
     unreachable!("abi declaration only")
 }
 

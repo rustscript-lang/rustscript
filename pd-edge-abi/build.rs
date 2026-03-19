@@ -417,6 +417,7 @@ fn type_label(ty: &Type) -> String {
                 "f32" | "f64" => "Float".to_string(),
                 "bool" => "Bool".to_string(),
                 "String" | "str" => "String".to_string(),
+                "Bytes" => "Bytes".to_string(),
                 "Any" | "AnyValue" | "Value" => "Any".to_string(),
                 "Array" => "Array".to_string(),
                 "Map" | "VmMap" => "Map".to_string(),
@@ -755,7 +756,7 @@ fn render_abi_rust(functions: &[AbiFunctionDecl], namespaces: &[NamespaceDecl]) 
 fn render_abi_json(functions: &[AbiFunctionDecl]) -> String {
     let mut out = String::new();
     out.push_str("{\n");
-    out.push_str("  \"abi_version\": 23,\n");
+    out.push_str("  \"abi_version\": 24,\n");
     out.push_str("  \"functions\": [\n");
     for (index, function) in functions.iter().enumerate() {
         let suffix = if index + 1 == functions.len() {

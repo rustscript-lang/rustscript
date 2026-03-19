@@ -4,66 +4,66 @@ use math as native_math;
 
 // Returns the constant pi.
 pub fn pi() {
-    native_math::pi();
+    native_math::pi()
 }
 
 // Returns the constant tau.
 pub fn tau() {
-    native_math::tau();
+    native_math::tau()
 }
 
 // Returns Euler's number.
 pub fn e() {
-    native_math::e();
+    native_math::e()
 }
 
 // Returns the machine epsilon for floating-point comparisons.
 pub fn epsilon() {
-    native_math::epsilon();
+    native_math::epsilon()
 }
 
 // Returns positive infinity.
 pub fn inf() {
-    native_math::inf();
+    native_math::inf()
 }
 
 // Returns negative infinity.
 pub fn neg_inf() {
-    native_math::neg_inf();
+    native_math::neg_inf()
 }
 
 // Returns NaN.
 pub fn nan() {
-    native_math::nan();
+    native_math::nan()
 }
 
 // Returns the absolute value of a number.
-pub fn abs(value) {
-    native_math::abs(value);
+pub fn abs(value: any) {
+    native_math::abs(value)
 }
 
 // Returns the smaller of two numbers.
-pub fn min(lhs, rhs) {
-    native_math::min(lhs, rhs);
+pub fn min(lhs: any, rhs: any) {
+    native_math::min(lhs, rhs)
 }
 
 // Returns the larger of two numbers.
-pub fn max(lhs, rhs) {
-    native_math::max(lhs, rhs);
+pub fn max(lhs: any, rhs: any) {
+    native_math::max(lhs, rhs)
 }
 
 // Clamps a number to an inclusive range.
-pub fn clamp(value, lower, upper) {
-    native_math::clamp(value, lower, upper);
+pub fn clamp(value: any, lower: any, upper: any) {
+    native_math::clamp(value, lower, upper)
 }
 
 // Returns the sign of a number.
-pub fn signum(value) {
-    native_math::signum(value);
+pub fn signum(value: any) {
+    native_math::signum(value)
 }
 
 // Returns -1, 0, or 1 depending on the sign of a number.
-pub fn sign(value) {
+pub fn sign(value: any) {
     let out = if value < 0 => {
         -1
     } else if value > 0 => {
@@ -71,214 +71,214 @@ pub fn sign(value) {
     } else => {
         0
     };
-    out;
+    out
 }
 
 // Returns whether a number lies within an inclusive range.
-pub fn in_range(value, lower, upper) {
-    value >= lower && value <= upper;
+pub fn in_range(value: any, lower: any, upper: any) {
+    value >= lower && value <= upper
 }
 
 // Returns whether a number is even.
-pub fn is_even(value) {
-    value % 2 == 0;
+pub fn is_even(value: int) {
+    value % 2 == 0
 }
 
 // Returns whether a number is odd.
-pub fn is_odd(value) {
-    !is_even(value);
+pub fn is_odd(value: int) {
+    !is_even(value)
 }
 
 // Returns the sum of numeric values.
-pub fn sum(values) {
+pub fn sum(values: [any]) {
     let mut out = 0;
     for (let mut index = 0; index < values.length; index = index + 1) {
         out = out + values[index];
     }
-    out;
+    out
 }
 
 // Rounds a number down to the nearest integer value.
-pub fn floor(value) {
-    native_math::floor(value);
+pub fn floor(value: any) {
+    native_math::floor(value)
 }
 
 // Rounds a number up to the nearest integer value.
-pub fn ceil(value) {
-    native_math::ceil(value);
+pub fn ceil(value: any) {
+    native_math::ceil(value)
 }
 
 // Rounds a number to the nearest integer value.
-pub fn round(value) {
-    native_math::round(value);
+pub fn round(value: any) {
+    native_math::round(value)
 }
 
 // Truncates the fractional part of a number.
-pub fn trunc(value) {
-    native_math::trunc(value);
+pub fn trunc(value: any) {
+    native_math::trunc(value)
 }
 
 // Returns the fractional part of a number.
-pub fn fract(value) {
-    native_math::fract(value);
+pub fn fract(value: any) {
+    native_math::fract(value)
 }
 
 // Returns the square root of a number.
-pub fn sqrt(value) {
-    native_math::sqrt(value);
+pub fn sqrt(value: any) {
+    native_math::sqrt(value)
 }
 
 // Returns the cube root of a number.
-pub fn cbrt(value) {
-    native_math::cbrt(value);
+pub fn cbrt(value: any) {
+    native_math::cbrt(value)
 }
 
 // Raises a number to a floating-point power.
-pub fn powf(value, exponent) {
-    native_math::powf(value, exponent);
+pub fn powf(value: any, exponent: any) {
+    native_math::powf(value, exponent)
 }
 
 // Raises a number to an integer power.
-pub fn powi(value, exponent) {
-    native_math::powi(value, exponent);
+pub fn powi(value: any, exponent: int) {
+    native_math::powi(value, exponent)
 }
 
 // Returns e raised to the given power.
-pub fn exp(value) {
-    native_math::exp(value);
+pub fn exp(value: any) {
+    native_math::exp(value)
 }
 
 // Returns 2 raised to the given power.
-pub fn exp2(value) {
-    native_math::exp2(value);
+pub fn exp2(value: any) {
+    native_math::exp2(value)
 }
 
 // Returns the natural logarithm of a number.
-pub fn ln(value) {
-    native_math::ln(value);
+pub fn ln(value: any) {
+    native_math::ln(value)
 }
 
 // Returns the natural logarithm of one plus a number.
-pub fn ln_1p(value) {
-    native_math::ln_1p(value);
+pub fn ln_1p(value: any) {
+    native_math::ln_1p(value)
 }
 
 // Returns the logarithm of a number for the given base.
-pub fn log(value, base) {
-    native_math::log(value, base);
+pub fn log(value: any, base: any) {
+    native_math::log(value, base)
 }
 
 // Returns the base-2 logarithm of a number.
-pub fn log2(value) {
-    native_math::log2(value);
+pub fn log2(value: any) {
+    native_math::log2(value)
 }
 
 // Returns the base-10 logarithm of a number.
-pub fn log10(value) {
-    native_math::log10(value);
+pub fn log10(value: any) {
+    native_math::log10(value)
 }
 
 // Returns the sine of an angle in radians.
-pub fn sin(value) {
-    native_math::sin(value);
+pub fn sin(value: any) {
+    native_math::sin(value)
 }
 
 // Returns the cosine of an angle in radians.
-pub fn cos(value) {
-    native_math::cos(value);
+pub fn cos(value: any) {
+    native_math::cos(value)
 }
 
 // Returns the tangent of an angle in radians.
-pub fn tan(value) {
-    native_math::tan(value);
+pub fn tan(value: any) {
+    native_math::tan(value)
 }
 
 // Returns the arcsine of a number.
-pub fn asin(value) {
-    native_math::asin(value);
+pub fn asin(value: any) {
+    native_math::asin(value)
 }
 
 // Returns the arccosine of a number.
-pub fn acos(value) {
-    native_math::acos(value);
+pub fn acos(value: any) {
+    native_math::acos(value)
 }
 
 // Returns the arctangent of a number.
-pub fn atan(value) {
-    native_math::atan(value);
+pub fn atan(value: any) {
+    native_math::atan(value)
 }
 
 // Returns the four-quadrant arctangent of two numbers.
-pub fn atan2(y, x) {
-    native_math::atan2(y, x);
+pub fn atan2(y: any, x: any) {
+    native_math::atan2(y, x)
 }
 
 // Returns the hyperbolic sine of a number.
-pub fn sinh(value) {
-    native_math::sinh(value);
+pub fn sinh(value: any) {
+    native_math::sinh(value)
 }
 
 // Returns the hyperbolic cosine of a number.
-pub fn cosh(value) {
-    native_math::cosh(value);
+pub fn cosh(value: any) {
+    native_math::cosh(value)
 }
 
 // Returns the hyperbolic tangent of a number.
-pub fn tanh(value) {
-    native_math::tanh(value);
+pub fn tanh(value: any) {
+    native_math::tanh(value)
 }
 
 // Returns the hypotenuse length for two numbers.
-pub fn hypot(lhs, rhs) {
-    native_math::hypot(lhs, rhs);
+pub fn hypot(lhs: any, rhs: any) {
+    native_math::hypot(lhs, rhs)
 }
 
 // Returns the first number with the sign of the second number.
-pub fn copysign(value, sign_value) {
-    native_math::copysign(value, sign_value);
+pub fn copysign(value: any, sign_value: any) {
+    native_math::copysign(value, sign_value)
 }
 
 // Computes a fused multiply-add operation.
-pub fn mul_add(a, b, c) {
-    native_math::mul_add(a, b, c);
+pub fn mul_add(a: any, b: any, c: any) {
+    native_math::mul_add(a, b, c)
 }
 
 // Converts radians to degrees.
-pub fn to_degrees(value) {
-    native_math::to_degrees(value);
+pub fn to_degrees(value: any) {
+    native_math::to_degrees(value)
 }
 
 // Converts degrees to radians.
-pub fn to_radians(value) {
-    native_math::to_radians(value);
+pub fn to_radians(value: any) {
+    native_math::to_radians(value)
 }
 
 // Converts radians to degrees.
-pub fn deg(value) {
-    to_degrees(value);
+pub fn deg(value: any) {
+    to_degrees(value)
 }
 
 // Converts degrees to radians.
-pub fn rad(value) {
-    to_radians(value);
+pub fn rad(value: any) {
+    to_radians(value)
 }
 
 // Returns the remainder of dividing lhs by rhs.
-pub fn fmod(lhs, rhs) {
-    lhs % rhs;
+pub fn fmod(lhs: any, rhs: any) {
+    lhs % rhs
 }
 
 // Returns whether a number is NaN.
-pub fn is_nan(value) {
-    native_math::is_nan(value);
+pub fn is_nan(value: any) {
+    native_math::is_nan(value)
 }
 
 // Returns whether a number is infinite.
-pub fn is_infinite(value) {
-    native_math::is_infinite(value);
+pub fn is_infinite(value: any) {
+    native_math::is_infinite(value)
 }
 
 // Returns whether a number is finite.
-pub fn is_finite(value) {
-    native_math::is_finite(value);
+pub fn is_finite(value: any) {
+    native_math::is_finite(value)
 }

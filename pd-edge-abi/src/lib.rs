@@ -6,6 +6,7 @@ pub enum AbiValueType {
     Float,
     Bool,
     String,
+    Bytes,
     Array,
     Map,
 }
@@ -19,6 +20,7 @@ impl AbiValueType {
             Self::Float => "float",
             Self::Bool => "bool",
             Self::String => "string",
+            Self::Bytes => "bytes",
             Self::Array => "array",
             Self::Map => "map",
         }
@@ -33,6 +35,7 @@ pub enum AbiParamType {
     Float,
     Bool,
     String,
+    Bytes,
     Array,
     Map,
     Number,
@@ -47,6 +50,7 @@ impl AbiParamType {
             Self::Float => "float",
             Self::Bool => "bool",
             Self::String => "string",
+            Self::Bytes => "bytes",
             Self::Array => "array",
             Self::Map => "map",
             Self::Number => "number",
@@ -71,7 +75,7 @@ pub struct HostNamespaceSpec {
     pub docs: &'static str,
 }
 
-pub const ABI_VERSION: u16 = 23;
+pub const ABI_VERSION: u16 = 24;
 
 #[allow(dead_code, unused_variables)]
 mod callable_specs {
@@ -83,6 +87,9 @@ mod callable_specs {
         pub struct Array;
 
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        pub struct Bytes;
+
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
         pub struct Map;
 
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -90,7 +97,7 @@ mod callable_specs {
     }
 
     #[allow(unused_imports)]
-    use self::marker::{Any, Array, Map, Value};
+    use self::marker::{Any, Array, Bytes, Map, Value};
     use pd_host_function::pd_host_function;
 
     include!("abi_spec/functions.rs");
@@ -142,7 +149,7 @@ mod tests {
     #[test]
     fn abi_json_contains_declared_functions() {
         let manifest = abi_json();
-        assert!(manifest.contains("\"abi_version\": 23"));
+        assert!(manifest.contains("\"abi_version\": 24"));
         for function in FUNCTIONS {
             assert!(manifest.contains(function.name));
             assert!(manifest.contains(function.return_type.as_str()));

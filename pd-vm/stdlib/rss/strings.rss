@@ -1,31 +1,31 @@
 // String helpers implemented in pure RustScript using language syntax.
-fn is_whitespace(ch) {
+fn is_whitespace(ch: string) {
     match ch {
         " " => true,
         "\n" => true,
         "\r" => true,
         "\t" => true,
         _ => false,
-    };
+    }
 }
 
 // Returns whether two strings are equal.
-pub fn equals(lhs, rhs) {
-    lhs == rhs;
+pub fn equals(lhs: string, rhs: string) {
+    lhs == rhs
 }
 
 // Returns whether a string is empty.
-pub fn is_empty(value) {
-    value.length == 0;
+pub fn is_empty(value: string) {
+    value.length == 0
 }
 
 // Returns whether a string is not empty.
-pub fn non_empty(value) {
-    !is_empty(value);
+pub fn non_empty(value: string) {
+    !is_empty(value)
 }
 
 // Returns whether a string contains a substring.
-pub fn contains(haystack, needle) {
+pub fn contains(haystack: string, needle: string) {
     let haystack_len = haystack.length;
     let needle_len = needle.length;
     let out = if needle_len == 0 => {
@@ -41,11 +41,11 @@ pub fn contains(haystack, needle) {
         }
         found
     };
-    out;
+    out
 }
 
 // Splits a string on a separator.
-pub fn split(value, separator) {
+pub fn split(value: string, separator: string) {
     let value_len = value.length;
     let separator_len = separator.length;
     let out = if separator_len == 0 => {
@@ -71,11 +71,11 @@ pub fn split(value, separator) {
         out[out.length] = value[part_start:value_len];
         out
     };
-    out;
+    out
 }
 
 // Trims leading and trailing ASCII whitespace from a string.
-pub fn trim(value) {
+pub fn trim(value: string) {
     let trim_len = value.length;
     let mut trim_start = 0;
     while trim_start < trim_len {
@@ -94,11 +94,11 @@ pub fn trim(value) {
             break;
         }
     }
-    value[trim_start:trim_end];
+    value[trim_start:trim_end]
 }
 
 // Replaces all matching substrings in a string.
-pub fn replace(value, needle, replacement) {
+pub fn replace(value: string, needle: string, replacement: string) {
     let value_len = value.length;
     let needle_len = needle.length;
     let out = if needle_len == 0 => {
@@ -120,5 +120,5 @@ pub fn replace(value, needle, replacement) {
         }
         output
     };
-    out;
+    out
 }

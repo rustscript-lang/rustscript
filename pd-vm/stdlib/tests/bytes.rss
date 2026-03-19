@@ -1,43 +1,50 @@
 use super::rss::bytes as bytes_std;
+use bytes as builtin_bytes;
 
-let empty = bytes_std::empty();
+let empty = builtin_bytes::from_hex("");
 assert(type(empty) == "bytes");
 assert(empty.length == 0);
 
-let hello = bytes_std::from_utf8("hello");
+let hello = builtin_bytes::from_utf8("hello");
 assert(hello.length == 5);
-assert(bytes_std::to_utf8(hello) == "hello");
-assert(bytes_std::to_hex(hello) == "68656c6c6f");
-assert(bytes_std::to_base64(hello) == "aGVsbG8=");
+assert(builtin_bytes::to_utf8(hello) == "hello");
+assert(builtin_bytes::to_hex(hello) == "68656c6c6f");
+assert(builtin_bytes::to_base64(hello) == "aGVsbG8=");
 
-let hex_payload = bytes_std::from_hex("deadbeef");
-assert(bytes_std::to_hex(hex_payload) == "deadbeef");
-assert(bytes_std::to_base64(hex_payload) == "3q2+7w==");
+let hex_payload = builtin_bytes::from_hex("deadbeef");
+assert(builtin_bytes::to_hex(hex_payload) == "deadbeef");
+assert(builtin_bytes::to_base64(hex_payload) == "3q2+7w==");
 
-let base64_payload = bytes_std::from_base64("AP8Q");
-assert(bytes_std::to_hex(base64_payload) == "00ff10");
+let base64_payload = builtin_bytes::from_base64("AP8Q");
+assert(builtin_bytes::to_hex(base64_payload) == "00ff10");
 
-let appended = bytes_std::append(bytes_std::from_hex("0011"), bytes_std::from_hex("2233"));
-assert(bytes_std::to_hex(appended) == "00112233");
-assert(bytes_std::to_hex(bytes_std::slice(appended, 1, 2)) == "1122");
+let appended = builtin_bytes::from_hex("0011") + builtin_bytes::from_hex("2233");
+assert(builtin_bytes::to_hex(appended) == "00112233");
+assert(builtin_bytes::to_hex(bytes_std::slice(appended, 1, 2)) == "1122");
 
-assert(bytes_std::equal(bytes_std::from_hex("cafebabe"), bytes_std::from_hex("cafebabe")));
-assert(bytes_std::equal(bytes_std::from_hex("cafebabe"), bytes_std::from_hex("cafed00d")) == false);
+assert(bytes_std::equal(
+    builtin_bytes::from_hex("cafebabe"),
+    builtin_bytes::from_hex("cafebabe")
+));
+assert(bytes_std::equal(
+    builtin_bytes::from_hex("cafebabe"),
+    builtin_bytes::from_hex("cafed00d")
+) == false);
 
-assert(bytes_std::starts_with(hello, bytes_std::from_utf8("he")));
-assert(bytes_std::starts_with(hello, bytes_std::from_utf8("ll")) == false);
-assert(bytes_std::ends_with(hello, bytes_std::from_utf8("lo")));
-assert(bytes_std::ends_with(hello, bytes_std::from_utf8("he")) == false);
+assert(bytes_std::starts_with(hello, builtin_bytes::from_utf8("he")));
+assert(bytes_std::starts_with(hello, builtin_bytes::from_utf8("ll")) == false);
+assert(bytes_std::ends_with(hello, builtin_bytes::from_utf8("lo")));
+assert(bytes_std::ends_with(hello, builtin_bytes::from_utf8("he")) == false);
 
-assert(bytes_std::index_of(hello, bytes_std::from_utf8("")) == 0);
-assert(bytes_std::index_of(hello, bytes_std::from_utf8("ll")) == 2);
-assert(bytes_std::index_of(hello, bytes_std::from_utf8("zz")) == -1);
+assert(bytes_std::index_of(hello, builtin_bytes::from_utf8("")) == 0);
+assert(bytes_std::index_of(hello, builtin_bytes::from_utf8("ll")) == 2);
+assert(bytes_std::index_of(hello, builtin_bytes::from_utf8("zz")) == -1);
 
-let with_tail = bytes_std::push_u8(bytes_std::from_hex("0102"), 255);
-assert(bytes_std::to_hex(with_tail) == "0102ff");
+let with_tail = bytes_std::push_u8(builtin_bytes::from_hex("0102"), 255);
+assert(builtin_bytes::to_hex(with_tail) == "0102ff");
 assert(bytes_std::read_u8(with_tail, 2) == 255);
 
-assert(bytes_std::read_u16_be(bytes_std::from_hex("1234"), 0) == 4660);
-assert(bytes_std::read_u16_le(bytes_std::from_hex("3412"), 0) == 4660);
-assert(bytes_std::to_hex(bytes_std::write_u16_be(4660)) == "1234");
-assert(bytes_std::to_hex(bytes_std::write_u16_le(4660)) == "3412");
+assert(bytes_std::read_u16_be(builtin_bytes::from_hex("1234"), 0) == 4660);
+assert(bytes_std::read_u16_le(builtin_bytes::from_hex("3412"), 0) == 4660);
+assert(builtin_bytes::to_hex(bytes_std::write_u16_be(4660)) == "1234");
+assert(builtin_bytes::to_hex(bytes_std::write_u16_le(4660)) == "3412");

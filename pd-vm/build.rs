@@ -333,6 +333,16 @@ fn render_builtin_catalog(
     let host_groups = stable_groups(&host_group_input, |callable| callable.name.clone());
     let (builtin_variant_order, actual_builtin_by_variant) =
         ordered_actual_builtin_variants(namespaces, builtin_callables, metadata_callables);
+    let builtin_call_count = u16::try_from(builtin_variant_order.len())
+        .expect("builtin function count should fit in u16");
+    let builtin_call_base = u16::MAX
+        .checked_sub(builtin_call_count)
+        .and_then(|value| value.checked_add(1))
+        .expect("builtin call base should fit in u16");
+    assert!(
+        builtin_call_base >= 4,
+        "builtin call base must leave room for reserved special builtins"
+    );
 
     let namespace_member_group_input = builtin_callables
         .iter()
@@ -424,7 +434,7 @@ fn render_builtin_catalog(
 
     writeln!(
         &mut out,
-        "pub(crate) const BUILTIN_CALL_BASE: u16 = 0xFFB0;"
+        "pub(crate) const BUILTIN_CALL_BASE: u16 = 0x{builtin_call_base:04X};"
     )
     .unwrap();
     writeln!(

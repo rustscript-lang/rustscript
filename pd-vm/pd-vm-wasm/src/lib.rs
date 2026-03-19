@@ -1784,13 +1784,11 @@ mod runtime_tests {
     }
 
     #[test]
-    fn lint_accepts_embedded_parse_and_set_stdlib_imports() {
+    fn lint_accepts_embedded_parse_stdlib_imports() {
         let source = r#"
             use stdlib::rss::parse as parse;
-            use stdlib::rss::set as set;
             let value = parse::try_parse_int_base("ff", 16);
-            let joined = set::union([1, 2, 2], [2, 3, 4]);
-            value == 255 && joined.length == 4;
+            value == 255;
         "#;
         let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
         assert!(
@@ -1798,7 +1796,7 @@ mod runtime_tests {
                 .diagnostics
                 .iter()
                 .all(|diagnostic| diagnostic.severity == LintSeverity::Warning),
-            "expected embedded parse/set stdlib lint to emit warnings only, got {:?}",
+            "expected embedded parse stdlib lint to emit warnings only, got {:?}",
             report.diagnostics
         );
         assert!(
@@ -1951,13 +1949,6 @@ mod runtime_tests {
                 .iter()
                 .any(|entry| entry.label == "parse::try_parse_int_base"),
             "expected RustScript parse stdlib completion entry"
-        );
-        assert!(
-            catalog
-                .rustscript
-                .iter()
-                .any(|entry| entry.label == "set::union"),
-            "expected RustScript set stdlib completion entry"
         );
         assert!(
             catalog

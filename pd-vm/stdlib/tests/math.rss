@@ -2,7 +2,7 @@ use super::rss::math as math_std;
 use math as native_math;
 
 fn approx_eq(lhs, rhs) {
-    math_std::abs(lhs - rhs) < 0.0000001;
+    math_std::abs(lhs - rhs) < 0.0000001
 }
 
 assert(math_std::abs(-7) == 7);

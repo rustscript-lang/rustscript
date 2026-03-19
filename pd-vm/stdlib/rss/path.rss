@@ -1,18 +1,18 @@
 // Path helpers implemented in pure RustScript.
-fn is_separator(ch) {
-    ch == "/" || ch == "\\";
+fn is_separator(ch: string) {
+    ch == "/" || ch == "\\"
 }
 
-fn trim_trailing_separators(path) {
+fn trim_trailing_separators(path: string) {
     let mut end =(&path).length;
     while end > 1 && is_separator((&path)[(end - 1):end]) {
         end = end - 1;
     }
-    (&path)[0:end];
+    (&path)[0:end]
 }
 
 // Replaces backslashes with forward slashes in a path.
-pub fn normalize_sep(path) {
+pub fn normalize_sep(path: string) {
     let mut out = "";
     for (let mut index = 0; index <(&path).length; index = index + 1) {
         let ch =(&path)[index:(index + 1)];
@@ -23,11 +23,11 @@ pub fn normalize_sep(path) {
         };
         out = out + segment;
     }
-    out;
+    out
 }
 
 // Joins two path segments with a single separator.
-pub fn join(lhs, rhs) {
+pub fn join(lhs: string, rhs: string) {
     let left = normalize_sep(lhs);
     let right = normalize_sep(rhs);
     let out = if (&left).length == 0 => {
@@ -45,11 +45,11 @@ pub fn join(lhs, rhs) {
             left + "/" + right
         }
     };
-    out;
+    out
 }
 
 // Returns the final path segment.
-pub fn basename(path) {
+pub fn basename(path: string) {
     let normalized = trim_trailing_separators(normalize_sep(path));
     let mut start = 0;
     let mut index =(&normalized).length - 1;
@@ -60,11 +60,11 @@ pub fn basename(path) {
         }
         index = index - 1;
     }
-    (&normalized)[start:(&normalized).length];
+    (&normalized)[start:(&normalized).length]
 }
 
 // Returns the parent directory portion of a path.
-pub fn dirname(path) {
+pub fn dirname(path: string) {
     let normalized = trim_trailing_separators(normalize_sep(path));
     let mut cut =-1;
     let mut index =(&normalized).length - 1;
@@ -82,11 +82,11 @@ pub fn dirname(path) {
     } else => {
         (&normalized)[0:cut]
     };
-    out;
+    out
 }
 
 // Returns the file extension of a path.
-pub fn extname(path) {
+pub fn extname(path: string) {
     let name = basename(path);
     let mut dot =-1;
     let mut index =(&name).length - 1;
@@ -102,5 +102,5 @@ pub fn extname(path) {
     } else => {
         (&name)[dot:(&name).length]
     };
-    out;
+    out
 }

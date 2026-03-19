@@ -31,10 +31,6 @@ const STDLIB_RSS_MODULES: &[(&str, &str)] = &[
         include_str!("../../stdlib/rss/path.rss"),
     ),
     (
-        "stdlib/rss/set.rss",
-        include_str!("../../stdlib/rss/set.rss"),
-    ),
-    (
         "stdlib/rss/strings.rss",
         include_str!("../../stdlib/rss/strings.rss"),
     ),

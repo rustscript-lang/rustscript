@@ -51,7 +51,7 @@ struct LruEntryRow<K, V> {
     value: V
 }
 
-fn normalized_capacity(raw_capacity) {
+fn normalized_capacity(raw_capacity: int) {
     let out = if raw_capacity > 0 => {
         raw_capacity
     } else => {
@@ -60,7 +60,15 @@ fn normalized_capacity(raw_capacity) {
     out
 }
 
-fn make_cache<K, V>(limit, size, next_id, head, tail, lookup, nodes) {
+fn make_cache<K, V>(
+    limit: int,
+    size: int,
+    next_id: int,
+    head: int,
+    tail: int,
+    lookup: map,
+    nodes: map
+) {
     let out: LruCacheState<K, V> = {
         capacity: limit,
         size: size,
@@ -73,7 +81,7 @@ fn make_cache<K, V>(limit, size, next_id, head, tail, lookup, nodes) {
     out
 }
 
-fn append_existing_node<K, V>(nodes, head, tail, id, node) {
+fn append_existing_node<K, V>(nodes: map, head: int, tail: int, id: int, node: LruNode<K, V>) {
     let mut next_nodes = nodes;
     let mut appended: LruNode<K, V> = node;
     appended.prev = tail;
@@ -93,7 +101,7 @@ fn append_existing_node<K, V>(nodes, head, tail, id, node) {
     out
 }
 
-fn append_new_node<K, V>(nodes, head, tail, id, key, value) {
+fn append_new_node<K, V>(nodes: map, head: int, tail: int, id: int, key: K, value: V) {
     let mut next_nodes = nodes;
     let appended: LruNode<K, V> = {key: key, value: value, prev: tail, next: 0};
     next_nodes[id] = appended;
@@ -111,7 +119,7 @@ fn append_new_node<K, V>(nodes, head, tail, id, key, value) {
     out
 }
 
-fn unlink_node<K, V>(nodes, head, tail, id, node) {
+fn unlink_node<K, V>(nodes: map, head: int, tail: int, id: int, node: LruNode<K, V>) {
     let node_view: LruNode<K, V> = node.copy();
     let prev = node_view.prev;
     let next = node_view.next;
@@ -144,7 +152,15 @@ fn unlink_node<K, V>(nodes, head, tail, id, node) {
     out
 }
 
-fn evict_oldest<K, V>(limit, size, next_id, lookup, nodes, head, tail) {
+fn evict_oldest<K, V>(
+    limit: int,
+    size: int,
+    next_id: int,
+    lookup: map,
+    nodes: map,
+    head: int,
+    tail: int
+) {
     let out = if size == 0 || head == 0 => {
         make_cache::<K, V>(limit, size, next_id, head, tail, lookup, nodes)
     } else => {
@@ -181,7 +197,7 @@ fn evict_oldest<K, V>(limit, size, next_id, lookup, nodes, head, tail) {
     out
 }
 
-fn entry_report<K, V>(cache, id) {
+fn entry_report<K, V>(cache: LruCacheState<K, V>, id: int) {
     let out: LruEntryReport<K, V> = if id != 0 => {
         let node: LruNode<K, V> =&((&cache).nodes[id]);
         {found: true, key: node.key.copy(), value: node.value.copy()}
@@ -192,37 +208,37 @@ fn entry_report<K, V>(cache, id) {
 }
 
 // Creates an LRU cache with the given capacity.
-pub fn new<K, V>(raw_capacity) {
+pub fn new<K, V>(raw_capacity: int) {
     let limit = normalized_capacity(raw_capacity);
     make_cache::<K, V>(limit, 0, 1, 0, 0, {}, {})
 }
 
 // Returns the cache capacity.
-pub fn capacity<K, V>(cache) {
+pub fn capacity<K, V>(cache: LruCacheState<K, V>) {
     let state: LruCacheState<K, V> = cache;
     normalized_capacity(state.capacity)
 }
 
 // Returns the number of cached entries.
-pub fn len<K, V>(cache) {
+pub fn len<K, V>(cache: LruCacheState<K, V>) {
     let state: LruCacheState<K, V> = cache;
     state.size
 }
 
 // Returns whether the cache is empty.
-pub fn is_empty<K, V>(cache) {
+pub fn is_empty<K, V>(cache: LruCacheState<K, V>) {
     len::<K, V>(cache) == 0
 }
 
 // Returns whether the cache contains a key.
-pub fn has<K, V>(cache, key) {
+pub fn has<K, V>(cache: LruCacheState<K, V>, key: K) {
     let state: LruCacheState<K, V> = cache;
     let lookup = state.lookup;
     lookup.has(key)
 }
 
 // Returns the cached value without updating recency.
-pub fn peek<K, V>(cache, key) {
+pub fn peek<K, V>(cache: LruCacheState<K, V>, key: K) {
     let state: LruCacheState<K, V> = cache;
     let lookup = state.lookup;
     let out: LruPeekResult<V> = if lookup.has(key) => {
@@ -236,7 +252,7 @@ pub fn peek<K, V>(cache, key) {
 }
 
 // Returns the cached value and promotes it to the most recently used position.
-pub fn get<K, V>(cache, key) {
+pub fn get<K, V>(cache: LruCacheState<K, V>, key: K) {
     let state: LruCacheState<K, V> = cache;
     let limit = normalized_capacity(state.capacity);
     let size = state.size;
@@ -285,7 +301,7 @@ pub fn get<K, V>(cache, key) {
 }
 
 // Inserts or updates a cache entry and returns the next cache state.
-pub fn put<K, V>(cache, key, value) {
+pub fn put<K, V>(cache: LruCacheState<K, V>, key: K, value: V) {
     let state: LruCacheState<K, V> = cache;
     let limit = normalized_capacity(state.capacity);
     let size = state.size;
@@ -362,7 +378,7 @@ pub fn put<K, V>(cache, key, value) {
 }
 
 // Promotes a key to the most recently used position if it exists.
-pub fn touch<K, V>(cache, key) {
+pub fn touch<K, V>(cache: LruCacheState<K, V>, key: K) {
     let state: LruCacheState<K, V> = cache;
     let limit = normalized_capacity(state.capacity);
     let size = state.size;
@@ -403,7 +419,7 @@ pub fn touch<K, V>(cache, key) {
 }
 
 // Removes a cache entry by key.
-pub fn remove<K, V>(cache, key) {
+pub fn remove<K, V>(cache: LruCacheState<K, V>, key: K) {
     let state: LruCacheState<K, V> = cache;
     let limit = normalized_capacity(state.capacity);
     let size = state.size;
@@ -437,13 +453,13 @@ pub fn remove<K, V>(cache, key) {
 }
 
 // Removes all entries from the cache.
-pub fn clear<K, V>(cache) {
+pub fn clear<K, V>(cache: LruCacheState<K, V>) {
     let state: LruCacheState<K, V> = cache;
     make_cache::<K, V>(normalized_capacity(state.capacity), 0, 1, 0, 0, {}, {})
 }
 
 // Returns cache keys from oldest to newest.
-pub fn keys<K, V>(cache) {
+pub fn keys<K, V>(cache: LruCacheState<K, V>) {
     let state: LruCacheState<K, V> = cache;
     let nodes = state.nodes;
     let mut current = state.head;
@@ -458,7 +474,7 @@ pub fn keys<K, V>(cache) {
 }
 
 // Returns cache values from oldest to newest.
-pub fn values<K, V>(cache) {
+pub fn values<K, V>(cache: LruCacheState<K, V>) {
     let state: LruCacheState<K, V> = cache;
     let nodes = state.nodes;
     let mut current = state.head;
@@ -473,7 +489,7 @@ pub fn values<K, V>(cache) {
 }
 
 // Returns cache entries from oldest to newest.
-pub fn entries<K, V>(cache) {
+pub fn entries<K, V>(cache: LruCacheState<K, V>) {
     let state: LruCacheState<K, V> = cache;
     let nodes = state.nodes;
     let mut current = state.head;
@@ -488,13 +504,13 @@ pub fn entries<K, V>(cache) {
 }
 
 // Returns the oldest cache entry report.
-pub fn oldest<K, V>(cache) {
+pub fn oldest<K, V>(cache: LruCacheState<K, V>) {
     let state: LruCacheState<K, V> = cache;
     entry_report::<K, V>(state, state.head)
 }
 
 // Returns the newest cache entry report.
-pub fn newest<K, V>(cache) {
+pub fn newest<K, V>(cache: LruCacheState<K, V>) {
     let state: LruCacheState<K, V> = cache;
     entry_report::<K, V>(state, state.tail)
 }

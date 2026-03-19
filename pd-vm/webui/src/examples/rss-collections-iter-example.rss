@@ -69,7 +69,7 @@ assert(config_entry_count == 3);
 assert(config_value_count == 3);
 
 let reversed_preview: [string] = collections::reverse(["world", "finance"]);
-let combined_names: [string] = collections::append(reversed_preview, ["archive"]);
+let combined_names: [string] = reversed_preview + ["archive"];
 assert(collections::index_of(&combined_names, "archive") == 2);
 assert(collections::contains(&combined_names, "world"));
 assert(collections::contains(combined_names, "sports") == false);

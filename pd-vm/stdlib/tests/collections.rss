@@ -1,6 +1,6 @@
-use super::rss::collections::{append, contains, deep_compare, dedup, entries, get_or, has, index_of, merge, reverse, values};
+use super::rss::collections::{contains, deep_compare, dedup, entries, get_or, has, index_of, merge, reverse, values};
 
-let mut appended = append([1, 2], [3, 4]);
+let mut appended = [1, 2] + [3, 4];
 assert(appended.length == 4);
 assert(appended.copy()[0] == 1);
 assert(appended.copy()[3] == 4);

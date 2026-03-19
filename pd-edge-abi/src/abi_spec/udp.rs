@@ -58,6 +58,16 @@ fn udp_socket_recv_text(socket: i64, max_bytes: i64) -> String {
     unreachable!("abi declaration only")
 }
 
+#[pd_host_function(name = "udp::socket::send_binary")]
+fn udp_socket_send_binary(socket: i64, payload: Bytes) -> i64 {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "udp::socket::recv_binary")]
+fn udp_socket_recv_binary(socket: i64, max_bytes: i64) -> Bytes {
+    unreachable!("abi declaration only")
+}
+
 #[pd_host_function(name = "udp::socket::send_binary_base64")]
 fn udp_socket_send_binary_base64(socket: i64, payload: &str) -> i64 {
     unreachable!("abi declaration only")
