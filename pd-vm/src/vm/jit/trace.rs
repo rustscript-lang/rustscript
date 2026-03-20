@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
-use crate::builtins::BuiltinFunction;
 use crate::debug_info::DebugInfo;
-use crate::vm::{OpCode, Program, Value, ValueType};
+use crate::vm::{OpCode, Program};
+
+use super::ir::SsaTrace;
+use super::liveness::{boxed_load_site_count, boxed_store_site_count};
+use super::recorder::{RecordedTrace, TraceRecordError, record_trace};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JitConfig {
@@ -41,6 +43,7 @@ pub enum JitNyiReason {
     UnsupportedArch,
     HotLoopThresholdZero,
     UnsupportedOpcode(u8),
+    UnsupportedTrace(String),
     InvalidJumpTarget { target: usize },
     InvalidImmediate(&'static str),
     TraceTooLong { limit: usize },
@@ -55,6 +58,7 @@ impl JitNyiReason {
             }
             JitNyiReason::HotLoopThresholdZero => "hot_loop_threshold must be > 0".to_string(),
             JitNyiReason::UnsupportedOpcode(op) => format!("unsupported opcode 0x{op:02X}"),
+            JitNyiReason::UnsupportedTrace(detail) => detail.clone(),
             JitNyiReason::InvalidJumpTarget { target } => {
                 format!("jump target {target} is invalid or out of bytecode bounds")
             }
@@ -71,183 +75,43 @@ impl JitNyiReason {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum TraceConcatKind {
-    String,
-    Bytes,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum TraceTextBytesKind {
-    String,
-    Bytes,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum TraceBytesCodecKind {
-    FromUtf8,
-    ToUtf8,
-    ToUtf8Lossy,
-    FromHex,
-    ToHex,
-    FromBase64,
-    ToBase64,
-    FromArrayU8,
-    ToArrayU8,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum TraceStep {
-    Nop,
-    Ldc(u32),
-    Add,
-    IAdd,
-    IAddImm(i64),
-    ILocalAddImm {
-        local: u8,
-        imm: i64,
-    },
-    FAdd,
-    FAddImm(u64),
-    FLocalAddImm {
-        local: u8,
-        imm_bits: u64,
-    },
-    Concat(TraceConcatKind),
-    Len(TraceTextBytesKind),
-    Slice(TraceTextBytesKind),
-    Get(TraceTextBytesKind),
-    HasBytes,
-    BytesCodec(TraceBytesCodecKind),
-    Sub,
-    ISub,
-    ISubImm(i64),
-    ILocalSubImm {
-        local: u8,
-        imm: i64,
-    },
-    FSub,
-    FSubImm(u64),
-    FLocalSubImm {
-        local: u8,
-        imm_bits: u64,
-    },
-    Mul,
-    IMul,
-    IMulImm(i64),
-    ILocalMulImm {
-        local: u8,
-        imm: i64,
-    },
-    FMul,
-    FMulImm(u64),
-    FLocalMulImm {
-        local: u8,
-        imm_bits: u64,
-    },
-    Div,
-    IDiv,
-    IDivImm(i64),
-    ILocalDivImm {
-        local: u8,
-        imm: i64,
-    },
-    FDiv,
-    FDivImm(u64),
-    FLocalDivImm {
-        local: u8,
-        imm_bits: u64,
-    },
-    Mod,
-    IMod,
-    IModImm(i64),
-    ILocalModImm {
-        local: u8,
-        imm: i64,
-    },
-    FMod,
-    FModImm(u64),
-    FLocalModImm {
-        local: u8,
-        imm_bits: u64,
-    },
-    Shl,
-    Shr,
-    Lshr,
-    And,
-    Or,
-    Not,
-    Neg,
-    INeg,
-    FNeg,
-    Ceq,
-    FCeq,
-    Clt,
-    ILocalCltImm {
-        local: u8,
-        imm: i64,
-    },
-    FClt,
-    FLocalCltImm {
-        local: u8,
-        imm_bits: u64,
-    },
-    Cgt,
-    ILocalCgtImm {
-        local: u8,
-        imm: i64,
-    },
-    FCgt,
-    FLocalCgtImm {
-        local: u8,
-        imm_bits: u64,
-    },
-    Pop,
-    Dup,
-    Ldloc(u8),
-    ILocalShlImm {
-        local: u8,
-        amount: u32,
-    },
-    Stloc(u8),
-    BuiltinCall {
-        index: u16,
-        argc: u8,
-        call_ip: usize,
-    },
-    Call {
-        index: u16,
-        argc: u8,
-        call_ip: usize,
-    },
-    GuardFalse {
-        exit_ip: usize,
-    },
-    LoopIfFalse {
-        target_ip: usize,
-        exit_ip: usize,
-    },
-    GuardTrue {
-        exit_ip: usize,
-    },
-    JumpToIp {
-        target_ip: usize,
-    },
-    JumpToRoot,
-    Ret,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct JitTrace {
     pub id: usize,
     pub root_ip: usize,
     pub start_line: Option<u32>,
     pub has_call: bool,
     pub has_yielding_call: bool,
-    pub steps: Vec<TraceStep>,
-    pub step_ips: Vec<usize>,
+    pub op_names: Vec<String>,
     pub terminal: JitTraceTerminal,
     pub executions: u64,
+    pub(crate) ssa: SsaTrace,
+}
+
+impl JitTrace {
+    pub fn op_names(&self) -> &[String] {
+        &self.op_names
+    }
+
+    pub fn ssa_text(&self) -> String {
+        self.ssa.render_text()
+    }
+
+    pub fn ssa_block_count(&self) -> usize {
+        self.ssa.blocks.len()
+    }
+
+    pub fn ssa_exit_count(&self) -> usize {
+        self.ssa.exits.len()
+    }
+
+    pub fn boxed_load_site_count(&self) -> u64 {
+        boxed_load_site_count(&self.ssa)
+    }
+
+    pub fn boxed_store_site_count(&self) -> u64 {
+        boxed_store_site_count(&self.ssa)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -257,12 +121,29 @@ pub struct JitAttempt {
     pub result: Result<usize, JitNyiReason>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JitMetrics {
+    pub boxed_load_site_count: u64,
+    pub boxed_store_site_count: u64,
+    pub trace_exit_count: u64,
+    pub native_loop_back_count: u64,
+    pub helper_fallback_count: u64,
+    pub native_trace_exec_count: u64,
+}
+
+impl JitMetrics {
+    pub fn guard_exit_count(self) -> u64 {
+        self.trace_exit_count
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct JitSnapshot {
     pub arch: &'static str,
     pub config: JitConfig,
     pub traces: Vec<JitTrace>,
     pub attempts: Vec<JitAttempt>,
+    pub metrics: JitMetrics,
     pub nyi_reference: Vec<JitNyiDoc>,
 }
 
@@ -279,7 +160,6 @@ pub struct TraceJitEngine {
     blocked_roots: HashSet<usize>,
     loop_headers: Option<HashSet<usize>>,
     traces: Vec<JitTrace>,
-    trace_step_indices_by_ip: Vec<Arc<HashMap<usize, usize>>>,
     attempts: Vec<JitAttempt>,
 }
 
@@ -298,7 +178,6 @@ impl TraceJitEngine {
             blocked_roots: HashSet::new(),
             loop_headers: None,
             traces: Vec::new(),
-            trace_step_indices_by_ip: Vec::new(),
             attempts: Vec::new(),
         }
     }
@@ -314,24 +193,17 @@ impl TraceJitEngine {
         self.blocked_roots.clear();
         self.loop_headers = None;
         self.traces.clear();
-        self.trace_step_indices_by_ip.clear();
         self.attempts.clear();
     }
 
     pub fn observe_hot_ip(&mut self, ip: usize, program: &Program) -> Option<usize> {
-        if !self.config.enabled {
-            return None;
-        }
-        if !native_jit_supported() {
+        if !self.config.enabled || !native_jit_supported() {
             return None;
         }
         if let Some(&trace_id) = self.compiled_by_root.get(&ip) {
             return Some(trace_id);
         }
-        if self.blocked_roots.contains(&ip) {
-            return None;
-        }
-        if !self.is_loop_header(program, ip) {
+        if self.blocked_roots.contains(&ip) || !self.is_loop_header(program, ip) {
             return None;
         }
 
@@ -347,48 +219,20 @@ impl TraceJitEngine {
             .and_then(|debug| debug.line_for_offset(ip));
         let result = if self.config.hot_loop_threshold == 0 {
             Err(JitNyiReason::HotLoopThresholdZero)
-        } else if !native_jit_supported() {
-            Err(JitNyiReason::UnsupportedArch)
         } else {
             self.compile_trace(program, ip)
         };
-
-        match result {
-            Ok(trace_id) => {
-                self.attempts.push(JitAttempt {
-                    root_ip: ip,
-                    line,
-                    result: Ok(trace_id),
-                });
-                self.compiled_by_root.insert(ip, trace_id);
-                Some(trace_id)
-            }
-            Err(reason) => {
-                self.attempts.push(JitAttempt {
-                    root_ip: ip,
-                    line,
-                    result: Err(reason),
-                });
-                self.blocked_roots.insert(ip);
-                None
-            }
-        }
+        self.finish_attempt(ip, line, result)
     }
 
     pub fn trace_clone(&self, trace_id: usize) -> Option<JitTrace> {
         self.traces.get(trace_id).cloned()
     }
 
-    pub fn trace_step_index_lookup(&self, trace_id: usize) -> Option<Arc<HashMap<usize, usize>>> {
-        self.trace_step_indices_by_ip.get(trace_id).cloned()
-    }
-
     pub fn observe_exit_ip(&mut self, ip: usize, program: &Program) -> Option<usize> {
         if !self.config.enabled || !native_jit_supported() {
             return None;
         }
-        // Keep default behavior unchanged: only aggressively chain-compile exit roots when the
-        // user requested the most aggressive hotness policy.
         if self.config.hot_loop_threshold > 1 {
             return None;
         }
@@ -408,27 +252,7 @@ impl TraceJitEngine {
         } else {
             self.compile_trace(program, ip)
         };
-
-        match result {
-            Ok(trace_id) => {
-                self.attempts.push(JitAttempt {
-                    root_ip: ip,
-                    line,
-                    result: Ok(trace_id),
-                });
-                self.compiled_by_root.insert(ip, trace_id);
-                Some(trace_id)
-            }
-            Err(reason) => {
-                self.attempts.push(JitAttempt {
-                    root_ip: ip,
-                    line,
-                    result: Err(reason),
-                });
-                self.blocked_roots.insert(ip);
-                None
-            }
-        }
+        self.finish_attempt(ip, line, result)
     }
 
     pub fn trace_has_call(&self, trace_id: usize) -> bool {
@@ -447,18 +271,27 @@ impl TraceJitEngine {
         }
     }
 
-    pub fn snapshot(&self) -> JitSnapshot {
+    pub(crate) fn block_trace(&mut self, trace_id: usize) {
+        if let Some(trace) = self.traces.get(trace_id) {
+            self.compiled_by_root.remove(&trace.root_ip);
+            self.blocked_roots.insert(trace.root_ip);
+        }
+    }
+
+    pub fn snapshot(&self, runtime_metrics: JitMetrics) -> JitSnapshot {
         JitSnapshot {
             arch: std::env::consts::ARCH,
             config: self.config,
             traces: self.traces.clone(),
             attempts: self.attempts.clone(),
+            metrics: self.aggregate_metrics(runtime_metrics),
             nyi_reference: nyi_reference(),
         }
     }
 
-    pub fn dump_text(&self, debug: Option<&DebugInfo>) -> String {
+    pub fn dump_text(&self, debug: Option<&DebugInfo>, runtime_metrics: JitMetrics) -> String {
         let mut out = String::new();
+        let metrics = self.aggregate_metrics(runtime_metrics);
         out.push_str("trace-jit:\n");
         out.push_str(&format!("  arch: {}\n", std::env::consts::ARCH));
         out.push_str(&format!("  enabled: {}\n", self.config.enabled));
@@ -469,6 +302,20 @@ impl TraceJitEngine {
         out.push_str(&format!("  max_trace_len: {}\n", self.config.max_trace_len));
         out.push_str(&format!("  compiled traces: {}\n", self.traces.len()));
         out.push_str(&format!("  compile attempts: {}\n", self.attempts.len()));
+        out.push_str(&format!(
+            "  boxed value sites: loads={} stores={}\n",
+            metrics.boxed_load_site_count, metrics.boxed_store_site_count
+        ));
+        out.push_str(&format!(
+            "  trace exits: total={} guard_like={} loop_backs={}\n",
+            metrics.trace_exit_count,
+            metrics.guard_exit_count(),
+            metrics.native_loop_back_count
+        ));
+        out.push_str(&format!(
+            "  interpreter fallbacks: {}\n",
+            metrics.helper_fallback_count
+        ));
 
         for trace in &self.traces {
             let line = trace
@@ -479,22 +326,32 @@ impl TraceJitEngine {
                 .and_then(|info| trace.start_line.and_then(|l| info.source_line(l)))
                 .unwrap_or_default();
             out.push_str(&format!(
-                "  trace#{} root_ip={} line={} terminal={:?} steps={} executions={}\n",
+                "  trace#{} root_ip={} line={} terminal={:?} ops={} executions={}\n",
                 trace.id,
                 trace.root_ip,
                 line,
                 trace.terminal,
-                trace.steps.len(),
+                trace.op_names.len(),
                 trace.executions
             ));
             if !source.is_empty() {
                 out.push_str(&format!("    source: {}\n", source.trim()));
             }
             out.push_str("    ops:");
-            for step in &trace.steps {
-                out.push_str(&format!(" {}", trace_step_name(step)));
+            for op in &trace.op_names {
+                out.push_str(&format!(" {}", op));
             }
             out.push('\n');
+            out.push_str(&format!(
+                "    ssa: blocks={} exits={}\n",
+                trace.ssa.blocks.len(),
+                trace.ssa.exits.len()
+            ));
+            for line in trace.ssa.render_text().lines() {
+                out.push_str("      ");
+                out.push_str(line);
+                out.push('\n');
+            }
         }
 
         let mut nyi = 0usize;
@@ -523,258 +380,43 @@ impl TraceJitEngine {
         out
     }
 
-    fn compile_trace(&mut self, program: &Program, root_ip: usize) -> Result<usize, JitNyiReason> {
-        let code = &program.code;
-        let mut ip = root_ip;
-        let mut steps = Vec::new();
-        let mut step_ips = Vec::new();
-
-        while steps.len() < self.config.max_trace_len {
-            let instr_ip = ip;
-            let opcode = *code
-                .get(ip)
-                .ok_or(JitNyiReason::InvalidJumpTarget { target: ip })?;
-            ip = ip.saturating_add(1);
-
-            if opcode == OpCode::Nop as u8 {
-                step_ips.push(instr_ip);
-                steps.push(TraceStep::Nop);
-                continue;
+    fn finish_attempt(
+        &mut self,
+        ip: usize,
+        line: Option<u32>,
+        result: Result<usize, JitNyiReason>,
+    ) -> Option<usize> {
+        match result {
+            Ok(trace_id) => {
+                self.attempts.push(JitAttempt {
+                    root_ip: ip,
+                    line,
+                    result: Ok(trace_id),
+                });
+                self.compiled_by_root.insert(ip, trace_id);
+                Some(trace_id)
             }
-            if opcode == OpCode::Ret as u8 {
-                step_ips.push(instr_ip);
-                steps.push(TraceStep::Ret);
-                return self.finish_trace(
-                    program,
-                    root_ip,
-                    steps,
-                    step_ips,
-                    JitTraceTerminal::Halt,
-                );
+            Err(reason) => {
+                self.attempts.push(JitAttempt {
+                    root_ip: ip,
+                    line,
+                    result: Err(reason),
+                });
+                self.blocked_roots.insert(ip);
+                None
             }
-            if opcode == OpCode::Ldc as u8 {
-                let value = read_u32(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("ldc"))?;
-                step_ips.push(instr_ip);
-                steps.push(TraceStep::Ldc(value));
-                continue;
-            }
-            if opcode == OpCode::Add as u8 {
-                step_ips.push(instr_ip);
-                steps.push(typed_trace_step(program, instr_ip, opcode));
-                continue;
-            }
-            if opcode == OpCode::Sub as u8 {
-                step_ips.push(instr_ip);
-                steps.push(typed_trace_step(program, instr_ip, opcode));
-                continue;
-            }
-            if opcode == OpCode::Mul as u8 {
-                step_ips.push(instr_ip);
-                steps.push(typed_trace_step(program, instr_ip, opcode));
-                continue;
-            }
-            if opcode == OpCode::Div as u8 {
-                step_ips.push(instr_ip);
-                steps.push(typed_trace_step(program, instr_ip, opcode));
-                continue;
-            }
-            if opcode == OpCode::Mod as u8 {
-                step_ips.push(instr_ip);
-                steps.push(typed_trace_step(program, instr_ip, opcode));
-                continue;
-            }
-            if opcode == OpCode::Shl as u8 {
-                step_ips.push(instr_ip);
-                steps.push(TraceStep::Shl);
-                continue;
-            }
-            if opcode == OpCode::Shr as u8 {
-                step_ips.push(instr_ip);
-                steps.push(TraceStep::Shr);
-                continue;
-            }
-            if opcode == OpCode::Lshr as u8 {
-                step_ips.push(instr_ip);
-                steps.push(TraceStep::Lshr);
-                continue;
-            }
-            if opcode == OpCode::And as u8 {
-                step_ips.push(instr_ip);
-                steps.push(TraceStep::And);
-                continue;
-            }
-            if opcode == OpCode::Or as u8 {
-                step_ips.push(instr_ip);
-                steps.push(TraceStep::Or);
-                continue;
-            }
-            if opcode == OpCode::Not as u8 {
-                step_ips.push(instr_ip);
-                steps.push(TraceStep::Not);
-                continue;
-            }
-            if opcode == OpCode::Neg as u8 {
-                step_ips.push(instr_ip);
-                steps.push(typed_trace_step(program, instr_ip, opcode));
-                continue;
-            }
-            if opcode == OpCode::Ceq as u8 {
-                step_ips.push(instr_ip);
-                steps.push(typed_trace_step(program, instr_ip, opcode));
-                continue;
-            }
-            if opcode == OpCode::Clt as u8 {
-                step_ips.push(instr_ip);
-                steps.push(typed_trace_step(program, instr_ip, opcode));
-                continue;
-            }
-            if opcode == OpCode::Cgt as u8 {
-                step_ips.push(instr_ip);
-                steps.push(typed_trace_step(program, instr_ip, opcode));
-                continue;
-            }
-            if opcode == OpCode::Pop as u8 {
-                step_ips.push(instr_ip);
-                steps.push(TraceStep::Pop);
-                continue;
-            }
-            if opcode == OpCode::Dup as u8 {
-                step_ips.push(instr_ip);
-                steps.push(TraceStep::Dup);
-                continue;
-            }
-            if opcode == OpCode::Ldloc as u8 {
-                let index =
-                    read_u8(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("ldloc"))?;
-                step_ips.push(instr_ip);
-                steps.push(TraceStep::Ldloc(index));
-                continue;
-            }
-            if opcode == OpCode::Stloc as u8 {
-                let index =
-                    read_u8(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("stloc"))?;
-                step_ips.push(instr_ip);
-                steps.push(TraceStep::Stloc(index));
-                continue;
-            }
-            if opcode == OpCode::Brfalse as u8 {
-                match record_trace_branch(
-                    program,
-                    code,
-                    TraceBranchLocation { root_ip, instr_ip },
-                    opcode,
-                    &mut ip,
-                    &mut steps,
-                    &mut step_ips,
-                )? {
-                    TraceBranchOutcome::Continue => {}
-                    TraceBranchOutcome::Finish(terminal) => {
-                        return self.finish_trace(program, root_ip, steps, step_ips, terminal);
-                    }
-                }
-                continue;
-            }
-            if opcode == OpCode::Br as u8 {
-                match record_trace_branch(
-                    program,
-                    code,
-                    TraceBranchLocation { root_ip, instr_ip },
-                    opcode,
-                    &mut ip,
-                    &mut steps,
-                    &mut step_ips,
-                )? {
-                    TraceBranchOutcome::Continue => {}
-                    TraceBranchOutcome::Finish(terminal) => {
-                        return self.finish_trace(program, root_ip, steps, step_ips, terminal);
-                    }
-                }
-                continue;
-            }
-            if opcode == OpCode::Call as u8 {
-                let call_ip = ip.saturating_sub(1);
-                let index =
-                    read_u16(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("call index"))?;
-                let argc =
-                    read_u8(code, &mut ip).ok_or(JitNyiReason::InvalidImmediate("call argc"))?;
-                if let Some(builtin) = BuiltinFunction::from_call_index(index) {
-                    if !builtin.accepts_arity(argc) {
-                        return Err(JitNyiReason::InvalidImmediate("builtin call arity"));
-                    }
-                    step_ips.push(instr_ip);
-                    steps.push(
-                        typed_builtin_trace_step(program, call_ip, builtin).unwrap_or(
-                            TraceStep::BuiltinCall {
-                                index,
-                                argc,
-                                call_ip,
-                            },
-                        ),
-                    );
-                } else {
-                    step_ips.push(instr_ip);
-                    steps.push(TraceStep::Call {
-                        index,
-                        argc,
-                        call_ip,
-                    });
-                }
-                continue;
-            }
-
-            return Err(JitNyiReason::UnsupportedOpcode(opcode));
         }
-
-        Err(JitNyiReason::TraceTooLong {
-            limit: self.config.max_trace_len,
-        })
     }
 
-    fn finish_trace(
-        &mut self,
-        program: &Program,
-        root_ip: usize,
-        steps: Vec<TraceStep>,
-        step_ips: Vec<usize>,
-        terminal: JitTraceTerminal,
-    ) -> Result<usize, JitNyiReason> {
-        let (steps, step_ips) = optimize_trace_steps(program, steps, step_ips);
-        debug_assert_eq!(
-            steps.len(),
-            step_ips.len(),
-            "trace steps and step_ips must stay aligned"
-        );
-        if let Some(target) = missing_loop_if_false_target(&steps, &step_ips) {
-            return Err(JitNyiReason::InvalidJumpTarget { target });
-        }
+    fn compile_trace(&mut self, program: &Program, root_ip: usize) -> Result<usize, JitNyiReason> {
+        let recorded = record_trace(program, root_ip, self.config.max_trace_len).map_err(to_nyi)?;
         let id = self.traces.len();
         let start_line = program
             .debug
             .as_ref()
             .and_then(|debug| debug.line_for_offset(root_ip));
-        let has_call = steps
-            .iter()
-            .any(|step| matches!(step, TraceStep::Call { .. } | TraceStep::BuiltinCall { .. }));
-        let has_yielding_call = steps.iter().any(|step| {
-            if let TraceStep::Call { index, .. } = step {
-                BuiltinFunction::from_call_index(*index).is_none()
-            } else {
-                false
-            }
-        });
-        let step_index_lookup = build_trace_step_index_lookup(&step_ips);
-        self.traces.push(JitTrace {
-            id,
-            root_ip,
-            start_line,
-            has_call,
-            has_yielding_call,
-            steps,
-            step_ips,
-            terminal,
-            executions: 0,
-        });
-        self.trace_step_indices_by_ip.push(step_index_lookup);
+        let trace = build_jit_trace(id, root_ip, start_line, recorded);
+        self.traces.push(trace);
         Ok(id)
     }
 
@@ -786,527 +428,58 @@ impl TraceJitEngine {
             .as_ref()
             .is_some_and(|headers| headers.contains(&ip))
     }
-}
 
-fn build_trace_step_index_lookup(step_ips: &[usize]) -> Arc<HashMap<usize, usize>> {
-    Arc::new(
-        step_ips
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(step_index, step_ip)| (step_ip, step_index))
-            .collect(),
-    )
-}
-
-fn read_u8(code: &[u8], ip: &mut usize) -> Option<u8> {
-    let value = *code.get(*ip)?;
-    *ip = ip.saturating_add(1);
-    Some(value)
-}
-
-fn read_u32(code: &[u8], ip: &mut usize) -> Option<u32> {
-    if ip.saturating_add(4) > code.len() {
-        return None;
-    }
-    let bytes = [code[*ip], code[*ip + 1], code[*ip + 2], code[*ip + 3]];
-    *ip = ip.saturating_add(4);
-    Some(u32::from_le_bytes(bytes))
-}
-
-fn straight_line_if_join_side_entry(
-    code: &[u8],
-    side_start: usize,
-    join_ip: usize,
-) -> Option<usize> {
-    let mut cursor = side_start;
-    while cursor < join_ip {
-        let opcode = OpCode::try_from(*code.get(cursor)?).ok()?;
-        cursor = cursor.saturating_add(1);
-        match opcode {
-            OpCode::Br => {
-                let target = read_u32(code, &mut cursor)? as usize;
-                return (target == join_ip && cursor == join_ip).then_some(side_start);
-            }
-            OpCode::Brfalse | OpCode::Ret => return None,
-            _ => {
-                let operand_len = opcode.operand_len();
-                if cursor.saturating_add(operand_len) > join_ip {
-                    return None;
-                }
-                cursor = cursor.saturating_add(operand_len);
+    fn aggregate_metrics(&self, mut runtime_metrics: JitMetrics) -> JitMetrics {
+        for trace in &self.traces {
+            runtime_metrics.boxed_load_site_count = runtime_metrics
+                .boxed_load_site_count
+                .saturating_add(boxed_load_site_count(&trace.ssa));
+            runtime_metrics.boxed_store_site_count = runtime_metrics
+                .boxed_store_site_count
+                .saturating_add(boxed_store_site_count(&trace.ssa));
+            if trace.terminal == JitTraceTerminal::LoopBack {
+                runtime_metrics.native_loop_back_count =
+                    runtime_metrics.native_loop_back_count.saturating_add(1);
             }
         }
+        runtime_metrics
     }
-    None
 }
 
-fn can_prefer_join_path(program: &Program, steps: &[TraceStep]) -> bool {
-    !matches!(
-        steps.last(),
-        Some(TraceStep::Ldc(index))
-            if matches!(program.constants.get(*index as usize), Some(Value::Bool(_)))
-    )
-}
-
-enum TraceBranchOutcome {
-    Continue,
-    Finish(JitTraceTerminal),
-}
-
-#[derive(Clone, Copy)]
-struct TraceBranchLocation {
+fn build_jit_trace(
+    id: usize,
     root_ip: usize,
-    instr_ip: usize,
-}
-
-fn record_trace_branch(
-    program: &Program,
-    code: &[u8],
-    location: TraceBranchLocation,
-    opcode: u8,
-    ip: &mut usize,
-    steps: &mut Vec<TraceStep>,
-    step_ips: &mut Vec<usize>,
-) -> Result<TraceBranchOutcome, JitNyiReason> {
-    if opcode == OpCode::Brfalse as u8 {
-        let target_u32 = read_u32(code, ip).ok_or(JitNyiReason::InvalidImmediate("brfalse"))?;
-        let target = target_u32 as usize;
-        if target >= code.len() {
-            return Err(JitNyiReason::InvalidJumpTarget { target });
-        }
-        let fallthrough_ip = *ip;
-        step_ips.push(location.instr_ip);
-        if target < fallthrough_ip {
-            if step_ips[..step_ips.len().saturating_sub(1)].contains(&target) {
-                steps.push(TraceStep::LoopIfFalse {
-                    target_ip: target,
-                    exit_ip: fallthrough_ip,
-                });
-                return Ok(TraceBranchOutcome::Finish(JitTraceTerminal::BranchExit));
-            }
-            steps.push(TraceStep::GuardFalse { exit_ip: target });
-            return Ok(TraceBranchOutcome::Continue);
-        }
-        if can_prefer_join_path(program, steps)
-            && let Some(side_entry_ip) =
-                straight_line_if_join_side_entry(code, fallthrough_ip, target)
-        {
-            steps.push(TraceStep::GuardTrue {
-                exit_ip: side_entry_ip,
-            });
-            *ip = target;
-        } else {
-            steps.push(TraceStep::GuardFalse { exit_ip: target });
-        }
-        return Ok(TraceBranchOutcome::Continue);
-    }
-
-    let target_u32 = read_u32(code, ip).ok_or(JitNyiReason::InvalidImmediate("br"))?;
-    let target = target_u32 as usize;
-    if target >= code.len() {
-        return Err(JitNyiReason::InvalidJumpTarget { target });
-    }
-    if target == location.root_ip {
-        step_ips.push(location.instr_ip);
-        steps.push(TraceStep::JumpToRoot);
-        return Ok(TraceBranchOutcome::Finish(JitTraceTerminal::LoopBack));
-    }
-    if target < *ip {
-        step_ips.push(location.instr_ip);
-        steps.push(TraceStep::JumpToIp { target_ip: target });
-        return Ok(TraceBranchOutcome::Finish(JitTraceTerminal::BranchExit));
-    }
-    // Follow forward unconditional branches to avoid creating tiny branch-exit traces.
-    *ip = target;
-    Ok(TraceBranchOutcome::Continue)
-}
-
-fn optimize_trace_steps(
-    program: &Program,
-    steps: Vec<TraceStep>,
-    step_ips: Vec<usize>,
-) -> (Vec<TraceStep>, Vec<usize>) {
-    debug_assert_eq!(steps.len(), step_ips.len());
-    let loop_targets = steps
-        .iter()
-        .filter_map(|step| match step {
-            TraceStep::LoopIfFalse { target_ip, .. } => Some(*target_ip),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-    let mut optimized_steps = Vec::with_capacity(steps.len());
-    let mut optimized_ips = Vec::with_capacity(step_ips.len());
-    let mut cursor = 0usize;
-
-    while cursor < steps.len() {
-        if let Some((step, consumed)) = fuse_local_int_immediate_step(program, &steps[cursor..])
-            && fusion_preserves_loop_targets(&loop_targets, &step_ips, cursor, consumed)
-        {
-            optimized_steps.push(step);
-            optimized_ips.push(step_ips[cursor]);
-            cursor += consumed;
-            continue;
-        }
-        if let Some((step, consumed)) = fuse_local_float_immediate_step(program, &steps[cursor..])
-            && fusion_preserves_loop_targets(&loop_targets, &step_ips, cursor, consumed)
-        {
-            optimized_steps.push(step);
-            optimized_ips.push(step_ips[cursor]);
-            cursor += consumed;
-            continue;
-        }
-        if let Some((step, consumed)) = fuse_stack_int_immediate_step(program, &steps[cursor..])
-            && fusion_preserves_loop_targets(&loop_targets, &step_ips, cursor, consumed)
-        {
-            optimized_steps.push(step);
-            optimized_ips.push(step_ips[cursor]);
-            cursor += consumed;
-            continue;
-        }
-        if let Some((step, consumed)) = fuse_stack_float_immediate_step(program, &steps[cursor..])
-            && fusion_preserves_loop_targets(&loop_targets, &step_ips, cursor, consumed)
-        {
-            optimized_steps.push(step);
-            optimized_ips.push(step_ips[cursor]);
-            cursor += consumed;
-            continue;
-        }
-
-        optimized_steps.push(steps[cursor].clone());
-        optimized_ips.push(step_ips[cursor]);
-        cursor += 1;
-    }
-
-    (optimized_steps, optimized_ips)
-}
-
-fn fusion_preserves_loop_targets(
-    loop_targets: &HashSet<usize>,
-    step_ips: &[usize],
-    cursor: usize,
-    consumed: usize,
-) -> bool {
-    !step_ips[cursor.saturating_add(1)..cursor.saturating_add(consumed)]
-        .iter()
-        .any(|ip| loop_targets.contains(ip))
-}
-
-fn missing_loop_if_false_target(steps: &[TraceStep], step_ips: &[usize]) -> Option<usize> {
-    let step_ip_set = step_ips.iter().copied().collect::<HashSet<_>>();
-    steps.iter().find_map(|step| match step {
-        TraceStep::LoopIfFalse { target_ip, .. } if !step_ip_set.contains(target_ip) => {
-            Some(*target_ip)
-        }
-        _ => None,
-    })
-}
-
-fn fuse_local_int_immediate_step(
-    program: &Program,
-    steps: &[TraceStep],
-) -> Option<(TraceStep, usize)> {
-    let [TraceStep::Ldloc(local), TraceStep::Ldc(index), op, ..] = steps else {
-        return None;
-    };
-    let imm = int_constant(program, *index)?;
-    let step = match op {
-        TraceStep::IAdd => TraceStep::ILocalAddImm { local: *local, imm },
-        TraceStep::ISub => TraceStep::ILocalSubImm { local: *local, imm },
-        TraceStep::IMul => TraceStep::ILocalMulImm { local: *local, imm },
-        TraceStep::IDiv => TraceStep::ILocalDivImm { local: *local, imm },
-        TraceStep::IMod => TraceStep::ILocalModImm { local: *local, imm },
-        TraceStep::Clt => TraceStep::ILocalCltImm { local: *local, imm },
-        TraceStep::Cgt => TraceStep::ILocalCgtImm { local: *local, imm },
-        TraceStep::Shl => {
-            let amount = u32::try_from(imm).ok()?;
-            if amount > 63 {
-                return None;
-            }
-            TraceStep::ILocalShlImm {
-                local: *local,
-                amount,
-            }
-        }
-        _ => return None,
-    };
-    Some((step, 3))
-}
-
-fn fuse_local_float_immediate_step(
-    program: &Program,
-    steps: &[TraceStep],
-) -> Option<(TraceStep, usize)> {
-    let [TraceStep::Ldloc(local), TraceStep::Ldc(index), op, ..] = steps else {
-        return None;
-    };
-    let imm_bits = float_constant_bits(program, *index)?;
-    let step = match op {
-        TraceStep::FAdd => TraceStep::FLocalAddImm {
-            local: *local,
-            imm_bits,
-        },
-        TraceStep::FSub => TraceStep::FLocalSubImm {
-            local: *local,
-            imm_bits,
-        },
-        TraceStep::FMul => TraceStep::FLocalMulImm {
-            local: *local,
-            imm_bits,
-        },
-        TraceStep::FDiv => TraceStep::FLocalDivImm {
-            local: *local,
-            imm_bits,
-        },
-        TraceStep::FMod => TraceStep::FLocalModImm {
-            local: *local,
-            imm_bits,
-        },
-        TraceStep::FClt => TraceStep::FLocalCltImm {
-            local: *local,
-            imm_bits,
-        },
-        TraceStep::FCgt => TraceStep::FLocalCgtImm {
-            local: *local,
-            imm_bits,
-        },
-        _ => return None,
-    };
-    Some((step, 3))
-}
-
-fn fuse_stack_int_immediate_step(
-    program: &Program,
-    steps: &[TraceStep],
-) -> Option<(TraceStep, usize)> {
-    let [TraceStep::Ldc(index), op, ..] = steps else {
-        return None;
-    };
-    let imm = int_constant(program, *index)?;
-    let step = match op {
-        TraceStep::IAdd => TraceStep::IAddImm(imm),
-        TraceStep::ISub => TraceStep::ISubImm(imm),
-        TraceStep::IMul => TraceStep::IMulImm(imm),
-        TraceStep::IDiv => TraceStep::IDivImm(imm),
-        TraceStep::IMod => TraceStep::IModImm(imm),
-        _ => return None,
-    };
-    Some((step, 2))
-}
-
-fn fuse_stack_float_immediate_step(
-    program: &Program,
-    steps: &[TraceStep],
-) -> Option<(TraceStep, usize)> {
-    let [TraceStep::Ldc(index), op, ..] = steps else {
-        return None;
-    };
-    let imm_bits = float_constant_bits(program, *index)?;
-    let step = match op {
-        TraceStep::FAdd => TraceStep::FAddImm(imm_bits),
-        TraceStep::FSub => TraceStep::FSubImm(imm_bits),
-        TraceStep::FMul => TraceStep::FMulImm(imm_bits),
-        TraceStep::FDiv => TraceStep::FDivImm(imm_bits),
-        TraceStep::FMod => TraceStep::FModImm(imm_bits),
-        _ => return None,
-    };
-    Some((step, 2))
-}
-
-fn int_constant(program: &Program, index: u32) -> Option<i64> {
-    match program.constants.get(index as usize) {
-        Some(Value::Int(value)) => Some(*value),
-        _ => None,
+    start_line: Option<u32>,
+    recorded: RecordedTrace,
+) -> JitTrace {
+    JitTrace {
+        id,
+        root_ip,
+        start_line,
+        has_call: recorded.has_call,
+        has_yielding_call: recorded.has_yielding_call,
+        op_names: recorded.op_names,
+        terminal: recorded.terminal,
+        executions: 0,
+        ssa: recorded.ssa,
     }
 }
 
-fn float_constant_bits(program: &Program, index: u32) -> Option<u64> {
-    match program.constants.get(index as usize) {
-        Some(Value::Float(value)) => Some(value.to_bits()),
-        _ => None,
-    }
-}
-
-fn typed_trace_step(program: &Program, ip: usize, opcode: u8) -> TraceStep {
-    let operand_types = program
-        .type_map
-        .as_ref()
-        .and_then(|type_map| type_map.operand_types.get(&ip))
-        .copied()
-        .unwrap_or((ValueType::Unknown, ValueType::Unknown));
-    match (opcode, operand_types) {
-        (x, (ValueType::Int, ValueType::Int)) if x == OpCode::Add as u8 => TraceStep::IAdd,
-        (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Add as u8 => TraceStep::FAdd,
-        (x, (ValueType::String, ValueType::String)) if x == OpCode::Add as u8 => {
-            TraceStep::Concat(TraceConcatKind::String)
+fn to_nyi(err: TraceRecordError) -> JitNyiReason {
+    match err {
+        TraceRecordError::UnsupportedOpcode(op) => JitNyiReason::UnsupportedOpcode(op),
+        TraceRecordError::UnsupportedTrace(detail) => JitNyiReason::UnsupportedTrace(detail),
+        TraceRecordError::InvalidJumpTarget { target } => {
+            JitNyiReason::InvalidJumpTarget { target }
         }
-        (x, (ValueType::Bytes, ValueType::Bytes)) if x == OpCode::Add as u8 => {
-            TraceStep::Concat(TraceConcatKind::Bytes)
-        }
-        (x, (ValueType::Int, ValueType::Int)) if x == OpCode::Sub as u8 => TraceStep::ISub,
-        (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Sub as u8 => TraceStep::FSub,
-        (x, (ValueType::Int, ValueType::Int)) if x == OpCode::Mul as u8 => TraceStep::IMul,
-        (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Mul as u8 => TraceStep::FMul,
-        (x, (ValueType::Int, ValueType::Int)) if x == OpCode::Div as u8 => TraceStep::IDiv,
-        (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Div as u8 => TraceStep::FDiv,
-        (x, (ValueType::Int, ValueType::Int)) if x == OpCode::Mod as u8 => TraceStep::IMod,
-        (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Mod as u8 => TraceStep::FMod,
-        (x, (ValueType::Int, _)) if x == OpCode::Neg as u8 => TraceStep::INeg,
-        (x, (ValueType::Float, _)) if x == OpCode::Neg as u8 => TraceStep::FNeg,
-        (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Ceq as u8 => TraceStep::FCeq,
-        (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Clt as u8 => TraceStep::FClt,
-        (x, (ValueType::Float, ValueType::Float)) if x == OpCode::Cgt as u8 => TraceStep::FCgt,
-        (x, _) if x == OpCode::Add as u8 => TraceStep::Add,
-        (x, _) if x == OpCode::Sub as u8 => TraceStep::Sub,
-        (x, _) if x == OpCode::Mul as u8 => TraceStep::Mul,
-        (x, _) if x == OpCode::Div as u8 => TraceStep::Div,
-        (x, _) if x == OpCode::Mod as u8 => TraceStep::Mod,
-        (x, _) if x == OpCode::Neg as u8 => TraceStep::Neg,
-        (x, _) if x == OpCode::Ceq as u8 => TraceStep::Ceq,
-        (x, _) if x == OpCode::Clt as u8 => TraceStep::Clt,
-        (x, _) if x == OpCode::Cgt as u8 => TraceStep::Cgt,
-        _ => unreachable!("typed_trace_step only supports arithmetic/comparison opcodes"),
-    }
-}
-
-fn builtin_operand_types(program: &Program, call_ip: usize) -> (ValueType, ValueType) {
-    program
-        .type_map
-        .as_ref()
-        .and_then(|type_map| type_map.operand_types.get(&call_ip))
-        .copied()
-        .unwrap_or((ValueType::Unknown, ValueType::Unknown))
-}
-
-fn typed_builtin_trace_step(
-    program: &Program,
-    call_ip: usize,
-    builtin: BuiltinFunction,
-) -> Option<TraceStep> {
-    let (lhs, rhs) = builtin_operand_types(program, call_ip);
-    match builtin {
-        BuiltinFunction::Len => match lhs {
-            ValueType::String => Some(TraceStep::Len(TraceTextBytesKind::String)),
-            ValueType::Bytes => Some(TraceStep::Len(TraceTextBytesKind::Bytes)),
-            _ => None,
-        },
-        BuiltinFunction::Slice => match lhs {
-            ValueType::String => Some(TraceStep::Slice(TraceTextBytesKind::String)),
-            ValueType::Bytes => Some(TraceStep::Slice(TraceTextBytesKind::Bytes)),
-            _ => None,
-        },
-        BuiltinFunction::Concat => match (lhs, rhs) {
-            (ValueType::String, ValueType::String) => {
-                Some(TraceStep::Concat(TraceConcatKind::String))
-            }
-            (ValueType::Bytes, ValueType::Bytes) => Some(TraceStep::Concat(TraceConcatKind::Bytes)),
-            _ => None,
-        },
-        BuiltinFunction::Get => match lhs {
-            ValueType::String => Some(TraceStep::Get(TraceTextBytesKind::String)),
-            ValueType::Bytes => Some(TraceStep::Get(TraceTextBytesKind::Bytes)),
-            _ => None,
-        },
-        BuiltinFunction::Has if lhs == ValueType::Bytes => Some(TraceStep::HasBytes),
-        BuiltinFunction::BytesFromArrayU8 if lhs == ValueType::Array => {
-            Some(TraceStep::BytesCodec(TraceBytesCodecKind::FromArrayU8))
-        }
-        BuiltinFunction::BytesToArrayU8 if lhs == ValueType::Bytes => {
-            Some(TraceStep::BytesCodec(TraceBytesCodecKind::ToArrayU8))
-        }
-        _ => None,
-    }
-}
-
-fn trace_step_name(step: &TraceStep) -> &'static str {
-    match step {
-        TraceStep::Nop => "nop",
-        TraceStep::Ldc(_) => "ldc",
-        TraceStep::Add => "add",
-        TraceStep::IAdd => "add",
-        TraceStep::IAddImm(_) => "add_imm",
-        TraceStep::ILocalAddImm { .. } => "ldloc_add_imm",
-        TraceStep::FAdd => "add",
-        TraceStep::FAddImm(_) => "fadd_imm",
-        TraceStep::FLocalAddImm { .. } => "ldloc_fadd_imm",
-        TraceStep::Concat(TraceConcatKind::String) => "concat_string",
-        TraceStep::Concat(TraceConcatKind::Bytes) => "concat_bytes",
-        TraceStep::Len(TraceTextBytesKind::String) => "len_string",
-        TraceStep::Len(TraceTextBytesKind::Bytes) => "len_bytes",
-        TraceStep::Slice(TraceTextBytesKind::String) => "slice_string",
-        TraceStep::Slice(TraceTextBytesKind::Bytes) => "slice_bytes",
-        TraceStep::Get(TraceTextBytesKind::String) => "get_string",
-        TraceStep::Get(TraceTextBytesKind::Bytes) => "get_bytes",
-        TraceStep::HasBytes => "has_bytes",
-        TraceStep::BytesCodec(TraceBytesCodecKind::FromUtf8) => "bytes_from_utf8",
-        TraceStep::BytesCodec(TraceBytesCodecKind::ToUtf8) => "bytes_to_utf8",
-        TraceStep::BytesCodec(TraceBytesCodecKind::ToUtf8Lossy) => "bytes_to_utf8_lossy",
-        TraceStep::BytesCodec(TraceBytesCodecKind::FromHex) => "bytes_from_hex",
-        TraceStep::BytesCodec(TraceBytesCodecKind::ToHex) => "bytes_to_hex",
-        TraceStep::BytesCodec(TraceBytesCodecKind::FromBase64) => "bytes_from_base64",
-        TraceStep::BytesCodec(TraceBytesCodecKind::ToBase64) => "bytes_to_base64",
-        TraceStep::BytesCodec(TraceBytesCodecKind::FromArrayU8) => "bytes_from_array_u8",
-        TraceStep::BytesCodec(TraceBytesCodecKind::ToArrayU8) => "bytes_to_array_u8",
-        TraceStep::Sub => "sub",
-        TraceStep::ISub => "sub",
-        TraceStep::ISubImm(_) => "sub_imm",
-        TraceStep::ILocalSubImm { .. } => "ldloc_sub_imm",
-        TraceStep::FSub => "sub",
-        TraceStep::FSubImm(_) => "fsub_imm",
-        TraceStep::FLocalSubImm { .. } => "ldloc_fsub_imm",
-        TraceStep::Mul => "mul",
-        TraceStep::IMul => "mul",
-        TraceStep::IMulImm(_) => "mul_imm",
-        TraceStep::ILocalMulImm { .. } => "ldloc_mul_imm",
-        TraceStep::FMul => "mul",
-        TraceStep::FMulImm(_) => "fmul_imm",
-        TraceStep::FLocalMulImm { .. } => "ldloc_fmul_imm",
-        TraceStep::Div => "div",
-        TraceStep::IDiv => "div",
-        TraceStep::IDivImm(_) => "div_imm",
-        TraceStep::ILocalDivImm { .. } => "ldloc_div_imm",
-        TraceStep::FDiv => "div",
-        TraceStep::FDivImm(_) => "fdiv_imm",
-        TraceStep::FLocalDivImm { .. } => "ldloc_fdiv_imm",
-        TraceStep::Mod => "mod",
-        TraceStep::IMod => "mod",
-        TraceStep::IModImm(_) => "mod_imm",
-        TraceStep::ILocalModImm { .. } => "ldloc_mod_imm",
-        TraceStep::FMod => "mod",
-        TraceStep::FModImm(_) => "fmod_imm",
-        TraceStep::FLocalModImm { .. } => "ldloc_fmod_imm",
-        TraceStep::Shl => "shl",
-        TraceStep::Shr => "shr",
-        TraceStep::Lshr => "lshr",
-        TraceStep::And => "and",
-        TraceStep::Or => "or",
-        TraceStep::Not => "not",
-        TraceStep::Neg => "neg",
-        TraceStep::INeg => "neg",
-        TraceStep::FNeg => "neg",
-        TraceStep::Ceq => "ceq",
-        TraceStep::FCeq => "ceq",
-        TraceStep::Clt => "clt",
-        TraceStep::ILocalCltImm { .. } => "ldloc_clt_imm",
-        TraceStep::FClt => "clt",
-        TraceStep::FLocalCltImm { .. } => "ldloc_fclt_imm",
-        TraceStep::Cgt => "cgt",
-        TraceStep::ILocalCgtImm { .. } => "ldloc_cgt_imm",
-        TraceStep::FCgt => "cgt",
-        TraceStep::FLocalCgtImm { .. } => "ldloc_fcgt_imm",
-        TraceStep::Pop => "pop",
-        TraceStep::Dup => "dup",
-        TraceStep::Ldloc(_) => "ldloc",
-        TraceStep::ILocalShlImm { .. } => "ldloc_shl_imm",
-        TraceStep::Stloc(_) => "stloc",
-        TraceStep::BuiltinCall { .. } => "call",
-        TraceStep::Call { .. } => "call",
-        TraceStep::GuardFalse { .. } => "guard_false",
-        TraceStep::LoopIfFalse { .. } => "loop_if_false",
-        TraceStep::GuardTrue { .. } => "guard_true",
-        TraceStep::JumpToIp { .. } => "jump_ip",
-        TraceStep::JumpToRoot => "jump_root",
-        TraceStep::Ret => "ret",
+        TraceRecordError::InvalidImmediate(kind) => JitNyiReason::InvalidImmediate(kind),
+        TraceRecordError::TraceTooLong { limit } => JitNyiReason::TraceTooLong { limit },
+        TraceRecordError::MissingTerminal => JitNyiReason::MissingTerminal,
+        TraceRecordError::InvalidLocal(_)
+        | TraceRecordError::StackUnderflow
+        | TraceRecordError::TypeMismatch { .. }
+        | TraceRecordError::LiveStackOnBackedge { .. }
+        | TraceRecordError::InvalidIr(_) => JitNyiReason::UnsupportedTrace(err.to_string()),
     }
 }
 
@@ -1354,6 +527,12 @@ fn scan_loop_headers(program: &Program) -> HashSet<usize> {
     headers
 }
 
+fn read_u8(code: &[u8], ip: &mut usize) -> Option<u8> {
+    let value = *code.get(*ip)?;
+    *ip = ip.saturating_add(1);
+    Some(value)
+}
+
 fn read_u16(code: &[u8], ip: &mut usize) -> Option<u16> {
     if ip.saturating_add(2) > code.len() {
         return None;
@@ -1361,6 +540,15 @@ fn read_u16(code: &[u8], ip: &mut usize) -> Option<u16> {
     let bytes = [code[*ip], code[*ip + 1]];
     *ip = ip.saturating_add(2);
     Some(u16::from_le_bytes(bytes))
+}
+
+fn read_u32(code: &[u8], ip: &mut usize) -> Option<u32> {
+    if ip.saturating_add(4) > code.len() {
+        return None;
+    }
+    let bytes = [code[*ip], code[*ip + 1], code[*ip + 2], code[*ip + 3]];
+    *ip = ip.saturating_add(4);
+    Some(u32::from_le_bytes(bytes))
 }
 
 fn nyi_reference() -> Vec<JitNyiDoc> {
@@ -1379,40 +567,19 @@ fn nyi_reference() -> Vec<JitNyiDoc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{BytecodeBuilder, Value};
 
     #[test]
-    fn finish_trace_preserves_targeted_step_ips_during_fusion() {
-        let program = Program::new(vec![Value::Int(1)], vec![]);
-        let steps = vec![
-            TraceStep::Ldloc(0),
-            TraceStep::Ldc(0),
-            TraceStep::IAdd,
-            TraceStep::LoopIfFalse {
-                target_ip: 17,
-                exit_ip: 40,
-            },
-        ];
-        let step_ips = vec![10, 12, 17, 20];
+    fn scan_loop_headers_finds_backward_targets() {
+        let mut bc = BytecodeBuilder::new();
+        let root_ip = bc.position();
+        bc.ldc(0);
+        let branch_ip = bc.position();
+        bc.br(root_ip);
+        let program = Program::new(vec![Value::Int(1)], bc.finish());
 
-        let mut engine = TraceJitEngine::new(JitConfig {
-            enabled: true,
-            hot_loop_threshold: 1,
-            max_trace_len: 16,
-        });
-        let trace_id = engine
-            .finish_trace(
-                &program,
-                10,
-                steps.clone(),
-                step_ips.clone(),
-                JitTraceTerminal::BranchExit,
-            )
-            .expect("finish_trace should keep targeted step ips intact");
-        let trace = engine
-            .trace_clone(trace_id)
-            .expect("compiled trace should be stored");
-
-        assert_eq!(trace.steps, steps);
-        assert_eq!(trace.step_ips, step_ips);
+        let headers = scan_loop_headers(&program);
+        assert!(headers.contains(&(root_ip as usize)));
+        assert!(!headers.contains(&(branch_ip as usize)));
     }
 }

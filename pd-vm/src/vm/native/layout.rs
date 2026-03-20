@@ -39,9 +39,7 @@ pub(crate) struct NativeStackLayout {
     pub(crate) vm_program_constants_ptr_offset: i32,
     pub(crate) vm_program_constants_len_offset: i32,
     pub(crate) vm_ip_offset: i32,
-    pub(crate) vm_interrupt_mode_offset: i32,
     pub(crate) vm_fuel_remaining_offset: i32,
-    pub(crate) vm_fuel_check_interval_offset: i32,
     pub(crate) vm_fuel_ops_until_check_offset: i32,
     pub(crate) vm_epoch_deadline_offset: i32,
     pub(crate) vm_epoch_counter_ptr_offset: i32,
@@ -72,17 +70,9 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         "Vm::program_constants_len offset",
     )?;
     let vm_ip_offset = usize_to_i32(std::mem::offset_of!(Vm, ip), "Vm::ip offset")?;
-    let vm_interrupt_mode_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, interrupt_mode),
-        "Vm::interrupt_mode offset",
-    )?;
     let vm_fuel_remaining_offset = usize_to_i32(
         std::mem::offset_of!(Vm, fuel_remaining),
         "Vm::fuel_remaining offset",
-    )?;
-    let vm_fuel_check_interval_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, fuel_check_interval),
-        "Vm::fuel_check_interval offset",
     )?;
     let vm_fuel_ops_until_check_offset = usize_to_i32(
         std::mem::offset_of!(Vm, fuel_ops_until_check),
@@ -112,9 +102,7 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         vm_program_constants_ptr_offset,
         vm_program_constants_len_offset,
         vm_ip_offset,
-        vm_interrupt_mode_offset,
         vm_fuel_remaining_offset,
-        vm_fuel_check_interval_offset,
         vm_fuel_ops_until_check_offset,
         vm_epoch_deadline_offset,
         vm_epoch_counter_ptr_offset,

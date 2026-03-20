@@ -1,5 +1,5 @@
 use crate::builtins::BuiltinFunction;
-use crate::bytecode::Value;
+use crate::bytecode::{Value, ValueType, VmMap};
 use crate::vm::{HostCallExecOutcome, NumericValue, Vm, VmError, VmResult, logical_shr_i64};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
@@ -220,6 +220,18 @@ pub(crate) fn drop_shared_array_entry_address() -> usize {
     pd_vm_native_drop_shared_array as *const () as usize
 }
 
+pub(crate) fn clone_value_to_slot_entry_address() -> usize {
+    pd_vm_native_clone_value_to_slot as *const () as usize
+}
+
+pub(crate) fn write_heap_value_to_slot_entry_address() -> usize {
+    pd_vm_native_write_heap_value_to_slot as *const () as usize
+}
+
+pub(crate) fn restore_exit_state_entry_address() -> usize {
+    pd_vm_native_restore_exit_state as *const () as usize
+}
+
 pub(crate) fn helper_entry_offset() -> i32 {
     i32::try_from(std::mem::offset_of!(Vm, native_helper_fn))
         .expect("Vm::native_helper_fn offset must fit i32")
@@ -318,6 +330,116 @@ pub(crate) extern "C" fn pd_vm_native_drop_shared_array(ptr: *mut u8) {
     unsafe {
         drop_arc_from_repr_ptr::<Vec<Value>>(ptr);
     }
+}
+
+unsafe fn clone_arc_from_repr_ptr<T>(ptr: *mut u8) -> Arc<T> {
+    let arc = unsafe { arc_from_repr_ptr::<T>(ptr) };
+    let cloned = arc.clone();
+    std::mem::forget(arc);
+    cloned
+}
+
+pub(crate) extern "C" fn pd_vm_native_clone_value_to_slot(
+    dst: *mut Value,
+    src: *const Value,
+) -> i32 {
+    if dst.is_null() || src.is_null() {
+        store_bridge_error(VmError::JitNative(
+            "native clone-value helper received null slot pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+
+    unsafe {
+        std::ptr::write(dst, (*src).clone());
+    }
+    STATUS_CONTINUE
+}
+
+pub(crate) extern "C" fn pd_vm_native_write_heap_value_to_slot(
+    dst: *mut Value,
+    repr_ptr: *mut u8,
+    tag: i64,
+) -> i32 {
+    if dst.is_null() || repr_ptr.is_null() {
+        store_bridge_error(VmError::JitNative(
+            "native box-heap helper received null pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+
+    let value = match tag {
+        x if x == ValueType::String as i64 => {
+            Value::String(unsafe { clone_arc_from_repr_ptr::<String>(repr_ptr) })
+        }
+        x if x == ValueType::Bytes as i64 => {
+            Value::Bytes(unsafe { clone_arc_from_repr_ptr::<Vec<u8>>(repr_ptr) })
+        }
+        x if x == ValueType::Array as i64 => {
+            Value::Array(unsafe { clone_arc_from_repr_ptr::<Vec<Value>>(repr_ptr) })
+        }
+        x if x == ValueType::Map as i64 => {
+            Value::Map(unsafe { clone_arc_from_repr_ptr::<VmMap>(repr_ptr) })
+        }
+        _ => {
+            store_bridge_error(VmError::JitNative(format!(
+                "native box-heap helper received unsupported ValueType tag {tag}"
+            )));
+            return STATUS_ERROR;
+        }
+    };
+
+    unsafe {
+        std::ptr::write(dst, value);
+    }
+    STATUS_CONTINUE
+}
+
+pub(crate) extern "C" fn pd_vm_native_restore_exit_state(
+    vm: *mut Vm,
+    stack_src: *const Value,
+    stack_len: usize,
+    locals_src: *const Value,
+    locals_len: usize,
+    ip: usize,
+) -> i32 {
+    run_step(vm, "restore_exit_state", |vm| {
+        if locals_len != vm.locals.len() {
+            return Err(VmError::JitNative(format!(
+                "native exit restore locals length mismatch: expected {}, got {}",
+                vm.locals.len(),
+                locals_len
+            )));
+        }
+        if stack_len != 0 && stack_src.is_null() {
+            return Err(VmError::JitNative(
+                "native exit restore received null stack buffer".to_string(),
+            ));
+        }
+        if locals_len != 0 && locals_src.is_null() {
+            return Err(VmError::JitNative(
+                "native exit restore received null locals buffer".to_string(),
+            ));
+        }
+
+        vm.clear_stack_with_drop_contract();
+        vm.stack.reserve(stack_len);
+        for index in 0..stack_len {
+            let value = unsafe { std::ptr::read(stack_src.add(index)) };
+            vm.stack.push(value);
+        }
+
+        for index in 0..locals_len {
+            let local_index = u8::try_from(index).map_err(|_| {
+                VmError::JitNative("native exit restore local index out of range".to_string())
+            })?;
+            let value = unsafe { std::ptr::read(locals_src.add(index)) };
+            vm.store_local_with_drop_contract(local_index, value)?;
+        }
+
+        vm.jump_to(ip)?;
+        Ok(STATUS_CONTINUE)
+    })
 }
 
 pub(crate) extern "C" fn pd_vm_native_step(vm: *mut Vm, op: i64, a: i64, b: i64, c: i64) -> i32 {

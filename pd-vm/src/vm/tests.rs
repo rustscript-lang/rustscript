@@ -57,21 +57,21 @@ fn native_trace_cache_resets_when_program_changes() {
 
     let source_one = r#"
         let mut i = 0;
+        let mut sum = 0;
         while i < 8 {
+            sum = sum + i;
             i = i + 1;
         }
-        let mut j = 0;
-        while j < 8 {
-            j = j + 1;
-        }
-        i + j;
+        sum;
     "#;
     let source_two = r#"
         let mut k = 0;
-        while k < 8 {
+        let mut total = 0;
+        while k < 9 {
+            total = total + k;
             k = k + 1;
         }
-        k;
+        total;
     "#;
 
     let compiled_one = crate::compile_source(source_one).expect("source one should compile");

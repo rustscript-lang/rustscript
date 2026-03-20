@@ -230,6 +230,9 @@ pub struct Vm {
     jit: jit::TraceJitEngine,
     native_traces: HashMap<usize, jit::NativeTrace>,
     native_trace_exec_count: u64,
+    jit_trace_exit_count: u64,
+    jit_native_loop_back_count: u64,
+    jit_helper_fallback_count: u64,
     jit_native_bridge_stats_enabled: bool,
     jit_native_bridge_counts: HashMap<&'static str, u64>,
     async_bridge: Option<Box<dyn HostAsyncBridge>>,
@@ -395,6 +398,9 @@ impl Vm {
             jit: jit::TraceJitEngine::new(jit_config),
             native_traces: HashMap::new(),
             native_trace_exec_count: 0,
+            jit_trace_exit_count: 0,
+            jit_native_loop_back_count: 0,
+            jit_helper_fallback_count: 0,
             jit_native_bridge_stats_enabled: false,
             jit_native_bridge_counts: HashMap::new(),
             async_bridge: None,
@@ -1308,7 +1314,11 @@ impl Vm {
                 continue;
             }
 
-            if allow_jit && self.jit_config().enabled {
+            if allow_jit
+                && self.jit_config().enabled
+                && self.builtin_overrides.is_empty()
+                && !self.drop_contract_events_enabled()
+            {
                 let trace_id = {
                     let program = &self.program;
                     self.jit.observe_hot_ip(self.ip, program)

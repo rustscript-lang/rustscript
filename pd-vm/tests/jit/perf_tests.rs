@@ -284,6 +284,93 @@ fn jit_emitted_machine_code_is_executed_on_native_targets() {
 }
 
 #[test]
+#[ignore = "performance/diagnostics harness; run manually"]
+fn perf_jit_diagnostics_capture_exit_and_call_boundary_counters() {
+    if !native_jit_supported() {
+        println!("skipping jit diagnostics harness on unsupported native JIT target");
+        return;
+    }
+
+    let numeric_source = r#"
+        let mut i = 1;
+        let mut sum = 0;
+        while i < 64 {
+            let is_evenish = ((i % 2) == 0) && true;
+            let is_small = (i < 3) || is_evenish;
+            if is_small {
+                sum = sum + 1;
+            } else {
+                sum = sum + 2;
+            }
+            i = i + 1;
+        }
+        sum;
+    "#;
+    let numeric_compiled = compile_source(numeric_source).expect("numeric diagnostics compile");
+    let mut numeric_vm = Vm::new(numeric_compiled.program);
+    numeric_vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 1_024,
+    });
+    let numeric_status = numeric_vm.run().expect("numeric diagnostics vm should run");
+    assert_eq!(numeric_status, VmStatus::Halted);
+    let numeric_metrics = numeric_vm.jit_snapshot().metrics;
+    println!(
+        "jit numeric diagnostics: boxed_load_sites={} boxed_store_sites={} trace_exits={} guard_like_exits={} native_loop_backs={} native_execs={}",
+        numeric_metrics.boxed_load_site_count,
+        numeric_metrics.boxed_store_site_count,
+        numeric_metrics.trace_exit_count,
+        numeric_metrics.guard_exit_count(),
+        numeric_metrics.native_loop_back_count,
+        numeric_metrics.native_trace_exec_count
+    );
+    assert!(numeric_metrics.boxed_load_site_count > 0);
+    assert!(numeric_metrics.boxed_store_site_count > 0);
+    assert!(numeric_metrics.trace_exit_count > 0);
+    assert!(numeric_metrics.native_loop_back_count > 0);
+
+    let call_source = r#"
+        fn print(x);
+        let mut i = 0;
+        while i < 32 {
+            print(i);
+            i = i + 1;
+        }
+        i;
+    "#;
+    let call_compiled = compile_source(call_source).expect("call diagnostics compile");
+    let mut call_vm = Vm::new(call_compiled.program);
+    call_vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 1_024,
+    });
+    for func in &call_compiled.functions {
+        match func.name.as_str() {
+            "print" => call_vm.register_function(Box::new(PerfNoopHost { _marker: 0 })),
+            _ => panic!("unexpected function {}", func.name),
+        };
+    }
+    let call_status = call_vm.run().expect("call diagnostics vm should run");
+    assert_eq!(call_status, VmStatus::Halted);
+    let call_snapshot = call_vm.jit_snapshot();
+    let call_metrics = call_snapshot.metrics;
+    println!(
+        "jit call-boundary diagnostics: fallbacks={} native_execs={} traces={} attempts={} trace_exits={}",
+        call_metrics.helper_fallback_count,
+        call_metrics.native_trace_exec_count,
+        call_snapshot.traces.len(),
+        call_snapshot.attempts.len(),
+        call_metrics.trace_exit_count
+    );
+    assert!(call_snapshot.traces.iter().any(|trace| trace.has_call));
+    assert!(call_metrics.trace_exit_count > 0);
+    assert!(call_metrics.native_trace_exec_count > 0);
+    assert_eq!(call_metrics.helper_fallback_count, 0);
+}
+
+#[test]
 #[ignore = "performance characterization test; run manually"]
 fn perf_jit_native_reduces_tight_loop_latency() {
     if !native_jit_supported() {
@@ -492,6 +579,7 @@ fn perf_manual_aes_128_cbc_rustscript_matches_in_interpreter_jit_and_aot() {
         jit_native_exec_total = jit_native_exec_total.saturating_add(trial_native_exec);
 
         if diag_enabled && trial == 0 {
+            let metrics = snapshot.metrics;
             let traces_with_calls = snapshot
                 .traces
                 .iter()
@@ -502,37 +590,38 @@ fn perf_manual_aes_128_cbc_rustscript_matches_in_interpreter_jit_and_aot() {
                 .iter()
                 .filter(|trace| trace.has_yielding_call)
                 .count();
-            let helper_like_steps = snapshot
+            let helper_like_ops = snapshot
                 .traces
                 .iter()
-                .flat_map(|trace| trace.steps.iter())
-                .filter(|step| {
+                .flat_map(|trace| trace.op_names().iter())
+                .filter(|op| {
                     matches!(
-                        step,
-                        vm::jit::TraceStep::Ldc(_)
-                            | vm::jit::TraceStep::Pop
-                            | vm::jit::TraceStep::Dup
-                            | vm::jit::TraceStep::Ldloc(_)
-                            | vm::jit::TraceStep::Stloc(_)
-                            | vm::jit::TraceStep::Call { .. }
+                        op.as_str(),
+                        "ldc" | "pop" | "dup" | "ldloc" | "stloc" | "call"
                     )
                 })
                 .count();
-            let total_steps = snapshot
+            let total_ops = snapshot
                 .traces
                 .iter()
-                .map(|trace| trace.steps.len())
+                .map(|trace| trace.op_names().len())
                 .sum::<usize>();
             println!(
-                "aes jit trial0 diagnostics: attempts={} traces={} nyi={} native_exec={} helper_like_steps={} total_steps={} traces_with_calls={} traces_with_yielding_calls={}",
+                "aes jit trial0 diagnostics: attempts={} traces={} nyi={} native_exec={} helper_like_ops={} total_ops={} traces_with_calls={} traces_with_yielding_calls={} boxed_load_sites={} boxed_store_sites={} trace_exits={} guard_like_exits={} native_loop_backs={} fallbacks={}",
                 trial_attempts,
                 trial_traces,
                 trial_nyi,
                 trial_native_exec,
-                helper_like_steps,
-                total_steps,
+                helper_like_ops,
+                total_ops,
                 traces_with_calls,
-                traces_with_yielding_calls
+                traces_with_yielding_calls,
+                metrics.boxed_load_site_count,
+                metrics.boxed_store_site_count,
+                metrics.trace_exit_count,
+                metrics.guard_exit_count(),
+                metrics.native_loop_back_count,
+                metrics.helper_fallback_count
             );
             if std::env::var_os("PDVM_PERF_AES_JIT_DUMP").is_some() {
                 println!("aes jit trial0 dump:\n{}", vm_jit.dump_jit_info());

@@ -1,6 +1,5 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use vm::jit::TraceStep;
 use vm::{
     AotArtifactError, BytecodeBuilder, CallOutcome, HostFunction, JitConfig, JitNyiReason,
     JitTraceTerminal, Value, Vm, VmStatus, compile_source,
@@ -43,8 +42,6 @@ fn patch_branch_target(code: &mut [u8], instr_ip: u32, target: u32) {
 struct ManualTraceProgram {
     program: vm::Program,
     root_ip: usize,
-    target_ip: usize,
-    exit_ip: usize,
 }
 
 fn loop_if_false_root_program() -> ManualTraceProgram {
@@ -61,7 +58,7 @@ fn loop_if_false_root_program() -> ManualTraceProgram {
     bc.ceq();
     let loop_if_false_ip = bc.position();
     bc.brfalse(0);
-    let exit_ip = bc.position();
+    let _exit_ip = bc.position();
     bc.ldloc(0);
     bc.ret();
 
@@ -72,8 +69,6 @@ fn loop_if_false_root_program() -> ManualTraceProgram {
         program: vm::Program::new(vec![Value::Int(0), Value::Int(1), Value::Int(4)], code)
             .with_local_count(1),
         root_ip: root_ip as usize,
-        target_ip: root_ip as usize,
-        exit_ip: exit_ip as usize,
     }
 }
 
@@ -141,11 +136,7 @@ fn jit_supports_backward_brfalse_to_trace_root() {
             .expect("expected a compiled loop trace");
         assert_eq!(trace.terminal, JitTraceTerminal::BranchExit);
         assert!(
-            trace.steps.iter().any(|step| matches!(
-                step,
-                TraceStep::LoopIfFalse { target_ip, exit_ip }
-                    if *target_ip == case.target_ip && *exit_ip == case.exit_ip
-            )),
+            trace.op_names().iter().any(|op| op == "loop_if_false"),
             "expected loop_if_false in trace, dump:\n{}",
             vm.dump_jit_info()
         );
@@ -215,7 +206,7 @@ fn aot_keeps_backward_brfalse_outside_trace_as_guard_false() {
 }
 
 #[test]
-fn trace_interpreter_path_executes_loop_if_false() {
+fn jit_skips_tracing_when_builtin_override_disables_ssa_path() {
     let case = loop_if_false_root_program();
     let mut vm = Vm::new(case.program);
     configure_jit(&mut vm);
@@ -228,28 +219,20 @@ fn trace_interpreter_path_executes_loop_if_false() {
 
     if native_jit_supported() {
         let snapshot = vm.jit_snapshot();
-        let trace = snapshot
-            .traces
-            .iter()
-            .find(|trace| trace.root_ip == case.root_ip)
-            .expect("expected the loop trace to compile");
         assert!(
-            trace.steps.iter().any(|step| matches!(
-                step,
-                TraceStep::LoopIfFalse { target_ip, .. } if *target_ip == case.target_ip
-            )),
-            "expected loop_if_false in interpreter-executed trace, dump:\n{}",
+            snapshot.traces.is_empty(),
+            "builtin overrides should disable SSA trace compilation, dump:\n{}",
             vm.dump_jit_info()
         );
         assert!(
-            trace.executions > 0,
-            "expected interpreter trace execution count to advance, dump:\n{}",
+            snapshot.attempts.is_empty(),
+            "builtin overrides should avoid trace compile attempts, dump:\n{}",
             vm.dump_jit_info()
         );
         assert_eq!(
             vm.jit_native_exec_count(),
             0,
-            "builtin override should force interpreter trace execution"
+            "builtin override should force interpreter execution"
         );
     }
 }

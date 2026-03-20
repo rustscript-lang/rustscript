@@ -1,4 +1,4 @@
-use super::super::{ExecOutcome, HostCallExecOutcome, Value, Vm, VmError, VmResult};
+use super::super::{ExecOutcome, Vm, VmError, VmResult};
 #[cfg(any(
     all(
         target_arch = "x86_64",
@@ -7,9 +7,7 @@ use super::super::{ExecOutcome, HostCallExecOutcome, Value, Vm, VmError, VmResul
     all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
 ))]
 use super::JitTrace;
-use super::{
-    JitTraceTerminal, TraceBytesCodecKind, TraceConcatKind, TraceStep, TraceTextBytesKind, native,
-};
+use super::{JitMetrics, JitTraceTerminal, native};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 #[cfg(any(
@@ -45,7 +43,9 @@ pub(crate) struct NativeTrace {
     pub(super) code: Arc<[u8]>,
     root_ip: usize,
     terminal: JitTraceTerminal,
+    has_call: bool,
     has_yielding_call: bool,
+    lowering_kind: native::TraceLoweringKind,
     interrupt_settings: Option<native::NativeInterruptSettings>,
     compile_profile: native::NativeCompileProfile,
     drop_contract_events_enabled: bool,
@@ -65,7 +65,7 @@ struct NativeTraceCacheKey {
     drop_contract_events_enabled: bool,
     root_ip: usize,
     terminal: JitTraceTerminal,
-    steps: Vec<TraceStep>,
+    ssa_text: String,
 }
 
 #[cfg(any(
@@ -80,6 +80,7 @@ struct NativeTraceCacheEntry {
     entry: NativeTraceEntry,
     keepalive: Arc<Mutex<native::TraceKeepAlive>>,
     code: Arc<[u8]>,
+    lowering_kind: native::TraceLoweringKind,
     compile_profile: native::NativeCompileProfile,
 }
 
@@ -144,7 +145,7 @@ fn native_trace_cache_key(
         drop_contract_events_enabled,
         root_ip: trace.root_ip,
         terminal: trace.terminal.clone(),
-        steps: trace.steps.clone(),
+        ssa_text: trace.ssa_text(),
     }
 }
 
@@ -160,6 +161,11 @@ fn compile_profile_satisfies(
     requested: native::NativeCompileProfile,
 ) -> bool {
     compiled == requested
+}
+
+fn should_fallback_to_interpreter(err: &VmError) -> bool {
+    matches!(err, VmError::JitNative(detail)
+        if detail.contains("SSA native lowering does not support"))
 }
 
 impl Vm {
@@ -180,6 +186,10 @@ impl Vm {
             self.ensure_program_cache_key();
         }
         self.native_traces.clear();
+        self.native_trace_exec_count = 0;
+        self.jit_trace_exit_count = 0;
+        self.jit_native_loop_back_count = 0;
+        self.jit_helper_fallback_count = 0;
         self.jit.set_config(config);
     }
 
@@ -188,7 +198,7 @@ impl Vm {
     }
 
     pub fn jit_snapshot(&self) -> super::JitSnapshot {
-        self.jit.snapshot()
+        self.jit.snapshot(self.jit_runtime_metrics())
     }
 
     pub fn dump_jit_info(&self) -> String {
@@ -196,7 +206,9 @@ impl Vm {
     }
 
     pub fn dump_jit_info_with_machine_code(&self, include_machine_code: bool) -> String {
-        let mut out = self.jit.dump_text(self.program.debug.as_ref());
+        let mut out = self
+            .jit
+            .dump_text(self.program.debug.as_ref(), self.jit_runtime_metrics());
         out.push_str(&format!(
             "  native codegen backend: {}\n",
             native::selected_codegen_backend()
@@ -235,10 +247,11 @@ impl Vm {
         for id in ids {
             if let Some(native) = self.native_traces.get(&id) {
                 out.push_str(&format!(
-                    "  native trace#{} entry=0x{:X} code_bytes={}\n",
+                    "  native trace#{} entry=0x{:X} code_bytes={} lowering={}\n",
                     id,
                     native.entry as usize,
-                    native.code.len()
+                    native.code.len(),
+                    native.lowering_kind.as_str()
                 ));
                 if include_machine_code {
                     out.push_str("    code:");
@@ -252,491 +265,6 @@ impl Vm {
         out
     }
 
-    fn execute_jit_trace(&mut self, trace_id: usize) -> VmResult<ExecOutcome> {
-        let Some(trace) = self.jit.trace_clone(trace_id) else {
-            return Ok(ExecOutcome::Continue);
-        };
-        let step_indices_by_ip = self.jit.trace_step_index_lookup(trace_id).ok_or_else(|| {
-            VmError::JitNative(format!(
-                "trace {} is missing its step-index lookup",
-                trace_id
-            ))
-        })?;
-        let mut step_index = 0usize;
-        while step_index < trace.steps.len() {
-            self.ip = trace
-                .step_ips
-                .get(step_index)
-                .copied()
-                .unwrap_or(trace.root_ip);
-            self.charge_interrupt_tick()?;
-            let step = &trace.steps[step_index];
-            match step {
-                TraceStep::Nop => {}
-                TraceStep::Ldc(index) => {
-                    let value = self
-                        .program
-                        .constants
-                        .get(*index as usize)
-                        .cloned()
-                        .ok_or(VmError::InvalidConstant(*index))?;
-                    self.stack.push(value);
-                }
-                TraceStep::Add => {
-                    self.binary_add_op()?;
-                }
-                TraceStep::IAdd => {
-                    self.int_add_op()?;
-                }
-                TraceStep::IAddImm(imm) => {
-                    let lhs = self.pop_int()?;
-                    self.stack
-                        .push(crate::bytecode::Value::Int(lhs.wrapping_add(*imm)));
-                }
-                TraceStep::ILocalAddImm { local, imm } => {
-                    let lhs = self
-                        .locals
-                        .get(*local as usize)
-                        .ok_or(VmError::InvalidLocal(*local))?
-                        .as_int()?;
-                    self.stack
-                        .push(crate::bytecode::Value::Int(lhs.wrapping_add(*imm)));
-                }
-                TraceStep::FAdd => {
-                    self.float_add_op()?;
-                }
-                TraceStep::FAddImm(imm_bits) => {
-                    let imm = f64::from_bits(*imm_bits);
-                    let lhs = self.pop_float_exact()?;
-                    self.stack.push(crate::bytecode::Value::Float(lhs + imm));
-                }
-                TraceStep::FLocalAddImm { local, imm_bits } => {
-                    let imm = f64::from_bits(*imm_bits);
-                    let lhs = self
-                        .locals
-                        .get(*local as usize)
-                        .ok_or(VmError::InvalidLocal(*local))?;
-                    let Value::Float(lhs) = lhs else {
-                        return Err(VmError::TypeMismatch("float"));
-                    };
-                    self.stack.push(crate::bytecode::Value::Float(*lhs + imm));
-                }
-                TraceStep::Concat(kind) => match kind {
-                    TraceConcatKind::String => self.string_concat_op()?,
-                    TraceConcatKind::Bytes => self.bytes_concat_op()?,
-                },
-                TraceStep::Len(kind) => match kind {
-                    TraceTextBytesKind::String => self.string_len_op()?,
-                    TraceTextBytesKind::Bytes => self.bytes_len_op()?,
-                },
-                TraceStep::Slice(kind) => match kind {
-                    TraceTextBytesKind::String => self.string_slice_op()?,
-                    TraceTextBytesKind::Bytes => self.bytes_slice_op()?,
-                },
-                TraceStep::Get(kind) => match kind {
-                    TraceTextBytesKind::String => self.string_get_op()?,
-                    TraceTextBytesKind::Bytes => self.bytes_get_op()?,
-                },
-                TraceStep::HasBytes => {
-                    self.bytes_has_op()?;
-                }
-                TraceStep::BytesCodec(kind) => match kind {
-                    TraceBytesCodecKind::FromUtf8 => self.bytes_from_utf8_op()?,
-                    TraceBytesCodecKind::ToUtf8 => self.bytes_to_utf8_op()?,
-                    TraceBytesCodecKind::ToUtf8Lossy => self.bytes_to_utf8_lossy_op()?,
-                    TraceBytesCodecKind::FromHex => self.bytes_from_hex_op()?,
-                    TraceBytesCodecKind::ToHex => self.bytes_to_hex_op()?,
-                    TraceBytesCodecKind::FromBase64 => self.bytes_from_base64_op()?,
-                    TraceBytesCodecKind::ToBase64 => self.bytes_to_base64_op()?,
-                    TraceBytesCodecKind::FromArrayU8 => self.bytes_from_array_u8_op()?,
-                    TraceBytesCodecKind::ToArrayU8 => self.bytes_to_array_u8_op()?,
-                },
-                TraceStep::Sub => {
-                    self.binary_numeric_op(
-                        |lhs, rhs| Ok(lhs.wrapping_sub(rhs)),
-                        |lhs, rhs| Ok(lhs - rhs),
-                    )?;
-                }
-                TraceStep::ISub => {
-                    self.int_binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_sub(rhs)))?;
-                }
-                TraceStep::ISubImm(imm) => {
-                    let lhs = self.pop_int()?;
-                    self.stack
-                        .push(crate::bytecode::Value::Int(lhs.wrapping_sub(*imm)));
-                }
-                TraceStep::ILocalSubImm { local, imm } => {
-                    let lhs = self
-                        .locals
-                        .get(*local as usize)
-                        .ok_or(VmError::InvalidLocal(*local))?
-                        .as_int()?;
-                    self.stack
-                        .push(crate::bytecode::Value::Int(lhs.wrapping_sub(*imm)));
-                }
-                TraceStep::FSub => {
-                    self.float_binary_numeric_op(|lhs, rhs| Ok(lhs - rhs))?;
-                }
-                TraceStep::FSubImm(imm_bits) => {
-                    let imm = f64::from_bits(*imm_bits);
-                    let lhs = self.pop_float_exact()?;
-                    self.stack.push(crate::bytecode::Value::Float(lhs - imm));
-                }
-                TraceStep::FLocalSubImm { local, imm_bits } => {
-                    let imm = f64::from_bits(*imm_bits);
-                    let lhs = self
-                        .locals
-                        .get(*local as usize)
-                        .ok_or(VmError::InvalidLocal(*local))?;
-                    let Value::Float(lhs) = lhs else {
-                        return Err(VmError::TypeMismatch("float"));
-                    };
-                    self.stack.push(crate::bytecode::Value::Float(*lhs - imm));
-                }
-                TraceStep::Mul => {
-                    self.binary_numeric_op(
-                        |lhs, rhs| Ok(lhs.wrapping_mul(rhs)),
-                        |lhs, rhs| Ok(lhs * rhs),
-                    )?;
-                }
-                TraceStep::IMul => {
-                    self.int_binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_mul(rhs)))?;
-                }
-                TraceStep::IMulImm(imm) => {
-                    let lhs = self.pop_int()?;
-                    self.stack
-                        .push(crate::bytecode::Value::Int(lhs.wrapping_mul(*imm)));
-                }
-                TraceStep::ILocalMulImm { local, imm } => {
-                    let lhs = self
-                        .locals
-                        .get(*local as usize)
-                        .ok_or(VmError::InvalidLocal(*local))?
-                        .as_int()?;
-                    self.stack
-                        .push(crate::bytecode::Value::Int(lhs.wrapping_mul(*imm)));
-                }
-                TraceStep::FMul => {
-                    self.float_binary_numeric_op(|lhs, rhs| Ok(lhs * rhs))?;
-                }
-                TraceStep::FMulImm(imm_bits) => {
-                    let imm = f64::from_bits(*imm_bits);
-                    let lhs = self.pop_float_exact()?;
-                    self.stack.push(crate::bytecode::Value::Float(lhs * imm));
-                }
-                TraceStep::FLocalMulImm { local, imm_bits } => {
-                    let imm = f64::from_bits(*imm_bits);
-                    let lhs = self
-                        .locals
-                        .get(*local as usize)
-                        .ok_or(VmError::InvalidLocal(*local))?;
-                    let Value::Float(lhs) = lhs else {
-                        return Err(VmError::TypeMismatch("float"));
-                    };
-                    self.stack.push(crate::bytecode::Value::Float(*lhs * imm));
-                }
-                TraceStep::Div => {
-                    self.binary_numeric_op(crate::vm::checked_int_div, |lhs, rhs| Ok(lhs / rhs))?;
-                }
-                TraceStep::IDiv => {
-                    self.int_binary_numeric_op(crate::vm::checked_int_div)?;
-                }
-                TraceStep::IDivImm(imm) => {
-                    let lhs = self.pop_int()?;
-                    self.stack
-                        .push(crate::bytecode::Value::Int(crate::vm::checked_int_div(
-                            lhs, *imm,
-                        )?));
-                }
-                TraceStep::ILocalDivImm { local, imm } => {
-                    let lhs = self
-                        .locals
-                        .get(*local as usize)
-                        .ok_or(VmError::InvalidLocal(*local))?
-                        .as_int()?;
-                    self.stack
-                        .push(crate::bytecode::Value::Int(crate::vm::checked_int_div(
-                            lhs, *imm,
-                        )?));
-                }
-                TraceStep::FDiv => {
-                    self.float_binary_numeric_op(|lhs, rhs| Ok(lhs / rhs))?;
-                }
-                TraceStep::FDivImm(imm_bits) => {
-                    let imm = f64::from_bits(*imm_bits);
-                    let lhs = self.pop_float_exact()?;
-                    self.stack.push(crate::bytecode::Value::Float(lhs / imm));
-                }
-                TraceStep::FLocalDivImm { local, imm_bits } => {
-                    let imm = f64::from_bits(*imm_bits);
-                    let lhs = self
-                        .locals
-                        .get(*local as usize)
-                        .ok_or(VmError::InvalidLocal(*local))?;
-                    let Value::Float(lhs) = lhs else {
-                        return Err(VmError::TypeMismatch("float"));
-                    };
-                    self.stack.push(crate::bytecode::Value::Float(*lhs / imm));
-                }
-                TraceStep::Mod => {
-                    self.binary_numeric_op(crate::vm::checked_int_rem, |lhs, rhs| Ok(lhs % rhs))?;
-                }
-                TraceStep::IMod => {
-                    self.int_binary_numeric_op(crate::vm::checked_int_rem)?;
-                }
-                TraceStep::IModImm(imm) => {
-                    let lhs = self.pop_int()?;
-                    self.stack
-                        .push(crate::bytecode::Value::Int(crate::vm::checked_int_rem(
-                            lhs, *imm,
-                        )?));
-                }
-                TraceStep::ILocalModImm { local, imm } => {
-                    let lhs = self
-                        .locals
-                        .get(*local as usize)
-                        .ok_or(VmError::InvalidLocal(*local))?
-                        .as_int()?;
-                    self.stack
-                        .push(crate::bytecode::Value::Int(crate::vm::checked_int_rem(
-                            lhs, *imm,
-                        )?));
-                }
-                TraceStep::FMod => {
-                    self.float_binary_numeric_op(|lhs, rhs| Ok(lhs % rhs))?;
-                }
-                TraceStep::FModImm(imm_bits) => {
-                    let imm = f64::from_bits(*imm_bits);
-                    let lhs = self.pop_float_exact()?;
-                    self.stack.push(crate::bytecode::Value::Float(lhs % imm));
-                }
-                TraceStep::FLocalModImm { local, imm_bits } => {
-                    let imm = f64::from_bits(*imm_bits);
-                    let lhs = self
-                        .locals
-                        .get(*local as usize)
-                        .ok_or(VmError::InvalidLocal(*local))?;
-                    let Value::Float(lhs) = lhs else {
-                        return Err(VmError::TypeMismatch("float"));
-                    };
-                    self.stack.push(crate::bytecode::Value::Float(*lhs % imm));
-                }
-                TraceStep::Shl => {
-                    let rhs = self.pop_shift_amount()?;
-                    let lhs = self.pop_int()?;
-                    self.stack
-                        .push(crate::bytecode::Value::Int(lhs.wrapping_shl(rhs)));
-                }
-                TraceStep::Shr => {
-                    let rhs = self.pop_shift_amount()?;
-                    let lhs = self.pop_int()?;
-                    self.stack
-                        .push(crate::bytecode::Value::Int(lhs.wrapping_shr(rhs)));
-                }
-                TraceStep::Lshr => {
-                    let rhs = self.pop_shift_amount()?;
-                    let lhs = self.pop_int()?;
-                    self.stack
-                        .push(crate::bytecode::Value::Int(super::super::logical_shr_i64(
-                            lhs, rhs,
-                        )));
-                }
-                TraceStep::And => {
-                    let rhs = self.pop_bool()?;
-                    let lhs = self.pop_bool()?;
-                    self.stack.push(crate::bytecode::Value::Bool(lhs && rhs));
-                }
-                TraceStep::Or => {
-                    let rhs = self.pop_bool()?;
-                    let lhs = self.pop_bool()?;
-                    self.stack.push(crate::bytecode::Value::Bool(lhs || rhs));
-                }
-                TraceStep::Not => {
-                    self.unary_not_op()?;
-                }
-                TraceStep::Neg => {
-                    let value = self.pop_numeric()?;
-                    match value {
-                        super::super::NumericValue::Int(value) => self
-                            .stack
-                            .push(crate::bytecode::Value::Int(value.wrapping_neg())),
-                        super::super::NumericValue::Float(value) => {
-                            self.stack.push(crate::bytecode::Value::Float(-value))
-                        }
-                    }
-                }
-                TraceStep::INeg => {
-                    self.int_neg_op()?;
-                }
-                TraceStep::FNeg => {
-                    self.float_neg_op()?;
-                }
-                TraceStep::Ceq => {
-                    let rhs = self.pop_value()?;
-                    let lhs = self.pop_value()?;
-                    self.stack.push(crate::bytecode::Value::Bool(lhs == rhs));
-                }
-                TraceStep::FCeq => {
-                    self.float_eq_op()?;
-                }
-                TraceStep::Clt => {
-                    self.compare_numeric_op(|lhs, rhs| lhs < rhs, |lhs, rhs| lhs < rhs)?;
-                }
-                TraceStep::ILocalCltImm { local, imm } => {
-                    let lhs = self
-                        .locals
-                        .get(*local as usize)
-                        .ok_or(VmError::InvalidLocal(*local))?
-                        .as_int()?;
-                    self.stack.push(crate::bytecode::Value::Bool(lhs < *imm));
-                }
-                TraceStep::FClt => {
-                    self.float_compare_op(|lhs, rhs| lhs < rhs)?;
-                }
-                TraceStep::FLocalCltImm { local, imm_bits } => {
-                    let imm = f64::from_bits(*imm_bits);
-                    let lhs = self
-                        .locals
-                        .get(*local as usize)
-                        .ok_or(VmError::InvalidLocal(*local))?;
-                    let Value::Float(lhs) = lhs else {
-                        return Err(VmError::TypeMismatch("float"));
-                    };
-                    self.stack.push(crate::bytecode::Value::Bool(*lhs < imm));
-                }
-                TraceStep::Cgt => {
-                    self.compare_numeric_op(|lhs, rhs| lhs > rhs, |lhs, rhs| lhs > rhs)?;
-                }
-                TraceStep::ILocalCgtImm { local, imm } => {
-                    let lhs = self
-                        .locals
-                        .get(*local as usize)
-                        .ok_or(VmError::InvalidLocal(*local))?
-                        .as_int()?;
-                    self.stack.push(crate::bytecode::Value::Bool(lhs > *imm));
-                }
-                TraceStep::FCgt => {
-                    self.float_compare_op(|lhs, rhs| lhs > rhs)?;
-                }
-                TraceStep::FLocalCgtImm { local, imm_bits } => {
-                    let imm = f64::from_bits(*imm_bits);
-                    let lhs = self
-                        .locals
-                        .get(*local as usize)
-                        .ok_or(VmError::InvalidLocal(*local))?;
-                    let Value::Float(lhs) = lhs else {
-                        return Err(VmError::TypeMismatch("float"));
-                    };
-                    self.stack.push(crate::bytecode::Value::Bool(*lhs > imm));
-                }
-                TraceStep::Pop => {
-                    self.pop_value()?;
-                }
-                TraceStep::Dup => {
-                    let value = self.peek_value()?.clone();
-                    self.stack.push(value);
-                }
-                TraceStep::Ldloc(index) => {
-                    let value = self
-                        .locals
-                        .get(*index as usize)
-                        .cloned()
-                        .ok_or(VmError::InvalidLocal(*index))?;
-                    self.stack.push(value);
-                }
-                TraceStep::ILocalShlImm { local, amount } => {
-                    let lhs = self
-                        .locals
-                        .get(*local as usize)
-                        .ok_or(VmError::InvalidLocal(*local))?
-                        .as_int()?;
-                    self.stack
-                        .push(crate::bytecode::Value::Int(lhs.wrapping_shl(*amount)));
-                }
-                TraceStep::Stloc(index) => {
-                    let value = self.pop_value()?;
-                    self.store_local_with_drop_contract(*index, value)?;
-                }
-                TraceStep::BuiltinCall {
-                    index,
-                    argc,
-                    call_ip,
-                } => match self.execute_host_call(*index, *argc, *call_ip)? {
-                    HostCallExecOutcome::Returned => {}
-                    HostCallExecOutcome::Halted => return Ok(ExecOutcome::Halted),
-                    HostCallExecOutcome::Yielded => {
-                        self.last_yield_reason = Some(super::super::VmYieldReason::Host);
-                        return Ok(ExecOutcome::Yielded);
-                    }
-                    HostCallExecOutcome::Pending(op_id) => {
-                        return Ok(ExecOutcome::Waiting(op_id));
-                    }
-                },
-                TraceStep::Call {
-                    index,
-                    argc,
-                    call_ip,
-                } => match self.execute_host_call(*index, *argc, *call_ip)? {
-                    HostCallExecOutcome::Returned => {}
-                    HostCallExecOutcome::Halted => return Ok(ExecOutcome::Halted),
-                    HostCallExecOutcome::Yielded => {
-                        self.last_yield_reason = Some(super::super::VmYieldReason::Host);
-                        return Ok(ExecOutcome::Yielded);
-                    }
-                    HostCallExecOutcome::Pending(op_id) => return Ok(ExecOutcome::Waiting(op_id)),
-                },
-                TraceStep::GuardFalse { exit_ip } => {
-                    let condition = self.pop_bool()?;
-                    if !condition {
-                        self.jump_to(*exit_ip)?;
-                        self.jit.mark_trace_executed(trace_id);
-                        return Ok(ExecOutcome::Continue);
-                    }
-                }
-                TraceStep::GuardTrue { exit_ip } => {
-                    let condition = self.pop_bool()?;
-                    if condition {
-                        self.jump_to(*exit_ip)?;
-                        self.jit.mark_trace_executed(trace_id);
-                        return Ok(ExecOutcome::Continue);
-                    }
-                }
-                TraceStep::LoopIfFalse { target_ip, exit_ip } => {
-                    let condition = self.pop_bool()?;
-                    if !condition {
-                        step_index = *step_indices_by_ip.get(target_ip).ok_or_else(|| {
-                            VmError::JitNative(format!(
-                                "trace {} is missing loop target step_ip {}",
-                                trace.id, target_ip
-                            ))
-                        })?;
-                        continue;
-                    }
-                    self.ip = *exit_ip;
-                    self.jit.mark_trace_executed(trace_id);
-                    return Ok(ExecOutcome::Continue);
-                }
-                TraceStep::JumpToIp { target_ip } => {
-                    self.jump_to(*target_ip)?;
-                    self.jit.mark_trace_executed(trace_id);
-                    return Ok(ExecOutcome::Continue);
-                }
-                TraceStep::JumpToRoot => {
-                    self.jump_to(trace.root_ip)?;
-                    self.jit.mark_trace_executed(trace_id);
-                    return Ok(ExecOutcome::Continue);
-                }
-                TraceStep::Ret => {
-                    self.jit.mark_trace_executed(trace_id);
-                    return Ok(ExecOutcome::Halted);
-                }
-            }
-            step_index += 1;
-        }
-        self.jit.mark_trace_executed(trace_id);
-        Ok(ExecOutcome::Continue)
-    }
-
     pub(in crate::vm) fn execute_jit_entry(&mut self, trace_id: usize) -> VmResult<ExecOutcome> {
         #[cfg(any(
             all(
@@ -746,10 +274,15 @@ impl Vm {
             all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
         ))]
         {
-            if !self.builtin_overrides.is_empty() {
-                return self.execute_jit_trace(trace_id);
+            match self.execute_jit_native(trace_id) {
+                Ok(outcome) => Ok(outcome),
+                Err(err) if should_fallback_to_interpreter(&err) => {
+                    self.record_jit_helper_fallback();
+                    self.jit.block_trace(trace_id);
+                    Ok(ExecOutcome::Continue)
+                }
+                Err(err) => Err(err),
             }
-            self.execute_jit_native(trace_id)
         }
         #[cfg(not(any(
             all(
@@ -759,7 +292,8 @@ impl Vm {
             all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
         )))]
         {
-            self.execute_jit_trace(trace_id)
+            let _ = trace_id;
+            Ok(ExecOutcome::Continue)
         }
     }
 
@@ -772,8 +306,17 @@ impl Vm {
     ))]
     fn execute_jit_native(&mut self, trace_id: usize) -> VmResult<ExecOutcome> {
         let mut current_trace_id = trace_id;
-        self.ensure_native_trace(current_trace_id, native::NativeCompileProfile::Jit)?;
-        let (mut entry, mut root_ip, mut terminal, mut has_yielding_call) =
+        if let Err(err) =
+            self.ensure_native_trace(current_trace_id, native::NativeCompileProfile::Jit)
+        {
+            if should_fallback_to_interpreter(&err) {
+                self.record_jit_helper_fallback();
+                self.jit.block_trace(current_trace_id);
+                return Ok(ExecOutcome::Continue);
+            }
+            return Err(err);
+        }
+        let (mut entry, mut root_ip, mut terminal, mut has_call, mut has_yielding_call) =
             self.native_trace_state(current_trace_id)?;
         loop {
             native::clear_bridge_error();
@@ -788,23 +331,36 @@ impl Vm {
                         && next_trace_id != current_trace_id
                     {
                         current_trace_id = next_trace_id;
-                        self.ensure_native_trace(
+                        if let Err(err) = self.ensure_native_trace(
                             current_trace_id,
                             native::NativeCompileProfile::Jit,
-                        )?;
-                        (entry, root_ip, terminal, has_yielding_call) =
+                        ) {
+                            if should_fallback_to_interpreter(&err) {
+                                self.record_jit_helper_fallback();
+                                self.jit.block_trace(current_trace_id);
+                                return Ok(ExecOutcome::Continue);
+                            }
+                            return Err(err);
+                        }
+                        (entry, root_ip, terminal, has_call, has_yielding_call) =
                             self.native_trace_state(current_trace_id)?;
                         continue;
                     }
                     return Ok(ExecOutcome::Continue);
                 }
                 native::STATUS_TRACE_EXIT => {
+                    self.jit_trace_exit_count = self.jit_trace_exit_count.saturating_add(1);
+                    if has_call {
+                        return Ok(ExecOutcome::Continue);
+                    }
                     // Fast path: if this trace looped back to its own root and cannot yield via host
                     // calls, keep executing in native mode without bouncing through the interpreter.
                     if !has_yielding_call
                         && terminal == JitTraceTerminal::LoopBack
                         && self.ip == root_ip
                     {
+                        self.jit_native_loop_back_count =
+                            self.jit_native_loop_back_count.saturating_add(1);
                         continue;
                     }
                     if !has_yielding_call {
@@ -820,11 +376,18 @@ impl Vm {
                             && next_trace_id != current_trace_id
                         {
                             current_trace_id = next_trace_id;
-                            self.ensure_native_trace(
+                            if let Err(err) = self.ensure_native_trace(
                                 current_trace_id,
                                 native::NativeCompileProfile::Jit,
-                            )?;
-                            (entry, root_ip, terminal, has_yielding_call) =
+                            ) {
+                                if should_fallback_to_interpreter(&err) {
+                                    self.record_jit_helper_fallback();
+                                    self.jit.block_trace(current_trace_id);
+                                    return Ok(ExecOutcome::Continue);
+                                }
+                                return Err(err);
+                            }
+                            (entry, root_ip, terminal, has_call, has_yielding_call) =
                                 self.native_trace_state(current_trace_id)?;
                             continue;
                         }
@@ -864,11 +427,11 @@ impl Vm {
                     let err = native::take_bridge_error().unwrap_or_else(|| {
                         let trace_meta = self.jit.trace_clone(current_trace_id).map(|trace| {
                             format!(
-                                "trace_id={} root_ip={} terminal={:?} steps={}",
+                                "trace_id={} root_ip={} terminal={:?} ops={}",
                                 trace.id,
                                 trace.root_ip,
                                 trace.terminal,
-                                trace.steps.len()
+                                trace.op_names.len()
                             )
                         });
                         VmError::JitNative(format!(
@@ -900,7 +463,7 @@ impl Vm {
     fn native_trace_state(
         &self,
         trace_id: usize,
-    ) -> VmResult<(NativeTraceEntry, usize, JitTraceTerminal, bool)> {
+    ) -> VmResult<(NativeTraceEntry, usize, JitTraceTerminal, bool, bool)> {
         let native = self.native_traces.get(&trace_id).ok_or_else(|| {
             VmError::JitNative(format!("native trace entry for id {} missing", trace_id))
         })?;
@@ -908,6 +471,7 @@ impl Vm {
             native.entry,
             native.root_ip,
             native.terminal.clone(),
+            native.has_call,
             native.has_yielding_call,
         ))
     }
@@ -980,7 +544,9 @@ impl Vm {
                     code: cached.code,
                     root_ip: trace.root_ip,
                     terminal: trace.terminal,
+                    has_call: trace.has_call,
                     has_yielding_call: trace.has_yielding_call,
+                    lowering_kind: cached.lowering_kind,
                     interrupt_settings,
                     compile_profile: cached.compile_profile,
                     drop_contract_events_enabled,
@@ -1002,6 +568,7 @@ impl Vm {
             entry,
             keepalive: Arc::clone(&keepalive),
             code: Arc::clone(&code),
+            lowering_kind: compiled.lowering_kind,
             compile_profile,
         };
         with_native_trace_cache(|cache| {
@@ -1019,7 +586,9 @@ impl Vm {
                 code,
                 root_ip: trace.root_ip,
                 terminal: trace.terminal,
+                has_call: trace.has_call,
                 has_yielding_call: trace.has_yielding_call,
+                lowering_kind: compiled.lowering_kind,
                 interrupt_settings,
                 compile_profile,
                 drop_contract_events_enabled,
@@ -1034,6 +603,21 @@ impl Vm {
 
     pub fn jit_native_exec_count(&self) -> u64 {
         self.native_trace_exec_count
+    }
+
+    fn jit_runtime_metrics(&self) -> JitMetrics {
+        JitMetrics {
+            boxed_load_site_count: 0,
+            boxed_store_site_count: 0,
+            trace_exit_count: self.jit_trace_exit_count,
+            native_loop_back_count: self.jit_native_loop_back_count,
+            helper_fallback_count: self.jit_helper_fallback_count,
+            native_trace_exec_count: self.native_trace_exec_count,
+        }
+    }
+
+    fn record_jit_helper_fallback(&mut self) {
+        self.jit_helper_fallback_count = self.jit_helper_fallback_count.saturating_add(1);
     }
 }
 

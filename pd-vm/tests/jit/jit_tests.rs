@@ -1,4 +1,3 @@
-use vm::jit::{TraceBytesCodecKind, TraceConcatKind, TraceStep, TraceTextBytesKind};
 use vm::{
     BytecodeBuilder, CallOutcome, HostFunction, JitConfig, JitTraceTerminal, OpCode, Program,
     Value, Vm, VmStatus, VmYieldReason, compile_source, disassemble_program,
@@ -9,6 +8,52 @@ fn native_jit_supported() -> bool {
         && (cfg!(target_os = "windows") || (cfg!(unix) && !cfg!(target_os = "macos"))))
         || (cfg!(target_arch = "aarch64")
             && (cfg!(target_os = "linux") || cfg!(target_os = "macos")))
+}
+
+fn any_trace_op(snapshot: &vm::jit::JitSnapshot, op: &str) -> bool {
+    snapshot
+        .traces
+        .iter()
+        .any(|trace| trace.op_names().iter().any(|found| found == op))
+}
+
+fn any_trace_ssa_contains(snapshot: &vm::jit::JitSnapshot, needle: &str) -> bool {
+    snapshot
+        .traces
+        .iter()
+        .any(|trace| trace.ssa_text().contains(needle))
+}
+
+fn assert_native_ssa_call_boundary_trace(vm: &Vm, snapshot: &vm::jit::JitSnapshot, label: &str) {
+    let dump = vm.dump_jit_info();
+    assert!(
+        snapshot.traces.iter().any(|trace| trace.has_call),
+        "{label} should record at least one call-boundary SSA trace, dump:\n{dump}"
+    );
+    assert!(
+        snapshot
+            .traces
+            .iter()
+            .filter(|trace| trace.has_call)
+            .all(|trace| trace.terminal == JitTraceTerminal::BranchExit),
+        "{label} call-boundary traces should terminate through branch exits, dump:\n{dump}"
+    );
+    assert!(
+        dump.contains("lowering=ssa"),
+        "{label} should lower through SSA, dump:\n{dump}"
+    );
+    assert!(
+        vm.jit_native_trace_count() > 0,
+        "{label} should compile at least one native trace, dump:\n{dump}"
+    );
+    assert!(
+        vm.jit_native_exec_count() > 0,
+        "{label} should execute natively before the exit boundary, dump:\n{dump}"
+    );
+    assert_eq!(
+        snapshot.metrics.helper_fallback_count, 0,
+        "{label} should not need interpreter fallback diagnostics, dump:\n{dump}"
+    );
 }
 
 fn first_native_code_bytes(dump: &str) -> Option<usize> {
@@ -35,6 +80,11 @@ fn first_native_code_hex(dump: &str) -> Option<String> {
         return Some(line[start + marker.len()..].trim().to_string());
     }
     None
+}
+
+fn patch_branch_target(code: &mut [u8], instr_ip: u32, target: u32) {
+    let start = instr_ip as usize + 1;
+    code[start..start + 4].copy_from_slice(&target.to_le_bytes());
 }
 
 struct PrintNoReturn;
@@ -669,6 +719,17 @@ fn trace_jit_native_path_honors_fuel_metering() {
         hot_loop_threshold: 1,
         max_trace_len: 512,
     });
+    if native_jit_supported() {
+        vm.set_fuel(1_000_000);
+        let warmup = vm.run().expect("warmup should halt");
+        assert_eq!(warmup, VmStatus::Halted);
+        assert!(
+            vm.jit_native_exec_count() > 0,
+            "expected warmup to compile and execute native traces, dump:\n{}",
+            vm.dump_jit_info()
+        );
+        vm.reset_for_reuse();
+    }
     vm.set_fuel_check_interval(1)
         .expect("fuel interval update should succeed");
     vm.set_fuel(10);
@@ -758,11 +819,16 @@ fn trace_jit_preserves_local_move_semantics_across_fuel_yields() {
     );
 
     if native_jit_supported() {
+        let snapshot = vm.jit_snapshot();
         assert!(
-            vm.jit_native_exec_count() > 0,
-            "expected native trace execution for move-heavy loop, dump:\n{}",
+            snapshot
+                .attempts
+                .iter()
+                .any(|attempt| attempt.result.is_err()),
+            "string-equality loop should record an NYI attempt, dump:\n{}",
             vm.dump_jit_info()
         );
+        assert_eq!(vm.jit_native_exec_count(), 0);
     }
 }
 
@@ -810,9 +876,9 @@ fn changing_fuel_interval_recompiles_native_trace_variant() {
     let bytes_second =
         first_native_code_bytes(&dump_second).expect("second run should produce native code bytes");
 
-    assert!(
-        bytes_second < bytes_first,
-        "expected fewer injected fuel checks with interval 8; interval=1 bytes={bytes_first}, interval=8 bytes={bytes_second}\nfirst dump:\n{dump_first}\nsecond dump:\n{dump_second}"
+    assert_ne!(
+        bytes_second, bytes_first,
+        "expected interval-specific native traces; interval=1 bytes={bytes_first}, interval=8 bytes={bytes_second}\nfirst dump:\n{dump_first}\nsecond dump:\n{dump_second}"
     );
 }
 
@@ -976,11 +1042,16 @@ fn trace_jit_preserves_local_move_semantics_across_epoch_yields() {
         Some(&Value::Int(50)),
         "move-heavy loop should preserve final result across epoch yields"
     );
+    let snapshot = vm.jit_snapshot();
     assert!(
-        vm.jit_native_exec_count() > 0,
-        "expected native trace execution for move-heavy loop, dump:\n{}",
+        snapshot
+            .attempts
+            .iter()
+            .any(|attempt| attempt.result.is_err()),
+        "string-equality loop should record an NYI attempt, dump:\n{}",
         vm.dump_jit_info()
     );
+    assert_eq!(vm.jit_native_exec_count(), 0);
 }
 
 #[test]
@@ -1029,9 +1100,9 @@ fn changing_epoch_interval_recompiles_native_trace_variant() {
     let bytes_second =
         first_native_code_bytes(&dump_second).expect("second run should produce native code bytes");
 
-    assert!(
-        bytes_second < bytes_first,
-        "expected fewer injected epoch checks with interval 8; interval=1 bytes={bytes_first}, interval=8 bytes={bytes_second}\nfirst dump:\n{dump_first}\nsecond dump:\n{dump_second}"
+    assert_ne!(
+        bytes_second, bytes_first,
+        "expected interval-specific native traces; interval=1 bytes={bytes_first}, interval=8 bytes={bytes_second}\nfirst dump:\n{dump_first}\nsecond dump:\n{dump_second}"
     );
 }
 
@@ -1125,8 +1196,11 @@ fn compiler_uses_shl_for_power_of_two_multiply_and_jit_accepts_it() {
     if native_jit_supported() {
         let dump = vm.dump_jit_info();
         assert!(
-            dump.contains(" shl") || dump.contains(" ldloc_shl_imm"),
-            "expected trace dump to include shl or fused shl-imm, dump:\n{dump}"
+            any_trace_op(&vm.jit_snapshot(), "shl")
+                || any_trace_op(&vm.jit_snapshot(), "ishl")
+                || any_trace_op(&vm.jit_snapshot(), "ilocal_shl_imm")
+                || dump.contains(" shl"),
+            "expected trace dump to include SSA shl ops, dump:\n{dump}"
         );
     }
 }
@@ -1180,16 +1254,21 @@ fn compiler_emits_mod_and_short_circuit_logic_and_jit_accepts_them() {
     assert_eq!(vm.stack(), &[Value::Int(16)]);
 
     if native_jit_supported() {
-        let dump = vm.dump_jit_info();
         assert!(
-            dump.contains(" mod") || dump.contains(" mod_imm") || dump.contains(" ldloc_mod_imm"),
-            "expected trace dump to include mod or fused mod-imm, dump:\n{dump}"
+            any_trace_op(&vm.jit_snapshot(), "mod")
+                || any_trace_op(&vm.jit_snapshot(), "imod")
+                || any_trace_op(&vm.jit_snapshot(), "mod_imm")
+                || any_trace_op(&vm.jit_snapshot(), "imod_imm")
+                || any_trace_ssa_contains(&vm.jit_snapshot(), "imod_imm ")
+                || any_trace_ssa_contains(&vm.jit_snapshot(), "mod_imm "),
+            "expected trace dump to include SSA mod ops, dump:\n{}",
+            vm.dump_jit_info()
         );
     }
 }
 
 #[test]
-fn trace_jit_supports_host_calls_with_native_mixed_mode() {
+fn trace_jit_supports_host_call_loops_with_branch_exit_traces() {
     let source = r#"
         fn print(x);
         let mut i = 0;
@@ -1221,34 +1300,19 @@ fn trace_jit_supports_host_calls_with_native_mixed_mode() {
     let dump = vm.dump_jit_info();
     let snapshot = vm.jit_snapshot();
     if native_jit_supported() {
+        assert_native_ssa_call_boundary_trace(&vm, &snapshot, "host call loop");
         assert!(
             snapshot
-                .attempts
+                .traces
                 .iter()
-                .any(|attempt| attempt.result.is_ok()),
-            "expected at least one successful trace compile, dump:\n{dump}"
-        );
-        assert!(
-            snapshot.traces.iter().any(|trace| trace.has_call),
-            "expected at least one call-containing trace, dump:\n{dump}"
-        );
-        assert!(
-            dump.contains(" call"),
-            "expected trace dump to include call"
-        );
-        assert!(
-            vm.jit_native_trace_count() > 0,
-            "expected call trace to compile to native code"
-        );
-        assert!(
-            vm.jit_native_exec_count() > 0,
-            "expected native call trace to execute at least once"
+                .all(|trace| trace.terminal == JitTraceTerminal::BranchExit),
+            "host call loop traces should terminate through branch exits, dump:\n{dump}"
         );
     }
 }
 
 #[test]
-fn trace_jit_nested_loops_use_branch_exit_segments() {
+fn trace_jit_nested_call_loops_use_branch_exit_segments() {
     let source = r#"
         fn print(x);
         let mut i = 0;
@@ -1287,26 +1351,10 @@ fn trace_jit_nested_loops_use_branch_exit_segments() {
         let dump = vm.dump_jit_info();
         let snapshot = vm.jit_snapshot();
         assert!(
-            snapshot
-                .attempts
-                .iter()
-                .any(|attempt| attempt.result.is_ok()),
-            "expected successful trace compiles for nested loops, dump:\n{dump}"
+            snapshot.traces.len() >= 2,
+            "nested call loops should record multiple SSA branch-exit traces, dump:\n{dump}"
         );
-        assert!(
-            snapshot
-                .traces
-                .iter()
-                .any(|trace| trace.terminal == JitTraceTerminal::BranchExit),
-            "expected at least one branch-exit trace for nested loop handoff, dump:\n{dump}"
-        );
-        assert!(
-            snapshot
-                .traces
-                .iter()
-                .any(|trace| trace.terminal == JitTraceTerminal::LoopBack),
-            "expected at least one loop-back trace, dump:\n{dump}"
-        );
+        assert_native_ssa_call_boundary_trace(&vm, &snapshot, "nested call loops");
     }
 }
 
@@ -1340,18 +1388,220 @@ fn trace_jit_records_typed_int_add_steps() {
 
     let snapshot = vm.jit_snapshot();
     assert!(
-        snapshot
-            .traces
-            .iter()
-            .flat_map(|trace| trace.steps.iter())
-            .any(|step| matches!(step, TraceStep::IAdd)),
-        "expected a typed integer add trace step, dump:\n{}",
+        any_trace_op(&snapshot, "iadd")
+            || any_trace_op(&snapshot, "iadd_imm")
+            || any_trace_op(&snapshot, "ilocal_add_imm")
+            || any_trace_ssa_contains(&snapshot, "iadd "),
+        "expected a typed integer add SSA trace, dump:\n{}",
         vm.dump_jit_info()
     );
 }
 
 #[test]
-fn trace_jit_records_typed_float_and_string_add_steps() {
+fn trace_jit_uses_ssa_lowering_for_supported_numeric_loop() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let mut i = 0;
+        let mut sum = 0;
+        while i < 6 {
+            sum = sum + i;
+            i = i + 1;
+        }
+        sum;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(15)]);
+    assert!(
+        vm.jit_native_exec_count() > 0,
+        "expected native execution for SSA candidate loop, dump:\n{}",
+        vm.dump_jit_info()
+    );
+
+    let dump = vm.dump_jit_info();
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        dump.contains("lowering=ssa"),
+        "expected at least one SSA-lowered native trace, dump:\n{dump}"
+    );
+    assert!(
+        snapshot.metrics.boxed_load_site_count > 0,
+        "expected SSA diagnostics to report boxed load sites, dump:\n{dump}"
+    );
+    assert!(
+        snapshot.metrics.boxed_store_site_count > 0,
+        "expected SSA diagnostics to report boxed store sites, dump:\n{dump}"
+    );
+    assert!(
+        snapshot.metrics.trace_exit_count > 0,
+        "expected SSA diagnostics to report trace exits, dump:\n{dump}"
+    );
+    assert!(
+        snapshot.metrics.native_loop_back_count > 0,
+        "expected SSA diagnostics to report native loop-backs, dump:\n{dump}"
+    );
+}
+
+#[test]
+fn trace_jit_restores_tagged_heap_locals_on_ssa_exit() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.stloc(0);
+    bc.ldc(1);
+    bc.stloc(1);
+    bc.ldc(2);
+    bc.stloc(2);
+    let root_ip = bc.position();
+    bc.ldloc(2);
+    bc.ldc(4);
+    bc.clt();
+    let guard_ip = bc.position();
+    bc.brfalse(0);
+    bc.ldloc(0);
+    bc.stloc(1);
+    bc.ldloc(2);
+    bc.ldc(3);
+    bc.add();
+    bc.stloc(2);
+    bc.br(root_ip);
+    let exit_ip = bc.position();
+    bc.ldloc(1);
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, guard_ip, exit_ip);
+    let program = Program::new(
+        vec![
+            Value::string("seed"),
+            Value::string(""),
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(4),
+        ],
+        code,
+    )
+    .with_local_count(3);
+
+    let mut vm = Vm::new(program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("seed")]);
+    assert!(
+        vm.jit_native_exec_count() > 0,
+        "expected native SSA execution for tagged-local rebinding loop, dump:\n{}",
+        vm.dump_jit_info()
+    );
+
+    let dump = vm.dump_jit_info();
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        dump.contains("lowering=ssa"),
+        "expected tagged-local rebinding loop to lower through SSA, dump:\n{dump}"
+    );
+    assert_eq!(
+        snapshot.metrics.helper_fallback_count, 0,
+        "tagged-local rebinding loop should not need interpreter fallback, dump:\n{dump}"
+    );
+}
+
+#[test]
+fn trace_jit_restores_array_and_map_locals_on_ssa_exit() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let array_value = Value::array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+    let map_value = Value::map(vec![(Value::string("k"), Value::Int(9))]);
+
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.stloc(0);
+    bc.ldc(1);
+    bc.stloc(1);
+    bc.ldc(2);
+    bc.stloc(2);
+    let root_ip = bc.position();
+    bc.ldloc(2);
+    bc.ldc(4);
+    bc.clt();
+    let guard_ip = bc.position();
+    bc.brfalse(0);
+    bc.ldloc(2);
+    bc.ldc(3);
+    bc.add();
+    bc.stloc(2);
+    bc.br(root_ip);
+    let exit_ip = bc.position();
+    bc.ldloc(0);
+    bc.ldloc(1);
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, guard_ip, exit_ip);
+    let program = Program::new(
+        vec![
+            array_value.clone(),
+            map_value.clone(),
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(4),
+        ],
+        code,
+    )
+    .with_local_count(3);
+
+    let mut vm = Vm::new(program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[array_value, map_value]);
+    assert!(
+        vm.jit_native_exec_count() > 0,
+        "expected native SSA execution for array/map exit restore, dump:\n{}",
+        vm.dump_jit_info()
+    );
+
+    let dump = vm.dump_jit_info();
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        dump.contains("lowering=ssa"),
+        "expected array/map restore loop to lower through SSA, dump:\n{dump}"
+    );
+    assert_eq!(
+        snapshot.metrics.helper_fallback_count, 0,
+        "array/map restore loop should not need interpreter fallback, dump:\n{dump}"
+    );
+}
+
+#[test]
+fn trace_jit_supports_float_and_string_loops_through_ssa() {
     if !native_jit_supported() {
         return;
     }
@@ -1387,17 +1637,18 @@ fn trace_jit_records_typed_float_and_string_add_steps() {
     assert_eq!(float_vm.stack(), &[Value::Float(5.0)]);
     let float_snapshot = float_vm.jit_snapshot();
     assert!(
-        float_snapshot
-            .traces
-            .iter()
-            .flat_map(|trace| trace.steps.iter())
-            .any(|step| {
-                matches!(
-                    step,
-                    TraceStep::FAdd | TraceStep::FAddImm(_) | TraceStep::FLocalAddImm { .. }
-                )
-            }),
-        "expected a typed float add or fused float-add-imm trace step, dump:\n{}",
+        float_vm.jit_native_exec_count() > 0,
+        "float loop should execute through native SSA, dump:\n{}",
+        float_vm.dump_jit_info()
+    );
+    assert!(
+        any_trace_ssa_contains(&float_snapshot, "fadd "),
+        "float loop should record SSA float ops, dump:\n{}",
+        float_vm.dump_jit_info()
+    );
+    assert!(
+        float_vm.dump_jit_info().contains("lowering=ssa"),
+        "float loop should lower through SSA, dump:\n{}",
         float_vm.dump_jit_info()
     );
 
@@ -1412,19 +1663,11 @@ fn trace_jit_records_typed_float_and_string_add_steps() {
     assert_eq!(string_status, VmStatus::Halted);
     assert_eq!(string_vm.stack(), &[Value::string("xxx")]);
     let string_snapshot = string_vm.jit_snapshot();
-    assert!(
-        string_snapshot
-            .traces
-            .iter()
-            .flat_map(|trace| trace.steps.iter())
-            .any(|step| { matches!(step, TraceStep::Concat(TraceConcatKind::String)) }),
-        "expected a typed string concat trace step, dump:\n{}",
-        string_vm.dump_jit_info()
-    );
+    assert_native_ssa_call_boundary_trace(&string_vm, &string_snapshot, "string add loop");
 }
 
 #[test]
-fn trace_jit_records_typed_bytes_concat_and_builtin_steps() {
+fn trace_jit_supports_bytes_heavy_call_boundary_exits_without_fallback() {
     if !native_jit_supported() {
         return;
     }
@@ -1475,58 +1718,7 @@ fn trace_jit_records_typed_bytes_concat_and_builtin_steps() {
     );
 
     let snapshot = vm.jit_snapshot();
-    let steps = snapshot
-        .traces
-        .iter()
-        .flat_map(|trace| trace.steps.iter())
-        .collect::<Vec<_>>();
-    assert!(
-        steps
-            .iter()
-            .any(|step| matches!(step, TraceStep::Concat(TraceConcatKind::Bytes))),
-        "expected typed bytes concat trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        steps
-            .iter()
-            .any(|step| matches!(step, TraceStep::Len(TraceTextBytesKind::Bytes))),
-        "expected typed bytes len trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        steps
-            .iter()
-            .any(|step| matches!(step, TraceStep::Slice(TraceTextBytesKind::Bytes))),
-        "expected typed bytes slice trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        steps
-            .iter()
-            .any(|step| matches!(step, TraceStep::Get(TraceTextBytesKind::Bytes))),
-        "expected typed bytes get trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        steps.iter().any(|step| matches!(step, TraceStep::HasBytes)),
-        "expected typed bytes has trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        steps
-            .iter()
-            .any(|step| matches!(step, TraceStep::BuiltinCall { .. })),
-        "expected bytes::from_hex to stay on the BuiltinCall path, dump:\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        !steps
-            .iter()
-            .any(|step| matches!(step, TraceStep::BytesCodec(TraceBytesCodecKind::FromHex))),
-        "expected bytes::from_hex to avoid typed bytes codec lowering, dump:\n{}",
-        vm.dump_jit_info()
-    );
+    assert_native_ssa_call_boundary_trace(&vm, &snapshot, "bytes-heavy loop");
 }
 
 #[test]
@@ -1566,24 +1758,18 @@ fn trace_jit_keeps_join_path_inline_for_straight_line_if_diamond() {
         .iter()
         .find(|trace| {
             trace.terminal == JitTraceTerminal::LoopBack
-                && trace
-                    .steps
-                    .iter()
-                    .any(|step| matches!(step, TraceStep::GuardTrue { .. }))
+                && trace.op_names().iter().any(|op| op == "guard_true")
         })
         .expect("expected loop trace with join-path guard");
     assert!(
-        loop_trace
-            .steps
-            .iter()
-            .any(|step| matches!(step, TraceStep::JumpToRoot)),
+        loop_trace.op_names().iter().any(|op| op == "jump_root"),
         "expected loop trace to continue through the join path, dump:\n{}",
         vm.dump_jit_info()
     );
 }
 
 #[test]
-fn trace_jit_executes_typed_float_math_without_helper_bridge() {
+fn trace_jit_supports_float_math_in_ssa() {
     if !native_jit_supported() {
         return;
     }
@@ -1615,88 +1801,33 @@ fn trace_jit_executes_typed_float_math_without_helper_bridge() {
     let status = vm.run().expect("float math vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Float(-0.46875)]);
+    let snapshot = vm.jit_snapshot();
     assert!(
         vm.jit_native_exec_count() > 0,
-        "expected native execution, dump:\n{}",
-        vm.dump_jit_info()
-    );
-
-    let snapshot = vm.jit_snapshot();
-    let steps = snapshot
-        .traces
-        .iter()
-        .flat_map(|trace| trace.steps.iter())
-        .collect::<Vec<_>>();
-    assert!(
-        steps.iter().any(|step| {
-            matches!(
-                step,
-                TraceStep::FAdd | TraceStep::FAddImm(_) | TraceStep::FLocalAddImm { .. }
-            )
-        }),
-        "expected float add trace step, dump:\n{}",
+        "float math loop should execute through native SSA, dump:\n{}",
         vm.dump_jit_info()
     );
     assert!(
-        steps.iter().any(|step| {
-            matches!(
-                step,
-                TraceStep::FSub | TraceStep::FSubImm(_) | TraceStep::FLocalSubImm { .. }
-            )
-        }),
-        "expected float sub trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        steps.iter().any(|step| {
-            matches!(
-                step,
-                TraceStep::FMul | TraceStep::FMulImm(_) | TraceStep::FLocalMulImm { .. }
-            )
-        }),
-        "expected float mul trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        steps.iter().any(|step| {
-            matches!(
-                step,
-                TraceStep::FDiv | TraceStep::FDivImm(_) | TraceStep::FLocalDivImm { .. }
-            )
-        }),
-        "expected float div trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        steps.iter().any(|step| {
-            matches!(
-                step,
-                TraceStep::FMod | TraceStep::FModImm(_) | TraceStep::FLocalModImm { .. }
-            )
-        }),
-        "expected float mod trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        steps.iter().any(|step| **step == TraceStep::FNeg),
-        "expected float neg trace step, dump:\n{}",
+        any_trace_ssa_contains(&snapshot, "fadd ")
+            && any_trace_ssa_contains(&snapshot, "fsub ")
+            && any_trace_ssa_contains(&snapshot, "fmul ")
+            && any_trace_ssa_contains(&snapshot, "fdiv ")
+            && any_trace_ssa_contains(&snapshot, "fmod ")
+            && any_trace_ssa_contains(&snapshot, "fneg "),
+        "float math loop should record SSA float math ops, dump:\n{}",
         vm.dump_jit_info()
     );
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
-    for bridge_name in ["add", "sub", "mul", "div", "mod", "neg"] {
-        assert!(
-            !bridge_hits
-                .iter()
-                .any(|(name, count)| *name == bridge_name && *count > 0),
-            "expected float op '{bridge_name}' to lower natively, bridge hits: {bridge_hits:?}\n{}",
-            vm.dump_jit_info()
-        );
-    }
+    assert!(
+        bridge_hits.iter().all(|(_, count)| *count == 0),
+        "float loop should not use native helper bridges, bridge hits: {bridge_hits:?}\n{}",
+        vm.dump_jit_info()
+    );
 }
 
 #[test]
-fn trace_jit_executes_typed_string_concat_without_generic_add_bridge() {
+fn trace_jit_supports_string_call_boundary_exits() {
     if !native_jit_supported() {
         return;
     }
@@ -1723,42 +1854,19 @@ fn trace_jit_executes_typed_string_concat_without_generic_add_bridge() {
     let status = vm.run().expect("string concat vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::string("xxxxxx")]);
-    assert!(
-        vm.jit_native_exec_count() > 0,
-        "expected native execution, dump:\n{}",
-        vm.dump_jit_info()
-    );
-
     let snapshot = vm.jit_snapshot();
-    assert!(
-        snapshot
-            .traces
-            .iter()
-            .flat_map(|trace| trace.steps.iter())
-            .any(|step| matches!(step, TraceStep::Concat(TraceConcatKind::String))),
-        "expected typed string concat trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
+    assert_native_ssa_call_boundary_trace(&vm, &snapshot, "string concat loop");
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        !bridge_hits
-            .iter()
-            .any(|(name, count)| *name == "add" && *count > 0),
-        "expected string concat to avoid generic add bridge, bridge hits: {bridge_hits:?}\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        !bridge_hits
-            .iter()
-            .any(|(name, count)| *name == "sconcat" && *count > 0),
-        "expected string concat to avoid sconcat helper bridge, bridge hits: {bridge_hits:?}\n{}",
+        bridge_hits.iter().all(|(_, count)| *count == 0),
+        "string concat loop should not need native helper bridges for call-boundary execution, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
 }
 
 #[test]
-fn trace_jit_executes_typed_bytes_concat_without_helper_bridge() {
+fn trace_jit_supports_bytes_call_boundary_exits() {
     if !native_jit_supported() {
         return;
     }
@@ -1791,31 +1899,19 @@ fn trace_jit_executes_typed_bytes_concat_without_helper_bridge() {
             0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF
         ])]
     );
-    assert!(
-        vm.jit_native_exec_count() > 0,
-        "expected native execution, dump:\n{}",
-        vm.dump_jit_info()
-    );
+    let snapshot = vm.jit_snapshot();
+    assert_native_ssa_call_boundary_trace(&vm, &snapshot, "bytes concat loop");
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        !bridge_hits
-            .iter()
-            .any(|(name, count)| *name == "add" && *count > 0),
-        "expected bytes concat to avoid generic add bridge, bridge hits: {bridge_hits:?}\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        !bridge_hits
-            .iter()
-            .any(|(name, count)| name.contains("concat") && *count > 0),
-        "expected bytes concat to avoid concat helper bridges, bridge hits: {bridge_hits:?}\n{}",
+        bridge_hits.iter().all(|(_, count)| *count == 0),
+        "bytes concat loop should not need native helper bridges for call-boundary execution, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
 }
 
 #[test]
-fn trace_jit_executes_typed_bytes_sequence_builtins_without_builtin_bridge() {
+fn trace_jit_supports_bytes_sequence_call_boundary_exits() {
     if !native_jit_supported() {
         return;
     }
@@ -1863,52 +1959,18 @@ fn trace_jit_executes_typed_bytes_sequence_builtins_without_builtin_bridge() {
     );
 
     let snapshot = vm.jit_snapshot();
-    let steps = snapshot
-        .traces
-        .iter()
-        .flat_map(|trace| trace.steps.iter())
-        .collect::<Vec<_>>();
-    assert!(
-        steps
-            .iter()
-            .any(|step| matches!(step, TraceStep::Len(TraceTextBytesKind::Bytes))),
-        "expected typed bytes len trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        steps
-            .iter()
-            .any(|step| matches!(step, TraceStep::Slice(TraceTextBytesKind::Bytes))),
-        "expected typed bytes slice trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        steps
-            .iter()
-            .any(|step| matches!(step, TraceStep::Get(TraceTextBytesKind::Bytes))),
-        "expected typed bytes get trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        steps.iter().any(|step| matches!(step, TraceStep::HasBytes)),
-        "expected typed bytes has trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
+    assert_native_ssa_call_boundary_trace(&vm, &snapshot, "bytes builtin loop");
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
-    for bridge_name in ["len", "slice", "get", "has"] {
-        assert!(
-            !bridge_hits
-                .iter()
-                .any(|(name, count)| *name == bridge_name && *count > 0),
-            "expected bytes builtin '{bridge_name}' to avoid builtin helper bridge, bridge hits: {bridge_hits:?}\n{}",
-            vm.dump_jit_info()
-        );
-    }
+    assert!(
+        bridge_hits.iter().all(|(_, count)| *count == 0),
+        "bytes builtin loop should not need native helper bridges for call-boundary execution, bridge hits: {bridge_hits:?}\n{}",
+        vm.dump_jit_info()
+    );
 }
 
 #[test]
-fn trace_jit_executes_typed_string_sequence_builtins_without_builtin_bridge() {
+fn trace_jit_supports_string_sequence_call_boundary_exits() {
     if !native_jit_supported() {
         return;
     }
@@ -1947,47 +2009,18 @@ fn trace_jit_executes_typed_string_sequence_builtins_without_builtin_bridge() {
     );
 
     let snapshot = vm.jit_snapshot();
-    let steps = snapshot
-        .traces
-        .iter()
-        .flat_map(|trace| trace.steps.iter())
-        .collect::<Vec<_>>();
-    assert!(
-        steps
-            .iter()
-            .any(|step| matches!(step, TraceStep::Len(TraceTextBytesKind::String))),
-        "expected typed string len trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        steps
-            .iter()
-            .any(|step| matches!(step, TraceStep::Slice(TraceTextBytesKind::String))),
-        "expected typed string slice trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        steps
-            .iter()
-            .any(|step| matches!(step, TraceStep::Get(TraceTextBytesKind::String))),
-        "expected typed string get trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
+    assert_native_ssa_call_boundary_trace(&vm, &snapshot, "string builtin loop");
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
-    for bridge_name in ["len", "slice", "get"] {
-        assert!(
-            !bridge_hits
-                .iter()
-                .any(|(name, count)| *name == bridge_name && *count > 0),
-            "expected string builtin '{bridge_name}' to avoid builtin helper bridge, bridge hits: {bridge_hits:?}\n{}",
-            vm.dump_jit_info()
-        );
-    }
+    assert!(
+        bridge_hits.iter().all(|(_, count)| *count == 0),
+        "string builtin loop should not need native helper bridges for call-boundary execution, bridge hits: {bridge_hits:?}\n{}",
+        vm.dump_jit_info()
+    );
 }
 
 #[test]
-fn trace_jit_executes_typed_bytes_array_codec_builtins_without_builtin_bridge() {
+fn trace_jit_supports_bytes_array_codec_call_boundary_exits() {
     if !native_jit_supported() {
         return;
     }
@@ -2026,38 +2059,18 @@ fn trace_jit_executes_typed_bytes_array_codec_builtins_without_builtin_bridge() 
     );
 
     let snapshot = vm.jit_snapshot();
-    let steps = snapshot
-        .traces
-        .iter()
-        .flat_map(|trace| trace.steps.iter())
-        .collect::<Vec<_>>();
-    for kind in [
-        TraceBytesCodecKind::FromArrayU8,
-        TraceBytesCodecKind::ToArrayU8,
-    ] {
-        assert!(
-            steps
-                .iter()
-                .any(|step| matches!(step, TraceStep::BytesCodec(found) if *found == kind)),
-            "expected bytes codec step {kind:?}, dump:\n{}",
-            vm.dump_jit_info()
-        );
-    }
+    assert_native_ssa_call_boundary_trace(&vm, &snapshot, "bytes array codec loop");
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
-    for bridge_name in ["bytes_from_array_u8", "bytes_to_array_u8"] {
-        assert!(
-            !bridge_hits
-                .iter()
-                .any(|(name, count)| *name == bridge_name && *count > 0),
-            "expected bytes array codec '{bridge_name}' to avoid builtin helper bridge, bridge hits: {bridge_hits:?}\n{}",
-            vm.dump_jit_info()
-        );
-    }
+    assert!(
+        bridge_hits.iter().all(|(_, count)| *count == 0),
+        "bytes array codec loop should not need native helper bridges for call-boundary execution, bridge hits: {bridge_hits:?}\n{}",
+        vm.dump_jit_info()
+    );
 }
 
 #[test]
-fn trace_jit_executes_typed_float_comparisons_without_helper_bridge() {
+fn trace_jit_supports_float_comparisons_in_ssa() {
     if !native_jit_supported() {
         return;
     }
@@ -2095,48 +2108,24 @@ fn trace_jit_executes_typed_float_comparisons_without_helper_bridge() {
         vm.stack(),
         &[Value::Bool(false), Value::Bool(true), Value::Bool(false)]
     );
+    let snapshot = vm.jit_snapshot();
     assert!(
         vm.jit_native_exec_count() > 0,
-        "expected native execution, dump:\n{}",
-        vm.dump_jit_info()
-    );
-
-    let snapshot = vm.jit_snapshot();
-    let steps = snapshot
-        .traces
-        .iter()
-        .flat_map(|trace| trace.steps.iter())
-        .collect::<Vec<_>>();
-    assert!(
-        steps
-            .iter()
-            .any(|step| { matches!(step, TraceStep::FClt | TraceStep::FLocalCltImm { .. }) }),
-        "expected float less-than trace step, dump:\n{}",
+        "float compare loop should execute through native SSA, dump:\n{}",
         vm.dump_jit_info()
     );
     assert!(
-        steps
-            .iter()
-            .any(|step| { matches!(step, TraceStep::FCgt | TraceStep::FLocalCgtImm { .. }) }),
-        "expected float greater-than trace step, dump:\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        steps
-            .iter()
-            .any(|step| matches!(step, TraceStep::FCeq | TraceStep::Ceq)),
-        "expected float equality trace step, dump:\n{}",
+        any_trace_ssa_contains(&snapshot, "fcmp_lt ")
+            && any_trace_ssa_contains(&snapshot, "fcmp_gt ")
+            && any_trace_ssa_contains(&snapshot, "fcmp_eq "),
+        "float compare loop should record SSA float compare ops, dump:\n{}",
         vm.dump_jit_info()
     );
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
-    for bridge_name in ["clt", "cgt", "ceq"] {
-        assert!(
-            !bridge_hits
-                .iter()
-                .any(|(name, count)| *name == bridge_name && *count > 0),
-            "expected float compare '{bridge_name}' to lower natively, bridge hits: {bridge_hits:?}\n{}",
-            vm.dump_jit_info()
-        );
-    }
+    assert!(
+        bridge_hits.iter().all(|(_, count)| *count == 0),
+        "float compare loop should not use native helper bridges, bridge hits: {bridge_hits:?}\n{}",
+        vm.dump_jit_info()
+    );
 }

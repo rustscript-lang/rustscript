@@ -447,14 +447,19 @@ fn jit_uses_interpreter_trace_path_when_builtin_override_is_bound() {
     if native_jit_supported() {
         let snapshot = vm.jit_snapshot();
         assert!(
-            !snapshot.traces.is_empty(),
-            "expected loop trace to still be recorded, dump:\n{}",
+            snapshot.traces.is_empty(),
+            "builtin overrides should disable SSA trace recording entirely, dump:\n{}",
+            vm.dump_jit_info()
+        );
+        assert!(
+            snapshot.attempts.is_empty(),
+            "builtin overrides should avoid trace compile attempts, dump:\n{}",
             vm.dump_jit_info()
         );
         assert_eq!(
             vm.jit_native_exec_count(),
             0,
-            "builtin override should force interpreter-side trace execution"
+            "builtin override should force interpreter execution"
         );
     }
 }

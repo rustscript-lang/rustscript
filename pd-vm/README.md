@@ -188,7 +188,7 @@ use vm::{Store, VmStatus};
 // ... create vm ...
 let mut store = Store::from_vm(vm);
 store.set_fuel(10_000);
-store.set_fuel_check_interval(1)?; // exact mode: check every instruction/trace step
+store.set_fuel_check_interval(1)?; // exact mode: check every instruction/trace op
 let checkpoint = store.checkpoint();
 
 loop {
@@ -215,7 +215,7 @@ Fuel charging semantics:
   Chunk size = `fuel_check_interval`.
   Default interval is `1` (exact mode).
 - The interpreter applies fuel checks in the VM loop before opcode fetch/execute.
-- Trace-JIT execution applies the same cadence before each `TraceStep`.
+- Trace-JIT execution applies the same cadence against recorded trace ops/blocks.
 - When fuel metering is enabled, native JIT execution injects fuel checks in generated machine
   code at the configured check cadence.
 - With interval `> 1`, out-of-fuel detection is coarse-grained: execution may run up to
@@ -456,8 +456,8 @@ The end-to-end stack is split into layers. Not every entrypoint uses every layer
 1. Type-consistency validation on legalized IR (for example rejecting known `if`/`else` branch mismatches)
 1. Lifetime/liveness lowering plus type metadata collection
 1. Bytecode backend (`Compiler` + `Assembler` -> `Program`) executed by VM
-1. Trace-JIT IR recording (`JitTrace` + `TraceStep`) using TraceStep IR
-1. Native machine code emission and execution
+1. Trace-JIT SSA recording (`JitTrace` + `SsaTrace`) with symbolic stack/local state
+1. Native machine code emission and execution from SSA traces
 
 #### Type Metadata and Inference
 
@@ -582,8 +582,8 @@ At runtime, `call` is bridged through `Vm::execute_host_call`:
 
 - builtin call indices dispatch to `vm/builtin_runtime.rs`
 - non-builtin indices dispatch to bound host imports
-- trace-JIT records `TraceStep::Call`, and native traces bridge call steps through runtime helpers
-  (with builtin fast paths where available), preserving interpreter semantics
+- trace-JIT records supported hot paths into SSA and falls back to the interpreter for call-heavy
+  or otherwise unsupported traces, preserving interpreter semantics
 
 #### Current Compiler Subset Limitations
 
