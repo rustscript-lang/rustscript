@@ -3,7 +3,7 @@
 use std::task::{Context, Poll};
 
 use crate::builtins::BuiltinFunction;
-use crate::vm::{CallOutcome, HostOpId, Value, Vm, VmResult};
+use crate::vm::{CallOutcome, CallReturn, HostOpId, Value, Vm, VmResult};
 
 mod aot;
 mod bytes;
@@ -26,11 +26,11 @@ use io_wasm as io;
 pub(crate) use io::IoState;
 use typed::{
     AnyValue, BuiltinResult, IntoBuiltinCallOutcome, IntoHostCallOutcome, NumberValue,
-    UnknownValue, VmArray, VmBytes, VmMap, arg, return_values,
+    UnknownValue, VmArray, VmBytes, VmMap, arg, borrow_arg, return_none, return_one, take_arg,
 };
 
 pub(crate) enum BuiltinCallOutcome {
-    Return(Vec<Value>),
+    Return(CallReturn),
     #[allow(dead_code)]
     Halt,
     Pending(HostOpId),
@@ -50,13 +50,13 @@ pub(crate) fn execute_builtin_call(
         BuiltinFunction::Len => core::builtin_len(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Slice => core::builtin_slice(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Concat => core::builtin_concat(args).map(BuiltinCallOutcome::Return),
-        BuiltinFunction::ArrayNew => Ok(BuiltinCallOutcome::Return(return_values(
+        BuiltinFunction::ArrayNew => Ok(BuiltinCallOutcome::Return(return_one(
             core::builtin_array_new_impl(),
         ))),
         BuiltinFunction::ArrayPush => {
             core::builtin_array_push(args).map(BuiltinCallOutcome::Return)
         }
-        BuiltinFunction::MapNew => Ok(BuiltinCallOutcome::Return(return_values(
+        BuiltinFunction::MapNew => Ok(BuiltinCallOutcome::Return(return_one(
             core::builtin_map_new_impl(),
         ))),
         BuiltinFunction::Get => core::builtin_get(args).map(BuiltinCallOutcome::Return),
@@ -74,7 +74,7 @@ pub(crate) fn execute_builtin_call(
         }
         BuiltinFunction::Assert => core::builtin_assert(args).map(|()| {
             // Successful asserts are control checks, not value-producing expressions.
-            BuiltinCallOutcome::Return(Vec::new())
+            BuiltinCallOutcome::Return(return_none())
         }),
         _ => execute_namespaced_builtin_call(vm, builtin, args),
     }
@@ -84,7 +84,7 @@ pub(crate) fn poll_builtin_io_op(
     vm: &mut Vm,
     op_id: HostOpId,
     cx: &mut Context<'_>,
-) -> Poll<VmResult<Vec<Value>>> {
+) -> Poll<VmResult<CallReturn>> {
     io::poll_builtin_io_op(vm, op_id, cx)
 }
 

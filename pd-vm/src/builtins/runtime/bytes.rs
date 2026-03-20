@@ -1,5 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
+use super::typed::{VmArrayRef, VmBytesRef};
 use super::{VmArray, VmBytes};
 use crate::vm::{Value, VmError, VmResult};
 use pd_host_function::pd_host_function;
@@ -12,7 +13,7 @@ pub(super) fn builtin_bytes_from_utf8_impl(text: &str) -> VmBytes {
 
 /// Decodes UTF-8 bytes into a string.
 #[pd_host_function(name = "bytes::to_utf8")]
-pub(super) fn builtin_bytes_to_utf8_impl(payload: &[u8]) -> VmResult<String> {
+pub(super) fn builtin_bytes_to_utf8_impl(payload: VmBytesRef<'_>) -> VmResult<String> {
     std::str::from_utf8(payload)
         .map(str::to_string)
         .map_err(|err| VmError::HostError(format!("bytes::to_utf8 requires valid utf-8: {err}")))
@@ -20,7 +21,7 @@ pub(super) fn builtin_bytes_to_utf8_impl(payload: &[u8]) -> VmResult<String> {
 
 /// Decodes bytes into a string using UTF-8 replacement semantics.
 #[pd_host_function(name = "bytes::to_utf8_lossy")]
-pub(super) fn builtin_bytes_to_utf8_lossy_impl(payload: &[u8]) -> String {
+pub(super) fn builtin_bytes_to_utf8_lossy_impl(payload: VmBytesRef<'_>) -> String {
     String::from_utf8_lossy(payload).into_owned()
 }
 
@@ -58,7 +59,7 @@ pub(super) fn builtin_bytes_from_hex_impl(text: &str) -> VmResult<VmBytes> {
 
 /// Encodes bytes as lowercase hexadecimal.
 #[pd_host_function(name = "bytes::to_hex")]
-pub(super) fn builtin_bytes_to_hex_impl(payload: &[u8]) -> String {
+pub(super) fn builtin_bytes_to_hex_impl(payload: VmBytesRef<'_>) -> String {
     let mut out = String::with_capacity(payload.len() * 2);
     for byte in payload {
         out.push(nibble_to_hex(byte >> 4));
@@ -77,21 +78,21 @@ pub(super) fn builtin_bytes_from_base64_impl(text: &str) -> VmResult<VmBytes> {
 
 /// Encodes bytes as standard base64.
 #[pd_host_function(name = "bytes::to_base64")]
-pub(super) fn builtin_bytes_to_base64_impl(payload: &[u8]) -> String {
+pub(super) fn builtin_bytes_to_base64_impl(payload: VmBytesRef<'_>) -> String {
     STANDARD.encode(payload)
 }
 
 /// Converts an array of ints in 0..=255 into bytes.
 #[pd_host_function(name = "bytes::from_array_u8")]
-pub(super) fn builtin_bytes_from_array_u8_impl(values: VmArray) -> VmResult<VmBytes> {
+pub(super) fn builtin_bytes_from_array_u8_impl(values: VmArrayRef<'_>) -> VmResult<VmBytes> {
     let mut out = Vec::with_capacity(values.len());
-    for (index, value) in values.into_iter().enumerate() {
+    for (index, value) in values.iter().enumerate() {
         let Value::Int(value) = value else {
             return Err(VmError::HostError(format!(
                 "bytes::from_array_u8 entry {index} must be an int in 0..=255"
             )));
         };
-        let value = u8::try_from(value).map_err(|_| {
+        let value = u8::try_from(*value).map_err(|_| {
             VmError::HostError(format!(
                 "bytes::from_array_u8 entry {index} must be an int in 0..=255"
             ))
@@ -103,7 +104,7 @@ pub(super) fn builtin_bytes_from_array_u8_impl(values: VmArray) -> VmResult<VmBy
 
 /// Converts bytes into an array of ints in 0..=255.
 #[pd_host_function(name = "bytes::to_array_u8")]
-pub(super) fn builtin_bytes_to_array_u8_impl(payload: &[u8]) -> VmArray {
+pub(super) fn builtin_bytes_to_array_u8_impl(payload: VmBytesRef<'_>) -> VmArray {
     payload
         .iter()
         .copied()
@@ -152,7 +153,8 @@ mod tests {
 
     #[test]
     fn to_array_roundtrips() {
-        let bytes = builtin_bytes_from_array_u8_impl(vec![Value::Int(1), Value::Int(255)])
+        let values = [Value::Int(1), Value::Int(255)];
+        let bytes = builtin_bytes_from_array_u8_impl(&values)
             .expect("array<u8> should decode");
         assert_eq!(bytes, vec![1, 255]);
         assert_eq!(

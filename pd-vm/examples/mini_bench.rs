@@ -623,7 +623,7 @@ struct PerfNoopHost {
 
 impl HostFunction for PerfNoopHost {
     fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, VmError> {
-        Ok(CallOutcome::Return(Vec::new()))
+        Ok(CallOutcome::Return(Vec::new().into()))
     }
 }
 

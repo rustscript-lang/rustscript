@@ -128,7 +128,7 @@ fn args_only_call_can_yield_and_resume_without_rebuilding_args() {
                 self.yielded = true;
                 Ok(CallOutcome::Yield)
             } else {
-                Ok(CallOutcome::Return(vec![Value::Int(42)]))
+                Ok(CallOutcome::Return(vec![Value::Int(42)].into()))
             }
         }
     }
@@ -236,7 +236,7 @@ fn namespaced_builtin_io_call_can_be_overridden_by_host_binding() {
     impl HostFunction for ExistsOverride {
         fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
             assert_eq!(args, &[Value::string("request_body")]);
-            Ok(CallOutcome::Return(vec![Value::Bool(false)]))
+            Ok(CallOutcome::Return(vec![Value::Bool(false)].into()))
         }
     }
 
@@ -262,7 +262,7 @@ fn namespaced_builtin_json_encode_call_can_be_overridden_by_host_binding() {
     impl HostFunction for JsonEncodeOverride {
         fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
             assert_eq!(args, &[Value::string("request_body")]);
-            Ok(CallOutcome::Return(vec![Value::string("\"override\"")]))
+            Ok(CallOutcome::Return(vec![Value::string("\"override\"")].into()))
         }
     }
 
@@ -288,7 +288,7 @@ fn namespaced_builtin_math_call_can_be_overridden_by_host_binding() {
     impl HostFunction for MathSqrtOverride {
         fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
             assert_eq!(args, &[Value::Int(81)]);
-            Ok(CallOutcome::Return(vec![Value::Float(7.0)]))
+            Ok(CallOutcome::Return(vec![Value::Float(7.0)].into()))
         }
     }
 
@@ -350,7 +350,7 @@ fn runtime_sleep_host_import_can_be_overridden_by_host_binding() {
     impl HostFunction for RuntimeSleepOverride {
         fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
             assert_eq!(args, &[Value::Int(3)]);
-            Ok(CallOutcome::Return(vec![Value::Int(7)]))
+            Ok(CallOutcome::Return(vec![Value::Int(7)].into()))
         }
     }
 
@@ -502,7 +502,7 @@ fn bind_builtin_override_rejects_unknown_namespaced_builtin() {
 
     impl HostFunction for Dummy {
         fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-            Ok(CallOutcome::Return(vec![]))
+            Ok(CallOutcome::Return(vec![].into()))
         }
     }
 

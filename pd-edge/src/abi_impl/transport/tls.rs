@@ -725,7 +725,7 @@ async fn session_from_socket(
         }
         TlsSessionHandle::OutboundExchange(handle) => handle,
     };
-    Ok(CallOutcome::Return(vec![Value::Int(handle)]))
+    Ok(CallOutcome::Return((vec![Value::Int(handle)]).into()))
 }
 
 /// Returns whether the TLS session handle is present.
@@ -735,9 +735,9 @@ async fn session_is_present(
     context: SharedProxyVmContext,
     session: i64,
 ) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return(vec![Value::Bool(
+    Ok(CallOutcome::Return((vec![Value::Bool(
         session_flow(&context, decode_session(&context, session)?).is_present(),
-    )]))
+    )]).into()))
 }
 
 /// Runs the TLS handshake for the TLS session.
@@ -750,13 +750,13 @@ async fn session_handshake(
     let session = decode_session(&context, session)?;
     let flow = session_flow(&context, session);
     if !flow.is_present() {
-        return Ok(CallOutcome::Return(vec![Value::Bool(false)]));
+        return Ok(CallOutcome::Return((vec![Value::Bool(false)]).into()));
     }
     if flow.handshake_complete() {
-        return Ok(CallOutcome::Return(vec![Value::Bool(true)]));
+        return Ok(CallOutcome::Return((vec![Value::Bool(true)]).into()));
     }
     if apply_cached_session(&context, session)? {
-        return Ok(CallOutcome::Return(vec![Value::Bool(true)]));
+        return Ok(CallOutcome::Return((vec![Value::Bool(true)]).into()));
     }
 
     match session {
@@ -924,7 +924,7 @@ async fn session_handshake(
         }
     }
     let ready = session_flow(&context, session).handshake_complete();
-    Ok(CallOutcome::Return(vec![Value::Bool(ready)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(ready)]).into()))
 }
 
 /// Sets the ALPN protocol list for the TLS session.
@@ -940,7 +940,7 @@ async fn session_set_alpn(
         flow.set_desired_alpn(protocols);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Enables or disables certificate verification for the TLS session.
@@ -955,7 +955,7 @@ async fn session_set_verify(
         flow.set_verify_peer(verify);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Enables or disables hostname verification for the TLS session.
@@ -970,7 +970,7 @@ async fn session_set_verify_hostname(
         flow.set_verify_hostname(verify);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets a trusted CA certificate for the TLS session.
@@ -985,7 +985,7 @@ async fn session_set_trusted_certificate(
         flow.set_trusted_certificate_pem(certificate_pem);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the client certificate for the TLS session.
@@ -1000,7 +1000,7 @@ async fn session_set_client_certificate(
         flow.set_client_certificate_pem(certificate_pem);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the client private key for the TLS session.
@@ -1015,7 +1015,7 @@ async fn session_set_client_private_key(
         flow.set_client_private_key_pem(private_key_pem);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the server certificate for the TLS session.
@@ -1030,7 +1030,7 @@ async fn session_set_server_certificate(
         flow.set_server_certificate_pem(certificate_pem);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the server private key for the TLS session.
@@ -1045,7 +1045,7 @@ async fn session_set_server_private_key(
         flow.set_server_private_key_pem(private_key_pem);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Enables or disables SNI for the TLS session.
@@ -1060,7 +1060,7 @@ async fn session_set_sni(
         flow.set_sni_enabled(enabled);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the minimum TLS version for the TLS session.
@@ -1076,7 +1076,7 @@ async fn session_set_min_version(
         flow.set_min_version(Some(version));
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the maximum TLS version for the TLS session.
@@ -1092,7 +1092,7 @@ async fn session_set_max_version(
         flow.set_max_version(Some(version));
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Returns the peer certificate name for the TLS session.
@@ -1102,11 +1102,11 @@ async fn session_get_peer_name(
     context: SharedProxyVmContext,
     session: i64,
 ) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return(vec![Value::string(
+    Ok(CallOutcome::Return((vec![Value::string(
         session_flow(&context, decode_session(&context, session)?)
             .peer_name()
             .to_string(),
-    )]))
+    )]).into()))
 }
 
 /// Returns the negotiated ALPN protocol for the TLS session.
@@ -1116,11 +1116,11 @@ async fn session_get_alpn(
     context: SharedProxyVmContext,
     session: i64,
 ) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return(vec![Value::string(
+    Ok(CallOutcome::Return((vec![Value::string(
         session_flow(&context, decode_session(&context, session)?)
             .alpn()
             .to_string(),
-    )]))
+    )]).into()))
 }
 
 /// Returns the current phase for the TLS session.
@@ -1130,11 +1130,11 @@ async fn session_get_phase(
     context: SharedProxyVmContext,
     session: i64,
 ) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return(vec![Value::string(
+    Ok(CallOutcome::Return((vec![Value::string(
         session_flow(&context, decode_session(&context, session)?)
             .phase_label()
             .to_string(),
-    )]))
+    )]).into()))
 }
 
 /// Returns the peer certificate for the TLS session.
@@ -1148,7 +1148,7 @@ async fn session_get_peer_certificate(
         .peer_certificate_der()
         .map(|bytes| STANDARD.encode(bytes))
         .unwrap_or_default();
-    Ok(CallOutcome::Return(vec![Value::string(encoded)]))
+    Ok(CallOutcome::Return((vec![Value::string(encoded)]).into()))
 }
 
 /// Returns whether the TLS session reused a previous TLS session.
@@ -1158,7 +1158,7 @@ async fn session_is_session_reused(
     context: SharedProxyVmContext,
     session: i64,
 ) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return(vec![Value::Bool(
+    Ok(CallOutcome::Return((vec![Value::Bool(
         session_flow(&context, decode_session(&context, session)?).is_session_reused(),
-    )]))
+    )]).into()))
 }

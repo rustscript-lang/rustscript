@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use serde::Deserialize;
 use vm::{
-    CallOutcome, FunctionDecl, HostAsyncBridge, HostFunction, HostOpId, LocalInfo, SourceFlavor,
-    SourcePathError, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
+    CallOutcome, CallReturn, FunctionDecl, HostAsyncBridge, HostFunction, HostOpId, LocalInfo,
+    SourceFlavor, SourcePathError, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
     compile_source_with_flavor_and_options, format_value, render_vm_error,
 };
 
@@ -276,7 +276,7 @@ impl BrowserAsyncBridge {
 }
 
 impl HostAsyncBridge for BrowserAsyncBridge {
-    fn poll_op(&mut self, op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<Vec<Value>>> {
+    fn poll_op(&mut self, op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
         let Ok(mut state) = self.state.lock() else {
             return Poll::Ready(Err(VmError::HostError(
                 "browser async bridge state is unavailable".to_string(),
@@ -289,7 +289,7 @@ impl HostAsyncBridge for BrowserAsyncBridge {
         };
         if current_time_ms() >= deadline_ms {
             state.deadlines_ms.remove(&op_id);
-            Poll::Ready(Ok(vec![Value::Bool(true)]))
+            Poll::Ready(Ok(CallReturn::one(Value::Bool(true))))
         } else {
             Poll::Pending
         }

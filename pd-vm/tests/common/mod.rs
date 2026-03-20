@@ -295,7 +295,7 @@ impl HostFunction for YieldOnce {
             self.yielded = true;
             Ok(CallOutcome::Yield)
         } else {
-            Ok(CallOutcome::Return(vec![Value::Int(42)]))
+            Ok(CallOutcome::Return(vec![Value::Int(42)].into()))
         }
     }
 }
@@ -312,7 +312,7 @@ impl HostFunction for AddOne {
             Some(Value::Int(value)) => *value,
             _ => 0,
         };
-        Ok(CallOutcome::Return(vec![Value::Int(value + 1)]))
+        Ok(CallOutcome::Return(vec![Value::Int(value + 1)].into()))
     }
 }
 
@@ -322,25 +322,25 @@ impl HostFunction for EchoString {
             Some(Value::String(value)) => value.as_str().to_string(),
             _ => return Err(vm::VmError::TypeMismatch("string")),
         };
-        Ok(CallOutcome::Return(vec![Value::string(value)]))
+        Ok(CallOutcome::Return(vec![Value::string(value)].into()))
     }
 }
 
 impl HostFunction for PrintBuiltin {
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-        Ok(CallOutcome::Return(args.to_vec()))
+        Ok(CallOutcome::Return(args.to_vec().into()))
     }
 }
 
 impl HostFunction for AlwaysAllow {
     fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-        Ok(CallOutcome::Return(vec![Value::Bool(true)]))
+        Ok(CallOutcome::Return(vec![Value::Bool(true)].into()))
     }
 }
 
 impl HostFunction for RuntimeSleep {
     fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-        Ok(CallOutcome::Return(vec![Value::Bool(true)]))
+        Ok(CallOutcome::Return(vec![Value::Bool(true)].into()))
     }
 }
 
@@ -349,7 +349,7 @@ pub fn static_add_one(_vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::V
         Some(Value::Int(value)) => *value,
         _ => 0,
     };
-    Ok(CallOutcome::Return(vec![Value::Int(value + 1)]))
+    Ok(CallOutcome::Return(vec![Value::Int(value + 1)].into()))
 }
 
 pub fn static_add_one_args(args: &[Value]) -> Result<CallOutcome, vm::VmError> {
@@ -357,7 +357,7 @@ pub fn static_add_one_args(args: &[Value]) -> Result<CallOutcome, vm::VmError> {
         Some(Value::Int(value)) => *value,
         _ => 0,
     };
-    Ok(CallOutcome::Return(vec![Value::Int(value + 1)]))
+    Ok(CallOutcome::Return(vec![Value::Int(value + 1)].into()))
 }
 
 pub fn make_add_one() -> Box<dyn HostFunction> {

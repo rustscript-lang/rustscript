@@ -10,7 +10,7 @@ use std::{
 
 use edge_abi::FUNCTIONS as EDGE_ABI_FUNCTIONS;
 use tokio::sync::oneshot;
-use vm::{CallOutcome, HostAsyncBridge, HostFunction, HostOpId, Value, Vm, VmError};
+use vm::{CallOutcome, CallReturn, HostAsyncBridge, HostFunction, HostOpId, Value, Vm, VmError};
 
 use crate::lock_metrics::{self, LockMetricKey, ProfiledMutexGuard};
 
@@ -57,7 +57,7 @@ pub type SharedVmAsyncOps = Arc<LazyVmAsyncOps>;
 #[cfg(feature = "console")]
 pub type SharedConsoleProgramArgs = Arc<Vec<String>>;
 
-type AsyncOpResult = Result<Vec<Value>, VmError>;
+type AsyncOpResult = Result<CallReturn, VmError>;
 type PendingFuture = Pin<Box<dyn Future<Output = AsyncOpResult> + Send + 'static>>;
 type HostCallResult = Result<CallOutcome, VmError>;
 type HostCallHandler = dyn FnMut(&mut Vm, &[Value]) -> HostCallResult + Send + 'static;
@@ -819,7 +819,7 @@ where
 
 fn schedule_ready_call(
     async_ops: &SharedVmAsyncOps,
-    values: Vec<Value>,
+    values: CallReturn,
 ) -> Result<CallOutcome, VmError> {
     let mut ops = async_ops.lock_ops();
     let op_id = ops.schedule_ready(Ok(values))?;
@@ -890,14 +890,14 @@ mod tests {
         _context: SharedProxyVmContext,
     ) -> Result<CallOutcome, VmError> {
         tokio::task::yield_now().await;
-        Ok(CallOutcome::Return(vec![]))
+        Ok(CallOutcome::Return((vec![]).into()))
     }
 
     #[cfg(feature = "http")]
     /// Returns immediately from a scoped HTTP host call while taking Vm.
     #[pd_edge_host_function(name = "test::sync_return_with_vm", scope = http)]
     fn sync_return_with_vm(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
-        Ok(CallOutcome::Return(vec![]))
+        Ok(CallOutcome::Return((vec![]).into()))
     }
 
     fn test_context() -> SharedProxyVmContext {

@@ -148,7 +148,7 @@ struct PrintNoReturn;
 
 impl HostFunction for PrintNoReturn {
     fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-        Ok(CallOutcome::Return(vec![]))
+        Ok(CallOutcome::Return(vec![].into()))
     }
 }
 
@@ -159,7 +159,7 @@ struct YieldOnce {
 impl HostFunction for YieldOnce {
     fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
         if self.yielded {
-            Ok(CallOutcome::Return(vec![Value::Int(42)]))
+            Ok(CallOutcome::Return(vec![Value::Int(42)].into()))
         } else {
             self.yielded = true;
             Ok(CallOutcome::Yield)

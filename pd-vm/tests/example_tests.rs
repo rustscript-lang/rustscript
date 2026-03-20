@@ -12,7 +12,7 @@ struct AddOneFunction;
 
 impl HostFunction for PrintFunction {
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-        Ok(CallOutcome::Return(args.to_vec()))
+        Ok(CallOutcome::Return(args.to_vec().into()))
     }
 }
 
@@ -22,7 +22,7 @@ impl HostFunction for AddOneFunction {
             Some(Value::Int(value)) => *value,
             _ => return Err(vm::VmError::TypeMismatch("int")),
         };
-        Ok(CallOutcome::Return(vec![Value::Int(value + 1)]))
+        Ok(CallOutcome::Return(vec![Value::Int(value + 1)].into()))
     }
 }
 

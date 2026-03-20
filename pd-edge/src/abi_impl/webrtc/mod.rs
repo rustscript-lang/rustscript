@@ -602,7 +602,7 @@ async fn connection_new(
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
     let handle = http::allocate_webrtc_connection_handle(&context)?;
-    Ok(CallOutcome::Return(vec![Value::Int(handle)]))
+    Ok(CallOutcome::Return((vec![Value::Int(handle)]).into()))
 }
 
 /// Returns the WebRTC connection handle for the current downstream flow.
@@ -611,9 +611,9 @@ async fn connection_downstream(
     _vm: &mut Vm,
     _context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return(vec![Value::Int(
+    Ok(CallOutcome::Return((vec![Value::Int(
         DOWNSTREAM_CONNECTION_HANDLE,
-    )]))
+    )]).into()))
 }
 
 /// Returns the default upstream handle for the WebRTC connection.
@@ -622,9 +622,9 @@ async fn connection_default_upstream(
     _vm: &mut Vm,
     _context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return(vec![Value::Int(
+    Ok(CallOutcome::Return((vec![Value::Int(
         http::default_upstream_webrtc_connection_handle(),
-    )]))
+    )]).into()))
 }
 
 /// Returns whether the WebRTC connection handle is present.
@@ -638,7 +638,7 @@ async fn connection_is_present(
         WebRtcHandle::Downstream => false,
         handle => connection_state(&context, handle).is_present(),
     };
-    Ok(CallOutcome::Return(vec![Value::Bool(present)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(present)]).into()))
 }
 
 /// Sets the ICE server list for the WebRTC connection.
@@ -660,7 +660,7 @@ async fn connection_set_ice_servers(
         state.set_ice_server_urls(urls);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the data channel label for the WebRTC connection.
@@ -689,7 +689,7 @@ async fn connection_set_data_channel_label(
         state.set_data_channel_label(label);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the remote session description for the WebRTC connection.
@@ -715,7 +715,7 @@ async fn connection_set_remote_description(
         state.set_remote_description_json(description_json);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Creates an SDP offer for the WebRTC connection.
@@ -748,7 +748,7 @@ async fn connection_create_offer(
         state.set_local_description_json(json.clone(), WebRtcPhase::OfferCreated);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![Value::string(json)]))
+    Ok(CallOutcome::Return((vec![Value::string(json)]).into()))
 }
 
 /// Creates an SDP answer for the WebRTC connection.
@@ -780,7 +780,7 @@ async fn connection_create_answer(
         state.set_local_description_json(json.clone(), WebRtcPhase::AnswerCreated);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![Value::string(json)]))
+    Ok(CallOutcome::Return((vec![Value::string(json)]).into()))
 }
 
 /// Attempts to connect the WebRTC connection.
@@ -800,7 +800,7 @@ async fn connection_connect(
         state.refresh_async_state();
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![Value::Bool(open)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(open)]).into()))
 }
 
 /// Returns the current phase for the WebRTC connection.
@@ -818,7 +818,7 @@ async fn connection_get_phase(
             state.phase()
         }
     };
-    Ok(CallOutcome::Return(vec![Value::string(phase.as_str())]))
+    Ok(CallOutcome::Return((vec![Value::string(phase.as_str())]).into()))
 }
 
 /// Sends a text message over the WebRTC connection.
@@ -839,7 +839,7 @@ async fn connection_send_text(
         .send_text(text)
         .await
         .map_err(|err| VmError::HostError(format!("failed to send webrtc text message: {err}")))?;
-    Ok(CallOutcome::Return(vec![Value::Int(sent as i64)]))
+    Ok(CallOutcome::Return((vec![Value::Int(sent as i64)]).into()))
 }
 
 /// Reads a text message from the WebRTC connection.
@@ -860,7 +860,7 @@ async fn connection_read_text(
         }
         None => String::new(),
     };
-    Ok(CallOutcome::Return(vec![Value::string(text)]))
+    Ok(CallOutcome::Return((vec![Value::string(text)]).into()))
 }
 
 /// Sends a base64-encoded binary message over the WebRTC connection.
@@ -891,7 +891,7 @@ async fn connection_send_binary_base64(
         .map_err(|err| {
             VmError::HostError(format!("failed to send webrtc binary message: {err}"))
         })?;
-    Ok(CallOutcome::Return(vec![Value::Int(sent as i64)]))
+    Ok(CallOutcome::Return((vec![Value::Int(sent as i64)]).into()))
 }
 
 /// Sends a binary message over the WebRTC connection.
@@ -913,7 +913,7 @@ async fn connection_send_binary(
     let sent = data_channel.send(&payload).await.map_err(|err| {
         VmError::HostError(format!("failed to send webrtc binary message: {err}"))
     })?;
-    Ok(CallOutcome::Return(vec![Value::Int(sent as i64)]))
+    Ok(CallOutcome::Return((vec![Value::Int(sent as i64)]).into()))
 }
 
 /// Reads a base64-encoded binary message from the WebRTC connection.
@@ -937,7 +937,7 @@ async fn connection_read_binary_base64(
         }
         None => String::new(),
     };
-    Ok(CallOutcome::Return(vec![Value::string(payload)]))
+    Ok(CallOutcome::Return((vec![Value::string(payload)]).into()))
 }
 
 /// Reads a binary message from the WebRTC connection.
@@ -958,7 +958,7 @@ async fn connection_read_binary(
         }
         None => Value::bytes(Vec::new()),
     };
-    Ok(CallOutcome::Return(vec![payload]))
+    Ok(CallOutcome::Return((vec![payload]).into()))
 }
 
 /// Returns whether the WebRTC connection has reached EOF.
@@ -975,7 +975,7 @@ async fn connection_eof(
             state.eof()
         }
     };
-    Ok(CallOutcome::Return(vec![Value::Bool(eof)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(eof)]).into()))
 }
 
 /// Closes the WebRTC connection.
@@ -994,7 +994,7 @@ async fn connection_close(
         state.mark_closed();
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 #[cfg(test)]

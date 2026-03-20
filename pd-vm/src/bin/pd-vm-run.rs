@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use vm::{
-    CallOutcome, Debugger, DisassembleOptions, JitConfig, ReplLocalBinding, SourceFlavor,
+    CallOutcome, CallReturn, Debugger, DisassembleOptions, JitConfig, ReplLocalBinding, SourceFlavor,
     SourceMap, SourcePathError, Value, Vm, VmError, VmRecording, VmStatus, compile_source_file,
     compile_source_for_repl_with_locals, disassemble_vmbc_with_options, encode_program,
     format_source_with_flavor, render_source_error, render_vm_error, replay_recording_stdio,
@@ -1232,12 +1232,12 @@ fn add_one_host_function(_vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, Vm
         Some(Value::Int(value)) => *value,
         _ => return Err(VmError::TypeMismatch("int")),
     };
-    Ok(CallOutcome::Return(vec![Value::Int(value + 1)]))
+    Ok(CallOutcome::Return(CallReturn::one(Value::Int(value + 1))))
 }
 
 fn echo_host_function(_vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
     let value = args.first().cloned().ok_or(VmError::StackUnderflow)?;
-    Ok(CallOutcome::Return(vec![value]))
+    Ok(CallOutcome::Return(CallReturn::one(value)))
 }
 
 fn format_value(value: &Value) -> String {

@@ -17,7 +17,7 @@ async fn runtime_sleep(_vm: &mut Vm, millis: i64) -> Result<CallOutcome, VmError
 
     let duration = Duration::from_millis(millis as u64);
     tokio::time::sleep(duration).await;
-    Ok(CallOutcome::Return(vec![Value::Bool(true)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(true)]).into()))
 }
 
 /// Halts the current VM invocation immediately.
@@ -36,10 +36,10 @@ async fn rate_limit_allow(
     window_seconds: i64,
 ) -> Result<CallOutcome, VmError> {
     if limit <= 0 || window_seconds <= 0 {
-        return Ok(CallOutcome::Return(vec![Value::Bool(false)]));
+        return Ok(CallOutcome::Return((vec![Value::Bool(false)]).into()));
     }
 
     let rate_limiter = context.services().rate_limiter();
     let allowed = rate_limiter.allow(&key, limit as u64, window_seconds as u64);
-    Ok(CallOutcome::Return(vec![Value::Bool(allowed)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(allowed)]).into()))
 }

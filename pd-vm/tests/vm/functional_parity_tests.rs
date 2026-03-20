@@ -31,7 +31,7 @@ struct CountedTrueHost {
 impl HostFunction for CountedTrueHost {
     fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        Ok(CallOutcome::Return(vec![Value::Bool(true)]))
+        Ok(CallOutcome::Return(vec![Value::Bool(true)].into()))
     }
 }
 
@@ -275,7 +275,7 @@ impl HostFunction for YieldThenOne {
             return Ok(CallOutcome::Yield);
         }
         self.return_count.fetch_add(1, Ordering::Relaxed);
-        Ok(CallOutcome::Return(vec![Value::Int(1)]))
+        Ok(CallOutcome::Return(vec![Value::Int(1)].into()))
     }
 }
 
@@ -353,7 +353,7 @@ impl HostFunction for PendingOnceThenAddOne {
             self.pending_emitted = true;
             return Ok(CallOutcome::Pending(4242));
         }
-        Ok(CallOutcome::Return(vec![Value::Int(value + 1)]))
+        Ok(CallOutcome::Return(vec![Value::Int(value + 1)].into()))
     }
 }
 
@@ -415,7 +415,7 @@ fn jit_pending_host_call_waits_and_resumes_without_replay() {
 }
 
 fn builtin_exists_override(_vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-    Ok(CallOutcome::Return(vec![Value::Bool(true)]))
+    Ok(CallOutcome::Return(vec![Value::Bool(true)].into()))
 }
 
 #[test]

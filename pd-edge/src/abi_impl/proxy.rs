@@ -928,7 +928,7 @@ fn stream_downstream(context: SharedProxyVmContext) -> Result<CallOutcome, VmErr
     } else {
         allocate_proxy_stream_handle(&context, endpoint)?
     };
-    Ok(CallOutcome::Return(vec![Value::Int(handle)]))
+    Ok(CallOutcome::Return((vec![Value::Int(handle)]).into()))
 }
 
 /// Wraps an outbound HTTP exchange as a proxy byte stream.
@@ -945,7 +945,7 @@ fn stream_exchange(context: SharedProxyVmContext, exchange: i64) -> Result<CallO
     } else {
         allocate_proxy_stream_handle(&context, endpoint)?
     };
-    Ok(CallOutcome::Return(vec![Value::Int(handle)]))
+    Ok(CallOutcome::Return((vec![Value::Int(handle)]).into()))
 }
 
 /// Wraps a TCP stream as a proxy byte stream.
@@ -957,7 +957,7 @@ fn stream_from_tcp(context: SharedProxyVmContext, stream: i64) -> Result<CallOut
     } else {
         allocate_proxy_stream_handle(&context, endpoint)?
     };
-    Ok(CallOutcome::Return(vec![Value::Int(handle)]))
+    Ok(CallOutcome::Return((vec![Value::Int(handle)]).into()))
 }
 
 /// Wraps a TLS plaintext session as a proxy byte stream.
@@ -972,7 +972,7 @@ fn stream_from_tls_plaintext(
     } else {
         allocate_proxy_stream_handle(&context, endpoint)?
     };
-    Ok(CallOutcome::Return(vec![Value::Int(handle)]))
+    Ok(CallOutcome::Return((vec![Value::Int(handle)]).into()))
 }
 
 /// Wraps a WebSocket connection as a proxy byte stream.
@@ -983,7 +983,7 @@ fn stream_from_websocket_binary(
 ) -> Result<CallOutcome, VmError> {
     let endpoint = endpoint_from_websocket_binary(&context, connection)?;
     let handle = allocate_proxy_stream_handle(&context, endpoint)?;
-    Ok(CallOutcome::Return(vec![Value::Int(handle)]))
+    Ok(CallOutcome::Return((vec![Value::Int(handle)]).into()))
 }
 
 /// Copies bytes in one direction from `source` into `destination`.
@@ -1000,7 +1000,7 @@ async fn proxy_pipe(
 ) -> Result<CallOutcome, VmError> {
     let max_bytes = decode_chunk_size(max_bytes)?;
     let status = drive_pipe(context, source, destination, max_bytes).await?;
-    Ok(CallOutcome::Return(vec![Value::string(status)]))
+    Ok(CallOutcome::Return((vec![Value::string(status)]).into()))
 }
 
 /// Relays bytes in both directions between `left` and `right`.
@@ -1017,7 +1017,7 @@ async fn proxy_forward(
 ) -> Result<CallOutcome, VmError> {
     let max_bytes = decode_chunk_size(max_bytes)?;
     let status = drive_forward(context, left, right, max_bytes).await?;
-    Ok(CallOutcome::Return(vec![Value::string(status)]))
+    Ok(CallOutcome::Return((vec![Value::string(status)]).into()))
 }
 
 /// Performs a native runtime handoff between supported proxy stream pairs.
@@ -1044,7 +1044,7 @@ async fn proxy_forward_native(
             "proxy::forward_native supports only downstream CONNECT<->dynamic tcp/tls, downstream websocket<->websocket, or downstream HTTP<->default upstream exchange native pairs; use proxy::forward for the buffered fallback path".to_string(),
         )
     })?;
-    Ok(CallOutcome::Return(vec![Value::string(status)]))
+    Ok(CallOutcome::Return((vec![Value::string(status)]).into()))
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ async fn stdin_read_line(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
     })
     .await
     .map_err(|err| VmError::HostError(format!("stdin read_line task failed: {err}")))??;
-    Ok(CallOutcome::Return(vec![Value::string(line)]))
+    Ok(CallOutcome::Return((vec![Value::string(line)]).into()))
 }
 
 /// Reads all remaining bytes from process stdin and returns them as a string.
@@ -33,7 +33,7 @@ async fn stdin_read_all(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
     })
     .await
     .map_err(|err| VmError::HostError(format!("stdin read_all task failed: {err}")))??;
-    Ok(CallOutcome::Return(vec![Value::string(text)]))
+    Ok(CallOutcome::Return((vec![Value::string(text)]).into()))
 }
 
 /// Writes text to process stdout and returns the number of bytes written.
@@ -48,7 +48,7 @@ async fn stdout_write(_vm: &mut Vm, text: String) -> Result<CallOutcome, VmError
     })
     .await
     .map_err(|err| VmError::HostError(format!("stdout write task failed: {err}")))??;
-    Ok(CallOutcome::Return(vec![Value::Int(written)]))
+    Ok(CallOutcome::Return((vec![Value::Int(written)]).into()))
 }
 
 /// Flushes process stdout and reports whether the flush succeeded.
@@ -62,7 +62,7 @@ async fn stdout_flush(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
     })
     .await
     .map_err(|err| VmError::HostError(format!("stdout flush task failed: {err}")))??;
-    Ok(CallOutcome::Return(vec![Value::Bool(true)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(true)]).into()))
 }
 
 /// Writes text to process stderr and returns the number of bytes written.
@@ -77,7 +77,7 @@ async fn stderr_write(_vm: &mut Vm, text: String) -> Result<CallOutcome, VmError
     })
     .await
     .map_err(|err| VmError::HostError(format!("stderr write task failed: {err}")))??;
-    Ok(CallOutcome::Return(vec![Value::Int(written)]))
+    Ok(CallOutcome::Return((vec![Value::Int(written)]).into()))
 }
 
 /// Flushes process stderr and reports whether the flush succeeded.
@@ -91,16 +91,16 @@ async fn stderr_flush(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
     })
     .await
     .map_err(|err| VmError::HostError(format!("stderr flush task failed: {err}")))??;
-    Ok(CallOutcome::Return(vec![Value::Bool(true)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(true)]).into()))
 }
 
 /// Returns the number of arguments passed to the loaded console program.
 #[pd_edge_host_function(name = console_symbols::args::COUNT.name, scope = console)]
 fn args_count() -> Result<CallOutcome, VmError> {
     let program_args = current_console_program_args()?;
-    Ok(CallOutcome::Return(vec![Value::Int(
+    Ok(CallOutcome::Return((vec![Value::Int(
         program_args.len() as i64
-    )]))
+    )]).into()))
 }
 
 /// Returns the argument at the requested zero-based index, or an empty string when it is missing.
@@ -116,5 +116,5 @@ fn args_get(index: i64) -> Result<CallOutcome, VmError> {
         .get(index as usize)
         .cloned()
         .unwrap_or_default();
-    Ok(CallOutcome::Return(vec![Value::string(value)]))
+    Ok(CallOutcome::Return((vec![Value::string(value)]).into()))
 }

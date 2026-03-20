@@ -278,7 +278,7 @@ async fn io_open(
             )));
         }
     };
-    Ok(CallOutcome::Return(values))
+    Ok(CallOutcome::Return((values).into()))
 }
 
 /// Starts a child process and returns a process-backed handle.
@@ -301,7 +301,7 @@ async fn io_read_all(
         EdgeIoReadSource::Protocol(target) => read_io_target_all(&context, target).await?,
         EdgeIoReadSource::VirtualHandle(handle) => read_edge_virtual_handle_all(&context, handle)?,
     };
-    Ok(CallOutcome::Return(vec![Value::string(text)]))
+    Ok(CallOutcome::Return((vec![Value::string(text)]).into()))
 }
 
 /// Reads a single line of text from an I/O handle.
@@ -316,7 +316,7 @@ async fn io_read_line(
         EdgeIoReadSource::Protocol(target) => read_io_target_line(&context, target).await?,
         EdgeIoReadSource::VirtualHandle(handle) => read_edge_virtual_handle_line(&context, handle)?,
     };
-    Ok(CallOutcome::Return(vec![Value::string(text)]))
+    Ok(CallOutcome::Return((vec![Value::string(text)]).into()))
 }
 
 /// Writes text to an I/O handle.
@@ -334,7 +334,7 @@ async fn io_write(
             write_edge_file_path(&path, append, &text).await?;
         }
     }
-    Ok(CallOutcome::Return(vec![Value::Int(text.len() as i64)]))
+    Ok(CallOutcome::Return((vec![Value::Int(text.len() as i64)]).into()))
 }
 
 /// Flushes buffered output for an I/O handle.
@@ -356,7 +356,7 @@ async fn io_flush(
         Value::String(_) => return Err(requires_io_handle_error("io::flush")),
         _ => return Err(VmError::TypeMismatch("int")),
     }
-    Ok(CallOutcome::Return(vec![Value::Bool(true)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(true)]).into()))
 }
 
 /// Closes an I/O handle.
@@ -369,7 +369,7 @@ async fn io_close(
     match target {
         Value::Int(handle) => {
             if decode_protocol_io_handle(&context, handle).is_some() {
-                return Ok(CallOutcome::Return(vec![Value::Bool(true)]));
+                return Ok(CallOutcome::Return((vec![Value::Bool(true)]).into()));
             }
             if context.lock_edge_io().handles.remove(&handle).is_none() {
                 return Err(invalid_io_handle_error(handle));
@@ -378,7 +378,7 @@ async fn io_close(
         Value::String(_) => return Err(requires_io_handle_error("io::close")),
         _ => return Err(VmError::TypeMismatch("int")),
     }
-    Ok(CallOutcome::Return(vec![Value::Bool(true)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(true)]).into()))
 }
 
 /// Returns whether a file system path exists.
@@ -389,5 +389,5 @@ async fn io_exists(
     path: String,
 ) -> Result<CallOutcome, VmError> {
     let exists = tokio::fs::metadata(path.as_str()).await.is_ok();
-    Ok(CallOutcome::Return(vec![Value::Bool(exists)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(exists)]).into()))
 }

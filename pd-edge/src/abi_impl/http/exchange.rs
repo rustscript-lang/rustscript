@@ -18,7 +18,7 @@ use crate::abi_impl::schedule_current_future_call;
 use axum::http::Method;
 use edge_abi::symbols::http::exchange as http_exchange;
 use pd_edge_host_function::pd_edge_host_function;
-use vm::{CallOutcome, Value, Vm, VmError};
+use vm::{CallOutcome, CallReturn, Value, Vm, VmError};
 
 fn unknown_exchange_handle(handle: i64) -> VmError {
     VmError::HostError(format!("unknown outbound exchange handle {handle}"))
@@ -89,7 +89,7 @@ fn exchange_response_values_outcome<F>(
     extract: F,
 ) -> Result<CallOutcome, VmError>
 where
-    F: FnOnce(super::state::HttpUpstreamResponseSnapshot) -> Result<Vec<Value>, VmError>
+    F: FnOnce(super::state::HttpUpstreamResponseSnapshot) -> Result<CallReturn, VmError>
         + Send
         + 'static,
 {
@@ -105,7 +105,7 @@ where
         }
     };
     if let Some(snapshot) = snapshot {
-        return Ok(CallOutcome::Return(extract(snapshot)?));
+        return Ok(CallOutcome::Return((extract(snapshot)?).into()));
     }
 
     schedule_current_future_call(vm, async move {
@@ -130,7 +130,7 @@ fn apply_exchange_query(
     with_exchange_request_mut(context, handle, |request| {
         request.query = normalized_query.to_string();
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 fn parse_version_preference(label: &str) -> Result<HttpVersionPreference, VmError> {
@@ -186,9 +186,9 @@ fn prepare_default_upstream_call(
     headers: Value,
 ) -> Result<CallOutcome, VmError> {
     prepare_default_upstream_request(&context, host, port, version, headers)?;
-    Ok(CallOutcome::Return(vec![Value::Int(
+    Ok(CallOutcome::Return((vec![Value::Int(
         default_upstream_exchange_handle(),
-    )]))
+    )]).into()))
 }
 
 fn set_exchange_header_call(
@@ -201,7 +201,7 @@ fn set_exchange_header_call(
     with_exchange_request_mut(&context, exchange, |request| {
         request.headers.insert(header_name, header_value);
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 fn set_exchange_target_call(
@@ -235,7 +235,7 @@ fn set_exchange_target_call(
             target_host,
         );
     }
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 fn set_exchange_scheme_call(
@@ -272,22 +272,22 @@ fn set_exchange_scheme_call(
         }
     }
 
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Allocates an outbound HTTP exchange handle.
 #[pd_edge_host_function(name = http_exchange::NEW.name, scope = http)]
 fn new_exchange(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
     let handle = allocate_outbound_exchange_handle(&context)?;
-    Ok(CallOutcome::Return(vec![Value::Int(handle)]))
+    Ok(CallOutcome::Return((vec![Value::Int(handle)]).into()))
 }
 
 /// Returns the default upstream handle for the outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::DEFAULT_UPSTREAM.name, scope = http)]
 fn default_upstream_exchange(_context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return(vec![Value::Int(
+    Ok(CallOutcome::Return((vec![Value::Int(
         default_upstream_exchange_handle(),
-    )]))
+    )]).into()))
 }
 
 /// Configures the inherited default upstream request target, version, and header batch.
@@ -311,7 +311,7 @@ async fn send_exchange(
 ) -> Result<CallOutcome, VmError> {
     ensure_known_exchange_handle(&context, exchange)?;
     ensure_outbound_exchange_response_started(&context, exchange).await?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets a header on the outbound HTTP exchange.
@@ -337,7 +337,7 @@ fn set_exchange_method(
     with_exchange_request_mut(&context, exchange, |request| {
         request.method = parsed;
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the request path on the outbound HTTP exchange.
@@ -355,7 +355,7 @@ fn set_exchange_path(
     with_exchange_request_mut(&context, exchange, |request| {
         request.path = path;
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the decoded query string on the outbound HTTP exchange.
@@ -379,7 +379,7 @@ fn set_exchange_version(
     with_exchange_request_mut(&context, exchange, |request| {
         request.version_preference = parsed;
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Returns the configured HTTP version preference for the outbound HTTP exchange.
@@ -391,7 +391,7 @@ fn get_exchange_version(
     let version = with_exchange_request(&context, exchange, |request| {
         request.version_preference.as_str().to_string()
     })?;
-    Ok(CallOutcome::Return(vec![Value::string(version)]))
+    Ok(CallOutcome::Return((vec![Value::string(version)]).into()))
 }
 
 /// Sets the target endpoint for the outbound HTTP exchange.
@@ -424,7 +424,7 @@ fn attach_exchange_tcp(
 ) -> Result<CallOutcome, VmError> {
     ensure_known_exchange_handle(&context, exchange)?;
     attach_outbound_exchange_tcp_transport(&context, exchange, stream)?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 #[cfg(feature = "tls")]
@@ -437,7 +437,7 @@ fn attach_exchange_tls_plaintext(
 ) -> Result<CallOutcome, VmError> {
     ensure_known_exchange_handle(&context, exchange)?;
     attach_outbound_exchange_tls_transport(&context, exchange, session)?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the body for the outbound HTTP exchange.
@@ -450,7 +450,7 @@ fn set_exchange_body(
     with_exchange_request_mut(&context, exchange, |request| {
         request.body_override = Some(body.into_bytes());
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Adds a header value to the outbound HTTP exchange.
@@ -465,7 +465,7 @@ fn add_exchange_header(
     with_exchange_request_mut(&context, exchange, |request| {
         request.headers.append(header_name, header_value);
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Clears all values for a header on the outbound HTTP exchange.
@@ -479,7 +479,7 @@ fn clear_exchange_header(
     with_exchange_request_mut(&context, exchange, |request| {
         request.headers.remove(header_name);
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets a query parameter on the outbound HTTP exchange.
@@ -498,7 +498,7 @@ fn set_exchange_query_arg(
         pairs.push((key, value));
         request.query = serialize_query_pairs(pairs);
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Returns the status code for the outbound HTTP exchange.
@@ -509,7 +509,7 @@ fn get_exchange_status(
     exchange: i64,
 ) -> Result<CallOutcome, VmError> {
     exchange_response_values_outcome(vm, context, exchange, |snapshot| {
-        Ok(vec![Value::Int(snapshot.status as i64)])
+        Ok(vec![Value::Int(snapshot.status as i64)].into())
     })
 }
 
@@ -529,7 +529,7 @@ fn get_exchange_header(
             .get(&header_name)
             .and_then(|value| value.to_str().ok())
             .unwrap_or("");
-        Ok(vec![Value::string(value)])
+        Ok(vec![Value::string(value)].into())
     })
 }
 
@@ -541,7 +541,7 @@ fn get_exchange_headers(
     exchange: i64,
 ) -> Result<CallOutcome, VmError> {
     exchange_response_values_outcome(vm, context, exchange, |snapshot| {
-        Ok(vec![headers_to_value_map(&snapshot.headers)])
+        Ok(vec![headers_to_value_map(&snapshot.headers)].into())
     })
 }
 
@@ -553,9 +553,9 @@ async fn get_exchange_body(
     exchange: i64,
 ) -> Result<CallOutcome, VmError> {
     let body = read_outbound_exchange_response_all(&context, exchange).await?;
-    Ok(CallOutcome::Return(vec![Value::string(
+    Ok(CallOutcome::Return((vec![Value::string(
         String::from_utf8_lossy(&body).into_owned(),
-    )]))
+    )]).into()))
 }
 
 /// Returns the first trailer value for the outbound HTTP exchange.
@@ -574,7 +574,7 @@ async fn get_exchange_trailer(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
-    Ok(CallOutcome::Return(vec![Value::string(value)]))
+    Ok(CallOutcome::Return((vec![Value::string(value)]).into()))
 }
 
 /// Returns all trailers on the outbound HTTP exchange as a map.
@@ -585,7 +585,7 @@ async fn get_exchange_trailers(
     exchange: i64,
 ) -> Result<CallOutcome, VmError> {
     let trailers = read_outbound_exchange_response_trailers(&context, exchange).await?;
-    Ok(CallOutcome::Return(vec![headers_to_value_map(&trailers)]))
+    Ok(CallOutcome::Return((vec![headers_to_value_map(&trailers)]).into()))
 }
 
 /// Returns the HTTP version for the outbound HTTP exchange.
@@ -596,7 +596,7 @@ fn get_exchange_http_version(
     exchange: i64,
 ) -> Result<CallOutcome, VmError> {
     exchange_response_values_outcome(vm, context, exchange, |snapshot| {
-        Ok(vec![Value::string(snapshot.http_version)])
+        Ok(vec![Value::string(snapshot.http_version)].into())
     })
 }
 
@@ -618,9 +618,9 @@ async fn get_exchange_body_next_chunk(
     }
     let chunk =
         read_outbound_exchange_response_next_chunk(&context, exchange, max_bytes as usize).await?;
-    Ok(CallOutcome::Return(vec![Value::string(
+    Ok(CallOutcome::Return((vec![Value::string(
         String::from_utf8_lossy(&chunk).into_owned(),
-    )]))
+    )]).into()))
 }
 
 /// Returns whether the body stream for the outbound HTTP exchange is exhausted.
@@ -631,5 +631,5 @@ async fn get_exchange_body_eof(
     exchange: i64,
 ) -> Result<CallOutcome, VmError> {
     let eof = outbound_exchange_response_eof(&context, exchange).await?;
-    Ok(CallOutcome::Return(vec![Value::Bool(eof)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(eof)]).into()))
 }

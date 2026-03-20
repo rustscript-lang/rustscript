@@ -10,7 +10,7 @@ use futures_channel::oneshot;
 use pd_host_function::pd_host_function;
 
 use super::BuiltinResult;
-use crate::vm::{HostOpId, Value, Vm, VmError, VmResult};
+use crate::vm::{CallReturn, HostOpId, Value, Vm, VmError, VmResult};
 
 pub(crate) struct IoState {
     pub(super) next_handle: i64,
@@ -36,14 +36,14 @@ pub(super) enum IoHandle {
 
 struct IoAsyncCompletion {
     restored_handle: Option<(i64, IoHandle)>,
-    result: VmResult<Vec<Value>>,
+    result: VmResult<CallReturn>,
 }
 
 pub(super) fn poll_builtin_io_op(
     vm: &mut Vm,
     op_id: HostOpId,
     cx: &mut Context<'_>,
-) -> Poll<VmResult<Vec<Value>>> {
+) -> Poll<VmResult<CallReturn>> {
     let poll_result = {
         let receiver = match vm.io_state.pending_ops.get_mut(&op_id) {
             Some(receiver) => receiver,
@@ -121,7 +121,7 @@ pub(super) fn builtin_io_open(vm: &mut Vm, path: &str, mode: &str) -> VmResult<B
         match options.open(path) {
             Ok(file) => IoAsyncCompletion {
                 restored_handle: Some((reserved_id, IoHandle::File(file))),
-                result: Ok(vec![Value::Int(reserved_id)]),
+                result: Ok(CallReturn::one(Value::Int(reserved_id))),
             },
             Err(err) => IoAsyncCompletion {
                 restored_handle: None,
@@ -184,7 +184,7 @@ pub(super) fn builtin_io_popen(
         };
         IoAsyncCompletion {
             restored_handle: Some((reserved_id, handle)),
-            result: Ok(vec![Value::Int(reserved_id)]),
+            result: Ok(CallReturn::one(Value::Int(reserved_id))),
         }
     })?;
     Ok(BuiltinResult::Pending(op_id))
@@ -201,7 +201,7 @@ pub(super) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<Built
             IoHandle::File(file) => file
                 .read_to_string(&mut out)
                 .map_err(|err| VmError::HostError(format!("io_read_all failed: {err}")))
-                .map(|_| vec![Value::string(out)]),
+                .map(|_| CallReturn::one(Value::string(out))),
             IoHandle::PopenRead { child } => {
                 let stdout = match child.stdout.as_mut() {
                     Some(stdout) => stdout,
@@ -217,7 +217,7 @@ pub(super) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<Built
                 stdout
                     .read_to_string(&mut out)
                     .map_err(|err| VmError::HostError(format!("io_read_all failed: {err}")))
-                    .map(|_| vec![Value::string(out)])
+                    .map(|_| CallReturn::one(Value::string(out)))
             }
             IoHandle::PopenWrite { .. } => Err(VmError::HostError(
                 "io_read_all requires a readable handle".to_string(),
@@ -239,7 +239,7 @@ pub(super) fn builtin_io_read_line(vm: &mut Vm, handle_id: i64) -> VmResult<Buil
         let mut handle = handle;
         let result = match &mut handle {
             IoHandle::File(file) => {
-                read_line_from_reader(file).map(|line| vec![Value::string(line)])
+                read_line_from_reader(file).map(|line| CallReturn::one(Value::string(line)))
             }
             IoHandle::PopenRead { child } => {
                 let stdout = match child.stdout.as_mut() {
@@ -253,7 +253,7 @@ pub(super) fn builtin_io_read_line(vm: &mut Vm, handle_id: i64) -> VmResult<Buil
                         };
                     }
                 };
-                read_line_from_reader(stdout).map(|line| vec![Value::string(line)])
+                read_line_from_reader(stdout).map(|line| CallReturn::one(Value::string(line)))
             }
             IoHandle::PopenWrite { .. } => Err(VmError::HostError(
                 "io_read_line requires a readable handle".to_string(),
@@ -282,7 +282,7 @@ pub(super) fn builtin_io_write(
             IoHandle::File(file) => file
                 .write(&bytes)
                 .map_err(|err| VmError::HostError(format!("io_write failed: {err}")))
-                .map(|written| vec![Value::Int(written as i64)]),
+                .map(|written| CallReturn::one(Value::Int(written as i64))),
             IoHandle::PopenWrite { child } => {
                 let stdin = match child.stdin.as_mut() {
                     Some(stdin) => stdin,
@@ -298,7 +298,7 @@ pub(super) fn builtin_io_write(
                 stdin
                     .write(&bytes)
                     .map_err(|err| VmError::HostError(format!("io_write failed: {err}")))
-                    .map(|written| vec![Value::Int(written as i64)])
+                    .map(|written| CallReturn::one(Value::Int(written as i64)))
             }
             IoHandle::PopenRead { .. } => Err(VmError::HostError(
                 "io_write requires a writable handle".to_string(),
@@ -322,7 +322,7 @@ pub(super) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinR
             IoHandle::File(file) => file
                 .flush()
                 .map_err(|err| VmError::HostError(format!("io_flush failed: {err}")))
-                .map(|_| vec![Value::Bool(true)]),
+                .map(|_| CallReturn::one(Value::Bool(true))),
             IoHandle::PopenWrite { child } => {
                 let stdin = match child.stdin.as_mut() {
                     Some(stdin) => stdin,
@@ -338,9 +338,9 @@ pub(super) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinR
                 stdin
                     .flush()
                     .map_err(|err| VmError::HostError(format!("io_flush failed: {err}")))
-                    .map(|_| vec![Value::Bool(true)])
+                    .map(|_| CallReturn::one(Value::Bool(true)))
             }
-            IoHandle::PopenRead { .. } => Ok(vec![Value::Bool(true)]),
+            IoHandle::PopenRead { .. } => Ok(CallReturn::one(Value::Bool(true))),
         };
         IoAsyncCompletion {
             restored_handle: Some((handle_id, handle)),
@@ -356,7 +356,7 @@ pub(super) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinR
     let handle = io_take_handle(vm, handle_id)?;
     let op_id = schedule_io_task(vm, move || IoAsyncCompletion {
         restored_handle: None,
-        result: close_io_handle(handle).map(|_| vec![Value::Bool(true)]),
+        result: close_io_handle(handle).map(|_| CallReturn::one(Value::Bool(true))),
     })?;
     Ok(BuiltinResult::Pending(op_id))
 }
@@ -367,9 +367,9 @@ pub(super) fn builtin_io_exists(vm: &mut Vm, path: &str) -> VmResult<BuiltinResu
     let path = path.to_string();
     let op_id = schedule_io_task(vm, move || IoAsyncCompletion {
         restored_handle: None,
-        result: Ok(vec![Value::Bool(
+        result: Ok(CallReturn::one(Value::Bool(
             std::path::Path::new(path.as_str()).exists(),
-        )]),
+        ))),
     })?;
     Ok(BuiltinResult::Pending(op_id))
 }

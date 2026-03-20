@@ -1065,7 +1065,12 @@ mod runtime_tests {
 
     impl HostFunction for TestPrintFunction {
         fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-            Ok(CallOutcome::Return(args.to_vec()))
+            let values = match args {
+                [] => vm::CallReturn::none(),
+                [value] => vm::CallReturn::one(value.clone()),
+                _ => vm::CallReturn::one(Value::array(args.to_vec())),
+            };
+            Ok(CallOutcome::Return(values))
         }
     }
 

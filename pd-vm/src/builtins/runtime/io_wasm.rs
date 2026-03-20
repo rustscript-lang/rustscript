@@ -3,7 +3,7 @@ use std::task::{Context, Poll};
 use pd_host_function::pd_host_function;
 
 use super::BuiltinResult;
-use crate::vm::{HostOpId, Value, Vm, VmError, VmResult};
+use crate::vm::{CallReturn, HostOpId, Value, Vm, VmError, VmResult};
 
 pub(crate) struct IoState;
 
@@ -17,7 +17,7 @@ pub(super) fn poll_builtin_io_op(
     _vm: &mut Vm,
     op_id: HostOpId,
     _cx: &mut Context<'_>,
-) -> Poll<VmResult<Vec<Value>>> {
+) -> Poll<VmResult<CallReturn>> {
     Poll::Ready(Err(VmError::HostError(format!(
         "builtin io op {op_id} is unsupported on wasm32 runtime",
     ))))

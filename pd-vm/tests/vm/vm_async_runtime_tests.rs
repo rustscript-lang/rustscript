@@ -16,7 +16,7 @@ use vm::{
     Value, ValueType, Vm, VmError, VmStatus,
 };
 
-type AsyncHostResult = Result<Vec<Value>, VmError>;
+type AsyncHostResult = Result<vm::CallReturn, VmError>;
 type SharedAsyncOps = Arc<Mutex<TestAsyncOps>>;
 
 #[derive(Default)]
@@ -82,7 +82,7 @@ impl HostAsyncBridge for TestAsyncBridge {
         &mut self,
         op_id: HostOpId,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Vec<Value>, VmError>> {
+    ) -> Poll<Result<vm::CallReturn, VmError>> {
         self.ops
             .lock()
             .expect("test async ops lock poisoned")
@@ -120,7 +120,7 @@ impl HostFunction for AsyncAddOneFunction {
         let mut ops = self.ops.lock().expect("test async ops lock poisoned");
         let op_id = ops.schedule_future(vm, async move {
             tokio::time::sleep(delay).await;
-            Ok(vec![Value::Int(value + 1)])
+            Ok(vec![Value::Int(value + 1)].into())
         })?;
         Ok(CallOutcome::Pending(op_id))
     }

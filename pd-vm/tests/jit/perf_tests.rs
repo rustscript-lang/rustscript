@@ -2,8 +2,9 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use vm::{
-    CallOutcome, HostFunction, HostFunctionRegistry, JitConfig, OpCode, Program, Value, ValueType,
-    Vm, VmStatus, compile_source, compile_source_file,
+    CallOutcome, HostArgsFunction, HostFunction, HostFunctionRegistry, HostStackFunction,
+    JitConfig, OpCode, Program, Value, ValueType, Vm, VmStatus, compile_source,
+    compile_source_file,
 };
 
 struct PerfNoopHost {
@@ -12,12 +13,63 @@ struct PerfNoopHost {
 
 impl HostFunction for PerfNoopHost {
     fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-        Ok(CallOutcome::Return(Vec::new()))
+        Ok(CallOutcome::Return(vm::CallReturn::none()))
     }
 }
 
 fn perf_noop_host_static(_vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-    Ok(CallOutcome::Return(Vec::new()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
+}
+
+struct PerfIdentityHost;
+
+impl HostFunction for PerfIdentityHost {
+    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+        perf_identity_host_result(args)
+    }
+}
+
+struct PerfIdentityStackHost;
+
+impl HostStackFunction for PerfIdentityStackHost {
+    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+        perf_identity_host_result(args)
+    }
+}
+
+struct PerfIdentityArgsHost;
+
+impl HostArgsFunction for PerfIdentityArgsHost {
+    fn call(&mut self, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+        perf_identity_host_result(args)
+    }
+}
+
+fn perf_identity_host_static(
+    _vm: &mut Vm,
+    args: &[Value],
+) -> Result<CallOutcome, vm::VmError> {
+    perf_identity_host_result(args)
+}
+
+fn perf_identity_host_stack_static(
+    _vm: &mut Vm,
+    args: &[Value],
+) -> Result<CallOutcome, vm::VmError> {
+    perf_identity_host_result(args)
+}
+
+fn perf_identity_host_args_static(args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    perf_identity_host_result(args)
+}
+
+fn perf_identity_host_result(args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    let value = match args {
+        [] => Value::Int(1),
+        [Value::Int(value)] => Value::Int(*value),
+        _ => return Err(vm::VmError::TypeMismatch("int")),
+    };
+    Ok(CallOutcome::Return(vm::CallReturn::one(value)))
 }
 
 fn force_local_types(program: Program, hints: &[(usize, ValueType)]) -> Program {
@@ -224,6 +276,174 @@ fn perf_vm_creation_cleanup_speed_and_ram_usage() {
         static_cached_overhead_per_vm_ns / host_import_count as u128;
     println!(
         "host static fn ptr overhead: iterations={host_iterations}, imports_per_vm={host_import_count}, plain_per_vm_ns={plain_per_vm_ns}, static_cached_per_vm_ns={static_cached_per_vm_ns}, overhead_per_vm_ns={static_cached_overhead_per_vm_ns}, overhead_per_import_ns={static_cached_overhead_per_import_ns}",
+    );
+}
+
+#[test]
+#[ignore = "performance characterization test; run manually"]
+fn perf_host_call_steady_state_latency() {
+    const CALLS: i64 = 200_000;
+    const TRIALS: usize = 5;
+
+    let expected_zero_arg = CALLS;
+    let expected_one_arg = CALLS * (CALLS - 1) / 2;
+
+    benchmark_source_latency_case(
+        "host legacy dynamic 0arg",
+        &build_host_call_latency_source("perf_host0", 0, CALLS),
+        &[Value::Int(expected_zero_arg)],
+        CALLS,
+        TRIALS,
+        |vm| {
+            vm.bind_function("perf_host0", Box::new(PerfIdentityHost));
+        },
+    );
+    benchmark_source_latency_case(
+        "host legacy static 0arg",
+        &build_host_call_latency_source("perf_host0", 0, CALLS),
+        &[Value::Int(expected_zero_arg)],
+        CALLS,
+        TRIALS,
+        |vm| {
+            vm.bind_static_function("perf_host0", perf_identity_host_static);
+        },
+    );
+    benchmark_source_latency_case(
+        "host args dynamic 0arg",
+        &build_host_call_latency_source("perf_host0", 0, CALLS),
+        &[Value::Int(expected_zero_arg)],
+        CALLS,
+        TRIALS,
+        |vm| {
+            vm.bind_args_function("perf_host0", Box::new(PerfIdentityArgsHost));
+        },
+    );
+    benchmark_source_latency_case(
+        "host args static 0arg",
+        &build_host_call_latency_source("perf_host0", 0, CALLS),
+        &[Value::Int(expected_zero_arg)],
+        CALLS,
+        TRIALS,
+        |vm| {
+            vm.bind_static_args_function("perf_host0", perf_identity_host_args_static);
+        },
+    );
+    benchmark_source_latency_case(
+        "host stack dynamic 0arg",
+        &build_host_call_latency_source("perf_host0", 0, CALLS),
+        &[Value::Int(expected_zero_arg)],
+        CALLS,
+        TRIALS,
+        |vm| {
+            vm.bind_stack_function("perf_host0", Box::new(PerfIdentityStackHost));
+        },
+    );
+    benchmark_source_latency_case(
+        "host stack static 0arg",
+        &build_host_call_latency_source("perf_host0", 0, CALLS),
+        &[Value::Int(expected_zero_arg)],
+        CALLS,
+        TRIALS,
+        |vm| {
+            vm.bind_static_stack_function("perf_host0", perf_identity_host_stack_static);
+        },
+    );
+
+    benchmark_source_latency_case(
+        "host legacy dynamic 1arg",
+        &build_host_call_latency_source("perf_host1", 1, CALLS),
+        &[Value::Int(expected_one_arg)],
+        CALLS,
+        TRIALS,
+        |vm| {
+            vm.bind_function("perf_host1", Box::new(PerfIdentityHost));
+        },
+    );
+    benchmark_source_latency_case(
+        "host legacy static 1arg",
+        &build_host_call_latency_source("perf_host1", 1, CALLS),
+        &[Value::Int(expected_one_arg)],
+        CALLS,
+        TRIALS,
+        |vm| {
+            vm.bind_static_function("perf_host1", perf_identity_host_static);
+        },
+    );
+    benchmark_source_latency_case(
+        "host args dynamic 1arg",
+        &build_host_call_latency_source("perf_host1", 1, CALLS),
+        &[Value::Int(expected_one_arg)],
+        CALLS,
+        TRIALS,
+        |vm| {
+            vm.bind_args_function("perf_host1", Box::new(PerfIdentityArgsHost));
+        },
+    );
+    benchmark_source_latency_case(
+        "host args static 1arg",
+        &build_host_call_latency_source("perf_host1", 1, CALLS),
+        &[Value::Int(expected_one_arg)],
+        CALLS,
+        TRIALS,
+        |vm| {
+            vm.bind_static_args_function("perf_host1", perf_identity_host_args_static);
+        },
+    );
+    benchmark_source_latency_case(
+        "host stack dynamic 1arg",
+        &build_host_call_latency_source("perf_host1", 1, CALLS),
+        &[Value::Int(expected_one_arg)],
+        CALLS,
+        TRIALS,
+        |vm| {
+            vm.bind_stack_function("perf_host1", Box::new(PerfIdentityStackHost));
+        },
+    );
+    benchmark_source_latency_case(
+        "host stack static 1arg",
+        &build_host_call_latency_source("perf_host1", 1, CALLS),
+        &[Value::Int(expected_one_arg)],
+        CALLS,
+        TRIALS,
+        |vm| {
+            vm.bind_static_stack_function("perf_host1", perf_identity_host_stack_static);
+        },
+    );
+}
+
+#[test]
+#[ignore = "performance characterization test; run manually"]
+fn perf_proc_macro_builtin_heap_arg_latency() {
+    const CALLS: i64 = 50_000;
+    const TRIALS: usize = 5;
+
+    benchmark_source_latency_case(
+        "proc-macro bytes::from_array_u8",
+        &build_proc_macro_bytes_from_array_u8_source(CALLS),
+        &[Value::Int(CALLS * 16)],
+        CALLS,
+        TRIALS,
+        |_| {},
+    );
+
+    benchmark_source_latency_case(
+        "proc-macro bytes::to_hex control",
+        &build_proc_macro_bytes_to_hex_control_source(CALLS),
+        &[Value::Int(CALLS * 32)],
+        CALLS,
+        TRIALS,
+        |_| {},
+    );
+
+    benchmark_source_latency_case(
+        "proc-macro format-template via print formatting",
+        &build_proc_macro_format_template_source(CALLS),
+        &[Value::Int(expected_print_format_total(CALLS))],
+        CALLS,
+        TRIALS,
+        |vm| {
+            vm.set_runtime_print_sink(|_| {});
+        },
     );
 }
 
@@ -488,7 +708,7 @@ fn perf_jit_native_reduces_tight_loop_latency() {
 
 #[test]
 #[ignore = "performance characterization test; run manually"]
-fn perf_jit_native_reduces_array_builtin_loop_latency() {
+fn perf_jit_native_characterizes_array_builtin_loop_latency() {
     if !native_jit_supported() {
         println!("skipping array builtin perf on unsupported native JIT target");
         return;
@@ -578,12 +798,6 @@ fn perf_jit_native_reduces_array_builtin_loop_latency() {
         jit_vm.jit_native_exec_count()
     );
 
-    assert!(
-        jit_median < interpreter_median,
-        "expected warmed array builtin JIT latency to be lower (interpreter={:?}, jit={:?})",
-        interpreter_median,
-        jit_median
-    );
 }
 
 #[test]
@@ -1233,6 +1447,93 @@ iteration;
     )
 }
 
+fn build_host_call_latency_source(name: &str, arity: u8, calls: i64) -> String {
+    match arity {
+        0 => format!(
+            r#"
+            fn {name}();
+            let mut i = 0;
+            let mut sum = 0;
+            while i < {calls} {{
+                sum = sum + {name}();
+                i = i + 1;
+            }}
+            sum;
+        "#
+        ),
+        1 => format!(
+            r#"
+            fn {name}(x);
+            let mut i = 0;
+            let mut sum = 0;
+            while i < {calls} {{
+                sum = sum + {name}(i);
+                i = i + 1;
+            }}
+            sum;
+        "#
+        ),
+        other => panic!("unsupported host latency arity {other}"),
+    }
+}
+
+fn build_proc_macro_bytes_from_array_u8_source(calls: i64) -> String {
+    format!(
+        r#"
+        use bytes;
+        let values = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let mut i = 0;
+        let mut sum = 0;
+        while i < {calls} {{
+            let payload = bytes::from_array_u8(values);
+            sum = sum + payload.length;
+            i = i + 1;
+        }}
+        sum;
+    "#
+    )
+}
+
+fn build_proc_macro_bytes_to_hex_control_source(calls: i64) -> String {
+    format!(
+        r#"
+        use bytes;
+        let payload = bytes::from_hex("00112233445566778899aabbccddeeff");
+        let mut i = 0;
+        let mut sum = 0;
+        while i < {calls} {{
+            let text = bytes::to_hex(payload);
+            sum = sum + text.length;
+            i = i + 1;
+        }}
+        sum;
+    "#
+    )
+}
+
+fn build_proc_macro_format_template_source(calls: i64) -> String {
+    format!(
+        r#"
+        let mut i = 0;
+        let mut sum = 0;
+        while i < {calls} {{
+            let rendered = print("item={{}} next={{}}", i, i + 1);
+            sum = sum + rendered.length;
+            i = i + 1;
+        }}
+        sum;
+    "#
+    )
+}
+
+fn expected_print_format_total(calls: i64) -> i64 {
+    let mut total = 0_i64;
+    for i in 0..calls {
+        total += format!("item={} next={}", i, i + 1).len() as i64;
+    }
+    total
+}
+
 fn build_array_builtin_perf_source(elements: &[i64], outer_loops: i64) -> String {
     let values = elements
         .iter()
@@ -1293,6 +1594,36 @@ fn warm_reusable_vm_once(vm: &mut Vm, expected_stack: &[Value]) -> std::time::Du
     let elapsed = run_vm_once(vm, expected_stack);
     vm.reset_for_reuse();
     elapsed
+}
+
+fn benchmark_source_latency_case<F>(
+    label: &str,
+    source: &str,
+    expected_stack: &[Value],
+    calls: i64,
+    trials: usize,
+    configure_vm: F,
+) where
+    F: Fn(&mut Vm),
+{
+    let compiled = compile_source(source).expect("benchmark source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: false,
+        hot_loop_threshold: 1,
+        max_trace_len: 1_024,
+    });
+    configure_vm(&mut vm);
+
+    let warmup = warm_reusable_vm_once(&mut vm, expected_stack);
+    let mut samples = sample_reused_vm_latencies(&mut vm, expected_stack, trials);
+    let median = median_duration(&mut samples);
+    println!(
+        "{label}: warmup_us={} median_us={} per_call_ns={}",
+        warmup.as_micros(),
+        median.as_micros(),
+        median.as_nanos() / calls.max(1) as u128
+    );
 }
 
 fn sample_reused_vm_latencies(

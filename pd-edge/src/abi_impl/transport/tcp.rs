@@ -709,9 +709,9 @@ async fn stream_downstream(
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
     context.note_downstream_transport_access();
-    Ok(CallOutcome::Return(vec![Value::Int(
+    Ok(CallOutcome::Return((vec![Value::Int(
         TcpStreamRef::Downstream.handle(),
-    )]))
+    )]).into()))
 }
 
 /// Returns the default upstream handle for the TCP stream.
@@ -720,16 +720,16 @@ async fn stream_default_upstream(
     _vm: &mut Vm,
     _context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return(vec![Value::Int(
+    Ok(CallOutcome::Return((vec![Value::Int(
         TcpStreamRef::DefaultUpstream.handle(),
-    )]))
+    )]).into()))
 }
 
 /// Allocates a TCP stream handle.
 #[pd_edge_host_function(name = tcp::stream::NEW.name, scope = transport)]
 async fn stream_new(_vm: &mut Vm, context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
     let handle = allocate_tcp_stream_handle(&context)?;
-    Ok(CallOutcome::Return(vec![Value::Int(handle)]))
+    Ok(CallOutcome::Return((vec![Value::Int(handle)]).into()))
 }
 
 /// Returns whether the TCP stream handle is present.
@@ -745,7 +745,7 @@ async fn stream_is_present(
             dynamic_tcp_socket_state(&context, handle)?.is_present()
         }
     };
-    Ok(CallOutcome::Return(vec![Value::Bool(present)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(present)]).into()))
 }
 
 /// Binds the TCP stream to a local address.
@@ -761,7 +761,7 @@ async fn stream_bind(
         *io = None;
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the target endpoint for the TCP stream.
@@ -779,7 +779,7 @@ async fn stream_set_target(
         *io = None;
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Attempts to connect the TCP stream.
@@ -790,7 +790,7 @@ async fn stream_connect(
     stream: i64,
 ) -> Result<CallOutcome, VmError> {
     ensure_dynamic_tcp_stream_connected(&context, stream).await?;
-    Ok(CallOutcome::Return(vec![Value::Bool(true)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(true)]).into()))
 }
 
 /// Reports the current lifecycle phase for a TCP stream handle.
@@ -821,7 +821,7 @@ async fn stream_get_phase(
             dynamic_tcp_socket_state(&context, handle)?.phase().as_str()
         }
     };
-    Ok(CallOutcome::Return(vec![Value::string(phase)]))
+    Ok(CallOutcome::Return((vec![Value::string(phase)]).into()))
 }
 
 /// Returns the local address for the TCP stream.
@@ -840,7 +840,7 @@ async fn stream_get_local_addr(
             .to_string(),
         _ => String::new(),
     };
-    Ok(CallOutcome::Return(vec![Value::string(local_addr)]))
+    Ok(CallOutcome::Return((vec![Value::string(local_addr)]).into()))
 }
 
 /// Returns the peer address for the TCP stream.
@@ -865,7 +865,7 @@ async fn stream_get_peer_addr(
             .peer_address()
             .to_string(),
     };
-    Ok(CallOutcome::Return(vec![Value::string(peer_addr)]))
+    Ok(CallOutcome::Return((vec![Value::string(peer_addr)]).into()))
 }
 
 /// Reads text from the TCP stream.
@@ -948,9 +948,9 @@ async fn stream_read(
             }
         }
     };
-    Ok(CallOutcome::Return(vec![Value::string(
+    Ok(CallOutcome::Return((vec![Value::string(
         String::from_utf8_lossy(&chunk).into_owned(),
-    )]))
+    )]).into()))
 }
 
 /// Reads binary bytes from the TCP stream as an integer array.
@@ -965,7 +965,7 @@ async fn stream_read_binary(
     let max_bytes = decode_chunk_size(max_bytes)?;
     note_stream_read(&context, stream);
     let chunk = read_stream_binary_chunk(&context, stream, max_bytes).await?;
-    Ok(CallOutcome::Return(vec![bytes_to_value(chunk)]))
+    Ok(CallOutcome::Return((vec![bytes_to_value(chunk)]).into()))
 }
 
 /// Reads exactly the requested number of binary bytes from the TCP stream.
@@ -1002,7 +1002,7 @@ async fn stream_read_exact_binary(
         out.extend_from_slice(&chunk);
     }
 
-    Ok(CallOutcome::Return(vec![bytes_to_value(out)]))
+    Ok(CallOutcome::Return((vec![bytes_to_value(out)]).into()))
 }
 
 /// Peeks text from the TCP stream without advancing the VM-visible read cursor.
@@ -1072,9 +1072,9 @@ async fn stream_peek(
             ));
         }
     };
-    Ok(CallOutcome::Return(vec![Value::string(
+    Ok(CallOutcome::Return((vec![Value::string(
         String::from_utf8_lossy(&chunk).into_owned(),
-    )]))
+    )]).into()))
 }
 
 /// Peeks binary bytes from the TCP stream without advancing the VM-visible read cursor.
@@ -1145,7 +1145,7 @@ async fn stream_peek_binary(
             ));
         }
     };
-    Ok(CallOutcome::Return(vec![bytes_to_value(chunk)]))
+    Ok(CallOutcome::Return((vec![bytes_to_value(chunk)]).into()))
 }
 
 /// Writes text to the TCP stream.
@@ -1213,7 +1213,7 @@ async fn stream_write(
             clear_dynamic_tcp_stream_eof(&context, handle);
         }
     }
-    Ok(CallOutcome::Return(vec![Value::Int(text.len() as i64)]))
+    Ok(CallOutcome::Return((vec![Value::Int(text.len() as i64)]).into()))
 }
 
 /// Writes binary bytes to the TCP stream.
@@ -1286,7 +1286,7 @@ async fn stream_write_binary(
             clear_dynamic_tcp_stream_eof(&context, handle);
         }
     }
-    Ok(CallOutcome::Return(vec![Value::Int(bytes.len() as i64)]))
+    Ok(CallOutcome::Return((vec![Value::Int(bytes.len() as i64)]).into()))
 }
 
 /// Returns whether the TCP stream has reached EOF.
@@ -1325,7 +1325,7 @@ async fn stream_eof(
             matches!(state.phase(), TcpSocketPhase::Closed) || state.read_eof()
         }
     };
-    Ok(CallOutcome::Return(vec![Value::Bool(eof)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(eof)]).into()))
 }
 
 /// Closes the TCP stream.
@@ -1388,5 +1388,5 @@ async fn stream_close(
         }
         TcpStreamHandle::OutboundExchange(_) => return Err(mutable_dynamic_tcp_stream_only()),
     }
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }

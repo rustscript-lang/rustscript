@@ -31,6 +31,7 @@ struct CallableParamDecl {
 #[derive(Clone, Debug)]
 struct WrapperDecl {
     fn_name: String,
+    mut_fn_name: String,
     params: Vec<WrapperParamKind>,
 }
 
@@ -710,7 +711,7 @@ fn render_builtin_runtime_dispatch(
         if wrapper_uses_vm(wrapper) {
             writeln!(
                 &mut out,
-                "    registry.register_static({:?}, {}, {});",
+                "    registry.register_static_stack({:?}, {}, {});",
                 callable.name,
                 callable.params.len(),
                 host_wrapper_adapter_name(callable)
@@ -745,7 +746,7 @@ fn render_builtin_runtime_dispatch(
         if wrapper_uses_vm(wrapper) {
             writeln!(
                 &mut out,
-                "            vm.bind_static_function({:?}, {});",
+                "            vm.bind_static_stack_function({:?}, {});",
                 callable.name,
                 host_wrapper_adapter_name(callable)
             )
@@ -1452,7 +1453,11 @@ fn render_wrapper_call(
             WrapperParamKind::SliceArgs => args.push(slice_args_expr.to_string()),
         }
     }
-    let call = format!("{module}::{}({})", wrapper.fn_name, args.join(", "));
+    let wrapper_name = match category {
+        SourceCategory::NamespacedBuiltin => wrapper.mut_fn_name.as_str(),
+        SourceCategory::DefaultHost | SourceCategory::MetadataOnlyBuiltin => wrapper.fn_name.as_str(),
+    };
+    let call = format!("{module}::{wrapper_name}({})", args.join(", "));
     match category {
         SourceCategory::DefaultHost => {
             format!("{call}.map(IntoHostCallOutcome::into_host_call_outcome)")
@@ -1493,8 +1498,10 @@ fn generated_wrapper_decl(function: &ItemFn) -> WrapperDecl {
         }
     }
     params.push(WrapperParamKind::SliceArgs);
+    let fn_name = wrapper_name_for_callable(&function.sig.ident.to_string());
     WrapperDecl {
-        fn_name: wrapper_name_for_callable(&function.sig.ident.to_string()),
+        mut_fn_name: format!("{fn_name}_mut"),
+        fn_name,
         params,
     }
 }
@@ -1657,11 +1664,13 @@ fn type_label(ty: &Type) -> String {
                 | "u128" | "usize" => "int".to_string(),
                 "f32" | "f64" => "float".to_string(),
                 "bool" => "bool".to_string(),
-                "String" | "str" => "string".to_string(),
-                "Bytes" | "VmBytes" => "bytes".to_string(),
-                "Any" | "AnyValue" | "Value" => "any".to_string(),
-                "Array" | "VmArray" => "array".to_string(),
-                "Map" | "VmMap" => "map".to_string(),
+                "String" | "str" | "VmStringRef" => "string".to_string(),
+                "Bytes" | "VmBytes" | "VmBytesRef" | "VmBytesHandle" => "bytes".to_string(),
+                "Any" | "AnyValue" | "Value" | "VmValueRef" | "VmValueOwned" => {
+                    "any".to_string()
+                }
+                "Array" | "VmArray" | "VmArrayRef" | "VmArrayHandle" => "array".to_string(),
+                "Map" | "VmMap" | "VmMapRef" | "VmMapHandle" => "map".to_string(),
                 "Number" | "NumberValue" => "number".to_string(),
                 "Unknown" | "UnknownValue" => "unknown".to_string(),
                 "CallOutcome" => "unknown".to_string(),

@@ -928,7 +928,7 @@ async fn connection_new(
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
     let handle = allocate_outbound_exchange_handle(&context)?;
-    Ok(CallOutcome::Return(vec![Value::Int(handle)]))
+    Ok(CallOutcome::Return((vec![Value::Int(handle)]).into()))
 }
 
 /// Returns the WebSocket connection handle for the current downstream flow.
@@ -937,9 +937,9 @@ async fn connection_downstream(
     _vm: &mut Vm,
     _context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return(vec![Value::Int(
+    Ok(CallOutcome::Return((vec![Value::Int(
         DOWNSTREAM_CONNECTION_HANDLE,
-    )]))
+    )]).into()))
 }
 
 /// Returns the default upstream handle for the WebSocket connection.
@@ -948,9 +948,9 @@ async fn connection_default_upstream(
     _vm: &mut Vm,
     _context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return(vec![Value::Int(
+    Ok(CallOutcome::Return((vec![Value::Int(
         default_upstream_exchange_handle(),
-    )]))
+    )]).into()))
 }
 
 /// Returns whether the WebSocket connection handle is present.
@@ -967,7 +967,7 @@ async fn connection_is_present(
         }
         handle => connection_state(&context, handle).is_present(),
     };
-    Ok(CallOutcome::Return(vec![Value::Bool(present)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(present)]).into()))
 }
 
 /// Sets the target endpoint for the WebSocket connection.
@@ -985,7 +985,7 @@ async fn connection_set_target(
             prepare_outbound_socket_target(&context, connection, host, port)?;
         }
     }
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the scheme for the WebSocket connection.
@@ -1002,7 +1002,7 @@ async fn connection_set_scheme(
             prepare_outbound_scheme(&context, connection, scheme)?;
         }
     }
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the path for the WebSocket connection.
@@ -1019,7 +1019,7 @@ async fn connection_set_path(
             prepare_outbound_path(&context, connection, path)?;
         }
     }
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the query string for the WebSocket connection.
@@ -1036,7 +1036,7 @@ async fn connection_set_query(
             prepare_outbound_query(&context, connection, query)?;
         }
     }
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets a header on the WebSocket connection.
@@ -1054,7 +1054,7 @@ async fn connection_set_header(
             prepare_outbound_header(&context, connection, name, value)?;
         }
     }
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the preferred subprotocol list for the WebSocket connection.
@@ -1085,7 +1085,7 @@ async fn connection_set_subprotocols(
             )?;
         }
     }
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Attempts to connect the WebSocket connection.
@@ -1096,7 +1096,7 @@ async fn connection_connect(
     connection: i64,
 ) -> Result<CallOutcome, VmError> {
     ensure_outbound_websocket_connection_open(&context, connection).await?;
-    Ok(CallOutcome::Return(vec![Value::Bool(true)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(true)]).into()))
 }
 
 /// Returns the current phase for the WebSocket connection.
@@ -1108,9 +1108,9 @@ async fn connection_get_phase(
 ) -> Result<CallOutcome, VmError> {
     let mut state = connection_state(&context, decode_connection(&context, connection)?);
     state.refresh_close_state();
-    Ok(CallOutcome::Return(vec![Value::string(
+    Ok(CallOutcome::Return((vec![Value::string(
         state.phase().as_str(),
-    )]))
+    )]).into()))
 }
 
 /// Returns the negotiated subprotocol for the WebSocket connection.
@@ -1121,9 +1121,9 @@ async fn connection_get_subprotocol(
     connection: i64,
 ) -> Result<CallOutcome, VmError> {
     let state = connection_state(&context, decode_connection(&context, connection)?);
-    Ok(CallOutcome::Return(vec![Value::string(
+    Ok(CallOutcome::Return((vec![Value::string(
         state.negotiated_subprotocol(),
-    )]))
+    )]).into()))
 }
 
 /// Sends a text message over the WebSocket connection.
@@ -1138,7 +1138,7 @@ async fn connection_send_text(
     let io = websocket_io(&context, connection)?;
     let mut io = io.lock().await;
     let sent = io.send_text(text).await?;
-    Ok(CallOutcome::Return(vec![Value::Int(sent as i64)]))
+    Ok(CallOutcome::Return((vec![Value::Int(sent as i64)]).into()))
 }
 
 /// Reads a text message from the WebSocket connection.
@@ -1154,7 +1154,7 @@ async fn connection_read_text(
     let text = io.read_text().await?.unwrap_or_default();
     drop(io);
     refresh_connection_close_state(&context, connection);
-    Ok(CallOutcome::Return(vec![Value::string(text)]))
+    Ok(CallOutcome::Return((vec![Value::string(text)]).into()))
 }
 
 /// Sends a base64-encoded binary message over the WebSocket connection.
@@ -1172,7 +1172,7 @@ async fn connection_send_binary_base64(
     let io = websocket_io(&context, connection)?;
     let mut io = io.lock().await;
     let sent = io.send_binary_base64(payload).await?;
-    Ok(CallOutcome::Return(vec![Value::Int(sent as i64)]))
+    Ok(CallOutcome::Return((vec![Value::Int(sent as i64)]).into()))
 }
 
 /// Sends a binary message over the WebSocket connection.
@@ -1188,7 +1188,7 @@ async fn connection_send_binary(
     let io = websocket_io(&context, connection)?;
     let mut io = io.lock().await;
     let sent = io.send_binary_bytes(bytes).await?;
-    Ok(CallOutcome::Return(vec![Value::Int(sent as i64)]))
+    Ok(CallOutcome::Return((vec![Value::Int(sent as i64)]).into()))
 }
 
 /// Reads a base64-encoded binary message from the WebSocket connection.
@@ -1207,7 +1207,7 @@ async fn connection_read_binary_base64(
     let payload = io.read_binary_base64().await?.unwrap_or_default();
     drop(io);
     refresh_connection_close_state(&context, connection);
-    Ok(CallOutcome::Return(vec![Value::string(payload)]))
+    Ok(CallOutcome::Return((vec![Value::string(payload)]).into()))
 }
 
 /// Reads a binary message from the WebSocket connection.
@@ -1223,7 +1223,7 @@ async fn connection_read_binary(
     let payload = io.read_binary_bytes().await?.unwrap_or_default();
     drop(io);
     refresh_connection_close_state(&context, connection);
-    Ok(CallOutcome::Return(vec![bytes_to_value(payload)]))
+    Ok(CallOutcome::Return((vec![bytes_to_value(payload)]).into()))
 }
 
 /// Returns whether the WebSocket connection has reached EOF.
@@ -1235,7 +1235,7 @@ async fn connection_eof(
 ) -> Result<CallOutcome, VmError> {
     let mut state = connection_state(&context, decode_connection(&context, connection)?);
     let eof = state.eof();
-    Ok(CallOutcome::Return(vec![Value::Bool(eof)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(eof)]).into()))
 }
 
 /// Closes the WebSocket connection.
@@ -1289,5 +1289,5 @@ async fn connection_close(
             }
         }
     }
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }

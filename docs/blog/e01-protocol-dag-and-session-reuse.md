@@ -1,6 +1,6 @@
 # The Protocol DAG: How pd-edge Models Connection Lifecycles
 
-*Auto-advancing state graphs, detachable sub-graphs, and why TLS session reuse removes the need for VM forking*
+*Auto-advancing state graphs, detachable sub-graphs, and why it removes the need for VM forking*
 
 ---
 

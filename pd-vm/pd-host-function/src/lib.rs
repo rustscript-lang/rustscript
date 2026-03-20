@@ -147,8 +147,9 @@ fn generate_vm_wrapper(
     let impl_name = &item.sig.ident;
     let mut wrapper_params = Vec::<proc_macro2::TokenStream>::new();
     let mut call_args = Vec::<proc_macro2::TokenStream>::new();
-    let mut extract_stmts = Vec::<proc_macro2::TokenStream>::new();
-
+    let mut imm_extract_stmts = Vec::<proc_macro2::TokenStream>::new();
+    let mut mut_extract_stmts = Vec::<proc_macro2::TokenStream>::new();
+    let mutable_wrapper_name = syn::Ident::new(&format!("{wrapper_name}_mut"), wrapper_name.span());
     let has_vm = item.sig.inputs.iter().any(|input| match input {
         FnArg::Typed(pat_type) => is_vm_context_type(&pat_type.ty),
         FnArg::Receiver(_) => false,
@@ -157,7 +158,16 @@ fn generate_vm_wrapper(
         wrapper_params.push(quote!(vm: &mut super::super::Vm));
         call_args.push(quote!(vm));
     }
-    wrapper_params.push(quote!(args: &[super::super::Value]));
+    let imm_wrapper_params = {
+        let mut params = wrapper_params.clone();
+        params.push(quote!(args: &[super::super::Value]));
+        params
+    };
+    let mut_wrapper_params = {
+        let mut params = wrapper_params.clone();
+        params.push(quote!(args: &mut [super::super::Value]));
+        params
+    };
 
     let mut arg_index = 0usize;
     for input in &item.sig.inputs {
@@ -179,8 +189,16 @@ fn generate_vm_wrapper(
             proc_macro2::Span::call_site(),
         );
         let index = syn::Index::from(arg_index);
-        extract_stmts.push(quote! {
-            let #ident = super::arg::<#ty>(args, #index, #label)?;
+        imm_extract_stmts.push(quote! {
+            let #ident = super::borrow_arg::<#ty>(args, #index, #label)?;
+        });
+        let extractor = if uses_taken_extractor(ty) {
+            quote!(super::take_arg::<#ty>(args, #index, #label)?)
+        } else {
+            quote!(super::borrow_arg::<#ty>(&*args, #index, #label)?)
+        };
+        mut_extract_stmts.push(quote! {
+            let #ident = #extractor;
         });
         call_args.push(quote!(#ident));
         arg_index += 1;
@@ -195,8 +213,14 @@ fn generate_vm_wrapper(
 
     Ok(quote! {
         #[allow(dead_code)]
-        pub(super) fn #wrapper_name(#(#wrapper_params),*) -> #wrapper_output {
-            #(#extract_stmts)*
+        pub(super) fn #wrapper_name(#(#imm_wrapper_params),*) -> #wrapper_output {
+            #(#imm_extract_stmts)*
+            #call_expr
+        }
+
+        #[allow(dead_code)]
+        pub(super) fn #mutable_wrapper_name(#(#mut_wrapper_params),*) -> #wrapper_output {
+            #(#mut_extract_stmts)*
             #call_expr
         }
     })
@@ -302,11 +326,17 @@ fn type_label(ty: &Type) -> Result<String, Error> {
                 | "u128" | "usize" => Ok("int".to_string()),
                 "f32" | "f64" => Ok("float".to_string()),
                 "bool" => Ok("bool".to_string()),
-                "String" | "str" => Ok("string".to_string()),
-                "Bytes" | "VmBytes" => Ok("bytes".to_string()),
-                "Any" | "AnyValue" | "Value" => Ok("any".to_string()),
-                "Array" | "VmArray" => Ok("array".to_string()),
-                "Map" | "VmMap" => Ok("map".to_string()),
+                "String" | "str" | "VmStringRef" => Ok("string".to_string()),
+                "Bytes" | "VmBytes" | "VmBytesRef" | "VmBytesHandle" => {
+                    Ok("bytes".to_string())
+                }
+                "Any" | "AnyValue" | "Value" | "VmValueRef" | "VmValueOwned" => {
+                    Ok("any".to_string())
+                }
+                "Array" | "VmArray" | "VmArrayRef" | "VmArrayHandle" => {
+                    Ok("array".to_string())
+                }
+                "Map" | "VmMap" | "VmMapRef" | "VmMapHandle" => Ok("map".to_string()),
                 "Number" | "NumberValue" => Ok("number".to_string()),
                 "Unknown" | "UnknownValue" => Ok("unknown".to_string()),
                 "CallOutcome" => Ok("unknown".to_string()),
@@ -419,6 +449,30 @@ fn is_vm_context_type(ty: &Type) -> bool {
             .segments
             .last()
             .is_some_and(|segment| segment.ident == "Vm"),
+        _ => false,
+    }
+}
+
+fn uses_taken_extractor(ty: &Type) -> bool {
+    match ty {
+        Type::Group(group) => uses_taken_extractor(&group.elem),
+        Type::Paren(paren) => uses_taken_extractor(&paren.elem),
+        Type::Reference(_) => false,
+        Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
+            matches!(
+                segment.ident.to_string().as_str(),
+                "Value"
+                    | "AnyValue"
+                    | "UnknownValue"
+                    | "VmArray"
+                    | "VmBytes"
+                    | "VmMap"
+                    | "VmArrayHandle"
+                    | "VmBytesHandle"
+                    | "VmMapHandle"
+                    | "VmValueOwned"
+            )
+        }),
         _ => false,
     }
 }

@@ -187,8 +187,7 @@ Current function surfaces:
 Planned target surfaces:
 
 - new small-result carrier
-  - `CallReturn::{None, One(Value), Many(SmallVec<[Value; 2]>)}` or equivalent local enum
-  - do we actually allow to return multiple values from host function? if no, we shouldn't need Many(SmallVec<[Value; 2]>)
+  - `CallReturn::{None, One(Value)}`
 - `CallOutcome::Return(CallReturn)`
 - `BuiltinCallOutcome::Return(CallReturn)`
 - `HostAsyncBridge::poll_op(op_id, cx) -> Poll<VmResult<CallReturn>>`
@@ -202,14 +201,17 @@ Planned target surfaces:
   - arity: `0`
   - `return_one(value) -> CallReturn`
   - arity: `1`
-  - `return_many(values) -> CallReturn`
+- legacy compatibility
+  - `From<Vec<Value>> for CallReturn`
   - arity: `1`
-  - do we support return many?
+  - many legacy values are packed into one array `Value`, which matches the current Lua-style pack
+    and unpack model
 
 Intent:
 
 - common 0-result and 1-result call paths become allocation-free
-- many-result paths remain correct without forcing the common case to pay for them
+- legacy many-result compatibility remains available through packed array values without forcing the
+  common case to pay for them
 
 ### Stage 3 ABI Surfaces: VM-Aware Host Dispatch
 
@@ -242,8 +244,8 @@ Planned target:
   - `HostFunction::call(vm, args)` stays arity `2`
   - `StaticHostFunction` stays arity `2`
 - replace the allocating internal execution path with borrowed stack-tail dispatch
-  - `Vm::execute_bound_host_function_from_stack(resolved_index, arg_start, argc, call_ip)`
-  - arity: `4`
+  - `Vm::execute_bound_host_function_from_stack(resolved_index, argc, call_ip)`
+  - arity: `3`
 - `Vm::pop_call_args(argc)` leaves the steady-state path for ordinary VM-aware host calls
 
 Optional follow-up, explicitly not required in first Stage 3 pass:
@@ -325,7 +327,7 @@ Remove the mandatory `Vec<Value>` allocation from the common 0-result and 1-resu
 1. Introduce `CallReturn` or equivalent local small-result carrier.
 2. Update builtin and host outcomes to return `CallReturn`.
 3. Update async host completion surfaces to return and complete `CallReturn`.
-4. Replace `return_values(...)` with `return_none()`, `return_one(...)`, and `return_many(...)`.
+4. Replace `return_values(...)` with `return_none()` and `return_one(...)`.
 5. Update the VM stack push sites in [`pd-vm/src/vm/host.rs`](../pd-vm/src/vm/host.rs) to consume
    `CallReturn` without heap allocation in the common case.
 
@@ -333,8 +335,8 @@ Remove the mandatory `Vec<Value>` allocation from the common 0-result and 1-resu
 
 - returning zero values does not allocate
 - returning one value does not allocate
-- multi-value compatibility stays intact for debugger, async completion, and any existing host
-  behaviors that need it
+- legacy multi-value compatibility stays intact through packed array values for debugger, async
+  completion, and Lua-style pack/unpack behavior
 
 ## Stage 3: Zero-Alloc VM-Aware Host Dispatch
 
@@ -444,4 +446,3 @@ Reason for this order:
 - [`pd-vm/src/vm/aot/ssa.rs`](../pd-vm/src/vm/aot/ssa.rs)
 - [`pd-vm/src/vm/aot/compile.rs`](../pd-vm/src/vm/aot/compile.rs), only if Stage 4 needs parity
 - [`pd-vm/tests/jit/perf_tests.rs`](../pd-vm/tests/jit/perf_tests.rs)
-

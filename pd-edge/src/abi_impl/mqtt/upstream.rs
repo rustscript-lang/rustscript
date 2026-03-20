@@ -1130,7 +1130,7 @@ async fn connection_new(
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
     let handle = allocate_mqtt_connection_handle(&context)?;
-    Ok(CallOutcome::Return(vec![Value::Int(handle)]))
+    Ok(CallOutcome::Return((vec![Value::Int(handle)]).into()))
 }
 
 /// Returns the default upstream handle for the MQTT connection.
@@ -1139,9 +1139,9 @@ async fn connection_default_upstream(
     _vm: &mut Vm,
     _context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return(vec![Value::Int(
+    Ok(CallOutcome::Return((vec![Value::Int(
         default_upstream_mqtt_connection_handle(),
-    )]))
+    )]).into()))
 }
 
 /// Returns whether the MQTT connection handle is present.
@@ -1152,7 +1152,7 @@ async fn connection_is_present(
     connection: i64,
 ) -> Result<CallOutcome, VmError> {
     let present = connection_state(&context, decode_connection(&context, connection)?).is_present();
-    Ok(CallOutcome::Return(vec![Value::Bool(present)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(present)]).into()))
 }
 
 /// Sets the scheme for the MQTT connection.
@@ -1168,7 +1168,7 @@ async fn connection_set_scheme(
         state.set_scheme(scheme);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the target endpoint for the MQTT connection.
@@ -1185,7 +1185,7 @@ async fn connection_set_target(
         state.set_target(normalized_host, port);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the client identifier for the MQTT connection.
@@ -1200,7 +1200,7 @@ async fn connection_set_client_id(
         state.set_client_id(client_id);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the username for the MQTT connection.
@@ -1215,7 +1215,7 @@ async fn connection_set_username(
         state.set_username(username);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the password for the MQTT connection.
@@ -1230,7 +1230,7 @@ async fn connection_set_password(
         state.set_password(password);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Sets the keep-alive interval for the MQTT connection.
@@ -1250,7 +1250,7 @@ async fn connection_set_keep_alive_secs(
         state.set_keep_alive_secs(keep_alive_secs);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Enables or disables clean start for the MQTT connection.
@@ -1265,7 +1265,7 @@ async fn connection_set_clean_start(
         state.set_clean_start(enabled);
         Ok(())
     })?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Connects the MQTT session over its attached transport carrier.
@@ -1276,7 +1276,7 @@ async fn connection_connect(
     connection: i64,
 ) -> Result<CallOutcome, VmError> {
     let connected = ensure_connection_open(&context, connection).await?;
-    Ok(CallOutcome::Return(vec![Value::Bool(connected)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(connected)]).into()))
 }
 
 /// Reports the current lifecycle phase for the MQTT connection.
@@ -1289,7 +1289,7 @@ async fn connection_get_phase(
     let phase = connection_state(&context, decode_connection(&context, connection)?)
         .phase()
         .as_str();
-    Ok(CallOutcome::Return(vec![Value::string(phase)]))
+    Ok(CallOutcome::Return((vec![Value::string(phase)]).into()))
 }
 
 /// Sends an MQTT DISCONNECT and closes the carrier.
@@ -1321,7 +1321,7 @@ async fn connection_disconnect(
         Ok(())
     })?;
     write_result?;
-    Ok(CallOutcome::Return(vec![]))
+    Ok(CallOutcome::Return((vec![]).into()))
 }
 
 /// Publishes a UTF-8 text payload on the MQTT connection.
@@ -1344,7 +1344,7 @@ async fn connection_publish_text(
         retain,
     )
     .await?;
-    Ok(CallOutcome::Return(vec![Value::Bool(published)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(published)]).into()))
 }
 
 /// Publishes a binary payload on the MQTT connection.
@@ -1360,7 +1360,7 @@ async fn connection_publish_binary(
 ) -> Result<CallOutcome, VmError> {
     let payload = value_to_bytes(&payload, "mqtt::connection::publish_binary payload")?.to_vec();
     let published = publish_payload(&context, connection, topic, payload, qos, retain).await?;
-    Ok(CallOutcome::Return(vec![Value::Bool(published)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(published)]).into()))
 }
 
 /// Publishes a base64-encoded binary payload on the MQTT connection.
@@ -1381,7 +1381,7 @@ async fn connection_publish_binary_base64(
         VmError::HostError(format!("mqtt binary payload must be base64 encoded: {err}",))
     })?;
     let published = publish_payload(&context, connection, topic, payload, qos, retain).await?;
-    Ok(CallOutcome::Return(vec![Value::Bool(published)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(published)]).into()))
 }
 
 /// Subscribes the MQTT connection to a topic filter.
@@ -1394,7 +1394,7 @@ async fn connection_subscribe(
     qos: i64,
 ) -> Result<CallOutcome, VmError> {
     let subscribed = subscribe_filter(&context, connection, filter, qos).await?;
-    Ok(CallOutcome::Return(vec![Value::Bool(subscribed)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(subscribed)]).into()))
 }
 
 /// Removes a topic filter subscription from the MQTT connection.
@@ -1406,7 +1406,7 @@ async fn connection_unsubscribe(
     filter: String,
 ) -> Result<CallOutcome, VmError> {
     let unsubscribed = unsubscribe_filter(&context, connection, filter).await?;
-    Ok(CallOutcome::Return(vec![Value::Bool(unsubscribed)]))
+    Ok(CallOutcome::Return((vec![Value::Bool(unsubscribed)]).into()))
 }
 
 /// Reads the next MQTT event from the connection.
@@ -1417,7 +1417,7 @@ async fn connection_read_event(
     connection: i64,
 ) -> Result<CallOutcome, VmError> {
     let event = read_next_event_value(&context, connection).await?;
-    Ok(CallOutcome::Return(vec![event]))
+    Ok(CallOutcome::Return((vec![event]).into()))
 }
 
 #[cfg(test)]

@@ -113,7 +113,7 @@ struct UnusedBuiltinOverride;
 
 impl HostFunction for UnusedBuiltinOverride {
     fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-        Ok(CallOutcome::Return(vec![]))
+        Ok(CallOutcome::Return(vec![].into()))
     }
 }
 

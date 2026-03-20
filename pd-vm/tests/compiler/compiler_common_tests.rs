@@ -617,7 +617,7 @@ fn host_function_registry_caches_static_function_pointer_plan_across_vms() {
 
     let mut registry = HostFunctionRegistry::new();
     registry.register_static("print", 1, |_vm, args| {
-        Ok(CallOutcome::Return(args.to_vec()))
+        Ok(CallOutcome::Return(args.to_vec().into()))
     });
     registry.register_static("add_one", 1, static_add_one);
     let plan = registry
@@ -647,7 +647,9 @@ fn host_function_registry_caches_static_args_function_pointer_plan_across_vms() 
     let compiled = compile_source(source).expect("compile should succeed");
 
     let mut registry = HostFunctionRegistry::new();
-    registry.register_static_args("print", 1, |args| Ok(CallOutcome::Return(args.to_vec())));
+    registry.register_static_args("print", 1, |args| {
+        Ok(CallOutcome::Return(args.to_vec().into()))
+    });
     registry.register_static_args("add_one", 1, static_add_one_args);
     let plan = registry
         .prepare_plan(&compiled.program.imports)

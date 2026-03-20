@@ -17,8 +17,9 @@ pub use self::aot::AotArtifactError;
 pub use self::epoch::{EpochCheckpoint, EpochHandle};
 pub use self::fuel::FuelCheckpoint;
 pub use self::host::{
-    CallOutcome, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction,
-    HostFunctionRegistry, HostOpId, StaticHostArgsFunction, StaticHostFunction,
+    CallOutcome, CallReturn, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction,
+    HostFunctionRegistry, HostOpId, HostStackFunction, StaticHostArgsFunction, StaticHostFunction,
+    StaticHostStackFunction,
 };
 use self::host::{HostCallExecOutcome, VmHostFunction, WaitingHostOp};
 pub use crate::bytecode::{HostImport, OpCode, Program, Value, ValueType};

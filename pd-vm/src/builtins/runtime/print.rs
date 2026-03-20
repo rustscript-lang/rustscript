@@ -1,4 +1,4 @@
-use crate::vm::{CallOutcome, HostFunction, Value, Vm, VmResult};
+use crate::vm::{CallOutcome, CallReturn, HostFunction, Value, Vm, VmResult};
 
 pub fn format_value(value: &Value) -> String {
     match value {
@@ -53,6 +53,14 @@ fn format_values(args: &[Value]) -> String {
     args.iter().map(format_value).collect::<Vec<_>>().join(" ")
 }
 
+fn borrowed_args_return(args: &[Value]) -> CallReturn {
+    match args {
+        [] => CallReturn::none(),
+        [value] => CallReturn::one(value.clone()),
+        _ => CallReturn::one(Value::array(args.to_vec())),
+    }
+}
+
 pub struct PrintHostFunction<F>
 where
     F: FnMut(String) + Send + 'static,
@@ -76,7 +84,7 @@ where
     fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         let rendered = format_values(args);
         (self.sink)(rendered);
-        Ok(CallOutcome::Return(args.to_vec()))
+        Ok(CallOutcome::Return(borrowed_args_return(args)))
     }
 }
 
@@ -104,7 +112,7 @@ where
         let mut rendered = format_values(args);
         rendered.push('\n');
         (self.sink)(rendered);
-        Ok(CallOutcome::Return(args.to_vec()))
+        Ok(CallOutcome::Return(borrowed_args_return(args)))
     }
 }
 

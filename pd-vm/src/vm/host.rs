@@ -7,9 +7,63 @@ use super::*;
 
 pub type HostOpId = u64;
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum CallReturn {
+    #[default]
+    None,
+    One(Value),
+}
+
+impl CallReturn {
+    pub fn none() -> Self {
+        Self::None
+    }
+
+    pub fn one(value: Value) -> Self {
+        Self::One(value)
+    }
+
+    pub fn from_values(values: Vec<Value>) -> Self {
+        match values.len() {
+            0 => Self::None,
+            1 => Self::One(
+                values
+                    .into_iter()
+                    .next()
+                    .expect("single-value return should contain one value"),
+            ),
+            _ => Self::One(Value::array(values)),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub fn as_slice(&self) -> &[Value] {
+        match self {
+            Self::None => &[],
+            Self::One(value) => std::slice::from_ref(value),
+        }
+    }
+
+    pub(crate) fn push_onto_stack(self, stack: &mut Vec<Value>) {
+        match self {
+            Self::None => {}
+            Self::One(value) => stack.push(value),
+        }
+    }
+}
+
+impl From<Vec<Value>> for CallReturn {
+    fn from(values: Vec<Value>) -> Self {
+        Self::from_values(values)
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum CallOutcome {
-    Return(Vec<Value>),
+    Return(CallReturn),
     Halt,
     Yield,
     Pending(HostOpId),
@@ -19,24 +73,36 @@ pub trait HostFunction: Send {
     fn call(&mut self, vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome>;
 }
 
+/// VM-aware host functions that opt into borrowed stack-tail dispatch.
+///
+/// Implementations must not re-enter the VM or otherwise structurally mutate
+/// the value stack while `args` is borrowed for the duration of `call`.
+pub trait HostStackFunction: Send {
+    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome>;
+}
+
 pub trait HostArgsFunction: Send {
     fn call(&mut self, args: &[Value]) -> VmResult<CallOutcome>;
 }
 
 pub trait HostAsyncBridge: Send {
-    fn poll_op(&mut self, op_id: HostOpId, cx: &mut Context<'_>) -> Poll<VmResult<Vec<Value>>>;
+    fn poll_op(&mut self, op_id: HostOpId, cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>>;
 }
 
 pub type StaticHostFunction = fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>;
+pub type StaticHostStackFunction = fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>;
 pub type StaticHostArgsFunction = fn(&[Value]) -> VmResult<CallOutcome>;
 
 type HostFactory = dyn Fn() -> Box<dyn HostFunction> + Send + Sync;
+type HostStackFactory = dyn Fn() -> Box<dyn HostStackFunction> + Send + Sync;
 type HostArgsFactory = dyn Fn() -> Box<dyn HostArgsFunction> + Send + Sync;
 
 #[derive(Clone)]
 enum RegistryEntryKind {
     Factory(Arc<HostFactory>),
     Static(StaticHostFunction),
+    StackFactory(Arc<HostStackFactory>),
+    StackStatic(StaticHostStackFunction),
     ArgsFactory(Arc<HostArgsFactory>),
     ArgsStatic(StaticHostArgsFunction),
 }
@@ -137,6 +203,56 @@ impl HostFunctionRegistry {
         entries.push(RegistryEntry {
             arity,
             kind: RegistryEntryKind::Static(function),
+        });
+        Arc::make_mut(&mut self.by_name).insert(name, slot);
+        self.invalidate_plan_cache();
+    }
+
+    pub fn register_stack<F>(&mut self, name: impl Into<String>, arity: u8, factory: F)
+    where
+        F: Fn() -> Box<dyn HostStackFunction> + Send + Sync + 'static,
+    {
+        let name = name.into();
+        if let Some(&slot) = self.by_name.get(&name)
+            && let Some(entry) = Arc::make_mut(&mut self.entries).get_mut(slot as usize)
+        {
+            entry.arity = arity;
+            entry.kind = RegistryEntryKind::StackFactory(Arc::new(factory));
+            self.invalidate_plan_cache();
+            return;
+        }
+
+        let entries = Arc::make_mut(&mut self.entries);
+        let slot = entries.len() as u16;
+        entries.push(RegistryEntry {
+            arity,
+            kind: RegistryEntryKind::StackFactory(Arc::new(factory)),
+        });
+        Arc::make_mut(&mut self.by_name).insert(name, slot);
+        self.invalidate_plan_cache();
+    }
+
+    pub fn register_static_stack(
+        &mut self,
+        name: impl Into<String>,
+        arity: u8,
+        function: StaticHostStackFunction,
+    ) {
+        let name = name.into();
+        if let Some(&slot) = self.by_name.get(&name)
+            && let Some(entry) = Arc::make_mut(&mut self.entries).get_mut(slot as usize)
+        {
+            entry.arity = arity;
+            entry.kind = RegistryEntryKind::StackStatic(function);
+            self.invalidate_plan_cache();
+            return;
+        }
+
+        let entries = Arc::make_mut(&mut self.entries);
+        let slot = entries.len() as u16;
+        entries.push(RegistryEntry {
+            arity,
+            kind: RegistryEntryKind::StackStatic(function),
         });
         Arc::make_mut(&mut self.by_name).insert(name, slot);
         self.invalidate_plan_cache();
@@ -287,6 +403,12 @@ impl HostFunctionRegistry {
                 RegistryEntryKind::Static(function) => {
                     vm.register_static_function(*function);
                 }
+                RegistryEntryKind::StackFactory(factory) => {
+                    vm.register_stack_function(factory());
+                }
+                RegistryEntryKind::StackStatic(function) => {
+                    vm.register_static_stack_function(*function);
+                }
                 RegistryEntryKind::ArgsFactory(factory) => {
                     vm.register_args_function(factory());
                 }
@@ -303,6 +425,8 @@ impl HostFunctionRegistry {
 pub(super) enum VmHostFunction {
     Dynamic(Box<dyn HostFunction>),
     Static(StaticHostFunction),
+    StackDynamic(Box<dyn HostStackFunction>),
+    StackStatic(StaticHostStackFunction),
     ArgsDynamic(Box<dyn HostArgsFunction>),
     ArgsStatic(StaticHostArgsFunction),
 }
@@ -359,6 +483,22 @@ impl Vm {
         index
     }
 
+    pub fn register_stack_function(&mut self, function: Box<dyn HostStackFunction>) -> u16 {
+        let index = self.host_functions.len() as u16;
+        self.host_functions
+            .push(VmHostFunction::StackDynamic(function));
+        self.resolved_calls_dirty = true;
+        index
+    }
+
+    pub fn register_static_stack_function(&mut self, function: StaticHostStackFunction) -> u16 {
+        let index = self.host_functions.len() as u16;
+        self.host_functions
+            .push(VmHostFunction::StackStatic(function));
+        self.resolved_calls_dirty = true;
+        index
+    }
+
     pub fn register_args_function(&mut self, function: Box<dyn HostArgsFunction>) -> u16 {
         let index = self.host_functions.len() as u16;
         self.host_functions
@@ -409,6 +549,51 @@ impl Vm {
         }
 
         let index = self.register_static_function(function);
+        self.host_function_symbols.insert(name, index);
+        self.resolved_calls_dirty = true;
+    }
+
+    pub fn bind_stack_function(
+        &mut self,
+        name: impl Into<String>,
+        function: Box<dyn HostStackFunction>,
+    ) {
+        let name = name.into();
+        if let Some(&index) = self.host_function_symbols.get(&name)
+            && let Some(slot) = self.host_functions.get_mut(index as usize)
+        {
+            *slot = VmHostFunction::StackDynamic(function);
+            self.resolved_calls_dirty = true;
+            return;
+        }
+
+        let index = self.register_stack_function(function);
+        self.host_function_symbols.insert(name, index);
+        self.resolved_calls_dirty = true;
+    }
+
+    pub fn bind_static_stack_function(
+        &mut self,
+        name: impl Into<String>,
+        function: StaticHostStackFunction,
+    ) {
+        let name = name.into();
+        if let Some(builtin) = builtin_for_binding_name(&name) {
+            self.bind_builtin_overrideslot(
+                builtin.call_index(),
+                VmHostFunction::StackStatic(function),
+            );
+            return;
+        }
+        if let Some(&index) = self.host_function_symbols.get(&name)
+            && let Some(slot) = self.host_functions.get_mut(index as usize)
+        {
+            *slot = VmHostFunction::StackStatic(function);
+            self.resolved_calls_dirty = true;
+            return;
+        }
+
+        let index = self.register_static_stack_function(function);
         self.host_function_symbols.insert(name, index);
         self.resolved_calls_dirty = true;
     }
@@ -543,8 +728,12 @@ impl Vm {
         self.waiting_host_op.map(|op| op.op_id)
     }
 
-    pub fn complete_host_op(&mut self, op_id: HostOpId, values: Vec<Value>) -> VmResult<()> {
-        self.complete_waiting_host_op(op_id, values)
+    pub fn complete_host_op(
+        &mut self,
+        op_id: HostOpId,
+        values: impl Into<CallReturn>,
+    ) -> VmResult<()> {
+        self.complete_waiting_host_op(op_id, values.into())
     }
 
     pub fn poll_waiting_host_op(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<()>> {
@@ -628,15 +817,19 @@ impl Vm {
             if self.builtin_overrides.contains_key(&index) {
                 return self.execute_builtin_override_call(index, argc_u8, call_ip);
             }
+            if let Some(outcome) = self.try_execute_builtin_projection_fast_path(builtin, argc)? {
+                return Ok(outcome);
+            }
             return self.execute_builtin_call_from_stack(builtin, argc, call_ip);
         }
 
         let resolved_index = self.resolve_call_target(index, argc_u8)?;
         if self.bound_host_function_uses_args_slice(resolved_index)? {
             self.execute_bound_args_host_function(resolved_index, argc, call_ip)
+        } else if self.bound_host_function_uses_stack_borrow(resolved_index)? {
+            self.execute_bound_stack_host_function(resolved_index, argc, call_ip)
         } else {
-            let args = self.pop_call_args(argc)?;
-            self.execute_bound_host_function(resolved_index, args, call_ip)
+            self.execute_bound_host_function_from_stack(resolved_index, argc, call_ip)
         }
     }
 
@@ -658,9 +851,10 @@ impl Vm {
         let argc = argc_u8 as usize;
         if self.bound_host_function_uses_args_slice(resolved_index)? {
             self.execute_bound_args_host_function(resolved_index, argc, call_ip)
+        } else if self.bound_host_function_uses_stack_borrow(resolved_index)? {
+            self.execute_bound_stack_host_function(resolved_index, argc, call_ip)
         } else {
-            let args = self.pop_call_args(argc)?;
-            self.execute_bound_host_function(resolved_index, args, call_ip)
+            self.execute_bound_host_function_from_stack(resolved_index, argc, call_ip)
         }
     }
 
@@ -685,9 +879,7 @@ impl Vm {
         match outcome {
             crate::builtins::runtime::BuiltinCallOutcome::Return(values) => {
                 self.stack.truncate(arg_start);
-                for value in values {
-                    self.stack.push(value);
-                }
+                values.push_onto_stack(&mut self.stack);
                 Ok(HostCallExecOutcome::Returned)
             }
             crate::builtins::runtime::BuiltinCallOutcome::Halt => {
@@ -704,58 +896,206 @@ impl Vm {
         }
     }
 
-    pub(super) fn execute_bound_host_function(
+    fn try_execute_builtin_projection_fast_path(
+        &mut self,
+        builtin: BuiltinFunction,
+        argc: usize,
+    ) -> VmResult<Option<HostCallExecOutcome>> {
+        let arg_start = self
+            .stack
+            .len()
+            .checked_sub(argc)
+            .ok_or(VmError::StackUnderflow)?;
+        let result = {
+            let args = &self.stack[arg_start..];
+            match (builtin, args) {
+                (BuiltinFunction::Len, [value]) => Self::fast_path_len_result(value),
+                (BuiltinFunction::Get, [container, key]) => {
+                    Self::fast_path_get_result(container, key)?
+                }
+                (BuiltinFunction::Has, [container, key]) => {
+                    Self::fast_path_has_result(container, key)?
+                }
+                _ => None,
+            }
+        };
+        let Some(value) = result else {
+            return Ok(None);
+        };
+        self.stack.truncate(arg_start);
+        self.stack.push(value);
+        Ok(Some(HostCallExecOutcome::Returned))
+    }
+
+    fn fast_path_len_result(value: &Value) -> Option<Value> {
+        match value {
+            Value::String(text) => Some(Value::Int(text.chars().count() as i64)),
+            Value::Bytes(values) => Some(Value::Int(values.len() as i64)),
+            Value::Array(values) => Some(Value::Int(values.len() as i64)),
+            Value::Map(entries) => Some(Value::Int(entries.len() as i64)),
+            _ => None,
+        }
+    }
+
+    fn fast_path_get_result(container: &Value, key: &Value) -> VmResult<Option<Value>> {
+        match container {
+            Value::Array(values) => {
+                let index = key.as_int()?;
+                if index < 0 {
+                    return Err(VmError::HostError(
+                        "array index must be non-negative".to_string(),
+                    ));
+                }
+                let index = usize::try_from(index)
+                    .map_err(|_| VmError::HostError("array index overflow".to_string()))?;
+                let value = values.get(index).cloned().ok_or_else(|| {
+                    VmError::HostError(format!("array index {index} out of bounds"))
+                })?;
+                Ok(Some(value))
+            }
+            Value::Map(entries) => {
+                let value = entries
+                    .get(key)
+                    .cloned()
+                    .ok_or_else(|| VmError::HostError("map key not found".to_string()))?;
+                Ok(Some(value))
+            }
+            Value::Bytes(values) => {
+                let index = key.as_int()?;
+                if index < 0 {
+                    return Err(VmError::HostError(
+                        "bytes index must be non-negative".to_string(),
+                    ));
+                }
+                let index = usize::try_from(index)
+                    .map_err(|_| VmError::HostError("bytes index overflow".to_string()))?;
+                let value = values.get(index).copied().ok_or_else(|| {
+                    VmError::HostError(format!("bytes index {index} out of bounds"))
+                })?;
+                Ok(Some(Value::Int(i64::from(value))))
+            }
+            Value::String(text) => {
+                let index = key.as_int()?;
+                if index < 0 {
+                    return Err(VmError::HostError(
+                        "string index must be non-negative".to_string(),
+                    ));
+                }
+                let index = usize::try_from(index)
+                    .map_err(|_| VmError::HostError("string index overflow".to_string()))?;
+                let value = text
+                    .chars()
+                    .nth(index)
+                    .map(|ch| Value::string(ch.to_string()))
+                    .ok_or_else(|| {
+                        VmError::HostError(format!("string index {index} out of bounds"))
+                    })?;
+                Ok(Some(value))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn fast_path_has_result(container: &Value, key: &Value) -> VmResult<Option<Value>> {
+        match container {
+            Value::Array(values) => {
+                let index = key.as_int()?;
+                let present = if index < 0 {
+                    false
+                } else {
+                    usize::try_from(index)
+                        .ok()
+                        .is_some_and(|index| index < values.len())
+                };
+                Ok(Some(Value::Bool(present)))
+            }
+            Value::Bytes(values) => {
+                let index = key.as_int()?;
+                let present = if index < 0 {
+                    false
+                } else {
+                    usize::try_from(index)
+                        .ok()
+                        .is_some_and(|index| index < values.len())
+                };
+                Ok(Some(Value::Bool(present)))
+            }
+            Value::Map(entries) => Ok(Some(Value::Bool(entries.get(key).is_some()))),
+            _ => Ok(None),
+        }
+    }
+
+    pub(super) fn execute_bound_host_function_from_stack(
         &mut self,
         resolved_index: u16,
-        args: Vec<Value>,
+        argc: usize,
         call_ip: usize,
     ) -> VmResult<HostCallExecOutcome> {
+        let arg_start = self
+            .stack
+            .len()
+            .checked_sub(argc)
+            .ok_or(VmError::StackUnderflow)?;
+        let mut saved_stack = std::mem::take(&mut self.stack);
         self.call_depth += 1;
         let function_ptr =
             self.host_functions
                 .get_mut(resolved_index as usize)
                 .ok_or(VmError::InvalidCall(resolved_index))? as *mut VmHostFunction;
         let outcome = unsafe {
+            let args = &saved_stack[arg_start..];
             match &mut *function_ptr {
-                VmHostFunction::Dynamic(function) => function.call(self, &args),
-                VmHostFunction::Static(function) => function(self, &args),
-                VmHostFunction::ArgsDynamic(_) | VmHostFunction::ArgsStatic(_) => unreachable!(),
+                VmHostFunction::Dynamic(function) => function.call(self, args),
+                VmHostFunction::Static(function) => function(self, args),
+                VmHostFunction::StackDynamic(_)
+                | VmHostFunction::StackStatic(_)
+                | VmHostFunction::ArgsDynamic(_)
+                | VmHostFunction::ArgsStatic(_) => unreachable!(),
             }
         };
         self.call_depth = self.call_depth.saturating_sub(1);
-        let outcome = outcome?;
+
+        let mut host_stack = std::mem::take(&mut self.stack);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                saved_stack.truncate(arg_start);
+                saved_stack.append(&mut host_stack);
+                self.stack = saved_stack;
+                return Err(err);
+            }
+        };
 
         match outcome {
             CallOutcome::Return(values) => {
-                for value in values {
-                    self.stack.push(value);
-                }
+                saved_stack.truncate(arg_start);
+                saved_stack.append(&mut host_stack);
+                values.push_onto_stack(&mut saved_stack);
+                self.stack = saved_stack;
                 Ok(HostCallExecOutcome::Returned)
             }
-            CallOutcome::Halt => Ok(HostCallExecOutcome::Halted),
+            CallOutcome::Halt => {
+                saved_stack.truncate(arg_start);
+                saved_stack.append(&mut host_stack);
+                self.stack = saved_stack;
+                Ok(HostCallExecOutcome::Halted)
+            }
             CallOutcome::Yield => {
-                for value in args {
-                    self.stack.push(value);
-                }
+                saved_stack.append(&mut host_stack);
+                self.stack = saved_stack;
                 self.ip = call_ip;
                 Ok(HostCallExecOutcome::Yielded)
             }
             CallOutcome::Pending(op_id) => {
+                saved_stack.truncate(arg_start);
+                saved_stack.append(&mut host_stack);
+                self.stack = saved_stack;
                 let resume_ip = self.call_resume_ip(call_ip)?;
                 self.set_waiting_host_op(op_id, WaitingHostOpSource::HostBridge)?;
                 self.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }
         }
-    }
-
-    fn pop_call_args(&mut self, argc: usize) -> VmResult<Vec<Value>> {
-        let mut args = Vec::with_capacity(argc);
-        for _ in 0..argc {
-            args.push(self.pop_value()?);
-        }
-        args.reverse();
-        Ok(args)
     }
 
     fn bound_host_function_uses_args_slice(&self, resolved_index: u16) -> VmResult<bool> {
@@ -766,6 +1106,17 @@ impl Vm {
         Ok(matches!(
             function,
             VmHostFunction::ArgsDynamic(_) | VmHostFunction::ArgsStatic(_)
+        ))
+    }
+
+    fn bound_host_function_uses_stack_borrow(&self, resolved_index: u16) -> VmResult<bool> {
+        let function = self
+            .host_functions
+            .get(resolved_index as usize)
+            .ok_or(VmError::InvalidCall(resolved_index))?;
+        Ok(matches!(
+            function,
+            VmHostFunction::StackDynamic(_) | VmHostFunction::StackStatic(_)
         ))
     }
 
@@ -790,7 +1141,10 @@ impl Vm {
             match function {
                 VmHostFunction::ArgsDynamic(function) => function.call(args),
                 VmHostFunction::ArgsStatic(function) => function(args),
-                VmHostFunction::Dynamic(_) | VmHostFunction::Static(_) => unreachable!(),
+                VmHostFunction::Dynamic(_)
+                | VmHostFunction::Static(_)
+                | VmHostFunction::StackDynamic(_)
+                | VmHostFunction::StackStatic(_) => unreachable!(),
             }
         };
         self.call_depth = self.call_depth.saturating_sub(1);
@@ -799,9 +1153,64 @@ impl Vm {
         match outcome {
             CallOutcome::Return(values) => {
                 self.stack.truncate(arg_start);
-                for value in values {
-                    self.stack.push(value);
-                }
+                values.push_onto_stack(&mut self.stack);
+                Ok(HostCallExecOutcome::Returned)
+            }
+            CallOutcome::Halt => {
+                self.stack.truncate(arg_start);
+                Ok(HostCallExecOutcome::Halted)
+            }
+            CallOutcome::Yield => {
+                self.ip = call_ip;
+                Ok(HostCallExecOutcome::Yielded)
+            }
+            CallOutcome::Pending(op_id) => {
+                self.stack.truncate(arg_start);
+                let resume_ip = self.call_resume_ip(call_ip)?;
+                self.set_waiting_host_op(op_id, WaitingHostOpSource::HostBridge)?;
+                self.ip = resume_ip;
+                Ok(HostCallExecOutcome::Pending(op_id))
+            }
+        }
+    }
+
+    pub(super) fn execute_bound_stack_host_function(
+        &mut self,
+        resolved_index: u16,
+        argc: usize,
+        call_ip: usize,
+    ) -> VmResult<HostCallExecOutcome> {
+        let arg_start = self
+            .stack
+            .len()
+            .checked_sub(argc)
+            .ok_or(VmError::StackUnderflow)?;
+        self.call_depth += 1;
+        let function_ptr =
+            self.host_functions
+                .get_mut(resolved_index as usize)
+                .ok_or(VmError::InvalidCall(resolved_index))? as *mut VmHostFunction;
+        // Stack-borrowed host functions opt into the same raw stack-tail borrowing model used
+        // by builtin dispatch. They must not re-enter the VM or otherwise mutate `self.stack`
+        // while the borrowed slice is alive.
+        let outcome = unsafe {
+            let args = std::slice::from_raw_parts(self.stack.as_ptr().add(arg_start), argc);
+            match &mut *function_ptr {
+                VmHostFunction::StackDynamic(function) => function.call(self, args),
+                VmHostFunction::StackStatic(function) => function(self, args),
+                VmHostFunction::Dynamic(_)
+                | VmHostFunction::Static(_)
+                | VmHostFunction::ArgsDynamic(_)
+                | VmHostFunction::ArgsStatic(_) => unreachable!(),
+            }
+        };
+        self.call_depth = self.call_depth.saturating_sub(1);
+        let outcome = outcome?;
+
+        match outcome {
+            CallOutcome::Return(values) => {
+                self.stack.truncate(arg_start);
+                values.push_onto_stack(&mut self.stack);
                 Ok(HostCallExecOutcome::Returned)
             }
             CallOutcome::Halt => {
@@ -850,7 +1259,7 @@ impl Vm {
     pub(super) fn complete_waiting_host_op(
         &mut self,
         op_id: HostOpId,
-        values: Vec<Value>,
+        values: CallReturn,
     ) -> VmResult<()> {
         let waiting = self.waiting_host_op.ok_or_else(|| {
             VmError::HostError(format!(
@@ -865,9 +1274,7 @@ impl Vm {
             )));
         }
         self.waiting_host_op = None;
-        for value in values {
-            self.stack.push(value);
-        }
+        values.push_onto_stack(&mut self.stack);
         Ok(())
     }
 
