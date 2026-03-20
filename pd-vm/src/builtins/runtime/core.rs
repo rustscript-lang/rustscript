@@ -1,8 +1,9 @@
 use super::{AnyValue, UnknownValue, VmArray, VmBytes, VmMap, arg, return_values};
-use crate::bytecode::unwrap_or_clone_shared;
+use crate::bytecode::{SharedArray, SharedMap};
 use crate::vm::{Value, VmError, VmResult};
 use pd_host_function::pd_host_function;
 use rt_format::{Format, FormatArgument, NoNamedArguments, ParsedFormat, Specifier};
+use std::sync::Arc;
 
 /// Return the length of a string, array, or map.
 #[pd_host_function(name = "len")]
@@ -197,13 +198,20 @@ pub(super) fn builtin_array_push_typed_impl(mut items: VmArray, value: AnyValue)
     items
 }
 
+fn builtin_array_push_shared_impl(mut items: SharedArray, value: AnyValue) -> SharedArray {
+    Arc::make_mut(&mut items).push(value);
+    items
+}
+
 pub(super) fn builtin_array_push(args: &mut [Value]) -> VmResult<Vec<Value>> {
     let items = match take_arg(args, 0, "array_push array")? {
-        Value::Array(values) => unwrap_or_clone_shared(values),
+        Value::Array(values) => values,
         _ => return Err(VmError::TypeMismatch("array")),
     };
     let value = take_arg(args, 1, "array_push value")?;
-    Ok(return_values(builtin_array_push_typed_impl(items, value)))
+    Ok(return_values(Value::Array(builtin_array_push_shared_impl(
+        items, value,
+    ))))
 }
 
 /// Create an empty map.
@@ -600,6 +608,31 @@ pub(super) fn builtin_set_array_impl(
     Ok(items)
 }
 
+fn builtin_set_array_shared_impl(
+    mut items: SharedArray,
+    index: i64,
+    value: AnyValue,
+) -> VmResult<SharedArray> {
+    let items_mut = Arc::make_mut(&mut items);
+    if index < 0 {
+        return Err(VmError::HostError(
+            "array index must be non-negative".to_string(),
+        ));
+    }
+    let index = usize::try_from(index)
+        .map_err(|_| VmError::HostError("array index overflow".to_string()))?;
+    if index < items_mut.len() {
+        items_mut[index] = value;
+    } else if index == items_mut.len() {
+        items_mut.push(value);
+    } else {
+        return Err(VmError::HostError(format!(
+            "array index {index} out of bounds"
+        )));
+    }
+    Ok(items)
+}
+
 /// Update a map entry and return the updated map.
 #[pd_host_function(name = "set")]
 pub(super) fn builtin_set_map_impl(mut entries: VmMap, key: AnyValue, value: AnyValue) -> VmMap {
@@ -611,20 +644,30 @@ pub(super) fn builtin_set_map_impl(mut entries: VmMap, key: AnyValue, value: Any
     entries
 }
 
+fn builtin_set_map_shared_impl(
+    mut entries: SharedMap,
+    key: AnyValue,
+    value: AnyValue,
+) -> SharedMap {
+    let entries_mut = Arc::make_mut(&mut entries);
+    if matches!(value, Value::Null) {
+        entries_mut.remove(&key);
+    } else {
+        entries_mut.insert(key, value);
+    }
+    entries
+}
+
 pub(super) fn builtin_set(args: &mut [Value]) -> VmResult<Vec<Value>> {
     let container = take_arg(args, 0, "set container")?;
     let key = take_arg(args, 1, "set key")?;
     let value = take_arg(args, 2, "set value")?;
     match container {
-        Value::Array(values) => {
-            builtin_set_array_impl(unwrap_or_clone_shared(values), key.as_int()?, value)
-                .map(return_values)
-        }
-        Value::Map(entries) => Ok(return_values(builtin_set_map_impl(
-            unwrap_or_clone_shared(entries),
-            key,
-            value,
-        ))),
+        Value::Array(values) => builtin_set_array_shared_impl(values, key.as_int()?, value)
+            .map(|values| return_values(Value::Array(values))),
+        Value::Map(entries) => Ok(return_values(Value::Map(builtin_set_map_shared_impl(
+            entries, key, value,
+        )))),
         _ => Err(VmError::TypeMismatch("array/map")),
     }
 }
