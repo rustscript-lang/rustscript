@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use crate::bytecode::VmMap;
+use crate::bytecode::{VmMap, vm_map_len_field_offset};
 
 use super::super::{Value, Vm, VmError, VmResult};
 
@@ -34,6 +34,11 @@ pub(crate) struct ValueLayout {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) struct MapLayout {
+    pub(crate) len_offset: i32,
+}
+
+#[derive(Clone, Copy)]
 pub(crate) struct NativeStackLayout {
     pub(crate) vm_stack_offset: i32,
     pub(crate) vm_locals_offset: i32,
@@ -47,6 +52,7 @@ pub(crate) struct NativeStackLayout {
     pub(crate) vm_drop_contract_events_enabled_offset: i32,
     pub(crate) vm_drop_contract_events_offset: i32,
     pub(crate) stack_vec: VecLayout,
+    pub(crate) map: MapLayout,
     pub(crate) value: ValueLayout,
 }
 
@@ -96,6 +102,7 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         "Vm::drop_contract_events offset",
     )?;
     let stack_vec = detect_vec_layout()?;
+    let map = detect_map_layout()?;
     let value = detect_value_layout()?;
     Ok(NativeStackLayout {
         vm_stack_offset,
@@ -110,6 +117,7 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         vm_drop_contract_events_enabled_offset,
         vm_drop_contract_events_offset,
         stack_vec,
+        map,
         value,
     })
 }
@@ -155,6 +163,12 @@ fn detect_vec_layout() -> VmResult<VecLayout> {
             cap_index * std::mem::size_of::<usize>(),
             "Vec<Value>::cap offset",
         )?,
+    })
+}
+
+fn detect_map_layout() -> VmResult<MapLayout> {
+    Ok(MapLayout {
+        len_offset: usize_to_i32(vm_map_len_field_offset(), "VmMap::cached_len offset")?,
     })
 }
 

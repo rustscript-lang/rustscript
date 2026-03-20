@@ -8,17 +8,18 @@ use crate::vm::jit::ir::{
     SsaValueId, SsaValueRepr,
 };
 use crate::vm::native::{
-    ExecutableBuffer, NativeInterruptMode, NativeInterruptSettings, NativeStackLayout,
-    STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_OUT_OF_FUEL, STATUS_TRACE_EXIT,
-    box_heap_value_signature, bytes_concat_entry_address, bytes_slice_entry_address,
-    checked_add_i32, clear_value_slot_entry_address, clone_value_signature,
-    clone_value_to_slot_entry_address, collection_get_signature, collection_predicate_signature,
-    concat_value_result_signature, detect_native_stack_layout, entry_signature, heap_len_signature,
-    indexed_value_result_signature, init_null_value_slot_entry_address, jump_with_status,
-    map_get_entry_address, map_has_entry_address, map_len_entry_address,
-    ranged_value_result_signature, restore_exit_signature, restore_exit_state_entry_address,
-    string_concat_entry_address, string_get_entry_address, string_len_entry_address,
-    string_slice_entry_address, value_slot_signature, write_heap_value_to_slot_entry_address,
+    ExecutableBuffer, HeapIntrinsicAddrs, HeapIntrinsicRefs, NativeInterruptMode,
+    NativeInterruptSettings, NativeStackLayout, STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED,
+    STATUS_OUT_OF_FUEL, STATUS_TRACE_EXIT, alloc_buffer_signature, alloc_byte_buffer_entry_address,
+    box_heap_value_signature, checked_add_i32, clear_value_slot_entry_address,
+    clone_value_signature, clone_value_to_slot_entry_address, collection_get_signature,
+    collection_predicate_signature, copy_bytes_entry_address, copy_bytes_signature,
+    detect_native_stack_layout, drop_shared_signature, entry_signature, free_buffer_signature,
+    init_null_value_slot_entry_address, jump_with_status, map_get_entry_address,
+    map_has_entry_address, pack_shared_signature, restore_exit_signature,
+    restore_exit_state_entry_address, shared_bytes_from_buffer_entry_address,
+    shared_string_from_buffer_entry_address, value_slot_signature,
+    write_heap_value_to_slot_entry_address,
 };
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Ieee64;
@@ -90,12 +91,13 @@ fn try_compile_ssa_trace(
     let clone_value_sig = clone_value_signature(pointer_type, call_conv);
     let value_slot_sig = value_slot_signature(pointer_type, call_conv);
     let box_heap_value_sig = box_heap_value_signature(pointer_type, call_conv);
-    let map_len_sig = heap_len_signature(pointer_type, call_conv);
+    let alloc_buffer_sig = alloc_buffer_signature(pointer_type, call_conv);
+    let free_buffer_sig = free_buffer_signature(pointer_type, call_conv);
+    let pack_shared_sig = pack_shared_signature(pointer_type, call_conv);
+    let drop_shared_sig = drop_shared_signature(pointer_type, call_conv);
+    let copy_bytes_sig = copy_bytes_signature(pointer_type, call_conv);
     let map_has_sig = collection_predicate_signature(pointer_type, call_conv);
     let map_get_sig = collection_get_signature(pointer_type, call_conv);
-    let indexed_value_result_sig = indexed_value_result_signature(pointer_type, call_conv);
-    let ranged_value_result_sig = ranged_value_result_signature(pointer_type, call_conv);
-    let concat_value_result_sig = concat_value_result_signature(pointer_type, call_conv);
     let restore_exit_sig = restore_exit_signature(pointer_type, call_conv);
     let resume_linked_trace_sig = entry_signature(pointer_type, call_conv);
 
@@ -113,17 +115,32 @@ fn try_compile_ssa_trace(
         let entry_block = b.create_block();
         let exit_block = b.create_block();
         b.append_block_param(exit_block, types::I32);
+        let heap_refs = HeapIntrinsicRefs {
+            alloc_buffer_ref: b.import_signature(alloc_buffer_sig),
+            free_buffer_ref: b.import_signature(free_buffer_sig),
+            pack_shared_ref: b.import_signature(pack_shared_sig),
+            drop_shared_ref: b.import_signature(drop_shared_sig),
+            copy_bytes_ref: b.import_signature(copy_bytes_sig),
+        };
+        let heap_addrs = HeapIntrinsicAddrs {
+            alloc_byte_buffer: alloc_byte_buffer_entry_address(),
+            alloc_value_buffer: 0,
+            pack_string: shared_string_from_buffer_entry_address(),
+            pack_bytes: shared_bytes_from_buffer_entry_address(),
+            pack_array: 0,
+            copy_bytes: copy_bytes_entry_address(),
+            zero_bytes: 0,
+            drop_string: 0,
+            drop_bytes: 0,
+            drop_array: 0,
+        };
         let deopt_refs = SsaDeoptHelperRefs {
             clone_value_ref: b.import_signature(clone_value_sig),
             init_null_slot_ref: b.import_signature(value_slot_sig.clone()),
             clear_value_slot_ref: b.import_signature(value_slot_sig),
             box_heap_value_ref: b.import_signature(box_heap_value_sig),
-            map_len_ref: b.import_signature(map_len_sig),
             map_has_ref: b.import_signature(map_has_sig),
             map_get_ref: b.import_signature(map_get_sig),
-            indexed_value_result_ref: b.import_signature(indexed_value_result_sig),
-            ranged_value_result_ref: b.import_signature(ranged_value_result_sig),
-            concat_value_result_ref: b.import_signature(concat_value_result_sig),
             restore_exit_ref: b.import_signature(restore_exit_sig),
             resume_linked_trace_ref: b.import_signature(resume_linked_trace_sig),
         };
@@ -132,15 +149,8 @@ fn try_compile_ssa_trace(
             init_null_slot: init_null_value_slot_entry_address(),
             clear_value_slot: clear_value_slot_entry_address(),
             box_heap_value: write_heap_value_to_slot_entry_address(),
-            map_len: map_len_entry_address(),
             map_has: map_has_entry_address(),
             map_get: map_get_entry_address(),
-            string_len: string_len_entry_address(),
-            string_get: string_get_entry_address(),
-            string_slice: string_slice_entry_address(),
-            bytes_slice: bytes_slice_entry_address(),
-            string_concat: string_concat_entry_address(),
-            bytes_concat: bytes_concat_entry_address(),
             restore_exit: restore_exit_state_entry_address(),
             resume_linked_trace: resume_linked_trace_entry_address(),
         };
@@ -266,6 +276,8 @@ fn try_compile_ssa_trace(
                     pointer_type,
                     layout,
                     offsets,
+                    heap_refs,
+                    heap_addrs,
                     deopt_refs,
                     deopt_addrs,
                     inst,
@@ -382,12 +394,8 @@ struct SsaDeoptHelperRefs {
     init_null_slot_ref: cranelift_codegen::ir::SigRef,
     clear_value_slot_ref: cranelift_codegen::ir::SigRef,
     box_heap_value_ref: cranelift_codegen::ir::SigRef,
-    map_len_ref: cranelift_codegen::ir::SigRef,
     map_has_ref: cranelift_codegen::ir::SigRef,
     map_get_ref: cranelift_codegen::ir::SigRef,
-    indexed_value_result_ref: cranelift_codegen::ir::SigRef,
-    ranged_value_result_ref: cranelift_codegen::ir::SigRef,
-    concat_value_result_ref: cranelift_codegen::ir::SigRef,
     restore_exit_ref: cranelift_codegen::ir::SigRef,
     resume_linked_trace_ref: cranelift_codegen::ir::SigRef,
 }
@@ -398,15 +406,8 @@ struct SsaDeoptHelperAddrs {
     init_null_slot: usize,
     clear_value_slot: usize,
     box_heap_value: usize,
-    map_len: usize,
     map_has: usize,
     map_get: usize,
-    string_len: usize,
-    string_get: usize,
-    string_slice: usize,
-    bytes_slice: usize,
-    string_concat: usize,
-    bytes_concat: usize,
     restore_exit: usize,
     resume_linked_trace: usize,
 }
@@ -747,6 +748,8 @@ fn lower_ssa_inst(
     pointer_type: cranelift_codegen::ir::Type,
     layout: crate::vm::native::NativeStackLayout,
     offsets: ResolvedOffsets,
+    heap_refs: HeapIntrinsicRefs,
+    heap_addrs: HeapIntrinsicAddrs,
     helper_refs: SsaDeoptHelperRefs,
     helper_addrs: SsaDeoptHelperAddrs,
     inst: &crate::vm::jit::ir::SsaInst,
@@ -886,11 +889,58 @@ fn lower_ssa_inst(
             out
         }
         SsaInstKind::StringLen { text } => {
-            let helper_ptr = iconst_ptr_from_addr(b, pointer_type, helper_addrs.string_len)?;
-            let call = b
+            let string_data = ssa_load_heap_data_ptr(b, layout.value, values[text]);
+            let bytes_ptr = b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                string_data,
+                layout.stack_vec.ptr_offset,
+            );
+            let bytes_len = b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                string_data,
+                layout.stack_vec.len_offset,
+            );
+            let loop_block = b.create_block();
+            let step_block = b.create_block();
+            let done_block = b.create_block();
+            b.append_block_param(loop_block, pointer_type);
+            b.append_block_param(loop_block, pointer_type);
+            b.append_block_param(done_block, pointer_type);
+
+            let zero = b.ins().iconst(pointer_type, 0);
+            b.ins()
+                .jump(loop_block, &[BlockArg::Value(zero), BlockArg::Value(zero)]);
+
+            b.switch_to_block(loop_block);
+            let byte_index = b.block_params(loop_block)[0];
+            let char_count = b.block_params(loop_block)[1];
+            let done = b
                 .ins()
-                .call_indirect(helper_refs.map_len_ref, helper_ptr, &[values[text]]);
-            b.inst_results(call)[0]
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, byte_index, bytes_len);
+            b.ins().brif(
+                done,
+                done_block,
+                &[BlockArg::Value(char_count)],
+                step_block,
+                &[],
+            );
+
+            b.switch_to_block(step_block);
+            let byte_ptr = b.ins().iadd(bytes_ptr, byte_index);
+            let byte = ssa_load_byte(b, byte_ptr);
+            let cont = ssa_is_utf8_continuation_byte(b, byte);
+            let advanced_count = b.ins().iadd_imm(char_count, 1);
+            let next_count = b.ins().select(cont, char_count, advanced_count);
+            let next_index = b.ins().iadd_imm(byte_index, 1);
+            b.ins().jump(
+                loop_block,
+                &[BlockArg::Value(next_index), BlockArg::Value(next_count)],
+            );
+
+            b.switch_to_block(done_block);
+            b.block_params(done_block)[0]
         }
         SsaInstKind::BytesLen { bytes } => {
             let bytes = values[bytes];
@@ -907,20 +957,165 @@ fn lower_ssa_inst(
             start,
             length,
         } => {
+            let text = values[text];
+            let start = values[start];
+            let length = values[length];
+            let string_data = ssa_load_heap_data_ptr(b, layout.value, text);
+            let bytes_ptr = b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                string_data,
+                layout.stack_vec.ptr_offset,
+            );
+            let bytes_len = b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                string_data,
+                layout.stack_vec.len_offset,
+            );
             let out = owned_value_temp_slot_addr(
                 b,
                 pointer_type,
                 owned_value_temps,
                 SsaTempValueSlotKey::Output(output.id),
             )?;
-            ssa_call_status_helper(
+            let seek_start = b.create_block();
+            let seek_end = b.create_block();
+            let copy_block = b.create_block();
+            let empty_block = b.create_block();
+            let cont = b.create_block();
+            b.append_block_param(seek_start, pointer_type);
+            b.append_block_param(seek_start, pointer_type);
+            b.append_block_param(seek_end, pointer_type);
+            b.append_block_param(seek_end, pointer_type);
+            b.append_block_param(seek_end, pointer_type);
+            b.append_block_param(copy_block, pointer_type);
+            b.append_block_param(copy_block, pointer_type);
+
+            let zero = b.ins().iconst(pointer_type, 0);
+            let start_negative = b.ins().icmp_imm(IntCC::SignedLessThan, start, 0);
+            let length_positive = b.ins().icmp_imm(IntCC::SignedGreaterThan, length, 0);
+            let start_non_negative = b.ins().bnot(start_negative);
+            let positive = b.ins().band(start_non_negative, length_positive);
+            b.ins().brif(
+                positive,
+                seek_start,
+                &[BlockArg::Value(zero), BlockArg::Value(zero)],
+                empty_block,
+                &[],
+            );
+
+            b.switch_to_block(seek_start);
+            let byte_index = b.block_params(seek_start)[0];
+            let char_index = b.block_params(seek_start)[1];
+            let reached_start = b.ins().icmp(IntCC::Equal, char_index, start);
+            let scan_more = b.create_block();
+            b.ins().brif(
+                reached_start,
+                seek_end,
+                &[
+                    BlockArg::Value(byte_index),
+                    BlockArg::Value(byte_index),
+                    BlockArg::Value(length),
+                ],
+                scan_more,
+                &[],
+            );
+
+            b.switch_to_block(scan_more);
+            let at_end = b
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, byte_index, bytes_len);
+            let start_found = b.create_block();
+            b.ins().brif(at_end, empty_block, &[], start_found, &[]);
+
+            b.switch_to_block(start_found);
+            let current_ptr = b.ins().iadd(bytes_ptr, byte_index);
+            let current_byte = ssa_load_byte(b, current_ptr);
+            let current_width = ssa_utf8_char_width(b, pointer_type, current_byte);
+            let next_byte = b.ins().iadd(byte_index, current_width);
+            let next_char = b.ins().iadd_imm(char_index, 1);
+            b.ins().jump(
+                seek_start,
+                &[BlockArg::Value(next_byte), BlockArg::Value(next_char)],
+            );
+
+            b.switch_to_block(seek_end);
+            let slice_start = b.block_params(seek_end)[0];
+            let end_byte = b.block_params(seek_end)[1];
+            let remaining_chars = b.block_params(seek_end)[2];
+            let no_chars_left = b.ins().icmp_imm(IntCC::Equal, remaining_chars, 0);
+            let reached_end = b
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, end_byte, bytes_len);
+            let finish_now = b.ins().bor(no_chars_left, reached_end);
+            let finish_block = b.create_block();
+            let advance_block = b.create_block();
+            b.ins()
+                .brif(finish_now, finish_block, &[], advance_block, &[]);
+
+            b.switch_to_block(advance_block);
+            let end_ptr = b.ins().iadd(bytes_ptr, end_byte);
+            let end_byte_value = ssa_load_byte(b, end_ptr);
+            let end_width = ssa_utf8_char_width(b, pointer_type, end_byte_value);
+            let next_end = b.ins().iadd(end_byte, end_width);
+            let one = b.ins().iconst(pointer_type, 1);
+            let remaining_next = b.ins().isub(remaining_chars, one);
+            b.ins().jump(
+                seek_end,
+                &[
+                    BlockArg::Value(slice_start),
+                    BlockArg::Value(next_end),
+                    BlockArg::Value(remaining_next),
+                ],
+            );
+
+            b.switch_to_block(finish_block);
+            let slice_len = b.ins().isub(end_byte, slice_start);
+            b.ins().jump(
+                copy_block,
+                &[BlockArg::Value(slice_start), BlockArg::Value(slice_len)],
+            );
+
+            b.switch_to_block(empty_block);
+            b.ins()
+                .jump(copy_block, &[BlockArg::Value(zero), BlockArg::Value(zero)]);
+
+            b.switch_to_block(copy_block);
+            let slice_start = b.block_params(copy_block)[0];
+            let slice_len = b.block_params(copy_block)[1];
+            let source_ptr = b.ins().iadd(bytes_ptr, slice_start);
+            let out_ptr = ssa_call_alloc_buffer(
                 b,
-                exit_block,
                 pointer_type,
-                helper_refs.ranged_value_result_ref,
-                helper_addrs.string_slice,
-                &[out, values[text], values[start], values[length]],
+                heap_refs,
+                heap_addrs,
+                heap_addrs.alloc_byte_buffer,
+                slice_len,
             )?;
+            ssa_call_copy_bytes(
+                b,
+                pointer_type,
+                heap_refs,
+                heap_addrs,
+                out_ptr,
+                source_ptr,
+                slice_len,
+            )?;
+            let out_raw = ssa_call_pack_shared(
+                b,
+                pointer_type,
+                heap_refs,
+                heap_addrs.pack_string,
+                out_ptr,
+                slice_len,
+                slice_len,
+            )?;
+            clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
+            ssa_store_heap_ptr_in_value(b, layout.value, out, layout.value.string_tag, out_raw);
+            b.ins().jump(cont, &[]);
+
+            b.switch_to_block(cont);
             out
         }
         SsaInstKind::BytesSlice {
@@ -928,37 +1123,197 @@ fn lower_ssa_inst(
             start,
             length,
         } => {
+            let bytes = values[bytes];
+            let start = values[start];
+            let length = values[length];
+            let bytes_data = ssa_load_heap_data_ptr(b, layout.value, bytes);
+            let bytes_ptr = b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                bytes_data,
+                layout.stack_vec.ptr_offset,
+            );
+            let bytes_len = b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                bytes_data,
+                layout.stack_vec.len_offset,
+            );
             let out = owned_value_temp_slot_addr(
                 b,
                 pointer_type,
                 owned_value_temps,
                 SsaTempValueSlotKey::Output(output.id),
             )?;
-            ssa_call_status_helper(
+            let copy_block = b.create_block();
+            let cont = b.create_block();
+            b.append_block_param(copy_block, pointer_type);
+            b.append_block_param(copy_block, pointer_type);
+            let zero = b.ins().iconst(pointer_type, 0);
+            let start_negative = b.ins().icmp_imm(IntCC::SignedLessThan, start, 0);
+            let length_positive = b.ins().icmp_imm(IntCC::SignedGreaterThan, length, 0);
+            let start_non_negative = b.ins().bnot(start_negative);
+            let positive = b.ins().band(start_non_negative, length_positive);
+            let positive_block = b.create_block();
+            let empty_block = b.create_block();
+            b.ins()
+                .brif(positive, positive_block, &[], empty_block, &[]);
+
+            b.switch_to_block(positive_block);
+            let start_in_bounds = b.ins().icmp(IntCC::UnsignedLessThan, start, bytes_len);
+            let in_bounds_block = b.create_block();
+            b.ins()
+                .brif(start_in_bounds, in_bounds_block, &[], empty_block, &[]);
+
+            b.switch_to_block(in_bounds_block);
+            let available = b.ins().isub(bytes_len, start);
+            let take_full = b.ins().icmp(IntCC::UnsignedGreaterThan, length, available);
+            let actual_len = b.ins().select(take_full, available, length);
+            let slice_ptr = b.ins().iadd(bytes_ptr, start);
+            b.ins().jump(
+                copy_block,
+                &[BlockArg::Value(slice_ptr), BlockArg::Value(actual_len)],
+            );
+
+            b.switch_to_block(empty_block);
+            b.ins().jump(
+                copy_block,
+                &[BlockArg::Value(bytes_ptr), BlockArg::Value(zero)],
+            );
+
+            b.switch_to_block(copy_block);
+            let slice_ptr = b.block_params(copy_block)[0];
+            let actual_len = b.block_params(copy_block)[1];
+            let out_ptr = ssa_call_alloc_buffer(
                 b,
-                exit_block,
                 pointer_type,
-                helper_refs.ranged_value_result_ref,
-                helper_addrs.bytes_slice,
-                &[out, values[bytes], values[start], values[length]],
+                heap_refs,
+                heap_addrs,
+                heap_addrs.alloc_byte_buffer,
+                actual_len,
             )?;
+            ssa_call_copy_bytes(
+                b,
+                pointer_type,
+                heap_refs,
+                heap_addrs,
+                out_ptr,
+                slice_ptr,
+                actual_len,
+            )?;
+            let out_raw = ssa_call_pack_shared(
+                b,
+                pointer_type,
+                heap_refs,
+                heap_addrs.pack_bytes,
+                out_ptr,
+                actual_len,
+                actual_len,
+            )?;
+            clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
+            ssa_store_heap_ptr_in_value(b, layout.value, out, layout.value.bytes_tag, out_raw);
+            b.ins().jump(cont, &[]);
+
+            b.switch_to_block(cont);
             out
         }
         SsaInstKind::StringGet { text, index } => {
+            let text = values[text];
+            let index = values[index];
+            let string_data = ssa_load_heap_data_ptr(b, layout.value, text);
+            let bytes_ptr = b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                string_data,
+                layout.stack_vec.ptr_offset,
+            );
+            let bytes_len = b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                string_data,
+                layout.stack_vec.len_offset,
+            );
             let out = owned_value_temp_slot_addr(
                 b,
                 pointer_type,
                 owned_value_temps,
                 SsaTempValueSlotKey::Output(output.id),
             )?;
-            ssa_call_status_helper(
+            let loop_block = b.create_block();
+            let scan_block = b.create_block();
+            let copy_block = b.create_block();
+            let advance_block = b.create_block();
+            let cont = b.create_block();
+            let fail = b.create_block();
+            b.append_block_param(loop_block, pointer_type);
+            b.append_block_param(loop_block, pointer_type);
+            let negative = b.ins().icmp_imm(IntCC::SignedLessThan, index, 0);
+            let loop_entry = b.create_block();
+            b.ins().brif(negative, fail, &[], loop_entry, &[]);
+
+            b.switch_to_block(loop_entry);
+            let zero = b.ins().iconst(pointer_type, 0);
+            b.ins()
+                .jump(loop_block, &[BlockArg::Value(zero), BlockArg::Value(zero)]);
+
+            b.switch_to_block(loop_block);
+            let byte_index = b.block_params(loop_block)[0];
+            let char_index = b.block_params(loop_block)[1];
+            let past_end = b
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, byte_index, bytes_len);
+            b.ins().brif(past_end, fail, &[], scan_block, &[]);
+
+            b.switch_to_block(scan_block);
+            let byte_ptr = b.ins().iadd(bytes_ptr, byte_index);
+            let byte = ssa_load_byte(b, byte_ptr);
+            let width = ssa_utf8_char_width(b, pointer_type, byte);
+            let at_target = b.ins().icmp(IntCC::Equal, char_index, index);
+            b.ins().brif(at_target, copy_block, &[], advance_block, &[]);
+
+            b.switch_to_block(copy_block);
+            let out_ptr = ssa_call_alloc_buffer(
                 b,
-                exit_block,
                 pointer_type,
-                helper_refs.indexed_value_result_ref,
-                helper_addrs.string_get,
-                &[out, values[text], values[index]],
+                heap_refs,
+                heap_addrs,
+                heap_addrs.alloc_byte_buffer,
+                width,
             )?;
+            ssa_call_copy_bytes(
+                b,
+                pointer_type,
+                heap_refs,
+                heap_addrs,
+                out_ptr,
+                byte_ptr,
+                width,
+            )?;
+            let out_raw = ssa_call_pack_shared(
+                b,
+                pointer_type,
+                heap_refs,
+                heap_addrs.pack_string,
+                out_ptr,
+                width,
+                width,
+            )?;
+            clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
+            ssa_store_heap_ptr_in_value(b, layout.value, out, layout.value.string_tag, out_raw);
+            b.ins().jump(cont, &[]);
+
+            b.switch_to_block(advance_block);
+            let next_byte = b.ins().iadd(byte_index, width);
+            let next_char = b.ins().iadd_imm(char_index, 1);
+            b.ins().jump(
+                loop_block,
+                &[BlockArg::Value(next_byte), BlockArg::Value(next_char)],
+            );
+
+            b.switch_to_block(fail);
+            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+
+            b.switch_to_block(cont);
             out
         }
         SsaInstKind::BytesGet { bytes, index } => {
@@ -995,40 +1350,44 @@ fn lower_ssa_inst(
             b.switch_to_block(cont);
             out
         }
-        SsaInstKind::StringConcat { lhs, rhs } => {
-            let out = owned_value_temp_slot_addr(
-                b,
-                pointer_type,
-                owned_value_temps,
-                SsaTempValueSlotKey::Output(output.id),
-            )?;
-            ssa_call_status_helper(
-                b,
-                exit_block,
-                pointer_type,
-                helper_refs.concat_value_result_ref,
-                helper_addrs.string_concat,
-                &[out, values[lhs], values[rhs]],
-            )?;
-            out
-        }
-        SsaInstKind::BytesConcat { lhs, rhs } => {
-            let out = owned_value_temp_slot_addr(
-                b,
-                pointer_type,
-                owned_value_temps,
-                SsaTempValueSlotKey::Output(output.id),
-            )?;
-            ssa_call_status_helper(
-                b,
-                exit_block,
-                pointer_type,
-                helper_refs.concat_value_result_ref,
-                helper_addrs.bytes_concat,
-                &[out, values[lhs], values[rhs]],
-            )?;
-            out
-        }
+        SsaInstKind::StringConcat { lhs, rhs } => ssa_inline_concat(
+            b,
+            vm_ptr,
+            exit_block,
+            pointer_type,
+            layout,
+            offsets,
+            heap_refs,
+            heap_addrs,
+            helper_refs,
+            helper_addrs,
+            owned_value_temps,
+            output.id,
+            inst.ip,
+            values[lhs],
+            values[rhs],
+            layout.value.string_tag,
+            heap_addrs.pack_string,
+        )?,
+        SsaInstKind::BytesConcat { lhs, rhs } => ssa_inline_concat(
+            b,
+            vm_ptr,
+            exit_block,
+            pointer_type,
+            layout,
+            offsets,
+            heap_refs,
+            heap_addrs,
+            helper_refs,
+            helper_addrs,
+            owned_value_temps,
+            output.id,
+            inst.ip,
+            values[lhs],
+            values[rhs],
+            layout.value.bytes_tag,
+            heap_addrs.pack_bytes,
+        )?,
         SsaInstKind::ArrayLen { array } => {
             let array = values[array];
             let vec_ptr = ssa_load_heap_data_ptr(b, layout.value, array);
@@ -1052,7 +1411,7 @@ fn lower_ssa_inst(
             let in_range = ssa_index_in_range(b, index, len);
             let ok = b.create_block();
             let fail = b.create_block();
-            let cont = b.create_block();
+            let done = b.create_block();
             b.ins().brif(in_range, ok, &[], fail, &[]);
 
             b.switch_to_block(ok);
@@ -1069,6 +1428,19 @@ fn lower_ssa_inst(
                 owned_value_temps,
                 SsaTempValueSlotKey::Output(output.id),
             )?;
+            let tag = ssa_load_tag_i32(b, layout.value, element_addr);
+            let scalar = ssa_is_scalar_tag(b, layout.value, tag);
+            let fast = b.create_block();
+            let slow = b.create_block();
+            let clone_done = b.create_block();
+            b.ins().brif(scalar, fast, &[], slow, &[]);
+
+            b.switch_to_block(fast);
+            clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
+            ssa_copy_value_bytes(b, element_addr, out, layout.value.size);
+            b.ins().jump(clone_done, &[]);
+
+            b.switch_to_block(slow);
             clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
             ssa_call_status_helper(
                 b,
@@ -1078,12 +1450,15 @@ fn lower_ssa_inst(
                 helper_addrs.clone_value,
                 &[out, element_addr],
             )?;
-            b.ins().jump(cont, &[]);
+            b.ins().jump(clone_done, &[]);
+
+            b.switch_to_block(clone_done);
+            b.ins().jump(done, &[]);
 
             b.switch_to_block(fail);
             ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
 
-            b.switch_to_block(cont);
+            b.switch_to_block(done);
             out
         }
         SsaInstKind::ArrayHas { array, index } => {
@@ -1099,11 +1474,13 @@ fn lower_ssa_inst(
             ssa_index_in_range(b, index, len)
         }
         SsaInstKind::MapLen { map } => {
-            let helper_ptr = iconst_ptr_from_addr(b, pointer_type, helper_addrs.map_len)?;
-            let call = b
-                .ins()
-                .call_indirect(helper_refs.map_len_ref, helper_ptr, &[values[map]]);
-            b.inst_results(call)[0]
+            let map_ptr = ssa_load_heap_data_ptr(b, layout.value, values[map]);
+            b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                map_ptr,
+                layout.map.len_offset,
+            )
         }
         SsaInstKind::MapGet { map, key } => {
             let key_box_slot = owned_value_temp_slot_addr(
@@ -1820,6 +2197,123 @@ fn ssa_index_in_range(
     b.ins().band(ge_zero, lt_len)
 }
 
+fn ssa_inline_concat(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    layout: crate::vm::native::NativeStackLayout,
+    offsets: ResolvedOffsets,
+    heap_refs: HeapIntrinsicRefs,
+    heap_addrs: HeapIntrinsicAddrs,
+    helper_refs: SsaDeoptHelperRefs,
+    helper_addrs: SsaDeoptHelperAddrs,
+    owned_value_temps: &SsaOwnedValueTemps,
+    output_id: SsaValueId,
+    ip: usize,
+    lhs: cranelift_codegen::ir::Value,
+    rhs: cranelift_codegen::ir::Value,
+    result_tag: u32,
+    pack_addr: usize,
+) -> VmResult<cranelift_codegen::ir::Value> {
+    let lhs_data = ssa_load_heap_data_ptr(b, layout.value, lhs);
+    let rhs_data = ssa_load_heap_data_ptr(b, layout.value, rhs);
+    let lhs_bytes_ptr = b.ins().load(
+        pointer_type,
+        MemFlags::new(),
+        lhs_data,
+        layout.stack_vec.ptr_offset,
+    );
+    let lhs_bytes_len = b.ins().load(
+        pointer_type,
+        MemFlags::new(),
+        lhs_data,
+        layout.stack_vec.len_offset,
+    );
+    let rhs_bytes_ptr = b.ins().load(
+        pointer_type,
+        MemFlags::new(),
+        rhs_data,
+        layout.stack_vec.ptr_offset,
+    );
+    let rhs_bytes_len = b.ins().load(
+        pointer_type,
+        MemFlags::new(),
+        rhs_data,
+        layout.stack_vec.len_offset,
+    );
+    let max_usize = b.ins().iconst(pointer_type, -1);
+    let remaining = b.ins().isub(max_usize, lhs_bytes_len);
+    let overflow = b
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThan, rhs_bytes_len, remaining);
+    let add_ok = b.create_block();
+    let fail = b.create_block();
+    let cont = b.create_block();
+    let out = owned_value_temp_slot_addr(
+        b,
+        pointer_type,
+        owned_value_temps,
+        SsaTempValueSlotKey::Output(output_id),
+    )?;
+    b.ins().brif(overflow, fail, &[], add_ok, &[]);
+
+    b.switch_to_block(add_ok);
+    let total_len = b.ins().iadd(lhs_bytes_len, rhs_bytes_len);
+    let exceeds_isize = b
+        .ins()
+        .icmp_imm(IntCC::UnsignedGreaterThan, total_len, i64::MAX);
+    let cap_ok = b.create_block();
+    b.ins().brif(exceeds_isize, fail, &[], cap_ok, &[]);
+
+    b.switch_to_block(cap_ok);
+    let out_ptr = ssa_call_alloc_buffer(
+        b,
+        pointer_type,
+        heap_refs,
+        heap_addrs,
+        heap_addrs.alloc_byte_buffer,
+        total_len,
+    )?;
+    ssa_call_copy_bytes(
+        b,
+        pointer_type,
+        heap_refs,
+        heap_addrs,
+        out_ptr,
+        lhs_bytes_ptr,
+        lhs_bytes_len,
+    )?;
+    let rhs_dst = b.ins().iadd(out_ptr, lhs_bytes_len);
+    ssa_call_copy_bytes(
+        b,
+        pointer_type,
+        heap_refs,
+        heap_addrs,
+        rhs_dst,
+        rhs_bytes_ptr,
+        rhs_bytes_len,
+    )?;
+    let out_raw = ssa_call_pack_shared(
+        b,
+        pointer_type,
+        heap_refs,
+        pack_addr,
+        out_ptr,
+        total_len,
+        total_len,
+    )?;
+    clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
+    ssa_store_heap_ptr_in_value(b, layout.value, out, result_tag, out_raw);
+    b.ins().jump(cont, &[]);
+
+    b.switch_to_block(fail);
+    ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, ip)?;
+
+    b.switch_to_block(cont);
+    Ok(out)
+}
+
 fn ssa_alloc_single_value_slot(
     b: &mut FunctionBuilder,
     pointer_type: cranelift_codegen::ir::Type,
@@ -2015,6 +2509,148 @@ fn ssa_store_float_in_value(
         value_addr,
         layout.float_payload_offset,
     );
+}
+
+fn ssa_is_scalar_tag(
+    b: &mut FunctionBuilder,
+    layout: crate::vm::native::ValueLayout,
+    tag: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    let is_null = b
+        .ins()
+        .icmp_imm(IntCC::Equal, tag, i64::from(layout.null_tag));
+    let is_int = b
+        .ins()
+        .icmp_imm(IntCC::Equal, tag, i64::from(layout.int_tag));
+    let is_float = b
+        .ins()
+        .icmp_imm(IntCC::Equal, tag, i64::from(layout.float_tag));
+    let is_bool = b
+        .ins()
+        .icmp_imm(IntCC::Equal, tag, i64::from(layout.bool_tag));
+    let scalar_a = b.ins().bor(is_null, is_int);
+    let scalar_b = b.ins().bor(is_float, is_bool);
+    b.ins().bor(scalar_a, scalar_b)
+}
+
+fn ssa_copy_value_bytes(
+    b: &mut FunctionBuilder,
+    src_addr: cranelift_codegen::ir::Value,
+    dst_addr: cranelift_codegen::ir::Value,
+    size: i32,
+) {
+    let mut offset = 0i32;
+    while offset + 8 <= size {
+        let chunk = b.ins().load(types::I64, MemFlags::new(), src_addr, offset);
+        b.ins().store(MemFlags::new(), chunk, dst_addr, offset);
+        offset += 8;
+    }
+    if offset + 4 <= size {
+        let chunk = b.ins().load(types::I32, MemFlags::new(), src_addr, offset);
+        b.ins().store(MemFlags::new(), chunk, dst_addr, offset);
+        offset += 4;
+    }
+    while offset < size {
+        let chunk = b.ins().load(types::I8, MemFlags::new(), src_addr, offset);
+        b.ins().store(MemFlags::new(), chunk, dst_addr, offset);
+        offset += 1;
+    }
+}
+
+fn ssa_store_heap_ptr_in_value(
+    b: &mut FunctionBuilder,
+    layout: crate::vm::native::ValueLayout,
+    value_addr: cranelift_codegen::ir::Value,
+    tag: u32,
+    heap_ptr: cranelift_codegen::ir::Value,
+) {
+    ssa_store_tag(b, layout, value_addr, tag);
+    b.ins().store(
+        MemFlags::new(),
+        heap_ptr,
+        value_addr,
+        layout.heap_payload_offset,
+    );
+}
+
+fn ssa_call_alloc_buffer(
+    b: &mut FunctionBuilder,
+    pointer_type: cranelift_codegen::ir::Type,
+    heap_refs: HeapIntrinsicRefs,
+    _heap_addrs: HeapIntrinsicAddrs,
+    addr: usize,
+    cap: cranelift_codegen::ir::Value,
+) -> VmResult<cranelift_codegen::ir::Value> {
+    let helper_ptr = iconst_ptr_from_addr(b, pointer_type, addr)?;
+    let call = b
+        .ins()
+        .call_indirect(heap_refs.alloc_buffer_ref, helper_ptr, &[cap]);
+    Ok(b.inst_results(call)[0])
+}
+
+fn ssa_call_pack_shared(
+    b: &mut FunctionBuilder,
+    pointer_type: cranelift_codegen::ir::Type,
+    heap_refs: HeapIntrinsicRefs,
+    addr: usize,
+    ptr: cranelift_codegen::ir::Value,
+    len: cranelift_codegen::ir::Value,
+    cap: cranelift_codegen::ir::Value,
+) -> VmResult<cranelift_codegen::ir::Value> {
+    let helper_ptr = iconst_ptr_from_addr(b, pointer_type, addr)?;
+    let call = b
+        .ins()
+        .call_indirect(heap_refs.pack_shared_ref, helper_ptr, &[ptr, len, cap]);
+    Ok(b.inst_results(call)[0])
+}
+
+fn ssa_call_copy_bytes(
+    b: &mut FunctionBuilder,
+    pointer_type: cranelift_codegen::ir::Type,
+    heap_refs: HeapIntrinsicRefs,
+    heap_addrs: HeapIntrinsicAddrs,
+    dst: cranelift_codegen::ir::Value,
+    src: cranelift_codegen::ir::Value,
+    len: cranelift_codegen::ir::Value,
+) -> VmResult<()> {
+    let helper_ptr = iconst_ptr_from_addr(b, pointer_type, heap_addrs.copy_bytes)?;
+    b.ins()
+        .call_indirect(heap_refs.copy_bytes_ref, helper_ptr, &[dst, src, len]);
+    Ok(())
+}
+
+fn ssa_load_byte(
+    b: &mut FunctionBuilder,
+    ptr: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    let byte = b.ins().load(types::I8, MemFlags::new(), ptr, 0);
+    b.ins().uextend(types::I32, byte)
+}
+
+fn ssa_is_utf8_continuation_byte(
+    b: &mut FunctionBuilder,
+    byte: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    let mask = b.ins().iconst(types::I32, 0xC0);
+    let masked = b.ins().band(byte, mask);
+    b.ins().icmp_imm(IntCC::Equal, masked, 0x80)
+}
+
+fn ssa_utf8_char_width(
+    b: &mut FunctionBuilder,
+    pointer_type: cranelift_codegen::ir::Type,
+    byte: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    let one = b.ins().iconst(pointer_type, 1);
+    let two = b.ins().iconst(pointer_type, 2);
+    let three = b.ins().iconst(pointer_type, 3);
+    let four = b.ins().iconst(pointer_type, 4);
+    let lt_80 = b.ins().icmp_imm(IntCC::UnsignedLessThan, byte, 0x80);
+    let lt_e0 = b.ins().icmp_imm(IntCC::UnsignedLessThan, byte, 0xE0);
+    let lt_f0 = b.ins().icmp_imm(IntCC::UnsignedLessThan, byte, 0xF0);
+    let tail = b.ins().select(lt_f0, three, four);
+    let wide = b.ins().select(lt_e0, two, tail);
+    b.ins().select(lt_80, one, wide)
 }
 
 fn ssa_emit_trace_exit_status(

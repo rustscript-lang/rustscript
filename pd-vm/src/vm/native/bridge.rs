@@ -241,40 +241,12 @@ pub(crate) fn restore_exit_state_entry_address() -> usize {
     pd_vm_native_restore_exit_state as *const () as usize
 }
 
-pub(crate) fn map_len_entry_address() -> usize {
-    pd_vm_native_map_len as *const () as usize
-}
-
 pub(crate) fn map_has_entry_address() -> usize {
     pd_vm_native_map_has as *const () as usize
 }
 
 pub(crate) fn map_get_entry_address() -> usize {
     pd_vm_native_map_get as *const () as usize
-}
-
-pub(crate) fn string_len_entry_address() -> usize {
-    pd_vm_native_string_len as *const () as usize
-}
-
-pub(crate) fn string_get_entry_address() -> usize {
-    pd_vm_native_string_get as *const () as usize
-}
-
-pub(crate) fn string_slice_entry_address() -> usize {
-    pd_vm_native_string_slice as *const () as usize
-}
-
-pub(crate) fn bytes_slice_entry_address() -> usize {
-    pd_vm_native_bytes_slice as *const () as usize
-}
-
-pub(crate) fn string_concat_entry_address() -> usize {
-    pd_vm_native_string_concat as *const () as usize
-}
-
-pub(crate) fn bytes_concat_entry_address() -> usize {
-    pd_vm_native_bytes_concat as *const () as usize
 }
 
 pub(crate) fn helper_entry_offset() -> i32 {
@@ -384,19 +356,6 @@ unsafe fn clone_arc_from_repr_ptr<T>(ptr: *mut u8) -> Arc<T> {
     cloned
 }
 
-fn checked_slice_bounds(start: i64, length: i64) -> VmResult<Option<(usize, usize)>> {
-    if start < 0 || length <= 0 {
-        return Ok(None);
-    }
-    let start = usize::try_from(start).map_err(|_| {
-        VmError::HostError("slice start overflow while converting to usize".to_string())
-    })?;
-    let length = usize::try_from(length).map_err(|_| {
-        VmError::HostError("slice length overflow while converting to usize".to_string())
-    })?;
-    Ok(Some((start, length)))
-}
-
 pub(crate) extern "C" fn pd_vm_native_clone_value_to_slot(
     dst: *mut Value,
     src: *const Value,
@@ -482,175 +441,6 @@ pub(crate) extern "C" fn pd_vm_native_write_heap_value_to_slot(
     STATUS_CONTINUE
 }
 
-pub(crate) extern "C" fn pd_vm_native_string_len(repr_ptr: *mut u8) -> i64 {
-    if repr_ptr.is_null() {
-        store_bridge_error(VmError::JitNative(
-            "native string-len helper received null repr pointer".to_string(),
-        ));
-        return 0;
-    }
-
-    let text = unsafe { arc_from_repr_ptr::<String>(repr_ptr) };
-    let len = text.chars().count() as i64;
-    std::mem::forget(text);
-    len
-}
-
-pub(crate) extern "C" fn pd_vm_native_string_get(
-    dst: *mut Value,
-    repr_ptr: *mut u8,
-    index: i64,
-) -> i32 {
-    if dst.is_null() || repr_ptr.is_null() {
-        store_bridge_error(VmError::JitNative(
-            "native string-get helper received null pointer".to_string(),
-        ));
-        return STATUS_ERROR;
-    }
-    if index < 0 {
-        store_bridge_error(VmError::HostError(
-            "string index must be non-negative".to_string(),
-        ));
-        return STATUS_ERROR;
-    }
-    let index = match usize::try_from(index) {
-        Ok(index) => index,
-        Err(_) => {
-            store_bridge_error(VmError::HostError("string index overflow".to_string()));
-            return STATUS_ERROR;
-        }
-    };
-
-    let text = unsafe { clone_arc_from_repr_ptr::<String>(repr_ptr) };
-    let Some(ch) = text.chars().nth(index) else {
-        store_bridge_error(VmError::HostError(format!(
-            "string index {index} out of bounds"
-        )));
-        return STATUS_ERROR;
-    };
-    unsafe {
-        let old = std::mem::replace(&mut *dst, Value::Null);
-        drop(old);
-        std::ptr::write(dst, Value::string(ch.to_string()));
-    }
-    STATUS_CONTINUE
-}
-
-pub(crate) extern "C" fn pd_vm_native_string_slice(
-    dst: *mut Value,
-    repr_ptr: *mut u8,
-    start: i64,
-    length: i64,
-) -> i32 {
-    if dst.is_null() || repr_ptr.is_null() {
-        store_bridge_error(VmError::JitNative(
-            "native string-slice helper received null pointer".to_string(),
-        ));
-        return STATUS_ERROR;
-    }
-
-    let text = unsafe { clone_arc_from_repr_ptr::<String>(repr_ptr) };
-    let sliced = match checked_slice_bounds(start, length) {
-        Ok(Some((start, length))) => text.chars().skip(start).take(length).collect::<String>(),
-        Ok(None) => String::new(),
-        Err(err) => {
-            store_bridge_error(err);
-            return STATUS_ERROR;
-        }
-    };
-    unsafe {
-        let old = std::mem::replace(&mut *dst, Value::Null);
-        drop(old);
-        std::ptr::write(dst, Value::string(sliced));
-    }
-    STATUS_CONTINUE
-}
-
-pub(crate) extern "C" fn pd_vm_native_bytes_slice(
-    dst: *mut Value,
-    repr_ptr: *mut u8,
-    start: i64,
-    length: i64,
-) -> i32 {
-    if dst.is_null() || repr_ptr.is_null() {
-        store_bridge_error(VmError::JitNative(
-            "native bytes-slice helper received null pointer".to_string(),
-        ));
-        return STATUS_ERROR;
-    }
-
-    let bytes = unsafe { clone_arc_from_repr_ptr::<Vec<u8>>(repr_ptr) };
-    let sliced = match checked_slice_bounds(start, length) {
-        Ok(Some((start, length))) => bytes
-            .iter()
-            .skip(start)
-            .take(length)
-            .copied()
-            .collect::<Vec<_>>(),
-        Ok(None) => Vec::new(),
-        Err(err) => {
-            store_bridge_error(err);
-            return STATUS_ERROR;
-        }
-    };
-    unsafe {
-        let old = std::mem::replace(&mut *dst, Value::Null);
-        drop(old);
-        std::ptr::write(dst, Value::bytes(sliced));
-    }
-    STATUS_CONTINUE
-}
-
-pub(crate) extern "C" fn pd_vm_native_string_concat(
-    dst: *mut Value,
-    lhs_repr_ptr: *mut u8,
-    rhs_repr_ptr: *mut u8,
-) -> i32 {
-    if dst.is_null() || lhs_repr_ptr.is_null() || rhs_repr_ptr.is_null() {
-        store_bridge_error(VmError::JitNative(
-            "native string-concat helper received null pointer".to_string(),
-        ));
-        return STATUS_ERROR;
-    }
-
-    let lhs = unsafe { clone_arc_from_repr_ptr::<String>(lhs_repr_ptr) };
-    let rhs = unsafe { clone_arc_from_repr_ptr::<String>(rhs_repr_ptr) };
-    let mut out = String::with_capacity(lhs.len() + rhs.len());
-    out.push_str(lhs.as_str());
-    out.push_str(rhs.as_str());
-    unsafe {
-        let old = std::mem::replace(&mut *dst, Value::Null);
-        drop(old);
-        std::ptr::write(dst, Value::string(out));
-    }
-    STATUS_CONTINUE
-}
-
-pub(crate) extern "C" fn pd_vm_native_bytes_concat(
-    dst: *mut Value,
-    lhs_repr_ptr: *mut u8,
-    rhs_repr_ptr: *mut u8,
-) -> i32 {
-    if dst.is_null() || lhs_repr_ptr.is_null() || rhs_repr_ptr.is_null() {
-        store_bridge_error(VmError::JitNative(
-            "native bytes-concat helper received null pointer".to_string(),
-        ));
-        return STATUS_ERROR;
-    }
-
-    let lhs = unsafe { clone_arc_from_repr_ptr::<Vec<u8>>(lhs_repr_ptr) };
-    let rhs = unsafe { clone_arc_from_repr_ptr::<Vec<u8>>(rhs_repr_ptr) };
-    let mut out = Vec::with_capacity(lhs.len() + rhs.len());
-    out.extend(lhs.iter().copied());
-    out.extend(rhs.iter().copied());
-    unsafe {
-        let old = std::mem::replace(&mut *dst, Value::Null);
-        drop(old);
-        std::ptr::write(dst, Value::bytes(out));
-    }
-    STATUS_CONTINUE
-}
-
 pub(crate) extern "C" fn pd_vm_native_restore_exit_state(
     vm: *mut Vm,
     stack_src: *const Value,
@@ -696,20 +486,6 @@ pub(crate) extern "C" fn pd_vm_native_restore_exit_state(
         vm.jump_to(ip)?;
         Ok(STATUS_CONTINUE)
     })
-}
-
-pub(crate) extern "C" fn pd_vm_native_map_len(repr_ptr: *mut u8) -> i64 {
-    if repr_ptr.is_null() {
-        store_bridge_error(VmError::JitNative(
-            "native map-len helper received null repr pointer".to_string(),
-        ));
-        return 0;
-    }
-
-    let entries = unsafe { arc_from_repr_ptr::<VmMap>(repr_ptr) };
-    let len = entries.len() as i64;
-    std::mem::forget(entries);
-    len
 }
 
 pub(crate) extern "C" fn pd_vm_native_map_has(repr_ptr: *mut u8, key: *const Value) -> i32 {

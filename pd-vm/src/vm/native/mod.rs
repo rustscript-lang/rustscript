@@ -10,26 +10,22 @@ pub(crate) use bridge::{
     OP_MUL, OP_NEG, OP_NOT, OP_OR, OP_POP, OP_SHL, OP_SHR, OP_STLOC, OP_SUB, STATUS_CONTINUE,
     STATUS_ERROR, STATUS_HALTED, STATUS_LINKED_CONTINUE, STATUS_OUT_OF_FUEL, STATUS_TRACE_EXIT,
     STATUS_WAITING, STATUS_YIELDED, alloc_byte_buffer_entry_address,
-    alloc_value_buffer_entry_address, bytes_concat_entry_address, bytes_slice_entry_address,
-    clear_bridge_error, clear_value_slot_entry_address, clone_value_to_slot_entry_address,
-    copy_bytes_entry_address, drop_shared_array_entry_address, drop_shared_bytes_entry_address,
-    drop_shared_string_entry_address, helper_entry_address, helper_entry_offset,
-    init_null_value_slot_entry_address, interrupt_helper_entry_address,
+    alloc_value_buffer_entry_address, clear_bridge_error, clear_value_slot_entry_address,
+    clone_value_to_slot_entry_address, copy_bytes_entry_address, drop_shared_array_entry_address,
+    drop_shared_bytes_entry_address, drop_shared_string_entry_address, helper_entry_address,
+    helper_entry_offset, init_null_value_slot_entry_address, interrupt_helper_entry_address,
     interrupt_helper_entry_offset, map_get_entry_address, map_has_entry_address,
-    map_len_entry_address, restore_exit_state_entry_address,
-    shared_array_from_buffer_entry_address, shared_bytes_from_buffer_entry_address,
-    shared_string_from_buffer_entry_address, store_bridge_error, string_concat_entry_address,
-    string_get_entry_address, string_len_entry_address, string_slice_entry_address,
-    take_bridge_error, write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
+    restore_exit_state_entry_address, shared_array_from_buffer_entry_address,
+    shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
+    store_bridge_error, take_bridge_error, write_heap_value_to_slot_entry_address,
+    zero_bytes_entry_address,
 };
 #[cfg(feature = "cranelift-jit")]
 pub(crate) use codegen::{
     alloc_buffer_signature, box_heap_value_signature, clone_value_signature,
-    collection_get_signature, collection_predicate_signature, concat_value_result_signature,
-    copy_bytes_signature, drop_shared_signature, entry_signature, free_buffer_signature,
-    heap_len_signature, helper_signature, indexed_value_result_signature, jump_with_status,
-    pack_shared_signature, ranged_value_result_signature, restore_exit_signature,
-    value_slot_signature,
+    collection_get_signature, collection_predicate_signature, copy_bytes_signature,
+    drop_shared_signature, entry_signature, free_buffer_signature, helper_signature,
+    jump_with_status, pack_shared_signature, restore_exit_signature, value_slot_signature,
 };
 pub(crate) use exec::{ExecutableBuffer, prepare_for_execution};
 #[cfg(feature = "cranelift-jit")]

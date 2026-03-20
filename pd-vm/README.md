@@ -632,17 +632,58 @@ Scheme frontend:
 
 ### JIT Internals
 
-The VM includes a trace-based JIT path inspired by LuaJIT hot-loop tracing:
+The VM has two native codegen paths:
+
+- `AOT`: lowers the whole bytecode CFG into ahead-of-time native segments.
+- `Trace JIT`: records hot loops, prefers SSA native lowering when the recorder can specialize the
+  loop, and otherwise leaves the operation on a call/exit path or records NYI.
+
+Trace JIT remains LuaJIT-style hot-loop tracing:
 
 - hot bytecode loop heads are detected
 - a trace is recorded from each hot root
 - backward `brfalse` can loop inside the trace when it targets an earlier recorded step
 - native machine code is emitted per compiled trace and invoked by the VM
-- the native bridge executes trace semantics without bytecode re-decoding
-- unsupported shapes fall back to interpreter and are recorded as NYI
-- native trace emission supports arithmetic/logical opcodes including `mod`, `and`, and `or`
+- unsupported opcodes or trace shapes fall back to interpreter and are recorded as NYI
 
-Current NYI in trace compiler:
+Status legend:
+
+- `Inline`: dedicated native lowering, no runtime helper/bridge on the fast path.
+- `Helper`: compiled native code calls a narrow native helper but stays in compiled execution.
+- `Bridge/Exit`: no dedicated lowering for that backend; execution stays on the normal runtime call path or exits the trace around that operation.
+- `NYI`: not currently lowered by that backend.
+
+The table below tracks lowering state once typed lowering/specialization is available. For trace JIT,
+frontend/source patterns may still reach a `Bridge/Exit` path even when an SSA inline form exists.
+
+| Operator family | AOT | Trace JIT |
+| --- | --- | --- |
+| Typed numeric `+`, `-`, `*`, `/`, `%`, unary `-` | Inline | Inline |
+| Typed numeric `==`, `<`, `>` | Inline | Inline |
+| `<<` | Inline | Inline |
+| `>>`, `>>>` | Inline | NYI |
+| Eager `and`, `or`, `not` opcodes | Inline | NYI |
+| Short-circuit `&&`, `\|\|` source forms | Lowered as branches, then compiled | Lowered as branches, then traced/compiled |
+
+| Builtin / container op | AOT | Trace JIT |
+| --- | --- | --- |
+| String concat / bytes concat | Inline | Inline |
+| `len(string)`, `len(bytes)` | Inline | Inline |
+| `get(string)`, `get(bytes)` | Inline | Inline |
+| `slice(string)`, `slice(bytes)` | Inline | Inline |
+| `has(bytes)` | Inline | Bridge/Exit |
+| `bytes::from_array_u8`, `bytes::to_array_u8` | Inline | Bridge/Exit |
+| `len(array)` | Bridge/Exit | Inline |
+| `get(array)` | Bridge/Exit | Inline for scalar elements, Helper for heap elements |
+| `has(array)` | Bridge/Exit | Inline |
+| `len(map)` | Bridge/Exit | Inline |
+| `get(map)` | Bridge/Exit | Helper |
+| `has(map)` | Bridge/Exit | Helper |
+| All other builtins | Bridge/Exit | Bridge/Exit or NYI, depending on trace shape |
+| Host imports | Bridge/Exit | Bridge/Exit or branch-exit trace, never inline |
+
+Current trace-JIT-wide NYI:
 
 - traces longer than configured max trace length
-- unsupported native targets (currently `x86_64` Windows/Unix-non-macOS and `aarch64` Linux/macOS)
+- unsupported opcodes or unsupported trace shapes during recording/lowering
+- unsupported native targets outside `x86_64` Windows / Unix-non-macOS and `aarch64` Linux / macOS

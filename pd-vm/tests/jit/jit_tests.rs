@@ -2614,6 +2614,13 @@ fn trace_jit_supports_string_len_get_slice_in_ssa() {
         "string builtin loop should guard a string heap pointer at trace entry, dump:\n{}",
         vm.dump_jit_info()
     );
+
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert!(
+        bridge_hits.iter().all(|(_, count)| *count == 0),
+        "string builtin loop should not need native helper bridges for call-boundary execution, bridge hits: {bridge_hits:?}\n{}",
+        vm.dump_jit_info()
+    );
 }
 
 #[test]
@@ -2682,6 +2689,7 @@ fn trace_jit_supports_manual_string_concat_in_ssa() {
         hot_loop_threshold: 1,
         max_trace_len: 512,
     });
+    vm.set_jit_native_bridge_stats_enabled(true);
 
     let status = vm.run().expect("manual string concat vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -2697,6 +2705,13 @@ fn trace_jit_supports_manual_string_concat_in_ssa() {
     assert!(
         any_trace_ssa_contains(&snapshot, "unbox_ptr "),
         "manual string concat loop should unbox string operands into heap pointers, dump:\n{}",
+        vm.dump_jit_info()
+    );
+
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert!(
+        bridge_hits.iter().all(|(_, count)| *count == 0),
+        "manual string concat loop should not need native helper bridges for call-boundary execution, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
 }
@@ -2767,6 +2782,7 @@ fn trace_jit_supports_manual_bytes_concat_in_ssa() {
         hot_loop_threshold: 1,
         max_trace_len: 512,
     });
+    vm.set_jit_native_bridge_stats_enabled(true);
 
     let status = vm.run().expect("manual bytes concat vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -2787,6 +2803,13 @@ fn trace_jit_supports_manual_bytes_concat_in_ssa() {
     assert!(
         any_trace_ssa_contains(&snapshot, "unbox_ptr "),
         "manual bytes concat loop should unbox bytes operands into heap pointers, dump:\n{}",
+        vm.dump_jit_info()
+    );
+
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert!(
+        bridge_hits.iter().all(|(_, count)| *count == 0),
+        "manual bytes concat loop should not need native helper bridges for call-boundary execution, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
 }

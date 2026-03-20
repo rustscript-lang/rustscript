@@ -26,6 +26,7 @@ type VmMapStorage = HashMap<MapKey, Value, BuildHasherDefault<StableHasher>>;
 #[derive(Clone, Default)]
 pub struct VmMap {
     entries: VmMapStorage,
+    cached_len: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -75,11 +76,12 @@ impl VmMap {
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        debug_assert_eq!(self.cached_len, self.entries.len());
+        self.cached_len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 
     pub fn iter(&self) -> VmMapIter<'_> {
@@ -93,12 +95,20 @@ impl VmMap {
     }
 
     pub fn insert(&mut self, key: Value, value: Value) -> Option<Value> {
-        self.entries.insert(MapKey::new(key), value)
+        let replaced = self.entries.insert(MapKey::new(key), value);
+        self.cached_len = self.entries.len();
+        replaced
     }
 
     pub fn remove(&mut self, key: &Value) -> Option<Value> {
-        self.entries.remove(&MapKey::new(key.clone()))
+        let removed = self.entries.remove(&MapKey::new(key.clone()));
+        self.cached_len = self.entries.len();
+        removed
     }
+}
+
+pub(crate) fn vm_map_len_field_offset() -> usize {
+    std::mem::offset_of!(VmMap, cached_len)
 }
 
 impl From<Vec<(Value, Value)>> for VmMap {
@@ -846,5 +856,29 @@ mod tests {
 
         assert_eq!(map.get(&lookup_key), Some(&expected));
         assert_eq!(map.get(&structural_peer), None);
+    }
+
+    #[test]
+    fn vm_map_cached_len_stays_in_sync() {
+        let mut map = VmMap::new();
+        assert_eq!(map.len(), 0);
+
+        assert_eq!(map.insert(Value::string("a"), Value::Int(1)), None);
+        assert_eq!(map.len(), 1);
+
+        assert_eq!(
+            map.insert(Value::string("a"), Value::Int(2)),
+            Some(Value::Int(1))
+        );
+        assert_eq!(map.len(), 1);
+
+        assert_eq!(map.insert(Value::string("b"), Value::Int(3)), None);
+        assert_eq!(map.len(), 2);
+
+        assert_eq!(map.remove(&Value::string("missing")), None);
+        assert_eq!(map.len(), 2);
+
+        assert_eq!(map.remove(&Value::string("a")), Some(Value::Int(2)));
+        assert_eq!(map.len(), 1);
     }
 }
