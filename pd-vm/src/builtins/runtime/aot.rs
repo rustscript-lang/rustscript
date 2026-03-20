@@ -82,7 +82,7 @@ mod tests {
         assert!(vm.has_aot_program(), "aot program should be installed");
         assert_eq!(
             builtin_aot_resume_ips(&mut vm, args).expect("resume query should succeed"),
-            vec![Value::Int(0), Value::Int(5)]
+            vec![Value::Int(0)]
         );
 
         assert!(

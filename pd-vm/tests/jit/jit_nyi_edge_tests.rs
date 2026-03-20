@@ -174,11 +174,15 @@ fn aot_supports_backward_brfalse_to_earlier_non_root_step() {
     let status = vm.run().expect("aot vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(4)]);
+    let resume_ips = vm.aot_resume_ips().expect("resume ips should exist");
     assert!(
-        vm.aot_resume_ips()
-            .expect("resume ips should exist")
-            .contains(&target_ip),
-        "backward branch target should be resumable, dump:\n{}",
+        resume_ips.contains(&0),
+        "entry ip should remain resumable, dump:\n{}",
+        vm.dump_aot_info()
+    );
+    assert!(
+        !resume_ips.contains(&target_ip),
+        "non-call backward branch target should not be externally resumable, dump:\n{}",
         vm.dump_aot_info()
     );
 }
@@ -196,11 +200,15 @@ fn aot_keeps_backward_brfalse_outside_trace_as_guard_false() {
     let status = vm.run().expect("aot vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(4)]);
+    let resume_ips = vm.aot_resume_ips().expect("resume ips should exist");
     assert!(
-        vm.aot_resume_ips()
-            .expect("resume ips should exist")
-            .contains(&case.root_ip),
-        "loop root should be resumable, dump:\n{}",
+        resume_ips.contains(&0),
+        "entry ip should remain resumable, dump:\n{}",
+        vm.dump_aot_info()
+    );
+    assert!(
+        !resume_ips.contains(&case.root_ip),
+        "loop root should not be externally resumable without a host call boundary, dump:\n{}",
         vm.dump_aot_info()
     );
 }

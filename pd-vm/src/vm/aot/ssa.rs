@@ -107,9 +107,15 @@ pub(crate) enum AotSsaInstKind {
     IntConst(i64),
     FloatConst(f64),
     BoolConst(bool),
-    ConstSlot { index: u32 },
-    StringLen { text: AotSsaValueId },
-    BytesLen { bytes: AotSsaValueId },
+    ConstSlot {
+        index: u32,
+    },
+    StringLen {
+        text: AotSsaValueId,
+    },
+    BytesLen {
+        bytes: AotSsaValueId,
+    },
     StringSlice {
         text: AotSsaValueId,
         start: AotSsaValueId,
@@ -140,40 +146,134 @@ pub(crate) enum AotSsaInstKind {
         lhs: AotSsaValueId,
         rhs: AotSsaValueId,
     },
-    BytesFromArrayU8 { array: AotSsaValueId },
-    BytesToArrayU8 { bytes: AotSsaValueId },
-    IntAdd { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    IntSub { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    IntMul { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    IntDiv { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    IntMod { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    IntShl { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    IntShr { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    IntLshr { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    FloatAdd { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    FloatSub { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    FloatMul { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    FloatDiv { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    FloatMod { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    BoolAnd { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    BoolOr { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    BoolNot { input: AotSsaValueId },
-    TaggedToInt { input: AotSsaValueId },
-    TaggedNumberToFloat { input: AotSsaValueId },
-    IntToFloat { input: AotSsaValueId },
-    IntNeg { input: AotSsaValueId },
-    FloatNeg { input: AotSsaValueId },
-    IntCmpEq { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    IntCmpLt { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    IntCmpGt { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    BoolCmpEq { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    TaggedCmpEq { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    StringCmpEq { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    BytesCmpEq { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    NullCmpEq { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    FloatCmpEq { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    FloatCmpLt { lhs: AotSsaValueId, rhs: AotSsaValueId },
-    FloatCmpGt { lhs: AotSsaValueId, rhs: AotSsaValueId },
+    BytesFromArrayU8 {
+        array: AotSsaValueId,
+    },
+    BytesToArrayU8 {
+        bytes: AotSsaValueId,
+    },
+    IntAdd {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    IntSub {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    IntMul {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    IntDiv {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    IntMod {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    IntShl {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    IntShr {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    IntLshr {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    FloatAdd {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    FloatSub {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    FloatMul {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    FloatDiv {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    FloatMod {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    BoolAnd {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    BoolOr {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    BoolNot {
+        input: AotSsaValueId,
+    },
+    TaggedToInt {
+        input: AotSsaValueId,
+    },
+    TaggedNumberToFloat {
+        input: AotSsaValueId,
+    },
+    IntToFloat {
+        input: AotSsaValueId,
+    },
+    IntNeg {
+        input: AotSsaValueId,
+    },
+    FloatNeg {
+        input: AotSsaValueId,
+    },
+    IntCmpEq {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    IntCmpLt {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    IntCmpGt {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    BoolCmpEq {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    TaggedCmpEq {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    StringCmpEq {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    BytesCmpEq {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    NullCmpEq {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    FloatCmpEq {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    FloatCmpLt {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    FloatCmpGt {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
 }
 
 impl AotSsaInstKind {
@@ -252,7 +352,10 @@ pub(crate) enum AotSsaMaterialization {
     BoxInt(AotSsaValueId),
     BoxFloat(AotSsaValueId),
     BoxBool(AotSsaValueId),
-    BoxHeapPtr { value: AotSsaValueId, tag: ValueType },
+    BoxHeapPtr {
+        value: AotSsaValueId,
+        tag: ValueType,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -313,7 +416,9 @@ pub(crate) struct AotSsaProgram {
 
 impl AotSsaProgram {
     pub(crate) fn checkpoint_for_ip(&self, ip: usize) -> Option<&AotCheckpoint> {
-        self.checkpoints.iter().find(|checkpoint| checkpoint.ip == ip)
+        self.checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.ip == ip)
     }
 
     pub(crate) fn text(&self) -> String {
@@ -459,8 +564,12 @@ pub(crate) enum AotSsaVerifyError {
         block: AotSsaBlockId,
         value: AotSsaValueId,
     },
-    JumpArityMismatch { target: AotSsaBlockId },
-    JumpReprMismatch { target: AotSsaBlockId },
+    JumpArityMismatch {
+        target: AotSsaBlockId,
+    },
+    JumpReprMismatch {
+        target: AotSsaBlockId,
+    },
     NonBoolBranchCondition(AotSsaValueId),
     CheckpointArityMismatch {
         checkpoint: AotCheckpointId,
@@ -486,8 +595,14 @@ pub(crate) enum AotSsaBuildError {
     InvalidCheckpointIp(usize),
     InvalidLocal(u8),
     InvalidConstant(u32),
-    UnsupportedInstruction { ip: usize, instruction: String },
-    StackUnderflow { ip: usize, instruction: &'static str },
+    UnsupportedInstruction {
+        ip: usize,
+        instruction: String,
+    },
+    StackUnderflow {
+        ip: usize,
+        instruction: &'static str,
+    },
     FrameMismatch {
         ip: usize,
         expected: FrameShape,
@@ -536,7 +651,11 @@ impl Frame {
         }
     }
 
-    fn pop(&mut self, ip: usize, instruction: &'static str) -> Result<FrameValue, AotSsaBuildError> {
+    fn pop(
+        &mut self,
+        ip: usize,
+        instruction: &'static str,
+    ) -> Result<FrameValue, AotSsaBuildError> {
         self.stack
             .pop()
             .ok_or(AotSsaBuildError::StackUnderflow { ip, instruction })
@@ -571,7 +690,9 @@ fn verify_terminator(
     available_values: &HashMap<AotSsaValueId, AotSsaValueRepr>,
 ) -> Result<(), AotSsaVerifyError> {
     match terminator {
-        AotSsaTerminator::Jump(target) => verify_jump_target(target, block_params, available_values),
+        AotSsaTerminator::Jump(target) => {
+            verify_jump_target(target, block_params, available_values)
+        }
         AotSsaTerminator::BranchBool {
             condition,
             if_true,
@@ -767,17 +888,21 @@ impl<'a> Builder<'a> {
                 terminal_lookup.insert(terminal_ip, block_index);
             }
         }
-        let mut external_resume_ips = BTreeSet::new();
+        let mut checkpoint_ips = BTreeSet::new();
         for block in &decoded_blocks {
-            external_resume_ips.insert(block.start_ip);
+            checkpoint_ips.insert(block.start_ip);
+        }
+        let mut external_resume_ips = BTreeSet::from([lowered.entry_ip]);
+        for block in &decoded_blocks {
             for step in &block.steps {
-                external_resume_ips.insert(step.ip);
-            }
-            if let Some(terminal_ip) = block.terminal_ip {
-                external_resume_ips.insert(terminal_ip);
+                if let AotInstruction::Call(call) = &step.instruction {
+                    checkpoint_ips.insert(call.call_ip);
+                    checkpoint_ips.insert(call.resume_ip);
+                    external_resume_ips.insert(call.call_ip);
+                    external_resume_ips.insert(call.resume_ip);
+                }
             }
         }
-        let checkpoint_ips = external_resume_ips.clone();
         Ok(Self {
             program,
             lowered,
@@ -873,12 +998,14 @@ impl<'a> Builder<'a> {
             let mut frame = frame_from_params(&emitter.block.params);
             let result = self.process_from_ip(ip, &mut frame, &mut emitter)?;
             emitter.block.terminator = Some(match result {
-                ProcessResult::Jump { target_ip, frame } => AotSsaTerminator::Jump(AotSsaJumpTarget {
-                    target: *block_ids
-                        .get(&target_ip)
-                        .ok_or(AotSsaBuildError::InvalidCheckpointIp(target_ip))?,
-                    args: block_args(&frame),
-                }),
+                ProcessResult::Jump { target_ip, frame } => {
+                    AotSsaTerminator::Jump(AotSsaJumpTarget {
+                        target: *block_ids
+                            .get(&target_ip)
+                            .ok_or(AotSsaBuildError::InvalidCheckpointIp(target_ip))?,
+                        args: block_args(&frame),
+                    })
+                }
                 ProcessResult::Branch {
                     condition,
                     if_true_ip,
@@ -982,9 +1109,7 @@ impl<'a> Builder<'a> {
                     self.merge_shape(if_false_ip, shape, &mut queue)?;
                 }
                 ProcessResult::CallBoundary {
-                    call,
-                    resume_frame,
-                    ..
+                    call, resume_frame, ..
                 } => {
                     self.merge_shape(call.resume_ip, resume_frame.shape(), &mut queue)?;
                 }
@@ -1026,10 +1151,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn lookup_block_and_step(
-        &self,
-        ip: usize,
-    ) -> Result<(&DecodedBlock, usize), AotSsaBuildError> {
+    fn lookup_block_and_step(&self, ip: usize) -> Result<(&DecodedBlock, usize), AotSsaBuildError> {
         if let Some(loc) = self.step_lookup.get(&ip).copied() {
             let block = self
                 .decoded_blocks
@@ -1244,7 +1366,10 @@ impl<'a> Builder<'a> {
     }
 }
 
-fn decode_blocks(program: &Program, lowered: &AotProgram) -> Result<Vec<DecodedBlock>, AotSsaBuildError> {
+fn decode_blocks(
+    program: &Program,
+    lowered: &AotProgram,
+) -> Result<Vec<DecodedBlock>, AotSsaBuildError> {
     let mut blocks = Vec::with_capacity(lowered.blocks.len());
     for block in &lowered.blocks {
         let mut steps = Vec::with_capacity(block.instructions.len());
@@ -1418,9 +1543,13 @@ fn apply_direct_instruction<E: InstEmitter>(
                 Value::Int(value) => AotSsaInstKind::IntConst(*value),
                 Value::Float(value) => AotSsaInstKind::FloatConst(*value),
                 Value::Bool(value) => AotSsaInstKind::BoolConst(*value),
-                Value::Null | Value::String(_) | Value::Bytes(_) | Value::Array(_) | Value::Map(_) => {
-                    AotSsaInstKind::ConstSlot { index: *const_index }
-                }
+                Value::Null
+                | Value::String(_)
+                | Value::Bytes(_)
+                | Value::Array(_)
+                | Value::Map(_) => AotSsaInstKind::ConstSlot {
+                    index: *const_index,
+                },
             };
             frame.stack.push(FrameValue {
                 value: emitter.emit(ip, kind, repr),
@@ -1450,13 +1579,10 @@ fn apply_direct_instruction<E: InstEmitter>(
             Ok(true)
         }
         AotInstruction::Dup => {
-            let value = *frame
-                .stack
-                .last()
-                .ok_or(AotSsaBuildError::StackUnderflow {
-                    ip,
-                    instruction: "dup",
-                })?;
+            let value = *frame.stack.last().ok_or(AotSsaBuildError::StackUnderflow {
+                ip,
+                instruction: "dup",
+            })?;
             frame.stack.push(value);
             Ok(true)
         }
@@ -1469,15 +1595,30 @@ fn apply_direct_instruction<E: InstEmitter>(
         AotInstruction::IMul => emit_typed_int_binary(frame, emitter, ip, "imul", |lhs, rhs| {
             AotSsaInstKind::IntMul { lhs, rhs }
         }),
-        AotInstruction::Shl => emit_binary(frame, emitter, ip, "shl", AotSsaValueRepr::I64, |lhs, rhs| {
-            AotSsaInstKind::IntShl { lhs, rhs }
-        }),
-        AotInstruction::Shr => emit_binary(frame, emitter, ip, "shr", AotSsaValueRepr::I64, |lhs, rhs| {
-            AotSsaInstKind::IntShr { lhs, rhs }
-        }),
-        AotInstruction::Lshr => emit_binary(frame, emitter, ip, "lshr", AotSsaValueRepr::I64, |lhs, rhs| {
-            AotSsaInstKind::IntLshr { lhs, rhs }
-        }),
+        AotInstruction::Shl => emit_binary(
+            frame,
+            emitter,
+            ip,
+            "shl",
+            AotSsaValueRepr::I64,
+            |lhs, rhs| AotSsaInstKind::IntShl { lhs, rhs },
+        ),
+        AotInstruction::Shr => emit_binary(
+            frame,
+            emitter,
+            ip,
+            "shr",
+            AotSsaValueRepr::I64,
+            |lhs, rhs| AotSsaInstKind::IntShr { lhs, rhs },
+        ),
+        AotInstruction::Lshr => emit_binary(
+            frame,
+            emitter,
+            ip,
+            "lshr",
+            AotSsaValueRepr::I64,
+            |lhs, rhs| AotSsaInstKind::IntLshr { lhs, rhs },
+        ),
         AotInstruction::FAdd => emit_typed_float_binary(frame, emitter, ip, "fadd", |lhs, rhs| {
             AotSsaInstKind::FloatAdd { lhs, rhs }
         }),
@@ -1490,16 +1631,22 @@ fn apply_direct_instruction<E: InstEmitter>(
         AotInstruction::FDiv => emit_typed_float_binary(frame, emitter, ip, "fdiv", |lhs, rhs| {
             AotSsaInstKind::FloatDiv { lhs, rhs }
         }),
-        AotInstruction::Len(AotTextBytesKind::String) => {
-            emit_tagged_unary(frame, emitter, ip, "string_len", AotSsaValueRepr::I64, |text| {
-                AotSsaInstKind::StringLen { text }
-            })
-        }
-        AotInstruction::Len(AotTextBytesKind::Bytes) => {
-            emit_tagged_unary(frame, emitter, ip, "bytes_len", AotSsaValueRepr::I64, |bytes| {
-                AotSsaInstKind::BytesLen { bytes }
-            })
-        }
+        AotInstruction::Len(AotTextBytesKind::String) => emit_tagged_unary(
+            frame,
+            emitter,
+            ip,
+            "string_len",
+            AotSsaValueRepr::I64,
+            |text| AotSsaInstKind::StringLen { text },
+        ),
+        AotInstruction::Len(AotTextBytesKind::Bytes) => emit_tagged_unary(
+            frame,
+            emitter,
+            ip,
+            "bytes_len",
+            AotSsaValueRepr::I64,
+            |bytes| AotSsaInstKind::BytesLen { bytes },
+        ),
         AotInstruction::Concat(AotConcatKind::String) => {
             emit_tagged_binary(frame, emitter, ip, "string_concat", |lhs, rhs| {
                 AotSsaInstKind::StringConcat { lhs, rhs }
@@ -1556,25 +1703,43 @@ fn apply_direct_instruction<E: InstEmitter>(
             AotSsaValueRepr::Bool,
             |bytes, index| AotSsaInstKind::BytesHas { bytes, index },
         ),
-        AotInstruction::BytesCodec(AotBytesCodecKind::FromArrayU8) => {
-            emit_tagged_unary(frame, emitter, ip, "bytes_from_array_u8", AotSsaValueRepr::Tagged, |array| {
-                AotSsaInstKind::BytesFromArrayU8 { array }
+        AotInstruction::BytesCodec(AotBytesCodecKind::FromArrayU8) => emit_tagged_unary(
+            frame,
+            emitter,
+            ip,
+            "bytes_from_array_u8",
+            AotSsaValueRepr::Tagged,
+            |array| AotSsaInstKind::BytesFromArrayU8 { array },
+        ),
+        AotInstruction::BytesCodec(AotBytesCodecKind::ToArrayU8) => emit_tagged_unary(
+            frame,
+            emitter,
+            ip,
+            "bytes_to_array_u8",
+            AotSsaValueRepr::Tagged,
+            |bytes| AotSsaInstKind::BytesToArrayU8 { bytes },
+        ),
+        AotInstruction::And => emit_binary(
+            frame,
+            emitter,
+            ip,
+            "and",
+            AotSsaValueRepr::Bool,
+            |lhs, rhs| AotSsaInstKind::BoolAnd { lhs, rhs },
+        ),
+        AotInstruction::Or => emit_binary(
+            frame,
+            emitter,
+            ip,
+            "or",
+            AotSsaValueRepr::Bool,
+            |lhs, rhs| AotSsaInstKind::BoolOr { lhs, rhs },
+        ),
+        AotInstruction::Not => {
+            emit_unary(frame, emitter, ip, "not", AotSsaValueRepr::Bool, |input| {
+                AotSsaInstKind::BoolNot { input }
             })
         }
-        AotInstruction::BytesCodec(AotBytesCodecKind::ToArrayU8) => {
-            emit_tagged_unary(frame, emitter, ip, "bytes_to_array_u8", AotSsaValueRepr::Tagged, |bytes| {
-                AotSsaInstKind::BytesToArrayU8 { bytes }
-            })
-        }
-        AotInstruction::And => emit_binary(frame, emitter, ip, "and", AotSsaValueRepr::Bool, |lhs, rhs| {
-            AotSsaInstKind::BoolAnd { lhs, rhs }
-        }),
-        AotInstruction::Or => emit_binary(frame, emitter, ip, "or", AotSsaValueRepr::Bool, |lhs, rhs| {
-            AotSsaInstKind::BoolOr { lhs, rhs }
-        }),
-        AotInstruction::Not => emit_unary(frame, emitter, ip, "not", AotSsaValueRepr::Bool, |input| {
-            AotSsaInstKind::BoolNot { input }
-        }),
         AotInstruction::INeg => emit_typed_int_unary(frame, emitter, ip, "ineg", |input| {
             AotSsaInstKind::IntNeg { input }
         }),
@@ -1696,11 +1861,17 @@ fn apply_direct_instruction<E: InstEmitter>(
         }
         AotInstruction::Clt => emit_generic_compare(program, frame, emitter, ip, "clt", true),
         AotInstruction::Cgt => emit_generic_compare(program, frame, emitter, ip, "cgt", false),
-        AotInstruction::Neg => emit_generic_unary(frame, emitter, ip, "neg", |repr, input| match repr {
-            AotSsaValueRepr::I64 => Some((AotSsaValueRepr::I64, AotSsaInstKind::IntNeg { input })),
-            AotSsaValueRepr::F64 => Some((AotSsaValueRepr::F64, AotSsaInstKind::FloatNeg { input })),
-            _ => None,
-        }),
+        AotInstruction::Neg => {
+            emit_generic_unary(frame, emitter, ip, "neg", |repr, input| match repr {
+                AotSsaValueRepr::I64 => {
+                    Some((AotSsaValueRepr::I64, AotSsaInstKind::IntNeg { input }))
+                }
+                AotSsaValueRepr::F64 => {
+                    Some((AotSsaValueRepr::F64, AotSsaInstKind::FloatNeg { input }))
+                }
+                _ => None,
+            })
+        }
         AotInstruction::Call(_) => Ok(false),
     }
 }
@@ -1754,9 +1925,13 @@ fn emit_typed_int_binary<E: InstEmitter>(
 ) -> Result<bool, AotSsaBuildError> {
     let rhs = frame.pop(ip, instruction)?;
     let lhs = frame.pop(ip, instruction)?;
-    if !matches!(lhs.value.repr, AotSsaValueRepr::I64 | AotSsaValueRepr::Tagged)
-        || !matches!(rhs.value.repr, AotSsaValueRepr::I64 | AotSsaValueRepr::Tagged)
-    {
+    if !matches!(
+        lhs.value.repr,
+        AotSsaValueRepr::I64 | AotSsaValueRepr::Tagged
+    ) || !matches!(
+        rhs.value.repr,
+        AotSsaValueRepr::I64 | AotSsaValueRepr::Tagged
+    ) {
         frame.stack.push(lhs);
         frame.stack.push(rhs);
         return Ok(false);
@@ -1805,7 +1980,10 @@ fn emit_typed_int_unary<E: InstEmitter>(
     build: impl FnOnce(AotSsaValueId) -> AotSsaInstKind,
 ) -> Result<bool, AotSsaBuildError> {
     let input = frame.pop(ip, instruction)?;
-    if !matches!(input.value.repr, AotSsaValueRepr::I64 | AotSsaValueRepr::Tagged) {
+    if !matches!(
+        input.value.repr,
+        AotSsaValueRepr::I64 | AotSsaValueRepr::Tagged
+    ) {
         frame.stack.push(input);
         return Ok(false);
     }
@@ -1871,10 +2049,7 @@ fn emit_generic_unary<E: InstEmitter>(
     emitter: &mut E,
     ip: usize,
     instruction: &'static str,
-    build: impl FnOnce(
-        AotSsaValueRepr,
-        AotSsaValueId,
-    ) -> Option<(AotSsaValueRepr, AotSsaInstKind)>,
+    build: impl FnOnce(AotSsaValueRepr, AotSsaValueId) -> Option<(AotSsaValueRepr, AotSsaInstKind)>,
 ) -> Result<bool, AotSsaBuildError> {
     let input = frame.pop(ip, instruction)?;
     let Some((repr, kind)) = build(input.value.repr, input.value.id) else {
@@ -1921,7 +2096,11 @@ fn emit_tagged_binary<E: InstEmitter>(
         return Ok(false);
     }
     frame.stack.push(FrameValue {
-        value: emitter.emit(ip, build(lhs.value.id, rhs.value.id), AotSsaValueRepr::Tagged),
+        value: emitter.emit(
+            ip,
+            build(lhs.value.id, rhs.value.id),
+            AotSsaValueRepr::Tagged,
+        ),
     });
     Ok(true)
 }
@@ -2081,18 +2260,30 @@ fn emit_generic_compare<E: InstEmitter>(
             let lhs = coerce_numeric_to_int(emitter, ip, lhs.value);
             let rhs = coerce_numeric_to_int(emitter, ip, rhs.value);
             Some(if is_lt {
-                AotSsaInstKind::IntCmpLt { lhs: lhs.id, rhs: rhs.id }
+                AotSsaInstKind::IntCmpLt {
+                    lhs: lhs.id,
+                    rhs: rhs.id,
+                }
             } else {
-                AotSsaInstKind::IntCmpGt { lhs: lhs.id, rhs: rhs.id }
+                AotSsaInstKind::IntCmpGt {
+                    lhs: lhs.id,
+                    rhs: rhs.id,
+                }
             })
         }
         Some(AotNumericMode::Float) => {
             let lhs = coerce_numeric_to_float(emitter, ip, lhs.value);
             let rhs = coerce_numeric_to_float(emitter, ip, rhs.value);
             Some(if is_lt {
-                AotSsaInstKind::FloatCmpLt { lhs: lhs.id, rhs: rhs.id }
+                AotSsaInstKind::FloatCmpLt {
+                    lhs: lhs.id,
+                    rhs: rhs.id,
+                }
             } else {
-                AotSsaInstKind::FloatCmpGt { lhs: lhs.id, rhs: rhs.id }
+                AotSsaInstKind::FloatCmpGt {
+                    lhs: lhs.id,
+                    rhs: rhs.id,
+                }
             })
         }
         _ => None,
@@ -2333,5 +2524,37 @@ mod tests {
         let ssa = build_aot_ssa(&program).expect("ssa should build");
         assert!(ssa.resume_ips.contains(&(call_ip as usize)));
         assert!(ssa.resume_ips.contains(&(resume_ip as usize)));
+    }
+
+    #[test]
+    fn aot_ssa_limits_resume_ips_to_entry_without_host_calls() {
+        let mut bc = BytecodeBuilder::new();
+        bc.ldc(0);
+        bc.stloc(0);
+        let loop_ip = bc.position();
+        bc.ldloc(0);
+        bc.ldc(2);
+        bc.clt();
+        let exit_branch_ip = bc.position();
+        bc.brfalse(0);
+        bc.ldloc(0);
+        bc.ldc(1);
+        bc.add();
+        bc.stloc(0);
+        bc.br(loop_ip);
+        let exit_ip = bc.position();
+        bc.ldloc(0);
+        bc.ret();
+
+        let mut code = bc.finish();
+        let exit_branch_ip = exit_branch_ip as usize;
+        code[exit_branch_ip + 1..exit_branch_ip + 5]
+            .copy_from_slice(&exit_ip.to_le_bytes());
+
+        let program = Program::new(vec![Value::Int(0), Value::Int(1), Value::Int(3)], code)
+            .with_local_count(1);
+
+        let ssa = build_aot_ssa(&program).expect("ssa should build");
+        assert_eq!(ssa.resume_ips, vec![0]);
     }
 }
