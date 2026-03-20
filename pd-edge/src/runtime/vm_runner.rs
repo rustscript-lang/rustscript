@@ -147,7 +147,7 @@ pub struct VmDebugInvocation {
 
 pub async fn execute_vm_with_context(
     program: &LoadedProgram,
-    vm_context: SharedProxyVmContext,
+    vm_context: &SharedProxyVmContext,
     debug_session: SharedDebugSession,
     debug: VmDebugInvocation,
     register_host_modules: HostModuleRegistrar,
@@ -155,7 +155,7 @@ pub async fn execute_vm_with_context(
 ) -> Result<(), VmExecutionError> {
     let AcquiredVmRunnerStore { vm_store, pool_key } = acquire_vm_runner_store(
         program,
-        vm_context,
+        vm_context.clone(),
         register_host_modules,
         vm_execution.jit_enabled,
         vm_execution.drop_contract_events_enabled,

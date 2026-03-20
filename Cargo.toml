@@ -6,6 +6,7 @@ members = [
 	"pd-edge-abi",
 	"pd-edge/pd-edge-host-function",
 	"pd-edge",
+	"pd-edge-http-minimal",
 	"pd-controller",
 ]
 resolver = "2"

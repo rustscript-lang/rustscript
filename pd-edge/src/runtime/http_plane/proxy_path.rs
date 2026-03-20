@@ -48,11 +48,12 @@ use crate::abi_impl::{
 };
 use crate::{
     abi_impl::http::state::{
-        DownstreamConnectionMetadata, DownstreamHttpListenerGoal, HttpRequestContext,
-        InlineDownstreamHttpResponse, LazyRequestId, PromotedDownstreamTransport,
-        ResolvedHttpGraphResponse, build_downstream_http_request_context,
-        finish_downstream_response_stream, resolve_committed_http_graph_response,
-        resolve_http_graph_response, take_promoted_downstream_transport,
+        DownstreamConnectionMetadata, DownstreamHttpListenerGoal, DownstreamPostResponsePlan,
+        HttpRequestContext, InlineDownstreamHttpResponse, LazyRequestId,
+        PromotedDownstreamTransport, ResolvedHttpGraphResponse,
+        build_downstream_http_request_context, finish_downstream_response_stream,
+        resolve_committed_http_graph_response, resolve_http_graph_response,
+        take_promoted_downstream_transport,
     },
     abi_impl::{
         DownstreamHttp2ConnectionTracker, Http2DownstreamStreamAttachment, ProxyVmContext,
@@ -129,6 +130,19 @@ pub(super) fn record_stage_metrics(pre_vm_us: u64, vm_us: u64, resolve_us: u64, 
         eprintln!(
             "stage_metrics requests={count} avg_pre_vm_us={pre_vm_avg:.1} avg_vm_us={vm_avg:.1} avg_resolve_us={resolve_avg:.1} avg_total_us={total_avg:.1}"
         );
+    }
+}
+
+pub(super) fn spawn_post_response_plan_if_needed(plan: Option<DownstreamPostResponsePlan>) {
+    if let Some(plan) = plan {
+        tokio::spawn(async move {
+            if let Err(err) = plan.run().await {
+                warn!(
+                    "{} downstream post-response transport failed: {err}",
+                    category_program()
+                );
+            }
+        });
     }
 }
 
@@ -899,16 +913,7 @@ async fn run_inline_promoted_http_connection<S>(
                     Ok(resolved) => {
                         tracker.note_response_head(attachment.as_ref());
                         tracker.finish_request(attachment.as_ref(), None);
-                        if let Some(plan) = resolved.post_response_plan {
-                            tokio::spawn(async move {
-                                if let Err(err) = plan.run().await {
-                                    warn!(
-                                        "{} downstream post-response transport failed: {err}",
-                                        category_program()
-                                    );
-                                }
-                            });
-                        }
+                        spawn_post_response_plan_if_needed(resolved.post_response_plan);
                         Ok::<_, std::convert::Infallible>(resolved.response)
                     }
                     Err(_) => {
@@ -1103,79 +1108,71 @@ async fn handle_data_plane_http_request_context(
         Err(response) => return finalize_data_plane_response(&state, started, *response, 0),
     };
     if !program_may_stream_downstream_http_response(Some(prepared.program.as_ref())) {
-        let (vm_context, pre_vm_finished, after_vm) =
-            match run_prepared_data_plane_http_request_context(
-                state.clone(),
-                prepared.program,
-                prepared.vm_context,
-                prepared.debug,
-            )
-            .await
-            {
-                Ok(executed) => executed,
-                Err(response) => return finalize_data_plane_response(&state, started, response, 0),
-            };
+        let PreparedDataPlaneHttpRequestExecution {
+            program,
+            vm_context,
+            debug,
+        } = prepared;
+        let (pre_vm_finished, after_vm) = match run_prepared_data_plane_http_request_context(
+            state.clone(),
+            program,
+            &vm_context,
+            debug,
+        )
+        .await
+        {
+            Ok(executed) => executed,
+            Err(response) => return finalize_data_plane_response(&state, started, response, 0),
+        };
         let resolved = resolve_http_graph_response(&vm_context).await;
         let ResolvedHttpGraphResponse {
             response,
             upstream_latency_ms,
             post_response_plan,
         } = resolved;
-        if let Some(plan) = post_response_plan {
-            tokio::spawn(async move {
-                if let Err(err) = plan.run().await {
-                    warn!(
-                        "{} downstream post-response transport failed: {err}",
-                        category_program()
-                    );
-                }
-            });
-        }
+        drop(vm_context);
+        spawn_post_response_plan_if_needed(post_response_plan);
         record_stage_metrics_if_enabled(started, pre_vm_finished, after_vm);
         return finalize_data_plane_response(&state, started, response, upstream_latency_ms);
     }
 
-    let response_stream_notify = prepared
-        .vm_context
-        .downstream_response_stream_ready_notify();
-    let wait_for_response_stream = {
-        let vm_context = prepared.vm_context.clone();
-        async move {
-            loop {
-                if vm_context.downstream_response_stream_committed() {
-                    break;
-                }
-                response_stream_notify.notified().await;
+    let PreparedDataPlaneHttpRequestExecution {
+        program,
+        vm_context,
+        debug,
+    } = prepared;
+    let response_stream_notify = vm_context.downstream_response_stream_ready_notify();
+    let wait_for_response_stream = async {
+        loop {
+            if vm_context.downstream_response_stream_committed() {
+                break;
             }
+            response_stream_notify.notified().await;
         }
     };
-    let mut execution = tokio::spawn(run_prepared_data_plane_http_request_context(
-        state.clone(),
-        prepared.program.clone(),
-        prepared.vm_context.clone(),
-        prepared.debug,
-    ));
+    let execution_vm_context = vm_context.clone();
+    let execution_state = state.clone();
+    let mut execution = tokio::spawn(async move {
+        run_prepared_data_plane_http_request_context(
+            execution_state,
+            program,
+            &execution_vm_context,
+            debug,
+        )
+        .await
+    });
     tokio::pin!(wait_for_response_stream);
 
-    let (vm_context, pre_vm_finished, after_vm) = match tokio::select! {
+    let (pre_vm_finished, after_vm) = match tokio::select! {
         execution_result = &mut execution => execution_result,
         _ = &mut wait_for_response_stream => {
-            let resolved = resolve_committed_http_graph_response(&prepared.vm_context).await;
+            let resolved = resolve_committed_http_graph_response(&vm_context).await;
             let ResolvedHttpGraphResponse {
                 response,
                 upstream_latency_ms,
                 post_response_plan,
             } = resolved;
-            if let Some(plan) = post_response_plan {
-                tokio::spawn(async move {
-                    if let Err(err) = plan.run().await {
-                        warn!(
-                            "{} downstream post-response transport failed: {err}",
-                            category_program()
-                        );
-                    }
-                });
-            }
+            spawn_post_response_plan_if_needed(post_response_plan);
             return finalize_data_plane_response(&state, started, response, upstream_latency_ms);
         }
     } {
@@ -1200,27 +1197,18 @@ async fn handle_data_plane_http_request_context(
         upstream_latency_ms,
         post_response_plan,
     } = resolved;
-    if let Some(plan) = post_response_plan {
-        tokio::spawn(async move {
-            if let Err(err) = plan.run().await {
-                warn!(
-                    "{} downstream post-response transport failed: {err}",
-                    category_program()
-                );
-            }
-        });
-    }
+    spawn_post_response_plan_if_needed(post_response_plan);
     record_stage_metrics_if_enabled(started, pre_vm_finished, after_vm);
     finalize_data_plane_response(&state, started, response, upstream_latency_ms)
 }
 
-struct PreparedDataPlaneHttpRequestExecution {
-    program: Arc<LoadedProgram>,
-    vm_context: SharedProxyVmContext,
-    debug: VmDebugInvocation,
+pub(super) struct PreparedDataPlaneHttpRequestExecution {
+    pub(super) program: Arc<LoadedProgram>,
+    pub(super) vm_context: SharedProxyVmContext,
+    pub(super) debug: VmDebugInvocation,
 }
 
-fn prepare_data_plane_http_request_context(
+pub(super) fn prepare_data_plane_http_request_context(
     state: &SharedState,
     vm_request: HttpRequestContext,
     connection_metadata: Option<DownstreamConnectionMetadata>,
@@ -1268,82 +1256,56 @@ fn prepare_data_plane_http_request_context(
     })
 }
 
-async fn run_prepared_data_plane_http_request_context(
-    state: SharedState,
-    program: Arc<LoadedProgram>,
-    vm_context: SharedProxyVmContext,
-    debug: VmDebugInvocation,
-) -> Result<(SharedProxyVmContext, Option<Instant>, Option<Instant>), Response<Body>> {
-    let stage_metrics = stage_metrics_active();
-    let pre_vm_finished = stage_metrics.then(Instant::now);
-    match execute_vm_with_context(
-        &program,
-        vm_context.clone(),
-        state.debug_session.clone(),
-        debug,
-        register_http_plane_host_module,
-        state.vm_execution,
-    )
-    .await
-    {
-        Ok(()) => {
-            let _ = finish_downstream_response_stream(&vm_context);
-        }
-        Err(VmExecutionError::HostRegistration(err)) => {
+fn data_plane_vm_execution_error_response(
+    state: &SharedState,
+    err: VmExecutionError,
+) -> Response<Body> {
+    match err {
+        VmExecutionError::HostRegistration(err) => {
             state.record_vm_execution_error();
             warn!(
                 "{} failed to register host module: {err}",
                 category_program()
             );
-            let _ = finish_downstream_response_stream(&vm_context);
-            return Err(text_response(
+            text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("host registration error: {err}"),
-            ));
+            )
         }
-        Err(VmExecutionError::Vm(err)) => {
+        VmExecutionError::Vm(err) => {
             state.record_vm_execution_error();
             warn!("{} vm execution error: {err}", category_program());
-            let _ = finish_downstream_response_stream(&vm_context);
-            return Err(text_response(
+            text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("vm execution error: {err}"),
-            ));
+            )
         }
     }
-
-    Ok((
-        vm_context,
-        pre_vm_finished,
-        stage_metrics.then(Instant::now),
-    ))
 }
 
-pub(super) async fn execute_data_plane_http_request_context(
-    state: &SharedState,
-    vm_request: HttpRequestContext,
-    connection_metadata: Option<DownstreamConnectionMetadata>,
-    downstream_http2_attachment: Option<Http2DownstreamStreamAttachment>,
-    #[cfg(feature = "http3")] downstream_http3_attachment: Option<Http3DownstreamStreamAttachment>,
-    downstream_http1_upgrade: Option<hyper::upgrade::OnUpgrade>,
-) -> Result<(SharedProxyVmContext, Option<Instant>, Option<Instant>), Response<Body>> {
-    let prepared = prepare_data_plane_http_request_context(
-        state,
-        vm_request,
-        connection_metadata,
-        downstream_http2_attachment,
-        #[cfg(feature = "http3")]
-        downstream_http3_attachment,
-        downstream_http1_upgrade,
+pub(super) async fn run_prepared_data_plane_http_request_context(
+    state: SharedState,
+    program: Arc<LoadedProgram>,
+    vm_context: &SharedProxyVmContext,
+    debug: VmDebugInvocation,
+) -> Result<(Option<Instant>, Option<Instant>), Response<Body>> {
+    let stage_metrics = stage_metrics_active();
+    let pre_vm_finished = stage_metrics.then(Instant::now);
+    let execution = execute_vm_with_context(
+        &program,
+        vm_context,
+        state.debug_session.clone(),
+        debug,
+        register_http_plane_host_module,
+        state.vm_execution,
     )
-    .map_err(|response| *response)?;
-    run_prepared_data_plane_http_request_context(
-        state.clone(),
-        prepared.program,
-        prepared.vm_context,
-        prepared.debug,
-    )
-    .await
+    .await;
+    let _ = finish_downstream_response_stream(vm_context);
+    if let Err(err) = execution {
+        return Err(data_plane_vm_execution_error_response(&state, err));
+    }
+
+    Ok((pre_vm_finished, stage_metrics.then(Instant::now)))
 }
 
 async fn dispatch_data_plane_request(state: SharedState, request: Request) -> Response<Body> {

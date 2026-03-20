@@ -94,7 +94,7 @@ pub(crate) async fn serve_transport_connection_with_listener_goal(
 
     let execution = execute_vm_with_context(
         &program,
-        vm_context.clone(),
+        &vm_context,
         state.debug_session.clone(),
         debug,
         register_http_plane_host_module,

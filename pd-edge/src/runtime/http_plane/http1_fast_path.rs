@@ -17,10 +17,11 @@ use super::super::SharedState;
 #[cfg(feature = "http2")]
 use super::proxy_path::serve_http_connection;
 use super::proxy_path::{
-    execute_data_plane_http_request_context, finalize_data_plane_response,
+    finalize_data_plane_response, prepare_data_plane_http_request_context,
     program_may_stream_downstream_http_response, record_data_plane_response_metrics,
-    record_stage_metrics, record_stage_metrics_if_enabled, serve_http1_connection_via_hyper,
-    stage_metrics_active,
+    record_stage_metrics, record_stage_metrics_if_enabled,
+    run_prepared_data_plane_http_request_context, serve_http1_connection_via_hyper,
+    spawn_post_response_plan_if_needed, stage_metrics_active,
 };
 use crate::{
     abi_impl::ReplayPrefixedIo,
@@ -1366,7 +1367,7 @@ async fn serve_http1_fast_connection<S>(
         state.record_data_plane_request();
         let started =
             (stage_metrics_active() || state.metrics_collection_enabled()).then(Instant::now);
-        let execution = execute_data_plane_http_request_context(
+        let prepared = match prepare_data_plane_http_request_context(
             &state,
             vm_request,
             connection_metadata.clone(),
@@ -1374,11 +1375,31 @@ async fn serve_http1_fast_connection<S>(
             #[cfg(feature = "http3")]
             None,
             None,
+        ) {
+            Ok(prepared) => prepared,
+            Err(response) => {
+                let _ = connection
+                    .write_response(&request_method, false, *response)
+                    .await;
+                return;
+            }
+        };
+        let super::proxy_path::PreparedDataPlaneHttpRequestExecution {
+            program,
+            vm_context,
+            debug,
+        } = prepared;
+        let execution = run_prepared_data_plane_http_request_context(
+            state.clone(),
+            program,
+            &vm_context,
+            debug,
         )
         .await;
         let (keep_alive, response_status) = match execution {
-            Ok((vm_context, pre_vm_finished, after_vm)) => {
-                match resolve_http1_downstream_response(&vm_context).await {
+            Ok((pre_vm_finished, after_vm)) => {
+                let resolution = resolve_http1_downstream_response(&vm_context).await;
+                match resolution {
                     Http1DownstreamResolution::NativeLocal(native_local) => {
                         let native_local = *native_local;
                         if let Some(body_lease) = body_lease.take() {
@@ -1664,16 +1685,7 @@ async fn serve_http1_fast_connection<S>(
                             upstream_latency_ms,
                             post_response_plan,
                         } = resolved;
-                        if let Some(plan) = post_response_plan {
-                            tokio::spawn(async move {
-                                if let Err(err) = plan.run().await {
-                                    warn!(
-                                        "{} downstream post-response transport failed: {err}",
-                                        category_program()
-                                    );
-                                }
-                            });
-                        }
+                        spawn_post_response_plan_if_needed(post_response_plan);
                         record_stage_metrics_if_enabled(started, pre_vm_finished, after_vm);
                         let response = finalize_data_plane_response(
                             &state,
