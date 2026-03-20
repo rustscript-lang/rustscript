@@ -54,6 +54,7 @@ impl Vm {
         };
 
         clear_bridge_error();
+        unsafe { crate::vm::native::prepare_for_execution() };
         let status = unsafe { entry(self as *mut Vm) };
         self.aot_exec_count = self.aot_exec_count.saturating_add(1);
 

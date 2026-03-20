@@ -320,6 +320,7 @@ impl Vm {
             self.native_trace_state(current_trace_id)?;
         loop {
             native::clear_bridge_error();
+            unsafe { crate::vm::native::prepare_for_execution() };
             let status = unsafe { entry(self as *mut Vm) };
             self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
             self.jit.mark_trace_executed(current_trace_id);

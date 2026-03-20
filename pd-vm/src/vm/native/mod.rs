@@ -24,7 +24,7 @@ pub(crate) use codegen::{
     drop_shared_signature, entry_signature, free_buffer_signature, helper_signature,
     jump_with_status, pack_shared_signature, restore_exit_signature,
 };
-pub(crate) use exec::ExecutableBuffer;
+pub(crate) use exec::{ExecutableBuffer, prepare_for_execution};
 #[cfg(feature = "cranelift-jit")]
 pub(crate) use inline::{
     HeapIntrinsicAddrs, HeapIntrinsicRefs, InlineEmitCtx, NativeInlineStep, ResolvedOffsets,
