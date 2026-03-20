@@ -310,6 +310,9 @@ enum DecodedOp {
     Neg {
         ip: usize,
     },
+    Not {
+        ip: usize,
+    },
     BinOp {
         ip: usize,
         opcode: u8,
@@ -344,6 +347,14 @@ enum IntBinOpKind {
     Div,
     Mod,
     Shl,
+    Shr,
+    Lshr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoolBinOpKind {
+    And,
+    Or,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -410,8 +421,11 @@ enum SpecializedBuiltinKind {
     BytesSlice,
     StringGet,
     BytesGet,
+    BytesHas,
     StringConcat,
     BytesConcat,
+    BytesFromArrayU8,
+    BytesToArrayU8,
     ArrayLen,
     ArrayGet,
     ArrayHas,
@@ -500,12 +514,19 @@ impl<'a> TraceCursor<'a> {
         } else if opcode == OpCode::Neg as u8 {
             self.recorded_ops += 1;
             DecodedOp::Neg { ip: instr_ip }
+        } else if opcode == OpCode::Not as u8 {
+            self.recorded_ops += 1;
+            DecodedOp::Not { ip: instr_ip }
         } else if opcode == OpCode::Add as u8
             || opcode == OpCode::Sub as u8
             || opcode == OpCode::Mul as u8
             || opcode == OpCode::Div as u8
             || opcode == OpCode::Mod as u8
             || opcode == OpCode::Shl as u8
+            || opcode == OpCode::Shr as u8
+            || opcode == OpCode::Lshr as u8
+            || opcode == OpCode::And as u8
+            || opcode == OpCode::Or as u8
         {
             self.recorded_ops += 1;
             DecodedOp::BinOp {
@@ -747,10 +768,21 @@ pub(crate) fn record_trace(
                 op_names.push(name.to_string());
                 frame.push(out);
             }
+            DecodedOp::Not { ip } => {
+                let value = ensure_bool(&mut builder, current_block, ip, frame.pop()?)?;
+                let (name, out) = emit_bool_not(&mut builder, current_block, ip, value)?;
+                op_names.push(name.to_string());
+                frame.push(out);
+            }
             DecodedOp::BinOp { ip, opcode } => {
                 let rhs = frame.pop()?;
                 let lhs = frame.pop()?;
-                let (name, out) =
+                let (name, out) = if opcode == OpCode::And as u8 || opcode == OpCode::Or as u8 {
+                    let kind = select_bool_binop(program, ip, opcode, lhs.info, rhs.info)?;
+                    let lhs = ensure_bool(&mut builder, current_block, ip, lhs)?;
+                    let rhs = ensure_bool(&mut builder, current_block, ip, rhs)?;
+                    emit_bool_binop(&mut builder, current_block, ip, kind, lhs, rhs)?
+                } else {
                     match select_numeric_binop(program, ip, opcode, lhs.info, rhs.info)? {
                         NumericBinOpKind::Int(kind) => {
                             let lhs = ensure_int(&mut builder, current_block, ip, lhs)?;
@@ -765,7 +797,8 @@ pub(crate) fn record_trace(
                         NumericBinOpKind::Concat(kind) => {
                             emit_concat_binop(&mut builder, current_block, ip, kind, lhs, rhs)?
                         }
-                    };
+                    }
+                };
                 op_names.push(name.to_string());
                 frame.push(out);
             }
@@ -1066,24 +1099,35 @@ fn infer_loop_header_plan(
                 };
                 frame.push(result);
             }
+            DecodedOp::Not { .. } => {
+                let value = expect_bool_info(frame.pop()?)?;
+                frame.push(ValueInfo::bool(value.const_bool.map(|value| !value)));
+            }
             DecodedOp::BinOp { ip, opcode } => {
                 let rhs = frame.pop()?;
                 let lhs = frame.pop()?;
-                match select_numeric_binop(program, ip, opcode, lhs, rhs)? {
-                    NumericBinOpKind::Int(kind) => {
-                        let lhs = expect_int_info(lhs)?;
-                        let rhs = expect_int_info(rhs)?;
-                        validate_int_operands(program, ip, kind, lhs, rhs)?;
-                        frame.push(result_info_for_int_binop(kind, lhs, rhs)?);
-                    }
-                    NumericBinOpKind::Float(kind) => {
-                        let lhs = expect_float_info(lhs)?;
-                        let rhs = expect_float_info(rhs)?;
-                        validate_float_operands(program, ip, kind, lhs, rhs)?;
-                        frame.push(result_info_for_float_binop(kind, lhs, rhs));
-                    }
-                    NumericBinOpKind::Concat(kind) => {
-                        frame.push(result_info_for_concat_binop(kind));
+                if opcode == OpCode::And as u8 || opcode == OpCode::Or as u8 {
+                    let kind = select_bool_binop(program, ip, opcode, lhs, rhs)?;
+                    let lhs = expect_bool_info(lhs)?;
+                    let rhs = expect_bool_info(rhs)?;
+                    frame.push(result_info_for_bool_binop(kind, lhs, rhs));
+                } else {
+                    match select_numeric_binop(program, ip, opcode, lhs, rhs)? {
+                        NumericBinOpKind::Int(kind) => {
+                            let lhs = expect_int_info(lhs)?;
+                            let rhs = expect_int_info(rhs)?;
+                            validate_int_operands(program, ip, kind, lhs, rhs)?;
+                            frame.push(result_info_for_int_binop(kind, lhs, rhs)?);
+                        }
+                        NumericBinOpKind::Float(kind) => {
+                            let lhs = expect_float_info(lhs)?;
+                            let rhs = expect_float_info(rhs)?;
+                            validate_float_operands(program, ip, kind, lhs, rhs)?;
+                            frame.push(result_info_for_float_binop(kind, lhs, rhs));
+                        }
+                        NumericBinOpKind::Concat(kind) => {
+                            frame.push(result_info_for_concat_binop(kind));
+                        }
                     }
                 }
             }
@@ -1177,6 +1221,48 @@ fn select_numeric_neg(value: ValueInfo) -> Result<NumericUnaryKind, TraceRecordE
         SsaValueRepr::Tagged if value.const_float.is_some() => Ok(NumericUnaryKind::Float),
         _ => Err(TraceRecordError::UnsupportedTrace(
             "SSA recorder requires numeric specialization for neg traces".to_string(),
+        )),
+    }
+}
+
+fn select_bool_binop(
+    program: &Program,
+    ip: usize,
+    opcode: u8,
+    lhs: ValueInfo,
+    rhs: ValueInfo,
+) -> Result<BoolBinOpKind, TraceRecordError> {
+    let operand_types = operand_types(program, ip);
+    let bool_like = matches!(lhs.repr, SsaValueRepr::Bool | SsaValueRepr::Tagged)
+        && matches!(rhs.repr, SsaValueRepr::Bool | SsaValueRepr::Tagged);
+    let has_bool_evidence = lhs.repr == SsaValueRepr::Bool
+        || rhs.repr == SsaValueRepr::Bool
+        || lhs.const_bool.is_some()
+        || rhs.const_bool.is_some()
+        || lhs.known_type == Some(ValueType::Bool)
+        || rhs.known_type == Some(ValueType::Bool);
+
+    let kind = match opcode {
+        x if x == OpCode::And as u8 => BoolBinOpKind::And,
+        x if x == OpCode::Or as u8 => BoolBinOpKind::Or,
+        _ => {
+            return Err(TraceRecordError::UnsupportedTrace(
+                "SSA recorder expected a boolean binop opcode".to_string(),
+            ));
+        }
+    };
+
+    match operand_types {
+        (ValueType::Bool, ValueType::Bool) => Ok(kind),
+        (ValueType::Unknown, ValueType::Unknown)
+        | (ValueType::Bool, ValueType::Unknown)
+        | (ValueType::Unknown, ValueType::Bool)
+            if bool_like && has_bool_evidence =>
+        {
+            Ok(kind)
+        }
+        _ => Err(TraceRecordError::UnsupportedTrace(
+            "SSA recorder requires bool-specializable eager boolean operands".to_string(),
         )),
     }
 }
@@ -1361,6 +1447,32 @@ fn select_numeric_binop(
                 if int_like && (has_int_evidence || !has_float_evidence) =>
             {
                 Ok(NumericBinOpKind::Int(IntBinOpKind::Shl))
+            }
+            _ => Err(TraceRecordError::UnsupportedTrace(
+                "SSA recorder requires int-specializable shift operands".to_string(),
+            )),
+        },
+        x if x == OpCode::Shr as u8 => match operand_types {
+            (ValueType::Int, ValueType::Int)
+            | (ValueType::Unknown, ValueType::Unknown)
+            | (ValueType::Int, ValueType::Unknown)
+            | (ValueType::Unknown, ValueType::Int)
+                if int_like && (has_int_evidence || !has_float_evidence) =>
+            {
+                Ok(NumericBinOpKind::Int(IntBinOpKind::Shr))
+            }
+            _ => Err(TraceRecordError::UnsupportedTrace(
+                "SSA recorder requires int-specializable shift operands".to_string(),
+            )),
+        },
+        x if x == OpCode::Lshr as u8 => match operand_types {
+            (ValueType::Int, ValueType::Int)
+            | (ValueType::Unknown, ValueType::Unknown)
+            | (ValueType::Int, ValueType::Unknown)
+            | (ValueType::Unknown, ValueType::Int)
+                if int_like && (has_int_evidence || !has_float_evidence) =>
+            {
+                Ok(NumericBinOpKind::Int(IntBinOpKind::Lshr))
             }
             _ => Err(TraceRecordError::UnsupportedTrace(
                 "SSA recorder requires int-specializable shift operands".to_string(),
@@ -1793,7 +1905,168 @@ fn emit_int_binop(
                 ))
             }
         }
+        IntBinOpKind::Shr => {
+            if let Some(amount) = rhs
+                .info
+                .const_int
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| *value <= 63)
+            {
+                let value = builder
+                    .append_value_inst(
+                        block,
+                        ip,
+                        SsaValueRepr::I64,
+                        SsaInstKind::IntShrImm {
+                            lhs: lhs.value.id,
+                            amount,
+                        },
+                    )
+                    .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                Ok((
+                    "ishr_imm",
+                    SymbolicValue {
+                        value,
+                        info: ValueInfo::int(None),
+                    },
+                ))
+            } else {
+                let value = builder
+                    .append_value_inst(
+                        block,
+                        ip,
+                        SsaValueRepr::I64,
+                        SsaInstKind::IntShr {
+                            lhs: lhs.value.id,
+                            rhs: rhs.value.id,
+                        },
+                    )
+                    .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                Ok((
+                    "ishr",
+                    SymbolicValue {
+                        value,
+                        info: ValueInfo::int(None),
+                    },
+                ))
+            }
+        }
+        IntBinOpKind::Lshr => {
+            if let Some(amount) = rhs
+                .info
+                .const_int
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| *value <= 63)
+            {
+                let value = builder
+                    .append_value_inst(
+                        block,
+                        ip,
+                        SsaValueRepr::I64,
+                        SsaInstKind::IntLshrImm {
+                            lhs: lhs.value.id,
+                            amount,
+                        },
+                    )
+                    .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                Ok((
+                    "ilshr_imm",
+                    SymbolicValue {
+                        value,
+                        info: ValueInfo::int(None),
+                    },
+                ))
+            } else {
+                let value = builder
+                    .append_value_inst(
+                        block,
+                        ip,
+                        SsaValueRepr::I64,
+                        SsaInstKind::IntLshr {
+                            lhs: lhs.value.id,
+                            rhs: rhs.value.id,
+                        },
+                    )
+                    .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                Ok((
+                    "ilshr",
+                    SymbolicValue {
+                        value,
+                        info: ValueInfo::int(None),
+                    },
+                ))
+            }
+        }
     }
+}
+
+fn emit_bool_binop(
+    builder: &mut SsaTraceBuilder,
+    block: super::ir::SsaBlockId,
+    ip: usize,
+    kind: BoolBinOpKind,
+    lhs: SymbolicValue,
+    rhs: SymbolicValue,
+) -> Result<(&'static str, SymbolicValue), TraceRecordError> {
+    let (name, inst_kind, const_bool) = match kind {
+        BoolBinOpKind::And => (
+            "bool_and",
+            SsaInstKind::BoolAnd {
+                lhs: lhs.value.id,
+                rhs: rhs.value.id,
+            },
+            lhs.info
+                .const_bool
+                .zip(rhs.info.const_bool)
+                .map(|(lhs, rhs)| lhs && rhs),
+        ),
+        BoolBinOpKind::Or => (
+            "bool_or",
+            SsaInstKind::BoolOr {
+                lhs: lhs.value.id,
+                rhs: rhs.value.id,
+            },
+            lhs.info
+                .const_bool
+                .zip(rhs.info.const_bool)
+                .map(|(lhs, rhs)| lhs || rhs),
+        ),
+    };
+    let value = builder
+        .append_value_inst(block, ip, SsaValueRepr::Bool, inst_kind)
+        .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+    Ok((
+        name,
+        SymbolicValue {
+            value,
+            info: ValueInfo::bool(const_bool),
+        },
+    ))
+}
+
+fn emit_bool_not(
+    builder: &mut SsaTraceBuilder,
+    block: super::ir::SsaBlockId,
+    ip: usize,
+    value: SymbolicValue,
+) -> Result<(&'static str, SymbolicValue), TraceRecordError> {
+    let result = builder
+        .append_value_inst(
+            block,
+            ip,
+            SsaValueRepr::Bool,
+            SsaInstKind::BoolNot {
+                input: value.value.id,
+            },
+        )
+        .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+    Ok((
+        "bool_not",
+        SymbolicValue {
+            value: result,
+            info: ValueInfo::bool(value.info.const_bool.map(|value| !value)),
+        },
+    ))
 }
 
 fn emit_int_compare(
@@ -2046,11 +2319,18 @@ fn select_specialized_builtin_kind(
             Some(SpecializedBuiltinKind::StringGet)
         }
         (BuiltinFunction::Get, HeapContainerKind::Bytes) => Some(SpecializedBuiltinKind::BytesGet),
+        (BuiltinFunction::Has, HeapContainerKind::Bytes) => Some(SpecializedBuiltinKind::BytesHas),
         (BuiltinFunction::Concat, HeapContainerKind::String) => {
             Some(SpecializedBuiltinKind::StringConcat)
         }
         (BuiltinFunction::Concat, HeapContainerKind::Bytes) => {
             Some(SpecializedBuiltinKind::BytesConcat)
+        }
+        (BuiltinFunction::BytesFromArrayU8, HeapContainerKind::Array) => {
+            Some(SpecializedBuiltinKind::BytesFromArrayU8)
+        }
+        (BuiltinFunction::BytesToArrayU8, HeapContainerKind::Bytes) => {
+            Some(SpecializedBuiltinKind::BytesToArrayU8)
         }
         (BuiltinFunction::Len, HeapContainerKind::Array) => Some(SpecializedBuiltinKind::ArrayLen),
         (BuiltinFunction::Get, HeapContainerKind::Array) => Some(SpecializedBuiltinKind::ArrayGet),
@@ -2103,6 +2383,12 @@ fn analyze_specialized_builtin_call(
             frame.push(ValueInfo::int(None));
             Ok("bytes_get")
         }
+        SpecializedBuiltinKind::BytesHas => {
+            let _ = frame.pop()?;
+            let _ = frame.pop()?;
+            frame.push(ValueInfo::bool(None));
+            Ok("bytes_has")
+        }
         SpecializedBuiltinKind::StringConcat => {
             let _ = frame.pop()?;
             let _ = frame.pop()?;
@@ -2114,6 +2400,16 @@ fn analyze_specialized_builtin_call(
             let _ = frame.pop()?;
             frame.push(ValueInfo::tagged_typed(ValueType::Bytes));
             Ok("bytes_concat")
+        }
+        SpecializedBuiltinKind::BytesFromArrayU8 => {
+            let _ = frame.pop()?;
+            frame.push(ValueInfo::tagged_typed(ValueType::Bytes));
+            Ok("bytes_from_array_u8")
+        }
+        SpecializedBuiltinKind::BytesToArrayU8 => {
+            let _ = frame.pop()?;
+            frame.push(ValueInfo::tagged_typed(ValueType::Array));
+            Ok("bytes_to_array_u8")
         }
         SpecializedBuiltinKind::ArrayLen => {
             let _ = frame.pop()?;
@@ -2318,6 +2614,32 @@ fn emit_specialized_builtin_call(
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("bytes_get", out))
         }
+        SpecializedBuiltinKind::BytesHas => {
+            let index = ensure_int(builder, block, ip, frame.pop()?)?;
+            let bytes = ensure_heap_ptr(
+                builder,
+                block,
+                ip,
+                frame.pop()?,
+                HeapContainerKind::Bytes.value_type(),
+            )?;
+            let out = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Bool,
+                    SsaInstKind::BytesHas {
+                        bytes: bytes.value.id,
+                        index: index.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::bool(None),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("bytes_has", out))
+        }
         SpecializedBuiltinKind::StringConcat => {
             let rhs = frame.pop()?;
             let lhs = frame.pop()?;
@@ -2327,6 +2649,54 @@ fn emit_specialized_builtin_call(
             let rhs = frame.pop()?;
             let lhs = frame.pop()?;
             emit_concat_binop(builder, block, ip, ConcatBinOpKind::Bytes, lhs, rhs)
+        }
+        SpecializedBuiltinKind::BytesFromArrayU8 => {
+            let array = ensure_heap_ptr(
+                builder,
+                block,
+                ip,
+                frame.pop()?,
+                HeapContainerKind::Array.value_type(),
+            )?;
+            let out = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Tagged,
+                    SsaInstKind::BytesFromArrayU8 {
+                        array: array.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::tagged_typed(ValueType::Bytes),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("bytes_from_array_u8", out))
+        }
+        SpecializedBuiltinKind::BytesToArrayU8 => {
+            let bytes = ensure_heap_ptr(
+                builder,
+                block,
+                ip,
+                frame.pop()?,
+                HeapContainerKind::Bytes.value_type(),
+            )?;
+            let out = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Tagged,
+                    SsaInstKind::BytesToArrayU8 {
+                        bytes: bytes.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::tagged_typed(ValueType::Array),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("bytes_to_array_u8", out))
         }
         SpecializedBuiltinKind::ArrayLen => {
             let array = frame.pop()?;
@@ -2839,6 +3209,30 @@ fn result_info_for_int_binop(
                 Ok(ValueInfo::int(None))
             }
         }
+        IntBinOpKind::Shr => {
+            if let Some(amount) = rhs
+                .const_int
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| *value <= 63)
+            {
+                Ok(ValueInfo::int(lhs.const_int.map(|value| value >> amount)))
+            } else {
+                Ok(ValueInfo::int(None))
+            }
+        }
+        IntBinOpKind::Lshr => {
+            if let Some(amount) = rhs
+                .const_int
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| *value <= 63)
+            {
+                Ok(ValueInfo::int(
+                    lhs.const_int.map(|value| ((value as u64) >> amount) as i64),
+                ))
+            } else {
+                Ok(ValueInfo::int(None))
+            }
+        }
     }
 }
 
@@ -2905,6 +3299,17 @@ fn result_info_for_concat_binop(kind: ConcatBinOpKind) -> ValueInfo {
         ConcatBinOpKind::String => ValueInfo::tagged_typed(ValueType::String),
         ConcatBinOpKind::Bytes => ValueInfo::tagged_typed(ValueType::Bytes),
     }
+}
+
+fn result_info_for_bool_binop(kind: BoolBinOpKind, lhs: ValueInfo, rhs: ValueInfo) -> ValueInfo {
+    let const_bool = lhs
+        .const_bool
+        .zip(rhs.const_bool)
+        .map(|(lhs, rhs)| match kind {
+            BoolBinOpKind::And => lhs && rhs,
+            BoolBinOpKind::Or => lhs || rhs,
+        });
+    ValueInfo::bool(const_bool)
 }
 
 fn load_constant(

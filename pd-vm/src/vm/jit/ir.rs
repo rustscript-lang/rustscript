@@ -131,6 +131,10 @@ pub(crate) enum SsaInstKind {
         bytes: SsaValueId,
         index: SsaValueId,
     },
+    BytesHas {
+        bytes: SsaValueId,
+        index: SsaValueId,
+    },
     StringConcat {
         lhs: SsaValueId,
         rhs: SsaValueId,
@@ -138,6 +142,12 @@ pub(crate) enum SsaInstKind {
     BytesConcat {
         lhs: SsaValueId,
         rhs: SsaValueId,
+    },
+    BytesFromArrayU8 {
+        array: SsaValueId,
+    },
+    BytesToArrayU8 {
+        bytes: SsaValueId,
     },
     ArrayLen {
         array: SsaValueId,
@@ -212,6 +222,33 @@ pub(crate) enum SsaInstKind {
         lhs: SsaValueId,
         amount: u32,
     },
+    IntShr {
+        lhs: SsaValueId,
+        rhs: SsaValueId,
+    },
+    IntShrImm {
+        lhs: SsaValueId,
+        amount: u32,
+    },
+    IntLshr {
+        lhs: SsaValueId,
+        rhs: SsaValueId,
+    },
+    IntLshrImm {
+        lhs: SsaValueId,
+        amount: u32,
+    },
+    BoolAnd {
+        lhs: SsaValueId,
+        rhs: SsaValueId,
+    },
+    BoolOr {
+        lhs: SsaValueId,
+        rhs: SsaValueId,
+    },
+    BoolNot {
+        input: SsaValueId,
+    },
     FloatNeg {
         input: SsaValueId,
     },
@@ -282,6 +319,7 @@ impl SsaInstKind {
             | Self::ArrayLen { array: input }
             | Self::MapLen { map: input }
             | Self::IntNeg { input }
+            | Self::BoolNot { input }
             | Self::FloatNeg { input } => vec![*input],
             Self::StringSlice {
                 text,
@@ -295,7 +333,10 @@ impl SsaInstKind {
             } => vec![*bytes, *start, *length],
             Self::StringGet { text, index } => vec![*text, *index],
             Self::BytesGet { bytes, index } => vec![*bytes, *index],
+            Self::BytesHas { bytes, index } => vec![*bytes, *index],
             Self::StringConcat { lhs, rhs } | Self::BytesConcat { lhs, rhs } => vec![*lhs, *rhs],
+            Self::BytesFromArrayU8 { array } => vec![*array],
+            Self::BytesToArrayU8 { bytes } => vec![*bytes],
             Self::ArrayGet { array, index } => vec![*array, *index],
             Self::ArrayHas { array, index } => vec![*array, *index],
             Self::MapGet { map, key } => vec![*map, *key],
@@ -306,6 +347,10 @@ impl SsaInstKind {
             | Self::IntDiv { lhs, rhs }
             | Self::IntMod { lhs, rhs }
             | Self::IntShl { lhs, rhs }
+            | Self::IntShr { lhs, rhs }
+            | Self::IntLshr { lhs, rhs }
+            | Self::BoolAnd { lhs, rhs }
+            | Self::BoolOr { lhs, rhs }
             | Self::FloatAdd { lhs, rhs }
             | Self::FloatSub { lhs, rhs }
             | Self::FloatMul { lhs, rhs }
@@ -323,6 +368,8 @@ impl SsaInstKind {
             | Self::IntDivImm { lhs, .. }
             | Self::IntModImm { lhs, .. }
             | Self::IntShlImm { lhs, .. }
+            | Self::IntShrImm { lhs, .. }
+            | Self::IntLshrImm { lhs, .. }
             | Self::IntCmpLtImm { lhs, .. }
             | Self::IntCmpGtImm { lhs, .. } => vec![*lhs],
         }
@@ -812,8 +859,11 @@ fn render_inst_kind(kind: &SsaInstKind) -> String {
         } => format!("bytes_slice {bytes}, {start}, {length}"),
         SsaInstKind::StringGet { text, index } => format!("string_get {text}, {index}"),
         SsaInstKind::BytesGet { bytes, index } => format!("bytes_get {bytes}, {index}"),
+        SsaInstKind::BytesHas { bytes, index } => format!("bytes_has {bytes}, {index}"),
         SsaInstKind::StringConcat { lhs, rhs } => format!("string_concat {lhs}, {rhs}"),
         SsaInstKind::BytesConcat { lhs, rhs } => format!("bytes_concat {lhs}, {rhs}"),
+        SsaInstKind::BytesFromArrayU8 { array } => format!("bytes_from_array_u8 {array}"),
+        SsaInstKind::BytesToArrayU8 { bytes } => format!("bytes_to_array_u8 {bytes}"),
         SsaInstKind::ArrayLen { array } => format!("array_len {array}"),
         SsaInstKind::ArrayGet { array, index } => format!("array_get {array}, {index}"),
         SsaInstKind::ArrayHas { array, index } => format!("array_has {array}, {index}"),
@@ -833,6 +883,13 @@ fn render_inst_kind(kind: &SsaInstKind) -> String {
         SsaInstKind::IntModImm { lhs, imm } => format!("imod_imm {lhs}, {imm}"),
         SsaInstKind::IntShl { lhs, rhs } => format!("ishl {lhs}, {rhs}"),
         SsaInstKind::IntShlImm { lhs, amount } => format!("ishl_imm {lhs}, {amount}"),
+        SsaInstKind::IntShr { lhs, rhs } => format!("ishr {lhs}, {rhs}"),
+        SsaInstKind::IntShrImm { lhs, amount } => format!("ishr_imm {lhs}, {amount}"),
+        SsaInstKind::IntLshr { lhs, rhs } => format!("ilshr {lhs}, {rhs}"),
+        SsaInstKind::IntLshrImm { lhs, amount } => format!("ilshr_imm {lhs}, {amount}"),
+        SsaInstKind::BoolAnd { lhs, rhs } => format!("bool_and {lhs}, {rhs}"),
+        SsaInstKind::BoolOr { lhs, rhs } => format!("bool_or {lhs}, {rhs}"),
+        SsaInstKind::BoolNot { input } => format!("bool_not {input}"),
         SsaInstKind::FloatNeg { input } => format!("fneg {input}"),
         SsaInstKind::FloatAdd { lhs, rhs } => format!("fadd {lhs}, {rhs}"),
         SsaInstKind::FloatSub { lhs, rhs } => format!("fsub {lhs}, {rhs}"),

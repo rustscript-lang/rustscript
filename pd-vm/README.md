@@ -661,8 +661,8 @@ frontend/source patterns may still reach a `Bridge/Exit` path even when an SSA i
 | Typed numeric `+`, `-`, `*`, `/`, `%`, unary `-` | Inline | Inline |
 | Typed numeric `==`, `<`, `>` | Inline | Inline |
 | `<<` | Inline | Inline |
-| `>>`, `>>>` | Inline | NYI |
-| Eager `and`, `or`, `not` opcodes | Inline | NYI |
+| `>>`, `>>>` | Inline | Inline |
+| Eager `and`, `or`, `not` opcodes | Inline | Inline |
 | Short-circuit `&&`, `\|\|` source forms | Lowered as branches, then compiled | Lowered as branches, then traced/compiled |
 
 | Builtin / container op | AOT | Trace JIT |
@@ -671,8 +671,8 @@ frontend/source patterns may still reach a `Bridge/Exit` path even when an SSA i
 | `len(string)`, `len(bytes)` | Inline | Inline |
 | `get(string)`, `get(bytes)` | Inline | Inline |
 | `slice(string)`, `slice(bytes)` | Inline | Inline |
-| `has(bytes)` | Inline | Bridge/Exit |
-| `bytes::from_array_u8`, `bytes::to_array_u8` | Inline | Bridge/Exit |
+| `has(bytes)` | Inline | Inline |
+| `bytes::from_array_u8`, `bytes::to_array_u8` | Inline | Inline |
 | `len(array)` | Bridge/Exit | Inline |
 | `get(array)` | Bridge/Exit | Inline for scalar elements, Helper for heap elements |
 | `has(array)` | Bridge/Exit | Inline |

@@ -2492,6 +2492,105 @@ fn trace_jit_supports_bytes_len_get_slice_in_ssa() {
 }
 
 #[test]
+fn trace_jit_supports_bytes_has_in_ssa() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let mut bc = BytecodeBuilder::new();
+    let has_call = builtin_call_index("has").expect("has builtin should exist");
+    bc.ldc(0);
+    bc.stloc(0);
+    bc.ldc(1);
+    bc.stloc(1);
+    bc.ldc(2);
+    bc.stloc(2);
+
+    let root_ip = bc.position();
+    bc.ldloc(1);
+    bc.ldc(3);
+    let clt_ip = bc.position();
+    bc.clt();
+    let guard_ip = bc.position();
+    bc.brfalse(0);
+
+    bc.ldloc(0);
+    bc.ldc(4);
+    let has_ip = bc.position();
+    bc.call(has_call, 2);
+    bc.stloc(2);
+
+    bc.ldloc(1);
+    bc.ldc(5);
+    let add_ip = bc.position();
+    bc.add();
+    bc.stloc(1);
+    bc.br(root_ip);
+
+    let exit_ip = bc.position();
+    bc.ldloc(2);
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, guard_ip, exit_ip);
+    let program = Program::new(
+        vec![
+            Value::bytes(vec![0x00, 0xFF, 0x10]),
+            Value::Int(0),
+            Value::Bool(false),
+            Value::Int(4),
+            Value::Int(2),
+            Value::Int(1),
+        ],
+        code,
+    )
+    .with_local_count(3);
+    let program = force_local_types(
+        program,
+        &[
+            (0, ValueType::Bytes),
+            (1, ValueType::Int),
+            (2, ValueType::Bool),
+        ],
+    );
+    let program = force_operand_types(
+        program,
+        &[
+            (clt_ip as usize, (ValueType::Int, ValueType::Int)),
+            (has_ip as usize, (ValueType::Bytes, ValueType::Int)),
+            (add_ip as usize, (ValueType::Int, ValueType::Int)),
+        ],
+    );
+
+    let mut vm = Vm::new(program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.set_jit_native_bridge_stats_enabled(true);
+
+    let status = vm.run().expect("bytes has vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Bool(true)]);
+
+    let snapshot = vm.jit_snapshot();
+    assert_native_ssa_specialized_trace(&vm, &snapshot, "bytes has loop", &["bytes_has"]);
+    assert!(
+        any_trace_ssa_contains(&snapshot, "unbox_ptr "),
+        "bytes has loop should guard a bytes heap pointer at trace entry, dump:\n{}",
+        vm.dump_jit_info()
+    );
+
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert!(
+        bridge_hits.iter().all(|(_, count)| *count == 0),
+        "bytes has loop should not need native helper bridges, bridge hits: {bridge_hits:?}\n{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
 fn trace_jit_supports_string_len_get_slice_in_ssa() {
     if !native_jit_supported() {
         return;
@@ -2815,27 +2914,85 @@ fn trace_jit_supports_manual_bytes_concat_in_ssa() {
 }
 
 #[test]
-fn trace_jit_supports_bytes_array_codec_call_boundary_exits() {
+fn trace_jit_supports_bytes_array_codecs_in_ssa() {
     if !native_jit_supported() {
         return;
     }
 
-    let source = r#"
-        use bytes;
-        let mut i = 0;
-        let mut arr = [0];
-        let mut payload = bytes::from_array_u8([0]);
-        while i < 3 {
-            arr = bytes::to_array_u8(bytes::from_array_u8([1, 2, 255]));
-            payload = bytes::from_array_u8(arr);
-            i = i + 1;
-        }
-        arr;
-        payload;
-    "#;
+    let mut bc = BytecodeBuilder::new();
+    let from_call =
+        builtin_call_index("bytes::from_array_u8").expect("bytes::from_array_u8 should exist");
+    let to_call =
+        builtin_call_index("bytes::to_array_u8").expect("bytes::to_array_u8 should exist");
+    bc.ldc(0);
+    bc.stloc(0);
+    bc.ldc(1);
+    bc.stloc(1);
+    bc.ldc(2);
+    bc.stloc(2);
 
-    let compiled = compile_source(source).expect("bytes array codec compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let root_ip = bc.position();
+    bc.ldloc(2);
+    bc.ldc(3);
+    let clt_ip = bc.position();
+    bc.clt();
+    let guard_ip = bc.position();
+    bc.brfalse(0);
+
+    bc.ldloc(0);
+    let from_ip = bc.position();
+    bc.call(from_call, 1);
+    bc.stloc(1);
+
+    bc.ldloc(1);
+    let to_ip = bc.position();
+    bc.call(to_call, 1);
+    bc.stloc(0);
+
+    bc.ldloc(2);
+    bc.ldc(4);
+    let add_ip = bc.position();
+    bc.add();
+    bc.stloc(2);
+    bc.br(root_ip);
+
+    let exit_ip = bc.position();
+    bc.ldloc(0);
+    bc.ldloc(1);
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, guard_ip, exit_ip);
+    let program = Program::new(
+        vec![
+            Value::array(vec![Value::Int(1), Value::Int(2), Value::Int(255)]),
+            Value::bytes(vec![]),
+            Value::Int(0),
+            Value::Int(3),
+            Value::Int(1),
+        ],
+        code,
+    )
+    .with_local_count(3);
+    let program = force_local_types(
+        program,
+        &[
+            (0, ValueType::Array),
+            (1, ValueType::Bytes),
+            (2, ValueType::Int),
+        ],
+    );
+    let program = force_operand_types(
+        program,
+        &[
+            (clt_ip as usize, (ValueType::Int, ValueType::Int)),
+            (from_ip as usize, (ValueType::Array, ValueType::Unknown)),
+            (to_ip as usize, (ValueType::Bytes, ValueType::Unknown)),
+            (add_ip as usize, (ValueType::Int, ValueType::Int)),
+        ],
+    );
+
+    let mut vm = Vm::new(program);
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -2854,12 +3011,231 @@ fn trace_jit_supports_bytes_array_codec_call_boundary_exits() {
     );
 
     let snapshot = vm.jit_snapshot();
-    assert_native_ssa_call_boundary_trace(&vm, &snapshot, "bytes array codec loop");
+    assert_native_ssa_specialized_trace(
+        &vm,
+        &snapshot,
+        "bytes array codec loop",
+        &["bytes_from_array_u8", "bytes_to_array_u8"],
+    );
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
         bridge_hits.iter().all(|(_, count)| *count == 0),
-        "bytes array codec loop should not need native helper bridges for call-boundary execution, bridge hits: {bridge_hits:?}\n{}",
+        "bytes array codec loop should not need native helper bridges, bridge hits: {bridge_hits:?}\n{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
+fn trace_jit_supports_shift_ops_in_ssa() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.stloc(0);
+    bc.ldc(1);
+    bc.stloc(1);
+    bc.ldc(1);
+    bc.stloc(2);
+    bc.ldc(1);
+    bc.stloc(3);
+
+    let root_ip = bc.position();
+    bc.ldloc(1);
+    bc.ldc(3);
+    let clt_ip = bc.position();
+    bc.clt();
+    let guard_ip = bc.position();
+    bc.brfalse(0);
+
+    bc.ldloc(0);
+    bc.ldc(2);
+    let shr_ip = bc.position();
+    bc.shr();
+    bc.stloc(2);
+
+    bc.ldloc(0);
+    bc.ldc(2);
+    let lshr_ip = bc.position();
+    bc.lshr();
+    bc.stloc(3);
+
+    bc.ldloc(1);
+    bc.ldc(2);
+    let add_ip = bc.position();
+    bc.add();
+    bc.stloc(1);
+    bc.br(root_ip);
+
+    let exit_ip = bc.position();
+    bc.ldloc(2);
+    bc.ldloc(3);
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, guard_ip, exit_ip);
+    let program = Program::new(
+        vec![Value::Int(-8), Value::Int(0), Value::Int(1), Value::Int(3)],
+        code,
+    )
+    .with_local_count(4);
+    let program = force_local_types(
+        program,
+        &[
+            (0, ValueType::Int),
+            (1, ValueType::Int),
+            (2, ValueType::Int),
+            (3, ValueType::Int),
+        ],
+    );
+    let program = force_operand_types(
+        program,
+        &[
+            (clt_ip as usize, (ValueType::Int, ValueType::Int)),
+            (shr_ip as usize, (ValueType::Int, ValueType::Int)),
+            (lshr_ip as usize, (ValueType::Int, ValueType::Int)),
+            (add_ip as usize, (ValueType::Int, ValueType::Int)),
+        ],
+    );
+
+    let mut vm = Vm::new(program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.set_jit_native_bridge_stats_enabled(true);
+
+    let status = vm.run().expect("shift vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[
+            Value::Int(-4),
+            Value::Int(((i64::from(-8i8) as u64) >> 1) as i64)
+        ]
+    );
+
+    let snapshot = vm.jit_snapshot();
+    assert_native_ssa_specialized_trace(&vm, &snapshot, "shift loop", &["ishr_imm", "ilshr_imm"]);
+
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert!(
+        bridge_hits.iter().all(|(_, count)| *count == 0),
+        "shift loop should not need native helper bridges, bridge hits: {bridge_hits:?}\n{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
+fn trace_jit_supports_eager_bool_ops_in_ssa() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.stloc(0);
+    bc.ldc(1);
+    bc.stloc(1);
+    bc.ldc(2);
+    bc.stloc(2);
+    bc.ldc(1);
+    bc.stloc(3);
+
+    let root_ip = bc.position();
+    bc.ldloc(2);
+    bc.ldc(3);
+    let clt_ip = bc.position();
+    bc.clt();
+    let guard_ip = bc.position();
+    bc.brfalse(0);
+
+    bc.ldloc(0);
+    bc.ldloc(1);
+    let and_ip = bc.position();
+    bc.and();
+    bc.ldloc(0);
+    let or_ip = bc.position();
+    bc.or();
+    let _not_ip = bc.position();
+    bc.not();
+    bc.stloc(3);
+
+    bc.ldloc(2);
+    bc.ldc(4);
+    let add_ip = bc.position();
+    bc.add();
+    bc.stloc(2);
+    bc.br(root_ip);
+
+    let exit_ip = bc.position();
+    bc.ldloc(3);
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, guard_ip, exit_ip);
+    let program = Program::new(
+        vec![
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Int(0),
+            Value::Int(4),
+            Value::Int(1),
+        ],
+        code,
+    )
+    .with_local_count(4);
+    let program = force_local_types(
+        program,
+        &[
+            (0, ValueType::Bool),
+            (1, ValueType::Bool),
+            (2, ValueType::Int),
+            (3, ValueType::Bool),
+        ],
+    );
+    let program = force_operand_types(
+        program,
+        &[
+            (clt_ip as usize, (ValueType::Int, ValueType::Int)),
+            (and_ip as usize, (ValueType::Bool, ValueType::Bool)),
+            (or_ip as usize, (ValueType::Bool, ValueType::Bool)),
+            (add_ip as usize, (ValueType::Int, ValueType::Int)),
+        ],
+    );
+
+    let mut vm = Vm::new(program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.set_jit_native_bridge_stats_enabled(true);
+
+    let status = vm.run().expect("bool vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Bool(false)]);
+
+    let snapshot = vm.jit_snapshot();
+    assert_native_ssa_specialized_trace(
+        &vm,
+        &snapshot,
+        "eager bool loop",
+        &["bool_and", "bool_or", "bool_not"],
+    );
+    assert!(
+        any_trace_ssa_contains(&snapshot, "bool_not "),
+        "eager bool loop should record a bool_not SSA op, dump:\n{}",
+        vm.dump_jit_info()
+    );
+
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert!(
+        bridge_hits.iter().all(|(_, count)| *count == 0),
+        "eager bool loop should not need native helper bridges, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
 }
