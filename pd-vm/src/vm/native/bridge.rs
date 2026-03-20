@@ -112,15 +112,6 @@ unsafe fn arc_from_repr_ptr<T>(ptr: *mut u8) -> Arc<T> {
     unsafe { std::mem::transmute_copy(&ptr) }
 }
 
-unsafe fn drop_arc_from_repr_ptr<T>(ptr: *mut u8) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        drop(arc_from_repr_ptr::<T>(ptr));
-    }
-}
-
 fn run_step<F>(vm: *mut Vm, helper_name: &str, f: F) -> i32
 where
     F: FnOnce(&mut Vm) -> VmResult<i32>,
@@ -211,18 +202,6 @@ pub(crate) fn copy_bytes_entry_address() -> usize {
 
 pub(crate) fn zero_bytes_entry_address() -> usize {
     pd_vm_native_zero_bytes as *const () as usize
-}
-
-pub(crate) fn drop_shared_string_entry_address() -> usize {
-    pd_vm_native_drop_shared_string as *const () as usize
-}
-
-pub(crate) fn drop_shared_bytes_entry_address() -> usize {
-    pd_vm_native_drop_shared_bytes as *const () as usize
-}
-
-pub(crate) fn drop_shared_array_entry_address() -> usize {
-    pd_vm_native_drop_shared_array as *const () as usize
 }
 
 pub(crate) fn clone_value_to_slot_entry_address() -> usize {
@@ -357,24 +336,6 @@ pub(crate) extern "C" fn pd_vm_native_zero_bytes(dst: *mut u8, len: usize) {
     }
 }
 
-pub(crate) extern "C" fn pd_vm_native_drop_shared_string(ptr: *mut u8) {
-    unsafe {
-        drop_arc_from_repr_ptr::<String>(ptr);
-    }
-}
-
-pub(crate) extern "C" fn pd_vm_native_drop_shared_bytes(ptr: *mut u8) {
-    unsafe {
-        drop_arc_from_repr_ptr::<Vec<u8>>(ptr);
-    }
-}
-
-pub(crate) extern "C" fn pd_vm_native_drop_shared_array(ptr: *mut u8) {
-    unsafe {
-        drop_arc_from_repr_ptr::<Vec<Value>>(ptr);
-    }
-}
-
 unsafe fn clone_arc_from_repr_ptr<T>(ptr: *mut u8) -> Arc<T> {
     let arc = unsafe { arc_from_repr_ptr::<T>(ptr) };
     let cloned = arc.clone();
@@ -436,7 +397,7 @@ pub(crate) extern "C" fn pd_vm_native_value_eq(lhs: *const Value, rhs: *const Va
         return STATUS_ERROR;
     }
 
-    i32::from(unsafe { &*lhs == &*rhs })
+    i32::from(unsafe { *lhs == *rhs })
 }
 
 pub(crate) extern "C" fn pd_vm_native_write_heap_value_to_slot(

@@ -965,7 +965,7 @@ async fn stream_read_binary(
     let max_bytes = decode_chunk_size(max_bytes)?;
     note_stream_read(&context, stream);
     let chunk = read_stream_binary_chunk(&context, stream, max_bytes).await?;
-    Ok(CallOutcome::Return(vec![bytes_to_value(&chunk)]))
+    Ok(CallOutcome::Return(vec![bytes_to_value(chunk)]))
 }
 
 /// Reads exactly the requested number of binary bytes from the TCP stream.
@@ -1002,7 +1002,7 @@ async fn stream_read_exact_binary(
         out.extend_from_slice(&chunk);
     }
 
-    Ok(CallOutcome::Return(vec![bytes_to_value(&out)]))
+    Ok(CallOutcome::Return(vec![bytes_to_value(out)]))
 }
 
 /// Peeks text from the TCP stream without advancing the VM-visible read cursor.
@@ -1145,7 +1145,7 @@ async fn stream_peek_binary(
             ));
         }
     };
-    Ok(CallOutcome::Return(vec![bytes_to_value(&chunk)]))
+    Ok(CallOutcome::Return(vec![bytes_to_value(chunk)]))
 }
 
 /// Writes text to the TCP stream.
@@ -1231,12 +1231,12 @@ async fn stream_write_binary(
         TcpStreamHandle::Reserved(TcpStreamRef::Downstream) => {
             #[cfg(feature = "tls")]
             if let Some(io) = active_downstream_tls_io(&context) {
-                if let Err(err) = write_attached_downstream_tls(io, &bytes).await {
+                if let Err(err) = write_attached_downstream_tls(io, bytes).await {
                     mark_attached_downstream_failed(&context, err.to_string());
                     return Err(err);
                 }
             } else if let Some(io) = active_downstream_tcp_io(&context) {
-                if let Err(err) = write_attached_downstream_tcp(io, &bytes).await {
+                if let Err(err) = write_attached_downstream_tcp(io, bytes).await {
                     mark_attached_downstream_failed(&context, err.to_string());
                     return Err(err);
                 }
@@ -1245,27 +1245,27 @@ async fn stream_write_binary(
                     "downstream tcp stream is pending tls handshake; call tls::session::handshake before writing plaintext".to_string(),
                 ));
             } else {
-                append_response_output_body_bytes(&context, &bytes)?;
+                append_response_output_body_bytes(&context, bytes)?;
             }
             #[cfg(not(feature = "tls"))]
             if let Some(io) = active_downstream_tcp_io(&context) {
-                if let Err(err) = write_attached_downstream_tcp(io, &bytes).await {
+                if let Err(err) = write_attached_downstream_tcp(io, bytes).await {
                     mark_attached_downstream_failed(&context, err.to_string());
                     return Err(err);
                 }
             } else {
-                append_response_output_body_bytes(&context, &bytes)?;
+                append_response_output_body_bytes(&context, bytes)?;
             }
         }
         TcpStreamHandle::Reserved(TcpStreamRef::DefaultUpstream) => {
             append_outbound_exchange_body_bytes(
                 &context,
                 TcpStreamRef::DefaultUpstream.handle(),
-                &bytes,
+                bytes,
             )?
         }
         TcpStreamHandle::OutboundExchange(handle) => {
-            append_outbound_exchange_body_bytes(&context, handle, &bytes)?
+            append_outbound_exchange_body_bytes(&context, handle, bytes)?
         }
         TcpStreamHandle::Dynamic(handle) => {
             let io = ensure_dynamic_tcp_stream_connected(&context, handle).await?;
@@ -1276,7 +1276,7 @@ async fn stream_write_binary(
                 ))
             })?;
             stream_io
-                .write_all(&bytes)
+                .write_all(bytes)
                 .await
                 .map_err(|err| VmError::HostError(format!("tcp write failed: {err}")))?;
             stream_io

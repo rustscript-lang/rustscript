@@ -41,7 +41,7 @@ fn compile_source_file_parse_error_uses_original_line() {
     let source = "const broken = ;\n";
     fs::write(&path, source).expect("temp source should be writable");
 
-    let result = compile_source_file(&path);
+    let result = compile_source_file(path.as_path());
     let _ = fs::remove_file(&path);
 
     match result {
@@ -117,7 +117,7 @@ pub fn ok() {
     let main_path = root.join("main.rss");
     fs::write(&main_path, "use module;\nok();\n").expect("main source should be writable");
 
-    let result = compile_source_file(&main_path);
+    let result = compile_source_file(main_path.as_path());
 
     let _ = fs::remove_file(&main_path);
     let _ = fs::remove_file(&module_path);

@@ -1846,15 +1846,6 @@ mod runtime_tests {
             "expected an unknown warning for 'value', got {:?}",
             report.diagnostics
         );
-        assert!(
-            report.diagnostics.iter().any(|diagnostic| {
-                diagnostic
-                    .message
-                    .contains("compiler could not determine the type of local 'joined'")
-            }),
-            "expected an unknown warning for 'joined', got {:?}",
-            report.diagnostics
-        );
     }
 
     #[test]

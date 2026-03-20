@@ -612,6 +612,7 @@ mod tests {
         ));
         let async_ops = new_shared_vm_async_ops();
         let store = new_vm_runner_store(&loaded_program, context, async_ops, true, false);
+        let epoch_handle = store.vm().epoch_handle();
         let debug = VmDebugInvocation {
             attach_debugger: false,
             force_threading: false,
@@ -626,12 +627,21 @@ mod tests {
             jit_enabled: true,
             drop_contract_events_enabled: false,
         };
+        let epoch_advancer = std::thread::spawn(move || {
+            for _ in 0..8 {
+                std::thread::sleep(Duration::from_millis(1));
+                epoch_handle.increment();
+            }
+        });
 
         let result = tokio::task::spawn_blocking(move || {
             run_vm_threading(store, debug_session, debug, execution)
         })
         .await
         .expect("threading task should complete");
+        epoch_advancer
+            .join()
+            .expect("epoch advancer thread should complete");
 
         let profile = match result {
             Ok(profile) => profile,

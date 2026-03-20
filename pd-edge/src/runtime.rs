@@ -10,7 +10,7 @@ use std::{
 use arc_swap::ArcSwapOption;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
-use vm::{Program, Vm, decode_program, validate_program};
+use vm::{Program, decode_program, validate_program};
 
 use crate::{
     HOST_FUNCTION_COUNT,

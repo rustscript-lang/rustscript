@@ -1187,7 +1187,7 @@ async fn connection_send_binary(
     ensure_outbound_websocket_connection_open(&context, connection).await?;
     let io = websocket_io(&context, connection)?;
     let mut io = io.lock().await;
-    let sent = io.send_binary_bytes(&bytes).await?;
+    let sent = io.send_binary_bytes(bytes).await?;
     Ok(CallOutcome::Return(vec![Value::Int(sent as i64)]))
 }
 
@@ -1223,7 +1223,7 @@ async fn connection_read_binary(
     let payload = io.read_binary_bytes().await?.unwrap_or_default();
     drop(io);
     refresh_connection_close_state(&context, connection);
-    Ok(CallOutcome::Return(vec![bytes_to_value(&payload)]))
+    Ok(CallOutcome::Return(vec![bytes_to_value(payload)]))
 }
 
 /// Returns whether the WebSocket connection has reached EOF.

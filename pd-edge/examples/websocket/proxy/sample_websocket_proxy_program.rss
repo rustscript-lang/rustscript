@@ -75,14 +75,14 @@ if websocket::connection::eof(connection) {
 let protocol = websocket::connection::get_subprotocol(connection);
 if binary_payload_hex != "" {
     websocket::connection::send_binary(connection, bytes::from_hex(binary_payload_hex));
-    let reply = websocket::connection::read_binary(connection);
+    let binary_reply = websocket::connection::read_binary(connection);
     http::response::set_header("x-ws-mode", "binary");
-    http::response::set_body(bytes::to_hex(reply));
+    http::response::set_body(bytes::to_hex(binary_reply));
 } else {
     websocket::connection::send_text(connection, text_payload);
-    let reply = websocket::connection::read_text(connection);
+    let text_reply = websocket::connection::read_text(connection);
     http::response::set_header("x-ws-mode", "text");
-    http::response::set_body(reply);
+    http::response::set_body(text_reply);
 }
 
 websocket::connection::close(connection, 1000, "sample-complete");

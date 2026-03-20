@@ -905,7 +905,7 @@ where
     let mut body = Vec::with_capacity(3 + count);
     body.extend_from_slice(&packet_id.to_be_bytes());
     body.push(0x00);
-    body.extend(std::iter::repeat(0x00).take(count));
+    body.extend(std::iter::repeat_n(0x00, count));
     let mut packet = vec![0xB0];
     packet.extend_from_slice(&encode_sample_mqtt_variable_int(body.len()));
     packet.extend_from_slice(&body);

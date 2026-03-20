@@ -4,6 +4,8 @@ use std::sync::Arc;
 #[cfg(feature = "cranelift-jit")]
 use std::collections::HashMap;
 #[cfg(feature = "cranelift-jit")]
+use std::time::Instant;
+#[cfg(feature = "cranelift-jit")]
 use std::sync::OnceLock;
 #[cfg(feature = "cranelift-jit")]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,19 +13,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::vm::native::ExecutableBuffer;
 #[cfg(feature = "cranelift-jit")]
 use crate::vm::native::{
-    HeapIntrinsicAddrs, HeapIntrinsicRefs, OP_BUILTIN_CALL, OP_CALL, STATUS_CONTINUE,
-    STATUS_ERROR, clear_value_slot_entry_address,
-    alloc_buffer_signature, aot_call_boundary_interrupt_entry_address, alloc_byte_buffer_entry_address,
-    alloc_value_buffer_entry_address, box_heap_value_signature, clone_value_signature,
-    value_eq_entry_address, value_eq_signature,
-    init_null_value_slot_entry_address,
-    clone_value_to_slot_entry_address, copy_bytes_entry_address, copy_bytes_signature,
-    detect_native_stack_layout, drop_shared_array_entry_address, drop_shared_bytes_entry_address,
-    drop_shared_signature, drop_shared_string_entry_address, entry_signature,
-    free_buffer_signature, helper_entry_offset, helper_signature, jump_with_status,
-    pack_shared_signature, resolve_offsets, restore_exit_signature,
-    restore_exit_state_entry_address, shared_array_from_buffer_entry_address,
-    shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
+    HeapIntrinsicAddrs, HeapIntrinsicRefs, OP_BUILTIN_CALL, OP_CALL, STATUS_CONTINUE, STATUS_ERROR,
+    alloc_buffer_signature, alloc_byte_buffer_entry_address, alloc_value_buffer_entry_address,
+    aot_call_boundary_interrupt_entry_address, box_heap_value_signature,
+    clear_value_slot_entry_address, clone_value_signature, clone_value_to_slot_entry_address,
+    copy_bytes_entry_address, copy_bytes_signature, detect_native_stack_layout, entry_signature,
+    free_buffer_signature, helper_entry_offset, helper_signature,
+    init_null_value_slot_entry_address, jump_with_status, pack_shared_signature, resolve_offsets,
+    restore_exit_signature, restore_exit_state_entry_address,
+    shared_array_from_buffer_entry_address, shared_bytes_from_buffer_entry_address,
+    shared_string_from_buffer_entry_address, value_eq_entry_address, value_eq_signature,
     value_slot_signature, write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
 };
 use crate::vm::{Program, Value, Vm, VmError, VmResult};
@@ -48,9 +47,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 #[cfg(feature = "cranelift-jit")]
 use cranelift_module::{Linkage, Module};
 
-use super::ir::{
-    AotCallDispatch, AotLowerError,
-};
+use super::ir::{AotCallDispatch, AotLowerError};
 use super::ssa::{
     AotCheckpoint, AotSsaBuildError, AotSsaInstKind, AotSsaJumpTarget, AotSsaMaterialization,
     AotSsaProgram, AotSsaTerminator, AotSsaValueId, AotSsaValueRepr, build_aot_ssa,
@@ -155,8 +152,47 @@ pub(crate) fn compile_program(program: &Program) -> VmResult<CompiledProgram> {
 
 #[cfg(feature = "cranelift-jit")]
 fn compile_program_inner(program: &Program) -> Result<CompiledProgram, AotCompileError> {
+    let trace_enabled = std::env::var_os("PDVM_TRACE_AOT_COMPILE").is_some();
+    let build_started = Instant::now();
     let ssa = build_aot_ssa(program)?;
-    compile_ssa(program, &ssa)
+    let build_elapsed = build_started.elapsed();
+    if trace_enabled {
+        let total_insts = ssa.blocks.iter().map(|block| block.insts.len()).sum::<usize>();
+        let external_checkpoints = ssa.checkpoints.iter().filter(|cp| cp.external).count();
+        let total_block_params = ssa.blocks.iter().map(|block| block.params.len()).sum::<usize>();
+        let max_block_params = ssa
+            .blocks
+            .iter()
+            .map(|block| block.params.len())
+            .max()
+            .unwrap_or(0);
+        let total_checkpoint_values = ssa
+            .checkpoints
+            .iter()
+            .map(|cp| cp.stack.len() + cp.locals.len())
+            .sum::<usize>();
+        let max_checkpoint_values = ssa
+            .checkpoints
+            .iter()
+            .map(|cp| cp.stack.len() + cp.locals.len())
+            .max()
+            .unwrap_or(0);
+        eprintln!(
+            "aot trace: code_bytes={} ssa_blocks={} ssa_insts={} block_params_total={} block_params_max={} checkpoints={} external_checkpoints={} checkpoint_values_total={} checkpoint_values_max={} resume_ips={} ssa_build_us={}",
+            program.code.len(),
+            ssa.blocks.len(),
+            total_insts,
+            total_block_params,
+            max_block_params,
+            ssa.checkpoints.len(),
+            external_checkpoints,
+            total_checkpoint_values,
+            max_checkpoint_values,
+            ssa.resume_ips.len(),
+            build_elapsed.as_micros(),
+        );
+    }
+    compile_ssa(program, &ssa, trace_enabled)
 }
 
 #[cfg(not(feature = "cranelift-jit"))]
@@ -206,18 +242,123 @@ struct AotOwnedValueTemps {
 }
 
 #[cfg(feature = "cranelift-jit")]
-fn compile_ssa(program: &Program, ssa: &AotSsaProgram) -> Result<CompiledProgram, AotCompileError> {
+#[derive(Clone, Copy)]
+struct AotLowerCtx<'a> {
+    vm_ptr: cranelift_codegen::ir::Value,
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    layout: crate::vm::native::NativeStackLayout,
+    offsets: crate::vm::native::ResolvedOffsets,
+    heap_refs: HeapIntrinsicRefs,
+    heap_addrs: HeapIntrinsicAddrs,
+    helper_refs: AotDeoptHelperRefs,
+    helper_addrs: AotDeoptHelperAddrs,
+    owned_value_temps: &'a AotOwnedValueTemps,
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[derive(Clone, Copy)]
+struct AotTaggedValueOp {
+    ip: usize,
+    value: cranelift_codegen::ir::Value,
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[derive(Clone, Copy)]
+struct AotBinaryOp {
+    ip: usize,
+    lhs: cranelift_codegen::ir::Value,
+    rhs: cranelift_codegen::ir::Value,
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[derive(Clone, Copy)]
+struct AotBytesIndexOp {
+    ip: usize,
+    bytes: cranelift_codegen::ir::Value,
+    index: cranelift_codegen::ir::Value,
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[derive(Clone, Copy)]
+struct AotStringGetOp {
+    output_id: AotSsaValueId,
+    ip: usize,
+    text: cranelift_codegen::ir::Value,
+    index: cranelift_codegen::ir::Value,
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[derive(Clone, Copy)]
+struct AotConcatOp {
+    output_id: AotSsaValueId,
+    ip: usize,
+    lhs: cranelift_codegen::ir::Value,
+    rhs: cranelift_codegen::ir::Value,
+    result_tag: u32,
+    pack_addr: usize,
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[derive(Clone, Copy)]
+struct AotSliceOp {
+    output_id: AotSsaValueId,
+    ip: usize,
+    value: cranelift_codegen::ir::Value,
+    start: cranelift_codegen::ir::Value,
+    length: cranelift_codegen::ir::Value,
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[derive(Clone, Copy)]
+struct AotArrayConvertOp {
+    output_id: AotSsaValueId,
+    ip: usize,
+    value: cranelift_codegen::ir::Value,
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[derive(Clone, Copy)]
+struct AotStepHelperArgs {
+    op: i64,
+    a: i64,
+    b_arg: i64,
+    c: i64,
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[derive(Clone, Copy)]
+struct AotMaterializeCtx<'a> {
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    value_layout: crate::vm::native::ValueLayout,
+    helper_refs: AotDeoptHelperRefs,
+    helper_addrs: AotDeoptHelperAddrs,
+    values: &'a HashMap<AotSsaValueId, cranelift_codegen::ir::Value>,
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn compile_ssa(
+    program: &Program,
+    ssa: &AotSsaProgram,
+    trace_enabled: bool,
+) -> Result<CompiledProgram, AotCompileError> {
+    let total_started = Instant::now();
+    let isa_started = Instant::now();
     let isa = native_isa()?;
+    let isa_elapsed = isa_started.elapsed();
+    let module_started = Instant::now();
     let jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     let mut module = JITModule::new(jit_builder);
     let pointer_type = module.target_config().pointer_type();
     let call_conv = module.target_config().default_call_conv;
+    let module_elapsed = module_started.elapsed();
 
+    let sigs_started = Instant::now();
     let helper_sig = helper_signature(pointer_type, call_conv);
     let alloc_buffer_sig = alloc_buffer_signature(pointer_type, call_conv);
     let free_buffer_sig = free_buffer_signature(pointer_type, call_conv);
     let pack_shared_sig = pack_shared_signature(pointer_type, call_conv);
-    let drop_shared_sig = drop_shared_signature(pointer_type, call_conv);
     let copy_bytes_sig = copy_bytes_signature(pointer_type, call_conv);
     let vm_status_sig = entry_signature(pointer_type, call_conv);
     let interrupt_sig = entry_signature(pointer_type, call_conv);
@@ -226,7 +367,9 @@ fn compile_ssa(program: &Program, ssa: &AotSsaProgram) -> Result<CompiledProgram
     let value_slot_sig = value_slot_signature(pointer_type, call_conv);
     let box_heap_sig = box_heap_value_signature(pointer_type, call_conv);
     let restore_exit_sig = restore_exit_signature(pointer_type, call_conv);
+    let sigs_elapsed = sigs_started.elapsed();
 
+    let addr_setup_started = Instant::now();
     let helper_offset = helper_entry_offset();
     let heap_addrs = HeapIntrinsicAddrs {
         alloc_byte_buffer: alloc_byte_buffer_entry_address(),
@@ -236,9 +379,6 @@ fn compile_ssa(program: &Program, ssa: &AotSsaProgram) -> Result<CompiledProgram
         pack_array: shared_array_from_buffer_entry_address(),
         copy_bytes: copy_bytes_entry_address(),
         zero_bytes: zero_bytes_entry_address(),
-        drop_string: drop_shared_string_entry_address(),
-        drop_bytes: drop_shared_bytes_entry_address(),
-        drop_array: drop_shared_array_entry_address(),
     };
     let helper_addrs = AotDeoptHelperAddrs {
         aot_interrupt: aot_call_boundary_interrupt_entry_address(),
@@ -249,13 +389,17 @@ fn compile_ssa(program: &Program, ssa: &AotSsaProgram) -> Result<CompiledProgram
         box_heap_value: write_heap_value_to_slot_entry_address(),
         restore_exit: restore_exit_state_entry_address(),
     };
+    let addr_setup_elapsed = addr_setup_started.elapsed();
 
+    let layout_started = Instant::now();
     let layout = detect_native_stack_layout().map_err(|err| {
         AotCompileError::Codegen(format!("detect native stack layout failed: {err}"))
     })?;
     let offsets = resolve_offsets(layout)
         .map_err(|err| AotCompileError::Codegen(format!("resolve native offsets failed: {err}")))?;
+    let layout_elapsed = layout_started.elapsed();
 
+    let ctx_setup_started = Instant::now();
     let mut ctx = module.make_context();
     ctx.func.signature = entry_signature(pointer_type, call_conv);
 
@@ -268,12 +412,14 @@ fn compile_ssa(program: &Program, ssa: &AotSsaProgram) -> Result<CompiledProgram
                 AotCompileError::Codegen(format!("declare aot function failed: {err}"))
             })?
     };
+    let ctx_setup_elapsed = ctx_setup_started.elapsed();
 
     let vm_ip_offset =
         i32::try_from(std::mem::offset_of!(Vm, ip)).expect("Vm::ip offset must fit i32");
     let code_len_i64 = i64::try_from(program.code.len())
         .map_err(|_| AotCompileError::Codegen("program length does not fit i64".to_string()))?;
 
+    let ir_build_started = Instant::now();
     {
         let mut fb_ctx = FunctionBuilderContext::new();
         let mut b = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
@@ -299,7 +445,6 @@ fn compile_ssa(program: &Program, ssa: &AotSsaProgram) -> Result<CompiledProgram
             alloc_buffer_ref: b.import_signature(alloc_buffer_sig),
             free_buffer_ref: b.import_signature(free_buffer_sig),
             pack_shared_ref: b.import_signature(pack_shared_sig),
-            drop_shared_ref: b.import_signature(drop_shared_sig),
             copy_bytes_ref: b.import_signature(copy_bytes_sig),
         };
 
@@ -334,6 +479,18 @@ fn compile_ssa(program: &Program, ssa: &AotSsaProgram) -> Result<CompiledProgram
         b.switch_to_block(entry_block);
         b.append_block_params_for_function_params(entry_block);
         let vm_ptr = b.block_params(entry_block)[0];
+        let lower_ctx = AotLowerCtx {
+            vm_ptr,
+            exit_block,
+            pointer_type,
+            layout,
+            offsets,
+            heap_refs,
+            heap_addrs,
+            helper_refs,
+            helper_addrs,
+            owned_value_temps: &owned_value_temps,
+        };
         init_owned_value_temps(
             &mut b,
             pointer_type,
@@ -348,7 +505,11 @@ fn compile_ssa(program: &Program, ssa: &AotSsaProgram) -> Result<CompiledProgram
             .ins()
             .load(pointer_type, MemFlags::new(), vm_ptr, vm_ip_offset);
         let mut switch = Switch::new();
-        for checkpoint in ssa.checkpoints.iter().filter(|checkpoint| checkpoint.external) {
+        for checkpoint in ssa
+            .checkpoints
+            .iter()
+            .filter(|checkpoint| checkpoint.external)
+        {
             switch.set_entry(checkpoint.ip as u128, checkpoint_blocks[&checkpoint.id]);
         }
         switch.emit(&mut b, vm_ip, miss_block);
@@ -360,8 +521,17 @@ fn compile_ssa(program: &Program, ssa: &AotSsaProgram) -> Result<CompiledProgram
         for checkpoint in &ssa.checkpoints {
             let handle = checkpoint_blocks[&checkpoint.id];
             b.switch_to_block(handle);
-            let args = load_checkpoint_args(&mut b, vm_ptr, exit_block, pointer_type, layout, offsets, checkpoint)?;
-            b.ins().jump(ssa_blocks[&checkpoint.target], &ssa_block_args(args));
+            let args = load_checkpoint_args(
+                &mut b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                offsets,
+                checkpoint,
+            )?;
+            b.ins()
+                .jump(ssa_blocks[&checkpoint.target], &ssa_block_args(args));
         }
 
         for block in &ssa.blocks {
@@ -376,21 +546,7 @@ fn compile_ssa(program: &Program, ssa: &AotSsaProgram) -> Result<CompiledProgram
                 values.insert(param.value.id, lowered);
             }
             for inst in &block.insts {
-                let lowered = lower_aot_ssa_inst(
-                    &mut b,
-                    vm_ptr,
-                    exit_block,
-                    pointer_type,
-                    layout,
-                    offsets,
-                    heap_refs,
-                    heap_addrs,
-                    helper_refs,
-                    helper_addrs,
-                    &owned_value_temps,
-                    inst,
-                    &values,
-                )?;
+                let lowered = lower_aot_ssa_inst(&mut b, lower_ctx, inst, &values)?;
                 values.insert(inst.output.id, lowered);
             }
             lower_aot_ssa_terminator(
@@ -432,16 +588,21 @@ fn compile_ssa(program: &Program, ssa: &AotSsaProgram) -> Result<CompiledProgram
         b.seal_all_blocks();
         b.finalize();
     }
+    let ir_build_elapsed = ir_build_started.elapsed();
 
+    let verify_started = Instant::now();
     if let Err(err) = verify_function(&ctx.func, module.isa()) {
         let pretty = pretty_verifier_error(&ctx.func, None, err);
         return Err(AotCompileError::Codegen(format!(
             "aot ssa verifier failed:\n{pretty}"
         )));
     }
+    let verify_elapsed = verify_started.elapsed();
+    let define_started = Instant::now();
     module
         .define_function(func_id, &mut ctx)
         .map_err(|err| AotCompileError::Codegen(format!("define aot function failed: {err}")))?;
+    let define_elapsed = define_started.elapsed();
     let code_len = ctx
         .compiled_code()
         .ok_or_else(|| {
@@ -449,19 +610,48 @@ fn compile_ssa(program: &Program, ssa: &AotSsaProgram) -> Result<CompiledProgram
         })?
         .code_buffer()
         .len();
+    let clear_ctx_started = Instant::now();
     module.clear_context(&mut ctx);
+    let clear_ctx_elapsed = clear_ctx_started.elapsed();
+    let finalize_started = Instant::now();
     module.finalize_definitions().map_err(|err| {
         AotCompileError::Codegen(format!("finalize aot definitions failed: {err}"))
     })?;
+    let finalize_elapsed = finalize_started.elapsed();
 
+    let copy_started = Instant::now();
     let entry = module.get_finalized_function(func_id);
     let code = if code_len == 0 {
         Vec::new()
     } else {
         unsafe { std::slice::from_raw_parts(entry, code_len).to_vec() }
     };
-    CompiledProgram::from_code(code, ssa.resume_ips.clone())
-        .map_err(|err| AotCompileError::Codegen(err.to_string()))
+    let copy_elapsed = copy_started.elapsed();
+    let program_wrap_started = Instant::now();
+    let compiled = CompiledProgram::from_code(code, ssa.resume_ips.clone())
+        .map_err(|err| AotCompileError::Codegen(err.to_string()))?;
+    let program_wrap_elapsed = program_wrap_started.elapsed();
+    if trace_enabled {
+        eprintln!(
+            "aot trace: isa_us={} module_us={} sigs_us={} addrs_us={} layout_us={} ctx_us={} ir_build_us={} verify_us={} define_us={} clear_ctx_us={} finalize_us={} copy_us={} wrap_us={} total_codegen_us={} final_code_bytes={}",
+            isa_elapsed.as_micros(),
+            module_elapsed.as_micros(),
+            sigs_elapsed.as_micros(),
+            addr_setup_elapsed.as_micros(),
+            layout_elapsed.as_micros(),
+            ctx_setup_elapsed.as_micros(),
+            ir_build_elapsed.as_micros(),
+            verify_elapsed.as_micros(),
+            define_elapsed.as_micros(),
+            clear_ctx_elapsed.as_micros(),
+            finalize_elapsed.as_micros(),
+            copy_elapsed.as_micros(),
+            program_wrap_elapsed.as_micros(),
+            total_started.elapsed().as_micros(),
+            compiled.code.len(),
+        );
+    }
+    Ok(compiled)
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -479,8 +669,9 @@ fn load_checkpoint_args(
         .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_len);
     let expected_stack_len = b.ins().iconst(
         pointer_type,
-        i64::try_from(checkpoint.stack.len())
-            .map_err(|_| AotCompileError::Codegen("checkpoint stack length out of range".to_string()))?,
+        i64::try_from(checkpoint.stack.len()).map_err(|_| {
+            AotCompileError::Codegen("checkpoint stack length out of range".to_string())
+        })?,
     );
     let stack_ok = b.ins().icmp(IntCC::Equal, stack_len, expected_stack_len);
     let stack_match = b.create_block();
@@ -499,8 +690,9 @@ fn load_checkpoint_args(
         .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_len);
     let expected_locals_len = b.ins().iconst(
         pointer_type,
-        i64::try_from(checkpoint.locals.len())
-            .map_err(|_| AotCompileError::Codegen("checkpoint locals length out of range".to_string()))?,
+        i64::try_from(checkpoint.locals.len()).map_err(|_| {
+            AotCompileError::Codegen("checkpoint locals length out of range".to_string())
+        })?,
     );
     let locals_ok = b.ins().icmp(IntCC::Equal, locals_len, expected_locals_len);
     let locals_match = b.create_block();
@@ -525,20 +717,34 @@ fn load_checkpoint_args(
     for (index, repr) in checkpoint.stack.iter().copied().enumerate() {
         let index_val = b.ins().iconst(
             pointer_type,
-            i64::try_from(index)
-                .map_err(|_| AotCompileError::Codegen("checkpoint stack index out of range".to_string()))?,
+            i64::try_from(index).map_err(|_| {
+                AotCompileError::Codegen("checkpoint stack index out of range".to_string())
+            })?,
         );
         let addr = ssa_value_addr(b, pointer_type, stack_ptr, index_val, layout.value.size);
-        args.push(load_aot_checkpoint_value(b, pointer_type, layout.value, addr, repr));
+        args.push(load_aot_checkpoint_value(
+            b,
+            pointer_type,
+            layout.value,
+            addr,
+            repr,
+        ));
     }
     for (index, repr) in checkpoint.locals.iter().copied().enumerate() {
         let index_val = b.ins().iconst(
             pointer_type,
-            i64::try_from(index)
-                .map_err(|_| AotCompileError::Codegen("checkpoint local index out of range".to_string()))?,
+            i64::try_from(index).map_err(|_| {
+                AotCompileError::Codegen("checkpoint local index out of range".to_string())
+            })?,
         );
         let addr = ssa_value_addr(b, pointer_type, locals_ptr, index_val, layout.value.size);
-        args.push(load_aot_checkpoint_value(b, pointer_type, layout.value, addr, repr));
+        args.push(load_aot_checkpoint_value(
+            b,
+            pointer_type,
+            layout.value,
+            addr,
+            repr,
+        ));
     }
     Ok(args)
 }
@@ -583,49 +789,50 @@ fn load_aot_checkpoint_value(
 #[cfg(feature = "cranelift-jit")]
 fn lower_aot_ssa_inst(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: crate::vm::native::ResolvedOffsets,
-    heap_refs: HeapIntrinsicRefs,
-    heap_addrs: HeapIntrinsicAddrs,
-    helper_refs: AotDeoptHelperRefs,
-    helper_addrs: AotDeoptHelperAddrs,
-    owned_value_temps: &AotOwnedValueTemps,
+    ctx: AotLowerCtx<'_>,
     inst: &super::ssa::AotSsaInst,
     values: &HashMap<AotSsaValueId, cranelift_codegen::ir::Value>,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotLowerCtx {
+        vm_ptr,
+        pointer_type,
+        layout,
+        offsets,
+        heap_addrs,
+        ..
+    } = ctx;
     let value = match &inst.kind {
         AotSsaInstKind::IntConst(value) => b.ins().iconst(types::I64, *value),
         AotSsaInstKind::FloatConst(value) => b.ins().f64const(*value),
         AotSsaInstKind::BoolConst(value) => b.ins().iconst(types::I8, i64::from(*value as u8)),
         AotSsaInstKind::ConstSlot { index } => {
-            let constants_ptr = b
-                .ins()
-                .load(pointer_type, MemFlags::new(), vm_ptr, offsets.constants_ptr);
+            let constants_ptr =
+                b.ins()
+                    .load(pointer_type, MemFlags::new(), vm_ptr, offsets.constants_ptr);
             let idx = b.ins().iconst(pointer_type, i64::from(*index));
-            ssa_value_addr(b, pointer_type, constants_ptr, idx, std::mem::size_of::<Value>() as i32)
+            ssa_value_addr(
+                b,
+                pointer_type,
+                constants_ptr,
+                idx,
+                std::mem::size_of::<Value>() as i32,
+            )
         }
         AotSsaInstKind::StringLen { text } => aot_lower_string_len(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            inst.ip,
-            values[text],
+            ctx,
+            AotTaggedValueOp {
+                ip: inst.ip,
+                value: values[text],
+            },
         )?,
         AotSsaInstKind::BytesLen { bytes } => aot_lower_bytes_len(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            inst.ip,
-            values[bytes],
+            ctx,
+            AotTaggedValueOp {
+                ip: inst.ip,
+                value: values[bytes],
+            },
         )?,
         AotSsaInstKind::StringSlice {
             text,
@@ -633,21 +840,14 @@ fn lower_aot_ssa_inst(
             length,
         } => aot_lower_string_slice(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            heap_refs,
-            heap_addrs,
-            helper_refs,
-            helper_addrs,
-            owned_value_temps,
-            inst.output.id,
-            inst.ip,
-            values[text],
-            values[start],
-            values[length],
+            ctx,
+            AotSliceOp {
+                output_id: inst.output.id,
+                ip: inst.ip,
+                value: values[text],
+                start: values[start],
+                length: values[length],
+            },
         )?,
         AotSsaInstKind::BytesSlice {
             bytes,
@@ -655,154 +855,106 @@ fn lower_aot_ssa_inst(
             length,
         } => aot_lower_bytes_slice(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            heap_refs,
-            heap_addrs,
-            helper_refs,
-            helper_addrs,
-            owned_value_temps,
-            inst.output.id,
-            inst.ip,
-            values[bytes],
-            values[start],
-            values[length],
+            ctx,
+            AotSliceOp {
+                output_id: inst.output.id,
+                ip: inst.ip,
+                value: values[bytes],
+                start: values[start],
+                length: values[length],
+            },
         )?,
         AotSsaInstKind::StringGet { text, index } => aot_lower_string_get(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            heap_refs,
-            heap_addrs,
-            helper_refs,
-            helper_addrs,
-            owned_value_temps,
-            inst.output.id,
-            inst.ip,
-            values[text],
-            values[index],
+            ctx,
+            AotStringGetOp {
+                output_id: inst.output.id,
+                ip: inst.ip,
+                text: values[text],
+                index: values[index],
+            },
         )?,
         AotSsaInstKind::BytesGet { bytes, index } => aot_lower_bytes_get(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            inst.ip,
-            values[bytes],
-            values[index],
+            ctx,
+            AotBytesIndexOp {
+                ip: inst.ip,
+                bytes: values[bytes],
+                index: values[index],
+            },
         )?,
         AotSsaInstKind::BytesHas { bytes, index } => aot_lower_bytes_has(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            inst.ip,
-            values[bytes],
-            values[index],
+            ctx,
+            AotBytesIndexOp {
+                ip: inst.ip,
+                bytes: values[bytes],
+                index: values[index],
+            },
         )?,
         AotSsaInstKind::StringConcat { lhs, rhs } => aot_lower_concat(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            heap_refs,
-            heap_addrs,
-            helper_refs,
-            helper_addrs,
-            owned_value_temps,
-            inst.output.id,
-            inst.ip,
-            values[lhs],
-            values[rhs],
-            layout.value.string_tag,
-            heap_addrs.pack_string,
+            ctx,
+            AotConcatOp {
+                output_id: inst.output.id,
+                ip: inst.ip,
+                lhs: values[lhs],
+                rhs: values[rhs],
+                result_tag: layout.value.string_tag,
+                pack_addr: heap_addrs.pack_string,
+            },
         )?,
         AotSsaInstKind::BytesConcat { lhs, rhs } => aot_lower_concat(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            heap_refs,
-            heap_addrs,
-            helper_refs,
-            helper_addrs,
-            owned_value_temps,
-            inst.output.id,
-            inst.ip,
-            values[lhs],
-            values[rhs],
-            layout.value.bytes_tag,
-            heap_addrs.pack_bytes,
+            ctx,
+            AotConcatOp {
+                output_id: inst.output.id,
+                ip: inst.ip,
+                lhs: values[lhs],
+                rhs: values[rhs],
+                result_tag: layout.value.bytes_tag,
+                pack_addr: heap_addrs.pack_bytes,
+            },
         )?,
         AotSsaInstKind::BytesFromArrayU8 { array } => aot_lower_bytes_from_array_u8(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            heap_refs,
-            heap_addrs,
-            helper_refs,
-            helper_addrs,
-            owned_value_temps,
-            inst.output.id,
-            inst.ip,
-            values[array],
+            ctx,
+            AotArrayConvertOp {
+                output_id: inst.output.id,
+                ip: inst.ip,
+                value: values[array],
+            },
         )?,
         AotSsaInstKind::BytesToArrayU8 { bytes } => aot_lower_bytes_to_array_u8(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            heap_refs,
-            heap_addrs,
-            helper_refs,
-            helper_addrs,
-            owned_value_temps,
-            inst.output.id,
-            inst.ip,
-            values[bytes],
+            ctx,
+            AotArrayConvertOp {
+                output_id: inst.output.id,
+                ip: inst.ip,
+                value: values[bytes],
+            },
         )?,
         AotSsaInstKind::IntAdd { lhs, rhs } => b.ins().iadd(values[lhs], values[rhs]),
         AotSsaInstKind::IntSub { lhs, rhs } => b.ins().isub(values[lhs], values[rhs]),
         AotSsaInstKind::IntMul { lhs, rhs } => b.ins().imul(values[lhs], values[rhs]),
         AotSsaInstKind::IntDiv { lhs, rhs } => aot_lower_int_divrem(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            offsets,
-            inst.ip,
-            values[lhs],
-            values[rhs],
+            ctx,
+            AotBinaryOp {
+                ip: inst.ip,
+                lhs: values[lhs],
+                rhs: values[rhs],
+            },
             false,
         ),
         AotSsaInstKind::IntMod { lhs, rhs } => aot_lower_int_divrem(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            offsets,
-            inst.ip,
-            values[lhs],
-            values[rhs],
+            ctx,
+            AotBinaryOp {
+                ip: inst.ip,
+                lhs: values[lhs],
+                rhs: values[rhs],
+            },
             true,
         ),
         AotSsaInstKind::IntShl { lhs, rhs } => b.ins().ishl(values[lhs], values[rhs]),
@@ -823,92 +975,90 @@ fn lower_aot_ssa_inst(
         AotSsaInstKind::BoolNot { input } => b.ins().icmp_imm(IntCC::Equal, values[input], 0),
         AotSsaInstKind::TaggedToInt { input } => aot_lower_tagged_to_int(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            inst.ip,
-            values[input],
+            ctx,
+            AotTaggedValueOp {
+                ip: inst.ip,
+                value: values[input],
+            },
         )?,
         AotSsaInstKind::TaggedNumberToFloat { input } => aot_lower_tagged_number_to_float(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            inst.ip,
-            values[input],
+            ctx,
+            AotTaggedValueOp {
+                ip: inst.ip,
+                value: values[input],
+            },
         )?,
         AotSsaInstKind::IntToFloat { input } => b.ins().fcvt_from_sint(types::F64, values[input]),
         AotSsaInstKind::IntNeg { input } => b.ins().ineg(values[input]),
         AotSsaInstKind::FloatNeg { input } => b.ins().fneg(values[input]),
-        AotSsaInstKind::IntCmpEq { lhs, rhs } => b.ins().icmp(IntCC::Equal, values[lhs], values[rhs]),
+        AotSsaInstKind::IntCmpEq { lhs, rhs } => {
+            b.ins().icmp(IntCC::Equal, values[lhs], values[rhs])
+        }
         AotSsaInstKind::IntCmpLt { lhs, rhs } => {
-            b.ins().icmp(IntCC::SignedLessThan, values[lhs], values[rhs])
+            b.ins()
+                .icmp(IntCC::SignedLessThan, values[lhs], values[rhs])
         }
         AotSsaInstKind::IntCmpGt { lhs, rhs } => {
-            b.ins().icmp(IntCC::SignedGreaterThan, values[lhs], values[rhs])
+            b.ins()
+                .icmp(IntCC::SignedGreaterThan, values[lhs], values[rhs])
         }
-        AotSsaInstKind::BoolCmpEq { lhs, rhs } => b.ins().icmp(IntCC::Equal, values[lhs], values[rhs]),
+        AotSsaInstKind::BoolCmpEq { lhs, rhs } => {
+            b.ins().icmp(IntCC::Equal, values[lhs], values[rhs])
+        }
         AotSsaInstKind::TaggedCmpEq { lhs, rhs } => aot_lower_tagged_eq(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            helper_refs,
-            helper_addrs,
-            inst.ip,
-            values[lhs],
-            values[rhs],
+            ctx,
+            AotBinaryOp {
+                ip: inst.ip,
+                lhs: values[lhs],
+                rhs: values[rhs],
+            },
         )?,
         AotSsaInstKind::StringCmpEq { lhs, rhs } => aot_lower_tagged_bytes_eq(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            inst.ip,
-            values[lhs],
-            values[rhs],
+            ctx,
+            AotBinaryOp {
+                ip: inst.ip,
+                lhs: values[lhs],
+                rhs: values[rhs],
+            },
             layout.value.string_tag,
         )?,
         AotSsaInstKind::BytesCmpEq { lhs, rhs } => aot_lower_tagged_bytes_eq(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            inst.ip,
-            values[lhs],
-            values[rhs],
+            ctx,
+            AotBinaryOp {
+                ip: inst.ip,
+                lhs: values[lhs],
+                rhs: values[rhs],
+            },
             layout.value.bytes_tag,
         )?,
         AotSsaInstKind::NullCmpEq { lhs, rhs } => aot_lower_null_eq(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            inst.ip,
+            ctx,
+            AotBinaryOp {
+                ip: inst.ip,
+                lhs: values[lhs],
+                rhs: values[rhs],
+            },
+        )?,
+        AotSsaInstKind::FloatCmpEq { lhs, rhs } => b.ins().fcmp(
+            cranelift_codegen::ir::condcodes::FloatCC::Equal,
             values[lhs],
             values[rhs],
-        )?,
-        AotSsaInstKind::FloatCmpEq { lhs, rhs } => {
-            b.ins().fcmp(cranelift_codegen::ir::condcodes::FloatCC::Equal, values[lhs], values[rhs])
-        }
-        AotSsaInstKind::FloatCmpLt { lhs, rhs } => {
-            b.ins().fcmp(cranelift_codegen::ir::condcodes::FloatCC::LessThan, values[lhs], values[rhs])
-        }
-        AotSsaInstKind::FloatCmpGt { lhs, rhs } => {
-            b.ins().fcmp(cranelift_codegen::ir::condcodes::FloatCC::GreaterThan, values[lhs], values[rhs])
-        }
+        ),
+        AotSsaInstKind::FloatCmpLt { lhs, rhs } => b.ins().fcmp(
+            cranelift_codegen::ir::condcodes::FloatCC::LessThan,
+            values[lhs],
+            values[rhs],
+        ),
+        AotSsaInstKind::FloatCmpGt { lhs, rhs } => b.ins().fcmp(
+            cranelift_codegen::ir::condcodes::FloatCC::GreaterThan,
+            values[lhs],
+            values[rhs],
+        ),
     };
     Ok(value)
 }
@@ -985,7 +1135,11 @@ fn lower_aot_ssa_terminator(
                 &ssa_block_args(false_args),
             );
         }
-        AotSsaTerminator::CallBoundary { call, stack, locals } => {
+        AotSsaTerminator::CallBoundary {
+            call,
+            stack,
+            locals,
+        } => {
             materialize_state_to_vm(
                 b,
                 vm_ptr,
@@ -1017,12 +1171,14 @@ fn lower_aot_ssa_terminator(
                 helper_refs.helper_ref,
                 helper_offset,
                 pointer_type,
-                op,
-                i64::from(call.index),
-                i64::from(call.argc),
-                i64::try_from(call.call_ip).map_err(|_| {
-                    AotCompileError::Codegen("call ip does not fit i64".to_string())
-                })?,
+                AotStepHelperArgs {
+                    op,
+                    a: i64::from(call.index),
+                    b_arg: i64::from(call.argc),
+                    c: i64::try_from(call.call_ip).map_err(|_| {
+                        AotCompileError::Codegen("call ip does not fit i64".to_string())
+                    })?,
+                },
             )?;
             let is_continue = b
                 .ins()
@@ -1061,7 +1217,9 @@ fn lower_aot_ssa_terminator(
                 values,
                 *ip,
             )?;
-            let halted = b.ins().iconst(types::I32, crate::vm::native::STATUS_HALTED as i64);
+            let halted = b
+                .ins()
+                .iconst(types::I32, crate::vm::native::STATUS_HALTED as i64);
             jump_with_status(b, exit_block, halted);
         }
         AotSsaTerminator::Stop { ip } => {
@@ -1070,8 +1228,9 @@ fn lower_aot_ssa_terminator(
                 vm_ptr,
                 pointer_type,
                 offsets.vm_ip,
-                i64::try_from(*ip)
-                    .map_err(|_| AotCompileError::Codegen("stop ip does not fit i64".to_string()))?,
+                i64::try_from(*ip).map_err(|_| {
+                    AotCompileError::Codegen("stop ip does not fit i64".to_string())
+                })?,
             );
             let status = b.ins().iconst(types::I32, STATUS_ERROR as i64);
             jump_with_status(b, exit_block, status);
@@ -1178,11 +1337,9 @@ fn owned_value_temp_slot_addr(
     temps: &AotOwnedValueTemps,
     key: AotTempValueSlotKey,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
-    let slot = temps
-        .slots
-        .get(&key)
-        .copied()
-        .ok_or_else(|| AotCompileError::Codegen(format!("AOT temp value slot missing for {key:?}")))?;
+    let slot = temps.slots.get(&key).copied().ok_or_else(|| {
+        AotCompileError::Codegen(format!("AOT temp value slot missing for {key:?}"))
+    })?;
     Ok(b.ins().stack_addr(pointer_type, slot, 0))
 }
 
@@ -1241,28 +1398,33 @@ fn aot_emit_error_status(
 #[cfg(feature = "cranelift-jit")]
 fn aot_load_checked_heap_ptr(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::ValueLayout,
-    offsets: crate::vm::native::ResolvedOffsets,
-    ip: usize,
-    tagged_value: cranelift_codegen::ir::Value,
+    ctx: AotLowerCtx<'_>,
+    operand: AotTaggedValueOp,
     expected_tag: u32,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotLowerCtx {
+        vm_ptr,
+        exit_block,
+        pointer_type,
+        layout,
+        offsets,
+        ..
+    } = ctx;
+    let AotTaggedValueOp {
+        ip,
+        value: tagged_value,
+    } = operand;
     let ok = b.create_block();
     let fail = b.create_block();
     let cont = b.create_block();
     b.append_block_param(cont, pointer_type);
 
-    let tag = ssa_load_tag_i32(b, layout, tagged_value);
-    let matches = b
-        .ins()
-        .icmp_imm(IntCC::Equal, tag, i64::from(expected_tag));
+    let tag = ssa_load_tag_i32(b, layout.value, tagged_value);
+    let matches = b.ins().icmp_imm(IntCC::Equal, tag, i64::from(expected_tag));
     b.ins().brif(matches, ok, &[], fail, &[]);
 
     b.switch_to_block(ok);
-    let raw = ssa_load_heap_ptr(b, layout, tagged_value, pointer_type);
+    let raw = ssa_load_heap_ptr(b, layout.value, tagged_value, pointer_type);
     b.ins().jump(cont, &[BlockArg::Value(raw)]);
 
     b.switch_to_block(fail);
@@ -1275,14 +1437,21 @@ fn aot_load_checked_heap_ptr(
 #[cfg(feature = "cranelift-jit")]
 fn aot_lower_tagged_to_int(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: crate::vm::native::ResolvedOffsets,
-    ip: usize,
-    tagged_value: cranelift_codegen::ir::Value,
+    ctx: AotLowerCtx<'_>,
+    operand: AotTaggedValueOp,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotLowerCtx {
+        vm_ptr,
+        exit_block,
+        pointer_type,
+        layout,
+        offsets,
+        ..
+    } = ctx;
+    let AotTaggedValueOp {
+        ip,
+        value: tagged_value,
+    } = operand;
     let ok = b.create_block();
     let fail = b.create_block();
     let cont = b.create_block();
@@ -1313,14 +1482,21 @@ fn aot_lower_tagged_to_int(
 #[cfg(feature = "cranelift-jit")]
 fn aot_lower_tagged_number_to_float(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: crate::vm::native::ResolvedOffsets,
-    ip: usize,
-    tagged_value: cranelift_codegen::ir::Value,
+    ctx: AotLowerCtx<'_>,
+    operand: AotTaggedValueOp,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotLowerCtx {
+        vm_ptr,
+        exit_block,
+        pointer_type,
+        layout,
+        offsets,
+        ..
+    } = ctx;
+    let AotTaggedValueOp {
+        ip,
+        value: tagged_value,
+    } = operand;
     let check_float = b.create_block();
     let int_ok = b.create_block();
     let float_ok = b.create_block();
@@ -1369,25 +1545,13 @@ fn aot_lower_tagged_number_to_float(
 #[cfg(feature = "cranelift-jit")]
 fn aot_lower_string_len(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: crate::vm::native::ResolvedOffsets,
-    ip: usize,
-    text: cranelift_codegen::ir::Value,
+    ctx: AotLowerCtx<'_>,
+    operand: AotTaggedValueOp,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
-    let string_raw = aot_load_checked_heap_ptr(
-        b,
-        vm_ptr,
-        exit_block,
-        pointer_type,
-        layout.value,
-        offsets,
-        ip,
-        text,
-        layout.value.string_tag,
-    )?;
+    let AotLowerCtx {
+        pointer_type, layout, ..
+    } = ctx;
+    let string_raw = aot_load_checked_heap_ptr(b, ctx, operand, layout.value.string_tag)?;
     let string_data = ssa_load_heap_data_ptr(b, layout.value, string_raw);
     let bytes_ptr = b.ins().load(
         pointer_type,
@@ -1445,25 +1609,13 @@ fn aot_lower_string_len(
 #[cfg(feature = "cranelift-jit")]
 fn aot_lower_bytes_len(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: crate::vm::native::ResolvedOffsets,
-    ip: usize,
-    bytes: cranelift_codegen::ir::Value,
+    ctx: AotLowerCtx<'_>,
+    operand: AotTaggedValueOp,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
-    let bytes_raw = aot_load_checked_heap_ptr(
-        b,
-        vm_ptr,
-        exit_block,
-        pointer_type,
-        layout.value,
-        offsets,
-        ip,
-        bytes,
-        layout.value.bytes_tag,
-    )?;
+    let AotLowerCtx {
+        pointer_type, layout, ..
+    } = ctx;
+    let bytes_raw = aot_load_checked_heap_ptr(b, ctx, operand, layout.value.bytes_tag)?;
     let vec_ptr = ssa_load_heap_data_ptr(b, layout.value, bytes_raw);
     Ok(b.ins().load(
         pointer_type,
@@ -1476,24 +1628,22 @@ fn aot_lower_bytes_len(
 #[cfg(feature = "cranelift-jit")]
 fn aot_lower_bytes_get(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: crate::vm::native::ResolvedOffsets,
-    ip: usize,
-    bytes: cranelift_codegen::ir::Value,
-    index: cranelift_codegen::ir::Value,
+    ctx: AotLowerCtx<'_>,
+    op: AotBytesIndexOp,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
-    let bytes_raw = aot_load_checked_heap_ptr(
-        b,
+    let AotLowerCtx {
         vm_ptr,
         exit_block,
         pointer_type,
-        layout.value,
+        layout,
         offsets,
-        ip,
-        bytes,
+        ..
+    } = ctx;
+    let AotBytesIndexOp { ip, bytes, index } = op;
+    let bytes_raw = aot_load_checked_heap_ptr(
+        b,
+        ctx,
+        AotTaggedValueOp { ip, value: bytes },
         layout.value.bytes_tag,
     )?;
     let vec_ptr = ssa_load_heap_data_ptr(b, layout.value, bytes_raw);
@@ -1532,24 +1682,19 @@ fn aot_lower_bytes_get(
 #[cfg(feature = "cranelift-jit")]
 fn aot_lower_bytes_has(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: crate::vm::native::ResolvedOffsets,
-    ip: usize,
-    bytes: cranelift_codegen::ir::Value,
-    index: cranelift_codegen::ir::Value,
+    ctx: AotLowerCtx<'_>,
+    op: AotBytesIndexOp,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotLowerCtx {
+        layout,
+        pointer_type,
+        ..
+    } = ctx;
+    let AotBytesIndexOp { ip, bytes, index } = op;
     let bytes_raw = aot_load_checked_heap_ptr(
         b,
-        vm_ptr,
-        exit_block,
-        pointer_type,
-        layout.value,
-        offsets,
-        ip,
-        bytes,
+        ctx,
+        AotTaggedValueOp { ip, value: bytes },
         layout.value.bytes_tag,
     )?;
     let vec_ptr = ssa_load_heap_data_ptr(b, layout.value, bytes_raw);
@@ -1565,15 +1710,18 @@ fn aot_lower_bytes_has(
 #[cfg(feature = "cranelift-jit")]
 fn aot_lower_int_divrem(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    offsets: crate::vm::native::ResolvedOffsets,
-    ip: usize,
-    lhs: cranelift_codegen::ir::Value,
-    rhs: cranelift_codegen::ir::Value,
+    ctx: AotLowerCtx<'_>,
+    op: AotBinaryOp,
     is_mod: bool,
 ) -> cranelift_codegen::ir::Value {
+    let AotLowerCtx {
+        vm_ptr,
+        exit_block,
+        pointer_type,
+        offsets,
+        ..
+    } = ctx;
+    let AotBinaryOp { ip, lhs, rhs } = op;
     let non_zero = b.ins().icmp_imm(IntCC::NotEqual, rhs, 0);
     let check_overflow = b.create_block();
     let fail = b.create_block();
@@ -1606,17 +1754,19 @@ fn aot_lower_int_divrem(
 #[cfg(feature = "cranelift-jit")]
 fn aot_lower_tagged_eq(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    _layout: crate::vm::native::NativeStackLayout,
-    offsets: crate::vm::native::ResolvedOffsets,
-    helper_refs: AotDeoptHelperRefs,
-    helper_addrs: AotDeoptHelperAddrs,
-    ip: usize,
-    lhs: cranelift_codegen::ir::Value,
-    rhs: cranelift_codegen::ir::Value,
+    ctx: AotLowerCtx<'_>,
+    op: AotBinaryOp,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotLowerCtx {
+        vm_ptr,
+        exit_block,
+        pointer_type,
+        offsets,
+        helper_refs,
+        helper_addrs,
+        ..
+    } = ctx;
+    let AotBinaryOp { ip, lhs, rhs } = op;
     let helper_ptr = iconst_ptr_from_addr(b, pointer_type, helper_addrs.value_eq)?;
     let call = b
         .ins()
@@ -1645,36 +1795,24 @@ fn aot_lower_tagged_eq(
 #[cfg(feature = "cranelift-jit")]
 fn aot_lower_tagged_bytes_eq(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: crate::vm::native::ResolvedOffsets,
-    ip: usize,
-    lhs: cranelift_codegen::ir::Value,
-    rhs: cranelift_codegen::ir::Value,
+    ctx: AotLowerCtx<'_>,
+    op: AotBinaryOp,
     expected_tag: u32,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotLowerCtx {
+        pointer_type, layout, ..
+    } = ctx;
+    let AotBinaryOp { ip, lhs, rhs } = op;
     let lhs_raw = aot_load_checked_heap_ptr(
         b,
-        vm_ptr,
-        exit_block,
-        pointer_type,
-        layout.value,
-        offsets,
-        ip,
-        lhs,
+        ctx,
+        AotTaggedValueOp { ip, value: lhs },
         expected_tag,
     )?;
     let rhs_raw = aot_load_checked_heap_ptr(
         b,
-        vm_ptr,
-        exit_block,
-        pointer_type,
-        layout.value,
-        offsets,
-        ip,
-        rhs,
+        ctx,
+        AotTaggedValueOp { ip, value: rhs },
         expected_tag,
     )?;
     let lhs_data = ssa_load_heap_data_ptr(b, layout.value, lhs_raw);
@@ -1714,13 +1852,21 @@ fn aot_lower_tagged_bytes_eq(
     let zero = b.ins().iconst(pointer_type, 0);
     let one = b.ins().iconst(types::I8, 1);
     let zero_bool = b.ins().iconst(types::I8, 0);
-    b.ins()
-        .brif(same_len, loop_block, &[BlockArg::Value(zero)], done_block, &[BlockArg::Value(zero_bool)]);
+    b.ins().brif(
+        same_len,
+        loop_block,
+        &[BlockArg::Value(zero)],
+        done_block,
+        &[BlockArg::Value(zero_bool)],
+    );
 
     b.switch_to_block(loop_block);
     let index = b.block_params(loop_block)[0];
-    let done = b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, index, lhs_len);
-    b.ins().brif(done, done_block, &[BlockArg::Value(one)], step_block, &[]);
+    let done = b
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, index, lhs_len);
+    b.ins()
+        .brif(done, done_block, &[BlockArg::Value(one)], step_block, &[]);
 
     b.switch_to_block(step_block);
     let lhs_byte_ptr = b.ins().iadd(lhs_ptr, index);
@@ -1728,7 +1874,13 @@ fn aot_lower_tagged_bytes_eq(
     let lhs_byte = ssa_load_byte(b, lhs_byte_ptr);
     let rhs_byte = ssa_load_byte(b, rhs_byte_ptr);
     let equal = b.ins().icmp(IntCC::Equal, lhs_byte, rhs_byte);
-    b.ins().brif(equal, false_block, &[], done_block, &[BlockArg::Value(zero_bool)]);
+    b.ins().brif(
+        equal,
+        false_block,
+        &[],
+        done_block,
+        &[BlockArg::Value(zero_bool)],
+    );
 
     b.switch_to_block(false_block);
     let next_index = b.ins().iadd_imm(index, 1);
@@ -1741,15 +1893,18 @@ fn aot_lower_tagged_bytes_eq(
 #[cfg(feature = "cranelift-jit")]
 fn aot_lower_null_eq(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: crate::vm::native::ResolvedOffsets,
-    ip: usize,
-    lhs: cranelift_codegen::ir::Value,
-    rhs: cranelift_codegen::ir::Value,
+    ctx: AotLowerCtx<'_>,
+    op: AotBinaryOp,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotLowerCtx {
+        vm_ptr,
+        exit_block,
+        pointer_type,
+        layout,
+        offsets,
+        ..
+    } = ctx;
+    let AotBinaryOp { ip, lhs, rhs } = op;
     let lhs_tag = ssa_load_tag_i32(b, layout.value, lhs);
     let rhs_tag = ssa_load_tag_i32(b, layout.value, rhs);
     let lhs_null = b
@@ -1779,30 +1934,31 @@ fn aot_lower_null_eq(
 #[cfg(feature = "cranelift-jit")]
 fn aot_lower_string_get(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: crate::vm::native::ResolvedOffsets,
-    heap_refs: HeapIntrinsicRefs,
-    heap_addrs: HeapIntrinsicAddrs,
-    helper_refs: AotDeoptHelperRefs,
-    helper_addrs: AotDeoptHelperAddrs,
-    owned_value_temps: &AotOwnedValueTemps,
-    output_id: AotSsaValueId,
-    ip: usize,
-    text: cranelift_codegen::ir::Value,
-    index: cranelift_codegen::ir::Value,
+    ctx: AotLowerCtx<'_>,
+    op: AotStringGetOp,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
-    let string_raw = aot_load_checked_heap_ptr(
-        b,
+    let AotLowerCtx {
         vm_ptr,
         exit_block,
         pointer_type,
-        layout.value,
+        layout,
         offsets,
+        heap_refs,
+        heap_addrs,
+        helper_refs,
+        helper_addrs,
+        owned_value_temps,
+    } = ctx;
+    let AotStringGetOp {
+        output_id,
         ip,
         text,
+        index,
+    } = op;
+    let string_raw = aot_load_checked_heap_ptr(
+        b,
+        ctx,
+        AotTaggedValueOp { ip, value: text },
         layout.value.string_tag,
     )?;
     let string_data = ssa_load_heap_data_ptr(b, layout.value, string_raw);
@@ -1906,43 +2062,39 @@ fn aot_lower_string_get(
 #[cfg(feature = "cranelift-jit")]
 fn aot_lower_concat(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: crate::vm::native::ResolvedOffsets,
-    heap_refs: HeapIntrinsicRefs,
-    heap_addrs: HeapIntrinsicAddrs,
-    helper_refs: AotDeoptHelperRefs,
-    helper_addrs: AotDeoptHelperAddrs,
-    owned_value_temps: &AotOwnedValueTemps,
-    output_id: AotSsaValueId,
-    ip: usize,
-    lhs: cranelift_codegen::ir::Value,
-    rhs: cranelift_codegen::ir::Value,
-    result_tag: u32,
-    pack_addr: usize,
+    ctx: AotLowerCtx<'_>,
+    op: AotConcatOp,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
-    let lhs_raw = aot_load_checked_heap_ptr(
-        b,
+    let AotLowerCtx {
         vm_ptr,
         exit_block,
         pointer_type,
-        layout.value,
+        layout,
         offsets,
+        heap_refs,
+        heap_addrs,
+        helper_refs,
+        helper_addrs,
+        owned_value_temps,
+    } = ctx;
+    let AotConcatOp {
+        output_id,
         ip,
         lhs,
+        rhs,
+        result_tag,
+        pack_addr,
+    } = op;
+    let lhs_raw = aot_load_checked_heap_ptr(
+        b,
+        ctx,
+        AotTaggedValueOp { ip, value: lhs },
         result_tag,
     )?;
     let rhs_raw = aot_load_checked_heap_ptr(
         b,
-        vm_ptr,
-        exit_block,
-        pointer_type,
-        layout.value,
-        offsets,
-        ip,
-        rhs,
+        ctx,
+        AotTaggedValueOp { ip, value: rhs },
         result_tag,
     )?;
     let lhs_data = ssa_load_heap_data_ptr(b, layout.value, lhs_raw);
@@ -2046,31 +2198,31 @@ fn aot_lower_concat(
 #[cfg(feature = "cranelift-jit")]
 fn aot_lower_string_slice(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: crate::vm::native::ResolvedOffsets,
-    heap_refs: HeapIntrinsicRefs,
-    heap_addrs: HeapIntrinsicAddrs,
-    helper_refs: AotDeoptHelperRefs,
-    helper_addrs: AotDeoptHelperAddrs,
-    owned_value_temps: &AotOwnedValueTemps,
-    output_id: AotSsaValueId,
-    ip: usize,
-    text: cranelift_codegen::ir::Value,
-    start: cranelift_codegen::ir::Value,
-    length: cranelift_codegen::ir::Value,
+    ctx: AotLowerCtx<'_>,
+    op: AotSliceOp,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotLowerCtx {
+        heap_refs,
+        heap_addrs,
+        helper_refs,
+        helper_addrs,
+        owned_value_temps,
+        ..
+    } = ctx;
+    let AotSliceOp {
+        output_id,
+        ip,
+        value: text,
+        start,
+        length,
+    } = op;
+    let AotLowerCtx {
+        pointer_type, layout, ..
+    } = ctx;
     let string_raw = aot_load_checked_heap_ptr(
         b,
-        vm_ptr,
-        exit_block,
-        pointer_type,
-        layout.value,
-        offsets,
-        ip,
-        text,
+        ctx,
+        AotTaggedValueOp { ip, value: text },
         layout.value.string_tag,
     )?;
     let string_data = ssa_load_heap_data_ptr(b, layout.value, string_raw);
@@ -2235,31 +2387,31 @@ fn aot_lower_string_slice(
 #[cfg(feature = "cranelift-jit")]
 fn aot_lower_bytes_slice(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: crate::vm::native::ResolvedOffsets,
-    heap_refs: HeapIntrinsicRefs,
-    heap_addrs: HeapIntrinsicAddrs,
-    helper_refs: AotDeoptHelperRefs,
-    helper_addrs: AotDeoptHelperAddrs,
-    owned_value_temps: &AotOwnedValueTemps,
-    output_id: AotSsaValueId,
-    ip: usize,
-    bytes: cranelift_codegen::ir::Value,
-    start: cranelift_codegen::ir::Value,
-    length: cranelift_codegen::ir::Value,
+    ctx: AotLowerCtx<'_>,
+    op: AotSliceOp,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotLowerCtx {
+        heap_refs,
+        heap_addrs,
+        helper_refs,
+        helper_addrs,
+        owned_value_temps,
+        ..
+    } = ctx;
+    let AotSliceOp {
+        output_id,
+        ip,
+        value: bytes,
+        start,
+        length,
+    } = op;
+    let AotLowerCtx {
+        pointer_type, layout, ..
+    } = ctx;
     let bytes_raw = aot_load_checked_heap_ptr(
         b,
-        vm_ptr,
-        exit_block,
-        pointer_type,
-        layout.value,
-        offsets,
-        ip,
-        bytes,
+        ctx,
+        AotTaggedValueOp { ip, value: bytes },
         layout.value.bytes_tag,
     )?;
     let bytes_data = ssa_load_heap_data_ptr(b, layout.value, bytes_raw);
@@ -2357,29 +2509,30 @@ fn aot_lower_bytes_slice(
 #[cfg(feature = "cranelift-jit")]
 fn aot_lower_bytes_from_array_u8(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: crate::vm::native::ResolvedOffsets,
-    heap_refs: HeapIntrinsicRefs,
-    heap_addrs: HeapIntrinsicAddrs,
-    helper_refs: AotDeoptHelperRefs,
-    helper_addrs: AotDeoptHelperAddrs,
-    owned_value_temps: &AotOwnedValueTemps,
-    output_id: AotSsaValueId,
-    ip: usize,
-    array: cranelift_codegen::ir::Value,
+    ctx: AotLowerCtx<'_>,
+    op: AotArrayConvertOp,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
-    let array_raw = aot_load_checked_heap_ptr(
-        b,
+    let AotLowerCtx {
         vm_ptr,
         exit_block,
         pointer_type,
-        layout.value,
+        layout,
         offsets,
+        heap_refs,
+        heap_addrs,
+        helper_refs,
+        helper_addrs,
+        owned_value_temps,
+    } = ctx;
+    let AotArrayConvertOp {
+        output_id,
         ip,
-        array,
+        value: array,
+    } = op;
+    let array_raw = aot_load_checked_heap_ptr(
+        b,
+        ctx,
+        AotTaggedValueOp { ip, value: array },
         layout.value.array_tag,
     )?;
     let array_data = ssa_load_heap_data_ptr(b, layout.value, array_raw);
@@ -2424,14 +2577,17 @@ fn aot_lower_bytes_from_array_u8(
     b.ins().brif(done, validated, &[], validate_step, &[]);
 
     b.switch_to_block(validate_step);
-    let element_addr =
-        ssa_value_addr(b, pointer_type, values_ptr, validate_index, layout.value.size);
-    let element_tag = ssa_load_tag_i32(b, layout.value, element_addr);
-    let is_int = b.ins().icmp_imm(
-        IntCC::Equal,
-        element_tag,
-        i64::from(layout.value.int_tag),
+    let element_addr = ssa_value_addr(
+        b,
+        pointer_type,
+        values_ptr,
+        validate_index,
+        layout.value.size,
     );
+    let element_tag = ssa_load_tag_i32(b, layout.value, element_addr);
+    let is_int = b
+        .ins()
+        .icmp_imm(IntCC::Equal, element_tag, i64::from(layout.value.int_tag));
     let int_ok = b.create_block();
     b.ins().brif(is_int, int_ok, &[], fail, &[]);
 
@@ -2472,8 +2628,7 @@ fn aot_lower_bytes_from_array_u8(
     b.ins().brif(copy_done, finish, &[], copy_step, &[]);
 
     b.switch_to_block(copy_step);
-    let element_addr =
-        ssa_value_addr(b, pointer_type, values_ptr, copy_index, layout.value.size);
+    let element_addr = ssa_value_addr(b, pointer_type, values_ptr, copy_index, layout.value.size);
     let value = b.ins().load(
         types::I64,
         MemFlags::new(),
@@ -2510,29 +2665,30 @@ fn aot_lower_bytes_from_array_u8(
 #[cfg(feature = "cranelift-jit")]
 fn aot_lower_bytes_to_array_u8(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: crate::vm::native::ResolvedOffsets,
-    heap_refs: HeapIntrinsicRefs,
-    heap_addrs: HeapIntrinsicAddrs,
-    helper_refs: AotDeoptHelperRefs,
-    helper_addrs: AotDeoptHelperAddrs,
-    owned_value_temps: &AotOwnedValueTemps,
-    output_id: AotSsaValueId,
-    ip: usize,
-    bytes: cranelift_codegen::ir::Value,
+    ctx: AotLowerCtx<'_>,
+    op: AotArrayConvertOp,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
-    let bytes_raw = aot_load_checked_heap_ptr(
-        b,
+    let AotLowerCtx {
         vm_ptr,
         exit_block,
         pointer_type,
-        layout.value,
+        layout,
         offsets,
+        heap_refs,
+        heap_addrs,
+        helper_refs,
+        helper_addrs,
+        owned_value_temps,
+    } = ctx;
+    let AotArrayConvertOp {
+        output_id,
         ip,
-        bytes,
+        value: bytes,
+    } = op;
+    let bytes_raw = aot_load_checked_heap_ptr(
+        b,
+        ctx,
+        AotTaggedValueOp { ip, value: bytes },
         layout.value.bytes_tag,
     )?;
     let bytes_data = ssa_load_heap_data_ptr(b, layout.value, bytes_raw);
@@ -2640,10 +2796,17 @@ fn resolve_jump_args(
                 .get(value_id)
                 .copied()
                 .ok_or_else(|| AotCompileError::Codegen("missing jump arg value".to_string()))?;
-            let src_repr = *value_reprs.get(value_id).ok_or_else(|| {
-                AotCompileError::Codegen("missing jump arg repr".to_string())
-            })?;
-            adapt_jump_arg(b, pointer_type, value_layout, value, src_repr, param.value.repr)
+            let src_repr = *value_reprs
+                .get(value_id)
+                .ok_or_else(|| AotCompileError::Codegen("missing jump arg repr".to_string()))?;
+            adapt_jump_arg(
+                b,
+                pointer_type,
+                value_layout,
+                value,
+                src_repr,
+                param.value.repr,
+            )
         })
         .collect()
 }
@@ -2720,38 +2883,38 @@ fn materialize_state_to_vm(
     values: &HashMap<AotSsaValueId, cranelift_codegen::ir::Value>,
     ip: usize,
 ) -> Result<(), AotCompileError> {
+    let materialize_ctx = AotMaterializeCtx {
+        exit_block,
+        pointer_type,
+        value_layout: layout.value,
+        helper_refs,
+        helper_addrs,
+        values,
+    };
     let stack_ptr = alloc_value_buffer(b, pointer_type, stack.len(), layout.value.size)?;
     for (index, materialization) in stack.iter().enumerate() {
-        let dst = value_buffer_slot_addr(b, pointer_type, stack_ptr, index, layout.value.size, "stack")?;
-        materialize_slot(
+        let dst = value_buffer_slot_addr(
             b,
-            exit_block,
             pointer_type,
-            layout.value,
-            helper_refs,
-            helper_addrs,
-            materialization,
-            values,
-            dst,
+            stack_ptr,
+            index,
+            layout.value.size,
             "stack",
         )?;
+        materialize_slot(b, materialize_ctx, materialization, dst, "stack")?;
     }
 
     let locals_ptr = alloc_value_buffer(b, pointer_type, locals.len(), layout.value.size)?;
     for (index, materialization) in locals.iter().enumerate() {
-        let dst = value_buffer_slot_addr(b, pointer_type, locals_ptr, index, layout.value.size, "local")?;
-        materialize_slot(
+        let dst = value_buffer_slot_addr(
             b,
-            exit_block,
             pointer_type,
-            layout.value,
-            helper_refs,
-            helper_addrs,
-            materialization,
-            values,
-            dst,
+            locals_ptr,
+            index,
+            layout.value.size,
             "local",
         )?;
+        materialize_slot(b, materialize_ctx, materialization, dst, "local")?;
     }
 
     let null_ptr = b.ins().iconst(pointer_type, 0);
@@ -2789,16 +2952,19 @@ fn materialize_state_to_vm(
 #[cfg(feature = "cranelift-jit")]
 fn materialize_slot(
     b: &mut FunctionBuilder,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    value_layout: crate::vm::native::ValueLayout,
-    helper_refs: AotDeoptHelperRefs,
-    helper_addrs: AotDeoptHelperAddrs,
+    ctx: AotMaterializeCtx<'_>,
     materialization: &AotSsaMaterialization,
-    values: &HashMap<AotSsaValueId, cranelift_codegen::ir::Value>,
     dst_addr: cranelift_codegen::ir::Value,
     slot_kind: &'static str,
 ) -> Result<(), AotCompileError> {
+    let AotMaterializeCtx {
+        exit_block,
+        pointer_type,
+        value_layout,
+        helper_refs,
+        helper_addrs,
+        values,
+    } = ctx;
     match materialization {
         AotSsaMaterialization::Value(value) => {
             let src = *values.get(value).ok_or_else(|| {
@@ -2814,27 +2980,27 @@ fn materialize_slot(
             )?;
         }
         AotSsaMaterialization::BoxInt(value) => {
-            let src = *values
-                .get(value)
-                .ok_or_else(|| AotCompileError::Codegen(format!("missing int {slot_kind} value")))?;
+            let src = *values.get(value).ok_or_else(|| {
+                AotCompileError::Codegen(format!("missing int {slot_kind} value"))
+            })?;
             ssa_store_int_in_value(b, value_layout, dst_addr, src);
         }
         AotSsaMaterialization::BoxFloat(value) => {
-            let src = *values
-                .get(value)
-                .ok_or_else(|| AotCompileError::Codegen(format!("missing float {slot_kind} value")))?;
+            let src = *values.get(value).ok_or_else(|| {
+                AotCompileError::Codegen(format!("missing float {slot_kind} value"))
+            })?;
             ssa_store_float_in_value(b, value_layout, dst_addr, src);
         }
         AotSsaMaterialization::BoxBool(value) => {
-            let src = *values
-                .get(value)
-                .ok_or_else(|| AotCompileError::Codegen(format!("missing bool {slot_kind} value")))?;
+            let src = *values.get(value).ok_or_else(|| {
+                AotCompileError::Codegen(format!("missing bool {slot_kind} value"))
+            })?;
             ssa_store_bool_in_value(b, value_layout, dst_addr, src);
         }
         AotSsaMaterialization::BoxHeapPtr { value, tag } => {
-            let src = *values
-                .get(value)
-                .ok_or_else(|| AotCompileError::Codegen(format!("missing heap {slot_kind} value")))?;
+            let src = *values.get(value).ok_or_else(|| {
+                AotCompileError::Codegen(format!("missing heap {slot_kind} value"))
+            })?;
             let tag = b.ins().iconst(types::I64, *tag as i64);
             call_status_helper(
                 b,
@@ -2907,9 +3073,8 @@ fn value_buffer_slot_addr(
     value_size: i32,
     slot_kind: &'static str,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
-    let base_ptr = base_ptr.ok_or_else(|| {
-        AotCompileError::Codegen(format!("missing {slot_kind} value buffer"))
-    })?;
+    let base_ptr = base_ptr
+        .ok_or_else(|| AotCompileError::Codegen(format!("missing {slot_kind} value buffer")))?;
     let index = b.ins().iconst(
         pointer_type,
         i64::try_from(index)
@@ -2976,7 +3141,8 @@ fn ssa_store_tag(
 ) {
     let ty = ssa_tag_type(layout);
     let raw = b.ins().iconst(ty, i64::from(tag));
-    b.ins().store(MemFlags::new(), raw, value_addr, layout.tag_offset);
+    b.ins()
+        .store(MemFlags::new(), raw, value_addr, layout.tag_offset);
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -3248,17 +3414,20 @@ fn call_step_helper(
     helper_ref: cranelift_codegen::ir::SigRef,
     helper_offset: i32,
     pointer_type: cranelift_codegen::ir::Type,
-    op: i64,
-    a: i64,
-    b_arg: i64,
-    c: i64,
+    args: AotStepHelperArgs,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotStepHelperArgs {
+        op,
+        a,
+        b_arg: arg_b,
+        c,
+    } = args;
     let helper_ptr = b
         .ins()
         .load(pointer_type, MemFlags::new(), vm_ptr, helper_offset);
     let op_val = b.ins().iconst(types::I64, op);
     let a_val = b.ins().iconst(types::I64, a);
-    let b_val = b.ins().iconst(types::I64, b_arg);
+    let b_val = b.ins().iconst(types::I64, arg_b);
     let c_val = b.ins().iconst(types::I64, c);
     let call = b.ins().call_indirect(
         helper_ref,
@@ -3293,5 +3462,5 @@ fn native_isa() -> Result<OwnedTargetIsa, AotCompileError> {
             .finish(settings::Flags::new(flag_builder))
             .map_err(|err| format!("failed to finalize cranelift ISA: {err}"))
     });
-    cached.clone().map_err(|err| AotCompileError::Codegen(err))
+    cached.clone().map_err(AotCompileError::Codegen)
 }

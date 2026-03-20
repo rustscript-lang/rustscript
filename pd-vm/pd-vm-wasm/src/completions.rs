@@ -1140,8 +1140,8 @@ mod tests {
             catalog
                 .javascript
                 .iter()
-                .any(|entry| entry.label == "math::sqrt"),
-            "expected RustScript builtin completion for math::sqrt",
+                .any(|entry| entry.label == "math.sqrt"),
+            "expected JavaScript builtin completion for math.sqrt",
         );
     }
 

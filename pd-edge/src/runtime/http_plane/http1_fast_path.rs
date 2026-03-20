@@ -1374,42 +1374,6 @@ async fn serve_http1_fast_connection<S>(
             None,
         )
         .await;
-        let delay_body_finalize = matches!(
-            &execution,
-            Ok((vm_context, ..)) if vm_context.native_default_upstream_http_forward_active()
-        );
-        if !delay_body_finalize && let Some(body_lease) = body_lease.take() {
-            match body_lease.finish().await {
-                Ok(returned) => connection.restore(returned),
-                Err((FastHttp1ReadError::Io(err), returned)) => {
-                    connection.restore(returned);
-                    warn!(
-                        "{} downstream http/1.1 request body finalize failed for {peer_addr}: {err}",
-                        category_program()
-                    );
-                    return;
-                }
-                Err((FastHttp1ReadError::BadRequest(message), returned)) => {
-                    connection.restore(returned);
-                    let response = fast_http1_error_response(StatusCode::BAD_REQUEST, &message);
-                    let _ = connection
-                        .write_response(&request_method, false, response)
-                        .await;
-                    return;
-                }
-                Err((FastHttp1ReadError::PayloadTooLarge, returned)) => {
-                    connection.restore(returned);
-                    let response = fast_http1_error_response(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        "request body exceeds fast http/1.1 limit",
-                    );
-                    let _ = connection
-                        .write_response(&request_method, false, response)
-                        .await;
-                    return;
-                }
-            }
-        }
         let (keep_alive, response_status) = match execution {
             Ok((vm_context, pre_vm_finished, after_vm)) => {
                 match resolve_http1_downstream_response(&vm_context).await {
@@ -1733,6 +1697,39 @@ async fn serve_http1_fast_connection<S>(
                 }
             }
             Err(response) => {
+                if let Some(body_lease) = body_lease.take() {
+                    match body_lease.finish().await {
+                        Ok(returned) => connection.restore(returned),
+                        Err((FastHttp1ReadError::Io(err), returned)) => {
+                            connection.restore(returned);
+                            warn!(
+                                "{} downstream http/1.1 request body finalize failed for {peer_addr}: {err}",
+                                category_program()
+                            );
+                            return;
+                        }
+                        Err((FastHttp1ReadError::BadRequest(message), returned)) => {
+                            connection.restore(returned);
+                            let response =
+                                fast_http1_error_response(StatusCode::BAD_REQUEST, &message);
+                            let _ = connection
+                                .write_response(&request_method, false, response)
+                                .await;
+                            return;
+                        }
+                        Err((FastHttp1ReadError::PayloadTooLarge, returned)) => {
+                            connection.restore(returned);
+                            let response = fast_http1_error_response(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "request body exceeds fast http/1.1 limit",
+                            );
+                            let _ = connection
+                                .write_response(&request_method, false, response)
+                                .await;
+                            return;
+                        }
+                    }
+                }
                 let response = finalize_data_plane_response(&state, started, response, 0);
                 let response_status = response.status();
                 match connection

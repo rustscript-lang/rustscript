@@ -15,7 +15,7 @@ async fn sample_forward_proxy_program_tunnels_https_request_through_connect_prox
         .join("proxy")
         .join("forward")
         .join("sample_forward_proxy_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);

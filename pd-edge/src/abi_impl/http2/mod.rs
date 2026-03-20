@@ -6,12 +6,12 @@ pub(crate) use self::downstream::{
     DownstreamHttp2ConnectionTracker, Http2DownstreamStreamAttachment,
     SharedHttpDownstreamSessions, new_shared_http_downstream_sessions,
 };
-#[cfg(test)]
-pub(crate) use self::model::Http2SessionFrontier;
 pub(crate) use self::model::{
     Http2StreamRef, Http2UpstreamMode, response_version_label, select_upstream_mode,
     supports_response_version,
 };
+#[cfg(test)]
+pub(crate) use self::model::Http2SessionFrontier;
 #[cfg(all(test, feature = "http2"))]
 pub(crate) use self::upstream::total_active_streams;
 #[cfg(feature = "http2")]

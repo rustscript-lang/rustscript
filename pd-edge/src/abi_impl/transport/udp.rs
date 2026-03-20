@@ -465,7 +465,7 @@ async fn socket_send_binary_base64(
     let io = ensure_udp_socket_connected(&context, socket).await?;
     let sent = {
         let io = io.lock().await;
-        io.send(&bytes)
+        io.send(bytes.as_slice())
             .await
             .map_err(|err| VmError::HostError(format!("failed to send udp datagram: {err}")))?
     };
@@ -484,7 +484,7 @@ async fn socket_send_binary(
     let io = ensure_udp_socket_connected(&context, socket).await?;
     let sent = {
         let io = io.lock().await;
-        io.send(&bytes)
+        io.send(bytes)
             .await
             .map_err(|err| VmError::HostError(format!("failed to send udp datagram: {err}")))?
     };
@@ -532,7 +532,7 @@ async fn socket_recv_binary(
             .map_err(|err| VmError::HostError(format!("failed to receive udp datagram: {err}")))?
     };
     buffer.truncate(received);
-    Ok(CallOutcome::Return(vec![bytes_to_value(&buffer)]))
+    Ok(CallOutcome::Return(vec![bytes_to_value(buffer)]))
 }
 
 /// Closes the UDP socket.

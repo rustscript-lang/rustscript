@@ -704,22 +704,22 @@ async fn read_next_packet(
             return Ok(Some(packet));
         }
 
-        if let Some(keep_alive_wait) = keep_alive_read_wait(context, connection)? {
-            if keep_alive_wait.timeout.is_zero() {
-                if keep_alive_wait.ping_response_pending {
-                    let message =
-                        "mqtt keepalive expired while waiting for broker activity".to_string();
-                    with_connection_state_mut(context, connection, |state| {
-                        state.pending_read_buffer = buffer;
-                        state.mark_failed(message.clone());
-                        Ok(())
-                    })?;
-                    close_connection_carrier(context, connection, Some(&message)).await?;
-                    return Ok(None);
-                }
-                write_connection_ping_request(context, connection).await?;
-                continue;
+        if let Some(keep_alive_wait) = keep_alive_read_wait(context, connection)?
+            && keep_alive_wait.timeout.is_zero()
+        {
+            if keep_alive_wait.ping_response_pending {
+                let message =
+                    "mqtt keepalive expired while waiting for broker activity".to_string();
+                with_connection_state_mut(context, connection, |state| {
+                    state.pending_read_buffer = buffer;
+                    state.mark_failed(message.clone());
+                    Ok(())
+                })?;
+                close_connection_carrier(context, connection, Some(&message)).await?;
+                return Ok(None);
             }
+            write_connection_ping_request(context, connection).await?;
+            continue;
         }
 
         let keep_alive_wait = keep_alive_read_wait(context, connection)?;

@@ -14,8 +14,8 @@ use crate::vm::native::{
     alloc_value_buffer_entry_address, box_heap_value_signature, checked_add_i32,
     clear_value_slot_entry_address, clone_value_signature, clone_value_to_slot_entry_address,
     collection_get_signature, collection_predicate_signature, copy_bytes_entry_address,
-    copy_bytes_signature, detect_native_stack_layout, drop_shared_signature, entry_signature,
-    free_buffer_signature, init_null_value_slot_entry_address, jump_with_status,
+    copy_bytes_signature, detect_native_stack_layout, entry_signature, free_buffer_signature,
+    init_null_value_slot_entry_address, jump_with_status,
     map_get_entry_address, map_has_entry_address, pack_shared_signature, restore_exit_signature,
     restore_exit_state_entry_address, shared_array_from_buffer_entry_address,
     shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
@@ -37,6 +37,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static CRANELIFT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 static CRANELIFT_JIT_ISA: OnceLock<Result<OwnedTargetIsa, String>> = OnceLock::new();
+
+type TaggedConstants = (Box<[Value]>, HashMap<SsaValueId, usize>);
 
 pub(crate) struct CompiledTrace {
     pub(crate) entry: *const u8,
@@ -94,7 +96,6 @@ fn try_compile_ssa_trace(
     let alloc_buffer_sig = alloc_buffer_signature(pointer_type, call_conv);
     let free_buffer_sig = free_buffer_signature(pointer_type, call_conv);
     let pack_shared_sig = pack_shared_signature(pointer_type, call_conv);
-    let drop_shared_sig = drop_shared_signature(pointer_type, call_conv);
     let copy_bytes_sig = copy_bytes_signature(pointer_type, call_conv);
     let map_has_sig = collection_predicate_signature(pointer_type, call_conv);
     let map_get_sig = collection_get_signature(pointer_type, call_conv);
@@ -119,7 +120,6 @@ fn try_compile_ssa_trace(
             alloc_buffer_ref: b.import_signature(alloc_buffer_sig),
             free_buffer_ref: b.import_signature(free_buffer_sig),
             pack_shared_ref: b.import_signature(pack_shared_sig),
-            drop_shared_ref: b.import_signature(drop_shared_sig),
             copy_bytes_ref: b.import_signature(copy_bytes_sig),
         };
         let heap_addrs = HeapIntrinsicAddrs {
@@ -130,9 +130,6 @@ fn try_compile_ssa_trace(
             pack_array: shared_array_from_buffer_entry_address(),
             copy_bytes: copy_bytes_entry_address(),
             zero_bytes: zero_bytes_entry_address(),
-            drop_string: 0,
-            drop_bytes: 0,
-            drop_array: 0,
         };
         let deopt_refs = SsaDeoptHelperRefs {
             clone_value_ref: b.import_signature(clone_value_sig),
@@ -209,6 +206,20 @@ fn try_compile_ssa_trace(
         b.switch_to_block(entry_block);
         b.append_block_params_for_function_params(entry_block);
         let vm_ptr = b.block_params(entry_block)[0];
+        let lower_ctx = SsaLowerCtx {
+            vm_ptr,
+            exit_block,
+            pointer_type,
+            layout,
+            offsets,
+            heap_refs,
+            heap_addrs,
+            helper_refs: deopt_refs,
+            helper_addrs: deopt_addrs,
+            owned_value_temps: &owned_value_temps,
+            value_reprs: &value_reprs,
+            tagged_constant_addrs: &tagged_constant_addrs,
+        };
         let root_ip = b.ins().iconst(
             pointer_type,
             i64::try_from(trace.root_ip)
@@ -269,31 +280,11 @@ fn try_compile_ssa_trace(
                 );
             }
             for inst in &block.insts {
-                lower_ssa_inst(
-                    &mut b,
-                    vm_ptr,
-                    exit_block,
-                    pointer_type,
-                    layout,
-                    offsets,
-                    heap_refs,
-                    heap_addrs,
-                    deopt_refs,
-                    deopt_addrs,
-                    inst,
-                    &value_reprs,
-                    &tagged_constant_addrs,
-                    &owned_value_temps,
-                    &mut values,
-                )?;
+                lower_ssa_inst(&mut b, lower_ctx, inst, &mut values)?;
             }
             lower_ssa_terminator(
                 &mut b,
-                vm_ptr,
-                exit_block,
-                pointer_type,
-                layout,
-                offsets,
+                lower_ctx,
                 block.terminator.as_ref().ok_or_else(|| {
                     VmError::JitNative("SSA block missing terminator".to_string())
                 })?,
@@ -309,12 +300,7 @@ fn try_compile_ssa_trace(
                 .ok_or_else(|| VmError::JitNative("SSA exit lowering missing".to_string()))?;
             lower_ssa_exit_block(
                 &mut b,
-                vm_ptr,
-                exit_block,
-                pointer_type,
-                layout,
-                deopt_refs,
-                deopt_addrs,
+                lower_ctx,
                 exit,
                 spec,
                 false,
@@ -322,12 +308,7 @@ fn try_compile_ssa_trace(
             )?;
             lower_ssa_exit_block(
                 &mut b,
-                vm_ptr,
-                exit_block,
-                pointer_type,
-                layout,
-                deopt_refs,
-                deopt_addrs,
+                lower_ctx,
                 exit,
                 spec,
                 true,
@@ -424,6 +405,51 @@ struct SsaOwnedValueTemps {
     slots: HashMap<SsaTempValueSlotKey, StackSlot>,
 }
 
+#[derive(Clone, Copy)]
+struct SsaLowerCtx<'a> {
+    vm_ptr: cranelift_codegen::ir::Value,
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    layout: crate::vm::native::NativeStackLayout,
+    offsets: ResolvedOffsets,
+    heap_refs: HeapIntrinsicRefs,
+    heap_addrs: HeapIntrinsicAddrs,
+    helper_refs: SsaDeoptHelperRefs,
+    helper_addrs: SsaDeoptHelperAddrs,
+    owned_value_temps: &'a SsaOwnedValueTemps,
+    value_reprs: &'a HashMap<SsaValueId, SsaValueRepr>,
+    tagged_constant_addrs: &'a HashMap<SsaValueId, usize>,
+}
+
+#[derive(Clone, Copy)]
+struct SsaMaterializeCtx<'a> {
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    value_layout: crate::vm::native::ValueLayout,
+    exit_values: &'a HashMap<SsaValueId, cranelift_codegen::ir::Value>,
+    deopt_refs: SsaDeoptHelperRefs,
+    deopt_addrs: SsaDeoptHelperAddrs,
+}
+
+#[derive(Clone, Copy)]
+struct SsaBoxCtx {
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    value_layout: crate::vm::native::ValueLayout,
+    helper_refs: SsaDeoptHelperRefs,
+    helper_addrs: SsaDeoptHelperAddrs,
+}
+
+#[derive(Clone, Copy)]
+struct SsaConcatOp {
+    output_id: SsaValueId,
+    ip: usize,
+    lhs: cranelift_codegen::ir::Value,
+    rhs: cranelift_codegen::ir::Value,
+    result_tag: u32,
+    pack_addr: usize,
+}
+
 fn ssa_trace_supported(ssa: &SsaTrace) -> bool {
     for block in &ssa.blocks {
         for inst in &block.insts {
@@ -513,9 +539,7 @@ fn ssa_trace_supported(ssa: &SsaTrace) -> bool {
     true
 }
 
-fn prepare_tagged_constants(
-    ssa: &SsaTrace,
-) -> VmResult<(Box<[Value]>, HashMap<SsaValueId, usize>)> {
+fn prepare_tagged_constants(ssa: &SsaTrace) -> VmResult<TaggedConstants> {
     let mut entries = Vec::new();
     for block in &ssa.blocks {
         for inst in &block.insts {
@@ -755,21 +779,24 @@ fn ssa_block_args(values: impl IntoIterator<Item = cranelift_codegen::ir::Value>
 
 fn lower_ssa_inst(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: ResolvedOffsets,
-    heap_refs: HeapIntrinsicRefs,
-    heap_addrs: HeapIntrinsicAddrs,
-    helper_refs: SsaDeoptHelperRefs,
-    helper_addrs: SsaDeoptHelperAddrs,
+    ctx: SsaLowerCtx<'_>,
     inst: &crate::vm::jit::ir::SsaInst,
-    value_reprs: &HashMap<SsaValueId, SsaValueRepr>,
-    tagged_constant_addrs: &HashMap<SsaValueId, usize>,
-    owned_value_temps: &SsaOwnedValueTemps,
     values: &mut HashMap<SsaValueId, cranelift_codegen::ir::Value>,
 ) -> VmResult<()> {
+    let SsaLowerCtx {
+        vm_ptr,
+        exit_block,
+        pointer_type,
+        layout,
+        offsets,
+        heap_refs,
+        heap_addrs,
+        helper_refs,
+        helper_addrs,
+        owned_value_temps,
+        value_reprs,
+        tagged_constant_addrs,
+    } = ctx;
     let Some(output) = inst.output else {
         return Err(VmError::JitNative(
             "SSA effect-only inst not supported".to_string(),
@@ -1376,41 +1403,27 @@ fn lower_ssa_inst(
         }
         SsaInstKind::StringConcat { lhs, rhs } => ssa_inline_concat(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            heap_refs,
-            heap_addrs,
-            helper_refs,
-            helper_addrs,
-            owned_value_temps,
-            output.id,
-            inst.ip,
-            values[lhs],
-            values[rhs],
-            layout.value.string_tag,
-            heap_addrs.pack_string,
+            ctx,
+            SsaConcatOp {
+                output_id: output.id,
+                ip: inst.ip,
+                lhs: values[lhs],
+                rhs: values[rhs],
+                result_tag: layout.value.string_tag,
+                pack_addr: heap_addrs.pack_string,
+            },
         )?,
         SsaInstKind::BytesConcat { lhs, rhs } => ssa_inline_concat(
             b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            layout,
-            offsets,
-            heap_refs,
-            heap_addrs,
-            helper_refs,
-            helper_addrs,
-            owned_value_temps,
-            output.id,
-            inst.ip,
-            values[lhs],
-            values[rhs],
-            layout.value.bytes_tag,
-            heap_addrs.pack_bytes,
+            ctx,
+            SsaConcatOp {
+                output_id: output.id,
+                ip: inst.ip,
+                lhs: values[lhs],
+                rhs: values[rhs],
+                result_tag: layout.value.bytes_tag,
+                pack_addr: heap_addrs.pack_bytes,
+            },
         )?,
         SsaInstKind::BytesFromArrayU8 { array } => {
             let array = values[array];
@@ -1731,11 +1744,13 @@ fn lower_ssa_inst(
             )?;
             let key_addr = ssa_ensure_boxed_value_addr(
                 b,
-                exit_block,
-                pointer_type,
-                layout.value,
-                helper_refs,
-                helper_addrs,
+                SsaBoxCtx {
+                    exit_block,
+                    pointer_type,
+                    value_layout: layout.value,
+                    helper_refs,
+                    helper_addrs,
+                },
                 Some(key_box_slot),
                 *value_reprs.get(key).ok_or_else(|| {
                     VmError::JitNative("SSA map-get key representation missing".to_string())
@@ -1795,11 +1810,13 @@ fn lower_ssa_inst(
             )?;
             let key_addr = ssa_ensure_boxed_value_addr(
                 b,
-                exit_block,
-                pointer_type,
-                layout.value,
-                helper_refs,
-                helper_addrs,
+                SsaBoxCtx {
+                    exit_block,
+                    pointer_type,
+                    value_layout: layout.value,
+                    helper_refs,
+                    helper_addrs,
+                },
                 Some(key_box_slot),
                 *value_reprs.get(key).ok_or_else(|| {
                     VmError::JitNative("SSA map-has key representation missing".to_string())
@@ -2043,17 +2060,12 @@ fn lower_ssa_inst(
 
 fn lower_ssa_terminator(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: ResolvedOffsets,
+    _ctx: SsaLowerCtx<'_>,
     terminator: &SsaTerminator,
     values: &HashMap<SsaValueId, cranelift_codegen::ir::Value>,
     block_handles: &HashMap<crate::vm::jit::ir::SsaBlockId, Block>,
     exit_specs: &HashMap<SsaExitId, SsaExitLowering>,
 ) -> VmResult<()> {
-    let _ = (vm_ptr, exit_block, pointer_type, layout, offsets);
     match terminator {
         SsaTerminator::Jump { target, args } => {
             let handle = *block_handles
@@ -2181,17 +2193,21 @@ fn ssa_branch_target_block(
 
 fn lower_ssa_exit_block(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    deopt_refs: SsaDeoptHelperRefs,
-    deopt_addrs: SsaDeoptHelperAddrs,
+    ctx: SsaLowerCtx<'_>,
     exit: &crate::vm::jit::ir::SsaExit,
     spec: &SsaExitLowering,
     halted: bool,
     allow_link_handoff: bool,
 ) -> VmResult<()> {
+    let SsaLowerCtx {
+        vm_ptr,
+        exit_block,
+        pointer_type,
+        layout,
+        helper_refs: deopt_refs,
+        helper_addrs: deopt_addrs,
+        ..
+    } = ctx;
     let block = if halted {
         spec.halted_block
     } else {
@@ -2205,6 +2221,14 @@ fn lower_ssa_exit_block(
         .copied()
         .zip(block_params.iter().copied())
         .collect::<HashMap<_, _>>();
+    let materialize_ctx = SsaMaterializeCtx {
+        exit_block,
+        pointer_type,
+        value_layout: layout.value,
+        exit_values: &exit_values,
+        deopt_refs,
+        deopt_addrs,
+    };
 
     let stack_ptr = ssa_alloc_value_buffer(b, pointer_type, exit.stack.len(), layout.value.size)?;
     for (stack_index, materialization) in exit.stack.iter().enumerate() {
@@ -2216,18 +2240,7 @@ fn lower_ssa_exit_block(
             layout.value.size,
             "stack",
         )?;
-        ssa_materialize_slot(
-            b,
-            exit_block,
-            pointer_type,
-            layout.value,
-            &exit_values,
-            deopt_refs,
-            deopt_addrs,
-            materialization,
-            dst_addr,
-            "stack",
-        )?;
+        ssa_materialize_slot(b, materialize_ctx, materialization, dst_addr, "stack")?;
     }
 
     let locals_ptr = ssa_alloc_value_buffer(b, pointer_type, exit.locals.len(), layout.value.size)?;
@@ -2240,18 +2253,7 @@ fn lower_ssa_exit_block(
             layout.value.size,
             "local",
         )?;
-        ssa_materialize_slot(
-            b,
-            exit_block,
-            pointer_type,
-            layout.value,
-            &exit_values,
-            deopt_refs,
-            deopt_addrs,
-            materialization,
-            dst_addr,
-            "local",
-        )?;
+        ssa_materialize_slot(b, materialize_ctx, materialization, dst_addr, "local")?;
     }
     let stack_len = b.ins().iconst(
         pointer_type,
@@ -2296,16 +2298,19 @@ fn lower_ssa_exit_block(
 
 fn ssa_materialize_slot(
     b: &mut FunctionBuilder,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    value_layout: crate::vm::native::ValueLayout,
-    exit_values: &HashMap<SsaValueId, cranelift_codegen::ir::Value>,
-    deopt_refs: SsaDeoptHelperRefs,
-    deopt_addrs: SsaDeoptHelperAddrs,
+    ctx: SsaMaterializeCtx<'_>,
     materialization: &SsaMaterialization,
     dst_addr: cranelift_codegen::ir::Value,
     slot_kind: &'static str,
 ) -> VmResult<()> {
+    let SsaMaterializeCtx {
+        exit_block,
+        pointer_type,
+        value_layout,
+        exit_values,
+        deopt_refs,
+        deopt_addrs,
+    } = ctx;
     match materialization {
         SsaMaterialization::Value(value) => {
             let src = *exit_values.get(value).ok_or_else(|| {
@@ -2498,23 +2503,30 @@ fn ssa_index_in_range(
 
 fn ssa_inline_concat(
     b: &mut FunctionBuilder,
-    vm_ptr: cranelift_codegen::ir::Value,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    layout: crate::vm::native::NativeStackLayout,
-    offsets: ResolvedOffsets,
-    heap_refs: HeapIntrinsicRefs,
-    heap_addrs: HeapIntrinsicAddrs,
-    helper_refs: SsaDeoptHelperRefs,
-    helper_addrs: SsaDeoptHelperAddrs,
-    owned_value_temps: &SsaOwnedValueTemps,
-    output_id: SsaValueId,
-    ip: usize,
-    lhs: cranelift_codegen::ir::Value,
-    rhs: cranelift_codegen::ir::Value,
-    result_tag: u32,
-    pack_addr: usize,
+    ctx: SsaLowerCtx<'_>,
+    op: SsaConcatOp,
 ) -> VmResult<cranelift_codegen::ir::Value> {
+    let SsaLowerCtx {
+        vm_ptr,
+        exit_block,
+        pointer_type,
+        layout,
+        offsets,
+        heap_refs,
+        heap_addrs,
+        helper_refs,
+        helper_addrs,
+        owned_value_temps,
+        ..
+    } = ctx;
+    let SsaConcatOp {
+        output_id,
+        ip,
+        lhs,
+        rhs,
+        result_tag,
+        pack_addr,
+    } = op;
     let lhs_data = ssa_load_heap_data_ptr(b, layout.value, lhs);
     let rhs_data = ssa_load_heap_data_ptr(b, layout.value, rhs);
     let lhs_bytes_ptr = b.ins().load(
@@ -2625,15 +2637,18 @@ fn ssa_alloc_single_value_slot(
 
 fn ssa_materialize_runtime_value_to_slot(
     b: &mut FunctionBuilder,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    value_layout: crate::vm::native::ValueLayout,
-    helper_refs: SsaDeoptHelperRefs,
-    helper_addrs: SsaDeoptHelperAddrs,
+    ctx: SsaBoxCtx,
     repr: SsaValueRepr,
     value: cranelift_codegen::ir::Value,
     dst_addr: cranelift_codegen::ir::Value,
 ) -> VmResult<()> {
+    let SsaBoxCtx {
+        exit_block,
+        pointer_type,
+        value_layout,
+        helper_refs,
+        helper_addrs,
+    } = ctx;
     match repr {
         SsaValueRepr::Tagged => ssa_call_status_helper(
             b,
@@ -2671,15 +2686,18 @@ fn ssa_materialize_runtime_value_to_slot(
 
 fn ssa_ensure_boxed_value_addr(
     b: &mut FunctionBuilder,
-    exit_block: Block,
-    pointer_type: cranelift_codegen::ir::Type,
-    value_layout: crate::vm::native::ValueLayout,
-    helper_refs: SsaDeoptHelperRefs,
-    helper_addrs: SsaDeoptHelperAddrs,
+    ctx: SsaBoxCtx,
     temp_slot: Option<cranelift_codegen::ir::Value>,
     repr: SsaValueRepr,
     value: cranelift_codegen::ir::Value,
 ) -> VmResult<cranelift_codegen::ir::Value> {
+    let SsaBoxCtx {
+        exit_block: _,
+        pointer_type,
+        value_layout,
+        helper_refs,
+        helper_addrs,
+    } = ctx;
     if repr == SsaValueRepr::Tagged {
         return Ok(value);
     }
@@ -2691,11 +2709,7 @@ fn ssa_ensure_boxed_value_addr(
     };
     ssa_materialize_runtime_value_to_slot(
         b,
-        exit_block,
-        pointer_type,
-        value_layout,
-        helper_refs,
-        helper_addrs,
+        ctx,
         repr,
         value,
         slot,

@@ -2,7 +2,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use vm::{
-    CallOutcome, HostFunction, HostFunctionRegistry, JitConfig, OpCode, Program, TypeMap, Value,
+    CallOutcome, HostFunction, HostFunctionRegistry, JitConfig, OpCode, Program, Value,
     ValueType, Vm, VmStatus, compile_source, compile_source_file,
 };
 
@@ -21,7 +21,7 @@ fn perf_noop_host_static(_vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, v
 }
 
 fn force_local_types(program: Program, hints: &[(usize, ValueType)]) -> Program {
-    let mut type_map = program.type_map.clone().unwrap_or_else(TypeMap::default);
+    let mut type_map = program.type_map.clone().unwrap_or_default();
     if type_map.local_types.len() < program.local_count {
         type_map
             .local_types
@@ -684,7 +684,7 @@ fn perf_jit_native_characterizes_map_builtin_loop_latency() {
 fn perf_manual_aes_128_cbc_rustscript_matches_in_interpreter_jit_and_aot() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/aes_128_cbc_usage.rss");
-    let compiled = compile_source_file(&path).expect("aes RustScript usage example should compile");
+    let compiled = compile_source_file(path.as_path()).expect("aes RustScript usage example should compile");
 
     let expected = vec![Value::string("7649abac8119b246cee98e9b12e9197d")];
 

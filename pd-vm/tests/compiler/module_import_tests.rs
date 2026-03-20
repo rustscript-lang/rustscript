@@ -97,7 +97,7 @@ fn compile_source_file_rustscript_named_import_is_selective() {
         "main source",
     );
 
-    let err = match compile_source_file(&main_path) {
+    let err = match compile_source_file(main_path.as_path()) {
         Ok(_) => panic!("selective import should not expose unlisted exports"),
         Err(err) => err,
     };
@@ -144,7 +144,7 @@ fn compile_source_file_rustscript_named_import_preserves_generic_function_type_p
         "main source",
     );
 
-    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
     assert!(
         compiled.functions.is_empty(),
         "generic imported RustScript functions should inline without host imports"
@@ -185,7 +185,7 @@ fn compile_source_file_rustscript_module_exports_only_pub_functions() {
     "#,
         "ok main source",
     );
-    let compiled = compile_source_file(&ok_main_path).expect("compile should succeed");
+    let compiled = compile_source_file(ok_main_path.as_path()).expect("compile should succeed");
     assert!(
         compiled.functions.is_empty(),
         "pure RustScript function module should not require host imports"
@@ -204,7 +204,7 @@ fn compile_source_file_rustscript_module_exports_only_pub_functions() {
     "#,
         "bad main source",
     );
-    let err = match compile_source_file(&bad_main_path) {
+    let err = match compile_source_file(bad_main_path.as_path()) {
         Ok(_) => panic!("private import should fail"),
         Err(err) => err,
     };
@@ -272,7 +272,7 @@ fn compile_source_file_imported_module_slice_hidden_bindings_work() {
         "main source",
     );
 
-    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -310,7 +310,7 @@ fn compile_source_file_imported_module_dynamic_slice_end_bindings_work() {
         "main source",
     );
 
-    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);

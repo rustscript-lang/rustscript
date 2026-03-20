@@ -293,7 +293,7 @@ fn lua_rejection_cases_work() {
 fn lua_complex_fixture_runs() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.lua");
-    let compiled = compile_source_file(&path).expect("compile should succeed");
+    let compiled = compile_source_file(path.as_path()).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
     for func in &compiled.functions {
         match func.name.as_str() {

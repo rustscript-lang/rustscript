@@ -32,7 +32,7 @@ fn compile_edge_source_file_supports_runtime_namespace_host_import() {
     )
     .expect("main source should write");
 
-    let compiled = compile_edge_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_edge_source_file(main_path.as_path()).expect("compile should succeed");
     assert!(
         compiled
             .program
@@ -59,7 +59,7 @@ fn compile_edge_source_file_supports_runtime_exit_host_import() {
     )
     .expect("main source should write");
 
-    let compiled = compile_edge_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_edge_source_file(main_path.as_path()).expect("compile should succeed");
     assert!(
         compiled
             .program
@@ -86,7 +86,7 @@ fn compile_edge_source_file_supports_rate_limit_namespace_host_import() {
     )
     .expect("main source should write");
 
-    let compiled = compile_edge_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_edge_source_file(main_path.as_path()).expect("compile should succeed");
     assert!(
         compiled
             .program
@@ -114,7 +114,7 @@ fn compile_edge_source_file_supports_console_namespace_host_import() {
     )
     .expect("main source should write");
 
-    let compiled = compile_edge_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_edge_source_file(main_path.as_path()).expect("compile should succeed");
     assert!(
         compiled
             .program
@@ -149,7 +149,7 @@ fn compile_edge_source_file_supports_console_http3_client_example() {
     let program_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples/console/sample_console_http3_client.rss");
 
-    let compiled = compile_edge_source_file(&program_path).expect("example should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("example should compile");
     let import_names = compiled
         .program
         .imports
@@ -186,7 +186,7 @@ fn sample_anthropic_messages_to_openai_chat_completions_program_compiles_and_lin
     );
     let source = std::fs::read_to_string(&program_path).expect("sample source should read");
 
-    compile_edge_source_file(&program_path).expect("sample should compile");
+    compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let unknown_inferred_locals = lint_unknown_inferred_local_types_at_path_with_options(
         &program_path,
@@ -241,7 +241,7 @@ fn compile_edge_source_file_prefers_local_module_over_host_namespace_fallback() 
     )
     .expect("main source should write");
 
-    let compiled = compile_edge_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_edge_source_file(main_path.as_path()).expect("compile should succeed");
     assert!(
         compiled.program.imports.is_empty(),
         "local runtime module should win over host namespace fallback"
@@ -325,7 +325,7 @@ fn compile_edge_source_file_supports_embedded_edge_upstream_wrapper_modules() {
     )
     .expect("main source should write");
 
-    let compiled = compile_edge_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_edge_source_file(main_path.as_path()).expect("compile should succeed");
     let import_names = compiled
         .program
         .imports

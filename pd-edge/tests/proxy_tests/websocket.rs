@@ -1,8 +1,14 @@
 use super::support::*;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+fn sample_websocket_upstream_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 #[tokio::test]
 async fn sample_websocket_proxy_program_round_trips_text_frames() {
+    let _guard = sample_websocket_upstream_test_lock().lock().await;
     let (_upstream_addr, upstream_handle) =
         spawn_websocket_echo_upstream_on(loopback_addr(SAMPLE_WEBSOCKET_UPSTREAM_PORT)).await;
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
@@ -12,7 +18,7 @@ async fn sample_websocket_proxy_program_round_trips_text_frames() {
         .join("websocket")
         .join("proxy")
         .join("sample_websocket_proxy_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
@@ -131,12 +137,14 @@ async fn sample_websocket_proxy_program_round_trips_text_frames() {
     );
 
     upstream_handle.abort();
+    let _ = upstream_handle.await;
     data_handle.abort();
     admin_handle.abort();
 }
 
 #[tokio::test]
 async fn sample_websocket_proxy_program_round_trips_binary_frames_with_default_handle() {
+    let _guard = sample_websocket_upstream_test_lock().lock().await;
     let (_upstream_addr, upstream_handle) =
         spawn_websocket_echo_upstream_on(loopback_addr(SAMPLE_WEBSOCKET_UPSTREAM_PORT)).await;
     let (data_addr, admin_addr, data_handle, admin_handle) = spawn_proxy(1024 * 1024).await;
@@ -146,7 +154,7 @@ async fn sample_websocket_proxy_program_round_trips_binary_frames_with_default_h
         .join("websocket")
         .join("proxy")
         .join("sample_websocket_proxy_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
     let payload = "62696e2d7061796c6f6164";
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
@@ -240,6 +248,7 @@ async fn sample_websocket_proxy_program_round_trips_binary_frames_with_default_h
     assert_eq!(response.text().await.expect("body should read"), payload);
 
     upstream_handle.abort();
+    let _ = upstream_handle.await;
     data_handle.abort();
     admin_handle.abort();
 }
@@ -517,7 +526,7 @@ async fn sample_transport_websocket_sse_bridge_program_forwards_events_as_text_f
         .join("websocket")
         .join("bridge")
         .join("sample_transport_websocket_sse_bridge_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);

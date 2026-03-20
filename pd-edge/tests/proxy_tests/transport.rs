@@ -74,7 +74,7 @@ async fn sample_upstream_transport_proxy_program_streams_plain_http_body() {
         .join("transport")
         .join("upstream")
         .join("sample_upstream_transport_proxy_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
@@ -130,7 +130,7 @@ async fn sample_upstream_transport_proxy_program_handles_https_tls_session() {
         .join("transport")
         .join("upstream")
         .join("sample_upstream_transport_proxy_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
@@ -196,7 +196,7 @@ async fn sample_transport_tls_handshake_program_echoes_plaintext_after_tls_hands
         .join("transport")
         .join("tls")
         .join("sample_transport_tls_handshake_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
@@ -361,7 +361,7 @@ async fn transport_downstream_http_handoff_promotes_plain_connection_into_http11
         .join("transport")
         .join("handoff")
         .join("sample_transport_http_handoff_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
 
@@ -409,7 +409,7 @@ async fn transport_downstream_http_handoff_promotes_plain_connection_into_http2_
         .join("transport")
         .join("handoff")
         .join("sample_transport_http_handoff_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
 
@@ -485,7 +485,7 @@ async fn transport_downstream_http_handoff_promotes_tls_plaintext_into_https_run
         .join("transport")
         .join("handoff")
         .join("sample_transport_http_handoff_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
 
@@ -573,7 +573,7 @@ async fn sample_http_proxy_tls_prelude_program_serves_http_and_https_listeners()
         .join("http")
         .join("proxy")
         .join("sample_http_proxy_tls_prelude_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
 
@@ -705,7 +705,7 @@ async fn sample_tunnel_proxy_program_tunnels_plain_http_body() {
         .join("proxy")
         .join("tunnel")
         .join("sample_tunnel_proxy_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
@@ -873,7 +873,7 @@ async fn sample_tunnel_proxy_program_tunnels_https_body_via_tls_plaintext_stream
         .join("proxy")
         .join("tunnel")
         .join("sample_tunnel_proxy_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);

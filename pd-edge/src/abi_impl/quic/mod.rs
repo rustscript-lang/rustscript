@@ -1,5 +1,6 @@
 #![cfg_attr(not(feature = "http3"), allow(dead_code))]
 
+#[cfg(feature = "http3")]
 use std::{io, io::BufReader, sync::Arc};
 
 #[cfg(feature = "http3")]
@@ -14,6 +15,7 @@ use rustls::{
 #[cfg(feature = "http3")]
 use socket2::SockRef;
 
+#[cfg(feature = "http3")]
 use crate::abi_impl::transport::{TlsFlowState, TlsProtocolVersion};
 
 pub(crate) const ALPN_PROTOCOL: &str = "h3";

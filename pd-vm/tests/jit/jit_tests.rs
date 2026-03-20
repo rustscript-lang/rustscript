@@ -1,6 +1,6 @@
 use vm::{
     BytecodeBuilder, CallOutcome, HostFunction, JitConfig, JitTraceTerminal, OpCode, Program,
-    SourceFlavor, TypeMap, Value, ValueType, Vm, VmStatus, VmYieldReason, builtin_call_index,
+    SourceFlavor, Value, ValueType, Vm, VmStatus, VmYieldReason, builtin_call_index,
     compile_source, compile_source_with_flavor, disassemble_program,
 };
 
@@ -124,7 +124,7 @@ fn patch_branch_target(code: &mut [u8], instr_ip: u32, target: u32) {
 }
 
 fn force_local_types(program: Program, hints: &[(usize, ValueType)]) -> Program {
-    let mut type_map = program.type_map.clone().unwrap_or_else(TypeMap::default);
+    let mut type_map = program.type_map.clone().unwrap_or_default();
     if type_map.local_types.len() < program.local_count {
         type_map
             .local_types
@@ -137,7 +137,7 @@ fn force_local_types(program: Program, hints: &[(usize, ValueType)]) -> Program 
 }
 
 fn force_operand_types(program: Program, hints: &[(usize, (ValueType, ValueType))]) -> Program {
-    let mut type_map = program.type_map.clone().unwrap_or_else(TypeMap::default);
+    let mut type_map = program.type_map.clone().unwrap_or_default();
     for (ip, (lhs, rhs)) in hints {
         type_map.operand_types.insert(*ip, (*lhs, *rhs));
     }
@@ -471,7 +471,7 @@ fn aot_handles_tagged_array_elements_in_float_arithmetic() {
 
     let compiled = compile_source(source).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
-        install_aot(&mut vm);
+    install_aot(&mut vm);
 
     let status = vm.run().expect("aot vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -801,7 +801,10 @@ fn aot_honors_fuel_metering_at_host_call_boundaries_only() {
         }
     }
 
-    assert_eq!(yielded, 3, "fuel should only yield before the next host call");
+    assert_eq!(
+        yielded, 3,
+        "fuel should only yield before the next host call"
+    );
     assert_eq!(vm.stack().last(), Some(&Value::Int(4)));
     assert!(
         vm.aot_exec_count() > 1,

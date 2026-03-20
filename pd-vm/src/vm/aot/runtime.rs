@@ -1,7 +1,8 @@
 use super::compile::{CompiledProgram, compile_program};
 use crate::vm::native::{
     STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_OUT_OF_FUEL, STATUS_TRACE_EXIT,
-    STATUS_WAITING, STATUS_YIELDED, clear_bridge_error, selected_codegen_backend, take_bridge_error,
+    STATUS_WAITING, STATUS_YIELDED, clear_bridge_error, selected_codegen_backend,
+    take_bridge_error,
 };
 use crate::vm::{ExecOutcome, Vm, VmError, VmResult};
 

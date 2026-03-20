@@ -1352,7 +1352,7 @@ fn compile_source_file_detects_extension() {
     std::fs::write(&path, include_str!("../../examples/example.js"))
         .expect("temp source should write");
 
-    let compiled = compile_source_file(&path).expect("compile should succeed");
+    let compiled = compile_source_file(path.as_path()).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
     for func in &compiled.functions {
         match func.name.as_str() {
@@ -1371,7 +1371,7 @@ fn compile_source_file_detects_extension() {
 #[test]
 fn compile_source_file_detects_lua_extension() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example.lua");
-    let compiled = compile_source_file(&path).expect("compile should succeed");
+    let compiled = compile_source_file(path.as_path()).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
     for func in &compiled.functions {
         match func.name.as_str() {
@@ -1410,7 +1410,7 @@ fn compile_source_file_detects_scheme_extension() {
     )
     .expect("temp source should write");
 
-    let compiled = compile_source_file(&path).expect("compile should succeed");
+    let compiled = compile_source_file(path.as_path()).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -1443,7 +1443,7 @@ fn compile_source_file_supports_rss_modules_from_js_lua_and_scheme() {
     "#,
     )
     .expect("js source should write");
-    let js_compiled = compile_source_file(&js_path).expect("js compile should succeed");
+    let js_compiled = compile_source_file(js_path.as_path()).expect("js compile should succeed");
     let mut js_vm = Vm::new(js_compiled.program);
     for func in &js_compiled.functions {
         match func.name.as_str() {
@@ -1465,7 +1465,7 @@ fn compile_source_file_supports_rss_modules_from_js_lua_and_scheme() {
     "#,
     )
     .expect("lua source should write");
-    let lua_compiled = compile_source_file(&lua_path).expect("lua compile should succeed");
+    let lua_compiled = compile_source_file(lua_path.as_path()).expect("lua compile should succeed");
     let mut lua_vm = Vm::new(lua_compiled.program);
     for func in &lua_compiled.functions {
         match func.name.as_str() {
@@ -1487,7 +1487,7 @@ fn compile_source_file_supports_rss_modules_from_js_lua_and_scheme() {
     "#,
     )
     .expect("scheme source should write");
-    let scm_compiled = compile_source_file(&scm_path).expect("scheme compile should succeed");
+    let scm_compiled = compile_source_file(scm_path.as_path()).expect("scheme compile should succeed");
     let mut scm_vm = Vm::new(scm_compiled.program);
     for func in &scm_compiled.functions {
         match func.name.as_str() {
@@ -1529,7 +1529,7 @@ console.log(value);
     let js_path = root.join("main.js");
     std::fs::write(&js_path, js_source).expect("js source should write");
 
-    let compiled = compile_source_file(&js_path).expect("js compile should succeed");
+    let compiled = compile_source_file(js_path.as_path()).expect("js compile should succeed");
     let debug = compiled
         .program
         .debug
@@ -1575,7 +1575,7 @@ fn compile_source_file_rejects_import_cycles() {
     std::fs::write(&a_path, "use b;\n").expect("module a source should write");
     std::fs::write(&b_path, "use a;\n").expect("module b source should write");
 
-    let err = match compile_source_file(&main_path) {
+    let err = match compile_source_file(main_path.as_path()) {
         Ok(_) => panic!("cycle should fail"),
         Err(err) => err,
     };
@@ -1628,7 +1628,7 @@ fn compile_source_emits_named_locals_in_debug_info() {
     assert_eq!(debug.local_index("beta"), Some(1));
 }
 // ---------------------------------------------------------------------------
-// Liveness / Availability – Additional Edge Cases
+// Liveness / Availability - Additional Edge Cases
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1704,7 +1704,7 @@ fn local_declared_in_both_branches_is_available_after_merge() {
         }
         val;
     "#;
-    // This should compile and run — val in the outer scope is still 0.
+    // This should compile and run - val in the outer scope is still 0.
     let compiled = compile_source(source).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
@@ -1743,7 +1743,7 @@ fn liveness_clears_dead_locals_in_nested_control_flow() {
     assert_eq!(
         vm.locals()[outer_idx as usize],
         Value::Null,
-        "'outer' should be Null — dead before result expression"
+        "'outer' should be Null - dead before result expression"
     );
     assert_eq!(
         vm.locals()[inner_idx as usize],
@@ -1789,7 +1789,7 @@ fn for_loop_variable_is_null_after_last_use() {
 #[test]
 fn stack_is_clean_after_halt_with_single_result() {
     // After a program halts, the stack should contain exactly the final
-    // expression value and nothing else — no stale temporaries.
+    // expression value and nothing else - no stale temporaries.
     let source = r#"
         let a = 1 + 2;
         let b = a * 3;

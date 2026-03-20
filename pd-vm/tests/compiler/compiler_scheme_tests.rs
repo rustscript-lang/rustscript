@@ -126,7 +126,7 @@ fn scheme_rejection_cases_work() {
 fn scheme_complex_fixture_runs() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.scm");
-    let compiled = compile_source_file(&path).expect("compile should succeed");
+    let compiled = compile_source_file(path.as_path()).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
     for func in &compiled.functions {
         match func.name.as_str() {
@@ -167,7 +167,7 @@ fn scheme_runtime_namespace_host_calls_are_supported() {
     )
     .expect("scheme source should write");
 
-    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
     vm.bind_function("runtime::sleep", make_runtime_sleep());
 

@@ -33,7 +33,7 @@ fn sample_mqtt_program_path() -> PathBuf {
 
 async fn upload_sample_mqtt_program(client: &reqwest::Client, admin_addr: SocketAddr) {
     let compiled =
-        compile_edge_source_file(&sample_mqtt_program_path()).expect("sample should compile");
+        compile_edge_source_file(sample_mqtt_program_path().as_path()).expect("sample should compile");
     let upload = upload_program(client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
 }

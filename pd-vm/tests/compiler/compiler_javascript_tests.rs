@@ -24,7 +24,7 @@ fn javascript_runtime_namespace_custom_host_calls_are_supported() {
     )
     .expect("js source should write");
 
-    let compiled = compile_source_file(&path).expect("compile should succeed");
+    let compiled = compile_source_file(path.as_path()).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
     vm.bind_function("runtime::add_one", Box::new(AddOne));
 
@@ -436,7 +436,7 @@ fn javascript_print_alias_handles_mixed_call_arities() {
 #[test]
 fn compile_source_file_with_javascript_complex_fixture() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.js");
-    let compiled = compile_source_file(&path).expect("compile should succeed");
+    let compiled = compile_source_file(path.as_path()).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
 
     for func in &compiled.functions {
@@ -489,7 +489,7 @@ console.log(value);
 "#;
     std::fs::write(&main_path, main_source).expect("js source should write");
 
-    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
     let recording_program = compiled.program.clone();
     let mut vm = Vm::new(compiled.program);
     for func in &compiled.functions {
@@ -548,7 +548,7 @@ console.log(value);
 #[test]
 fn compile_source_file_js_complex_replay_break_line_resolves_non_executable_lines() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.js");
-    let compiled = compile_source_file(&path).expect("compile should succeed");
+    let compiled = compile_source_file(path.as_path()).expect("compile should succeed");
     let recording_program = compiled.program.clone();
     let mut vm = Vm::new(compiled.program);
     for func in &compiled.functions {
@@ -676,7 +676,7 @@ fn compile_source_file_js_supports_namespace_and_named_alias_imports() {
     )
     .expect("js source should write");
 
-    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
     assert_eq!(compiled.functions.len(), 1);
     assert_eq!(compiled.functions[0].name, "print");
 

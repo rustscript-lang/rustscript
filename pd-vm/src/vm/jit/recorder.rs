@@ -2277,7 +2277,7 @@ impl HeapContainerKind {
     }
 }
 
-fn call_arg_slice<'a, T>(stack: &'a [T], argc: usize) -> Result<&'a [T], TraceRecordError> {
+fn call_arg_slice<T>(stack: &[T], argc: usize) -> Result<&[T], TraceRecordError> {
     if stack.len() < argc {
         return Err(TraceRecordError::StackUnderflow);
     }

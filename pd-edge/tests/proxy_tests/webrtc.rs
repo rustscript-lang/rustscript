@@ -13,7 +13,7 @@ async fn sample_webrtc_proxy_program_round_trips_text_messages() {
         .join("webrtc")
         .join("proxy")
         .join("sample_webrtc_proxy_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
@@ -144,7 +144,7 @@ async fn sample_webrtc_proxy_program_round_trips_binary_messages_with_default_ha
         .join("webrtc")
         .join("proxy")
         .join("sample_webrtc_proxy_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
     let payload = "7765627274632d62696e";
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;

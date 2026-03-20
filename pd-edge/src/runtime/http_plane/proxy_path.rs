@@ -16,6 +16,8 @@ use axum::{
 use bytes::Buf;
 #[cfg(feature = "http3")]
 use futures_util::stream::try_unfold;
+#[cfg(feature = "http3")]
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},

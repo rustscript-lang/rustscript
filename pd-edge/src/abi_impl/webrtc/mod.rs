@@ -903,6 +903,7 @@ async fn connection_send_binary(
     payload: Value,
 ) -> Result<CallOutcome, VmError> {
     let bytes = value_to_bytes(&payload, "webrtc::connection::send_binary payload")?;
+    let payload = Bytes::copy_from_slice(bytes);
     let io = ensure_connection_open(&context, connection).await?;
     let data_channel = io.current_data_channel().ok_or_else(|| {
         VmError::HostError(
@@ -910,7 +911,7 @@ async fn connection_send_binary(
         )
     })?;
     let sent = data_channel
-        .send(&Bytes::from(bytes))
+        .send(&payload)
         .await
         .map_err(|err| {
             VmError::HostError(format!("failed to send webrtc binary message: {err}"))
@@ -952,7 +953,7 @@ async fn connection_read_binary(
     let io = ensure_connection_open(&context, connection).await?;
     let message = pop_next_message(&io).await?;
     let payload = match message {
-        Some(WebRtcMessage::Binary(bytes)) => bytes_to_value(&bytes),
+        Some(WebRtcMessage::Binary(bytes)) => bytes_to_value(bytes),
         Some(WebRtcMessage::Text(_)) => {
             return Err(VmError::HostError(
                 "next webrtc message is text; call webrtc::connection::read_text".to_string(),

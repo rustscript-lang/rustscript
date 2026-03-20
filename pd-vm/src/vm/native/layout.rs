@@ -10,7 +10,6 @@ static NATIVE_STACK_LAYOUT: OnceLock<Result<NativeStackLayout, String>> = OnceLo
 pub(crate) struct VecLayout {
     pub(crate) ptr_offset: i32,
     pub(crate) len_offset: i32,
-    pub(crate) cap_offset: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -43,14 +42,11 @@ pub(crate) struct NativeStackLayout {
     pub(crate) vm_stack_offset: i32,
     pub(crate) vm_locals_offset: i32,
     pub(crate) vm_program_constants_ptr_offset: i32,
-    pub(crate) vm_program_constants_len_offset: i32,
     pub(crate) vm_ip_offset: i32,
     pub(crate) vm_fuel_remaining_offset: i32,
     pub(crate) vm_fuel_ops_until_check_offset: i32,
     pub(crate) vm_epoch_deadline_offset: i32,
     pub(crate) vm_epoch_counter_ptr_offset: i32,
-    pub(crate) vm_drop_contract_events_enabled_offset: i32,
-    pub(crate) vm_drop_contract_events_offset: i32,
     pub(crate) stack_vec: VecLayout,
     pub(crate) map: MapLayout,
     pub(crate) value: ValueLayout,
@@ -72,10 +68,6 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         std::mem::offset_of!(Vm, program_constants_ptr),
         "Vm::program_constants_ptr offset",
     )?;
-    let vm_program_constants_len_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, program_constants_len),
-        "Vm::program_constants_len offset",
-    )?;
     let vm_ip_offset = usize_to_i32(std::mem::offset_of!(Vm, ip), "Vm::ip offset")?;
     let vm_fuel_remaining_offset = usize_to_i32(
         std::mem::offset_of!(Vm, fuel_remaining),
@@ -93,14 +85,6 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         std::mem::offset_of!(Vm, epoch_counter_ptr),
         "Vm::epoch_counter_ptr offset",
     )?;
-    let vm_drop_contract_events_enabled_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, drop_contract_events_enabled),
-        "Vm::drop_contract_events_enabled offset",
-    )?;
-    let vm_drop_contract_events_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, drop_contract_events),
-        "Vm::drop_contract_events offset",
-    )?;
     let stack_vec = detect_vec_layout()?;
     let map = detect_map_layout()?;
     let value = detect_value_layout()?;
@@ -108,14 +92,11 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         vm_stack_offset,
         vm_locals_offset,
         vm_program_constants_ptr_offset,
-        vm_program_constants_len_offset,
         vm_ip_offset,
         vm_fuel_remaining_offset,
         vm_fuel_ops_until_check_offset,
         vm_epoch_deadline_offset,
         vm_epoch_counter_ptr_offset,
-        vm_drop_contract_events_enabled_offset,
-        vm_drop_contract_events_offset,
         stack_vec,
         map,
         value,
@@ -143,12 +124,9 @@ fn detect_vec_layout() -> VmResult<VecLayout> {
     sample.push(Value::Int(2));
     let ptr_value = sample.as_ptr() as usize;
     let len_value = sample.len();
-    let cap_value = sample.capacity();
-
     let words = unsafe { &*((&sample as *const Vec<Value>) as *const [usize; 3]) };
     let ptr_index = find_unique_word_index(words, ptr_value, "Vec<Value> ptr field")?;
     let len_index = find_unique_word_index(words, len_value, "Vec<Value> len field")?;
-    let cap_index = find_unique_word_index(words, cap_value, "Vec<Value> cap field")?;
 
     Ok(VecLayout {
         ptr_offset: usize_to_i32(
@@ -158,10 +136,6 @@ fn detect_vec_layout() -> VmResult<VecLayout> {
         len_offset: usize_to_i32(
             len_index * std::mem::size_of::<usize>(),
             "Vec<Value>::len offset",
-        )?,
-        cap_offset: usize_to_i32(
-            cap_index * std::mem::size_of::<usize>(),
-            "Vec<Value>::cap offset",
         )?,
     })
 }

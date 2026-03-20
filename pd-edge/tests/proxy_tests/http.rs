@@ -1112,6 +1112,7 @@ async fn http_proxy_reuses_https_http1_default_upstream_connections() {
         http::exchange::set_scheme(upstream, "https");
         let session = tls::session::from_socket(upstream);
         tls::session::set_verify(session, false);
+        tls::session::set_alpn(session, "http/1.1");
         let downstream = proxy::stream::downstream();
         let upstream_stream = proxy::stream::exchange(upstream);
         proxy::forward_native(downstream, upstream_stream);
@@ -1699,7 +1700,7 @@ async fn sample_proxy_program_streams_or_buffers_upstream_body() {
         .join("http")
         .join("proxy")
         .join("sample_proxy_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
@@ -1778,7 +1779,7 @@ async fn sample_request_transform_program_streams_or_buffers_downstream_request_
         .join("http")
         .join("proxy")
         .join("sample_request_transform_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
@@ -1880,7 +1881,7 @@ async fn sample_sse_proxy_program_mutates_each_upstream_event_before_returning()
         .join("http")
         .join("proxy")
         .join("sample_sse_proxy_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
@@ -1912,6 +1913,7 @@ async fn sample_sse_proxy_program_mutates_each_upstream_event_before_returning()
     );
 
     upstream_handle.abort();
+    let _ = upstream_handle.await;
     data_handle.abort();
     admin_handle.abort();
 }
@@ -1989,7 +1991,7 @@ async fn sample_sse_proxy_program_streams_the_first_event_before_upstream_comple
         .join("http")
         .join("proxy")
         .join("sample_sse_proxy_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
 
@@ -2049,6 +2051,7 @@ async fn sample_sse_proxy_program_streams_the_first_event_before_upstream_comple
     );
 
     upstream_handle.abort();
+    let _ = upstream_handle.await;
     data_handle.abort();
     admin_handle.abort();
 }
@@ -2108,7 +2111,7 @@ async fn sample_anthropic_messages_to_openai_chat_completions_program_translates
         .join("http")
         .join("proxy")
         .join("sample_anthropic_messages_to_openai_chat_completions_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
@@ -2204,7 +2207,7 @@ async fn sample_anthropic_messages_to_openai_chat_completions_program_translates
         .join("http")
         .join("proxy")
         .join("sample_anthropic_messages_to_openai_chat_completions_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
@@ -2368,7 +2371,7 @@ async fn sample_anthropic_messages_to_openai_chat_completions_program_streams_th
         .join("http")
         .join("proxy")
         .join("sample_anthropic_messages_to_openai_chat_completions_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
 
@@ -2513,7 +2516,7 @@ async fn sample_subrequest_proxy_program_fans_out_across_default_and_dynamic_exc
         .join("http")
         .join("proxy")
         .join("sample_subrequest_proxy_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
@@ -2791,7 +2794,7 @@ async fn sample_downstream_http2_program_handles_cleartext_h2_requests() {
         .join("http")
         .join("downstream")
         .join("sample_downstream_http2_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
@@ -2875,7 +2878,7 @@ async fn sample_downstream_http3_program_handles_http3_requests() {
         .join("http")
         .join("downstream")
         .join("sample_downstream_http3_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
@@ -2943,7 +2946,7 @@ async fn sample_upstream_http2_program_demonstrates_multiplex_and_reuse() {
         .join("http")
         .join("upstream")
         .join("sample_upstream_http2_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);
@@ -3053,7 +3056,7 @@ async fn sample_upstream_http3_program_demonstrates_multiplex_and_reuse() {
         .join("http")
         .join("upstream")
         .join("sample_upstream_http3_program.rss");
-    let compiled = compile_edge_source_file(&program_path).expect("sample should compile");
+    let compiled = compile_edge_source_file(program_path.as_path()).expect("sample should compile");
 
     let upload = upload_program(&client, admin_addr, &compiled.program).await;
     assert_eq!(upload.status(), StatusCode::NO_CONTENT);

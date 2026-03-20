@@ -58,7 +58,7 @@ fn assert_builtin_namespace_stays_builtin(
     let main_path = root.join("main.rss");
     std::fs::write(&main_path, source).expect("main source should write");
 
-    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
     assert!(
         compiled
             .program
@@ -507,7 +507,7 @@ fn rustscript_print_rejects_non_literal_format_string() {
 fn compile_source_file_with_rustscript_complex_fixture() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.rss");
-    let compiled = compile_source_file(&path).expect("compile should succeed");
+    let compiled = compile_source_file(path.as_path()).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
 
     for func in &compiled.functions {
@@ -2181,7 +2181,7 @@ fn compile_source_file_rustscript_imports_merge_with_scoped_locals() {
     )
     .expect("main source should write");
 
-    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
     let debug = compiled
         .program
         .debug
@@ -2252,7 +2252,7 @@ fn compile_source_file_rustscript_imported_function_capture_binds_once() {
     )
     .expect("main source should write");
 
-    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -2303,7 +2303,7 @@ fn compile_source_file_rustscript_imported_borrow_capture_survives_nested_calls(
     )
     .expect("main source should write");
 
-    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -2350,7 +2350,7 @@ fn compile_source_file_rustscript_imported_direct_capture_multiple_move_is_rejec
     )
     .expect("main source should write");
 
-    let err = match compile_source_file(&main_path) {
+    let err = match compile_source_file(main_path.as_path()) {
         Ok(_) => panic!("compile should fail"),
         Err(err) => err,
     };
@@ -2384,7 +2384,7 @@ fn compile_source_file_rustscript_rejects_import_keyword() {
     let main_path = root.join("main.rss");
     std::fs::write(&main_path, "import \"./module.rss\";\n1;\n").expect("source should write");
 
-    let err = match compile_source_file(&main_path) {
+    let err = match compile_source_file(main_path.as_path()) {
         Ok(_) => panic!("legacy import syntax should be rejected for RustScript"),
         Err(err) => err,
     };
@@ -2444,7 +2444,7 @@ fn compile_source_file_rustscript_supports_namespace_and_named_imports() {
     )
     .expect("main source should write");
 
-    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
     assert!(
         compiled.functions.is_empty(),
         "module functions should be fully inlined for RustScript root"
@@ -2494,7 +2494,7 @@ fn compile_source_file_rustscript_all_public_import_supports_namespace_calls() {
     )
     .expect("main source should write");
 
-    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -2528,7 +2528,7 @@ fn compile_source_file_rustscript_missing_runtime_module_falls_back_to_host_name
     )
     .expect("main source should write");
 
-    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
     assert!(
         compiled
             .program
@@ -2565,7 +2565,7 @@ fn compile_source_file_rustscript_host_namespace_alias_maps_to_host_import() {
     )
     .expect("main source should write");
 
-    let compiled = compile_source_file(&main_path).expect("compile should succeed");
+    let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
     assert!(
         compiled
             .program
