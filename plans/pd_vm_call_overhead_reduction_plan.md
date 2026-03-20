@@ -15,7 +15,7 @@ The intent is not to redesign ordinary RustScript function calls. Those are alre
 inline today in [`pd-vm/src/compiler/codegen.rs`](../pd-vm/src/compiler/codegen.rs), so the main
 runtime tax is on builtin and host dispatch.
 
-## Current Snapshot (2026-03-20)
+## Current Snapshot (2026-03-20 Baseline)
 
 Observed behavior in the current workspace:
 
@@ -43,7 +43,7 @@ Observed behavior in the current workspace:
 
 Current measured baselines from this workspace:
 
-- `perf_jit_native_reduces_array_builtin_loop_latency`
+- `perf_jit_native_characterizes_array_builtin_loop_latency`
   - interpreter: `29129 us`
   - JIT: `15732 us`
   - workload executes about `303104` array builtin operations in the timed loop
@@ -55,10 +55,10 @@ Current measured baselines from this workspace:
   - cached host bind/load overhead: about `173 ns/import`
   - cached static host bind/load overhead: about `163 ns/import`
 
-Important gap:
+Historical baseline note:
 
-- the repo does not yet have a dedicated steady-state host call latency benchmark that isolates
-  per-call runtime cost from bind/load/setup cost
+- the missing steady-state host call latency benchmark called out here has since been added in
+  [`pd-vm/tests/jit/perf_tests.rs`](../pd-vm/tests/jit/perf_tests.rs)
 
 ## Goals
 
@@ -68,6 +68,82 @@ Important gap:
 - let the interpreter hit direct collection/string/bytes projection fast paths without going
   through the generic builtin dispatch boundary
 - keep rollout incremental so each stage has a measurable before/after perf gate
+
+## Status (2026-03-21)
+
+- Stage 1 shipped in `pd-vm`
+  - proc-macro builtin wrappers now support borrowed and taken extraction
+  - read-only heap-backed builtin inputs use borrowed refs
+  - mutation-capable builtin inputs use shared handles
+  - the old clone-heavy owned `VmArray`/`VmBytes`/`VmMap` input extractor path has been removed
+- Stage 2 shipped in `pd-vm` and `pd-edge`
+  - common 0/1-result host and builtin returns use `CallReturn::{None, One}`
+  - legacy many-result compatibility packs into one array `Value`
+- Stage 3 shipped in `pd-vm`
+  - steady-state VM-aware host dispatch no longer allocates an argument `Vec<Value>`
+  - `Args*` and `Stack*` host ABIs are benchmarked in the steady-state perf harness
+  - `pd-edge` VM-aware scoped hosts bind through `StackStatic`
+  - sync `pd-edge` borrowed typed args stay borrowed on the normal path and only clone into owned
+    `Vec<Value>` on the rare async-prepare slow path
+- Stage 4 shipped in `pd-vm`
+  - the interpreter fast-paths the first-wave string/bytes/array/map projection set
+
+## Audit Closure (2026-03-21)
+
+Open gaps inside this plan's intended scope: none.
+
+Intentional residuals outside this plan's scope:
+
+- async `pd-edge` host functions still use owned `String`/`Value`/`VmMap` inputs when those values
+  may cross a `'static` future boundary
+- tests, examples, and generic VM stack/program structures still use `Vec<Value>` where that is
+  not part of the steady-state builtin or host-call overhead targeted by this plan
+- internal placeholder binding such as `unbound_edge_abi_function` may still use the legacy static
+  host binder because it is cold setup code, not steady-state dispatch
+
+## Latest Validation (2026-03-21)
+
+Latest successful validation run:
+
+- `cargo check -p pd-vm`
+- `cargo check -p pd-edge`
+- `cargo test -p pd-vm --no-run`
+- `cargo test -p pd-edge --no-run`
+- `cargo test -p pd-vm --test jit_tests perf_host_call_steady_state_latency -- --ignored --nocapture`
+- `cargo test -p pd-vm --test jit_tests perf_proc_macro_builtin_heap_arg_latency -- --ignored --nocapture`
+- `cargo test -p pd-vm --release --features cranelift-jit --test jit_tests perf_jit_native_characterizes_array_builtin_loop_latency -- --ignored --nocapture`
+- `cargo test -p pd-vm --release --features cranelift-jit --test jit_tests perf_jit_native_characterizes_map_builtin_loop_latency -- --ignored --nocapture`
+
+Latest perf samples from this machine:
+
+- steady-state host call latency
+  - legacy dynamic `0arg`: `914 ns/call`
+  - legacy static `0arg`: `979 ns/call`
+  - args dynamic `0arg`: `976 ns/call`
+  - args static `0arg`: `861 ns/call`
+  - stack dynamic `0arg`: `922 ns/call`
+  - stack static `0arg`: `919 ns/call`
+  - legacy dynamic `1arg`: `1183 ns/call`
+  - legacy static `1arg`: `1118 ns/call`
+  - args dynamic `1arg`: `998 ns/call`
+  - args static `1arg`: `986 ns/call`
+  - stack dynamic `1arg`: `1015 ns/call`
+  - stack static `1arg`: `1006 ns/call`
+- proc-macro builtin heap-arg latency
+  - `bytes::from_array_u8`: `1714 ns/call`
+  - `bytes::to_hex` borrowed control: `1928 ns/call`
+  - `__format_template` path via print formatting: `14545 ns/call`
+- release array/map characterization
+  - array loop: interpreter `15747 us`, JIT `16425 us`, `jit_traces=5`
+  - map loop: interpreter `19582 us`, JIT `20165 us`, `jit_traces=6`
+
+Interpretation:
+
+- Stage 3 benchmark gate is satisfied: the borrowed `Args*` and `Stack*` paths stay at or below
+  the legacy VM-aware path on the steady-state call loop, especially for the `1arg` case that
+  previously paid more bookkeeping tax
+- Stage 4 remains in the expected post-fast-path regime where interpreter and JIT are close enough
+  that specialized-trace coverage, not simple wall-clock ordering, is the stable regression guard
 
 ## Non-Goals
 
@@ -86,13 +162,18 @@ Required new measurements:
 - no-op host import call loop
   - dynamic host function
   - static host function
+  - args-slice dynamic host function
+  - args-slice static host function
   - 0-arg and 1-arg variants
   - interpreter first; JIT optional second
 - clone-heavy proc-macro builtin loop
   - `bytes::from_array_u8`
   - `__format_template`
   - one borrowed bytes/string path as control
-- existing array and map builtin loop benchmarks remain as regression guards
+- existing array and map builtin loop benchmarks remain as characterization and regression data
+  - after Stage 4, the array interpreter fast path may be close to or faster than JIT on some
+    machines, so specialized-trace coverage is the stable guard and wall-clock ordering is only a
+    measurement
 
 Suggested harness location:
 
@@ -206,6 +287,14 @@ Planned target surfaces:
   - arity: `1`
   - many legacy values are packed into one array `Value`, which matches the current Lua-style pack
     and unpack model
+- downstream `pd-edge` async result carrier
+  - `type AsyncOpResult = Result<CallReturn, VmError>`
+- downstream `pd-edge` ready-completion helper
+  - `schedule_ready_call(async_ops: &SharedVmAsyncOps, values: CallReturn) -> Result<CallOutcome, VmError>`
+  - arity: `2`
+- downstream `pd-edge` async bridge
+  - `VmAsyncOpBridge::poll_op(op_id, cx) -> Poll<Result<CallReturn, VmError>>`
+  - arity: `2`
 
 Intent:
 
@@ -247,6 +336,24 @@ Planned target:
   - `Vm::execute_bound_host_function_from_stack(resolved_index, argc, call_ip)`
   - arity: `3`
 - `Vm::pop_call_args(argc)` leaves the steady-state path for ordinary VM-aware host calls
+- downstream `pd-edge` scoped host registration enum
+  - `EdgeHostRegistrationFunction::{StackStatic(StaticHostStackFunction), ArgsStatic(StaticHostArgsFunction)}`
+- downstream `pd-edge` scoped wrapper shapes
+  - VM-aware scoped wrapper
+    `fn wrapper(vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError>`
+  - arity: `2`
+  - args-only scoped wrapper
+    `fn wrapper(args: &[Value]) -> Result<CallOutcome, VmError>`
+  - arity: `1`
+- downstream `pd-edge` direct bind surfaces
+  - `registry.register_static_stack(name, arity, function)`
+  - arity: `3`
+  - `registry.register_static_args(name, arity, function)`
+  - arity: `3`
+  - `vm.bind_static_stack_function(name, function)`
+  - arity: `2`
+  - `vm.bind_static_args_function(name, function)`
+  - arity: `2`
 
 Optional follow-up, explicitly not required in first Stage 3 pass:
 
@@ -259,6 +366,9 @@ Intent:
 - `print`, `println`, `runtime::sleep`, and similar read-only VM-aware host calls stop allocating
   an argument `Vec<Value>` on every invocation
 - Stage 3 remains semantically conservative by not changing host trait shapes unless required
+- downstream edge follow-through should bind VM-aware scoped hosts through `StackStatic` and let
+  sync borrowed typed args stay on-stack, cloning into owned `Vec<Value>` only on the rare
+  async-prepare slow path where a future must own the captured arguments
 
 ### Stage 4 ABI Surfaces: Hot Builtin Lowering
 

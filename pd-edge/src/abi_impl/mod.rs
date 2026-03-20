@@ -10,7 +10,7 @@ use std::{
 
 use edge_abi::FUNCTIONS as EDGE_ABI_FUNCTIONS;
 use tokio::sync::oneshot;
-use vm::{CallOutcome, CallReturn, HostAsyncBridge, HostFunction, HostOpId, Value, Vm, VmError};
+use vm::{CallOutcome, CallReturn, HostAsyncBridge, HostOpId, HostStackFunction, Value, Vm, VmError};
 
 use crate::lock_metrics::{self, LockMetricKey, ProfiledMutexGuard};
 
@@ -398,17 +398,17 @@ pub(crate) fn scoped_host_call_can_run_synchronously(
 }
 
 struct AsyncHostAdapter {
-    inner: Box<dyn HostFunction>,
+    inner: Box<dyn HostStackFunction>,
     async_ops: SharedVmAsyncOps,
 }
 
 impl AsyncHostAdapter {
-    fn new(inner: Box<dyn HostFunction>, async_ops: SharedVmAsyncOps) -> Self {
+    fn new(inner: Box<dyn HostStackFunction>, async_ops: SharedVmAsyncOps) -> Self {
         Self { inner, async_ops }
     }
 }
 
-impl HostFunction for AsyncHostAdapter {
+impl HostStackFunction for AsyncHostAdapter {
     fn call(&mut self, vm: &mut Vm, args: &[Value]) -> HostCallResult {
         match self.inner.call(vm, args)? {
             CallOutcome::Return(values) => schedule_ready_call(&self.async_ops, values),
@@ -434,7 +434,7 @@ impl ClosureHostFunction {
     }
 }
 
-impl HostFunction for ClosureHostFunction {
+impl HostStackFunction for ClosureHostFunction {
     fn call(&mut self, vm: &mut Vm, args: &[Value]) -> HostCallResult {
         (self.handler)(vm, args)
     }
@@ -444,9 +444,9 @@ fn bind_async_host(
     vm: &mut Vm,
     async_ops: &SharedVmAsyncOps,
     name: impl Into<String>,
-    function: Box<dyn HostFunction>,
+    function: Box<dyn HostStackFunction>,
 ) {
-    vm.bind_function(
+    vm.bind_stack_function(
         name,
         Box::new(AsyncHostAdapter::new(function, async_ops.clone())),
     );
@@ -890,14 +890,14 @@ mod tests {
         _context: SharedProxyVmContext,
     ) -> Result<CallOutcome, VmError> {
         tokio::task::yield_now().await;
-        Ok(CallOutcome::Return((vec![]).into()))
+        Ok(CallOutcome::Return(vm::CallReturn::none()))
     }
 
     #[cfg(feature = "http")]
     /// Returns immediately from a scoped HTTP host call while taking Vm.
     #[pd_edge_host_function(name = "test::sync_return_with_vm", scope = http)]
     fn sync_return_with_vm(_vm: &mut Vm) -> Result<CallOutcome, VmError> {
-        Ok(CallOutcome::Return((vec![]).into()))
+        Ok(CallOutcome::Return(vm::CallReturn::none()))
     }
 
     fn test_context() -> SharedProxyVmContext {

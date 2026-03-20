@@ -43,7 +43,7 @@ fn request_field_outcome(
         RequestField::Host => request_head.host().to_string(),
         RequestField::ClientIp => request_head.client_ip().to_string(),
     });
-    Ok(CallOutcome::Return((vec![Value::string(value)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::string(value))))
 }
 
 /// Returns the full body for the downstream HTTP request as text.
@@ -53,9 +53,9 @@ async fn get_request_body(
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
     let body = read_request_body_all(&context).await?;
-    Ok(CallOutcome::Return((vec![Value::string(
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::string(
         String::from_utf8_lossy(&body).into_owned(),
-    )]).into()))
+    ))))
 }
 
 /// Reads the next body chunk from the downstream HTTP request.
@@ -71,9 +71,9 @@ async fn get_request_body_chunk(
         )));
     }
     let chunk = read_request_body_next_chunk(&context, max_bytes as usize).await?;
-    Ok(CallOutcome::Return((vec![Value::string(
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::string(
         String::from_utf8_lossy(&chunk).into_owned(),
-    )]).into()))
+    ))))
 }
 
 /// Returns whether the body stream for the downstream HTTP request is exhausted.
@@ -83,7 +83,7 @@ async fn get_request_body_eof(
     context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
     let eof = request_body_eof(&context).await?;
-    Ok(CallOutcome::Return((vec![Value::Bool(eof)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::Bool(eof))))
 }
 
 /// Attaches the untouched downstream transport to the HTTP stack and resumes
@@ -156,26 +156,26 @@ fn get_request_http_version(context: SharedProxyVmContext) -> Result<CallOutcome
 
 /// Returns the first value for a header on the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_HEADER.name, scope = http)]
-fn get_request_header(context: SharedProxyVmContext, name: String) -> Result<CallOutcome, VmError> {
+fn get_request_header(context: SharedProxyVmContext, name: &str) -> Result<CallOutcome, VmError> {
     let value = context
-        .with_request_head(|request_head| request_head.lazy_headers().get_str(&name))
+        .with_request_head(|request_head| request_head.lazy_headers().get_str(name))
         .unwrap_or_default();
-    Ok(CallOutcome::Return((vec![Value::string(value)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::string(value))))
 }
 
 /// Returns all headers on the downstream HTTP request as a map.
 #[pd_edge_host_function(name = http_request::GET_HEADERS.name, scope = http)]
 fn get_request_headers(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return((vec![context.with_request_head(
+    Ok(CallOutcome::Return(vm::CallReturn::one(context.with_request_head(
         |request_head| headers_to_value_map(request_head.headers()),
-    )]).into()))
+    ))))
 }
 
 /// Returns a query parameter from the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_QUERY_ARG.name, scope = http)]
 fn get_request_query_arg(
     context: SharedProxyVmContext,
-    name: String,
+    name: &str,
 ) -> Result<CallOutcome, VmError> {
     let value = context.with_request_head(|request_head| {
         url::form_urlencoded::parse(request_head.query().as_bytes())
@@ -188,21 +188,21 @@ fn get_request_query_arg(
             })
             .unwrap_or_default()
     });
-    Ok(CallOutcome::Return((vec![Value::string(value)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::string(value))))
 }
 
 /// Returns all query parameters from the downstream HTTP request as a map.
 #[pd_edge_host_function(name = http_request::GET_QUERY_ARGS.name, scope = http)]
 fn get_request_query_args(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return((vec![context.with_request_head(
+    Ok(CallOutcome::Return(vm::CallReturn::one(context.with_request_head(
         |request_head| query_to_value_map(request_head.query()),
-    )]).into()))
+    ))))
 }
 
 /// Returns the local destination port for the downstream HTTP request.
 #[pd_edge_host_function(name = http_request::GET_PORT.name, scope = http)]
 fn get_request_port(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return((vec![Value::Int(
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::Int(
         context.with_request_head(|request_head| request_head.port() as i64),
-    )]).into()))
+    ))))
 }

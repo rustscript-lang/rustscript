@@ -106,13 +106,13 @@ fn store_cached_header_batch(headers: &Value, parsed: &HeaderMap) {
 }
 
 pub(super) fn parse_string_header_batch(
-    headers: Value,
+    headers: &Value,
     batch_name: &'static str,
 ) -> Result<HeaderMap, VmError> {
     match headers {
         Value::Null => Ok(HeaderMap::new()),
         Value::Array(values) => {
-            if let Some(parsed) = lookup_cached_header_batch(&Value::Array(values.clone())) {
+            if let Some(parsed) = lookup_cached_header_batch(headers) {
                 return Ok(parsed);
             }
             if values.len() % 2 != 0 {
@@ -135,11 +135,11 @@ pub(super) fn parse_string_header_batch(
                 let (header_name, header_value) = parse_header(name.as_str(), value.as_str())?;
                 parsed.insert(header_name, header_value);
             }
-            store_cached_header_batch(&Value::Array(values.clone()), &parsed);
+            store_cached_header_batch(headers, &parsed);
             Ok(parsed)
         }
         Value::Map(entries) => {
-            if let Some(parsed) = lookup_cached_header_batch(&Value::Map(entries.clone())) {
+            if let Some(parsed) = lookup_cached_header_batch(headers) {
                 return Ok(parsed);
             }
             let mut parsed = HeaderMap::new();
@@ -157,7 +157,7 @@ pub(super) fn parse_string_header_batch(
                 let (header_name, header_value) = parse_header(name.as_str(), value.as_str())?;
                 parsed.insert(header_name, header_value);
             }
-            store_cached_header_batch(&Value::Map(entries.clone()), &parsed);
+            store_cached_header_batch(headers, &parsed);
             Ok(parsed)
         }
         _ => Err(VmError::HostError(format!(

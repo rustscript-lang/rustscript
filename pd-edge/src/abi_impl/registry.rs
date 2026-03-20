@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
 use edge_abi::FUNCTIONS as EDGE_ABI_FUNCTIONS;
-use vm::{HostFunctionRegistry, StaticHostArgsFunction, StaticHostFunction, Vm, VmError};
+use vm::{
+    HostFunctionRegistry, StaticHostArgsFunction, StaticHostStackFunction, Vm, VmError,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EdgeHostScope {
@@ -24,7 +26,7 @@ pub(crate) enum EdgeHostScope {
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub(crate) enum EdgeHostRegistrationFunction {
-    Static(StaticHostFunction),
+    StackStatic(StaticHostStackFunction),
     ArgsStatic(StaticHostArgsFunction),
 }
 
@@ -110,8 +112,8 @@ fn cached_registry_for_scope_mask(scope_mask_bits: u16) -> HostFunctionRegistry 
     for registration in PD_EDGE_HOST_FUNCTIONS {
         if registration_matches_scope_mask(registration, scope_mask_bits) {
             match registration.function {
-                EdgeHostRegistrationFunction::Static(function) => {
-                    registry.register_static(registration.name, registration.arity, function);
+                EdgeHostRegistrationFunction::StackStatic(function) => {
+                    registry.register_static_stack(registration.name, registration.arity, function);
                 }
                 EdgeHostRegistrationFunction::ArgsStatic(function) => {
                     registry.register_static_args(registration.name, registration.arity, function);
@@ -153,8 +155,8 @@ pub(crate) fn bind_host_scopes_direct(vm: &mut Vm, scopes: &[EdgeHostScope]) {
     for registration in PD_EDGE_HOST_FUNCTIONS {
         if registration_matches_scope_mask(registration, scope_mask_bits) {
             match registration.function {
-                EdgeHostRegistrationFunction::Static(function) => {
-                    vm.bind_static_function(registration.name, function);
+                EdgeHostRegistrationFunction::StackStatic(function) => {
+                    vm.bind_static_stack_function(registration.name, function);
                 }
                 EdgeHostRegistrationFunction::ArgsStatic(function) => {
                     vm.bind_static_args_function(registration.name, function);

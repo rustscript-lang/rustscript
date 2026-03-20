@@ -73,7 +73,7 @@ fn with_exchange_request<T>(
 
 fn apply_header_batch(
     request: &mut super::state::HttpOutboundRequestNode,
-    headers: Value,
+    headers: &Value,
 ) -> Result<(), VmError> {
     let parsed = parse_string_header_batch(headers, "header batch")?;
     for (name, value) in parsed.iter() {
@@ -105,7 +105,7 @@ where
         }
     };
     if let Some(snapshot) = snapshot {
-        return Ok(CallOutcome::Return((extract(snapshot)?).into()));
+        return Ok(CallOutcome::Return(extract(snapshot)?));
     }
 
     schedule_current_future_call(vm, async move {
@@ -117,10 +117,10 @@ where
 fn apply_exchange_query(
     context: &SharedProxyVmContext,
     handle: i64,
-    query: String,
+    query: &str,
 ) -> Result<CallOutcome, VmError> {
     ensure_known_exchange_handle(context, handle)?;
-    let normalized_query = query.strip_prefix('?').unwrap_or(query.as_str());
+    let normalized_query = query.strip_prefix('?').unwrap_or(query);
     if normalized_query.contains('#') || normalized_query.chars().any(|ch| ch.is_whitespace()) {
         return Err(VmError::HostError(format!(
             "query must not contain whitespace or '#', got '{query}'",
@@ -130,7 +130,7 @@ fn apply_exchange_query(
     with_exchange_request_mut(context, handle, |request| {
         request.query = normalized_query.to_string();
     })?;
-    Ok(CallOutcome::Return((vec![]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
 }
 
 fn parse_version_preference(label: &str) -> Result<HttpVersionPreference, VmError> {
@@ -150,12 +150,12 @@ fn parse_upstream_port(port: i64) -> Result<u16, VmError> {
 
 pub(crate) fn prepare_default_upstream_request(
     context: &SharedProxyVmContext,
-    host: String,
+    host: &str,
     port: i64,
-    version: String,
-    headers: Value,
+    version: &str,
+    headers: &Value,
 ) -> Result<(), VmError> {
-    let version = parse_version_preference(&version)?;
+    let version = parse_version_preference(version)?;
     let port = parse_upstream_port(port)?;
     let mut exchanges = context.lock_exchanges();
     let exchange = exchanges
@@ -164,7 +164,7 @@ pub(crate) fn prepare_default_upstream_request(
         .ok_or_else(|| unknown_exchange_handle(default_upstream_exchange_handle()))?;
     let (target_scheme, target_host) = {
         let request = &mut exchange.request;
-        request.set_target_host_port(&host, port)?;
+        request.set_target_host_port(host, port)?;
         request.version_preference = version;
         apply_header_batch(request, headers)?;
         (request.target_scheme, request.target_host.clone())
@@ -180,39 +180,39 @@ pub(crate) fn prepare_default_upstream_request(
 
 fn prepare_default_upstream_call(
     context: SharedProxyVmContext,
-    host: String,
+    host: &str,
     port: i64,
-    version: String,
-    headers: Value,
+    version: &str,
+    headers: &Value,
 ) -> Result<CallOutcome, VmError> {
     prepare_default_upstream_request(&context, host, port, version, headers)?;
-    Ok(CallOutcome::Return((vec![Value::Int(
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::Int(
         default_upstream_exchange_handle(),
-    )]).into()))
+    ))))
 }
 
 fn set_exchange_header_call(
     context: SharedProxyVmContext,
     exchange: i64,
-    name: String,
-    value: String,
+    name: &str,
+    value: &str,
 ) -> Result<CallOutcome, VmError> {
     let (header_name, header_value) = parse_header(name, value)?;
     with_exchange_request_mut(&context, exchange, |request| {
         request.headers.insert(header_name, header_value);
     })?;
-    Ok(CallOutcome::Return((vec![]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
 }
 
 fn set_exchange_target_call(
     context: SharedProxyVmContext,
     exchange: i64,
-    host: String,
+    host: &str,
     port: i64,
 ) -> Result<CallOutcome, VmError> {
     let port = parse_upstream_port(port)?;
     let (target_scheme, target_host) = with_exchange_request_mut(&context, exchange, |request| {
-        request.set_target_host_port(&host, port)?;
+        request.set_target_host_port(host, port)?;
         Ok((request.target_scheme, request.target_host.clone()))
     })??;
 
@@ -235,15 +235,15 @@ fn set_exchange_target_call(
             target_host,
         );
     }
-    Ok(CallOutcome::Return((vec![]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
 }
 
 fn set_exchange_scheme_call(
     context: SharedProxyVmContext,
     exchange: i64,
-    scheme: String,
+    scheme: &str,
 ) -> Result<CallOutcome, VmError> {
-    let scheme = HttpUpstreamScheme::parse(&scheme)?;
+    let scheme = HttpUpstreamScheme::parse(scheme)?;
     let (target_scheme, target_host) = with_exchange_request_mut(&context, exchange, |request| {
         request.set_target_scheme(scheme)?;
         Ok((request.target_scheme, request.target_host.clone()))
@@ -272,32 +272,32 @@ fn set_exchange_scheme_call(
         }
     }
 
-    Ok(CallOutcome::Return((vec![]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
 }
 
 /// Allocates an outbound HTTP exchange handle.
 #[pd_edge_host_function(name = http_exchange::NEW.name, scope = http)]
 fn new_exchange(context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
     let handle = allocate_outbound_exchange_handle(&context)?;
-    Ok(CallOutcome::Return((vec![Value::Int(handle)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::Int(handle))))
 }
 
 /// Returns the default upstream handle for the outbound HTTP exchange.
 #[pd_edge_host_function(name = http_exchange::DEFAULT_UPSTREAM.name, scope = http)]
 fn default_upstream_exchange(_context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return((vec![Value::Int(
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::Int(
         default_upstream_exchange_handle(),
-    )]).into()))
+    ))))
 }
 
 /// Configures the inherited default upstream request target, version, and header batch.
 #[pd_edge_host_function(name = http_exchange::PREPARE_DEFAULT_UPSTREAM.name, scope = http)]
 fn prepare_default_upstream(
     context: SharedProxyVmContext,
-    host: String,
+    host: &str,
     port: i64,
-    version: String,
-    headers: Value,
+    version: &str,
+    headers: &Value,
 ) -> Result<CallOutcome, VmError> {
     prepare_default_upstream_call(context, host, port, version, headers)
 }
@@ -311,7 +311,7 @@ async fn send_exchange(
 ) -> Result<CallOutcome, VmError> {
     ensure_known_exchange_handle(&context, exchange)?;
     ensure_outbound_exchange_response_started(&context, exchange).await?;
-    Ok(CallOutcome::Return((vec![]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
 }
 
 /// Sets a header on the outbound HTTP exchange.
@@ -319,8 +319,8 @@ async fn send_exchange(
 fn set_exchange_header(
     context: SharedProxyVmContext,
     exchange: i64,
-    name: String,
-    value: String,
+    name: &str,
+    value: &str,
 ) -> Result<CallOutcome, VmError> {
     set_exchange_header_call(context, exchange, name, value)
 }
@@ -330,14 +330,14 @@ fn set_exchange_header(
 fn set_exchange_method(
     context: SharedProxyVmContext,
     exchange: i64,
-    method: String,
+    method: &str,
 ) -> Result<CallOutcome, VmError> {
     let parsed = Method::from_bytes(method.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid http method '{method}'")))?;
     with_exchange_request_mut(&context, exchange, |request| {
         request.method = parsed;
     })?;
-    Ok(CallOutcome::Return((vec![]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
 }
 
 /// Sets the request path on the outbound HTTP exchange.
@@ -345,17 +345,17 @@ fn set_exchange_method(
 fn set_exchange_path(
     context: SharedProxyVmContext,
     exchange: i64,
-    path: String,
+    path: &str,
 ) -> Result<CallOutcome, VmError> {
-    if !is_valid_request_path(&path) {
+    if !is_valid_request_path(path) {
         return Err(VmError::HostError(format!(
             "path must start with '/' and must not contain whitespace, '?', or '#', got '{path}'",
         )));
     }
     with_exchange_request_mut(&context, exchange, |request| {
-        request.path = path;
+        request.path = path.to_string();
     })?;
-    Ok(CallOutcome::Return((vec![]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
 }
 
 /// Sets the decoded query string on the outbound HTTP exchange.
@@ -363,7 +363,7 @@ fn set_exchange_path(
 fn set_exchange_query(
     context: SharedProxyVmContext,
     exchange: i64,
-    query: String,
+    query: &str,
 ) -> Result<CallOutcome, VmError> {
     apply_exchange_query(&context, exchange, query)
 }
@@ -373,13 +373,13 @@ fn set_exchange_query(
 fn set_exchange_version(
     context: SharedProxyVmContext,
     exchange: i64,
-    version: String,
+    version: &str,
 ) -> Result<CallOutcome, VmError> {
-    let parsed = parse_version_preference(&version)?;
+    let parsed = parse_version_preference(version)?;
     with_exchange_request_mut(&context, exchange, |request| {
         request.version_preference = parsed;
     })?;
-    Ok(CallOutcome::Return((vec![]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
 }
 
 /// Returns the configured HTTP version preference for the outbound HTTP exchange.
@@ -391,7 +391,7 @@ fn get_exchange_version(
     let version = with_exchange_request(&context, exchange, |request| {
         request.version_preference.as_str().to_string()
     })?;
-    Ok(CallOutcome::Return((vec![Value::string(version)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::string(version))))
 }
 
 /// Sets the target endpoint for the outbound HTTP exchange.
@@ -399,7 +399,7 @@ fn get_exchange_version(
 fn set_exchange_target(
     context: SharedProxyVmContext,
     exchange: i64,
-    host: String,
+    host: &str,
     port: i64,
 ) -> Result<CallOutcome, VmError> {
     set_exchange_target_call(context, exchange, host, port)
@@ -410,7 +410,7 @@ fn set_exchange_target(
 fn set_exchange_scheme(
     context: SharedProxyVmContext,
     exchange: i64,
-    scheme: String,
+    scheme: &str,
 ) -> Result<CallOutcome, VmError> {
     set_exchange_scheme_call(context, exchange, scheme)
 }
@@ -424,7 +424,7 @@ fn attach_exchange_tcp(
 ) -> Result<CallOutcome, VmError> {
     ensure_known_exchange_handle(&context, exchange)?;
     attach_outbound_exchange_tcp_transport(&context, exchange, stream)?;
-    Ok(CallOutcome::Return((vec![]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
 }
 
 #[cfg(feature = "tls")]
@@ -437,7 +437,7 @@ fn attach_exchange_tls_plaintext(
 ) -> Result<CallOutcome, VmError> {
     ensure_known_exchange_handle(&context, exchange)?;
     attach_outbound_exchange_tls_transport(&context, exchange, session)?;
-    Ok(CallOutcome::Return((vec![]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
 }
 
 /// Sets the body for the outbound HTTP exchange.
@@ -445,12 +445,12 @@ fn attach_exchange_tls_plaintext(
 fn set_exchange_body(
     context: SharedProxyVmContext,
     exchange: i64,
-    body: String,
+    body: &str,
 ) -> Result<CallOutcome, VmError> {
     with_exchange_request_mut(&context, exchange, |request| {
-        request.body_override = Some(body.into_bytes());
+        request.body_override = Some(body.as_bytes().to_vec());
     })?;
-    Ok(CallOutcome::Return((vec![]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
 }
 
 /// Adds a header value to the outbound HTTP exchange.
@@ -458,14 +458,14 @@ fn set_exchange_body(
 fn add_exchange_header(
     context: SharedProxyVmContext,
     exchange: i64,
-    name: String,
-    value: String,
+    name: &str,
+    value: &str,
 ) -> Result<CallOutcome, VmError> {
     let (header_name, header_value) = parse_header(name, value)?;
     with_exchange_request_mut(&context, exchange, |request| {
         request.headers.append(header_name, header_value);
     })?;
-    Ok(CallOutcome::Return((vec![]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
 }
 
 /// Clears all values for a header on the outbound HTTP exchange.
@@ -473,13 +473,13 @@ fn add_exchange_header(
 fn clear_exchange_header(
     context: SharedProxyVmContext,
     exchange: i64,
-    name: String,
+    name: &str,
 ) -> Result<CallOutcome, VmError> {
     let header_name = parse_header_name(name)?;
     with_exchange_request_mut(&context, exchange, |request| {
         request.headers.remove(header_name);
     })?;
-    Ok(CallOutcome::Return((vec![]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
 }
 
 /// Sets a query parameter on the outbound HTTP exchange.
@@ -487,18 +487,18 @@ fn clear_exchange_header(
 fn set_exchange_query_arg(
     context: SharedProxyVmContext,
     exchange: i64,
-    key: String,
-    value: String,
+    key: &str,
+    value: &str,
 ) -> Result<CallOutcome, VmError> {
     with_exchange_request_mut(&context, exchange, |request| {
         let mut pairs = url::form_urlencoded::parse(request.query.as_bytes())
             .map(|(name, value)| (name.into_owned(), value.into_owned()))
             .collect::<Vec<_>>();
         pairs.retain(|(name, _)| name != &key);
-        pairs.push((key, value));
+        pairs.push((key.to_string(), value.to_string()));
         request.query = serialize_query_pairs(pairs);
     })?;
-    Ok(CallOutcome::Return((vec![]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
 }
 
 /// Returns the status code for the outbound HTTP exchange.
@@ -509,7 +509,7 @@ fn get_exchange_status(
     exchange: i64,
 ) -> Result<CallOutcome, VmError> {
     exchange_response_values_outcome(vm, context, exchange, |snapshot| {
-        Ok(vec![Value::Int(snapshot.status as i64)].into())
+        Ok(vm::CallReturn::one(Value::Int(snapshot.status as i64)))
     })
 }
 
@@ -519,7 +519,7 @@ fn get_exchange_header(
     vm: &mut Vm,
     context: SharedProxyVmContext,
     exchange: i64,
-    name: String,
+    name: &str,
 ) -> Result<CallOutcome, VmError> {
     let header_name = axum::http::HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| VmError::HostError(format!("invalid header name '{name}'")))?;
@@ -529,7 +529,7 @@ fn get_exchange_header(
             .get(&header_name)
             .and_then(|value| value.to_str().ok())
             .unwrap_or("");
-        Ok(vec![Value::string(value)].into())
+        Ok(vm::CallReturn::one(Value::string(value)))
     })
 }
 
@@ -541,7 +541,7 @@ fn get_exchange_headers(
     exchange: i64,
 ) -> Result<CallOutcome, VmError> {
     exchange_response_values_outcome(vm, context, exchange, |snapshot| {
-        Ok(vec![headers_to_value_map(&snapshot.headers)].into())
+        Ok(vm::CallReturn::one(headers_to_value_map(&snapshot.headers)))
     })
 }
 
@@ -553,9 +553,9 @@ async fn get_exchange_body(
     exchange: i64,
 ) -> Result<CallOutcome, VmError> {
     let body = read_outbound_exchange_response_all(&context, exchange).await?;
-    Ok(CallOutcome::Return((vec![Value::string(
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::string(
         String::from_utf8_lossy(&body).into_owned(),
-    )]).into()))
+    ))))
 }
 
 /// Returns the first trailer value for the outbound HTTP exchange.
@@ -574,7 +574,7 @@ async fn get_exchange_trailer(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
-    Ok(CallOutcome::Return((vec![Value::string(value)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::string(value))))
 }
 
 /// Returns all trailers on the outbound HTTP exchange as a map.
@@ -585,7 +585,7 @@ async fn get_exchange_trailers(
     exchange: i64,
 ) -> Result<CallOutcome, VmError> {
     let trailers = read_outbound_exchange_response_trailers(&context, exchange).await?;
-    Ok(CallOutcome::Return((vec![headers_to_value_map(&trailers)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(headers_to_value_map(&trailers))))
 }
 
 /// Returns the HTTP version for the outbound HTTP exchange.
@@ -596,7 +596,7 @@ fn get_exchange_http_version(
     exchange: i64,
 ) -> Result<CallOutcome, VmError> {
     exchange_response_values_outcome(vm, context, exchange, |snapshot| {
-        Ok(vec![Value::string(snapshot.http_version)].into())
+        Ok(vm::CallReturn::one(Value::string(snapshot.http_version)))
     })
 }
 
@@ -618,9 +618,9 @@ async fn get_exchange_body_next_chunk(
     }
     let chunk =
         read_outbound_exchange_response_next_chunk(&context, exchange, max_bytes as usize).await?;
-    Ok(CallOutcome::Return((vec![Value::string(
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::string(
         String::from_utf8_lossy(&chunk).into_owned(),
-    )]).into()))
+    ))))
 }
 
 /// Returns whether the body stream for the outbound HTTP exchange is exhausted.
@@ -631,5 +631,5 @@ async fn get_exchange_body_eof(
     exchange: i64,
 ) -> Result<CallOutcome, VmError> {
     let eof = outbound_exchange_response_eof(&context, exchange).await?;
-    Ok(CallOutcome::Return((vec![Value::Bool(eof)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::Bool(eof))))
 }

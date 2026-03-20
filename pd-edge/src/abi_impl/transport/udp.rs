@@ -265,7 +265,7 @@ async fn ensure_udp_socket_connected(
 #[pd_edge_host_function(name = udp::socket::NEW.name, scope = transport)]
 async fn socket_new(_vm: &mut Vm, context: SharedProxyVmContext) -> Result<CallOutcome, VmError> {
     let handle = allocate_udp_socket_handle(&context)?;
-    Ok(CallOutcome::Return((vec![Value::Int(handle)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::Int(handle))))
 }
 
 /// Returns the UDP socket handle for the current downstream flow.
@@ -274,9 +274,9 @@ async fn socket_downstream(
     _vm: &mut Vm,
     _context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return((vec![Value::Int(
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::Int(
         UdpSocketRef::Downstream.handle(),
-    )]).into()))
+    ))))
 }
 
 /// Returns the default upstream handle for the UDP socket.
@@ -285,9 +285,9 @@ async fn socket_default_upstream(
     _vm: &mut Vm,
     _context: SharedProxyVmContext,
 ) -> Result<CallOutcome, VmError> {
-    Ok(CallOutcome::Return((vec![Value::Int(
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::Int(
         default_upstream_udp_socket_handle(),
-    )]).into()))
+    ))))
 }
 
 /// Returns whether the UDP socket handle is present.
@@ -302,7 +302,7 @@ async fn socket_is_present(
         UdpSocketHandle::Downstream => false,
         _ => socket_state(&context, handle).is_present(),
     };
-    Ok(CallOutcome::Return((vec![Value::Bool(present)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::Bool(present))))
 }
 
 /// Binds the UDP socket to a local address.
@@ -319,7 +319,7 @@ async fn socket_bind(
         state.set_bind_address(local_addr);
         Ok(())
     })?;
-    Ok(CallOutcome::Return((vec![]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
 }
 
 /// Sets the target endpoint for the UDP socket.
@@ -339,7 +339,7 @@ async fn socket_set_target(
         state.set_target(authority, normalized_host, normalized_port);
         Ok(())
     })?;
-    Ok(CallOutcome::Return((vec![]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
 }
 
 /// Attempts to connect the UDP socket.
@@ -358,7 +358,7 @@ async fn socket_connect(
                 err.to_string(),
             );
         })?;
-    Ok(CallOutcome::Return((vec![Value::Bool(true)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::Bool(true))))
 }
 
 /// Returns the current phase for the UDP socket.
@@ -372,7 +372,7 @@ async fn socket_get_phase(
         UdpSocketHandle::Downstream => "inactive".to_string(),
         handle => socket_state(&context, handle).phase().as_str().to_string(),
     };
-    Ok(CallOutcome::Return((vec![Value::string(phase)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::string(phase))))
 }
 
 /// Returns the local address for the UDP socket.
@@ -386,7 +386,7 @@ async fn socket_get_local_addr(
         UdpSocketHandle::Downstream => String::new(),
         handle => socket_state(&context, handle).local_address().to_string(),
     };
-    Ok(CallOutcome::Return((vec![Value::string(address)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::string(address))))
 }
 
 /// Returns the peer address for the UDP socket.
@@ -400,7 +400,7 @@ async fn socket_get_peer_addr(
         UdpSocketHandle::Downstream => String::new(),
         handle => socket_state(&context, handle).peer_address().to_string(),
     };
-    Ok(CallOutcome::Return((vec![Value::string(address)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::string(address))))
 }
 
 /// Sends a text message over the UDP socket.
@@ -425,7 +425,7 @@ async fn socket_send_text(
         .send(text.as_bytes())
         .await
         .map_err(|err| VmError::HostError(format!("failed to send udp datagram: {err}")))?;
-    Ok(CallOutcome::Return((vec![Value::Int(sent as i64)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::Int(sent as i64))))
 }
 
 /// Receives a text datagram from the UDP socket.
@@ -446,9 +446,9 @@ async fn socket_recv_text(
             .map_err(|err| VmError::HostError(format!("failed to receive udp datagram: {err}")))?
     };
     buffer.truncate(received);
-    Ok(CallOutcome::Return((vec![Value::string(
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::string(
         String::from_utf8_lossy(&buffer).into_owned(),
-    )]).into()))
+    ))))
 }
 
 /// Sends a base64-encoded binary message over the UDP socket.
@@ -469,7 +469,7 @@ async fn socket_send_binary_base64(
             .await
             .map_err(|err| VmError::HostError(format!("failed to send udp datagram: {err}")))?
     };
-    Ok(CallOutcome::Return((vec![Value::Int(sent as i64)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::Int(sent as i64))))
 }
 
 /// Sends a binary message over the UDP socket.
@@ -488,7 +488,7 @@ async fn socket_send_binary(
             .await
             .map_err(|err| VmError::HostError(format!("failed to send udp datagram: {err}")))?
     };
-    Ok(CallOutcome::Return((vec![Value::Int(sent as i64)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::Int(sent as i64))))
 }
 
 /// Receives a base64-encoded binary datagram from the UDP socket.
@@ -509,9 +509,9 @@ async fn socket_recv_binary_base64(
             .map_err(|err| VmError::HostError(format!("failed to receive udp datagram: {err}")))?
     };
     buffer.truncate(received);
-    Ok(CallOutcome::Return((vec![Value::string(
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::string(
         STANDARD.encode(buffer),
-    )]).into()))
+    ))))
 }
 
 /// Receives a binary datagram from the UDP socket.
@@ -532,7 +532,7 @@ async fn socket_recv_binary(
             .map_err(|err| VmError::HostError(format!("failed to receive udp datagram: {err}")))?
     };
     buffer.truncate(received);
-    Ok(CallOutcome::Return((vec![bytes_to_value(buffer)]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::one(bytes_to_value(buffer))))
 }
 
 /// Closes the UDP socket.
@@ -548,5 +548,5 @@ async fn socket_close(
         state.mark_closed();
         Ok(())
     })?;
-    Ok(CallOutcome::Return((vec![]).into()))
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
 }

@@ -286,6 +286,15 @@ fn transform_async_edge_function(item: &mut ItemFn, attr: &EdgeHostAttr) -> Resu
                 "async edge host functions do not support raw args; use typed parameters instead",
             ));
         }
+        if edge_arg_decoder_kind(&pat_type.ty)
+            .ok()
+            .is_some_and(edge_arg_decoder_is_borrowed)
+        {
+            return Err(Error::new_spanned(
+                &pat_type.ty,
+                "async edge host functions do not support borrowed typed parameters; use owned String, Value, or VmMap inputs",
+            ));
+        }
     }
 
     let Some(vm_ident) = find_vm_param_ident(item) else {
@@ -645,17 +654,21 @@ fn generate_scoped_edge_host_static_wrapper(
                     )));
                 }
                 let #prepare_context_ident = crate::abi_impl::current_vm_context()?;
-                #(#setup_stmts)*
-                #(#extract_stmts)*
                 if crate::abi_impl::scoped_host_call_can_run_synchronously(
                     &#prepare_context_ident,
                     #scope_tokens,
                     #name_expr,
                 )? {
+                    #(#setup_stmts)*
+                    #(#extract_stmts)*
                     let __pd_edge_outcome = #call_expr?;
                     return Ok(__pd_edge_outcome);
                 }
+                let __pd_edge_owned_args = args.to_vec();
                 crate::abi_impl::schedule_current_args_future_call(async move {
+                    let args = &__pd_edge_owned_args;
+                    #(#setup_stmts)*
+                    #(#extract_stmts)*
                     crate::abi_impl::prepare_scoped_host_call(
                         #prepare_context_ident.clone(),
                         #scope_tokens,
@@ -715,7 +728,7 @@ fn generate_edge_host_registration(
     let scope_tokens = edge_scope_tokens(scope);
     let static_wrapper_name = format_ident!("__pd_edge_static_{}", wrapper_name);
     let function_kind = if scoped_wrapper_uses_vm(item) {
-        quote!(crate::abi_impl::registry::EdgeHostRegistrationFunction::Static(#static_wrapper_name))
+        quote!(crate::abi_impl::registry::EdgeHostRegistrationFunction::StackStatic(#static_wrapper_name))
     } else {
         quote!(crate::abi_impl::registry::EdgeHostRegistrationFunction::ArgsStatic(#static_wrapper_name))
     };
@@ -802,10 +815,13 @@ fn wrapper_and_impl_names(name: &syn::Ident) -> (syn::Ident, syn::Ident) {
 #[derive(Clone, Copy)]
 enum EdgeArgDecoderKind {
     String,
+    StringRef,
     Int,
     Bool,
     Value,
+    ValueRef,
     Map,
+    MapRef,
 }
 
 #[derive(Clone, Copy)]
@@ -818,6 +834,29 @@ fn edge_arg_decoder_kind(ty: &Type) -> Result<EdgeArgDecoderKind, Error> {
     match ty {
         Type::Group(group) => edge_arg_decoder_kind(&group.elem),
         Type::Paren(paren) => edge_arg_decoder_kind(&paren.elem),
+        Type::Reference(reference) => {
+            if reference.mutability.is_some() {
+                return Err(Error::new_spanned(
+                    ty,
+                    "mutable borrowed edge host argument types are not supported",
+                ));
+            }
+            let Some(inner) = type_path_terminal_ident(reference.elem.as_ref()) else {
+                return Err(Error::new_spanned(
+                    ty,
+                    "unsupported borrowed edge host argument type",
+                ));
+            };
+            match inner.as_str() {
+                "str" => Ok(EdgeArgDecoderKind::StringRef),
+                "Value" => Ok(EdgeArgDecoderKind::ValueRef),
+                "VmMap" => Ok(EdgeArgDecoderKind::MapRef),
+                other => Err(Error::new_spanned(
+                    ty,
+                    format!("unsupported borrowed edge host argument type '&{other}'"),
+                )),
+            }
+        }
         Type::Path(path) => {
             let Some(segment) = path.path.segments.last() else {
                 return Err(Error::new_spanned(
@@ -870,6 +909,18 @@ fn edge_extract_stmt(
                 }
             };
         },
+        EdgeArgDecoderKind::StringRef => quote! {
+            let #ident = match args.get(#index) {
+                Some(::vm::Value::String(value)) => value.as_str(),
+                Some(_) => return Err(::vm::VmError::TypeMismatch("string")),
+                None => {
+                    return Err(::vm::VmError::HostError(format!(
+                        "missing argument: {}",
+                        #label
+                    )));
+                }
+            };
+        },
         EdgeArgDecoderKind::Int => quote! {
             let #ident = match args.get(#index) {
                 Some(::vm::Value::Int(value)) => *value,
@@ -905,6 +956,17 @@ fn edge_extract_stmt(
                 }
             };
         },
+        EdgeArgDecoderKind::ValueRef => quote! {
+            let #ident = match args.get(#index) {
+                Some(value) => value,
+                None => {
+                    return Err(::vm::VmError::HostError(format!(
+                        "missing argument: {}",
+                        #label
+                    )));
+                }
+            };
+        },
         EdgeArgDecoderKind::Map => quote! {
             let #ident = match args.get(#index) {
                 Some(::vm::Value::Map(entries)) => entries.as_ref().clone(),
@@ -917,6 +979,36 @@ fn edge_extract_stmt(
                 }
             };
         },
+        EdgeArgDecoderKind::MapRef => quote! {
+            let #ident = match args.get(#index) {
+                Some(::vm::Value::Map(entries)) => entries.as_ref(),
+                Some(_) => return Err(::vm::VmError::TypeMismatch("map")),
+                None => {
+                    return Err(::vm::VmError::HostError(format!(
+                        "missing argument: {}",
+                        #label
+                    )));
+                }
+            };
+        },
+    }
+}
+
+fn edge_arg_decoder_is_borrowed(decoder: EdgeArgDecoderKind) -> bool {
+    matches!(
+        decoder,
+        EdgeArgDecoderKind::StringRef
+            | EdgeArgDecoderKind::ValueRef
+            | EdgeArgDecoderKind::MapRef
+    )
+}
+
+fn type_path_terminal_ident(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Group(group) => type_path_terminal_ident(&group.elem),
+        Type::Paren(paren) => type_path_terminal_ident(&paren.elem),
+        Type::Path(path) => path.path.segments.last().map(|segment| segment.ident.to_string()),
+        _ => None,
     }
 }
 
