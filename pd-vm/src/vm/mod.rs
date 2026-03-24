@@ -162,6 +162,17 @@ pub enum VmYieldReason {
     Host,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InterpreterMetrics {
+    pub operand_hint_hit_count: u64,
+    pub operand_hint_miss_count: u64,
+    pub typed_builtin_fast_path_count: u64,
+    pub projection_fast_path_count: u64,
+    pub generic_builtin_call_count: u64,
+    pub scalar_superinstruction_count: u64,
+    pub local_type_hint_hit_count: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 enum InterruptMode {
@@ -254,6 +265,13 @@ pub struct Vm {
     last_yield_reason: Option<VmYieldReason>,
     drop_contract_events_enabled: bool,
     drop_contract_events: u64,
+    operand_hint_hit_count: u64,
+    operand_hint_miss_count: u64,
+    typed_builtin_fast_path_count: u64,
+    projection_fast_path_count: u64,
+    generic_builtin_call_count: u64,
+    scalar_superinstruction_count: u64,
+    local_type_hint_hit_count: u64,
 }
 
 pub(crate) enum ExecOutcome {
@@ -271,6 +289,26 @@ fn logical_shr_i64(value: i64, amount: u32) -> i64 {
 #[inline(always)]
 const fn pack_operand_types(lhs: ValueType, rhs: ValueType) -> PackedOperandTypes {
     lhs as u8 | ((rhs as u8) << 4)
+}
+
+#[inline(always)]
+const fn unpack_operand_type(raw: u8) -> ValueType {
+    match raw & 0x0F {
+        1 => ValueType::Null,
+        2 => ValueType::Int,
+        3 => ValueType::Float,
+        4 => ValueType::Bool,
+        5 => ValueType::String,
+        6 => ValueType::Bytes,
+        7 => ValueType::Array,
+        8 => ValueType::Map,
+        _ => ValueType::Unknown,
+    }
+}
+
+#[inline(always)]
+const fn unpack_operand_types(hint: PackedOperandTypes) -> (ValueType, ValueType) {
+    (unpack_operand_type(hint), unpack_operand_type(hint >> 4))
 }
 
 #[inline(always)]
@@ -328,10 +366,7 @@ fn hash_type_map(type_map: Option<&crate::bytecode::TypeMap>, state: &mut impl H
     operand_entries.hash(state);
 }
 
-fn hash_local_schemas(
-    schemas: &[Option<crate::compiler::TypeSchema>],
-    state: &mut impl Hasher,
-) {
+fn hash_local_schemas(schemas: &[Option<crate::compiler::TypeSchema>], state: &mut impl Hasher) {
     schemas.len().hash(state);
     for schema in schemas {
         match schema {
@@ -484,6 +519,13 @@ impl Vm {
             last_yield_reason: None,
             drop_contract_events_enabled: false,
             drop_contract_events: 0,
+            operand_hint_hit_count: 0,
+            operand_hint_miss_count: 0,
+            typed_builtin_fast_path_count: 0,
+            projection_fast_path_count: 0,
+            generic_builtin_call_count: 0,
+            scalar_superinstruction_count: 0,
+            local_type_hint_hit_count: 0,
         }
     }
 
@@ -523,6 +565,28 @@ impl Vm {
 
     pub fn clear_jit_native_bridge_stats(&mut self) {
         self.jit_native_bridge_counts.clear();
+    }
+
+    pub fn interpreter_metrics_snapshot(&self) -> InterpreterMetrics {
+        InterpreterMetrics {
+            operand_hint_hit_count: self.operand_hint_hit_count,
+            operand_hint_miss_count: self.operand_hint_miss_count,
+            typed_builtin_fast_path_count: self.typed_builtin_fast_path_count,
+            projection_fast_path_count: self.projection_fast_path_count,
+            generic_builtin_call_count: self.generic_builtin_call_count,
+            scalar_superinstruction_count: self.scalar_superinstruction_count,
+            local_type_hint_hit_count: self.local_type_hint_hit_count,
+        }
+    }
+
+    pub fn clear_interpreter_metrics(&mut self) {
+        self.operand_hint_hit_count = 0;
+        self.operand_hint_miss_count = 0;
+        self.typed_builtin_fast_path_count = 0;
+        self.projection_fast_path_count = 0;
+        self.generic_builtin_call_count = 0;
+        self.scalar_superinstruction_count = 0;
+        self.local_type_hint_hit_count = 0;
     }
 
     pub fn jit_native_bridge_stats_snapshot(&self) -> Vec<(&'static str, u64)> {
@@ -566,6 +630,7 @@ impl Vm {
         self.waiting_host_op = None;
         self.next_host_op_id = 1;
         self.io_state = crate::builtins::runtime::IoState::default();
+        self.clear_interpreter_metrics();
     }
 
     #[inline(always)]
@@ -737,6 +802,56 @@ impl Vm {
         self.operand_type_hints
             .as_deref()
             .map_or(NO_OPERAND_TYPE_HINT, |hints| hints[ip])
+    }
+
+    #[inline(always)]
+    pub(super) fn operand_value_types(&self, ip: usize) -> (ValueType, ValueType) {
+        unpack_operand_types(self.operand_type_hint(ip))
+    }
+
+    #[inline(always)]
+    pub(super) fn local_type_hint(&self, index: u8) -> ValueType {
+        self.program
+            .type_map
+            .as_ref()
+            .and_then(|type_map| type_map.local_types.get(index as usize))
+            .copied()
+            .unwrap_or(ValueType::Unknown)
+    }
+
+    #[inline(always)]
+    pub(super) fn record_local_type_hint_hit(&mut self) {
+        self.local_type_hint_hit_count = self.local_type_hint_hit_count.saturating_add(1);
+    }
+
+    #[inline(always)]
+    pub(super) fn record_scalar_superinstruction(&mut self) {
+        self.scalar_superinstruction_count = self.scalar_superinstruction_count.saturating_add(1);
+    }
+
+    #[inline(always)]
+    pub(super) fn record_typed_builtin_fast_path(&mut self) {
+        self.typed_builtin_fast_path_count = self.typed_builtin_fast_path_count.saturating_add(1);
+    }
+
+    #[inline(always)]
+    pub(super) fn record_projection_fast_path(&mut self) {
+        self.projection_fast_path_count = self.projection_fast_path_count.saturating_add(1);
+    }
+
+    #[inline(always)]
+    pub(super) fn record_generic_builtin_call(&mut self) {
+        self.generic_builtin_call_count = self.generic_builtin_call_count.saturating_add(1);
+    }
+
+    #[inline(always)]
+    fn record_operand_hint_hit(&mut self) {
+        self.operand_hint_hit_count = self.operand_hint_hit_count.saturating_add(1);
+    }
+
+    #[inline(always)]
+    fn record_operand_hint_miss(&mut self) {
+        self.operand_hint_miss_count = self.operand_hint_miss_count.saturating_add(1);
     }
 
     #[inline(always)]
@@ -1251,51 +1366,83 @@ impl Vm {
             x if x == OpCode::Add as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
-                    INT_INT_OPERAND_TYPE_HINT => self.int_add_op()?,
-                    FLOAT_FLOAT_OPERAND_TYPE_HINT => self.float_add_op()?,
-                    STRING_STRING_OPERAND_TYPE_HINT => self.string_concat_op()?,
-                    BYTES_BYTES_OPERAND_TYPE_HINT => self.bytes_concat_op()?,
-                    _ => self.binary_add_op()?,
+                    INT_INT_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.int_add_op()?
+                    }
+                    FLOAT_FLOAT_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.float_add_op()?
+                    }
+                    STRING_STRING_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.string_concat_op()?
+                    }
+                    BYTES_BYTES_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.bytes_concat_op()?
+                    }
+                    _ => {
+                        self.record_operand_hint_miss();
+                        self.binary_add_op()?
+                    }
                 }
             }
             x if x == OpCode::Sub as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
                     INT_INT_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
                         self.int_binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_sub(rhs)))?
                     }
                     FLOAT_FLOAT_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
                         self.float_binary_numeric_op(|lhs, rhs| Ok(lhs - rhs))?
                     }
-                    _ => self.binary_numeric_op(
-                        |lhs, rhs| Ok(lhs.wrapping_sub(rhs)),
-                        |lhs, rhs| Ok(lhs - rhs),
-                    )?,
+                    _ => {
+                        self.record_operand_hint_miss();
+                        self.binary_numeric_op(
+                            |lhs, rhs| Ok(lhs.wrapping_sub(rhs)),
+                            |lhs, rhs| Ok(lhs - rhs),
+                        )?
+                    }
                 }
             }
             x if x == OpCode::Mul as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
                     INT_INT_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
                         self.int_binary_numeric_op(|lhs, rhs| Ok(lhs.wrapping_mul(rhs)))?
                     }
                     FLOAT_FLOAT_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
                         self.float_binary_numeric_op(|lhs, rhs| Ok(lhs * rhs))?
                     }
-                    _ => self.binary_numeric_op(
-                        |lhs, rhs| Ok(lhs.wrapping_mul(rhs)),
-                        |lhs, rhs| Ok(lhs * rhs),
-                    )?,
+                    _ => {
+                        self.record_operand_hint_miss();
+                        self.binary_numeric_op(
+                            |lhs, rhs| Ok(lhs.wrapping_mul(rhs)),
+                            |lhs, rhs| Ok(lhs * rhs),
+                        )?
+                    }
                 }
             }
             x if x == OpCode::Div as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
-                    INT_INT_OPERAND_TYPE_HINT => self.int_binary_numeric_op(checked_int_div)?,
+                    INT_INT_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.int_binary_numeric_op(checked_int_div)?
+                    }
                     FLOAT_FLOAT_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
                         self.float_binary_numeric_op(|lhs, rhs| Ok(lhs / rhs))?
                     }
-                    _ => self.binary_numeric_op(checked_int_div, |lhs, rhs| Ok(lhs / rhs))?,
+                    _ => {
+                        self.record_operand_hint_miss();
+                        self.binary_numeric_op(checked_int_div, |lhs, rhs| Ok(lhs / rhs))?
+                    }
                 }
             }
             x if x == OpCode::Shl as u8 => {
@@ -1316,11 +1463,18 @@ impl Vm {
             x if x == OpCode::Mod as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
-                    INT_INT_OPERAND_TYPE_HINT => self.int_binary_numeric_op(checked_int_rem)?,
+                    INT_INT_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.int_binary_numeric_op(checked_int_rem)?
+                    }
                     FLOAT_FLOAT_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
                         self.float_binary_numeric_op(|lhs, rhs| Ok(lhs % rhs))?
                     }
-                    _ => self.binary_numeric_op(checked_int_rem, |lhs, rhs| Ok(lhs % rhs))?,
+                    _ => {
+                        self.record_operand_hint_miss();
+                        self.binary_numeric_op(checked_int_rem, |lhs, rhs| Ok(lhs % rhs))?
+                    }
                 }
             }
             x if x == OpCode::And as u8 => {
@@ -1337,25 +1491,50 @@ impl Vm {
             x if x == OpCode::Neg as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
-                    INT_UNARY_OPERAND_TYPE_HINT => self.int_neg_op()?,
-                    FLOAT_UNARY_OPERAND_TYPE_HINT => self.float_neg_op()?,
-                    _ => match self.pop_numeric()? {
-                        NumericValue::Int(value) => {
-                            self.stack.push(Value::Int(value.wrapping_neg()))
+                    INT_UNARY_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.int_neg_op()?
+                    }
+                    FLOAT_UNARY_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.float_neg_op()?
+                    }
+                    _ => {
+                        self.record_operand_hint_miss();
+                        match self.pop_numeric()? {
+                            NumericValue::Int(value) => {
+                                self.stack.push(Value::Int(value.wrapping_neg()))
+                            }
+                            NumericValue::Float(value) => self.stack.push(Value::Float(-value)),
                         }
-                        NumericValue::Float(value) => self.stack.push(Value::Float(-value)),
-                    },
+                    }
                 }
             }
             x if x == OpCode::Ceq as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
-                    INT_INT_OPERAND_TYPE_HINT => self.int_eq_op()?,
-                    FLOAT_FLOAT_OPERAND_TYPE_HINT => self.float_eq_op()?,
-                    BOOL_BOOL_OPERAND_TYPE_HINT => self.bool_eq_op()?,
-                    STRING_STRING_OPERAND_TYPE_HINT => self.string_eq_op()?,
-                    NULL_NULL_OPERAND_TYPE_HINT => self.null_eq_op()?,
+                    INT_INT_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.int_eq_op()?
+                    }
+                    FLOAT_FLOAT_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.float_eq_op()?
+                    }
+                    BOOL_BOOL_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.bool_eq_op()?
+                    }
+                    STRING_STRING_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.string_eq_op()?
+                    }
+                    NULL_NULL_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.null_eq_op()?
+                    }
                     _ => {
+                        self.record_operand_hint_miss();
                         let rhs = self.pop_value()?;
                         let lhs = self.pop_value()?;
                         self.stack.push(Value::Bool(lhs == rhs));
@@ -1365,17 +1544,35 @@ impl Vm {
             x if x == OpCode::Clt as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
-                    INT_INT_OPERAND_TYPE_HINT => self.int_compare_op(|lhs, rhs| lhs < rhs)?,
-                    FLOAT_FLOAT_OPERAND_TYPE_HINT => self.float_compare_op(|lhs, rhs| lhs < rhs)?,
-                    _ => self.compare_numeric_op(|lhs, rhs| lhs < rhs, |lhs, rhs| lhs < rhs)?,
+                    INT_INT_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.int_compare_op(|lhs, rhs| lhs < rhs)?
+                    }
+                    FLOAT_FLOAT_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.float_compare_op(|lhs, rhs| lhs < rhs)?
+                    }
+                    _ => {
+                        self.record_operand_hint_miss();
+                        self.compare_numeric_op(|lhs, rhs| lhs < rhs, |lhs, rhs| lhs < rhs)?
+                    }
                 }
             }
             x if x == OpCode::Cgt as u8 => {
                 let ip = self.ip - 1;
                 match self.operand_type_hint(ip) {
-                    INT_INT_OPERAND_TYPE_HINT => self.int_compare_op(|lhs, rhs| lhs > rhs)?,
-                    FLOAT_FLOAT_OPERAND_TYPE_HINT => self.float_compare_op(|lhs, rhs| lhs > rhs)?,
-                    _ => self.compare_numeric_op(|lhs, rhs| lhs > rhs, |lhs, rhs| lhs > rhs)?,
+                    INT_INT_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.int_compare_op(|lhs, rhs| lhs > rhs)?
+                    }
+                    FLOAT_FLOAT_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.float_compare_op(|lhs, rhs| lhs > rhs)?
+                    }
+                    _ => {
+                        self.record_operand_hint_miss();
+                        self.compare_numeric_op(|lhs, rhs| lhs > rhs, |lhs, rhs| lhs > rhs)?
+                    }
                 }
             }
             x if x == OpCode::Br as u8 => {

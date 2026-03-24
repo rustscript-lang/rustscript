@@ -27,6 +27,32 @@ impl ScalarValue {
 
 impl Vm {
     #[inline(always)]
+    fn local_scalar_value_with_hint(&mut self, index: u8) -> Option<ScalarValue> {
+        match self.local_type_hint(index) {
+            ValueType::Int => {
+                let value = match self.locals.get(index as usize)? {
+                    Value::Int(value) => *value,
+                    _ => return None,
+                };
+                self.record_local_type_hint_hit();
+                Some(ScalarValue::Int(value))
+            }
+            ValueType::Float => {
+                let value = match self.locals.get(index as usize)? {
+                    Value::Float(value) => *value,
+                    _ => return None,
+                };
+                self.record_local_type_hint_hit();
+                Some(ScalarValue::Float(value))
+            }
+            _ => self.local_numeric_value(index).map(|value| match value {
+                NumericValue::Int(value) => ScalarValue::Int(value),
+                NumericValue::Float(value) => ScalarValue::Float(value),
+            }),
+        }
+    }
+
+    #[inline(always)]
     pub(super) fn decoded_ldc_value_at(&self, opcode_ip: usize) -> Option<&Value> {
         self.decoded_instruction_data
             .ldc_values
@@ -59,22 +85,21 @@ impl Vm {
         if !allow_superinstructions {
             return Ok(false);
         }
-        let Some(initial) = self.local_numeric_value(src).map(|value| match value {
-            NumericValue::Int(value) => ScalarValue::Int(value),
-            NumericValue::Float(value) => ScalarValue::Float(value),
-        }) else {
+        let Some(initial) = self.local_scalar_value_with_hint(src) else {
             return Ok(false);
         };
-        let code = &self.program.code;
         let mut cursor = self.ip;
         let mut stack = [None; 8];
         let mut stack_len = 1usize;
         stack[0] = Some(initial);
         let mut steps = 0usize;
-        while cursor < code.len() && steps < 16 {
-            let opcode = match OpCode::try_from(code[cursor]) {
-                Ok(opcode) => opcode,
-                Err(_) => return Ok(false),
+        while cursor < self.program.code.len() && steps < 16 {
+            let opcode = match self.program.code.get(cursor).copied() {
+                Some(raw) => match OpCode::try_from(raw) {
+                    Ok(opcode) => opcode,
+                    Err(_) => return Ok(false),
+                },
+                None => return Ok(false),
             };
             match opcode {
                 OpCode::Ldc => {
@@ -95,10 +120,7 @@ impl Vm {
                     let Some(index) = self.decoded_local_index_at(cursor) else {
                         return Ok(false);
                     };
-                    let Some(value) = self.local_numeric_value(index).map(|value| match value {
-                        NumericValue::Int(value) => ScalarValue::Int(value),
-                        NumericValue::Float(value) => ScalarValue::Float(value),
-                    }) else {
+                    let Some(value) = self.local_scalar_value_with_hint(index) else {
                         return Ok(false);
                     };
                     if stack_len == stack.len() {
@@ -190,6 +212,7 @@ impl Vm {
                         .expect("result scalar should exist")
                         .into_value();
                     self.store_local_with_drop_contract(dst, value)?;
+                    self.record_scalar_superinstruction();
                     self.ip = cursor + 2;
                     return Ok(true);
                 }
@@ -197,7 +220,7 @@ impl Vm {
                     if stack_len != 2 {
                         return Ok(false);
                     }
-                    if code.get(cursor + 1).copied() != Some(OpCode::Brfalse as u8) {
+                    if self.program.code.get(cursor + 1).copied() != Some(OpCode::Brfalse as u8) {
                         return Ok(false);
                     }
                     let Some(target) = self.decoded_jump_target_at(cursor + 1) else {
@@ -232,6 +255,7 @@ impl Vm {
                     if !condition {
                         self.jump_to(target)?;
                     }
+                    self.record_scalar_superinstruction();
                     return Ok(true);
                 }
                 _ => return Ok(false),

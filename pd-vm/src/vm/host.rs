@@ -817,9 +817,15 @@ impl Vm {
             if self.builtin_overrides.contains_key(&index) {
                 return self.execute_builtin_override_call(index, argc_u8, call_ip);
             }
+            if let Some(outcome) =
+                self.try_execute_typed_builtin_fast_path(builtin, argc, call_ip)?
+            {
+                return Ok(outcome);
+            }
             if let Some(outcome) = self.try_execute_builtin_projection_fast_path(builtin, argc)? {
                 return Ok(outcome);
             }
+            self.record_generic_builtin_call();
             return self.execute_builtin_call_from_stack(builtin, argc, call_ip);
         }
 
@@ -896,6 +902,77 @@ impl Vm {
         }
     }
 
+    fn try_execute_typed_builtin_fast_path(
+        &mut self,
+        builtin: BuiltinFunction,
+        argc: usize,
+        call_ip: usize,
+    ) -> VmResult<Option<HostCallExecOutcome>> {
+        let arg_start = self
+            .stack
+            .len()
+            .checked_sub(argc)
+            .ok_or(VmError::StackUnderflow)?;
+        let (lhs, rhs) = self.operand_value_types(call_ip);
+        let result = {
+            let args = &self.stack[arg_start..];
+            match builtin {
+                BuiltinFunction::Len => match (lhs, args) {
+                    (
+                        ValueType::String | ValueType::Bytes | ValueType::Array | ValueType::Map,
+                        [value],
+                    ) => Self::fast_path_len_result(value),
+                    _ => None,
+                },
+                BuiltinFunction::Slice => match (lhs, rhs, args) {
+                    (ValueType::String, ValueType::Int, [source, start, length]) => {
+                        Some(Self::fast_path_slice_string_result(source, start, length)?)
+                    }
+                    (ValueType::Array, ValueType::Int, [source, start, length]) => {
+                        Some(Self::fast_path_slice_array_result(source, start, length)?)
+                    }
+                    (ValueType::Bytes, ValueType::Int, [source, start, length]) => {
+                        Some(Self::fast_path_slice_bytes_result(source, start, length)?)
+                    }
+                    _ => None,
+                },
+                BuiltinFunction::Get => match (lhs, args) {
+                    (
+                        ValueType::String | ValueType::Bytes | ValueType::Array | ValueType::Map,
+                        [container, key],
+                    ) => Self::fast_path_get_result(container, key)?,
+                    _ => None,
+                },
+                BuiltinFunction::Has => match (lhs, args) {
+                    (ValueType::Bytes | ValueType::Array | ValueType::Map, [container, key]) => {
+                        Self::fast_path_has_result(container, key)?
+                    }
+                    _ => None,
+                },
+                BuiltinFunction::BytesFromArrayU8 => match (lhs, args) {
+                    (ValueType::Array, [value]) => {
+                        Some(Self::fast_path_bytes_from_array_u8_result(value)?)
+                    }
+                    _ => None,
+                },
+                BuiltinFunction::BytesToArrayU8 => match (lhs, args) {
+                    (ValueType::Bytes, [value]) => {
+                        Some(Self::fast_path_bytes_to_array_u8_result(value)?)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let Some(value) = result else {
+            return Ok(None);
+        };
+        self.stack.truncate(arg_start);
+        self.stack.push(value);
+        self.record_typed_builtin_fast_path();
+        Ok(Some(HostCallExecOutcome::Returned))
+    }
+
     fn try_execute_builtin_projection_fast_path(
         &mut self,
         builtin: BuiltinFunction,
@@ -924,6 +1001,7 @@ impl Vm {
         };
         self.stack.truncate(arg_start);
         self.stack.push(value);
+        self.record_projection_fast_path();
         Ok(Some(HostCallExecOutcome::Returned))
     }
 
@@ -1023,6 +1101,117 @@ impl Vm {
             Value::Map(entries) => Ok(Some(Value::Bool(entries.get(key).is_some()))),
             _ => Ok(None),
         }
+    }
+
+    fn fast_path_slice_bounds(start: i64, length: i64) -> VmResult<Option<(usize, usize)>> {
+        if start < 0 || length <= 0 {
+            return Ok(None);
+        }
+        let start = usize::try_from(start).map_err(|_| {
+            VmError::HostError("slice start overflow while converting to usize".to_string())
+        })?;
+        let length = usize::try_from(length).map_err(|_| {
+            VmError::HostError("slice length overflow while converting to usize".to_string())
+        })?;
+        Ok(Some((start, length)))
+    }
+
+    fn fast_path_slice_string_result(
+        source: &Value,
+        start: &Value,
+        length: &Value,
+    ) -> VmResult<Value> {
+        let Value::String(text) = source else {
+            return Err(VmError::TypeMismatch("string"));
+        };
+        let start = start.as_int()?;
+        let length = length.as_int()?;
+        let Some((start, length)) = Self::fast_path_slice_bounds(start, length)? else {
+            return Ok(Value::string(String::new()));
+        };
+        Ok(Value::string(
+            text.chars().skip(start).take(length).collect::<String>(),
+        ))
+    }
+
+    fn fast_path_slice_array_result(
+        source: &Value,
+        start: &Value,
+        length: &Value,
+    ) -> VmResult<Value> {
+        let Value::Array(values) = source else {
+            return Err(VmError::TypeMismatch("array"));
+        };
+        let start = start.as_int()?;
+        let length = length.as_int()?;
+        let Some((start, length)) = Self::fast_path_slice_bounds(start, length)? else {
+            return Ok(Value::array(Vec::new()));
+        };
+        Ok(Value::array(
+            values
+                .iter()
+                .skip(start)
+                .take(length)
+                .cloned()
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn fast_path_slice_bytes_result(
+        source: &Value,
+        start: &Value,
+        length: &Value,
+    ) -> VmResult<Value> {
+        let Value::Bytes(values) = source else {
+            return Err(VmError::TypeMismatch("bytes"));
+        };
+        let start = start.as_int()?;
+        let length = length.as_int()?;
+        let Some((start, length)) = Self::fast_path_slice_bounds(start, length)? else {
+            return Ok(Value::bytes(Vec::new()));
+        };
+        Ok(Value::bytes(
+            values
+                .iter()
+                .skip(start)
+                .take(length)
+                .copied()
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn fast_path_bytes_from_array_u8_result(value: &Value) -> VmResult<Value> {
+        let Value::Array(values) = value else {
+            return Err(VmError::TypeMismatch("array"));
+        };
+        let mut out = Vec::with_capacity(values.len());
+        for (index, value) in values.iter().enumerate() {
+            let Value::Int(value) = value else {
+                return Err(VmError::HostError(format!(
+                    "bytes::from_array_u8 entry {index} must be an int in 0..=255"
+                )));
+            };
+            let value = u8::try_from(*value).map_err(|_| {
+                VmError::HostError(format!(
+                    "bytes::from_array_u8 entry {index} must be an int in 0..=255"
+                ))
+            })?;
+            out.push(value);
+        }
+        Ok(Value::bytes(out))
+    }
+
+    fn fast_path_bytes_to_array_u8_result(value: &Value) -> VmResult<Value> {
+        let Value::Bytes(payload) = value else {
+            return Err(VmError::TypeMismatch("bytes"));
+        };
+        Ok(Value::array(
+            payload
+                .iter()
+                .copied()
+                .map(|byte| Value::Int(i64::from(byte)))
+                .collect(),
+        ))
     }
 
     pub(super) fn execute_bound_host_function_from_stack(

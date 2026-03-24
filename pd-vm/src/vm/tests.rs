@@ -1,5 +1,7 @@
 use super::*;
 use crate::builtins::BuiltinFunction;
+use crate::bytecode::TypeMap;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 fn native_cache_test_lock() -> &'static Mutex<()> {
@@ -235,6 +237,138 @@ fn assert_shared_heap_backing(lhs: &Value, rhs: &Value) {
         }
         _ => panic!("expected matching heap values, got lhs={lhs:?} rhs={rhs:?}"),
     }
+}
+
+#[test]
+fn interpreter_metrics_track_operand_hint_hits_for_typed_add() {
+    let mut operand_types = HashMap::new();
+    operand_types.insert(4usize, (ValueType::Int, ValueType::Int));
+    let program = Program::new(
+        vec![],
+        vec![
+            OpCode::Ldloc as u8,
+            0,
+            OpCode::Ldloc as u8,
+            1,
+            OpCode::Add as u8,
+            OpCode::Ret as u8,
+        ],
+    )
+    .with_local_count(2)
+    .with_type_map(TypeMap {
+        strict_types: true,
+        local_types: vec![ValueType::Int, ValueType::Int],
+        local_schemas: vec![None, None],
+        callable_slots: vec![false, false],
+        optional_slots: vec![false, false],
+        operand_types,
+    });
+    let mut vm = Vm::new(program);
+    vm.set_local(0, Value::Int(7))
+        .expect("setting first local should succeed");
+    vm.set_local(1, Value::Int(5))
+        .expect("setting second local should succeed");
+
+    let status = vm.run().expect("typed add program should run");
+
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(12)]);
+    let metrics = vm.interpreter_metrics_snapshot();
+    assert_eq!(metrics.operand_hint_hit_count, 1);
+    assert_eq!(metrics.operand_hint_miss_count, 0);
+}
+
+#[test]
+fn interpreter_uses_typed_builtin_fast_path_for_slice_calls() {
+    let [call_lo, call_hi] = BuiltinFunction::Slice.call_index().to_le_bytes();
+    let mut operand_types = HashMap::new();
+    operand_types.insert(15usize, (ValueType::String, ValueType::Int));
+    let program = Program::new(
+        vec![Value::string("abcd"), Value::Int(1), Value::Int(2)],
+        vec![
+            OpCode::Ldc as u8,
+            0,
+            0,
+            0,
+            0,
+            OpCode::Ldc as u8,
+            1,
+            0,
+            0,
+            0,
+            OpCode::Ldc as u8,
+            2,
+            0,
+            0,
+            0,
+            OpCode::Call as u8,
+            call_lo,
+            call_hi,
+            3,
+            OpCode::Ret as u8,
+        ],
+    )
+    .with_type_map(TypeMap {
+        strict_types: true,
+        local_types: Vec::new(),
+        local_schemas: Vec::new(),
+        callable_slots: Vec::new(),
+        optional_slots: Vec::new(),
+        operand_types,
+    });
+    let mut vm = Vm::new(program);
+
+    let status = vm.run().expect("typed slice builtin should run");
+
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("bc")]);
+    let metrics = vm.interpreter_metrics_snapshot();
+    assert_eq!(metrics.typed_builtin_fast_path_count, 1);
+    assert_eq!(metrics.projection_fast_path_count, 0);
+    assert_eq!(metrics.generic_builtin_call_count, 0);
+}
+
+#[test]
+fn interpreter_superinstructions_use_local_type_hints() {
+    let program = Program::new(
+        vec![Value::Int(1)],
+        vec![
+            OpCode::Ldloc as u8,
+            0,
+            OpCode::Ldc as u8,
+            0,
+            0,
+            0,
+            0,
+            OpCode::Add as u8,
+            OpCode::Stloc as u8,
+            0,
+            OpCode::Ret as u8,
+        ],
+    )
+    .with_local_count(1)
+    .with_type_map(TypeMap {
+        strict_types: true,
+        local_types: vec![ValueType::Int],
+        local_schemas: vec![None],
+        callable_slots: vec![false],
+        optional_slots: vec![false],
+        operand_types: HashMap::new(),
+    });
+    let mut vm = Vm::new(program);
+    vm.set_local(0, Value::Int(9))
+        .expect("setting local should succeed");
+
+    let outcome = step_once(&mut vm).expect("ldloc should fuse scalar sequence");
+
+    assert!(matches!(outcome, ExecOutcome::Continue));
+    assert_eq!(vm.locals[0], Value::Int(10));
+    let metrics = vm.interpreter_metrics_snapshot();
+    assert_eq!(metrics.scalar_superinstruction_count, 1);
+    assert!(
+        metrics.local_type_hint_hit_count >= 1,
+        "expected local type hints to seed superinstruction execution"
+    );
 }
 
 #[test]
