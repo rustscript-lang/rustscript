@@ -872,6 +872,8 @@ struct LoadRunResult {
 
 struct ProxyProcess {
     child: Child,
+    flavor: ProxyFlavor,
+    temp_files: Vec<PathBuf>,
 }
 
 struct UpstreamProcess {
@@ -884,9 +886,16 @@ struct ProxyProcessConfig<'a> {
     https_addr: Option<SocketAddr>,
     http3_addr: Option<SocketAddr>,
     admin_addr: SocketAddr,
+    program_bytes: Option<Vec<u8>>,
     vm_fuel: Option<u64>,
     vm_fuel_check_interval: u32,
     vm_execution_mode: VmExecutionModeArg,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxyFlavor {
+    PdEdgeAdmin,
+    MinimalCli,
 }
 
 struct UpstreamProcessConfig<'a> {
@@ -904,10 +913,12 @@ impl ProxyProcess {
             https_addr,
             http3_addr,
             admin_addr,
+            program_bytes,
             vm_fuel,
             vm_fuel_check_interval,
             vm_execution_mode,
         } = config;
+        let flavor = detect_proxy_flavor(binary_path);
         let rust_log = env::var("PD_EDGE_PROXY_RUST_LOG").unwrap_or_else(|_| "error".to_string());
         let inherit_stdout = env_flag("PD_EDGE_PROXY_STDOUT_INHERIT");
         let enable_proxy_logging = env_flag("PD_EDGE_PROXY_ENABLE_LOGGING");
@@ -917,50 +928,79 @@ impl ProxyProcess {
         } else {
             Stdio::null()
         };
+
         command.arg("--data-addr").arg(data_addr.to_string());
         if !enable_proxy_logging {
             command.arg("--disable-logging");
         }
         command
-            .arg("--disable-metrics")
-            .arg("--tls-session-reuse-entries")
-            .arg(BENCH_TLS_SESSION_REUSE_ENTRIES.to_string())
-            .arg("--upstream-http-reuse-entries")
-            .arg(BENCH_UPSTREAM_HTTP_REUSE_ENTRIES.to_string())
-            .arg("--downstream-http2-session-entries")
-            .arg(BENCH_DOWNSTREAM_HTTP2_SESSION_ENTRIES.to_string())
-            .arg("--upstream-http3-reuse-entries")
-            .arg(BENCH_UPSTREAM_HTTP3_REUSE_ENTRIES.to_string())
-            .arg("--downstream-http3-session-entries")
-            .arg(BENCH_DOWNSTREAM_HTTP3_SESSION_ENTRIES.to_string())
-            .arg("--admin-addr")
-            .arg(admin_addr.to_string())
             .arg("--vm-execution-mode")
             .arg(vm_execution_mode.as_flag_value())
             .env("RUST_LOG", rust_log)
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(Stdio::inherit());
-        if let Some(https_addr) = https_addr {
-            command.arg("--https-addr").arg(https_addr.to_string());
+        if env_flag("PD_EDGE_PROXY_VM_JIT") {
+            command.arg("--vm-jit");
         }
-        if let Some(http3_addr) = http3_addr {
-            command.arg("--http3-addr").arg(http3_addr.to_string());
+
+        let mut temp_files = Vec::new();
+        match flavor {
+            ProxyFlavor::PdEdgeAdmin => {
+                command
+                    .arg("--disable-metrics")
+                    .arg("--tls-session-reuse-entries")
+                    .arg(BENCH_TLS_SESSION_REUSE_ENTRIES.to_string())
+                    .arg("--upstream-http-reuse-entries")
+                    .arg(BENCH_UPSTREAM_HTTP_REUSE_ENTRIES.to_string())
+                    .arg("--downstream-http2-session-entries")
+                    .arg(BENCH_DOWNSTREAM_HTTP2_SESSION_ENTRIES.to_string())
+                    .arg("--upstream-http3-reuse-entries")
+                    .arg(BENCH_UPSTREAM_HTTP3_REUSE_ENTRIES.to_string())
+                    .arg("--downstream-http3-session-entries")
+                    .arg(BENCH_DOWNSTREAM_HTTP3_SESSION_ENTRIES.to_string())
+                    .arg("--admin-addr")
+                    .arg(admin_addr.to_string());
+                if let Some(https_addr) = https_addr {
+                    command.arg("--https-addr").arg(https_addr.to_string());
+                }
+                if let Some(http3_addr) = http3_addr {
+                    command.arg("--http3-addr").arg(http3_addr.to_string());
+                }
+                if let Ok(value) = env::var("PD_EDGE_PROFILE_VM_TAIL") {
+                    command.env("PD_EDGE_PROFILE_VM_TAIL", value);
+                }
+                if let Ok(value) = env::var("PD_EDGE_PROFILE_VM_TAIL_THRESHOLD_US") {
+                    command.env("PD_EDGE_PROFILE_VM_TAIL_THRESHOLD_US", value);
+                }
+            }
+            ProxyFlavor::MinimalCli => {
+                if https_addr.is_some() || http3_addr.is_some() {
+                    return Err(io::Error::other(
+                        "pd-edge-http-minimal only supports plaintext HTTP/1.1 downstream",
+                    )
+                    .into());
+                }
+                if let Some(bytes) = program_bytes.as_ref() {
+                    let path = write_temp_program_file(bytes)?;
+                    command.arg("--program-vmbc").arg(&path);
+                    temp_files.push(path);
+                }
+            }
         }
+
         if let Some(fuel) = vm_fuel {
             command.arg("--vm-fuel").arg(fuel.to_string());
             command
                 .arg("--vm-fuel-check-interval")
                 .arg(vm_fuel_check_interval.to_string());
         }
-        if let Ok(value) = env::var("PD_EDGE_PROFILE_VM_TAIL") {
-            command.env("PD_EDGE_PROFILE_VM_TAIL", value);
-        }
-        if let Ok(value) = env::var("PD_EDGE_PROFILE_VM_TAIL_THRESHOLD_US") {
-            command.env("PD_EDGE_PROFILE_VM_TAIL_THRESHOLD_US", value);
-        }
         let child = command.spawn()?;
-        Ok(Self { child })
+        Ok(Self {
+            child,
+            flavor,
+            temp_files,
+        })
     }
 
     fn pid(&self) -> u32 {
@@ -970,6 +1010,29 @@ impl ProxyProcess {
     fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, io::Error> {
         self.child.try_wait()
     }
+}
+
+fn detect_proxy_flavor(binary_path: &Path) -> ProxyFlavor {
+    let name = binary_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name.contains("pd-edge-http-minimal") || name.contains("http-minimal") {
+        ProxyFlavor::MinimalCli
+    } else {
+        ProxyFlavor::PdEdgeAdmin
+    }
+}
+
+fn write_temp_program_file(bytes: &[u8]) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let path = env::temp_dir().join(format!(
+        "pd-edge-bench-{}-{timestamp}.vmbc",
+        std::process::id()
+    ));
+    fs::write(&path, bytes)?;
+    Ok(path)
 }
 
 impl UpstreamProcess {
@@ -1301,6 +1364,9 @@ impl Drop for ProxyProcess {
         if let Ok(None) = self.child.try_wait() {
             let _ = self.child.kill();
             let _ = self.child.wait();
+        }
+        for path in self.temp_files.drain(..) {
+            let _ = fs::remove_file(path);
         }
     }
 }
@@ -1893,6 +1959,7 @@ async fn run_scenario(
             https_addr,
             http3_addr,
             admin_addr,
+            program_bytes: program_bytes.clone(),
             vm_fuel: config.vm_fuel,
             vm_fuel_check_interval: config.vm_fuel_check_interval,
             vm_execution_mode: config.vm_execution_mode,
@@ -1900,13 +1967,16 @@ async fn run_scenario(
 
         wait_until_proxy_ready(
             &clients.http,
+            data_addr,
             admin_addr,
             Duration::from_millis(config.startup_timeout_ms),
             &mut proxy,
         )
         .await?;
 
-        if let Some(bytes) = program_bytes {
+        if matches!(proxy.flavor, ProxyFlavor::PdEdgeAdmin)
+            && let Some(bytes) = program_bytes
+        {
             upload_program(&clients.http, admin_addr, bytes).await?;
         }
 
@@ -2015,8 +2085,12 @@ async fn run_scenario(
     } else {
         empty_memory_stats()
     };
-    let telemetry = if let Some((_, _, _, _, admin_addr)) = proxy.as_ref() {
-        fetch_telemetry_summary(&clients.http, *admin_addr).await
+    let telemetry = if let Some((proxy, _, _, _, admin_addr)) = proxy.as_ref() {
+        if matches!(proxy.flavor, ProxyFlavor::PdEdgeAdmin) {
+            fetch_telemetry_summary(&clients.http, *admin_addr).await
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -3210,6 +3284,7 @@ async fn wait_until_upstream_ready(
 
 async fn wait_until_proxy_ready(
     client: &Client,
+    data_addr: SocketAddr,
     admin_addr: SocketAddr,
     timeout: Duration,
     proxy: &mut ProxyProcess,
@@ -3222,21 +3297,39 @@ async fn wait_until_proxy_ready(
             );
         }
 
-        if let Ok(response) = client
-            .get(format!("http://{admin_addr}/healthz"))
-            .send()
-            .await
-            && response.status().is_success()
-        {
-            return Ok(());
+        match proxy.flavor {
+            ProxyFlavor::PdEdgeAdmin => {
+                if let Ok(response) = client
+                    .get(format!("http://{admin_addr}/healthz"))
+                    .send()
+                    .await
+                    && response.status().is_success()
+                {
+                    return Ok(());
+                }
+            }
+            ProxyFlavor::MinimalCli => {
+                if client
+                    .get(format!("http://{data_addr}/__bench_ready"))
+                    .send()
+                    .await
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            }
         }
 
         if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("timed out waiting for proxy admin endpoint at {admin_addr}"),
-            )
-            .into());
+            let message = match proxy.flavor {
+                ProxyFlavor::PdEdgeAdmin => {
+                    format!("timed out waiting for proxy admin endpoint at {admin_addr}")
+                }
+                ProxyFlavor::MinimalCli => {
+                    format!("timed out waiting for minimal proxy listener at {data_addr}")
+                }
+            };
+            return Err(io::Error::new(io::ErrorKind::TimedOut, message).into());
         }
         sleep(Duration::from_millis(50)).await;
     }
@@ -3781,10 +3874,10 @@ Options:\n\
   --fuel-latency-sweep              Run latency sweeps for fuel and fuel-check-interval (defaults to scenario no_host_calls_program)\n\
   --fuel-latency-fuels <CSV>        CSV list for fuel sweep; must be > 0 (default starts at 1)\n\
   --fuel-latency-check-intervals <CSV> CSV list for check-interval sweep; must be > 0 (default starts at 1)\n\
-  --binary <PATH>                   Explicit pd-edge-http-proxy binary path\n\
+  --binary <PATH>                   Explicit proxy binary path (pd-edge-http-proxy or pd-edge-http-minimal)\n\
   --json-out <PATH>                 Write JSON report to path\n\
   --scenario <ID>                   Run a single scenario id ({scenario_ids})\n\
-  --skip-build                      Do not auto-build pd-edge-http-proxy\n\
+  --skip-build                      Do not auto-build the default pd-edge-http-proxy binary\n\
   --build-release                   Auto-build release binary (default)\n\
   --build-debug                     Auto-build debug binary\n\
   -h, --help                        Show help\n\n\
