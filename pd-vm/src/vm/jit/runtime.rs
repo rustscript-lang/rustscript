@@ -168,10 +168,24 @@ fn should_fallback_to_interpreter(err: &VmError) -> bool {
         if detail.contains("SSA native lowering does not support"))
 }
 
+#[cfg(any(
+    all(
+        target_arch = "x86_64",
+        any(target_os = "windows", all(unix, not(target_os = "macos")))
+    ),
+    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+))]
 pub(crate) fn resume_linked_trace_entry_address() -> usize {
     pd_vm_native_resume_linked_trace as *const () as usize
 }
 
+#[cfg(any(
+    all(
+        target_arch = "x86_64",
+        any(target_os = "windows", all(unix, not(target_os = "macos")))
+    ),
+    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+))]
 pub(crate) extern "C" fn pd_vm_native_resume_linked_trace(vm: *mut Vm) -> i32 {
     let Some(vm_ref) = (unsafe { vm.as_mut() }) else {
         native::store_bridge_error(VmError::JitNative(
@@ -201,6 +215,13 @@ pub(crate) extern "C" fn pd_vm_native_resume_linked_trace(vm: *mut Vm) -> i32 {
 }
 
 impl Vm {
+    #[cfg(any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "windows", all(unix, not(target_os = "macos")))
+        ),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+    ))]
     fn continue_linked_native_trace_from_exit(&mut self) -> VmResult<i32> {
         self.jit_trace_exit_count = self.jit_trace_exit_count.saturating_add(1);
         let mut current_trace_id = {
