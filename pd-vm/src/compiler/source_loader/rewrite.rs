@@ -886,7 +886,10 @@ is_empty("");
         )
         .expect("rewrite should succeed");
 
-        assert_eq!(rewritten.source.trim(), r#"dedup::<string>(["rss", "rss"]);"#);
+        assert_eq!(
+            rewritten.source.trim(),
+            r#"dedup::<string>(["rss", "rss"]);"#
+        );
     }
 
     #[test]
@@ -924,7 +927,10 @@ is_empty("");
         )
         .expect("rewrite should succeed");
 
-        assert_eq!(rewritten.source.trim(), r#"dedup::<string>(["rss", "rss"]);"#);
+        assert_eq!(
+            rewritten.source.trim(),
+            r#"dedup::<string>(["rss", "rss"]);"#
+        );
     }
 
     #[test]

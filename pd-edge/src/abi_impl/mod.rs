@@ -53,6 +53,10 @@ pub(crate) use self::http3::{
 pub(crate) use self::quic::{build_quic_server_config, tune_udp_socket_buffers};
 #[cfg(feature = "tls")]
 pub(crate) use self::transport::build_default_self_signed_server_config;
+#[cfg(feature = "tls")]
+pub(crate) use self::transport::new_shared_downstream_tls_configuration_cache;
+#[cfg(feature = "tls")]
+pub(crate) use self::transport::new_shared_downstream_tls_resumption_cache;
 pub(crate) use self::transport::{ReplayPrefixedIo, new_shared_tls_session_cache};
 
 pub type SharedRateLimiter = Arc<RateLimiterStore>;

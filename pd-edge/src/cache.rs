@@ -192,6 +192,14 @@ where
         guard.insert(key, value)
     }
 
+    pub(crate) fn clear(&self, metric_key: LockMetricKey, poison_message: &'static str) {
+        for shard in self.shards.iter() {
+            let mut guard = lock_metrics::write_lock(shard, metric_key, poison_message);
+            guard.values.clear();
+            guard.lru_order.clear();
+        }
+    }
+
     #[cfg(any(test, feature = "http2"))]
     pub(crate) fn get_or_insert_with_cloned(
         &self,

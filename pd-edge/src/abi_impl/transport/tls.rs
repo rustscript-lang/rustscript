@@ -30,8 +30,9 @@ use super::super::websocket::{
 };
 use super::state::tls_session_cache_key;
 use super::state::{
-    DownstreamTlsServerStart, ReplayPrefixedIo, TlsFlowState, TlsProtocolVersion, TlsSessionRef,
-    decode_tls_session_handle,
+    CachedDownstreamTlsConfiguration, DownstreamTlsResumptionState, DownstreamTlsServerStart,
+    ReplayPrefixedIo, TlsFlowState, TlsProtocolVersion, TlsSessionRef,
+    decode_tls_session_handle, downstream_tls_configuration_key, downstream_tls_resumption_key,
 };
 use crate::abi_impl::transport::HTTP11_ALPN_PROTOCOL;
 use crate::lock_metrics::LockMetricKey;
@@ -190,7 +191,9 @@ fn with_configurable_session_mut<T>(
                 ));
             }
             let mut guard = context.lock_transport();
-            mutate(&mut guard.tls_dag.downstream)
+            let result = mutate(&mut guard.tls_dag.downstream)?;
+            guard.downstream_tls_server_config = None;
+            Ok(result)
         }
         TlsSessionHandle::Reserved(TlsSessionRef::DefaultUpstream) => {
             if upstream_response_available(context) {
@@ -572,7 +575,64 @@ fn build_downstream_server_identity(
     }
 }
 
-fn build_downstream_server_config(flow: &TlsFlowState) -> Result<ServerConfig, VmError> {
+fn downstream_tls_resumption_state(
+    context: &SharedProxyVmContext,
+    flow: &TlsFlowState,
+) -> Result<Option<DownstreamTlsResumptionState>, VmError> {
+    let Some(cache) = context.services().downstream_tls_resumption_cache() else {
+        return Ok(None);
+    };
+    let entries = context.services().downstream_tls_resumption_entries();
+    if entries == 0 {
+        return Ok(None);
+    }
+    let Some(key) = downstream_tls_resumption_key(flow) else {
+        return Ok(None);
+    };
+
+    if let Some(existing) = cache.peek_cloned(
+        &key,
+        LockMetricKey::TlsSessionCache,
+        "downstream tls resumption cache lock poisoned",
+    ) {
+        return Ok(Some(existing));
+    }
+
+    let state = DownstreamTlsResumptionState {
+        session_storage: rustls::server::ServerSessionMemoryCache::new(entries.max(1)),
+        ticketer: rustls::crypto::aws_lc_rs::Ticketer::new().map_err(|err| {
+            VmError::HostError(format!(
+                "failed to initialize downstream tls session tickets: {err}",
+            ))
+        })?,
+    };
+    let _ = cache.insert(
+        key,
+        state.clone(),
+        LockMetricKey::TlsSessionCache,
+        "downstream tls resumption cache lock poisoned",
+    );
+    Ok(Some(state))
+}
+
+#[cfg(feature = "tls")]
+fn cached_downstream_configuration(
+    context: &SharedProxyVmContext,
+    start: &DownstreamTlsServerStart,
+) -> Option<CachedDownstreamTlsConfiguration> {
+    let cache = context.services().downstream_tls_configuration_cache()?;
+    let key = downstream_tls_configuration_key(start.client_hello_server_name(), start.client_hello_alpn());
+    cache.peek_cloned(
+        &key,
+        LockMetricKey::TlsSessionCache,
+        "downstream tls configuration cache lock poisoned",
+    )
+}
+
+fn build_downstream_server_config(
+    context: &SharedProxyVmContext,
+    flow: &TlsFlowState,
+) -> Result<Arc<ServerConfig>, VmError> {
     ensure_rustls_provider();
     let versions = supported_protocol_versions(flow)?;
     let builder =
@@ -608,7 +668,39 @@ fn build_downstream_server_config(flow: &TlsFlowState) -> Result<ServerConfig, V
         .iter()
         .map(|protocol| protocol.as_bytes().to_vec())
         .collect();
-    Ok(config)
+    if let Some(resumption) = downstream_tls_resumption_state(context, flow)? {
+        config.session_storage = resumption.session_storage;
+        config.ticketer = resumption.ticketer;
+    }
+    Ok(Arc::new(config))
+}
+
+#[cfg(feature = "tls")]
+fn cache_downstream_server_config(
+    context: &SharedProxyVmContext,
+    key: super::state::DownstreamTlsConfigurationKey,
+    flow: &TlsFlowState,
+    server_config: Arc<ServerConfig>,
+) {
+    let Some(cache) = context.services().downstream_tls_configuration_cache() else {
+        return;
+    };
+    let cached = CachedDownstreamTlsConfiguration {
+        desired_alpn: flow.desired_alpn().to_vec(),
+        verify_peer: flow.verify_peer(),
+        trusted_certificate_pem: flow.trusted_certificate_pem().map(str::to_string),
+        server_certificate_pem: flow.server_certificate_pem().map(str::to_string),
+        server_private_key_pem: flow.server_private_key_pem().map(str::to_string),
+        min_version: flow.min_version(),
+        max_version: flow.max_version(),
+        server_config,
+    };
+    let _ = cache.insert(
+        key,
+        cached,
+        LockMetricKey::TlsSessionCache,
+        "downstream tls configuration cache lock poisoned",
+    );
 }
 
 fn downstream_tls_session_is_configurable(context: &SharedProxyVmContext) -> bool {
@@ -682,11 +774,16 @@ async fn session_from_socket(
                     Ok(start) => {
                         let start = DownstreamTlsServerStart::new(start);
                         let server_name = start.client_hello_server_name();
+                        let cached_config = cached_downstream_configuration(&context, &start);
                         let mut guard = context.lock_transport();
-                        guard
-                            .tls_dag
-                            .downstream
-                            .observe_downstream_client_hello(server_name);
+                        let flow = &mut guard.tls_dag.downstream;
+                        flow.observe_downstream_client_hello(server_name);
+                        if let Some(cached) = cached_config {
+                            flow.restore_downstream_configuration(&cached);
+                            guard.downstream_tls_server_config = Some(cached.server_config);
+                        } else {
+                            guard.downstream_tls_server_config = None;
+                        }
                         guard.downstream_tls_server_start = Some(start);
                         TlsSessionRef::Downstream.handle()
                     }
@@ -737,6 +834,18 @@ async fn session_is_present(
 ) -> Result<CallOutcome, VmError> {
     Ok(CallOutcome::Return(vm::CallReturn::one(Value::Bool(
         session_flow(&context, decode_session(&context, session)?).is_present(),
+    ))))
+}
+
+/// Returns whether the TLS session still needs explicit configuration before handshake.
+#[pd_edge_host_function(name = "tls::session::needs_configuration", scope = transport)]
+async fn session_needs_configuration(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    session: i64,
+) -> Result<CallOutcome, VmError> {
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::Bool(
+        session_flow(&context, decode_session(&context, session)?).needs_configuration(),
     ))))
 }
 
@@ -862,18 +971,28 @@ async fn session_handshake(
             }
         }
         TlsSessionHandle::Reserved(TlsSessionRef::Downstream) => {
-            let start = {
+            let (start, prepared_config) = {
                 let mut guard = context.lock_transport();
-                guard.downstream_tls_server_start.take().ok_or_else(|| {
+                let start = guard.downstream_tls_server_start.take().ok_or_else(|| {
                     VmError::HostError(
                         "downstream tls session has no pending client hello; call tls::session::from_socket on the downstream tcp stream first".to_string(),
                     )
-                })?
+                })?;
+                let prepared_config = guard.downstream_tls_server_config.take();
+                (start, prepared_config)
             };
             let flow = session_flow(&context, session);
-            let config = build_downstream_server_config(&flow)?;
-            match start.into_inner().into_stream(Arc::new(config)).await {
+            let config = match prepared_config {
+                Some(config) => config,
+                None => build_downstream_server_config(&context, &flow)?,
+            };
+            let configuration_key = downstream_tls_configuration_key(
+                start.client_hello_server_name(),
+                start.client_hello_alpn(),
+            );
+            match start.into_inner().into_stream(config.clone()).await {
                 Ok(tls_stream) => {
+                    let handshake_kind = tls_stream.get_ref().1.handshake_kind();
                     let negotiated_alpn = tls_stream
                         .get_ref()
                         .1
@@ -889,25 +1008,32 @@ async fn session_handshake(
                     let mut guard = context.lock_transport();
                     guard.tcp_dag.downstream.mark_connected();
                     guard.downstream_read_eof = false;
-                    let flow = &mut guard.tls_dag.downstream;
-                    flow.note_server_hello_received();
-                    flow.note_server_certificate_received(peer_certificate_der.clone());
-                    if flow.verify_peer() && flow.trusted_certificate_pem().is_some() {
-                        flow.note_server_certificate_verified();
-                    } else {
-                        flow.note_verification_skipped();
+                    let downstream_flow = &mut guard.tls_dag.downstream;
+                    if matches!(handshake_kind, Some(rustls::HandshakeKind::Resumed)) {
+                        downstream_flow.note_handshake_resumed();
                     }
-                    if !flow.accepts_negotiated_alpn(negotiated_alpn.as_deref()) {
-                        flow.mark_failed();
+                    downstream_flow.note_server_hello_received();
+                    downstream_flow.note_server_certificate_received(peer_certificate_der.clone());
+                    if downstream_flow.verify_peer()
+                        && downstream_flow.trusted_certificate_pem().is_some()
+                    {
+                        downstream_flow.note_server_certificate_verified();
+                    } else {
+                        downstream_flow.note_verification_skipped();
+                    }
+                    if !downstream_flow.accepts_negotiated_alpn(negotiated_alpn.as_deref()) {
+                        downstream_flow.mark_failed();
                         return Err(VmError::HostError(format!(
                             "downstream tls ALPN mismatch: requested [{}], negotiated {}",
-                            flow.desired_alpn().join(", "),
+                            downstream_flow.desired_alpn().join(", "),
                             negotiated_alpn.as_deref().unwrap_or("none"),
                         )));
                     }
-                    flow.mark_handshake_complete(negotiated_alpn);
+                    downstream_flow.mark_handshake_complete(negotiated_alpn);
                     guard.downstream_tls_io =
                         Some(Arc::new(tokio::sync::Mutex::new(Some(tls_stream))));
+                    drop(guard);
+                    cache_downstream_server_config(&context, configuration_key, &flow, config);
                 }
                 Err(err) => {
                     let mut guard = context.lock_transport();
@@ -1105,6 +1231,20 @@ async fn session_get_peer_name(
     Ok(CallOutcome::Return(vm::CallReturn::one(Value::string(
         session_flow(&context, decode_session(&context, session)?)
             .peer_name()
+            .to_string(),
+    ))))
+}
+
+/// Returns the observed server name for the TLS session.
+#[pd_edge_host_function(name = tls::session::GET_SERVER_NAME.name, scope = transport)]
+async fn session_get_server_name(
+    _vm: &mut Vm,
+    context: SharedProxyVmContext,
+    session: i64,
+) -> Result<CallOutcome, VmError> {
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::string(
+        session_flow(&context, decode_session(&context, session)?)
+            .server_name()
             .to_string(),
     ))))
 }

@@ -1069,8 +1069,11 @@ pub(crate) async fn spawn_https_http2_sample_upstream_on(
 pub(crate) struct TlsTestMaterials {
     pub(crate) ca_pem: String,
     pub(crate) ca_der: Vec<u8>,
+    pub(crate) server_cert_pem: String,
     pub(crate) server_cert_der: Vec<u8>,
+    pub(crate) server_key_pem: String,
     pub(crate) server_key_der: Vec<u8>,
+    pub(crate) client_cert_der: Vec<u8>,
     pub(crate) client_cert_pem: String,
     pub(crate) client_key_pem: String,
 }
@@ -1082,6 +1085,16 @@ pub(crate) fn source_string_literal(value: &str) -> String {
 
 #[cfg(feature = "tls")]
 pub(crate) fn build_ca_signed_tls_materials() -> TlsTestMaterials {
+    fn first_cert_der(pem: &str) -> Vec<u8> {
+        let mut reader = std::io::Cursor::new(pem.as_bytes());
+        rustls_pemfile::certs(&mut reader)
+            .next()
+            .transpose()
+            .expect("certificate pem should parse")
+            .expect("certificate pem should contain a certificate")
+            .to_vec()
+    }
+
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new());
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![
@@ -1101,16 +1114,23 @@ pub(crate) fn build_ca_signed_tls_materials() -> TlsTestMaterials {
     let client =
         rcgen::Certificate::from_params(client_params).expect("client certificate should build");
 
+    let server_cert_pem = server
+        .serialize_pem_with_signer(&ca)
+        .expect("server cert should serialize");
+    let client_cert_pem = client
+        .serialize_pem_with_signer(&ca)
+        .expect("client cert should serialize");
+    let server_cert_der = first_cert_der(&server_cert_pem);
+    let client_cert_der = first_cert_der(&client_cert_pem);
     TlsTestMaterials {
         ca_pem: ca.serialize_pem().expect("ca pem should serialize"),
         ca_der: ca.serialize_der().expect("ca der should serialize"),
-        server_cert_der: server
-            .serialize_der_with_signer(&ca)
-            .expect("server cert should serialize"),
+        server_cert_pem,
+        server_cert_der,
+        server_key_pem: server.serialize_private_key_pem(),
         server_key_der: server.serialize_private_key_der(),
-        client_cert_pem: client
-            .serialize_pem_with_signer(&ca)
-            .expect("client cert should serialize"),
+        client_cert_der,
+        client_cert_pem,
         client_key_pem: client.serialize_private_key_pem(),
     }
 }

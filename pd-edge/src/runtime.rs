@@ -39,6 +39,10 @@ use crate::{
     lock_metrics::{self, LockMetricSnapshot},
     logging::category_program,
 };
+#[cfg(feature = "tls")]
+use crate::abi_impl::{
+    new_shared_downstream_tls_configuration_cache, new_shared_downstream_tls_resumption_cache,
+};
 
 mod http_plane;
 mod transport_plane;
@@ -222,6 +226,12 @@ impl SharedState {
         let plain_http1_sender_pool = new_shared_plain_http1_sender_pool();
         let tls_session_cache =
             new_shared_tls_session_cache(store_limits.tls_session_reuse_entries);
+        #[cfg(feature = "tls")]
+        let downstream_tls_configuration_cache =
+            new_shared_downstream_tls_configuration_cache(store_limits.tls_session_reuse_entries);
+        #[cfg(feature = "tls")]
+        let downstream_tls_resumption_cache =
+            new_shared_downstream_tls_resumption_cache(store_limits.tls_session_reuse_entries);
         let upstream_http_sessions =
             new_shared_http_upstream_sessions(store_limits.upstream_http_reuse_entries);
         let upstream_http3_sessions =
@@ -237,6 +247,12 @@ impl SharedState {
                 plain_http1_sender_pool,
                 upstream_http_reuse_entries: store_limits.upstream_http_reuse_entries,
                 tls_session_cache: tls_session_cache.clone(),
+                #[cfg(feature = "tls")]
+                downstream_tls_configuration_cache: downstream_tls_configuration_cache.clone(),
+                #[cfg(feature = "tls")]
+                downstream_tls_resumption_cache: downstream_tls_resumption_cache.clone(),
+                #[cfg(feature = "tls")]
+                downstream_tls_resumption_entries: store_limits.tls_session_reuse_entries,
                 upstream_http_sessions: upstream_http_sessions.clone(),
                 upstream_http3_sessions: upstream_http3_sessions.clone(),
                 downstream_http_sessions: downstream_http2_sessions.clone(),
@@ -716,6 +732,13 @@ pub async fn apply_program_from_bytes(state: &SharedState, bytes: &[u8]) -> Prog
     let const_count = program.constants.len();
     let code_len = program.code.len();
     let program = Arc::new(program);
+    #[cfg(feature = "tls")]
+    if let Some(cache) = state.runtime_services.downstream_tls_configuration_cache() {
+        cache.clear(
+            lock_metrics::LockMetricKey::TlsSessionCache,
+            "downstream tls configuration cache lock poisoned",
+        );
+    }
     state.active_program.store(Some(Arc::new(LoadedProgram {
         program,
         vm_pool: Arc::new(vm_runner::LoadedProgramVmPool::new()),
@@ -751,6 +774,11 @@ mod tests {
             .tls_session_cache()
             .expect("tls session cache should exist")
             .capacity();
+        #[cfg(feature = "tls")]
+        let downstream_tls_capacity = services
+            .downstream_tls_resumption_cache()
+            .expect("downstream tls resumption cache should exist")
+            .capacity();
         let upstream_capacity = services
             .upstream_http_sessions()
             .expect("http upstream session store should exist")
@@ -774,6 +802,8 @@ mod tests {
 
         let defaults = RuntimeStoreLimits::default();
         assert_eq!(tls_capacity, defaults.tls_session_reuse_entries);
+        #[cfg(feature = "tls")]
+        assert_eq!(downstream_tls_capacity, defaults.tls_session_reuse_entries);
         assert_eq!(
             upstream_capacity,
             if cfg!(feature = "http2") {
@@ -818,6 +848,14 @@ mod tests {
             services
                 .tls_session_cache()
                 .expect("tls session cache should exist")
+                .capacity(),
+            8
+        );
+        #[cfg(feature = "tls")]
+        assert_eq!(
+            services
+                .downstream_tls_resumption_cache()
+                .expect("downstream tls resumption cache should exist")
                 .capacity(),
             8
         );

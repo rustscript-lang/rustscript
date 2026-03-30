@@ -61,6 +61,140 @@ impl rustls::client::danger::ServerCertVerifier for PermissiveTestServerCertVeri
     }
 }
 
+#[cfg(feature = "tls")]
+struct DownstreamHttpsResponse {
+    handshake_kind: rustls::HandshakeKind,
+    status: u16,
+    headers: std::collections::HashMap<String, String>,
+    body: String,
+}
+
+#[cfg(feature = "tls")]
+fn build_downstream_mtls_https_client_config(
+    materials: &TlsTestMaterials,
+) -> Arc<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(materials.ca_der.clone()))
+        .expect("ca certificate should parse");
+    let mut key_reader = std::io::Cursor::new(materials.client_key_pem.as_bytes());
+    let client_key = rustls_pemfile::private_key(&mut key_reader)
+        .expect("client private key should parse")
+        .expect("client private key should exist");
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            vec![CertificateDer::from(materials.client_cert_der.clone())],
+            client_key,
+        )
+        .expect("downstream mtls https client config should build");
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Arc::new(config)
+}
+
+#[cfg(feature = "tls")]
+async fn send_downstream_mtls_https_request(
+    config: Arc<rustls::ClientConfig>,
+    https_addr: SocketAddr,
+    path: &str,
+    body: &str,
+) -> DownstreamHttpsResponse {
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+    async fn read_http1_response<S>(
+        stream: &mut S,
+        buffered: &mut Vec<u8>,
+    ) -> std::io::Result<(u16, std::collections::HashMap<String, String>, String)>
+    where
+        S: AsyncRead + Unpin,
+    {
+        loop {
+            if let Some(head_end) = buffered.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head_len = head_end + 4;
+                let head = buffered[..head_len].to_vec();
+                let head_text = String::from_utf8_lossy(&head);
+                let mut lines = head_text.split("\r\n").filter(|line| !line.is_empty());
+                let status = lines
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .expect("status line should parse");
+                let mut headers = std::collections::HashMap::new();
+                let mut content_length = 0usize;
+                for line in lines {
+                    let Some((name, value)) = line.split_once(':') else {
+                        continue;
+                    };
+                    let name = name.trim().to_ascii_lowercase();
+                    let value = value.trim().to_string();
+                    if name == "content-length" {
+                        content_length = value.parse::<usize>().unwrap_or(0);
+                    }
+                    headers.insert(name, value);
+                }
+                while buffered.len() < head_len + content_length {
+                    let mut chunk = [0u8; 1024];
+                    let read = stream.read(&mut chunk).await?;
+                    if read == 0 {
+                        break;
+                    }
+                    buffered.extend_from_slice(&chunk[..read]);
+                }
+                let body =
+                    String::from_utf8_lossy(&buffered[head_len..head_len + content_length])
+                        .into_owned();
+                buffered.drain(..head_len + content_length);
+                return Ok((status, headers, body));
+            }
+
+            let mut chunk = [0u8; 1024];
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "stream closed before response head completed",
+                ));
+            }
+            buffered.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    let connector = tokio_rustls::TlsConnector::from(config);
+    let stream = tokio::net::TcpStream::connect(https_addr)
+        .await
+        .expect("https listener should accept tls clients");
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .expect("server name should parse")
+        .to_owned();
+    let mut tls_stream = connector
+        .connect(server_name, stream)
+        .await
+        .expect("downstream tls handshake should succeed");
+    let handshake_kind = tls_stream
+        .get_ref()
+        .1
+        .handshake_kind()
+        .expect("handshake kind should be known after connect");
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    tls_stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("https request should write");
+    let mut buffered = Vec::new();
+    let (status, headers, body) = read_http1_response(&mut tls_stream, &mut buffered)
+        .await
+        .expect("https response should read");
+    DownstreamHttpsResponse {
+        handshake_kind,
+        status,
+        headers,
+        body,
+    }
+}
+
 fn sample_sse_upstream_test_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -4300,6 +4434,147 @@ async fn http_proxy_https_listener_explicit_handoff_uses_listener_goal_before_ra
         .expect("https request should complete");
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.text().await.expect("body should read"), "https");
+
+    http_handle.abort();
+    https_handle.abort();
+    admin_handle.abort();
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn http_proxy_https_listener_explicit_handoff_exposes_downstream_mtls_and_sni() {
+    let materials = build_ca_signed_tls_materials();
+    let expected_client_cert = STANDARD.encode(&materials.client_cert_der);
+    let (_http_addr, https_addr, admin_addr, http_handle, https_handle, admin_handle) =
+        spawn_http_https_proxy(1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let source = format!(
+        r#"
+        use http;
+        use tcp;
+        use tls;
+
+        let downstream = tcp::stream::downstream();
+        let configuration_mode = if http::request::get_scheme() == "tcp" => {{
+            let session = tls::session::from_socket(downstream);
+            // perf: skip setting the following in reused sessions as they are no-op
+            let mode = if tls::session::needs_configuration(session) => {{
+                tls::session::set_server_certificate(session, {});
+                tls::session::set_server_private_key(session, {});
+                tls::session::set_trusted_certificate(session, {});
+                tls::session::set_alpn(session, "http/1.1");
+                "explicit"
+            }} else => {{
+                "restored"
+            }};
+            tls::session::handshake(session);
+            http::downstream::attach_transport();
+            mode
+        }} else => {{
+            "attached"
+        }};
+
+        let session = tls::session::from_socket(downstream);
+        http::response::set_header("x-configuration-mode", configuration_mode);
+        http::response::set_header("x-request-scheme", http::request::get_scheme());
+        http::response::set_header("x-sni", tls::session::get_server_name(session));
+        http::response::set_header("x-phase", tls::session::get_phase(session));
+        if tls::session::needs_configuration(session) {{
+            http::response::set_header("x-needs-configuration", "true");
+        }} else {{
+            http::response::set_header("x-needs-configuration", "false");
+        }}
+        http::response::set_header("x-client-cert", tls::session::get_peer_certificate(session));
+        if tls::session::is_session_reused(session) {{
+            http::response::set_header("x-reused", "true");
+        }} else {{
+            http::response::set_header("x-reused", "false");
+        }}
+        http::response::set_body(
+            http::request::get_method() + "|" +
+            http::request::get_path() + "|" +
+            http::request::get_body()
+        );
+    "#,
+        source_string_literal(&materials.server_cert_pem),
+        source_string_literal(&materials.server_key_pem),
+        source_string_literal(&materials.ca_pem),
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let upload = upload_program(&client, admin_addr, &compiled.program).await;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+    let client_config = build_downstream_mtls_https_client_config(&materials);
+    let first = send_downstream_mtls_https_request(
+        client_config.clone(),
+        https_addr,
+        "/downstream-mtls-sni",
+        "mtls-body",
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK.as_u16());
+    assert!(matches!(
+        first.handshake_kind,
+        rustls::HandshakeKind::Full | rustls::HandshakeKind::FullWithHelloRetryRequest
+    ));
+    assert_eq!(
+        first.headers.get("x-request-scheme").map(String::as_str),
+        Some("https")
+    );
+    assert_eq!(
+        first.headers.get("x-configuration-mode").map(String::as_str),
+        Some("explicit")
+    );
+    assert_eq!(first.headers.get("x-sni").map(String::as_str), Some("localhost"));
+    assert_eq!(
+        first.headers.get("x-phase").map(String::as_str),
+        Some("plaintext-ready")
+    );
+    assert_eq!(
+        first.headers.get("x-needs-configuration").map(String::as_str),
+        Some("false")
+    );
+    assert_eq!(
+        first.headers.get("x-client-cert").map(String::as_str),
+        Some(expected_client_cert.as_str())
+    );
+    assert_eq!(first.headers.get("x-reused").map(String::as_str), Some("false"));
+    assert_eq!(first.body, "POST|/downstream-mtls-sni|mtls-body");
+
+    let second = send_downstream_mtls_https_request(
+        client_config,
+        https_addr,
+        "/downstream-mtls-sni",
+        "mtls-body",
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::OK.as_u16());
+    assert_eq!(second.handshake_kind, rustls::HandshakeKind::Resumed);
+    assert_eq!(
+        second.headers.get("x-request-scheme").map(String::as_str),
+        Some("https")
+    );
+    assert_eq!(
+        second.headers.get("x-configuration-mode").map(String::as_str),
+        Some("restored")
+    );
+    assert_eq!(
+        second.headers.get("x-sni"),
+        first.headers.get("x-sni"),
+    );
+    assert_eq!(
+        second.headers.get("x-phase").map(String::as_str),
+        Some("plaintext-ready")
+    );
+    assert_eq!(
+        second.headers.get("x-needs-configuration").map(String::as_str),
+        Some("false")
+    );
+    assert_eq!(
+        second.headers.get("x-client-cert"),
+        first.headers.get("x-client-cert"),
+    );
+    assert_eq!(second.headers.get("x-reused").map(String::as_str), Some("true"));
+    assert_eq!(second.body, first.body);
 
     http_handle.abort();
     https_handle.abort();

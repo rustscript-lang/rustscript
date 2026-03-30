@@ -375,7 +375,7 @@ Current state:
   - `udp::socket::{bind, set_target, connect, get_phase, get_local_addr, get_peer_addr, send_text, recv_text, send_binary_base64, recv_binary_base64, close}` operate on any UDP socket handle
   - `tls::session::from_socket(sock)` projects a TLS-session handle from a socket handle
   - `tls::session::{set_alpn, set_verify, set_verify_hostname, set_trusted_certificate, set_client_certificate, set_client_private_key, set_server_certificate, set_server_private_key, set_sni, set_min_version, set_max_version}` configure a TLS session handle
-  - `tls::session::{is_present, handshake, get_phase, get_peer_name, get_alpn, get_peer_certificate, is_session_reused}` read back negotiated or observed TLS state
+  - `tls::session::{is_present, needs_configuration, handshake, get_phase, get_peer_name, get_server_name, get_alpn, get_peer_certificate, is_session_reused}` read back negotiated, observed, or restored TLS state
   - `http::exchange::default_upstream()` returns outbound exchange handle `1`
   - `http::exchange::new()` allocates independent outbound exchange handles starting at `2`
   - `http::exchange::{set_*, send, get_*}` operates on any outbound exchange handle
@@ -396,6 +396,7 @@ Current state:
   - generic `http::exchange::*` is the stable VM-facing request/response surface
   - feature `http2` currently adds explicit upstream session pooling plus downstream session tracking under the generic HTTP layer; it does not yet expose a VM-visible `http2::session::*` namespace
   - downstream HTTPS listener entry is now modeled as a runtime-owned listener goal over the downstream DAG; an untouched connection may auto-advance `tcp -> tls -> http` on first HTTP-scoped host-call entry or during finalization, while raw downstream transport or TLS prelude use still requires explicit `http::downstream::attach_transport()`
+  - explicit downstream TLS handoff now models post-`ClientHello` configuration state inside the TLS DAG itself: `tls::session::from_socket(...)` reaches `client-hello-received`, then either runtime-restored configuration makes `tls::session::needs_configuration(...) == false` or VM code supplies policy with `tls::session::set_*` before `tls::session::handshake(...)`
   - there is no symmetric upstream listener-goal edge today; upstream DAGs still begin only when the VM selects or allocates a handle and asks for connect, handshake, or send progression
   - outbound UDP sockets are executable today
   - downstream UDP handle `0` is reserved but inactive in the current one-shot HTTP runtime
@@ -479,6 +480,8 @@ Rules:
 
 - TLS enters only after `tcp.connected` exists and a TLS parser is attached to the TCP byte stream.
 - `tls.session.selected` is a logical node, not a hardcoded code path. It may be reached by a full handshake or by session reuse.
+- Downstream explicit handoff first observes `ClientHello`, then branches through TLS configuration state in the DAG itself: `NeedsConfiguration` means script still has to call `tls::session::set_*`, while `ConfiguredRestored` means the runtime has already restored the effective server-side TLS policy for this connection.
+- `tls::session::needs_configuration()` reports that DAG branch. `false` means the runtime already restored a usable config; it does not mean the handshake is already complete.
 - Outbound TLS configuration lives on the session node itself: ALPN policy, verification flags, trusted CA bundle, client certificate/key, SNI enablement, and min/max TLS version.
 - The current runtime can enforce verification, trust roots, client authentication, SNI enablement, and TLS version bounds per session. `set_alpn` is currently a negotiated-ALPN policy check over the resulting exchange, not a low-level custom ClientHello generator.
 - `tls.plaintext` is the exported capability for HTTP or another application protocol.
@@ -487,22 +490,31 @@ Rules:
 
 ```mermaid
 flowchart TD
-    A["tcp connected"] --> B["tls configured"]
-    B --> C["tls client hello prepared"]
-    C --> D["tls client hello sent"]
-    D --> E["tls server hello received"]
-    E --> F["tls server certificate received"]
-    F --> G{"verification policy"}
-    G -->|verify enabled| H["tls server certificate verified"]
-    G -->|verify relaxed| I["tls verification skipped"]
-    H --> J{"ALPN policy satisfied"}
-    I --> J
-    J -->|yes| K["tls plaintext ready"]
-    J -->|no| L["tls failed"]
-    K --> M["http ingress may attach here"]
-    K --> N["tls close notify"]
-    N --> O["tls closed"]
-    L --> O
+    A["tcp connected"] --> B{"tls ingress path"}
+    B -->|client / outbound| C["tls configured"]
+    B -->|downstream explicit handoff| D["downstream client hello observed"]
+    D --> E{"configuration state"}
+    E -->|needs_configuration| F["tls configured explicitly"]
+    E -->|restored config| G["tls configuration restored"]
+    C --> H["tls handshake prepared"]
+    F --> H
+    G --> H
+    H --> I{"handshake path"}
+    I -->|full handshake| J["tls server hello received"]
+    I -->|resumed session| N["tls session reused"]
+    J --> K["tls server certificate received"]
+    K --> L{"verification policy"}
+    L -->|verify enabled| M["tls server certificate verified"]
+    L -->|verify relaxed| O["tls verification skipped"]
+    M --> P{"ALPN policy satisfied"}
+    O --> P
+    N --> P
+    P -->|yes| Q["tls plaintext ready"]
+    P -->|no| R["tls failed"]
+    Q --> S["http ingress may attach here"]
+    Q --> T["tls close notify"]
+    T --> U["tls closed"]
+    R --> U
 ```
 
 TLS session reuse is exactly why advancement must be generic. The system should not special-case reuse at every call site. Instead, the DAG engine should be able to satisfy the goal `tls.handshake complete` by selecting one of multiple legal forward paths:

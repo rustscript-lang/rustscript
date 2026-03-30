@@ -10,6 +10,8 @@ use std::{
 
 use axum::http::{Version, uri::Authority};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+#[cfg(feature = "tls")]
+use tokio_rustls::rustls::server::{ProducesTickets, StoresServerSessions};
 
 use crate::cache::ShardedRwLruStore;
 
@@ -564,6 +566,15 @@ impl TlsHandshakePhase {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TlsConfigurationState {
+    #[default]
+    None,
+    NeedsConfiguration,
+    ConfiguredExplicitly,
+    ConfiguredRestored,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum TlsProtocolVersion {
     Tls1_0,
@@ -594,8 +605,53 @@ pub(crate) struct CachedTlsSession {
     pub(crate) peer_certificate_der: Option<Vec<u8>>,
 }
 
+#[cfg(feature = "tls")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DownstreamTlsResumptionKey {
+    pub(crate) desired_alpn: Vec<String>,
+    pub(crate) client_auth_enabled: bool,
+    pub(crate) trusted_certificate_fingerprint: Option<u64>,
+    pub(crate) server_certificate_fingerprint: Option<u64>,
+    pub(crate) server_private_key_fingerprint: Option<u64>,
+    pub(crate) min_version: Option<TlsProtocolVersion>,
+    pub(crate) max_version: Option<TlsProtocolVersion>,
+}
+
+#[cfg(feature = "tls")]
+#[derive(Clone, Debug)]
+pub(crate) struct DownstreamTlsResumptionState {
+    pub(crate) session_storage: Arc<dyn StoresServerSessions>,
+    pub(crate) ticketer: Arc<dyn ProducesTickets>,
+}
+
+#[cfg(feature = "tls")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DownstreamTlsConfigurationKey {
+    pub(crate) server_name: Option<String>,
+    pub(crate) offered_alpn: Vec<Vec<u8>>,
+}
+
+#[cfg(feature = "tls")]
+#[derive(Clone, Debug)]
+pub(crate) struct CachedDownstreamTlsConfiguration {
+    pub(crate) desired_alpn: Vec<String>,
+    pub(crate) verify_peer: bool,
+    pub(crate) trusted_certificate_pem: Option<String>,
+    pub(crate) server_certificate_pem: Option<String>,
+    pub(crate) server_private_key_pem: Option<String>,
+    pub(crate) min_version: Option<TlsProtocolVersion>,
+    pub(crate) max_version: Option<TlsProtocolVersion>,
+    pub(crate) server_config: Arc<tokio_rustls::rustls::ServerConfig>,
+}
+
 pub(crate) type SharedTlsSessionCache =
     Arc<ShardedRwLruStore<TlsSessionCacheKey, CachedTlsSession>>;
+#[cfg(feature = "tls")]
+pub(crate) type SharedDownstreamTlsResumptionCache =
+    Arc<ShardedRwLruStore<DownstreamTlsResumptionKey, DownstreamTlsResumptionState>>;
+#[cfg(feature = "tls")]
+pub(crate) type SharedDownstreamTlsConfigurationCache =
+    Arc<ShardedRwLruStore<DownstreamTlsConfigurationKey, CachedDownstreamTlsConfiguration>>;
 pub(crate) type SharedTcpStreamIo = Arc<tokio::sync::Mutex<Option<tokio::net::TcpStream>>>;
 pub(crate) type SharedUdpSocketIo = Arc<tokio::sync::Mutex<tokio::net::UdpSocket>>;
 #[cfg(feature = "tls")]
@@ -715,6 +771,14 @@ impl DownstreamTlsServerStart {
         self.start.client_hello().server_name().map(str::to_string)
     }
 
+    pub(crate) fn client_hello_alpn(&self) -> Vec<Vec<u8>> {
+        self.start
+            .client_hello()
+            .alpn()
+            .map(|protocols| protocols.map(|protocol| protocol.to_vec()).collect())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn into_inner(self) -> tokio_rustls::StartHandshake<DownstreamReplayTcpStream> {
         self.start
     }
@@ -731,6 +795,20 @@ pub(crate) fn new_shared_tls_session_cache(capacity: usize) -> SharedTlsSessionC
     Arc::new(ShardedRwLruStore::new(capacity))
 }
 
+#[cfg(feature = "tls")]
+pub(crate) fn new_shared_downstream_tls_resumption_cache(
+    capacity: usize,
+) -> SharedDownstreamTlsResumptionCache {
+    Arc::new(ShardedRwLruStore::new(capacity))
+}
+
+#[cfg(feature = "tls")]
+pub(crate) fn new_shared_downstream_tls_configuration_cache(
+    capacity: usize,
+) -> SharedDownstreamTlsConfigurationCache {
+    Arc::new(ShardedRwLruStore::new(capacity))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TlsFlowState {
     present: bool,
@@ -738,6 +816,7 @@ pub(crate) struct TlsFlowState {
     plaintext_ready: bool,
     session_path: TlsSessionPath,
     phase: TlsHandshakePhase,
+    configuration_state: TlsConfigurationState,
     peer_name: Option<String>,
     server_name: Option<String>,
     alpn: Option<String>,
@@ -767,6 +846,7 @@ impl TlsFlowState {
             plaintext_ready: true,
             session_path: TlsSessionPath::Opaque,
             phase: TlsHandshakePhase::OpaqueEstablished,
+            configuration_state: TlsConfigurationState::ConfiguredRestored,
             peer_name: None,
             server_name: normalize_authority_host(host),
             alpn: alpn_from_http_version_label(http_version),
@@ -792,6 +872,7 @@ impl TlsFlowState {
             plaintext_ready: false,
             session_path: TlsSessionPath::None,
             phase: TlsHandshakePhase::Configured,
+            configuration_state: TlsConfigurationState::ConfiguredExplicitly,
             peer_name: None,
             server_name: None,
             alpn: None,
@@ -823,6 +904,7 @@ impl TlsFlowState {
         self.handshake_complete = false;
         self.plaintext_ready = false;
         self.session_path = TlsSessionPath::None;
+        self.configuration_state = TlsConfigurationState::ConfiguredExplicitly;
         self.peer_name = peer_name;
         self.server_name = if self.present && self.sni_enabled {
             self.peer_name.clone()
@@ -843,6 +925,7 @@ impl TlsFlowState {
         self.handshake_complete = false;
         self.plaintext_ready = false;
         self.session_path = TlsSessionPath::None;
+        self.configuration_state = TlsConfigurationState::ConfiguredExplicitly;
         self.peer_name = peer_name;
         self.server_name = if self.present && self.sni_enabled {
             self.peer_name.clone()
@@ -863,6 +946,7 @@ impl TlsFlowState {
         self.handshake_complete = false;
         self.plaintext_ready = false;
         self.session_path = TlsSessionPath::None;
+        self.configuration_state = TlsConfigurationState::NeedsConfiguration;
         self.peer_name = None;
         self.server_name = server_name;
         self.alpn = None;
@@ -872,18 +956,22 @@ impl TlsFlowState {
 
     pub(crate) fn set_desired_alpn(&mut self, protocols: Vec<String>) {
         self.desired_alpn = protocols;
+        self.configuration_state = TlsConfigurationState::ConfiguredExplicitly;
     }
 
     pub(crate) fn set_verify_peer(&mut self, verify: bool) {
         self.verify_peer = verify;
+        self.configuration_state = TlsConfigurationState::ConfiguredExplicitly;
     }
 
     pub(crate) fn set_verify_hostname(&mut self, verify: bool) {
         self.verify_hostname = verify;
+        self.configuration_state = TlsConfigurationState::ConfiguredExplicitly;
     }
 
     pub(crate) fn set_sni_enabled(&mut self, enabled: bool) {
         self.sni_enabled = enabled;
+        self.configuration_state = TlsConfigurationState::ConfiguredExplicitly;
         if enabled && self.present {
             self.server_name = self.peer_name.clone();
         } else if !enabled {
@@ -897,6 +985,7 @@ impl TlsFlowState {
         } else {
             Some(certificate_pem)
         };
+        self.configuration_state = TlsConfigurationState::ConfiguredExplicitly;
     }
 
     pub(crate) fn set_server_certificate_pem(&mut self, certificate_pem: String) {
@@ -905,6 +994,7 @@ impl TlsFlowState {
         } else {
             Some(certificate_pem)
         };
+        self.configuration_state = TlsConfigurationState::ConfiguredExplicitly;
     }
 
     pub(crate) fn set_server_private_key_pem(&mut self, private_key_pem: String) {
@@ -913,6 +1003,7 @@ impl TlsFlowState {
         } else {
             Some(private_key_pem)
         };
+        self.configuration_state = TlsConfigurationState::ConfiguredExplicitly;
     }
 
     pub(crate) fn set_client_certificate_pem(&mut self, certificate_pem: String) {
@@ -921,6 +1012,7 @@ impl TlsFlowState {
         } else {
             Some(certificate_pem)
         };
+        self.configuration_state = TlsConfigurationState::ConfiguredExplicitly;
     }
 
     pub(crate) fn set_client_private_key_pem(&mut self, private_key_pem: String) {
@@ -929,14 +1021,32 @@ impl TlsFlowState {
         } else {
             Some(private_key_pem)
         };
+        self.configuration_state = TlsConfigurationState::ConfiguredExplicitly;
     }
 
     pub(crate) fn set_min_version(&mut self, version: Option<TlsProtocolVersion>) {
         self.min_version = version;
+        self.configuration_state = TlsConfigurationState::ConfiguredExplicitly;
     }
 
     pub(crate) fn set_max_version(&mut self, version: Option<TlsProtocolVersion>) {
         self.max_version = version;
+        self.configuration_state = TlsConfigurationState::ConfiguredExplicitly;
+    }
+
+    #[cfg(feature = "tls")]
+    pub(crate) fn restore_downstream_configuration(
+        &mut self,
+        cached: &CachedDownstreamTlsConfiguration,
+    ) {
+        self.desired_alpn = cached.desired_alpn.clone();
+        self.verify_peer = cached.verify_peer;
+        self.trusted_certificate_pem = cached.trusted_certificate_pem.clone();
+        self.server_certificate_pem = cached.server_certificate_pem.clone();
+        self.server_private_key_pem = cached.server_private_key_pem.clone();
+        self.min_version = cached.min_version;
+        self.max_version = cached.max_version;
+        self.configuration_state = TlsConfigurationState::ConfiguredRestored;
     }
 
     pub(crate) fn note_handshake_prepared(&mut self) {
@@ -979,6 +1089,13 @@ impl TlsFlowState {
             return;
         }
         self.phase = TlsHandshakePhase::ServerCertificateVerified;
+    }
+
+    pub(crate) fn note_handshake_resumed(&mut self) {
+        if !self.present {
+            return;
+        }
+        self.session_path = TlsSessionPath::SessionReuse;
     }
 
     pub(crate) fn note_verification_skipped(&mut self) {
@@ -1049,6 +1166,13 @@ impl TlsFlowState {
 
     pub(crate) fn is_present(&self) -> bool {
         self.present
+    }
+
+    pub(crate) fn needs_configuration(&self) -> bool {
+        matches!(
+            self.configuration_state,
+            TlsConfigurationState::NeedsConfiguration
+        )
     }
 
     pub(crate) fn handshake_complete(&self) -> bool {
@@ -1161,6 +1285,7 @@ impl Default for TlsFlowState {
             plaintext_ready: false,
             session_path: TlsSessionPath::None,
             phase: TlsHandshakePhase::None,
+            configuration_state: TlsConfigurationState::None,
             peer_name: None,
             server_name: None,
             alpn: None,
@@ -1262,6 +1387,38 @@ pub(crate) fn tls_session_cache_key(
     })
 }
 
+#[cfg(feature = "tls")]
+pub(crate) fn downstream_tls_resumption_key(
+    flow: &TlsFlowState,
+) -> Option<DownstreamTlsResumptionKey> {
+    if !flow.is_present() {
+        return None;
+    }
+    let client_auth_enabled = flow.verify_peer() && flow.trusted_certificate_pem().is_some();
+    Some(DownstreamTlsResumptionKey {
+        desired_alpn: flow.desired_alpn().to_vec(),
+        client_auth_enabled,
+        trusted_certificate_fingerprint: client_auth_enabled
+            .then(|| fingerprint_optional_pem(flow.trusted_certificate_pem()))
+            .flatten(),
+        server_certificate_fingerprint: fingerprint_optional_pem(flow.server_certificate_pem()),
+        server_private_key_fingerprint: fingerprint_optional_pem(flow.server_private_key_pem()),
+        min_version: flow.min_version(),
+        max_version: flow.max_version(),
+    })
+}
+
+#[cfg(feature = "tls")]
+pub(crate) fn downstream_tls_configuration_key(
+    server_name: Option<String>,
+    offered_alpn: Vec<Vec<u8>>,
+) -> DownstreamTlsConfigurationKey {
+    DownstreamTlsConfigurationKey {
+        server_name,
+        offered_alpn,
+    }
+}
+
 fn tls_session_origin(scheme: &str, host: &str, port: u16) -> Option<String> {
     let host = normalize_authority_host(host)?.to_ascii_lowercase();
     Some(format!("{}://{}:{port}", scheme.to_ascii_lowercase(), host))
@@ -1288,6 +1445,8 @@ mod tests {
         alpn_from_http_version, decode_tcp_stream_handle, decode_tls_session_handle,
         decode_udp_socket_handle, tls_session_cache_key,
     };
+    #[cfg(feature = "tls")]
+    use super::CachedDownstreamTlsConfiguration;
 
     #[test]
     fn reserved_socket_handles_decode_to_default_streams_and_sessions() {
@@ -1464,6 +1623,34 @@ mod tests {
         assert_eq!(flow.max_version(), Some(TlsProtocolVersion::Tls1_3));
     }
 
+    #[cfg(feature = "tls")]
+    #[test]
+    fn downstream_client_hello_requires_configuration_until_it_is_supplied_or_restored() {
+        let mut flow = TlsFlowState::default();
+        flow.observe_downstream_client_hello(Some("localhost".to_string()));
+        assert!(flow.needs_configuration());
+
+        flow.set_trusted_certificate_pem("ca-pem".to_string());
+        assert!(!flow.needs_configuration());
+
+        let mut restored = TlsFlowState::default();
+        restored.observe_downstream_client_hello(Some("localhost".to_string()));
+        restored.restore_downstream_configuration(&CachedDownstreamTlsConfiguration {
+            desired_alpn: vec!["http/1.1".to_string()],
+            verify_peer: true,
+            trusted_certificate_pem: Some("ca-pem".to_string()),
+            server_certificate_pem: Some("server-cert".to_string()),
+            server_private_key_pem: Some("server-key".to_string()),
+            min_version: Some(TlsProtocolVersion::Tls1_2),
+            max_version: Some(TlsProtocolVersion::Tls1_3),
+            server_config: crate::abi_impl::transport::build_default_self_signed_server_config(
+                Vec::new(),
+            )
+            .expect("default self-signed server config should build"),
+        });
+        assert!(!restored.needs_configuration());
+    }
+
     #[test]
     fn tls_failure_phase_is_recorded() {
         let mut flow = TlsFlowState::default();
@@ -1510,6 +1697,21 @@ mod tests {
         assert_eq!(flow.phase_label(), "plaintext-ready");
         assert_eq!(flow.alpn(), "h2");
         assert_eq!(flow.peer_certificate_der(), Some(&[7, 8, 9][..]));
+    }
+
+    #[test]
+    fn resumed_live_tls_handshake_preserves_session_reuse_path() {
+        let mut flow = TlsFlowState::default();
+        flow.observe_downstream_client_hello(Some("localhost".to_string()));
+        flow.note_handshake_resumed();
+        flow.mark_handshake_complete(Some("http/1.1".to_string()));
+
+        assert!(flow.handshake_complete());
+        assert!(flow.plaintext_ready());
+        assert!(flow.is_session_reused());
+        assert_eq!(flow.phase_label(), "plaintext-ready");
+        assert_eq!(flow.server_name(), "localhost");
+        assert_eq!(flow.alpn(), "http/1.1");
     }
 
     #[test]

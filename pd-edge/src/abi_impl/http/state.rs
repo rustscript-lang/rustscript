@@ -72,7 +72,8 @@ use super::version::HttpVersionPreference;
 use crate::abi_impl::mqtt::MqttConnectionState;
 #[cfg(feature = "tls")]
 use crate::abi_impl::transport::{
-    DownstreamTlsServerStart, SharedServerTlsStreamIo, SharedTlsStreamIo,
+    DownstreamTlsServerStart, SharedDownstreamTlsConfigurationCache,
+    SharedDownstreamTlsResumptionCache, SharedServerTlsStreamIo, SharedTlsStreamIo,
 };
 #[cfg(feature = "webrtc")]
 use crate::abi_impl::webrtc::WebRtcConnectionState;
@@ -867,6 +868,12 @@ pub(crate) struct RuntimeServices {
     plain_http1_sender_pool: Option<SharedPlainHttp1SenderPool>,
     upstream_http_reuse_entries: usize,
     tls_session_cache: Option<SharedTlsSessionCache>,
+    #[cfg(feature = "tls")]
+    downstream_tls_configuration_cache: Option<SharedDownstreamTlsConfigurationCache>,
+    #[cfg(feature = "tls")]
+    downstream_tls_resumption_cache: Option<SharedDownstreamTlsResumptionCache>,
+    #[cfg(feature = "tls")]
+    downstream_tls_resumption_entries: usize,
     upstream_http_sessions: Option<SharedHttpUpstreamSessions>,
     upstream_http3_sessions: Option<SharedHttp3UpstreamSessions>,
     downstream_http_sessions: Option<http2::SharedHttpDownstreamSessions>,
@@ -883,6 +890,12 @@ impl RuntimeServices {
             plain_http1_sender_pool: None,
             upstream_http_reuse_entries: 0,
             tls_session_cache: None,
+            #[cfg(feature = "tls")]
+            downstream_tls_configuration_cache: None,
+            #[cfg(feature = "tls")]
+            downstream_tls_resumption_cache: None,
+            #[cfg(feature = "tls")]
+            downstream_tls_resumption_entries: 0,
             upstream_http_sessions: None,
             upstream_http3_sessions: None,
             downstream_http_sessions: None,
@@ -902,6 +915,25 @@ impl RuntimeServices {
 
     pub(crate) fn tls_session_cache(&self) -> Option<SharedTlsSessionCache> {
         self.tls_session_cache.clone()
+    }
+
+    #[cfg(feature = "tls")]
+    pub(crate) fn downstream_tls_configuration_cache(
+        &self,
+    ) -> Option<SharedDownstreamTlsConfigurationCache> {
+        self.downstream_tls_configuration_cache.clone()
+    }
+
+    #[cfg(feature = "tls")]
+    pub(crate) fn downstream_tls_resumption_cache(
+        &self,
+    ) -> Option<SharedDownstreamTlsResumptionCache> {
+        self.downstream_tls_resumption_cache.clone()
+    }
+
+    #[cfg(feature = "tls")]
+    pub(crate) fn downstream_tls_resumption_entries(&self) -> usize {
+        self.downstream_tls_resumption_entries
     }
 
     pub(crate) fn upstream_http_sessions(&self) -> Option<SharedHttpUpstreamSessions> {
@@ -939,6 +971,12 @@ pub(crate) struct HttpPlaneRuntimeServicesConfig {
     pub(crate) plain_http1_sender_pool: SharedPlainHttp1SenderPool,
     pub(crate) upstream_http_reuse_entries: usize,
     pub(crate) tls_session_cache: SharedTlsSessionCache,
+    #[cfg(feature = "tls")]
+    pub(crate) downstream_tls_configuration_cache: SharedDownstreamTlsConfigurationCache,
+    #[cfg(feature = "tls")]
+    pub(crate) downstream_tls_resumption_cache: SharedDownstreamTlsResumptionCache,
+    #[cfg(feature = "tls")]
+    pub(crate) downstream_tls_resumption_entries: usize,
     pub(crate) upstream_http_sessions: SharedHttpUpstreamSessions,
     pub(crate) upstream_http3_sessions: SharedHttp3UpstreamSessions,
     pub(crate) downstream_http_sessions: http2::SharedHttpDownstreamSessions,
@@ -951,6 +989,12 @@ pub(crate) fn new_shared_http_plane_runtime_services(
         plain_http1_sender_pool: Some(config.plain_http1_sender_pool),
         upstream_http_reuse_entries: config.upstream_http_reuse_entries,
         tls_session_cache: Some(config.tls_session_cache),
+        #[cfg(feature = "tls")]
+        downstream_tls_configuration_cache: Some(config.downstream_tls_configuration_cache),
+        #[cfg(feature = "tls")]
+        downstream_tls_resumption_cache: Some(config.downstream_tls_resumption_cache),
+        #[cfg(feature = "tls")]
+        downstream_tls_resumption_entries: config.downstream_tls_resumption_entries,
         upstream_http_sessions: Some(config.upstream_http_sessions),
         upstream_http3_sessions: Some(config.upstream_http3_sessions),
         downstream_http_sessions: Some(config.downstream_http_sessions),
@@ -1117,6 +1161,8 @@ pub(crate) struct TransportState {
     #[cfg(feature = "tls")]
     pub(crate) downstream_tls_server_start: Option<DownstreamTlsServerStart>,
     #[cfg(feature = "tls")]
+    pub(crate) downstream_tls_server_config: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
+    #[cfg(feature = "tls")]
     pub(crate) downstream_tls_io: Option<SharedServerTlsStreamIo>,
     pub(crate) next_tcp_stream_handle: i64,
     pub(crate) tcp_streams: LazyHandleMap<i64, TcpSocketState>,
@@ -1160,6 +1206,8 @@ impl TransportState {
             #[cfg(feature = "tls")]
             downstream_tls_server_start: None,
             #[cfg(feature = "tls")]
+            downstream_tls_server_config: None,
+            #[cfg(feature = "tls")]
             downstream_tls_io: None,
             next_tcp_stream_handle: FIRST_DYNAMIC_TCP_STREAM_HANDLE,
             tcp_streams: LazyHandleMap::default(),
@@ -1198,6 +1246,8 @@ impl TransportState {
             downstream_peer_addr: Some(peer_addr),
             #[cfg(feature = "tls")]
             downstream_tls_server_start: None,
+            #[cfg(feature = "tls")]
+            downstream_tls_server_config: None,
             #[cfg(feature = "tls")]
             downstream_tls_io: None,
             next_tcp_stream_handle: FIRST_DYNAMIC_TCP_STREAM_HANDLE,

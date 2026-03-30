@@ -21,6 +21,11 @@ pub(crate) use state::{
     tls_session_cache_key,
 };
 #[cfg(feature = "tls")]
+pub(crate) use state::{
+    SharedDownstreamTlsConfigurationCache, SharedDownstreamTlsResumptionCache,
+    new_shared_downstream_tls_configuration_cache, new_shared_downstream_tls_resumption_cache,
+};
+#[cfg(feature = "tls")]
 pub(crate) use state::{DownstreamTlsServerStart, SharedServerTlsStreamIo, SharedTlsStreamIo};
 #[cfg(feature = "tls")]
 pub(crate) use tls::build_default_self_signed_server_config;

@@ -8,6 +8,11 @@ fn tls_session_is_present(session: i64) -> bool {
     unreachable!("abi declaration only")
 }
 
+#[pd_host_function(name = "tls::session::needs_configuration")]
+fn tls_session_needs_configuration(session: i64) -> bool {
+    unreachable!("abi declaration only")
+}
+
 #[pd_host_function(name = "tls::session::handshake")]
 fn tls_session_handshake(session: i64) -> bool {
     unreachable!("abi declaration only")
@@ -70,6 +75,11 @@ fn tls_session_set_max_version(session: i64, version: &str) {
 
 #[pd_host_function(name = "tls::session::get_peer_name")]
 fn tls_session_get_peer_name(session: i64) -> String {
+    unreachable!("abi declaration only")
+}
+
+#[pd_host_function(name = "tls::session::get_server_name")]
+fn tls_session_get_server_name(session: i64) -> String {
     unreachable!("abi declaration only")
 }
 

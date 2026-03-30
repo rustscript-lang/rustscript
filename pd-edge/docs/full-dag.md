@@ -18,6 +18,7 @@ Notes:
 - VM host calls, request execution, graph resolution, and proxy byte-stream wiring are runtime control layers, not protocol goals. They are intentionally omitted from the graphs below.
 - Downstream listener goals are shown below because they now affect which forward edges are legal. The HTTP proxy HTTPS listener begins as downstream TCP with goal `https`; a plain HTTP listener still enters directly at downstream HTTP ingress.
 - An untouched downstream HTTPS listener may auto-advance through `tcp -> tls -> http` on first HTTP-scoped host-call entry or during finalization. Once VM code uses raw downstream transport or TLS prelude state, that automatic edge is blocked and `http::downstream::attach_transport()` becomes the explicit bridge into HTTP.
+- In that explicit downstream TLS-prelude path, `tls::session::from_socket(...)` first observes `ClientHello`, then the TLS DAG branches to either `configuration needed` or `configuration restored`. `tls::session::needs_configuration(...)` exposes that state to VM code before `tls::session::handshake(...)`.
 - There is no symmetric upstream listener-goal layer. Upstream DAGs still begin from VM-selected handles, explicit targets, and connect/send/handshake demand. The adjacent upstream refinement is that TLS sessions now observe the logical target as part of the TLS session DAG, even when the underlying transport was attached first.
 - UDP datagrams and WebRTC data-channel messages do not currently flow through `proxy::pipe` or `proxy::forward`; they remain sibling message-oriented DAGs.
 - MQTT delivery queues are session-level events above TCP/TLS today; they are not adapted into `proxy::pipe` or `proxy::forward`.
@@ -47,13 +48,18 @@ flowchart LR
     subgraph DS_TLS["Downstream TLS DAG"]
         DTL0["tls ingress attached"]
         DTL1["downstream client hello observed"]
-        DTL2["downstream handshake in progress"]
-        DTL3["downstream plaintext ready"]
-        DTL4["downstream tls closed or failed"]
+        DTL2["downstream tls configuration needed"]
+        DTL3["downstream tls configuration restored"]
+        DTL4["downstream handshake in progress"]
+        DTL5["downstream plaintext ready"]
+        DTL6["downstream tls closed or failed"]
         DTL0 --> DTL1
         DTL1 --> DTL2
-        DTL2 --> DTL3
+        DTL1 --> DTL3
+        DTL2 --> DTL4
         DTL3 --> DTL4
+        DTL4 --> DTL5
+        DTL5 --> DTL6
     end
 
     subgraph DS_HTTP["Downstream HTTP DAG"]
@@ -95,7 +101,7 @@ flowchart LR
     DT1 -->|tls may attach| DTL0
     DT1 -. explicit cleartext handoff .-> DH0
     DT1 -->|vm transport host call| DB0
-    DTL3 --> DH0
+    DTL5 --> DH0
     DTL0 -->|vm tls prelude host call| DB0
     DB0 -. http::downstream::attach_transport required for http entry .-> DH0
     DH1 --> DW0

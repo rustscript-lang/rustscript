@@ -1180,10 +1180,8 @@ mod runtime_tests {
 
     #[test]
     fn playground_demo_example_lints_clean() {
-        let lint = lint_source_with_flavor(
-            rss_playground_example("Demo"),
-            SourceFlavor::RustScript,
-        );
+        let lint =
+            lint_source_with_flavor(rss_playground_example("Demo"), SourceFlavor::RustScript);
         assert!(
             lint.diagnostics.is_empty(),
             "playground example 'Demo' should be lint clean, got {:?}",
