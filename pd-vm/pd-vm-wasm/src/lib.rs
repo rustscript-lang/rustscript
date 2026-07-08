@@ -951,18 +951,18 @@ mod lint_tests {
 
     #[test]
     fn lint_with_context_resolves_relative_imports_from_real_document_path() {
-        let path = Path::new("workspace/examples/list_comp_test.rss");
+        let path = Path::new("workspace/examples/string_comp_test.rss");
         let source = r#"
-            use super::stdlib::rss::iter::{range, map, filter};
-            let values = filter(map(range(4), |value| value + 1), |value| value > 2);
+            use super::stdlib::rss::strings::{trim};
+            let values = trim("  two  ");
             values;
         "#;
         let mut options = parse_module_overrides(
-            r#"[{"path":"workspace/stdlib/rss/iter.rss","source":"pub fn range(stop) {}\npub fn map(iterable, f) {}\npub fn filter(iterable, f) {}"}]"#,
+            r#"[{"path":"workspace/stdlib/rss/strings.rss","source":"pub fn trim(value) { value }"}]"#,
         );
         options.set_module_override_source(
-            "workspace/stdlib/rss/iter.rss",
-            include_str!("../../stdlib/rss/iter.rss"),
+            "workspace/stdlib/rss/strings.rss",
+            "pub fn trim(value) { value }",
         );
 
         let report =
@@ -988,20 +988,20 @@ mod lint_tests {
 
     #[test]
     fn lint_with_context_keeps_unknown_local_warnings_with_relative_imports() {
-        let path = Path::new("workspace/examples/list_comp_test.rss");
+        let path = Path::new("workspace/examples/string_comp_test.rss");
         let source = r#"
-            use super::stdlib::rss::iter::{range, map, filter};
-            let values = filter(map(range(4), |item| item + 1), |item| item > 2);
+            use super::stdlib::rss::strings::{trim};
+            let values = trim("  two  ");
             let arr = [1, "two"];
             let value = arr[0];
             value;
         "#;
         let mut options = parse_module_overrides(
-            r#"[{"path":"workspace/stdlib/rss/iter.rss","source":"pub fn range(stop) {}\npub fn map(iterable, f) {}\npub fn filter(iterable, f) {}"}]"#,
+            r#"[{"path":"workspace/stdlib/rss/strings.rss","source":"pub fn trim(value) { value }"}]"#,
         );
         options.set_module_override_source(
-            "workspace/stdlib/rss/iter.rss",
-            include_str!("../../stdlib/rss/iter.rss"),
+            "workspace/stdlib/rss/strings.rss",
+            "pub fn trim(value) { value }",
         );
 
         let report =

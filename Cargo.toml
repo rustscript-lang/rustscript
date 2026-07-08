@@ -1,13 +1,9 @@
 [workspace]
 members = [
-	"pd-vm/pd-host-function",
-	"pd-vm",
-	"pd-vm/pd-vm-wasm",
-	"pd-edge-abi",
-	"pd-edge/pd-edge-host-function",
-	"pd-edge",
-	"pd-edge-http-minimal",
-	"pd-controller",
+    "pd-vm/pd-host-function",
+    "pd-edge-abi",
+    "pd-vm",
+    "pd-vm/pd-vm-wasm",
 ]
 resolver = "2"
 

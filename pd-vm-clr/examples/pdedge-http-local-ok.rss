@@ -1,7 +1,0 @@
-use http;
-
-http::response::set_status(200);
-http::response::set_header("x-method", http::request::get_method());
-http::response::set_header("x-path", http::request::get_path());
-http::response::set_header("x-body", http::request::get_body());
-http::response::set_body("ok");
