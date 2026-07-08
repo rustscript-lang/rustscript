@@ -461,7 +461,7 @@ fn compiler_rejects_if_else_type_mismatch_cases() {
             name: "if else branch type mismatch through shadowed outer local after loop",
             source: r#"
                 let mut total = 0;
-                for (let mut i = 0; i < 4; i = i + 1) {
+                for i in 0..4 {
                     total = total + i;
                 }
 

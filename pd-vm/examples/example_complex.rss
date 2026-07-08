@@ -16,7 +16,7 @@ struct Profile {
 }
 
 let mut total = 0;
-for (let mut i = 0; i < 4; i = i + 1) {
+for i in 0..4 {
     total = total + i;
 }
 

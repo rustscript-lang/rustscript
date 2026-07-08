@@ -33,7 +33,7 @@ pub fn contains(haystack: string, needle: string) -> bool {
     } else => {
         let mut found = false;
         let limit = haystack_len - needle_len + 1;
-        for (let mut index = 0; index < limit; index = index + 1) {
+        for index in 0..limit {
             if equals(haystack[index:(index + needle_len)], needle) {
                 found = true;
                 break;
@@ -50,7 +50,7 @@ pub fn split(value: string, separator: string) -> [string] {
     let separator_len = separator.length;
     let out: [string] = if separator_len == 0 => {
         let mut out: [string] = [];
-        for (let mut char_index = 0; char_index < value_len; char_index = char_index + 1) {
+        for char_index in 0..value_len {
             out[out.length] = value[char_index:(char_index + 1)];
         }
         out

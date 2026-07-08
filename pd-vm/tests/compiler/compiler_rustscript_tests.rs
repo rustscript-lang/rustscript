@@ -1567,7 +1567,7 @@ fn rustscript_move_and_alias_parse_rejection_cases_work() {
             name: "for loop repeated field move is rejected",
             source: r#"
                 let p = { a: "x" };
-                for (let mut i = 0; i < 2; i = i + 1) {
+                for i in 0..2 {
                     let _moved = p.a;
                 }
             "#,
@@ -1743,10 +1743,10 @@ fn rustscript_mutability_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
-            name: "for loop mutating iterator local supports let mut initializer",
+            name: "rust style exclusive range for loop works",
             source: r#"
                 let mut total = 0;
-                for (let mut i = 0; i < 3; i = i + 1) {
+                for i in 0..3 {
                     total = total + i;
                 }
                 total;
@@ -1755,8 +1755,43 @@ fn rustscript_mutability_runtime_cases_work() {
             expected_stack: vec![Value::Int(3)],
             expected_locals: None,
         },
+        RuntimeCase {
+            name: "rust style inclusive range for loop works",
+            source: r#"
+                let mut total = 0;
+                for i in 1..=3 {
+                    total = total + i;
+                }
+                total;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(6)],
+            expected_locals: None,
+        },
     ];
     run_runtime_cases(&cases);
+}
+
+#[test]
+fn c_style_for_loop_parentheses_are_rejected() {
+    let err = match compile_source(
+        r#"
+        let mut total = 0;
+        for (let mut i = 0; i < 3; i = i + 1) {
+            total = total + i;
+        }
+        total;
+    "#,
+    ) {
+        Ok(_) => panic!("parenthesized for loop should be rejected"),
+        Err(err) => err,
+    };
+
+    let text = err.to_string();
+    assert!(
+        text.contains("expected Rust-style for-in loop") && text.contains("for i in 0..n"),
+        "unexpected error: {text}"
+    );
 }
 
 #[test]

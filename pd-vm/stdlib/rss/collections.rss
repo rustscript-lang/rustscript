@@ -3,7 +3,7 @@
 // Returns the first index of a value in an array, or -1 when it is absent.
 pub fn index_of<T>(values: [T], needle: T) -> int {
     let mut found =-1;
-    for (let mut find_index = 0; find_index < values.length; find_index = find_index + 1) {
+    for find_index in 0..values.length {
         if values[find_index] == needle {
             found = find_index;
             break;
@@ -20,12 +20,10 @@ pub fn contains<T>(values: [T], needle: T) -> bool {
 // Returns a reversed copy of an array.
 pub fn reverse<T>(values: [T]) -> [T] {
     let mut out: [T] = [];
-    for (
-        let mut reverse_index = values.length - 1;
-        reverse_index >-1;
-        reverse_index = reverse_index - 1
-    ) {
+    let mut reverse_index = values.length - 1;
+    while reverse_index > -1 {
         out[out.length] = values[reverse_index];
+        reverse_index = reverse_index - 1;
     }
     out
 }
@@ -33,7 +31,7 @@ pub fn reverse<T>(values: [T]) -> [T] {
 // Returns an array with duplicate values removed.
 pub fn dedup<T>(values: [T]) -> [T] {
     let mut out: [T] = [];
-    for (let mut dedup_index = 0; dedup_index < values.length; dedup_index = dedup_index + 1) {
+    for dedup_index in 0..values.length {
         let value = values[dedup_index];
         if contains::<T>(out, value) == false {
             out[out.length] = value;
@@ -60,7 +58,7 @@ pub fn get_or<K, V>(map: map<V>, key: K, fallback: V) -> V {
 pub fn values<V>(map: map<V>) -> [V] {
     let keys =(&map).keys;
     let mut out: [V] = [];
-    for (let mut value_index = 0; value_index <(&keys).length; value_index = value_index + 1) {
+    for value_index in 0..(&keys).length {
         out[out.length] = map[(&keys)[value_index]];
     }
     out
@@ -70,7 +68,7 @@ pub fn values<V>(map: map<V>) -> [V] {
 pub fn entries<K, V>(map: map<V>) -> [[K, V]] {
     let keys =(&map).keys;
     let mut out: [[K, V]] = [];
-    for (let mut entry_index = 0; entry_index <(&keys).length; entry_index = entry_index + 1) {
+    for entry_index in 0..(&keys).length {
         out[out.length] = [(&keys)[entry_index], map[(&keys)[entry_index]]];
     }
     out
@@ -81,12 +79,12 @@ pub fn merge<V>(lhs: map<V>, rhs: map<V>) -> map<V> {
     let mut out: map<V> = {};
 
     let lhs_keys =(&lhs).keys;
-    for (let mut left_index = 0; left_index <(&lhs_keys).length; left_index = left_index + 1) {
+    for left_index in 0..(&lhs_keys).length {
         out[(&lhs_keys)[left_index]] = lhs[(&lhs_keys)[left_index]];
     }
 
     let rhs_keys =(&rhs).keys;
-    for (let mut right_index = 0; right_index <(&rhs_keys).length; right_index = right_index + 1) {
+    for right_index in 0..(&rhs_keys).length {
         out[(&rhs_keys)[right_index]] = rhs[(&rhs_keys)[right_index]];
     }
     out

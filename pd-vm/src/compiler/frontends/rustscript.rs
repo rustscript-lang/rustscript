@@ -16,6 +16,10 @@ impl ParserDialect for RustScriptDialect {
     fn allow_plus_equal_operator(&self) -> bool {
         true
     }
+
+    fn allow_for_in_loop(&self) -> bool {
+        true
+    }
 }
 
 static RUSTSCRIPT_DIALECT: RustScriptDialect = RustScriptDialect;

@@ -991,7 +991,125 @@ impl Parser {
 
     pub(super) fn parse_for(&mut self) -> Result<Stmt, ParseError> {
         let line = self.last_line();
-        self.expect(&TokenKind::LParen, "expected '(' after 'for'")?;
+        if self.dialect.allow_for_in_loop() {
+            return self.parse_for_in(line);
+        }
+        self.parse_c_style_for(line)
+    }
+
+    fn parse_for_in(&mut self, line: u32) -> Result<Stmt, ParseError> {
+        if self.match_kind(&TokenKind::LParen) || self.match_kind(&TokenKind::Let) {
+            return Err(ParseError {
+                span: Some(self.current_span()),
+                code: None,
+                line: self.last_line() as usize,
+                message: "expected Rust-style for-in loop; write `for i in 0..n { ... }`"
+                    .to_string(),
+            });
+        }
+
+        let declared_mutable =
+            self.dialect.allow_let_mut_binding() && self.match_ident_literal("mut");
+        let name = if declared_mutable {
+            self.expect_ident("expected identifier after 'for mut'")?
+        } else {
+            self.expect_ident("expected identifier after 'for'")?
+        };
+        if !self.match_ident_literal("in") {
+            return Err(ParseError {
+                span: Some(self.current_span()),
+                code: None,
+                line: self.current_line(),
+                message: "expected Rust-style for-in loop; write `for i in 0..n { ... }`"
+                    .to_string(),
+            });
+        }
+
+        let start = self.parse_expr()?;
+        let inclusive = if self.match_kind(&TokenKind::DotDot) {
+            false
+        } else if self.match_kind(&TokenKind::DotDotEqual) {
+            true
+        } else {
+            return Err(ParseError {
+                span: Some(self.current_span()),
+                code: None,
+                line: self.current_line(),
+                message: "expected range expression after 'in'; write `for i in 0..n { ... }`"
+                    .to_string(),
+            });
+        };
+        let end = self.parse_expr()?;
+
+        let (index, _) = self.bind_for_loop_local(&name)?;
+        if self.enforce_mutable_bindings {
+            self.set_local_slot_mutable(index, declared_mutable);
+        }
+
+        self.loop_depth += 1;
+        let body = self.parse_block("expected '{' after for range")?;
+        self.loop_depth -= 1;
+
+        let loop_var = Expr::Var(index);
+        let condition = if inclusive {
+            self.build_non_strict_comparison(loop_var, end, Expr::Lt)?
+        } else {
+            Expr::Lt(Box::new(loop_var), Box::new(end))
+        };
+        Ok(Stmt::For {
+            init: Box::new(Stmt::Let {
+                index,
+                declared_schema: None,
+                expr: start,
+                line,
+            }),
+            condition,
+            post: Box::new(Stmt::Assign {
+                kind: AssignmentKind::Set,
+                index,
+                expr: self.build_numeric_addition_expr(index, Expr::Int(1)),
+                line,
+            }),
+            body,
+            line,
+        })
+    }
+
+    fn bind_for_loop_local(&mut self, name: &str) -> Result<(LocalSlot, bool), ParseError> {
+        if !self.closure_scopes.is_empty() {
+            if let Some(index) = self
+                .closure_scopes
+                .last()
+                .and_then(|scope| scope.get(name))
+                .copied()
+            {
+                return Ok((index, false));
+            }
+            let index = self.allocate_hidden_local()?;
+            if let Some(scope) = self.closure_scopes.last_mut() {
+                scope.insert(name.to_string(), index);
+            }
+            self.named_local_bindings.push((name.to_string(), index));
+            return Ok((index, true));
+        }
+        self.get_or_assign_local(name)
+    }
+
+    fn parse_c_style_for(&mut self, line: u32) -> Result<Stmt, ParseError> {
+        let parenthesized = if self.match_kind(&TokenKind::LParen) {
+            if !self.dialect.allow_parenthesized_for_loop() {
+                return Err(ParseError {
+                    span: Some(self.current_span()),
+                    code: None,
+                    line: self.last_line() as usize,
+                    message: "expected Rust-style for-in loop; write `for i in 0..n { ... }`"
+                        .to_string(),
+                });
+            }
+            true
+        } else {
+            false
+        };
 
         let init = if self.match_kind(&TokenKind::Let) {
             self.parse_let_with_terminator(false)?
@@ -1024,7 +1142,9 @@ impl Parser {
                 line: post_line,
             }
         };
-        self.expect(&TokenKind::RParen, "expected ')' after for clauses")?;
+        if parenthesized {
+            self.expect(&TokenKind::RParen, "expected ')' after for clauses")?;
+        }
         self.loop_depth += 1;
         let body = self.parse_block("expected '{' after for clauses")?;
         self.loop_depth -= 1;

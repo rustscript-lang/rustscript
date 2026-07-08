@@ -393,7 +393,7 @@ fn compiler_type_inference_runtime_cases_cover_loop_and_container_flows() {
             "for loop counter types stay stable after the loop",
             r#"
                 let mut total = 0;
-                for (let mut i = 0; i < 4; i = i + 1) {
+                for i in 0..4 {
                     total = total + i;
                 }
                 let after = total + 1;
@@ -427,8 +427,8 @@ fn compiler_type_inference_runtime_cases_cover_loop_and_container_flows() {
             "outer loop types remain concrete across nested loops",
             r#"
                 let mut total = 0;
-                for (let mut i = 0; i < 2; i = i + 1) {
-                    for (let mut j = 0; j < 2; j = j + 1) {
+                for i in 0..2 {
+                    for j in 0..2 {
                         total = total + i + j;
                     }
                 }
@@ -772,7 +772,7 @@ fn compiler_type_inference_compile_only_metadata_cases_work() {
             r#"
                 let mut value: number = 0;
                 let values: [number] = [1, 1.5];
-                for (let mut i = 0; i < 2; i = i + 1) {
+                for i in 0..2 {
                     value = values[i].copy();
                 }
                 value + 1;
@@ -857,7 +857,7 @@ fn compiler_type_inference_compile_rejections_work() {
             name: "loop-carried shadowed if else branch mismatches are rejected",
             source: r#"
                 let mut total = 0;
-                for (let mut i = 0; i < 4; i = i + 1) {
+                for i in 0..4 {
                     total = total + i;
                 }
 

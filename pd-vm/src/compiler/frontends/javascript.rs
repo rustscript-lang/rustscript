@@ -56,6 +56,10 @@ impl ParserDialect for JavaScriptDialect {
     fn allow_increment_operator(&self) -> bool {
         true
     }
+
+    fn allow_parenthesized_for_loop(&self) -> bool {
+        true
+    }
 }
 
 static JAVASCRIPT_DIALECT: JavaScriptDialect = JavaScriptDialect;

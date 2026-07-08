@@ -92,7 +92,7 @@ pub fn is_odd(value: int) -> bool {
 // Returns the sum of numeric values.
 pub fn sum(values: [number]) -> number {
     let mut out = 0;
-    for (let mut index = 0; index < values.length; index = index + 1) {
+    for index in 0..values.length {
         out = out + values[index];
     }
     out

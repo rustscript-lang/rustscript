@@ -828,7 +828,7 @@ fn build_complex_rss_source() -> String {
     fn keep(value) { value }
 
     let mut total = 0;
-    for (let mut i = 0; i < 8; i = i + 1) {
+    for i in 0..8 {
         total = total + i;
     }
 

@@ -33,7 +33,7 @@ pub fn read_lines(path: string) -> [string] {
     let mut lines: [string] = [];
     let text_len =(&text).length;
     let mut start = 0;
-    for (let mut index = 0; index < text_len; index = index + 1) {
+    for index in 0..text_len {
         if (&text)[index:(index + 1)] == "\n" {
             lines[lines.length] =(&text)[start:index];
             start = index + 1;

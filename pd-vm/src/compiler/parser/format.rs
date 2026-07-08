@@ -87,6 +87,7 @@ enum PrevKind {
     Comma,
     Colon,
     Dot,
+    DotDot,
     PathSeparator,
     OptionalAccess,
     Semicolon,
@@ -138,6 +139,7 @@ struct SourceFormatter<'a> {
     at_stmt_start: bool,
     in_fn_signature: bool,
     in_closure_params: bool,
+    for_head_semicolons_remaining: u8,
 }
 
 impl<'a> SourceFormatter<'a> {
@@ -161,6 +163,7 @@ impl<'a> SourceFormatter<'a> {
             at_stmt_start: true,
             in_fn_signature: false,
             in_closure_params: false,
+            for_head_semicolons_remaining: 0,
         }
     }
 
@@ -235,6 +238,9 @@ impl<'a> SourceFormatter<'a> {
             }
             TokenKind::For => {
                 self.emit_keyword("for", PrevKind::For, true);
+                if !matches!(self.peek_kind_at(self.index + 1), Some(TokenKind::LParen)) {
+                    self.for_head_semicolons_remaining = 2;
+                }
                 self.push_brace_expectation(BraceKind::Block);
             }
             TokenKind::If => {
@@ -347,6 +353,16 @@ impl<'a> SourceFormatter<'a> {
                 self.write_raw(".");
                 self.prev_kind = Some(PrevKind::Dot);
             }
+            TokenKind::DotDot => {
+                self.clear_pending_space();
+                self.write_raw("..");
+                self.prev_kind = Some(PrevKind::DotDot);
+            }
+            TokenKind::DotDotEqual => {
+                self.clear_pending_space();
+                self.write_raw("..=");
+                self.prev_kind = Some(PrevKind::DotDot);
+            }
             TokenKind::Ellipsis => {
                 self.clear_pending_space();
                 self.write_raw("...");
@@ -360,6 +376,9 @@ impl<'a> SourceFormatter<'a> {
                     if !matches!(self.peek_kind_at(self.index + 1), Some(TokenKind::RParen)) {
                         self.request_space();
                     }
+                } else if self.for_head_semicolons_remaining > 0 {
+                    self.for_head_semicolons_remaining -= 1;
+                    self.request_space();
                 } else {
                     self.pending_code_break = true;
                     self.at_stmt_start = true;

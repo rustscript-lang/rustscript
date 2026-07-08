@@ -29,7 +29,7 @@ All frontends lower to the same frontend IR and VM bytecode model.
 | Closure literal | `|x| x + 1` | `(x) => x + 1` | `function(x) return x + 1 end` | `(lambda (x) (+ x 1))` |
 | If statement | `if cond { ... } else { ... }` | `if (cond) { ... } else { ... }` | `if cond then ... elseif/elif ... else ... end` | `(if cond then else)` |
 | While loop | `while cond { ... }` | `while (cond) { ... }` | `while cond do ... end` | `(while cond ...)` |
-| For loop | `for (let i = 0; i < n; i = i + 1) { ... }` | same style | `for i = 0, n, 1 do ... end` / `for k,v in pairs(t) do ... end` | `(for (i 0 n [step]) ...)` / `(do ...)` |
+| For loop | `for i in 0..n { ... }` / `for i in 0..=n { ... }` | `for (let i = 0; i < n; i = i + 1) { ... }` | `for i = 0, n, 1 do ... end` / `for k,v in pairs(t) do ... end` | `(for (i 0 n [step]) ...)` / `(do ...)` |
 | Collection literals | `[1, 2]`, `{x: 1}` | `[1, 2]`, `{ x: 1 }` | `{1, 2, x = 1}` | `(vector 1 2)`, `(list 1 2)`, `(hash (x 1))` |
 | Index/member access | `a[i]`, `m.key` | `a[i]`, `m.key` | `a[i]`, `m.key` | `(vector-ref a i)`, `(hash-ref m k)` |
 | Optional chain | `a?.b?.c` | `a?.b?.c` | `a?.b?.c` | `a?.b?.c` |

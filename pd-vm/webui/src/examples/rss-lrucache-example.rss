@@ -610,7 +610,7 @@ let visible_items: [FeedCacheItem] = values::<string, FeedCacheItem>(cache);
 let mut visible_topics: [string] = [];
 let mut total_visible_articles: int = 0;
 let visible_count = visible_items.length;
-for (let mut index = 0; index < visible_count; index = index + 1) {
+for index in 0..visible_count {
     let item: FeedCacheItem = (&visible_items)[index];
     visible_topics[visible_topics.length] = item.topic;
     total_visible_articles = total_visible_articles + item.article_count;

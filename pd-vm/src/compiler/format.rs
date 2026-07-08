@@ -92,6 +92,15 @@ mod tests {
     }
 
     #[test]
+    fn formats_rust_style_for_in_loop_head_on_one_line() {
+        let input = "for i in 0..3{\nvalue=value+i;\n}\n";
+        let formatted = format_source_with_flavor(input, SourceFlavor::RustScript)
+            .expect("formatting should succeed");
+
+        assert_eq!(formatted, "for i in 0..3 {\n    value = value + i;\n}\n");
+    }
+
+    #[test]
     fn adds_space_before_array_literals_after_assignment() {
         let input = "let a =[1, \"a\"];\n";
         let formatted = format_source_with_flavor(input, SourceFlavor::RustScript)

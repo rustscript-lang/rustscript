@@ -87,6 +87,14 @@ pub(super) trait ParserDialect {
     fn allow_increment_operator(&self) -> bool {
         false
     }
+
+    fn allow_parenthesized_for_loop(&self) -> bool {
+        false
+    }
+
+    fn allow_for_in_loop(&self) -> bool {
+        false
+    }
 }
 
 pub(super) fn lint_trailing_function_return_semicolons(

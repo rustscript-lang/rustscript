@@ -14,7 +14,7 @@ fn trim_trailing_separators(path: string) -> string {
 // Replaces backslashes with forward slashes in a path.
 pub fn normalize_sep(path: string) -> string {
     let mut out = "";
-    for (let mut index = 0; index <(&path).length; index = index + 1) {
+    for index in 0..(&path).length {
         let ch =(&path)[index:(index + 1)];
         let segment = if ch == "\\" => {
             "/"

@@ -52,7 +52,7 @@ pub fn index_of(buf: bytes, needle: bytes) -> int {
     } else => {
         let mut found = -1;
         let limit = buf_len - needle_len + 1;
-        for (let mut index = 0; index < limit; index = index + 1) {
+        for index in 0..limit {
             if buf[index:(index + needle_len)] == needle {
                 found = index;
                 break;
