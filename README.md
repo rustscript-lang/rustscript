@@ -5,7 +5,7 @@ RustScript is the language, VM, Lua/JavaScript frontends, standard library, exam
 ## Related projects
 
 - RustScript core: https://github.com/rustscript-lang/rustscript
-- RustScript Playground: https://github.com/rustscript-lang/rustscript-playground
+- RustScript Playground: https://github.com/rustscript-lang/playground
 - CLR VM: https://github.com/rustscript-lang/rustscript-clr-vm
 - Edge runtime and ABI: https://github.com/rustscript-lang/pd-edge
 - Controller: https://github.com/rustscript-lang/pd-controller

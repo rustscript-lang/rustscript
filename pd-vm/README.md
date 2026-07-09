@@ -297,8 +297,8 @@ Browser playground wasm runtime is provided by sibling crate `pd-vm-wasm` built 
 
 The Monaco browser playground lives in a standalone repository:
 
-- source: https://github.com/rustscript-lang/rustscript-playground
-- published site: https://rustscript-lang.github.io/rustscript-playground/
+- source: https://github.com/rustscript-lang/playground
+- published site: https://rustscript-lang.github.io/playground/
 
 It builds `pd-vm-wasm --features runtime`, copies wasm artifacts into the web app, and uses the Monaco grammar assets kept under `pd-vm/editor-assets/monaco`.
 
