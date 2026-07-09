@@ -14,6 +14,8 @@ pub mod jit {
     };
 }
 #[cfg(feature = "runtime")]
+pub mod cli;
+#[cfg(feature = "runtime")]
 pub mod vm;
 #[cfg(feature = "runtime")]
 pub mod vmbc;
