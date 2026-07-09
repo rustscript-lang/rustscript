@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: target
+
+jobs:
+  rust:
+    name: Rust lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features
+      - name: Tests
+        run: cargo test --workspace --jobs 4
+
+  pd-vm-cli:
+    name: pd-vm CLI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build pd-vm CLI
+        run: cargo build -p pd-vm --bin pd-vm-run --release
+      - name: Stage pd-vm CLI artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          suffix=""
+          if [[ "${{ runner.os }}" == "Windows" ]]; then suffix=".exe"; fi
+          cp "target/release/pd-vm-run${suffix}" "dist/pd-vm-run-${{ runner.os }}-${{ runner.arch }}${suffix}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pd-vm-cli-${{ runner.os }}-${{ runner.arch }}
+          path: dist/*
+
+  vscode-extension:
+    name: VS Code extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Package VS Code extension
+        working-directory: vscode-rustscript
+        run: |
+          mkdir -p dist
+          npx --yes @vscode/vsce package --out dist/rustscript-vscode.vsix
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustscript-vscode-extension
+          path: vscode-rustscript/dist/*.vsix

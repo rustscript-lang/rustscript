@@ -1,6 +1,0 @@
-[build]
-target-dir = "/mnt/TEMP/workspace/rustscript/target"
-jobs = 4
-
-[env]
-RUST_TEST_THREADS = "4"

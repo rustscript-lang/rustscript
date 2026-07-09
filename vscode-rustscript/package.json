@@ -1,0 +1,41 @@
+{
+  "name": "rustscript-vscode",
+  "displayName": "RustScript",
+  "description": "RustScript language support for Visual Studio Code.",
+  "version": "0.1.0",
+  "publisher": "rustscript-lang",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rustscript-lang/rustscript.git",
+    "directory": "vscode-rustscript"
+  },
+  "engines": {
+    "vscode": "^1.92.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "rustscript",
+        "aliases": [
+          "RustScript",
+          "rustscript"
+        ],
+        "extensions": [
+          ".rss"
+        ],
+        "configuration": "./language-configuration/rustscript.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "rustscript",
+        "scopeName": "source.rustscript",
+        "path": "./syntaxes/rustscript.tmLanguage.json"
+      }
+    ]
+  }
+}
