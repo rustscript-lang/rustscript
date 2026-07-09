@@ -342,7 +342,7 @@ cargo test -p pd-vm --test jit_tests perf_ -- --ignored --nocapture
 
 Migration perf record (handwritten vs Cranelift baseline before handwritten backend removal):
 
-- `docs/JIT_BACKEND_MIGRATION_PERF_2026-03-06.md`
+- https://rustscript.org/docs/jit-backend-migration-perf-2026-03-06/
 
 ## Internals
 
